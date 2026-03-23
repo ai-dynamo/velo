@@ -1,0 +1,27 @@
+# IDE
+.idea/
+.vscode/
+.helix/
+
+# Rust
+target/
+debug/
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Claude / AI
+/.claude/*
+!/.claude/skills/
+worklogs/
+
+# Coverage
+*.profraw
+lcov.info
+codecov.json
+
+# Misc
+*.log
+core
+.envrc
