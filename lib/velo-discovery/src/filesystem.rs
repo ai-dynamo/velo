@@ -41,6 +41,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use velo_common::{InstanceId, PeerInfo, WorkerAddress, WorkerId};
 
 use super::PeerDiscovery;
+use super::RegistrationGuard;
 
 /// Filesystem-based peer discovery backend.
 ///
@@ -107,7 +108,10 @@ impl FilesystemPeerDiscovery {
     }
 
     /// Register peer info.
-    pub async fn register_peer_info(&self, peer_info: &PeerInfo) -> Result<RegistrationGuard> {
+    pub async fn register_peer_info(
+        &self,
+        peer_info: &PeerInfo,
+    ) -> Result<FilesystemRegistrationGuard> {
         let instance_id = peer_info.instance_id();
         let worker_address = peer_info.worker_address().clone();
         self.register_instance_async(instance_id, worker_address)
@@ -116,12 +120,12 @@ impl FilesystemPeerDiscovery {
 
     /// Register an instance with an address.
     ///
-    /// Returns a [`RegistrationGuard`] that automatically unregisters the instance when dropped.
+    /// Returns a [`FilesystemRegistrationGuard`] that automatically unregisters the instance when dropped.
     pub async fn register_instance_async(
         &self,
         instance_id: InstanceId,
         worker_address: WorkerAddress,
-    ) -> Result<RegistrationGuard> {
+    ) -> Result<FilesystemRegistrationGuard> {
         let _guard = self.write_mutex.lock().await;
 
         self.load_from_disk().await?;
@@ -160,7 +164,7 @@ impl FilesystemPeerDiscovery {
         }
 
         self.save_to_disk().await?;
-        Ok(RegistrationGuard::new(self.clone(), instance_id))
+        Ok(FilesystemRegistrationGuard::new(self.clone(), instance_id))
     }
 
     /// Unregister an instance.
@@ -308,14 +312,13 @@ impl PeerDiscovery for FilesystemPeerDiscovery {
 ///
 /// Obtained from [`FilesystemPeerDiscovery::register_instance_async`] or
 /// [`FilesystemPeerDiscovery::register_peer_info`].
-/// Dropping this guard asynchronously unregisters all tracked instances.
 #[derive(Debug)]
-pub struct RegistrationGuard {
+pub struct FilesystemRegistrationGuard {
     discovery: FilesystemPeerDiscovery,
     instances: Vec<InstanceId>,
 }
 
-impl RegistrationGuard {
+impl FilesystemRegistrationGuard {
     fn new(discovery: FilesystemPeerDiscovery, instance_id: InstanceId) -> Self {
         Self {
             discovery,
@@ -324,7 +327,19 @@ impl RegistrationGuard {
     }
 }
 
-impl Drop for RegistrationGuard {
+impl RegistrationGuard for FilesystemRegistrationGuard {
+    fn unregister(&mut self) -> BoxFuture<'_, anyhow::Result<()>> {
+        Box::pin(async move {
+            let instances = std::mem::take(&mut self.instances);
+            for id in instances {
+                self.discovery.unregister_instance_async(id).await?;
+            }
+            Ok(())
+        })
+    }
+}
+
+impl Drop for FilesystemRegistrationGuard {
     fn drop(&mut self) {
         let discovery = self.discovery.clone();
         let instances = std::mem::take(&mut self.instances);
@@ -605,5 +620,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(peer_info.instance_id(), instance_id);
+    }
+
+    #[tokio::test]
+    async fn test_registration_guard_trait_unregister() {
+        use crate::RegistrationGuard as _;
+        let discovery = FilesystemPeerDiscovery::new_temp().unwrap();
+        let (instance_id, worker_address) = create_test_peer_info();
+        let worker_id = instance_id.worker_id();
+
+        let mut guard = discovery
+            .register_instance_async(instance_id, worker_address)
+            .await
+            .unwrap();
+
+        assert!(
+            discovery
+                .discover_by_worker_id_async(worker_id)
+                .await
+                .is_ok()
+        );
+
+        guard.unregister().await.unwrap();
+
+        assert!(
+            discovery
+                .discover_by_worker_id_async(worker_id)
+                .await
+                .is_err(),
+            "Instance should be unregistered after explicit unregister()"
+        );
     }
 }

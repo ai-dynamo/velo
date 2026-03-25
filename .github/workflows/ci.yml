@@ -91,6 +91,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    services:
+      nats:
+        image: nats:latest
+        ports:
+          - 4222:4222
     steps:
     - uses: actions/checkout@v4
     - name: Install protoc
@@ -125,6 +130,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    services:
+      nats:
+        image: nats:latest
+        ports:
+          - 4222:4222
     steps:
     - uses: actions/checkout@v4
     - name: Install protoc

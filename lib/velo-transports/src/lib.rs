@@ -31,22 +31,29 @@ mod address;
 
 pub mod tcp;
 
+/// Shared utility functions for transport implementations.
+pub mod utils;
+
+#[cfg(unix)]
+pub mod uds;
+
 // #[cfg(feature = "ucx")]
 // pub mod ucx;
 
 // #[cfg(feature = "http")]
 // pub mod http;
 
-// #[cfg(feature = "nats")]
-// pub mod nats;
+#[cfg(feature = "nats")]
+pub mod nats;
 
-// #[cfg(feature = "grpc")]
-// pub mod grpc;
+#[cfg(feature = "grpc")]
+pub mod grpc;
 
 mod transport;
 
 use std::{collections::HashMap, sync::Arc};
 
+use bytes::Bytes;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 
@@ -57,6 +64,9 @@ pub use velo_common::{
 
 // Internal builder for address construction
 use address::WorkerAddressBuilder;
+
+// Re-export interface discovery types
+pub use utils::interfaces::{InterfaceEndpoint, InterfaceFilter};
 
 // Re-export transport types
 pub use transport::{
@@ -213,8 +223,8 @@ impl VeloBackend {
     pub fn send_message(
         &self,
         target: InstanceId,
-        header: Vec<u8>,
-        payload: Vec<u8>,
+        header: Bytes,
+        payload: Bytes,
         message_type: MessageType,
         on_error: Arc<dyn TransportErrorHandler>,
     ) -> anyhow::Result<()> {
@@ -237,8 +247,8 @@ impl VeloBackend {
     pub fn send_message_with_transport(
         &self,
         target: InstanceId,
-        header: Vec<u8>,
-        payload: Vec<u8>,
+        header: Bytes,
+        payload: Bytes,
         message_type: MessageType,
         on_error: Arc<dyn TransportErrorHandler>,
         transport_key: TransportKey,
@@ -291,8 +301,8 @@ impl VeloBackend {
     pub fn send_message_to_worker(
         &self,
         worker_id: WorkerId,
-        header: Vec<u8>,
-        payload: Vec<u8>,
+        header: Bytes,
+        payload: Bytes,
         message_type: MessageType,
         on_error: Arc<dyn TransportErrorHandler>,
     ) -> anyhow::Result<()> {
@@ -472,8 +482,8 @@ mod tests {
         fn send_message(
             &self,
             _instance_id: InstanceId,
-            _header: Vec<u8>,
-            _payload: Vec<u8>,
+            _header: Bytes,
+            _payload: Bytes,
             _message_type: MessageType,
             _on_error: Arc<dyn TransportErrorHandler>,
         ) {
@@ -623,8 +633,8 @@ mod tests {
         backend
             .send_message(
                 peer_id,
-                vec![1],
-                vec![2],
+                Bytes::from_static(&[1]),
+                Bytes::from_static(&[2]),
                 MessageType::Message,
                 Arc::new(NoopErrorHandler),
             )
@@ -642,8 +652,8 @@ mod tests {
 
         let result = backend.send_message(
             InstanceId::new_v4(),
-            vec![],
-            vec![],
+            Bytes::new(),
+            Bytes::new(),
             MessageType::Message,
             Arc::new(NoopErrorHandler),
         );
@@ -664,8 +674,8 @@ mod tests {
         backend
             .send_message_with_transport(
                 peer_id,
-                vec![1],
-                vec![2],
+                Bytes::from_static(&[1]),
+                Bytes::from_static(&[2]),
                 MessageType::Message,
                 Arc::new(NoopErrorHandler),
                 TransportKey::from("tcp"),
@@ -694,8 +704,8 @@ mod tests {
         backend
             .send_message_with_transport(
                 peer_id,
-                vec![1],
-                vec![2],
+                Bytes::from_static(&[1]),
+                Bytes::from_static(&[2]),
                 MessageType::Message,
                 Arc::new(NoopErrorHandler),
                 TransportKey::from("http"),
@@ -718,8 +728,8 @@ mod tests {
 
         let result = backend.send_message_with_transport(
             peer_id,
-            vec![],
-            vec![],
+            Bytes::new(),
+            Bytes::new(),
             MessageType::Message,
             Arc::new(NoopErrorHandler),
             TransportKey::from("grpc"),

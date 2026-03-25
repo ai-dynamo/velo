@@ -213,9 +213,10 @@ pub async fn large_payload<F: TransportFactory>() {
 
     transport_a.register_peer(&transport_b).unwrap();
 
-    // 1MB payload
+    // 900KB payload — large enough to stress transports, small enough to fit
+    // within NATS default max_payload (1MB) after header + protocol overhead.
     let header = b"large-payload".to_vec();
-    let payload = test_data(1024 * 1024);
+    let payload = test_data(900 * 1024);
 
     transport_a.send(
         transport_b.instance_id,

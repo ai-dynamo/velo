@@ -8,14 +8,12 @@
 
 #![allow(dead_code)]
 
-// #[cfg(feature = "grpc")]
-// use velo_transports::grpc::{GrpcTransport, GrpcTransportBuilder};
+#[cfg(feature = "grpc")]
+use velo_transports::grpc::{GrpcTransport, GrpcTransportBuilder};
 // #[cfg(feature = "http")]
 // use velo_transports::http::{HttpTransport, HttpTransportBuilder};
-// #[cfg(feature = "nats")]
-// use velo_transports::nats::{NatsTransport, NatsTransportBuilder};
-// #[cfg(feature = "ucx")]
-// use velo_transports::ucx::{UcxTransport, UcxTransportBuilder};
+#[cfg(feature = "nats")]
+use velo_transports::nats::{NatsTransport, NatsTransportBuilder};
 
 use bytes::Bytes;
 use std::sync::{Arc, Mutex};
@@ -25,6 +23,9 @@ use velo_transports::{
     DataStreams, InstanceId, MessageType, PeerInfo, Transport, TransportErrorHandler,
     tcp::{TcpTransport, TcpTransportBuilder},
 };
+
+#[cfg(unix)]
+use velo_transports::uds::{UdsTransport, UdsTransportBuilder};
 
 use std::sync::Once;
 use tracing_subscriber::FmtSubscriber;
@@ -42,6 +43,7 @@ pub fn init_tracing() {
 }
 
 pub mod scenarios;
+pub mod shutdown_scenarios;
 
 /// Test error handler that tracks errors for verification
 #[derive(Clone)]
@@ -153,8 +155,8 @@ impl<T: Transport> TestTransportHandle<T> {
     ) {
         self.transport.send_message(
             target,
-            header,
-            payload,
+            Bytes::from(header),
+            Bytes::from(payload),
             msg_type,
             self.error_handler.clone(),
         );
@@ -254,6 +256,24 @@ impl TestTransportHandle<TcpTransport> {
     }
 }
 
+// UDS-specific convenience constructors
+#[cfg(unix)]
+impl TestTransportHandle<UdsTransport> {
+    /// Create a new UDS transport using a temp directory socket path
+    pub async fn new_uds() -> anyhow::Result<Self> {
+        Self::with_factory(|| {
+            let dir = std::env::temp_dir().join(format!(
+                "velo-uds-test-{}",
+                velo_transports::InstanceId::new_v4()
+            ));
+            std::fs::create_dir_all(&dir)?;
+            let socket_path = dir.join("transport.sock");
+            UdsTransportBuilder::new().socket_path(&socket_path).build()
+        })
+        .await
+    }
+}
+
 // // UCX-specific convenience constructors
 // #[cfg(feature = "ucx")]
 // impl TestTransportHandle<UcxTransport> {
@@ -282,66 +302,29 @@ impl TestTransportHandle<TcpTransport> {
 //     }
 // }
 
-// // NATS-specific convenience constructor
-// #[cfg(feature = "nats")]
-// impl TestTransportHandle<NatsTransport> {
-//     /// Create a new NATS transport
-//     ///
-//     /// This is a convenience method for creating NATS transports.
-//     /// For other transport types, use `with_factory()`.
-//     ///
-//     /// Note: NATS transport requires special handling because it needs the instance_id
-//     /// at construction time to set up subject subscriptions. We can't use the generic
-//     /// with_factory() because it creates the instance_id AFTER calling the factory.
-//     pub async fn new_nats() -> anyhow::Result<Self> {
-//         // Create instance_id
-//         let instance_id = InstanceId::new_v4();
-//         let error_handler = Arc::new(TestErrorHandler::new());
+// NATS-specific convenience constructor
+#[cfg(feature = "nats")]
+impl TestTransportHandle<NatsTransport> {
+    /// Create a new NATS transport with a unique cluster_id for test isolation (TEST-06).
+    pub async fn new_nats(cluster_id: &str) -> anyhow::Result<Self> {
+        let client = velo_transports::nats::utils::connect("nats://127.0.0.1:4222").await?;
+        Self::with_factory(|| Ok(NatsTransportBuilder::new(client.clone(), cluster_id).build()))
+            .await
+    }
+}
 
-//         // Build transport
-//         let transport = NatsTransportBuilder::new()
-//             .nats_url("nats://127.0.0.1:4222")
-//             .build()?;
-
-//         // Create channels for this transport
-//         let (adapter, streams) = velo_transports::make_channels();
-
-//         // Get runtime handle
-//         let runtime = tokio::runtime::Handle::current();
-
-//         // Start the transport
-//         transport
-//             .start(instance_id, adapter, runtime.clone())
-//             .await?;
-
-//         // Give NATS a moment to establish subscriptions
-//         tokio::time::sleep(Duration::from_millis(50)).await;
-
-//         Ok(Self {
-//             transport,
-//             streams,
-//             instance_id,
-//             error_handler,
-//             runtime,
-//         })
-//     }
-// }
-
-// // gRPC-specific convenience constructors
-// #[cfg(feature = "grpc")]
-// impl TestTransportHandle<GrpcTransport> {
-//     /// Create a new gRPC transport with OS-provided port
-//     ///
-//     /// This is a convenience method for creating gRPC transports.
-//     /// For other transport types, use `with_factory()`.
-//     pub async fn new_grpc() -> anyhow::Result<Self> {
-//         Self::with_factory(|| {
-//             // Use default builder which binds to 0.0.0.0:0 (OS-provided port)
-//             GrpcTransportBuilder::new().build()
-//         })
-//         .await
-//     }
-// }
+// gRPC-specific convenience constructors
+#[cfg(feature = "grpc")]
+impl TestTransportHandle<GrpcTransport> {
+    /// Create a new gRPC transport with OS-provided port
+    pub async fn new_grpc() -> anyhow::Result<Self> {
+        Self::with_factory(|| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+            GrpcTransportBuilder::new().from_listener(listener)?.build()
+        })
+        .await
+    }
+}
 
 /// Multi-transport test cluster
 ///
@@ -418,15 +401,21 @@ impl TestCluster<TcpTransport> {
     }
 }
 
-// UCX-specific convenience constructor
-#[cfg(feature = "ucx")]
-impl TestCluster<UcxTransport> {
-    /// Create a new UCX test cluster with the specified number of transports
-    ///
-    /// This is a convenience method for creating UCX clusters.
-    /// For other transport types, use `with_factory()`.
-    pub async fn new_ucx(size: usize) -> anyhow::Result<Self> {
-        Self::with_factory(size, || UcxTransportBuilder::new().build()).await
+// UDS-specific convenience constructor
+#[cfg(unix)]
+impl TestCluster<UdsTransport> {
+    /// Create a new UDS test cluster with the specified number of transports
+    pub async fn new_uds(size: usize) -> anyhow::Result<Self> {
+        Self::with_factory(size, || {
+            let dir = std::env::temp_dir().join(format!(
+                "velo-uds-test-{}",
+                velo_transports::InstanceId::new_v4()
+            ));
+            std::fs::create_dir_all(&dir)?;
+            let socket_path = dir.join("transport.sock");
+            UdsTransportBuilder::new().socket_path(&socket_path).build()
+        })
+        .await
     }
 }
 
@@ -446,52 +435,34 @@ impl TestCluster<UcxTransport> {
 //     }
 // }
 
-// // NATS-specific convenience constructor
-// #[cfg(feature = "nats")]
-// impl TestCluster<NatsTransport> {
-//     /// Create a new NATS test cluster with the specified number of transports
-//     ///
-//     /// This is a convenience method for creating NATS clusters.
-//     /// For other transport types, use `with_factory()`.
-//     ///
-//     /// Note: NATS transport requires special handling because it needs the instance_id
-//     /// at construction time. We can't use the generic with_factory() which creates
-//     /// instance_id after calling the factory function.
-//     pub async fn new_nats(size: usize) -> anyhow::Result<Self> {
-//         let mut transports = Vec::new();
+// NATS-specific convenience constructor
+#[cfg(feature = "nats")]
+impl TestCluster<NatsTransport> {
+    /// Create a new NATS test cluster sharing a single cluster_id (TEST-06).
+    ///
+    /// All nodes share the same cluster_id so they can exchange messages.
+    /// The client is shared via Arc.
+    pub async fn new_nats(size: usize, cluster_id: &str) -> anyhow::Result<Self> {
+        let client = velo_transports::nats::utils::connect("nats://127.0.0.1:4222").await?;
+        Self::with_factory(size, || {
+            Ok(NatsTransportBuilder::new(client.clone(), cluster_id).build())
+        })
+        .await
+    }
+}
 
-//         for _ in 0..size {
-//             transports.push(TestTransportHandle::new_nats().await?);
-//         }
-
-//         // Register all peers with each other (full mesh)
-//         for i in 0..transports.len() {
-//             for j in 0..transports.len() {
-//                 if i != j {
-//                     transports[i].register_peer(&transports[j])?;
-//                 }
-//             }
-//         }
-
-//         Ok(Self { transports })
-//     }
-// }
-
-// // gRPC-specific convenience constructor
-// #[cfg(feature = "grpc")]
-// impl TestCluster<GrpcTransport> {
-//     /// Create a new gRPC test cluster with the specified number of transports
-//     ///
-//     /// This is a convenience method for creating gRPC clusters.
-//     /// For other transport types, use `with_factory()`.
-//     pub async fn new_grpc(size: usize) -> anyhow::Result<Self> {
-//         Self::with_factory(size, || {
-//             // Use default builder which binds to OS-provided ports
-//             GrpcTransportBuilder::new().build()
-//         })
-//         .await
-//     }
-// }
+// gRPC-specific convenience constructor
+#[cfg(feature = "grpc")]
+impl TestCluster<GrpcTransport> {
+    /// Create a new gRPC test cluster with the specified number of transports
+    pub async fn new_grpc(size: usize) -> anyhow::Result<Self> {
+        Self::with_factory(size, || {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+            GrpcTransportBuilder::new().from_listener(listener)?.build()
+        })
+        .await
+    }
+}
 
 // Helper utilities
 
@@ -524,6 +495,271 @@ pub fn assert_message_eq(
     assert_eq!(received.1.as_ref(), expected_payload, "Payload mismatch");
 }
 
+// ---------------------------------------------------------------------------
+// ShutdownTestClient trait + implementations
+// ---------------------------------------------------------------------------
+
+/// Trait abstracting over transport-specific shutdown test operations.
+///
+/// This allows shutdown tests to be written generically and instantiated
+/// for TCP, UDS, etc. via the `transport_shutdown_tests!` macro.
+pub trait ShutdownTestClient {
+    type Transport: Transport;
+    type Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send;
+
+    /// Create a new transport handle for testing.
+    fn new_handle()
+    -> impl std::future::Future<Output = anyhow::Result<TestTransportHandle<Self::Transport>>> + Send;
+
+    /// Connect a raw client to the transport and send one frame. Returns the stream.
+    fn connect_and_send_frame(
+        handle: &TestTransportHandle<Self::Transport>,
+        msg_type: MessageType,
+        header: &[u8],
+        payload: &[u8],
+    ) -> impl std::future::Future<Output = Self::Stream> + Send;
+
+    /// Read one frame from the raw stream.
+    fn read_one_frame(
+        stream: &mut Self::Stream,
+    ) -> impl std::future::Future<Output = (MessageType, Bytes, Bytes)> + Send;
+}
+
+/// TCP shutdown test client
+pub struct TcpShutdownClient;
+
+impl ShutdownTestClient for TcpShutdownClient {
+    type Transport = TcpTransport;
+    type Stream = tokio::net::TcpStream;
+
+    async fn new_handle() -> anyhow::Result<TestTransportHandle<Self::Transport>> {
+        TestTransportHandle::new_tcp().await
+    }
+
+    async fn connect_and_send_frame(
+        handle: &TestTransportHandle<Self::Transport>,
+        msg_type: MessageType,
+        header: &[u8],
+        payload: &[u8],
+    ) -> Self::Stream {
+        use velo_transports::InterfaceEndpoint;
+        use velo_transports::tcp::TcpFrameCodec;
+
+        let addr = {
+            let wa = handle.transport.address();
+            let key = handle.transport.key();
+            let endpoint = wa.get_entry(&key).unwrap().unwrap();
+            // Try new msgpack format first, fall back to legacy string
+            if let Ok(endpoints) = rmp_serde::from_slice::<Vec<InterfaceEndpoint>>(&endpoint) {
+                endpoints[0].socket_addr().unwrap()
+            } else {
+                let s = std::str::from_utf8(&endpoint).unwrap();
+                let s = s.strip_prefix("tcp://").unwrap_or(s);
+                s.parse::<std::net::SocketAddr>().unwrap()
+            }
+        };
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        TcpFrameCodec::encode_frame(&mut stream, msg_type, header, payload)
+            .await
+            .unwrap();
+        stream
+    }
+
+    async fn read_one_frame(stream: &mut Self::Stream) -> (MessageType, Bytes, Bytes) {
+        use futures::StreamExt;
+        use tokio_util::codec::Framed;
+        use velo_transports::tcp::TcpFrameCodec;
+
+        let mut framed = Framed::new(stream, TcpFrameCodec::new());
+        framed.next().await.unwrap().unwrap()
+    }
+}
+
+/// UDS shutdown test client
+#[cfg(unix)]
+pub struct UdsShutdownClient;
+
+#[cfg(unix)]
+impl ShutdownTestClient for UdsShutdownClient {
+    type Transport = UdsTransport;
+    type Stream = tokio::net::UnixStream;
+
+    async fn new_handle() -> anyhow::Result<TestTransportHandle<Self::Transport>> {
+        TestTransportHandle::new_uds().await
+    }
+
+    async fn connect_and_send_frame(
+        handle: &TestTransportHandle<Self::Transport>,
+        msg_type: MessageType,
+        header: &[u8],
+        payload: &[u8],
+    ) -> Self::Stream {
+        use velo_transports::tcp::TcpFrameCodec;
+
+        let socket_path = {
+            let wa = handle.transport.address();
+            let key = handle.transport.key();
+            let endpoint = wa.get_entry(&key).unwrap().unwrap();
+            let s = std::str::from_utf8(&endpoint).unwrap();
+            let s = s.strip_prefix("uds://").unwrap_or(s);
+            std::path::PathBuf::from(s)
+        };
+        let mut stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        TcpFrameCodec::encode_frame(&mut stream, msg_type, header, payload)
+            .await
+            .unwrap();
+        stream
+    }
+
+    async fn read_one_frame(stream: &mut Self::Stream) -> (MessageType, Bytes, Bytes) {
+        use futures::StreamExt;
+        use tokio_util::codec::Framed;
+        use velo_transports::tcp::TcpFrameCodec;
+
+        let mut framed = Framed::new(stream, TcpFrameCodec::new());
+        framed.next().await.unwrap().unwrap()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test generation macros
+// ---------------------------------------------------------------------------
+
+/// Macro to generate integration tests for a transport factory.
+///
+/// This eliminates the boilerplate of writing individual `#[tokio::test]` functions
+/// for each scenario when the only difference is the factory type parameter.
+#[allow(unused_macros)]
+macro_rules! transport_integration_tests {
+    ($factory:ty) => {
+        paste::paste! {
+            #[tokio::test]
+            async fn test_single_message_round_trip() {
+                scenarios::single_message_round_trip::<$factory>().await;
+            }
+            #[tokio::test]
+            async fn test_bidirectional_messaging() {
+                scenarios::bidirectional_messaging::<$factory>().await;
+            }
+            #[tokio::test]
+            async fn test_multiple_messages_same_connection() {
+                scenarios::multiple_messages_same_connection::<$factory>().await;
+            }
+            #[tokio::test]
+            async fn test_response_message_type() {
+                scenarios::response_message_type::<$factory>().await;
+            }
+            #[tokio::test]
+            async fn test_event_message_type() {
+                scenarios::event_message_type::<$factory>().await;
+            }
+            #[tokio::test]
+            async fn test_ack_message_type() {
+                scenarios::ack_message_type::<$factory>().await;
+            }
+            #[tokio::test]
+            async fn test_mixed_message_types() {
+                scenarios::mixed_message_types::<$factory>().await;
+            }
+            #[tokio::test]
+            async fn test_large_payload() {
+                scenarios::large_payload::<$factory>().await;
+            }
+            #[tokio::test]
+            async fn test_empty_header_and_payload() {
+                scenarios::empty_header_and_payload::<$factory>().await;
+            }
+            #[tokio::test]
+            async fn test_cluster_mesh_communication() {
+                scenarios::cluster_mesh_communication::<$factory>().await;
+            }
+            #[tokio::test]
+            async fn test_concurrent_senders() {
+                scenarios::concurrent_senders::<$factory>().await;
+            }
+            #[tokio::test]
+            async fn test_send_to_unregistered_peer() {
+                scenarios::send_to_unregistered_peer::<$factory>().await;
+            }
+            #[tokio::test]
+            async fn test_connection_reuse() {
+                scenarios::connection_reuse::<$factory>().await;
+            }
+            #[tokio::test]
+            async fn test_graceful_shutdown() {
+                scenarios::graceful_shutdown::<$factory>().await;
+            }
+            #[tokio::test]
+            async fn test_high_throughput() {
+                scenarios::high_throughput::<$factory>().await;
+            }
+            #[tokio::test]
+            async fn test_zero_copy_efficiency() {
+                scenarios::zero_copy_efficiency::<$factory>().await;
+            }
+            #[tokio::test]
+            async fn test_drain_rejects_messages() {
+                scenarios::drain_rejects_messages::<$factory>().await;
+            }
+            #[tokio::test]
+            async fn test_drain_accepts_responses() {
+                scenarios::drain_accepts_responses::<$factory>().await;
+            }
+            #[tokio::test]
+            async fn test_drain_accepts_events() {
+                scenarios::drain_accepts_events::<$factory>().await;
+            }
+            #[tokio::test]
+            async fn test_health_during_drain() {
+                scenarios::health_during_drain::<$factory>().await;
+            }
+        }
+    };
+}
+
+/// Macro to generate shutdown tests for a transport.
+///
+/// Generates tests with names like `test_{prefix}_drain_rejects_messages`.
+#[allow(unused_macros)]
+macro_rules! transport_shutdown_tests {
+    ($prefix:ident, $client:ty) => {
+        paste::paste! {
+            #[tokio::test]
+            async fn [<test_ $prefix _drain_rejects_messages>]() {
+                shutdown_scenarios::drain_rejects_messages::<$client>().await;
+            }
+            #[tokio::test]
+            async fn [<test_ $prefix _drain_accepts_responses>]() {
+                shutdown_scenarios::drain_accepts_responses::<$client>().await;
+            }
+            #[tokio::test]
+            async fn [<test_ $prefix _drain_accepts_events>]() {
+                shutdown_scenarios::drain_accepts_events::<$client>().await;
+            }
+            #[tokio::test]
+            async fn [<test_ $prefix _new_connection_during_drain>]() {
+                shutdown_scenarios::new_connection_during_drain::<$client>().await;
+            }
+            #[tokio::test]
+            async fn [<test_ $prefix _graceful_shutdown_lifecycle>]() {
+                shutdown_scenarios::graceful_shutdown_lifecycle::<$client>().await;
+            }
+            #[tokio::test]
+            async fn [<test_ $prefix _shutdown_timeout_forces_teardown>]() {
+                shutdown_scenarios::shutdown_timeout_forces_teardown::<$client>().await;
+            }
+            #[tokio::test]
+            async fn [<test_ $prefix _outbound_sends_during_drain>]() {
+                shutdown_scenarios::outbound_sends_during_drain::<$client>().await;
+            }
+            #[tokio::test]
+            async fn [<test_ $prefix _connection_writer_exits_on_teardown>]() {
+                shutdown_scenarios::connection_writer_exits_on_teardown::<$client>().await;
+            }
+        }
+    };
+}
+
 // Transport factory abstraction for parameterized tests
 
 /// Transport factory trait for creating transports in parameterized tests
@@ -546,6 +782,23 @@ impl TransportFactory for TcpFactory {
 
     async fn create_cluster(size: usize) -> anyhow::Result<TestCluster<Self::Transport>> {
         TestCluster::new(size).await
+    }
+}
+
+/// UDS transport factory
+#[cfg(unix)]
+pub struct UdsFactory;
+
+#[cfg(unix)]
+impl TransportFactory for UdsFactory {
+    type Transport = UdsTransport;
+
+    async fn create() -> anyhow::Result<TestTransportHandle<Self::Transport>> {
+        TestTransportHandle::new_uds().await
+    }
+
+    async fn create_cluster(size: usize) -> anyhow::Result<TestCluster<Self::Transport>> {
+        TestCluster::new_uds(size).await
     }
 }
 
@@ -583,36 +836,38 @@ impl TransportFactory for TcpFactory {
 //     }
 // }
 
-// /// NATS transport factory
-// #[cfg(feature = "nats")]
-// pub struct NatsFactory;
+/// NATS transport factory
+#[cfg(feature = "nats")]
+pub struct NatsFactory;
 
-// #[cfg(feature = "nats")]
-// impl TransportFactory for NatsFactory {
-//     type Transport = NatsTransport;
+#[cfg(feature = "nats")]
+impl TransportFactory for NatsFactory {
+    type Transport = NatsTransport;
 
-//     async fn create() -> anyhow::Result<TestTransportHandle<Self::Transport>> {
-//         TestTransportHandle::new_nats().await
-//     }
+    async fn create() -> anyhow::Result<TestTransportHandle<Self::Transport>> {
+        let cluster_id = format!("test-{}", velo_transports::InstanceId::new_v4());
+        TestTransportHandle::new_nats(&cluster_id).await
+    }
 
-//     async fn create_cluster(size: usize) -> anyhow::Result<TestCluster<Self::Transport>> {
-//         TestCluster::new_nats(size).await
-//     }
-// }
+    async fn create_cluster(size: usize) -> anyhow::Result<TestCluster<Self::Transport>> {
+        let cluster_id = format!("test-{}", velo_transports::InstanceId::new_v4());
+        TestCluster::new_nats(size, &cluster_id).await
+    }
+}
 
-// /// gRPC transport factory
-// #[cfg(feature = "grpc")]
-// pub struct GrpcFactory;
+/// gRPC transport factory
+#[cfg(feature = "grpc")]
+pub struct GrpcFactory;
 
-// #[cfg(feature = "grpc")]
-// impl TransportFactory for GrpcFactory {
-//     type Transport = GrpcTransport;
+#[cfg(feature = "grpc")]
+impl TransportFactory for GrpcFactory {
+    type Transport = GrpcTransport;
 
-//     async fn create() -> anyhow::Result<TestTransportHandle<Self::Transport>> {
-//         TestTransportHandle::new_grpc().await
-//     }
+    async fn create() -> anyhow::Result<TestTransportHandle<Self::Transport>> {
+        TestTransportHandle::new_grpc().await
+    }
 
-//     async fn create_cluster(size: usize) -> anyhow::Result<TestCluster<Self::Transport>> {
-//         TestCluster::new_grpc(size).await
-//     }
-// }
+    async fn create_cluster(size: usize) -> anyhow::Result<TestCluster<Self::Transport>> {
+        TestCluster::new_grpc(size).await
+    }
+}

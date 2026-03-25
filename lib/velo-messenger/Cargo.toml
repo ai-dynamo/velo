@@ -13,7 +13,6 @@ repository.workspace = true
 
 [features]
 default = ["http", "nats", "grpc"]
-ucx = ["velo-transports/ucx"]
 http = ["velo-transports/http"]
 grpc = ["velo-transports/grpc"]
 nats = ["velo-transports/nats"]
