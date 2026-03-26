@@ -36,10 +36,14 @@ async fn test_two_messenger_round_trip() {
     let server_transport = new_transport();
     let client_transport = new_transport();
 
-    let server_messenger = Messenger::new(vec![server_transport], None)
+    let server_messenger = Messenger::builder()
+        .add_transport(server_transport)
+        .build()
         .await
         .expect("create server messenger");
-    let client_messenger = Messenger::new(vec![client_transport], None)
+    let client_messenger = Messenger::builder()
+        .add_transport(client_transport)
+        .build()
         .await
         .expect("create client messenger");
 
@@ -60,7 +64,7 @@ async fn test_two_messenger_round_trip() {
     let client_worker_id = client_messenger.instance_id().worker_id();
 
     // Build VeloFrameTransport on server (receiver) side.
-    let server_vft = VeloFrameTransport::new(server_messenger.clone(), server_worker_id)
+    let server_vft = VeloFrameTransport::new(server_messenger.clone(), server_worker_id, None)
         .expect("create server VeloFrameTransport");
 
     // Bind anchor 42 on the server side.
@@ -71,7 +75,7 @@ async fn test_two_messenger_round_trip() {
     );
 
     // Build VeloFrameTransport on client (sender) side.
-    let client_vft = VeloFrameTransport::new(client_messenger.clone(), client_worker_id)
+    let client_vft = VeloFrameTransport::new(client_messenger.clone(), client_worker_id, None)
         .expect("create client VeloFrameTransport");
 
     // Connect from client to server's endpoint.
@@ -153,10 +157,14 @@ async fn test_sender_drop_closes_pump() {
     let server_transport = new_transport();
     let client_transport = new_transport();
 
-    let server_messenger = Messenger::new(vec![server_transport], None)
+    let server_messenger = Messenger::builder()
+        .add_transport(server_transport)
+        .build()
         .await
         .expect("create server messenger");
-    let client_messenger = Messenger::new(vec![client_transport], None)
+    let client_messenger = Messenger::builder()
+        .add_transport(client_transport)
+        .build()
         .await
         .expect("create client messenger");
 
@@ -174,11 +182,11 @@ async fn test_sender_drop_closes_pump() {
     let server_worker_id = server_messenger.instance_id().worker_id();
     let client_worker_id = client_messenger.instance_id().worker_id();
 
-    let server_vft = VeloFrameTransport::new(server_messenger.clone(), server_worker_id)
+    let server_vft = VeloFrameTransport::new(server_messenger.clone(), server_worker_id, None)
         .expect("create server VeloFrameTransport");
     let (endpoint, rx) = server_vft.bind(100, 1).await.expect("bind");
 
-    let client_vft = VeloFrameTransport::new(client_messenger.clone(), client_worker_id)
+    let client_vft = VeloFrameTransport::new(client_messenger.clone(), client_worker_id, None)
         .expect("create client VeloFrameTransport");
     let tx = client_vft
         .connect(&endpoint, 100, 1)
@@ -209,13 +217,15 @@ async fn test_sender_drop_closes_pump() {
 async fn test_bind_unbind_cleanup() {
     // Single Messenger is sufficient (no AM send needed, just dispatch map management).
     let transport = new_transport();
-    let messenger = Messenger::new(vec![transport], None)
+    let messenger = Messenger::builder()
+        .add_transport(transport)
+        .build()
         .await
         .expect("create messenger");
 
     let worker_id = messenger.instance_id().worker_id();
-    let vft =
-        VeloFrameTransport::new(messenger.clone(), worker_id).expect("create VeloFrameTransport");
+    let vft = VeloFrameTransport::new(messenger.clone(), worker_id, None)
+        .expect("create VeloFrameTransport");
 
     // bind(42, session=1) -- dispatch map has entry for (42, 1).
     let (endpoint1, _rx1) = vft.bind(42, 1).await.expect("bind 42");
@@ -239,10 +249,14 @@ async fn test_session_isolation_stale_frames_dropped() {
     let server_transport = new_transport();
     let client_transport = new_transport();
 
-    let server_messenger = Messenger::new(vec![server_transport], None)
+    let server_messenger = Messenger::builder()
+        .add_transport(server_transport)
+        .build()
         .await
         .expect("create server messenger");
-    let client_messenger = Messenger::new(vec![client_transport], None)
+    let client_messenger = Messenger::builder()
+        .add_transport(client_transport)
+        .build()
         .await
         .expect("create client messenger");
 
@@ -260,9 +274,9 @@ async fn test_session_isolation_stale_frames_dropped() {
     let server_worker_id = server_messenger.instance_id().worker_id();
     let client_worker_id = client_messenger.instance_id().worker_id();
 
-    let server_vft = VeloFrameTransport::new(server_messenger.clone(), server_worker_id)
+    let server_vft = VeloFrameTransport::new(server_messenger.clone(), server_worker_id, None)
         .expect("create server VeloFrameTransport");
-    let client_vft = VeloFrameTransport::new(client_messenger.clone(), client_worker_id)
+    let client_vft = VeloFrameTransport::new(client_messenger.clone(), client_worker_id, None)
         .expect("create client VeloFrameTransport");
 
     // --- Session 1: bind, send, verify delivery ---

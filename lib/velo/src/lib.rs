@@ -11,6 +11,7 @@ use std::sync::Arc;
 use anyhow::Result;
 
 pub use backend::Transport;
+pub use velo_observability::VeloMetrics;
 pub use velo_transports as backend;
 
 // Re-exports: Messaging (from velo-messenger)
@@ -36,6 +37,11 @@ pub use velo_discovery as discovery;
 pub use velo_streaming::{
     AnchorManager, AttachError, SendError, StreamAnchor, StreamAnchorHandle, StreamController,
     StreamError, StreamFrame, StreamSender,
+};
+
+// Re-exports: Rendezvous (from velo-rendezvous)
+pub use velo_rendezvous::{
+    DataHandle, DataMetadata, RegisterOptions, RendezvousManager, RendezvousWrite, StageMode,
 };
 
 /// Configuration for TCP streaming transport.
@@ -114,18 +120,20 @@ pub enum StreamConfig {
 
 /// High-level facade for the Velo distributed system.
 ///
-/// Wraps a [`Messenger`] and [`AnchorManager`]
+/// Wraps a [`Messenger`], [`AnchorManager`], and [`RendezvousManager`]
 /// and provides the same public API with a simpler name.
 #[derive(Clone)]
 pub struct Velo {
     messenger: Arc<Messenger>,
     anchor_manager: Arc<velo_streaming::AnchorManager>,
+    rendezvous_manager: Arc<velo_rendezvous::RendezvousManager>,
 }
 
 /// Builder for configuring and creating a [`Velo`] instance.
 pub struct VeloBuilder {
     inner: MessengerBuilder,
     stream_config: Option<StreamConfig>,
+    metrics: Option<Arc<VeloMetrics>>,
 }
 
 impl VeloBuilder {
@@ -134,6 +142,7 @@ impl VeloBuilder {
         Self {
             inner: MessengerBuilder::new(),
             stream_config: None,
+            metrics: None,
         }
     }
 
@@ -187,6 +196,13 @@ impl VeloBuilder {
         self
     }
 
+    /// Install Prometheus collectors for this Velo instance.
+    pub fn metrics(mut self, metrics: Arc<VeloMetrics>) -> Self {
+        self.inner = self.inner.metrics(metrics.clone());
+        self.metrics = Some(metrics);
+        self
+    }
+
     /// Build the Velo system with the configured transports and discovery.
     ///
     /// Construction order:
@@ -208,6 +224,7 @@ impl VeloBuilder {
         let velo_transport = Arc::new(velo_streaming::VeloFrameTransport::new(
             Arc::clone(&messenger),
             worker_id,
+            self.metrics.clone(),
         )?);
 
         // Step 4: Resolve transport and registry from stream_config
@@ -269,6 +286,7 @@ impl VeloBuilder {
                 .transport(default_transport)
                 .transport_registry(transport_registry)
                 .messenger(Some(Arc::clone(&messenger)))
+                .metrics(self.metrics.clone())
                 .build()
                 .map_err(|e| anyhow::anyhow!("{}", e))?,
         );
@@ -276,10 +294,27 @@ impl VeloBuilder {
         // Step 6: Register streaming control-plane handlers
         anchor_manager.register_handlers(Arc::clone(&messenger))?;
 
-        // Step 7: Assemble Velo
+        // Step 7: Create RendezvousManager and register handlers
+        let rendezvous_manager = Arc::new(match self.metrics.as_ref() {
+            Some(m) => velo_rendezvous::RendezvousManager::with_metrics(worker_id, Arc::clone(m)),
+            None => velo_rendezvous::RendezvousManager::new(worker_id),
+        });
+        rendezvous_manager.register_handlers(Arc::clone(&messenger))?;
+
+        // Step 8: Enable transparent large payload support
+        let stager = Arc::new(velo_rendezvous::RendezvousStager::new(Arc::clone(
+            &rendezvous_manager,
+        )));
+        let resolver = Arc::new(velo_rendezvous::RendezvousResolver::new(Arc::clone(
+            &rendezvous_manager,
+        )));
+        messenger.set_large_payload_support(stager, resolver);
+
+        // Step 9: Assemble Velo
         Ok(Arc::new(Velo {
             messenger,
             anchor_manager,
+            rendezvous_manager,
         }))
     }
 }
@@ -423,6 +458,70 @@ impl Velo {
     /// Get the underlying anchor manager for direct registry access.
     pub fn anchor_manager(&self) -> &velo_streaming::AnchorManager {
         &self.anchor_manager
+    }
+
+    // -----------------------------------------------------------------------
+    // Rendezvous API
+    // -----------------------------------------------------------------------
+
+    /// Stage data at this worker and return a [`DataHandle`].
+    ///
+    /// The handle encodes this worker's ID and a local slot ID. Pass it to
+    /// consumers via any channel (AM, event, typed message field).
+    /// Default refcount is 1.
+    pub fn register_data(&self, data: bytes::Bytes) -> DataHandle {
+        self.rendezvous_manager.register_data(data)
+    }
+
+    /// Stage data with options (TTL, etc.) and return a [`DataHandle`].
+    pub fn register_data_with(&self, data: bytes::Bytes, opts: RegisterOptions) -> DataHandle {
+        self.rendezvous_manager.register_data_with(data, opts)
+    }
+
+    /// Query metadata about the data behind a handle (no lock acquired).
+    pub async fn metadata(&self, handle: DataHandle) -> Result<DataMetadata> {
+        self.rendezvous_manager.metadata(handle).await
+    }
+
+    /// Pull data from a handle. Acquires a read lock on the owner side.
+    ///
+    /// Returns `(data, lease_id)`. The `lease_id` must be passed to
+    /// [`detach()`](Self::detach) or [`release()`](Self::release) when done.
+    pub async fn get(&self, handle: DataHandle) -> Result<(bytes::Bytes, u64)> {
+        self.rendezvous_manager.get(handle).await
+    }
+
+    /// Pull data from a handle into an explicit destination buffer.
+    ///
+    /// Returns `lease_id`.
+    pub async fn get_into(
+        &self,
+        handle: DataHandle,
+        dest: &mut impl RendezvousWrite,
+    ) -> Result<u64> {
+        self.rendezvous_manager.get_into(handle, dest).await
+    }
+
+    /// Increment the refcount on a handle (for additional consumers).
+    pub async fn ref_handle(&self, handle: DataHandle) -> Result<()> {
+        self.rendezvous_manager.ref_handle(handle).await
+    }
+
+    /// Release the read lock WITHOUT decrementing refcount.
+    /// The handle remains alive and can be `get()`-ed again.
+    pub async fn detach(&self, handle: DataHandle, lease_id: u64) -> Result<()> {
+        self.rendezvous_manager.detach(handle, lease_id).await
+    }
+
+    /// Release the read lock AND decrement refcount.
+    /// Data is freed when both refcount and read_lock_count reach zero.
+    pub async fn release(&self, handle: DataHandle, lease_id: u64) -> Result<()> {
+        self.rendezvous_manager.release(handle, lease_id).await
+    }
+
+    /// Get the underlying rendezvous manager for direct access.
+    pub fn rendezvous_manager(&self) -> &velo_rendezvous::RendezvousManager {
+        &self.rendezvous_manager
     }
 }
 

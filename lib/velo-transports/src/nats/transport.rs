@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
+use velo_observability::{Direction, TransportRejection, VeloMetrics};
 
 /// NATS header name for the Velo message type discriminator (D-05a).
 ///
@@ -72,6 +73,17 @@ pub struct NatsTransport {
     shutdown_state: OnceLock<ShutdownState>,
     /// Maximum NATS payload size in bytes (queried from server on start).
     max_payload: Arc<AtomicUsize>,
+    /// Shared observability collectors installed by the backend.
+    observability: OnceLock<Arc<VeloMetrics>>,
+    metrics: OnceLock<velo_observability::TransportMetricsHandle>,
+}
+
+impl NatsTransport {
+    fn update_peer_gauge(&self) {
+        if let Some(metrics) = self.metrics.get() {
+            metrics.set_registered_peers(self.peers.len());
+        }
+    }
 }
 
 impl Transport for NatsTransport {
@@ -101,6 +113,7 @@ impl Transport for NatsTransport {
             "Registered NATS peer"
         );
         self.peers.insert(instance_id, subject);
+        self.update_peer_gauge();
         Ok(())
     }
 
@@ -267,6 +280,8 @@ impl Transport for NatsTransport {
             let cancel = self.cancel_token.clone();
             let begin_shutdown = self.begin_shutdown_token.clone();
             let client = self.client.clone();
+            let transport_key = self.key.to_string();
+            let metrics = self.metrics.get().cloned();
             rt.spawn(async move {
                 run_receive_loop(
                     data_sub,
@@ -275,6 +290,8 @@ impl Transport for NatsTransport {
                     cancel,
                     begin_shutdown,
                     client,
+                    transport_key,
+                    metrics,
                 )
                 .await;
             });
@@ -298,6 +315,14 @@ impl Transport for NatsTransport {
         // Also cancel directly in case the loop is not running (transport never started,
         // or loop already exited via stream-end).
         self.cancel_token.cancel();
+    }
+
+    fn set_observability(&self, observability: Arc<VeloMetrics>) {
+        let _ = self
+            .metrics
+            .set(observability.bind_transport(self.key.as_str()));
+        let _ = self.observability.set(observability);
+        self.update_peer_gauge();
     }
 
     fn check_health(
@@ -348,6 +373,8 @@ async fn run_receive_loop(
     cancel: CancellationToken,
     begin_shutdown: CancellationToken,
     client: Arc<async_nats::Client>,
+    transport_key: String,
+    metrics: Option<velo_observability::TransportMetricsHandle>,
 ) {
     loop {
         tokio::select! {
@@ -383,6 +410,9 @@ async fn run_receive_loop(
                                 .unwrap_or(false);
 
                             if is_message {
+                                if let Some(metrics) = metrics.as_ref() {
+                                    metrics.record_rejection(TransportRejection::DrainRejected);
+                                }
                                 if let Some(reply) = &msg.reply {
                                     // D-02: Send ShuttingDown response echoing original header
                                     // for correlation, with empty velo payload.
@@ -418,9 +448,9 @@ async fn run_receive_loop(
                                     tracing::debug!(
                                         "Discarding fire-and-forget Message during drain (no reply inbox)"
                                     );
-                                }
-                                continue;
                             }
+                            continue;
+                        }
                             // D-04: Non-Message frames (Response, Ack, Event) fall through
                             // to normal ack + routing below.
                         }
@@ -431,7 +461,7 @@ async fn run_receive_loop(
                                 tracing::warn!(error = %e, "Failed to ack data message");
                             }
                         }
-                        route_frame(&msg, &adapter);
+                        route_frame(&msg, &adapter, &transport_key, metrics.as_ref());
                     }
                     None => {
                         tracing::warn!("NATS data subscription stream ended");
@@ -472,10 +502,20 @@ async fn run_receive_loop(
 ///
 /// The NATS payload is `velo_header_bytes ++ velo_payload_bytes` (no binary preamble).
 /// Messages missing required headers or with invalid formats are silently dropped.
-fn route_frame(msg: &async_nats::Message, adapter: &TransportAdapter) {
+fn route_frame(
+    msg: &async_nats::Message,
+    adapter: &TransportAdapter,
+    transport_key: &str,
+    metrics: Option<&velo_observability::TransportMetricsHandle>,
+) {
+    #[cfg(not(feature = "distributed-tracing"))]
+    let _ = transport_key;
     let headers = match &msg.headers {
         Some(h) => h,
         None => {
+            if let Some(metrics) = metrics {
+                metrics.record_rejection(TransportRejection::MissingHeaders);
+            }
             tracing::trace!("Dropping NATS message with no headers");
             return;
         }
@@ -485,6 +525,9 @@ fn route_frame(msg: &async_nats::Message, adapter: &TransportAdapter) {
     let type_str = match headers.get(HEADER_VELO_TYPE) {
         Some(v) => v.as_str(),
         None => {
+            if let Some(metrics) = metrics {
+                metrics.record_rejection(TransportRejection::MissingType);
+            }
             tracing::trace!("Dropping NATS message missing Velo-Type header");
             return;
         }
@@ -496,6 +539,9 @@ fn route_frame(msg: &async_nats::Message, adapter: &TransportAdapter) {
         Ok(3) => MessageType::Event,
         Ok(4) => MessageType::ShuttingDown,
         _ => {
+            if let Some(metrics) = metrics {
+                metrics.record_rejection(TransportRejection::InvalidType);
+            }
             tracing::trace!(
                 velo_type = type_str,
                 "Dropping NATS message with invalid Velo-Type"
@@ -511,6 +557,9 @@ fn route_frame(msg: &async_nats::Message, adapter: &TransportAdapter) {
     {
         Some(n) => n,
         None => {
+            if let Some(metrics) = metrics {
+                metrics.record_rejection(TransportRejection::InvalidHeaderLength);
+            }
             tracing::trace!("Dropping NATS message missing or invalid Velo-HLen header");
             return;
         }
@@ -518,6 +567,9 @@ fn route_frame(msg: &async_nats::Message, adapter: &TransportAdapter) {
 
     // NATS payload = velo_header ++ velo_payload
     if msg.payload.len() < hlen {
+        if let Some(metrics) = metrics {
+            metrics.record_rejection(TransportRejection::TruncatedFrame);
+        }
         tracing::trace!(
             expected_min = hlen,
             actual = msg.payload.len(),
@@ -528,13 +580,37 @@ fn route_frame(msg: &async_nats::Message, adapter: &TransportAdapter) {
     let header = msg.payload.slice(..hlen);
     let body = msg.payload.slice(hlen..);
 
-    let _ = match msg_type {
+    if let Some(metrics) = metrics {
+        #[cfg(feature = "distributed-tracing")]
+        let span = tracing::debug_span!(
+            "velo.transport.receive",
+            transport = transport_key,
+            message_type = crate::message_type_label(msg_type),
+            bytes = header.len() + body.len()
+        );
+        #[cfg(feature = "distributed-tracing")]
+        let _entered = span.enter();
+
+        metrics.record_frame(
+            Direction::Inbound,
+            crate::message_type_label(msg_type),
+            header.len() + body.len(),
+        );
+    }
+
+    let result = match msg_type {
         MessageType::Message => adapter.message_stream.try_send((header, body)),
         MessageType::Response | MessageType::ShuttingDown => {
             adapter.response_stream.try_send((header, body))
         }
         MessageType::Ack | MessageType::Event => adapter.event_stream.try_send((header, body)),
     };
+
+    if result.is_err() {
+        if let Some(metrics) = metrics {
+            metrics.record_rejection(TransportRejection::RouteFailed);
+        }
+    }
 }
 
 /// Builder for [`NatsTransport`].
@@ -582,6 +658,8 @@ impl NatsTransportBuilder {
             begin_shutdown_token: CancellationToken::new(),
             shutdown_state: OnceLock::new(),
             max_payload: Arc::new(AtomicUsize::new(usize::MAX)),
+            observability: OnceLock::new(),
+            metrics: OnceLock::new(),
         }
     }
 }
@@ -625,7 +703,7 @@ mod tests {
             length: 0,
         };
 
-        route_frame(&msg, &adapter);
+        route_frame(&msg, &adapter, "nats", None);
 
         // Response should be routed to response_stream
         let result = streams.response_stream.try_recv();
@@ -656,7 +734,7 @@ mod tests {
             length: 0,
         };
 
-        route_frame(&msg, &adapter);
+        route_frame(&msg, &adapter, "nats", None);
 
         let result = streams.event_stream.try_recv();
         assert!(
@@ -685,7 +763,7 @@ mod tests {
             length: 0,
         };
 
-        route_frame(&msg, &adapter);
+        route_frame(&msg, &adapter, "nats", None);
 
         let result = streams.message_stream.try_recv();
         assert!(

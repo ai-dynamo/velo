@@ -16,6 +16,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, info, warn};
+use velo_observability::{Direction, TransportRejection, VeloMetrics};
 
 use crate::tcp::TcpFrameCodec;
 use crate::transport::{HealthCheckError, ShutdownState, TransportError, TransportErrorHandler};
@@ -72,6 +73,10 @@ pub struct GrpcTransport {
 
     /// NUMA hint for topology-aware NIC selection.
     numa_hint: Option<u32>,
+
+    /// Shared observability collectors, installed by the backend.
+    observability: OnceLock<Arc<VeloMetrics>>,
+    metrics: OnceLock<velo_observability::TransportMetricsHandle>,
 }
 
 /// Handle to a connection's writer task.
@@ -107,6 +112,7 @@ impl GrpcTransport {
             drop(handle);
             self.connections
                 .remove_if(&instance_id, |_, h| h.tx.is_disconnected());
+            self.update_connection_gauge();
         }
 
         let rt = self.runtime.get().ok_or(TransportError::NotStarted)?;
@@ -118,12 +124,14 @@ impl GrpcTransport {
                 } else {
                     let handle = self.create_connection(instance_id, rt)?;
                     entry.insert(handle.clone());
+                    self.update_connection_gauge();
                     handle
                 }
             }
             dashmap::mapref::entry::Entry::Vacant(entry) => {
                 let handle = self.create_connection(instance_id, rt)?;
                 entry.insert(handle.clone());
+                self.update_connection_gauge();
                 handle
             }
         };
@@ -151,6 +159,8 @@ impl GrpcTransport {
         let connect_timeout = self.connect_timeout;
         let channel_capacity = self.channel_capacity;
         let adapter = self.adapter.get().cloned();
+        let metrics = self.metrics.get().cloned();
+        let transport_name = self.key.to_string();
 
         rt.spawn(connection_writer_task(
             addr,
@@ -161,10 +171,24 @@ impl GrpcTransport {
             connect_timeout,
             channel_capacity,
             adapter,
+            metrics,
+            transport_name,
         ));
 
         debug!("Created new gRPC connection to {} ({})", instance_id, addr);
         Ok(handle)
+    }
+
+    fn update_peer_gauge(&self) {
+        if let Some(metrics) = self.metrics.get() {
+            metrics.set_registered_peers(self.peers.len());
+        }
+    }
+
+    fn update_connection_gauge(&self) {
+        if let Some(metrics) = self.metrics.get() {
+            metrics.set_active_connections(self.connections.len());
+        }
     }
 }
 
@@ -200,6 +224,7 @@ impl Transport for GrpcTransport {
             .ok_or(TransportError::InvalidEndpoint)?;
 
         self.peers.insert(peer_info.instance_id(), addr);
+        self.update_peer_gauge();
         debug!("Registered peer {} at {}", peer_info.instance_id(), addr);
 
         Ok(())
@@ -230,6 +255,7 @@ impl Transport for GrpcTransport {
                     drop(handle);
                     self.connections
                         .remove_if(&instance_id, |_, h| h.tx.is_disconnected());
+                    self.update_connection_gauge();
                     send_msg
                 }
             },
@@ -298,7 +324,12 @@ impl Transport for GrpcTransport {
                 .context("Failed to convert std TcpListener to tokio TcpListener")?;
             let incoming = tokio_stream::wrappers::TcpListenerStream::new(incoming);
 
-            let svc = VeloStreamingService::new(channels, shutdown_state.clone());
+            let svc = VeloStreamingService::new(
+                channels,
+                shutdown_state.clone(),
+                self.key.to_string(),
+                self.metrics.get().cloned(),
+            );
             let teardown_token = shutdown_state.teardown_token().clone();
 
             rt.spawn(async move {
@@ -329,6 +360,16 @@ impl Transport for GrpcTransport {
         }
         self.cancel_token.cancel();
         self.connections.clear();
+        self.update_connection_gauge();
+    }
+
+    fn set_observability(&self, observability: Arc<VeloMetrics>) {
+        let _ = self
+            .metrics
+            .set(observability.bind_transport(self.key.as_str()));
+        let _ = self.observability.set(observability);
+        self.update_peer_gauge();
+        self.update_connection_gauge();
     }
 
     fn check_health(
@@ -391,6 +432,8 @@ async fn connection_writer_task(
     connect_timeout: Duration,
     channel_capacity: usize,
     adapter: Option<TransportAdapter>,
+    metrics: Option<velo_observability::TransportMetricsHandle>,
+    transport_name: String,
 ) -> Result<()> {
     let result = connection_writer_inner(
         addr,
@@ -400,6 +443,8 @@ async fn connection_writer_task(
         connect_timeout,
         channel_capacity,
         adapter,
+        metrics.clone(),
+        &transport_name,
     )
     .await;
 
@@ -412,6 +457,9 @@ async fn connection_writer_task(
     // the stale entry. The predicate ensures we only remove our own entry.
     drop(rx);
     connections.remove_if(&instance_id, |_, h| h.tx.is_disconnected());
+    if let Some(metrics) = metrics.as_ref() {
+        metrics.set_active_connections(connections.len());
+    }
 
     debug!("gRPC connection to {} ({}) closed", instance_id, addr);
 
@@ -428,6 +476,8 @@ async fn connection_writer_inner(
     connect_timeout: Duration,
     channel_capacity: usize,
     adapter: Option<TransportAdapter>,
+    metrics: Option<velo_observability::TransportMetricsHandle>,
+    transport_name: &str,
 ) -> Result<()> {
     debug!("gRPC connecting to {}", addr);
 
@@ -457,6 +507,10 @@ async fn connection_writer_inner(
 
     // Spawn a reader task that consumes the response stream from the server.
     if let Some(adapter) = adapter {
+        let metrics = metrics.clone();
+        let transport_name = transport_name.to_string();
+        #[cfg(not(feature = "distributed-tracing"))]
+        let _ = &transport_name;
         tokio::spawn(async move {
             loop {
                 match response_stream.message().await {
@@ -471,6 +525,23 @@ async fn connection_writer_inner(
                                 MessageType::Ack | MessageType::Event => &adapter.event_stream,
                                 MessageType::Message => &adapter.message_stream,
                             };
+                            if let Some(metrics) = metrics.as_ref() {
+                                #[cfg(feature = "distributed-tracing")]
+                                let span = tracing::debug_span!(
+                                    "velo.transport.receive",
+                                    transport = transport_name.as_str(),
+                                    message_type = crate::message_type_label(msg_type),
+                                    bytes = framed_data.header.len() + framed_data.payload.len()
+                                );
+                                #[cfg(feature = "distributed-tracing")]
+                                let _entered = span.enter();
+
+                                metrics.record_frame(
+                                    Direction::Inbound,
+                                    crate::message_type_label(msg_type),
+                                    framed_data.header.len() + framed_data.payload.len(),
+                                );
+                            }
                             if sender
                                 .send_async((
                                     Bytes::from(framed_data.header),
@@ -479,8 +550,13 @@ async fn connection_writer_inner(
                                 .await
                                 .is_err()
                             {
+                                if let Some(metrics) = metrics.as_ref() {
+                                    metrics.record_rejection(TransportRejection::RouteFailed);
+                                }
                                 break;
                             }
+                        } else if let Some(metrics) = metrics.as_ref() {
+                            metrics.record_rejection(TransportRejection::DecodeError);
                         }
                     }
                     Ok(None) => break,
@@ -695,6 +771,8 @@ impl GrpcTransportBuilder {
             listener: std::sync::Mutex::new(listener),
             local_interfaces: OnceLock::new(),
             numa_hint: self.numa_hint,
+            observability: OnceLock::new(),
+            metrics: OnceLock::new(),
         })
     }
 }

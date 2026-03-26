@@ -15,6 +15,7 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+use velo_observability::VeloMetrics;
 
 use crate::transport::{HealthCheckError, ShutdownState, TransportError, TransportErrorHandler};
 use crate::utils::interfaces::{
@@ -62,6 +63,10 @@ pub struct TcpTransport {
 
     // NUMA hint for topology-aware NIC selection
     numa_hint: Option<u32>,
+
+    // Optional shared metrics.
+    observability: OnceLock<Arc<VeloMetrics>>,
+    metrics: OnceLock<velo_observability::TransportMetricsHandle>,
 }
 
 /// Handle to a connection's writer task
@@ -114,6 +119,8 @@ impl TcpTransport {
             listener: Mutex::new(listener),
             local_interfaces: OnceLock::new(),
             numa_hint,
+            observability: OnceLock::new(),
+            metrics: OnceLock::new(),
         }
     }
 
@@ -137,6 +144,7 @@ impl TcpTransport {
             drop(handle);
             self.connections
                 .remove_if(&instance_id, |_, h| h.tx.is_disconnected());
+            self.update_connection_gauge();
         }
 
         let rt = self.runtime.get().ok_or(TransportError::NotStarted)?;
@@ -150,12 +158,14 @@ impl TcpTransport {
                     // Stale entry — replace in-place with a fresh connection
                     let handle = self.create_connection(instance_id, rt)?;
                     entry.insert(handle.clone());
+                    self.update_connection_gauge();
                     handle
                 }
             }
             dashmap::mapref::entry::Entry::Vacant(entry) => {
                 let handle = self.create_connection(instance_id, rt)?;
                 entry.insert(handle.clone());
+                self.update_connection_gauge();
                 handle
             }
         };
@@ -181,6 +191,7 @@ impl TcpTransport {
         let cancel = self.cancel_token.clone();
         let conns = Arc::clone(&self.connections);
         let connect_timeout = self.connect_timeout;
+        let metrics = self.metrics.get().cloned();
         rt.spawn(connection_writer_task(
             addr,
             instance_id,
@@ -188,10 +199,23 @@ impl TcpTransport {
             conns,
             cancel,
             connect_timeout,
+            metrics,
         ));
 
         debug!("Created new connection to {} ({})", instance_id, addr);
         Ok(handle)
+    }
+
+    fn update_peer_gauge(&self) {
+        if let Some(metrics) = self.metrics.get() {
+            metrics.set_registered_peers(self.peers.len());
+        }
+    }
+
+    fn update_connection_gauge(&self) {
+        if let Some(metrics) = self.metrics.get() {
+            metrics.set_active_connections(self.connections.len());
+        }
     }
 }
 
@@ -229,6 +253,7 @@ impl Transport for TcpTransport {
 
         // Store peer address
         self.peers.insert(peer_info.instance_id(), addr);
+        self.update_peer_gauge();
 
         debug!("Registered peer {} at {}", peer_info.instance_id(), addr);
 
@@ -331,6 +356,8 @@ impl Transport for TcpTransport {
                 .error_handler(std::sync::Arc::new(DefaultErrorHandler))
                 .shutdown_state(shutdown_state)
                 .listener(listener)
+                .transport_key(self.key.as_str())
+                .metrics(self.metrics.get().cloned())
                 .build()?;
 
             rt.spawn(async move {
@@ -360,6 +387,16 @@ impl Transport for TcpTransport {
 
         // Clear connections
         self.connections.clear();
+        self.update_connection_gauge();
+    }
+
+    fn set_observability(&self, observability: Arc<VeloMetrics>) {
+        let _ = self
+            .metrics
+            .set(observability.bind_transport(self.key.as_str()));
+        let _ = self.observability.set(observability);
+        self.update_peer_gauge();
+        self.update_connection_gauge();
     }
 
     fn check_health(
@@ -425,6 +462,7 @@ async fn connection_writer_task(
     connections: Arc<DashMap<crate::InstanceId, ConnectionHandle>>,
     cancel_token: CancellationToken,
     connect_timeout: Duration,
+    metrics: Option<velo_observability::TransportMetricsHandle>,
 ) -> Result<()> {
     let result =
         connection_writer_inner(addr, instance_id, &rx, &cancel_token, connect_timeout).await;
@@ -447,6 +485,9 @@ async fn connection_writer_task(
     // a replacement connection's tx will still be connected.
     drop(rx);
     connections.remove_if(&instance_id, |_, h| h.tx.is_disconnected());
+    if let Some(metrics) = metrics.as_ref() {
+        metrics.set_active_connections(connections.len());
+    }
 
     debug!("Connection to {} ({}) closed", instance_id, addr);
 
@@ -943,6 +984,7 @@ mod tests {
             conns,
             cancel,
             Duration::from_secs(5),
+            None,
         ));
 
         // Accept the connection, then immediately drop it + the listener
@@ -1059,6 +1101,7 @@ mod tests {
             conns,
             cancel,
             Duration::from_secs(5),
+            None,
         ));
         let _ = writer.await;
 

@@ -22,13 +22,14 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use derive_builder::Builder;
 use futures::Stream;
 use serde::de::DeserializeOwned;
 use tokio_util::sync::CancellationToken;
+use velo_observability::{HandlerOutcome, StreamingOp, VeloMetrics};
 
 use crate::frame::{StreamError, StreamFrame};
 use crate::handle::StreamAnchorHandle;
@@ -114,6 +115,7 @@ pub(crate) struct AnchorEntry {
 struct StreamControllerInner {
     local_id: u64,
     registry: Arc<DashMap<u64, AnchorEntry>>,
+    metrics: Option<Arc<VeloMetrics>>,
     /// Sender-side registry: used to directly cancel the [`crate::control::SenderEntry`]
     /// when the anchor is cancelled (same-worker path without AM round-trip).
     sender_registry: Arc<crate::control::SenderRegistry>,
@@ -151,6 +153,8 @@ impl StreamController {
             return; // already cancelled
         }
 
+        let started = Instant::now();
+
         // Remove anchor from registry and extract stream_cancel_handle
         let stream_cancel_handle =
             self.inner
@@ -160,6 +164,15 @@ impl StreamController {
                     entry.cancel_token.cancel();
                     entry.stream_cancel_handle
                 });
+        if let Some(metrics) = self.inner.metrics.as_ref() {
+            metrics.set_streaming_active_anchors(self.inner.registry.len());
+            metrics.record_streaming_operation(
+                StreamingOp::Cancel,
+                HandlerOutcome::Success,
+                "velo",
+                started.elapsed(),
+            );
+        }
 
         // Directly cancel the SenderEntry in the local sender_registry.
         // This fires the user-facing cancel_token and poisons send() immediately
@@ -254,6 +267,7 @@ pub struct StreamAnchor<T> {
     registry: Arc<DashMap<u64, AnchorEntry>>,
     /// Shared cancel handle — also held by any [`StreamController`] clones.
     controller: StreamController,
+    metrics: Option<Arc<VeloMetrics>>,
     _phantom: std::marker::PhantomData<T>,
 }
 
@@ -263,12 +277,14 @@ impl<T> StreamAnchor<T> {
         rx: flume::Receiver<Vec<u8>>,
         local_id: u64,
         registry: Arc<DashMap<u64, AnchorEntry>>,
+        metrics: Option<Arc<VeloMetrics>>,
         sender_registry: Arc<crate::control::SenderRegistry>,
         messenger: Option<Arc<velo_messenger::Messenger>>,
     ) -> Self {
         let inner = Arc::new(StreamControllerInner {
             local_id,
             registry: registry.clone(),
+            metrics: metrics.clone(),
             sender_registry,
             messenger,
             cancelled: AtomicBool::new(false),
@@ -281,6 +297,7 @@ impl<T> StreamAnchor<T> {
             local_id,
             registry,
             controller,
+            metrics,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -334,6 +351,7 @@ impl<T> StreamAnchor<T> {
                 if let Some(duration) = timeout {
                     let tc = AnchorManager::spawn_timeout_task(
                         self.registry.clone(),
+                        self.metrics.clone(),
                         self.local_id,
                         duration,
                         &entry.cancel_token,
@@ -390,6 +408,9 @@ impl<T: DeserializeOwned> Stream for StreamAnchor<T> {
                             // Clean up registry entry — anchor is permanently closed.
                             if let Some((_, entry)) = this.registry.remove(&this.local_id) {
                                 entry.cancel_token.cancel();
+                                if let Some(metrics) = this.metrics.as_ref() {
+                                    metrics.set_streaming_active_anchors(this.registry.len());
+                                }
                             }
                             return Poll::Ready(Some(Ok(StreamFrame::Finalized)));
                         }
@@ -406,6 +427,9 @@ impl<T: DeserializeOwned> Stream for StreamAnchor<T> {
                             // Clean up registry entry — sender dropped without explicit close.
                             if let Some((_, entry)) = this.registry.remove(&this.local_id) {
                                 entry.cancel_token.cancel();
+                                if let Some(metrics) = this.metrics.as_ref() {
+                                    metrics.set_streaming_active_anchors(this.registry.len());
+                                }
                             }
                             return Poll::Ready(Some(Err(StreamError::SenderDropped)));
                         }
@@ -479,6 +503,10 @@ pub struct AnchorManager {
     #[builder(default)]
     pub messenger: Option<Arc<velo_messenger::Messenger>>,
 
+    /// Shared Prometheus collectors for streaming control-plane metrics.
+    #[builder(default)]
+    pub metrics: Option<Arc<VeloMetrics>>,
+
     /// Monotonically increasing counter for sender_stream_id values.
     /// Separate from next_local_id to keep anchor-side and sender-side namespaces distinct.
     #[builder(setter(skip), default = "AtomicU64::new(0)")]
@@ -538,7 +566,13 @@ impl AnchorManager {
         // Spawn timeout task if configured — derive child from the anchor's parent token
         // so that finalize/remove auto-cancels it.
         let timeout_cancel = self.default_timeout.map(|timeout| {
-            Self::spawn_timeout_task(self.registry.clone(), local_id, timeout, &cancel_token)
+            Self::spawn_timeout_task(
+                self.registry.clone(),
+                self.metrics.clone(),
+                local_id,
+                timeout,
+                &cancel_token,
+            )
         });
 
         let entry = AnchorEntry {
@@ -552,6 +586,7 @@ impl AnchorManager {
         };
 
         self.registry.insert(local_id, entry);
+        self.update_active_anchor_gauge();
 
         let handle = StreamAnchorHandle::pack(self.worker_id, local_id);
         StreamAnchor::new(
@@ -559,6 +594,7 @@ impl AnchorManager {
             frame_rx,
             local_id,
             self.registry.clone(),
+            self.metrics.clone(),
             self.sender_registry.clone(),
             self.messenger.clone(),
         )
@@ -570,6 +606,7 @@ impl AnchorManager {
     /// (e.g. on attach, or when `set_timeout(None)` is called).
     pub(crate) fn spawn_timeout_task(
         registry: Arc<DashMap<u64, AnchorEntry>>,
+        metrics: Option<Arc<VeloMetrics>>,
         local_id: u64,
         timeout: Duration,
         parent_cancel: &CancellationToken,
@@ -585,6 +622,9 @@ impl AnchorManager {
                     // Timeout expired -- remove anchor
                     if let Some((_, entry)) = registry.remove(&local_id) {
                         entry.cancel_token.cancel();
+                        if let Some(metrics) = metrics.as_ref() {
+                            metrics.set_streaming_active_anchors(registry.len());
+                        }
                         // Dropping frame_tx closes the channel -> StreamAnchor yields None
                     }
                 }
@@ -601,6 +641,7 @@ impl AnchorManager {
     pub(crate) fn remove_anchor(&self, local_id: u64) -> Option<AnchorEntry> {
         self.registry.remove(&local_id).map(|(_, entry)| {
             entry.cancel_token.cancel();
+            self.update_active_anchor_gauge();
             entry
         })
     }
@@ -723,7 +764,13 @@ impl AnchorManager {
             let parent = maybe_parent
                 .as_ref()
                 .expect("cancel_token present when timeout_duration is");
-            let tc = Self::spawn_timeout_task(self.registry.clone(), local_id, timeout, parent);
+            let tc = Self::spawn_timeout_task(
+                self.registry.clone(),
+                self.metrics.clone(),
+                local_id,
+                timeout,
+                parent,
+            );
             // Store the new cancellation token back in the entry
             if let Some(mut entry) = self.registry.get_mut(&local_id) {
                 entry.timeout_cancel = Some(tc);
@@ -731,6 +778,29 @@ impl AnchorManager {
         }
 
         was_attached
+    }
+
+    pub(crate) fn update_active_anchor_gauge(&self) {
+        if let Some(metrics) = self.metrics.as_ref() {
+            metrics.set_streaming_active_anchors(self.registry.len());
+        }
+    }
+
+    pub(crate) fn record_streaming_operation(
+        &self,
+        operation: StreamingOp,
+        outcome: HandlerOutcome,
+        transport_scheme: &str,
+        started: Instant,
+    ) {
+        if let Some(metrics) = self.metrics.as_ref() {
+            metrics.record_streaming_operation(
+                operation,
+                outcome,
+                transport_scheme,
+                started.elapsed(),
+            );
+        }
     }
 
     /// Register all five control-plane AM handlers on a live Messenger.

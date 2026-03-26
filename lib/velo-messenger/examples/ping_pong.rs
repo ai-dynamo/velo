@@ -60,7 +60,11 @@ fn main() -> Result<()> {
         runtime_server.block_on(async {
             // Create server Messenger instance with TCP transport
             let transport = new_transport();
-            let messenger = Messenger::new(vec![transport], None).await.unwrap();
+            let messenger = Messenger::builder()
+                .add_transport(transport)
+                .build()
+                .await
+                .unwrap();
 
             // Give transport a moment to bind and start accepting connections
             sleep(Duration::from_millis(100)).await;
@@ -91,7 +95,11 @@ fn main() -> Result<()> {
         runtime_client.block_on(async {
             // Create client Messenger instance with TCP transport
             let transport = new_transport();
-            let messenger = Messenger::new(vec![transport], None).await.unwrap();
+            let messenger = Messenger::builder()
+                .add_transport(transport)
+                .build()
+                .await
+                .unwrap();
 
             // Give transport a moment to bind
             sleep(Duration::from_millis(100)).await;

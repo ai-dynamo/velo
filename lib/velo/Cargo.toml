@@ -13,14 +13,22 @@ repository.workspace = true
 
 [features]
 grpc = ["velo-streaming/grpc"]
+distributed-tracing = [
+    "velo-messenger/distributed-tracing",
+    "velo-streaming/distributed-tracing",
+    "velo-transports/distributed-tracing",
+]
 
 [dependencies]
 velo-common = { workspace = true }
 velo-discovery = { workspace = true }
 velo-events = { workspace = true }
 velo-messenger = { workspace = true }
+velo-observability = { workspace = true }
 velo-streaming = { workspace = true }
+velo-rendezvous = { workspace = true }
 velo-transports = { workspace = true }
+bytes = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
@@ -28,7 +36,10 @@ tokio-util = { workspace = true }
 
 [dev-dependencies]
 bytes = { workspace = true }
+prometheus = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true }
+velo-observability = { workspace = true, features = ["test-helpers"] }
+velo-transports = { workspace = true }

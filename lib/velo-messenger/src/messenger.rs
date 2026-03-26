@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use velo_common::{InstanceId, PeerInfo};
 use velo_events::{DistributedEventFactory, EventHandle};
+use velo_observability::VeloMetrics;
 use velo_transports::{Transport, VeloBackend};
 
 use crate::PeerDiscovery;
@@ -28,14 +29,19 @@ pub struct Messenger {
     handlers: HandlerManager,
     discovery: Option<Arc<dyn PeerDiscovery>>,
     events: Arc<VeloEvents>,
+    observability: Option<Arc<VeloMetrics>>,
     runtime: tokio::runtime::Handle,
     tracker: tokio_util::task::TaskTracker,
+    /// Late-bound large payload resolver for transparent rendezvous (receiver side).
+    large_payload_resolver:
+        Arc<std::sync::OnceLock<Arc<dyn crate::large_payload::LargePayloadResolver>>>,
 }
 
 /// Builder for Messenger allowing incremental configuration.
 pub struct MessengerBuilder {
     transports: Vec<Arc<dyn Transport>>,
     discovery: Option<Arc<dyn PeerDiscovery>>,
+    metrics: Option<Arc<VeloMetrics>>,
 }
 
 impl MessengerBuilder {
@@ -44,6 +50,7 @@ impl MessengerBuilder {
         Self {
             transports: Vec::new(),
             discovery: None,
+            metrics: None,
         }
     }
 
@@ -59,9 +66,15 @@ impl MessengerBuilder {
         self
     }
 
+    /// Install Prometheus collectors for this messenger instance.
+    pub fn metrics(mut self, metrics: Arc<VeloMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
     /// Build the Messenger system with the configured transports and discovery.
     pub async fn build(self) -> Result<Arc<Messenger>> {
-        Messenger::new(self.transports, self.discovery).await
+        Messenger::new(self.transports, self.discovery, self.metrics).await
     }
 }
 
@@ -86,17 +99,21 @@ impl Messenger {
         MessengerBuilder::new()
     }
 
-    /// Create a new Messenger system.
-    pub async fn new(
+    /// Create a new Messenger system from builder-owned parts.
+    pub(crate) async fn new(
         transports: Vec<Arc<dyn Transport>>,
         discovery: Option<Arc<dyn PeerDiscovery>>,
+        metrics: Option<Arc<VeloMetrics>>,
     ) -> Result<Arc<Self>> {
         // 1. Setup infrastructure
-        let (backend, data_streams) = VeloBackend::new(transports).await?;
+        let (backend, data_streams) = VeloBackend::new(transports, metrics.clone()).await?;
         let backend = Arc::new(backend);
         let instance_id = backend.instance_id();
         let worker_id = instance_id.worker_id();
-        let response_manager = crate::common::responses::ResponseManager::new(worker_id.as_u64());
+        let response_manager = crate::common::responses::ResponseManager::with_observability(
+            worker_id.as_u64(),
+            metrics.clone(),
+        );
         let runtime = tokio::runtime::Handle::current();
         let tracker = tokio_util::task::TaskTracker::new();
 
@@ -112,13 +129,20 @@ impl Messenger {
             response_manager.clone(),
         );
 
-        // 3. Create server (no event frame handler — events use AM handlers)
+        // 3. Create shared OnceLock for large payload resolver (receiver side)
+        let large_payload_resolver: Arc<
+            std::sync::OnceLock<Arc<dyn crate::large_payload::LargePayloadResolver>>,
+        > = Arc::new(std::sync::OnceLock::new());
+
+        // 4. Create server (no event frame handler — events use AM handlers)
         let server = ActiveMessageServer::new(
             response_manager.clone(),
             None,
             data_streams,
             backend.clone(),
             tracker.clone(),
+            metrics.clone(),
+            large_payload_resolver.clone(),
         )
         .await;
         let server = Arc::new(server);
@@ -136,6 +160,7 @@ impl Messenger {
             backend.clone(),
             Arc::new(DefaultErrorHandler),
             discovery.clone(),
+            metrics.clone(),
         ));
 
         // 5. Create handler manager
@@ -151,8 +176,10 @@ impl Messenger {
             handlers,
             discovery,
             events: events.clone(),
+            observability: metrics,
             runtime,
             tracker,
+            large_payload_resolver,
         });
 
         // 7. Initialize hub's system reference (OnceLock)
@@ -186,6 +213,10 @@ impl Messenger {
     /// Get the discovery backend, if configured.
     pub(crate) fn discovery(&self) -> Option<Arc<dyn PeerDiscovery>> {
         self.discovery.clone()
+    }
+
+    pub(crate) fn observability(&self) -> Option<Arc<VeloMetrics>> {
+        self.observability.clone()
     }
 
     /// Get the distributed event system.
@@ -237,6 +268,14 @@ impl Messenger {
         crate::client::builders::TypedUnaryBuilder::new(self.client.clone(), handler)
     }
 
+    /// Unary builder returning raw bytes that bypasses handler name validation.
+    ///
+    /// Intended for internal subsystems (e.g., `velo-rendezvous`) to send
+    /// unary requests to underscore-prefixed handlers like `_rv_pull`.
+    pub fn unary_streaming(&self, handler: &str) -> crate::client::builders::UnaryBuilder {
+        crate::client::builders::UnaryBuilder::new_unchecked(self.client.clone(), handler)
+    }
+
     /// Typed unary request-response builder that bypasses handler name validation.
     ///
     /// This is the request-response analog of [`Messenger::am_send_streaming`].
@@ -268,6 +307,22 @@ impl Messenger {
         handler: crate::handlers::Handler,
     ) -> anyhow::Result<()> {
         self.handlers.register_internal_handler(handler)
+    }
+
+    /// Enable transparent large payload support.
+    ///
+    /// After calling this, payloads exceeding the stager's threshold are automatically
+    /// staged via rendezvous on send, and resolved transparently on receive.
+    ///
+    /// Must be called after construction (the stager/resolver are typically provided
+    /// by `velo-rendezvous` which depends on this crate).
+    pub fn set_large_payload_support(
+        &self,
+        stager: Arc<dyn crate::large_payload::LargePayloadStager>,
+        resolver: Arc<dyn crate::large_payload::LargePayloadResolver>,
+    ) {
+        let _ = self.client.large_payload_stager.set(stager);
+        let _ = self.large_payload_resolver.set(resolver);
     }
 
     /// Connect to a peer by registering their peer information.

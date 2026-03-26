@@ -13,6 +13,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, warn};
 
+use velo_observability::{Direction, TransportRejection};
+
 use crate::MessageType;
 use crate::tcp::TcpFrameCodec;
 use crate::transport::{ShutdownState, TransportAdapter};
@@ -29,14 +31,23 @@ use super::proto::velo_streaming_server::VeloStreaming;
 pub struct VeloStreamingService {
     adapter: TransportAdapter,
     shutdown_state: ShutdownState,
+    transport_key: String,
+    metrics: Option<velo_observability::TransportMetricsHandle>,
 }
 
 impl VeloStreamingService {
     /// Create a new service instance with the given adapter and shutdown state.
-    pub fn new(adapter: TransportAdapter, shutdown_state: ShutdownState) -> Self {
+    pub fn new(
+        adapter: TransportAdapter,
+        shutdown_state: ShutdownState,
+        transport_key: String,
+        metrics: Option<velo_observability::TransportMetricsHandle>,
+    ) -> Self {
         Self {
             adapter,
             shutdown_state,
+            transport_key,
+            metrics,
         }
     }
 }
@@ -52,6 +63,10 @@ impl VeloStreaming for VeloStreamingService {
         let mut inbound = request.into_inner();
         let adapter = self.adapter.clone();
         let shutdown_state = self.shutdown_state.clone();
+        let transport_key = self.transport_key.clone();
+        let metrics = self.metrics.clone();
+        #[cfg(not(feature = "distributed-tracing"))]
+        let _ = &transport_key;
 
         // Response channel for sending frames back to the client (e.g. ShuttingDown).
         let (response_tx, response_rx) = mpsc::channel::<Result<proto::FramedData, Status>>(256);
@@ -62,6 +77,9 @@ impl VeloStreaming for VeloStreamingService {
                     match TcpFrameCodec::parse_message_type_from_preamble(&framed_data.preamble) {
                         Ok(mt) => mt,
                         Err(e) => {
+                            if let Some(metrics) = metrics.as_ref() {
+                                metrics.record_rejection(TransportRejection::DecodeError);
+                            }
                             warn!("gRPC server: invalid preamble: {}", e);
                             continue;
                         }
@@ -70,6 +88,9 @@ impl VeloStreaming for VeloStreamingService {
                 // During drain: reject new Message frames with ShuttingDown,
                 // but always pass through Response/Ack/Event frames.
                 if shutdown_state.is_draining() && msg_type == MessageType::Message {
+                    if let Some(metrics) = metrics.as_ref() {
+                        metrics.record_rejection(TransportRejection::DrainRejected);
+                    }
                     debug!("gRPC server: rejecting Message during drain (sending ShuttingDown)");
                     let preamble = match TcpFrameCodec::build_preamble(
                         MessageType::ShuttingDown,
@@ -78,6 +99,9 @@ impl VeloStreaming for VeloStreamingService {
                     ) {
                         Ok(p) => p,
                         Err(e) => {
+                            if let Some(metrics) = metrics.as_ref() {
+                                metrics.record_rejection(TransportRejection::DrainReplyBuildFailed);
+                            }
                             warn!("gRPC server: failed to build ShuttingDown preamble: {}", e);
                             continue;
                         }
@@ -101,6 +125,24 @@ impl VeloStreaming for VeloStreamingService {
                     MessageType::ShuttingDown => &adapter.response_stream,
                 };
 
+                if let Some(metrics) = metrics.as_ref() {
+                    #[cfg(feature = "distributed-tracing")]
+                    let span = tracing::debug_span!(
+                        "velo.transport.receive",
+                        transport = transport_key.as_str(),
+                        message_type = crate::message_type_label(msg_type),
+                        bytes = framed_data.header.len() + framed_data.payload.len()
+                    );
+                    #[cfg(feature = "distributed-tracing")]
+                    let _entered = span.enter();
+
+                    metrics.record_frame(
+                        Direction::Inbound,
+                        crate::message_type_label(msg_type),
+                        framed_data.header.len() + framed_data.payload.len(),
+                    );
+                }
+
                 if let Err(e) = sender
                     .send_async((
                         Bytes::from(framed_data.header),
@@ -108,6 +150,9 @@ impl VeloStreaming for VeloStreamingService {
                     ))
                     .await
                 {
+                    if let Some(metrics) = metrics.as_ref() {
+                        metrics.record_rejection(TransportRejection::RouteFailed);
+                    }
                     warn!("gRPC server: failed to route {:?} frame: {}", msg_type, e);
                     break;
                 }

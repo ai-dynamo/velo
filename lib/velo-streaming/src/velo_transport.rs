@@ -36,6 +36,7 @@ use dashmap::DashMap;
 use futures::future::BoxFuture;
 use velo_common::WorkerId;
 use velo_messenger::{Context, Handler, Messenger};
+use velo_observability::VeloMetrics;
 
 use crate::transport::FrameTransport;
 
@@ -73,7 +74,11 @@ impl VeloFrameTransport {
     /// # Errors
     ///
     /// Returns an error if handler registration fails (e.g., duplicate handler name).
-    pub fn new(messenger: Arc<Messenger>, worker_id: WorkerId) -> Result<Self> {
+    pub fn new(
+        messenger: Arc<Messenger>,
+        worker_id: WorkerId,
+        metrics: Option<Arc<VeloMetrics>>,
+    ) -> Result<Self> {
         let dispatch: Arc<DashMap<(u64, u64), flume::Sender<Vec<u8>>>> = Arc::new(DashMap::new());
         let backpressure_count: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
 
@@ -82,9 +87,13 @@ impl VeloFrameTransport {
         // correct per-anchor transport channel based on the anchor_id AM header.
         let handler_dispatch = dispatch.clone();
         let handler_backpressure = backpressure_count.clone();
+        let handler_metrics = metrics
+            .as_ref()
+            .map(|metrics| metrics.bind_streaming_transport("velo"));
         let handler = Handler::am_handler_async("_stream_data", move |ctx: Context| {
             let handler_dispatch = handler_dispatch.clone();
             let backpressure = handler_backpressure.clone();
+            let metrics = handler_metrics.clone();
             async move {
                 let headers = match ctx.headers.as_ref() {
                     Some(h) => h,
@@ -133,6 +142,9 @@ impl VeloFrameTransport {
                         Ok(()) => {}
                         Err(flume::TrySendError::Full(frame_bytes)) => {
                             backpressure.fetch_add(1, Ordering::Relaxed);
+                            if let Some(metrics) = metrics.as_ref() {
+                                metrics.record_backpressure();
+                            }
                             tracing::debug!(
                                 anchor_id,
                                 "_stream_data: dispatch channel full, blocking"

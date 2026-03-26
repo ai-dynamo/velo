@@ -44,10 +44,14 @@ async fn make_two_messengers() -> (Arc<Messenger>, Arc<Messenger>) {
     let t1 = new_tcp_transport();
     let t2 = new_tcp_transport();
 
-    let m1 = Messenger::new(vec![t1], None)
+    let m1 = Messenger::builder()
+        .add_transport(t1)
+        .build()
         .await
         .expect("create messenger 1");
-    let m2 = Messenger::new(vec![t2], None)
+    let m2 = Messenger::builder()
+        .add_transport(t2)
+        .build()
         .await
         .expect("create messenger 2");
 
@@ -86,7 +90,7 @@ async fn test_02_remote_attach() {
 
     // Worker A: create VeloFrameTransport and AnchorManager
     let vft_a = Arc::new(
-        VeloFrameTransport::new(Arc::clone(&messenger_a), worker_id_a).expect("VFT worker A"),
+        VeloFrameTransport::new(Arc::clone(&messenger_a), worker_id_a, None).expect("VFT worker A"),
     );
     let am_a: Arc<velo_streaming::AnchorManager> = Arc::new(
         AnchorManagerBuilder::default()
@@ -116,7 +120,7 @@ async fn test_02_remote_attach() {
 
     // Worker B: create VeloFrameTransport and AnchorManager
     let vft_b = Arc::new(
-        VeloFrameTransport::new(Arc::clone(&messenger_b), worker_id_b).expect("VFT worker B"),
+        VeloFrameTransport::new(Arc::clone(&messenger_b), worker_id_b, None).expect("VFT worker B"),
     );
     let am_b: Arc<velo_streaming::AnchorManager> = Arc::new(
         AnchorManagerBuilder::default()

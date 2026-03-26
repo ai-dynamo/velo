@@ -17,6 +17,7 @@ use serde::de::DeserializeOwned;
 use super::ActiveMessageClient;
 use crate::common::{ActiveMessage, MessageMetadata};
 use velo_common::{InstanceId, WorkerId};
+use velo_observability::ClientResolution;
 
 /// Fire-and-forget builder.
 pub struct AmSendBuilder {
@@ -131,6 +132,12 @@ impl UnaryBuilder {
         Ok(Self {
             inner: MessageBuilder::new(client, handler)?,
         })
+    }
+
+    pub(crate) fn new_unchecked(client: Arc<ActiveMessageClient>, handler: &str) -> Self {
+        Self {
+            inner: MessageBuilder::new_unchecked(client, handler),
+        }
     }
 
     pub fn payload<T: Serialize>(mut self, data: T) -> Result<Self> {
@@ -554,6 +561,9 @@ impl MessageBuilder {
         tokio::spawn(async move {
             // Ensure peer ready (handshake)
             if let Err(e) = client.ensure_peer_ready(target, &handler).await {
+                if let Some(metrics) = client.observability.as_ref() {
+                    metrics.record_client_resolution(ClientResolution::HandshakeError);
+                }
                 tracing::error!(
                     target: "velo_messenger::client",
                     error = %e,
@@ -581,6 +591,9 @@ impl MessageBuilder {
                     error = %e,
                     "Failed to send message in slow path"
                 );
+                if let Some(metrics) = client.observability.as_ref() {
+                    metrics.record_client_resolution(ClientResolution::SendError);
+                }
                 let _ = response_manager
                     .complete_outcome(response_id, Err(format!("Send failed: {}", e)));
             }
@@ -604,6 +617,9 @@ impl MessageBuilder {
             let target = match client.resolve_peer_via_discovery(worker_id).await {
                 Ok(instance_id) => instance_id,
                 Err(e) => {
+                    if let Some(metrics) = client.observability.as_ref() {
+                        metrics.record_client_resolution(ClientResolution::DiscoveryError);
+                    }
                     tracing::error!(
                         target: "velo_messenger::client",
                         error = %e,
@@ -618,6 +634,9 @@ impl MessageBuilder {
 
             // Ensure peer ready (handshake)
             if let Err(e) = client.ensure_peer_ready(target, &handler).await {
+                if let Some(metrics) = client.observability.as_ref() {
+                    metrics.record_client_resolution(ClientResolution::HandshakeError);
+                }
                 tracing::error!(
                     target: "velo_messenger::client",
                     error = %e,
@@ -645,6 +664,9 @@ impl MessageBuilder {
                     error = %e,
                     "Failed to send message after discovery"
                 );
+                if let Some(metrics) = client.observability.as_ref() {
+                    metrics.record_client_resolution(ClientResolution::SendError);
+                }
                 let _ = response_manager
                     .complete_outcome(response_id, Err(format!("Send failed: {}", e)));
             }
@@ -657,6 +679,9 @@ impl MessageBuilder {
 
         match target_result {
             Ok(target) if self.client.can_send_directly(target, &self.handler) => {
+                if let Some(metrics) = self.client.observability.as_ref() {
+                    metrics.record_client_resolution(ClientResolution::DirectSuccess);
+                }
                 // Fast path: send immediately
                 let outcome = self.client.register_outcome()?;
                 let message = ActiveMessage {
@@ -698,6 +723,9 @@ impl MessageBuilder {
                             fire_send_after_ready(client, target, handler, payload, headers).await;
                         }
                         Err(e) => {
+                            if let Some(metrics) = client.observability.as_ref() {
+                                metrics.record_client_resolution(ClientResolution::DiscoveryError);
+                            }
                             tracing::error!(
                                 target: "velo_messenger::client",
                                 error = %e,
@@ -729,6 +757,9 @@ impl MessageBuilder {
 
         match target_result {
             Ok(target) if self.client.can_send_directly(target, &self.handler) => {
+                if let Some(metrics) = self.client.observability.as_ref() {
+                    metrics.record_client_resolution(ClientResolution::DirectSuccess);
+                }
                 let message = ActiveMessage {
                     metadata: self.create_metadata(response_id, MsgType::Sync),
                     payload: self.payload.unwrap_or_default(),
@@ -784,6 +815,9 @@ impl MessageBuilder {
 
         match target_result {
             Ok(target) if self.client.can_send_directly(target, &self.handler) => {
+                if let Some(metrics) = self.client.observability.as_ref() {
+                    metrics.record_client_resolution(ClientResolution::DirectSuccess);
+                }
                 let message = ActiveMessage {
                     metadata: self.create_metadata(response_id, MsgType::Unary),
                     payload: self.payload.unwrap_or_default(),
@@ -842,6 +876,9 @@ impl MessageBuilder {
 
         match target_result {
             Ok(target) if self.client.can_send_directly(target, &self.handler) => {
+                if let Some(metrics) = self.client.observability.as_ref() {
+                    metrics.record_client_resolution(ClientResolution::DirectSuccess);
+                }
                 let message = ActiveMessage {
                     metadata: self.create_metadata(response_id, MsgType::Unary),
                     payload: self.payload.unwrap_or_default(),

@@ -17,6 +17,8 @@ use tokio::net::UnixStream;
 use tokio_util::codec::Framed;
 use tracing::{debug, error, info, warn};
 
+use velo_observability::{Direction, TransportRejection};
+
 use crate::{MessageType, ShutdownState, TransportAdapter, TransportErrorHandler};
 
 use crate::tcp::TcpFrameCodec;
@@ -32,6 +34,8 @@ pub struct UdsListener {
     adapter: TransportAdapter,
     error_handler: Arc<dyn TransportErrorHandler>,
     shutdown_state: ShutdownState,
+    transport_key: String,
+    metrics: Option<velo_observability::TransportMetricsHandle>,
 }
 
 /// UDS listener that has been bound to a socket path, ready to accept connections.
@@ -44,6 +48,8 @@ pub struct BoundUdsListener {
     error_handler: Arc<dyn TransportErrorHandler>,
     shutdown_state: ShutdownState,
     listener: TokioUnixListener,
+    transport_key: String,
+    metrics: Option<velo_observability::TransportMetricsHandle>,
 }
 
 impl UdsListener {
@@ -67,6 +73,8 @@ impl UdsListener {
             error_handler: self.error_handler,
             shutdown_state: self.shutdown_state,
             listener,
+            transport_key: self.transport_key,
+            metrics: self.metrics,
         })
     }
 
@@ -81,6 +89,8 @@ impl UdsListener {
         adapter: TransportAdapter,
         error_handler: Arc<dyn TransportErrorHandler>,
         shutdown_state: ShutdownState,
+        transport_key: String,
+        metrics: Option<velo_observability::TransportMetricsHandle>,
     ) -> Result<()> {
         debug!("Configuring UDS connection");
 
@@ -98,6 +108,9 @@ impl UdsListener {
                             // During drain: reject new Message frames with ShuttingDown,
                             // but always pass through Response/Ack/Event frames.
                             if shutdown_state.is_draining() && msg_type == MessageType::Message {
+                                if let Some(metrics) = metrics.as_ref() {
+                                    metrics.record_rejection(TransportRejection::DrainRejected);
+                                }
                                 debug!(
                                     "Rejecting Message frame during drain (sending ShuttingDown)"
                                 );
@@ -124,6 +137,8 @@ impl UdsListener {
                                 payload,
                                 &adapter,
                                 &error_handler,
+                                &transport_key,
+                                metrics.as_ref(),
                             )
                             .await
                             {
@@ -134,6 +149,9 @@ impl UdsListener {
                             }
                         }
                         Some(Err(e)) => {
+                            if let Some(metrics) = metrics.as_ref() {
+                                metrics.record_rejection(TransportRejection::DecodeError);
+                            }
                             error!("Frame decode error from UDS: {}", e);
                             break;
                         }
@@ -160,7 +178,11 @@ impl UdsListener {
         payload: Bytes,
         adapter: &TransportAdapter,
         error_handler: &Arc<dyn TransportErrorHandler>,
+        transport_key: &str,
+        metrics: Option<&velo_observability::TransportMetricsHandle>,
     ) -> Result<()> {
+        #[cfg(not(feature = "distributed-tracing"))]
+        let _ = transport_key;
         let sender = match msg_type {
             MessageType::Message => &adapter.message_stream,
             MessageType::Response => &adapter.response_stream,
@@ -173,9 +195,30 @@ impl UdsListener {
             }
         };
 
+        if let Some(metrics) = metrics {
+            #[cfg(feature = "distributed-tracing")]
+            let span = tracing::debug_span!(
+                "velo.transport.receive",
+                transport = transport_key,
+                message_type = crate::message_type_label(msg_type),
+                bytes = header.len() + payload.len()
+            );
+            #[cfg(feature = "distributed-tracing")]
+            let _entered = span.enter();
+
+            metrics.record_frame(
+                Direction::Inbound,
+                crate::message_type_label(msg_type),
+                header.len() + payload.len(),
+            );
+        }
+
         match sender.send_async((header, payload)).await {
             Ok(_) => Ok(()),
             Err(e) => {
+                if let Some(metrics) = metrics {
+                    metrics.record_rejection(TransportRejection::RouteFailed);
+                }
                 error_handler.on_error(e.0.0, e.0.1, format!("Failed to route {:?}", msg_type));
                 Err(anyhow::anyhow!("Failed to send to stream"))
             }
@@ -198,6 +241,8 @@ impl BoundUdsListener {
                             let adapter = self.adapter.clone();
                             let error_handler = self.error_handler.clone();
                             let shutdown_state = self.shutdown_state.clone();
+                            let transport_key = self.transport_key.clone();
+                            let metrics = self.metrics.clone();
 
                             tokio::spawn(async move {
                                 if let Err(e) = UdsListener::handle_connection(
@@ -205,6 +250,8 @@ impl BoundUdsListener {
                                     adapter,
                                     error_handler,
                                     shutdown_state,
+                                    transport_key,
+                                    metrics,
                                 )
                                 .await
                                 {
@@ -237,6 +284,8 @@ pub struct UdsListenerBuilder {
     adapter: Option<TransportAdapter>,
     error_handler: Option<Arc<dyn TransportErrorHandler>>,
     shutdown_state: Option<ShutdownState>,
+    transport_key: Option<String>,
+    metrics: Option<velo_observability::TransportMetricsHandle>,
 }
 
 impl UdsListenerBuilder {
@@ -247,6 +296,8 @@ impl UdsListenerBuilder {
             adapter: None,
             error_handler: None,
             shutdown_state: None,
+            transport_key: None,
+            metrics: None,
         }
     }
 
@@ -274,6 +325,18 @@ impl UdsListenerBuilder {
         self
     }
 
+    /// Set the transport key used for metrics labels.
+    pub fn transport_key(mut self, transport_key: impl Into<String>) -> Self {
+        self.transport_key = Some(transport_key.into());
+        self
+    }
+
+    /// Install transport-scoped observability handles.
+    pub fn metrics(mut self, metrics: Option<velo_observability::TransportMetricsHandle>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
     /// Build the UdsListener
     pub fn build(self) -> Result<UdsListener> {
         let socket_path = self
@@ -292,6 +355,8 @@ impl UdsListenerBuilder {
             adapter,
             error_handler,
             shutdown_state,
+            transport_key: self.transport_key.unwrap_or_else(|| "uds".to_string()),
+            metrics: self.metrics,
         })
     }
 }

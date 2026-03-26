@@ -17,9 +17,11 @@ default = ["http", "nats", "grpc"]
 http = ["dep:axum", "dep:reqwest"]
 nats = ["dep:async-nats", "dep:bs58"]
 grpc = ["dep:tonic", "dep:prost", "dep:tower", "dep:hyper", "dep:http", "dep:http-body", "dep:http-body-util", "dep:hyper-util", "dep:tokio-stream"]
+distributed-tracing = ["velo-observability/distributed-tracing"]
 
 [dependencies]
 velo-common = { workspace = true }
+velo-observability = { workspace = true }
 
 anyhow = { workspace = true }
 bytes = { workspace = true }

@@ -10,6 +10,7 @@ use tokio::sync::Semaphore;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, error, trace, warn};
 use velo_common::WorkerId;
+use velo_observability::DispatchFailure;
 use velo_transports::VeloBackend;
 
 use crate::Messenger;
@@ -281,6 +282,9 @@ impl DispatcherHub {
 
     /// Handle messages for unknown handlers
     fn handle_unknown_handler(&self, handler_name: &str, ctx: HandlerContext) {
+        if let Some(metrics) = ctx.system.observability().as_ref() {
+            metrics.record_dispatch_failure(DispatchFailure::DispatchUnknownHandler);
+        }
         error!(
             target: "velo_messenger::dispatcher",
             handler = %handler_name,
@@ -314,6 +318,15 @@ impl DispatcherHub {
                 );
             }
         }
+    }
+
+    /// Send an error response back to the sender.
+    pub(crate) async fn send_error_response(
+        &self,
+        response_id: ResponseId,
+        error_message: String,
+    ) -> anyhow::Result<()> {
+        Self::send_error_response_static(&self.backend, response_id, error_message).await
     }
 
     /// Send an error response back to the sender (static method)

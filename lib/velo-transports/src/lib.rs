@@ -56,6 +56,7 @@ use std::{collections::HashMap, sync::Arc};
 use bytes::Bytes;
 use dashmap::DashMap;
 use parking_lot::Mutex;
+use velo_observability::{Direction, TransportRejection, VeloMetrics};
 
 // Public re-exports from velo-common
 pub use velo_common::{
@@ -73,6 +74,7 @@ pub use transport::{
     DataStreams, HealthCheckError, InFlightGuard, MessageType, ShutdownPolicy, ShutdownState,
     Transport, TransportAdapter, TransportError, TransportErrorHandler, make_channels,
 };
+pub use velo_observability::VeloMetrics as TransportMetrics;
 
 /// Errors returned by [`VeloBackend`] operations.
 #[derive(Debug, thiserror::Error)]
@@ -109,6 +111,7 @@ pub struct VeloBackend {
     address: WorkerAddress,
     priorities: Mutex<Vec<TransportKey>>,
     transports: HashMap<TransportKey, Arc<dyn Transport>>,
+    transport_metrics: HashMap<TransportKey, velo_observability::TransportMetricsHandle>,
     primary_transport: DashMap<InstanceId, Arc<dyn Transport>>,
     alternative_transports: DashMap<InstanceId, Vec<TransportKey>>,
     workers: DashMap<WorkerId, InstanceId>,
@@ -126,6 +129,7 @@ impl VeloBackend {
     /// [`DataStreams`] receivers for inbound messages.
     pub async fn new(
         backend_transports: Vec<Arc<dyn Transport>>,
+        observability: Option<Arc<VeloMetrics>>,
     ) -> anyhow::Result<(Self, DataStreams)> {
         let instance_id = InstanceId::new_v4();
 
@@ -133,6 +137,7 @@ impl VeloBackend {
         let mut priorities = Vec::new();
         let mut builder = WorkerAddressBuilder::new();
         let mut transports = HashMap::new();
+        let mut transport_metrics = HashMap::new();
 
         let (adapter, data_streams) = transport::make_channels();
         let shutdown_state = adapter.shutdown_state.clone();
@@ -140,12 +145,17 @@ impl VeloBackend {
         let runtime = tokio::runtime::Handle::current();
 
         for transport in backend_transports {
+            let key = transport.key();
+            if let Some(metrics) = observability.as_ref() {
+                transport.set_observability(metrics.clone());
+                transport_metrics.insert(key.clone(), metrics.bind_transport(key.as_str()));
+            }
             transport
                 .start(instance_id, adapter.clone(), runtime.clone())
                 .await?;
             builder.merge(&transport.address())?;
-            priorities.push(transport.key());
-            transports.insert(transport.key(), transport);
+            priorities.push(key.clone());
+            transports.insert(key, transport);
         }
         let address = builder.build()?;
 
@@ -154,6 +164,7 @@ impl VeloBackend {
                 instance_id,
                 address,
                 transports,
+                transport_metrics,
                 priorities: Mutex::new(priorities),
                 primary_transport: DashMap::new(),
                 alternative_transports: DashMap::new(),
@@ -232,8 +243,34 @@ impl VeloBackend {
             .primary_transport
             .get(&target)
             .ok_or(VeloBackendError::InstanceNotRegistered(target))?;
+        let transport_key = transport.value().key();
+        let transport_name = transport_key.to_string();
+        #[cfg(not(feature = "distributed-tracing"))]
+        let _ = &transport_name;
+        let bytes = header.len() + payload.len();
+        let metrics = self.transport_metrics.get(&transport_key);
 
-        transport.send_message(target, header, payload, message_type, on_error);
+        let error_handler = instrument_transport_error_handler(metrics.cloned(), on_error);
+
+        #[cfg(feature = "distributed-tracing")]
+        {
+            let span = tracing::info_span!(
+                "velo.transport.send",
+                transport = transport_name.as_str(),
+                message_type = message_type_label(message_type),
+                bytes
+            );
+            let _entered = span.enter();
+            transport.send_message(target, header, payload, message_type, error_handler);
+        }
+
+        #[cfg(not(feature = "distributed-tracing"))]
+        transport.send_message(target, header, payload, message_type, error_handler);
+
+        // Record AFTER successful enqueue
+        if let Some(metrics) = metrics {
+            metrics.record_frame(Direction::Outbound, message_type_label(message_type), bytes);
+        }
 
         Ok(())
     }
@@ -259,7 +296,19 @@ impl VeloBackend {
             .ok_or(VeloBackendError::InstanceNotRegistered(target))?;
 
         if transport.value().key() == transport_key {
-            transport.send_message(target, header, payload, message_type, on_error);
+            let transport_name = transport_key.to_string();
+            let bytes = header.len() + payload.len();
+            let metrics = self.transport_metrics.get(&transport_key);
+
+            let error_handler = instrument_transport_error_handler(metrics.cloned(), on_error);
+            #[cfg(not(feature = "distributed-tracing"))]
+            let _ = transport_name;
+            transport.send_message(target, header, payload, message_type, error_handler);
+
+            // Record AFTER successful enqueue
+            if let Some(metrics) = metrics {
+                metrics.record_frame(Direction::Outbound, message_type_label(message_type), bytes);
+            }
             return Ok(());
         } else {
             // if we got here, we can unwrap because there is an entry in the alternative_transports map
@@ -272,7 +321,24 @@ impl VeloBackend {
                 if *alternative_transport == transport_key
                     && let Some(transport) = self.transports.get(alternative_transport)
                 {
-                    transport.send_message(target, header, payload, message_type, on_error);
+                    let transport_name = alternative_transport.to_string();
+                    let bytes = header.len() + payload.len();
+                    let metrics = self.transport_metrics.get(alternative_transport);
+
+                    let error_handler =
+                        instrument_transport_error_handler(metrics.cloned(), on_error);
+                    #[cfg(not(feature = "distributed-tracing"))]
+                    let _ = transport_name;
+                    transport.send_message(target, header, payload, message_type, error_handler);
+
+                    // Record AFTER successful enqueue
+                    if let Some(metrics) = metrics {
+                        metrics.record_frame(
+                            Direction::Outbound,
+                            message_type_label(message_type),
+                            bytes,
+                        );
+                    }
                     return Ok(());
                 }
             }
@@ -426,6 +492,37 @@ impl VeloBackend {
     }
 }
 
+pub(crate) fn message_type_label(message_type: MessageType) -> &'static str {
+    match message_type {
+        MessageType::Message => "message",
+        MessageType::Response => "response",
+        MessageType::Ack => "ack",
+        MessageType::Event => "event",
+        MessageType::ShuttingDown => "shutting_down",
+    }
+}
+
+struct InstrumentedTransportErrorHandler {
+    metrics: Option<velo_observability::TransportMetricsHandle>,
+    inner: Arc<dyn TransportErrorHandler>,
+}
+
+impl TransportErrorHandler for InstrumentedTransportErrorHandler {
+    fn on_error(&self, header: Bytes, payload: Bytes, error: String) {
+        if let Some(metrics) = self.metrics.as_ref() {
+            metrics.record_rejection(TransportRejection::SendError);
+        }
+        self.inner.on_error(header, payload, error);
+    }
+}
+
+fn instrument_transport_error_handler(
+    metrics: Option<velo_observability::TransportMetricsHandle>,
+    inner: Arc<dyn TransportErrorHandler>,
+) -> Arc<dyn TransportErrorHandler> {
+    Arc::new(InstrumentedTransportErrorHandler { metrics, inner })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,7 +637,7 @@ mod tests {
     #[tokio::test]
     async fn test_new_single_transport() {
         let t = MockTransport::new("tcp", true);
-        let (backend, _streams) = VeloBackend::new(vec![t.clone() as Arc<dyn Transport>])
+        let (backend, _streams) = VeloBackend::new(vec![t.clone() as Arc<dyn Transport>], None)
             .await
             .unwrap();
 
@@ -554,10 +651,13 @@ mod tests {
     async fn test_new_multiple_transports() {
         let t1 = MockTransport::new("tcp", true);
         let t2 = MockTransport::new("http", true);
-        let (backend, _streams) = VeloBackend::new(vec![
-            t1.clone() as Arc<dyn Transport>,
-            t2.clone() as Arc<dyn Transport>,
-        ])
+        let (backend, _streams) = VeloBackend::new(
+            vec![
+                t1.clone() as Arc<dyn Transport>,
+                t2.clone() as Arc<dyn Transport>,
+            ],
+            None,
+        )
         .await
         .unwrap();
 
@@ -570,10 +670,13 @@ mod tests {
     async fn test_register_peer_selects_primary_by_priority() {
         let t1 = MockTransport::new("tcp", true);
         let t2 = MockTransport::new("http", true);
-        let (backend, _streams) = VeloBackend::new(vec![
-            t1.clone() as Arc<dyn Transport>,
-            t2.clone() as Arc<dyn Transport>,
-        ])
+        let (backend, _streams) = VeloBackend::new(
+            vec![
+                t1.clone() as Arc<dyn Transport>,
+                t2.clone() as Arc<dyn Transport>,
+            ],
+            None,
+        )
         .await
         .unwrap();
 
@@ -591,7 +694,7 @@ mod tests {
     async fn test_register_peer_no_compatible_transports() {
         // Transport rejects all registrations
         let t = MockTransport::new("tcp", false);
-        let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>])
+        let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>], None)
             .await
             .unwrap();
 
@@ -606,7 +709,7 @@ mod tests {
     #[tokio::test]
     async fn test_register_peer_stores_worker_mapping() {
         let t = MockTransport::new("tcp", true);
-        let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>])
+        let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>], None)
             .await
             .unwrap();
 
@@ -622,7 +725,7 @@ mod tests {
     #[tokio::test]
     async fn test_send_message_routes_to_primary() {
         let t = MockTransport::new("tcp", true);
-        let (backend, _streams) = VeloBackend::new(vec![t.clone() as Arc<dyn Transport>])
+        let (backend, _streams) = VeloBackend::new(vec![t.clone() as Arc<dyn Transport>], None)
             .await
             .unwrap();
 
@@ -646,7 +749,7 @@ mod tests {
     #[tokio::test]
     async fn test_send_message_unregistered_peer() {
         let t = MockTransport::new("tcp", true);
-        let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>])
+        let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>], None)
             .await
             .unwrap();
 
@@ -663,7 +766,7 @@ mod tests {
     #[tokio::test]
     async fn test_send_message_with_transport_primary_match() {
         let t = MockTransport::new("tcp", true);
-        let (backend, _streams) = VeloBackend::new(vec![t.clone() as Arc<dyn Transport>])
+        let (backend, _streams) = VeloBackend::new(vec![t.clone() as Arc<dyn Transport>], None)
             .await
             .unwrap();
 
@@ -689,10 +792,13 @@ mod tests {
     async fn test_send_message_with_transport_alternative() {
         let t1 = MockTransport::new("tcp", true);
         let t2 = MockTransport::new("http", true);
-        let (backend, _streams) = VeloBackend::new(vec![
-            t1.clone() as Arc<dyn Transport>,
-            t2.clone() as Arc<dyn Transport>,
-        ])
+        let (backend, _streams) = VeloBackend::new(
+            vec![
+                t1.clone() as Arc<dyn Transport>,
+                t2.clone() as Arc<dyn Transport>,
+            ],
+            None,
+        )
         .await
         .unwrap();
 
@@ -718,7 +824,7 @@ mod tests {
     #[tokio::test]
     async fn test_send_message_with_transport_not_found() {
         let t = MockTransport::new("tcp", true);
-        let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>])
+        let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>], None)
             .await
             .unwrap();
 
@@ -740,7 +846,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_translate_worker_id_not_found() {
         let t = MockTransport::new("tcp", true);
-        let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>])
+        let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>], None)
             .await
             .unwrap();
 
@@ -755,10 +861,12 @@ mod tests {
     async fn test_set_transport_priority_valid() {
         let t1 = MockTransport::new("tcp", true);
         let t2 = MockTransport::new("http", true);
-        let (backend, _streams) =
-            VeloBackend::new(vec![t1 as Arc<dyn Transport>, t2 as Arc<dyn Transport>])
-                .await
-                .unwrap();
+        let (backend, _streams) = VeloBackend::new(
+            vec![t1 as Arc<dyn Transport>, t2 as Arc<dyn Transport>],
+            None,
+        )
+        .await
+        .unwrap();
 
         // Reverse the priority
         backend
@@ -769,7 +877,7 @@ mod tests {
     #[tokio::test]
     async fn test_set_transport_priority_wrong_length() {
         let t = MockTransport::new("tcp", true);
-        let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>])
+        let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>], None)
             .await
             .unwrap();
 
@@ -784,7 +892,7 @@ mod tests {
     #[tokio::test]
     async fn test_set_transport_priority_unknown_key() {
         let t = MockTransport::new("tcp", true);
-        let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>])
+        let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>], None)
             .await
             .unwrap();
 
@@ -799,10 +907,13 @@ mod tests {
     async fn test_graceful_shutdown_calls_all_transports() {
         let t1 = MockTransport::new("tcp", true);
         let t2 = MockTransport::new("http", true);
-        let (backend, _streams) = VeloBackend::new(vec![
-            t1.clone() as Arc<dyn Transport>,
-            t2.clone() as Arc<dyn Transport>,
-        ])
+        let (backend, _streams) = VeloBackend::new(
+            vec![
+                t1.clone() as Arc<dyn Transport>,
+                t2.clone() as Arc<dyn Transport>,
+            ],
+            None,
+        )
         .await
         .unwrap();
 
@@ -821,7 +932,7 @@ mod tests {
     #[tokio::test]
     async fn test_peer_info_roundtrip() {
         let t = MockTransport::new("tcp", true);
-        let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>])
+        let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>], None)
             .await
             .unwrap();
 

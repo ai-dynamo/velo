@@ -8,6 +8,7 @@
 //! patterns over pluggable transports. Includes a distributed event system.
 
 mod client;
+pub mod large_payload;
 mod messenger;
 
 pub(crate) mod common;
@@ -28,8 +29,10 @@ pub use handlers::{
     AmHandlerBuilder, AsyncExecutor, Context, DispatchMode, Handler, HandlerExecutor, SyncExecutor,
     TypedContext, TypedUnaryHandlerBuilder, UnaryHandlerBuilder, UnifiedResponse,
 };
+pub use large_payload::{LargePayloadResolver, LargePayloadStager, RV_HEADER_KEY};
 pub use messenger::{Messenger, MessengerBuilder};
 pub use server::EventFrameHandler;
+pub use velo_observability::VeloMetrics;
 
 // Re-exports from velo-common for convenience
 pub use velo_common::{InstanceId, PeerInfo, WorkerAddress, WorkerId};

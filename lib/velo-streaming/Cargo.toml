@@ -13,10 +13,12 @@ repository.workspace = true
 
 [features]
 grpc = ["dep:tonic", "dep:prost", "dep:tokio-stream", "velo/grpc"]
+distributed-tracing = ["velo-observability/distributed-tracing", "velo-messenger/distributed-tracing"]
 
 [dependencies]
 velo-common = { workspace = true }
 velo-messenger = { workspace = true }
+velo-observability = { workspace = true }
 velo-transports = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

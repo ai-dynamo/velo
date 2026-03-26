@@ -1137,8 +1137,16 @@ mod tests {
     }
 
     async fn make_pair() -> (Arc<Messenger>, Arc<Messenger>) {
-        let a = Messenger::new(vec![new_transport()], None).await.unwrap();
-        let b = Messenger::new(vec![new_transport()], None).await.unwrap();
+        let a = Messenger::builder()
+            .add_transport(new_transport())
+            .build()
+            .await
+            .unwrap();
+        let b = Messenger::builder()
+            .add_transport(new_transport())
+            .build()
+            .await
+            .unwrap();
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 

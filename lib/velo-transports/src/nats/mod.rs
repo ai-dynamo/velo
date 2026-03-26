@@ -12,5 +12,4 @@ mod transport;
 /// NATS client connection utilities.
 pub mod utils;
 
-pub(crate) use subjects::{health_subject, inbound_subject};
 pub use transport::{NatsTransport, NatsTransportBuilder};

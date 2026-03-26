@@ -18,6 +18,8 @@ use tokio::runtime::{Handle, Runtime};
 use tokio_util::codec::Framed;
 use tracing::{debug, error, info, warn};
 
+use velo_observability::{Direction, TransportRejection};
+
 use crate::{MessageType, ShutdownState, TransportAdapter, TransportErrorHandler};
 
 use super::framing::TcpFrameCodec;
@@ -43,6 +45,8 @@ pub struct TcpListener {
     shutdown_state: ShutdownState,
     runtime_config: RuntimeConfig,
     listener: Option<std::net::TcpListener>,
+    transport_key: String,
+    metrics: Option<velo_observability::TransportMetricsHandle>,
 }
 
 impl TcpListener {
@@ -159,6 +163,8 @@ impl TcpListener {
                             let adapter = self.adapter.clone();
                             let error_handler = self.error_handler.clone();
                             let shutdown_state = self.shutdown_state.clone();
+                            let transport_key = self.transport_key.clone();
+                            let metrics = self.metrics.clone();
 
                             tokio::spawn(async move {
                                 if let Err(e) = Self::handle_connection(
@@ -167,6 +173,8 @@ impl TcpListener {
                                     adapter,
                                     error_handler,
                                     shutdown_state,
+                                    transport_key,
+                                    metrics,
                                 )
                                 .await
                                 {
@@ -196,6 +204,8 @@ impl TcpListener {
         adapter: TransportAdapter,
         error_handler: Arc<dyn TransportErrorHandler>,
         shutdown_state: ShutdownState,
+        transport_key: String,
+        metrics: Option<velo_observability::TransportMetricsHandle>,
     ) -> Result<()> {
         debug!("Configuring connection from {}", peer_addr);
 
@@ -242,6 +252,9 @@ impl TcpListener {
                             // During drain: reject new Message frames with ShuttingDown,
                             // but always pass through Response/Ack/Event frames.
                             if shutdown_state.is_draining() && msg_type == MessageType::Message {
+                                if let Some(metrics) = metrics.as_ref() {
+                                    metrics.record_rejection(TransportRejection::DrainRejected);
+                                }
                                 debug!(
                                     "Rejecting Message frame from {} during drain (sending ShuttingDown)",
                                     peer_addr
@@ -270,6 +283,8 @@ impl TcpListener {
                                 payload,
                                 &adapter,
                                 &error_handler,
+                                &transport_key,
+                                metrics.as_ref(),
                             )
                             .await
                             {
@@ -280,6 +295,9 @@ impl TcpListener {
                             }
                         }
                         Some(Err(e)) => {
+                            if let Some(metrics) = metrics.as_ref() {
+                                metrics.record_rejection(TransportRejection::DecodeError);
+                            }
                             error!("Frame decode error from {}: {}", peer_addr, e);
                             break;
                         }
@@ -311,7 +329,11 @@ impl TcpListener {
         payload: Bytes,
         adapter: &TransportAdapter,
         error_handler: &Arc<dyn TransportErrorHandler>,
+        transport_key: &str,
+        metrics: Option<&velo_observability::TransportMetricsHandle>,
     ) -> Result<()> {
+        #[cfg(not(feature = "distributed-tracing"))]
+        let _ = transport_key;
         let sender = match msg_type {
             MessageType::Message => &adapter.message_stream,
             MessageType::Response => &adapter.response_stream,
@@ -324,10 +346,31 @@ impl TcpListener {
             }
         };
 
+        if let Some(metrics) = metrics {
+            #[cfg(feature = "distributed-tracing")]
+            let span = tracing::debug_span!(
+                "velo.transport.receive",
+                transport = transport_key,
+                message_type = crate::message_type_label(msg_type),
+                bytes = header.len() + payload.len()
+            );
+            #[cfg(feature = "distributed-tracing")]
+            let _entered = span.enter();
+
+            metrics.record_frame(
+                Direction::Inbound,
+                crate::message_type_label(msg_type),
+                header.len() + payload.len(),
+            );
+        }
+
         // Try to send with ownership transfer (zero-copy)
         match sender.send_async((header, payload)).await {
             Ok(_) => Ok(()),
             Err(e) => {
+                if let Some(metrics) = metrics {
+                    metrics.record_rejection(TransportRejection::RouteFailed);
+                }
                 // Send failed - invoke error callback with the data
                 error_handler.on_error(
                     e.0.0, // header
@@ -348,6 +391,8 @@ pub struct TcpListenerBuilder {
     shutdown_state: Option<ShutdownState>,
     runtime_config: Option<RuntimeConfig>,
     listener: Option<std::net::TcpListener>,
+    transport_key: Option<String>,
+    metrics: Option<velo_observability::TransportMetricsHandle>,
 }
 
 impl TcpListenerBuilder {
@@ -360,6 +405,8 @@ impl TcpListenerBuilder {
             shutdown_state: None,
             runtime_config: None,
             listener: None,
+            transport_key: None,
+            metrics: None,
         }
     }
 
@@ -414,6 +461,18 @@ impl TcpListenerBuilder {
         self
     }
 
+    /// Set the transport key used for metrics labels.
+    pub fn transport_key(mut self, transport_key: impl Into<String>) -> Self {
+        self.transport_key = Some(transport_key.into());
+        self
+    }
+
+    /// Install transport-scoped observability handles.
+    pub fn metrics(mut self, metrics: Option<velo_observability::TransportMetricsHandle>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
     /// Build the TcpListener
     pub fn build(self) -> Result<TcpListener> {
         let bind_addr = self
@@ -437,6 +496,8 @@ impl TcpListenerBuilder {
             shutdown_state,
             runtime_config,
             listener: self.listener,
+            transport_key: self.transport_key.unwrap_or_else(|| "tcp".to_string()),
+            metrics: self.metrics,
         })
     }
 }

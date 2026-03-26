@@ -17,6 +17,7 @@ use crate::{
 
 use peer_registry::PeerRegistry;
 use velo_common::InstanceId;
+use velo_observability::{ClientResolution, VeloMetrics};
 use velo_transports::{TransportErrorHandler, VeloBackend};
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -28,6 +29,10 @@ pub(crate) struct ActiveMessageClient {
     peer_registry: Arc<PeerRegistry>,
     discovery: Option<Arc<dyn PeerDiscovery>>,
     handshake_timeout: Duration,
+    observability: Option<Arc<VeloMetrics>>,
+    /// Late-bound large payload stager for transparent rendezvous.
+    pub(crate) large_payload_stager:
+        Arc<std::sync::OnceLock<Arc<dyn crate::large_payload::LargePayloadStager>>>,
 }
 
 impl ActiveMessageClient {
@@ -36,6 +41,7 @@ impl ActiveMessageClient {
         backend: Arc<VeloBackend>,
         error_handler: Arc<dyn TransportErrorHandler>,
         discovery: Option<Arc<dyn PeerDiscovery>>,
+        observability: Option<Arc<VeloMetrics>>,
     ) -> Self {
         Self {
             response_manager,
@@ -44,11 +50,55 @@ impl ActiveMessageClient {
             peer_registry: Arc::new(PeerRegistry::new()),
             discovery,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            observability,
+            large_payload_stager: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
-    pub(crate) fn send_message(&self, target: InstanceId, message: ActiveMessage) -> Result<()> {
+    #[allow(unused_mut)]
+    pub(crate) fn send_message(
+        &self,
+        target: InstanceId,
+        mut message: ActiveMessage,
+    ) -> Result<()> {
+        // Transparent large payload staging: if payload exceeds threshold,
+        // stage it via rendezvous and replace with a handle in the headers.
+        if let Some(stager) = self.large_payload_stager.get() {
+            if message.payload.len() > stager.threshold() {
+                let staged_payload = std::mem::replace(&mut message.payload, bytes::Bytes::new());
+                let handle_str = stager.stage(staged_payload);
+                message
+                    .metadata
+                    .headers
+                    .get_or_insert_with(std::collections::HashMap::new)
+                    .insert(crate::large_payload::RV_HEADER_KEY.to_string(), handle_str);
+            }
+        }
+
+        #[cfg(feature = "distributed-tracing")]
+        velo_observability::inject_current_context(&mut message.metadata.headers);
+
         let (header, payload, message_type) = message.encode()?;
+
+        #[cfg(feature = "distributed-tracing")]
+        {
+            let span = tracing::info_span!(
+                "velo.messenger.client_send",
+                target = %target,
+                message_type = ?message_type,
+                bytes = header.len() + payload.len()
+            );
+            let _entered = span.enter();
+            return self.backend.send_message(
+                target,
+                header,
+                payload,
+                message_type,
+                self.error_handler.clone(),
+            );
+        }
+
+        #[cfg(not(feature = "distributed-tracing"))]
         self.backend.send_message(
             target,
             header,
@@ -98,6 +148,9 @@ impl ActiveMessageClient {
             target_instance = %target,
             "Initiating handshake with peer"
         );
+        if let Some(metrics) = self.observability.as_ref() {
+            metrics.record_client_resolution(ClientResolution::HandshakeAttempt);
+        }
 
         // Send _hello with our peer info
         let request = HelloRequest {
@@ -156,6 +209,9 @@ impl ActiveMessageClient {
             handler_count = response.handlers.len(),
             "Handshake completed successfully"
         );
+        if let Some(metrics) = self.observability.as_ref() {
+            metrics.record_client_resolution(ClientResolution::HandshakeSuccess);
+        }
 
         Ok(())
     }
@@ -229,6 +285,9 @@ impl ActiveMessageClient {
 
         let peer_info = discovery.discover_by_worker_id(worker_id).await?;
         let instance_id = peer_info.instance_id();
+        if let Some(metrics) = self.observability.as_ref() {
+            metrics.record_client_resolution(ClientResolution::DiscoverySuccess);
+        }
 
         tracing::debug!(
             target: "velo_messenger::client",

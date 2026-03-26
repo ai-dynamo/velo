@@ -32,9 +32,13 @@ use futures::future::{BoxFuture, Ready, ready};
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
+#[cfg(feature = "distributed-tracing")]
+use tracing::Instrument;
 use tracing::{debug, error};
 use velo_common::WorkerId;
+use velo_observability::{DispatchFailure, HandlerOutcome, HandlerResponseType};
 
 use crate::common::events::{EventType, Outcome, encode_event_header};
 use crate::common::messages::ResponseType;
@@ -293,6 +297,7 @@ where
 struct AmExecutorAdapter<E> {
     executor: Arc<E>,
     name: String,
+    metrics: OnceLock<Option<velo_observability::HandlerMetricsHandle>>,
 }
 
 impl<E> AmExecutorAdapter<E> {
@@ -300,6 +305,7 @@ impl<E> AmExecutorAdapter<E> {
         Self {
             executor: Arc::new(executor),
             name,
+            metrics: OnceLock::new(),
         }
     }
 }
@@ -309,6 +315,7 @@ where
     E: HandlerExecutor<Context, ()> + 'static,
 {
     fn handle(&self, ctx: HandlerContext) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        let request_bytes = ctx.payload.len();
         let am_ctx = Context {
             message_id: crate::common::MessageId::new(ctx.message_id),
             payload: ctx.payload,
@@ -318,19 +325,37 @@ where
 
         let executor = self.executor.clone();
         let name = self.name.clone();
+        #[cfg(feature = "distributed-tracing")]
+        let span_name = name.clone();
 
         let backend = ctx.system.backend().clone();
         let response_id = ctx.message_id;
         let response_type = ctx.response_type;
         let headers = ctx.headers.clone();
-
-        Box::pin(async move {
+        #[cfg(feature = "distributed-tracing")]
+        let trace_headers = headers.clone();
+        let observability = ctx.system.observability();
+        let handler_metrics = self
+            .metrics
+            .get_or_init(|| {
+                ctx.system
+                    .observability()
+                    .as_ref()
+                    .and_then(|metrics| metrics.bind_handler(&self.name))
+            })
+            .clone();
+        let future = async move {
+            let _in_flight = handler_metrics.as_ref().map(|m| m.start());
+            let started = Instant::now();
             let result = executor.execute(am_ctx).await;
+            let mut outcome = HandlerOutcome::Success;
+            let mut response_bytes = 0usize;
 
             match response_type {
                 ResponseType::FireAndForget => {
                     if let Err(e) = result {
                         error!("AM handler '{}' failed: {}", name, e);
+                        outcome = HandlerOutcome::Error;
                     }
                 }
                 ResponseType::AckNack => {
@@ -338,10 +363,15 @@ where
                         Ok(()) => send_ack(backend, response_id).await,
                         Err(err) => {
                             error!("AM handler '{}' failed: {}", name, err);
+                            response_bytes = err.to_string().len();
+                            outcome = HandlerOutcome::Error;
                             send_nack(backend, response_id, err.to_string()).await
                         }
                     };
                     if let Err(e) = send_result {
+                        if let Some(metrics) = observability.as_ref() {
+                            metrics.record_dispatch_failure(DispatchFailure::ResponseSendAckNack);
+                        }
                         debug!("Failed to send ACK/NACK response: {}", e);
                     }
                 }
@@ -358,14 +388,45 @@ where
                         }
                     };
                     error!("{}", error_message);
+                    outcome = HandlerOutcome::Error;
+                    response_bytes = error_message.len();
                     let send_result =
                         send_response_error(backend, response_id, headers, error_message).await;
                     if let Err(e) = send_result {
+                        if let Some(metrics) = observability.as_ref() {
+                            metrics
+                                .record_dispatch_failure(DispatchFailure::ResponseSendUnaryError);
+                        }
                         debug!("Failed to send unary error response: {}", e);
                     }
                 }
             }
-        })
+
+            if let Some(metrics) = handler_metrics.as_ref() {
+                metrics.finish(
+                    handler_response_type(response_type),
+                    outcome,
+                    started.elapsed(),
+                    request_bytes,
+                    response_bytes,
+                );
+            }
+        };
+
+        #[cfg(feature = "distributed-tracing")]
+        {
+            let span = tracing::info_span!(
+                "velo.messenger.handler",
+                handler = %span_name,
+                response_type = response_type_label(response_type),
+                request_bytes
+            );
+            velo_observability::apply_remote_parent(&span, trace_headers.as_ref());
+            return Box::pin(future.instrument(span));
+        }
+
+        #[cfg(not(feature = "distributed-tracing"))]
+        Box::pin(future)
     }
 
     fn name(&self) -> &str {
@@ -376,6 +437,7 @@ where
 struct UnaryExecutorAdapter<E> {
     executor: Arc<E>,
     name: String,
+    metrics: OnceLock<Option<velo_observability::HandlerMetricsHandle>>,
 }
 
 impl<E> UnaryExecutorAdapter<E> {
@@ -383,6 +445,7 @@ impl<E> UnaryExecutorAdapter<E> {
         Self {
             executor: Arc::new(executor),
             name,
+            metrics: OnceLock::new(),
         }
     }
 }
@@ -392,6 +455,7 @@ where
     E: HandlerExecutor<Context, Option<Bytes>> + 'static,
 {
     fn handle(&self, ctx: HandlerContext) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        let request_bytes = ctx.payload.len();
         let unary_ctx = Context {
             message_id: crate::common::MessageId::new(ctx.message_id),
             payload: ctx.payload,
@@ -404,37 +468,95 @@ where
         let response_id = ctx.message_id;
         let response_type = ctx.response_type;
         let headers = ctx.headers.clone();
+        #[cfg(feature = "distributed-tracing")]
+        let trace_headers = headers.clone();
+        let observability = ctx.system.observability();
+        let handler_name = self.name.clone();
+        #[cfg(not(feature = "distributed-tracing"))]
+        let _ = &handler_name;
+        #[cfg(feature = "distributed-tracing")]
+        let span_handler_name = handler_name.clone();
+        let handler_metrics = self
+            .metrics
+            .get_or_init(|| {
+                ctx.system
+                    .observability()
+                    .as_ref()
+                    .and_then(|metrics| metrics.bind_handler(&self.name))
+            })
+            .clone();
 
-        Box::pin(async move {
+        let future = async move {
+            let _in_flight = handler_metrics.as_ref().map(|m| m.start());
+            let started = Instant::now();
             let result = executor.execute(unary_ctx).await;
+            let mut outcome = HandlerOutcome::Success;
+            let mut response_bytes = 0usize;
 
             let send_result = match (response_type, result) {
                 (ResponseType::AckNack, Ok(None)) => send_ack(backend, response_id).await,
-                (ResponseType::AckNack, Ok(Some(_))) => send_ack(backend, response_id).await,
+                (ResponseType::AckNack, Ok(Some(_))) => {
+                    // AckNack response carries no payload on wire.
+                    send_ack(backend, response_id).await
+                }
                 (ResponseType::AckNack, Err(err)) => {
                     let error_msg = err.to_string();
+                    outcome = HandlerOutcome::Error;
+                    response_bytes = error_msg.len();
                     send_nack(backend, response_id, error_msg).await
                 }
                 (ResponseType::Unary, Ok(None)) => {
                     send_response_ok(backend, response_id, headers.clone()).await
                 }
                 (ResponseType::Unary, Ok(Some(bytes))) => {
+                    response_bytes = bytes.len();
                     send_response(backend, response_id, headers.clone(), bytes).await
                 }
                 (ResponseType::Unary, Err(err)) => {
                     let error_msg = err.to_string();
+                    outcome = HandlerOutcome::Error;
+                    response_bytes = error_msg.len();
                     send_response_error(backend, response_id, headers.clone(), error_msg).await
                 }
                 (ResponseType::FireAndForget, _) => {
+                    outcome = HandlerOutcome::Error;
                     error!("FireAndForget message incorrectly routed to unary handler");
                     Ok(())
                 }
             };
 
             if let Err(e) = send_result {
+                if let Some(metrics) = observability.as_ref() {
+                    metrics.record_dispatch_failure(DispatchFailure::ResponseSendUnary);
+                }
                 debug!("Failed to send response: {}", e);
             }
-        })
+
+            if let Some(metrics) = handler_metrics.as_ref() {
+                metrics.finish(
+                    handler_response_type(response_type),
+                    outcome,
+                    started.elapsed(),
+                    request_bytes,
+                    response_bytes,
+                );
+            }
+        };
+
+        #[cfg(feature = "distributed-tracing")]
+        {
+            let span = tracing::info_span!(
+                "velo.messenger.handler",
+                handler = %span_handler_name,
+                response_type = response_type_label(response_type),
+                request_bytes
+            );
+            velo_observability::apply_remote_parent(&span, trace_headers.as_ref());
+            return Box::pin(future.instrument(span));
+        }
+
+        #[cfg(not(feature = "distributed-tracing"))]
+        Box::pin(future)
     }
 
     fn name(&self) -> &str {
@@ -445,6 +567,7 @@ where
 struct TypedUnaryExecutorAdapter<E, I, O> {
     executor: Arc<E>,
     name: String,
+    metrics: OnceLock<Option<velo_observability::HandlerMetricsHandle>>,
     _phantom: PhantomData<fn(I) -> O>,
 }
 
@@ -453,6 +576,7 @@ impl<E, I, O> TypedUnaryExecutorAdapter<E, I, O> {
         Self {
             executor: Arc::new(executor),
             name,
+            metrics: OnceLock::new(),
             _phantom: PhantomData,
         }
     }
@@ -465,16 +589,36 @@ where
     O: serde::Serialize + Send + Sync + 'static,
 {
     fn handle(&self, ctx: HandlerContext) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        let request_bytes = ctx.payload.len();
         let payload = ctx.payload;
         let system = ctx.system.clone();
         let msg_id = crate::common::MessageId::new(ctx.message_id);
         let headers = ctx.headers.clone();
+        #[cfg(feature = "distributed-tracing")]
+        let trace_headers = headers.clone();
         let backend = ctx.system.backend().clone();
         let response_id = ctx.message_id;
         let response_type = ctx.response_type;
         let executor = self.executor.clone();
+        let handler_name = self.name.clone();
+        #[cfg(not(feature = "distributed-tracing"))]
+        let _ = &handler_name;
+        #[cfg(feature = "distributed-tracing")]
+        let span_handler_name = handler_name.clone();
+        let observability = ctx.system.observability();
+        let handler_metrics = self
+            .metrics
+            .get_or_init(|| {
+                ctx.system
+                    .observability()
+                    .as_ref()
+                    .and_then(|metrics| metrics.bind_handler(&self.name))
+            })
+            .clone();
 
-        Box::pin(async move {
+        let future = async move {
+            let _in_flight = handler_metrics.as_ref().map(|m| m.start());
+            let started = Instant::now();
             let input: I = match if payload.is_empty() {
                 serde_json::from_slice(b"null")
             } else {
@@ -483,6 +627,10 @@ where
                 Ok(input) => input,
                 Err(e) => {
                     let error_msg = format!("Failed to deserialize input: {}", e);
+                    let error_msg_len = error_msg.len();
+                    if let Some(metrics) = observability.as_ref() {
+                        metrics.record_dispatch_failure(DispatchFailure::DeserializeTypedInput);
+                    }
                     let send_result = match response_type {
                         ResponseType::AckNack => send_nack(backend, response_id, error_msg).await,
                         ResponseType::Unary => {
@@ -492,7 +640,21 @@ where
                         ResponseType::FireAndForget => Ok(()),
                     };
                     if let Err(send_err) = send_result {
+                        if let Some(metrics) = observability.as_ref() {
+                            metrics.record_dispatch_failure(
+                                DispatchFailure::ResponseSendTypedDeserialize,
+                            );
+                        }
                         debug!("Failed to send deserialization error: {}", send_err);
+                    }
+                    if let Some(metrics) = handler_metrics.as_ref() {
+                        metrics.finish(
+                            handler_response_type(response_type),
+                            HandlerOutcome::Error,
+                            started.elapsed(),
+                            request_bytes,
+                            error_msg_len,
+                        );
                     }
                     return;
                 }
@@ -506,37 +668,78 @@ where
             };
 
             let result = executor.execute(typed_ctx).await;
+            let mut outcome = HandlerOutcome::Success;
+            let mut response_bytes = 0usize;
 
             let send_result = match (response_type, result) {
                 (ResponseType::AckNack, Ok(_output)) => send_ack(backend, response_id).await,
                 (ResponseType::AckNack, Err(err)) => {
                     let error_msg = err.to_string();
+                    outcome = HandlerOutcome::Error;
+                    response_bytes = error_msg.len();
                     send_nack(backend, response_id, error_msg).await
                 }
                 (ResponseType::Unary, Ok(output)) => match serde_json::to_vec(&output) {
-                    Ok(response_bytes) => {
-                        let bytes = Bytes::from(response_bytes);
+                    Ok(serialized) => {
+                        let bytes = Bytes::from(serialized);
+                        response_bytes = bytes.len();
                         send_response(backend, response_id, headers.clone(), bytes).await
                     }
                     Err(e) => {
                         let error_msg = format!("Failed to serialize output: {}", e);
+                        if let Some(metrics) = observability.as_ref() {
+                            metrics.record_dispatch_failure(DispatchFailure::SerializeTypedOutput);
+                        }
+                        outcome = HandlerOutcome::Error;
+                        response_bytes = error_msg.len();
                         send_response_error(backend, response_id, headers.clone(), error_msg).await
                     }
                 },
                 (ResponseType::Unary, Err(err)) => {
                     let error_msg = err.to_string();
+                    outcome = HandlerOutcome::Error;
+                    response_bytes = error_msg.len();
                     send_response_error(backend, response_id, headers.clone(), error_msg).await
                 }
                 (ResponseType::FireAndForget, _) => {
+                    outcome = HandlerOutcome::Error;
                     error!("FireAndForget message incorrectly routed to typed unary handler");
                     Ok(())
                 }
             };
 
             if let Err(e) = send_result {
+                if let Some(metrics) = observability.as_ref() {
+                    metrics.record_dispatch_failure(DispatchFailure::ResponseSendTypedUnary);
+                }
                 debug!("Failed to send response: {}", e);
             }
-        })
+
+            if let Some(metrics) = handler_metrics.as_ref() {
+                metrics.finish(
+                    handler_response_type(response_type),
+                    outcome,
+                    started.elapsed(),
+                    request_bytes,
+                    response_bytes,
+                );
+            }
+        };
+
+        #[cfg(feature = "distributed-tracing")]
+        {
+            let span = tracing::info_span!(
+                "velo.messenger.handler",
+                handler = %span_handler_name,
+                response_type = response_type_label(response_type),
+                request_bytes
+            );
+            velo_observability::apply_remote_parent(&span, trace_headers.as_ref());
+            return Box::pin(future.instrument(span));
+        }
+
+        #[cfg(not(feature = "distributed-tracing"))]
+        Box::pin(future)
     }
 
     fn name(&self) -> &str {
@@ -610,6 +813,23 @@ async fn send_ack(backend: Arc<VeloBackend>, response_id: ResponseId) -> Result<
     )?;
 
     Ok(())
+}
+
+#[cfg(feature = "distributed-tracing")]
+fn response_type_label(response_type: ResponseType) -> &'static str {
+    match response_type {
+        ResponseType::FireAndForget => "fire_and_forget",
+        ResponseType::AckNack => "ack_nack",
+        ResponseType::Unary => "unary",
+    }
+}
+
+fn handler_response_type(response_type: ResponseType) -> HandlerResponseType {
+    match response_type {
+        ResponseType::FireAndForget => HandlerResponseType::FireAndForget,
+        ResponseType::AckNack => HandlerResponseType::AckNack,
+        ResponseType::Unary => HandlerResponseType::Unary,
+    }
 }
 
 async fn send_nack(

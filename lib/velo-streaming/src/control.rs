@@ -15,6 +15,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Instant;
+use velo_observability::{HandlerOutcome, StreamingOp};
 
 use crate::anchor::AnchorManager;
 use crate::handle::StreamAnchorHandle;
@@ -217,6 +219,7 @@ pub(crate) async fn reader_pump(
     frame_tx: flume::Sender<Vec<u8>>,
     cancel_token: tokio_util::sync::CancellationToken,
     registry: std::sync::Arc<dashmap::DashMap<u64, crate::anchor::AnchorEntry>>,
+    metrics: Option<Arc<velo_observability::VeloMetrics>>,
     local_id: u64,
 ) {
     let mut missed_heartbeats: u8 = 0;
@@ -246,6 +249,9 @@ pub(crate) async fn reader_pump(
                             // so no stale entry remains (ANCR-04)
                             if let Some((_, entry)) = registry.remove(&local_id) {
                                 entry.cancel_token.cancel();
+                                if let Some(metrics) = metrics.as_ref() {
+                                    metrics.set_streaming_active_anchors(registry.len());
+                                }
                             }
                             break;
                         }
@@ -276,6 +282,7 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> velo_messeng
         move |ctx: velo_messenger::TypedContext<AnchorAttachRequest>| {
             let manager = manager.clone();
             async move {
+                let started = Instant::now();
                 let req = ctx.input;
                 let (_, local_id) = req.handle.unpack();
 
@@ -284,11 +291,23 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> velo_messeng
                     let entry = manager.registry.get(&local_id);
                     match entry {
                         None => {
+                            manager.record_streaming_operation(
+                                StreamingOp::Attach,
+                                HandlerOutcome::Error,
+                                "unknown",
+                                started,
+                            );
                             return Ok(AnchorAttachResponse::Err {
                                 reason: format!("anchor {} not found", req.handle),
                             });
                         }
                         Some(e) if e.attachment => {
+                            manager.record_streaming_operation(
+                                StreamingOp::Attach,
+                                HandlerOutcome::Error,
+                                "unknown",
+                                started,
+                            );
                             return Ok(AnchorAttachResponse::Err {
                                 reason: format!("anchor {} already attached", req.handle),
                             });
@@ -302,6 +321,12 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> velo_messeng
                     match manager.transport.bind(local_id, req.session_id).await {
                         Ok(pair) => pair,
                         Err(e) => {
+                            manager.record_streaming_operation(
+                                StreamingOp::Attach,
+                                HandlerOutcome::Error,
+                                "unknown",
+                                started,
+                            );
                             return Ok(AnchorAttachResponse::Err {
                                 reason: format!("transport error: {}", e),
                             });
@@ -311,12 +336,26 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> velo_messeng
                 // Step 3: Atomically set attachment under shard lock
                 use dashmap::mapref::entry::Entry;
                 match manager.registry.entry(local_id) {
-                    Entry::Vacant(_) => Ok(AnchorAttachResponse::Err {
-                        reason: format!("anchor {} removed during bind", req.handle),
-                    }),
+                    Entry::Vacant(_) => {
+                        manager.record_streaming_operation(
+                            StreamingOp::Attach,
+                            HandlerOutcome::Error,
+                            "unknown",
+                            started,
+                        );
+                        Ok(AnchorAttachResponse::Err {
+                            reason: format!("anchor {} removed during bind", req.handle),
+                        })
+                    }
                     Entry::Occupied(mut occ) => {
                         let entry = occ.get_mut();
                         if entry.attachment {
+                            manager.record_streaming_operation(
+                                StreamingOp::Attach,
+                                HandlerOutcome::Error,
+                                "unknown",
+                                started,
+                            );
                             Ok(AnchorAttachResponse::Err {
                                 reason: format!("anchor {} already attached", req.handle),
                             })
@@ -342,8 +381,18 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> velo_messeng
                                 pump_frame_tx, // cloned from entry
                                 pump_cancel,   // cloned from entry
                                 pump_registry, // Arc clone of registry
-                                local_id,      // anchor's local_id
+                                manager.metrics.clone(),
+                                local_id, // anchor's local_id
                             ));
+
+                            let transport_scheme =
+                                endpoint.split("://").next().unwrap_or("unknown");
+                            manager.record_streaming_operation(
+                                StreamingOp::Attach,
+                                HandlerOutcome::Success,
+                                transport_scheme,
+                                started,
+                            );
 
                             Ok(AnchorAttachResponse::Ok {
                                 stream_endpoint: endpoint,
@@ -372,6 +421,7 @@ pub fn create_anchor_detach_handler(manager: Arc<AnchorManager>) -> velo_messeng
         move |ctx: velo_messenger::TypedContext<AnchorDetachRequest>| {
             let manager = manager.clone();
             async move {
+                let started = Instant::now();
                 let req = ctx.input;
                 let (_, local_id) = req.handle.unpack();
 
@@ -396,6 +446,19 @@ pub fn create_anchor_detach_handler(manager: Arc<AnchorManager>) -> velo_messeng
                     }
                     let sentinel_bytes = crate::sender::cached_detached().clone();
                     let _ = frame_tx.try_send(sentinel_bytes);
+                    manager.record_streaming_operation(
+                        StreamingOp::Detach,
+                        HandlerOutcome::Success,
+                        "velo",
+                        started,
+                    );
+                } else {
+                    manager.record_streaming_operation(
+                        StreamingOp::Detach,
+                        HandlerOutcome::Error,
+                        "velo",
+                        started,
+                    );
                 }
 
                 Ok(())
@@ -418,6 +481,7 @@ pub fn create_anchor_finalize_handler(manager: Arc<AnchorManager>) -> velo_messe
         move |ctx: velo_messenger::TypedContext<AnchorFinalizeRequest>| {
             let manager = manager.clone();
             async move {
+                let started = Instant::now();
                 let req = ctx.input;
                 let (_, local_id) = req.handle.unpack();
 
@@ -425,6 +489,19 @@ pub fn create_anchor_finalize_handler(manager: Arc<AnchorManager>) -> velo_messe
                 if let Some(entry) = manager.remove_anchor(local_id) {
                     let sentinel_bytes = crate::sender::cached_finalized().clone();
                     let _ = entry.frame_tx.try_send(sentinel_bytes);
+                    manager.record_streaming_operation(
+                        StreamingOp::Finalize,
+                        HandlerOutcome::Success,
+                        "velo",
+                        started,
+                    );
+                } else {
+                    manager.record_streaming_operation(
+                        StreamingOp::Finalize,
+                        HandlerOutcome::Error,
+                        "velo",
+                        started,
+                    );
                 }
 
                 Ok(())
@@ -447,12 +524,26 @@ pub fn create_anchor_cancel_handler(manager: Arc<AnchorManager>) -> velo_messeng
         move |ctx: velo_messenger::TypedContext<AnchorCancelRequest>| {
             let manager = manager.clone();
             async move {
+                let started = Instant::now();
                 let req = ctx.input;
                 let (_, local_id) = req.handle.unpack();
 
                 // remove_anchor is a no-op (returns None) if anchor absent -- idempotent
                 if let Some(entry) = manager.remove_anchor(local_id) {
                     entry.cancel_token.cancel();
+                    manager.record_streaming_operation(
+                        StreamingOp::Cancel,
+                        HandlerOutcome::Success,
+                        "velo",
+                        started,
+                    );
+                } else {
+                    manager.record_streaming_operation(
+                        StreamingOp::Cancel,
+                        HandlerOutcome::Error,
+                        "velo",
+                        started,
+                    );
                 }
 
                 Ok(())
@@ -875,6 +966,7 @@ mod tests {
             frame_tx,
             pump_cancel,
             pump_registry,
+            None,
             local_id,
         ));
 
@@ -1060,6 +1152,7 @@ mod tests {
             frame_tx.clone(),
             child1.clone(),
             registry.clone(),
+            None,
             local_id,
         ));
 
@@ -1098,6 +1191,7 @@ mod tests {
             frame_tx.clone(),
             child2.clone(),
             registry.clone(),
+            None,
             local_id,
         ));
 

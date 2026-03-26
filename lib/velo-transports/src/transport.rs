@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
+use velo_observability::VeloMetrics;
 
 /// Errors returned by individual [`Transport`] implementations.
 #[derive(thiserror::Error, Debug)]
@@ -209,6 +210,12 @@ pub trait Transport: Send + Sync {
 
     /// Tear down the transport, cancelling all tasks and closing connections.
     fn shutdown(&self);
+
+    /// Install shared observability state for the transport.
+    ///
+    /// Default implementation is a no-op for transports that do not emit
+    /// transport-local metrics or tracing metadata.
+    fn set_observability(&self, _observability: Arc<VeloMetrics>) {}
 
     /// Begin draining: reject new inbound requests while allowing responses.
     ///

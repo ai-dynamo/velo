@@ -17,6 +17,7 @@ use std::time::Duration;
 use tokio::net::UnixStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+use velo_observability::VeloMetrics;
 
 use crate::transport::{HealthCheckError, ShutdownState, TransportError, TransportErrorHandler};
 use crate::{MessageType, PeerInfo, Transport, TransportAdapter, TransportKey, WorkerAddress};
@@ -48,6 +49,9 @@ pub struct UdsTransport {
 
     // Connect timeout for outbound connections
     connect_timeout: Duration,
+
+    observability: OnceLock<Arc<VeloMetrics>>,
+    metrics: OnceLock<velo_observability::TransportMetricsHandle>,
 }
 
 /// Handle to a connection's writer task
@@ -91,6 +95,8 @@ impl UdsTransport {
             shutdown_state: OnceLock::new(),
             channel_capacity,
             connect_timeout,
+            observability: OnceLock::new(),
+            metrics: OnceLock::new(),
         }
     }
 
@@ -116,6 +122,7 @@ impl UdsTransport {
             drop(handle);
             self.connections
                 .remove_if(&instance_id, |_, h| h.tx.is_disconnected());
+            self.update_connection_gauge();
         }
 
         let rt = self.runtime.get().ok_or(TransportError::NotStarted)?;
@@ -129,12 +136,14 @@ impl UdsTransport {
                     // Stale entry — replace in-place with a fresh connection
                     let handle = self.create_connection(instance_id, rt)?;
                     entry.insert(handle.clone());
+                    self.update_connection_gauge();
                     handle
                 }
             }
             dashmap::mapref::entry::Entry::Vacant(entry) => {
                 let handle = self.create_connection(instance_id, rt)?;
                 entry.insert(handle.clone());
+                self.update_connection_gauge();
                 handle
             }
         };
@@ -161,7 +170,7 @@ impl UdsTransport {
         let cancel = self.cancel_token.clone();
         let conns = Arc::clone(&self.connections);
         let connect_timeout = self.connect_timeout;
-
+        let metrics = self.metrics.get().cloned();
         debug!("Created new UDS connection to {} ({:?})", instance_id, path);
         rt.spawn(connection_writer_task(
             path,
@@ -170,8 +179,21 @@ impl UdsTransport {
             conns,
             cancel,
             connect_timeout,
+            metrics,
         ));
         Ok(handle)
+    }
+
+    fn update_peer_gauge(&self) {
+        if let Some(metrics) = self.metrics.get() {
+            metrics.set_registered_peers(self.peers.len());
+        }
+    }
+
+    fn update_connection_gauge(&self) {
+        if let Some(metrics) = self.metrics.get() {
+            metrics.set_active_connections(self.connections.len());
+        }
     }
 }
 
@@ -200,6 +222,7 @@ impl Transport for UdsTransport {
 
         // Store peer path
         self.peers.insert(peer_info.instance_id(), path.clone());
+        self.update_peer_gauge();
 
         debug!("Registered peer {} at {:?}", peer_info.instance_id(), path);
 
@@ -232,6 +255,7 @@ impl Transport for UdsTransport {
                     drop(handle);
                     self.connections
                         .remove_if(&instance_id, |_, h| h.tx.is_disconnected());
+                    self.update_connection_gauge();
                     // Fall through to slow path to create a fresh connection
                     send_msg
                 }
@@ -326,6 +350,8 @@ impl Transport for UdsTransport {
                 .adapter(channels)
                 .error_handler(Arc::new(DefaultErrorHandler))
                 .shutdown_state(shutdown_state)
+                .transport_key(self.key.as_str())
+                .metrics(self.metrics.get().cloned())
                 .build()?;
 
             let bound_listener = uds_listener.bind()?;
@@ -359,6 +385,16 @@ impl Transport for UdsTransport {
 
         // Clear connections
         self.connections.clear();
+        self.update_connection_gauge();
+    }
+
+    fn set_observability(&self, observability: Arc<VeloMetrics>) {
+        let _ = self
+            .metrics
+            .set(observability.bind_transport(self.key.as_str()));
+        let _ = self.observability.set(observability);
+        self.update_peer_gauge();
+        self.update_connection_gauge();
     }
 
     fn check_health(
@@ -416,6 +452,7 @@ async fn connection_writer_task(
     connections: Arc<DashMap<crate::InstanceId, ConnectionHandle>>,
     cancel_token: CancellationToken,
     connect_timeout: Duration,
+    metrics: Option<velo_observability::TransportMetricsHandle>,
 ) -> Result<()> {
     let result =
         connection_writer_inner(&path, instance_id, &rx, &cancel_token, connect_timeout).await;
@@ -430,6 +467,9 @@ async fn connection_writer_task(
     // a replacement connection's tx will still be connected.
     drop(rx);
     connections.remove_if(&instance_id, |_, h| h.tx.is_disconnected());
+    if let Some(metrics) = metrics.as_ref() {
+        metrics.set_active_connections(connections.len());
+    }
 
     debug!("UDS connection to {} ({:?}) closed", instance_id, path);
 
@@ -790,6 +830,7 @@ mod tests {
             conns,
             cancel,
             Duration::from_secs(5),
+            None,
         ));
 
         // Accept the connection, then immediately drop it + the listener
@@ -988,6 +1029,7 @@ mod tests {
             conns,
             cancel,
             Duration::from_secs(5),
+            None,
         ));
         let _ = writer.await;
 

@@ -205,8 +205,16 @@ async fn make_two_messengers() -> (Arc<Messenger>, Arc<Messenger>) {
     let t1 = new_tcp_transport();
     let t2 = new_tcp_transport();
 
-    let m1 = Messenger::new(vec![t1], None).await.expect("m1");
-    let m2 = Messenger::new(vec![t2], None).await.expect("m2");
+    let m1 = Messenger::builder()
+        .add_transport(t1)
+        .build()
+        .await
+        .expect("m1");
+    let m2 = Messenger::builder()
+        .add_transport(t2)
+        .build()
+        .await
+        .expect("m2");
 
     m2.register_peer(m1.peer_info()).expect("register m1 on m2");
     m1.register_peer(m2.peer_info()).expect("register m2 on m1");

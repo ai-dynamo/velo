@@ -16,11 +16,13 @@ default = ["http", "nats", "grpc"]
 http = ["velo-transports/http"]
 grpc = ["velo-transports/grpc"]
 nats = ["velo-transports/nats"]
+distributed-tracing = ["velo-observability/distributed-tracing", "velo-transports/distributed-tracing"]
 
 [dependencies]
 velo-common = { workspace = true }
 velo-discovery = { workspace = true }
 velo-events = { workspace = true }
+velo-observability = { workspace = true }
 velo-transports = { workspace = true }
 
 lru = "0.12"

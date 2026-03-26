@@ -66,6 +66,7 @@ use std::sync::{
 use thiserror::Error;
 use tracing::{debug, trace, warn};
 use uuid::Uuid;
+use velo_observability::VeloMetrics;
 
 use super::events::Outcome;
 
@@ -367,9 +368,17 @@ pub(crate) struct ResponseManager {
 }
 
 impl ResponseManager {
+    #[allow(dead_code)]
     pub fn new(worker_id: WorkerId) -> Self {
+        Self::with_observability(worker_id, None)
+    }
+
+    pub fn with_observability(
+        worker_id: WorkerId,
+        observability: Option<Arc<VeloMetrics>>,
+    ) -> Self {
         Self {
-            inner: Arc::new(ResponseManagerInner::new(worker_id)),
+            inner: Arc::new(ResponseManagerInner::new(worker_id, observability)),
         }
     }
 
@@ -407,16 +416,18 @@ struct ResponseManagerInner {
     arena: Arc<SlotArena<Option<Bytes>, String>>,
     pending: AtomicUsize,
     capacity: usize,
+    observability: Option<Arc<VeloMetrics>>,
 }
 
 impl ResponseManagerInner {
-    fn new(worker_id: WorkerId) -> Self {
+    fn new(worker_id: WorkerId, observability: Option<Arc<VeloMetrics>>) -> Self {
         let arena = SlotArena::with_capacity(RESPONSE_SLOT_CAPACITY);
         Self {
             worker_id,
             arena,
             pending: AtomicUsize::new(0),
             capacity: RESPONSE_SLOT_CAPACITY,
+            observability,
         }
     }
 
@@ -426,11 +437,17 @@ impl ResponseManagerInner {
 
     fn recycle_slot(&self, index: usize) {
         self.arena.recycle(index);
-        self.pending.fetch_sub(1, Ordering::Release);
+        let pending = self.pending.fetch_sub(1, Ordering::Release) - 1;
+        if let Some(metrics) = self.observability.as_ref() {
+            metrics.set_pending_responses(pending);
+        }
     }
 
     fn mark_pending(&self) {
-        self.pending.fetch_add(1, Ordering::AcqRel);
+        let pending = self.pending.fetch_add(1, Ordering::AcqRel) + 1;
+        if let Some(metrics) = self.observability.as_ref() {
+            metrics.set_pending_responses(pending);
+        }
     }
 
     fn encode_key(&self, slot_index: usize, generation: u64) -> ResponseId {

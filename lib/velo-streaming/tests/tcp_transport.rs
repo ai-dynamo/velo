@@ -454,10 +454,14 @@ async fn make_two_messengers() -> (Arc<Messenger>, Arc<Messenger>) {
     let t1 = new_am_tcp_transport();
     let t2 = new_am_tcp_transport();
 
-    let m1 = Messenger::new(vec![t1], None)
+    let m1 = Messenger::builder()
+        .add_transport(t1)
+        .build()
         .await
         .expect("create messenger 1");
-    let m2 = Messenger::new(vec![t2], None)
+    let m2 = Messenger::builder()
+        .add_transport(t2)
+        .build()
         .await
         .expect("create messenger 2");
 
