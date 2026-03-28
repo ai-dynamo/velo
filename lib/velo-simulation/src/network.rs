@@ -3,11 +3,14 @@
 
 //! Pluggable network models for the simulation fabric.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use velo_common::InstanceId;
 
 use crate::fabric::Transfer;
+
+const COMPLETION_EPSILON_BYTES: f64 = 1e-9;
 
 /// Result of evaluating the network model: which transfer completes next.
 pub struct NextCompletion {
@@ -19,14 +22,19 @@ pub struct NextCompletion {
 
 /// Pluggable network model that determines transfer completion times.
 ///
-/// Given all active transfers and the current virtual time, the model computes
-/// which transfer finishes next and when. The fabric calls `evaluate()` every
-/// time a transfer is added or completed.
+/// The model owns both the rules for advancing transfer progress over virtual
+/// time and the selection of the next completion under the current contention.
 pub trait NetworkModel: Send + Sync + 'static {
+    /// Advance all active transfers to `now`.
+    fn advance_to(&self, transfers: &mut [Transfer], now: Duration);
+
     /// Evaluate all active transfers and return the next completion.
     ///
     /// Returns `None` if no transfers are active.
-    fn evaluate(&self, transfers: &[Transfer], now: Duration) -> Option<NextCompletion>;
+    fn next_completion(&self, transfers: &[Transfer], now: Duration) -> Option<NextCompletion>;
+
+    /// Returns `true` if the transfer is complete at `now`.
+    fn is_complete(&self, transfer: &Transfer, now: Duration) -> bool;
 }
 
 /// Per-adapter link bandwidth with a global bisection cap.
@@ -65,63 +73,61 @@ impl Default for BisectionBandwidth {
 }
 
 impl NetworkModel for BisectionBandwidth {
-    fn evaluate(&self, transfers: &[Transfer], now: Duration) -> Option<NextCompletion> {
+    fn advance_to(&self, transfers: &mut [Transfer], now: Duration) {
+        if transfers.is_empty() {
+            return;
+        }
+
+        let per_transfer_bps = self.per_transfer_bps(transfers);
+
+        for (transfer, bps) in transfers.iter_mut().zip(per_transfer_bps) {
+            let active_after = transfer.enqueue_time + self.base_latency;
+            let active_start = std::cmp::max(transfer.last_update_time, active_after);
+            let active_elapsed = now.saturating_sub(active_start);
+
+            if !active_elapsed.is_zero() && bps > 0.0 {
+                let bits_transferred = bps * active_elapsed.as_secs_f64();
+                transfer.bytes_transferred = (transfer.bytes_transferred
+                    + (bits_transferred / 8.0))
+                    .min(transfer.total_bytes as f64);
+            }
+
+            transfer.last_update_time = now;
+        }
+    }
+
+    fn next_completion(&self, transfers: &[Transfer], now: Duration) -> Option<NextCompletion> {
         if transfers.is_empty() {
             return None;
         }
 
-        let link_bps = self.link_gbps * 1e9;
-        let bisection_bps = self.bisection_gbps * 1e9;
-
-        // Step 1: Compute per-link share for each transfer.
-        // Group by (source, target) and divide link bandwidth equally.
-        let mut per_transfer_bps = vec![0.0f64; transfers.len()];
-
-        // Count transfers per link
-        let mut link_counts: Vec<((InstanceId, InstanceId), usize)> = Vec::new();
-        for t in transfers {
-            let key = (t.source, t.target);
-            if let Some(entry) = link_counts.iter_mut().find(|(k, _)| *k == key) {
-                entry.1 += 1;
-            } else {
-                link_counts.push((key, 1));
-            }
-        }
-
-        // Assign per-link share
-        for (i, t) in transfers.iter().enumerate() {
-            let key = (t.source, t.target);
-            let count = link_counts.iter().find(|(k, _)| *k == key).unwrap().1;
-            per_transfer_bps[i] = link_bps / count as f64;
-        }
-
-        // Step 2: Apply bisection cap.
-        // If sum of all allocations exceeds bisection, scale down proportionally.
-        let total_bps: f64 = per_transfer_bps.iter().sum();
-        if total_bps > bisection_bps {
-            let scale = bisection_bps / total_bps;
-            for bps in &mut per_transfer_bps {
-                *bps *= scale;
-            }
-        }
-
-        // Step 3: Find which transfer completes first.
+        let per_transfer_bps = self.per_transfer_bps(transfers);
         let mut earliest_idx = 0;
         let mut earliest_time = Duration::MAX;
 
-        for (i, t) in transfers.iter().enumerate() {
-            let bits_remaining = (t.total_bytes as f64 - t.bytes_transferred) * 8.0;
+        for (i, transfer) in transfers.iter().enumerate() {
+            let bytes_remaining =
+                (transfer.total_bytes as f64 - transfer.bytes_transferred).max(0.0);
+            let latency_ready_at = transfer.enqueue_time + self.base_latency;
+            let latency_remaining = latency_ready_at.saturating_sub(now);
+
+            if bytes_remaining <= COMPLETION_EPSILON_BYTES {
+                let completion = now + latency_remaining;
+                if completion < earliest_time {
+                    earliest_time = completion;
+                    earliest_idx = i;
+                }
+                continue;
+            }
+
             let bps = per_transfer_bps[i];
             if bps <= 0.0 {
                 continue;
             }
+
+            let bits_remaining = bytes_remaining * 8.0;
             let transfer_secs = bits_remaining / bps;
-            let base_latency_remaining = if t.bytes_transferred == 0.0 {
-                self.base_latency
-            } else {
-                Duration::ZERO // latency already paid
-            };
-            let completion = now + base_latency_remaining + Duration::from_secs_f64(transfer_secs);
+            let completion = now + latency_remaining + Duration::from_secs_f64(transfer_secs);
 
             if completion < earliest_time {
                 earliest_time = completion;
@@ -138,12 +144,59 @@ impl NetworkModel for BisectionBandwidth {
             completion_time: earliest_time,
         })
     }
+
+    fn is_complete(&self, transfer: &Transfer, now: Duration) -> bool {
+        now >= transfer.enqueue_time + self.base_latency
+            && transfer.bytes_transferred + COMPLETION_EPSILON_BYTES >= transfer.total_bytes as f64
+    }
+}
+
+impl BisectionBandwidth {
+    fn per_transfer_bps(&self, transfers: &[Transfer]) -> Vec<f64> {
+        let link_bps = self.link_gbps * 1e9;
+        let bisection_bps = self.bisection_gbps * 1e9;
+        let mut link_counts: HashMap<(InstanceId, InstanceId), usize> = HashMap::new();
+
+        for transfer in transfers {
+            *link_counts
+                .entry((transfer.source, transfer.target))
+                .or_insert(0) += 1;
+        }
+
+        let mut per_transfer_bps = Vec::with_capacity(transfers.len());
+        for transfer in transfers {
+            let count = link_counts
+                .get(&(transfer.source, transfer.target))
+                .copied()
+                .unwrap_or(1);
+            per_transfer_bps.push(link_bps / count as f64);
+        }
+
+        let total_bps: f64 = per_transfer_bps.iter().sum();
+        if total_bps > bisection_bps {
+            let scale = bisection_bps / total_bps;
+            for bps in &mut per_transfer_bps {
+                *bps *= scale;
+            }
+        }
+
+        per_transfer_bps
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use velo_common::InstanceId;
+    use velo_transports::TransportErrorHandler;
+
+    struct NoopErrorHandler;
+
+    impl TransportErrorHandler for NoopErrorHandler {
+        fn on_error(&self, _header: bytes::Bytes, _payload: bytes::Bytes, _error: String) {}
+    }
 
     fn make_transfer(source: InstanceId, target: InstanceId, bytes: usize) -> Transfer {
         Transfer {
@@ -156,6 +209,7 @@ mod tests {
             bytes_transferred: 0.0,
             enqueue_time: Duration::ZERO,
             last_update_time: Duration::ZERO,
+            on_error: Arc::new(NoopErrorHandler),
         }
     }
 
@@ -172,11 +226,11 @@ mod tests {
 
         // 1 KB message at 200 Gbps = 8000 bits / 200e9 bps = 40ns + 10µs latency
         let transfers = vec![make_transfer(a, b, 1024)];
-        let result = model.evaluate(&transfers, Duration::ZERO).unwrap();
+        let result = model.next_completion(&transfers, Duration::ZERO).unwrap();
 
         assert_eq!(result.transfer_index, 0);
         // Should be ~10.04µs (10µs latency + 40ns transfer)
-        let expected_ns = 10_000 + 40; // approximate
+        let expected_ns = 10_000 + 40;
         let actual_ns = result.completion_time.as_nanos();
         assert!(
             (actual_ns as i128 - expected_ns as i128).unsigned_abs() < 5,
@@ -195,11 +249,9 @@ mod tests {
         let a = InstanceId::new_v4();
         let b = InstanceId::new_v4();
 
-        // Two identical transfers on same link: each gets 100 Gbps
         let transfers = vec![make_transfer(a, b, 1024), make_transfer(a, b, 1024)];
-        let result = model.evaluate(&transfers, Duration::ZERO).unwrap();
+        let result = model.next_completion(&transfers, Duration::ZERO).unwrap();
 
-        // 8192 bits / 100e9 bps = 81.92ns — either finishes at same time
         let expected_ns = 81;
         let actual_ns = result.completion_time.as_nanos();
         assert!(
@@ -220,11 +272,9 @@ mod tests {
         let b = InstanceId::new_v4();
         let c = InstanceId::new_v4();
 
-        // Two transfers on different links: each gets full 200 Gbps
         let transfers = vec![make_transfer(a, b, 1024), make_transfer(a, c, 1024)];
-        let result = model.evaluate(&transfers, Duration::ZERO).unwrap();
+        let result = model.next_completion(&transfers, Duration::ZERO).unwrap();
 
-        // 8192 bits / 200e9 bps = 40.96ns
         let expected_ns = 40;
         let actual_ns = result.completion_time.as_nanos();
         assert!(
@@ -237,7 +287,7 @@ mod tests {
     fn bisection_cap_throttles() {
         let model = BisectionBandwidth {
             link_gbps: 200.0,
-            bisection_gbps: 200.0, // very low bisection = only 200 Gbps total
+            bisection_gbps: 200.0,
             base_latency: Duration::ZERO,
         };
 
@@ -245,17 +295,54 @@ mod tests {
         let b = InstanceId::new_v4();
         let c = InstanceId::new_v4();
 
-        // Two transfers on different links, but bisection caps at 200 Gbps total
-        // Each gets 100 Gbps
         let transfers = vec![make_transfer(a, b, 1024), make_transfer(a, c, 1024)];
-        let result = model.evaluate(&transfers, Duration::ZERO).unwrap();
+        let result = model.next_completion(&transfers, Duration::ZERO).unwrap();
 
-        // 8192 bits / 100e9 bps = 81.92ns
         let expected_ns = 81;
         let actual_ns = result.completion_time.as_nanos();
         assert!(
             (actual_ns as i128 - expected_ns as i128).unsigned_abs() < 5,
             "expected ~{expected_ns}ns, got {actual_ns}ns"
         );
+    }
+
+    #[test]
+    fn advance_to_respects_base_latency() {
+        let model = BisectionBandwidth {
+            link_gbps: 8.0,
+            bisection_gbps: 8.0,
+            base_latency: Duration::from_nanos(100),
+        };
+
+        let a = InstanceId::new_v4();
+        let b = InstanceId::new_v4();
+        let mut transfers = vec![make_transfer(a, b, 1000)];
+
+        model.advance_to(&mut transfers, Duration::from_nanos(50));
+        assert_eq!(transfers[0].bytes_transferred, 0.0);
+
+        model.advance_to(&mut transfers, Duration::from_nanos(600));
+        assert!((transfers[0].bytes_transferred - 500.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn next_completion_uses_remaining_progress() {
+        let model = BisectionBandwidth {
+            link_gbps: 8.0,
+            bisection_gbps: 8.0,
+            base_latency: Duration::ZERO,
+        };
+
+        let a = InstanceId::new_v4();
+        let b = InstanceId::new_v4();
+        let mut transfers = vec![make_transfer(a, b, 1000)];
+
+        model.advance_to(&mut transfers, Duration::from_nanos(500));
+        let result = model
+            .next_completion(&transfers, Duration::from_nanos(500))
+            .unwrap();
+
+        assert_eq!(result.transfer_index, 0);
+        assert_eq!(result.completion_time, Duration::from_nanos(1_000));
     }
 }

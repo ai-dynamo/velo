@@ -14,7 +14,7 @@ use futures::future::BoxFuture;
 use velo_common::{InstanceId, PeerInfo, TransportKey, WorkerAddress};
 use velo_observability::VeloMetrics;
 use velo_transports::{
-    HealthCheckError, MessageType, Transport, TransportAdapter, TransportError,
+    HealthCheckError, MessageType, ShutdownState, Transport, TransportAdapter, TransportError,
     TransportErrorHandler,
 };
 
@@ -31,14 +31,13 @@ pub struct SimTransport {
     fabric: Arc<SimFabric>,
     instance_id: OnceLock<InstanceId>,
     adapter: OnceLock<TransportAdapter>,
+    shutdown_state: OnceLock<ShutdownState>,
     peers: DashMap<InstanceId, ()>,
 }
 
 impl SimTransport {
     /// Create a new simulated transport backed by the given fabric.
     pub fn new(fabric: Arc<SimFabric>) -> Self {
-        // Build a WorkerAddress with a "sim" entry.
-        // The value is a placeholder — SimTransport doesn't use real addresses.
         let address_map: std::collections::HashMap<String, Vec<u8>> =
             [("sim".to_string(), b"sim".to_vec())].into_iter().collect();
         let encoded = rmp_serde::to_vec(&address_map).expect("msgpack encode");
@@ -50,6 +49,7 @@ impl SimTransport {
             fabric,
             instance_id: OnceLock::new(),
             adapter: OnceLock::new(),
+            shutdown_state: OnceLock::new(),
             peers: DashMap::new(),
         }
     }
@@ -65,7 +65,6 @@ impl Transport for SimTransport {
     }
 
     fn register(&self, peer_info: PeerInfo) -> Result<(), TransportError> {
-        // Check that the peer has a "sim" transport entry
         let addr = &peer_info.worker_address;
         if addr.get_entry("sim").ok().flatten().is_none() {
             return Err(TransportError::NoEndpoint);
@@ -96,8 +95,14 @@ impl Transport for SimTransport {
             return;
         }
 
-        self.fabric
-            .enqueue(source_id, instance_id, header, payload, message_type);
+        self.fabric.enqueue(
+            source_id,
+            instance_id,
+            header,
+            payload,
+            message_type,
+            on_error,
+        );
     }
 
     fn start(
@@ -110,24 +115,36 @@ impl Transport for SimTransport {
             .set(instance_id)
             .map_err(|_| anyhow::anyhow!("SimTransport already started"))
             .ok();
+
         let adapter = channels.clone();
         self.adapter
-            .set(channels)
+            .set(channels.clone())
             .map_err(|_| anyhow::anyhow!("SimTransport adapter already set"))
             .ok();
+        self.shutdown_state
+            .set(channels.shutdown_state.clone())
+            .map_err(|_| anyhow::anyhow!("SimTransport shutdown state already set"))
+            .ok();
 
-        // Register adapter with fabric so it can deliver messages to this instance
         self.fabric.register_adapter(instance_id, adapter);
-
         Box::pin(async { Ok(()) })
     }
 
     fn shutdown(&self) {
-        // No resources to clean up in simulation
+        if let Some(instance_id) = self.instance_id.get().copied() {
+            self.fabric.unregister_adapter(instance_id);
+        }
+        self.peers.clear();
     }
 
     fn set_observability(&self, _observability: Arc<VeloMetrics>) {
         // No-op for simulation
+    }
+
+    fn begin_drain(&self) {
+        if let Some(state) = self.shutdown_state.get() {
+            state.begin_drain();
+        }
     }
 
     fn check_health(
@@ -135,9 +152,12 @@ impl Transport for SimTransport {
         instance_id: InstanceId,
         _timeout: Duration,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<(), HealthCheckError>> + Send + '_>> {
+        let started = self.instance_id.get().is_some();
         let registered = self.peers.contains_key(&instance_id);
         Box::pin(async move {
-            if registered {
+            if !started {
+                Err(HealthCheckError::TransportNotStarted)
+            } else if registered {
                 Ok(())
             } else {
                 Err(HealthCheckError::PeerNotRegistered)
@@ -170,11 +190,68 @@ mod tests {
         let fabric = Arc::new(SimFabric::new(handle, BisectionBandwidth::default()));
         let transport = SimTransport::new(fabric.clone());
 
-        // Build a peer with "sim" entry
         let other = SimTransport::new(fabric);
         let peer_addr = other.address();
         let peer_info = PeerInfo::new(InstanceId::new_v4(), peer_addr);
 
         assert!(transport.register(peer_info).is_ok());
+    }
+
+    #[test]
+    fn begin_drain_sets_shared_shutdown_state() {
+        let mut sim = SimulationRuntime::new().unwrap();
+        let handle = sim.handle();
+        let fabric = Arc::new(SimFabric::new(handle, BisectionBandwidth::default()));
+        let transport = Arc::new(SimTransport::new(fabric));
+        let instance_id = InstanceId::new_v4();
+        let (adapter, streams) = velo_transports::make_channels();
+        let transport_start = Arc::clone(&transport);
+
+        sim.run_until_complete(async move {
+            transport_start
+                .start(instance_id, adapter, tokio::runtime::Handle::current())
+                .await
+                .unwrap();
+        })
+        .unwrap();
+
+        transport.begin_drain();
+        assert!(streams.shutdown_state.is_draining());
+    }
+
+    #[test]
+    fn shutdown_unregisters_adapter() {
+        let mut sim = SimulationRuntime::new().unwrap();
+        let handle = sim.handle();
+        let fabric = Arc::new(SimFabric::new(handle, BisectionBandwidth::default()));
+        let transport = Arc::new(SimTransport::new(Arc::clone(&fabric)));
+        let instance_id = InstanceId::new_v4();
+        let (adapter, _streams) = velo_transports::make_channels();
+        let transport_start = Arc::clone(&transport);
+
+        sim.run_until_complete(async move {
+            transport_start
+                .start(instance_id, adapter, tokio::runtime::Handle::current())
+                .await
+                .unwrap();
+        })
+        .unwrap();
+
+        assert!(fabric.adapters.contains_key(&instance_id));
+        transport.shutdown();
+        assert!(!fabric.adapters.contains_key(&instance_id));
+    }
+
+    #[test]
+    fn check_health_requires_start() {
+        let sim = SimulationRuntime::new().unwrap();
+        let handle = sim.handle();
+        let fabric = Arc::new(SimFabric::new(handle, BisectionBandwidth::default()));
+        let transport = SimTransport::new(fabric);
+
+        let result = sim
+            .loom()
+            .block_on(transport.check_health(InstanceId::new_v4(), Duration::from_secs(1)));
+        assert_eq!(result, Err(HealthCheckError::TransportNotStarted));
     }
 }

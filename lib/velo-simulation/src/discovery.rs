@@ -31,6 +31,16 @@ impl SimDiscovery {
     pub fn register(&self, peer_info: PeerInfo) {
         self.fabric.register_peer(peer_info);
     }
+
+    /// Unregister a peer from discovery.
+    pub fn unregister(&self, instance_id: InstanceId) {
+        self.fabric.unregister_peer(instance_id);
+    }
+
+    /// Clear the entire shared simulation state.
+    pub fn reset(&self) {
+        self.fabric.reset();
+    }
 }
 
 impl PeerDiscovery for SimDiscovery {
@@ -105,6 +115,27 @@ mod tests {
             .block_on(discovery.discover_by_worker_id(worker_id))
             .unwrap();
         assert_eq!(found.instance_id(), id);
+    }
+
+    #[test]
+    fn unregister_removes_instance_and_worker_lookup() {
+        let sim = SimulationRuntime::new().unwrap();
+        let handle = sim.handle();
+        let fabric = Arc::new(SimFabric::new(handle, BisectionBandwidth::default()));
+        let discovery = SimDiscovery::new(fabric);
+
+        let peer = make_peer_info();
+        let id = peer.instance_id();
+        let worker_id = id.worker_id();
+        discovery.register(peer);
+        discovery.unregister(id);
+
+        let by_instance = sim.loom().block_on(discovery.discover_by_instance_id(id));
+        let by_worker = sim
+            .loom()
+            .block_on(discovery.discover_by_worker_id(worker_id));
+        assert!(by_instance.is_err());
+        assert!(by_worker.is_err());
     }
 
     #[test]
