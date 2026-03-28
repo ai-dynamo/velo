@@ -60,6 +60,8 @@ jobs:
     - name: Install system dependencies
       run: sudo apt-get update -qq && sudo apt-get install -y -qq cmake
     - uses: Swatinem/rust-cache@v2
+      with:
+        cache-directories: ~/.cargo/bin
     - name: Add clippy component
       run: rustup component add clippy
     - name: Run clippy
@@ -76,6 +78,9 @@ jobs:
       contents: read
     steps:
     - uses: actions/checkout@v4
+    - uses: Swatinem/rust-cache@v2
+      with:
+        cache-directories: ~/.cargo/bin
     - name: Install and run cargo-deny
       run: |
         cargo install cargo-deny@0.19.0 --locked || true
@@ -106,6 +111,8 @@ jobs:
     - name: Install system dependencies
       run: sudo apt-get update -qq && sudo apt-get install -y -qq cmake mold clang
     - uses: Swatinem/rust-cache@v2
+      with:
+        cache-directories: ~/.cargo/bin
     - name: Verify Cargo.lock is in sync
       run: cargo metadata --locked --format-version 1 > /dev/null
     - name: Compile and run tests
@@ -136,6 +143,8 @@ jobs:
     - name: Install system dependencies
       run: sudo apt-get update -qq && sudo apt-get install -y -qq cmake mold clang
     - uses: Swatinem/rust-cache@v2
+      with:
+        cache-directories: ~/.cargo/bin
     - name: Install cargo-llvm-cov
       run: cargo install cargo-llvm-cov --locked || true
     - name: Add llvm-tools component
