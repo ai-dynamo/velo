@@ -28,6 +28,7 @@ cargo machete
 
 - **Always use `--all-features`** for clippy, tests, and coverage. Without it, feature-gated code (zmq, grpc, nats) is silently skipped.
 - **`cmake` is required** on CI runners — `zeromq-src` (bundled with the `zmq` crate) compiles libzmq from source and needs cmake.
+- **`mold` linker** is used on CI for test/coverage compilation — linking all features (including the bundled libzmq C library) can OOM the default `ld` linker on GitHub runners. Set via `RUSTFLAGS="-C linker=clang -C link-arg=-fuse-ld=mold"`.
 - **`rustup component add rustfmt clippy`** — the toolchain pinned in `rust-toolchain.toml` (1.93.1) does not ship these by default on CI runners.
 - **`cargo-machete`** may false-positive on feature-gated deps. Use `[package.metadata.cargo-machete] ignored` in Cargo.toml when a dep is only used behind a feature gate (e.g., `prost` in velo-streaming's grpc feature).
 - **Codecov** uses `fail_ci_if_error: false` since the token may not be available on external PR runs.
