@@ -58,17 +58,8 @@ jobs:
         rm "${PROTOC_ZIP}"
         echo "$HOME/.local/bin" >> $GITHUB_PATH
     - name: Install system dependencies
-      run: sudo apt-get update -qq && sudo apt-get install -y -qq cmake mold
-    - name: Cache cargo artifacts
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/.cargo/bin/
-          ~/.cargo/registry/
-          ~/.cargo/git/
-          target/
-        key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: ${{ runner.os }}-cargo-clippy-
+      run: sudo apt-get update -qq && sudo apt-get install -y -qq cmake
+    - uses: Swatinem/rust-cache@v2
     - name: Add clippy component
       run: rustup component add clippy
     - name: Run clippy
@@ -113,24 +104,11 @@ jobs:
         rm "${PROTOC_ZIP}"
         echo "$HOME/.local/bin" >> $GITHUB_PATH
     - name: Install system dependencies
-      run: sudo apt-get update -qq && sudo apt-get install -y -qq cmake mold
-    - name: Cache cargo artifacts
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/.cargo/bin/
-          ~/.cargo/registry/
-          ~/.cargo/git/
-          target/
-        key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: ${{ runner.os }}-cargo-test-
+      run: sudo apt-get update -qq && sudo apt-get install -y -qq cmake mold clang
+    - uses: Swatinem/rust-cache@v2
     - name: Verify Cargo.lock is in sync
       run: cargo metadata --locked --format-version 1 > /dev/null
-    - name: Compile tests
-      run: cargo test --locked --all-features --no-run
-    - name: Run doc tests
-      run: cargo test --locked --all-features --doc
-    - name: Run unit tests
+    - name: Compile and run tests
       run: cargo test --locked --all-features --all-targets
 
   coverage:
@@ -156,17 +134,8 @@ jobs:
         rm "${PROTOC_ZIP}"
         echo "$HOME/.local/bin" >> $GITHUB_PATH
     - name: Install system dependencies
-      run: sudo apt-get update -qq && sudo apt-get install -y -qq cmake mold
-    - name: Cache cargo artifacts
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/.cargo/bin/
-          ~/.cargo/registry/
-          ~/.cargo/git/
-          target/
-        key: ${{ runner.os }}-cargo-coverage-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: ${{ runner.os }}-cargo-coverage-
+      run: sudo apt-get update -qq && sudo apt-get install -y -qq cmake mold clang
+    - uses: Swatinem/rust-cache@v2
     - name: Install cargo-llvm-cov
       run: cargo install cargo-llvm-cov --locked || true
     - name: Add llvm-tools component
