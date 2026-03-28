@@ -66,7 +66,16 @@ async fn new_transport(transport_type: &TransportType) -> Arc<dyn Transport> {
             Arc::new(NatsTransportBuilder::new(client, "ping-pong").build())
         }
         #[cfg(feature = "grpc")]
-        TransportType::Grpc => Arc::new(GrpcTransportBuilder::new().build().unwrap()),
+        TransportType::Grpc => {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            Arc::new(
+                GrpcTransportBuilder::new()
+                    .from_listener(listener)
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+            )
+        }
     }
 }
 
