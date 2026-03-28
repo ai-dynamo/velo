@@ -13,6 +13,11 @@ use velo_messenger::{Handler, Messenger};
 use velo_transports::Transport;
 use velo_transports::tcp::TcpTransportBuilder;
 
+#[cfg(feature = "grpc")]
+use velo_transports::grpc::GrpcTransportBuilder;
+#[cfg(feature = "nats")]
+use velo_transports::nats::{NatsTransportBuilder, utils::connect};
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
@@ -25,10 +30,16 @@ enum TransportType {
     /// ZMQ DEALER/ROUTER transport
     #[cfg(feature = "zmq")]
     Zmq,
+    /// NATS transport (requires NATS server on localhost:4222)
+    #[cfg(feature = "nats")]
+    Nats,
+    /// gRPC transport
+    #[cfg(feature = "grpc")]
+    Grpc,
 }
 
 /// Create a transport instance based on the selected type.
-fn new_transport(transport_type: &TransportType) -> Arc<dyn Transport> {
+async fn new_transport(transport_type: &TransportType) -> Arc<dyn Transport> {
     match transport_type {
         TransportType::Tcp => {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -47,6 +58,15 @@ fn new_transport(transport_type: &TransportType) -> Arc<dyn Transport> {
                 .build()
                 .unwrap(),
         ),
+        #[cfg(feature = "nats")]
+        TransportType::Nats => {
+            let client = connect("nats://127.0.0.1:4222")
+                .await
+                .expect("failed to connect to NATS server at 127.0.0.1:4222");
+            Arc::new(NatsTransportBuilder::new(client, "ping-pong").build())
+        }
+        #[cfg(feature = "grpc")]
+        TransportType::Grpc => Arc::new(GrpcTransportBuilder::new().build().unwrap()),
     }
 }
 
@@ -87,7 +107,7 @@ fn main() -> Result<()> {
     let server_handle = std::thread::spawn(move || {
         runtime_server.block_on(async {
             // Create server Messenger instance with selected transport
-            let transport = new_transport(&transport_type);
+            let transport = new_transport(&transport_type).await;
             let messenger = Messenger::builder()
                 .add_transport(transport)
                 .build()
@@ -124,7 +144,7 @@ fn main() -> Result<()> {
     let client_handle = std::thread::spawn(move || {
         runtime_client.block_on(async {
             // Create client Messenger instance with selected transport
-            let transport = new_transport(&transport_type);
+            let transport = new_transport(&transport_type).await;
             let messenger = Messenger::builder()
                 .add_transport(transport)
                 .build()
