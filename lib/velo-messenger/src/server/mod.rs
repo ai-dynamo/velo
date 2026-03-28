@@ -179,20 +179,18 @@ async fn create_message_handler(
                                         response_type,
                                         crate::common::messages::ResponseType::AckNack
                                             | crate::common::messages::ResponseType::Unary
-                                    ) {
-                                        if let Err(send_err) = hub
-                                            .send_error_response(
-                                                message_id,
-                                                format!("Failed to resolve large payload: {e}"),
-                                            )
-                                            .await
-                                        {
-                                            tracing::error!(
-                                                target: "velo_messenger::server",
-                                                handler = %handler_name,
-                                                "Failed to send error response: {send_err}"
-                                            );
-                                        }
+                                    ) && let Err(send_err) = hub
+                                        .send_error_response(
+                                            message_id,
+                                            format!("Failed to resolve large payload: {e}"),
+                                        )
+                                        .await
+                                    {
+                                        tracing::error!(
+                                            target: "velo_messenger::server",
+                                            handler = %handler_name,
+                                            "Failed to send error response: {send_err}"
+                                        );
                                     }
                                 }
                             }

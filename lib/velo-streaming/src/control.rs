@@ -931,6 +931,7 @@ mod tests {
 
     /// Helper: set up infrastructure for reader_pump tests.
     /// Returns (transport_tx, frame_rx, cancel_token, registry, local_id).
+    #[allow(clippy::type_complexity)]
     fn make_pump_test_infra() -> (
         flume::Sender<Vec<u8>>,   // transport_tx: simulates transport frames
         flume::Receiver<Vec<u8>>, // frame_rx: where pump writes to (consumer side)

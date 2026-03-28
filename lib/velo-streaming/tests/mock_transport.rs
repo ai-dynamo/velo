@@ -6,10 +6,14 @@
 //! These tests validate the trait boundary and core state-machine assertions
 //! against an in-memory transport — no network, no Messenger required.
 
+#[allow(unused_imports)]
 mod common;
 
+#[allow(unused_imports)]
 use std::sync::Arc;
+#[allow(unused_imports)]
 use velo_common::WorkerId;
+#[allow(unused_imports)]
 use velo_streaming::AnchorManager;
 
 use common::MockFrameTransport;

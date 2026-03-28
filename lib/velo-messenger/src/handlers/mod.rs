@@ -422,7 +422,7 @@ where
                 request_bytes
             );
             velo_observability::apply_remote_parent(&span, trace_headers.as_ref());
-            return Box::pin(future.instrument(span));
+            Box::pin(future.instrument(span))
         }
 
         #[cfg(not(feature = "distributed-tracing"))]
@@ -552,7 +552,7 @@ where
                 request_bytes
             );
             velo_observability::apply_remote_parent(&span, trace_headers.as_ref());
-            return Box::pin(future.instrument(span));
+            Box::pin(future.instrument(span))
         }
 
         #[cfg(not(feature = "distributed-tracing"))]
@@ -735,7 +735,7 @@ where
                 request_bytes
             );
             velo_observability::apply_remote_parent(&span, trace_headers.as_ref());
-            return Box::pin(future.instrument(span));
+            Box::pin(future.instrument(span))
         }
 
         #[cfg(not(feature = "distributed-tracing"))]

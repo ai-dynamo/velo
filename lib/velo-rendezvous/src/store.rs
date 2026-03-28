@@ -266,7 +266,7 @@ impl DataStore {
         let slot = self.slots.get(&local_id)?;
         let total_len = slot.total_len;
         let chunk_size = max_chunk_size.min(DEFAULT_CHUNK_SIZE);
-        let chunk_count = ((total_len + chunk_size as u64 - 1) / chunk_size as u64) as u32;
+        let chunk_count = total_len.div_ceil(chunk_size as u64) as u32;
 
         let transfer_id = self.next_transfer_id.fetch_add(1, Ordering::Relaxed);
         self.transfers.insert(

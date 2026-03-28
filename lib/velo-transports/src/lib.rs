@@ -299,13 +299,11 @@ impl VeloBackend {
             .ok_or(VeloBackendError::InstanceNotRegistered(target))?;
 
         if transport.value().key() == transport_key {
-            let transport_name = transport_key.to_string();
+            let _transport_name = transport_key.to_string();
             let bytes = header.len() + payload.len();
             let metrics = self.transport_metrics.get(&transport_key);
 
             let error_handler = instrument_transport_error_handler(metrics.cloned(), on_error);
-            #[cfg(not(feature = "distributed-tracing"))]
-            let _ = transport_name;
             transport.send_message(target, header, payload, message_type, error_handler);
 
             // Record AFTER successful enqueue
@@ -324,14 +322,12 @@ impl VeloBackend {
                 if *alternative_transport == transport_key
                     && let Some(transport) = self.transports.get(alternative_transport)
                 {
-                    let transport_name = alternative_transport.to_string();
+                    let _transport_name = alternative_transport.to_string();
                     let bytes = header.len() + payload.len();
                     let metrics = self.transport_metrics.get(alternative_transport);
 
                     let error_handler =
                         instrument_transport_error_handler(metrics.cloned(), on_error);
-                    #[cfg(not(feature = "distributed-tracing"))]
-                    let _ = transport_name;
                     transport.send_message(target, header, payload, message_type, error_handler);
 
                     // Record AFTER successful enqueue

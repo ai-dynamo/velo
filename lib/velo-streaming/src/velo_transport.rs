@@ -54,9 +54,12 @@ const SESSION_ID_HEADER: &str = "session_id";
 /// the AM headers and writes the payload directly into the matching dispatch
 /// channel. This composite key ensures that stale frames from a prior session
 /// are silently dropped after a detach+reattach cycle.
+/// Dispatch map type: maps (stream_id, session_id) to frame sender channels.
+type DispatchMap = DashMap<(u64, u64), flume::Sender<Vec<u8>>>;
+
 pub struct VeloFrameTransport {
     messenger: Arc<Messenger>,
-    dispatch: Arc<DashMap<(u64, u64), flume::Sender<Vec<u8>>>>,
+    dispatch: Arc<DispatchMap>,
     worker_id: WorkerId,
     /// Number of times `_stream_data` hit the slow (blocking) send path
     /// because the dispatch channel was full. Indicates consumer backpressure.
@@ -79,7 +82,7 @@ impl VeloFrameTransport {
         worker_id: WorkerId,
         metrics: Option<Arc<VeloMetrics>>,
     ) -> Result<Self> {
-        let dispatch: Arc<DashMap<(u64, u64), flume::Sender<Vec<u8>>>> = Arc::new(DashMap::new());
+        let dispatch: Arc<DispatchMap> = Arc::new(DashMap::new());
         let backpressure_count: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
 
         // Register the shared _stream_data handler.
