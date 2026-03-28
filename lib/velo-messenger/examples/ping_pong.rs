@@ -10,8 +10,8 @@ use anyhow::Result;
 use bytes::Bytes;
 use clap::{Parser, ValueEnum};
 use velo_messenger::{Handler, Messenger};
-use velo_transports::tcp::TcpTransportBuilder;
 use velo_transports::Transport;
+use velo_transports::tcp::TcpTransportBuilder;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
