@@ -8,24 +8,46 @@
 
 use anyhow::Result;
 use bytes::Bytes;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use velo_messenger::{Handler, Messenger};
+use velo_transports::Transport;
 use velo_transports::tcp::TcpTransportBuilder;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
-/// Create a TcpTransport bound to an OS-assigned port (no TOCTOU race).
-fn new_transport() -> Arc<velo_transports::tcp::TcpTransport> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    Arc::new(
-        TcpTransportBuilder::new()
-            .from_listener(listener)
-            .unwrap()
-            .build()
-            .unwrap(),
-    )
+/// Supported transport backends for the ping-pong benchmark.
+#[derive(Debug, Clone, ValueEnum)]
+enum TransportType {
+    /// TCP transport (default)
+    Tcp,
+    /// ZMQ DEALER/ROUTER transport
+    #[cfg(feature = "zmq")]
+    Zmq,
+}
+
+/// Create a transport instance based on the selected type.
+fn new_transport(transport_type: &TransportType) -> Arc<dyn Transport> {
+    match transport_type {
+        TransportType::Tcp => {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            Arc::new(
+                TcpTransportBuilder::new()
+                    .from_listener(listener)
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+            )
+        }
+        #[cfg(feature = "zmq")]
+        TransportType::Zmq => Arc::new(
+            velo_transports::zmq::ZmqTransportBuilder::new()
+                .bind_endpoint("tcp://127.0.0.1:0")
+                .build()
+                .unwrap(),
+        ),
+    }
 }
 
 /// CLI arguments for ping-pong benchmark
@@ -36,12 +58,16 @@ struct Args {
     /// Number of ping-pong iterations
     #[arg(long, default_value = "1000")]
     rounds: u32,
+
+    /// Transport backend to use
+    #[arg(long, default_value = "tcp")]
+    transport: TransportType,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    println!("Using TCP transport");
+    println!("Using {:?} transport", args.transport);
 
     // Create two separate single-threaded tokio runtimes
     let runtime_server = tokio::runtime::Builder::new_current_thread()
@@ -55,11 +81,13 @@ fn main() -> Result<()> {
     // Channel to pass PeerInfo from server to client
     let (peer_info_tx, peer_info_rx) = std::sync::mpsc::channel();
 
+    let transport_type = args.transport.clone();
+
     // Spawn server thread
     let server_handle = std::thread::spawn(move || {
         runtime_server.block_on(async {
-            // Create server Messenger instance with TCP transport
-            let transport = new_transport();
+            // Create server Messenger instance with selected transport
+            let transport = new_transport(&transport_type);
             let messenger = Messenger::builder()
                 .add_transport(transport)
                 .build()
@@ -90,11 +118,13 @@ fn main() -> Result<()> {
     // Wait for server to send PeerInfo
     let server_peer_info = peer_info_rx.recv().unwrap();
 
+    let transport_type = args.transport.clone();
+
     // Spawn client thread
     let client_handle = std::thread::spawn(move || {
         runtime_client.block_on(async {
-            // Create client Messenger instance with TCP transport
-            let transport = new_transport();
+            // Create client Messenger instance with selected transport
+            let transport = new_transport(&transport_type);
             let messenger = Messenger::builder()
                 .add_transport(transport)
                 .build()
@@ -128,7 +158,7 @@ fn main() -> Result<()> {
                 Ok(_) => println!("Warmup complete"),
                 Err(e) => {
                     println!("Warmup failed: {}", e);
-                    return Err(e.into());
+                    return Err(e);
                 }
             }
 

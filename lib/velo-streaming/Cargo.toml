@@ -41,6 +41,9 @@ tonic = { version = "0.13.1", optional = true }
 prost = { version = "0.13", optional = true }
 tokio-stream = { version = "0.1", optional = true }
 
+[package.metadata.cargo-machete]
+ignored = ["prost"]  # Used by tonic-generated gRPC code behind grpc feature
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "time", "test-util"] }
 velo = { workspace = true }

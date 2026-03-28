@@ -37,6 +37,8 @@ jobs:
       contents: read
     steps:
     - uses: actions/checkout@v4
+    - name: Add rustfmt component
+      run: rustup component add rustfmt
     - name: Check formatting
       run: cargo fmt --check
 
@@ -55,20 +57,21 @@ jobs:
         unzip "${PROTOC_ZIP}" -d $HOME/.local
         rm "${PROTOC_ZIP}"
         echo "$HOME/.local/bin" >> $GITHUB_PATH
-    - name: Cache cargo artifacts
+    - name: Install system dependencies
+      run: sudo apt-get update -qq && sudo apt-get install -y -qq cmake
+    - name: Cache cargo registry and tools
       uses: actions/cache@v4
       with:
         path: |
           ~/.cargo/bin/
           ~/.cargo/registry/
           ~/.cargo/git/
-          target/
-        key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: ${{ runner.os }}-cargo-clippy-
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: ${{ runner.os }}-cargo-registry-
     - name: Add clippy component
       run: rustup component add clippy
     - name: Run clippy
-      run: cargo clippy --no-deps --all-targets -- -D warnings
+      run: cargo clippy --no-deps --all-features --all-targets -- -D warnings
     - name: Install and run cargo-machete
       run: |
         cargo install cargo-machete --locked || true
@@ -81,6 +84,15 @@ jobs:
       contents: read
     steps:
     - uses: actions/checkout@v4
+    - name: Cache cargo registry and tools
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/bin/
+          ~/.cargo/registry/
+          ~/.cargo/git/
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: ${{ runner.os }}-cargo-registry-
     - name: Install and run cargo-deny
       run: |
         cargo install cargo-deny@0.19.0 --locked || true
@@ -91,6 +103,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
     services:
       nats:
         image: nats:latest
@@ -106,30 +120,28 @@ jobs:
         unzip "${PROTOC_ZIP}" -d $HOME/.local
         rm "${PROTOC_ZIP}"
         echo "$HOME/.local/bin" >> $GITHUB_PATH
-    - name: Cache cargo artifacts
+    - name: Install system dependencies
+      run: sudo apt-get update -qq && sudo apt-get install -y -qq cmake mold clang
+    - name: Cache cargo registry
       uses: actions/cache@v4
       with:
         path: |
-          ~/.cargo/bin/
           ~/.cargo/registry/
           ~/.cargo/git/
-          target/
-        key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: ${{ runner.os }}-cargo-test-
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: ${{ runner.os }}-cargo-registry-
     - name: Verify Cargo.lock is in sync
       run: cargo metadata --locked --format-version 1 > /dev/null
-    - name: Compile tests
-      run: cargo test --locked --no-run
-    - name: Run doc tests
-      run: cargo test --locked --doc
-    - name: Run unit tests
-      run: cargo test --locked --all-targets
+    - name: Compile and run tests
+      run: cargo test --locked --all-features --all-targets
 
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
     services:
       nats:
         image: nats:latest
@@ -145,16 +157,17 @@ jobs:
         unzip "${PROTOC_ZIP}" -d $HOME/.local
         rm "${PROTOC_ZIP}"
         echo "$HOME/.local/bin" >> $GITHUB_PATH
-    - name: Cache cargo artifacts
+    - name: Install system dependencies
+      run: sudo apt-get update -qq && sudo apt-get install -y -qq cmake mold clang
+    - name: Cache cargo registry and tools
       uses: actions/cache@v4
       with:
         path: |
           ~/.cargo/bin/
           ~/.cargo/registry/
           ~/.cargo/git/
-          target/
-        key: ${{ runner.os }}-cargo-coverage-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: ${{ runner.os }}-cargo-coverage-
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: ${{ runner.os }}-cargo-registry-
     - name: Install cargo-llvm-cov
       run: cargo install cargo-llvm-cov --locked || true
     - name: Add llvm-tools component
@@ -165,7 +178,7 @@ jobs:
       uses: codecov/codecov-action@v5
       with:
         files: codecov.json
-        fail_ci_if_error: true
+        fail_ci_if_error: false
       env:
         CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 

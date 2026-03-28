@@ -10,6 +10,8 @@
 
 #[cfg(feature = "grpc")]
 use velo_transports::grpc::{GrpcTransport, GrpcTransportBuilder};
+#[cfg(feature = "zmq")]
+use velo_transports::zmq::{ZmqTransport, ZmqTransportBuilder};
 // #[cfg(feature = "http")]
 // use velo_transports::http::{HttpTransport, HttpTransportBuilder};
 #[cfg(feature = "nats")]
@@ -326,6 +328,20 @@ impl TestTransportHandle<GrpcTransport> {
     }
 }
 
+// ZMQ-specific convenience constructors
+#[cfg(feature = "zmq")]
+impl TestTransportHandle<ZmqTransport> {
+    /// Create a new ZMQ transport with OS-assigned port
+    pub async fn new_zmq() -> anyhow::Result<Self> {
+        Self::with_factory(|| {
+            ZmqTransportBuilder::new()
+                .bind_endpoint("tcp://127.0.0.1:0")
+                .build()
+        })
+        .await
+    }
+}
+
 /// Multi-transport test cluster
 ///
 /// A generic cluster that works with any transport implementation.
@@ -459,6 +475,20 @@ impl TestCluster<GrpcTransport> {
         Self::with_factory(size, || {
             let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
             GrpcTransportBuilder::new().from_listener(listener)?.build()
+        })
+        .await
+    }
+}
+
+// ZMQ-specific convenience constructor
+#[cfg(feature = "zmq")]
+impl TestCluster<ZmqTransport> {
+    /// Create a new ZMQ test cluster with the specified number of transports
+    pub async fn new_zmq(size: usize) -> anyhow::Result<Self> {
+        Self::with_factory(size, || {
+            ZmqTransportBuilder::new()
+                .bind_endpoint("tcp://127.0.0.1:0")
+                .build()
         })
         .await
     }
@@ -869,5 +899,22 @@ impl TransportFactory for GrpcFactory {
 
     async fn create_cluster(size: usize) -> anyhow::Result<TestCluster<Self::Transport>> {
         TestCluster::new_grpc(size).await
+    }
+}
+
+/// ZMQ transport factory
+#[cfg(feature = "zmq")]
+pub struct ZmqFactory;
+
+#[cfg(feature = "zmq")]
+impl TransportFactory for ZmqFactory {
+    type Transport = ZmqTransport;
+
+    async fn create() -> anyhow::Result<TestTransportHandle<Self::Transport>> {
+        TestTransportHandle::new_zmq().await
+    }
+
+    async fn create_cluster(size: usize) -> anyhow::Result<TestCluster<Self::Transport>> {
+        TestCluster::new_zmq(size).await
     }
 }

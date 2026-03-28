@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "velo-simulation"
+version.workspace = true
+edition.workspace = true
+description = "Discrete-event simulation transport for Velo"
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+keywords.workspace = true
+
+[dependencies]
+velo-common = { workspace = true }
+velo-transports = { workspace = true }
+velo-discovery = { workspace = true }
+velo-observability = { workspace = true }
+loom-rs = { path = "../../../loom-rs", features = ["sim"] }
+bytes = { workspace = true }
+dashmap = { workspace = true }
+futures = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+tokio = { workspace = true }
+rmp-serde = { workspace = true }
+
+[dev-dependencies]
+velo = { workspace = true }
+tokio = { workspace = true, features = ["macros", "test-util"] }

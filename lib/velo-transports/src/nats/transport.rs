@@ -172,7 +172,7 @@ impl Transport for NatsTransport {
             .entry(instance_id)
             .or_insert_with(|| AtomicU64::new(0))
             .fetch_add(1, Ordering::Relaxed);
-        let use_request = count % PROBE_INTERVAL == 0;
+        let use_request = count.is_multiple_of(PROBE_INTERVAL);
 
         // Clone client for async move block.
         let client = self.client.clone();
@@ -366,6 +366,7 @@ impl Transport for NatsTransport {
 /// cancelling the main cancel token (LIFECYCLE-05 D-06 unsubscribe-before-cancel ordering).
 /// During drain (LIFECYCLE-04), inbound Message frames are rejected with ShuttingDown responses
 /// for request-reply sends, or silently discarded for fire-and-forget sends.
+#[allow(clippy::too_many_arguments)]
 async fn run_receive_loop(
     mut data_sub: async_nats::Subscriber,
     mut health_sub: async_nats::Subscriber,
@@ -456,10 +457,10 @@ async fn run_receive_loop(
                         }
 
                         // D-05: Ack if sender used .request() (adaptive liveness probe)
-                        if let Some(reply) = &msg.reply {
-                            if let Err(e) = client.publish(reply.clone(), Bytes::new()).await {
-                                tracing::warn!(error = %e, "Failed to ack data message");
-                            }
+                        if let Some(reply) = &msg.reply
+                            && let Err(e) = client.publish(reply.clone(), Bytes::new()).await
+                        {
+                            tracing::warn!(error = %e, "Failed to ack data message");
                         }
                         route_frame(&msg, &adapter, &transport_key, metrics.as_ref());
                     }
@@ -473,10 +474,10 @@ async fn run_receive_loop(
             msg = health_sub.next() => {
                 match msg {
                     Some(msg) => {
-                        if let Some(reply) = msg.reply {
-                            if let Err(e) = client.publish(reply, Bytes::new()).await {
-                                tracing::warn!(error = %e, "Failed to reply to health check");
-                            }
+                        if let Some(reply) = msg.reply
+                            && let Err(e) = client.publish(reply, Bytes::new()).await
+                        {
+                            tracing::warn!(error = %e, "Failed to reply to health check");
                         }
                     }
                     None => {
@@ -606,10 +607,10 @@ fn route_frame(
         MessageType::Ack | MessageType::Event => adapter.event_stream.try_send((header, body)),
     };
 
-    if result.is_err() {
-        if let Some(metrics) = metrics {
-            metrics.record_rejection(TransportRejection::RouteFailed);
-        }
+    if result.is_err()
+        && let Some(metrics) = metrics
+    {
+        metrics.record_rejection(TransportRejection::RouteFailed);
     }
 }
 

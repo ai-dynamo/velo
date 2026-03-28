@@ -63,16 +63,16 @@ impl ActiveMessageClient {
     ) -> Result<()> {
         // Transparent large payload staging: if payload exceeds threshold,
         // stage it via rendezvous and replace with a handle in the headers.
-        if let Some(stager) = self.large_payload_stager.get() {
-            if message.payload.len() > stager.threshold() {
-                let staged_payload = std::mem::replace(&mut message.payload, bytes::Bytes::new());
-                let handle_str = stager.stage(staged_payload);
-                message
-                    .metadata
-                    .headers
-                    .get_or_insert_with(std::collections::HashMap::new)
-                    .insert(crate::large_payload::RV_HEADER_KEY.to_string(), handle_str);
-            }
+        if let Some(stager) = self.large_payload_stager.get()
+            && message.payload.len() > stager.threshold()
+        {
+            let staged_payload = std::mem::replace(&mut message.payload, bytes::Bytes::new());
+            let handle_str = stager.stage(staged_payload);
+            message
+                .metadata
+                .headers
+                .get_or_insert_with(std::collections::HashMap::new)
+                .insert(crate::large_payload::RV_HEADER_KEY.to_string(), handle_str);
         }
 
         #[cfg(feature = "distributed-tracing")]
@@ -89,13 +89,13 @@ impl ActiveMessageClient {
                 bytes = header.len() + payload.len()
             );
             let _entered = span.enter();
-            return self.backend.send_message(
+            self.backend.send_message(
                 target,
                 header,
                 payload,
                 message_type,
                 self.error_handler.clone(),
-            );
+            )
         }
 
         #[cfg(not(feature = "distributed-tracing"))]
