@@ -49,6 +49,9 @@ pub mod nats;
 #[cfg(feature = "grpc")]
 pub mod grpc;
 
+#[cfg(feature = "zmq")]
+pub mod zmq;
+
 mod transport;
 
 use std::{collections::HashMap, sync::Arc};

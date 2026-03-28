@@ -16,6 +16,7 @@ default = ["http", "nats", "grpc"]
 http = ["velo-transports/http"]
 grpc = ["velo-transports/grpc"]
 nats = ["velo-transports/nats"]
+zmq = ["velo-transports/zmq"]
 distributed-tracing = ["velo-observability/distributed-tracing", "velo-transports/distributed-tracing"]
 
 [dependencies]
