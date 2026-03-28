@@ -167,12 +167,21 @@ pub(crate) fn run_listener(cfg: ListenerConfig) {
                 }
             };
 
-            // During drain: reject new Message frames (do not send reply to DEALER identity)
+            // During drain: reject new Message frames with ShuttingDown reply.
+            // Echo the header for correlation, empty payload — matches TCP behavior.
             if cfg.shutdown_state.is_draining() && msg_type == MessageType::Message {
                 if let Some(ref m) = cfg.metrics {
                     m.record_rejection(velo_observability::TransportRejection::DrainRejected);
                 }
-                debug!("ZMQ: rejecting Message frame during drain (dropping without reply)");
+                debug!("ZMQ: rejecting Message frame during drain (sending ShuttingDown)");
+                let identity = &multipart[0];
+                let type_byte: &[u8] = &[MessageType::ShuttingDown.as_u8()];
+                let empty: &[u8] = &[];
+                let _ = router
+                    .send(identity, zmq::SNDMORE)
+                    .and_then(|_| router.send(type_byte, zmq::SNDMORE))
+                    .and_then(|_| router.send(header_frame, zmq::SNDMORE))
+                    .and_then(|_| router.send(empty, 0));
                 continue;
             }
 
