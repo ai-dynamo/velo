@@ -162,7 +162,7 @@ impl Transport for ZmqTransport {
 
         // Fast path: non-blocking try_send
         match tx.try_send(task) {
-            Ok(()) => return,
+            Ok(()) => {}
             Err(flume::TrySendError::Full(task)) => {
                 // Slow path: async backpressure
                 let tx = tx.clone();
@@ -202,7 +202,6 @@ impl Transport for ZmqTransport {
         let sndhwm = self.sndhwm;
         let rcvhwm = self.rcvhwm;
         let linger_ms = self.linger_ms;
-        let transport_key = self.key.as_str().to_string();
         let metrics = self.metrics.get().cloned();
         let shutdown_state = channels.shutdown_state.clone();
         let instance_id_bytes = instance_id.as_bytes().to_vec();
@@ -213,27 +212,20 @@ impl Transport for ZmqTransport {
             self.sender_tx.set(sender_tx).ok();
 
             // Spawn the listener thread (ROUTER socket)
-            let listener_ctx = ctx.clone();
-            let listener_adapter = channels;
-            let listener_metrics = metrics.clone();
-            let listener_shutdown = shutdown_state.clone();
-            let listener_transport_key = transport_key.clone();
-            let listener_rcvhwm = rcvhwm;
-            let listener_linger = linger_ms;
+            let listener_cfg = listener::ListenerConfig {
+                ctx: ctx.clone(),
+                bind_endpoint,
+                control_endpoint: listener_control_ep,
+                adapter: channels,
+                shutdown_state: shutdown_state.clone(),
+                rcvhwm,
+                linger_ms,
+                metrics: metrics.clone(),
+            };
             let listener_handle = std::thread::Builder::new()
                 .name("zmq-listener".to_string())
                 .spawn(move || {
-                    listener::run_listener(
-                        listener_ctx,
-                        &bind_endpoint,
-                        &listener_control_ep,
-                        listener_adapter,
-                        listener_shutdown,
-                        listener_rcvhwm,
-                        listener_linger,
-                        &listener_transport_key,
-                        listener_metrics,
-                    );
+                    listener::run_listener(listener_cfg);
                 })
                 .context("Failed to spawn ZMQ listener thread")?;
 
@@ -243,26 +235,20 @@ impl Transport for ZmqTransport {
                 .expect("listener_handle mutex poisoned") = Some(listener_handle);
 
             // Spawn the sender thread (multiplexed DEALER sockets)
-            let sender_ctx = ctx.clone();
-            let sender_peers = peers;
-            let sender_metrics = metrics;
-            let sender_transport_key = transport_key;
-            let sender_sndhwm = sndhwm;
-            let sender_linger = linger_ms;
+            let sender_cfg = SenderConfig {
+                ctx: ctx.clone(),
+                control_endpoint: sender_control_ep,
+                rx: sender_rx,
+                peers,
+                identity: instance_id_bytes,
+                sndhwm,
+                linger_ms,
+                metrics,
+            };
             let sender_handle = std::thread::Builder::new()
                 .name("zmq-sender".to_string())
                 .spawn(move || {
-                    run_sender(
-                        sender_ctx,
-                        &sender_control_ep,
-                        sender_rx,
-                        sender_peers,
-                        &instance_id_bytes,
-                        sender_sndhwm,
-                        sender_linger,
-                        &sender_transport_key,
-                        sender_metrics,
-                    );
+                    run_sender(sender_cfg);
                 })
                 .context("Failed to spawn ZMQ sender thread")?;
 
@@ -277,38 +263,25 @@ impl Transport for ZmqTransport {
     }
 
     fn begin_drain(&self) {
-        // Signal the listener thread to start rejecting Message frames.
-        if let Ok(ctrl) = self.zmq_context.socket(zmq::PAIR) {
-            if ctrl
-                .connect(&self.listener_control_endpoint)
-                .is_ok()
-            {
-                let _ = ctrl.send("drain", 0);
-            }
-        }
+        // Drain gating is handled by ShutdownState.is_draining() in the listener
+        // thread — no control signal needed. This matches TCP/gRPC behavior.
     }
 
     fn shutdown(&self) {
         info!("Shutting down ZMQ transport");
 
         // Signal the listener thread to stop
-        if let Ok(ctrl) = self.zmq_context.socket(zmq::PAIR) {
-            if ctrl
-                .connect(&self.listener_control_endpoint)
-                .is_ok()
-            {
-                let _ = ctrl.send("shutdown", 0);
-            }
+        if let Ok(ctrl) = self.zmq_context.socket(zmq::PAIR)
+            && ctrl.connect(&self.listener_control_endpoint).is_ok()
+        {
+            let _ = ctrl.send("shutdown", 0);
         }
 
         // Signal the sender thread to stop
-        if let Ok(ctrl) = self.zmq_context.socket(zmq::PAIR) {
-            if ctrl
-                .connect(&self.sender_control_endpoint)
-                .is_ok()
-            {
-                let _ = ctrl.send("shutdown", 0);
-            }
+        if let Ok(ctrl) = self.zmq_context.socket(zmq::PAIR)
+            && ctrl.connect(&self.sender_control_endpoint).is_ok()
+        {
+            let _ = ctrl.send("shutdown", 0);
         }
 
         // Drop the sender channel to unblock the sender thread
@@ -316,21 +289,11 @@ impl Transport for ZmqTransport {
 
         self.cancel_token.cancel();
 
-        // Join threads with a timeout
-        if let Some(handle) = self
-            .listener_handle
-            .lock()
-            .expect("mutex poisoned")
-            .take()
-        {
+        // Join threads (they exit promptly after receiving the shutdown signal)
+        if let Some(handle) = self.listener_handle.lock().expect("mutex poisoned").take() {
             let _ = handle.join();
         }
-        if let Some(handle) = self
-            .sender_handle
-            .lock()
-            .expect("mutex poisoned")
-            .take()
-        {
+        if let Some(handle) = self.sender_handle.lock().expect("mutex poisoned").take() {
             let _ = handle.join();
         }
     }
@@ -357,53 +320,97 @@ impl Transport for ZmqTransport {
                 .map(|e| e.value().clone())
                 .ok_or(HealthCheckError::PeerNotRegistered)?;
 
-            // ZMQ connect is async internally — create a probe socket, connect,
-            // and attempt a zero-byte send with a short timeout.
-            let result = tokio::task::spawn_blocking(move || -> Result<(), HealthCheckError> {
+            // ZMQ connect is async internally — create a probe socket, attach a
+            // monitor, and wait for a CONNECTED / CONNECT_RETRIED / DISCONNECTED
+            // event within the timeout.
+            tokio::task::spawn_blocking(move || -> Result<(), HealthCheckError> {
+                let timeout_ms = timeout.as_millis() as i32;
+
                 let ctx = zmq::Context::new();
-                let sock = ctx.socket(zmq::DEALER).map_err(|_| HealthCheckError::ConnectionFailed)?;
+                let sock = ctx
+                    .socket(zmq::DEALER)
+                    .map_err(|_| HealthCheckError::ConnectionFailed)?;
                 sock.set_linger(0).ok();
-                sock.set_connect_timeout(timeout.as_millis() as i32)
-                    .ok();
-                sock.set_sndtimeo(timeout.as_millis() as i32).ok();
+                sock.set_connect_timeout(timeout_ms).ok();
+
+                // Use a unique inproc endpoint for the monitor.
+                let monitor_endpoint = format!("inproc://zmq-healthcheck-monitor-{:p}", &sock);
+
+                // Monitor connection-related events.
+                let events = (zmq::SocketEvent::CONNECTED as i32)
+                    | (zmq::SocketEvent::CONNECT_RETRIED as i32)
+                    | (zmq::SocketEvent::DISCONNECTED as i32);
+                sock.monitor(&monitor_endpoint, events)
+                    .map_err(|_| HealthCheckError::ConnectionFailed)?;
+
+                let monitor_sock = ctx
+                    .socket(zmq::PAIR)
+                    .map_err(|_| HealthCheckError::ConnectionFailed)?;
+                monitor_sock.set_rcvtimeo(timeout_ms).ok();
+                monitor_sock
+                    .connect(&monitor_endpoint)
+                    .map_err(|_| HealthCheckError::ConnectionFailed)?;
+
+                // Initiate the actual connection to the peer endpoint.
                 sock.connect(&endpoint)
                     .map_err(|_| HealthCheckError::ConnectionFailed)?;
 
-                // Send a minimal probe — if the peer's ROUTER is listening, this succeeds
-                // (ZMQ DEALER can send even before the connection is fully established,
-                //  so we also set a send timeout to detect unreachable peers)
-                let empty: &[u8] = &[];
-                sock.send(empty, 0)
-                    .map_err(|_| HealthCheckError::ConnectionFailed)?;
-                Ok(())
+                // Wait for a decisive monitor event within the timeout.
+                // Monitor events are two-frame messages: [event_data (6 bytes), address].
+                // The event_data layout: [u16 event_id, u32 event_value].
+                const ZMQ_EVENT_CONNECTED: u16 = 0x0001;
+                const ZMQ_EVENT_CONNECT_RETRIED: u16 = 0x0040;
+                const ZMQ_EVENT_DISCONNECTED: u16 = 0x0200;
+
+                loop {
+                    let data = monitor_sock
+                        .recv_bytes(0)
+                        .map_err(|_| HealthCheckError::Timeout)?;
+                    // Drain the address frame
+                    let _ = monitor_sock.recv_bytes(0);
+
+                    if data.len() >= 2 {
+                        let event_id = u16::from_le_bytes([data[0], data[1]]);
+                        match event_id {
+                            ZMQ_EVENT_CONNECTED => return Ok(()),
+                            ZMQ_EVENT_CONNECT_RETRIED | ZMQ_EVENT_DISCONNECTED => {
+                                return Err(HealthCheckError::ConnectionFailed);
+                            }
+                            _ => { /* ignore unrelated events */ }
+                        }
+                    }
+                }
             })
             .await
-            .map_err(|_| HealthCheckError::Timeout)?;
-
-            result
+            .map_err(|_| HealthCheckError::Timeout)?
         })
     }
 }
 
 /// Sender thread: multiplexes all outbound messages through DEALER sockets.
 ///
-/// Owns a `HashMap<InstanceId, zmq::Socket>` of lazily-created DEALER sockets.
-/// Reads `OutboundTask` from a shared flume channel and dispatches to the correct socket.
-fn run_sender(
+/// Configuration bundle for the sender thread.
+struct SenderConfig {
     ctx: Arc<zmq::Context>,
-    control_endpoint: &str,
+    control_endpoint: String,
     rx: flume::Receiver<OutboundTask>,
     peers: Arc<DashMap<crate::InstanceId, String>>,
-    identity: &[u8],
+    identity: Vec<u8>,
     sndhwm: i32,
     linger_ms: i32,
-    _transport_key: &str,
     metrics: Option<velo_observability::TransportMetricsHandle>,
-) {
+}
+
+/// Owns a `HashMap<InstanceId, zmq::Socket>` of lazily-created DEALER sockets.
+/// Reads `OutboundTask` from a shared flume channel and dispatches to the correct socket.
+fn run_sender(cfg: SenderConfig) {
     // Control socket for shutdown signaling
-    let control = ctx.socket(zmq::PAIR).expect("Failed to create control socket");
+    let control = cfg
+        .ctx
+        .socket(zmq::PAIR)
+        .expect("Failed to create control socket");
     control
-        .bind(control_endpoint)
+        .bind(&cfg.control_endpoint)
         .expect("Failed to bind sender control socket");
 
     let mut dealer_sockets: HashMap<crate::InstanceId, zmq::Socket> = HashMap::new();
@@ -411,7 +418,7 @@ fn run_sender(
 
     while running {
         // Use recv_timeout on the flume channel so we can also check the control socket
-        match rx.recv_timeout(Duration::from_millis(10)) {
+        match cfg.rx.recv_timeout(Duration::from_millis(10)) {
             Ok(task) => {
                 let target = task.target;
 
@@ -419,18 +426,21 @@ fn run_sender(
                 let sock = match dealer_sockets.get(&target) {
                     Some(s) => s,
                     None => {
-                        let endpoint = match peers.get(&target) {
+                        let endpoint = match cfg.peers.get(&target) {
                             Some(ep) => ep.value().clone(),
                             None => {
-                                task.on_error(format!(
-                                    "Peer not registered: {}",
-                                    target
-                                ));
+                                task.on_error(format!("Peer not registered: {}", target));
                                 continue;
                             }
                         };
 
-                        match create_dealer_socket(&ctx, identity, &endpoint, sndhwm, linger_ms) {
+                        match create_dealer_socket(
+                            &cfg.ctx,
+                            &cfg.identity,
+                            &endpoint,
+                            cfg.sndhwm,
+                            cfg.linger_ms,
+                        ) {
                             Ok(sock) => {
                                 dealer_sockets.insert(target, sock);
                                 dealer_sockets.get(&target).unwrap()
@@ -452,7 +462,7 @@ fn run_sender(
 
                 match send_result {
                     Ok(()) => {
-                        if let Some(ref m) = metrics {
+                        if let Some(ref m) = cfg.metrics {
                             m.record_frame(
                                 velo_observability::Direction::Outbound,
                                 crate::message_type_label(task.msg_type),
@@ -478,19 +488,16 @@ fn run_sender(
         }
 
         // Non-blocking check for control commands
-        if let Ok(msg) = control.recv_bytes(zmq::DONTWAIT) {
-            match msg.as_slice() {
-                b"shutdown" => {
-                    debug!("ZMQ sender received shutdown signal");
-                    running = false;
-                }
-                _ => {}
-            }
+        if let Ok(msg) = control.recv_bytes(zmq::DONTWAIT)
+            && msg.as_slice() == b"shutdown"
+        {
+            debug!("ZMQ sender received shutdown signal");
+            running = false;
         }
     }
 
     // Drain remaining messages with error callbacks
-    while let Ok(task) = rx.try_recv() {
+    while let Ok(task) = cfg.rx.try_recv() {
         task.on_error("Transport shutting down");
     }
 
@@ -519,14 +526,11 @@ fn create_dealer_socket(
     // Set a send timeout to avoid blocking forever on a dead peer
     sock.set_sndtimeo(5000)
         .context("Failed to set ZMQ_SNDTIMEO")?;
-    sock.connect(endpoint)
-        .context(format!("Failed to connect DEALER to {}", endpoint))?;
-    // Brief pause for ZMQ async connection handshake to complete.
     // ZMQ connect is asynchronous — messages sent before the handshake
     // completes will be queued internally by ZMQ and delivered once connected.
-    // This sleep reduces latency on the first message by allowing the
-    // handshake to finish before we start sending.
-    std::thread::sleep(std::time::Duration::from_millis(20));
+    // No post-connect sleep needed; avoids blocking the shared sender thread.
+    sock.connect(endpoint)
+        .context(format!("Failed to connect DEALER to {}", endpoint))?;
     debug!("Created DEALER socket connected to {}", endpoint);
     Ok(sock)
 }
@@ -620,12 +624,10 @@ impl ZmqTransportBuilder {
         probe
             .set_linger(0)
             .context("Failed to set linger on probe")?;
-        probe
-            .bind(&requested_endpoint)
-            .context(format!(
-                "Failed to bind ROUTER socket to {}",
-                requested_endpoint
-            ))?;
+        probe.bind(&requested_endpoint).context(format!(
+            "Failed to bind ROUTER socket to {}",
+            requested_endpoint
+        ))?;
 
         let resolved_endpoint = probe
             .get_last_endpoint()
