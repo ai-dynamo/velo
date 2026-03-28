@@ -5,7 +5,7 @@
 //!
 //! This module provides a high-performance ZMQ transport implementation with:
 //! - DEALER/ROUTER socket pattern for bidirectional messaging
-//! - Zero-copy multipart framing (message type + header + payload)
+//! - Efficient multipart framing (message type + header + payload, one copy per frame)
 //! - Two dedicated I/O threads (one listener, one sender) regardless of peer count
 //! - Graceful shutdown with drain support
 

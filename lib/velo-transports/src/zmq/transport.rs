@@ -38,8 +38,8 @@ pub struct ZmqTransport {
     peers: Arc<DashMap<crate::InstanceId, String>>,
     /// Shared ZMQ context for all sockets.
     zmq_context: Arc<zmq::Context>,
-    /// Single shared sender channel — all peers multiplex through one sender thread.
-    sender_tx: OnceLock<flume::Sender<OutboundTask>>,
+    /// Single shared sender channel — droppable for clean shutdown.
+    sender_tx: std::sync::Mutex<Option<flume::Sender<OutboundTask>>>,
     /// Tokio runtime handle, set once during `start()`.
     runtime: OnceLock<tokio::runtime::Handle>,
     /// Transport-level cancellation token.
@@ -66,6 +66,8 @@ pub struct ZmqTransport {
     listener_control_endpoint: String,
     /// Control socket endpoint for the sender thread.
     sender_control_endpoint: String,
+    /// Pre-bound ROUTER socket, passed to the listener thread during `start()`.
+    router_socket: std::sync::Mutex<Option<zmq::Socket>>,
 }
 
 /// Task sent to the sender thread containing a message to send.
@@ -113,12 +115,13 @@ impl Transport for ZmqTransport {
             TransportError::InvalidEndpoint
         })?;
 
-        // Validate it looks like a ZMQ endpoint
-        if !endpoint_str.starts_with("tcp://")
-            && !endpoint_str.starts_with("ipc://")
-            && !endpoint_str.starts_with("inproc://")
-        {
-            error!("Invalid ZMQ endpoint format: {}", endpoint_str);
+        // Only tcp:// and ipc:// are supported for peer endpoints.
+        // inproc:// requires a shared zmq::Context which peers don't share.
+        if !endpoint_str.starts_with("tcp://") && !endpoint_str.starts_with("ipc://") {
+            error!(
+                "Invalid ZMQ peer endpoint (only tcp:// and ipc:// supported): {}",
+                endpoint_str
+            );
             return Err(TransportError::InvalidEndpoint);
         }
 
@@ -152,10 +155,12 @@ impl Transport for ZmqTransport {
             on_error,
         };
 
-        let tx = match self.sender_tx.get() {
+        let guard = self.sender_tx.lock().expect("sender_tx mutex poisoned");
+        let tx = match guard.as_ref() {
             Some(tx) => tx,
             None => {
-                task.on_error("Transport not started");
+                drop(guard);
+                task.on_error("Transport not started or shutting down");
                 return;
             }
         };
@@ -166,6 +171,7 @@ impl Transport for ZmqTransport {
             Err(flume::TrySendError::Full(task)) => {
                 // Slow path: async backpressure
                 let tx = tx.clone();
+                drop(guard);
                 if let Some(rt) = self.runtime.get() {
                     rt.spawn(async move {
                         if let Err(flume::SendError(task)) = tx.send_async(task).await {
@@ -177,6 +183,7 @@ impl Transport for ZmqTransport {
                 }
             }
             Err(flume::TrySendError::Disconnected(task)) => {
+                drop(guard);
                 task.on_error("Sender thread exited");
             }
         }
@@ -206,12 +213,20 @@ impl Transport for ZmqTransport {
         let shutdown_state = channels.shutdown_state.clone();
         let instance_id_bytes = instance_id.as_bytes().to_vec();
 
+        // Take the pre-bound ROUTER socket (if available)
+        let router_socket = self
+            .router_socket
+            .lock()
+            .expect("router_socket mutex poisoned")
+            .take();
+
         Box::pin(async move {
             // Create the sender channel
             let (sender_tx, sender_rx) = flume::bounded(channel_capacity);
-            self.sender_tx.set(sender_tx).ok();
+            *self.sender_tx.lock().expect("sender_tx mutex poisoned") = Some(sender_tx);
 
-            // Spawn the listener thread (ROUTER socket)
+            // Spawn the listener thread with a ready handshake
+            let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
             let listener_cfg = listener::ListenerConfig {
                 ctx: ctx.clone(),
                 bind_endpoint,
@@ -221,6 +236,8 @@ impl Transport for ZmqTransport {
                 rcvhwm,
                 linger_ms,
                 metrics: metrics.clone(),
+                router_socket,
+                ready_tx,
             };
             let listener_handle = std::thread::Builder::new()
                 .name("zmq-listener".to_string())
@@ -229,12 +246,20 @@ impl Transport for ZmqTransport {
                 })
                 .context("Failed to spawn ZMQ listener thread")?;
 
+            // Wait for the listener to signal ready (or fail)
+            match ready_rx.recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => anyhow::bail!("ZMQ listener failed to start: {}", e),
+                Err(_) => anyhow::bail!("ZMQ listener thread exited before signaling ready"),
+            }
+
             *self
                 .listener_handle
                 .lock()
                 .expect("listener_handle mutex poisoned") = Some(listener_handle);
 
-            // Spawn the sender thread (multiplexed DEALER sockets)
+            // Spawn the sender thread with a ready handshake
+            let (sender_ready_tx, sender_ready_rx) = std::sync::mpsc::sync_channel(1);
             let sender_cfg = SenderConfig {
                 ctx: ctx.clone(),
                 control_endpoint: sender_control_ep,
@@ -244,6 +269,7 @@ impl Transport for ZmqTransport {
                 sndhwm,
                 linger_ms,
                 metrics,
+                ready_tx: sender_ready_tx,
             };
             let sender_handle = std::thread::Builder::new()
                 .name("zmq-sender".to_string())
@@ -251,6 +277,13 @@ impl Transport for ZmqTransport {
                     run_sender(sender_cfg);
                 })
                 .context("Failed to spawn ZMQ sender thread")?;
+
+            // Wait for the sender to signal ready
+            match sender_ready_rx.recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => anyhow::bail!("ZMQ sender failed to start: {}", e),
+                Err(_) => anyhow::bail!("ZMQ sender thread exited before signaling ready"),
+            }
 
             *self
                 .sender_handle
@@ -284,12 +317,14 @@ impl Transport for ZmqTransport {
             let _ = ctrl.send("shutdown", 0);
         }
 
-        // Drop the sender channel to unblock the sender thread
-        // (OnceLock doesn't support take, but the thread will also see the control signal)
+        // Drop the sender channel to unblock the sender thread if the control
+        // signal failed (e.g., thread hasn't bound the control socket yet).
+        *self.sender_tx.lock().expect("sender_tx mutex poisoned") = None;
 
         self.cancel_token.cancel();
 
-        // Join threads (they exit promptly after receiving the shutdown signal)
+        // Join threads (they exit promptly after receiving the shutdown signal
+        // or observing the closed flume channel).
         if let Some(handle) = self.listener_handle.lock().expect("mutex poisoned").take() {
             let _ = handle.join();
         }
@@ -387,8 +422,6 @@ impl Transport for ZmqTransport {
     }
 }
 
-/// Sender thread: multiplexes all outbound messages through DEALER sockets.
-///
 /// Configuration bundle for the sender thread.
 struct SenderConfig {
     ctx: Arc<zmq::Context>,
@@ -399,19 +432,33 @@ struct SenderConfig {
     sndhwm: i32,
     linger_ms: i32,
     metrics: Option<velo_observability::TransportMetricsHandle>,
+    ready_tx: std::sync::mpsc::SyncSender<Result<(), String>>,
 }
 
+/// Sender thread: multiplexes all outbound messages through DEALER sockets.
+///
 /// Owns a `HashMap<InstanceId, zmq::Socket>` of lazily-created DEALER sockets.
 /// Reads `OutboundTask` from a shared flume channel and dispatches to the correct socket.
 fn run_sender(cfg: SenderConfig) {
     // Control socket for shutdown signaling
-    let control = cfg
-        .ctx
-        .socket(zmq::PAIR)
-        .expect("Failed to create control socket");
-    control
-        .bind(&cfg.control_endpoint)
-        .expect("Failed to bind sender control socket");
+    let control = match cfg.ctx.socket(zmq::PAIR) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = cfg
+                .ready_tx
+                .send(Err(format!("Failed to create control socket: {e}")));
+            return;
+        }
+    };
+    if let Err(e) = control.bind(&cfg.control_endpoint) {
+        let _ = cfg
+            .ready_tx
+            .send(Err(format!("Failed to bind sender control socket: {e}")));
+        return;
+    }
+
+    // Signal that the sender is ready
+    let _ = cfg.ready_tx.send(Ok(()));
 
     let mut dealer_sockets: HashMap<crate::InstanceId, zmq::Socket> = HashMap::new();
     let mut running = true;
@@ -604,8 +651,9 @@ impl ZmqTransportBuilder {
 
     /// Build the [`ZmqTransport`].
     ///
-    /// This pre-binds the ROUTER socket to resolve the actual endpoint
-    /// (important when using port 0 for OS-assigned ports).
+    /// Pre-binds the ROUTER socket to resolve the actual endpoint (important
+    /// when using port 0). The socket is kept open and handed to the listener
+    /// thread during `start()`, avoiding any TOCTOU port race.
     pub fn build(self) -> Result<ZmqTransport> {
         let key = self.key.unwrap_or_else(|| TransportKey::from("zmq"));
         let requested_endpoint = self
@@ -617,28 +665,29 @@ impl ZmqTransportBuilder {
         ctx.set_io_threads(self.zmq_io_threads as i32)
             .context("Failed to set ZMQ IO threads")?;
 
-        // Pre-bind a ROUTER socket to resolve the actual endpoint (for port 0)
-        let probe = ctx
+        // Pre-bind a ROUTER socket to resolve the actual endpoint (for port 0).
+        // The socket stays open and is passed to the listener thread in start().
+        let router = ctx
             .socket(zmq::ROUTER)
-            .context("Failed to create probe ROUTER socket")?;
-        probe
-            .set_linger(0)
-            .context("Failed to set linger on probe")?;
-        probe.bind(&requested_endpoint).context(format!(
+            .context("Failed to create ROUTER socket")?;
+        router
+            .set_rcvhwm(self.rcvhwm)
+            .context("Failed to set ZMQ_RCVHWM")?;
+        router
+            .set_linger(self.linger_ms)
+            .context("Failed to set ZMQ_LINGER")?;
+        router
+            .set_router_mandatory(true)
+            .context("Failed to set ZMQ_ROUTER_MANDATORY")?;
+        router.bind(&requested_endpoint).context(format!(
             "Failed to bind ROUTER socket to {}",
             requested_endpoint
         ))?;
 
-        let resolved_endpoint = probe
+        let resolved_endpoint = router
             .get_last_endpoint()
             .context("Failed to get last endpoint")?
             .map_err(|_| anyhow::anyhow!("Failed to get resolved endpoint"))?;
-
-        // Unbind so the actual listener can bind later
-        probe
-            .unbind(&resolved_endpoint)
-            .context("Failed to unbind probe socket")?;
-        drop(probe);
 
         // Build the WorkerAddress with the resolved endpoint
         let mut addr_builder = crate::address::WorkerAddressBuilder::new();
@@ -656,7 +705,7 @@ impl ZmqTransportBuilder {
             local_address,
             peers: Arc::new(DashMap::new()),
             zmq_context: Arc::new(ctx),
-            sender_tx: OnceLock::new(),
+            sender_tx: std::sync::Mutex::new(None),
             runtime: OnceLock::new(),
             cancel_token: CancellationToken::new(),
             shutdown_state: OnceLock::new(),
@@ -670,6 +719,7 @@ impl ZmqTransportBuilder {
             sender_handle: std::sync::Mutex::new(None),
             listener_control_endpoint,
             sender_control_endpoint,
+            router_socket: std::sync::Mutex::new(Some(router)),
         })
     }
 }
@@ -724,6 +774,13 @@ mod tests {
     fn test_register_invalid_endpoint() {
         let transport = ZmqTransportBuilder::new().build().unwrap();
         let peer = make_zmq_peer("invalid://foo");
+        assert!(transport.register(peer).is_err());
+    }
+
+    #[test]
+    fn test_register_inproc_rejected() {
+        let transport = ZmqTransportBuilder::new().build().unwrap();
+        let peer = make_zmq_peer("inproc://test");
         assert!(transport.register(peer).is_err());
     }
 

@@ -5,6 +5,7 @@
 //!
 //! Accepts inbound multipart messages from remote DEALER sockets and routes
 //! them to the appropriate transport adapter stream based on `MessageType`.
+//! Header and payload are copied once from ZMQ-owned buffers into `Bytes`.
 
 use bytes::Bytes;
 use std::sync::Arc;
@@ -22,58 +23,74 @@ pub(crate) struct ListenerConfig {
     pub rcvhwm: i32,
     pub linger_ms: i32,
     pub metrics: Option<velo_observability::TransportMetricsHandle>,
+    /// Pre-bound ROUTER socket. If `Some`, the listener uses this socket directly
+    /// (avoiding TOCTOU races with port 0). If `None`, binds a new socket.
+    pub router_socket: Option<zmq::Socket>,
+    /// Oneshot sender to signal that the listener is ready (or failed).
+    pub ready_tx: std::sync::mpsc::SyncSender<Result<(), String>>,
 }
 
 /// Run the ROUTER listener thread.
 ///
-/// Binds a ROUTER socket to `bind_endpoint`, polls for inbound messages, and
-/// routes decoded frames to the adapter channels. Uses `ShutdownState` for
-/// drain gating and a control PAIR socket for shutdown signaling.
+/// Uses a pre-bound ROUTER socket (if provided) or binds a new one. Polls for
+/// inbound messages and routes decoded frames to the adapter channels. Uses
+/// `ShutdownState` for drain gating and a control PAIR socket for shutdown.
 pub(crate) fn run_listener(cfg: ListenerConfig) {
-    // Create and bind the ROUTER socket
-    let router = match cfg.ctx.socket(zmq::ROUTER) {
-        Ok(s) => s,
-        Err(e) => {
-            error!("Failed to create ROUTER socket: {}", e);
+    // Use pre-bound socket or create + bind a new one
+    let router = if let Some(sock) = cfg.router_socket {
+        sock
+    } else {
+        let router = match cfg.ctx.socket(zmq::ROUTER) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = cfg
+                    .ready_tx
+                    .send(Err(format!("Failed to create ROUTER socket: {e}")));
+                return;
+            }
+        };
+
+        if let Err(e) = router.set_rcvhwm(cfg.rcvhwm) {
+            warn!("Failed to set ZMQ_RCVHWM: {}", e);
+        }
+        if let Err(e) = router.set_linger(cfg.linger_ms) {
+            warn!("Failed to set ZMQ_LINGER: {}", e);
+        }
+        if let Err(e) = router.set_router_mandatory(true) {
+            warn!("Failed to set ZMQ_ROUTER_MANDATORY: {}", e);
+        }
+
+        if let Err(e) = router.bind(&cfg.bind_endpoint) {
+            let _ = cfg.ready_tx.send(Err(format!(
+                "Failed to bind ROUTER socket to {}: {e}",
+                cfg.bind_endpoint
+            )));
             return;
         }
+        router
     };
-
-    if let Err(e) = router.set_rcvhwm(cfg.rcvhwm) {
-        warn!("Failed to set ZMQ_RCVHWM: {}", e);
-    }
-    if let Err(e) = router.set_linger(cfg.linger_ms) {
-        warn!("Failed to set ZMQ_LINGER: {}", e);
-    }
-    // ROUTER_MANDATORY: send to disconnected peer returns error instead of silently dropping
-    if let Err(e) = router.set_router_mandatory(true) {
-        warn!("Failed to set ZMQ_ROUTER_MANDATORY: {}", e);
-    }
-
-    if let Err(e) = router.bind(&cfg.bind_endpoint) {
-        error!(
-            "Failed to bind ROUTER socket to {}: {}",
-            cfg.bind_endpoint, e
-        );
-        return;
-    }
     debug!("ZMQ ROUTER socket bound to {}", cfg.bind_endpoint);
 
     // Control socket for shutdown signaling
     let control = match cfg.ctx.socket(zmq::PAIR) {
         Ok(s) => s,
         Err(e) => {
-            error!("Failed to create control socket: {}", e);
+            let _ = cfg
+                .ready_tx
+                .send(Err(format!("Failed to create control socket: {e}")));
             return;
         }
     };
     if let Err(e) = control.bind(&cfg.control_endpoint) {
-        error!(
-            "Failed to bind listener control socket to {}: {}",
-            cfg.control_endpoint, e
-        );
+        let _ = cfg.ready_tx.send(Err(format!(
+            "Failed to bind listener control socket to {}: {e}",
+            cfg.control_endpoint
+        )));
         return;
     }
+
+    // Signal that the listener is ready
+    let _ = cfg.ready_tx.send(Ok(()));
 
     loop {
         // Poll both ROUTER and control sockets
@@ -156,14 +173,10 @@ pub(crate) fn run_listener(cfg: ListenerConfig) {
                     m.record_rejection(velo_observability::TransportRejection::DrainRejected);
                 }
                 debug!("ZMQ: rejecting Message frame during drain (dropping without reply)");
-                // NOTE: We intentionally do not send a ShuttingDown reply back to the
-                // remote DEALER identity here, because DEALER sockets in this design
-                // are write-only and would never receive it. Higher layers are responsible
-                // for propagating shutdown notifications via the appropriate outbound path.
                 continue;
             }
 
-            // Convert to Bytes (single copy from ZMQ buffer → Bytes)
+            // Copy from ZMQ-owned buffers into Bytes (one copy per frame)
             let header = Bytes::copy_from_slice(header_frame);
             let payload = Bytes::copy_from_slice(payload_frame);
 
