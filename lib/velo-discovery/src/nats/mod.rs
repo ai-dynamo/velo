@@ -213,10 +213,10 @@ async fn reply_peer_info(
     msg: &async_nats::Message,
     peer_info_bytes: &Bytes,
 ) {
-    if let Some(reply) = &msg.reply {
-        if let Err(e) = client.publish(reply.clone(), peer_info_bytes.clone()).await {
-            tracing::warn!(error = %e, "Failed to reply to discovery request");
-        }
+    if let Some(reply) = &msg.reply
+        && let Err(e) = client.publish(reply.clone(), peer_info_bytes.clone()).await
+    {
+        tracing::warn!(error = %e, "Failed to reply to discovery request");
     }
     // Requests with no reply inbox are silently ignored
 }

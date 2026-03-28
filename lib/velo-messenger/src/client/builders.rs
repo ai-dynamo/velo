@@ -737,7 +737,7 @@ impl MessageBuilder {
                 });
                 Ok(())
             }
-            Err(ResolveError::Other(e)) => Err(e.into()),
+            Err(ResolveError::Other(e)) => Err(e),
         }
     }
 

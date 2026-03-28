@@ -468,6 +468,7 @@ async fn connection_writer_task(
 
 /// Inner loop: connect, open bidi stream, and send frames until the channel
 /// closes or a send error occurs.
+#[allow(clippy::too_many_arguments)]
 async fn connection_writer_inner(
     addr: SocketAddr,
     instance_id: crate::InstanceId,

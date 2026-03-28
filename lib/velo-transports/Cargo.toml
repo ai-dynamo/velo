@@ -17,6 +17,7 @@ default = ["http", "nats", "grpc"]
 http = ["dep:axum", "dep:reqwest"]
 nats = ["dep:async-nats", "dep:bs58"]
 grpc = ["dep:tonic", "dep:prost", "dep:tower", "dep:hyper", "dep:http", "dep:http-body", "dep:http-body-util", "dep:hyper-util", "dep:tokio-stream"]
+zmq = ["dep:zmq"]
 distributed-tracing = ["velo-observability/distributed-tracing"]
 
 [dependencies]
@@ -63,6 +64,7 @@ http-body = { version = "1.0", optional = true }
 http-body-util = { version = "0.1", optional = true }
 hyper-util = { version = "0.1", optional = true, features = ["tokio", "server", "server-auto"] }
 tokio-stream = { version = "0.1", optional = true, features = ["sync"] }
+zmq = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

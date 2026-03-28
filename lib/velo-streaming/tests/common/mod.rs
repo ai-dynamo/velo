@@ -61,6 +61,7 @@ impl FrameTransport for MockFrameTransport {
 }
 
 /// Create an [`AnchorManager`] backed by [`MockFrameTransport`].
+#[allow(dead_code)]
 pub async fn make_mock_manager() -> Arc<AnchorManager> {
     Arc::new(AnchorManager::new(
         WorkerId::from_u64(1),
@@ -91,9 +92,7 @@ macro_rules! run_transport_tests {
             use futures::StreamExt;
             use std::sync::Arc;
             use velo_common::WorkerId;
-            use velo_streaming::{
-                AnchorManager, AttachError, StreamAnchorHandle, StreamError, StreamFrame,
-            };
+            use velo_streaming::{AnchorManager, AttachError, StreamAnchorHandle, StreamFrame};
 
             async fn manager() -> Arc<AnchorManager> {
                 $make_manager
