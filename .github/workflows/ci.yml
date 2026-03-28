@@ -95,6 +95,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
     services:
       nats:
         image: nats:latest
@@ -126,8 +128,6 @@ jobs:
       run: cargo metadata --locked --format-version 1 > /dev/null
     - name: Compile tests
       run: cargo test --locked --all-features --no-run
-      env:
-        RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
     - name: Run doc tests
       run: cargo test --locked --all-features --doc
     - name: Run unit tests
@@ -138,6 +138,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
     services:
       nats:
         image: nats:latest
