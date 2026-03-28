@@ -17,7 +17,7 @@ velo-common = { workspace = true }
 velo-transports = { workspace = true }
 velo-discovery = { workspace = true }
 velo-observability = { workspace = true }
-loom-rs = { path = "../../../loom-rs", features = ["sim"] }
+loom-rs = { version = "0.5.0", features = ["sim"] }
 bytes = { workspace = true }
 dashmap = { workspace = true }
 futures = { workspace = true }

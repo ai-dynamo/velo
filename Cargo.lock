@@ -1326,6 +1326,8 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 [[package]]
 name = "loom-macros"
 version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d581a1e3891a7a9c7876c6a1a315ff54fbb49e98efcbf2a927d22d4d01d8db1c"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1335,6 +1337,8 @@ dependencies = [
 [[package]]
 name = "loom-rs"
 version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "efcf1a3c1b43c05d1ec85131724b11054495b9df8f2a5b5c90fdb25dfa8c6333"
 dependencies = [
  "clap",
  "core_affinity",
