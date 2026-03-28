@@ -12,6 +12,7 @@ members = [
     "lib/velo-transports",
     "lib/velo-streaming",
     "lib/velo-rendezvous",
+    "lib/velo-simulation",
 ]
 resolver = "3"
 
