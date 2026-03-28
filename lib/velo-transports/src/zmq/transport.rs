@@ -545,6 +545,11 @@ fn create_dealer_socket(
     // Set a send timeout to avoid blocking forever on a dead peer
     sock.set_sndtimeo(5000)
         .context("Failed to set ZMQ_SNDTIMEO")?;
+    // Only queue messages for peers that have completed the TCP handshake.
+    // Without this, messages to not-yet-connected peers sit in ZMQ's queue,
+    // adding latency to the first message.
+    sock.set_immediate(true)
+        .context("Failed to set ZMQ_IMMEDIATE")?;
     // ZMQ connect is asynchronous — messages sent before the handshake
     // completes will be queued internally by ZMQ and delivered once connected.
     // No post-connect sleep needed; avoids blocking the shared sender thread.
@@ -651,6 +656,9 @@ impl ZmqTransportBuilder {
         router
             .set_router_mandatory(true)
             .context("Failed to set ZMQ_ROUTER_MANDATORY")?;
+        router
+            .set_immediate(true)
+            .context("Failed to set ZMQ_IMMEDIATE")?;
         router.bind(&requested_endpoint).context(format!(
             "Failed to bind ROUTER socket to {}",
             requested_endpoint
