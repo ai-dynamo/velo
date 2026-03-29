@@ -74,14 +74,18 @@ All transports implement the `Transport` trait (`velo-transports/src/transport.r
 - Uses **DEALER/ROUTER** pattern: ROUTER on listener, multiplexed DEALERs on sender.
 - The `zmq` 0.10 crate's `send()` requires `&[u8]` (implements `Sendable`), not `&[u8; N]` — use slice references.
 - `zmq` 0.10 does not expose `recv_monitor_event()` — parse raw two-frame monitor messages manually (u16 LE event ID + u32 LE value, then address frame).
+- `zmq` 0.10 / zmq-sys 0.12 bundles **libzmq 4.3.1** — `ZMQ_TCP_NODELAY` (constant 167) is NOT available (requires libzmq 4.3.3+). The Rust bindings do not expose it.
 - Pre-bind the ROUTER socket in `build()` and pass it to the listener thread to avoid TOCTOU port races with port 0.
-- Use `inproc://` PAIR sockets for control signaling between async code and I/O threads.
+- Use `inproc://` PAIR sockets for control signaling between async code and I/O threads (listener thread only — the sender thread uses `SenderCommand::Shutdown` via the flume channel).
 - Both I/O threads must signal readiness (via `std::sync::mpsc::SyncSender`) before `start()` returns, preventing shutdown deadlocks.
+- **ZMQ has ~2.5x higher latency than TCP** (~85µs vs ~33µs RTT in ping-pong). This is inherent to ZMQ's architecture: each message direction crosses an extra ZMQ I/O thread hop (application thread ↔ libzmq I/O thread), adding ~4 thread wake-ups per round trip. This is the tradeoff for ZMQ's automatic reconnection, message queuing, and identity routing.
+- When receiving ZMQ multipart messages, prefer `Bytes::from(Vec<u8>)` (O(1) ownership transfer) over `Bytes::copy_from_slice(&[u8])` (O(n) memcpy). `recv_multipart()` returns `Vec<Vec<u8>>` where each inner Vec already owns a copy from ZMQ's internal buffer — converting to `Bytes::from()` avoids a redundant second copy.
 
 ## Code Style
 
 - Rust edition 2024 with let-chains (`if let ... && let ...`) preferred over nested `if let`
 - Clippy with `-D warnings` — zero warnings policy
 - No `#[allow(clippy::too_many_arguments)]` on new code — use config structs instead
-- Prefer `Bytes` / `BytesMut` for message data (zero-copy slicing via `split_to().freeze()`)
+- Prefer `Bytes` / `BytesMut` for message data (zero-copy slicing via `split_to().freeze()`). When converting from owned `Vec<u8>`, use `Bytes::from(vec)` (O(1) ownership transfer) not `Bytes::copy_from_slice(&vec)` (O(n) memcpy).
 - Use `DashMap` for lock-free concurrent state, `flume` for bounded channels
+- For ZMQ socket options that need non-Send thread isolation, use `OnceLock` for set-once values (lock-free reads) instead of `Mutex<Option<T>>` when the value never needs to be cleared.

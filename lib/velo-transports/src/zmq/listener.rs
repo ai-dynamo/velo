@@ -59,6 +59,9 @@ pub(crate) fn run_listener(cfg: ListenerConfig) {
         if let Err(e) = router.set_router_mandatory(true) {
             warn!("Failed to set ZMQ_ROUTER_MANDATORY: {}", e);
         }
+        if let Err(e) = router.set_immediate(true) {
+            warn!("Failed to set ZMQ_IMMEDIATE: {}", e);
+        }
 
         if let Err(e) = router.bind(&cfg.bind_endpoint) {
             let _ = cfg.ready_tx.send(Err(format!(
@@ -120,7 +123,7 @@ pub(crate) fn run_listener(cfg: ListenerConfig) {
         // Check ROUTER socket for inbound messages
         if poll_items[0].is_readable() {
             // ROUTER delivers: [identity, msg_type_frame, header_frame, payload_frame]
-            let multipart = match router.recv_multipart(0) {
+            let mut multipart = match router.recv_multipart(0) {
                 Ok(parts) => parts,
                 Err(e) => {
                     warn!("Error receiving multipart message: {}", e);
@@ -140,45 +143,55 @@ pub(crate) fn run_listener(cfg: ListenerConfig) {
                 continue;
             }
 
-            let type_frame = &multipart[1];
-            let header_frame = &multipart[2];
-            let payload_frame = &multipart[3];
-
             // Parse message type
-            if type_frame.len() != 1 {
+            if multipart[1].len() != 1 {
                 if let Some(ref m) = cfg.metrics {
                     m.record_rejection(velo_observability::TransportRejection::DecodeError);
                 }
                 warn!(
                     "ZMQ: message type frame should be 1 byte, got {}",
-                    type_frame.len()
+                    multipart[1].len()
                 );
                 continue;
             }
 
-            let msg_type = match MessageType::from_u8(type_frame[0]) {
+            let msg_type = match MessageType::from_u8(multipart[1][0]) {
                 Some(t) => t,
                 None => {
                     if let Some(ref m) = cfg.metrics {
                         m.record_rejection(velo_observability::TransportRejection::DecodeError);
                     }
-                    warn!("ZMQ: invalid message type byte: {}", type_frame[0]);
+                    warn!("ZMQ: invalid message type byte: {}", multipart[1][0]);
                     continue;
                 }
             };
 
-            // During drain: reject new Message frames (do not send reply to DEALER identity)
+            // During drain: reject new Message frames with ShuttingDown reply.
+            // Echo the header for correlation, empty payload — matches TCP behavior.
             if cfg.shutdown_state.is_draining() && msg_type == MessageType::Message {
                 if let Some(ref m) = cfg.metrics {
                     m.record_rejection(velo_observability::TransportRejection::DrainRejected);
                 }
-                debug!("ZMQ: rejecting Message frame during drain (dropping without reply)");
+                debug!("ZMQ: rejecting Message frame during drain (sending ShuttingDown)");
+                let type_byte: &[u8] = &[MessageType::ShuttingDown.as_u8()];
+                let empty: &[u8] = &[];
+                let _ = router.send_multipart(
+                    [
+                        multipart[0].as_slice(),
+                        type_byte,
+                        multipart[2].as_slice(),
+                        empty,
+                    ],
+                    0,
+                );
                 continue;
             }
 
-            // Copy from ZMQ-owned buffers into Bytes (one copy per frame)
-            let header = Bytes::copy_from_slice(header_frame);
-            let payload = Bytes::copy_from_slice(payload_frame);
+            // Take ownership of Vec buffers — O(1), no memcpy.
+            // recv_multipart() already copied from ZMQ-owned buffers into Vecs;
+            // Bytes::from(Vec<u8>) wraps the existing allocation without copying.
+            let header = Bytes::from(std::mem::take(&mut multipart[2]));
+            let payload = Bytes::from(std::mem::take(&mut multipart[3]));
 
             // Record metrics
             if let Some(ref m) = cfg.metrics {
