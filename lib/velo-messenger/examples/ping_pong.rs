@@ -12,6 +12,7 @@ use clap::{Parser, ValueEnum};
 use velo_messenger::{Handler, Messenger};
 use velo_transports::Transport;
 use velo_transports::tcp::TcpTransportBuilder;
+#[cfg(unix)]
 use velo_transports::uds::UdsTransportBuilder;
 
 #[cfg(feature = "grpc")]
@@ -29,6 +30,7 @@ enum TransportType {
     /// TCP transport (default)
     Tcp,
     /// Unix domain socket transport
+    #[cfg(unix)]
     Uds,
     /// ZMQ DEALER/ROUTER transport
     #[cfg(feature = "zmq")]
@@ -54,6 +56,7 @@ async fn new_transport(transport_type: &TransportType) -> Arc<dyn Transport> {
                     .unwrap(),
             )
         }
+        #[cfg(unix)]
         TransportType::Uds => {
             let socket_path =
                 std::env::temp_dir().join(format!("velo-ping-pong-{}.sock", uuid::Uuid::new_v4()));

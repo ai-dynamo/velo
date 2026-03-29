@@ -199,10 +199,12 @@ impl Transport for NatsTransport {
                 let tx = tx.clone();
                 if let Some(rt) = self.runtime.get() {
                     rt.spawn(async move {
-                        if tx.send_async(task).await.is_err() {
-                            // Channel closed — sender task exited.
-                            // The NatsSendTask is dropped with its on_error unused;
-                            // this is acceptable during shutdown.
+                        if let Err(flume::SendError(task)) = tx.send_async(task).await {
+                            task.on_error.on_error(
+                                task.header,
+                                task.payload,
+                                "NATS sender task exited (backpressure)".into(),
+                            );
                         }
                     });
                 } else {
@@ -362,6 +364,36 @@ impl Transport for NatsTransport {
     }
 }
 
+/// Build NATS headers and concatenated payload from a [`NatsSendTask`].
+///
+/// Returns `(headers, payload)` ready for `client.publish_with_headers()`.
+fn build_nats_frame(
+    message_type: MessageType,
+    header: &Bytes,
+    payload: &Bytes,
+) -> (async_nats::HeaderMap, Bytes) {
+    let mut nats_headers = async_nats::HeaderMap::new();
+    nats_headers.insert(
+        HEADER_VELO_TYPE,
+        VELO_TYPE_STRINGS[message_type as u8 as usize],
+    );
+    let hlen_str = header.len().to_string();
+    nats_headers.insert(HEADER_VELO_HLEN, hlen_str);
+
+    let nats_payload: Bytes = if header.is_empty() {
+        payload.clone()
+    } else if payload.is_empty() {
+        header.clone()
+    } else {
+        let mut buf = BytesMut::with_capacity(header.len() + payload.len());
+        buf.put(header.as_ref());
+        buf.put(payload.as_ref());
+        buf.freeze()
+    };
+
+    (nats_headers, nats_payload)
+}
+
 /// Dedicated sender task that drains the bounded channel and publishes to NATS.
 ///
 /// Runs until the cancellation token fires or the channel is closed (all senders dropped).
@@ -383,30 +415,11 @@ async fn run_sender_task(
             result = rx.recv_async() => {
                 match result {
                     Ok(task) => {
-                        // Build NATS headers with Velo frame metadata (D-05a).
-                        let mut nats_headers = async_nats::HeaderMap::new();
-                        nats_headers.insert(
-                            HEADER_VELO_TYPE,
-                            VELO_TYPE_STRINGS[task.message_type as u8 as usize],
+                        let (nats_headers, nats_payload) = build_nats_frame(
+                            task.message_type,
+                            &task.header,
+                            &task.payload,
                         );
-                        nats_headers.insert(
-                            HEADER_VELO_HLEN,
-                            task.header.len().to_string().as_str(),
-                        );
-
-                        // NATS payload = velo_header ++ velo_payload (no binary preamble — D-05a).
-                        let nats_payload: Bytes = if task.header.is_empty() {
-                            task.payload.clone()
-                        } else if task.payload.is_empty() {
-                            task.header.clone()
-                        } else {
-                            let mut buf = BytesMut::with_capacity(
-                                task.header.len() + task.payload.len(),
-                            );
-                            buf.put(task.header.as_ref());
-                            buf.put(task.payload.as_ref());
-                            buf.freeze()
-                        };
 
                         if let Some(metrics) = metrics.as_ref() {
                             metrics.record_frame(
@@ -531,7 +544,7 @@ async fn run_receive_loop(
                             continue;
                         }
                             // D-04: Non-Message frames (Response, Ack, Event) fall through
-                            // to normal ack + routing below.
+                            // to routing below.
                         }
 
                         route_frame(&msg, &adapter, &transport_key, metrics.as_ref());
@@ -861,5 +874,70 @@ mod tests {
     fn test_shutting_down_response_type_value() {
         // Verify ShuttingDown is type 4 (used in drain gate Velo-Type header)
         assert_eq!(MessageType::ShuttingDown as u8, 4);
+    }
+
+    #[test]
+    fn test_build_nats_frame_header_and_payload() {
+        let header = Bytes::from_static(b"hdr");
+        let payload = Bytes::from_static(b"payload");
+        let (nats_headers, nats_payload) =
+            build_nats_frame(MessageType::Message, &header, &payload);
+
+        assert_eq!(nats_headers.get(HEADER_VELO_TYPE).unwrap().as_str(), "0");
+        assert_eq!(nats_headers.get(HEADER_VELO_HLEN).unwrap().as_str(), "3");
+        assert_eq!(&nats_payload[..], b"hdrpayload");
+    }
+
+    #[test]
+    fn test_build_nats_frame_empty_header() {
+        let header = Bytes::new();
+        let payload = Bytes::from_static(b"payload");
+        let (nats_headers, nats_payload) =
+            build_nats_frame(MessageType::Response, &header, &payload);
+
+        assert_eq!(nats_headers.get(HEADER_VELO_TYPE).unwrap().as_str(), "1");
+        assert_eq!(nats_headers.get(HEADER_VELO_HLEN).unwrap().as_str(), "0");
+        assert_eq!(&nats_payload[..], b"payload");
+    }
+
+    #[test]
+    fn test_build_nats_frame_empty_payload() {
+        let header = Bytes::from_static(b"hdr");
+        let payload = Bytes::new();
+        let (nats_headers, nats_payload) = build_nats_frame(MessageType::Event, &header, &payload);
+
+        assert_eq!(nats_headers.get(HEADER_VELO_TYPE).unwrap().as_str(), "3");
+        assert_eq!(nats_headers.get(HEADER_VELO_HLEN).unwrap().as_str(), "3");
+        assert_eq!(&nats_payload[..], b"hdr");
+    }
+
+    #[test]
+    fn test_build_nats_frame_both_empty() {
+        let header = Bytes::new();
+        let payload = Bytes::new();
+        let (nats_headers, nats_payload) = build_nats_frame(MessageType::Ack, &header, &payload);
+
+        assert_eq!(nats_headers.get(HEADER_VELO_TYPE).unwrap().as_str(), "2");
+        assert_eq!(nats_headers.get(HEADER_VELO_HLEN).unwrap().as_str(), "0");
+        assert!(nats_payload.is_empty());
+    }
+
+    #[test]
+    fn test_build_nats_frame_all_message_types() {
+        for (msg_type, expected) in [
+            (MessageType::Message, "0"),
+            (MessageType::Response, "1"),
+            (MessageType::Ack, "2"),
+            (MessageType::Event, "3"),
+            (MessageType::ShuttingDown, "4"),
+        ] {
+            let (headers, _) = build_nats_frame(msg_type, &Bytes::new(), &Bytes::new());
+            assert_eq!(
+                headers.get(HEADER_VELO_TYPE).unwrap().as_str(),
+                expected,
+                "Velo-Type mismatch for {:?}",
+                msg_type
+            );
+        }
     }
 }
