@@ -286,10 +286,37 @@ impl Transport for TcpTransport {
                     // shard lock while blocked.
                     let tx = handle.tx.clone();
                     drop(handle);
-                    if let Err(flume::SendError(send_msg)) = tx.send(send_msg) {
-                        send_msg.on_error("Connection closed");
+                    match crate::utils::blocking_strategy() {
+                        crate::utils::BlockingStrategy::BlockInPlace => {
+                            match tokio::task::block_in_place(|| tx.send(send_msg)) {
+                                Ok(()) => return,
+                                Err(flume::SendError(send_msg)) => {
+                                    // Connection died while blocked — fall through to reconnect.
+                                    self.connections
+                                        .remove_if(&instance_id, |_, h| h.tx.is_disconnected());
+                                    send_msg
+                                }
+                            }
+                        }
+                        crate::utils::BlockingStrategy::Spawn(rt) => {
+                            rt.spawn(async move {
+                                if let Err(flume::SendError(send_msg)) =
+                                    tx.send_async(send_msg).await
+                                {
+                                    send_msg.on_error("Connection closed");
+                                }
+                            });
+                            return;
+                        }
+                        crate::utils::BlockingStrategy::Direct => match tx.send(send_msg) {
+                            Ok(()) => return,
+                            Err(flume::SendError(send_msg)) => {
+                                self.connections
+                                    .remove_if(&instance_id, |_, h| h.tx.is_disconnected());
+                                send_msg
+                            }
+                        },
                     }
-                    return;
                 }
                 Err(flume::TrySendError::Disconnected(send_msg)) => {
                     // Drop the guard before mutating the map
