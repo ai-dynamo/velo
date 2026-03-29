@@ -37,7 +37,8 @@ fn main() -> anyhow::Result<()> {
     let fabric_setup = fabric.clone();
     let discovery_setup = discovery.clone();
     let (velo_a, velo_b) = sim.run_until_complete(async move {
-        let transport_a = Arc::new(SimTransport::new(fabric_setup.clone()));
+        let transport_a =
+            Arc::new(SimTransport::new(fabric_setup.clone()).expect("SimTransport A"));
         let a = velo::Velo::builder()
             .add_transport(transport_a)
             .discovery(discovery_setup.clone())
@@ -45,7 +46,8 @@ fn main() -> anyhow::Result<()> {
             .await
             .expect("build velo A");
 
-        let transport_b = Arc::new(SimTransport::new(fabric_setup.clone()));
+        let transport_b =
+            Arc::new(SimTransport::new(fabric_setup.clone()).expect("SimTransport B"));
         let b = velo::Velo::builder()
             .add_transport(transport_b)
             .discovery(discovery_setup.clone())

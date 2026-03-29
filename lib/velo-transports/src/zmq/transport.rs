@@ -318,8 +318,10 @@ impl Transport for ZmqTransport {
 
         // Signal the sender thread to stop via the message channel.
         // This unblocks the sender's blocking recv() without polling.
-        if let Some(tx) = self.sender_tx.get() {
-            let _ = tx.send(SenderCommand::Shutdown);
+        if let Some(tx) = self.sender_tx.get()
+            && let Err(e) = tx.try_send(SenderCommand::Shutdown)
+        {
+            debug!("ZMQ shutdown signal not sent (channel full or disconnected): {e}");
         }
 
         // Join threads (they exit promptly after receiving their shutdown signals).

@@ -37,13 +37,13 @@ pub struct SimTransport {
 
 impl SimTransport {
     /// Create a new simulated transport backed by the given fabric.
-    pub fn new(fabric: Arc<SimFabric>) -> Self {
+    pub fn new(fabric: Arc<SimFabric>) -> anyhow::Result<Self> {
         let address_map: std::collections::HashMap<String, Vec<u8>> =
             [("sim".to_string(), b"sim".to_vec())].into_iter().collect();
-        let encoded = rmp_serde::to_vec(&address_map).expect("msgpack encode");
+        let encoded = rmp_serde::to_vec(&address_map)?;
         let local_address = WorkerAddress::from_encoded(Bytes::from(encoded));
 
-        Self {
+        Ok(Self {
             key: TransportKey::from("sim"),
             local_address,
             fabric,
@@ -51,7 +51,7 @@ impl SimTransport {
             adapter: OnceLock::new(),
             shutdown_state: OnceLock::new(),
             peers: DashMap::new(),
-        }
+        })
     }
 }
 
@@ -111,23 +111,28 @@ impl Transport for SimTransport {
         channels: TransportAdapter,
         _rt: tokio::runtime::Handle,
     ) -> BoxFuture<'_, anyhow::Result<()>> {
-        self.instance_id
+        let result = self
+            .instance_id
             .set(instance_id)
             .map_err(|_| anyhow::anyhow!("SimTransport already started"))
-            .ok();
+            .and_then(|_| {
+                self.adapter
+                    .set(channels.clone())
+                    .map_err(|_| anyhow::anyhow!("SimTransport adapter already set"))
+            })
+            .and_then(|_| {
+                self.shutdown_state
+                    .set(channels.shutdown_state.clone())
+                    .map_err(|_| anyhow::anyhow!("SimTransport shutdown state already set"))
+            });
 
-        let adapter = channels.clone();
-        self.adapter
-            .set(channels.clone())
-            .map_err(|_| anyhow::anyhow!("SimTransport adapter already set"))
-            .ok();
-        self.shutdown_state
-            .set(channels.shutdown_state.clone())
-            .map_err(|_| anyhow::anyhow!("SimTransport shutdown state already set"))
-            .ok();
-
-        self.fabric.register_adapter(instance_id, adapter);
-        Box::pin(async { Ok(()) })
+        match result {
+            Ok(()) => {
+                self.fabric.register_adapter(instance_id, channels);
+                Box::pin(async { Ok(()) })
+            }
+            Err(e) => Box::pin(async { Err(e) }),
+        }
     }
 
     fn shutdown(&self) {
@@ -177,7 +182,7 @@ mod tests {
         let sim = SimulationRuntime::new().unwrap();
         let handle = sim.handle();
         let fabric = Arc::new(SimFabric::new(handle, BisectionBandwidth::default()));
-        let transport = SimTransport::new(fabric);
+        let transport = SimTransport::new(fabric).unwrap();
 
         assert_eq!(transport.key(), TransportKey::from("sim"));
         assert!(transport.address().get_entry("sim").unwrap().is_some());
@@ -188,9 +193,9 @@ mod tests {
         let sim = SimulationRuntime::new().unwrap();
         let handle = sim.handle();
         let fabric = Arc::new(SimFabric::new(handle, BisectionBandwidth::default()));
-        let transport = SimTransport::new(fabric.clone());
+        let transport = SimTransport::new(fabric.clone()).unwrap();
 
-        let other = SimTransport::new(fabric);
+        let other = SimTransport::new(fabric).unwrap();
         let peer_addr = other.address();
         let peer_info = PeerInfo::new(InstanceId::new_v4(), peer_addr);
 
@@ -202,7 +207,7 @@ mod tests {
         let mut sim = SimulationRuntime::new().unwrap();
         let handle = sim.handle();
         let fabric = Arc::new(SimFabric::new(handle, BisectionBandwidth::default()));
-        let transport = Arc::new(SimTransport::new(fabric));
+        let transport = Arc::new(SimTransport::new(fabric).unwrap());
         let instance_id = InstanceId::new_v4();
         let (adapter, streams) = velo_transports::make_channels();
         let transport_start = Arc::clone(&transport);
@@ -224,7 +229,7 @@ mod tests {
         let mut sim = SimulationRuntime::new().unwrap();
         let handle = sim.handle();
         let fabric = Arc::new(SimFabric::new(handle, BisectionBandwidth::default()));
-        let transport = Arc::new(SimTransport::new(Arc::clone(&fabric)));
+        let transport = Arc::new(SimTransport::new(Arc::clone(&fabric)).unwrap());
         let instance_id = InstanceId::new_v4();
         let (adapter, _streams) = velo_transports::make_channels();
         let transport_start = Arc::clone(&transport);
@@ -247,7 +252,7 @@ mod tests {
         let sim = SimulationRuntime::new().unwrap();
         let handle = sim.handle();
         let fabric = Arc::new(SimFabric::new(handle, BisectionBandwidth::default()));
-        let transport = SimTransport::new(fabric);
+        let transport = SimTransport::new(fabric).unwrap();
 
         let result = sim
             .loom()
