@@ -75,3 +75,126 @@ pub fn try_send_or_block<T: Send + 'static>(tx: &flume::Sender<T>, msg: T) -> Se
         Err(flume::TrySendError::Disconnected(msg)) => SendOutcome::Disconnected(msg),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Fast path ──────────────────────────────────────────────────
+
+    #[test]
+    fn fast_path_sends_immediately() {
+        let (tx, rx) = flume::bounded(4);
+        assert!(matches!(try_send_or_block(&tx, 42), SendOutcome::Sent));
+        assert_eq!(rx.try_recv().unwrap(), 42);
+    }
+
+    // ── Disconnected path ──────────────────────────────────────────
+
+    #[test]
+    fn disconnected_returns_message() {
+        let (tx, rx) = flume::bounded::<String>(4);
+        drop(rx);
+        match try_send_or_block(&tx, "hello".into()) {
+            SendOutcome::Disconnected(msg) => assert_eq!(msg, "hello"),
+            SendOutcome::Sent => panic!("expected Disconnected"),
+        }
+    }
+
+    // ── Slow path (Direct — no runtime) ────────────────────────────
+
+    #[test]
+    fn slow_path_blocks_until_space_no_runtime() {
+        // Channel of capacity 1; fill it, then drain from another thread.
+        let (tx, rx) = flume::bounded(1);
+        tx.send(1).unwrap(); // fill
+
+        let tx2 = tx.clone();
+        let handle = std::thread::spawn(move || {
+            // Should block until the receiver drains.
+            try_send_or_block(&tx2, 2)
+        });
+
+        // Give the blocking send a moment to park.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Drain the first message — unblocks the sender.
+        assert_eq!(rx.recv().unwrap(), 1);
+
+        assert!(matches!(handle.join().unwrap(), SendOutcome::Sent));
+        assert_eq!(rx.recv().unwrap(), 2);
+    }
+
+    #[test]
+    fn slow_path_disconnected_no_runtime() {
+        let (tx, rx) = flume::bounded(1);
+        tx.send(1).unwrap(); // fill
+
+        // Drop receiver from another thread after a short delay, so the
+        // blocking send sees Disconnected.
+        let handle = std::thread::spawn(move || try_send_or_block(&tx, 2));
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        drop(rx);
+
+        assert!(matches!(
+            handle.join().unwrap(),
+            SendOutcome::Disconnected(2)
+        ));
+    }
+
+    // ── Slow path (BlockInPlace — multi-threaded runtime) ──────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slow_path_block_in_place_multi_thread() {
+        let (tx, rx) = flume::bounded(1);
+        tx.send(1).unwrap(); // fill
+
+        let tx2 = tx.clone();
+        let send_task = tokio::task::spawn_blocking(move || try_send_or_block(&tx2, 2));
+
+        // Drain from an async task on the runtime.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(rx.recv_async().await.unwrap(), 1);
+
+        assert!(matches!(send_task.await.unwrap(), SendOutcome::Sent));
+        assert_eq!(rx.recv_async().await.unwrap(), 2);
+    }
+
+    // ── Slow path (Spawn — current-thread runtime) ─────────────────
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_path_spawn_fallback_current_thread() {
+        let (tx, rx) = flume::bounded(1);
+        tx.send(1).unwrap(); // fill
+
+        // On current_thread, try_send_or_block spawns an async task
+        // and returns Sent immediately.
+        assert!(matches!(try_send_or_block(&tx, 2), SendOutcome::Sent));
+
+        // Drain the first message so the spawned task can complete.
+        assert_eq!(rx.recv_async().await.unwrap(), 1);
+        // Yield to let the spawned send_async task run.
+        tokio::task::yield_now().await;
+        assert_eq!(rx.recv_async().await.unwrap(), 2);
+    }
+
+    // ── blocking_strategy detection ────────────────────────────────
+
+    #[test]
+    fn strategy_direct_outside_runtime() {
+        assert!(matches!(blocking_strategy(), BlockingStrategy::Direct));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn strategy_block_in_place_on_multi_thread() {
+        assert!(matches!(
+            blocking_strategy(),
+            BlockingStrategy::BlockInPlace
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn strategy_spawn_on_current_thread() {
+        assert!(matches!(blocking_strategy(), BlockingStrategy::Spawn(_)));
+    }
+}
