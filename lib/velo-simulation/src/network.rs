@@ -78,7 +78,7 @@ impl NetworkModel for BisectionBandwidth {
             return;
         }
 
-        let per_transfer_bps = self.per_transfer_bps(transfers);
+        let per_transfer_bps = self.per_transfer_bps(transfers, now);
 
         for (transfer, bps) in transfers.iter_mut().zip(per_transfer_bps) {
             let active_after = transfer.enqueue_time + self.base_latency;
@@ -101,7 +101,7 @@ impl NetworkModel for BisectionBandwidth {
             return None;
         }
 
-        let per_transfer_bps = self.per_transfer_bps(transfers);
+        let per_transfer_bps = self.per_transfer_bps(transfers, now);
         let mut earliest_idx = 0;
         let mut earliest_time = Duration::MAX;
 
@@ -152,31 +152,48 @@ impl NetworkModel for BisectionBandwidth {
 }
 
 impl BisectionBandwidth {
-    fn per_transfer_bps(&self, transfers: &[Transfer]) -> Vec<f64> {
+    fn per_transfer_bps(&self, transfers: &[Transfer], now: Duration) -> Vec<f64> {
         let link_bps = self.link_gbps * 1e9;
         let bisection_bps = self.bisection_gbps * 1e9;
-        let mut link_counts: HashMap<(InstanceId, InstanceId), usize> = HashMap::new();
 
+        // Count only active transfers (past base_latency) per link for contention
+        let mut active_link_counts: HashMap<(InstanceId, InstanceId), usize> = HashMap::new();
         for transfer in transfers {
-            *link_counts
-                .entry((transfer.source, transfer.target))
-                .or_insert(0) += 1;
+            if now >= transfer.enqueue_time + self.base_latency {
+                *active_link_counts
+                    .entry((transfer.source, transfer.target))
+                    .or_insert(0) += 1;
+            }
         }
 
         let mut per_transfer_bps = Vec::with_capacity(transfers.len());
         for transfer in transfers {
-            let count = link_counts
+            let active = now >= transfer.enqueue_time + self.base_latency;
+            let count = active_link_counts
                 .get(&(transfer.source, transfer.target))
                 .copied()
-                .unwrap_or(1);
-            per_transfer_bps.push(link_bps / count as f64);
+                .unwrap_or(if active { 1 } else { 0 });
+            // Active transfers share link bandwidth among themselves.
+            // Inactive transfers (still in base_latency) get the full link rate
+            // as a prediction for next_completion — they don't reduce active
+            // transfers' share because they aren't counted in active_link_counts.
+            let effective_count = if active { count } else { 1 };
+            per_transfer_bps.push(link_bps / effective_count as f64);
         }
 
-        let total_bps: f64 = per_transfer_bps.iter().sum();
-        if total_bps > bisection_bps {
-            let scale = bisection_bps / total_bps;
-            for bps in &mut per_transfer_bps {
-                *bps *= scale;
+        // Bisection cap applies only to active transfers' aggregate
+        let active_total_bps: f64 = transfers
+            .iter()
+            .zip(per_transfer_bps.iter())
+            .filter(|(t, _)| now >= t.enqueue_time + self.base_latency)
+            .map(|(_, bps)| bps)
+            .sum();
+        if active_total_bps > bisection_bps {
+            let scale = bisection_bps / active_total_bps;
+            for (transfer, bps) in transfers.iter().zip(per_transfer_bps.iter_mut()) {
+                if now >= transfer.enqueue_time + self.base_latency {
+                    *bps *= scale;
+                }
             }
         }
 
