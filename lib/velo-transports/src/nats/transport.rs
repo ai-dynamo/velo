@@ -12,7 +12,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use dashmap::DashMap;
 use futures::StreamExt;
 use futures::future::BoxFuture;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -39,11 +39,22 @@ use crate::{
     },
 };
 
-/// How often to use `.request()` instead of `.publish()` for liveness probing (D-05).
+/// Static string representations of [`MessageType`] discriminants.
 ///
-/// The first send to any peer always uses `.request()` (send count == 0).
-/// After that, every `PROBE_INTERVAL`-th send will use `.request()`.
-const PROBE_INTERVAL: u64 = 100;
+/// Avoids a per-send heap allocation from `(msg_type as u8).to_string()`.
+const VELO_TYPE_STRINGS: [&str; 5] = ["0", "1", "2", "3", "4"];
+
+/// Default bounded-channel capacity for the sender task.
+const DEFAULT_SENDER_CAPACITY: usize = 1024;
+
+/// Task queued from [`send_message`](Transport::send_message) to the dedicated sender task.
+struct NatsSendTask {
+    subject: String,
+    message_type: MessageType,
+    header: Bytes,
+    payload: Bytes,
+    on_error: Arc<dyn TransportErrorHandler>,
+}
 
 /// NATS transport that implements the [`Transport`] trait.
 ///
@@ -59,8 +70,10 @@ pub struct NatsTransport {
     local_address: OnceLock<WorkerAddress>,
     /// Per-peer NATS subject strings.
     peers: Arc<DashMap<InstanceId, String>>,
-    /// Per-peer send counters for adaptive request/publish strategy.
-    send_counts: Arc<DashMap<InstanceId, AtomicU64>>,
+    /// Sender channel for the dedicated sender task (set once during `start()`).
+    sender_tx: OnceLock<flume::Sender<NatsSendTask>>,
+    /// Bounded channel capacity for the sender task.
+    sender_capacity: usize,
     /// Tokio runtime handle, set once during `start()`.
     runtime: OnceLock<tokio::runtime::Handle>,
     /// Transport-level cancellation token.
@@ -117,6 +130,7 @@ impl Transport for NatsTransport {
         Ok(())
     }
 
+    #[inline]
     fn send_message(
         &self,
         instance_id: InstanceId,
@@ -156,79 +170,54 @@ impl Transport for NatsTransport {
             return;
         }
 
-        // Get runtime handle — transport must be started before sending.
-        let rt = match self.runtime.get() {
-            Some(rt) => rt.clone(),
+        let task = NatsSendTask {
+            subject,
+            message_type,
+            header,
+            payload,
+            on_error,
+        };
+
+        // Lock-free read via OnceLock — no mutex on the hot path.
+        let tx = match self.sender_tx.get() {
+            Some(tx) => tx,
             None => {
-                on_error.on_error(header, payload, "NATS transport not started".into());
+                task.on_error.on_error(
+                    task.header,
+                    task.payload,
+                    "NATS transport not started".into(),
+                );
                 return;
             }
         };
 
-        // D-05: Determine if this send should use .request() for liveness probing.
-        // First send to a peer (count == 0) and every PROBE_INTERVAL-th send use request.
-        let count = self
-            .send_counts
-            .entry(instance_id)
-            .or_insert_with(|| AtomicU64::new(0))
-            .fetch_add(1, Ordering::Relaxed);
-        let use_request = count.is_multiple_of(PROBE_INTERVAL);
-
-        // Clone client for async move block.
-        let client = self.client.clone();
-
-        rt.spawn(async move {
-            // Build NATS headers with Velo frame metadata (D-05a).
-            let mut nats_headers = async_nats::HeaderMap::new();
-            nats_headers.insert(HEADER_VELO_TYPE, (message_type as u8).to_string().as_str());
-            nats_headers.insert(HEADER_VELO_HLEN, header.len().to_string().as_str());
-
-            // NATS payload = velo_header ++ velo_payload (no binary preamble — D-05a).
-            let nats_payload: Bytes = if header.is_empty() {
-                payload.clone()
-            } else if payload.is_empty() {
-                header.clone()
-            } else {
-                let mut buf = BytesMut::with_capacity(header.len() + payload.len());
-                buf.put(header.as_ref());
-                buf.put(payload.as_ref());
-                buf.freeze()
-            };
-
-            if use_request {
-                // D-05: Liveness probe — use request_with_headers, expect ack from receiver.
-                match tokio::time::timeout(
-                    Duration::from_secs(5),
-                    client.request_with_headers(subject, nats_headers, nats_payload),
-                )
-                .await
-                {
-                    Ok(Ok(_)) => {} // Ack received — peer is alive.
-                    Ok(Err(e)) => {
-                        on_error.on_error(
-                            header,
-                            payload,
-                            format!("NATS request failed (peer may be unreachable): {}", e),
-                        );
-                    }
-                    Err(_elapsed) => {
-                        on_error.on_error(
-                            header,
-                            payload,
-                            format!("NATS request timed out for peer {}", instance_id),
-                        );
-                    }
-                }
-            } else {
-                // Fire-and-forget publish.
-                if let Err(e) = client
-                    .publish_with_headers(subject, nats_headers, nats_payload)
-                    .await
-                {
-                    on_error.on_error(header, payload, format!("NATS publish failed: {}", e));
+        // Fast path: non-blocking try_send (matches ZMQ transport pattern).
+        match tx.try_send(task) {
+            Ok(()) => {}
+            Err(flume::TrySendError::Full(task)) => {
+                // Slow path: async backpressure.
+                let tx = tx.clone();
+                if let Some(rt) = self.runtime.get() {
+                    rt.spawn(async move {
+                        if tx.send_async(task).await.is_err() {
+                            // Channel closed — sender task exited.
+                            // The NatsSendTask is dropped with its on_error unused;
+                            // this is acceptable during shutdown.
+                        }
+                    });
+                } else {
+                    task.on_error.on_error(
+                        task.header,
+                        task.payload,
+                        "NATS transport not started".into(),
+                    );
                 }
             }
-        });
+            Err(flume::TrySendError::Disconnected(task)) => {
+                task.on_error
+                    .on_error(task.header, task.payload, "NATS sender task exited".into());
+            }
+        }
     }
 
     fn start(
@@ -275,6 +264,20 @@ impl Transport for NatsTransport {
                 health_subject = %health_subj,
                 "NATS transport started, subscriptions live"
             );
+
+            // Create bounded sender channel and spawn dedicated sender task.
+            let (sender_tx, sender_rx) = flume::bounded(self.sender_capacity);
+            let _ = self.sender_tx.set(sender_tx);
+
+            let sender_cancel = self.cancel_token.clone();
+            let sender_client = self.client.clone();
+            let sender_metrics = self.metrics.get().cloned();
+            rt.spawn(run_sender_task(
+                sender_rx,
+                sender_client,
+                sender_cancel,
+                sender_metrics,
+            ));
 
             // Spawn receive loop (LIFECYCLE-03)
             let cancel = self.cancel_token.clone();
@@ -356,6 +359,81 @@ impl Transport for NatsTransport {
                 Err(_elapsed) => Err(HealthCheckError::Timeout),
             }
         })
+    }
+}
+
+/// Dedicated sender task that drains the bounded channel and publishes to NATS.
+///
+/// Runs until the cancellation token fires or the channel is closed (all senders dropped).
+/// All NATS header construction and payload concatenation happen here, keeping the
+/// [`send_message`](Transport::send_message) hot path allocation-free.
+async fn run_sender_task(
+    rx: flume::Receiver<NatsSendTask>,
+    client: Arc<async_nats::Client>,
+    cancel: CancellationToken,
+    metrics: Option<velo_observability::TransportMetricsHandle>,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                tracing::debug!("NATS sender task cancelled");
+                break;
+            }
+            result = rx.recv_async() => {
+                match result {
+                    Ok(task) => {
+                        // Build NATS headers with Velo frame metadata (D-05a).
+                        let mut nats_headers = async_nats::HeaderMap::new();
+                        nats_headers.insert(
+                            HEADER_VELO_TYPE,
+                            VELO_TYPE_STRINGS[task.message_type as u8 as usize],
+                        );
+                        nats_headers.insert(
+                            HEADER_VELO_HLEN,
+                            task.header.len().to_string().as_str(),
+                        );
+
+                        // NATS payload = velo_header ++ velo_payload (no binary preamble — D-05a).
+                        let nats_payload: Bytes = if task.header.is_empty() {
+                            task.payload.clone()
+                        } else if task.payload.is_empty() {
+                            task.header.clone()
+                        } else {
+                            let mut buf = BytesMut::with_capacity(
+                                task.header.len() + task.payload.len(),
+                            );
+                            buf.put(task.header.as_ref());
+                            buf.put(task.payload.as_ref());
+                            buf.freeze()
+                        };
+
+                        if let Some(metrics) = metrics.as_ref() {
+                            metrics.record_frame(
+                                Direction::Outbound,
+                                crate::message_type_label(task.message_type),
+                                nats_payload.len(),
+                            );
+                        }
+
+                        if let Err(e) = client
+                            .publish_with_headers(task.subject, nats_headers, nats_payload)
+                            .await
+                        {
+                            task.on_error.on_error(
+                                task.header,
+                                task.payload,
+                                format!("NATS publish failed: {}", e),
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        tracing::debug!("NATS sender channel closed, exiting");
+                        break;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -456,12 +534,6 @@ async fn run_receive_loop(
                             // to normal ack + routing below.
                         }
 
-                        // D-05: Ack if sender used .request() (adaptive liveness probe)
-                        if let Some(reply) = &msg.reply
-                            && let Err(e) = client.publish(reply.clone(), Bytes::new()).await
-                        {
-                            tracing::warn!(error = %e, "Failed to ack data message");
-                        }
                         route_frame(&msg, &adapter, &transport_key, metrics.as_ref());
                     }
                     None => {
@@ -625,6 +697,7 @@ pub struct NatsTransportBuilder {
     client: Arc<async_nats::Client>,
     cluster_id: String,
     key: TransportKey,
+    sender_capacity: usize,
 }
 
 impl NatsTransportBuilder {
@@ -636,12 +709,19 @@ impl NatsTransportBuilder {
             client,
             cluster_id: cluster_id.into(),
             key: TransportKey::from("nats"),
+            sender_capacity: DEFAULT_SENDER_CAPACITY,
         }
     }
 
     /// Override the transport key (default: `"nats"`).
     pub fn with_key(mut self, key: impl Into<TransportKey>) -> Self {
         self.key = key.into();
+        self
+    }
+
+    /// Override the bounded sender channel capacity (default: 1024).
+    pub fn with_sender_capacity(mut self, capacity: usize) -> Self {
+        self.sender_capacity = capacity;
         self
     }
 
@@ -653,7 +733,8 @@ impl NatsTransportBuilder {
             cluster_id: self.cluster_id,
             local_address: OnceLock::new(),
             peers: Arc::new(DashMap::new()),
-            send_counts: Arc::new(DashMap::new()),
+            sender_tx: OnceLock::new(),
+            sender_capacity: self.sender_capacity,
             runtime: OnceLock::new(),
             cancel_token: CancellationToken::new(),
             begin_shutdown_token: CancellationToken::new(),

@@ -12,6 +12,7 @@ use clap::{Parser, ValueEnum};
 use velo_messenger::{Handler, Messenger};
 use velo_transports::Transport;
 use velo_transports::tcp::TcpTransportBuilder;
+use velo_transports::uds::UdsTransportBuilder;
 
 #[cfg(feature = "grpc")]
 use velo_transports::grpc::GrpcTransportBuilder;
@@ -27,6 +28,8 @@ use tokio::time::sleep;
 enum TransportType {
     /// TCP transport (default)
     Tcp,
+    /// Unix domain socket transport
+    Uds,
     /// ZMQ DEALER/ROUTER transport
     #[cfg(feature = "zmq")]
     Zmq,
@@ -47,6 +50,16 @@ async fn new_transport(transport_type: &TransportType) -> Arc<dyn Transport> {
                 TcpTransportBuilder::new()
                     .from_listener(listener)
                     .unwrap()
+                    .build()
+                    .unwrap(),
+            )
+        }
+        TransportType::Uds => {
+            let socket_path =
+                std::env::temp_dir().join(format!("velo-ping-pong-{}.sock", uuid::Uuid::new_v4()));
+            Arc::new(
+                UdsTransportBuilder::new()
+                    .socket_path(&socket_path)
                     .build()
                     .unwrap(),
             )
