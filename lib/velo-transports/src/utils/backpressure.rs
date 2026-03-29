@@ -5,7 +5,9 @@
 
 /// Outcome of [`try_send_or_block`].
 pub enum SendOutcome<T> {
-    /// Message was delivered to the channel.
+    /// Message was delivered to the channel (or, on a single-threaded
+    /// runtime, enqueued via a spawned async task — delivery is best-effort
+    /// in that case).
     Sent,
     /// The receiver has been dropped; the message is returned.
     Disconnected(T),
@@ -109,15 +111,19 @@ mod tests {
         let (tx, rx) = flume::bounded(1);
         tx.send(1).unwrap(); // fill
 
+        // Signal that the sender thread has started (and is about to block).
+        let started = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let started2 = started.clone();
+
         let tx2 = tx.clone();
         let handle = std::thread::spawn(move || {
+            started2.wait();
             // Should block until the receiver drains.
             try_send_or_block(&tx2, 2)
         });
 
-        // Give the blocking send a moment to park.
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        // Drain the first message — unblocks the sender.
+        // Wait for the sender thread to start, then drain.
+        started.wait();
         assert_eq!(rx.recv().unwrap(), 1);
 
         assert!(matches!(handle.join().unwrap(), SendOutcome::Sent));
@@ -129,11 +135,16 @@ mod tests {
         let (tx, rx) = flume::bounded(1);
         tx.send(1).unwrap(); // fill
 
-        // Drop receiver from another thread after a short delay, so the
-        // blocking send sees Disconnected.
-        let handle = std::thread::spawn(move || try_send_or_block(&tx, 2));
+        let started = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let started2 = started.clone();
 
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        let handle = std::thread::spawn(move || {
+            started2.wait();
+            try_send_or_block(&tx, 2)
+        });
+
+        // Wait for sender to start, then drop receiver so it sees Disconnected.
+        started.wait();
         drop(rx);
 
         assert!(matches!(
@@ -152,8 +163,8 @@ mod tests {
         let tx2 = tx.clone();
         let send_task = tokio::task::spawn_blocking(move || try_send_or_block(&tx2, 2));
 
-        // Drain from an async task on the runtime.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Yield to let spawn_blocking start, then drain.
+        tokio::task::yield_now().await;
         assert_eq!(rx.recv_async().await.unwrap(), 1);
 
         assert!(matches!(send_task.await.unwrap(), SendOutcome::Sent));

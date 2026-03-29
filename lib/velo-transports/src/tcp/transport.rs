@@ -294,6 +294,7 @@ impl Transport for TcpTransport {
                                     // Connection died while blocked — fall through to reconnect.
                                     self.connections
                                         .remove_if(&instance_id, |_, h| h.tx.is_disconnected());
+                                    self.update_connection_gauge();
                                     send_msg
                                 }
                             }
@@ -313,6 +314,7 @@ impl Transport for TcpTransport {
                             Err(flume::SendError(send_msg)) => {
                                 self.connections
                                     .remove_if(&instance_id, |_, h| h.tx.is_disconnected());
+                                self.update_connection_gauge();
                                 send_msg
                             }
                         },
