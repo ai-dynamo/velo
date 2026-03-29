@@ -171,29 +171,14 @@ impl Transport for ZmqTransport {
             }
         };
 
-        // Fast path: non-blocking try_send
+        // Fast path: non-blocking try_send, slow path: block for backpressure.
         let cmd = SenderCommand::Send(task);
-        match tx.try_send(cmd) {
-            Ok(()) => {}
-            Err(flume::TrySendError::Full(cmd)) => {
-                // Slow path: async backpressure
-                let tx = tx.clone();
-                if let Some(rt) = self.runtime.get() {
-                    rt.spawn(async move {
-                        if let Err(flume::SendError(SenderCommand::Send(task))) =
-                            tx.send_async(cmd).await
-                        {
-                            task.on_error("Sender channel closed");
-                        }
-                    });
-                } else if let SenderCommand::Send(task) = cmd {
-                    task.on_error("Transport not started");
-                }
-            }
-            Err(flume::TrySendError::Disconnected(SenderCommand::Send(task))) => {
+        match crate::utils::try_send_or_block(tx, cmd) {
+            crate::utils::SendOutcome::Sent => {}
+            crate::utils::SendOutcome::Disconnected(SenderCommand::Send(task)) => {
                 task.on_error("Sender thread exited");
             }
-            Err(flume::TrySendError::Disconnected(SenderCommand::Shutdown)) => {}
+            crate::utils::SendOutcome::Disconnected(SenderCommand::Shutdown) => {}
         }
     }
 

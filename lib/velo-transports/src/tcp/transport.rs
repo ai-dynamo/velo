@@ -280,7 +280,17 @@ impl Transport for TcpTransport {
         let send_msg = match self.connections.get(&instance_id) {
             Some(handle) => match handle.tx.try_send(send_msg) {
                 Ok(()) => return,
-                Err(flume::TrySendError::Full(send_msg)) => send_msg,
+                Err(flume::TrySendError::Full(send_msg)) => {
+                    // Backpressure: block until the writer drains space.
+                    // Clone tx and drop the DashMap guard to avoid holding the
+                    // shard lock while blocked.
+                    let tx = handle.tx.clone();
+                    drop(handle);
+                    if let Err(flume::SendError(send_msg)) = tx.send(send_msg) {
+                        send_msg.on_error("Connection closed");
+                    }
+                    return;
+                }
                 Err(flume::TrySendError::Disconnected(send_msg)) => {
                     // Drop the guard before mutating the map
                     drop(handle);
@@ -293,7 +303,7 @@ impl Transport for TcpTransport {
             None => send_msg,
         };
 
-        // Slow path: create new connection
+        // Slow path: reconnect only (channel full is handled above with blocking send)
         let rt = match self.runtime.get() {
             Some(rt) => rt,
             None => {

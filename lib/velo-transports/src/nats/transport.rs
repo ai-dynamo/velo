@@ -191,31 +191,10 @@ impl Transport for NatsTransport {
             }
         };
 
-        // Fast path: non-blocking try_send (matches ZMQ transport pattern).
-        match tx.try_send(task) {
-            Ok(()) => {}
-            Err(flume::TrySendError::Full(task)) => {
-                // Slow path: async backpressure.
-                let tx = tx.clone();
-                if let Some(rt) = self.runtime.get() {
-                    rt.spawn(async move {
-                        if let Err(flume::SendError(task)) = tx.send_async(task).await {
-                            task.on_error.on_error(
-                                task.header,
-                                task.payload,
-                                "NATS sender task exited (backpressure)".into(),
-                            );
-                        }
-                    });
-                } else {
-                    task.on_error.on_error(
-                        task.header,
-                        task.payload,
-                        "NATS transport not started".into(),
-                    );
-                }
-            }
-            Err(flume::TrySendError::Disconnected(task)) => {
+        // Fast path: non-blocking try_send, slow path: block for backpressure.
+        match crate::utils::try_send_or_block(tx, task) {
+            crate::utils::SendOutcome::Sent => {}
+            crate::utils::SendOutcome::Disconnected(task) => {
                 task.on_error
                     .on_error(task.header, task.payload, "NATS sender task exited".into());
             }

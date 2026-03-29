@@ -3,6 +3,8 @@
 
 //! Shared utility functions for transport implementations.
 
+pub mod backpressure;
 pub mod interfaces;
 
+pub use backpressure::*;
 pub use interfaces::*;

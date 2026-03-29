@@ -89,3 +89,14 @@ All transports implement the `Transport` trait (`velo-transports/src/transport.r
 - Prefer `Bytes` / `BytesMut` for message data (zero-copy slicing via `split_to().freeze()`). When converting from owned `Vec<u8>`, use `Bytes::from(vec)` (O(1) ownership transfer) not `Bytes::copy_from_slice(&vec)` (O(n) memcpy).
 - Use `DashMap` for lock-free concurrent state, `flume` for bounded channels
 - For ZMQ socket options that need non-Send thread isolation, use `OnceLock` for set-once values (lock-free reads) instead of `Mutex<Option<T>>` when the value never needs to be cleared.
+
+### Send-Path Backpressure
+
+All transports use a two-tier send pattern:
+- **Fast path**: `try_send()` — non-blocking, zero-allocation.
+- **Slow path (Full)**: `tx.send()` — blocks the caller until the writer drains space. Never spawn a task per message.
+- **Disconnected**: Return error or fall through to reconnection logic.
+
+Use `try_send_or_block()` from `velo-transports/src/utils/backpressure.rs` for single-channel transports (ZMQ, NATS). For connection-based transports (TCP, gRPC, UDS), clone the sender and drop the DashMap guard before blocking.
+
+Channel capacity is configurable via each transport's builder (default: 256, NATS: 1024).
