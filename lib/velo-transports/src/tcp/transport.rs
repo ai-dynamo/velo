@@ -281,44 +281,11 @@ impl Transport for TcpTransport {
             Some(handle) => match handle.tx.try_send(send_msg) {
                 Ok(()) => return,
                 Err(flume::TrySendError::Full(send_msg)) => {
-                    // Backpressure: block until the writer drains space.
-                    // Clone tx and drop the DashMap guard to avoid holding the
-                    // shard lock while blocked.
-                    let tx = handle.tx.clone();
+                    // Fail-fast: report channel full via error callback.
+                    // Drop the DashMap guard before invoking the callback.
                     drop(handle);
-                    match crate::utils::blocking_strategy() {
-                        crate::utils::BlockingStrategy::BlockInPlace => {
-                            match tokio::task::block_in_place(|| tx.send(send_msg)) {
-                                Ok(()) => return,
-                                Err(flume::SendError(send_msg)) => {
-                                    // Connection died while blocked — fall through to reconnect.
-                                    self.connections
-                                        .remove_if(&instance_id, |_, h| h.tx.is_disconnected());
-                                    self.update_connection_gauge();
-                                    send_msg
-                                }
-                            }
-                        }
-                        crate::utils::BlockingStrategy::Spawn(rt) => {
-                            rt.spawn(async move {
-                                if let Err(flume::SendError(send_msg)) =
-                                    tx.send_async(send_msg).await
-                                {
-                                    send_msg.on_error("Connection closed");
-                                }
-                            });
-                            return;
-                        }
-                        crate::utils::BlockingStrategy::Direct => match tx.send(send_msg) {
-                            Ok(()) => return,
-                            Err(flume::SendError(send_msg)) => {
-                                self.connections
-                                    .remove_if(&instance_id, |_, h| h.tx.is_disconnected());
-                                self.update_connection_gauge();
-                                send_msg
-                            }
-                        },
-                    }
+                    send_msg.on_error(crate::utils::CHANNEL_FULL_ERROR);
+                    return;
                 }
                 Err(flume::TrySendError::Disconnected(send_msg)) => {
                     // Drop the guard before mutating the map
@@ -631,7 +598,7 @@ impl TcpTransportBuilder {
         Self {
             bind_addr: None,
             key: None,
-            channel_capacity: 256,
+            channel_capacity: crate::utils::DEFAULT_CHANNEL_CAPACITY,
             connect_timeout: Duration::from_secs(5),
             listener: None,
             interface_filter: InterfaceFilter::default(),
@@ -1153,6 +1120,47 @@ mod tests {
         assert!(
             !connections.contains_key(&iid),
             "writer task should clean up its DashMap entry on connect failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_send_message_channel_full_calls_error_handler() {
+        let (transport, _our_addr) = make_transport();
+
+        let peer_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap();
+
+        let peer = make_tcp_peer(peer_addr);
+        let iid = peer.instance_id();
+        transport.register(peer).unwrap();
+
+        // Insert a handle with a capacity-1 channel and keep the rx alive.
+        let (tx, _rx) = flume::bounded::<SendTask>(1);
+        transport.connections.insert(iid, ConnectionHandle { tx });
+
+        // Fill the channel.
+        let error_handler = Arc::new(TrackingErrorHandler::new());
+        transport.send_message(
+            iid,
+            Bytes::from_static(b"fill"),
+            Bytes::from_static(b"msg"),
+            MessageType::Message,
+            error_handler.clone(),
+        );
+        assert_eq!(error_handler.error_count(), 0, "first send should succeed");
+
+        // This send should hit the Full path and call on_error.
+        transport.send_message(
+            iid,
+            Bytes::from_static(b"overflow"),
+            Bytes::from_static(b"msg"),
+            MessageType::Message,
+            error_handler.clone(),
+        );
+        assert_eq!(
+            error_handler.error_count(),
+            1,
+            "second send should trigger channel-full error"
         );
     }
 }

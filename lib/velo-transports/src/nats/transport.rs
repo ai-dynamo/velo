@@ -45,7 +45,7 @@ use crate::{
 const VELO_TYPE_STRINGS: [&str; 5] = ["0", "1", "2", "3", "4"];
 
 /// Default bounded-channel capacity for the sender task.
-const DEFAULT_SENDER_CAPACITY: usize = 1024;
+const DEFAULT_SENDER_CAPACITY: usize = crate::utils::DEFAULT_CHANNEL_CAPACITY;
 
 /// Task queued from [`send_message`](Transport::send_message) to the dedicated sender task.
 struct NatsSendTask {
@@ -191,10 +191,17 @@ impl Transport for NatsTransport {
             }
         };
 
-        // Fast path: non-blocking try_send, slow path: block for backpressure.
-        match crate::utils::try_send_or_block(tx, task) {
-            crate::utils::SendOutcome::Sent => {}
-            crate::utils::SendOutcome::Disconnected(task) => {
+        // Fast path: non-blocking try_send, fail-fast on full.
+        match tx.try_send(task) {
+            Ok(()) => {}
+            Err(flume::TrySendError::Full(task)) => {
+                task.on_error.on_error(
+                    task.header,
+                    task.payload,
+                    crate::utils::CHANNEL_FULL_ERROR.into(),
+                );
+            }
+            Err(flume::TrySendError::Disconnected(task)) => {
                 task.on_error
                     .on_error(task.header, task.payload, "NATS sender task exited".into());
             }

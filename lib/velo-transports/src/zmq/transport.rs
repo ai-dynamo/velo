@@ -171,14 +171,18 @@ impl Transport for ZmqTransport {
             }
         };
 
-        // Fast path: non-blocking try_send, slow path: block for backpressure.
+        // Fast path: non-blocking try_send, fail-fast on full.
         let cmd = SenderCommand::Send(task);
-        match crate::utils::try_send_or_block(tx, cmd) {
-            crate::utils::SendOutcome::Sent => {}
-            crate::utils::SendOutcome::Disconnected(SenderCommand::Send(task)) => {
+        match tx.try_send(cmd) {
+            Ok(()) => {}
+            Err(flume::TrySendError::Full(SenderCommand::Send(task))) => {
+                task.on_error(crate::utils::CHANNEL_FULL_ERROR);
+            }
+            Err(flume::TrySendError::Full(SenderCommand::Shutdown)) => {}
+            Err(flume::TrySendError::Disconnected(SenderCommand::Send(task))) => {
                 task.on_error("Sender thread exited");
             }
-            crate::utils::SendOutcome::Disconnected(SenderCommand::Shutdown) => {}
+            Err(flume::TrySendError::Disconnected(SenderCommand::Shutdown)) => {}
         }
     }
 
@@ -563,7 +567,7 @@ impl ZmqTransportBuilder {
         Self {
             bind_endpoint: None,
             key: None,
-            channel_capacity: 256,
+            channel_capacity: crate::utils::DEFAULT_CHANNEL_CAPACITY,
             zmq_io_threads: 1,
             sndhwm: 1000,
             rcvhwm: 1000,

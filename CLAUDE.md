@@ -92,11 +92,13 @@ All transports implement the `Transport` trait (`velo-transports/src/transport.r
 
 ### Send-Path Backpressure
 
-All transports use a two-tier send pattern:
+All transports use a fail-fast send pattern with deep channels (default 8192):
 - **Fast path**: `try_send()` — non-blocking, zero-allocation.
-- **Slow path (Full)**: `tx.send()` — blocks the caller until the writer drains space. On multi-threaded Tokio runtimes, uses `block_in_place` so other workers can progress. On single-threaded (current-thread) runtimes, falls back to spawning an async `send_async` task to avoid deadlocking the executor.
+- **Full**: Call `on_error(CHANNEL_FULL_ERROR)` synchronously — no blocking, no task spawning. The caller gets immediate feedback.
 - **Disconnected**: Return error or fall through to reconnection logic.
 
-Use `try_send_or_block()` from `velo-transports/src/utils/backpressure.rs` for single-channel transports (ZMQ, NATS). For connection-based transports (TCP, gRPC, UDS), clone the sender and drop the DashMap guard before blocking, and use `blocking_strategy()` to select the correct approach for the current runtime.
+Use `CHANNEL_FULL_ERROR` and `DEFAULT_CHANNEL_CAPACITY` from `velo-transports/src/utils/backpressure.rs`. For connection-based transports (TCP, gRPC, UDS), drop the DashMap guard before invoking the error callback.
 
-Channel capacity is configurable via each transport's builder (default: 256, NATS: 1024).
+For callers that want automatic retry, use `send_with_retry()` which wraps a send function with exponential backoff, detecting channel-full errors via the error callback.
+
+Channel capacity is configurable via each transport's builder (default: 8192).
