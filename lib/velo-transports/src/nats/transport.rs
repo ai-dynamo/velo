@@ -718,7 +718,7 @@ impl NatsTransportBuilder {
         self
     }
 
-    /// Override the bounded sender channel capacity (default: 1024).
+    /// Override the bounded sender channel capacity (default: 8192).
     pub fn with_sender_capacity(mut self, capacity: usize) -> Self {
         self.sender_capacity = capacity;
         self

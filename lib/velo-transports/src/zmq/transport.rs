@@ -178,11 +178,12 @@ impl Transport for ZmqTransport {
             Err(flume::TrySendError::Full(SenderCommand::Send(task))) => {
                 task.on_error(crate::utils::CHANNEL_FULL_ERROR);
             }
-            Err(flume::TrySendError::Full(SenderCommand::Shutdown)) => {}
             Err(flume::TrySendError::Disconnected(SenderCommand::Send(task))) => {
                 task.on_error("Sender thread exited");
             }
-            Err(flume::TrySendError::Disconnected(SenderCommand::Shutdown)) => {}
+            // Shutdown variants are unreachable from this call site since
+            // cmd is always SenderCommand::Send, but required for exhaustiveness.
+            _ => {}
         }
     }
 
@@ -587,7 +588,7 @@ impl ZmqTransportBuilder {
         self
     }
 
-    /// Set the channel capacity for sender backpressure (default: 256).
+    /// Set the channel capacity for sender backpressure (default: 8192).
     pub fn channel_capacity(mut self, capacity: usize) -> Self {
         self.channel_capacity = capacity;
         self

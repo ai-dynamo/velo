@@ -95,7 +95,7 @@ impl TcpTransport {
     ///
     /// An optional pre-bound `listener` can be provided (useful for tests binding
     /// to port 0). `channel_capacity` controls backpressure on per-connection
-    /// writer channels (default 256).
+    /// writer channels (default 8192).
     pub fn new(
         bind_addr: SocketAddr,
         key: TransportKey,
@@ -299,7 +299,7 @@ impl Transport for TcpTransport {
             None => send_msg,
         };
 
-        // Slow path: reconnect only (channel full is handled above with blocking send)
+        // Slow path: reconnect only (channel-full is handled above via fail-fast error callback)
         let rt = match self.runtime.get() {
             Some(rt) => rt,
             None => {
@@ -618,7 +618,7 @@ impl TcpTransportBuilder {
         self
     }
 
-    /// Set the channel capacity for backpressure (default: 256)
+    /// Set the channel capacity for backpressure (default: 8192)
     pub fn channel_capacity(mut self, capacity: usize) -> Self {
         self.channel_capacity = capacity;
         self

@@ -268,7 +268,7 @@ impl Transport for GrpcTransport {
             None => send_msg,
         };
 
-        // Slow path: reconnect only (channel full is handled above with blocking send)
+        // Slow path: reconnect only (channel-full is handled above via fail-fast error callback)
         let rt = match self.runtime.get() {
             Some(rt) => rt,
             None => {
@@ -676,7 +676,7 @@ impl GrpcTransportBuilder {
         self
     }
 
-    /// Set the channel capacity for backpressure (default: 256).
+    /// Set the channel capacity for backpressure (default: 8192).
     pub fn channel_capacity(mut self, capacity: usize) -> Self {
         self.channel_capacity = capacity;
         self

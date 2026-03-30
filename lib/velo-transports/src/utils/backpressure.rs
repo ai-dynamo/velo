@@ -19,7 +19,24 @@ use crate::transport::TransportErrorHandler;
 /// Well-known error string returned when a send channel is full.
 pub const CHANNEL_FULL_ERROR: &str = "channel full";
 
-/// Default bounded-channel capacity for all transports.
+/// Default bounded-channel capacity (in messages/frames) for transports that
+/// do not provide an explicit per-transport override.
+///
+/// This value is intentionally large (previous defaults were 256/1024) to
+/// reduce spurious `CHANNEL_FULL_ERROR` conditions under bursty workloads
+/// and keep the fast path (`try_send`) uncontended in common cases.
+///
+/// Trade-offs:
+/// - **Memory:** Increasing the capacity raises the worst-case number of
+///   in-memory queued frames per channel. For large frames or many concurrent
+///   channels, this can translate into a non-trivial memory footprint.
+/// - **Latency under load:** A larger queue can increase the *tail* latency
+///   of messages when producers outpace consumers, since more frames may be
+///   buffered before backpressure is applied.
+///
+/// Callers and transport implementations that have tighter memory or latency
+/// requirements should use a smaller, transport-specific capacity via the
+/// builder instead of relying on this global default.
 pub const DEFAULT_CHANNEL_CAPACITY: usize = 8192;
 
 /// Configuration for [`send_with_retry`].
