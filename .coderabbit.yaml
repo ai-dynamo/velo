@@ -1,0 +1,133 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# CodeRabbit Configuration for Velo
+# Velo is a Rust workspace providing a high-performance distributed messaging framework
+# with multiple transport backends (TCP, UDS, gRPC, NATS, ZMQ).
+
+language: en-US
+
+reviews:
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: false
+  sequence_diagrams: true
+
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches:
+      - main
+
+  path_instructions:
+    # Transport implementations
+    - path: "lib/velo-transports/src/**/*.rs"
+      instructions: |
+        Review transport implementations with focus on:
+        - All methods of the `Transport` trait are implemented: `key`, `address`, `register`,
+          `send_message`, `start`, `shutdown`, `check_health`
+        - Send failures use `TransportErrorHandler` callbacks — never panic, block, or silently drop
+        - Graceful 3-phase shutdown is respected: Gate (`begin_drain`) → Drain (wait in-flight)
+          → Teardown (cancel tokens); use `ShutdownState.is_draining()` in listener hot paths
+        - Prefer `Bytes::from(vec)` (O(1) ownership transfer) over `Bytes::copy_from_slice(&vec)`
+          (O(n) memcpy) when converting from owned `Vec<u8>`
+        - Use `DashMap` for concurrent peer/connection state; avoid `Mutex` on the hot path
+        - New transports must be feature-gated in their crate's `Cargo.toml` and re-exported from
+          `lib.rs`; the feature must propagate to `velo-messenger` and the top-level `velo` crate
+
+    # Transport integration tests
+    - path: "lib/velo-transports/tests/**"
+      instructions: |
+        Review transport tests with focus on:
+        - New transports must invoke `transport_integration_tests!(YourFactory)` — this generates
+          20 scenarios covering messaging, message types, large payloads, concurrency, error handling,
+          and drain semantics; do not hand-roll these tests
+        - Transport-specific shutdown tests should use `transport_shutdown_tests!` macro (8 scenarios)
+        - The `TransportFactory` impl must provide both `create()` (single instance) and
+          `create_cluster()` (multi-instance mesh)
+        - All async test awaits must be wrapped in `tokio::time::timeout(TEST_TIMEOUT, ...)`;
+          do not use unbounded waits
+        - NATS-dependent tests must be feature-gated with `#[cfg(feature = "nats")]`
+
+    # All Rust source
+    - path: "lib/**/*.rs"
+      instructions: |
+        Review Rust code with focus on:
+        - Edition 2024 style: prefer let-chains (`if let ... && let ...`) over nested `if let`
+        - Zero clippy warnings policy — `#[allow(clippy::...)]` is not acceptable on new code;
+          refactor instead (e.g., use config structs instead of `#[allow(clippy::too_many_arguments)]`)
+        - Error types should use `thiserror::Error` and include context in variants
+          (e.g., `PeerNotRegistered(InstanceId)` not just `PeerNotRegistered`)
+        - Async trait methods return `BoxFuture<'_, anyhow::Result<()>>`
+        - Prefer `flume` bounded channels for back-pressure; `DashMap` for shared concurrent state
+        - No business logic in `main.rs` or `lib.rs` re-exports — keep layers clean
+
+    # Crate manifests
+    - path: "lib/*/Cargo.toml"
+      instructions: |
+        Review Cargo.toml changes with focus on:
+        - New optional deps used only behind a feature gate need
+          `[package.metadata.cargo-machete] ignored` to avoid false-positive cargo-machete failures
+        - New transport feature flags must be propagated to `velo-messenger/Cargo.toml` and the
+          top-level `velo/Cargo.toml`
+        - All new dependencies must pass `cargo-deny` license and bans checks (Apache-2.0 / MIT
+          compatible licenses preferred); avoid GPL/LGPL transitive deps
+        - Pinned dependency versions (`=x.y.z`) should be justified in a comment
+
+    # Workspace root manifest
+    - path: "Cargo.toml"
+      instructions: |
+        Review workspace Cargo.toml changes with focus on:
+        - New workspace members must be added to the `[workspace] members` list
+        - Shared deps should use `[workspace.dependencies]` to keep versions consistent
+        - Cargo.lock must remain committed and in sync (`cargo metadata --locked`)
+
+    # CI workflows
+    - path: ".github/workflows/**"
+      instructions: |
+        Review GitHub Actions workflows with focus on:
+        - All `cargo` commands must use `--all-features`; omitting this silently skips
+          feature-gated code (zmq, grpc, nats)
+        - Test and coverage jobs need: NATS service (`nats:latest` on port 4222), and system
+          packages `cmake mold clang` (zeromq-src compiles libzmq from source)
+        - Test and coverage jobs must set `RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"`
+          to avoid OOM with the default `ld` linker when linking all features
+        - Use pinned action versions (SHA preferred over tags)
+        - Proper `permissions` scoping per job (principle of least privilege)
+        - Secrets must not be echoed or logged; `fail_ci_if_error: false` for Codecov uploads
+          (token may be absent on external PR runs)
+
+    # Examples
+    - path: "lib/**/examples/**"
+      instructions: |
+        Review examples with focus on:
+        - New transports should be selectable in `ping_pong.rs` via a CLI flag, feature-gated
+        - Examples should compile with `--all-features` without warnings
+        - Do not add external runtime dependencies (databases, cloud services) to examples
+
+    # Documentation
+    - path: "**/*.md"
+      instructions: |
+        Review documentation for:
+        - Accuracy with current code (command flags, feature names, crate names)
+        - Shell commands in docs must match the canonical commands in CLAUDE.md
+        - Clear structure and examples
+
+  tools:
+    shellcheck:
+      enabled: true
+    yamllint:
+      enabled: true
+    markdownlint:
+      enabled: true
+    actionlint:
+      enabled: true
+
+chat:
+  auto_reply: true
+
+knowledge_base:
+  opt_out: false
+  learnings:
+    scope: auto
+
+early_access: false
