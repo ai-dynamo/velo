@@ -41,7 +41,7 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: Add rustfmt component
-      run: rustup component add rustfmt
+      run: rustup component list --installed | grep -q '^rustfmt' || rustup component add rustfmt
     - name: Check formatting
       run: cargo fmt --check
 
@@ -56,14 +56,17 @@ jobs:
     - uses: actions/checkout@v4
     - name: Install protoc
       run: |
-        PB_REL="https://github.com/protocolbuffers/protobuf/releases"
-        PROTOC_ZIP="protoc-${PROTOC_VERSION}-linux-x86_64.zip"
-        curl -fsSLO "$PB_REL/download/v${PROTOC_VERSION}/${PROTOC_ZIP}"
-        unzip "${PROTOC_ZIP}" -d $HOME/.local
-        rm "${PROTOC_ZIP}"
-        echo "$HOME/.local/bin" >> $GITHUB_PATH
+        if ! command -v protoc >/dev/null 2>&1; then
+          PB_REL="https://github.com/protocolbuffers/protobuf/releases"
+          ARCH=$(uname -m | sed 's/x86_64/x86_64/;s/aarch64/aarch_64/')
+          PROTOC_ZIP="protoc-${PROTOC_VERSION}-linux-${ARCH}.zip"
+          curl -fsSLO "$PB_REL/download/v${PROTOC_VERSION}/${PROTOC_ZIP}"
+          unzip "${PROTOC_ZIP}" -d $HOME/.local
+          rm "${PROTOC_ZIP}"
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+        fi
     - name: Install system dependencies
-      run: sudo apt-get update -qq && sudo apt-get install -y -qq cmake
+      run: command -v cmake >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq cmake; }
     - name: Cache cargo registry and tools
       uses: actions/cache@v4
       with:
@@ -74,12 +77,12 @@ jobs:
         key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: ${{ runner.os }}-cargo-registry-
     - name: Add clippy component
-      run: rustup component add clippy
+      run: rustup component list --installed | grep -q '^clippy' || rustup component add clippy
     - name: Run clippy
       run: cargo clippy --no-deps --all-features --all-targets -- -D warnings
     - name: Install and run cargo-machete
       run: |
-        cargo install cargo-machete --locked || true
+        command -v cargo-machete >/dev/null 2>&1 || cargo install cargo-machete --locked
         cargo machete
 
   deny:
@@ -102,7 +105,7 @@ jobs:
         restore-keys: ${{ runner.os }}-cargo-registry-
     - name: Install and run cargo-deny
       run: |
-        cargo install cargo-deny@0.19.0 --locked || true
+        command -v cargo-deny >/dev/null 2>&1 || cargo install cargo-deny@0.19.0 --locked
         cargo-deny -L error --all-features check licenses bans
 
   test:
@@ -123,14 +126,22 @@ jobs:
     - uses: actions/checkout@v4
     - name: Install protoc
       run: |
-        PB_REL="https://github.com/protocolbuffers/protobuf/releases"
-        PROTOC_ZIP="protoc-${PROTOC_VERSION}-linux-x86_64.zip"
-        curl -fsSLO "$PB_REL/download/v${PROTOC_VERSION}/${PROTOC_ZIP}"
-        unzip "${PROTOC_ZIP}" -d $HOME/.local
-        rm "${PROTOC_ZIP}"
-        echo "$HOME/.local/bin" >> $GITHUB_PATH
+        if ! command -v protoc >/dev/null 2>&1; then
+          PB_REL="https://github.com/protocolbuffers/protobuf/releases"
+          ARCH=$(uname -m | sed 's/x86_64/x86_64/;s/aarch64/aarch_64/')
+          PROTOC_ZIP="protoc-${PROTOC_VERSION}-linux-${ARCH}.zip"
+          curl -fsSLO "$PB_REL/download/v${PROTOC_VERSION}/${PROTOC_ZIP}"
+          unzip "${PROTOC_ZIP}" -d $HOME/.local
+          rm "${PROTOC_ZIP}"
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+        fi
     - name: Install system dependencies
-      run: sudo apt-get update -qq && sudo apt-get install -y -qq cmake mold clang
+      run: |
+        pkgs=""
+        command -v cmake >/dev/null 2>&1 || pkgs="$pkgs cmake"
+        command -v mold  >/dev/null 2>&1 || pkgs="$pkgs mold"
+        command -v clang >/dev/null 2>&1 || pkgs="$pkgs clang"
+        [ -z "$pkgs" ] || { sudo apt-get update -qq && sudo apt-get install -y -qq $pkgs; }
     - name: Cache cargo registry
       uses: actions/cache@v4
       with:
@@ -162,14 +173,22 @@ jobs:
     - uses: actions/checkout@v4
     - name: Install protoc
       run: |
-        PB_REL="https://github.com/protocolbuffers/protobuf/releases"
-        PROTOC_ZIP="protoc-${PROTOC_VERSION}-linux-x86_64.zip"
-        curl -fsSLO "$PB_REL/download/v${PROTOC_VERSION}/${PROTOC_ZIP}"
-        unzip "${PROTOC_ZIP}" -d $HOME/.local
-        rm "${PROTOC_ZIP}"
-        echo "$HOME/.local/bin" >> $GITHUB_PATH
+        if ! command -v protoc >/dev/null 2>&1; then
+          PB_REL="https://github.com/protocolbuffers/protobuf/releases"
+          ARCH=$(uname -m | sed 's/x86_64/x86_64/;s/aarch64/aarch_64/')
+          PROTOC_ZIP="protoc-${PROTOC_VERSION}-linux-${ARCH}.zip"
+          curl -fsSLO "$PB_REL/download/v${PROTOC_VERSION}/${PROTOC_ZIP}"
+          unzip "${PROTOC_ZIP}" -d $HOME/.local
+          rm "${PROTOC_ZIP}"
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+        fi
     - name: Install system dependencies
-      run: sudo apt-get update -qq && sudo apt-get install -y -qq cmake mold clang
+      run: |
+        pkgs=""
+        command -v cmake >/dev/null 2>&1 || pkgs="$pkgs cmake"
+        command -v mold  >/dev/null 2>&1 || pkgs="$pkgs mold"
+        command -v clang >/dev/null 2>&1 || pkgs="$pkgs clang"
+        [ -z "$pkgs" ] || { sudo apt-get update -qq && sudo apt-get install -y -qq $pkgs; }
     - name: Cache cargo registry and tools
       uses: actions/cache@v4
       with:
@@ -180,9 +199,9 @@ jobs:
         key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: ${{ runner.os }}-cargo-registry-
     - name: Install cargo-llvm-cov
-      run: cargo install cargo-llvm-cov --locked || true
+      run: command -v cargo-llvm-cov >/dev/null 2>&1 || cargo install cargo-llvm-cov --locked
     - name: Add llvm-tools component
-      run: rustup component add llvm-tools-preview
+      run: rustup component list --installed | grep -q '^llvm-tools' || rustup component add llvm-tools-preview
     - name: Generate coverage
       run: cargo llvm-cov --all-features --workspace --codecov --output-path codecov.json
     - name: Upload to Codecov
