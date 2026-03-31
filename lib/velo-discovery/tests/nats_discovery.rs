@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use velo_common::{InstanceId, PeerInfo, WorkerAddress};
 use velo_discovery::nats::NatsPeerDiscoveryBuilder;
-use velo_discovery::{PeerDiscovery, RegistrationGuard};
+use velo_discovery::{PeerDiscovery, PeerRegistrationGuard};
 
 /// Build a test PeerInfo with a NATS inbound subject as the address.
 fn make_test_peer_info() -> PeerInfo {

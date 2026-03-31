@@ -12,6 +12,7 @@ homepage.workspace = true
 repository.workspace = true
 
 [features]
+etcd = ["velo-discovery/etcd"]
 grpc = ["velo-streaming/grpc"]
 zmq = ["velo-transports/zmq"]
 distributed-tracing = [
