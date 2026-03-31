@@ -306,10 +306,15 @@ impl TestTransportHandle<UdsTransport> {
 
 // NATS-specific convenience constructor
 #[cfg(feature = "nats")]
+pub fn nats_url() -> String {
+    std::env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".to_string())
+}
+
+#[cfg(feature = "nats")]
 impl TestTransportHandle<NatsTransport> {
     /// Create a new NATS transport with a unique cluster_id for test isolation (TEST-06).
     pub async fn new_nats(cluster_id: &str) -> anyhow::Result<Self> {
-        let client = velo_transports::nats::utils::connect("nats://127.0.0.1:4222").await?;
+        let client = velo_transports::nats::utils::connect(&nats_url()).await?;
         Self::with_factory(|| Ok(NatsTransportBuilder::new(client.clone(), cluster_id).build()))
             .await
     }
@@ -459,7 +464,7 @@ impl TestCluster<NatsTransport> {
     /// All nodes share the same cluster_id so they can exchange messages.
     /// The client is shared via Arc.
     pub async fn new_nats(size: usize, cluster_id: &str) -> anyhow::Result<Self> {
-        let client = velo_transports::nats::utils::connect("nats://127.0.0.1:4222").await?;
+        let client = velo_transports::nats::utils::connect(&nats_url()).await?;
         Self::with_factory(size, || {
             Ok(NatsTransportBuilder::new(client.clone(), cluster_id).build())
         })
