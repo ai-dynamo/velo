@@ -119,7 +119,7 @@ jobs:
       RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
     services:
       nats:
-        image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/nats:2.12.6
+        image: nats:latest
         ports:
           - 4222:4222
     steps:
@@ -166,7 +166,7 @@ jobs:
       RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
     services:
       nats:
-        image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/nats:2.12.6
+        image: nats:latest
         ports:
           - 4222:4222
     steps:
