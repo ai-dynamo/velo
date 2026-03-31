@@ -35,7 +35,7 @@ jobs:
     name: Formatting
     runs-on: stg-velo-default-v1
     container:
-      image: nats:latest
+      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.2
     permissions:
       contents: read
     steps:
