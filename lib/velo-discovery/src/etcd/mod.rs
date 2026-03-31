@@ -81,7 +81,8 @@ impl EtcdServiceDiscovery {
 
         // Spawn keep-alive task
         let cancel = CancellationToken::new();
-        let keepalive_interval = Duration::from_secs(self.lease_ttl as u64 / KEEPALIVE_DIVISOR);
+        let keepalive_interval =
+            Duration::from_secs((self.lease_ttl as u64 / KEEPALIVE_DIVISOR).max(1));
         let client = self.client.clone();
         let cancel_clone = cancel.clone();
 
@@ -194,22 +195,36 @@ impl ServiceDiscovery for EtcdServiceDiscovery {
                 yield ServiceEvent::Initial(initial);
 
                 let mut watch_stream = watch_stream;
-                while let Ok(Some(resp)) = watch_stream.message().await {
-                    for event in resp.events() {
-                        if let Some(kv) = event.kv()
-                            && let Ok(key_str) = kv.key_str()
-                            && let Some(id_str) = key_str.strip_prefix(&prefix_owned)
-                            && let Ok(uuid) = uuid::Uuid::parse_str(id_str)
-                        {
-                            let instance_id = InstanceId::from(uuid);
-                            match event.event_type() {
-                                EventType::Put => {
-                                    yield ServiceEvent::Added(instance_id);
-                                }
-                                EventType::Delete => {
-                                    yield ServiceEvent::Removed(instance_id);
+                loop {
+                    match watch_stream.message().await {
+                        Ok(Some(resp)) => {
+                            for event in resp.events() {
+                                if let Some(kv) = event.kv()
+                                    && let Ok(key_str) = kv.key_str()
+                                    && let Some(id_str) = key_str.strip_prefix(&prefix_owned)
+                                    && let Ok(uuid) = uuid::Uuid::parse_str(id_str)
+                                {
+                                    let instance_id = InstanceId::from(uuid);
+                                    match event.event_type() {
+                                        EventType::Put => {
+                                            yield ServiceEvent::Added(instance_id);
+                                        }
+                                        EventType::Delete => {
+                                            yield ServiceEvent::Removed(instance_id);
+                                        }
+                                    }
                                 }
                             }
+                        }
+                        Ok(None) => {
+                            tracing::warn!(prefix = %prefix_owned, "etcd watch stream closed by server");
+                            yield ServiceEvent::Disconnected;
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::warn!(prefix = %prefix_owned, error = %e, "etcd watch stream error");
+                            yield ServiceEvent::Disconnected;
+                            break;
                         }
                     }
                 }

@@ -50,7 +50,10 @@ pub trait PeerRegistrationGuard: Send {
 
 /// Deprecated: Use [`PeerRegistrationGuard`] instead.
 #[deprecated(note = "Renamed to PeerRegistrationGuard")]
-pub type RegistrationGuard = dyn PeerRegistrationGuard;
+pub trait RegistrationGuard: PeerRegistrationGuard {}
+
+#[allow(deprecated)]
+impl<T: PeerRegistrationGuard + ?Sized> RegistrationGuard for T {}
 
 // ---------------------------------------------------------------------------
 // Service discovery
@@ -65,6 +68,12 @@ pub enum ServiceEvent {
     Added(InstanceId),
     /// An instance was removed from the service.
     Removed(InstanceId),
+    /// The watch stream lost its connection to the backend.
+    ///
+    /// Callers should treat the current instance set as stale and re-establish
+    /// the watch via [`ServiceDiscovery::watch_instances`]. This is the last
+    /// event the stream will emit before ending.
+    Disconnected,
 }
 
 /// Abstraction over service discovery mechanisms.
