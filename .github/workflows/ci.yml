@@ -116,7 +116,7 @@ jobs:
     permissions:
       contents: read
     env:
-      NATS_URL: nats://nats:4222
+      NATS_URL: nats://127.0.0.1:4222
       RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
     services:
       nats:
@@ -162,7 +162,7 @@ jobs:
     permissions:
       contents: read
     env:
-      NATS_URL: nats://nats:4222
+      NATS_URL: nats://127.0.0.1:4222
       RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
     services:
       nats:
