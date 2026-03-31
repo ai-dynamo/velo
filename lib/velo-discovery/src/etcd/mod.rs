@@ -157,22 +157,36 @@ impl ServiceDiscovery for EtcdServiceDiscovery {
         let client = self.client.clone();
 
         Box::pin(async move {
-            // Get initial snapshot
-            let initial = {
+            // Get initial snapshot and capture the revision for gap-free watching.
+            // The revision from the GET response header tells us the exact point-in-time
+            // of the snapshot. Starting the watch at revision+1 ensures we don't miss
+            // events between the GET and the watch, and don't re-process existing keys.
+            let (initial, start_revision) = {
                 let mut c = client.lock().await;
                 let resp = c
                     .get(prefix.as_bytes(), Some(GetOptions::new().with_prefix()))
                     .await
                     .context("Failed to get initial service instances")?;
-                Self::parse_instances_from_kvs(resp.kvs(), &prefix)
+                let revision = resp.header().map(|h| h.revision()).unwrap_or(0);
+                (
+                    Self::parse_instances_from_kvs(resp.kvs(), &prefix),
+                    revision,
+                )
             };
 
-            // Start watch
+            // Start watch at revision+1 so we only see new changes
             let (_watcher, watch_stream) = {
                 let mut c = client.lock().await;
-                c.watch(prefix.as_bytes(), Some(WatchOptions::new().with_prefix()))
-                    .await
-                    .context("Failed to start etcd watch")?
+                c.watch(
+                    prefix.as_bytes(),
+                    Some(
+                        WatchOptions::new()
+                            .with_prefix()
+                            .with_start_revision(start_revision + 1),
+                    ),
+                )
+                .await
+                .context("Failed to start etcd watch")?
             };
 
             let prefix_owned = prefix;

@@ -111,14 +111,15 @@ jobs:
         ports:
           - 4222:4222
       etcd:
-        image: gcr.io/etcd-development/etcd:v3.5.21
+        image: gcr.io/etcd-development/etcd:v3.5.9
         ports:
           - 2379:2379
         options: >-
-          --health-cmd "etcdctl endpoint health"
+          --health-cmd "etcdctl endpoint health --endpoints=http://localhost:2379"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+          --entrypoint etcd
         env:
           ETCD_LISTEN_CLIENT_URLS: "http://0.0.0.0:2379"
           ETCD_ADVERTISE_CLIENT_URLS: "http://0.0.0.0:2379"
@@ -160,14 +161,15 @@ jobs:
         ports:
           - 4222:4222
       etcd:
-        image: gcr.io/etcd-development/etcd:v3.5.21
+        image: gcr.io/etcd-development/etcd:v3.5.9
         ports:
           - 2379:2379
         options: >-
-          --health-cmd "etcdctl endpoint health"
+          --health-cmd "etcdctl endpoint health --endpoints=http://localhost:2379"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+          --entrypoint etcd
         env:
           ETCD_LISTEN_CLIENT_URLS: "http://0.0.0.0:2379"
           ETCD_ADVERTISE_CLIENT_URLS: "http://0.0.0.0:2379"
