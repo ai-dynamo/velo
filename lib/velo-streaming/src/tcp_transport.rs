@@ -554,6 +554,17 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_bind_ipv6_endpoint_format() {
+        // Skip if IPv6 is not available (CI runners, containers without IPv6)
+        if std::net::TcpListener::bind(std::net::SocketAddr::from((
+            std::net::Ipv6Addr::LOCALHOST,
+            0,
+        )))
+        .is_err()
+        {
+            eprintln!("Skipping test_bind_ipv6_endpoint_format: IPv6 not available");
+            return;
+        }
+
         let transport = TcpFrameTransport::new(std::net::Ipv6Addr::LOCALHOST.into());
         let (endpoint, _rx) = transport.bind(1, 0).await.unwrap();
         assert!(
