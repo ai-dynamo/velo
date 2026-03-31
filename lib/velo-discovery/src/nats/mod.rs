@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 use velo_common::{InstanceId, PeerInfo, WorkerId};
 
-use super::{PeerDiscovery, RegistrationGuard};
+use super::{PeerDiscovery, PeerRegistrationGuard};
 use subjects::{discovery_instance_subject, discovery_worker_subject};
 
 /// Default timeout for discovery queries.
@@ -41,7 +41,7 @@ impl NatsPeerDiscovery {
     /// Pre-serializes `peer_info` to MessagePack bytes once, then spawns a task that
     /// replies to all incoming discovery requests with those bytes. The returned
     /// [`NatsRegistrationGuard`] cancels the responder task when dropped or when
-    /// [`RegistrationGuard::unregister`] is called.
+    /// [`PeerRegistrationGuard::unregister`] is called.
     pub async fn register(&self, peer_info: &PeerInfo) -> anyhow::Result<NatsRegistrationGuard> {
         let peer_info_bytes = Bytes::from(
             rmp_serde::to_vec(peer_info)
@@ -144,13 +144,13 @@ impl NatsPeerDiscoveryBuilder {
 /// RAII guard that cancels the discovery responder task when dropped.
 ///
 /// Obtained from [`NatsPeerDiscovery::register`]. Callers that can await
-/// should prefer [`unregister()`](RegistrationGuard::unregister) over
+/// should prefer [`unregister()`](PeerRegistrationGuard::unregister) over
 /// relying on `Drop` (per D-10).
 pub struct NatsRegistrationGuard {
     cancel: CancellationToken,
 }
 
-impl RegistrationGuard for NatsRegistrationGuard {
+impl PeerRegistrationGuard for NatsRegistrationGuard {
     fn unregister(&mut self) -> BoxFuture<'_, anyhow::Result<()>> {
         Box::pin(async move {
             self.cancel.cancel();

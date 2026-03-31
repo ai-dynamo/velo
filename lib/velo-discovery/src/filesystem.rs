@@ -41,7 +41,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use velo_common::{InstanceId, PeerInfo, WorkerAddress, WorkerId};
 
 use super::PeerDiscovery;
-use super::RegistrationGuard;
+use super::PeerRegistrationGuard;
 
 /// Filesystem-based peer discovery backend.
 ///
@@ -327,7 +327,7 @@ impl FilesystemRegistrationGuard {
     }
 }
 
-impl RegistrationGuard for FilesystemRegistrationGuard {
+impl PeerRegistrationGuard for FilesystemRegistrationGuard {
     fn unregister(&mut self) -> BoxFuture<'_, anyhow::Result<()>> {
         Box::pin(async move {
             let instances = std::mem::take(&mut self.instances);
@@ -624,7 +624,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_registration_guard_trait_unregister() {
-        use crate::RegistrationGuard as _;
+        use crate::PeerRegistrationGuard as _;
         let discovery = FilesystemPeerDiscovery::new_temp().unwrap();
         let (instance_id, worker_address) = create_test_peer_info();
         let worker_id = instance_id.worker_id();
