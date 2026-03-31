@@ -35,7 +35,7 @@ jobs:
     name: Formatting
     runs-on: stg-velo-default-v1
     container:
-      image: ubuntu-latest
+      image: ubuntu
     permissions:
       contents: read
     steps:
