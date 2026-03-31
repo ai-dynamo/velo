@@ -131,6 +131,9 @@ async fn test_check_health_timeout() {
     // Subscribe to B's health subject with a raw absorber that never replies
     let raw_client = async_nats::connect(&common::nats_url()).await.unwrap();
     let _absorber = raw_client.subscribe(health_subject.clone()).await.unwrap();
+    // Flush to ensure the server has registered the subscription before check_health fires.
+    // Without this, NATS can return NoResponders if the SUB hasn't propagated yet.
+    raw_client.flush().await.unwrap();
 
     // A checks health of B with a short timeout — absorber receives the request but never replies
     let result = transport_a
