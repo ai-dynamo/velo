@@ -156,6 +156,7 @@ jobs:
 
   coverage:
     name: Coverage
+    needs: [test] # todo: remove this after testing
     runs-on: stg-velo-default-v1
     container:
       image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.2
