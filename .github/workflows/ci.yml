@@ -18,13 +18,12 @@ name: CI
 on:
   push:
     branches:
-    - ops-4105/ci-runners # todo: remove this after testing
-    # - main
-  # pull_request:
+    - main
+  pull_request:
 
-# concurrency:
-#   group: ${{ github.event_name == 'pull_request' && format('{0}-{1}', github.workflow, github.event.pull_request.number) || format('{0}-{1}', github.workflow, github.run_id) }}
-#   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('{0}-{1}', github.workflow, github.event.pull_request.number) || format('{0}-{1}', github.workflow, github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
