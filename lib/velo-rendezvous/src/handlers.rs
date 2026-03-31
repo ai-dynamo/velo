@@ -91,16 +91,22 @@ pub fn create_rv_pull_handler(store: Arc<DataStore>) -> velo_messenger::Handler 
 }
 
 /// Build the `_rv_ref` handler: increments refcount.
+///
+/// Returns an empty ack so the caller can confirm the increment completed
+/// before proceeding (avoids races between fire-and-forget and metadata queries).
 pub fn create_rv_ref_handler(store: Arc<DataStore>) -> velo_messenger::Handler {
-    velo_messenger::Handler::am_handler("_rv_ref", move |ctx: velo_messenger::Context| {
-        let req: RvRefRequest = serde_json::from_slice(&ctx.payload)?;
-        let handle = req.handle.to_handle();
-        let (_, local_id) = handle.unpack();
-        if !store.ref_increment(local_id) {
-            tracing::warn!("_rv_ref: handle not found: {handle}");
-        }
-        Ok(())
-    })
+    velo_messenger::Handler::unary_handler(
+        "_rv_ref",
+        move |ctx: velo_messenger::Context| -> velo_messenger::UnifiedResponse {
+            let req: RvRefRequest = serde_json::from_slice(&ctx.payload)?;
+            let handle = req.handle.to_handle();
+            let (_, local_id) = handle.unpack();
+            if !store.ref_increment(local_id) {
+                anyhow::bail!("_rv_ref: handle not found: {handle}");
+            }
+            Ok(None)
+        },
+    )
     .build()
 }
 

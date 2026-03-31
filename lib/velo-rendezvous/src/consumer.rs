@@ -157,11 +157,15 @@ impl Consumer {
     }
 
     /// Increment the refcount on a remote handle.
+    ///
+    /// Waits for an ack from the owner confirming the increment completed,
+    /// so callers can safely read metadata or pass the handle to another
+    /// consumer immediately after this returns.
     pub async fn ref_handle(messenger: &Arc<Messenger>, handle: DataHandle) -> Result<()> {
         let target_worker = handle.worker_id();
 
         messenger
-            .am_send_streaming("_rv_ref")?
+            .unary_streaming("_rv_ref")
             .raw_payload(Bytes::from(serde_json::to_vec(&RvRefRequest {
                 handle: RvHandleWire::from_handle(handle),
             })?))
