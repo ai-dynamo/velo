@@ -31,82 +31,82 @@ env:
   PROTOC_VERSION: "30.2"
 
 jobs:
-  # fmt:
-  #   name: Formatting
-  #   runs-on: stg-velo-default-v1
-  #   container:
-  #     image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.2
-  #   permissions:
-  #     contents: read
-  #   steps:
-  #   - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 #v6.0.1
-  #   - name: Add rustfmt component
-  #     run: rustup component list --installed | grep -q '^rustfmt' || rustup component add rustfmt
-  #   - name: Check formatting
-  #     run: cargo fmt --check
+  fmt:
+    name: Formatting
+    runs-on: stg-velo-default-v1
+    container:
+      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.2
+    permissions:
+      contents: read
+    steps:
+    - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 #v6.0.1
+    - name: Add rustfmt component
+      run: rustup component list --installed | grep -q '^rustfmt' || rustup component add rustfmt
+    - name: Check formatting
+      run: cargo fmt --check
 
-  # clippy:
-  #   name: Clippy
-  #   runs-on: stg-velo-default-v1
-  #   container:
-  #     image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.2
-  #   permissions:
-  #     contents: read
-  #   steps:
-  #   - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 #v6.0.1
-  #   - name: Install protoc
-  #     run: |
-  #       if ! command -v protoc >/dev/null 2>&1; then
-  #         PB_REL="https://github.com/protocolbuffers/protobuf/releases"
-  #         ARCH=$(uname -m | sed 's/x86_64/x86_64/;s/aarch64/aarch_64/')
-  #         PROTOC_ZIP="protoc-${PROTOC_VERSION}-linux-${ARCH}.zip"
-  #         curl -fsSLO "$PB_REL/download/v${PROTOC_VERSION}/${PROTOC_ZIP}"
-  #         unzip "${PROTOC_ZIP}" -d $HOME/.local
-  #         rm "${PROTOC_ZIP}"
-  #         echo "$HOME/.local/bin" >> $GITHUB_PATH
-  #       fi
-  #   - name: Install system dependencies
-  #     run: command -v cmake >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq cmake; }
-  #   - name: Cache cargo registry and tools
-  #     uses: actions/cache@v4
-  #     with:
-  #       path: |
-  #         ~/.cargo/bin/
-  #         ~/.cargo/registry/
-  #         ~/.cargo/git/
-  #       key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-  #       restore-keys: ${{ runner.os }}-cargo-registry-
-  #   - name: Add clippy component
-  #     run: rustup component list --installed | grep -q '^clippy' || rustup component add clippy
-  #   - name: Run clippy
-  #     run: cargo clippy --no-deps --all-features --all-targets -- -D warnings
-  #   - name: Install and run cargo-machete
-  #     run: |
-  #       command -v cargo-machete >/dev/null 2>&1 || cargo install cargo-machete --locked
-  #       cargo machete
+  clippy:
+    name: Clippy
+    runs-on: stg-velo-default-v1
+    container:
+      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.2
+    permissions:
+      contents: read
+    steps:
+    - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 #v6.0.1
+    - name: Install protoc
+      run: |
+        if ! command -v protoc >/dev/null 2>&1; then
+          PB_REL="https://github.com/protocolbuffers/protobuf/releases"
+          ARCH=$(uname -m | sed 's/x86_64/x86_64/;s/aarch64/aarch_64/')
+          PROTOC_ZIP="protoc-${PROTOC_VERSION}-linux-${ARCH}.zip"
+          curl -fsSLO "$PB_REL/download/v${PROTOC_VERSION}/${PROTOC_ZIP}"
+          unzip "${PROTOC_ZIP}" -d $HOME/.local
+          rm "${PROTOC_ZIP}"
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+        fi
+    - name: Install system dependencies
+      run: command -v cmake >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq cmake; }
+    - name: Cache cargo registry and tools
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/bin/
+          ~/.cargo/registry/
+          ~/.cargo/git/
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: ${{ runner.os }}-cargo-registry-
+    - name: Add clippy component
+      run: rustup component list --installed | grep -q '^clippy' || rustup component add clippy
+    - name: Run clippy
+      run: cargo clippy --no-deps --all-features --all-targets -- -D warnings
+    - name: Install and run cargo-machete
+      run: |
+        command -v cargo-machete >/dev/null 2>&1 || cargo install cargo-machete --locked
+        cargo machete
 
-  # deny:
-  #   name: Cargo Deny
-  #   runs-on: stg-velo-default-v1
-  #   container:
-  #     image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.2
-  #   permissions:
-  #     contents: read
-  #   steps:
-  #   - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 #v6.0.1
-  #   - name: Cache cargo registry and tools
-  #     uses: actions/cache@v4
-  #     with:
-  #       path: |
-  #         ~/.cargo/bin/
-  #         ~/.cargo/registry/
-  #         ~/.cargo/git/
-  #       key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-  #       restore-keys: ${{ runner.os }}-cargo-registry-
-  #   - name: Install and run cargo-deny
-  #     run: |
-  #       command -v cargo-deny >/dev/null 2>&1 || cargo install cargo-deny@0.19.0 --locked
-  #       cargo-deny -L error --all-features check licenses bans
+  deny:
+    name: Cargo Deny
+    runs-on: stg-velo-default-v1
+    container:
+      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.2
+    permissions:
+      contents: read
+    steps:
+    - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 #v6.0.1
+    - name: Cache cargo registry and tools
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/bin/
+          ~/.cargo/registry/
+          ~/.cargo/git/
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: ${{ runner.os }}-cargo-registry-
+    - name: Install and run cargo-deny
+      run: |
+        command -v cargo-deny >/dev/null 2>&1 || cargo install cargo-deny@0.19.0 --locked
+        cargo-deny -L error --all-features check licenses bans
 
   test:
     name: Tests
@@ -210,14 +210,14 @@ jobs:
       env:
         CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
-  # ci-status:
-  #   name: CI Status
-  #   runs-on: stg-velo-default-v1
-  #   container:
-  #     image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.2
-  #   needs: [fmt, clippy, deny, test, coverage]
-  #   if: always()
-  #   steps:
-  #   - name: Check all jobs
-  #     run: |
-  #       echo '${{ toJson(needs) }}' | jq -e 'to_entries | map(.value.result) | all(. as $result | ["success", "skipped"] | any($result == .))'
+  ci-status:
+    name: CI Status
+    runs-on: stg-velo-default-v1
+    container:
+      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.2
+    needs: [fmt, clippy, deny, test, coverage]
+    if: always()
+    steps:
+    - name: Check all jobs
+      run: |
+        echo '${{ toJson(needs) }}' | jq -e 'to_entries | map(.value.result) | all(. as $result | ["success", "skipped"] | any($result == .))'
