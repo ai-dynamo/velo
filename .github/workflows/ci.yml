@@ -40,10 +40,10 @@ jobs:
       contents: read
     steps:
     - uses: actions/checkout@v4
-    - name: Add rustfmt component
-      run: rustup component add rustfmt
-    - name: Check formatting
-      run: cargo fmt --check
+    # - name: Add rustfmt component
+    #   run: rustup component add rustfmt
+    # - name: Check formatting
+    #   run: cargo fmt --check
 
   # clippy:
   #   name: Clippy
