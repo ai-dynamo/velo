@@ -84,19 +84,17 @@ jobs:
       contents: read
     steps:
     - uses: actions/checkout@v4
-    - name: Cache cargo registry and tools
+    - name: Cache cargo-deny binary
+      id: cache-cargo-deny
       uses: actions/cache@v4
       with:
-        path: |
-          ~/.cargo/bin/
-          ~/.cargo/registry/
-          ~/.cargo/git/
-        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: ${{ runner.os }}-cargo-registry-
-    - name: Install and run cargo-deny
-      run: |
-        cargo install cargo-deny@0.19.0 --locked || true
-        cargo-deny -L error --all-features check licenses bans
+        path: ~/.cargo/bin/cargo-deny
+        key: cargo-deny-0.19.0-${{ runner.arch }}
+    - name: Install cargo-deny
+      if: steps.cache-cargo-deny.outputs.cache-hit != 'true'
+      run: cargo install cargo-deny@0.19.0 --locked
+    - name: Run cargo-deny
+      run: cargo-deny -L error --all-features check licenses bans
 
   test:
     name: Tests
