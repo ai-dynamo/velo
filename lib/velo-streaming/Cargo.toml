@@ -12,7 +12,7 @@ homepage.workspace = true
 repository.workspace = true
 
 [features]
-grpc = ["dep:tonic", "dep:prost", "dep:tokio-stream", "velo/grpc"]
+grpc = ["dep:tonic", "dep:prost", "dep:tokio-stream"]
 distributed-tracing = ["velo-observability/distributed-tracing", "velo-messenger/distributed-tracing"]
 
 [dependencies]
