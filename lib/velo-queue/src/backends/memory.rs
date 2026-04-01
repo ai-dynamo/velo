@@ -128,19 +128,24 @@ impl ReceiverBackend for InMemoryQueue {
         let timeout = opts.timeout;
         Box::pin(async move {
             let mut batch = Vec::with_capacity(batch_size);
+            let deadline = tokio::time::Instant::now() + timeout;
 
-            // Wait for the first item (or timeout).
-            match tokio::time::timeout(timeout, self.rx.recv_async()).await {
-                Ok(Ok(data)) => batch.push(data),
-                Ok(Err(flume::RecvError::Disconnected)) => return Ok(batch),
-                Err(_timeout) => return Ok(batch),
-            }
-
-            // Try to fill the rest of the batch without blocking.
             while batch.len() < batch_size {
+                // Try non-blocking drain first.
                 match self.rx.try_recv() {
-                    Ok(data) => batch.push(data),
-                    Err(flume::TryRecvError::Empty | flume::TryRecvError::Disconnected) => break,
+                    Ok(data) => {
+                        batch.push(data);
+                        continue;
+                    }
+                    Err(flume::TryRecvError::Disconnected) => return Ok(batch),
+                    Err(flume::TryRecvError::Empty) => {}
+                }
+
+                // Wait for the next item until the deadline.
+                match tokio::time::timeout_at(deadline, self.rx.recv_async()).await {
+                    Ok(Ok(data)) => batch.push(data),
+                    Ok(Err(flume::RecvError::Disconnected)) => return Ok(batch),
+                    Err(_timeout) => return Ok(batch),
                 }
             }
 

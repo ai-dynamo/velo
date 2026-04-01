@@ -55,7 +55,13 @@ impl<T: Serialize> WorkQueueSender<T> {
         self.backend.try_send(bytes)
     }
 
-    /// Close the sender side. No more items can be enqueued after this.
+    /// Request that the sender side be closed.
+    ///
+    /// This delegates to the underlying [`SenderBackend`] and the exact
+    /// effect is backend-dependent. Callers should treat the sender as
+    /// logically closed and avoid further enqueue operations after calling
+    /// this method, but backends may not be able to *strictly* prevent
+    /// additional sends in all cases.
     pub async fn close(&self) {
         self.backend.close().await;
     }

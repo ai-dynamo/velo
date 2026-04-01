@@ -74,52 +74,57 @@ impl MessengerQueueBackend {
     /// handler and creates the backing buffer. If the target is remote,
     /// we assume the actor already exists there.
     fn get_or_create_actor(&self, name: &str) -> Result<Arc<QueueActor>, WorkQueueError> {
-        if let Some(actor) = self.registered_actors.get(name) {
-            return Ok(actor.clone());
-        }
+        // Use entry API to avoid TOCTOU race on concurrent calls for the same name.
+        // The `or_try_insert_with` closure runs exactly once per name.
+        let entry = self.registered_actors.entry(name.to_owned());
+        match entry {
+            dashmap::Entry::Occupied(e) => Ok(e.get().clone()),
+            dashmap::Entry::Vacant(e) => {
+                let actor = Arc::new(QueueActor::new(self.config.capacity));
+                let enqueue_name = format!("queue.{name}.enqueue");
+                let next_name = format!("queue.{name}.next");
 
-        let actor = Arc::new(QueueActor::new(self.config.capacity));
-        let enqueue_name = format!("queue.{name}.enqueue");
-        let next_name = format!("queue.{name}.next");
+                // Register the enqueue handler (fire-and-forget)
+                let actor_for_enqueue = Arc::clone(&actor);
+                let enqueue_handler =
+                    velo_messenger::Handler::am_handler_async(enqueue_name, move |ctx| {
+                        let actor = Arc::clone(&actor_for_enqueue);
+                        async move {
+                            actor.push(ctx.payload);
+                            Ok(())
+                        }
+                    })
+                    .spawn()
+                    .build();
 
-        // Register the enqueue handler (fire-and-forget)
-        let actor_for_enqueue = Arc::clone(&actor);
-        let enqueue_handler = velo_messenger::Handler::am_handler_async(enqueue_name, move |ctx| {
-            let actor = Arc::clone(&actor_for_enqueue);
-            async move {
-                actor.push(ctx.payload);
-                Ok(())
+                self.messenger
+                    .register_handler(enqueue_handler)
+                    .map_err(|e| WorkQueueError::Creation {
+                        name: name.to_owned(),
+                        source: e.into(),
+                    })?;
+
+                // Register the next handler (unary, returns raw bytes or empty)
+                let actor_for_next = Arc::clone(&actor);
+                let next_handler =
+                    velo_messenger::Handler::unary_handler_async(next_name, move |_ctx| {
+                        let actor = Arc::clone(&actor_for_next);
+                        async move { Ok(actor.pop()) }
+                    })
+                    .spawn()
+                    .build();
+
+                self.messenger.register_handler(next_handler).map_err(|e| {
+                    WorkQueueError::Creation {
+                        name: name.to_owned(),
+                        source: e.into(),
+                    }
+                })?;
+
+                e.insert(Arc::clone(&actor));
+                Ok(actor)
             }
-        })
-        .spawn()
-        .build();
-
-        self.messenger
-            .register_handler(enqueue_handler)
-            .map_err(|e| WorkQueueError::Creation {
-                name: name.to_owned(),
-                source: e.into(),
-            })?;
-
-        // Register the next handler (unary, returns raw bytes or empty)
-        let actor_for_next = Arc::clone(&actor);
-        let next_handler = velo_messenger::Handler::unary_handler_async(next_name, move |_ctx| {
-            let actor = Arc::clone(&actor_for_next);
-            async move { Ok(actor.pop()) }
-        })
-        .spawn()
-        .build();
-
-        self.messenger
-            .register_handler(next_handler)
-            .map_err(|e| WorkQueueError::Creation {
-                name: name.to_owned(),
-                source: e.into(),
-            })?;
-
-        self.registered_actors
-            .insert(name.to_owned(), Arc::clone(&actor));
-        Ok(actor)
+        }
     }
 }
 
@@ -213,12 +218,6 @@ impl QueueActor {
             self.notify.notified().await;
         }
     }
-
-    fn pop_batch(&self, count: usize) -> Vec<Bytes> {
-        let mut buf = self.buffer.lock();
-        let n = count.min(buf.len());
-        buf.drain(..n).collect()
-    }
 }
 
 // ============================================================================
@@ -248,20 +247,32 @@ impl SenderBackend for MessengerSender {
     }
 
     fn try_send(&self, data: Bytes) -> Result<(), WorkQueueSendError> {
-        // For messenger, try_send is the same as send but we can't make it
-        // truly non-blocking since AM send is inherently async. We spawn it.
+        // For messenger, try_send is best-effort async. We spawn the actual
+        // send on the runtime if one is available.
         let messenger = Arc::clone(&self.messenger);
         let target = self.target;
         let handler = self.enqueue_handler.clone();
-        tokio::spawn(async move {
-            if let Err(e) = messenger
-                .am_send(&handler)
-                .map(|b| b.raw_payload(data))
-                .map(|b| b.send_to(target))
-            {
-                tracing::warn!("messenger queue try_send failed: {e}");
-            }
-        });
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let res: Result<(), WorkQueueSendError> = async {
+                    messenger
+                        .am_send(&handler)
+                        .map_err(|e| WorkQueueSendError::Backend(e.into()))?
+                        .raw_payload(data)
+                        .send_to(target)
+                        .await
+                        .map_err(|e| WorkQueueSendError::Backend(e.into()))
+                }
+                .await;
+                if let Err(e) = res {
+                    tracing::warn!("messenger queue try_send failed: {e}");
+                }
+            });
+        } else {
+            tracing::warn!(
+                "messenger queue try_send called without an active Tokio runtime; message will be dropped"
+            );
+        }
         Ok(())
     }
 
@@ -292,17 +303,25 @@ impl ReceiverBackend for LocalMessengerReceiver {
         let batch_size = opts.batch_size;
         let timeout = opts.timeout;
         Box::pin(async move {
-            // Wait for at least one item, then grab as many as available up to batch_size.
-            match tokio::time::timeout(timeout, self.actor.pop_async()).await {
-                Ok(Some(first)) => {
-                    let mut batch = vec![first];
-                    let remaining = self.actor.pop_batch(batch_size - 1);
-                    batch.extend(remaining);
-                    Ok(batch)
+            let mut batch = Vec::with_capacity(batch_size);
+            let deadline = tokio::time::Instant::now() + timeout;
+
+            while batch.len() < batch_size {
+                // Try non-blocking drain first.
+                if let Some(data) = self.actor.pop() {
+                    batch.push(data);
+                    continue;
                 }
-                Ok(None) => Ok(Vec::new()),
-                Err(_timeout) => Ok(Vec::new()),
+
+                // Wait for the next item until the deadline.
+                match tokio::time::timeout_at(deadline, self.actor.pop_async()).await {
+                    Ok(Some(data)) => batch.push(data),
+                    Ok(None) => return Ok(batch),
+                    Err(_timeout) => return Ok(batch),
+                }
             }
+
+            Ok(batch)
         })
     }
 

@@ -32,8 +32,13 @@ impl NextOptions {
         Self::default()
     }
 
-    /// Set the maximum batch size.
+    /// Set the maximum batch size. Must be at least 1.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n` is 0.
     pub fn batch_size(mut self, n: usize) -> Self {
+        assert!(n > 0, "batch_size must be at least 1");
         self.batch_size = n;
         self
     }

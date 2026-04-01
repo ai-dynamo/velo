@@ -58,9 +58,10 @@ impl<T: DeserializeOwned> WorkQueueReceiver<T> {
 
     /// Get the next batch of items according to the given options.
     ///
-    /// Blocks until `batch_size` items are collected **or** `timeout` elapses,
-    /// whichever comes first. Returns an empty `Vec` only when the queue is
-    /// closed and drained.
+    /// whichever comes first. May return fewer than `batch_size` items,
+    /// including an empty `Vec`, for example when the timeout expires or when
+    /// the queue has been closed and fully drained. Callers MUST NOT treat an
+    /// empty batch as a definitive signal that the queue is closed.
     pub async fn next_with_options(
         &self,
         options: NextOptions,

@@ -76,8 +76,8 @@ pub trait ReceiverBackend: Send + Sync {
     /// Receive a batch of items according to the given options.
     ///
     /// Blocks until `batch_size` items are collected **or** `timeout` elapses,
-    /// whichever comes first. Returns an empty vec only if the queue is closed
-    /// and drained.
+    /// whichever comes first. May return fewer than `batch_size` items,
+    /// including an empty `Vec` on timeout.
     fn recv_batch(
         &self,
         opts: &NextOptions,

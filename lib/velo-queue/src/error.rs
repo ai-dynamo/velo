@@ -64,7 +64,7 @@ impl fmt::Debug for WorkQueueRecvError {
         match self {
             Self::Closed => write!(f, "Closed"),
             Self::Deserialization(msg) => f.debug_tuple("Deserialization").field(msg).finish(),
-            Self::Backend(e) => f.debug_tuple("Backend").field(e).finish(),
+            Self::Backend(e) => f.debug_tuple("Backend").field(&e.to_string()).finish(),
         }
     }
 }

@@ -5,9 +5,9 @@
 //!
 //! Maps named queues to JetStream streams with **WorkQueue** retention policy.
 //! Each queue creates:
-//! - A stream named `{cluster_id}_queue_{name}` with a single subject
+//! - A stream named `{cluster_id}_{name}` with a single subject
 //!   `{cluster_id}.queue.{name}`
-//! - A durable pull consumer named `{cluster_id}_queue_{name}_worker`
+//! - A durable pull consumer named `{cluster_id}_{name}_worker`
 //!
 //! Items are auto-acknowledged on receipt (consumer uses `AckPolicy::Explicit`
 //! and the receiver acks immediately after fetching).
@@ -199,11 +199,17 @@ impl SenderBackend for NatsSender {
     fn try_send(&self, data: Bytes) -> Result<(), WorkQueueSendError> {
         let js = self.js.clone();
         let subject = self.subject.clone();
-        tokio::spawn(async move {
-            if let Err(e) = js.publish(subject, data).await {
-                tracing::warn!("NATS queue try_send publish failed: {e}");
-            }
-        });
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Err(e) = js.publish(subject, data).await {
+                    tracing::warn!("NATS queue try_send publish failed: {e}");
+                }
+            });
+        } else {
+            tracing::warn!(
+                "NATS queue try_send called without an active Tokio runtime; message will be dropped"
+            );
+        }
         Ok(())
     }
 
@@ -237,8 +243,7 @@ impl ReceiverBackend for NatsReceiver {
             match batch.next().await {
                 Some(Ok(msg)) => {
                     // Auto-ack on receipt
-                    let ack_err: Result<(), async_nats::Error> = msg.ack().await;
-                    ack_err.map_err(WorkQueueRecvError::Backend)?;
+                    msg.ack().await.map_err(WorkQueueRecvError::Backend)?;
                     Ok(Some(msg.payload.clone()))
                 }
                 Some(Err(e)) => Err(WorkQueueRecvError::Backend(e)),
@@ -268,8 +273,7 @@ impl ReceiverBackend for NatsReceiver {
             while let Some(msg_result) = messages.next().await {
                 match msg_result {
                     Ok(msg) => {
-                        let ack_err: Result<(), async_nats::Error> = msg.ack().await;
-                        ack_err.map_err(WorkQueueRecvError::Backend)?;
+                        msg.ack().await.map_err(WorkQueueRecvError::Backend)?;
                         batch.push(msg.payload.clone());
                     }
                     Err(e) => {
