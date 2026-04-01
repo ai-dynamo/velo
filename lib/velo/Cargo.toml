@@ -15,6 +15,8 @@ repository.workspace = true
 etcd = ["velo-discovery/etcd"]
 grpc = ["velo-streaming/grpc"]
 zmq = ["velo-transports/zmq"]
+queue-nats = ["velo-queue/nats"]
+queue-messenger = ["velo-queue/messenger"]
 distributed-tracing = [
     "velo-messenger/distributed-tracing",
     "velo-streaming/distributed-tracing",
@@ -28,6 +30,7 @@ velo-events = { workspace = true }
 velo-messenger = { workspace = true }
 velo-observability = { workspace = true }
 velo-streaming = { workspace = true }
+velo-queue = { workspace = true }
 velo-rendezvous = { workspace = true }
 velo-transports = { workspace = true }
 bytes = { workspace = true }

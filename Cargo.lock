@@ -3306,6 +3306,7 @@ dependencies = [
  "velo-events",
  "velo-messenger",
  "velo-observability",
+ "velo-queue",
  "velo-rendezvous",
  "velo-streaming",
  "velo-transports",
@@ -3404,6 +3405,27 @@ dependencies = [
  "prometheus 0.14.0",
  "tracing",
  "tracing-opentelemetry",
+]
+
+[[package]]
+name = "velo-queue"
+version = "0.1.0"
+dependencies = [
+ "async-nats",
+ "bytes",
+ "dashmap",
+ "flume",
+ "futures",
+ "parking_lot",
+ "rmp-serde",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+ "velo-common",
+ "velo-messenger",
+ "velo-transports",
 ]
 
 [[package]]

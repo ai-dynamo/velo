@@ -39,6 +39,9 @@ pub use velo_streaming::{
     StreamError, StreamFrame, StreamSender,
 };
 
+// Re-exports: Queue (from velo-queue)
+pub use velo_queue as queue;
+
 // Re-exports: Rendezvous (from velo-rendezvous)
 pub use velo_rendezvous::{
     DataHandle, DataMetadata, RegisterOptions, RendezvousManager, RendezvousWrite, StageMode,

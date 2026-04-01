@@ -106,10 +106,6 @@ jobs:
     env:
       RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
     services:
-      nats:
-        image: nats:latest
-        ports:
-          - 4222:4222
       etcd:
         image: quay.io/coreos/etcd:v3.5.0
         ports:
@@ -124,6 +120,10 @@ jobs:
           --health-retries 5
     steps:
     - uses: actions/checkout@v4
+    - name: Start NATS with JetStream
+      run: |
+        docker run -d --name nats -p 4222:4222 nats:latest -js
+        for i in $(seq 1 10); do nc -z 127.0.0.1 4222 && break; sleep 1; done
     - name: Install protoc
       run: |
         PB_REL="https://github.com/protocolbuffers/protobuf/releases"
@@ -155,10 +155,6 @@ jobs:
     env:
       RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
     services:
-      nats:
-        image: nats:latest
-        ports:
-          - 4222:4222
       etcd:
         image: quay.io/coreos/etcd:v3.5.0
         ports:
@@ -173,6 +169,10 @@ jobs:
           --health-retries 5
     steps:
     - uses: actions/checkout@v4
+    - name: Start NATS with JetStream
+      run: |
+        docker run -d --name nats -p 4222:4222 nats:latest -js
+        for i in $(seq 1 10); do nc -z 127.0.0.1 4222 && break; sleep 1; done
     - name: Install protoc
       run: |
         PB_REL="https://github.com/protocolbuffers/protobuf/releases"
