@@ -55,12 +55,17 @@ jobs:
     - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 #v6.0.1
     - name: Install protoc
       run: |
-        if ! command -v protoc >/dev/null 2>&1; then
+        installed_version=$(protoc --version 2>/dev/null | awk '{print $2}')
+        if [ "$installed_version" != "$PROTOC_VERSION" ]; then
           PB_REL="https://github.com/protocolbuffers/protobuf/releases"
-          ARCH=$(uname -m | sed 's/x86_64/x86_64/;s/aarch64/aarch_64/')
+          case "$(uname -m)" in
+            x86_64) ARCH="x86_64" ;;
+            aarch64|arm64) ARCH="aarch_64" ;;
+            *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+          esac
           PROTOC_ZIP="protoc-${PROTOC_VERSION}-linux-${ARCH}.zip"
           curl -fsSLO "$PB_REL/download/v${PROTOC_VERSION}/${PROTOC_ZIP}"
-          unzip "${PROTOC_ZIP}" -d $HOME/.local
+          unzip -o "${PROTOC_ZIP}" -d "$HOME/.local"
           rm "${PROTOC_ZIP}"
           echo "$HOME/.local/bin" >> $GITHUB_PATH
         fi
@@ -110,26 +115,42 @@ jobs:
   test:
     name: Tests
     runs-on: stg-velo-default-v1
-    container:
-      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.2
     permissions:
       contents: read
     env:
-      NATS_URL: nats://127.0.0.1:4222
       RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
     services:
-      nats:
-        image: nats:latest
+      etcd:
+        image: quay.io/coreos/etcd:v3.5.0
+        ports:
+          - 2379:2379
+        env:
+          ETCD_LISTEN_CLIENT_URLS: "http://0.0.0.0:2379"
+          ETCD_ADVERTISE_CLIENT_URLS: "http://127.0.0.1:2379"
+        options: >-
+          --health-cmd "etcdctl endpoint health"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
     - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 #v6.0.1
+    - name: Start NATS with JetStream
+      run: |
+        docker run -d --name nats -p 4222:4222 nats:latest -js
+        for i in $(seq 1 10); do nc -z 127.0.0.1 4222 && break; sleep 1; done
     - name: Install protoc
       run: |
-        if ! command -v protoc >/dev/null 2>&1; then
+        installed_version=$(protoc --version 2>/dev/null | awk '{print $2}')
+        if [ "$installed_version" != "$PROTOC_VERSION" ]; then
           PB_REL="https://github.com/protocolbuffers/protobuf/releases"
-          ARCH=$(uname -m | sed 's/x86_64/x86_64/;s/aarch64/aarch_64/')
+          case "$(uname -m)" in
+            x86_64) ARCH="x86_64" ;;
+            aarch64|arm64) ARCH="aarch_64" ;;
+            *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+          esac
           PROTOC_ZIP="protoc-${PROTOC_VERSION}-linux-${ARCH}.zip"
           curl -fsSLO "$PB_REL/download/v${PROTOC_VERSION}/${PROTOC_ZIP}"
-          unzip "${PROTOC_ZIP}" -d $HOME/.local
+          unzip -o "${PROTOC_ZIP}" -d "$HOME/.local"
           rm "${PROTOC_ZIP}"
           echo "$HOME/.local/bin" >> $GITHUB_PATH
         fi
@@ -156,26 +177,42 @@ jobs:
   coverage:
     name: Coverage
     runs-on: stg-velo-default-v1
-    container:
-      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.2
     permissions:
       contents: read
     env:
-      NATS_URL: nats://127.0.0.1:4222
       RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
     services:
-      nats:
-        image: nats:latest
+      etcd:
+        image: quay.io/coreos/etcd:v3.5.0
+        ports:
+          - 2379:2379
+        env:
+          ETCD_LISTEN_CLIENT_URLS: "http://0.0.0.0:2379"
+          ETCD_ADVERTISE_CLIENT_URLS: "http://127.0.0.1:2379"
+        options: >-
+          --health-cmd "etcdctl endpoint health"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
     - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 #v6.0.1
+    - name: Start NATS with JetStream
+      run: |
+        docker run -d --name nats -p 4222:4222 nats:latest -js
+        for i in $(seq 1 10); do nc -z 127.0.0.1 4222 && break; sleep 1; done
     - name: Install protoc
       run: |
-        if ! command -v protoc >/dev/null 2>&1; then
+        installed_version=$(protoc --version 2>/dev/null | awk '{print $2}')
+        if [ "$installed_version" != "$PROTOC_VERSION" ]; then
           PB_REL="https://github.com/protocolbuffers/protobuf/releases"
-          ARCH=$(uname -m | sed 's/x86_64/x86_64/;s/aarch64/aarch_64/')
+          case "$(uname -m)" in
+            x86_64) ARCH="x86_64" ;;
+            aarch64|arm64) ARCH="aarch_64" ;;
+            *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+          esac
           PROTOC_ZIP="protoc-${PROTOC_VERSION}-linux-${ARCH}.zip"
           curl -fsSLO "$PB_REL/download/v${PROTOC_VERSION}/${PROTOC_ZIP}"
-          unzip "${PROTOC_ZIP}" -d $HOME/.local
+          unzip -o "${PROTOC_ZIP}" -d "$HOME/.local"
           rm "${PROTOC_ZIP}"
           echo "$HOME/.local/bin" >> $GITHUB_PATH
         fi
@@ -217,6 +254,8 @@ jobs:
     needs: [fmt, clippy, deny, test, coverage]
     if: always()
     steps:
+    - name: Install jq
+      run: command -v jq >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y -qq jq; }
     - name: Check all jobs
       run: |
         echo '${{ toJson(needs) }}' | jq -e 'to_entries | map(.value.result) | all(. as $result | ["success", "skipped"] | any($result == .))'
