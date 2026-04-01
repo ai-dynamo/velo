@@ -17,7 +17,7 @@ use velo_common::InstanceId;
 ///
 /// Format: `{cluster_id}.velo.{base58(instance_id.as_bytes())}`
 ///
-/// The base58 segment is always 22 characters for a 16-byte UUID.
+/// The base58 segment is typically 21–22 characters for a 16-byte UUID.
 pub fn inbound_subject(cluster_id: &str, instance_id: InstanceId) -> String {
     let b58 = bs58::encode(instance_id.as_bytes()).into_string();
     format!("{cluster_id}.velo.{b58}")
@@ -93,11 +93,10 @@ mod tests {
             "Base58 segment must be all alphanumeric, got: {b58_part}"
         );
 
-        // A 16-byte input always encodes to 22 characters in base58
-        assert_eq!(
-            b58_part.len(),
-            22,
-            "Base58 of 16 bytes must be 22 chars, got len={} for '{b58_part}'",
+        // A 16-byte input encodes to at most 22 characters in base58
+        assert!(
+            b58_part.len() <= 22 && !b58_part.is_empty(),
+            "Base58 of 16 bytes must be 1-22 chars, got len={} for '{b58_part}'",
             b58_part.len()
         );
     }
