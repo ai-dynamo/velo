@@ -46,7 +46,6 @@ ignored = ["prost"]  # Used by tonic-generated gRPC code behind grpc feature
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "time", "test-util"] }
-velo = { workspace = true }
 velo-common = { workspace = true }
 velo-messenger = { workspace = true }
 velo-transports = { workspace = true }
