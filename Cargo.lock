@@ -3489,7 +3489,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
- "velo",
  "velo-common",
  "velo-messenger",
  "velo-observability",
