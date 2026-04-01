@@ -3422,8 +3422,10 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "uuid",
  "velo-common",
  "velo-messenger",
+ "velo-transports",
 ]
 
 [[package]]

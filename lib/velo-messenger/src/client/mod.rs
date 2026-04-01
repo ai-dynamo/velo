@@ -236,7 +236,13 @@ impl ActiveMessageClient {
             self.handshake_with_peer(target).await?;
         }
 
-        // 4. Verify handler exists
+        // 4. Verify handler exists. If the peer already had cached handler
+        // info but this specific handler is missing, refresh once in case the
+        // remote instance registered it after our earlier handshake.
+        if !self.peer_registry.handler_exists(target, handler) {
+            self.handshake_with_peer(target).await?;
+        }
+
         if !self.peer_registry.handler_exists(target, handler) {
             anyhow::bail!(
                 "Handler '{}' not found on instance {}. Available handlers: {:?}",

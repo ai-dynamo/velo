@@ -3,31 +3,29 @@
 
 //! Velo-messenger-based work queue backend.
 //!
-//! Uses an **actor pattern**: the receiver side registers handlers on a target
-//! velo instance that hold an internal buffer (`VecDeque`). Senders enqueue
-//! items by sending active messages to the actor; receivers pull items via
-//! typed unary requests.
-//!
-//! ## Handler Names
-//!
-//! For a queue named `"my-queue"`, the following handlers are registered:
-//! - `queue.my-queue.enqueue` — fire-and-forget AM handler that pushes to the deque
-//! - `queue.my-queue.next` — typed unary handler that pops from the deque and returns
+//! Uses a single queue service actor per target messenger instance. Queue names
+//! are part of the request payload rather than the handler name, so the remote
+//! handler surface stays fixed even as queues are created dynamically.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
-use dashmap::DashMap;
-use tokio::sync::Notify;
+use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use velo_common::InstanceId;
-use velo_messenger::Messenger;
+use velo_messenger::{Messenger, TypedContext};
 
 use crate::backend::{ReceiverBackend, SenderBackend, WorkQueueBackend};
 use crate::error::{WorkQueueError, WorkQueueRecvError, WorkQueueSendError};
 use crate::options::NextOptions;
+
+const QUEUE_RPC_HANDLER: &str = "velo.queue.rpc";
+const REMOTE_RECV_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const REMOTE_RECV_POLL_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Configuration for the messenger queue backend.
 #[derive(Default)]
@@ -37,24 +35,21 @@ pub struct MessengerQueueConfig {
     pub capacity: Option<usize>,
 }
 
-/// A work queue backend that uses velo-messenger active messages.
+/// A work queue backend that uses a queue service actor behind fixed messenger handlers.
 ///
-/// The queue actor lives on `target_instance`. Senders route `am_send` messages
-/// to it; receivers send `typed_unary` requests to pull items.
+/// The service is created lazily on first use and lives as long as this backend
+/// (plus any outstanding sender/receiver handles). When the backend and all its
+/// handles are dropped, the background service task shuts down automatically.
 pub struct MessengerQueueBackend {
     messenger: Arc<Messenger>,
     target_instance: InstanceId,
     config: MessengerQueueConfig,
-    /// Tracks which queue names have had their actor handlers registered on
-    /// this instance (to avoid double-registration).
-    registered_actors: DashMap<String, Arc<QueueActor>>,
+    /// Lazily-initialized local queue service (only used when target == self).
+    local_service: Mutex<Option<Arc<QueueService>>>,
 }
 
 impl MessengerQueueBackend {
     /// Create a new messenger queue backend.
-    ///
-    /// - `messenger`: the local messenger instance
-    /// - `target_instance`: the instance where queue actors live (can be self)
     pub fn new(
         messenger: Arc<Messenger>,
         target_instance: InstanceId,
@@ -64,67 +59,27 @@ impl MessengerQueueBackend {
             messenger,
             target_instance,
             config,
-            registered_actors: DashMap::new(),
+            local_service: Mutex::new(None),
         }
     }
 
-    /// Get or create the local actor for a queue name.
-    ///
-    /// If the target instance is the local messenger, this registers the
-    /// handler and creates the backing buffer. If the target is remote,
-    /// we assume the actor already exists there.
-    fn get_or_create_actor(&self, name: &str) -> Result<Arc<QueueActor>, WorkQueueError> {
-        // Use entry API to avoid TOCTOU race on concurrent calls for the same name.
-        // The `or_try_insert_with` closure runs exactly once per name.
-        let entry = self.registered_actors.entry(name.to_owned());
-        match entry {
-            dashmap::Entry::Occupied(e) => Ok(e.get().clone()),
-            dashmap::Entry::Vacant(e) => {
-                let actor = Arc::new(QueueActor::new(self.config.capacity));
-                let enqueue_name = format!("queue.{name}.enqueue");
-                let next_name = format!("queue.{name}.next");
-
-                // Register the enqueue handler (fire-and-forget)
-                let actor_for_enqueue = Arc::clone(&actor);
-                let enqueue_handler =
-                    velo_messenger::Handler::am_handler_async(enqueue_name, move |ctx| {
-                        let actor = Arc::clone(&actor_for_enqueue);
-                        async move {
-                            actor.push(ctx.payload);
-                            Ok(())
-                        }
-                    })
-                    .spawn()
-                    .build();
-
-                self.messenger
-                    .register_handler(enqueue_handler)
-                    .map_err(|e| WorkQueueError::Creation {
-                        name: name.to_owned(),
-                        source: e.into(),
-                    })?;
-
-                // Register the next handler (unary, returns raw bytes or empty)
-                let actor_for_next = Arc::clone(&actor);
-                let next_handler =
-                    velo_messenger::Handler::unary_handler_async(next_name, move |_ctx| {
-                        let actor = Arc::clone(&actor_for_next);
-                        async move { Ok(actor.pop()) }
-                    })
-                    .spawn()
-                    .build();
-
-                self.messenger.register_handler(next_handler).map_err(|e| {
-                    WorkQueueError::Creation {
-                        name: name.to_owned(),
-                        source: e.into(),
-                    }
-                })?;
-
-                e.insert(Arc::clone(&actor));
-                Ok(actor)
-            }
+    fn local_service(&self) -> Result<Arc<QueueService>, WorkQueueError> {
+        let mut guard = self.local_service.lock();
+        if let Some(service) = guard.as_ref() {
+            return Ok(Arc::clone(service));
         }
+
+        let service = QueueService::spawn();
+        let handler = build_queue_rpc_handler(Arc::clone(&service));
+        self.messenger
+            .register_handler(handler)
+            .map_err(|e| WorkQueueError::Creation {
+                name: QUEUE_RPC_HANDLER.to_owned(),
+                source: e.into(),
+            })?;
+
+        *guard = Some(Arc::clone(&service));
+        Ok(service)
     }
 }
 
@@ -135,15 +90,20 @@ impl WorkQueueBackend for MessengerQueueBackend {
     ) -> Pin<Box<dyn Future<Output = Result<Arc<dyn SenderBackend>, WorkQueueError>> + Send + '_>>
     {
         let result = (|| {
-            // If we are the target, ensure the actor is registered locally.
             if self.target_instance == self.messenger.instance_id() {
-                self.get_or_create_actor(name)?;
+                let service = self.local_service()?;
+                return Ok(Arc::new(LocalMessengerSender {
+                    service,
+                    queue: name.to_owned(),
+                    capacity: self.config.capacity,
+                }) as Arc<dyn SenderBackend>);
             }
 
-            Ok(Arc::new(MessengerSender {
+            Ok(Arc::new(RemoteMessengerSender {
                 messenger: Arc::clone(&self.messenger),
                 target: self.target_instance,
-                enqueue_handler: format!("queue.{name}.enqueue"),
+                queue: name.to_owned(),
+                capacity: self.config.capacity,
             }) as Arc<dyn SenderBackend>)
         })();
         Box::pin(async move { result })
@@ -155,117 +115,424 @@ impl WorkQueueBackend for MessengerQueueBackend {
     ) -> Pin<Box<dyn Future<Output = Result<Arc<dyn ReceiverBackend>, WorkQueueError>> + Send + '_>>
     {
         let result = (|| {
-            // For local target, register the actor and return a local receiver
-            // that pulls directly from the deque (avoiding network round-trips).
             if self.target_instance == self.messenger.instance_id() {
-                let actor = self.get_or_create_actor(name)?;
-                return Ok(Arc::new(LocalMessengerReceiver { actor }) as Arc<dyn ReceiverBackend>);
+                let service = self.local_service()?;
+                return Ok(Arc::new(LocalMessengerReceiver {
+                    service,
+                    queue: name.to_owned(),
+                    capacity: self.config.capacity,
+                }) as Arc<dyn ReceiverBackend>);
             }
 
-            // For remote target, use typed_unary requests to pull items.
             Ok(Arc::new(RemoteMessengerReceiver {
                 messenger: Arc::clone(&self.messenger),
                 target: self.target_instance,
-                next_handler: format!("queue.{name}.next"),
+                queue: name.to_owned(),
+                capacity: self.config.capacity,
             }) as Arc<dyn ReceiverBackend>)
         })();
         Box::pin(async move { result })
     }
 }
 
-// ============================================================================
-// Queue Actor — the in-process buffer that backs a single named queue
-// ============================================================================
-
-struct QueueActor {
-    buffer: parking_lot::Mutex<VecDeque<Bytes>>,
-    capacity: Option<usize>,
-    notify: Notify,
+#[derive(Serialize, Deserialize)]
+enum QueueRpcRequest {
+    Enqueue {
+        queue: String,
+        data: Vec<u8>,
+        capacity: Option<usize>,
+    },
+    RecvPoll {
+        queue: String,
+        capacity: Option<usize>,
+        poll_timeout_ms: u64,
+    },
 }
 
-impl QueueActor {
+#[derive(Serialize, Deserialize)]
+enum QueueRpcResponse {
+    Ack,
+    Item(Vec<u8>),
+    Empty,
+}
+
+fn build_queue_rpc_handler(service: Arc<QueueService>) -> velo_messenger::Handler {
+    velo_messenger::Handler::typed_unary_async(
+        QUEUE_RPC_HANDLER,
+        move |ctx: TypedContext<QueueRpcRequest>| {
+            let service = Arc::clone(&service);
+            async move {
+                match ctx.input {
+                    QueueRpcRequest::Enqueue {
+                        queue,
+                        data,
+                        capacity,
+                    } => {
+                        service
+                            .enqueue_async(queue, data, capacity)
+                            .await
+                            .map_err(|_| std::io::Error::other("queue service closed"))?;
+                        Ok(QueueRpcResponse::Ack)
+                    }
+                    QueueRpcRequest::RecvPoll {
+                        queue,
+                        capacity,
+                        poll_timeout_ms,
+                    } => {
+                        let deadline =
+                            tokio::time::Instant::now() + Duration::from_millis(poll_timeout_ms);
+                        loop {
+                            if let Some(data) = service
+                                .try_recv_async(queue.clone(), capacity)
+                                .await
+                                .map_err(|_| std::io::Error::other("queue service closed"))?
+                            {
+                                return Ok(QueueRpcResponse::Item(data));
+                            }
+
+                            let now = tokio::time::Instant::now();
+                            if now >= deadline {
+                                return Ok(QueueRpcResponse::Empty);
+                            }
+
+                            tokio::time::sleep((deadline - now).min(REMOTE_RECV_POLL_INTERVAL))
+                                .await;
+                        }
+                    }
+                }
+            }
+        },
+    )
+    .spawn()
+    .build()
+}
+
+enum Command {
+    Enqueue {
+        queue: String,
+        data: Vec<u8>,
+        capacity: Option<usize>,
+        reply: flume::Sender<Result<(), QueueServiceError>>,
+    },
+    Recv {
+        queue: String,
+        capacity: Option<usize>,
+        reply: flume::Sender<Vec<u8>>,
+    },
+    TryRecv {
+        queue: String,
+        capacity: Option<usize>,
+        reply: flume::Sender<Option<Vec<u8>>>,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum QueueServiceError {
+    Closed,
+}
+
+struct QueueState {
+    items: VecDeque<Vec<u8>>,
+    capacity: Option<usize>,
+    pending_receivers: VecDeque<flume::Sender<Vec<u8>>>,
+}
+
+impl QueueState {
     fn new(capacity: Option<usize>) -> Self {
         Self {
-            buffer: parking_lot::Mutex::new(VecDeque::new()),
+            items: VecDeque::new(),
             capacity,
-            notify: Notify::new(),
+            pending_receivers: VecDeque::new(),
         }
     }
+}
 
-    fn push(&self, data: Bytes) {
-        let mut buf = self.buffer.lock();
-        if let Some(cap) = self.capacity
-            && buf.len() >= cap
-        {
-            // Drop oldest if at capacity (work queue semantics: prefer
-            // freshness over completeness). Callers that need backpressure
-            // should use bounded in-memory or NATS backends instead.
-            buf.pop_front();
-        }
-        buf.push_back(data);
-        self.notify.notify_one();
+struct QueueService {
+    commands: flume::Sender<Command>,
+}
+
+impl QueueService {
+    fn spawn() -> Arc<Self> {
+        let (tx, rx) = flume::unbounded();
+        let service = Arc::new(Self { commands: tx });
+        tokio::spawn(async move {
+            run_queue_service(rx).await;
+        });
+        service
     }
 
-    fn pop(&self) -> Option<Bytes> {
-        self.buffer.lock().pop_front()
+    async fn enqueue_async(
+        &self,
+        queue: String,
+        data: Vec<u8>,
+        capacity: Option<usize>,
+    ) -> Result<(), QueueServiceError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.commands
+            .send_async(Command::Enqueue {
+                queue,
+                data,
+                capacity,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| QueueServiceError::Closed)?;
+        reply_rx
+            .recv_async()
+            .await
+            .map_err(|_| QueueServiceError::Closed)?
     }
 
-    async fn pop_async(&self) -> Option<Bytes> {
-        loop {
-            if let Some(data) = self.pop() {
-                return Some(data);
+    fn enqueue_sync(
+        &self,
+        queue: String,
+        data: Vec<u8>,
+        capacity: Option<usize>,
+    ) -> Result<(), QueueServiceError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.commands
+            .send(Command::Enqueue {
+                queue,
+                data,
+                capacity,
+                reply: reply_tx,
+            })
+            .map_err(|_| QueueServiceError::Closed)?;
+        reply_rx.recv().map_err(|_| QueueServiceError::Closed)?
+    }
+
+    async fn recv_async(
+        &self,
+        queue: String,
+        capacity: Option<usize>,
+    ) -> Result<Vec<u8>, QueueServiceError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.commands
+            .send_async(Command::Recv {
+                queue,
+                capacity,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| QueueServiceError::Closed)?;
+        reply_rx
+            .recv_async()
+            .await
+            .map_err(|_| QueueServiceError::Closed)
+    }
+
+    async fn try_recv_async(
+        &self,
+        queue: String,
+        capacity: Option<usize>,
+    ) -> Result<Option<Vec<u8>>, QueueServiceError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.commands
+            .send_async(Command::TryRecv {
+                queue,
+                capacity,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| QueueServiceError::Closed)?;
+        reply_rx
+            .recv_async()
+            .await
+            .map_err(|_| QueueServiceError::Closed)
+    }
+
+    fn try_recv_sync(
+        &self,
+        queue: String,
+        capacity: Option<usize>,
+    ) -> Result<Option<Vec<u8>>, QueueServiceError> {
+        let (reply_tx, reply_rx) = flume::bounded(1);
+        self.commands
+            .send(Command::TryRecv {
+                queue,
+                capacity,
+                reply: reply_tx,
+            })
+            .map_err(|_| QueueServiceError::Closed)?;
+        reply_rx.recv().map_err(|_| QueueServiceError::Closed)
+    }
+}
+
+async fn run_queue_service(rx: flume::Receiver<Command>) {
+    let mut queues = HashMap::<String, QueueState>::new();
+
+    while let Ok(command) = rx.recv_async().await {
+        match command {
+            Command::Enqueue {
+                queue,
+                data,
+                capacity,
+                reply,
+            } => {
+                let state = queues
+                    .entry(queue)
+                    .or_insert_with(|| QueueState::new(capacity));
+                deliver_or_buffer(state, data);
+                let _ = reply.send(Ok(()));
             }
-            self.notify.notified().await;
+            Command::Recv {
+                queue,
+                capacity,
+                reply,
+            } => {
+                let state = queues
+                    .entry(queue)
+                    .or_insert_with(|| QueueState::new(capacity));
+                if let Some(data) = state.items.pop_front() {
+                    if let Err(flume::SendError(data)) = reply.send(data) {
+                        state.items.push_front(data);
+                    }
+                } else {
+                    state.pending_receivers.push_back(reply);
+                }
+            }
+            Command::TryRecv {
+                queue,
+                capacity,
+                reply,
+            } => {
+                let state = queues
+                    .entry(queue)
+                    .or_insert_with(|| QueueState::new(capacity));
+                let data = state.items.pop_front();
+                let _ = reply.send(data);
+            }
         }
     }
 }
 
-// ============================================================================
-// Sender: sends AM messages to the target instance's enqueue handler
-// ============================================================================
+fn deliver_or_buffer(state: &mut QueueState, mut data: Vec<u8>) {
+    while let Some(waiter) = state.pending_receivers.pop_front() {
+        match waiter.send(data) {
+            Ok(()) => return,
+            Err(flume::SendError(returned)) => {
+                data = returned;
+            }
+        }
+    }
 
-struct MessengerSender {
-    messenger: Arc<Messenger>,
-    target: InstanceId,
-    enqueue_handler: String,
+    if let Some(capacity) = state.capacity
+        && state.items.len() >= capacity
+    {
+        state.items.pop_front();
+    }
+    state.items.push_back(data);
 }
 
-impl SenderBackend for MessengerSender {
+fn map_service_send_error(err: QueueServiceError) -> WorkQueueSendError {
+    match err {
+        QueueServiceError::Closed => WorkQueueSendError::Closed,
+    }
+}
+
+fn map_service_recv_error(err: QueueServiceError) -> WorkQueueRecvError {
+    match err {
+        QueueServiceError::Closed => WorkQueueRecvError::Closed,
+    }
+}
+
+struct LocalMessengerSender {
+    service: Arc<QueueService>,
+    queue: String,
+    capacity: Option<usize>,
+}
+
+impl SenderBackend for LocalMessengerSender {
     fn send(
         &self,
         data: Bytes,
     ) -> Pin<Box<dyn Future<Output = Result<(), WorkQueueSendError>> + Send + '_>> {
+        let service = Arc::clone(&self.service);
+        let queue = self.queue.clone();
+        let capacity = self.capacity;
         Box::pin(async move {
-            self.messenger
-                .am_send(&self.enqueue_handler)
-                .map_err(|e| WorkQueueSendError::Backend(e.into()))?
-                .raw_payload(data)
-                .send_to(self.target)
+            service
+                .enqueue_async(queue, data.to_vec(), capacity)
                 .await
-                .map_err(|e| WorkQueueSendError::Backend(e.into()))
+                .map_err(map_service_send_error)
         })
     }
 
     fn try_send(&self, data: Bytes) -> Result<(), WorkQueueSendError> {
-        // For messenger, try_send is best-effort async. We spawn the actual
-        // send on the runtime if one is available.
+        self.service
+            .enqueue_sync(self.queue.clone(), data.to_vec(), self.capacity)
+            .map_err(map_service_send_error)
+    }
+
+    fn close(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async {})
+    }
+}
+
+struct RemoteMessengerSender {
+    messenger: Arc<Messenger>,
+    target: InstanceId,
+    queue: String,
+    capacity: Option<usize>,
+}
+
+impl RemoteMessengerSender {
+    async fn send_rpc(&self, data: Vec<u8>) -> Result<(), WorkQueueSendError> {
+        let response: QueueRpcResponse = self
+            .messenger
+            .typed_unary(QUEUE_RPC_HANDLER)
+            .map_err(|e| WorkQueueSendError::Backend(e.into()))?
+            .payload(QueueRpcRequest::Enqueue {
+                queue: self.queue.clone(),
+                data,
+                capacity: self.capacity,
+            })
+            .map_err(|e| WorkQueueSendError::Backend(e.into()))?
+            .send_to(self.target)
+            .await
+            .map_err(|e| WorkQueueSendError::Backend(e.into()))?;
+
+        match response {
+            QueueRpcResponse::Ack => Ok(()),
+            QueueRpcResponse::Item(_) | QueueRpcResponse::Empty => Err(
+                WorkQueueSendError::Backend("unexpected queue RPC response".into()),
+            ),
+        }
+    }
+}
+
+impl SenderBackend for RemoteMessengerSender {
+    fn send(
+        &self,
+        data: Bytes,
+    ) -> Pin<Box<dyn Future<Output = Result<(), WorkQueueSendError>> + Send + '_>> {
+        Box::pin(async move { self.send_rpc(data.to_vec()).await })
+    }
+
+    fn try_send(&self, data: Bytes) -> Result<(), WorkQueueSendError> {
         let messenger = Arc::clone(&self.messenger);
         let target = self.target;
-        let handler = self.enqueue_handler.clone();
+        let queue = self.queue.clone();
+        let capacity = self.capacity;
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                let res: Result<(), WorkQueueSendError> = async {
-                    messenger
-                        .am_send(&handler)
-                        .map_err(|e| WorkQueueSendError::Backend(e.into()))?
-                        .raw_payload(data)
-                        .send_to(target)
-                        .await
-                        .map_err(|e| WorkQueueSendError::Backend(e.into()))
-                }
-                .await;
-                if let Err(e) = res {
-                    tracing::warn!("messenger queue try_send failed: {e}");
+                let response = messenger
+                    .typed_unary::<QueueRpcResponse>(QUEUE_RPC_HANDLER)
+                    .and_then(|builder| {
+                        builder.payload(QueueRpcRequest::Enqueue {
+                            queue,
+                            data: data.to_vec(),
+                            capacity,
+                        })
+                    });
+
+                match response {
+                    Ok(builder) => {
+                        if let Err(e) = builder.send_to(target).await {
+                            tracing::warn!("messenger queue try_send failed: {e}");
+                        }
+                    }
+                    Err(e) => tracing::warn!("messenger queue try_send failed: {e}"),
                 }
             });
         } else {
@@ -281,19 +548,117 @@ impl SenderBackend for MessengerSender {
     }
 }
 
-// ============================================================================
-// Local Receiver: pulls directly from the QueueActor (same instance)
-// ============================================================================
-
 struct LocalMessengerReceiver {
-    actor: Arc<QueueActor>,
+    service: Arc<QueueService>,
+    queue: String,
+    capacity: Option<usize>,
 }
 
 impl ReceiverBackend for LocalMessengerReceiver {
     fn recv(
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<Option<Bytes>, WorkQueueRecvError>> + Send + '_>> {
-        Box::pin(async move { Ok(self.actor.pop_async().await) })
+        let service = Arc::clone(&self.service);
+        let queue = self.queue.clone();
+        let capacity = self.capacity;
+        Box::pin(async move {
+            service
+                .recv_async(queue, capacity)
+                .await
+                .map(Bytes::from)
+                .map(Some)
+                .map_err(map_service_recv_error)
+        })
+    }
+
+    fn recv_batch(
+        &self,
+        opts: &NextOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Bytes>, WorkQueueRecvError>> + Send + '_>> {
+        let service = Arc::clone(&self.service);
+        let queue = self.queue.clone();
+        let capacity = self.capacity;
+        let batch_size = opts.batch_size;
+        let timeout = opts.timeout;
+        Box::pin(async move {
+            let mut batch = Vec::with_capacity(batch_size);
+            let deadline = tokio::time::Instant::now() + timeout;
+
+            while batch.len() < batch_size {
+                if let Some(data) = service
+                    .try_recv_async(queue.clone(), capacity)
+                    .await
+                    .map_err(map_service_recv_error)?
+                {
+                    batch.push(Bytes::from(data));
+                    continue;
+                }
+
+                match tokio::time::timeout_at(deadline, service.recv_async(queue.clone(), capacity))
+                    .await
+                {
+                    Ok(Ok(data)) => batch.push(Bytes::from(data)),
+                    Ok(Err(err)) => return Err(map_service_recv_error(err)),
+                    Err(_timeout) => return Ok(batch),
+                }
+            }
+
+            Ok(batch)
+        })
+    }
+
+    fn try_recv(&self) -> Result<Option<Bytes>, WorkQueueRecvError> {
+        self.service
+            .try_recv_sync(self.queue.clone(), self.capacity)
+            .map(|data| data.map(Bytes::from))
+            .map_err(map_service_recv_error)
+    }
+}
+
+struct RemoteMessengerReceiver {
+    messenger: Arc<Messenger>,
+    target: InstanceId,
+    queue: String,
+    capacity: Option<usize>,
+}
+
+impl RemoteMessengerReceiver {
+    async fn poll_once(&self, timeout: Duration) -> Result<Option<Bytes>, WorkQueueRecvError> {
+        let response: QueueRpcResponse = self
+            .messenger
+            .typed_unary(QUEUE_RPC_HANDLER)
+            .map_err(|e| WorkQueueRecvError::Backend(e.into()))?
+            .payload(QueueRpcRequest::RecvPoll {
+                queue: self.queue.clone(),
+                capacity: self.capacity,
+                poll_timeout_ms: timeout.as_millis().min(u128::from(u64::MAX)) as u64,
+            })
+            .map_err(|e| WorkQueueRecvError::Backend(e.into()))?
+            .send_to(self.target)
+            .await
+            .map_err(|e| WorkQueueRecvError::Backend(e.into()))?;
+
+        match response {
+            QueueRpcResponse::Item(data) => Ok(Some(Bytes::from(data))),
+            QueueRpcResponse::Empty => Ok(None),
+            QueueRpcResponse::Ack => Err(WorkQueueRecvError::Backend(
+                "unexpected queue RPC response".into(),
+            )),
+        }
+    }
+}
+
+impl ReceiverBackend for RemoteMessengerReceiver {
+    fn recv(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Bytes>, WorkQueueRecvError>> + Send + '_>> {
+        Box::pin(async move {
+            loop {
+                if let Some(data) = self.poll_once(REMOTE_RECV_POLL_TIMEOUT).await? {
+                    return Ok(Some(data));
+                }
+            }
+        })
     }
 
     fn recv_batch(
@@ -307,18 +672,16 @@ impl ReceiverBackend for LocalMessengerReceiver {
             let deadline = tokio::time::Instant::now() + timeout;
 
             while batch.len() < batch_size {
-                // Try non-blocking drain first.
-                if let Some(data) = self.actor.pop() {
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    return Ok(batch);
+                }
+
+                let poll_timeout = (deadline - now).min(REMOTE_RECV_POLL_TIMEOUT);
+                if let Some(data) = self.poll_once(poll_timeout).await? {
                     batch.push(data);
-                    continue;
                 }
-
-                // Wait for the next item until the deadline.
-                match tokio::time::timeout_at(deadline, self.actor.pop_async()).await {
-                    Ok(Some(data)) => batch.push(data),
-                    Ok(None) => return Ok(batch),
-                    Err(_timeout) => return Ok(batch),
-                }
+                // On Empty, continue polling until the deadline expires.
             }
 
             Ok(batch)
@@ -326,69 +689,6 @@ impl ReceiverBackend for LocalMessengerReceiver {
     }
 
     fn try_recv(&self) -> Result<Option<Bytes>, WorkQueueRecvError> {
-        Ok(self.actor.pop())
-    }
-}
-
-// ============================================================================
-// Remote Receiver: sends typed_unary requests to the actor on another instance
-// ============================================================================
-
-struct RemoteMessengerReceiver {
-    messenger: Arc<Messenger>,
-    target: InstanceId,
-    next_handler: String,
-}
-
-impl ReceiverBackend for RemoteMessengerReceiver {
-    fn recv(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<Bytes>, WorkQueueRecvError>> + Send + '_>> {
-        Box::pin(async move {
-            let response = self
-                .messenger
-                .unary(&self.next_handler)
-                .map_err(|e| WorkQueueRecvError::Backend(e.into()))?
-                .send_to(self.target)
-                .await
-                .map_err(|e| WorkQueueRecvError::Backend(e.into()))?;
-
-            if response.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(response))
-            }
-        })
-    }
-
-    fn recv_batch(
-        &self,
-        opts: &NextOptions,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Bytes>, WorkQueueRecvError>> + Send + '_>> {
-        let batch_size = opts.batch_size;
-        let timeout = opts.timeout;
-        Box::pin(async move {
-            let mut batch = Vec::with_capacity(batch_size);
-
-            match tokio::time::timeout(timeout, self.recv()).await {
-                Ok(Ok(Some(data))) => batch.push(data),
-                Ok(Ok(None)) | Ok(Err(_)) | Err(_) => return Ok(batch),
-            }
-
-            // Try to fill the rest (non-blocking requests in quick succession)
-            for _ in 1..batch_size {
-                match self.recv().await {
-                    Ok(Some(data)) => batch.push(data),
-                    _ => break,
-                }
-            }
-
-            Ok(batch)
-        })
-    }
-
-    fn try_recv(&self) -> Result<Option<Bytes>, WorkQueueRecvError> {
-        // Can't do true non-blocking over the network — return None.
         Ok(None)
     }
 }

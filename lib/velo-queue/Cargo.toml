@@ -37,8 +37,13 @@ parking_lot = { workspace = true, optional = true }
 async-nats = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["test-util", "macros"] }
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread", "time"] }
 serde = { workspace = true, features = ["derive"] }
+uuid = { workspace = true, features = ["v4"] }
+velo-transports = { workspace = true }
+velo-messenger = { workspace = true }
+velo-common = { workspace = true }
+async-nats = { workspace = true }
 
 [package.metadata.cargo-machete]
 ignored = ["serde"]
