@@ -49,21 +49,28 @@ jobs:
       contents: read
     steps:
     - uses: actions/checkout@v4
+    - name: Cache protoc
+      id: cache-protoc
+      uses: actions/cache@v4
+      with:
+        path: ~/.local
+        key: protoc-${{ env.PROTOC_VERSION }}-${{ runner.arch }}
     - name: Install protoc
+      if: steps.cache-protoc.outputs.cache-hit != 'true'
       run: |
         PB_REL="https://github.com/protocolbuffers/protobuf/releases"
         PROTOC_ZIP="protoc-${PROTOC_VERSION}-linux-x86_64.zip"
         curl -fsSLO "$PB_REL/download/v${PROTOC_VERSION}/${PROTOC_ZIP}"
         unzip "${PROTOC_ZIP}" -d $HOME/.local
         rm "${PROTOC_ZIP}"
-        echo "$HOME/.local/bin" >> $GITHUB_PATH
+    - name: Add protoc to PATH
+      run: echo "$HOME/.local/bin" >> $GITHUB_PATH
     - name: Install system dependencies
       run: sudo apt-get update -qq && sudo apt-get install -y -qq cmake
-    - name: Cache cargo registry and tools
+    - name: Cache cargo registry
       uses: actions/cache@v4
       with:
         path: |
-          ~/.cargo/bin/
           ~/.cargo/registry/
           ~/.cargo/git/
         key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
@@ -72,10 +79,17 @@ jobs:
       run: rustup component add clippy
     - name: Run clippy
       run: cargo clippy --no-deps --all-features --all-targets -- -D warnings
-    - name: Install and run cargo-machete
-      run: |
-        cargo install cargo-machete --locked || true
-        cargo machete
+    - name: Cache cargo-machete binary
+      id: cache-cargo-machete
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/bin/cargo-machete
+        key: cargo-machete-0.9.1-${{ runner.arch }}
+    - name: Install cargo-machete
+      if: steps.cache-cargo-machete.outputs.cache-hit != 'true'
+      run: cargo install cargo-machete@0.9.1 --locked
+    - name: Run cargo-machete
+      run: cargo machete
 
   deny:
     name: Cargo Deny
@@ -122,14 +136,22 @@ jobs:
       run: |
         docker run -d --name nats -p 4222:4222 nats:latest -js
         for i in $(seq 1 10); do nc -z 127.0.0.1 4222 && break; sleep 1; done
+    - name: Cache protoc
+      id: cache-protoc
+      uses: actions/cache@v4
+      with:
+        path: ~/.local
+        key: protoc-${{ env.PROTOC_VERSION }}-${{ runner.arch }}
     - name: Install protoc
+      if: steps.cache-protoc.outputs.cache-hit != 'true'
       run: |
         PB_REL="https://github.com/protocolbuffers/protobuf/releases"
         PROTOC_ZIP="protoc-${PROTOC_VERSION}-linux-x86_64.zip"
         curl -fsSLO "$PB_REL/download/v${PROTOC_VERSION}/${PROTOC_ZIP}"
         unzip "${PROTOC_ZIP}" -d $HOME/.local
         rm "${PROTOC_ZIP}"
-        echo "$HOME/.local/bin" >> $GITHUB_PATH
+    - name: Add protoc to PATH
+      run: echo "$HOME/.local/bin" >> $GITHUB_PATH
     - name: Install system dependencies
       run: sudo apt-get update -qq && sudo apt-get install -y -qq cmake mold clang
     - name: Cache cargo registry
@@ -171,27 +193,41 @@ jobs:
       run: |
         docker run -d --name nats -p 4222:4222 nats:latest -js
         for i in $(seq 1 10); do nc -z 127.0.0.1 4222 && break; sleep 1; done
+    - name: Cache protoc
+      id: cache-protoc
+      uses: actions/cache@v4
+      with:
+        path: ~/.local
+        key: protoc-${{ env.PROTOC_VERSION }}-${{ runner.arch }}
     - name: Install protoc
+      if: steps.cache-protoc.outputs.cache-hit != 'true'
       run: |
         PB_REL="https://github.com/protocolbuffers/protobuf/releases"
         PROTOC_ZIP="protoc-${PROTOC_VERSION}-linux-x86_64.zip"
         curl -fsSLO "$PB_REL/download/v${PROTOC_VERSION}/${PROTOC_ZIP}"
         unzip "${PROTOC_ZIP}" -d $HOME/.local
         rm "${PROTOC_ZIP}"
-        echo "$HOME/.local/bin" >> $GITHUB_PATH
+    - name: Add protoc to PATH
+      run: echo "$HOME/.local/bin" >> $GITHUB_PATH
     - name: Install system dependencies
       run: sudo apt-get update -qq && sudo apt-get install -y -qq cmake mold clang
-    - name: Cache cargo registry and tools
+    - name: Cache cargo registry
       uses: actions/cache@v4
       with:
         path: |
-          ~/.cargo/bin/
           ~/.cargo/registry/
           ~/.cargo/git/
         key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: ${{ runner.os }}-cargo-registry-
+    - name: Cache cargo-llvm-cov binary
+      id: cache-cargo-llvm-cov
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/bin/cargo-llvm-cov
+        key: cargo-llvm-cov-0.8.5-${{ runner.arch }}
     - name: Install cargo-llvm-cov
-      run: cargo install cargo-llvm-cov --locked || true
+      if: steps.cache-cargo-llvm-cov.outputs.cache-hit != 'true'
+      run: cargo install cargo-llvm-cov@0.8.5 --locked
     - name: Add llvm-tools component
       run: rustup component add llvm-tools-preview
     - name: Generate coverage
