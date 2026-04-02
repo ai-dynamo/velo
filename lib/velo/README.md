@@ -14,7 +14,7 @@ messaging patterns, events, streaming, transports, discovery, and observability.
 | `velo-messenger` | Active messaging, handlers, distributed events |
 | `velo-streaming` | Typed exclusive-attachment streaming (anchors, senders) |
 | `velo-events` | Generational event system (local + distributed) |
-| `velo-transports` | Transport abstraction (TCP, HTTP, NATS, gRPC, ZMQ, UDS) |
+| `velo-transports` | Transport abstraction (TCP, NATS, gRPC, ZMQ, UDS) |
 | `velo-discovery` | Peer discovery backends (filesystem, NATS, etcd) |
 | `velo-observability` | Prometheus metrics + optional OpenTelemetry tracing |
 | `velo-rendezvous` | Large payload staging and retrieval |

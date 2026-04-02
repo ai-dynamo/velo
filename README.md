@@ -45,7 +45,7 @@ Transports, discovery backends, and metrics are injected at build time. The `vel
 | `velo-messenger` | Active messaging: fire-and-forget, sync, unary, typed-unary |
 | `velo-events` | Generational event system (local + distributed) |
 | `velo-streaming` | Typed exclusive-attachment streaming (anchors + senders) |
-| `velo-transports` | Transport backends: TCP, HTTP, NATS, gRPC, ZMQ, UDS |
+| `velo-transports` | Transport backends: TCP, NATS, gRPC, ZMQ, UDS |
 | `velo-discovery` | Peer discovery: filesystem, NATS, etcd |
 | `velo-observability` | Prometheus metrics + optional OpenTelemetry tracing |
 | `velo-rendezvous` | Large payload staging and retrieval |
@@ -72,7 +72,7 @@ Optional feature flags:
 | `queue-messenger`     | Active-message-backed work queue backend             |
 | `distributed-tracing` | OpenTelemetry trace context propagation              |
 
-TCP, HTTP, and NATS transports are always available (no feature gate required).
+TCP and NATS transports are always available (no feature gate required).
 
 ---
 
@@ -368,14 +368,13 @@ let node = Velo::builder()
 
 Available transports:
 
-| Transport | Feature Gate | Protocol         | Notes                                             |
-|-----------|--------------|------------------|---------------------------------------------------|
-| TCP       | _(always)_   | Raw TCP          | Default, lowest latency for direct connections    |
-| HTTP      | _(always)_   | HTTP/1.1 POST    | Axum server; fire-and-forget via 202 Accepted     |
-| NATS      | _(always)_   | NATS pub-sub     | Subject scheme `velo.{id}.{type}`                 |
-| gRPC      | `grpc`       | HTTP/2 streaming | Bidirectional, exponential backoff reconnect      |
-| ZMQ       | `zmq`        | ZMQ DEALER/ROUTER| Automatic reconnection and message queuing        |
-| UDS       | Unix only    | Unix Domain Socket | Local-only, lower overhead than TCP             |
+| Transport | Feature Gate | Protocol          | Notes                                             |
+|-----------|--------------|-------------------|---------------------------------------------------|
+| TCP       | _(always)_   | Raw TCP           | Default, lowest latency for direct connections    |
+| NATS      | _(always)_   | NATS pub-sub      | Subject scheme `velo.{id}.{type}`                 |
+| gRPC      | `grpc`       | HTTP/2 streaming  | Bidirectional, exponential backoff reconnect      |
+| ZMQ       | `zmq`        | ZMQ DEALER/ROUTER | Automatic reconnection and message queuing        |
+| UDS       | Unix only    | Unix Domain Socket | Local-only, lower overhead than TCP              |
 
 For detailed wire format, shutdown behavior, and priority-based routing, see [`lib/velo-transports/README.md`](lib/velo-transports/README.md).
 
