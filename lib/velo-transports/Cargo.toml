@@ -14,7 +14,7 @@ keywords.workspace = true
 
 [features]
 default = ["http", "nats", "grpc"]
-http = ["dep:axum", "dep:reqwest"]
+http = ["dep:axum"]
 nats = ["dep:async-nats", "dep:bs58"]
 grpc = ["dep:tonic", "dep:prost", "dep:tower", "dep:hyper", "dep:http", "dep:http-body", "dep:http-body-util", "dep:hyper-util", "dep:tokio-stream"]
 zmq = ["dep:zmq"]
@@ -52,7 +52,6 @@ nix = { version = "0.30", features = ["sched", "net"] }
 
 # optional dependencies
 axum = { version = "0.8", optional = true }
-reqwest = { workspace = true , optional = true }
 async-nats = { workspace = true, optional = true }
 bs58 = { version = "0.5", optional = true }
 prost = { version = "0.13", optional = true }

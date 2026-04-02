@@ -32,7 +32,7 @@ use std::sync::Arc;
 pub struct TransportKey(Arc<str>);
 
 impl TransportKey {
-    /// Create a new TransportKey from any type that can be converted into Arc<str>.
+    /// Create a new TransportKey from any type that can be converted into `Arc<str>`.
     pub fn new(key: impl Into<Arc<str>>) -> Self {
         Self(key.into())
     }

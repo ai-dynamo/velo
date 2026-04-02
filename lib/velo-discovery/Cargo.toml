@@ -39,7 +39,6 @@ bs58 = { version = "0.5", optional = true }
 etcd-client = { workspace = true, optional = true }
 
 [dev-dependencies]
-tempfile = "3"
 async-nats = { workspace = true }
 etcd-client = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros"] }
