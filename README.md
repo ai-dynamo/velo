@@ -39,18 +39,18 @@ Transports, discovery backends, and metrics are injected at build time. The `vel
 
 ## Crate Map
 
-```
-velo                    facade — re-exports everything below
-├── velo-messenger      active messaging: fire-and-forget, sync, unary, typed-unary
-├── velo-events         generational event system (local + distributed)
-├── velo-streaming      typed exclusive-attachment streaming (anchors + senders)
-├── velo-transports     transport backends: TCP, HTTP, NATS, gRPC, ZMQ, UDS
-├── velo-discovery      peer discovery: filesystem, NATS, etcd
-├── velo-observability  Prometheus metrics + optional OpenTelemetry tracing
-├── velo-rendezvous     large payload staging and retrieval
-├── velo-queue          named work queues (in-memory, NATS, messenger-backed)
-└── velo-common         core types: InstanceId, PeerInfo, WorkerId, WorkerAddress
-```
+| Crate | Purpose |
+|---|---|
+| `velo` | Facade — re-exports everything below |
+| `velo-messenger` | Active messaging: fire-and-forget, sync, unary, typed-unary |
+| `velo-events` | Generational event system (local + distributed) |
+| `velo-streaming` | Typed exclusive-attachment streaming (anchors + senders) |
+| `velo-transports` | Transport backends: TCP, HTTP, NATS, gRPC, ZMQ, UDS |
+| `velo-discovery` | Peer discovery: filesystem, NATS, etcd |
+| `velo-observability` | Prometheus metrics + optional OpenTelemetry tracing |
+| `velo-rendezvous` | Large payload staging and retrieval |
+| `velo-queue` | Named work queues (in-memory, NATS, messenger-backed) |
+| `velo-common` | Core types: InstanceId, PeerInfo, WorkerId, WorkerAddress |
 
 ---
 

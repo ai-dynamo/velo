@@ -8,18 +8,18 @@ messaging patterns, events, streaming, transports, discovery, and observability.
 
 ## Crate map
 
-```text
-velo                  <- you are here (facade + re-exports)
-├── velo-messenger    active messaging, handlers, distributed events
-├── velo-streaming    typed exclusive-attachment streaming (anchors, senders)
-├── velo-events       generational event system (local + distributed)
-├── velo-transports   transport abstraction (TCP, HTTP, NATS, gRPC, ZMQ, UDS)
-├── velo-discovery    peer discovery backends (filesystem, NATS, etcd)
-├── velo-observability Prometheus metrics + optional OpenTelemetry tracing
-├── velo-rendezvous   large payload staging and retrieval
-├── velo-queue        named work queues
-└── velo-common       shared types (InstanceId, PeerInfo, WorkerId, WorkerAddress)
-```
+| Crate | Purpose |
+|---|---|
+| `velo` | Facade — you are here |
+| `velo-messenger` | Active messaging, handlers, distributed events |
+| `velo-streaming` | Typed exclusive-attachment streaming (anchors, senders) |
+| `velo-events` | Generational event system (local + distributed) |
+| `velo-transports` | Transport abstraction (TCP, HTTP, NATS, gRPC, ZMQ, UDS) |
+| `velo-discovery` | Peer discovery backends (filesystem, NATS, etcd) |
+| `velo-observability` | Prometheus metrics + optional OpenTelemetry tracing |
+| `velo-rendezvous` | Large payload staging and retrieval |
+| `velo-queue` | Named work queues |
+| `velo-common` | Shared types: InstanceId, PeerInfo, WorkerId, WorkerAddress |
 
 ## What's re-exported
 
