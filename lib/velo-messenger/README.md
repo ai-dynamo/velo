@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # velo-messenger
 
 Active messaging layer for Velo distributed systems. Sits between `` (transport abstraction) and higher-level session/service crates, providing request-response and fire-and-forget messaging patterns over pluggable transports.
