@@ -18,6 +18,7 @@ http = ["dep:axum", "dep:reqwest"]
 nats = ["dep:async-nats", "dep:bs58"]
 grpc = ["dep:tonic", "dep:prost", "dep:tower", "dep:hyper", "dep:http", "dep:http-body", "dep:http-body-util", "dep:hyper-util", "dep:tokio-stream"]
 zmq = ["dep:zmq"]
+quic = ["dep:quinn", "dep:rustls", "dep:rcgen"]
 distributed-tracing = ["velo-observability/distributed-tracing"]
 
 [dependencies]
@@ -65,6 +66,9 @@ http-body-util = { version = "0.1", optional = true }
 hyper-util = { version = "0.1", optional = true, features = ["tokio", "server", "server-auto"] }
 tokio-stream = { version = "0.1", optional = true, features = ["sync"] }
 zmq = { workspace = true, optional = true }
+quinn = { version = "0.11", optional = true, default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std"] }
+rcgen = { version = "0.13", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

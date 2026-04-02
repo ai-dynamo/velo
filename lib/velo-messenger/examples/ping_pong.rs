@@ -19,6 +19,8 @@ use velo_transports::uds::UdsTransportBuilder;
 use velo_transports::grpc::GrpcTransportBuilder;
 #[cfg(feature = "nats")]
 use velo_transports::nats::{NatsTransportBuilder, utils::connect};
+#[cfg(feature = "quic")]
+use velo_transports::quic::QuicTransportBuilder;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -41,6 +43,9 @@ enum TransportType {
     /// gRPC transport
     #[cfg(feature = "grpc")]
     Grpc,
+    /// QUIC transport (TLS 1.3 encrypted)
+    #[cfg(feature = "quic")]
+    Quic,
 }
 
 /// Create a transport instance based on the selected type.
@@ -87,6 +92,17 @@ async fn new_transport(transport_type: &TransportType) -> Arc<dyn Transport> {
             Arc::new(
                 GrpcTransportBuilder::new()
                     .from_listener(listener)
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+            )
+        }
+        #[cfg(feature = "quic")]
+        TransportType::Quic => {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            Arc::new(
+                QuicTransportBuilder::new()
+                    .from_socket(socket)
                     .unwrap()
                     .build()
                     .unwrap(),

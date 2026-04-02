@@ -10,6 +10,8 @@
 
 #[cfg(feature = "grpc")]
 use velo_transports::grpc::{GrpcTransport, GrpcTransportBuilder};
+#[cfg(feature = "quic")]
+use velo_transports::quic::{QuicTransport, QuicTransportBuilder};
 #[cfg(feature = "zmq")]
 use velo_transports::zmq::{ZmqTransport, ZmqTransportBuilder};
 // #[cfg(feature = "http")]
@@ -328,6 +330,19 @@ impl TestTransportHandle<GrpcTransport> {
     }
 }
 
+// QUIC-specific convenience constructors
+#[cfg(feature = "quic")]
+impl TestTransportHandle<QuicTransport> {
+    /// Create a new QUIC transport with OS-assigned port
+    pub async fn new_quic() -> anyhow::Result<Self> {
+        Self::with_factory(|| {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
+            QuicTransportBuilder::new().from_socket(socket)?.build()
+        })
+        .await
+    }
+}
+
 // ZMQ-specific convenience constructors
 #[cfg(feature = "zmq")]
 impl TestTransportHandle<ZmqTransport> {
@@ -475,6 +490,19 @@ impl TestCluster<GrpcTransport> {
         Self::with_factory(size, || {
             let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
             GrpcTransportBuilder::new().from_listener(listener)?.build()
+        })
+        .await
+    }
+}
+
+// QUIC-specific convenience constructor
+#[cfg(feature = "quic")]
+impl TestCluster<QuicTransport> {
+    /// Create a new QUIC test cluster with the specified number of transports
+    pub async fn new_quic(size: usize) -> anyhow::Result<Self> {
+        Self::with_factory(size, || {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
+            QuicTransportBuilder::new().from_socket(socket)?.build()
         })
         .await
     }
@@ -899,6 +927,23 @@ impl TransportFactory for GrpcFactory {
 
     async fn create_cluster(size: usize) -> anyhow::Result<TestCluster<Self::Transport>> {
         TestCluster::new_grpc(size).await
+    }
+}
+
+/// QUIC transport factory
+#[cfg(feature = "quic")]
+pub struct QuicFactory;
+
+#[cfg(feature = "quic")]
+impl TransportFactory for QuicFactory {
+    type Transport = QuicTransport;
+
+    async fn create() -> anyhow::Result<TestTransportHandle<Self::Transport>> {
+        TestTransportHandle::new_quic().await
+    }
+
+    async fn create_cluster(size: usize) -> anyhow::Result<TestCluster<Self::Transport>> {
+        TestCluster::new_quic(size).await
     }
 }
 
