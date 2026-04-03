@@ -7,6 +7,8 @@ SPDX-License-Identifier: Apache-2.0
 
 A high-performance distributed messaging framework for Rust. Velo provides active messaging, typed streaming, and a distributed event system over pluggable transports, with peer discovery and Prometheus metrics built in.
 
+**Warning:** Velo is still in beta testing. We recommend against deploying it in production today.
+
 ## Table of Contents
 
 - [Overview](#overview)
