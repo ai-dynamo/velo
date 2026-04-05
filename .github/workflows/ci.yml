@@ -30,20 +30,20 @@ env:
   PROTOC_VERSION: "30.2"
 
 jobs:
-#  fmt:
-#    name: Formatting
-#    runs-on: stg-velo-default-v1
-#    container:
-#      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.2
-#    permissions:
-#      contents: read
-#    steps:
-#    - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 #v6.0.1
-#    - name: Add rustfmt component
-#      run: rustup component list --installed | grep -q '^rustfmt' || rustup component add rustfmt
-#    - name: Check formatting
-#      run: cargo fmt --check
-#
+  fmt:
+    name: Formatting
+    runs-on: stg-velo-default-v1
+    container:
+      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.3
+    permissions:
+      contents: read
+    steps:
+    - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 #v6.0.1
+    - name: Add rustfmt component
+      run: rustup component list --installed | grep -q '^rustfmt' || rustup component add rustfmt
+    - name: Check formatting
+      run: cargo fmt --check
+
   clippy:
     name: Clippy
     runs-on: stg-velo-default-v1
@@ -71,119 +71,119 @@ jobs:
     - name: sccache stats
       if: always()
       run: /tmp/use-sccache.sh show-stats "clippy" || true
-#
-#  deny:
-#    name: Cargo Deny
-#    runs-on: stg-velo-default-v1
-#    container:
-#      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.2
-#    permissions:
-#      contents: read
-#    steps:
-#    - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 #v6.0.1
-#    - name: Cache cargo registry and tools
-#      uses: actions/cache@v4
-#      with:
-#        path: |
-#          ~/.cargo/bin/
-#          ~/.cargo/registry/
-#          ~/.cargo/git/
-#        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-#        restore-keys: ${{ runner.os }}-cargo-registry-
-#    - name: Install cargo-deny
-#      run: |
-#        cargo-deny --version 2>/dev/null | grep -qF '0.19.0' || cargo install cargo-deny@0.19.0 --locked
-#    - name: Run cargo-deny
-#      run: cargo-deny -L error --all-features check licenses bans
-#
-#  test:
-#    name: Tests
-#    runs-on: stg-velo-default-v1
-#    container:
-#      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.2
-#    permissions:
-#      contents: read
-#    env:
-#      NATS_URL: nats://127.0.0.1:4222
-#      ETCD_URL: http://127.0.0.1:2379
-#      RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
-#    services:
-#      nats:
-#        image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/nats-jetstream:2.12.6v1
-#      etcd:
-#        image: quay.io/coreos/etcd:v3.5.0
-#        env:
-#          ETCD_LISTEN_CLIENT_URLS: "http://0.0.0.0:2379"
-#          ETCD_ADVERTISE_CLIENT_URLS: "http://127.0.0.1:2379"
-#    steps:
-#    - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 #v6.0.1
-#    - name: Rust setup
-#      uses: ./.github/actions/rust-setup
-#    - name: sccache setup
-#      uses: ./.github/actions/sccache-setup
-#      with:
-#        bucket: ${{ secrets.SCCACHE_S3_BUCKET }}
-#    - name: Verify Cargo.lock is in sync
-#      run: cargo metadata --locked --format-version 1 > /dev/null
-#    - name: Compile and run tests
-#      run: cargo test --locked --all-features --all-targets
-#    - name: sccache stats
-#      if: always()
-#      run: /tmp/use-sccache.sh show-stats "tests" || true
-#
-#  coverage:
-#    name: Coverage
-#    runs-on: stg-velo-default-v1
-#    container:
-#      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.2
-#    permissions:
-#      contents: read
-#    env:
-#      NATS_URL: nats://127.0.0.1:4222
-#      ETCD_URL: http://127.0.0.1:2379
-#      RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
-#    services:
-#      nats:
-#        image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/nats-jetstream:2.12.6v1
-#      etcd:
-#        image: quay.io/coreos/etcd:v3.5.0
-#        env:
-#          ETCD_LISTEN_CLIENT_URLS: "http://0.0.0.0:2379"
-#          ETCD_ADVERTISE_CLIENT_URLS: "http://127.0.0.1:2379"
-#    steps:
-#    - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 #v6.0.1
-#    - name: Rust setup
-#      uses: ./.github/actions/rust-setup
-#    - name: sccache setup
-#      uses: ./.github/actions/sccache-setup
-#      with:
-#        bucket: ${{ secrets.SCCACHE_S3_BUCKET }}
-#    - name: Install cargo-llvm-cov if missing
-#      run: |
-#        cargo-llvm-cov --version 2>/dev/null | grep -qF '0.8.5' || cargo install cargo-llvm-cov@0.8.5 --locked
-#    - name: Add llvm-tools component
-#      run: rustup component list --installed | grep -q '^llvm-tools' || rustup component add llvm-tools-preview
-#    - name: Generate coverage
-#      run: cargo llvm-cov --all-features --workspace --codecov --output-path codecov.json
-#    - name: sccache stats
-#      if: always()
-#      run: /tmp/use-sccache.sh show-stats "coverage" || true
-#    - name: Upload to Codecov
-#      uses: codecov/codecov-action@v5
-#      with:
-#        files: codecov.json
-#        fail_ci_if_error: false
-#      env:
-#        CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
-#
-#  ci-status:
-#    name: CI Status
-#    runs-on: stg-velo-default-v1
-#    container:
-#      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.2
-#    needs: [fmt, clippy, deny, test, coverage]
-#    if: always()
-#    steps:
-#    - name: Check all jobs
-#      run: |
-#        echo '${{ toJson(needs) }}' | jq -e 'to_entries | map(.value.result) | all(. as $result | ["success", "skipped"] | any($result == .))'
+
+  deny:
+    name: Cargo Deny
+    runs-on: stg-velo-default-v1
+    container:
+      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.3
+    permissions:
+      contents: read
+    steps:
+    - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 #v6.0.1
+    - name: Cache cargo registry and tools
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/bin/
+          ~/.cargo/registry/
+          ~/.cargo/git/
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: ${{ runner.os }}-cargo-registry-
+    - name: Install cargo-deny
+      run: |
+        cargo-deny --version 2>/dev/null | grep -qF '0.19.0' || cargo install cargo-deny@0.19.0 --locked
+    - name: Run cargo-deny
+      run: cargo-deny -L error --all-features check licenses bans
+
+  test:
+    name: Tests
+    runs-on: stg-velo-default-v1
+    container:
+      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.3
+    permissions:
+      contents: read
+    env:
+      NATS_URL: nats://127.0.0.1:4222
+      ETCD_URL: http://127.0.0.1:2379
+      RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
+    services:
+      nats:
+        image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/nats-jetstream:2.12.6v1
+      etcd:
+        image: quay.io/coreos/etcd:v3.5.0
+        env:
+          ETCD_LISTEN_CLIENT_URLS: "http://0.0.0.0:2379"
+          ETCD_ADVERTISE_CLIENT_URLS: "http://127.0.0.1:2379"
+    steps:
+    - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 #v6.0.1
+    - name: Rust setup
+      uses: ./.github/actions/rust-setup
+    - name: sccache setup
+      uses: ./.github/actions/sccache-setup
+      with:
+        bucket: ${{ secrets.SCCACHE_S3_BUCKET }}
+    - name: Verify Cargo.lock is in sync
+      run: cargo metadata --locked --format-version 1 > /dev/null
+    - name: Compile and run tests
+      run: cargo test --locked --all-features --all-targets
+    - name: sccache stats
+      if: always()
+      run: /tmp/use-sccache.sh show-stats "tests" || true
+
+  coverage:
+    name: Coverage
+    runs-on: stg-velo-default-v1
+    container:
+      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.3
+    permissions:
+      contents: read
+    env:
+      NATS_URL: nats://127.0.0.1:4222
+      ETCD_URL: http://127.0.0.1:2379
+      RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
+    services:
+      nats:
+        image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/nats-jetstream:2.12.6v1
+      etcd:
+        image: quay.io/coreos/etcd:v3.5.0
+        env:
+          ETCD_LISTEN_CLIENT_URLS: "http://0.0.0.0:2379"
+          ETCD_ADVERTISE_CLIENT_URLS: "http://127.0.0.1:2379"
+    steps:
+    - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 #v6.0.1
+    - name: Rust setup
+      uses: ./.github/actions/rust-setup
+    - name: sccache setup
+      uses: ./.github/actions/sccache-setup
+      with:
+        bucket: ${{ secrets.SCCACHE_S3_BUCKET }}
+    - name: Install cargo-llvm-cov if missing
+      run: |
+        cargo-llvm-cov --version 2>/dev/null | grep -qF '0.8.5' || cargo install cargo-llvm-cov@0.8.5 --locked
+    - name: Add llvm-tools component
+      run: rustup component list --installed | grep -q '^llvm-tools' || rustup component add llvm-tools-preview
+    - name: Generate coverage
+      run: cargo llvm-cov --all-features --workspace --codecov --output-path codecov.json
+    - name: sccache stats
+      if: always()
+      run: /tmp/use-sccache.sh show-stats "coverage" || true
+    - name: Upload to Codecov
+      uses: codecov/codecov-action@v5
+      with:
+        files: codecov.json
+        fail_ci_if_error: false
+      env:
+        CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  ci-status:
+    name: CI Status
+    runs-on: stg-velo-default-v1
+    container:
+      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.3
+    needs: [fmt, clippy, deny, test, coverage]
+    if: always()
+    steps:
+    - name: Check all jobs
+      run: |
+        echo '${{ toJson(needs) }}' | jq -e 'to_entries | map(.value.result) | all(. as $result | ["success", "skipped"] | any($result == .))'
