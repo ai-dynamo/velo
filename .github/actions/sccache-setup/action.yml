@@ -22,8 +22,9 @@ description: >
 
 inputs:
   bucket:
-    description: S3 bucket name for sccache
-    required: true
+    description: S3 bucket name for sccache. When empty (e.g. fork PRs where secrets are unavailable), the action is a no-op and the build proceeds uncached.
+    required: false
+    default: ''
   key_prefix:
     description: S3 key prefix to namespace cache entries within the shared bucket
     required: false
@@ -35,6 +36,13 @@ runs:
   - name: Configure sccache S3 cache
     shell: bash
     run: |
+      # On fork pull requests GitHub does not expose repository secrets, so the
+      # bucket input arrives as an empty string. Skip gracefully so CI still runs.
+      if [ -z "${{ inputs.bucket }}" ]; then
+        echo "SCCACHE_S3_BUCKET is unset (fork PR or secret unavailable); skipping sccache setup."
+        exit 0
+      fi
+
       # Fetch use-sccache.sh from the pinned dynamo release tag (Apache-2.0).
       # sccache binary and CC/CXX wrappers are pre-baked into the runner image;
       # we only need the script for setup-env (server start) and show-stats.
