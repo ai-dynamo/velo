@@ -48,7 +48,7 @@ jobs:
     name: Clippy
     runs-on: stg-velo-default-v1
     container:
-      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.2
+      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.3
     permissions:
       contents: read
     steps:
