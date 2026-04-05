@@ -8,7 +8,7 @@ use dashmap::DashMap;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::Semaphore;
 use tokio_util::task::TaskTracker;
-use tracing::{debug, error, trace};
+use tracing::{error, trace, warn};
 use velo_common::WorkerId;
 use velo_observability::DispatchFailure;
 use velo_transports::VeloBackend;
