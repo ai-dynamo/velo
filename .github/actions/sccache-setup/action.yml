@@ -1,0 +1,71 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: sccache Setup
+description: >
+  Install sccache and configure it to cache Rust (and C/C++) compilations in S3.
+  Downloads use-sccache.sh from ai-dynamo/dynamo at a pinned tag.
+  Credentials come from IRSA — no explicit AWS keys needed.
+
+inputs:
+  bucket:
+    description: S3 bucket name for sccache
+    required: true
+  key_prefix:
+    description: S3 key prefix to namespace cache entries within the shared bucket
+    required: false
+    default: 'velo'
+
+runs:
+  using: composite
+  steps:
+  - name: Install sccache and configure S3 cache
+    shell: bash
+    run: |
+      # Fetch use-sccache.sh from the pinned dynamo release tag (Apache-2.0)
+      curl -fsSL -o /tmp/use-sccache.sh \
+        "https://raw.githubusercontent.com/ai-dynamo/dynamo/v1.0.1/container/use-sccache.sh"
+      chmod +x /tmp/use-sccache.sh
+
+      # Install sccache binary and CC/CXX wrapper scripts
+      /tmp/use-sccache.sh install
+
+      # Set S3 config before starting the server so sccache can authenticate
+      export SCCACHE_BUCKET="${{ inputs.bucket }}"
+      export SCCACHE_S3_KEY_PREFIX="${{ inputs.key_prefix }}"
+      # SCCACHE_REGION is intentionally unset: AWS_DEFAULT_REGION is already
+      # in the pod environment via IRSA and sccache picks it up automatically.
+
+      # Start the sccache server and configure compiler wrappers.
+      # setup-env outputs export statements; eval applies them to this shell.
+      # If --start-server fails (bad credentials, unreachable bucket), the script
+      # prints a warning and leaves RUSTC_WRAPPER unset — build continues uncached.
+      eval $(/tmp/use-sccache.sh setup-env)
+
+      # Persist S3 config and compiler wrapper vars to GITHUB_ENV so they are
+      # visible in all subsequent steps of this job.
+      echo "SCCACHE_BUCKET=$SCCACHE_BUCKET" >> "$GITHUB_ENV"
+      echo "SCCACHE_S3_KEY_PREFIX=$SCCACHE_S3_KEY_PREFIX" >> "$GITHUB_ENV"
+
+      if [ -n "${RUSTC_WRAPPER:-}" ]; then
+        echo "RUSTC_WRAPPER=$RUSTC_WRAPPER" >> "$GITHUB_ENV"
+        echo "SCCACHE_IDLE_TIMEOUT=$SCCACHE_IDLE_TIMEOUT" >> "$GITHUB_ENV"
+        echo "SCCACHE_SERVER_UDS=$SCCACHE_SERVER_UDS" >> "$GITHUB_ENV"
+        echo "CC=$CC" >> "$GITHUB_ENV"
+        echo "CXX=$CXX" >> "$GITHUB_ENV"
+        echo "SCCACHE_CC_REAL=$SCCACHE_CC_REAL" >> "$GITHUB_ENV"
+        echo "SCCACHE_CXX_REAL=$SCCACHE_CXX_REAL" >> "$GITHUB_ENV"
+        echo "sccache server started; RUSTC_WRAPPER=sccache is active"
+      fi
