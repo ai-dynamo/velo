@@ -780,6 +780,14 @@ impl AnchorManager {
         was_attached
     }
 
+    /// Returns the number of anchors currently registered.
+    ///
+    /// Intended for testing and observability. The Prometheus
+    /// `velo_streaming_active_anchors` gauge reflects the same value.
+    pub fn active_anchor_count(&self) -> usize {
+        self.registry.len()
+    }
+
     pub(crate) fn update_active_anchor_gauge(&self) {
         if let Some(metrics) = self.metrics.as_ref() {
             metrics.set_streaming_active_anchors(self.registry.len());
