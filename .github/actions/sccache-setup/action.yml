@@ -15,8 +15,9 @@
 
 name: sccache Setup
 description: >
-  Install sccache and configure it to cache Rust (and C/C++) compilations in S3.
-  Downloads use-sccache.sh from ai-dynamo/dynamo at a pinned tag.
+  Configure sccache to cache Rust (and C/C++) compilations in S3.
+  sccache binary and CC/CXX wrappers are pre-baked into the runner image.
+  Downloads use-sccache.sh from ai-dynamo/dynamo at a pinned tag for setup-env/show-stats.
   Credentials come from IRSA — no explicit AWS keys needed.
 
 inputs:
@@ -31,16 +32,15 @@ inputs:
 runs:
   using: composite
   steps:
-  - name: Install sccache and configure S3 cache
+  - name: Configure sccache S3 cache
     shell: bash
     run: |
-      # Fetch use-sccache.sh from the pinned dynamo release tag (Apache-2.0)
+      # Fetch use-sccache.sh from the pinned dynamo release tag (Apache-2.0).
+      # sccache binary and CC/CXX wrappers are pre-baked into the runner image;
+      # we only need the script for setup-env (server start) and show-stats.
       curl -fsSL -o /tmp/use-sccache.sh \
         "https://raw.githubusercontent.com/ai-dynamo/dynamo/v1.0.1/container/use-sccache.sh"
       chmod +x /tmp/use-sccache.sh
-
-      # Install sccache binary and CC/CXX wrapper scripts
-      /tmp/use-sccache.sh install
 
       # Set S3 config before starting the server so sccache can authenticate
       export SCCACHE_BUCKET="${{ inputs.bucket }}"
