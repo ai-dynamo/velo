@@ -43,7 +43,7 @@ jobs:
 #      run: rustup component list --installed | grep -q '^rustfmt' || rustup component add rustfmt
 #    - name: Check formatting
 #      run: cargo fmt --check
-
+#
   clippy:
     name: Clippy
     runs-on: stg-velo-default-v1
