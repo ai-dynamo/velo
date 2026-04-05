@@ -3,7 +3,7 @@
 
 //! NATS health check and max_payload enforcement tests.
 //!
-//! Requires a running NATS server at nats://127.0.0.1:4222.
+//! Requires a running NATS server at nats://127.0.0.1:4222 (or $NATS_URL).
 //! Locally: `docker run -d -p 4222:4222 nats:latest`
 
 #![cfg(feature = "nats")]
@@ -41,8 +41,8 @@ async fn make_nats_transport(
 async fn test_check_health_healthy_peer() {
     let cluster_id = format!("test-{}", InstanceId::new_v4());
 
-    let client_a = Arc::new(async_nats::connect("nats://127.0.0.1:4222").await.unwrap());
-    let client_b = Arc::new(async_nats::connect("nats://127.0.0.1:4222").await.unwrap());
+    let client_a = Arc::new(async_nats::connect(&common::nats_url()).await.unwrap());
+    let client_b = Arc::new(async_nats::connect(&common::nats_url()).await.unwrap());
 
     let (transport_a, _id_a) = make_nats_transport(client_a, &cluster_id).await.unwrap();
     let (transport_b, id_b) = make_nats_transport(client_b, &cluster_id).await.unwrap();
@@ -69,8 +69,8 @@ async fn test_check_health_healthy_peer() {
 async fn test_check_health_unreachable_peer() {
     let cluster_id = format!("test-{}", InstanceId::new_v4());
 
-    let client_a = Arc::new(async_nats::connect("nats://127.0.0.1:4222").await.unwrap());
-    let client_b = Arc::new(async_nats::connect("nats://127.0.0.1:4222").await.unwrap());
+    let client_a = Arc::new(async_nats::connect(&common::nats_url()).await.unwrap());
+    let client_b = Arc::new(async_nats::connect(&common::nats_url()).await.unwrap());
 
     let (transport_a, _id_a) = make_nats_transport(client_a, &cluster_id).await.unwrap();
     let (transport_b, id_b) = make_nats_transport(client_b, &cluster_id).await.unwrap();
@@ -105,8 +105,8 @@ async fn test_check_health_unreachable_peer() {
 async fn test_check_health_timeout() {
     let cluster_id = format!("test-{}", InstanceId::new_v4());
 
-    let client_a = Arc::new(async_nats::connect("nats://127.0.0.1:4222").await.unwrap());
-    let client_b = Arc::new(async_nats::connect("nats://127.0.0.1:4222").await.unwrap());
+    let client_a = Arc::new(async_nats::connect(&common::nats_url()).await.unwrap());
+    let client_b = Arc::new(async_nats::connect(&common::nats_url()).await.unwrap());
 
     let (transport_a, _id_a) = make_nats_transport(client_a, &cluster_id).await.unwrap();
     let (transport_b, id_b) = make_nats_transport(client_b.clone(), &cluster_id)
@@ -129,8 +129,11 @@ async fn test_check_health_timeout() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Subscribe to B's health subject with a raw absorber that never replies
-    let raw_client = async_nats::connect("nats://127.0.0.1:4222").await.unwrap();
+    let raw_client = async_nats::connect(&common::nats_url()).await.unwrap();
     let _absorber = raw_client.subscribe(health_subject.clone()).await.unwrap();
+    // Flush to ensure the server has registered the subscription before check_health fires.
+    // Without this, NATS can return NoResponders if the SUB hasn't propagated yet.
+    raw_client.flush().await.unwrap();
 
     // A checks health of B with a short timeout — absorber receives the request but never replies
     let result = transport_a
@@ -157,8 +160,8 @@ async fn test_check_health_timeout() {
 async fn test_nats_max_payload_enforcement() {
     let cluster_id = format!("test-{}", InstanceId::new_v4());
 
-    let client_a = Arc::new(async_nats::connect("nats://127.0.0.1:4222").await.unwrap());
-    let client_b = Arc::new(async_nats::connect("nats://127.0.0.1:4222").await.unwrap());
+    let client_a = Arc::new(async_nats::connect(&common::nats_url()).await.unwrap());
+    let client_b = Arc::new(async_nats::connect(&common::nats_url()).await.unwrap());
 
     let error_handler = Arc::new(common::TestErrorHandler::new());
 

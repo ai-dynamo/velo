@@ -32,136 +32,86 @@ env:
 jobs:
   fmt:
     name: Formatting
-    runs-on: ubuntu-latest
+    runs-on: stg-velo-default-v1
+    container:
+      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.2
     permissions:
       contents: read
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 #v6.0.1
     - name: Add rustfmt component
-      run: rustup component add rustfmt
+      run: rustup component list --installed | grep -q '^rustfmt' || rustup component add rustfmt
     - name: Check formatting
       run: cargo fmt --check
 
   clippy:
     name: Clippy
-    runs-on: ubuntu-latest
+    runs-on: stg-velo-default-v1
+    container:
+      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.2
     permissions:
       contents: read
     steps:
-    - uses: actions/checkout@v4
-    - name: Cache protoc
-      id: cache-protoc
-      uses: actions/cache@v4
-      with:
-        path: ~/.local
-        key: protoc-${{ env.PROTOC_VERSION }}-${{ runner.arch }}
-    - name: Install protoc
-      if: steps.cache-protoc.outputs.cache-hit != 'true'
-      run: |
-        PB_REL="https://github.com/protocolbuffers/protobuf/releases"
-        PROTOC_ZIP="protoc-${PROTOC_VERSION}-linux-x86_64.zip"
-        curl -fsSLO "$PB_REL/download/v${PROTOC_VERSION}/${PROTOC_ZIP}"
-        unzip "${PROTOC_ZIP}" -d $HOME/.local
-        rm "${PROTOC_ZIP}"
-    - name: Add protoc to PATH
-      run: echo "$HOME/.local/bin" >> $GITHUB_PATH
-    - name: Install system dependencies
-      run: sudo apt-get update -qq && sudo apt-get install -y -qq cmake
-    - name: Cache cargo registry
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/.cargo/registry/
-          ~/.cargo/git/
-        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: ${{ runner.os }}-cargo-registry-
+    - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 #v6.0.1
+    - name: Rust setup
+      uses: ./.github/actions/rust-setup
     - name: Add clippy component
-      run: rustup component add clippy
+      run: rustup component list --installed | grep -q '^clippy' || rustup component add clippy
     - name: Run clippy
       run: cargo clippy --no-deps --all-features --all-targets -- -D warnings
-    - name: Cache cargo-machete binary
-      id: cache-cargo-machete
-      uses: actions/cache@v4
-      with:
-        path: ~/.cargo/bin/cargo-machete
-        key: cargo-machete-0.9.1-${{ runner.arch }}
     - name: Install cargo-machete
-      if: steps.cache-cargo-machete.outputs.cache-hit != 'true'
-      run: cargo install cargo-machete@0.9.1 --locked
+      run: |
+        cargo-machete --version 2>/dev/null | grep -qF '0.9.1' || cargo install cargo-machete@0.9.1 --locked
     - name: Run cargo-machete
       run: cargo machete
 
   deny:
     name: Cargo Deny
-    runs-on: ubuntu-latest
+    runs-on: stg-velo-default-v1
+    container:
+      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.2
     permissions:
       contents: read
     steps:
-    - uses: actions/checkout@v4
-    - name: Cache cargo-deny binary
-      id: cache-cargo-deny
+    - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 #v6.0.1
+    - name: Cache cargo registry and tools
       uses: actions/cache@v4
       with:
-        path: ~/.cargo/bin/cargo-deny
-        key: cargo-deny-0.19.0-${{ runner.arch }}
+        path: |
+          ~/.cargo/bin/
+          ~/.cargo/registry/
+          ~/.cargo/git/
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: ${{ runner.os }}-cargo-registry-
     - name: Install cargo-deny
-      if: steps.cache-cargo-deny.outputs.cache-hit != 'true'
-      run: cargo install cargo-deny@0.19.0 --locked
+      run: |
+        cargo-deny --version 2>/dev/null | grep -qF '0.19.0' || cargo install cargo-deny@0.19.0 --locked
     - name: Run cargo-deny
       run: cargo-deny -L error --all-features check licenses bans
 
   test:
     name: Tests
-    runs-on: ubuntu-latest
+    runs-on: stg-velo-default-v1
+    container:
+      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.2
     permissions:
       contents: read
     env:
+      NATS_URL: nats://127.0.0.1:4222
+      ETCD_URL: http://127.0.0.1:2379
       RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
     services:
+      nats:
+        image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/nats-jetstream:0.0.1
       etcd:
         image: quay.io/coreos/etcd:v3.5.0
-        ports:
-          - 2379:2379
         env:
           ETCD_LISTEN_CLIENT_URLS: "http://0.0.0.0:2379"
           ETCD_ADVERTISE_CLIENT_URLS: "http://127.0.0.1:2379"
-        options: >-
-          --health-cmd "etcdctl endpoint health"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
     steps:
-    - uses: actions/checkout@v4
-    - name: Start NATS with JetStream
-      run: |
-        docker run -d --name nats -p 4222:4222 nats:latest -js
-        for i in $(seq 1 10); do nc -z 127.0.0.1 4222 && break; sleep 1; done
-    - name: Cache protoc
-      id: cache-protoc
-      uses: actions/cache@v4
-      with:
-        path: ~/.local
-        key: protoc-${{ env.PROTOC_VERSION }}-${{ runner.arch }}
-    - name: Install protoc
-      if: steps.cache-protoc.outputs.cache-hit != 'true'
-      run: |
-        PB_REL="https://github.com/protocolbuffers/protobuf/releases"
-        PROTOC_ZIP="protoc-${PROTOC_VERSION}-linux-x86_64.zip"
-        curl -fsSLO "$PB_REL/download/v${PROTOC_VERSION}/${PROTOC_ZIP}"
-        unzip "${PROTOC_ZIP}" -d $HOME/.local
-        rm "${PROTOC_ZIP}"
-    - name: Add protoc to PATH
-      run: echo "$HOME/.local/bin" >> $GITHUB_PATH
-    - name: Install system dependencies
-      run: sudo apt-get update -qq && sudo apt-get install -y -qq cmake mold clang
-    - name: Cache cargo registry
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/.cargo/registry/
-          ~/.cargo/git/
-        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: ${{ runner.os }}-cargo-registry-
+    - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 #v6.0.1
+    - name: Rust setup
+      uses: ./.github/actions/rust-setup
     - name: Verify Cargo.lock is in sync
       run: cargo metadata --locked --format-version 1 > /dev/null
     - name: Compile and run tests
@@ -169,67 +119,32 @@ jobs:
 
   coverage:
     name: Coverage
-    runs-on: ubuntu-latest
+    runs-on: stg-velo-default-v1
+    container:
+      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.2
     permissions:
       contents: read
     env:
+      NATS_URL: nats://127.0.0.1:4222
+      ETCD_URL: http://127.0.0.1:2379
       RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
     services:
+      nats:
+        image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/nats-jetstream:0.0.1
       etcd:
         image: quay.io/coreos/etcd:v3.5.0
-        ports:
-          - 2379:2379
         env:
           ETCD_LISTEN_CLIENT_URLS: "http://0.0.0.0:2379"
           ETCD_ADVERTISE_CLIENT_URLS: "http://127.0.0.1:2379"
-        options: >-
-          --health-cmd "etcdctl endpoint health"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
     steps:
-    - uses: actions/checkout@v4
-    - name: Start NATS with JetStream
+    - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 #v6.0.1
+    - name: Rust setup
+      uses: ./.github/actions/rust-setup
+    - name: Install cargo-llvm-cov if missing
       run: |
-        docker run -d --name nats -p 4222:4222 nats:latest -js
-        for i in $(seq 1 10); do nc -z 127.0.0.1 4222 && break; sleep 1; done
-    - name: Cache protoc
-      id: cache-protoc
-      uses: actions/cache@v4
-      with:
-        path: ~/.local
-        key: protoc-${{ env.PROTOC_VERSION }}-${{ runner.arch }}
-    - name: Install protoc
-      if: steps.cache-protoc.outputs.cache-hit != 'true'
-      run: |
-        PB_REL="https://github.com/protocolbuffers/protobuf/releases"
-        PROTOC_ZIP="protoc-${PROTOC_VERSION}-linux-x86_64.zip"
-        curl -fsSLO "$PB_REL/download/v${PROTOC_VERSION}/${PROTOC_ZIP}"
-        unzip "${PROTOC_ZIP}" -d $HOME/.local
-        rm "${PROTOC_ZIP}"
-    - name: Add protoc to PATH
-      run: echo "$HOME/.local/bin" >> $GITHUB_PATH
-    - name: Install system dependencies
-      run: sudo apt-get update -qq && sudo apt-get install -y -qq cmake mold clang
-    - name: Cache cargo registry
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/.cargo/registry/
-          ~/.cargo/git/
-        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: ${{ runner.os }}-cargo-registry-
-    - name: Cache cargo-llvm-cov binary
-      id: cache-cargo-llvm-cov
-      uses: actions/cache@v4
-      with:
-        path: ~/.cargo/bin/cargo-llvm-cov
-        key: cargo-llvm-cov-0.8.5-${{ runner.arch }}
-    - name: Install cargo-llvm-cov
-      if: steps.cache-cargo-llvm-cov.outputs.cache-hit != 'true'
-      run: cargo install cargo-llvm-cov@0.8.5 --locked
+        cargo-llvm-cov --version 2>/dev/null | grep -qF '0.8.5' || cargo install cargo-llvm-cov@0.8.5 --locked
     - name: Add llvm-tools component
-      run: rustup component add llvm-tools-preview
+      run: rustup component list --installed | grep -q '^llvm-tools' || rustup component add llvm-tools-preview
     - name: Generate coverage
       run: cargo llvm-cov --all-features --workspace --codecov --output-path codecov.json
     - name: Upload to Codecov
@@ -242,7 +157,9 @@ jobs:
 
   ci-status:
     name: CI Status
-    runs-on: ubuntu-latest
+    runs-on: stg-velo-default-v1
+    container:
+      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.2
     needs: [fmt, clippy, deny, test, coverage]
     if: always()
     steps:

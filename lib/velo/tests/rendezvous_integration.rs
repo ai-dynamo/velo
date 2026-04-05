@@ -210,7 +210,6 @@ async fn test_rendezvous_ref_counting() {
 
     // Increment refcount for a second consumer
     pair.consumer.ref_handle(handle).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Verify refcount is now 2
     let meta = pair.consumer.metadata(handle).await.unwrap();

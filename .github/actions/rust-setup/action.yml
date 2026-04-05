@@ -1,0 +1,54 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Rust Setup
+description: Checkout, install protoc + system deps (cmake/mold/clang), and cache cargo registry
+
+runs:
+  using: composite
+  steps:
+  - name: Install protoc if missing
+    shell: bash
+    env:
+      PROTOC_VERSION: ${{ env.PROTOC_VERSION }}
+    run: |
+      if ! command -v protoc >/dev/null 2>&1; then
+        PB_REL="https://github.com/protocolbuffers/protobuf/releases"
+        ARCH=$(uname -m | sed 's/x86_64/x86_64/;s/aarch64/aarch_64/')
+        PROTOC_ZIP="protoc-${PROTOC_VERSION}-linux-${ARCH}.zip"
+        curl -fsSLO "$PB_REL/download/v${PROTOC_VERSION}/${PROTOC_ZIP}"
+        unzip "${PROTOC_ZIP}" -d $HOME/.local
+        rm "${PROTOC_ZIP}"
+        echo "$HOME/.local/bin" >> $GITHUB_PATH
+      fi
+
+  - name: Install missing system dependencies
+    shell: bash
+    run: |
+      pkgs=""
+      command -v cmake >/dev/null 2>&1 || pkgs="$pkgs cmake"
+      command -v mold  >/dev/null 2>&1 || pkgs="$pkgs mold"
+      command -v clang >/dev/null 2>&1 || pkgs="$pkgs clang"
+      [ -z "$pkgs" ] || { sudo apt-get update -qq && sudo apt-get install -y -qq $pkgs; }
+
+  - name: Cache cargo registry and tools
+    uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 #v5.0.4
+    with:
+      path: |
+        ~/.cargo/bin/
+        ~/.cargo/registry/
+        ~/.cargo/git/
+      key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+      restore-keys: ${{ runner.os }}-cargo-registry-

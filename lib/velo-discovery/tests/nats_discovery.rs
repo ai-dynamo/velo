@@ -3,7 +3,7 @@
 
 //! NATS peer discovery integration tests.
 //!
-//! Requires a running NATS server at nats://127.0.0.1:4222.
+//! Requires a running NATS server at nats://127.0.0.1:4222 (or $NATS_URL).
 //! Locally: `docker run -d -p 4222:4222 nats:latest`
 
 #![cfg(feature = "nats")]
@@ -15,6 +15,10 @@ use std::time::Duration;
 use velo_common::{InstanceId, PeerInfo, WorkerAddress};
 use velo_discovery::nats::NatsPeerDiscoveryBuilder;
 use velo_discovery::{PeerDiscovery, PeerRegistrationGuard};
+
+fn nats_url() -> String {
+    std::env::var("NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".to_string())
+}
 
 /// Build a test PeerInfo with a NATS inbound subject as the address.
 fn make_test_peer_info() -> PeerInfo {
@@ -31,7 +35,7 @@ fn make_test_peer_info() -> PeerInfo {
 /// TEST-03: Discover a registered peer by instance_id.
 #[tokio::test]
 async fn test_discover_by_instance_id() {
-    let client = Arc::new(async_nats::connect("nats://127.0.0.1:4222").await.unwrap());
+    let client = Arc::new(async_nats::connect(&nats_url()).await.unwrap());
     let cluster_id = format!("test-{}", InstanceId::new_v4());
     let discovery = NatsPeerDiscoveryBuilder::new(client.clone(), &cluster_id).build();
 
@@ -61,7 +65,7 @@ async fn test_discover_by_instance_id() {
 /// TEST-03: Discover a registered peer by worker_id.
 #[tokio::test]
 async fn test_discover_by_worker_id() {
-    let client = Arc::new(async_nats::connect("nats://127.0.0.1:4222").await.unwrap());
+    let client = Arc::new(async_nats::connect(&nats_url()).await.unwrap());
     let cluster_id = format!("test-{}", InstanceId::new_v4());
     let discovery = NatsPeerDiscoveryBuilder::new(client.clone(), &cluster_id).build();
 
@@ -91,7 +95,7 @@ async fn test_discover_by_worker_id() {
 /// Verify that discovering an unregistered peer returns an error.
 #[tokio::test]
 async fn test_discover_not_found() {
-    let client = Arc::new(async_nats::connect("nats://127.0.0.1:4222").await.unwrap());
+    let client = Arc::new(async_nats::connect(&nats_url()).await.unwrap());
     let cluster_id = format!("test-{}", InstanceId::new_v4());
     let discovery = NatsPeerDiscoveryBuilder::new(client.clone(), &cluster_id).build();
 
@@ -117,7 +121,7 @@ async fn test_discover_not_found() {
 /// Verify that calling unregister() stops discovery responses.
 #[tokio::test]
 async fn test_guard_unregister_stops_discovery() {
-    let client = Arc::new(async_nats::connect("nats://127.0.0.1:4222").await.unwrap());
+    let client = Arc::new(async_nats::connect(&nats_url()).await.unwrap());
     let cluster_id = format!("test-{}", InstanceId::new_v4());
     let discovery = NatsPeerDiscoveryBuilder::new(client.clone(), &cluster_id).build();
 
