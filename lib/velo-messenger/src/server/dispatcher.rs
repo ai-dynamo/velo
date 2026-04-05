@@ -8,7 +8,7 @@ use dashmap::DashMap;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::Semaphore;
 use tokio_util::task::TaskTracker;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, trace};
 use velo_common::WorkerId;
 use velo_observability::DispatchFailure;
 use velo_transports::VeloBackend;
@@ -154,34 +154,14 @@ impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for InlineDispat
     }
 }
 
-/// Control messages for dispatcher management (registration only, not dispatch).
-pub(crate) enum ControlMessage {
-    /// Register a new handler
-    Register {
-        dispatcher: Arc<dyn ActiveMessageDispatcher>,
-    },
-
-    /// Unregister a handler
-    #[expect(dead_code)]
-    #[doc(hidden)]
-    Unregister { name: String },
-
-    /// Shutdown the dispatcher
-    #[expect(dead_code)]
-    #[doc(hidden)]
-    Shutdown,
-}
-
 /// Main message dispatcher hub that routes messages to handlers.
 pub(crate) struct DispatcherHub {
-    /// Handler registry (lock-free for fast dispatch)
+    /// Handler registry (lock-free for fast dispatch).
+    /// Shared with HandlerManager so registration is immediately visible.
     handlers: Arc<DashMap<String, Arc<dyn ActiveMessageDispatcher>>>,
 
     /// Backend for sending messages
     backend: Arc<VeloBackend>,
-
-    /// Control channel for registration
-    control_rx: flume::Receiver<ControlMessage>,
 
     /// Messenger system reference (late-bound via OnceLock)
     system: OnceLock<Arc<Messenger>>,
@@ -192,11 +172,10 @@ pub(crate) struct DispatcherHub {
 
 impl DispatcherHub {
     /// Create a new dispatcher hub
-    pub fn new(backend: Arc<VeloBackend>, control_rx: flume::Receiver<ControlMessage>) -> Self {
+    pub fn new(backend: Arc<VeloBackend>) -> Self {
         Self {
             handlers: Arc::new(DashMap::new()),
             backend,
-            control_rx,
             system: OnceLock::new(),
             system_ready: tokio::sync::Notify::new(),
         }
@@ -235,37 +214,17 @@ impl DispatcherHub {
             .expect("system must be set after notification")
     }
 
+    /// Get a clone of the handlers Arc for sharing with HandlerManager.
+    pub(crate) fn handlers_arc(&self) -> Arc<DashMap<String, Arc<dyn ActiveMessageDispatcher>>> {
+        self.handlers.clone()
+    }
+
     /// Get a list of all registered handler names
     pub(crate) fn list_handlers(&self) -> Vec<String> {
         self.handlers
             .iter()
             .map(|entry| entry.key().clone())
             .collect()
-    }
-
-    /// Process control messages (registration, unregistration, shutdown)
-    pub async fn process_control(&self) -> bool {
-        match self.control_rx.recv_async().await {
-            Ok(ControlMessage::Register { dispatcher }) => {
-                let name = dispatcher.name().to_string();
-                debug!(target: "velo_messenger::dispatcher", handler = %name, "Registering handler");
-                self.handlers.insert(name, dispatcher);
-                true
-            }
-            Ok(ControlMessage::Unregister { name }) => {
-                debug!(target: "velo_messenger::dispatcher", handler = %name, "Unregistering handler");
-                self.handlers.remove(&name);
-                true
-            }
-            Ok(ControlMessage::Shutdown) => {
-                debug!(target: "velo_messenger::dispatcher", "Shutting down dispatcher hub");
-                false
-            }
-            Err(_) => {
-                warn!(target: "velo_messenger::dispatcher", "Control channel closed");
-                false
-            }
-        }
     }
 
     /// Dispatch a message to the appropriate handler

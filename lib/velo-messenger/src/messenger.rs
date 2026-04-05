@@ -163,9 +163,9 @@ impl Messenger {
             metrics.clone(),
         ));
 
-        // 5. Create handler manager
-        let control_tx = server.control_tx();
-        let handlers = HandlerManager::new(control_tx);
+        // 5. Create handler manager with direct DashMap access (avoids async
+        //    channel latency so handlers are visible before the first message arrives)
+        let handlers = HandlerManager::new(server.hub().handlers_arc());
 
         // 6. Wrap everything in Arc<Messenger>
         let system = Arc::new(Self {
@@ -182,15 +182,17 @@ impl Messenger {
             large_payload_resolver,
         });
 
-        // 7. Initialize hub's system reference (OnceLock)
-        server.hub().set_system(system.clone())?;
-
-        // 8. Wire events: set messenger reference and register event handlers
+        // 7. Register event and system handlers BEFORE unblocking the message
+        //    handler. Direct DashMap insertion (via HandlerManager) means the
+        //    handlers are in the map as soon as these calls return — no async
+        //    task needs to be scheduled first.
         events.set_messenger(system.clone());
         crate::events::handlers::register_event_handlers(&system.handlers, events)?;
-
-        // 9. Register system handlers
         crate::server::register_system_handlers(&system.handlers)?;
+
+        // 8. Initialize hub's system reference. This unblocks wait_for_system()
+        //    in the message handler task — all handlers are already in the map.
+        server.hub().set_system(system.clone())?;
 
         Ok(system)
     }

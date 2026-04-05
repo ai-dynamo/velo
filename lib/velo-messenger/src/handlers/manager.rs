@@ -3,20 +3,26 @@
 
 //! Handler registration manager for the messenger active message system.
 
-use anyhow::Result;
+use std::sync::Arc;
 
-use super::{ActiveMessageDispatcher, ControlMessage, Handler};
+use anyhow::Result;
+use dashmap::DashMap;
+
+use super::{ActiveMessageDispatcher, Handler};
 
 /// Manager for registering handlers with the dispatcher.
+///
+/// Inserts directly into the shared DashMap so registration is immediately
+/// visible to the dispatcher — no async task needs to run first.
 #[derive(Clone)]
 pub(crate) struct HandlerManager {
-    control_tx: flume::Sender<ControlMessage>,
+    handlers: Arc<DashMap<String, Arc<dyn ActiveMessageDispatcher>>>,
 }
 
 impl HandlerManager {
-    /// Create a new handler manager.
-    pub(crate) fn new(control_tx: flume::Sender<ControlMessage>) -> Self {
-        Self { control_tx }
+    /// Create a new handler manager backed by the given DashMap.
+    pub(crate) fn new(handlers: Arc<DashMap<String, Arc<dyn ActiveMessageDispatcher>>>) -> Self {
+        Self { handlers }
     }
 
     /// Register a public handler (handler names cannot start with `_`).
@@ -38,22 +44,18 @@ impl HandlerManager {
         self.register_dispatcher(handler.dispatcher)
     }
 
-    /// Internal method to send registration to dispatcher hub.
-    fn register_dispatcher(
-        &self,
-        dispatcher: std::sync::Arc<dyn ActiveMessageDispatcher>,
-    ) -> Result<()> {
-        self.control_tx
-            .try_send(ControlMessage::Register { dispatcher })
-            .map_err(|_| anyhow::anyhow!("Failed to register handler: control channel closed"))
+    /// Insert a dispatcher directly into the shared DashMap.
+    fn register_dispatcher(&self, dispatcher: Arc<dyn ActiveMessageDispatcher>) -> Result<()> {
+        let name = dispatcher.name().to_string();
+        self.handlers.insert(name, dispatcher);
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::dispatcher::{ControlMessage, HandlerContext};
-    use std::sync::Arc;
+    use crate::server::dispatcher::HandlerContext;
 
     struct MockDispatcher {
         name: String,
@@ -69,10 +71,13 @@ mod tests {
         }
     }
 
+    fn make_manager() -> HandlerManager {
+        HandlerManager::new(Arc::new(DashMap::new()))
+    }
+
     #[test]
     fn test_register_handler_blocks_underscore() {
-        let (tx, _rx) = flume::bounded(10);
-        let manager = HandlerManager::new(tx);
+        let manager = make_manager();
 
         let dispatcher = Arc::new(MockDispatcher {
             name: "_system".to_string(),
@@ -92,8 +97,7 @@ mod tests {
 
     #[test]
     fn test_register_handler_allows_normal_names() {
-        let (tx, rx) = flume::bounded(10);
-        let manager = HandlerManager::new(tx);
+        let manager = make_manager();
 
         let dispatcher = Arc::new(MockDispatcher {
             name: "my_handler".to_string(),
@@ -103,18 +107,12 @@ mod tests {
 
         let result = manager.register_handler(handler);
         assert!(result.is_ok());
-
-        let msg = rx.try_recv().unwrap();
-        match msg {
-            ControlMessage::Register { .. } => {}
-            _ => panic!("Expected Register message"),
-        }
+        assert!(manager.handlers.contains_key("my_handler"));
     }
 
     #[test]
     fn test_register_internal_handler_allows_underscore() {
-        let (tx, rx) = flume::bounded(10);
-        let manager = HandlerManager::new(tx);
+        let manager = make_manager();
 
         let dispatcher = Arc::new(MockDispatcher {
             name: "_hello".to_string(),
@@ -124,18 +122,12 @@ mod tests {
 
         let result = manager.register_internal_handler(handler);
         assert!(result.is_ok());
-
-        let msg = rx.try_recv().unwrap();
-        match msg {
-            ControlMessage::Register { .. } => {}
-            _ => panic!("Expected Register message"),
-        }
+        assert!(manager.handlers.contains_key("_hello"));
     }
 
     #[test]
     fn test_register_internal_handler_allows_normal_names() {
-        let (tx, rx) = flume::bounded(10);
-        let manager = HandlerManager::new(tx);
+        let manager = make_manager();
 
         let dispatcher = Arc::new(MockDispatcher {
             name: "internal_util".to_string(),
@@ -145,11 +137,6 @@ mod tests {
 
         let result = manager.register_internal_handler(handler);
         assert!(result.is_ok());
-
-        let msg = rx.try_recv().unwrap();
-        match msg {
-            ControlMessage::Register { .. } => {}
-            _ => panic!("Expected Register message"),
-        }
+        assert!(manager.handlers.contains_key("internal_util"));
     }
 }
