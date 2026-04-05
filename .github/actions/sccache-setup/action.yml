@@ -48,6 +48,12 @@ runs:
       # SCCACHE_REGION is intentionally unset: AWS_DEFAULT_REGION is already
       # in the pod environment via IRSA and sccache picks it up automatically.
 
+      # Tell setup-env which real C/C++ compiler to wrap. The runner image
+      # installs clang but not gcc; without this, SCCACHE_CC_REAL defaults to
+      # "gcc" which doesn't exist and breaks build.rs C compilation (e.g. ring).
+      export CC=clang
+      export CXX=clang++
+
       # Start the sccache server and configure compiler wrappers.
       # setup-env outputs export statements; eval applies them to this shell.
       # If --start-server fails (bad credentials, unreachable bucket), the script
