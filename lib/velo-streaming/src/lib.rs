@@ -26,6 +26,8 @@ pub mod frame;
 #[cfg(feature = "grpc")]
 pub mod grpc_transport;
 pub mod handle;
+#[cfg(feature = "quic")]
+pub mod quic_transport;
 pub mod sender;
 pub mod tcp_transport;
 pub mod transport;
@@ -45,6 +47,8 @@ pub use frame::{SendError, StreamError, StreamFrame};
 #[cfg(feature = "grpc")]
 pub use grpc_transport::GrpcFrameTransport;
 pub use handle::StreamAnchorHandle;
+#[cfg(feature = "quic")]
+pub use quic_transport::QuicFrameTransport;
 pub use sender::StreamSender;
 pub use tcp_transport::TcpFrameTransport;
 pub use transport::FrameTransport;

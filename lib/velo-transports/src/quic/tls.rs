@@ -16,7 +16,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 ///
 /// The certificate includes SANs for `localhost` and `127.0.0.1`, making it
 /// suitable for local/cluster testing.
-pub(crate) fn generate_self_signed_cert()
+pub fn generate_self_signed_cert()
 -> anyhow::Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
     let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()])?;
     params
@@ -40,7 +40,7 @@ pub(crate) fn generate_self_signed_cert()
 }
 
 /// Build a quinn `ServerConfig` from the given certificate chain and private key.
-pub(crate) fn make_server_config(
+pub fn make_server_config(
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
 ) -> anyhow::Result<quinn::ServerConfig> {
@@ -68,7 +68,7 @@ pub(crate) fn make_server_config(
 /// This is appropriate for internal cluster communication where both sides
 /// use self-signed certificates. For production, callers should provide a
 /// proper CA via `make_client_config_with_ca`.
-pub(crate) fn make_client_config_insecure() -> anyhow::Result<quinn::ClientConfig> {
+pub fn make_client_config_insecure() -> anyhow::Result<quinn::ClientConfig> {
     let mut client_crypto = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(SkipServerVerification))

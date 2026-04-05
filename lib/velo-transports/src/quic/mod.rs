@@ -11,7 +11,7 @@
 //! - Self-signed certificates by default for cluster-internal use
 
 mod listener;
-mod tls;
+pub mod tls;
 mod transport;
 
 pub use transport::{QuicTransport, QuicTransportBuilder};
