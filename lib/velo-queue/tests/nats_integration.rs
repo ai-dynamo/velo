@@ -189,12 +189,13 @@ async fn test_nats_recv_returns_none_on_close() {
     let backend = Arc::new(backend);
 
     // Obtain a receiver before closing the backend.
-    let receiver = backend.receiver("close_signal").await.expect("receiver creation failed");
+    let receiver = backend
+        .receiver("close_signal")
+        .await
+        .expect("receiver creation failed");
 
     // Spawn a task that blocks on recv().
-    let recv_task = tokio::spawn(async move {
-        receiver.recv().await
-    });
+    let recv_task = tokio::spawn(async move { receiver.recv().await });
 
     // Give the recv task a moment to enter the fetch loop.
     tokio::time::sleep(Duration::from_millis(100)).await;
