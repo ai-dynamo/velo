@@ -178,3 +178,37 @@ async fn test_nats_multiple_queues_independent() {
         Some(Bytes::from_static(b"bb"))
     );
 }
+
+/// Verify that closing the backend causes recv() to return Ok(None).
+///
+/// This exercises the ReceiverBackend contract:
+/// "Returns Ok(None) when the queue is closed and drained."
+#[tokio::test]
+async fn test_nats_recv_returns_none_on_close() {
+    let (backend, _guard) = setup("close_signal").await;
+    let backend = Arc::new(backend);
+
+    // Obtain a receiver before closing the backend.
+    let receiver = velo_queue::receiver::<String>(&*backend, "close_signal")
+        .await
+        .expect("receiver creation failed");
+
+    // Spawn a task that blocks on recv().
+    let recv_task = tokio::spawn(async move {
+        receiver.next().await
+    });
+
+    // Give the recv task a moment to enter the fetch loop.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Close the backend — this should unblock recv() with Ok(None).
+    backend.close();
+
+    // The task should complete promptly (well within 5 seconds).
+    let result = tokio::time::timeout(Duration::from_secs(5), recv_task)
+        .await
+        .expect("recv() did not return within 5 seconds after close()")
+        .expect("task panicked");
+
+    assert_eq!(result.unwrap(), None, "expected Ok(None) after close()");
+}
