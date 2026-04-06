@@ -72,3 +72,6 @@ paste = "1"
 
 [build-dependencies]
 tonic-build = "0.13.1"
+
+[package.metadata.cargo-machete]
+ignored = ["axum", "http", "http-body", "http-body-util", "hyper", "hyper-util", "prost", "tower"]

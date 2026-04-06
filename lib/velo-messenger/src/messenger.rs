@@ -489,8 +489,8 @@ mod tests {
                 .get_entry(self.key.as_str())
                 .map_err(|_| TransportError::InvalidEndpoint)?
                 .ok_or(TransportError::NoEndpoint)?;
-            let endpoint =
-                String::from_utf8(endpoint.to_vec()).map_err(|_| TransportError::InvalidEndpoint)?;
+            let endpoint = String::from_utf8(endpoint.to_vec())
+                .map_err(|_| TransportError::InvalidEndpoint)?;
             self.peers
                 .lock()
                 .expect("peer map poisoned")
@@ -536,7 +536,9 @@ mod tests {
                 MessageType::Response | MessageType::ShuttingDown => {
                     adapter.response_stream.send((header, payload))
                 }
-                MessageType::Ack | MessageType::Event => adapter.event_stream.send((header, payload)),
+                MessageType::Ack | MessageType::Event => {
+                    adapter.event_stream.send((header, payload))
+                }
             };
 
             if let Err(err) = send_result {
@@ -572,8 +574,9 @@ mod tests {
             &self,
             instance_id: InstanceId,
             _timeout: Duration,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), HealthCheckError>> + Send + '_>>
-        {
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), HealthCheckError>> + Send + '_>,
+        > {
             Box::pin(async move {
                 if self
                     .peers
@@ -674,8 +677,16 @@ mod tests {
             .clear();
 
         let (transport_a, transport_b) = make_transport_pair();
-        let a = Messenger::builder().add_transport(transport_a).build().await.unwrap();
-        let b = Messenger::builder().add_transport(transport_b).build().await.unwrap();
+        let a = Messenger::builder()
+            .add_transport(transport_a)
+            .build()
+            .await
+            .unwrap();
+        let b = Messenger::builder()
+            .add_transport(transport_b)
+            .build()
+            .await
+            .unwrap();
 
         a.register_peer(b.peer_info()).unwrap();
         b.register_peer(a.peer_info()).unwrap();
