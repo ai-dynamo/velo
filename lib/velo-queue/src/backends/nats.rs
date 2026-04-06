@@ -302,31 +302,44 @@ impl ReceiverBackend for NatsReceiver {
         let batch_size = opts.batch_size;
         let timeout = opts.timeout;
         Box::pin(async move {
-            let mut messages = self
-                .consumer
-                .fetch()
-                .max_messages(batch_size)
-                .expires(timeout)
-                .messages()
-                .await
-                .map_err(|e| WorkQueueRecvError::Backend(e.into()))?;
-
-            let mut batch = Vec::with_capacity(batch_size);
-
-            while let Some(msg_result) = messages.next().await {
-                match msg_result {
-                    Ok(msg) => {
-                        msg.ack().await.map_err(WorkQueueRecvError::Backend)?;
-                        batch.push(msg.payload.clone());
-                    }
-                    Err(e) => {
-                        tracing::warn!("NATS queue recv_batch message error: {e}");
-                        break;
-                    }
-                }
+            // Check shutdown before issuing the fetch.
+            if self.shutdown.is_cancelled() {
+                return Ok(Vec::new());
             }
 
-            Ok(batch)
+            let fetch_fut = async {
+                let mut messages = self
+                    .consumer
+                    .fetch()
+                    .max_messages(batch_size)
+                    .expires(timeout)
+                    .messages()
+                    .await
+                    .map_err(|e| WorkQueueRecvError::Backend(e.into()))?;
+
+                let mut batch = Vec::with_capacity(batch_size);
+
+                while let Some(msg_result) = messages.next().await {
+                    match msg_result {
+                        Ok(msg) => {
+                            msg.ack().await.map_err(WorkQueueRecvError::Backend)?;
+                            batch.push(msg.payload.clone());
+                        }
+                        Err(e) => {
+                            tracing::warn!("NATS queue recv_batch message error: {e}");
+                            break;
+                        }
+                    }
+                }
+
+                Ok::<_, WorkQueueRecvError>(batch)
+            };
+
+            tokio::select! {
+                biased;
+                _ = self.shutdown.cancelled() => Ok(Vec::new()),
+                result = fetch_fut => result,
+            }
         })
     }
 
