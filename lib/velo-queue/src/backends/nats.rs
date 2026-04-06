@@ -29,6 +29,8 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use futures::StreamExt;
 
+use tokio_util::sync::CancellationToken;
+
 use crate::backend::{ReceiverBackend, SenderBackend, WorkQueueBackend};
 use crate::error::{WorkQueueError, WorkQueueRecvError, WorkQueueSendError};
 use crate::options::NextOptions;
@@ -42,6 +44,9 @@ pub struct NatsQueueBackend {
     cluster_id: String,
     /// Cache of created stream/consumer resources per queue name.
     resources: DashMap<String, Arc<NatsQueueResources>>,
+    /// Cancellation token shared with all receivers created from this backend.
+    /// Cancelling it causes all active recv() calls to return Ok(None).
+    shutdown_token: CancellationToken,
 }
 
 struct NatsQueueResources {
@@ -58,6 +63,7 @@ impl NatsQueueBackend {
             jetstream,
             cluster_id,
             resources: DashMap::new(),
+            shutdown_token: CancellationToken::new(),
         }
     }
 
@@ -71,6 +77,7 @@ impl NatsQueueBackend {
             jetstream,
             cluster_id,
             resources: DashMap::new(),
+            shutdown_token: CancellationToken::new(),
         })
     }
 
@@ -139,6 +146,18 @@ impl NatsQueueBackend {
             .insert(name.to_owned(), Arc::clone(&resources));
         Ok(resources)
     }
+
+    /// Signal all receivers created from this backend to stop blocking and
+    /// return `Ok(None)`. Idempotent — safe to call multiple times.
+    pub fn close(&self) {
+        self.shutdown_token.cancel();
+    }
+}
+
+impl Drop for NatsQueueBackend {
+    fn drop(&mut self) {
+        self.shutdown_token.cancel();
+    }
 }
 
 impl WorkQueueBackend for NatsQueueBackend {
@@ -163,10 +182,12 @@ impl WorkQueueBackend for NatsQueueBackend {
     ) -> Pin<Box<dyn Future<Output = Result<Arc<dyn ReceiverBackend>, WorkQueueError>> + Send + '_>>
     {
         let name = name.to_owned();
+        let shutdown = self.shutdown_token.child_token();
         Box::pin(async move {
             let resources = self.get_or_create_resources(&name).await?;
             Ok(Arc::new(NatsReceiver {
                 consumer: resources.consumer.clone(),
+                shutdown,
             }) as Arc<dyn ReceiverBackend>)
         })
     }
@@ -226,6 +247,9 @@ impl SenderBackend for NatsSender {
 
 struct NatsReceiver {
     consumer: PullConsumer,
+    /// Child token of NatsQueueBackend::shutdown_token.
+    /// Cancelled when the parent backend closes or drops.
+    shutdown: CancellationToken,
 }
 
 impl ReceiverBackend for NatsReceiver {
@@ -234,24 +258,38 @@ impl ReceiverBackend for NatsReceiver {
     ) -> Pin<Box<dyn Future<Output = Result<Option<Bytes>, WorkQueueRecvError>> + Send + '_>> {
         Box::pin(async move {
             loop {
-                let mut batch = self
-                    .consumer
-                    .fetch()
-                    .max_messages(1)
-                    .expires(Duration::from_secs(30))
-                    .messages()
-                    .await
-                    .map_err(|e| WorkQueueRecvError::Backend(e.into()))?;
+                // Check shutdown before issuing the next fetch.
+                if self.shutdown.is_cancelled() {
+                    return Ok(None);
+                }
 
-                match batch.next().await {
-                    Some(Ok(msg)) => {
-                        // Auto-ack on receipt
-                        msg.ack().await.map_err(WorkQueueRecvError::Backend)?;
-                        return Ok(Some(msg.payload.clone()));
+                let fetch_fut = async {
+                    let mut batch = self
+                        .consumer
+                        .fetch()
+                        .max_messages(1)
+                        .expires(Duration::from_secs(30))
+                        .messages()
+                        .await
+                        .map_err(|e| WorkQueueRecvError::Backend(e.into()))?;
+                    Ok::<_, WorkQueueRecvError>(batch.next().await)
+                };
+
+                tokio::select! {
+                    biased;
+                    _ = self.shutdown.cancelled() => return Ok(None),
+                    result = fetch_fut => {
+                        match result? {
+                            Some(Ok(msg)) => {
+                                // Auto-ack on receipt
+                                msg.ack().await.map_err(WorkQueueRecvError::Backend)?;
+                                return Ok(Some(msg.payload.clone()));
+                            }
+                            Some(Err(e)) => return Err(WorkQueueRecvError::Backend(e)),
+                            // Fetch expired with no message; retry
+                            None => continue,
+                        }
                     }
-                    Some(Err(e)) => return Err(WorkQueueRecvError::Backend(e)),
-                    // Timeout expired with no message; retry
-                    None => continue,
                 }
             }
         })
