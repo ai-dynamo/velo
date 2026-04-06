@@ -20,6 +20,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_nats::jetstream;
 use async_nats::jetstream::consumer::PullConsumer;
@@ -232,22 +233,26 @@ impl ReceiverBackend for NatsReceiver {
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<Option<Bytes>, WorkQueueRecvError>> + Send + '_>> {
         Box::pin(async move {
-            let mut batch = self
-                .consumer
-                .fetch()
-                .max_messages(1)
-                .messages()
-                .await
-                .map_err(|e| WorkQueueRecvError::Backend(e.into()))?;
+            loop {
+                let mut batch = self
+                    .consumer
+                    .fetch()
+                    .max_messages(1)
+                    .expires(Duration::from_secs(30))
+                    .messages()
+                    .await
+                    .map_err(|e| WorkQueueRecvError::Backend(e.into()))?;
 
-            match batch.next().await {
-                Some(Ok(msg)) => {
-                    // Auto-ack on receipt
-                    msg.ack().await.map_err(WorkQueueRecvError::Backend)?;
-                    Ok(Some(msg.payload.clone()))
+                match batch.next().await {
+                    Some(Ok(msg)) => {
+                        // Auto-ack on receipt
+                        msg.ack().await.map_err(WorkQueueRecvError::Backend)?;
+                        return Ok(Some(msg.payload.clone()));
+                    }
+                    Some(Err(e)) => return Err(WorkQueueRecvError::Backend(e)),
+                    // Timeout expired with no message; retry
+                    None => continue,
                 }
-                Some(Err(e)) => Err(WorkQueueRecvError::Backend(e)),
-                None => Ok(None),
             }
         })
     }
