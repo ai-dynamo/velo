@@ -44,8 +44,8 @@ use crate::common::events::{EventType, Outcome, encode_event_header};
 use crate::common::messages::ResponseType;
 use crate::common::responses::{ResponseId, encode_response_header};
 use crate::server::dispatcher::{
-    ActiveMessageDispatcher, ActiveMessageHandler, ControlMessage, HandlerContext,
-    InlineDispatcher, SpawnedDispatcher,
+    ActiveMessageDispatcher, ActiveMessageHandler, HandlerContext, InlineDispatcher,
+    SpawnedDispatcher,
 };
 use derive_getters::Dissolve;
 use tokio_util::task::TaskTracker;

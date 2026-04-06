@@ -163,9 +163,9 @@ impl Messenger {
             metrics.clone(),
         ));
 
-        // 5. Create handler manager
-        let control_tx = server.control_tx();
-        let handlers = HandlerManager::new(control_tx);
+        // 5. Create handler manager with direct DashMap access (avoids async
+        //    channel latency so handlers are visible before the first message arrives)
+        let handlers = HandlerManager::new(server.hub().handlers_arc());
 
         // 6. Wrap everything in Arc<Messenger>
         let system = Arc::new(Self {
@@ -182,15 +182,17 @@ impl Messenger {
             large_payload_resolver,
         });
 
-        // 7. Initialize hub's system reference (OnceLock)
-        server.hub().set_system(system.clone())?;
-
-        // 8. Wire events: set messenger reference and register event handlers
+        // 7. Register event and system handlers BEFORE unblocking the message
+        //    handler. Direct DashMap insertion (via HandlerManager) means the
+        //    handlers are in the map as soon as these calls return — no async
+        //    task needs to be scheduled first.
         events.set_messenger(system.clone());
         crate::events::handlers::register_event_handlers(&system.handlers, events)?;
-
-        // 9. Register system handlers
         crate::server::register_system_handlers(&system.handlers)?;
+
+        // 8. Initialize hub's system reference. This unblocks wait_for_system()
+        //    in the message handler task — all handlers are already in the map.
+        server.hub().set_system(system.clone())?;
 
         Ok(system)
     }
@@ -429,6 +431,172 @@ impl Messenger {
 mod tests {
     use super::*;
     use crate::handlers::Handler;
+    use bytes::Bytes;
+    use futures::future::BoxFuture;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::Duration;
+    use velo_common::{PeerInfo, TransportKey, WorkerAddress};
+    use velo_transports::{
+        HealthCheckError, MessageType, Transport, TransportAdapter, TransportError,
+        TransportErrorHandler,
+    };
+
+    static TEST_TRANSPORT_REGISTRY: OnceLock<Mutex<HashMap<String, TransportAdapter>>> =
+        OnceLock::new();
+
+    fn test_transport_registry() -> &'static Mutex<HashMap<String, TransportAdapter>> {
+        TEST_TRANSPORT_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn make_test_address(key: &str, endpoint: &str) -> WorkerAddress {
+        let mut entries = HashMap::<String, Vec<u8>>::new();
+        entries.insert(key.to_string(), endpoint.as_bytes().to_vec());
+        WorkerAddress::from_encoded(rmp_serde::to_vec(&entries).unwrap())
+    }
+
+    struct InMemoryTransport {
+        key: TransportKey,
+        endpoint: String,
+        address: WorkerAddress,
+        peers: Mutex<HashMap<InstanceId, String>>,
+    }
+
+    impl InMemoryTransport {
+        fn new(endpoint: String) -> Arc<Self> {
+            let key = TransportKey::from("test");
+            Arc::new(Self {
+                key: key.clone(),
+                address: make_test_address(key.as_str(), &endpoint),
+                endpoint,
+                peers: Mutex::new(HashMap::new()),
+            })
+        }
+    }
+
+    impl Transport for InMemoryTransport {
+        fn key(&self) -> TransportKey {
+            self.key.clone()
+        }
+
+        fn address(&self) -> WorkerAddress {
+            self.address.clone()
+        }
+
+        fn register(&self, peer_info: PeerInfo) -> Result<(), TransportError> {
+            let endpoint = peer_info
+                .worker_address()
+                .get_entry(self.key.as_str())
+                .map_err(|_| TransportError::InvalidEndpoint)?
+                .ok_or(TransportError::NoEndpoint)?;
+            let endpoint = String::from_utf8(endpoint.to_vec())
+                .map_err(|_| TransportError::InvalidEndpoint)?;
+            self.peers
+                .lock()
+                .expect("peer map poisoned")
+                .insert(peer_info.instance_id(), endpoint);
+            Ok(())
+        }
+
+        fn send_message(
+            &self,
+            instance_id: InstanceId,
+            header: Bytes,
+            payload: Bytes,
+            message_type: MessageType,
+            on_error: Arc<dyn TransportErrorHandler>,
+        ) {
+            let target_endpoint = match self
+                .peers
+                .lock()
+                .expect("peer map poisoned")
+                .get(&instance_id)
+                .cloned()
+            {
+                Some(endpoint) => endpoint,
+                None => {
+                    on_error.on_error(header, payload, "Peer not registered".to_string());
+                    return;
+                }
+            };
+
+            let maybe_adapter = test_transport_registry()
+                .lock()
+                .expect("transport registry poisoned")
+                .get(&target_endpoint)
+                .cloned();
+
+            let Some(adapter) = maybe_adapter else {
+                on_error.on_error(header, payload, "Target transport not started".to_string());
+                return;
+            };
+
+            let send_result = match message_type {
+                MessageType::Message => adapter.message_stream.send((header, payload)),
+                MessageType::Response | MessageType::ShuttingDown => {
+                    adapter.response_stream.send((header, payload))
+                }
+                MessageType::Ack | MessageType::Event => {
+                    adapter.event_stream.send((header, payload))
+                }
+            };
+
+            if let Err(err) = send_result {
+                let (header, payload) = err.0;
+                on_error.on_error(header, payload, "Target receive channel closed".to_string());
+            }
+        }
+
+        fn start(
+            &self,
+            _instance_id: InstanceId,
+            channels: TransportAdapter,
+            _rt: tokio::runtime::Handle,
+        ) -> BoxFuture<'_, anyhow::Result<()>> {
+            let endpoint = self.endpoint.clone();
+            Box::pin(async move {
+                test_transport_registry()
+                    .lock()
+                    .expect("transport registry poisoned")
+                    .insert(endpoint, channels);
+                Ok(())
+            })
+        }
+
+        fn shutdown(&self) {
+            test_transport_registry()
+                .lock()
+                .expect("transport registry poisoned")
+                .remove(&self.endpoint);
+        }
+
+        fn check_health(
+            &self,
+            instance_id: InstanceId,
+            _timeout: Duration,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), HealthCheckError>> + Send + '_>,
+        > {
+            Box::pin(async move {
+                if self
+                    .peers
+                    .lock()
+                    .expect("peer map poisoned")
+                    .contains_key(&instance_id)
+                {
+                    Ok(())
+                } else {
+                    Err(HealthCheckError::PeerNotRegistered)
+                }
+            })
+        }
+    }
+
+    fn make_transport_pair() -> (Arc<dyn Transport>, Arc<dyn Transport>) {
+        let a = InMemoryTransport::new(format!("in-memory://{}", InstanceId::new_v4()));
+        let b = InMemoryTransport::new(format!("in-memory://{}", InstanceId::new_v4()));
+        (a as Arc<dyn Transport>, b as Arc<dyn Transport>)
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_register_streaming_handler_allows_underscore() {
@@ -498,6 +666,44 @@ mod tests {
         assert!(
             result.is_err(),
             "typed_unary should still reject underscore-prefixed handler names"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_system_and_event_handlers_are_available_immediately_after_startup() {
+        test_transport_registry()
+            .lock()
+            .expect("transport registry poisoned")
+            .clear();
+
+        let (transport_a, transport_b) = make_transport_pair();
+        let a = Messenger::builder()
+            .add_transport(transport_a)
+            .build()
+            .await
+            .unwrap();
+        let b = Messenger::builder()
+            .add_transport(transport_b)
+            .build()
+            .await
+            .unwrap();
+
+        a.register_peer(b.peer_info()).unwrap();
+        b.register_peer(a.peer_info()).unwrap();
+
+        let handlers = a.available_handlers(b.instance_id()).await.unwrap();
+
+        assert!(
+            handlers.iter().any(|handler| handler == "_hello"),
+            "expected _hello to be available immediately after startup"
+        );
+        assert!(
+            handlers.iter().any(|handler| handler == "_list_handlers"),
+            "expected _list_handlers to be available immediately after startup"
+        );
+        assert!(
+            handlers.iter().any(|handler| handler == "_event_subscribe"),
+            "expected _event_subscribe to be available immediately after startup"
         );
     }
 }
