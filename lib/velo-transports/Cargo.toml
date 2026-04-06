@@ -47,10 +47,6 @@ rmp-serde = "1.1"
 socket2 = "0.6"
 tokio-util = { version = "0.7", features = ["codec"] }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-nix = { version = "0.30", features = ["sched", "net"] }
-
-# optional dependencies
 axum = { version = "0.8", optional = true }
 async-nats = { workspace = true, optional = true }
 bs58 = { version = "0.5", optional = true }
@@ -65,6 +61,9 @@ hyper-util = { version = "0.1", optional = true, features = ["tokio", "server", 
 tokio-stream = { version = "0.1", optional = true, features = ["sync"] }
 zmq = { workspace = true, optional = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.30", features = ["sched", "net"] }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tower = "0.5"
@@ -73,3 +72,6 @@ paste = "1"
 
 [build-dependencies]
 tonic-build = "0.13.1"
+
+[package.metadata.cargo-machete]
+ignored = ["axum", "http", "http-body", "http-body-util", "hyper", "hyper-util", "prost", "tower"]

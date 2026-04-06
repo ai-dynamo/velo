@@ -20,6 +20,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_nats::jetstream;
 use async_nats::jetstream::consumer::PullConsumer;
@@ -27,6 +28,8 @@ use async_nats::jetstream::stream::RetentionPolicy;
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::StreamExt;
+
+use tokio_util::sync::CancellationToken;
 
 use crate::backend::{ReceiverBackend, SenderBackend, WorkQueueBackend};
 use crate::error::{WorkQueueError, WorkQueueRecvError, WorkQueueSendError};
@@ -41,6 +44,9 @@ pub struct NatsQueueBackend {
     cluster_id: String,
     /// Cache of created stream/consumer resources per queue name.
     resources: DashMap<String, Arc<NatsQueueResources>>,
+    /// Cancellation token shared with all receivers created from this backend.
+    /// Cancelling it causes all active recv() calls to return Ok(None).
+    shutdown_token: CancellationToken,
 }
 
 struct NatsQueueResources {
@@ -57,6 +63,7 @@ impl NatsQueueBackend {
             jetstream,
             cluster_id,
             resources: DashMap::new(),
+            shutdown_token: CancellationToken::new(),
         }
     }
 
@@ -70,6 +77,7 @@ impl NatsQueueBackend {
             jetstream,
             cluster_id,
             resources: DashMap::new(),
+            shutdown_token: CancellationToken::new(),
         })
     }
 
@@ -138,6 +146,18 @@ impl NatsQueueBackend {
             .insert(name.to_owned(), Arc::clone(&resources));
         Ok(resources)
     }
+
+    /// Signal all receivers created from this backend to stop blocking and
+    /// return `Ok(None)`. Idempotent — safe to call multiple times.
+    pub fn close(&self) {
+        self.shutdown_token.cancel();
+    }
+}
+
+impl Drop for NatsQueueBackend {
+    fn drop(&mut self) {
+        self.shutdown_token.cancel();
+    }
 }
 
 impl WorkQueueBackend for NatsQueueBackend {
@@ -162,10 +182,12 @@ impl WorkQueueBackend for NatsQueueBackend {
     ) -> Pin<Box<dyn Future<Output = Result<Arc<dyn ReceiverBackend>, WorkQueueError>> + Send + '_>>
     {
         let name = name.to_owned();
+        let shutdown = self.shutdown_token.child_token();
         Box::pin(async move {
             let resources = self.get_or_create_resources(&name).await?;
             Ok(Arc::new(NatsReceiver {
                 consumer: resources.consumer.clone(),
+                shutdown,
             }) as Arc<dyn ReceiverBackend>)
         })
     }
@@ -225,6 +247,9 @@ impl SenderBackend for NatsSender {
 
 struct NatsReceiver {
     consumer: PullConsumer,
+    /// Child token of NatsQueueBackend::shutdown_token.
+    /// Cancelled when the parent backend closes or drops.
+    shutdown: CancellationToken,
 }
 
 impl ReceiverBackend for NatsReceiver {
@@ -232,22 +257,40 @@ impl ReceiverBackend for NatsReceiver {
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<Option<Bytes>, WorkQueueRecvError>> + Send + '_>> {
         Box::pin(async move {
-            let mut batch = self
-                .consumer
-                .fetch()
-                .max_messages(1)
-                .messages()
-                .await
-                .map_err(|e| WorkQueueRecvError::Backend(e.into()))?;
-
-            match batch.next().await {
-                Some(Ok(msg)) => {
-                    // Auto-ack on receipt
-                    msg.ack().await.map_err(WorkQueueRecvError::Backend)?;
-                    Ok(Some(msg.payload.clone()))
+            loop {
+                // Check shutdown before issuing the next fetch.
+                if self.shutdown.is_cancelled() {
+                    return Ok(None);
                 }
-                Some(Err(e)) => Err(WorkQueueRecvError::Backend(e)),
-                None => Ok(None),
+
+                let fetch_fut = async {
+                    let mut batch = self
+                        .consumer
+                        .fetch()
+                        .max_messages(1)
+                        .expires(Duration::from_secs(30))
+                        .messages()
+                        .await
+                        .map_err(|e| WorkQueueRecvError::Backend(e.into()))?;
+                    Ok::<_, WorkQueueRecvError>(batch.next().await)
+                };
+
+                tokio::select! {
+                    biased;
+                    _ = self.shutdown.cancelled() => return Ok(None),
+                    result = fetch_fut => {
+                        match result? {
+                            Some(Ok(msg)) => {
+                                // Auto-ack on receipt
+                                msg.ack().await.map_err(WorkQueueRecvError::Backend)?;
+                                return Ok(Some(msg.payload.clone()));
+                            }
+                            Some(Err(e)) => return Err(WorkQueueRecvError::Backend(e)),
+                            // Fetch expired with no message; retry
+                            None => continue,
+                        }
+                    }
+                }
             }
         })
     }
@@ -259,31 +302,44 @@ impl ReceiverBackend for NatsReceiver {
         let batch_size = opts.batch_size;
         let timeout = opts.timeout;
         Box::pin(async move {
-            let mut messages = self
-                .consumer
-                .fetch()
-                .max_messages(batch_size)
-                .expires(timeout)
-                .messages()
-                .await
-                .map_err(|e| WorkQueueRecvError::Backend(e.into()))?;
-
-            let mut batch = Vec::with_capacity(batch_size);
-
-            while let Some(msg_result) = messages.next().await {
-                match msg_result {
-                    Ok(msg) => {
-                        msg.ack().await.map_err(WorkQueueRecvError::Backend)?;
-                        batch.push(msg.payload.clone());
-                    }
-                    Err(e) => {
-                        tracing::warn!("NATS queue recv_batch message error: {e}");
-                        break;
-                    }
-                }
+            // Check shutdown before issuing the fetch.
+            if self.shutdown.is_cancelled() {
+                return Ok(Vec::new());
             }
 
-            Ok(batch)
+            let fetch_fut = async {
+                let mut messages = self
+                    .consumer
+                    .fetch()
+                    .max_messages(batch_size)
+                    .expires(timeout)
+                    .messages()
+                    .await
+                    .map_err(|e| WorkQueueRecvError::Backend(e.into()))?;
+
+                let mut batch = Vec::with_capacity(batch_size);
+
+                while let Some(msg_result) = messages.next().await {
+                    match msg_result {
+                        Ok(msg) => {
+                            msg.ack().await.map_err(WorkQueueRecvError::Backend)?;
+                            batch.push(msg.payload.clone());
+                        }
+                        Err(e) => {
+                            tracing::warn!("NATS queue recv_batch message error: {e}");
+                            break;
+                        }
+                    }
+                }
+
+                Ok::<_, WorkQueueRecvError>(batch)
+            };
+
+            tokio::select! {
+                biased;
+                _ = self.shutdown.cancelled() => Ok(Vec::new()),
+                result = fetch_fut => result,
+            }
         })
     }
 

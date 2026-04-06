@@ -21,7 +21,7 @@ use tokio_util::task::TaskTracker;
 use velo_observability::{DispatchFailure, VeloMetrics};
 use velo_transports::{DataStreams, VeloBackend};
 
-pub(crate) use dispatcher::{ControlMessage, DispatcherHub, HandlerContext};
+pub(crate) use dispatcher::{DispatcherHub, HandlerContext};
 
 /// Handler for event frames received on the shared ack/event channel.
 /// Higher-level crates (e.g., one that wraps velo-events) implement this.
@@ -31,7 +31,6 @@ pub trait EventFrameHandler: Send + Sync {
 
 pub(crate) struct ActiveMessageServer {
     _tracker: TaskTracker,
-    control_tx: flume::Sender<ControlMessage>,
     hub: Arc<DispatcherHub>,
 }
 
@@ -49,21 +48,8 @@ impl ActiveMessageServer {
     ) -> Self {
         let (message_rx, response_rx, event_rx) = data_streams.into_parts();
 
-        // Create control channel for dispatcher hub (bounded for backpressure)
-        let (control_tx, control_rx) = flume::bounded(1000);
-
         // Create dispatcher hub (shareable)
-        let hub = Arc::new(DispatcherHub::new(backend.clone(), control_rx));
-
-        // Spawn dispatcher hub control task
-        let hub_clone = hub.clone();
-        tracker.spawn(async move {
-            while hub_clone.process_control().await {
-                // Continue processing control messages
-            }
-            tracing::debug!(target: "velo_messenger::server", "Dispatcher hub shutting down");
-            Ok::<(), anyhow::Error>(())
-        });
+        let hub = Arc::new(DispatcherHub::new(backend.clone()));
 
         // Spawn message handler with direct dispatch (hot path)
         tracker.spawn(create_message_handler(
@@ -84,7 +70,6 @@ impl ActiveMessageServer {
         ));
         Self {
             _tracker: tracker,
-            control_tx,
             hub,
         }
     }
@@ -92,11 +77,6 @@ impl ActiveMessageServer {
     /// Get a reference to the dispatcher hub
     pub(crate) fn hub(&self) -> &Arc<DispatcherHub> {
         &self.hub
-    }
-
-    /// Get a clone of the control channel sender
-    pub(crate) fn control_tx(&self) -> flume::Sender<ControlMessage> {
-        self.control_tx.clone()
     }
 }
 

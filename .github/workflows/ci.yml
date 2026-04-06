@@ -34,7 +34,7 @@ jobs:
     name: Formatting
     runs-on: stg-velo-default-v1
     container:
-      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.2
+      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.3
     permissions:
       contents: read
     steps:
@@ -48,13 +48,17 @@ jobs:
     name: Clippy
     runs-on: stg-velo-default-v1
     container:
-      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.2
+      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.3
     permissions:
       contents: read
     steps:
     - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 #v6.0.1
     - name: Rust setup
       uses: ./.github/actions/rust-setup
+    - name: sccache setup
+      uses: ./.github/actions/sccache-setup
+      with:
+        bucket: ${{ secrets.SCCACHE_S3_BUCKET }}
     - name: Add clippy component
       run: rustup component list --installed | grep -q '^clippy' || rustup component add clippy
     - name: Run clippy
@@ -64,18 +68,21 @@ jobs:
         cargo-machete --version 2>/dev/null | grep -qF '0.9.1' || cargo install cargo-machete@0.9.1 --locked
     - name: Run cargo-machete
       run: cargo machete
+    - name: sccache stats
+      if: always()
+      run: /tmp/use-sccache.sh show-stats "clippy" || true
 
   deny:
     name: Cargo Deny
     runs-on: stg-velo-default-v1
     container:
-      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.2
+      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.3
     permissions:
       contents: read
     steps:
     - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 #v6.0.1
     - name: Cache cargo registry and tools
-      uses: actions/cache@v4
+      uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 #v5.0.4
       with:
         path: |
           ~/.cargo/bin/
@@ -93,7 +100,7 @@ jobs:
     name: Tests
     runs-on: stg-velo-default-v1
     container:
-      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.2
+      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.3
     permissions:
       contents: read
     env:
@@ -112,16 +119,23 @@ jobs:
     - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 #v6.0.1
     - name: Rust setup
       uses: ./.github/actions/rust-setup
+    - name: sccache setup
+      uses: ./.github/actions/sccache-setup
+      with:
+        bucket: ${{ secrets.SCCACHE_S3_BUCKET }}
     - name: Verify Cargo.lock is in sync
       run: cargo metadata --locked --format-version 1 > /dev/null
     - name: Compile and run tests
       run: cargo test --locked --all-features --all-targets
+    - name: sccache stats
+      if: always()
+      run: /tmp/use-sccache.sh show-stats "tests" || true
 
   coverage:
     name: Coverage
     runs-on: stg-velo-default-v1
     container:
-      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.2
+      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.3
     permissions:
       contents: read
     env:
@@ -140,6 +154,10 @@ jobs:
     - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 #v6.0.1
     - name: Rust setup
       uses: ./.github/actions/rust-setup
+    - name: sccache setup
+      uses: ./.github/actions/sccache-setup
+      with:
+        bucket: ${{ secrets.SCCACHE_S3_BUCKET }}
     - name: Install cargo-llvm-cov if missing
       run: |
         cargo-llvm-cov --version 2>/dev/null | grep -qF '0.8.5' || cargo install cargo-llvm-cov@0.8.5 --locked
@@ -147,6 +165,9 @@ jobs:
       run: rustup component list --installed | grep -q '^llvm-tools' || rustup component add llvm-tools-preview
     - name: Generate coverage
       run: cargo llvm-cov --all-features --workspace --codecov --output-path codecov.json
+    - name: sccache stats
+      if: always()
+      run: /tmp/use-sccache.sh show-stats "coverage" || true
     - name: Upload to Codecov
       uses: codecov/codecov-action@v5
       with:
@@ -159,7 +180,7 @@ jobs:
     name: CI Status
     runs-on: stg-velo-default-v1
     container:
-      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.2
+      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.3
     needs: [fmt, clippy, deny, test, coverage]
     if: always()
     steps:
