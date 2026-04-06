@@ -201,10 +201,7 @@ impl FrameTransport for QuicFrameTransport {
                                 let connection = match connecting.await {
                                     Ok(conn) => conn,
                                     Err(e) => {
-                                        tracing::warn!(
-                                            "QUIC streaming handshake failed: {}",
-                                            e
-                                        );
+                                        tracing::warn!("QUIC streaming handshake failed: {}", e);
                                         continue;
                                     }
                                 };
@@ -223,24 +220,19 @@ impl FrameTransport for QuicFrameTransport {
                                 // Read 16-byte token
                                 let mut token_buf = [0u8; 16];
                                 let mut recv_reader = tokio::io::BufReader::new(recv);
-                                if let Err(e) =
-                                    tokio::io::AsyncReadExt::read_exact(&mut recv_reader, &mut token_buf)
-                                        .await
+                                if let Err(e) = tokio::io::AsyncReadExt::read_exact(
+                                    &mut recv_reader,
+                                    &mut token_buf,
+                                )
+                                .await
                                 {
-                                    tracing::warn!(
-                                        "QUIC streaming handshake read failed: {}",
-                                        e
-                                    );
+                                    tracing::warn!("QUIC streaming handshake read failed: {}", e);
                                     continue;
                                 }
 
                                 let received_token = Uuid::from_bytes(token_buf);
                                 if received_token != expected_token {
-                                    tracing::warn!(
-                                        "QUIC streaming handshake: invalid token (expected {}, got {})",
-                                        expected_token,
-                                        received_token
-                                    );
+                                    tracing::warn!("QUIC streaming handshake: invalid token");
                                     continue;
                                 }
 

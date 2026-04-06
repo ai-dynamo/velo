@@ -196,21 +196,14 @@ impl FrameTransport for TcpFrameTransport {
                                     tokio::io::AsyncReadExt::read_exact(&mut stream, &mut token_buf)
                                         .await
                                 {
-                                    tracing::warn!(
-                                        "TCP streaming handshake read failed: {}",
-                                        e
-                                    );
+                                    tracing::warn!("TCP streaming handshake read failed: {}", e);
                                     // Connection dropped before sending token; continue waiting
                                     continue;
                                 }
 
                                 let received_token = Uuid::from_bytes(token_buf);
                                 if received_token != expected_token {
-                                    tracing::warn!(
-                                        "TCP streaming handshake: invalid token (expected {}, got {})",
-                                        expected_token,
-                                        received_token
-                                    );
+                                    tracing::warn!("TCP streaming handshake: invalid token");
                                     // Reject and continue waiting for a valid connection
                                     drop(stream);
                                     continue;
