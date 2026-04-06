@@ -322,9 +322,13 @@ impl FrameTransport for QuicFrameTransport {
 
             let client_config = velo_transports::quic::tls::make_client_config_insecure()?;
 
-            // Create a client-only QUIC endpoint
-            let mut client_endpoint =
-                quinn::Endpoint::client("0.0.0.0:0".parse::<std::net::SocketAddr>()?)?;
+            // Create a client-only QUIC endpoint, matching address family to remote
+            let bind_addr: std::net::SocketAddr = if addr.is_ipv6() {
+                "[::]:0".parse()?
+            } else {
+                "0.0.0.0:0".parse()?
+            };
+            let mut client_endpoint = quinn::Endpoint::client(bind_addr)?;
             client_endpoint.set_default_client_config(client_config);
 
             // Connect to the server
@@ -600,5 +604,46 @@ mod tests {
             "unspecified bind should resolve to loopback in endpoint: {}",
             endpoint
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_ipv6_round_trip() {
+        // Skip if IPv6 is not available (CI runners, containers without IPv6)
+        if std::net::UdpSocket::bind(std::net::SocketAddr::from((
+            std::net::Ipv6Addr::LOCALHOST,
+            0,
+        )))
+        .is_err()
+        {
+            eprintln!("Skipping test_ipv6_round_trip: IPv6 not available");
+            return;
+        }
+
+        let transport = QuicFrameTransport::new(std::net::Ipv6Addr::LOCALHOST.into());
+        let (endpoint, rx) = transport.bind(1, 0).await.unwrap();
+
+        // Verify endpoint uses bracketed IPv6
+        assert!(
+            endpoint.contains("[::1]"),
+            "IPv6 endpoint must bracket the address: {}",
+            endpoint
+        );
+
+        // Connect and round-trip a frame
+        let sender = transport.connect(&endpoint, 1, 1).await.unwrap();
+        let frame_bytes = rmp_serde::to_vec(&crate::frame::StreamFrame::<String>::Item(
+            "ipv6 hello".to_string(),
+        ))
+        .unwrap();
+
+        sender.send_async(frame_bytes.clone()).await.unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(5), rx.recv_async())
+            .await
+            .expect("timeout waiting for frame")
+            .expect("channel closed unexpectedly");
+
+        assert_eq!(received, frame_bytes);
+        drop(sender);
     }
 }

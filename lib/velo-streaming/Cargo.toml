@@ -47,7 +47,7 @@ quinn = { version = "0.11", optional = true, default-features = false, features 
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std"] }
 
 [package.metadata.cargo-machete]
-ignored = ["prost"]  # Used by tonic-generated gRPC code behind grpc feature
+ignored = ["prost", "quinn", "rustls"]  # prost: gRPC feature; quinn/rustls: quic feature
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "time", "test-util"] }

@@ -70,6 +70,9 @@ quinn = { version = "0.11", optional = true, default-features = false, features 
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std"] }
 rcgen = { version = "0.13", optional = true }
 
+[package.metadata.cargo-machete]
+ignored = ["quinn", "rustls", "rcgen"]  # QUIC feature-gated deps
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tower = "0.5"
