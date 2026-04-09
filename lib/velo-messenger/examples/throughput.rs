@@ -189,10 +189,14 @@ async fn run_concurrent(
     let start = Instant::now();
 
     for _ in 0..count {
-        if set.len() >= concurrency
-            && let Some(Ok(Ok(us))) = set.join_next().await
-        {
-            let _ = hist.record(us);
+        if set.len() >= concurrency {
+            match set.join_next().await {
+                Some(Ok(Ok(us))) => {
+                    let _ = hist.record(us);
+                }
+                Some(Ok(Err(e))) => return Err(e),
+                _ => {}
+            }
         }
         let m = Arc::clone(&messenger);
         let p = payload.clone();
@@ -206,8 +210,14 @@ async fn run_concurrent(
             Ok(t.elapsed().as_micros() as u64)
         });
     }
-    while let Some(Ok(Ok(us))) = set.join_next().await {
-        let _ = hist.record(us);
+    while let Some(result) = set.join_next().await {
+        match result {
+            Ok(Ok(us)) => {
+                let _ = hist.record(us);
+            }
+            Ok(Err(e)) => return Err(e),
+            _ => {}
+        }
     }
 
     let elapsed = start.elapsed();
