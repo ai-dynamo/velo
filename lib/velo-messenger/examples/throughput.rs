@@ -166,8 +166,10 @@ async fn run_concurrent(
     {
         let mut set = JoinSet::new();
         for _ in 0..warmup {
-            if set.len() >= concurrency {
-                set.join_next().await;
+            if set.len() >= concurrency
+                && let Some(Ok(Err(e))) = set.join_next().await
+            {
+                return Err(e);
             }
             let m = Arc::clone(&messenger);
             let p = payload.clone();
@@ -393,11 +395,11 @@ fn main() -> Result<()> {
         args.count, args.payload_sizes, args.concurrency
     );
 
-    let runtime_server = tokio::runtime::Builder::new_current_thread()
+    let runtime_server = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
 
-    let runtime_client = tokio::runtime::Builder::new_current_thread()
+    let runtime_client = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
 
@@ -543,6 +545,7 @@ fn main() -> Result<()> {
 
     let results = client_handle.join().unwrap()?;
     print_table(&results, &args.transport);
+    // Server thread runs `pending::<()>()` forever; detach and let the process exit.
     drop(server_handle);
 
     Ok(())
