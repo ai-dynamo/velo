@@ -52,6 +52,10 @@ velo-transports = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+flume = { workspace = true }
 
 [build-dependencies]
 tonic-build = "0.13.1"

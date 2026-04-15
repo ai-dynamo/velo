@@ -109,3 +109,75 @@ async fn test_velo_builder_grpc_transport() {
 
     let _anchor = velo.create_anchor::<String>();
 }
+
+// ---------------------------------------------------------------------------
+// Test: Velo facade MPSC smoke test
+// ---------------------------------------------------------------------------
+
+/// Validates that the Velo top-level facade exposes MPSC anchors via
+/// `Velo::create_mpsc_anchor` / `Velo::attach_mpsc_anchor`, that the
+/// `velo::streaming::mpsc::*` namespace re-exports resolve, and that two
+/// local senders on one anchor get distinct `SenderId`s with correct
+/// per-sender item delivery.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_velo_facade_mpsc_create_and_attach() {
+    use futures::StreamExt;
+    use velo::StreamConfig;
+    use velo::streaming::mpsc::{MpscFrame, SenderId};
+
+    let transport = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        Arc::new(
+            velo_transports::tcp::TcpTransportBuilder::new()
+                .from_listener(listener)
+                .unwrap()
+                .build()
+                .unwrap(),
+        )
+    };
+
+    let velo = velo::Velo::builder()
+        .add_transport(transport)
+        .stream_config(StreamConfig::Tcp(None))
+        .expect("stream_config")
+        .build()
+        .await
+        .unwrap();
+
+    let mut anchor = velo.create_mpsc_anchor::<u32>();
+    let handle = anchor.handle();
+
+    let s1 = velo
+        .attach_mpsc_anchor::<u32>(handle)
+        .await
+        .expect("attach s1");
+    let s2 = velo
+        .attach_mpsc_anchor::<u32>(handle)
+        .await
+        .expect("attach s2");
+    assert_eq!(s1.sender_id(), SenderId(1));
+    assert_eq!(s2.sender_id(), SenderId(2));
+
+    s1.send(10).await.expect("s1 send");
+    s2.send(20).await.expect("s2 send");
+
+    let mut s1_items = Vec::new();
+    let mut s2_items = Vec::new();
+    while s1_items.is_empty() || s2_items.is_empty() {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(3), anchor.next())
+            .await
+            .expect("no stall")
+            .expect("frame")
+            .expect("stream ok");
+        match frame {
+            (SenderId(1), MpscFrame::Item(v)) => s1_items.push(v),
+            (SenderId(2), MpscFrame::Item(v)) => s2_items.push(v),
+            (_, MpscFrame::SenderError(m)) => panic!("sender error: {m}"),
+            _ => {}
+        }
+    }
+    assert_eq!(s1_items, vec![10]);
+    assert_eq!(s2_items, vec![20]);
+
+    anchor.cancel();
+}

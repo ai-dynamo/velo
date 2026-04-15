@@ -26,6 +26,7 @@ pub mod frame;
 #[cfg(feature = "grpc")]
 pub mod grpc_transport;
 pub mod handle;
+pub mod mpsc;
 pub mod sender;
 pub mod tcp_transport;
 pub mod transport;
@@ -45,6 +46,9 @@ pub use frame::{SendError, StreamError, StreamFrame};
 #[cfg(feature = "grpc")]
 pub use grpc_transport::GrpcFrameTransport;
 pub use handle::StreamAnchorHandle;
+pub use mpsc::{
+    MpscAnchorConfig, MpscFrame, MpscStreamAnchor, MpscStreamController, MpscStreamSender, SenderId,
+};
 pub use sender::StreamSender;
 pub use tcp_transport::TcpFrameTransport;
 pub use transport::FrameTransport;

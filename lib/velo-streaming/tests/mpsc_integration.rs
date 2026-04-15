@@ -1,0 +1,283 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Local integration tests for `velo_streaming::mpsc`.
+//!
+//! No messenger required — every attach is same-worker, so the AnchorManager
+//! can be driven entirely through `create_mpsc_anchor*` / `attach_mpsc_stream_anchor`.
+
+mod common;
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use common::MockFrameTransport;
+use futures::StreamExt;
+use velo_common::WorkerId;
+use velo_streaming::{
+    AnchorManager, AttachError, MpscAnchorConfig, MpscFrame, MpscStreamAnchor, SenderId,
+};
+
+fn make_manager() -> Arc<AnchorManager> {
+    Arc::new(AnchorManager::new(
+        WorkerId::from_u64(1),
+        Arc::new(MockFrameTransport::new()),
+    ))
+}
+
+/// Pull frames with a hard timeout so tests never hang when we've miscounted
+/// expected events.
+async fn next_frame<T: serde::de::DeserializeOwned>(
+    anchor: &mut MpscStreamAnchor<T>,
+) -> Option<Result<(SenderId, MpscFrame<T>), velo_streaming::StreamError>> {
+    match tokio::time::timeout(Duration::from_secs(3), anchor.next()).await {
+        Ok(v) => v,
+        Err(_) => panic!("stream stalled: no frame in 3s"),
+    }
+}
+
+/// Test 1: two interleaved senders — both sender_ids appear with correct attribution.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mpsc_two_local_senders_interleaved() {
+    let mgr = make_manager();
+    let mut anchor = mgr.create_mpsc_anchor::<u32>();
+    let handle = anchor.handle();
+
+    let s1 = mgr
+        .attach_mpsc_stream_anchor::<u32>(handle)
+        .await
+        .expect("attach s1");
+    let s2 = mgr
+        .attach_mpsc_stream_anchor::<u32>(handle)
+        .await
+        .expect("attach s2");
+    assert_eq!(s1.sender_id(), SenderId(1));
+    assert_eq!(s2.sender_id(), SenderId(2));
+
+    for i in 0u32..5 {
+        s1.send(i).await.expect("s1 send");
+        s2.send(100 + i).await.expect("s2 send");
+    }
+
+    let mut s1_items = Vec::new();
+    let mut s2_items = Vec::new();
+    let mut remaining = 10;
+    while remaining > 0 {
+        match next_frame(&mut anchor).await.expect("frame") {
+            Ok((SenderId(1), MpscFrame::Item(v))) => {
+                s1_items.push(v);
+                remaining -= 1;
+            }
+            Ok((SenderId(2), MpscFrame::Item(v))) => {
+                s2_items.push(v);
+                remaining -= 1;
+            }
+            Ok((sid, MpscFrame::Item(v))) => panic!("unexpected sender {sid} item {v}"),
+            Ok((sid, MpscFrame::Detached | MpscFrame::Dropped(_))) => {
+                panic!("unexpected early exit from {sid}");
+            }
+            Ok((_, MpscFrame::SenderError(m))) => panic!("unexpected sender error: {m}"),
+            Err(e) => panic!("stream error: {e}"),
+        }
+    }
+    assert_eq!(s1_items, (0u32..5).collect::<Vec<_>>());
+    assert_eq!(s2_items, (100u32..105).collect::<Vec<_>>());
+
+    anchor.cancel();
+}
+
+/// Test 2: dropping one of two senders is non-terminal — the other keeps flowing.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mpsc_sender_drop_not_terminal() {
+    let mgr = make_manager();
+    let mut anchor = mgr.create_mpsc_anchor::<u32>();
+    let handle = anchor.handle();
+
+    let s1 = mgr.attach_mpsc_stream_anchor::<u32>(handle).await.unwrap();
+    let s2 = mgr.attach_mpsc_stream_anchor::<u32>(handle).await.unwrap();
+
+    s1.send(1).await.unwrap();
+    s2.send(2).await.unwrap();
+
+    // Drop s1 → produces a Dropped event for SenderId(1). Anchor stays alive.
+    drop(s1);
+
+    // s2 is still usable.
+    s2.send(3).await.unwrap();
+    s2.send(4).await.unwrap();
+
+    // Consume 4 items + 1 Dropped event for SenderId(1).
+    let mut items_by_sender: HashMap<SenderId, Vec<u32>> = HashMap::new();
+    let mut dropped_sids: Vec<SenderId> = Vec::new();
+    let mut items_seen = 0;
+    while items_seen < 4 || dropped_sids.is_empty() {
+        match next_frame(&mut anchor).await.expect("frame") {
+            Ok((sid, MpscFrame::Item(v))) => {
+                items_by_sender.entry(sid).or_default().push(v);
+                items_seen += 1;
+            }
+            Ok((sid, MpscFrame::Dropped(_))) => dropped_sids.push(sid),
+            Ok((sid, MpscFrame::Detached)) => panic!("unexpected Detached from {sid}"),
+            Ok((sid, MpscFrame::SenderError(m))) => panic!("sender error {sid}: {m}"),
+            Err(e) => panic!("stream error: {e}"),
+        }
+    }
+    assert_eq!(
+        items_by_sender.get(&SenderId(1)).map(|v| v.as_slice()),
+        Some(&[1u32][..])
+    );
+    assert_eq!(
+        items_by_sender.get(&SenderId(2)).map(|v| v.as_slice()),
+        Some(&[2u32, 3, 4][..])
+    );
+    assert_eq!(dropped_sids, vec![SenderId(1)]);
+
+    // Anchor is still alive; new senders can attach.
+    let s3 = mgr.attach_mpsc_stream_anchor::<u32>(handle).await.unwrap();
+    assert_eq!(s3.sender_id(), SenderId(3));
+    drop(s3);
+    drop(s2);
+    anchor.cancel();
+}
+
+/// Test 3: detach returns handle; a fresh attach allocates a new SenderId.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mpsc_sender_detach_reattach() {
+    let mgr = make_manager();
+    let mut anchor = mgr.create_mpsc_anchor::<u32>();
+    let handle = anchor.handle();
+
+    let s1 = mgr.attach_mpsc_stream_anchor::<u32>(handle).await.unwrap();
+    assert_eq!(s1.sender_id(), SenderId(1));
+    s1.send(10).await.unwrap();
+    let returned = s1.detach().expect("detach");
+    assert_eq!(returned, handle);
+
+    let s2 = mgr
+        .attach_mpsc_stream_anchor::<u32>(returned)
+        .await
+        .unwrap();
+    assert_eq!(
+        s2.sender_id(),
+        SenderId(2),
+        "reattach must allocate fresh id"
+    );
+    s2.send(20).await.unwrap();
+    drop(s2);
+
+    // Expect: Item(SenderId(1), 10), Detached(SenderId(1)), Item(SenderId(2), 20),
+    // Dropped(SenderId(2)). Order of the first two may vary.
+    let mut got_item1 = false;
+    let mut got_item2 = false;
+    let mut got_detached1 = false;
+    let mut got_dropped2 = false;
+    while !(got_item1 && got_item2 && got_detached1 && got_dropped2) {
+        match next_frame(&mut anchor).await.expect("frame") {
+            Ok((SenderId(1), MpscFrame::Item(10))) => got_item1 = true,
+            Ok((SenderId(2), MpscFrame::Item(20))) => got_item2 = true,
+            Ok((SenderId(1), MpscFrame::Detached)) => got_detached1 = true,
+            Ok((SenderId(2), MpscFrame::Dropped(_))) => got_dropped2 = true,
+            Ok(other) => panic!("unexpected frame: {:?}", other),
+            Err(e) => panic!("stream error: {e}"),
+        }
+    }
+    anchor.cancel();
+}
+
+/// Test 4: all senders gone + unattached timeout ⇒ stream eventually ends.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mpsc_all_senders_gone_timeout() {
+    let mgr = make_manager();
+    let config = MpscAnchorConfig {
+        unattached_timeout: Some(Duration::from_millis(100)),
+        ..Default::default()
+    };
+    let mut anchor = mgr.create_mpsc_anchor_with_config::<u32>(config);
+    let handle = anchor.handle();
+
+    let s1 = mgr.attach_mpsc_stream_anchor::<u32>(handle).await.unwrap();
+    s1.send(42).await.unwrap();
+    drop(s1);
+
+    // Drain whatever the sender produced; expect the stream to eventually
+    // yield None after the unattached-timeout auto-removes the anchor.
+    let mut items = Vec::new();
+    let mut terminated = false;
+    for _ in 0..20 {
+        match tokio::time::timeout(Duration::from_secs(2), anchor.next()).await {
+            Ok(Some(Ok((_sid, MpscFrame::Item(v))))) => items.push(v),
+            Ok(Some(Ok((_, MpscFrame::Dropped(_))))) => {}
+            Ok(Some(Ok(_))) => {}
+            Ok(Some(Err(e))) => panic!("stream error: {e}"),
+            Ok(None) => {
+                terminated = true;
+                break;
+            }
+            Err(_) => panic!("stream did not terminate after unattached_timeout"),
+        }
+    }
+    assert!(terminated, "stream must have yielded None");
+    assert_eq!(items, vec![42u32]);
+}
+
+/// Test 5: max_senders cap enforced.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mpsc_max_senders() {
+    let mgr = make_manager();
+    let config = MpscAnchorConfig {
+        max_senders: Some(2),
+        ..Default::default()
+    };
+    let anchor = mgr.create_mpsc_anchor_with_config::<u32>(config);
+    let handle = anchor.handle();
+
+    let _s1 = mgr.attach_mpsc_stream_anchor::<u32>(handle).await.unwrap();
+    let _s2 = mgr.attach_mpsc_stream_anchor::<u32>(handle).await.unwrap();
+    let result = mgr.attach_mpsc_stream_anchor::<u32>(handle).await;
+    assert!(
+        matches!(result, Err(AttachError::MaxSendersReached { limit: 2, .. })),
+        "expected MaxSendersReached, got {result:?}"
+    );
+}
+
+/// Test 6: controller.cancel() poisons every attached sender.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mpsc_controller_cancel_propagates() {
+    let mgr = make_manager();
+    let anchor = mgr.create_mpsc_anchor::<u32>();
+    let handle = anchor.handle();
+    let controller = anchor.controller();
+
+    let s1 = mgr.attach_mpsc_stream_anchor::<u32>(handle).await.unwrap();
+    let s2 = mgr.attach_mpsc_stream_anchor::<u32>(handle).await.unwrap();
+
+    controller.cancel();
+
+    // Give the cancel poison a beat to propagate.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    assert!(
+        matches!(
+            s1.send(1).await,
+            Err(velo_streaming::SendError::ChannelClosed)
+        ),
+        "s1 send must fail after cancel"
+    );
+    assert!(
+        matches!(
+            s2.send(2).await,
+            Err(velo_streaming::SendError::ChannelClosed)
+        ),
+        "s2 send must fail after cancel"
+    );
+
+    // Re-attach must fail (anchor removed from registry).
+    let result = mgr.attach_mpsc_stream_anchor::<u32>(handle).await;
+    assert!(
+        matches!(result, Err(AttachError::AnchorNotFound { .. })),
+        "reattach after cancel must be AnchorNotFound, got {result:?}"
+    );
+
+    drop(anchor);
+}

@@ -3096,6 +3096,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "futures",
  "prometheus 0.14.0",
  "serde",
  "serde_json",

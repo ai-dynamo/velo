@@ -39,6 +39,31 @@ pub use velo_streaming::{
     StreamError, StreamFrame, StreamSender,
 };
 
+/// Streaming primitives (SPSC at the module root; MPSC under [`streaming::mpsc`]).
+///
+/// This namespace is strictly additive over the top-level flat re-exports
+/// above — both paths point at the same types. New code should prefer this
+/// namespace so the SPSC and MPSC surfaces live side-by-side.
+pub mod streaming {
+    pub use velo_streaming::{
+        AnchorConfig, AnchorManager, AnchorManagerBuilder, AttachError, FrameTransport, SendError,
+        StreamAnchor, StreamAnchorHandle, StreamController, StreamError, StreamFrame, StreamSender,
+    };
+
+    /// Multi-producer / single-consumer streaming anchors.
+    ///
+    /// See [`MpscStreamAnchor`] for semantics and
+    /// [`crate::Velo::create_mpsc_anchor`] for the facade entry point.
+    pub mod mpsc {
+        pub use velo_streaming::mpsc::{
+            MpscAnchorAttachRequest, MpscAnchorAttachResponse, MpscAnchorCancelRequest,
+            MpscAnchorConfig, MpscAnchorDetachRequest, MpscFrame, MpscStreamAnchor,
+            MpscStreamController, MpscStreamSender, SenderId, create_mpsc_anchor_attach_handler,
+            create_mpsc_anchor_cancel_handler, create_mpsc_anchor_detach_handler,
+        };
+    }
+}
+
 // Re-exports: Queue (from velo-queue)
 pub use velo_queue as queue;
 
@@ -461,6 +486,43 @@ impl Velo {
     /// Get the underlying anchor manager for direct registry access.
     pub fn anchor_manager(&self) -> &velo_streaming::AnchorManager {
         &self.anchor_manager
+    }
+
+    // -----------------------------------------------------------------------
+    // MPSC anchor API
+    // -----------------------------------------------------------------------
+
+    /// Create a new MPSC streaming anchor with manager defaults.
+    ///
+    /// Returns an [`streaming::mpsc::MpscStreamAnchor`] that accepts frames
+    /// from many senders (each tagged with a unique
+    /// [`streaming::mpsc::SenderId`]) and surfaces them to a single consumer.
+    /// Sender lifecycle events (`Detached`, `Dropped`) are non-terminal — the
+    /// stream only ends when the consumer cancels it or the anchor is dropped.
+    pub fn create_mpsc_anchor<T>(&self) -> streaming::mpsc::MpscStreamAnchor<T> {
+        self.anchor_manager.create_mpsc_anchor::<T>()
+    }
+
+    /// Create a new MPSC streaming anchor with per-anchor config
+    /// (`max_senders`, `unattached_timeout`, `heartbeat_interval`,
+    /// `channel_capacity`).
+    pub fn create_mpsc_anchor_with_config<T>(
+        &self,
+        config: streaming::mpsc::MpscAnchorConfig,
+    ) -> streaming::mpsc::MpscStreamAnchor<T> {
+        self.anchor_manager
+            .create_mpsc_anchor_with_config::<T>(config)
+    }
+
+    /// Attach a sender to an MPSC anchor. Handles both local (same-worker)
+    /// and cross-worker targets automatically.
+    pub async fn attach_mpsc_anchor<T: serde::Serialize>(
+        &self,
+        handle: StreamAnchorHandle,
+    ) -> Result<streaming::mpsc::MpscStreamSender<T>, AttachError> {
+        self.anchor_manager
+            .attach_mpsc_stream_anchor::<T>(handle)
+            .await
     }
 
     // -----------------------------------------------------------------------

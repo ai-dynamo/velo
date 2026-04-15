@@ -41,6 +41,7 @@ tokio-util = { workspace = true }
 
 [dev-dependencies]
 bytes = { workspace = true }
+futures = { workspace = true }
 prometheus = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

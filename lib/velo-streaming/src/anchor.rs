@@ -40,6 +40,7 @@ use crate::handle::StreamAnchorHandle;
 
 /// Errors that can occur when attempting to attach a sender to an anchor.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum AttachError {
     /// The requested anchor handle was not found in the registry.
     #[error("anchor {handle} not found in registry")]
@@ -48,6 +49,13 @@ pub enum AttachError {
     /// Another sender is already attached to this anchor.
     #[error("anchor {handle} is already attached")]
     AlreadyAttached { handle: StreamAnchorHandle },
+
+    /// The MPSC anchor has reached its configured `max_senders` cap.
+    #[error("anchor {handle} reached max_senders limit of {limit}")]
+    MaxSendersReached {
+        handle: StreamAnchorHandle,
+        limit: usize,
+    },
 
     /// The underlying transport failed during bind/connect.
     #[error("transport bind failed: {0}")]
@@ -519,6 +527,13 @@ pub struct AnchorManager {
     #[builder(default = "Arc::new(DashMap::new())")]
     pub(crate) registry: Arc<DashMap<u64, AnchorEntry>>,
 
+    /// MPSC-variant registry. Separate from `registry` so existing SPSC
+    /// handler code paths do not need enum-matching. Local IDs are still
+    /// allocated from the shared `next_local_id` counter so the two
+    /// namespaces never collide.
+    #[builder(default = "Arc::new(DashMap::new())")]
+    pub(crate) mpsc_registry: Arc<DashMap<u64, crate::mpsc::anchor::MpscAnchorEntry>>,
+
     pub transport: Arc<dyn crate::transport::FrameTransport>,
 
     /// Transport registry: maps scheme (e.g., "tcp", "velo") to the FrameTransport
@@ -905,6 +920,18 @@ impl AnchorManager {
             &self.sender_registry,
         )))?;
 
+        // MPSC handlers — share the same SenderRegistry so `_stream_cancel`
+        // covers both SPSC and MPSC senders uniformly.
+        messenger.register_streaming_handler(
+            crate::mpsc::control::create_mpsc_anchor_attach_handler(Arc::clone(self)),
+        )?;
+        messenger.register_streaming_handler(
+            crate::mpsc::control::create_mpsc_anchor_detach_handler(Arc::clone(self)),
+        )?;
+        messenger.register_streaming_handler(
+            crate::mpsc::control::create_mpsc_anchor_cancel_handler(Arc::clone(self)),
+        )?;
+
         self.messenger_lock
             .set(messenger)
             .map_err(|_| anyhow::anyhow!("register_handlers called twice"))?;
@@ -1107,6 +1134,245 @@ impl AnchorManager {
                         heartbeat_interval,
                     ))
                 }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // MPSC anchor API
+    // -----------------------------------------------------------------------
+
+    /// Create a new MPSC anchor using only manager-level defaults.
+    ///
+    /// See [`AnchorManager::create_mpsc_anchor_with_config`] for per-anchor
+    /// overrides (channel capacity, unattached timeout, heartbeat cadence,
+    /// `max_senders`).
+    pub fn create_mpsc_anchor<T>(&self) -> crate::mpsc::MpscStreamAnchor<T> {
+        self.create_mpsc_anchor_with_config(crate::mpsc::MpscAnchorConfig::default())
+    }
+
+    /// Create a new MPSC anchor with per-anchor config overrides.
+    ///
+    /// Shares `next_local_id` with the SPSC registry so handles are unique
+    /// across both kinds; the two DashMaps never see the same key.
+    pub fn create_mpsc_anchor_with_config<T>(
+        &self,
+        config: crate::mpsc::MpscAnchorConfig,
+    ) -> crate::mpsc::MpscStreamAnchor<T> {
+        let local_id = self.next_local_id.fetch_add(1, Ordering::Relaxed) + 1;
+
+        let capacity = config.channel_capacity.unwrap_or(256);
+        let (frame_tx, frame_rx) = flume::bounded::<(u64, Vec<u8>)>(capacity);
+        let cancel_token = CancellationToken::new();
+
+        let unattached_timeout = config
+            .unattached_timeout
+            .or(self.default_unattached_timeout);
+        let heartbeat_interval = config
+            .heartbeat_interval
+            .unwrap_or(self.default_heartbeat_interval);
+
+        let timeout_cancel = unattached_timeout.map(|timeout| {
+            crate::mpsc::anchor::spawn_mpsc_timeout_task(
+                self.mpsc_registry.clone(),
+                local_id,
+                timeout,
+                &cancel_token,
+            )
+        });
+
+        let entry = crate::mpsc::anchor::MpscAnchorEntry {
+            frame_tx,
+            cancel_token,
+            senders: HashMap::new(),
+            next_sender_id: 1,
+            unattached_timeout,
+            timeout_cancel,
+            heartbeat_interval,
+            max_senders: config.max_senders,
+        };
+
+        self.mpsc_registry.insert(local_id, entry);
+        self.update_active_anchor_gauge();
+
+        let handle = StreamAnchorHandle::pack(self.worker_id, local_id);
+        crate::mpsc::MpscStreamAnchor::new(
+            handle,
+            frame_rx,
+            local_id,
+            self.mpsc_registry.clone(),
+            self.sender_registry.clone(),
+            self.messenger.clone(),
+        )
+    }
+
+    /// Attach a sender to an MPSC anchor. Like [`attach_stream_anchor`] but
+    /// targets the MPSC registry: multiple senders may attach concurrently,
+    /// and each attach allocates a fresh [`crate::mpsc::SenderId`].
+    pub async fn attach_mpsc_stream_anchor<T: serde::Serialize>(
+        &self,
+        handle: StreamAnchorHandle,
+    ) -> Result<crate::mpsc::MpscStreamSender<T>, AttachError> {
+        let (handle_worker_id, local_id) = handle.unpack();
+
+        if handle_worker_id != self.worker_id {
+            return self.attach_mpsc_remote::<T>(handle).await;
+        }
+
+        // Local path: reserve a slot under the shard lock, then construct
+        // the sender after the lock is released.
+        use dashmap::mapref::entry::Entry;
+        let (
+            sender_id,
+            frame_tx,
+            heartbeat_interval,
+            cancel_token,
+            poison_tx,
+            poison_rx,
+            sender_stream_id,
+        ) = match self.mpsc_registry.entry(local_id) {
+            Entry::Vacant(_) => return Err(AttachError::AnchorNotFound { handle }),
+            Entry::Occupied(mut occ) => {
+                let entry = occ.get_mut();
+                if let Some(limit) = entry.max_senders
+                    && entry.senders.len() >= limit
+                {
+                    return Err(AttachError::MaxSendersReached { handle, limit });
+                }
+
+                let sender_id = entry.next_sender_id;
+                entry.next_sender_id += 1;
+
+                // Pause the unattached timeout the moment we have a sender.
+                if let Some(ref tc) = entry.timeout_cancel {
+                    tc.cancel();
+                }
+                entry.timeout_cancel = None;
+
+                let frame_tx = entry.frame_tx.clone();
+                let heartbeat_interval = entry.heartbeat_interval;
+
+                let sender_stream_id =
+                    self.next_sender_stream_id.fetch_add(1, Ordering::Relaxed) + 1;
+                let cancel_token = CancellationToken::new();
+                let (poison_tx, poison_rx) = flume::bounded::<()>(1);
+
+                let slot = crate::mpsc::anchor::MpscSenderSlot {
+                    pump_token: None,
+                    stream_cancel_handle: Some(crate::control::StreamCancelHandle::pack(
+                        self.worker_id,
+                        sender_stream_id,
+                    )),
+                };
+                entry.senders.insert(sender_id, slot);
+
+                (
+                    sender_id,
+                    frame_tx,
+                    heartbeat_interval,
+                    cancel_token,
+                    poison_tx,
+                    poison_rx,
+                    sender_stream_id,
+                )
+            }
+        };
+
+        // Register SenderEntry outside the shard lock.
+        let sender_entry = crate::control::SenderEntry {
+            cancel_token: cancel_token.clone(),
+            rx_closer: std::sync::Mutex::new(Some(poison_rx)),
+        };
+        self.sender_registry
+            .senders
+            .insert(sender_stream_id, sender_entry);
+
+        Ok(crate::mpsc::MpscStreamSender::new(
+            crate::mpsc::SenderId(sender_id),
+            crate::mpsc::sender::SenderChannel::Local(frame_tx),
+            handle,
+            self.mpsc_registry.clone(),
+            crate::sender::StreamSenderCancelInfo {
+                cancel_token,
+                sender_stream_id,
+                sender_registry: self.sender_registry.clone(),
+                poison_tx,
+            },
+            heartbeat_interval,
+        ))
+    }
+
+    async fn attach_mpsc_remote<T: serde::Serialize>(
+        &self,
+        handle: StreamAnchorHandle,
+    ) -> Result<crate::mpsc::MpscStreamSender<T>, AttachError> {
+        let (handle_worker_id, _) = handle.unpack();
+
+        let messenger = self.messenger_lock.get().ok_or_else(|| {
+            AttachError::TransportError(anyhow::anyhow!(
+                "register_handlers not called — messenger unavailable for remote mpsc attach"
+            ))
+        })?;
+
+        let sender_stream_id = self.next_sender_stream_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let cancel_token = CancellationToken::new();
+        let (poison_tx, poison_rx) = flume::bounded::<()>(1);
+        let stream_cancel_handle =
+            crate::control::StreamCancelHandle::pack(self.worker_id, sender_stream_id);
+
+        let req = crate::mpsc::control::MpscAnchorAttachRequest {
+            handle,
+            session_id: sender_stream_id,
+            stream_cancel_handle,
+        };
+
+        let response: crate::mpsc::control::MpscAnchorAttachResponse = messenger
+            .typed_unary_streaming::<crate::mpsc::control::MpscAnchorAttachResponse>(
+                "_mpsc_anchor_attach",
+            )
+            .payload(&req)
+            .map_err(AttachError::TransportError)?
+            .worker(handle_worker_id)
+            .send()
+            .await
+            .map_err(AttachError::TransportError)?;
+
+        match response {
+            crate::mpsc::control::MpscAnchorAttachResponse::Ok {
+                stream_endpoint,
+                heartbeat_interval_ms,
+                sender_id,
+            } => {
+                let (_, local_id) = handle.unpack();
+                let transport = self.resolve_transport(&stream_endpoint)?;
+                let frame_tx = transport
+                    .connect(&stream_endpoint, local_id, sender_stream_id)
+                    .await?;
+
+                let sender_entry = crate::control::SenderEntry {
+                    cancel_token: cancel_token.clone(),
+                    rx_closer: std::sync::Mutex::new(Some(poison_rx)),
+                };
+                self.sender_registry
+                    .senders
+                    .insert(sender_stream_id, sender_entry);
+
+                Ok(crate::mpsc::MpscStreamSender::new(
+                    crate::mpsc::SenderId(sender_id),
+                    crate::mpsc::sender::SenderChannel::Remote(frame_tx),
+                    handle,
+                    self.mpsc_registry.clone(),
+                    crate::sender::StreamSenderCancelInfo {
+                        cancel_token,
+                        sender_stream_id,
+                        sender_registry: self.sender_registry.clone(),
+                        poison_tx,
+                    },
+                    Duration::from_millis(heartbeat_interval_ms),
+                ))
+            }
+            crate::mpsc::control::MpscAnchorAttachResponse::Err { reason } => {
+                Err(AttachError::TransportError(anyhow::anyhow!("{}", reason)))
             }
         }
     }
