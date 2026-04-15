@@ -15,11 +15,27 @@
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use velo_observability::{HandlerOutcome, StreamingOp};
 
 use crate::anchor::AnchorManager;
 use crate::handle::StreamAnchorHandle;
+
+/// Number of consecutive missed heartbeat windows that trigger `Dropped` injection.
+///
+/// The reader pump tolerates `DETECTION_MULTIPLIER * heartbeat_interval` of total silence
+/// (each window of length `heartbeat_interval`) before declaring the sender dead.
+/// Both the producer (`StreamSender`) heartbeat cadence and the consumer (`reader_pump`)
+/// per-window deadline are negotiated via `AnchorAttachResponse::heartbeat_interval_ms`,
+/// but the multiplier itself is a protocol constant agreed by both sides.
+pub const DETECTION_MULTIPLIER: u8 = 3;
+
+/// Default heartbeat interval (milliseconds) used when `AnchorAttachResponse::Ok` is
+/// deserialized from a wire payload that predates the `heartbeat_interval_ms` field.
+/// Matches the historical hardcoded 5s constant.
+fn default_heartbeat_interval_ms() -> u64 {
+    5_000
+}
 
 // ---------------------------------------------------------------------------
 // StreamCancelHandle
@@ -174,7 +190,18 @@ pub struct AnchorAttachRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum AnchorAttachResponse {
     /// Attach succeeded; caller can connect to `stream_endpoint`.
-    Ok { stream_endpoint: String },
+    ///
+    /// `heartbeat_interval_ms` tells the sender how often it must emit a
+    /// [`crate::frame::StreamFrame::Heartbeat`] when no data frames are flowing.
+    /// The consumer's reader pump will tolerate `DETECTION_MULTIPLIER * heartbeat_interval_ms`
+    /// of total silence before injecting `Dropped`. The field is carried as `u64` ms
+    /// (rather than `Duration`) for stable msgpack encoding, and defaults to 5000ms
+    /// when absent so older clients continue to deserialize new responses unchanged.
+    Ok {
+        stream_endpoint: String,
+        #[serde(default = "default_heartbeat_interval_ms")]
+        heartbeat_interval_ms: u64,
+    },
     /// Attach failed; `reason` describes why.
     Err { reason: String },
 }
@@ -212,8 +239,10 @@ pub struct AnchorCancelRequest {
 ///
 /// Spawned as a tokio task after successful attach. Reads from the transport
 /// receiver, forwards to the anchor's frame_tx. Monitors for heartbeat
-/// timeouts: 3 consecutive 5-second windows with no frames trigger Dropped
-/// sentinel injection, registry removal (LIVE-02), and cleanup.
+/// timeouts: `DETECTION_MULTIPLIER` consecutive `heartbeat_deadline` windows
+/// with no frames trigger Dropped sentinel injection, registry removal
+/// (LIVE-02), and cleanup. The deadline is negotiated at attach time via
+/// `AnchorAttachResponse::heartbeat_interval_ms`.
 pub(crate) async fn reader_pump(
     transport_rx: flume::Receiver<Vec<u8>>,
     frame_tx: flume::Sender<Vec<u8>>,
@@ -221,9 +250,9 @@ pub(crate) async fn reader_pump(
     registry: std::sync::Arc<dashmap::DashMap<u64, crate::anchor::AnchorEntry>>,
     metrics: Option<Arc<velo_observability::VeloMetrics>>,
     local_id: u64,
+    heartbeat_deadline: Duration,
 ) {
     let mut missed_heartbeats: u8 = 0;
-    let heartbeat_deadline = std::time::Duration::from_secs(5);
 
     loop {
         tokio::select! {
@@ -241,7 +270,7 @@ pub(crate) async fn reader_pump(
                     Ok(Err(_)) => break, // transport channel closed
                     Err(_timeout) => {
                         missed_heartbeats += 1;
-                        if missed_heartbeats >= 3 {
+                        if missed_heartbeats >= DETECTION_MULTIPLIER {
                             // Inject Dropped sentinel -- sender is dead
                             let dropped_bytes = crate::sender::cached_dropped().clone();
                             let _ = frame_tx.send_async(dropped_bytes).await;
@@ -365,6 +394,8 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> velo_messeng
                             let pump_cancel = entry.cancel_token.child_token();
                             entry.active_pump_token = Some(pump_cancel.clone());
                             let pump_frame_tx = entry.frame_tx.clone();
+                            // Snapshot the negotiated heartbeat interval before dropping the lock.
+                            let heartbeat_interval = entry.heartbeat_interval;
 
                             // Mark as attached and store cancel handle for upstream cancel routing
                             entry.attachment = true;
@@ -383,6 +414,7 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> velo_messeng
                                 pump_registry, // Arc clone of registry
                                 manager.metrics.clone(),
                                 local_id, // anchor's local_id
+                                heartbeat_interval,
                             ));
 
                             let transport_scheme =
@@ -396,6 +428,7 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> velo_messeng
 
                             Ok(AnchorAttachResponse::Ok {
                                 stream_endpoint: endpoint,
+                                heartbeat_interval_ms: heartbeat_interval.as_millis() as u64,
                             })
                         }
                     }
@@ -623,12 +656,64 @@ mod tests {
     fn test_anchor_attach_response_serde_ok() {
         let resp = AnchorAttachResponse::Ok {
             stream_endpoint: "mock://test-endpoint".to_string(),
+            heartbeat_interval_ms: 5000,
         };
         let json = serde_json::to_string(&resp).expect("serialize Ok");
         let decoded: AnchorAttachResponse = serde_json::from_str(&json).expect("deserialize Ok");
         match decoded {
-            AnchorAttachResponse::Ok { stream_endpoint } => {
+            AnchorAttachResponse::Ok {
+                stream_endpoint,
+                heartbeat_interval_ms,
+            } => {
                 assert_eq!(stream_endpoint, "mock://test-endpoint");
+                assert_eq!(heartbeat_interval_ms, 5000);
+            }
+            other => panic!("expected Ok, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_anchor_attach_response_rmp_round_trip_non_default_heartbeat() {
+        // msgpack must carry the negotiated interval losslessly so the sender
+        // gets the cadence the consumer dictated.
+        let resp = AnchorAttachResponse::Ok {
+            stream_endpoint: "tcp://10.0.0.1:9000".to_string(),
+            heartbeat_interval_ms: 1234,
+        };
+        let bytes = rmp_serde::to_vec(&resp).expect("rmp serialize Ok");
+        let decoded: AnchorAttachResponse =
+            rmp_serde::from_slice(&bytes).expect("rmp deserialize Ok");
+        match decoded {
+            AnchorAttachResponse::Ok {
+                stream_endpoint,
+                heartbeat_interval_ms,
+            } => {
+                assert_eq!(stream_endpoint, "tcp://10.0.0.1:9000");
+                assert_eq!(heartbeat_interval_ms, 1234);
+            }
+            other => panic!("expected Ok, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_anchor_attach_response_serde_ok_backcompat_default_heartbeat() {
+        // An older client/server that has no `heartbeat_interval_ms` field
+        // must still deserialize cleanly into the 5000ms default. Construct
+        // the legacy shape directly via JSON so we don't need a frozen wire
+        // sample.
+        let legacy_json = r#"{"Ok":{"stream_endpoint":"mock://legacy"}}"#;
+        let decoded: AnchorAttachResponse =
+            serde_json::from_str(legacy_json).expect("legacy Ok response must deserialize");
+        match decoded {
+            AnchorAttachResponse::Ok {
+                stream_endpoint,
+                heartbeat_interval_ms,
+            } => {
+                assert_eq!(stream_endpoint, "mock://legacy");
+                assert_eq!(
+                    heartbeat_interval_ms, 5000,
+                    "missing field must default to 5000ms"
+                );
             }
             other => panic!("expected Ok, got {:?}", other),
         }
@@ -680,13 +765,16 @@ mod tests {
                     entry.attachment = true;
                     AnchorAttachResponse::Ok {
                         stream_endpoint: endpoint,
+                        heartbeat_interval_ms: 5000,
                     }
                 }
             }
         };
 
         match result {
-            AnchorAttachResponse::Ok { stream_endpoint } => {
+            AnchorAttachResponse::Ok {
+                stream_endpoint, ..
+            } => {
                 assert_eq!(stream_endpoint, "mock://test-endpoint");
             }
             other => panic!("expected Ok, got {:?}", other),
@@ -737,6 +825,7 @@ mod tests {
                 } else {
                     AnchorAttachResponse::Ok {
                         stream_endpoint: "unreachable".to_string(),
+                        heartbeat_interval_ms: 5000,
                     }
                 }
             }
@@ -954,7 +1043,8 @@ mod tests {
                 active_pump_token: None,
                 attachment: true,
                 timeout_cancel: None,
-                timeout_duration: None,
+                unattached_timeout: None,
+                heartbeat_interval: Duration::from_secs(5),
                 stream_cancel_handle: None,
             },
         );
@@ -969,6 +1059,7 @@ mod tests {
             pump_registry,
             None,
             local_id,
+            Duration::from_secs(5),
         ));
 
         (transport_tx, frame_rx, cancel_token, registry, local_id)
@@ -1143,7 +1234,8 @@ mod tests {
                 active_pump_token: Some(child1.clone()),
                 attachment: true,
                 timeout_cancel: None,
-                timeout_duration: None,
+                unattached_timeout: None,
+                heartbeat_interval: Duration::from_secs(5),
                 stream_cancel_handle: None,
             },
         );
@@ -1155,6 +1247,7 @@ mod tests {
             registry.clone(),
             None,
             local_id,
+            Duration::from_secs(5),
         ));
 
         // Send a frame -- pump should forward it
@@ -1194,6 +1287,7 @@ mod tests {
             registry.clone(),
             None,
             local_id,
+            Duration::from_secs(5),
         ));
 
         // Send a frame through the new transport -- pump should forward it

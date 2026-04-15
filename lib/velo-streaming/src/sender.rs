@@ -31,8 +31,22 @@ use crate::anchor::AnchorEntry;
 use crate::frame::{SendError, StreamFrame};
 use crate::handle::StreamAnchorHandle;
 
-/// Heartbeat interval: emits a [`StreamFrame::Heartbeat`] every 5 seconds.
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+/// Cancel/poison plumbing for a [`StreamSender`].
+///
+/// Bundled to keep [`StreamSender::new`] under the argument-count threshold
+/// while still keeping the call sites readable. All four fields are required
+/// — there are no defaults.
+pub(crate) struct StreamSenderCancelInfo {
+    /// User-facing cancellation signal: fires when `_stream_cancel` is received.
+    pub cancel_token: CancellationToken,
+    /// Sender-side registry key, also used by the `_stream_cancel` handler.
+    pub sender_stream_id: u64,
+    /// Sender-side registry shared with `_stream_cancel`.
+    pub sender_registry: Arc<crate::control::SenderRegistry>,
+    /// Poison channel sender: when its receiver is dropped (by `_stream_cancel`),
+    /// `send()` returns `ChannelClosed` because the channel is disconnected.
+    pub poison_tx: flume::Sender<()>,
+}
 
 // ---------------------------------------------------------------------------
 // Cached sentinel bytes (OnceLock)
@@ -117,9 +131,11 @@ impl<T> std::fmt::Debug for StreamSender<T> {
 impl<T: Serialize> StreamSender<T> {
     /// Create a new `StreamSender` and spawn the background heartbeat task.
     ///
-    /// The heartbeat task emits [`StreamFrame::Heartbeat`] every 5 seconds via
-    /// non-blocking `try_send`. It is cancelled when the sender is finalized,
-    /// detached, or dropped.
+    /// The heartbeat task emits [`StreamFrame::Heartbeat`] at `heartbeat_interval`
+    /// via non-blocking `try_send`. It is cancelled when the sender is finalized,
+    /// detached, or dropped. `heartbeat_interval` is negotiated by the consumer
+    /// via [`crate::control::AnchorAttachResponse::Ok::heartbeat_interval_ms`]
+    /// — both sides must agree so the consumer's reader pump deadline matches.
     ///
     /// `registry` is a shared reference to the anchor registry so that
     /// [`detach`](StreamSender::detach) can atomically clear the attachment flag.
@@ -127,18 +143,22 @@ impl<T: Serialize> StreamSender<T> {
         tx: flume::Sender<Vec<u8>>,
         handle: StreamAnchorHandle,
         registry: Arc<DashMap<u64, AnchorEntry>>,
-        cancel_token: CancellationToken,
-        sender_stream_id: u64,
-        sender_registry: Arc<crate::control::SenderRegistry>,
-        poison_tx: flume::Sender<()>,
+        cancel: StreamSenderCancelInfo,
+        heartbeat_interval: Duration,
     ) -> Self {
+        let StreamSenderCancelInfo {
+            cancel_token,
+            sender_stream_id,
+            sender_registry,
+            poison_tx,
+        } = cancel;
         let heartbeat_cancel = CancellationToken::new();
 
         // Spawn heartbeat background task
         let cancel = heartbeat_cancel.clone();
         let tx_clone = tx.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+            let mut interval = tokio::time::interval(heartbeat_interval);
             // Skip the first immediate tick
             interval.tick().await;
 
@@ -312,7 +332,7 @@ mod tests {
     use crate::frame::{SendError, StreamFrame};
     use crate::handle::StreamAnchorHandle;
 
-    use super::StreamSender;
+    use super::{StreamSender, StreamSenderCancelInfo};
 
     /// Create an empty registry for use in unit tests (no real anchors needed).
     fn empty_registry() -> Arc<DashMap<u64, AnchorEntry>> {
@@ -338,10 +358,13 @@ mod tests {
             tx,
             handle,
             empty_registry(),
-            cancel_token,
-            1,
-            sender_registry,
-            poison_tx,
+            StreamSenderCancelInfo {
+                cancel_token,
+                sender_stream_id: 1,
+                sender_registry,
+                poison_tx,
+            },
+            Duration::from_secs(5),
         );
         (sender, rx, poison_rx)
     }
@@ -370,10 +393,13 @@ mod tests {
             tx,
             handle,
             empty_registry(),
-            cancel_token,
-            sender_stream_id,
-            sender_registry.clone(),
-            poison_tx,
+            StreamSenderCancelInfo {
+                cancel_token,
+                sender_stream_id,
+                sender_registry: sender_registry.clone(),
+                poison_tx,
+            },
+            Duration::from_secs(5),
         );
         (sender, sender_registry)
     }
@@ -549,10 +575,13 @@ mod tests {
             tx,
             handle,
             empty_registry(),
-            cancel_token,
-            1,
-            sender_registry,
-            poison_tx,
+            StreamSenderCancelInfo {
+                cancel_token,
+                sender_stream_id: 1,
+                sender_registry,
+                poison_tx,
+            },
+            Duration::from_secs(5),
         );
 
         // Put an item in the channel to fill it
@@ -587,10 +616,13 @@ mod tests {
             tx,
             handle,
             empty_registry(),
-            cancel_token,
-            1,
-            sender_registry,
-            poison_tx,
+            StreamSenderCancelInfo {
+                cancel_token,
+                sender_stream_id: 1,
+                sender_registry,
+                poison_tx,
+            },
+            Duration::from_secs(5),
         );
 
         // Drop the receiver to close the channel
@@ -679,10 +711,13 @@ mod tests {
             frame_tx,
             handle,
             empty_registry(),
-            cancel_token,
-            2,
-            sender_registry,
-            poison_tx,
+            StreamSenderCancelInfo {
+                cancel_token,
+                sender_stream_id: 2,
+                sender_registry,
+                poison_tx,
+            },
+            Duration::from_secs(5),
         );
 
         // Drop the receiver (simulating rx_closer drop in _stream_cancel handler)
