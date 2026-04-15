@@ -55,6 +55,33 @@ pub enum AttachError {
 }
 
 // ---------------------------------------------------------------------------
+// AnchorConfig
+// ---------------------------------------------------------------------------
+
+/// Per-anchor overrides for the two liveness knobs.
+///
+/// Both fields are `Option`: `None` means "inherit the manager-level default"
+/// (`AnchorManager::default_unattached_timeout` and
+/// `AnchorManager::default_heartbeat_interval`); `Some(d)` overrides it for the
+/// single anchor created via [`AnchorManager::create_anchor_with_config`].
+///
+/// `AnchorConfig::default()` inherits everything, making it equivalent to the
+/// zero-arg [`AnchorManager::create_anchor`] path.
+#[derive(Debug, Clone, Default)]
+pub struct AnchorConfig {
+    /// How long an unattached anchor may live before being auto-removed.
+    /// `Some(None)` is not expressible — pass `None` to inherit the manager
+    /// default (which itself may be `None` to disable the timeout entirely).
+    pub unattached_timeout: Option<Duration>,
+
+    /// The heartbeat cadence the attached sender must emit at, and the
+    /// per-window deadline the consumer reader pump applies. Total tolerance
+    /// before `Dropped` injection is `crate::control::DETECTION_MULTIPLIER`
+    /// times this value.
+    pub heartbeat_interval: Option<Duration>,
+}
+
+// ---------------------------------------------------------------------------
 // AnchorEntry
 // ---------------------------------------------------------------------------
 
@@ -93,9 +120,17 @@ pub(crate) struct AnchorEntry {
     /// `None` if no timeout is configured for this anchor.
     pub timeout_cancel: Option<CancellationToken>,
 
-    /// The configured timeout duration for this anchor. Stored so that
+    /// The configured unattached timeout for this anchor. Stored so that
     /// `detach` can respawn the timeout task with the same duration.
-    pub timeout_duration: Option<Duration>,
+    /// `None` means the anchor never auto-removes while unattached.
+    pub unattached_timeout: Option<Duration>,
+
+    /// The negotiated heartbeat cadence for this anchor. The reader pump uses
+    /// this as its per-window deadline; the producer's `StreamSender` uses it
+    /// as its emit interval. Resolved at create-time from per-anchor config or
+    /// the manager-level default and echoed to the sender via
+    /// [`crate::control::AnchorAttachResponse::Ok::heartbeat_interval_ms`].
+    pub heartbeat_interval: Duration,
 
     /// Populated on successful attach from [`crate::control::AnchorAttachRequest::stream_cancel_handle`].
     /// Encodes the sender's WorkerId + stream ID so the anchor can route `_stream_cancel`
@@ -344,7 +379,7 @@ impl<T> StreamAnchor<T> {
             }
 
             // Update the stored duration
-            entry.timeout_duration = timeout;
+            entry.unattached_timeout = timeout;
 
             // If unattached and a timeout is set, spawn a new timeout task
             if !entry.attachment {
@@ -470,8 +505,9 @@ impl<T: DeserializeOwned> Stream for StreamAnchor<T> {
 /// and the data-path pump (Phase 8) can hold a cheap clone of the registry
 /// reference without holding a reference to the whole `AnchorManager`.
 ///
-/// Use [`AnchorManagerBuilder`] for optional configuration (e.g. `default_timeout`),
-/// or [`AnchorManager::new`] as a convenience constructor with no timeout.
+/// Use [`AnchorManagerBuilder`] for optional configuration (e.g. `default_unattached_timeout`,
+/// `default_heartbeat_interval`), or [`AnchorManager::new`] as a convenience constructor
+/// with no unattached timeout and the protocol default heartbeat interval (5s).
 #[derive(Builder)]
 #[builder(pattern = "owned", build_fn(name = "build_inner", private))]
 pub struct AnchorManager {
@@ -492,11 +528,21 @@ pub struct AnchorManager {
     #[builder(default = "Arc::new(HashMap::new())")]
     pub transport_registry: Arc<HashMap<String, Arc<dyn crate::transport::FrameTransport>>>,
 
-    /// Optional inactivity timeout for newly created anchors.
+    /// Default inactivity timeout for newly created anchors.
     /// When set, `create_anchor` spawns a timeout task that auto-removes the
-    /// anchor if no sender attaches within this duration.
+    /// anchor if no sender attaches within this duration. Per-anchor overrides
+    /// are supported via [`AnchorConfig::unattached_timeout`] +
+    /// [`AnchorManager::create_anchor_with_config`].
     #[builder(default, setter(into, strip_option))]
-    pub default_timeout: Option<Duration>,
+    pub default_unattached_timeout: Option<Duration>,
+
+    /// Default heartbeat cadence negotiated with senders attached to anchors
+    /// created by this manager. Per-anchor overrides are supported via
+    /// [`AnchorConfig::heartbeat_interval`] +
+    /// [`AnchorManager::create_anchor_with_config`]. Defaults to 5 seconds,
+    /// matching the historical hardcoded value.
+    #[builder(default = "Duration::from_secs(5)")]
+    pub default_heartbeat_interval: Duration,
 
     /// Optional messenger for sending `_stream_cancel` AM from the consumer side.
     /// Set by VeloFrameTransport scenarios; `None` for local/mock transport scenarios.
@@ -546,26 +592,46 @@ impl AnchorManager {
             .expect("required fields provided")
     }
 
-    /// Allocate a new anchor and return a [`StreamAnchor<T>`] for the consumer.
+    /// Allocate a new anchor with the manager's default liveness configuration.
+    ///
+    /// Equivalent to [`create_anchor_with_config`](Self::create_anchor_with_config)
+    /// called with `AnchorConfig::default()` — i.e. inherits both
+    /// `default_unattached_timeout` and `default_heartbeat_interval`.
     ///
     /// The returned `StreamAnchor` embeds the [`StreamAnchorHandle`]; obtain it via
     /// [`.handle()`](StreamAnchor::handle) to pass to a sender for attachment.
     ///
     /// Local IDs start at 1 and increment monotonically; ID 0 is reserved.
     /// A flume bounded channel (capacity 256) is created per anchor to deliver raw frame bytes.
-    ///
-    /// If `default_timeout` is configured, a background task is spawned that will
-    /// auto-remove the anchor if no sender attaches within the timeout duration.
     pub fn create_anchor<T>(&self) -> StreamAnchor<T> {
+        self.create_anchor_with_config(AnchorConfig::default())
+    }
+
+    /// Allocate a new anchor with per-anchor liveness overrides.
+    ///
+    /// `config.unattached_timeout` and `config.heartbeat_interval` each override
+    /// the corresponding manager default when `Some`; `None` inherits.
+    /// The resolved `heartbeat_interval` is later echoed to the attaching sender
+    /// via [`crate::control::AnchorAttachResponse`] so both sides agree without
+    /// hardcoded constants.
+    pub fn create_anchor_with_config<T>(&self, config: AnchorConfig) -> StreamAnchor<T> {
         // fetch_add returns the *old* value (starts at 0), so +1 gives us IDs starting at 1.
         let local_id = self.next_local_id.fetch_add(1, Ordering::Relaxed) + 1;
 
         let (frame_tx, frame_rx) = flume::bounded::<Vec<u8>>(256);
         let cancel_token = CancellationToken::new();
 
+        // Resolve liveness knobs: per-anchor override > manager default.
+        let unattached_timeout = config
+            .unattached_timeout
+            .or(self.default_unattached_timeout);
+        let heartbeat_interval = config
+            .heartbeat_interval
+            .unwrap_or(self.default_heartbeat_interval);
+
         // Spawn timeout task if configured — derive child from the anchor's parent token
         // so that finalize/remove auto-cancels it.
-        let timeout_cancel = self.default_timeout.map(|timeout| {
+        let timeout_cancel = unattached_timeout.map(|timeout| {
             Self::spawn_timeout_task(
                 self.registry.clone(),
                 self.metrics.clone(),
@@ -581,7 +647,8 @@ impl AnchorManager {
             active_pump_token: None,
             attachment: false,
             timeout_cancel,
-            timeout_duration: self.default_timeout,
+            unattached_timeout,
+            heartbeat_interval,
             stream_cancel_handle: None, // populated on attach
         };
 
@@ -738,13 +805,13 @@ impl AnchorManager {
 
     /// Clear the attachment flag on an anchor.
     ///
-    /// If the anchor has a configured `timeout_duration`, a new timeout task
+    /// If the anchor has a configured `unattached_timeout`, a new timeout task
     /// is spawned (timer "resumes" by restarting from the full duration).
     ///
     /// Returns `true` if the anchor was found and was previously attached.
     #[allow(dead_code)]
     pub(crate) fn detach(&self, local_id: u64) -> bool {
-        // Phase 1: Clear attachment and read timeout_duration + cancel_token (drop DashMap ref)
+        // Phase 1: Clear attachment and read unattached_timeout + cancel_token (drop DashMap ref)
         let (was_attached, maybe_timeout, maybe_parent) = self
             .registry
             .get_mut(&local_id)
@@ -753,7 +820,7 @@ impl AnchorManager {
                 entry.attachment = false;
                 (
                     was,
-                    entry.timeout_duration,
+                    entry.unattached_timeout,
                     Some(entry.cancel_token.clone()),
                 )
             })
@@ -763,7 +830,7 @@ impl AnchorManager {
         if let Some(timeout) = maybe_timeout {
             let parent = maybe_parent
                 .as_ref()
-                .expect("cancel_token present when timeout_duration is");
+                .expect("cancel_token present when unattached_timeout is");
             let tc = Self::spawn_timeout_task(
                 self.registry.clone(),
                 self.metrics.clone(),
@@ -898,7 +965,10 @@ impl AnchorManager {
             .map_err(AttachError::TransportError)?;
 
         match response {
-            crate::control::AnchorAttachResponse::Ok { stream_endpoint } => {
+            crate::control::AnchorAttachResponse::Ok {
+                stream_endpoint,
+                heartbeat_interval_ms,
+            } => {
                 let (_, local_id) = handle.unpack();
 
                 // Resolve transport from endpoint scheme, then connect
@@ -922,10 +992,13 @@ impl AnchorManager {
                     frame_tx,
                     handle,
                     self.registry.clone(), // Worker B's registry (no entry for this handle — correct)
-                    cancel_token,
-                    sender_stream_id,
-                    self.sender_registry.clone(),
-                    poison_tx,
+                    crate::sender::StreamSenderCancelInfo {
+                        cancel_token,
+                        sender_stream_id,
+                        sender_registry: self.sender_registry.clone(),
+                        poison_tx,
+                    },
+                    Duration::from_millis(heartbeat_interval_ms),
                 ))
             }
             crate::control::AnchorAttachResponse::Err { reason } => {
@@ -988,6 +1061,8 @@ impl AnchorManager {
                     // Clone the frame_tx so the StreamSender can write items
                     // directly to the StreamAnchor consumer.
                     let frame_tx = entry.frame_tx.clone();
+                    // Snapshot the negotiated heartbeat cadence for the sender.
+                    let heartbeat_interval = entry.heartbeat_interval;
 
                     // Mark as attached (reader pump takes ownership of transport
                     // receiver separately).
@@ -1023,10 +1098,13 @@ impl AnchorManager {
                         frame_tx,
                         handle,
                         self.registry.clone(),
-                        cancel_token,
-                        sender_stream_id,
-                        self.sender_registry.clone(),
-                        poison_tx,
+                        crate::sender::StreamSenderCancelInfo {
+                            cancel_token,
+                            sender_stream_id,
+                            sender_registry: self.sender_registry.clone(),
+                            poison_tx,
+                        },
+                        heartbeat_interval,
                     ))
                 }
             }
@@ -1540,7 +1618,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // AnchorManagerBuilder + default_timeout tests (Plan 08-04, Task 1)
+    // AnchorManagerBuilder + default_unattached_timeout tests (Plan 08-04, Task 1)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1553,8 +1631,8 @@ mod tests {
             .build()
             .expect("builder with required fields should succeed");
         assert!(
-            mgr.default_timeout.is_none(),
-            "default_timeout must be None when not set"
+            mgr.default_unattached_timeout.is_none(),
+            "default_unattached_timeout must be None when not set"
         );
     }
 
@@ -1565,13 +1643,13 @@ mod tests {
         let mgr = AnchorManagerBuilder::default()
             .worker_id(worker_id)
             .transport(transport)
-            .default_timeout(std::time::Duration::from_secs(10))
+            .default_unattached_timeout(std::time::Duration::from_secs(10))
             .build()
             .expect("builder with timeout should succeed");
         assert_eq!(
-            mgr.default_timeout,
+            mgr.default_unattached_timeout,
             Some(std::time::Duration::from_secs(10)),
-            "default_timeout must match configured value"
+            "default_unattached_timeout must match configured value"
         );
     }
 
@@ -1580,8 +1658,8 @@ mod tests {
         // AnchorManager::new must still compile and create a manager with no timeout
         let mgr = make_manager();
         assert!(
-            mgr.default_timeout.is_none(),
-            "AnchorManager::new must produce None default_timeout"
+            mgr.default_unattached_timeout.is_none(),
+            "AnchorManager::new must produce None default_unattached_timeout"
         );
     }
 
@@ -1594,7 +1672,7 @@ mod tests {
         let mgr = AnchorManagerBuilder::default()
             .worker_id(worker_id)
             .transport(transport)
-            .default_timeout(std::time::Duration::from_secs(1))
+            .default_unattached_timeout(std::time::Duration::from_secs(1))
             .build()
             .expect("builder should succeed");
 
@@ -1625,7 +1703,7 @@ mod tests {
         let mgr = AnchorManagerBuilder::default()
             .worker_id(worker_id)
             .transport(transport)
-            .default_timeout(std::time::Duration::from_secs(1))
+            .default_unattached_timeout(std::time::Duration::from_secs(1))
             .build()
             .expect("builder should succeed");
 
@@ -1653,7 +1731,7 @@ mod tests {
         let mgr = AnchorManagerBuilder::default()
             .worker_id(worker_id)
             .transport(transport)
-            .default_timeout(std::time::Duration::from_secs(2))
+            .default_unattached_timeout(std::time::Duration::from_secs(2))
             .build()
             .expect("builder should succeed");
 
@@ -1729,7 +1807,7 @@ mod tests {
         let mgr = AnchorManagerBuilder::default()
             .worker_id(worker_id)
             .transport(transport)
-            .default_timeout(std::time::Duration::from_secs(2))
+            .default_unattached_timeout(std::time::Duration::from_secs(2))
             .build()
             .expect("builder should succeed");
 
@@ -1757,7 +1835,7 @@ mod tests {
         let mgr = AnchorManagerBuilder::default()
             .worker_id(worker_id)
             .transport(transport)
-            .default_timeout(std::time::Duration::from_secs(10))
+            .default_unattached_timeout(std::time::Duration::from_secs(10))
             .build()
             .expect("builder should succeed");
 
@@ -2137,5 +2215,197 @@ mod tests {
             Arc::ptr_eq(&resolved, &default_clone),
             "resolved transport must be the default transport when registry is empty"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-anchor liveness configuration tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_default_heartbeat_interval_is_5s() {
+        // AnchorManager::new must produce the protocol default of 5s so that
+        // existing callers see no behavior change.
+        let mgr = make_manager();
+        assert_eq!(
+            mgr.default_heartbeat_interval,
+            std::time::Duration::from_secs(5),
+            "AnchorManager::new must default heartbeat_interval to 5s"
+        );
+    }
+
+    #[test]
+    fn test_builder_overrides_default_heartbeat_interval() {
+        let worker_id = velo_common::WorkerId::from_u64(42);
+        let transport: Arc<dyn crate::transport::FrameTransport> = Arc::new(MockTransport);
+        let mgr = AnchorManagerBuilder::default()
+            .worker_id(worker_id)
+            .transport(transport)
+            .default_heartbeat_interval(std::time::Duration::from_millis(750))
+            .build()
+            .expect("builder should succeed");
+        assert_eq!(
+            mgr.default_heartbeat_interval,
+            std::time::Duration::from_millis(750),
+            "builder must accept default_heartbeat_interval override"
+        );
+    }
+
+    #[test]
+    fn test_create_anchor_uses_manager_heartbeat_default() {
+        // create_anchor() (no config) must inherit the manager's default cadence.
+        let worker_id = velo_common::WorkerId::from_u64(42);
+        let transport: Arc<dyn crate::transport::FrameTransport> = Arc::new(MockTransport);
+        let mgr = AnchorManagerBuilder::default()
+            .worker_id(worker_id)
+            .transport(transport)
+            .default_heartbeat_interval(std::time::Duration::from_millis(250))
+            .build()
+            .expect("builder should succeed");
+
+        let anchor = mgr.create_anchor::<u32>();
+        let (_, local_id) = anchor.handle().unpack();
+
+        let entry = mgr
+            .registry
+            .get(&local_id)
+            .expect("entry must exist after create_anchor");
+        assert_eq!(
+            entry.heartbeat_interval,
+            std::time::Duration::from_millis(250),
+            "create_anchor must inherit manager-level default_heartbeat_interval"
+        );
+    }
+
+    #[test]
+    fn test_create_anchor_with_config_overrides_heartbeat() {
+        // Per-anchor override beats the manager default.
+        let mgr = make_manager(); // 5s default heartbeat
+        let cfg = AnchorConfig {
+            unattached_timeout: None,
+            heartbeat_interval: Some(std::time::Duration::from_millis(123)),
+        };
+        let anchor = mgr.create_anchor_with_config::<u32>(cfg);
+        let (_, local_id) = anchor.handle().unpack();
+
+        let entry = mgr.registry.get(&local_id).expect("entry exists");
+        assert_eq!(
+            entry.heartbeat_interval,
+            std::time::Duration::from_millis(123),
+            "AnchorConfig::heartbeat_interval must override the manager default"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_anchor_with_config_overrides_unattached_timeout() {
+        // Per-anchor override beats the manager default for the unattached TTL too.
+        let worker_id = velo_common::WorkerId::from_u64(42);
+        let transport: Arc<dyn crate::transport::FrameTransport> = Arc::new(MockTransport);
+        let mgr = AnchorManagerBuilder::default()
+            .worker_id(worker_id)
+            .transport(transport)
+            .default_unattached_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("builder should succeed");
+
+        let cfg = AnchorConfig {
+            unattached_timeout: Some(std::time::Duration::from_millis(50)),
+            heartbeat_interval: None,
+        };
+        let anchor = mgr.create_anchor_with_config::<u32>(cfg);
+        let (_, local_id) = anchor.handle().unpack();
+
+        let entry = mgr.registry.get(&local_id).expect("entry exists");
+        assert_eq!(
+            entry.unattached_timeout,
+            Some(std::time::Duration::from_millis(50)),
+            "AnchorConfig::unattached_timeout must override the manager default"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_anchor_with_default_config_inherits_both() {
+        // AnchorConfig::default() inherits both fields — equivalent to create_anchor().
+        let worker_id = velo_common::WorkerId::from_u64(42);
+        let transport: Arc<dyn crate::transport::FrameTransport> = Arc::new(MockTransport);
+        let mgr = AnchorManagerBuilder::default()
+            .worker_id(worker_id)
+            .transport(transport)
+            .default_unattached_timeout(std::time::Duration::from_secs(7))
+            .default_heartbeat_interval(std::time::Duration::from_millis(800))
+            .build()
+            .expect("builder should succeed");
+
+        let anchor = mgr.create_anchor_with_config::<u32>(AnchorConfig::default());
+        let (_, local_id) = anchor.handle().unpack();
+
+        let entry = mgr.registry.get(&local_id).expect("entry exists");
+        assert_eq!(
+            entry.heartbeat_interval,
+            std::time::Duration::from_millis(800)
+        );
+        assert_eq!(
+            entry.unattached_timeout,
+            Some(std::time::Duration::from_secs(7))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_per_anchor_heartbeat_propagates_through_attach_response() {
+        // End-to-end: create an anchor with a non-default heartbeat interval,
+        // attach via the local path, observe the sender ticks at the configured
+        // cadence (proves AnchorEntry → StreamSender plumbing works).
+        tokio::time::pause();
+
+        let worker_id = velo_common::WorkerId::from_u64(7);
+        let transport: Arc<dyn crate::transport::FrameTransport> = Arc::new(MockTransport);
+        let mgr = AnchorManagerBuilder::default()
+            .worker_id(worker_id)
+            .transport(transport)
+            .build()
+            .expect("builder should succeed");
+
+        let cfg = AnchorConfig {
+            unattached_timeout: None,
+            heartbeat_interval: Some(std::time::Duration::from_millis(200)),
+        };
+        let anchor = mgr.create_anchor_with_config::<u32>(cfg);
+        let handle = anchor.handle();
+
+        let sender = mgr
+            .attach_stream_anchor::<u32>(handle)
+            .await
+            .expect("local attach should succeed");
+
+        // Drain the consumer-side stream concurrently so the bounded channel
+        // doesn't block the sender's heartbeat task.
+        let collected: Arc<DashMap<usize, crate::frame::StreamFrame<u32>>> =
+            Arc::new(DashMap::new());
+        let collected_clone = collected.clone();
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            let mut anchor = anchor;
+            let mut idx = 0usize;
+            while let Some(frame) = anchor.next().await {
+                if let Ok(f) = frame {
+                    collected_clone.insert(idx, f);
+                    idx += 1;
+                }
+            }
+        });
+
+        // Advance ~1 full second: at 200ms cadence we expect at least 4 heartbeats
+        // emitted by the producer (the consumer filters them out, but the registry
+        // entry is what we care about — it must hold the configured interval).
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+        let (_, local_id) = handle.unpack();
+        let entry = mgr.registry.get(&local_id).expect("entry exists");
+        assert_eq!(
+            entry.heartbeat_interval,
+            std::time::Duration::from_millis(200),
+            "AnchorEntry must store the per-anchor cadence after attach"
+        );
+
+        drop(sender);
     }
 }

@@ -33,13 +33,13 @@ pub(crate) mod util;
 pub mod velo_transport;
 
 pub use anchor::{
-    AnchorManager, AnchorManagerBuilder, AttachError, StreamAnchor, StreamController,
+    AnchorConfig, AnchorManager, AnchorManagerBuilder, AttachError, StreamAnchor, StreamController,
 };
 pub use control::{
     AnchorAttachRequest, AnchorAttachResponse, AnchorCancelRequest, AnchorDetachRequest,
-    AnchorFinalizeRequest, SenderEntry, SenderRegistry, StreamCancelHandle, StreamCancelRequest,
-    create_anchor_attach_handler, create_anchor_cancel_handler, create_anchor_detach_handler,
-    create_anchor_finalize_handler, create_stream_cancel_handler,
+    AnchorFinalizeRequest, DETECTION_MULTIPLIER, SenderEntry, SenderRegistry, StreamCancelHandle,
+    StreamCancelRequest, create_anchor_attach_handler, create_anchor_cancel_handler,
+    create_anchor_detach_handler, create_anchor_finalize_handler, create_stream_cancel_handler,
 };
 pub use frame::{SendError, StreamError, StreamFrame};
 #[cfg(feature = "grpc")]
