@@ -194,6 +194,11 @@ jobs:
       uses: ./.github/actions/sccache-setup
       with:
         bucket: ${{ secrets.SCCACHE_S3_BUCKET }}
+    - name: Cache cargo-semver-checks binary
+      uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 #v5.0.4
+      with:
+        path: ~/.cargo/bin/cargo-semver-checks
+        key: ${{ runner.os }}-cargo-semver-checks-${{ hashFiles('scripts/check-semver.sh', 'rust-toolchain.toml') }}
     - name: Run semver check
       env:
         SEMVER_SKIP: ${{ contains(github.event.pull_request.labels.*.name, 'semver:skip') }}
