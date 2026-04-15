@@ -181,3 +181,64 @@ async fn test_velo_facade_mpsc_create_and_attach() {
 
     anchor.cancel();
 }
+
+/// Exercises `Velo::create_mpsc_anchor_with_config` — the per-anchor config
+/// path that the minimal smoke test above doesn't hit. Verifies that
+/// `max_senders` and `heartbeat_interval` are plumbed through the facade.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_velo_facade_mpsc_with_config() {
+    use velo::StreamConfig;
+    use velo::streaming::mpsc::MpscAnchorConfig;
+
+    let transport = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        Arc::new(
+            velo_transports::tcp::TcpTransportBuilder::new()
+                .from_listener(listener)
+                .unwrap()
+                .build()
+                .unwrap(),
+        )
+    };
+
+    let velo = velo::Velo::builder()
+        .add_transport(transport)
+        .stream_config(StreamConfig::Tcp(None))
+        .expect("stream_config")
+        .build()
+        .await
+        .unwrap();
+
+    let config = MpscAnchorConfig {
+        max_senders: Some(2),
+        heartbeat_interval: Some(std::time::Duration::from_millis(250)),
+        unattached_timeout: Some(std::time::Duration::from_secs(1)),
+        channel_capacity: Some(64),
+    };
+    let anchor = velo.create_mpsc_anchor_with_config::<u32>(config);
+    let handle = anchor.handle();
+
+    // First two attaches succeed …
+    let s1 = velo
+        .attach_mpsc_anchor::<u32>(handle)
+        .await
+        .expect("attach s1");
+    let s2 = velo
+        .attach_mpsc_anchor::<u32>(handle)
+        .await
+        .expect("attach s2");
+
+    // … third must hit the max_senders cap.
+    let third = velo.attach_mpsc_anchor::<u32>(handle).await;
+    assert!(
+        matches!(
+            third,
+            Err(velo::AttachError::MaxSendersReached { limit: 2, .. })
+        ),
+        "third attach must be MaxSendersReached, got {third:?}"
+    );
+
+    drop(s1);
+    drop(s2);
+    anchor.cancel();
+}

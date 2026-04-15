@@ -40,3 +40,53 @@ pub struct MpscAnchorConfig {
     /// fan-in where back-pressure against individual producers is desirable.
     pub channel_capacity: Option<usize>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sender_id_display() {
+        let sid = SenderId(42);
+        assert_eq!(format!("{sid}"), "SenderId(42)");
+        assert_eq!(format!("{sid:?}"), "SenderId(42)");
+    }
+
+    #[test]
+    fn sender_id_ordering() {
+        // Derive check — `SenderId` must be Copy, Eq, Hash, Ord for the
+        // tests that sort it and use it as HashMap keys.
+        let a = SenderId(1);
+        let b = SenderId(2);
+        assert!(a < b);
+        assert_eq!(a, SenderId(1));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn mpsc_anchor_config_default() {
+        let cfg = MpscAnchorConfig::default();
+        assert!(cfg.unattached_timeout.is_none());
+        assert!(cfg.heartbeat_interval.is_none());
+        assert!(cfg.max_senders.is_none());
+        assert!(cfg.channel_capacity.is_none());
+    }
+
+    #[test]
+    fn mpsc_anchor_config_override_all_fields() {
+        let cfg = MpscAnchorConfig {
+            unattached_timeout: Some(Duration::from_secs(1)),
+            heartbeat_interval: Some(Duration::from_millis(100)),
+            max_senders: Some(8),
+            channel_capacity: Some(512),
+        };
+        assert_eq!(cfg.unattached_timeout, Some(Duration::from_secs(1)));
+        assert_eq!(cfg.heartbeat_interval, Some(Duration::from_millis(100)));
+        assert_eq!(cfg.max_senders, Some(8));
+        assert_eq!(cfg.channel_capacity, Some(512));
+
+        // Clone is derived and should be cheap.
+        let cfg2 = cfg.clone();
+        assert_eq!(cfg2.max_senders, Some(8));
+    }
+}

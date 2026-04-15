@@ -357,3 +357,106 @@ async fn test_handle_kind_roundtrip_via_manager() {
     drop(spsc_anchor);
     drop(mpsc_anchor);
 }
+
+/// `send_err` surfaces a non-terminal `SenderError` to the consumer. The
+/// sender stays attached and can continue sending items afterwards.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mpsc_send_err_is_non_terminal() {
+    let mgr = make_manager();
+    let mut anchor = mgr.create_mpsc_anchor::<u32>();
+    let handle = anchor.handle();
+    let sender = mgr.attach_mpsc_stream_anchor::<u32>(handle).await.unwrap();
+
+    sender.send(1).await.unwrap();
+    sender.send_err("transient glitch").await.unwrap();
+    sender.send(2).await.unwrap();
+
+    let mut items = Vec::new();
+    let mut got_err = false;
+    while items.len() < 2 || !got_err {
+        match next_frame(&mut anchor).await.expect("frame") {
+            Ok((_, MpscFrame::Item(v))) => items.push(v),
+            Ok((_, MpscFrame::SenderError(msg))) => {
+                assert_eq!(msg, "transient glitch");
+                got_err = true;
+            }
+            Ok((sid, MpscFrame::Detached | MpscFrame::Dropped(_))) => {
+                panic!("unexpected exit from {sid}")
+            }
+            Err(e) => panic!("stream error: {e}"),
+        }
+    }
+    assert_eq!(items, vec![1u32, 2]);
+
+    drop(sender);
+    anchor.cancel();
+}
+
+/// `MpscStreamSender::cancellation_token()` fires when the consumer cancels.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mpsc_cancellation_token_fires_on_cancel() {
+    let mgr = make_manager();
+    let anchor = mgr.create_mpsc_anchor::<u32>();
+    let handle = anchor.handle();
+    let controller = anchor.controller();
+    let sender = mgr.attach_mpsc_stream_anchor::<u32>(handle).await.unwrap();
+    let token = sender.cancellation_token();
+    assert!(!token.is_cancelled());
+
+    // Cancel from the consumer side.
+    controller.cancel();
+
+    // Poison propagation should fire the user-facing token too.
+    tokio::time::timeout(Duration::from_secs(2), token.cancelled())
+        .await
+        .expect("cancellation_token must fire after controller.cancel()");
+
+    drop(sender);
+    drop(anchor);
+}
+
+/// `MpscStreamAnchor::cancel(self)` consume method (distinct from
+/// `controller.cancel()`) cleans up the registry and blocks reattach.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mpsc_anchor_consume_cancel() {
+    let mgr = make_manager();
+    let anchor = mgr.create_mpsc_anchor::<u32>();
+    let handle = anchor.handle();
+    let _controller = anchor.cancel(); // consume
+    // Wait a beat for cancel propagation.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let result = mgr.attach_mpsc_stream_anchor::<u32>(handle).await;
+    assert!(
+        matches!(result, Err(AttachError::AnchorNotFound { .. })),
+        "anchor must be gone after consume-cancel, got {result:?}"
+    );
+}
+
+/// Debug impl of `MpscStreamSender` is stable and includes sender_id + handle.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mpsc_sender_debug_impl() {
+    let mgr = make_manager();
+    let anchor = mgr.create_mpsc_anchor::<u32>();
+    let handle = anchor.handle();
+    let sender = mgr.attach_mpsc_stream_anchor::<u32>(handle).await.unwrap();
+    let dbg = format!("{sender:?}");
+    assert!(dbg.contains("MpscStreamSender"));
+    assert!(dbg.contains("SenderId(1)"));
+    drop(sender);
+    drop(anchor);
+}
+
+/// `cancel()` via [`MpscStreamController`] is idempotent — multiple calls
+/// short-circuit after the first one wins the AtomicBool gate.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mpsc_controller_cancel_idempotent() {
+    let mgr = make_manager();
+    let anchor = mgr.create_mpsc_anchor::<u32>();
+    let controller = anchor.controller();
+    let c2 = controller.clone();
+
+    controller.cancel();
+    c2.cancel(); // second call must not panic or double-remove
+    drop(anchor);
+}

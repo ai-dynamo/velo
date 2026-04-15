@@ -101,4 +101,38 @@ mod tests {
             other => panic!("expected Item, got {:?}", other),
         }
     }
+
+    #[test]
+    fn sender_error_maps_to_sender_error() {
+        let frame: StreamFrame<u32> = StreamFrame::SenderError("soft".into());
+        let mapped = MpscFrame::from_stream_frame(frame).expect("mapped");
+        match mapped {
+            MpscFrame::SenderError(msg) => assert_eq!(msg, "soft"),
+            other => panic!("expected SenderError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn detach_maps_to_detached() {
+        let frame: StreamFrame<u32> = StreamFrame::Detached;
+        let mapped = MpscFrame::from_stream_frame(frame).expect("mapped");
+        assert!(matches!(mapped, MpscFrame::Detached));
+    }
+
+    #[test]
+    fn is_sender_exit_predicate() {
+        // Item / SenderError are NOT exit events (anchor keeps the sender slot).
+        let item: MpscFrame<u32> = MpscFrame::Item(1);
+        assert!(!item.is_sender_exit());
+        let err: MpscFrame<u32> = MpscFrame::SenderError("x".into());
+        assert!(!err.is_sender_exit());
+
+        // Detached / Dropped ARE exit events.
+        let detached: MpscFrame<u32> = MpscFrame::Detached;
+        assert!(detached.is_sender_exit());
+        let dropped_none: MpscFrame<u32> = MpscFrame::Dropped(None);
+        assert!(dropped_none.is_sender_exit());
+        let dropped_some: MpscFrame<u32> = MpscFrame::Dropped(Some("why".into()));
+        assert!(dropped_some.is_sender_exit());
+    }
 }
