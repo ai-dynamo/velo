@@ -16,7 +16,7 @@ use common::MockFrameTransport;
 use futures::StreamExt;
 use velo_common::WorkerId;
 use velo_streaming::{
-    AnchorManager, AttachError, MpscAnchorConfig, MpscFrame, MpscStreamAnchor, SenderId,
+    AnchorKind, AnchorManager, AttachError, MpscAnchorConfig, MpscFrame, MpscStreamAnchor, SenderId,
 };
 
 fn make_manager() -> Arc<AnchorManager> {
@@ -280,4 +280,80 @@ async fn test_mpsc_controller_cancel_propagates() {
     );
 
     drop(anchor);
+}
+
+/// An MPSC handle passed to the SPSC attach path is rejected client-side
+/// with [`AttachError::WrongHandleKind`] — no AM round-trip required.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mpsc_handle_rejected_by_spsc_attach() {
+    let mgr = make_manager();
+    let anchor = mgr.create_mpsc_anchor::<u32>();
+    let handle = anchor.handle();
+    assert!(handle.is_mpsc_stream());
+    assert_eq!(handle.kind(), AnchorKind::Mpsc);
+
+    let result = mgr.attach_stream_anchor::<u32>(handle).await;
+    match result {
+        Err(AttachError::WrongHandleKind {
+            handle: h,
+            expected,
+        }) => {
+            assert_eq!(h, handle);
+            assert_eq!(expected, AnchorKind::Spsc);
+        }
+        other => panic!("expected WrongHandleKind(Spsc), got {other:?}"),
+    }
+
+    // Sanity: the MPSC anchor is still usable.
+    let s = mgr.attach_mpsc_stream_anchor::<u32>(handle).await.unwrap();
+    drop(s);
+    drop(anchor);
+}
+
+/// An SPSC handle passed to the MPSC attach path is rejected client-side.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_spsc_handle_rejected_by_mpsc_attach() {
+    let mgr = make_manager();
+    let anchor = mgr.create_anchor::<u32>();
+    let handle = anchor.handle();
+    assert!(handle.is_spsc_stream());
+    assert_eq!(handle.kind(), AnchorKind::Spsc);
+
+    let result = mgr.attach_mpsc_stream_anchor::<u32>(handle).await;
+    match result {
+        Err(AttachError::WrongHandleKind {
+            handle: h,
+            expected,
+        }) => {
+            assert_eq!(h, handle);
+            assert_eq!(expected, AnchorKind::Mpsc);
+        }
+        other => panic!("expected WrongHandleKind(Mpsc), got {other:?}"),
+    }
+
+    // Sanity: the SPSC anchor still accepts an SPSC attach.
+    let s = mgr.attach_stream_anchor::<u32>(handle).await.unwrap();
+    drop(s);
+    drop(anchor);
+}
+
+/// SPSC and MPSC handles for the same worker have distinct encoded forms.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_handle_kind_roundtrip_via_manager() {
+    let mgr = make_manager();
+    let spsc_anchor = mgr.create_anchor::<u32>();
+    let mpsc_anchor = mgr.create_mpsc_anchor::<u32>();
+
+    let spsc_handle = spsc_anchor.handle();
+    let mpsc_handle = mpsc_anchor.handle();
+
+    assert!(spsc_handle.is_spsc_stream());
+    assert!(mpsc_handle.is_mpsc_stream());
+    assert_ne!(
+        spsc_handle, mpsc_handle,
+        "SPSC and MPSC handles must not collide"
+    );
+
+    drop(spsc_anchor);
+    drop(mpsc_anchor);
 }

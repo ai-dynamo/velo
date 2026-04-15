@@ -313,6 +313,23 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> velo_messeng
             async move {
                 let started = Instant::now();
                 let req = ctx.input;
+
+                // Defence-in-depth: reject MPSC handles at the SPSC attach
+                // endpoint. The client-side `attach_stream_anchor` already
+                // rejects these before the AM, but misbehaving or older
+                // clients may still hit the wire.
+                if req.handle.is_mpsc_stream() {
+                    manager.record_streaming_operation(
+                        StreamingOp::Attach,
+                        HandlerOutcome::Error,
+                        "unknown",
+                        started,
+                    );
+                    return Ok(AnchorAttachResponse::Err {
+                        reason: format!("anchor {} is mpsc; use _mpsc_anchor_attach", req.handle),
+                    });
+                }
+
                 let (_, local_id) = req.handle.unpack();
 
                 // Step 1: Quick check -- anchor exists and is unattached (drop lock)

@@ -57,6 +57,18 @@ pub enum AttachError {
         limit: usize,
     },
 
+    /// The handle was produced for a different anchor kind than the attach
+    /// method expected (e.g. an MPSC handle passed to `attach_stream_anchor`,
+    /// or an SPSC handle passed to `attach_mpsc_stream_anchor`).
+    ///
+    /// Detected client-side from [`crate::handle::StreamAnchorHandle::kind`]
+    /// so no AM round-trip is wasted.
+    #[error("anchor {handle} is of wrong kind: expected {expected}")]
+    WrongHandleKind {
+        handle: StreamAnchorHandle,
+        expected: crate::handle::AnchorKind,
+    },
+
     /// The underlying transport failed during bind/connect.
     #[error("transport bind failed: {0}")]
     TransportError(#[from] anyhow::Error),
@@ -1056,6 +1068,16 @@ impl AnchorManager {
         &self,
         handle: StreamAnchorHandle,
     ) -> Result<crate::sender::StreamSender<T>, AttachError> {
+        // Fail fast if the caller passed an MPSC handle: the SPSC registry
+        // will never contain it, and the remote path would waste an AM
+        // round-trip to discover the same thing.
+        if handle.is_mpsc_stream() {
+            return Err(AttachError::WrongHandleKind {
+                handle,
+                expected: crate::handle::AnchorKind::Spsc,
+            });
+        }
+
         let (handle_worker_id, local_id) = handle.unpack();
 
         // Remote path: handle belongs to a different worker — send _anchor_attach AM
@@ -1159,7 +1181,12 @@ impl AnchorManager {
         &self,
         config: crate::mpsc::MpscAnchorConfig,
     ) -> crate::mpsc::MpscStreamAnchor<T> {
-        let local_id = self.next_local_id.fetch_add(1, Ordering::Relaxed) + 1;
+        // Raw 63-bit counter; the MPSC discriminator bit is applied at handle
+        // pack time (and is stored with the entry in `mpsc_registry` so
+        // registry keys match `handle.unpack().1` exactly).
+        let raw_local = self.next_local_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let handle = StreamAnchorHandle::pack_mpsc(self.worker_id, raw_local);
+        let (_, local_id) = handle.unpack();
 
         let capacity = config.channel_capacity.unwrap_or(256);
         let (frame_tx, frame_rx) = flume::bounded::<(u64, Vec<u8>)>(capacity);
@@ -1195,7 +1222,6 @@ impl AnchorManager {
         self.mpsc_registry.insert(local_id, entry);
         self.update_active_anchor_gauge();
 
-        let handle = StreamAnchorHandle::pack(self.worker_id, local_id);
         crate::mpsc::MpscStreamAnchor::new(
             handle,
             frame_rx,
@@ -1213,6 +1239,14 @@ impl AnchorManager {
         &self,
         handle: StreamAnchorHandle,
     ) -> Result<crate::mpsc::MpscStreamSender<T>, AttachError> {
+        // Fail fast if the caller passed an SPSC handle.
+        if handle.is_spsc_stream() {
+            return Err(AttachError::WrongHandleKind {
+                handle,
+                expected: crate::handle::AnchorKind::Mpsc,
+            });
+        }
+
         let (handle_worker_id, local_id) = handle.unpack();
 
         if handle_worker_id != self.worker_id {

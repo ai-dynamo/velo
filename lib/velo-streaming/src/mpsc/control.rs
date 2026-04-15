@@ -150,6 +150,16 @@ pub fn create_mpsc_anchor_attach_handler(manager: Arc<AnchorManager>) -> velo_me
             let manager = manager.clone();
             async move {
                 let req = ctx.input;
+
+                // Defence-in-depth: reject SPSC handles at the MPSC attach
+                // endpoint. Mirrors the symmetric check in
+                // `create_anchor_attach_handler`.
+                if req.handle.is_spsc_stream() {
+                    return Ok(MpscAnchorAttachResponse::Err {
+                        reason: format!("anchor {} is spsc; use _anchor_attach", req.handle),
+                    });
+                }
+
                 let (_, local_id) = req.handle.unpack();
 
                 // Step 1: quick existence / capacity check.

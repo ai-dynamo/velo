@@ -46,8 +46,9 @@ pub use velo_streaming::{
 /// namespace so the SPSC and MPSC surfaces live side-by-side.
 pub mod streaming {
     pub use velo_streaming::{
-        AnchorConfig, AnchorManager, AnchorManagerBuilder, AttachError, FrameTransport, SendError,
-        StreamAnchor, StreamAnchorHandle, StreamController, StreamError, StreamFrame, StreamSender,
+        AnchorConfig, AnchorKind, AnchorManager, AnchorManagerBuilder, AttachError, FrameTransport,
+        SendError, StreamAnchor, StreamAnchorHandle, StreamController, StreamError, StreamFrame,
+        StreamSender,
     };
 
     /// Multi-producer / single-consumer streaming anchors.

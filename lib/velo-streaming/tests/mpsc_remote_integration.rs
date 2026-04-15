@@ -11,7 +11,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use velo_common::WorkerId;
 use velo_messenger::Messenger;
 use velo_streaming::velo_transport::VeloFrameTransport;
 use velo_streaming::{
@@ -71,10 +70,9 @@ async fn make_am(messenger: Arc<Messenger>) -> Arc<AnchorManager> {
 }
 
 fn roundtrip_handle(handle: StreamAnchorHandle) -> StreamAnchorHandle {
-    let raw = handle.as_u128();
-    let hi = (raw >> 64) as u64;
-    let lo = raw as u64;
-    StreamAnchorHandle::pack(WorkerId::from_u64(hi), lo)
+    // Simulate opaque cross-worker transfer via the raw u128 (preserves the
+    // MPSC kind bit). `pack` is kind-validated; `from_u128` is not.
+    StreamAnchorHandle::from_u128(handle.as_u128())
 }
 
 /// Two remote senders attach to one MPSC anchor on a separate worker and

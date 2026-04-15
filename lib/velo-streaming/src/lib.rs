@@ -45,7 +45,7 @@ pub use control::{
 pub use frame::{SendError, StreamError, StreamFrame};
 #[cfg(feature = "grpc")]
 pub use grpc_transport::GrpcFrameTransport;
-pub use handle::StreamAnchorHandle;
+pub use handle::{AnchorKind, MPSC_STREAM_BIT, StreamAnchorHandle};
 pub use mpsc::{
     MpscAnchorConfig, MpscFrame, MpscStreamAnchor, MpscStreamController, MpscStreamSender, SenderId,
 };
