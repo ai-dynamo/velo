@@ -79,8 +79,11 @@ pub struct MpscAnchorCancelRequest {
 /// Reads raw bytes from a remote sender's transport receiver, tags each
 /// frame with this sender's `sender_id`, and forwards to the anchor's
 /// shared `(u64, Vec<u8>)` channel. On 3 missed heartbeats (or transport
-/// close) it injects a `Dropped` sentinel for **this sender only** — not for
-/// the whole anchor — and removes the sender slot from the MPSC entry.
+/// close with no explicit terminal) it injects a `Dropped` sentinel for
+/// **this sender only** — not for the whole anchor — and removes the sender
+/// slot from the MPSC entry. Explicit in-band terminal sentinels
+/// (`Detached`, `Dropped`, `Finalized`) are treated as authoritative and are
+/// forwarded exactly once.
 pub(crate) async fn mpsc_reader_pump(
     sender_id: u64,
     transport_rx: flume::Receiver<Vec<u8>>,
@@ -99,7 +102,19 @@ pub(crate) async fn mpsc_reader_pump(
                 match result {
                     Ok(Ok(bytes)) => {
                         missed_heartbeats = 0;
+                        let explicit_terminal = bytes == *crate::sender::cached_detached()
+                            || bytes == *crate::sender::cached_dropped()
+                            || bytes == *crate::sender::cached_finalized();
                         if frame_tx.send_async((sender_id, bytes)).await.is_err() {
+                            break;
+                        }
+                        if explicit_terminal {
+                            if let Some(slot) =
+                                super::anchor::remove_sender_slot(&mpsc_registry, local_id, sender_id)
+                                && let Some(pt) = slot.pump_token
+                            {
+                                pt.cancel();
+                            }
                             break;
                         }
                     }

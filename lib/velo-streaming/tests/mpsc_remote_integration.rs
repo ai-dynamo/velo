@@ -222,6 +222,112 @@ async fn test_mpsc_heartbeat_timeout_per_sender() {
     anchor.cancel();
 }
 
+/// Remote detach must surface exactly one `Detached` event and release
+/// `max_senders` capacity immediately.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mpsc_remote_detach_is_exact_once() {
+    let (messenger_a, messenger_b) = make_two_messengers().await;
+    let am_a = make_am(messenger_a).await;
+    let am_b = make_am(messenger_b).await;
+
+    let config = MpscAnchorConfig {
+        max_senders: Some(1),
+        ..Default::default()
+    };
+    let mut anchor = am_a.create_mpsc_anchor_with_config::<u32>(config);
+    let handle = roundtrip_handle(anchor.handle());
+
+    let sender = am_b.attach_mpsc_stream_anchor::<u32>(handle).await.unwrap();
+    assert_eq!(sender.sender_id(), SenderId(1));
+    let returned = sender.detach().await.expect("detach");
+    assert_eq!(returned, handle);
+
+    match tokio::time::timeout(Duration::from_secs(2), anchor.next())
+        .await
+        .expect("detach frame timeout")
+    {
+        Some(Ok((SenderId(1), MpscFrame::Detached))) => {}
+        other => panic!(
+            "expected exactly one Detached for sender 1, got {:?}",
+            other
+        ),
+    }
+
+    let s2 = am_b.attach_mpsc_stream_anchor::<u32>(handle).await.unwrap();
+    assert_eq!(s2.sender_id(), SenderId(2));
+    s2.send(42).await.unwrap();
+
+    match tokio::time::timeout(Duration::from_secs(2), anchor.next())
+        .await
+        .expect("item frame timeout")
+    {
+        Some(Ok((SenderId(2), MpscFrame::Item(42)))) => {}
+        other => panic!("expected SenderId(2) Item(42), got {:?}", other),
+    }
+
+    match tokio::time::timeout(Duration::from_millis(200), anchor.next()).await {
+        Err(_) => {}
+        other => panic!(
+            "unexpected extra frame after clean remote detach: {:?}",
+            other
+        ),
+    }
+
+    let _ = s2.detach().await;
+    anchor.cancel();
+}
+
+/// Remote drop must surface exactly one `Dropped` event and release
+/// `max_senders` capacity immediately.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mpsc_remote_drop_is_exact_once() {
+    let (messenger_a, messenger_b) = make_two_messengers().await;
+    let am_a = make_am(messenger_a).await;
+    let am_b = make_am(messenger_b).await;
+
+    let config = MpscAnchorConfig {
+        max_senders: Some(1),
+        ..Default::default()
+    };
+    let mut anchor = am_a.create_mpsc_anchor_with_config::<u32>(config);
+    let handle = roundtrip_handle(anchor.handle());
+
+    let sender = am_b.attach_mpsc_stream_anchor::<u32>(handle).await.unwrap();
+    assert_eq!(sender.sender_id(), SenderId(1));
+    drop(sender);
+
+    match tokio::time::timeout(Duration::from_secs(2), anchor.next())
+        .await
+        .expect("dropped frame timeout")
+    {
+        Some(Ok((SenderId(1), MpscFrame::Dropped(None)))) => {}
+        other => panic!(
+            "expected exactly one Dropped(None) for sender 1, got {:?}",
+            other
+        ),
+    }
+
+    let s2 = am_b.attach_mpsc_stream_anchor::<u32>(handle).await.unwrap();
+    assert_eq!(s2.sender_id(), SenderId(2));
+    s2.send(99).await.unwrap();
+
+    match tokio::time::timeout(Duration::from_secs(2), anchor.next())
+        .await
+        .expect("item frame timeout")
+    {
+        Some(Ok((SenderId(2), MpscFrame::Item(99)))) => {}
+        other => panic!("expected SenderId(2) Item(99), got {:?}", other),
+    }
+
+    match tokio::time::timeout(Duration::from_millis(200), anchor.next()).await {
+        Err(_) => {}
+        other => panic!("unexpected extra frame after remote drop: {:?}", other),
+    }
+
+    let _ = s2.detach().await;
+    anchor.cancel();
+}
+
 // ---------------------------------------------------------------------------
 // AM handler branch coverage — `_mpsc_anchor_attach` error paths, and the
 // currently-client-unused `_mpsc_anchor_detach` / `_mpsc_anchor_cancel`
@@ -455,4 +561,37 @@ async fn test_mpsc_controller_cancel_propagates_cross_worker() {
 
     drop(sender);
     drop(anchor);
+}
+
+/// A pending cross-worker `anchor.next()` must resolve to `None` promptly when
+/// the consumer cancels, even before the remote sender is dropped.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mpsc_pending_next_wakes_on_cross_worker_cancel() {
+    let (messenger_a, messenger_b) = make_two_messengers().await;
+    let am_a = make_am(messenger_a.clone()).await;
+    let am_b = make_am(messenger_b.clone()).await;
+
+    let anchor = am_a.create_mpsc_anchor::<u32>();
+    let handle = roundtrip_handle(anchor.handle());
+    let controller = anchor.controller();
+    let sender = am_b.attach_mpsc_stream_anchor::<u32>(handle).await.unwrap();
+
+    let next_task = tokio::spawn(async move {
+        let mut anchor = anchor;
+        anchor.next().await
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    controller.cancel();
+
+    let result = tokio::time::timeout(Duration::from_secs(2), next_task)
+        .await
+        .expect("pending next() must wake after cross-worker cancel")
+        .expect("next task join");
+    assert!(
+        result.is_none(),
+        "cancelled cross-worker anchor.next() must resolve to None, got {result:?}"
+    );
+
+    drop(sender);
 }

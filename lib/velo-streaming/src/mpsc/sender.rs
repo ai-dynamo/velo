@@ -229,19 +229,23 @@ impl<T> Drop for MpscStreamSender<T> {
         self.sender_registry.senders.remove(&self.sender_stream_id);
         if !self.sent_terminal {
             self.heartbeat_cancel.cancel();
-            // Fire-and-forget: try_send keeps Drop non-blocking. If the
-            // channel is full the consumer will still observe SenderDropped
-            // once the channel drains/closes.
             let bytes = cached_dropped().clone();
             match &self.channel {
                 SenderChannel::Local(tx) => {
-                    let _ = tx.try_send((self.sender_id.0, bytes));
+                    // Match SPSC drop semantics: local sender exits are
+                    // load-bearing protocol events and must not be lost when
+                    // the shared anchor queue is full.
+                    let _ = tx.send((self.sender_id.0, bytes));
                 }
                 SenderChannel::Remote(tx) => {
+                    // Keep remote drop non-blocking; transport close is the
+                    // fallback if we cannot enqueue the explicit sentinel.
                     let _ = tx.try_send(bytes);
                 }
             }
-            // Local: drop slot so an unattached-timeout can re-arm when last sender leaves.
+            // Same-worker: drop the slot immediately so capacity is released
+            // and the unattached timeout can re-arm when the last sender
+            // leaves. Cross-worker removal is performed by the remote pump.
             let (_, local_id) = self.handle.unpack();
             if let Some(slot) = crate::mpsc::anchor::remove_sender_slot(
                 &self.mpsc_registry,

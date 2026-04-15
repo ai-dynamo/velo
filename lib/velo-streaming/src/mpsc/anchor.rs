@@ -87,6 +87,7 @@ struct MpscStreamControllerInner {
     metrics: Option<Arc<VeloMetrics>>,
     sender_registry: Arc<crate::control::SenderRegistry>,
     messenger: Option<Arc<velo_messenger::Messenger>>,
+    cancel_wake: flume::Sender<()>,
     cancelled: AtomicBool,
 }
 
@@ -130,6 +131,7 @@ impl MpscStreamController {
             &self.inner.spsc_registry,
             &self.inner.registry,
         );
+        let _ = self.inner.cancel_wake.try_send(());
 
         for (_sender_id, slot) in entry.senders.into_iter() {
             if let Some(pump_token) = slot.pump_token {
@@ -186,6 +188,7 @@ impl MpscStreamController {
 pub struct MpscStreamAnchor<T> {
     handle: StreamAnchorHandle,
     inner_stream: flume::r#async::RecvStream<'static, (u64, Vec<u8>)>,
+    cancel_stream: flume::r#async::RecvStream<'static, ()>,
     terminated: bool,
     local_id: u64,
     registry: Arc<DashMap<u64, MpscAnchorEntry>>,
@@ -207,6 +210,7 @@ impl<T> MpscStreamAnchor<T> {
             mpsc_registry: registry,
             metrics,
         } = ctx;
+        let (cancel_wake, cancel_rx) = flume::bounded::<()>(1);
         let inner = Arc::new(MpscStreamControllerInner {
             local_id,
             registry: registry.clone(),
@@ -214,12 +218,14 @@ impl<T> MpscStreamAnchor<T> {
             metrics,
             sender_registry,
             messenger,
+            cancel_wake,
             cancelled: AtomicBool::new(false),
         });
         let controller = MpscStreamController { inner };
         Self {
             handle,
             inner_stream: rx.into_stream(),
+            cancel_stream: cancel_rx.into_stream(),
             terminated: false,
             local_id,
             registry,
@@ -267,6 +273,13 @@ impl<T: DeserializeOwned> Stream for MpscStreamAnchor<T> {
             return Poll::Ready(None);
         }
         loop {
+            match Pin::new(&mut this.cancel_stream).poll_next(cx) {
+                Poll::Ready(Some(_)) | Poll::Ready(None) => {
+                    this.terminated = true;
+                    return Poll::Ready(None);
+                }
+                Poll::Pending => {}
+            }
             match Pin::new(&mut this.inner_stream).poll_next(cx) {
                 Poll::Ready(Some((sender_id, bytes))) => {
                     match rmp_serde::from_slice::<StreamFrame<T>>(&bytes) {

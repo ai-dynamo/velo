@@ -282,6 +282,79 @@ async fn test_mpsc_controller_cancel_propagates() {
     drop(anchor);
 }
 
+/// Local drop must still surface one `Dropped` event even when the shared
+/// frame channel is full.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mpsc_local_drop_preserved_under_backpressure() {
+    let mgr = make_manager();
+    let config = MpscAnchorConfig {
+        channel_capacity: Some(1),
+        ..Default::default()
+    };
+    let mut anchor = mgr.create_mpsc_anchor_with_config::<u32>(config);
+    let handle = anchor.handle();
+
+    let sender = mgr.attach_mpsc_stream_anchor::<u32>(handle).await.unwrap();
+    let sid = sender.sender_id();
+    sender.send(1).await.unwrap();
+
+    let drop_task = tokio::spawn(async move {
+        drop(sender);
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        !drop_task.is_finished(),
+        "drop should block while the bounded channel is full"
+    );
+
+    match next_frame(&mut anchor).await.expect("frame") {
+        Ok((got_sid, MpscFrame::Item(1))) => assert_eq!(got_sid, sid),
+        other => panic!("expected Item(1), got {:?}", other),
+    }
+
+    tokio::time::timeout(Duration::from_secs(2), drop_task)
+        .await
+        .expect("drop task should finish once the queue drains")
+        .expect("drop task join");
+
+    match next_frame(&mut anchor).await.expect("frame") {
+        Ok((got_sid, MpscFrame::Dropped(None))) => assert_eq!(got_sid, sid),
+        other => panic!("expected Dropped(None), got {:?}", other),
+    }
+
+    anchor.cancel();
+}
+
+/// A pending `anchor.next()` must terminate promptly when the controller
+/// cancels, even if sender handles are still alive.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mpsc_pending_next_wakes_on_controller_cancel() {
+    let mgr = make_manager();
+    let anchor = mgr.create_mpsc_anchor::<u32>();
+    let handle = anchor.handle();
+    let controller = anchor.controller();
+    let sender = mgr.attach_mpsc_stream_anchor::<u32>(handle).await.unwrap();
+
+    let next_task = tokio::spawn(async move {
+        let mut anchor = anchor;
+        anchor.next().await
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    controller.cancel();
+
+    let result = tokio::time::timeout(Duration::from_secs(2), next_task)
+        .await
+        .expect("pending next() must wake after cancel")
+        .expect("next task join");
+    assert!(
+        result.is_none(),
+        "cancelled anchor.next() must resolve to None, got {result:?}"
+    );
+
+    drop(sender);
+}
+
 /// An MPSC handle passed to the SPSC attach path is rejected client-side
 /// with [`AttachError::WrongHandleKind`] — no AM round-trip required.
 #[tokio::test(flavor = "multi_thread")]
