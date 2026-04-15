@@ -79,7 +79,6 @@ impl<T: Serialize> MpscStreamSender<T> {
     /// further would obscure the local/remote dispatch. `cancel` is the same
     /// [`StreamSenderCancelInfo`] bundle used by SPSC senders so the
     /// `_stream_cancel` handler can cancel both kinds uniformly.
-    #[allow(clippy::too_many_arguments)] // mirrors SPSC sender.rs::new; five ctor args plus cancel bundle
     pub(crate) fn new(
         sender_id: SenderId,
         channel: SenderChannel,
@@ -171,6 +170,9 @@ impl<T: Serialize> MpscStreamSender<T> {
 
     /// Send a soft error string. Does not terminate the sender.
     pub async fn send_err(&self, msg: impl ToString) -> Result<(), SendError> {
+        if self.poison_tx.is_disconnected() {
+            return Err(SendError::ChannelClosed);
+        }
         let bytes = rmp_serde::to_vec(&StreamFrame::<()>::SenderError(msg.to_string()))
             .expect("SenderError serializes infallibly");
         match &self.channel {
@@ -189,22 +191,31 @@ impl<T: Serialize> MpscStreamSender<T> {
     ///
     /// Reattaching via [`crate::AnchorManager::attach_mpsc_stream_anchor`]
     /// allocates a fresh [`SenderId`].
-    pub fn detach(mut self) -> Result<StreamAnchorHandle, SendError> {
+    pub async fn detach(mut self) -> Result<StreamAnchorHandle, SendError> {
         self.heartbeat_cancel.cancel();
         self.sent_terminal = true;
         let bytes = cached_detached().clone();
         let result = match &self.channel {
             SenderChannel::Local(tx) => tx
-                .send((self.sender_id.0, bytes))
+                .send_async((self.sender_id.0, bytes))
+                .await
                 .map_err(|_| SendError::ChannelClosed),
-            SenderChannel::Remote(tx) => tx.send(bytes).map_err(|_| SendError::ChannelClosed),
+            SenderChannel::Remote(tx) => tx
+                .send_async(bytes)
+                .await
+                .map_err(|_| SendError::ChannelClosed),
         };
 
         // Same-worker: remove the slot locally so reattach can reuse capacity
         // immediately. Cross-worker: the remote pump forwards the Detached
         // sentinel and the anchor's `poll_next` removes the slot on its side.
         let (_, local_id) = self.handle.unpack();
-        crate::mpsc::anchor::remove_sender_slot(&self.mpsc_registry, local_id, self.sender_id.0);
+        if let Some(slot) =
+            crate::mpsc::anchor::remove_sender_slot(&self.mpsc_registry, local_id, self.sender_id.0)
+            && let Some(pt) = slot.pump_token
+        {
+            pt.cancel();
+        }
 
         self.sender_registry.senders.remove(&self.sender_stream_id);
         result?;
@@ -218,22 +229,28 @@ impl<T> Drop for MpscStreamSender<T> {
         self.sender_registry.senders.remove(&self.sender_stream_id);
         if !self.sent_terminal {
             self.heartbeat_cancel.cancel();
+            // Fire-and-forget: try_send keeps Drop non-blocking. If the
+            // channel is full the consumer will still observe SenderDropped
+            // once the channel drains/closes.
             let bytes = cached_dropped().clone();
             match &self.channel {
                 SenderChannel::Local(tx) => {
-                    let _ = tx.send((self.sender_id.0, bytes));
+                    let _ = tx.try_send((self.sender_id.0, bytes));
                 }
                 SenderChannel::Remote(tx) => {
-                    let _ = tx.send(bytes);
+                    let _ = tx.try_send(bytes);
                 }
             }
             // Local: drop slot so an unattached-timeout can re-arm when last sender leaves.
             let (_, local_id) = self.handle.unpack();
-            crate::mpsc::anchor::remove_sender_slot(
+            if let Some(slot) = crate::mpsc::anchor::remove_sender_slot(
                 &self.mpsc_registry,
                 local_id,
                 self.sender_id.0,
-            );
+            ) && let Some(pt) = slot.pump_token
+            {
+                pt.cancel();
+            }
         }
     }
 }

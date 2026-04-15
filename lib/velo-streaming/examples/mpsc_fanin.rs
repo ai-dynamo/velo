@@ -109,7 +109,7 @@ async fn producer(id: u32, sender: MpscStreamSender<WorkItem>, items: u32, detac
             && seq == threshold
         {
             println!("[producer {id}] detaching at seq {seq}");
-            let _ = sender.detach();
+            let _ = sender.detach().await;
             return;
         }
         if sender.send(WorkItem { seq, producer: id }).await.is_err() {

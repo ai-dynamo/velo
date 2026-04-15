@@ -145,8 +145,8 @@ async fn test_mpsc_remote_multi_attach() {
     assert_eq!(s2_count, 5);
 
     // Clean up: detach senders, then cancel the anchor.
-    let _ = s1.detach();
-    let _ = s2.detach();
+    let _ = s1.detach().await;
+    let _ = s2.detach().await;
     anchor.cancel();
 }
 
@@ -218,7 +218,7 @@ async fn test_mpsc_heartbeat_timeout_per_sender() {
     assert!(items_s2.contains(&3u32));
     assert!(dropped_s1, "must see Dropped for sender 1");
 
-    let _ = s2.detach();
+    let _ = s2.detach().await;
     anchor.cancel();
 }
 

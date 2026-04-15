@@ -278,21 +278,16 @@ pub fn create_mpsc_anchor_detach_handler(manager: Arc<AnchorManager>) -> velo_me
                 let req = ctx.input;
                 let (_, local_id) = req.handle.unpack();
 
-                let pump_token = {
-                    if let Some(mut entry) = manager.mpsc_registry.get_mut(&local_id) {
-                        entry
-                            .senders
-                            .remove(&req.sender_id)
-                            .and_then(|slot| slot.pump_token)
-                    } else {
-                        None
-                    }
-                };
-                if let Some(pt) = pump_token {
+                // Remove the slot (re-arms the unattached timeout if this was
+                // the last sender) and cancel its pump_token, if any.
+                if let Some(slot) = super::anchor::remove_sender_slot(
+                    &manager.mpsc_registry,
+                    local_id,
+                    req.sender_id,
+                ) && let Some(pt) = slot.pump_token
+                {
                     pt.cancel();
                 }
-                // Re-arm unattached timeout if this was the last sender.
-                super::anchor::remove_sender_slot(&manager.mpsc_registry, local_id, req.sender_id);
 
                 Ok(())
             }
@@ -317,6 +312,7 @@ pub fn create_mpsc_anchor_cancel_handler(manager: Arc<AnchorManager>) -> velo_me
                     if let Some(tc) = entry.timeout_cancel {
                         tc.cancel();
                     }
+                    manager.update_active_anchor_gauge();
                 }
 
                 Ok(())

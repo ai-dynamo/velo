@@ -151,7 +151,7 @@ async fn test_mpsc_sender_detach_reattach() {
     let s1 = mgr.attach_mpsc_stream_anchor::<u32>(handle).await.unwrap();
     assert_eq!(s1.sender_id(), SenderId(1));
     s1.send(10).await.unwrap();
-    let returned = s1.detach().expect("detach");
+    let returned = s1.detach().await.expect("detach");
     assert_eq!(returned, handle);
 
     let s2 = mgr

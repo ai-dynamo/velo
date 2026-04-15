@@ -35,6 +35,37 @@ use crate::frame::{StreamError, StreamFrame};
 use crate::handle::StreamAnchorHandle;
 
 // ---------------------------------------------------------------------------
+// Shared gauge helper
+// ---------------------------------------------------------------------------
+
+/// Set the `streaming_active_anchors` Prometheus gauge to
+/// `spsc.len() + mpsc.len()`. No-op when `metrics` is `None`.
+///
+/// SPSC and MPSC anchors live in separate registries but share a single
+/// `next_local_id` counter and a single gauge, so every path that mutates
+/// either registry must report the sum. Use this helper rather than reading
+/// `registry.len()` directly — that's how the pre-MPSC code mis-counted.
+pub(crate) fn set_active_anchor_gauge(
+    metrics: Option<&Arc<VeloMetrics>>,
+    spsc: &Arc<DashMap<u64, AnchorEntry>>,
+    mpsc: &Arc<DashMap<u64, crate::mpsc::anchor::MpscAnchorEntry>>,
+) {
+    if let Some(m) = metrics {
+        m.set_streaming_active_anchors(spsc.len() + mpsc.len());
+    }
+}
+
+/// Grouped handles needed by anchor constructors and background pumps to
+/// keep both registries and the metrics collector in a single parameter.
+/// Cheap to clone (all `Arc`s).
+#[derive(Clone)]
+pub(crate) struct AnchorContext {
+    pub registry: Arc<DashMap<u64, AnchorEntry>>,
+    pub mpsc_registry: Arc<DashMap<u64, crate::mpsc::anchor::MpscAnchorEntry>>,
+    pub metrics: Option<Arc<VeloMetrics>>,
+}
+
+// ---------------------------------------------------------------------------
 // AttachError
 // ---------------------------------------------------------------------------
 
@@ -170,6 +201,9 @@ pub(crate) struct AnchorEntry {
 struct StreamControllerInner {
     local_id: u64,
     registry: Arc<DashMap<u64, AnchorEntry>>,
+    /// Sibling MPSC registry — held so the shared gauge update includes MPSC
+    /// anchors alongside SPSC. Cheap `Arc` clone, no other use.
+    mpsc_registry: Arc<DashMap<u64, crate::mpsc::anchor::MpscAnchorEntry>>,
     metrics: Option<Arc<VeloMetrics>>,
     /// Sender-side registry: used to directly cancel the [`crate::control::SenderEntry`]
     /// when the anchor is cancelled (same-worker path without AM round-trip).
@@ -219,8 +253,12 @@ impl StreamController {
                     entry.cancel_token.cancel();
                     entry.stream_cancel_handle
                 });
+        set_active_anchor_gauge(
+            self.inner.metrics.as_ref(),
+            &self.inner.registry,
+            &self.inner.mpsc_registry,
+        );
         if let Some(metrics) = self.inner.metrics.as_ref() {
-            metrics.set_streaming_active_anchors(self.inner.registry.len());
             metrics.record_streaming_operation(
                 StreamingOp::Cancel,
                 HandlerOutcome::Success,
@@ -320,6 +358,8 @@ pub struct StreamAnchor<T> {
     local_id: u64,
     /// Arc clone of the AnchorManager's registry (for cancel).
     registry: Arc<DashMap<u64, AnchorEntry>>,
+    /// Sibling MPSC registry — used when updating the shared active-anchors gauge.
+    mpsc_registry: Arc<DashMap<u64, crate::mpsc::anchor::MpscAnchorEntry>>,
     /// Shared cancel handle — also held by any [`StreamController`] clones.
     controller: StreamController,
     metrics: Option<Arc<VeloMetrics>>,
@@ -331,14 +371,19 @@ impl<T> StreamAnchor<T> {
         handle: StreamAnchorHandle,
         rx: flume::Receiver<Vec<u8>>,
         local_id: u64,
-        registry: Arc<DashMap<u64, AnchorEntry>>,
-        metrics: Option<Arc<VeloMetrics>>,
+        ctx: AnchorContext,
         sender_registry: Arc<crate::control::SenderRegistry>,
         messenger: Option<Arc<velo_messenger::Messenger>>,
     ) -> Self {
+        let AnchorContext {
+            registry,
+            mpsc_registry,
+            metrics,
+        } = ctx;
         let inner = Arc::new(StreamControllerInner {
             local_id,
             registry: registry.clone(),
+            mpsc_registry: mpsc_registry.clone(),
             metrics: metrics.clone(),
             sender_registry,
             messenger,
@@ -351,6 +396,7 @@ impl<T> StreamAnchor<T> {
             terminated: false,
             local_id,
             registry,
+            mpsc_registry,
             controller,
             metrics,
             _phantom: std::marker::PhantomData,
@@ -406,6 +452,7 @@ impl<T> StreamAnchor<T> {
                 if let Some(duration) = timeout {
                     let tc = AnchorManager::spawn_timeout_task(
                         self.registry.clone(),
+                        self.mpsc_registry.clone(),
                         self.metrics.clone(),
                         self.local_id,
                         duration,
@@ -463,9 +510,11 @@ impl<T: DeserializeOwned> Stream for StreamAnchor<T> {
                             // Clean up registry entry — anchor is permanently closed.
                             if let Some((_, entry)) = this.registry.remove(&this.local_id) {
                                 entry.cancel_token.cancel();
-                                if let Some(metrics) = this.metrics.as_ref() {
-                                    metrics.set_streaming_active_anchors(this.registry.len());
-                                }
+                                set_active_anchor_gauge(
+                                    this.metrics.as_ref(),
+                                    &this.registry,
+                                    &this.mpsc_registry,
+                                );
                             }
                             return Poll::Ready(Some(Ok(StreamFrame::Finalized)));
                         }
@@ -482,9 +531,11 @@ impl<T: DeserializeOwned> Stream for StreamAnchor<T> {
                             // Clean up registry entry — sender dropped without explicit close.
                             if let Some((_, entry)) = this.registry.remove(&this.local_id) {
                                 entry.cancel_token.cancel();
-                                if let Some(metrics) = this.metrics.as_ref() {
-                                    metrics.set_streaming_active_anchors(this.registry.len());
-                                }
+                                set_active_anchor_gauge(
+                                    this.metrics.as_ref(),
+                                    &this.registry,
+                                    &this.mpsc_registry,
+                                );
                             }
                             return Poll::Ready(Some(Err(StreamError::SenderDropped)));
                         }
@@ -661,6 +712,7 @@ impl AnchorManager {
         let timeout_cancel = unattached_timeout.map(|timeout| {
             Self::spawn_timeout_task(
                 self.registry.clone(),
+                self.mpsc_registry.clone(),
                 self.metrics.clone(),
                 local_id,
                 timeout,
@@ -687,8 +739,7 @@ impl AnchorManager {
             handle,
             frame_rx,
             local_id,
-            self.registry.clone(),
-            self.metrics.clone(),
+            self.anchor_context(),
             self.sender_registry.clone(),
             self.messenger.clone(),
         )
@@ -700,6 +751,7 @@ impl AnchorManager {
     /// (e.g. on attach, or when `set_timeout(None)` is called).
     pub(crate) fn spawn_timeout_task(
         registry: Arc<DashMap<u64, AnchorEntry>>,
+        mpsc_registry: Arc<DashMap<u64, crate::mpsc::anchor::MpscAnchorEntry>>,
         metrics: Option<Arc<VeloMetrics>>,
         local_id: u64,
         timeout: Duration,
@@ -716,9 +768,7 @@ impl AnchorManager {
                     // Timeout expired -- remove anchor
                     if let Some((_, entry)) = registry.remove(&local_id) {
                         entry.cancel_token.cancel();
-                        if let Some(metrics) = metrics.as_ref() {
-                            metrics.set_streaming_active_anchors(registry.len());
-                        }
+                        set_active_anchor_gauge(metrics.as_ref(), &registry, &mpsc_registry);
                         // Dropping frame_tx closes the channel -> StreamAnchor yields None
                     }
                 }
@@ -860,6 +910,7 @@ impl AnchorManager {
                 .expect("cancel_token present when unattached_timeout is");
             let tc = Self::spawn_timeout_task(
                 self.registry.clone(),
+                self.mpsc_registry.clone(),
                 self.metrics.clone(),
                 local_id,
                 timeout,
@@ -875,8 +926,17 @@ impl AnchorManager {
     }
 
     pub(crate) fn update_active_anchor_gauge(&self) {
-        if let Some(metrics) = self.metrics.as_ref() {
-            metrics.set_streaming_active_anchors(self.registry.len());
+        set_active_anchor_gauge(self.metrics.as_ref(), &self.registry, &self.mpsc_registry);
+    }
+
+    /// Bundle the SPSC registry, MPSC registry, and metrics collector into
+    /// a cheap `Arc`-cloneable context. Used to keep anchor constructors
+    /// and background pumps under clippy's argument threshold.
+    pub(crate) fn anchor_context(&self) -> AnchorContext {
+        AnchorContext {
+            registry: self.registry.clone(),
+            mpsc_registry: self.mpsc_registry.clone(),
+            metrics: self.metrics.clone(),
         }
     }
 
@@ -1200,8 +1260,10 @@ impl AnchorManager {
             .unwrap_or(self.default_heartbeat_interval);
 
         let timeout_cancel = unattached_timeout.map(|timeout| {
-            crate::mpsc::anchor::spawn_mpsc_timeout_task(
+            crate::mpsc::anchor::spawn_mpsc_timeout_task_with_metrics(
                 self.mpsc_registry.clone(),
+                Some(self.registry.clone()),
+                self.metrics.clone(),
                 local_id,
                 timeout,
                 &cancel_token,
@@ -1217,6 +1279,8 @@ impl AnchorManager {
             timeout_cancel,
             heartbeat_interval,
             max_senders: config.max_senders,
+            spsc_registry: self.registry.clone(),
+            metrics: self.metrics.clone(),
         };
 
         self.mpsc_registry.insert(local_id, entry);
@@ -1226,7 +1290,7 @@ impl AnchorManager {
             handle,
             frame_rx,
             local_id,
-            self.mpsc_registry.clone(),
+            self.anchor_context(),
             self.sender_registry.clone(),
             self.messenger.clone(),
         )
