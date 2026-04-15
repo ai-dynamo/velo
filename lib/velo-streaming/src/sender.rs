@@ -53,7 +53,7 @@ pub(crate) struct StreamSenderCancelInfo {
 // ---------------------------------------------------------------------------
 
 /// Cached serialized bytes for `StreamFrame::<()>::Heartbeat`.
-/// Avoids re-serializing on every 5-second heartbeat tick.
+/// Avoids re-serializing on every heartbeat tick.
 pub(crate) fn cached_heartbeat() -> &'static Vec<u8> {
     static HEARTBEAT: OnceLock<Vec<u8>> = OnceLock::new();
     HEARTBEAT.get_or_init(|| {
