@@ -18,7 +18,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Velo Active Messenging Library"
 authors = ["NVIDIA Inc. <sw-dl-dynamo@nvidia.com>"]
@@ -29,7 +29,7 @@ keywords = ["nvidia", "distributed"]
 
 [workspace.dependencies]
 # Local crates
-velo = { path = "lib/velo", version = "0.1.0" }
+velo = { path = "lib/velo", version = "0.1.1" }
 velo-common = { path = "lib/velo-common", version = "0.1.0" }
 velo-discovery = { path = "lib/velo-discovery", version = "0.1.0" }
 velo-events = { path = "lib/velo-events", version = "0.1.0" }
