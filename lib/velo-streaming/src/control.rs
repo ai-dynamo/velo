@@ -247,11 +247,15 @@ pub(crate) async fn reader_pump(
     transport_rx: flume::Receiver<Vec<u8>>,
     frame_tx: flume::Sender<Vec<u8>>,
     cancel_token: tokio_util::sync::CancellationToken,
-    registry: std::sync::Arc<dashmap::DashMap<u64, crate::anchor::AnchorEntry>>,
-    metrics: Option<Arc<velo_observability::VeloMetrics>>,
+    ctx: crate::anchor::AnchorContext,
     local_id: u64,
     heartbeat_deadline: Duration,
 ) {
+    let crate::anchor::AnchorContext {
+        registry,
+        mpsc_registry,
+        metrics,
+    } = ctx;
     let mut missed_heartbeats: u8 = 0;
 
     loop {
@@ -278,9 +282,11 @@ pub(crate) async fn reader_pump(
                             // so no stale entry remains (ANCR-04)
                             if let Some((_, entry)) = registry.remove(&local_id) {
                                 entry.cancel_token.cancel();
-                                if let Some(metrics) = metrics.as_ref() {
-                                    metrics.set_streaming_active_anchors(registry.len());
-                                }
+                                crate::anchor::set_active_anchor_gauge(
+                                    metrics.as_ref(),
+                                    &registry,
+                                    &mpsc_registry,
+                                );
                             }
                             break;
                         }
@@ -313,6 +319,23 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> velo_messeng
             async move {
                 let started = Instant::now();
                 let req = ctx.input;
+
+                // Defence-in-depth: reject MPSC handles at the SPSC attach
+                // endpoint. The client-side `attach_stream_anchor` already
+                // rejects these before the AM, but misbehaving or older
+                // clients may still hit the wire.
+                if req.handle.is_mpsc_stream() {
+                    manager.record_streaming_operation(
+                        StreamingOp::Attach,
+                        HandlerOutcome::Error,
+                        "unknown",
+                        started,
+                    );
+                    return Ok(AnchorAttachResponse::Err {
+                        reason: format!("anchor {} is mpsc; use _mpsc_anchor_attach", req.handle),
+                    });
+                }
+
                 let (_, local_id) = req.handle.unpack();
 
                 // Step 1: Quick check -- anchor exists and is unattached (drop lock)
@@ -405,14 +428,12 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> velo_messeng
                             drop(occ);
 
                             // Spawn reader pump as background task
-                            let pump_registry = manager.registry.clone();
                             let (_, local_id) = req.handle.unpack();
                             tokio::spawn(reader_pump(
                                 receiver,      // transport receiver from bind
                                 pump_frame_tx, // cloned from entry
                                 pump_cancel,   // cloned from entry
-                                pump_registry, // Arc clone of registry
-                                manager.metrics.clone(),
+                                manager.anchor_context(),
                                 local_id, // anchor's local_id
                                 heartbeat_interval,
                             ));
@@ -1051,13 +1072,16 @@ mod tests {
 
         // Spawn the reader pump
         let pump_cancel = cancel_token.clone();
-        let pump_registry = registry.clone();
+        let ctx = crate::anchor::AnchorContext {
+            registry: registry.clone(),
+            mpsc_registry: std::sync::Arc::new(dashmap::DashMap::new()),
+            metrics: None,
+        };
         tokio::spawn(reader_pump(
             transport_rx,
             frame_tx,
             pump_cancel,
-            pump_registry,
-            None,
+            ctx,
             local_id,
             Duration::from_secs(5),
         ));
@@ -1240,12 +1264,18 @@ mod tests {
             },
         );
 
+        let mpsc_reg: std::sync::Arc<dashmap::DashMap<u64, crate::mpsc::anchor::MpscAnchorEntry>> =
+            std::sync::Arc::new(dashmap::DashMap::new());
+        let ctx1 = crate::anchor::AnchorContext {
+            registry: registry.clone(),
+            mpsc_registry: mpsc_reg.clone(),
+            metrics: None,
+        };
         tokio::spawn(reader_pump(
             rx1,
             frame_tx.clone(),
             child1.clone(),
-            registry.clone(),
-            None,
+            ctx1,
             local_id,
             Duration::from_secs(5),
         ));
@@ -1280,12 +1310,16 @@ mod tests {
             entry.attachment = true;
         }
 
+        let ctx2 = crate::anchor::AnchorContext {
+            registry: registry.clone(),
+            mpsc_registry: mpsc_reg.clone(),
+            metrics: None,
+        };
         tokio::spawn(reader_pump(
             rx2,
             frame_tx.clone(),
             child2.clone(),
-            registry.clone(),
-            None,
+            ctx2,
             local_id,
             Duration::from_secs(5),
         ));

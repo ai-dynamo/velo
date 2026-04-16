@@ -207,9 +207,11 @@ impl FrameTransport for VeloFrameTransport {
         let dispatch = self.dispatch.clone();
         Box::pin(async move {
             let (tx, rx) = flume::bounded::<Vec<u8>>(256);
-            // Remove any stale entry for a prior session on this anchor_id
-            // before inserting the new one.
-            dispatch.retain(|&(aid, _), _| aid != anchor_id);
+            // Clear entries for this anchor whose receiver is already dead so
+            // the dispatch map does not grow unboundedly across SPSC
+            // detach/reattach cycles. Live siblings (MPSC case: multiple
+            // concurrent session_ids on the same anchor) are preserved.
+            dispatch.retain(|&(aid, _), tx| aid != anchor_id || !tx.is_disconnected());
             dispatch.insert((anchor_id, session_id), tx);
             let endpoint = format!("velo://{}/stream/{}", worker_id.as_u64(), anchor_id);
             Ok((endpoint, rx))
