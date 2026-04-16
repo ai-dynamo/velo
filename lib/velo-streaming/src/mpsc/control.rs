@@ -324,9 +324,14 @@ pub fn create_mpsc_anchor_cancel_handler(manager: Arc<AnchorManager>) -> velo_me
 
                 if let Some((_, entry)) = manager.mpsc_registry.remove(&local_id) {
                     entry.cancel_token.cancel();
-                    if let Some(tc) = entry.timeout_cancel {
+                    if let Some(ref tc) = entry.timeout_cancel {
                         tc.cancel();
                     }
+                    super::anchor::cancel_all_senders(
+                        &entry,
+                        &manager.sender_registry,
+                        manager.messenger_lock.get(),
+                    );
                     manager.update_active_anchor_gauge();
                 }
 

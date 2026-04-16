@@ -516,6 +516,7 @@ async fn test_mpsc_sender_debug_impl() {
     let dbg = format!("{sender:?}");
     assert!(dbg.contains("MpscStreamSender"));
     assert!(dbg.contains("SenderId(1)"));
+    assert!(dbg.contains(&format!("{handle:?}")));
     drop(sender);
     drop(anchor);
 }

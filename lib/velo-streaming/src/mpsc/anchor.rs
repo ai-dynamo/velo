@@ -123,7 +123,7 @@ impl MpscStreamController {
         };
 
         entry.cancel_token.cancel();
-        if let Some(tc) = entry.timeout_cancel {
+        if let Some(ref tc) = entry.timeout_cancel {
             tc.cancel();
         }
         set_active_anchor_gauge(
@@ -133,44 +133,11 @@ impl MpscStreamController {
         );
         let _ = self.inner.cancel_wake.try_send(());
 
-        for (_sender_id, slot) in entry.senders.into_iter() {
-            if let Some(pump_token) = slot.pump_token {
-                pump_token.cancel();
-            }
-
-            let Some(handle) = slot.stream_cancel_handle else {
-                continue;
-            };
-            let (sender_worker_id, sender_stream_id) = handle.unpack();
-
-            // Same-worker fast path: poison the sender's poison channel
-            // directly so `send()` starts returning `ChannelClosed` without an
-            // AM round-trip. Idempotent.
-            if let Some((_, sender_entry)) =
-                self.inner.sender_registry.senders.remove(&sender_stream_id)
-            {
-                drop(sender_entry.rx_closer.lock().unwrap().take());
-                sender_entry.cancel_token.cancel();
-            }
-
-            // Cross-worker: fire-and-forget `_stream_cancel` AM.
-            if let Some(messenger) = self.inner.messenger.clone() {
-                let payload =
-                    serde_json::to_vec(&crate::control::StreamCancelRequest { sender_stream_id })
-                        .expect("serialize StreamCancelRequest");
-                if let Ok(rt) = tokio::runtime::Handle::try_current() {
-                    rt.spawn(async move {
-                        let _ = messenger
-                            .am_send_streaming("_stream_cancel")
-                            .expect("am_send_streaming builder")
-                            .raw_payload(bytes::Bytes::from(payload))
-                            .worker(sender_worker_id)
-                            .send()
-                            .await;
-                    });
-                }
-            }
-        }
+        cancel_all_senders(
+            &entry,
+            &self.inner.sender_registry,
+            self.inner.messenger.as_ref(),
+        );
     }
 }
 
@@ -313,6 +280,54 @@ impl<T: DeserializeOwned> Stream for MpscStreamAnchor<T> {
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
+
+/// Cancel every sender in an [`MpscAnchorEntry`].
+///
+/// For each slot:
+/// 1. Cancel the pump_token (remote senders — stops the per-sender reader pump).
+/// 2. Poison same-worker senders via [`crate::control::SenderRegistry`].
+/// 3. Fire-and-forget `_stream_cancel` AM for cross-worker senders.
+///
+/// Shared by [`MpscStreamController::cancel`] and the `_mpsc_anchor_cancel`
+/// handler so both paths give attached senders the same cleanup.
+pub(crate) fn cancel_all_senders(
+    entry: &MpscAnchorEntry,
+    sender_registry: &Arc<crate::control::SenderRegistry>,
+    messenger: Option<&Arc<velo_messenger::Messenger>>,
+) {
+    for (_sender_id, slot) in entry.senders.iter() {
+        if let Some(pump_token) = &slot.pump_token {
+            pump_token.cancel();
+        }
+
+        let Some(handle) = &slot.stream_cancel_handle else {
+            continue;
+        };
+        let (sender_worker_id, sender_stream_id) = handle.unpack();
+
+        if let Some((_, sender_entry)) = sender_registry.senders.remove(&sender_stream_id) {
+            drop(sender_entry.rx_closer.lock().unwrap().take());
+            sender_entry.cancel_token.cancel();
+        }
+
+        if let Some(messenger) = messenger.cloned() {
+            let payload =
+                serde_json::to_vec(&crate::control::StreamCancelRequest { sender_stream_id })
+                    .expect("serialize StreamCancelRequest");
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                rt.spawn(async move {
+                    let _ = messenger
+                        .am_send_streaming("_stream_cancel")
+                        .expect("am_send_streaming builder")
+                        .raw_payload(bytes::Bytes::from(payload))
+                        .worker(sender_worker_id)
+                        .send()
+                        .await;
+                });
+            }
+        }
+    }
+}
 
 /// Remove a sender slot from an MPSC anchor entry.
 ///
