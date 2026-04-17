@@ -230,6 +230,22 @@ impl VeloBackend {
         self.primary_transport.contains_key(&instance_id)
     }
 
+    /// Returns the [`TransportKey`] of the primary transport selected for `target`,
+    /// or `None` if the peer has not been registered.
+    pub fn primary_transport_key(&self, target: InstanceId) -> Option<TransportKey> {
+        self.primary_transport
+            .get(&target)
+            .map(|entry| entry.value().key())
+    }
+
+    /// Returns the ordered list of alternative [`TransportKey`]s for `target`,
+    /// or `None` if the peer has not been registered.
+    pub fn alternative_transport_keys(&self, target: InstanceId) -> Option<Vec<TransportKey>> {
+        self.alternative_transports
+            .get(&target)
+            .map(|entry| entry.value().clone())
+    }
+
     /// Send a message to a registered peer via its primary transport.
     ///
     /// Returns [`VeloBackendError::InstanceNotRegistered`] if the peer has not
