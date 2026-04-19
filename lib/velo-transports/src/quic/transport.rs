@@ -562,6 +562,8 @@ async fn connection_writer_inner(
         }
     }
 
+    let _ = send_stream.finish();
+
     Ok(())
 }
 

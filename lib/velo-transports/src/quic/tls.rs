@@ -67,7 +67,7 @@ pub fn make_server_config(
 ///
 /// This is appropriate for internal cluster communication where both sides
 /// use self-signed certificates. For production, callers should provide a
-/// proper CA via `make_client_config_with_ca`.
+/// proper CA via a custom `quinn::ClientConfig` with appropriate verification.
 pub fn make_client_config_insecure() -> anyhow::Result<quinn::ClientConfig> {
     let mut client_crypto = rustls::ClientConfig::builder()
         .dangerous()
