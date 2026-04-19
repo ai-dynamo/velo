@@ -563,6 +563,10 @@ async fn connection_writer_inner(
     }
 
     let _ = send_stream.finish();
+    drop(send_stream);
+
+    // Let QUIC flush FIN + buffered bytes before the connection is dropped.
+    let _ = tokio::time::timeout(Duration::from_secs(5), connection.closed()).await;
 
     Ok(())
 }
