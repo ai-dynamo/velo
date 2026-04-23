@@ -1,0 +1,40 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "velo-examples"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[features]
+default = []
+zmq = ["velo/zmq"]
+grpc = ["velo/grpc"]
+
+[dependencies]
+velo = { path = "../lib/velo" }
+
+anyhow = "1"
+bytes = "1"
+clap = { version = "4.5", features = ["derive"] }
+flume = "0.12.0"
+futures = "0.3"
+rmp-serde = "1"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "=1.48.0", features = ["full"] }
+uuid = { version = "1.18.1", features = ["v4"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+hdrhistogram = { version = "7", default-features = false }
+
+[[example]]
+name = "ping_pong"
+
+[[example]]
+name = "throughput"
+
+[[example]]
+name = "mpsc_fanin"

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Demonstrates `velo_streaming::mpsc`: one aggregator, many producers, one
+//! Demonstrates `velo::streaming::mpsc`: one aggregator, many producers, one
 //! consumer-owned finalize path.
 //!
 //! Default scenario (no flags): 4 producers fan into a single
@@ -14,23 +14,18 @@
 //!   `controller.cancel()` to finalize.
 //!
 //! Run: `cargo run --example mpsc_fanin -- --producers 4 --items 40`
-//!
-//! Flags (simple parser — no clap dependency):
-//!   --producers N       number of producers (default 4)
-//!   --items N           items per producer (default 40)
-//!   --heartbeat-ms N    heartbeat interval (default 200 ms)
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use clap::Parser;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use velo_common::WorkerId;
-use velo_streaming::{
-    AnchorManager, FrameTransport, MpscAnchorConfig, MpscFrame, MpscStreamSender, SenderId,
-};
+use velo::WorkerId;
+use velo::streaming::{AnchorManager, FrameTransport};
+use velo::streaming::mpsc::{MpscAnchorConfig, MpscFrame, MpscStreamSender, SenderId};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WorkItem {
@@ -38,41 +33,21 @@ struct WorkItem {
     producer: u32,
 }
 
+#[derive(Parser, Debug)]
+#[command(name = "mpsc_fanin")]
+#[command(about = "MPSC fan-in demo: many producers, one consumer")]
 struct Args {
+    /// Number of producers.
+    #[arg(long, default_value = "4")]
     producers: u32,
-    items: u32,
-    heartbeat: Duration,
-}
 
-fn parse_args() -> Args {
-    let mut args = Args {
-        producers: 4,
-        items: 40,
-        heartbeat: Duration::from_millis(200),
-    };
-    let mut it = std::env::args().skip(1);
-    while let Some(arg) = it.next() {
-        match arg.as_str() {
-            "--producers" => {
-                args.producers = it.next().and_then(|s| s.parse().ok()).unwrap_or(4);
-            }
-            "--items" => {
-                args.items = it.next().and_then(|s| s.parse().ok()).unwrap_or(40);
-            }
-            "--heartbeat-ms" => {
-                let ms: u64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(200);
-                args.heartbeat = Duration::from_millis(ms);
-            }
-            "--help" | "-h" => {
-                println!("usage: mpsc_fanin [--producers N] [--items N] [--heartbeat-ms N]");
-                std::process::exit(0);
-            }
-            other => {
-                eprintln!("ignoring unknown arg: {other}");
-            }
-        }
-    }
-    args
+    /// Items per producer.
+    #[arg(long, default_value = "40")]
+    items: u32,
+
+    /// Heartbeat interval in milliseconds.
+    #[arg(long = "heartbeat-ms", default_value = "200")]
+    heartbeat_ms: u64,
 }
 
 /// In-memory transport — sufficient for a same-process fan-in demo.
@@ -119,15 +94,15 @@ async fn producer(id: u32, sender: MpscStreamSender<WorkItem>, items: u32, detac
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     println!("[producer {id}] finished all {items} items, dropping");
-    // Drop sender → Dropped(None) sentinel.
 }
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
-    let args = parse_args();
+    let args = Args::parse();
+    let heartbeat = Duration::from_millis(args.heartbeat_ms);
     println!(
         "mpsc_fanin: producers={} items_per_producer={} heartbeat={:?}",
-        args.producers, args.items, args.heartbeat
+        args.producers, args.items, heartbeat
     );
 
     let mgr = Arc::new(AnchorManager::new(
@@ -136,7 +111,7 @@ async fn main() -> Result<()> {
     ));
 
     let config = MpscAnchorConfig {
-        heartbeat_interval: Some(args.heartbeat),
+        heartbeat_interval: Some(heartbeat),
         unattached_timeout: Some(Duration::from_secs(2)),
         ..Default::default()
     };
@@ -153,13 +128,10 @@ async fn main() -> Result<()> {
         println!("[consumer] attached producer {i} → {}", sender.sender_id());
 
         let detach_at = if i == 0 { Some(args.items / 2) } else { None };
+        let task = tokio::spawn(producer(i, sender, args.items, detach_at));
 
-        let handle_task = tokio::spawn(producer(i, sender, args.items, detach_at));
-
-        // Producer 1 simulates a crash: abort the task after a short delay
-        // so the heartbeat-timeout path fires a Dropped(None) event.
         if i == 1 {
-            let abort_handle = handle_task.abort_handle();
+            let abort_handle = task.abort_handle();
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(60)).await;
                 println!("[chaos] aborting producer 1 mid-stream");
@@ -167,10 +139,9 @@ async fn main() -> Result<()> {
             });
         }
 
-        tasks.push(handle_task);
+        tasks.push(task);
     }
 
-    // Consume frames until each producer has signalled its exit.
     let mut items_by_sender: HashMap<SenderId, u32> = HashMap::new();
     let mut exits_seen: HashMap<SenderId, String> = HashMap::new();
     let expected_exits = args.producers as usize;
@@ -180,7 +151,6 @@ async fn main() -> Result<()> {
         match next {
             Ok(Some(Ok((sid, MpscFrame::Item(item))))) => {
                 *items_by_sender.entry(sid).or_default() += 1;
-                // Print sparsely to keep stdout readable on large runs.
                 if item.seq % 10 == 0 {
                     println!("[{sid}] Item(seq={}, producer={})", item.seq, item.producer);
                 }
@@ -190,7 +160,7 @@ async fn main() -> Result<()> {
                 exits_seen.insert(sid, "Detached".to_string());
             }
             Ok(Some(Ok((sid, MpscFrame::Dropped(reason))))) => {
-                println!("[{sid}] Dropped({:?})", reason);
+                println!("[{sid}] Dropped({reason:?})");
                 exits_seen.insert(sid, format!("Dropped({reason:?})"));
             }
             Ok(Some(Ok((sid, MpscFrame::SenderError(msg))))) => {

@@ -46,12 +46,4 @@ parking_lot = { workspace = true }
 flume = "0.12.0"
 
 [dev-dependencies]
-clap = { version = "4.5", features = ["derive"] }
-hdrhistogram = { version = "7", default-features = false }
 xxhash-rust = { workspace = true }
-
-[[example]]
-name = "ping_pong"
-
-[[example]]
-name = "throughput"
