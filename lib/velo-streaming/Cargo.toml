@@ -63,3 +63,9 @@ tonic-build = "0.13.1"
 [[test]]
 name = "grpc_transport"
 required-features = ["grpc"]
+
+# `velo_endurance` is a rustc --cfg flag (NOT a Cargo feature) so `--all-features`
+# in CI never enables the endurance suites. Opt in locally with:
+#   RUSTFLAGS="--cfg velo_endurance" cargo test -p velo-streaming --test endurance
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(velo_endurance)'] }
