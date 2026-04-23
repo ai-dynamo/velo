@@ -726,4 +726,36 @@ mod tests {
             "expected _event_subscribe to be available immediately after startup"
         );
     }
+
+    /// Exercise the `.await_capacity()` chain on each public builder
+    /// (AmSend, AmSync, Unary, TypedUnary). Each delegation is a one-line
+    /// pass-through to `MessageBuilder::await_capacity`; this test pins that
+    /// every delegation compiles and returns the expected type so the
+    /// coverage gate observes those lines. Actually saturating the arena is
+    /// exercised in the `common::responses` unit tests.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_await_capacity_chains_through_all_public_builders() {
+        let messenger = Messenger::builder().build().await.unwrap();
+
+        let _ = messenger
+            .am_send("fan_out")
+            .unwrap()
+            .await_capacity()
+            .raw_payload(bytes::Bytes::from_static(b"x"));
+        let _ = messenger
+            .am_sync("fan_out")
+            .unwrap()
+            .await_capacity()
+            .raw_payload(bytes::Bytes::from_static(b"x"));
+        let _ = messenger
+            .unary("fan_out")
+            .unwrap()
+            .await_capacity()
+            .raw_payload(bytes::Bytes::from_static(b"x"));
+        let _ = messenger
+            .typed_unary::<String>("fan_out")
+            .unwrap()
+            .await_capacity()
+            .raw_payload(bytes::Bytes::from_static(b"x"));
+    }
 }

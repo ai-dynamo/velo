@@ -1187,6 +1187,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn slot_backpressure_debug_format() {
+        let manager = ResponseManager::with_capacity(0, TEST_CAPACITY, None);
+        let mut awaiters = Vec::with_capacity(TEST_CAPACITY);
+        for _ in 0..TEST_CAPACITY {
+            awaiters.push(manager.register_outcome().expect("allocate"));
+        }
+
+        let bp = match manager.try_register_outcome() {
+            RegisterOutcome::Backpressured(bp) => bp,
+            RegisterOutcome::Allocated(_) => panic!("expected backpressure"),
+        };
+
+        assert!(
+            format!("{:?}", bp).contains("SlotBackpressure"),
+            "Debug fmt should name the type"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_register_outcome_fires_exhaustion_metric() {
+        use velo_observability::VeloMetrics;
+        use velo_observability::test_helpers::MetricSnapshot;
+
+        // try_register_outcome's Backpressured branch increments the
+        // exhaustion counter. (The fail-fast register_outcome path is
+        // exercised by `exhaustion_records_metric_and_details`.)
+        let registry = prometheus::Registry::new();
+        let metrics = Arc::new(VeloMetrics::register(&registry).expect("metrics"));
+        let manager = ResponseManager::with_capacity(0, TEST_CAPACITY, Some(metrics));
+
+        let mut awaiters = Vec::with_capacity(TEST_CAPACITY);
+        for _ in 0..TEST_CAPACITY {
+            awaiters.push(manager.register_outcome().expect("allocate"));
+        }
+
+        for _ in 0..2 {
+            match manager.try_register_outcome() {
+                RegisterOutcome::Backpressured(_) => {}
+                RegisterOutcome::Allocated(_) => panic!("expected backpressure"),
+            }
+        }
+
+        let snapshot = MetricSnapshot::from_registry(&registry);
+        let value = snapshot.counter("velo_messenger_response_slot_exhausted_total", &[]);
+        assert!(
+            value >= 2.0,
+            "try_register_outcome should also fire the exhaustion counter"
+        );
+    }
+
+    #[tokio::test]
     async fn exhaustion_records_metric_and_details() {
         use velo_observability::VeloMetrics;
         use velo_observability::test_helpers::MetricSnapshot;

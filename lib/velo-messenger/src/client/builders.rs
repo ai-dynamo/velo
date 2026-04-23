@@ -1172,6 +1172,51 @@ mod tests {
         assert!(err.to_string().contains("Failed to deserialize"));
     }
 
+    // ── StageState ───────────────────────────────────────────────────────
+    //
+    // Exercises the deferred-acquisition path (`StageState::Pending`) used by
+    // `MessageBuilder::await_capacity` without requiring a full
+    // `ActiveMessageClient`. We hand-build a boxed future that yields a ready
+    // `ResponseStage` and assert the poll loop transitions Pending → Ready
+    // and surfaces the awaiter's outcome.
+
+    #[tokio::test]
+    async fn stage_state_pending_transitions_and_resolves() {
+        let (awaiter, id, rm) = make_awaiter();
+        let fut: futures::future::BoxFuture<'static, ResponseStage> =
+            Box::pin(async move { ResponseStage::ready(awaiter) });
+        let mut result = SyncResult {
+            stage: StageState::Pending(fut),
+        };
+
+        // Complete the outcome before polling so the transition proceeds.
+        assert!(rm.complete_outcome(id, Ok(None)));
+        let r = tokio::time::timeout(std::time::Duration::from_secs(1), &mut result)
+            .await
+            .expect("sync result resolves");
+        assert!(r.is_ok());
+    }
+
+    #[tokio::test]
+    async fn stage_state_pending_awaits_inner_future() {
+        // Pending future that never resolves — poll must stay Pending and
+        // never touch the awaiter slot.
+        let (awaiter, _id, _rm) = make_awaiter();
+        let fut: futures::future::BoxFuture<'static, ResponseStage> = Box::pin(async {
+            futures::future::pending::<()>().await;
+            ResponseStage::ready(awaiter)
+        });
+        let result = SyncResult {
+            stage: StageState::Pending(fut),
+        };
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_millis(50), result).await;
+        assert!(
+            outcome.is_err(),
+            "pending inner future should keep result pending"
+        );
+    }
+
     // ── drive_fire_send ──────────────────────────────────────────────────
 
     #[tokio::test]
