@@ -18,6 +18,7 @@ use velo_observability::VeloMetrics;
 
 use crate::transport::{
     HealthCheckError, SendBackpressure, ShutdownState, TransportError, TransportErrorHandler,
+    try_send_or_backpressure,
 };
 use crate::{MessageType, PeerInfo, Transport, TransportAdapter, TransportKey, WorkerAddress};
 
@@ -173,27 +174,19 @@ impl Transport for ZmqTransport {
             }
         };
 
-        // Fast path: non-blocking try_send
-        let cmd = SenderCommand::Send(task);
-        match tx.try_send(cmd) {
-            Ok(()) => Ok(()),
-            Err(flume::TrySendError::Full(cmd)) => {
-                // Surface backpressure to the caller via an awaitable future.
-                let tx = tx.clone();
-                Err(SendBackpressure::new(Box::pin(async move {
-                    if let Err(flume::SendError(SenderCommand::Send(task))) =
-                        tx.send_async(cmd).await
-                    {
-                        task.on_error("Sender channel closed");
-                    }
-                })))
-            }
-            Err(flume::TrySendError::Disconnected(SenderCommand::Send(task))) => {
-                task.on_error("Sender thread exited");
-                Ok(())
-            }
-            Err(flume::TrySendError::Disconnected(SenderCommand::Shutdown)) => Ok(()),
-        }
+        try_send_or_backpressure(
+            tx,
+            SenderCommand::Send(task),
+            |cmd| match cmd {
+                SenderCommand::Send(task) => task.on_error("Sender thread exited"),
+                SenderCommand::Shutdown => {}
+            },
+            |cmd| {
+                if let SenderCommand::Send(task) = cmd {
+                    task.on_error("Sender channel closed");
+                }
+            },
+        )
     }
 
     fn start(

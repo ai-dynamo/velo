@@ -76,7 +76,7 @@ pub use utils::interfaces::{InterfaceEndpoint, InterfaceFilter};
 pub use transport::{
     DataStreams, HealthCheckError, InFlightGuard, MessageType, SendBackpressure, SendOutcome,
     ShutdownPolicy, ShutdownState, Transport, TransportAdapter, TransportError,
-    TransportErrorHandler, make_channels,
+    TransportErrorHandler, make_channels, try_send_or_backpressure,
 };
 pub use velo_observability::VeloMetrics as TransportMetrics;
 

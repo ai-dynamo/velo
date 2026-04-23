@@ -35,7 +35,7 @@ use crate::{
     InstanceId, MessageType, PeerInfo, TransportKey, WorkerAddress,
     transport::{
         HealthCheckError, SendBackpressure, ShutdownState, Transport, TransportAdapter,
-        TransportError, TransportErrorHandler,
+        TransportError, TransportErrorHandler, try_send_or_backpressure,
     },
 };
 
@@ -191,28 +191,21 @@ impl Transport for NatsTransport {
             }
         };
 
-        // Fast path: non-blocking try_send (matches ZMQ transport pattern).
-        match tx.try_send(task) {
-            Ok(()) => Ok(()),
-            Err(flume::TrySendError::Full(task)) => {
-                // Surface backpressure to the caller via an awaitable future.
-                let tx = tx.clone();
-                Err(SendBackpressure::new(Box::pin(async move {
-                    if let Err(flume::SendError(task)) = tx.send_async(task).await {
-                        task.on_error.on_error(
-                            task.header,
-                            task.payload,
-                            "NATS sender task exited (backpressure)".into(),
-                        );
-                    }
-                })))
-            }
-            Err(flume::TrySendError::Disconnected(task)) => {
+        try_send_or_backpressure(
+            tx,
+            task,
+            |task| {
                 task.on_error
                     .on_error(task.header, task.payload, "NATS sender task exited".into());
-                Ok(())
-            }
-        }
+            },
+            |task| {
+                task.on_error.on_error(
+                    task.header,
+                    task.payload,
+                    "NATS sender task exited (backpressure)".into(),
+                );
+            },
+        )
     }
 
     fn start(

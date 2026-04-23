@@ -19,6 +19,7 @@ use velo_observability::VeloMetrics;
 
 use crate::transport::{
     HealthCheckError, SendBackpressure, ShutdownState, TransportError, TransportErrorHandler,
+    try_send_or_backpressure,
 };
 use crate::utils::interfaces::{
     InterfaceEndpoint, InterfaceFilter, parse_endpoints, resolve_advertise_endpoints,
@@ -219,6 +220,32 @@ impl TcpTransport {
             metrics.set_active_connections(self.connections.len());
         }
     }
+
+    /// Slow path: establish (or reuse) a connection, then enqueue via the
+    /// shared backpressure helper.
+    fn slow_path_send(
+        &self,
+        instance_id: crate::InstanceId,
+        send_msg: SendTask,
+    ) -> Result<(), SendBackpressure> {
+        if self.runtime.get().is_none() {
+            send_msg.on_error("Transport not started");
+            return Ok(());
+        }
+        let handle = match self.get_or_create_connection(instance_id) {
+            Ok(h) => h,
+            Err(e) => {
+                send_msg.on_error(format!("Failed to create connection: {}", e));
+                return Ok(());
+            }
+        };
+        try_send_or_backpressure(
+            &handle.tx,
+            send_msg,
+            |msg| msg.on_error("Connection closed immediately"),
+            |msg| msg.on_error("Connection closed"),
+        )
+    }
 }
 
 impl Transport for TcpTransport {
@@ -278,13 +305,11 @@ impl Transport for TcpTransport {
             on_error,
         };
 
-        // Fast path: try to send on existing connection
-        let send_msg = match self.connections.get(&instance_id) {
-            Some(handle) => match handle.tx.try_send(send_msg) {
+        // Fast path: try existing connection.
+        if let Some(handle) = self.connections.get(&instance_id) {
+            match handle.tx.try_send(send_msg) {
                 Ok(()) => return Ok(()),
                 Err(flume::TrySendError::Full(send_msg)) => {
-                    // Surface backpressure to the caller — they drive the
-                    // deferred enqueue by awaiting the returned future.
                     let tx = handle.tx.clone();
                     return Err(SendBackpressure::new(Box::pin(async move {
                         if let Err(flume::SendError(m)) = tx.send_async(send_msg).await {
@@ -292,49 +317,17 @@ impl Transport for TcpTransport {
                         }
                     })));
                 }
-                Err(flume::TrySendError::Disconnected(send_msg)) => {
-                    // Drop the guard before mutating the map
+                Err(flume::TrySendError::Disconnected(send_msg_out)) => {
+                    // Drop the guard before mutating the map, then fall
+                    // through to the slow path to create a fresh connection.
                     drop(handle);
                     self.connections
                         .remove_if(&instance_id, |_, h| h.tx.is_disconnected());
-                    // Fall through to slow path to create a fresh connection
-                    send_msg
+                    return self.slow_path_send(instance_id, send_msg_out);
                 }
-            },
-            None => send_msg,
-        };
-
-        // Slow path: create new connection
-        if self.runtime.get().is_none() {
-            send_msg.on_error("Transport not started");
-            return Ok(());
-        }
-
-        let handle = match self.get_or_create_connection(instance_id) {
-            Ok(h) => h,
-            Err(e) => {
-                send_msg.on_error(format!("Failed to create connection: {}", e));
-                return Ok(());
-            }
-        };
-
-        // Mirror the fast-path: try_send first, surface bp only if the
-        // freshly-created channel is already saturated.
-        match handle.tx.try_send(send_msg) {
-            Ok(()) => Ok(()),
-            Err(flume::TrySendError::Full(send_msg)) => {
-                let tx = handle.tx.clone();
-                Err(SendBackpressure::new(Box::pin(async move {
-                    if let Err(flume::SendError(m)) = tx.send_async(send_msg).await {
-                        m.on_error("Connection closed");
-                    }
-                })))
-            }
-            Err(flume::TrySendError::Disconnected(send_msg)) => {
-                send_msg.on_error("Connection closed immediately");
-                Ok(())
             }
         }
+        self.slow_path_send(instance_id, send_msg)
     }
 
     fn start(
