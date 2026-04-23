@@ -894,16 +894,22 @@ impl MessageBuilder {
         });
     }
 
-    /// Post-acquisition dispatch. Given a pre-acquired awaiter, resolves the
-    /// target and either sends on the fast path (returning a populated
-    /// `ResponseStage`) or spawns the slow path (returning a ready stage
-    /// whose awaiter will be completed by the spawned task).
+    /// Post-acquisition dispatch. Given a pre-resolved target and a
+    /// pre-acquired awaiter, either sends on the fast path (returning a
+    /// populated `ResponseStage`) or spawns the slow path (returning a ready
+    /// stage whose awaiter will be completed by the spawned task).
+    ///
+    /// Target resolution happens in [`MessageBuilder::make_stage_state`]
+    /// *before* slot acquisition so `ResolveError::Other` (programmer
+    /// misuse — target not set, or both `.instance()` and `.worker()` set)
+    /// fails the caller without consuming a slot or blocking on
+    /// `register_outcome_async`. This mirrors the ordering in [`fire`].
     fn dispatch_with_awaiter(
         self,
+        target_result: Result<InstanceId, ResolveError>,
         awaiter: crate::common::responses::ResponseAwaiter,
         message_type: MsgType,
     ) -> ResponseStage {
-        let target_result = self.resolve_target();
         let worker_id = self.target_worker;
         let response_id = awaiter.response_id();
 
@@ -924,6 +930,9 @@ impl MessageBuilder {
                 ResponseStage::ready(awaiter)
             }
             Err(ResolveError::UnresolvedPeer) => {
+                // `resolve_target` only returns UnresolvedPeer when
+                // target_worker is Some, so this else-branch is a defensive
+                // guard — unreachable in practice.
                 let Some(worker_id) = worker_id else {
                     tracing::error!(target: "velo_messenger::client", "UnresolvedPeer but no worker_id set");
                     return ResponseStage::ready(awaiter);
@@ -935,18 +944,20 @@ impl MessageBuilder {
                 );
                 ResponseStage::ready(awaiter)
             }
-            Err(ResolveError::Other(e)) => {
-                tracing::error!(target: "velo_messenger::client", error = %e, "Target resolution failed");
-                let _ = self
-                    .client
-                    .response_manager
-                    .complete_outcome(response_id, Err(format!("Resolution failed: {}", e)));
-                ResponseStage::ready(awaiter)
+            Err(ResolveError::Other(_)) => {
+                unreachable!("ResolveError::Other is short-circuited in make_stage_state")
             }
         }
     }
 
     /// Build a `StageState` according to the builder's acquisition policy.
+    ///
+    /// Target resolution runs first so `ResolveError::Other` (programmer
+    /// misuse) produces an immediate error stage and never consumes a slot.
+    /// Under `await_capacity` this is load-bearing: resolving inside the
+    /// deferred future would make the caller block on
+    /// `register_outcome_async()` under arena saturation before learning
+    /// the call can never succeed. Mirrors [`fire`]'s early return.
     ///
     /// - Default (fail-fast): acquire synchronously; propagate
     ///   `ResponseRegistrationError::Exhausted` as an immediate error stage.
@@ -954,15 +965,27 @@ impl MessageBuilder {
     ///   capacity before dispatching. Mirrors the `SendOutcome::Backpressured`
     ///   idiom transports already use.
     fn make_stage_state(self, message_type: MsgType) -> StageState {
+        // Short-circuit programmer-misuse resolution errors before touching
+        // the slot arena. Mirrors fire()'s early return so invalid target
+        // configs never block on register_outcome_async.
+        let target_result = match self.resolve_target() {
+            Err(ResolveError::Other(e)) => return StageState::error(e),
+            other => other,
+        };
+
         if self.await_capacity {
             let fut = Box::pin(async move {
                 let awaiter = self.client.response_manager.register_outcome_async().await;
-                self.dispatch_with_awaiter(awaiter, message_type)
+                self.dispatch_with_awaiter(target_result, awaiter, message_type)
             });
             StageState::Pending(fut)
         } else {
             match self.client.register_outcome() {
-                Ok(awaiter) => StageState::ready(self.dispatch_with_awaiter(awaiter, message_type)),
+                Ok(awaiter) => StageState::ready(self.dispatch_with_awaiter(
+                    target_result,
+                    awaiter,
+                    message_type,
+                )),
                 Err(e) => StageState::error(anyhow!("Failed to register outcome: {}", e)),
             }
         }
