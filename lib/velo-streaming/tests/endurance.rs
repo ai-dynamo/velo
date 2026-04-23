@@ -1,10 +1,17 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#![cfg(velo_endurance)]
+
 //! Endurance and fault-injection tests for velo-streaming.
 //!
-//! All tests are marked `#[ignore]` and only run under `--include-ignored`
-//! (e.g. a dedicated CI endurance job or `cargo test -- --include-ignored`).
+//! Gated behind the `velo_endurance` rustc cfg (NOT a Cargo feature), so CI's
+//! `cargo test --all-features --all-targets` never compiles or runs them.
+//! Opt in locally with:
+//!
+//! ```text
+//! RUSTFLAGS="--cfg velo_endurance" cargo test -p velo-streaming --test endurance
+//! ```
 //!
 //! Test inventory
 //! ─────────────
@@ -41,7 +48,6 @@ fn make_manager() -> Arc<AnchorManager> {
 /// Send 10 000 u64 frames on a single anchor as fast as possible.
 /// Verify zero frame loss and strict ordering.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "endurance — run with --include-ignored"]
 async fn test_e01_sustained_10k_frames() {
     const TOTAL: u64 = 10_000;
     let mgr = make_manager();
@@ -85,7 +91,6 @@ async fn test_e01_sustained_10k_frames() {
 /// 100 anchors × 100 frames concurrently. Verify all 10 000 frames arrive,
 /// each anchor receives exactly its own items, registry is clean at the end.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "endurance — run with --include-ignored"]
 async fn test_e02_concurrent_100_streams() {
     const STREAMS: usize = 100;
     const ITEMS: u32 = 100;
@@ -168,7 +173,6 @@ async fn test_e02_concurrent_100_streams() {
 /// Create and finalize 1 000 anchors sequentially.
 /// After each finalize the registry count must return to 0 (no anchor leak).
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "endurance — run with --include-ignored"]
 async fn test_e03_rapid_create_destroy_anchors() {
     const ROUNDS: usize = 1_000;
     let mgr = make_manager();
@@ -207,7 +211,6 @@ async fn test_e03_rapid_create_destroy_anchors() {
 /// even when the thread is unwinding due to a panic.
 /// The consumer must receive all 500 items followed by Err(SenderDropped).
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "endurance — run with --include-ignored"]
 async fn test_e04_sender_panic_drop() {
     use velo_streaming::StreamError;
 
@@ -259,7 +262,6 @@ async fn test_e04_sender_panic_drop() {
 /// The sender will block on the bounded channel (capacity 256).
 /// All 1 000 items must arrive; no ChannelClosed or frame loss.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "endurance — run with --include-ignored"]
 async fn test_e05_consumer_slow_sustained() {
     const TOTAL: u32 = 1_000;
 
@@ -308,7 +310,6 @@ async fn test_e05_consumer_slow_sustained() {
 /// All 500 items must arrive in strict order across all 6 attach sessions
 /// (5 detach + 1 final finalize), with exactly 5 Detached sentinels between batches.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "endurance — run with --include-ignored"]
 async fn test_e06_five_cycle_reattach_endurance() {
     const CYCLES: u32 = 5;
     const BATCH: u32 = 100;
@@ -395,7 +396,6 @@ async fn test_e06_five_cycle_reattach_endurance() {
 /// Only one should remove the anchor from the registry (AtomicBool gate).
 /// The rest should be no-ops. The final anchor count must be 0.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "endurance — run with --include-ignored"]
 async fn test_e07_cancel_storm() {
     const STORMERS: usize = 50;
 

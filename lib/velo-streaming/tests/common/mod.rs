@@ -102,7 +102,9 @@ macro_rules! run_transport_tests {
             #[tokio::test(flavor = "multi_thread")]
             async fn test_01_local_round_trip() {
                 let mgr = manager().await;
+                assert_eq!(mgr.active_anchor_count(), 0);
                 let mut anchor = mgr.create_anchor::<u32>();
+                assert_eq!(mgr.active_anchor_count(), 1);
                 let handle = anchor.handle();
                 let sender = mgr
                     .attach_stream_anchor::<u32>(handle)
@@ -122,6 +124,11 @@ macro_rules! run_transport_tests {
                 }
                 assert_eq!(items, (0u32..10).collect::<Vec<_>>());
                 assert!(anchor.next().await.is_none());
+                assert_eq!(
+                    mgr.active_anchor_count(),
+                    0,
+                    "registry must be empty after finalize drain"
+                );
             }
 
             /// TEST-04: Detach/reattach — first sender sends 3, detaches; second sends 3 more,
@@ -190,6 +197,9 @@ macro_rules! run_transport_tests {
                 assert_eq!(items.len(), 5);
                 // Stream yields None after Finalized
                 assert!(anchor.next().await.is_none());
+                // Registry entry removed after finalize — getter mirrors the state
+                // observed by the Prometheus `velo_streaming_active_anchors` gauge.
+                assert_eq!(mgr.active_anchor_count(), 0);
                 // Registry entry removed after finalize; second attach must fail
                 let second_attach = mgr.attach_stream_anchor::<u32>(handle).await;
                 assert!(
@@ -206,10 +216,16 @@ macro_rules! run_transport_tests {
             async fn test_06_cancel_prevents_attach() {
                 let mgr = manager().await;
                 let anchor = mgr.create_anchor::<u32>();
+                assert_eq!(mgr.active_anchor_count(), 1);
                 let handle = anchor.handle();
                 anchor.cancel();
                 // Give tokio a chance to process cancel
                 tokio::task::yield_now().await;
+                assert_eq!(
+                    mgr.active_anchor_count(),
+                    0,
+                    "cancel must remove the anchor from the registry"
+                );
                 let result = mgr.attach_stream_anchor::<u32>(handle).await;
                 assert!(
                     matches!(
