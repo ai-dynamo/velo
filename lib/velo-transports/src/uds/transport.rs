@@ -1091,17 +1091,13 @@ mod tests {
 
     #[test]
     fn test_register_rejects_missing_path() {
-        let (transport, _socket_path) = {
-            let dir =
-                std::env::temp_dir().join(format!("uds-reject-{}", crate::InstanceId::new_v4()));
-            std::fs::create_dir_all(&dir).unwrap();
-            let socket_path = dir.join("self.sock");
-            let transport = UdsTransportBuilder::new()
-                .socket_path(&socket_path)
-                .build()
-                .unwrap();
-            (transport, socket_path)
-        };
+        let dir = std::env::temp_dir().join(format!("uds-reject-{}", crate::InstanceId::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket_path = dir.join("self.sock");
+        let transport = UdsTransportBuilder::new()
+            .socket_path(&socket_path)
+            .build()
+            .unwrap();
 
         // Peer path does not exist at all.
         let missing =
@@ -1113,6 +1109,8 @@ mod tests {
         let result = transport.register(peer);
         assert!(matches!(result, Err(TransportError::NoEndpoint)));
         assert!(!transport.peers.contains_key(&peer_id));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
