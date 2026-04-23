@@ -191,7 +191,7 @@ impl Transport for NatsTransport {
             }
         };
 
-        try_send_or_backpressure(
+        let r = try_send_or_backpressure(
             tx,
             task,
             |task| {
@@ -205,7 +205,11 @@ impl Transport for NatsTransport {
                     "NATS sender task exited (backpressure)".into(),
                 );
             },
-        )
+        );
+        if let Some(m) = self.metrics.get() {
+            m.record_send_backpressure_on(&r);
+        }
+        r
     }
 
     fn start(

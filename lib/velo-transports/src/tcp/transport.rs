@@ -239,12 +239,16 @@ impl TcpTransport {
                 return Ok(());
             }
         };
-        try_send_or_backpressure(
+        let r = try_send_or_backpressure(
             &handle.tx,
             send_msg,
             |msg| msg.on_error("Connection closed immediately"),
             |msg| msg.on_error("Connection closed"),
-        )
+        );
+        if let Some(m) = self.metrics.get() {
+            m.record_send_backpressure_on(&r);
+        }
+        r
     }
 }
 
@@ -310,6 +314,9 @@ impl Transport for TcpTransport {
             match handle.tx.try_send(send_msg) {
                 Ok(()) => return Ok(()),
                 Err(flume::TrySendError::Full(send_msg)) => {
+                    if let Some(m) = self.metrics.get() {
+                        m.record_send_backpressure();
+                    }
                     let tx = handle.tx.clone();
                     return Err(SendBackpressure::new(Box::pin(async move {
                         if let Err(flume::SendError(m)) = tx.send_async(send_msg).await {

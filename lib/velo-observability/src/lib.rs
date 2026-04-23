@@ -372,6 +372,7 @@ pub struct TransportMetricsHandle {
     invalid_header_length: Counter,
     truncated_frame: Counter,
     drain_reply_build_failed: Counter,
+    send_backpressure: Counter,
 }
 
 impl TransportMetricsHandle {
@@ -420,6 +421,24 @@ impl TransportMetricsHandle {
     /// Set the active-connection gauge.
     pub fn set_active_connections(&self, count: usize) {
         self.active_connections.set(count as f64);
+    }
+
+    /// Record a send that could not enqueue synchronously on the per-peer
+    /// bounded channel and fell through to the `SendBackpressure` await path.
+    /// Fires once per `try_send_or_backpressure` Full-branch return.
+    pub fn record_send_backpressure(&self) {
+        self.send_backpressure.inc();
+    }
+
+    /// Convenience form: inspect a send result and increment the backpressure
+    /// counter iff it's `Err`. Generic over the error type so the helper is
+    /// usable without pulling `velo-transports` types into this crate.
+    /// Every transport's `send_message` result fits (the `Err` variant is
+    /// `SendBackpressure`, but this helper cares only about Ok vs Err).
+    pub fn record_send_backpressure_on<T, E>(&self, r: &Result<T, E>) {
+        if r.is_err() {
+            self.send_backpressure.inc();
+        }
     }
 }
 
@@ -499,6 +518,7 @@ pub struct VeloMetrics {
     transport_frames_total: CounterVec,
     transport_frame_bytes_total: CounterVec,
     transport_rejections_total: CounterVec,
+    transport_send_backpressure_total: CounterVec,
     transport_registered_peers: GaugeVec,
     transport_active_connections: GaugeVec,
     messenger_handler_requests_total: CounterVec,
@@ -509,6 +529,7 @@ pub struct VeloMetrics {
     messenger_dispatch_failures_total: CounterVec,
     messenger_client_resolution_total: CounterVec,
     messenger_pending_responses: Gauge,
+    messenger_response_slot_exhausted_total: Counter,
     streaming_anchor_operations_total: CounterVec,
     streaming_anchor_operation_duration_seconds: HistogramVec,
     streaming_active_anchors: Gauge,
@@ -555,6 +576,16 @@ impl VeloMetrics {
                     "Transport-level rejections and drops observed by Velo.",
                 ),
                 &["transport", "reason"],
+            )?,
+        )?;
+        let transport_send_backpressure_total = register_collector(
+            registry,
+            CounterVec::new(
+                Opts::new(
+                    "velo_transport_send_backpressure_total",
+                    "Sends that hit the bounded per-peer channel's Full branch and fell through to the SendBackpressure await path.",
+                ),
+                &["transport"],
             )?,
         )?;
         let transport_registered_peers = register_collector(
@@ -657,6 +688,13 @@ impl VeloMetrics {
                 "Pending messenger response awaiters.",
             ))?,
         )?;
+        let messenger_response_slot_exhausted_total = register_collector(
+            registry,
+            Counter::with_opts(Opts::new(
+                "velo_messenger_response_slot_exhausted_total",
+                "Response slot acquisitions that hit the per-worker capacity ceiling.",
+            ))?,
+        )?;
         let streaming_anchor_operations_total = register_collector(
             registry,
             CounterVec::new(
@@ -742,6 +780,7 @@ impl VeloMetrics {
             transport_frames_total,
             transport_frame_bytes_total,
             transport_rejections_total,
+            transport_send_backpressure_total,
             transport_registered_peers,
             transport_active_connections,
             messenger_handler_requests_total,
@@ -752,6 +791,7 @@ impl VeloMetrics {
             messenger_dispatch_failures_total,
             messenger_client_resolution_total,
             messenger_pending_responses,
+            messenger_response_slot_exhausted_total,
             streaming_anchor_operations_total,
             streaming_anchor_operation_duration_seconds,
             streaming_active_anchors,
@@ -836,6 +876,9 @@ impl VeloMetrics {
             drain_reply_build_failed: self
                 .transport_rejections_total
                 .with_label_values(&[transport_label, "drain_reply_build_failed"]),
+            send_backpressure: self
+                .transport_send_backpressure_total
+                .with_label_values(&[transport_label]),
         }
     }
 
@@ -909,6 +952,14 @@ impl VeloMetrics {
     /// Set the pending-response gauge.
     pub fn set_pending_responses(&self, count: usize) {
         self.messenger_pending_responses.set(count as f64);
+    }
+
+    /// Record a response-slot acquisition that hit the per-worker capacity
+    /// ceiling. Fired once per failed acquisition, whether the caller
+    /// fail-fasts via `register_outcome` or falls through to the async
+    /// backpressure path.
+    pub fn inc_response_slot_exhausted(&self) {
+        self.messenger_response_slot_exhausted_total.inc();
     }
 
     /// Record a streaming control-plane operation.

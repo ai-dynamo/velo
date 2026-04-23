@@ -47,3 +47,5 @@ flume = "0.12.0"
 
 [dev-dependencies]
 xxhash-rust = { workspace = true }
+prometheus = { workspace = true }
+velo-observability = { workspace = true, features = ["test-helpers"] }

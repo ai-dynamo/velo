@@ -14,8 +14,10 @@ use futures::future::BoxFuture;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
+use tokio::sync::OnceCell;
 
 use velo_common::{InstanceId, PeerInfo, TransportKey, WorkerAddress};
+use velo_observability::{TransportMetricsHandle, VeloMetrics};
 use velo_transports::{
     HealthCheckError, MessageType, SendBackpressure, Transport, TransportAdapter, TransportError,
     TransportErrorHandler,
@@ -40,6 +42,9 @@ struct SlowSendTransport {
     /// hold the channel at its capacity so `SendBackpressure` futures stay
     /// pending deterministically.
     paused: Arc<AtomicBool>,
+    /// Lazily populated via `Transport::set_observability`. Lets the bp test
+    /// observe the transport send-backpressure counter.
+    metrics: OnceCell<TransportMetricsHandle>,
 }
 
 struct SendTask {
@@ -59,6 +64,7 @@ impl SlowSendTransport {
             consumed: Arc::new(AtomicU64::new(0)),
             started: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
+            metrics: OnceCell::new(),
         })
     }
 
@@ -106,6 +112,9 @@ impl Transport for SlowSendTransport {
         match self.tx.try_send(task) {
             Ok(()) => Ok(()),
             Err(flume::TrySendError::Full(task)) => {
+                if let Some(m) = self.metrics.get() {
+                    m.record_send_backpressure();
+                }
                 let tx = self.tx.clone();
                 Err(SendBackpressure::new(Box::pin(async move {
                     let _ = tx.send_async(task).await;
@@ -149,6 +158,12 @@ impl Transport for SlowSendTransport {
     }
 
     fn shutdown(&self) {}
+
+    fn set_observability(&self, observability: Arc<VeloMetrics>) {
+        let _ = self
+            .metrics
+            .set(observability.bind_transport(self.key.as_str()));
+    }
 
     fn check_health(
         &self,
@@ -375,5 +390,59 @@ async fn timeout_wrapping_backpressured_send_cancels_cleanly() {
 
     let res = tokio::time::timeout(Duration::from_millis(100), bp).await;
     assert!(res.is_err(), "timeout should fire (writer is paused)");
+    assert_eq!(err.count(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bp_increments_send_backpressure_counter() {
+    use velo_observability::test_helpers::MetricSnapshot;
+
+    let registry = prometheus::Registry::new();
+    let metrics = Arc::new(VeloMetrics::register(&registry).expect("register metrics"));
+
+    // Capacity 1, writer paused so every send past the first hits Full.
+    let t = make_started(1, Duration::from_millis(1)).await;
+    t.set_observability(metrics);
+    t.pause();
+    let err = CountingHandler::new();
+
+    // First send fills the channel synchronously.
+    t.send_message(
+        InstanceId::new_v4(),
+        Bytes::from_static(b"h"),
+        Bytes::from_static(b"p"),
+        MessageType::Message,
+        err.clone(),
+    )
+    .expect("first send enqueues");
+
+    // Next N sends all hit the Full branch and must bump the counter.
+    let bp_sends = 5;
+    let mut bps = Vec::with_capacity(bp_sends);
+    for _ in 0..bp_sends {
+        bps.push(
+            t.send_message(
+                InstanceId::new_v4(),
+                Bytes::from_static(b"h"),
+                Bytes::from_static(b"p"),
+                MessageType::Message,
+                err.clone(),
+            )
+            .expect_err("should backpressure"),
+        );
+    }
+
+    let snapshot = MetricSnapshot::from_registry(&registry);
+    let value = snapshot.counter(
+        "velo_transport_send_backpressure_total",
+        &[("transport", "slow")],
+    );
+    assert_eq!(
+        value, bp_sends as f64,
+        "counter should fire once per Full-branch send"
+    );
+
+    // Cancel the pending bp futures (writer is still paused).
+    drop(bps);
     assert_eq!(err.count(), 0);
 }
