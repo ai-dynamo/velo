@@ -465,19 +465,6 @@ async fn drive_send_outcome(
     }
 }
 
-/// Fire-path driver. Returns `Ok(())` once the frame has been handed to the
-/// transport (either fast-pathed or bp-enqueued). Returns `Err` for pre-wire
-/// failures:
-///
-/// - Synchronous `send_message` error (peer unregistered, transport-level
-///   refusal).
-/// - `on_error` fires during `bp.await` (channel closed between hand-off and
-///   drain — frame never made it to the wire). The `DefaultErrorHandler`
-///   completes the awaiter with `Err`; after `bp.await` resolves we poll
-///   the awaiter once non-blockingly and surface any completion we find.
-///
-/// After the frame is accepted by the wire the awaiter is simply dropped —
-/// fire-and-forget semantics mean we don't observe remote processing.
 /// Slow-path fire completion: wait for the spawned task to complete the
 /// outcome with Ok (successful enqueue) or Err (pre-wire failure), and map
 /// the result into a `Result<()>` for the caller.
@@ -491,26 +478,41 @@ async fn finish_fire_via_awaiter(
         .map_err(|e| anyhow!("{}", e))
 }
 
+/// Fast-path fire driver. Returns `Ok(())` once the frame has been handed to
+/// the transport (either fast-pathed or bp-enqueued). Returns `Err` for
+/// pre-wire failures:
+///
+/// - Synchronous `send_message` error (peer unregistered, transport-level
+///   refusal).
+/// - `on_error` fires during `bp.await` (channel closed between hand-off and
+///   drain — frame never made it to the wire). The `DefaultErrorHandler`
+///   completes the awaiter with `Err`; after `bp.await` resolves we poll
+///   the awaiter once non-blockingly and surface any completion we find.
+///
+/// After the frame is accepted by the wire the awaiter is simply dropped —
+/// fire-and-forget semantics mean we don't observe remote processing.
 async fn drive_fire_send(
     send_result: Result<SendOutcome>,
     mut awaiter: crate::common::responses::ResponseAwaiter,
 ) -> Result<()> {
     use futures::FutureExt;
+    // Some transports (e.g. TCP's `slow_path_send` via
+    // `try_send_or_backpressure` on a disconnected channel, or early-returns
+    // like "Transport not started" and "Failed to create connection") invoke
+    // `on_error` synchronously and then return `Ok(())` — which `VeloBackend`
+    // maps to `SendOutcome::Enqueued`. In those cases DefaultErrorHandler
+    // has already completed the awaiter with Err before we get here. The
+    // Backpressured arm has the same property once bp resolves (transport
+    // calls on_error inside the bp future). Poll once in both arms and
+    // surface any Err we find.
     match send_result {
-        Ok(SendOutcome::Enqueued) => Ok(()),
-        Ok(SendOutcome::Backpressured(bp)) => {
-            bp.await;
-            // Transport invokes `on_error` synchronously inside the bp future
-            // before it resolves, so DefaultErrorHandler has already written
-            // Err into the awaiter's slot (if applicable) by the time we get
-            // here. `now_or_never` polls once: `Some(Err)` means we failed
-            // pre-wire; `None` or `Some(Ok(_))` means the frame was enqueued.
-            match awaiter.recv().now_or_never() {
-                Some(Err(e)) => Err(anyhow!("Send failed: {}", e)),
-                _ => Ok(()),
-            }
-        }
-        Err(e) => Err(e),
+        Ok(SendOutcome::Enqueued) => {}
+        Ok(SendOutcome::Backpressured(bp)) => bp.await,
+        Err(e) => return Err(e),
+    }
+    match awaiter.recv().now_or_never() {
+        Some(Err(e)) => Err(anyhow!("Send failed: {}", e)),
+        _ => Ok(()),
     }
 }
 
@@ -1075,6 +1077,21 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn drive_fire_send_enqueued_with_sync_on_error_surfaces_err() {
+        // Transports like TCP's slow_path_send can invoke on_error
+        // synchronously (e.g. connection already disconnected, transport
+        // not started) and still return Ok(Enqueued). DefaultErrorHandler
+        // completes the awaiter with Err before drive_fire_send runs —
+        // the Enqueued arm must surface that Err, not return Ok.
+        let (awaiter, id, rm) = make_awaiter();
+        assert!(rm.complete_outcome(id, Err("Connection closed immediately".to_string())));
+        let err = drive_fire_send(Ok(SendOutcome::Enqueued), awaiter)
+            .await
+            .expect_err("should surface sync on_error failure");
+        assert!(err.to_string().contains("Connection closed immediately"));
     }
 
     #[tokio::test]
