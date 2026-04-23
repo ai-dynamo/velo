@@ -277,17 +277,12 @@ impl VeloBackend {
         let send_result =
             transport.send_message(target, header, payload, message_type, error_handler);
 
-        // Record the frame regardless of enqueue vs backpressure — the frame
-        // is either already on the wire-side channel or will be as soon as the
-        // caller awaits the backpressure future.
-        if let Some(metrics) = metrics {
-            metrics.record_frame(Direction::Outbound, message_type_label(message_type), bytes);
-        }
-
-        Ok(match send_result {
-            Ok(()) => SendOutcome::Enqueued,
-            Err(bp) => SendOutcome::Backpressured(bp),
-        })
+        Ok(finalize_send_outcome(
+            send_result,
+            metrics.cloned(),
+            message_type,
+            bytes,
+        ))
     }
 
     /// Send a message to a registered peer via a specific transport.
@@ -319,13 +314,12 @@ impl VeloBackend {
             let send_result =
                 transport.send_message(target, header, payload, message_type, error_handler);
 
-            if let Some(metrics) = metrics {
-                metrics.record_frame(Direction::Outbound, message_type_label(message_type), bytes);
-            }
-            return Ok(match send_result {
-                Ok(()) => SendOutcome::Enqueued,
-                Err(bp) => SendOutcome::Backpressured(bp),
-            });
+            return Ok(finalize_send_outcome(
+                send_result,
+                metrics.cloned(),
+                message_type,
+                bytes,
+            ));
         } else {
             // if we got here, we can unwrap because there is an entry in the alternative_transports map
             let alternative_transports = self
@@ -351,17 +345,12 @@ impl VeloBackend {
                         error_handler,
                     );
 
-                    if let Some(metrics) = metrics {
-                        metrics.record_frame(
-                            Direction::Outbound,
-                            message_type_label(message_type),
-                            bytes,
-                        );
-                    }
-                    return Ok(match send_result {
-                        Ok(()) => SendOutcome::Enqueued,
-                        Err(bp) => SendOutcome::Backpressured(bp),
-                    });
+                    return Ok(finalize_send_outcome(
+                        send_result,
+                        metrics.cloned(),
+                        message_type,
+                        bytes,
+                    ));
                 }
             }
         }
@@ -377,11 +366,16 @@ impl VeloBackend {
     /// For automatic discovery, use the two-phase pattern:
     /// ```ignore
     /// match backend.send_message_to_worker(...) {
-    ///     Ok(()) => { /* success */ }
+    ///     Ok(SendOutcome::Enqueued) => { /* synchronous enqueue */ }
+    ///     Ok(SendOutcome::Backpressured(bp)) => { bp.await; }
     ///     Err(e) if matches_worker_not_registered(&e) => {
     ///         tokio::spawn(async move {
     ///             let instance_id = backend.resolve_and_register_worker(worker_id).await?;
-    ///             backend.send_message(instance_id, ...)?;
+    ///             if let SendOutcome::Backpressured(bp) =
+    ///                 backend.send_message(instance_id, ...)?
+    ///             {
+    ///                 bp.await;
+    ///             }
     ///         });
     ///     }
     /// }
@@ -545,6 +539,39 @@ fn instrument_transport_error_handler(
     Arc::new(InstrumentedTransportErrorHandler { metrics, inner })
 }
 
+/// Turn a transport `send_message` result into a [`SendOutcome`], recording
+/// the outbound-frame metric at the moment the frame is actually enqueued.
+///
+/// - On `Ok(())` (synchronous enqueue) the metric is recorded immediately.
+/// - On `Err(bp)` (backpressure) the bp future is wrapped so the metric is
+///   recorded only when the caller awaits it to completion. If the caller
+///   drops the future without awaiting, the frame was never enqueued and no
+///   outbound-frame count is recorded.
+fn finalize_send_outcome(
+    send_result: Result<(), SendBackpressure>,
+    metrics: Option<velo_observability::TransportMetricsHandle>,
+    message_type: MessageType,
+    bytes: usize,
+) -> SendOutcome {
+    match send_result {
+        Ok(()) => {
+            if let Some(metrics) = metrics {
+                metrics.record_frame(Direction::Outbound, message_type_label(message_type), bytes);
+            }
+            SendOutcome::Enqueued
+        }
+        Err(bp) => {
+            let label = message_type_label(message_type);
+            SendOutcome::Backpressured(SendBackpressure::new(Box::pin(async move {
+                bp.await;
+                if let Some(metrics) = metrics {
+                    metrics.record_frame(Direction::Outbound, label, bytes);
+                }
+            })))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -562,6 +589,10 @@ mod tests {
         drained: AtomicBool,
         shut_down: AtomicBool,
         send_count: AtomicUsize,
+        /// When true, `send_message` returns `Err(SendBackpressure::new(...))`
+        /// whose inner future is immediately ready. Lets tests exercise the
+        /// backend's Backpressured path.
+        always_backpressure: bool,
     }
 
     impl MockTransport {
@@ -580,6 +611,26 @@ mod tests {
                 drained: AtomicBool::new(false),
                 shut_down: AtomicBool::new(false),
                 send_count: AtomicUsize::new(0),
+                always_backpressure: false,
+            })
+        }
+
+        fn new_backpressured(key: &str) -> Arc<Self> {
+            let mut builder = WorkerAddressBuilder::new();
+            builder
+                .add_entry(key, format!("mock://{}", key).into_bytes())
+                .unwrap();
+            let address = builder.build().unwrap();
+
+            Arc::new(Self {
+                key: TransportKey::from(key),
+                address,
+                accept_register: true,
+                started: AtomicBool::new(false),
+                drained: AtomicBool::new(false),
+                shut_down: AtomicBool::new(false),
+                send_count: AtomicUsize::new(0),
+                always_backpressure: true,
             })
         }
     }
@@ -607,7 +658,11 @@ mod tests {
             _on_error: Arc<dyn TransportErrorHandler>,
         ) -> Result<(), SendBackpressure> {
             self.send_count.fetch_add(1, Ordering::Relaxed);
-            Ok(())
+            if self.always_backpressure {
+                Err(SendBackpressure::new(Box::pin(async {})))
+            } else {
+                Ok(())
+            }
         }
         fn start(
             &self,
@@ -756,7 +811,7 @@ mod tests {
         let peer_id = peer.instance_id();
         backend.register_peer(peer).unwrap();
 
-        backend
+        let outcome = backend
             .send_message(
                 peer_id,
                 Bytes::from_static(&[1]),
@@ -766,7 +821,47 @@ mod tests {
             )
             .unwrap();
 
+        assert!(
+            matches!(outcome, SendOutcome::Enqueued),
+            "MockTransport returns Ok(()) so backend should report Enqueued"
+        );
         assert_eq!(t.send_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_send_message_backpressured() {
+        // A transport that always returns Err(SendBackpressure) should cause
+        // the backend to surface SendOutcome::Backpressured; awaiting the
+        // future must resolve cleanly.
+        let t = MockTransport::new_backpressured("tcp");
+        let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>], None)
+            .await
+            .unwrap();
+
+        let peer = make_peer_info(&["tcp"]);
+        let peer_id = peer.instance_id();
+        backend.register_peer(peer).unwrap();
+
+        let outcome = backend
+            .send_message(
+                peer_id,
+                Bytes::from_static(&[1]),
+                Bytes::from_static(&[2]),
+                MessageType::Message,
+                Arc::new(NoopErrorHandler),
+            )
+            .unwrap();
+
+        match outcome {
+            SendOutcome::Backpressured(bp) => {
+                tokio::time::timeout(Duration::from_secs(1), bp)
+                    .await
+                    .expect("bp should resolve when inner future completes");
+            }
+            SendOutcome::Enqueued => {
+                panic!("backpressured mock should surface SendOutcome::Backpressured")
+            }
+        }
     }
 
     #[tokio::test]

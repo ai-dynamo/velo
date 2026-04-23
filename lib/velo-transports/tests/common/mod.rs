@@ -147,9 +147,12 @@ impl<T: Transport> TestTransportHandle<T> {
         Ok(())
     }
 
-    /// Send a message to a peer. Any `SendBackpressure` returned by the
-    /// transport is driven to completion transparently by spawning it
-    /// (tests assume a non-saturated channel).
+    /// Send a message to a peer.
+    ///
+    /// This helper assumes a non-saturated per-peer channel and panics if the
+    /// transport returns `SendBackpressure`. Tests that need to exercise
+    /// backpressure should drive `Transport::send_message` directly and
+    /// `.await` the returned future (see `tests/backpressure.rs`).
     pub fn send(
         &self,
         target: InstanceId,
@@ -157,14 +160,21 @@ impl<T: Transport> TestTransportHandle<T> {
         payload: Vec<u8>,
         msg_type: MessageType,
     ) {
-        if let Err(bp) = self.transport.send_message(
-            target,
-            Bytes::from(header),
-            Bytes::from(payload),
-            msg_type,
-            self.error_handler.clone(),
-        ) {
-            tokio::spawn(bp);
+        if self
+            .transport
+            .send_message(
+                target,
+                Bytes::from(header),
+                Bytes::from(payload),
+                msg_type,
+                self.error_handler.clone(),
+            )
+            .is_err()
+        {
+            panic!(
+                "TestTransportHandle::send saw SendBackpressure; the send channel is saturated. \
+                 Use Transport::send_message directly and .await the returned future for saturation-aware tests."
+            );
         }
     }
 

@@ -272,13 +272,10 @@ impl Transport for GrpcTransport {
         };
 
         // Slow path: create new connection.
-        let rt = match self.runtime.get() {
-            Some(rt) => rt,
-            None => {
-                send_msg.on_error("Transport not started");
-                return Ok(());
-            }
-        };
+        if self.runtime.get().is_none() {
+            send_msg.on_error("Transport not started");
+            return Ok(());
+        }
 
         let handle = match self.get_or_create_connection(instance_id) {
             Ok(h) => h,
@@ -288,12 +285,21 @@ impl Transport for GrpcTransport {
             }
         };
 
-        rt.spawn(async move {
-            if let Err(flume::SendError(send_msg)) = handle.tx.send_async(send_msg).await {
-                send_msg.on_error("Connection closed");
+        match handle.tx.try_send(send_msg) {
+            Ok(()) => Ok(()),
+            Err(flume::TrySendError::Full(send_msg)) => {
+                let tx = handle.tx.clone();
+                Err(SendBackpressure::new(Box::pin(async move {
+                    if let Err(flume::SendError(m)) = tx.send_async(send_msg).await {
+                        m.on_error("Connection closed");
+                    }
+                })))
             }
-        });
-        Ok(())
+            Err(flume::TrySendError::Disconnected(send_msg)) => {
+                send_msg.on_error("Connection closed immediately");
+                Ok(())
+            }
+        }
     }
 
     fn start(

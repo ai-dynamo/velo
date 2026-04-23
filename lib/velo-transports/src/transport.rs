@@ -191,7 +191,11 @@ pub enum ShutdownPolicy {
 ///   semantics).
 /// - Dropping the future before it resolves cancels the pending send cleanly
 ///   (the underlying `flume::send_async` future is drop-safe; the message is
-///   not enqueued).
+///   not enqueued). **`on_error` is NOT invoked on drop** — callers that need
+///   to observe dropped frames must track cancellation themselves. Fire-path
+///   helpers in `velo-messenger` (e.g. `send_ack`, `send_nack`,
+///   `send_response_*`) always `.await` the future so this case does not arise
+///   in normal request/response flows.
 ///
 /// Reordering: concurrent callers where one hits `Backpressured` and another
 /// fast-paths through `try_send` may land out of order at the remote. Callers

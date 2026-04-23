@@ -174,12 +174,17 @@ impl ActiveMessageClient {
             payload: bytes::Bytes::from(payload),
         };
 
-        if let SendOutcome::Backpressured(bp) = self.send_message(target, message)? {
-            bp.await;
-        }
+        let send_outcome = self.send_message(target, message)?;
 
-        // Wait for response with timeout
-        let result = tokio::time::timeout(self.handshake_timeout, outcome.recv()).await;
+        // Share a single handshake_timeout budget across both the send-side
+        // backpressure wait (if any) and the response receive.
+        let result = tokio::time::timeout(self.handshake_timeout, async {
+            if let SendOutcome::Backpressured(bp) = send_outcome {
+                bp.await;
+            }
+            outcome.recv().await
+        })
+        .await;
         let response_bytes = match result {
             Ok(Ok(Some(bytes))) => bytes,
             Ok(Ok(None)) => {

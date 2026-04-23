@@ -305,13 +305,10 @@ impl Transport for TcpTransport {
         };
 
         // Slow path: create new connection
-        let rt = match self.runtime.get() {
-            Some(rt) => rt,
-            None => {
-                send_msg.on_error("Transport not started");
-                return Ok(());
-            }
-        };
+        if self.runtime.get().is_none() {
+            send_msg.on_error("Transport not started");
+            return Ok(());
+        }
 
         let handle = match self.get_or_create_connection(instance_id) {
             Ok(h) => h,
@@ -321,12 +318,23 @@ impl Transport for TcpTransport {
             }
         };
 
-        rt.spawn(async move {
-            if let Err(flume::SendError(send_msg)) = handle.tx.send_async(send_msg).await {
-                send_msg.on_error("Connection closed");
+        // Mirror the fast-path: try_send first, surface bp only if the
+        // freshly-created channel is already saturated.
+        match handle.tx.try_send(send_msg) {
+            Ok(()) => Ok(()),
+            Err(flume::TrySendError::Full(send_msg)) => {
+                let tx = handle.tx.clone();
+                Err(SendBackpressure::new(Box::pin(async move {
+                    if let Err(flume::SendError(m)) = tx.send_async(send_msg).await {
+                        m.on_error("Connection closed");
+                    }
+                })))
             }
-        });
-        Ok(())
+            Err(flume::TrySendError::Disconnected(send_msg)) => {
+                send_msg.on_error("Connection closed immediately");
+                Ok(())
+            }
+        }
     }
 
     fn start(
@@ -1039,7 +1047,8 @@ mod tests {
         insert_stale_handle(&transport, iid);
 
         // send_message should detect the stale handle and create a new one,
-        // NOT immediately call on_error
+        // NOT immediately call on_error. This exercises the slow path
+        // (get_or_create_connection + try_send on a freshly-created handle).
         let error_handler = Arc::new(TrackingErrorHandler::new());
         transport
             .send_message(
@@ -1049,7 +1058,7 @@ mod tests {
                 MessageType::Message,
                 error_handler.clone(),
             )
-            .expect("fast path should enqueue synchronously");
+            .expect("slow-path send on fresh connection should enqueue synchronously");
 
         // Accept the connection that the new writer task will establish
         let (mut stream, _) = peer_listener.accept().await.unwrap();

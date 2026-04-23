@@ -186,17 +186,25 @@ impl TransportErrorHandler for CountingHandler {
 
 // ── Tests ─────────────────────────────────────────────────────────────────
 
+/// Upper bound on any test-setup await — individual tests supply their own
+/// timeouts on the interesting waits.
+const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Helper: build a started SlowSendTransport on the current runtime.
 async fn make_started(capacity: usize, frame_delay: Duration) -> Arc<SlowSendTransport> {
     let t = SlowSendTransport::new(capacity, frame_delay);
     let (adapter, _streams) = velo_transports::make_channels();
-    t.start(
-        InstanceId::new_v4(),
-        adapter,
-        tokio::runtime::Handle::current(),
+    tokio::time::timeout(
+        TEST_TIMEOUT,
+        t.start(
+            InstanceId::new_v4(),
+            adapter,
+            tokio::runtime::Handle::current(),
+        ),
     )
     .await
-    .unwrap();
+    .expect("SlowSendTransport::start timed out")
+    .expect("SlowSendTransport::start returned Err");
     t
 }
 
