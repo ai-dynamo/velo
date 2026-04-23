@@ -19,7 +19,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use velo_observability::VeloMetrics;
 
-use crate::transport::{HealthCheckError, ShutdownState, TransportError, TransportErrorHandler};
+use crate::transport::{
+    HealthCheckError, SendBackpressure, ShutdownState, TransportError, TransportErrorHandler,
+};
 use crate::{MessageType, PeerInfo, Transport, TransportAdapter, TransportKey, WorkerAddress};
 
 use super::listener::UdsListener;
@@ -237,7 +239,7 @@ impl Transport for UdsTransport {
         payload: Bytes,
         message_type: MessageType,
         on_error: Arc<dyn TransportErrorHandler>,
-    ) {
+    ) -> Result<(), SendBackpressure> {
         let send_msg = SendTask {
             msg_type: message_type,
             header,
@@ -248,8 +250,15 @@ impl Transport for UdsTransport {
         // Fast path: try to send on existing connection
         let send_msg = match self.connections.get(&instance_id) {
             Some(handle) => match handle.tx.try_send(send_msg) {
-                Ok(()) => return,
-                Err(flume::TrySendError::Full(send_msg)) => send_msg,
+                Ok(()) => return Ok(()),
+                Err(flume::TrySendError::Full(send_msg)) => {
+                    let tx = handle.tx.clone();
+                    return Err(SendBackpressure::new(Box::pin(async move {
+                        if let Err(flume::SendError(m)) = tx.send_async(send_msg).await {
+                            m.on_error("Connection closed");
+                        }
+                    })));
+                }
                 Err(flume::TrySendError::Disconnected(send_msg)) => {
                     // Drop the guard before mutating the map
                     drop(handle);
@@ -268,7 +277,7 @@ impl Transport for UdsTransport {
             Some(rt) => rt,
             None => {
                 send_msg.on_error("Transport not started");
-                return;
+                return Ok(());
             }
         };
 
@@ -276,7 +285,7 @@ impl Transport for UdsTransport {
             Ok(h) => h,
             Err(e) => {
                 send_msg.on_error(format!("Failed to create connection: {}", e));
-                return;
+                return Ok(());
             }
         };
 
@@ -285,6 +294,7 @@ impl Transport for UdsTransport {
                 send_msg.on_error("Connection closed");
             }
         });
+        Ok(())
     }
 
     fn start(
@@ -880,13 +890,15 @@ mod tests {
 
         // send_message should detect the stale handle and create a new one
         let error_handler = Arc::new(TrackingErrorHandler::new());
-        transport.send_message(
-            iid,
-            Bytes::from_static(b"test-header"),
-            Bytes::from_static(b"test-payload"),
-            MessageType::Message,
-            error_handler.clone(),
-        );
+        transport
+            .send_message(
+                iid,
+                Bytes::from_static(b"test-header"),
+                Bytes::from_static(b"test-payload"),
+                MessageType::Message,
+                error_handler.clone(),
+            )
+            .expect("fast path should enqueue synchronously");
 
         // Accept the connection that the new writer task will establish
         let (mut stream, _) = peer_listener.accept().await.unwrap();

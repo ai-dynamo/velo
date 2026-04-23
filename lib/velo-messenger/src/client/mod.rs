@@ -18,7 +18,7 @@ use crate::{
 use peer_registry::PeerRegistry;
 use velo_common::InstanceId;
 use velo_observability::{ClientResolution, VeloMetrics};
-use velo_transports::{TransportErrorHandler, VeloBackend};
+use velo_transports::{SendOutcome, TransportErrorHandler, VeloBackend};
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -60,7 +60,7 @@ impl ActiveMessageClient {
         &self,
         target: InstanceId,
         mut message: ActiveMessage,
-    ) -> Result<()> {
+    ) -> Result<SendOutcome> {
         // Transparent large payload staging: if payload exceeds threshold,
         // stage it via rendezvous and replace with a handle in the headers.
         if let Some(stager) = self.large_payload_stager.get()
@@ -174,7 +174,9 @@ impl ActiveMessageClient {
             payload: bytes::Bytes::from(payload),
         };
 
-        self.send_message(target, message)?;
+        if let SendOutcome::Backpressured(bp) = self.send_message(target, message)? {
+            bp.await;
+        }
 
         // Wait for response with timeout
         let result = tokio::time::timeout(self.handshake_timeout, outcome.recv()).await;

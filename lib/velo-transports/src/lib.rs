@@ -74,8 +74,9 @@ pub use utils::interfaces::{InterfaceEndpoint, InterfaceFilter};
 
 // Re-export transport types
 pub use transport::{
-    DataStreams, HealthCheckError, InFlightGuard, MessageType, ShutdownPolicy, ShutdownState,
-    Transport, TransportAdapter, TransportError, TransportErrorHandler, make_channels,
+    DataStreams, HealthCheckError, InFlightGuard, MessageType, SendBackpressure, SendOutcome,
+    ShutdownPolicy, ShutdownState, Transport, TransportAdapter, TransportError,
+    TransportErrorHandler, make_channels,
 };
 pub use velo_observability::VeloMetrics as TransportMetrics;
 
@@ -234,6 +235,11 @@ impl VeloBackend {
     ///
     /// Returns [`VeloBackendError::InstanceNotRegistered`] if the peer has not
     /// been registered with [`register_peer`](Self::register_peer).
+    ///
+    /// The inner [`SendOutcome`] distinguishes synchronous enqueue
+    /// ([`SendOutcome::Enqueued`]) from saturated channels
+    /// ([`SendOutcome::Backpressured`]) where the caller must `.await` the
+    /// returned future to complete the send.
     pub fn send_message(
         &self,
         target: InstanceId,
@@ -241,7 +247,7 @@ impl VeloBackend {
         payload: Bytes,
         message_type: MessageType,
         on_error: Arc<dyn TransportErrorHandler>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<SendOutcome> {
         let transport = self
             .primary_transport
             .get(&target)
@@ -256,7 +262,7 @@ impl VeloBackend {
         let error_handler = instrument_transport_error_handler(metrics.cloned(), on_error);
 
         #[cfg(feature = "distributed-tracing")]
-        {
+        let send_result = {
             let span = tracing::info_span!(
                 "velo.transport.send",
                 transport = transport_name.as_str(),
@@ -264,18 +270,24 @@ impl VeloBackend {
                 bytes
             );
             let _entered = span.enter();
-            transport.send_message(target, header, payload, message_type, error_handler);
-        }
+            transport.send_message(target, header, payload, message_type, error_handler)
+        };
 
         #[cfg(not(feature = "distributed-tracing"))]
-        transport.send_message(target, header, payload, message_type, error_handler);
+        let send_result =
+            transport.send_message(target, header, payload, message_type, error_handler);
 
-        // Record AFTER successful enqueue
+        // Record the frame regardless of enqueue vs backpressure — the frame
+        // is either already on the wire-side channel or will be as soon as the
+        // caller awaits the backpressure future.
         if let Some(metrics) = metrics {
             metrics.record_frame(Direction::Outbound, message_type_label(message_type), bytes);
         }
 
-        Ok(())
+        Ok(match send_result {
+            Ok(()) => SendOutcome::Enqueued,
+            Err(bp) => SendOutcome::Backpressured(bp),
+        })
     }
 
     /// Send a message to a registered peer via a specific transport.
@@ -292,7 +304,7 @@ impl VeloBackend {
         message_type: MessageType,
         on_error: Arc<dyn TransportErrorHandler>,
         transport_key: TransportKey,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<SendOutcome> {
         let transport = self
             .primary_transport
             .get(&target)
@@ -304,13 +316,16 @@ impl VeloBackend {
             let metrics = self.transport_metrics.get(&transport_key);
 
             let error_handler = instrument_transport_error_handler(metrics.cloned(), on_error);
-            transport.send_message(target, header, payload, message_type, error_handler);
+            let send_result =
+                transport.send_message(target, header, payload, message_type, error_handler);
 
-            // Record AFTER successful enqueue
             if let Some(metrics) = metrics {
                 metrics.record_frame(Direction::Outbound, message_type_label(message_type), bytes);
             }
-            return Ok(());
+            return Ok(match send_result {
+                Ok(()) => SendOutcome::Enqueued,
+                Err(bp) => SendOutcome::Backpressured(bp),
+            });
         } else {
             // if we got here, we can unwrap because there is an entry in the alternative_transports map
             let alternative_transports = self
@@ -328,9 +343,14 @@ impl VeloBackend {
 
                     let error_handler =
                         instrument_transport_error_handler(metrics.cloned(), on_error);
-                    transport.send_message(target, header, payload, message_type, error_handler);
+                    let send_result = transport.send_message(
+                        target,
+                        header,
+                        payload,
+                        message_type,
+                        error_handler,
+                    );
 
-                    // Record AFTER successful enqueue
                     if let Some(metrics) = metrics {
                         metrics.record_frame(
                             Direction::Outbound,
@@ -338,7 +358,10 @@ impl VeloBackend {
                             bytes,
                         );
                     }
-                    return Ok(());
+                    return Ok(match send_result {
+                        Ok(()) => SendOutcome::Enqueued,
+                        Err(bp) => SendOutcome::Backpressured(bp),
+                    });
                 }
             }
         }
@@ -370,7 +393,7 @@ impl VeloBackend {
         payload: Bytes,
         message_type: MessageType,
         on_error: Arc<dyn TransportErrorHandler>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<SendOutcome> {
         let instance_id = self.try_translate_worker_id(worker_id)?;
         self.send_message(instance_id, header, payload, message_type, on_error)
     }
@@ -582,8 +605,9 @@ mod tests {
             _payload: Bytes,
             _message_type: MessageType,
             _on_error: Arc<dyn TransportErrorHandler>,
-        ) {
+        ) -> Result<(), SendBackpressure> {
             self.send_count.fetch_add(1, Ordering::Relaxed);
+            Ok(())
         }
         fn start(
             &self,

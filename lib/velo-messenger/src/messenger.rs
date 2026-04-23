@@ -438,8 +438,8 @@ mod tests {
     use std::time::Duration;
     use velo_common::{PeerInfo, TransportKey, WorkerAddress};
     use velo_transports::{
-        HealthCheckError, MessageType, Transport, TransportAdapter, TransportError,
-        TransportErrorHandler,
+        HealthCheckError, MessageType, SendBackpressure, Transport, TransportAdapter,
+        TransportError, TransportErrorHandler,
     };
 
     static TEST_TRANSPORT_REGISTRY: OnceLock<Mutex<HashMap<String, TransportAdapter>>> =
@@ -505,7 +505,7 @@ mod tests {
             payload: Bytes,
             message_type: MessageType,
             on_error: Arc<dyn TransportErrorHandler>,
-        ) {
+        ) -> Result<(), SendBackpressure> {
             let target_endpoint = match self
                 .peers
                 .lock()
@@ -516,7 +516,7 @@ mod tests {
                 Some(endpoint) => endpoint,
                 None => {
                     on_error.on_error(header, payload, "Peer not registered".to_string());
-                    return;
+                    return Ok(());
                 }
             };
 
@@ -528,7 +528,7 @@ mod tests {
 
             let Some(adapter) = maybe_adapter else {
                 on_error.on_error(header, payload, "Target transport not started".to_string());
-                return;
+                return Ok(());
             };
 
             let send_result = match message_type {
@@ -545,6 +545,7 @@ mod tests {
                 let (header, payload) = err.0;
                 on_error.on_error(header, payload, "Target receive channel closed".to_string());
             }
+            Ok(())
         }
 
         fn start(

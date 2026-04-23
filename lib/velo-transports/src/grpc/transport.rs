@@ -19,7 +19,9 @@ use tracing::{debug, error, info, warn};
 use velo_observability::{Direction, TransportRejection, VeloMetrics};
 
 use crate::tcp::TcpFrameCodec;
-use crate::transport::{HealthCheckError, ShutdownState, TransportError, TransportErrorHandler};
+use crate::transport::{
+    HealthCheckError, SendBackpressure, ShutdownState, TransportError, TransportErrorHandler,
+};
 use crate::utils::interfaces::{
     InterfaceEndpoint, InterfaceFilter, parse_endpoints, resolve_advertise_endpoints,
     select_best_endpoint,
@@ -238,7 +240,7 @@ impl Transport for GrpcTransport {
         payload: Bytes,
         message_type: MessageType,
         on_error: Arc<dyn TransportErrorHandler>,
-    ) {
+    ) -> Result<(), SendBackpressure> {
         let send_msg = SendTask {
             msg_type: message_type,
             header,
@@ -249,8 +251,15 @@ impl Transport for GrpcTransport {
         // Fast path: try to send on existing connection.
         let send_msg = match self.connections.get(&instance_id) {
             Some(handle) => match handle.tx.try_send(send_msg) {
-                Ok(()) => return,
-                Err(flume::TrySendError::Full(send_msg)) => send_msg,
+                Ok(()) => return Ok(()),
+                Err(flume::TrySendError::Full(send_msg)) => {
+                    let tx = handle.tx.clone();
+                    return Err(SendBackpressure::new(Box::pin(async move {
+                        if let Err(flume::SendError(m)) = tx.send_async(send_msg).await {
+                            m.on_error("Connection closed");
+                        }
+                    })));
+                }
                 Err(flume::TrySendError::Disconnected(send_msg)) => {
                     drop(handle);
                     self.connections
@@ -267,7 +276,7 @@ impl Transport for GrpcTransport {
             Some(rt) => rt,
             None => {
                 send_msg.on_error("Transport not started");
-                return;
+                return Ok(());
             }
         };
 
@@ -275,7 +284,7 @@ impl Transport for GrpcTransport {
             Ok(h) => h,
             Err(e) => {
                 send_msg.on_error(format!("Failed to create connection: {}", e));
-                return;
+                return Ok(());
             }
         };
 
@@ -284,6 +293,7 @@ impl Transport for GrpcTransport {
                 send_msg.on_error("Connection closed");
             }
         });
+        Ok(())
     }
 
     fn start(
@@ -906,13 +916,15 @@ mod tests {
             .unwrap();
 
         let error_handler = Arc::new(TrackingErrorHandler::new());
-        transport.send_message(
-            crate::InstanceId::new_v4(),
-            Bytes::from_static(b"header"),
-            Bytes::from_static(b"payload"),
-            MessageType::Message,
-            error_handler.clone(),
-        );
+        transport
+            .send_message(
+                crate::InstanceId::new_v4(),
+                Bytes::from_static(b"header"),
+                Bytes::from_static(b"payload"),
+                MessageType::Message,
+                error_handler.clone(),
+            )
+            .expect("send returns Ok and reports via on_error");
 
         assert_eq!(error_handler.error_count(), 1);
     }

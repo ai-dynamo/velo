@@ -147,7 +147,9 @@ impl<T: Transport> TestTransportHandle<T> {
         Ok(())
     }
 
-    /// Send a message to a peer
+    /// Send a message to a peer. Any `SendBackpressure` returned by the
+    /// transport is driven to completion transparently by spawning it
+    /// (tests assume a non-saturated channel).
     pub fn send(
         &self,
         target: InstanceId,
@@ -155,13 +157,15 @@ impl<T: Transport> TestTransportHandle<T> {
         payload: Vec<u8>,
         msg_type: MessageType,
     ) {
-        self.transport.send_message(
+        if let Err(bp) = self.transport.send_message(
             target,
             Bytes::from(header),
             Bytes::from(payload),
             msg_type,
             self.error_handler.clone(),
-        );
+        ) {
+            tokio::spawn(bp);
+        }
     }
 
     /// Receive a message with timeout

@@ -16,7 +16,9 @@ use std::time::Duration;
 use tracing::{debug, error, info};
 use velo_observability::VeloMetrics;
 
-use crate::transport::{HealthCheckError, ShutdownState, TransportError, TransportErrorHandler};
+use crate::transport::{
+    HealthCheckError, SendBackpressure, ShutdownState, TransportError, TransportErrorHandler,
+};
 use crate::{MessageType, PeerInfo, Transport, TransportAdapter, TransportKey, WorkerAddress};
 
 use super::listener;
@@ -153,7 +155,7 @@ impl Transport for ZmqTransport {
         payload: Bytes,
         message_type: MessageType,
         on_error: Arc<dyn TransportErrorHandler>,
-    ) {
+    ) -> Result<(), SendBackpressure> {
         let task = OutboundTask {
             target: instance_id,
             msg_type: message_type,
@@ -167,33 +169,30 @@ impl Transport for ZmqTransport {
             Some(tx) => tx,
             None => {
                 task.on_error("Transport not started");
-                return;
+                return Ok(());
             }
         };
 
         // Fast path: non-blocking try_send
         let cmd = SenderCommand::Send(task);
         match tx.try_send(cmd) {
-            Ok(()) => {}
+            Ok(()) => Ok(()),
             Err(flume::TrySendError::Full(cmd)) => {
-                // Slow path: async backpressure
+                // Surface backpressure to the caller via an awaitable future.
                 let tx = tx.clone();
-                if let Some(rt) = self.runtime.get() {
-                    rt.spawn(async move {
-                        if let Err(flume::SendError(SenderCommand::Send(task))) =
-                            tx.send_async(cmd).await
-                        {
-                            task.on_error("Sender channel closed");
-                        }
-                    });
-                } else if let SenderCommand::Send(task) = cmd {
-                    task.on_error("Transport not started");
-                }
+                Err(SendBackpressure::new(Box::pin(async move {
+                    if let Err(flume::SendError(SenderCommand::Send(task))) =
+                        tx.send_async(cmd).await
+                    {
+                        task.on_error("Sender channel closed");
+                    }
+                })))
             }
             Err(flume::TrySendError::Disconnected(SenderCommand::Send(task))) => {
                 task.on_error("Sender thread exited");
+                Ok(())
             }
-            Err(flume::TrySendError::Disconnected(SenderCommand::Shutdown)) => {}
+            Err(flume::TrySendError::Disconnected(SenderCommand::Shutdown)) => Ok(()),
         }
     }
 

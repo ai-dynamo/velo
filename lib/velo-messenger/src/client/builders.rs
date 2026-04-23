@@ -18,6 +18,7 @@ use super::ActiveMessageClient;
 use crate::common::{ActiveMessage, MessageMetadata};
 use velo_common::{InstanceId, WorkerId};
 use velo_observability::ClientResolution;
+use velo_transports::{SendBackpressure, SendOutcome};
 
 /// Fire-and-forget builder.
 pub struct AmSendBuilder {
@@ -261,8 +262,14 @@ impl From<ResolveError> for anyhow::Error {
     }
 }
 
-/// Result wrapper for sync operations (acknowledgment only)
+/// Result wrapper for sync operations (acknowledgment only).
+///
+/// If the transport reports `SendOutcome::Backpressured` at send time, the
+/// `bp` future is driven to completion *before* the response awaiter is
+/// polled. Backpressure is transparent to callers — they still just `.await`
+/// the result.
 pub struct SyncResult {
+    bp: Option<SendBackpressure>,
     awaiter: Option<crate::common::responses::ResponseAwaiter>,
     immediate_error: Option<anyhow::Error>,
 }
@@ -270,6 +277,18 @@ pub struct SyncResult {
 impl SyncResult {
     fn new(awaiter: crate::common::responses::ResponseAwaiter) -> Self {
         Self {
+            bp: None,
+            awaiter: Some(awaiter),
+            immediate_error: None,
+        }
+    }
+
+    fn with_bp(
+        awaiter: crate::common::responses::ResponseAwaiter,
+        bp: Option<SendBackpressure>,
+    ) -> Self {
+        Self {
+            bp,
             awaiter: Some(awaiter),
             immediate_error: None,
         }
@@ -277,6 +296,7 @@ impl SyncResult {
 
     fn error(err: anyhow::Error) -> Self {
         Self {
+            bp: None,
             awaiter: None,
             immediate_error: Some(err),
         }
@@ -289,6 +309,17 @@ impl Future for SyncResult {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if let Some(err) = self.immediate_error.take() {
             return Poll::Ready(Err(err));
+        }
+
+        // Drive the backpressure future to completion first so the send is
+        // actually enqueued before we wait for a response.
+        if let Some(bp) = self.bp.as_mut() {
+            match Pin::new(bp).poll(cx) {
+                Poll::Ready(()) => {
+                    self.bp = None;
+                }
+                Poll::Pending => return Poll::Pending,
+            }
         }
 
         let awaiter = self
@@ -309,8 +340,11 @@ impl Future for SyncResult {
     }
 }
 
-/// Result wrapper for unary operations returning raw bytes
+/// Result wrapper for unary operations returning raw bytes.
+///
+/// Transparent send-side backpressure: see [`SyncResult`].
 pub struct UnaryResult {
+    bp: Option<SendBackpressure>,
     awaiter: Option<crate::common::responses::ResponseAwaiter>,
     immediate_error: Option<anyhow::Error>,
 }
@@ -318,6 +352,18 @@ pub struct UnaryResult {
 impl UnaryResult {
     fn new(awaiter: crate::common::responses::ResponseAwaiter) -> Self {
         Self {
+            bp: None,
+            awaiter: Some(awaiter),
+            immediate_error: None,
+        }
+    }
+
+    fn with_bp(
+        awaiter: crate::common::responses::ResponseAwaiter,
+        bp: Option<SendBackpressure>,
+    ) -> Self {
+        Self {
+            bp,
             awaiter: Some(awaiter),
             immediate_error: None,
         }
@@ -325,6 +371,7 @@ impl UnaryResult {
 
     fn error(err: anyhow::Error) -> Self {
         Self {
+            bp: None,
             awaiter: None,
             immediate_error: Some(err),
         }
@@ -337,6 +384,15 @@ impl Future for UnaryResult {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if let Some(err) = self.immediate_error.take() {
             return Poll::Ready(Err(err));
+        }
+
+        if let Some(bp) = self.bp.as_mut() {
+            match Pin::new(bp).poll(cx) {
+                Poll::Ready(()) => {
+                    self.bp = None;
+                }
+                Poll::Pending => return Poll::Pending,
+            }
         }
 
         let awaiter = self
@@ -358,8 +414,11 @@ impl Future for UnaryResult {
     }
 }
 
-/// Result wrapper for typed unary operations with deserialization
+/// Result wrapper for typed unary operations with deserialization.
+///
+/// Transparent send-side backpressure: see [`SyncResult`].
 pub struct TypedUnaryResult<R> {
+    bp: Option<SendBackpressure>,
     awaiter: Option<crate::common::responses::ResponseAwaiter>,
     immediate_error: Option<anyhow::Error>,
     _marker: std::marker::PhantomData<R>,
@@ -368,6 +427,19 @@ pub struct TypedUnaryResult<R> {
 impl<R> TypedUnaryResult<R> {
     fn new(awaiter: crate::common::responses::ResponseAwaiter) -> Self {
         Self {
+            bp: None,
+            awaiter: Some(awaiter),
+            immediate_error: None,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    fn with_bp(
+        awaiter: crate::common::responses::ResponseAwaiter,
+        bp: Option<SendBackpressure>,
+    ) -> Self {
+        Self {
+            bp,
             awaiter: Some(awaiter),
             immediate_error: None,
             _marker: std::marker::PhantomData,
@@ -376,6 +448,7 @@ impl<R> TypedUnaryResult<R> {
 
     fn error(err: anyhow::Error) -> Self {
         Self {
+            bp: None,
             awaiter: None,
             immediate_error: Some(err),
             _marker: std::marker::PhantomData,
@@ -387,11 +460,21 @@ impl<R: DeserializeOwned> Future for TypedUnaryResult<R> {
     type Output = Result<R>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // SAFETY: TypedUnaryResult is Unpin because ResponseAwaiter and PhantomData are both Unpin
+        // SAFETY: TypedUnaryResult is Unpin — all fields (SendBackpressure
+        // holds a BoxFuture, ResponseAwaiter, Option<Error>, PhantomData) are Unpin.
         let this = unsafe { self.get_unchecked_mut() };
 
         if let Some(err) = this.immediate_error.take() {
             return Poll::Ready(Err(err));
+        }
+
+        if let Some(bp) = this.bp.as_mut() {
+            match Pin::new(bp).poll(cx) {
+                Poll::Ready(()) => {
+                    this.bp = None;
+                }
+                Poll::Pending => return Poll::Pending,
+            }
         }
 
         let awaiter = this
@@ -442,12 +525,16 @@ async fn fire_send_after_ready(
                     metadata: MessageMetadata::new_fire(outcome.response_id(), handler, headers),
                     payload: payload.unwrap_or_default(),
                 };
-                if let Err(e) = client.send_message(target, message) {
-                    tracing::error!(
-                        target: "velo_messenger::client",
-                        error = %e,
-                        "Failed to send fire-and-forget message"
-                    );
+                match client.send_message(target, message) {
+                    Ok(SendOutcome::Enqueued) => {}
+                    Ok(SendOutcome::Backpressured(bp)) => bp.await,
+                    Err(e) => {
+                        tracing::error!(
+                            target: "velo_messenger::client",
+                            error = %e,
+                            "Failed to send fire-and-forget message"
+                        );
+                    }
                 }
             }
             Err(e) => {
@@ -585,17 +672,21 @@ impl MessageBuilder {
                 payload: payload.unwrap_or_default(),
             };
 
-            if let Err(e) = client.send_message(target, message) {
-                tracing::error!(
-                    target: "velo_messenger::client",
-                    error = %e,
-                    "Failed to send message in slow path"
-                );
-                if let Some(metrics) = client.observability.as_ref() {
-                    metrics.record_client_resolution(ClientResolution::SendError);
+            match client.send_message(target, message) {
+                Ok(SendOutcome::Enqueued) => {}
+                Ok(SendOutcome::Backpressured(bp)) => bp.await,
+                Err(e) => {
+                    tracing::error!(
+                        target: "velo_messenger::client",
+                        error = %e,
+                        "Failed to send message in slow path"
+                    );
+                    if let Some(metrics) = client.observability.as_ref() {
+                        metrics.record_client_resolution(ClientResolution::SendError);
+                    }
+                    let _ = response_manager
+                        .complete_outcome(response_id, Err(format!("Send failed: {}", e)));
                 }
-                let _ = response_manager
-                    .complete_outcome(response_id, Err(format!("Send failed: {}", e)));
             }
         });
     }
@@ -658,17 +749,21 @@ impl MessageBuilder {
                 payload: payload.unwrap_or_default(),
             };
 
-            if let Err(e) = client.send_message(target, message) {
-                tracing::error!(
-                    target: "velo_messenger::client",
-                    error = %e,
-                    "Failed to send message after discovery"
-                );
-                if let Some(metrics) = client.observability.as_ref() {
-                    metrics.record_client_resolution(ClientResolution::SendError);
+            match client.send_message(target, message) {
+                Ok(SendOutcome::Enqueued) => {}
+                Ok(SendOutcome::Backpressured(bp)) => bp.await,
+                Err(e) => {
+                    tracing::error!(
+                        target: "velo_messenger::client",
+                        error = %e,
+                        "Failed to send message after discovery"
+                    );
+                    if let Some(metrics) = client.observability.as_ref() {
+                        metrics.record_client_resolution(ClientResolution::SendError);
+                    }
+                    let _ = response_manager
+                        .complete_outcome(response_id, Err(format!("Send failed: {}", e)));
                 }
-                let _ = response_manager
-                    .complete_outcome(response_id, Err(format!("Send failed: {}", e)));
             }
         });
     }
@@ -692,7 +787,11 @@ impl MessageBuilder {
                     ),
                     payload: self.payload.unwrap_or_default(),
                 };
-                self.client.send_message(target, message)
+                match self.client.send_message(target, message)? {
+                    SendOutcome::Enqueued => {}
+                    SendOutcome::Backpressured(bp) => bp.await,
+                }
+                Ok(())
             }
             Ok(target) => {
                 // Slow path: spawn handshake + send
@@ -765,15 +864,20 @@ impl MessageBuilder {
                     payload: self.payload.unwrap_or_default(),
                 };
 
-                if let Err(e) = self.client.send_message(target, message) {
-                    tracing::error!(target: "velo_messenger::client", error = %e, "Failed to send message in fast path");
-                    let _ = self.client.response_manager.complete_outcome(
-                        response_id,
-                        Err(format!("Fast-path send failed: {}", e)),
-                    );
-                }
+                let bp = match self.client.send_message(target, message) {
+                    Ok(SendOutcome::Enqueued) => None,
+                    Ok(SendOutcome::Backpressured(bp)) => Some(bp),
+                    Err(e) => {
+                        tracing::error!(target: "velo_messenger::client", error = %e, "Failed to send message in fast path");
+                        let _ = self.client.response_manager.complete_outcome(
+                            response_id,
+                            Err(format!("Fast-path send failed: {}", e)),
+                        );
+                        None
+                    }
+                };
 
-                SyncResult::new(awaiter)
+                SyncResult::with_bp(awaiter, bp)
             }
             Ok(target) => {
                 self.spawn_handshake_task(target, response_id, MsgType::Sync);
@@ -823,15 +927,20 @@ impl MessageBuilder {
                     payload: self.payload.unwrap_or_default(),
                 };
 
-                if let Err(e) = self.client.send_message(target, message) {
-                    tracing::error!(target: "velo_messenger::client", error = %e, "Failed to send message in fast path");
-                    let _ = self.client.response_manager.complete_outcome(
-                        response_id,
-                        Err(format!("Fast-path send failed: {}", e)),
-                    );
-                }
+                let bp = match self.client.send_message(target, message) {
+                    Ok(SendOutcome::Enqueued) => None,
+                    Ok(SendOutcome::Backpressured(bp)) => Some(bp),
+                    Err(e) => {
+                        tracing::error!(target: "velo_messenger::client", error = %e, "Failed to send message in fast path");
+                        let _ = self.client.response_manager.complete_outcome(
+                            response_id,
+                            Err(format!("Fast-path send failed: {}", e)),
+                        );
+                        None
+                    }
+                };
 
-                UnaryResult::new(awaiter)
+                UnaryResult::with_bp(awaiter, bp)
             }
             Ok(target) => {
                 self.spawn_handshake_task(target, response_id, MsgType::Unary);
@@ -884,15 +993,20 @@ impl MessageBuilder {
                     payload: self.payload.unwrap_or_default(),
                 };
 
-                if let Err(e) = self.client.send_message(target, message) {
-                    tracing::error!(target: "velo_messenger::client", error = %e, "Failed to send message in fast path");
-                    let _ = self.client.response_manager.complete_outcome(
-                        response_id,
-                        Err(format!("Fast-path send failed: {}", e)),
-                    );
-                }
+                let bp = match self.client.send_message(target, message) {
+                    Ok(SendOutcome::Enqueued) => None,
+                    Ok(SendOutcome::Backpressured(bp)) => Some(bp),
+                    Err(e) => {
+                        tracing::error!(target: "velo_messenger::client", error = %e, "Failed to send message in fast path");
+                        let _ = self.client.response_manager.complete_outcome(
+                            response_id,
+                            Err(format!("Fast-path send failed: {}", e)),
+                        );
+                        None
+                    }
+                };
 
-                TypedUnaryResult::new(awaiter)
+                TypedUnaryResult::with_bp(awaiter, bp)
             }
             Ok(target) => {
                 self.spawn_handshake_task(target, response_id, MsgType::Unary);
