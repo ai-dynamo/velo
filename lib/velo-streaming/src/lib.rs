@@ -26,6 +26,7 @@ pub mod frame;
 #[cfg(feature = "grpc")]
 pub mod grpc_transport;
 pub mod handle;
+pub mod mpsc;
 pub mod sender;
 pub mod tcp_transport;
 pub mod transport;
@@ -33,18 +34,21 @@ pub(crate) mod util;
 pub mod velo_transport;
 
 pub use anchor::{
-    AnchorManager, AnchorManagerBuilder, AttachError, StreamAnchor, StreamController,
+    AnchorConfig, AnchorManager, AnchorManagerBuilder, AttachError, StreamAnchor, StreamController,
 };
 pub use control::{
     AnchorAttachRequest, AnchorAttachResponse, AnchorCancelRequest, AnchorDetachRequest,
-    AnchorFinalizeRequest, SenderEntry, SenderRegistry, StreamCancelHandle, StreamCancelRequest,
-    create_anchor_attach_handler, create_anchor_cancel_handler, create_anchor_detach_handler,
-    create_anchor_finalize_handler, create_stream_cancel_handler,
+    AnchorFinalizeRequest, DETECTION_MULTIPLIER, SenderEntry, SenderRegistry, StreamCancelHandle,
+    StreamCancelRequest, create_anchor_attach_handler, create_anchor_cancel_handler,
+    create_anchor_detach_handler, create_anchor_finalize_handler, create_stream_cancel_handler,
 };
 pub use frame::{SendError, StreamError, StreamFrame};
 #[cfg(feature = "grpc")]
 pub use grpc_transport::GrpcFrameTransport;
-pub use handle::StreamAnchorHandle;
+pub use handle::{AnchorKind, MPSC_STREAM_BIT, StreamAnchorHandle};
+pub use mpsc::{
+    MpscAnchorConfig, MpscFrame, MpscStreamAnchor, MpscStreamController, MpscStreamSender, SenderId,
+};
 pub use sender::StreamSender;
 pub use tcp_transport::TcpFrameTransport;
 pub use transport::FrameTransport;

@@ -3,7 +3,7 @@
 
 [package]
 name = "velo-streaming"
-version = "0.1.0"
+version = "0.3.0"
 edition.workspace = true
 description = "Typed exclusive-attachment streaming abstraction over the velo transport"
 authors.workspace = true
@@ -52,6 +52,10 @@ velo-transports = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+flume = { workspace = true }
 
 [build-dependencies]
 tonic-build = "0.13.1"

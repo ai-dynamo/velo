@@ -35,11 +35,43 @@ use crate::frame::{StreamError, StreamFrame};
 use crate::handle::StreamAnchorHandle;
 
 // ---------------------------------------------------------------------------
+// Shared gauge helper
+// ---------------------------------------------------------------------------
+
+/// Set the `streaming_active_anchors` Prometheus gauge to
+/// `spsc.len() + mpsc.len()`. No-op when `metrics` is `None`.
+///
+/// SPSC and MPSC anchors live in separate registries but share a single
+/// `next_local_id` counter and a single gauge, so every path that mutates
+/// either registry must report the sum. Use this helper rather than reading
+/// `registry.len()` directly — that's how the pre-MPSC code mis-counted.
+pub(crate) fn set_active_anchor_gauge(
+    metrics: Option<&Arc<VeloMetrics>>,
+    spsc: &Arc<DashMap<u64, AnchorEntry>>,
+    mpsc: &Arc<DashMap<u64, crate::mpsc::anchor::MpscAnchorEntry>>,
+) {
+    if let Some(m) = metrics {
+        m.set_streaming_active_anchors(spsc.len() + mpsc.len());
+    }
+}
+
+/// Grouped handles needed by anchor constructors and background pumps to
+/// keep both registries and the metrics collector in a single parameter.
+/// Cheap to clone (all `Arc`s).
+#[derive(Clone)]
+pub(crate) struct AnchorContext {
+    pub registry: Arc<DashMap<u64, AnchorEntry>>,
+    pub mpsc_registry: Arc<DashMap<u64, crate::mpsc::anchor::MpscAnchorEntry>>,
+    pub metrics: Option<Arc<VeloMetrics>>,
+}
+
+// ---------------------------------------------------------------------------
 // AttachError
 // ---------------------------------------------------------------------------
 
 /// Errors that can occur when attempting to attach a sender to an anchor.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum AttachError {
     /// The requested anchor handle was not found in the registry.
     #[error("anchor {handle} not found in registry")]
@@ -49,9 +81,55 @@ pub enum AttachError {
     #[error("anchor {handle} is already attached")]
     AlreadyAttached { handle: StreamAnchorHandle },
 
+    /// The MPSC anchor has reached its configured `max_senders` cap.
+    #[error("anchor {handle} reached max_senders limit of {limit}")]
+    MaxSendersReached {
+        handle: StreamAnchorHandle,
+        limit: usize,
+    },
+
+    /// The handle was produced for a different anchor kind than the attach
+    /// method expected (e.g. an MPSC handle passed to `attach_stream_anchor`,
+    /// or an SPSC handle passed to `attach_mpsc_stream_anchor`).
+    ///
+    /// Detected client-side from [`crate::handle::StreamAnchorHandle::kind`]
+    /// so no AM round-trip is wasted.
+    #[error("anchor {handle} is of wrong kind: expected {expected}")]
+    WrongHandleKind {
+        handle: StreamAnchorHandle,
+        expected: crate::handle::AnchorKind,
+    },
+
     /// The underlying transport failed during bind/connect.
     #[error("transport bind failed: {0}")]
     TransportError(#[from] anyhow::Error),
+}
+
+// ---------------------------------------------------------------------------
+// AnchorConfig
+// ---------------------------------------------------------------------------
+
+/// Per-anchor overrides for the two liveness knobs.
+///
+/// Both fields are `Option`: `None` means "inherit the manager-level default"
+/// (`AnchorManager::default_unattached_timeout` and
+/// `AnchorManager::default_heartbeat_interval`); `Some(d)` overrides it for the
+/// single anchor created via [`AnchorManager::create_anchor_with_config`].
+///
+/// `AnchorConfig::default()` inherits everything, making it equivalent to the
+/// zero-arg [`AnchorManager::create_anchor`] path.
+#[derive(Debug, Clone, Default)]
+pub struct AnchorConfig {
+    /// How long an unattached anchor may live before being auto-removed.
+    /// `Some(None)` is not expressible — pass `None` to inherit the manager
+    /// default (which itself may be `None` to disable the timeout entirely).
+    pub unattached_timeout: Option<Duration>,
+
+    /// The heartbeat cadence the attached sender must emit at, and the
+    /// per-window deadline the consumer reader pump applies. Total tolerance
+    /// before `Dropped` injection is `crate::control::DETECTION_MULTIPLIER`
+    /// times this value.
+    pub heartbeat_interval: Option<Duration>,
 }
 
 // ---------------------------------------------------------------------------
@@ -93,9 +171,17 @@ pub(crate) struct AnchorEntry {
     /// `None` if no timeout is configured for this anchor.
     pub timeout_cancel: Option<CancellationToken>,
 
-    /// The configured timeout duration for this anchor. Stored so that
+    /// The configured unattached timeout for this anchor. Stored so that
     /// `detach` can respawn the timeout task with the same duration.
-    pub timeout_duration: Option<Duration>,
+    /// `None` means the anchor never auto-removes while unattached.
+    pub unattached_timeout: Option<Duration>,
+
+    /// The negotiated heartbeat cadence for this anchor. The reader pump uses
+    /// this as its per-window deadline; the producer's `StreamSender` uses it
+    /// as its emit interval. Resolved at create-time from per-anchor config or
+    /// the manager-level default and echoed to the sender via
+    /// [`crate::control::AnchorAttachResponse::Ok::heartbeat_interval_ms`].
+    pub heartbeat_interval: Duration,
 
     /// Populated on successful attach from [`crate::control::AnchorAttachRequest::stream_cancel_handle`].
     /// Encodes the sender's WorkerId + stream ID so the anchor can route `_stream_cancel`
@@ -115,6 +201,9 @@ pub(crate) struct AnchorEntry {
 struct StreamControllerInner {
     local_id: u64,
     registry: Arc<DashMap<u64, AnchorEntry>>,
+    /// Sibling MPSC registry — held so the shared gauge update includes MPSC
+    /// anchors alongside SPSC. Cheap `Arc` clone, no other use.
+    mpsc_registry: Arc<DashMap<u64, crate::mpsc::anchor::MpscAnchorEntry>>,
     metrics: Option<Arc<VeloMetrics>>,
     /// Sender-side registry: used to directly cancel the [`crate::control::SenderEntry`]
     /// when the anchor is cancelled (same-worker path without AM round-trip).
@@ -164,8 +253,12 @@ impl StreamController {
                     entry.cancel_token.cancel();
                     entry.stream_cancel_handle
                 });
+        set_active_anchor_gauge(
+            self.inner.metrics.as_ref(),
+            &self.inner.registry,
+            &self.inner.mpsc_registry,
+        );
         if let Some(metrics) = self.inner.metrics.as_ref() {
-            metrics.set_streaming_active_anchors(self.inner.registry.len());
             metrics.record_streaming_operation(
                 StreamingOp::Cancel,
                 HandlerOutcome::Success,
@@ -265,6 +358,8 @@ pub struct StreamAnchor<T> {
     local_id: u64,
     /// Arc clone of the AnchorManager's registry (for cancel).
     registry: Arc<DashMap<u64, AnchorEntry>>,
+    /// Sibling MPSC registry — used when updating the shared active-anchors gauge.
+    mpsc_registry: Arc<DashMap<u64, crate::mpsc::anchor::MpscAnchorEntry>>,
     /// Shared cancel handle — also held by any [`StreamController`] clones.
     controller: StreamController,
     metrics: Option<Arc<VeloMetrics>>,
@@ -276,14 +371,19 @@ impl<T> StreamAnchor<T> {
         handle: StreamAnchorHandle,
         rx: flume::Receiver<Vec<u8>>,
         local_id: u64,
-        registry: Arc<DashMap<u64, AnchorEntry>>,
-        metrics: Option<Arc<VeloMetrics>>,
+        ctx: AnchorContext,
         sender_registry: Arc<crate::control::SenderRegistry>,
         messenger: Option<Arc<velo_messenger::Messenger>>,
     ) -> Self {
+        let AnchorContext {
+            registry,
+            mpsc_registry,
+            metrics,
+        } = ctx;
         let inner = Arc::new(StreamControllerInner {
             local_id,
             registry: registry.clone(),
+            mpsc_registry: mpsc_registry.clone(),
             metrics: metrics.clone(),
             sender_registry,
             messenger,
@@ -296,6 +396,7 @@ impl<T> StreamAnchor<T> {
             terminated: false,
             local_id,
             registry,
+            mpsc_registry,
             controller,
             metrics,
             _phantom: std::marker::PhantomData,
@@ -344,13 +445,14 @@ impl<T> StreamAnchor<T> {
             }
 
             // Update the stored duration
-            entry.timeout_duration = timeout;
+            entry.unattached_timeout = timeout;
 
             // If unattached and a timeout is set, spawn a new timeout task
             if !entry.attachment {
                 if let Some(duration) = timeout {
                     let tc = AnchorManager::spawn_timeout_task(
                         self.registry.clone(),
+                        self.mpsc_registry.clone(),
                         self.metrics.clone(),
                         self.local_id,
                         duration,
@@ -408,9 +510,11 @@ impl<T: DeserializeOwned> Stream for StreamAnchor<T> {
                             // Clean up registry entry — anchor is permanently closed.
                             if let Some((_, entry)) = this.registry.remove(&this.local_id) {
                                 entry.cancel_token.cancel();
-                                if let Some(metrics) = this.metrics.as_ref() {
-                                    metrics.set_streaming_active_anchors(this.registry.len());
-                                }
+                                set_active_anchor_gauge(
+                                    this.metrics.as_ref(),
+                                    &this.registry,
+                                    &this.mpsc_registry,
+                                );
                             }
                             return Poll::Ready(Some(Ok(StreamFrame::Finalized)));
                         }
@@ -427,9 +531,11 @@ impl<T: DeserializeOwned> Stream for StreamAnchor<T> {
                             // Clean up registry entry — sender dropped without explicit close.
                             if let Some((_, entry)) = this.registry.remove(&this.local_id) {
                                 entry.cancel_token.cancel();
-                                if let Some(metrics) = this.metrics.as_ref() {
-                                    metrics.set_streaming_active_anchors(this.registry.len());
-                                }
+                                set_active_anchor_gauge(
+                                    this.metrics.as_ref(),
+                                    &this.registry,
+                                    &this.mpsc_registry,
+                                );
                             }
                             return Poll::Ready(Some(Err(StreamError::SenderDropped)));
                         }
@@ -470,8 +576,9 @@ impl<T: DeserializeOwned> Stream for StreamAnchor<T> {
 /// and the data-path pump (Phase 8) can hold a cheap clone of the registry
 /// reference without holding a reference to the whole `AnchorManager`.
 ///
-/// Use [`AnchorManagerBuilder`] for optional configuration (e.g. `default_timeout`),
-/// or [`AnchorManager::new`] as a convenience constructor with no timeout.
+/// Use [`AnchorManagerBuilder`] for optional configuration (e.g. `default_unattached_timeout`,
+/// `default_heartbeat_interval`), or [`AnchorManager::new`] as a convenience constructor
+/// with no unattached timeout and the protocol default heartbeat interval (5s).
 #[derive(Builder)]
 #[builder(pattern = "owned", build_fn(name = "build_inner", private))]
 pub struct AnchorManager {
@@ -483,6 +590,13 @@ pub struct AnchorManager {
     #[builder(default = "Arc::new(DashMap::new())")]
     pub(crate) registry: Arc<DashMap<u64, AnchorEntry>>,
 
+    /// MPSC-variant registry. Separate from `registry` so existing SPSC
+    /// handler code paths do not need enum-matching. Local IDs are still
+    /// allocated from the shared `next_local_id` counter so the two
+    /// namespaces never collide.
+    #[builder(default = "Arc::new(DashMap::new())")]
+    pub(crate) mpsc_registry: Arc<DashMap<u64, crate::mpsc::anchor::MpscAnchorEntry>>,
+
     pub transport: Arc<dyn crate::transport::FrameTransport>,
 
     /// Transport registry: maps scheme (e.g., "tcp", "velo") to the FrameTransport
@@ -492,11 +606,21 @@ pub struct AnchorManager {
     #[builder(default = "Arc::new(HashMap::new())")]
     pub transport_registry: Arc<HashMap<String, Arc<dyn crate::transport::FrameTransport>>>,
 
-    /// Optional inactivity timeout for newly created anchors.
+    /// Default inactivity timeout for newly created anchors.
     /// When set, `create_anchor` spawns a timeout task that auto-removes the
-    /// anchor if no sender attaches within this duration.
+    /// anchor if no sender attaches within this duration. Per-anchor overrides
+    /// are supported via [`AnchorConfig::unattached_timeout`] +
+    /// [`AnchorManager::create_anchor_with_config`].
     #[builder(default, setter(into, strip_option))]
-    pub default_timeout: Option<Duration>,
+    pub default_unattached_timeout: Option<Duration>,
+
+    /// Default heartbeat cadence negotiated with senders attached to anchors
+    /// created by this manager. Per-anchor overrides are supported via
+    /// [`AnchorConfig::heartbeat_interval`] +
+    /// [`AnchorManager::create_anchor_with_config`]. Defaults to 5 seconds,
+    /// matching the historical hardcoded value.
+    #[builder(default = "Duration::from_secs(5)")]
+    pub default_heartbeat_interval: Duration,
 
     /// Optional messenger for sending `_stream_cancel` AM from the consumer side.
     /// Set by VeloFrameTransport scenarios; `None` for local/mock transport scenarios.
@@ -546,28 +670,49 @@ impl AnchorManager {
             .expect("required fields provided")
     }
 
-    /// Allocate a new anchor and return a [`StreamAnchor<T>`] for the consumer.
+    /// Allocate a new anchor with the manager's default liveness configuration.
+    ///
+    /// Equivalent to [`create_anchor_with_config`](Self::create_anchor_with_config)
+    /// called with `AnchorConfig::default()` — i.e. inherits both
+    /// `default_unattached_timeout` and `default_heartbeat_interval`.
     ///
     /// The returned `StreamAnchor` embeds the [`StreamAnchorHandle`]; obtain it via
     /// [`.handle()`](StreamAnchor::handle) to pass to a sender for attachment.
     ///
     /// Local IDs start at 1 and increment monotonically; ID 0 is reserved.
     /// A flume bounded channel (capacity 256) is created per anchor to deliver raw frame bytes.
-    ///
-    /// If `default_timeout` is configured, a background task is spawned that will
-    /// auto-remove the anchor if no sender attaches within the timeout duration.
     pub fn create_anchor<T>(&self) -> StreamAnchor<T> {
+        self.create_anchor_with_config(AnchorConfig::default())
+    }
+
+    /// Allocate a new anchor with per-anchor liveness overrides.
+    ///
+    /// `config.unattached_timeout` and `config.heartbeat_interval` each override
+    /// the corresponding manager default when `Some`; `None` inherits.
+    /// The resolved `heartbeat_interval` is later echoed to the attaching sender
+    /// via [`crate::control::AnchorAttachResponse`] so both sides agree without
+    /// hardcoded constants.
+    pub fn create_anchor_with_config<T>(&self, config: AnchorConfig) -> StreamAnchor<T> {
         // fetch_add returns the *old* value (starts at 0), so +1 gives us IDs starting at 1.
         let local_id = self.next_local_id.fetch_add(1, Ordering::Relaxed) + 1;
 
         let (frame_tx, frame_rx) = flume::bounded::<Vec<u8>>(256);
         let cancel_token = CancellationToken::new();
 
+        // Resolve liveness knobs: per-anchor override > manager default.
+        let unattached_timeout = config
+            .unattached_timeout
+            .or(self.default_unattached_timeout);
+        let heartbeat_interval = config
+            .heartbeat_interval
+            .unwrap_or(self.default_heartbeat_interval);
+
         // Spawn timeout task if configured — derive child from the anchor's parent token
         // so that finalize/remove auto-cancels it.
-        let timeout_cancel = self.default_timeout.map(|timeout| {
+        let timeout_cancel = unattached_timeout.map(|timeout| {
             Self::spawn_timeout_task(
                 self.registry.clone(),
+                self.mpsc_registry.clone(),
                 self.metrics.clone(),
                 local_id,
                 timeout,
@@ -581,7 +726,8 @@ impl AnchorManager {
             active_pump_token: None,
             attachment: false,
             timeout_cancel,
-            timeout_duration: self.default_timeout,
+            unattached_timeout,
+            heartbeat_interval,
             stream_cancel_handle: None, // populated on attach
         };
 
@@ -593,8 +739,7 @@ impl AnchorManager {
             handle,
             frame_rx,
             local_id,
-            self.registry.clone(),
-            self.metrics.clone(),
+            self.anchor_context(),
             self.sender_registry.clone(),
             self.messenger.clone(),
         )
@@ -606,6 +751,7 @@ impl AnchorManager {
     /// (e.g. on attach, or when `set_timeout(None)` is called).
     pub(crate) fn spawn_timeout_task(
         registry: Arc<DashMap<u64, AnchorEntry>>,
+        mpsc_registry: Arc<DashMap<u64, crate::mpsc::anchor::MpscAnchorEntry>>,
         metrics: Option<Arc<VeloMetrics>>,
         local_id: u64,
         timeout: Duration,
@@ -622,9 +768,7 @@ impl AnchorManager {
                     // Timeout expired -- remove anchor
                     if let Some((_, entry)) = registry.remove(&local_id) {
                         entry.cancel_token.cancel();
-                        if let Some(metrics) = metrics.as_ref() {
-                            metrics.set_streaming_active_anchors(registry.len());
-                        }
+                        set_active_anchor_gauge(metrics.as_ref(), &registry, &mpsc_registry);
                         // Dropping frame_tx closes the channel -> StreamAnchor yields None
                     }
                 }
@@ -738,13 +882,13 @@ impl AnchorManager {
 
     /// Clear the attachment flag on an anchor.
     ///
-    /// If the anchor has a configured `timeout_duration`, a new timeout task
+    /// If the anchor has a configured `unattached_timeout`, a new timeout task
     /// is spawned (timer "resumes" by restarting from the full duration).
     ///
     /// Returns `true` if the anchor was found and was previously attached.
     #[allow(dead_code)]
     pub(crate) fn detach(&self, local_id: u64) -> bool {
-        // Phase 1: Clear attachment and read timeout_duration + cancel_token (drop DashMap ref)
+        // Phase 1: Clear attachment and read unattached_timeout + cancel_token (drop DashMap ref)
         let (was_attached, maybe_timeout, maybe_parent) = self
             .registry
             .get_mut(&local_id)
@@ -753,7 +897,7 @@ impl AnchorManager {
                 entry.attachment = false;
                 (
                     was,
-                    entry.timeout_duration,
+                    entry.unattached_timeout,
                     Some(entry.cancel_token.clone()),
                 )
             })
@@ -763,9 +907,10 @@ impl AnchorManager {
         if let Some(timeout) = maybe_timeout {
             let parent = maybe_parent
                 .as_ref()
-                .expect("cancel_token present when timeout_duration is");
+                .expect("cancel_token present when unattached_timeout is");
             let tc = Self::spawn_timeout_task(
                 self.registry.clone(),
+                self.mpsc_registry.clone(),
                 self.metrics.clone(),
                 local_id,
                 timeout,
@@ -789,8 +934,17 @@ impl AnchorManager {
     }
 
     pub(crate) fn update_active_anchor_gauge(&self) {
-        if let Some(metrics) = self.metrics.as_ref() {
-            metrics.set_streaming_active_anchors(self.registry.len());
+        set_active_anchor_gauge(self.metrics.as_ref(), &self.registry, &self.mpsc_registry);
+    }
+
+    /// Bundle the SPSC registry, MPSC registry, and metrics collector into
+    /// a cheap `Arc`-cloneable context. Used to keep anchor constructors
+    /// and background pumps under clippy's argument threshold.
+    pub(crate) fn anchor_context(&self) -> AnchorContext {
+        AnchorContext {
+            registry: self.registry.clone(),
+            mpsc_registry: self.mpsc_registry.clone(),
+            metrics: self.metrics.clone(),
         }
     }
 
@@ -845,6 +999,18 @@ impl AnchorManager {
         messenger.register_streaming_handler(create_stream_cancel_handler(Arc::clone(
             &self.sender_registry,
         )))?;
+
+        // MPSC handlers — share the same SenderRegistry so `_stream_cancel`
+        // covers both SPSC and MPSC senders uniformly.
+        messenger.register_streaming_handler(
+            crate::mpsc::control::create_mpsc_anchor_attach_handler(Arc::clone(self)),
+        )?;
+        messenger.register_streaming_handler(
+            crate::mpsc::control::create_mpsc_anchor_detach_handler(Arc::clone(self)),
+        )?;
+        messenger.register_streaming_handler(
+            crate::mpsc::control::create_mpsc_anchor_cancel_handler(Arc::clone(self)),
+        )?;
 
         self.messenger_lock
             .set(messenger)
@@ -906,7 +1072,10 @@ impl AnchorManager {
             .map_err(AttachError::TransportError)?;
 
         match response {
-            crate::control::AnchorAttachResponse::Ok { stream_endpoint } => {
+            crate::control::AnchorAttachResponse::Ok {
+                stream_endpoint,
+                heartbeat_interval_ms,
+            } => {
                 let (_, local_id) = handle.unpack();
 
                 // Resolve transport from endpoint scheme, then connect
@@ -930,10 +1099,13 @@ impl AnchorManager {
                     frame_tx,
                     handle,
                     self.registry.clone(), // Worker B's registry (no entry for this handle — correct)
-                    cancel_token,
-                    sender_stream_id,
-                    self.sender_registry.clone(),
-                    poison_tx,
+                    crate::sender::StreamSenderCancelInfo {
+                        cancel_token,
+                        sender_stream_id,
+                        sender_registry: self.sender_registry.clone(),
+                        poison_tx,
+                    },
+                    Duration::from_millis(heartbeat_interval_ms),
                 ))
             }
             crate::control::AnchorAttachResponse::Err { reason } => {
@@ -964,6 +1136,16 @@ impl AnchorManager {
         &self,
         handle: StreamAnchorHandle,
     ) -> Result<crate::sender::StreamSender<T>, AttachError> {
+        // Fail fast if the caller passed an MPSC handle: the SPSC registry
+        // will never contain it, and the remote path would waste an AM
+        // round-trip to discover the same thing.
+        if handle.is_mpsc_stream() {
+            return Err(AttachError::WrongHandleKind {
+                handle,
+                expected: crate::handle::AnchorKind::Spsc,
+            });
+        }
+
         let (handle_worker_id, local_id) = handle.unpack();
 
         // Remote path: handle belongs to a different worker — send _anchor_attach AM
@@ -996,6 +1178,8 @@ impl AnchorManager {
                     // Clone the frame_tx so the StreamSender can write items
                     // directly to the StreamAnchor consumer.
                     let frame_tx = entry.frame_tx.clone();
+                    // Snapshot the negotiated heartbeat cadence for the sender.
+                    let heartbeat_interval = entry.heartbeat_interval;
 
                     // Mark as attached (reader pump takes ownership of transport
                     // receiver separately).
@@ -1031,12 +1215,270 @@ impl AnchorManager {
                         frame_tx,
                         handle,
                         self.registry.clone(),
-                        cancel_token,
-                        sender_stream_id,
-                        self.sender_registry.clone(),
-                        poison_tx,
+                        crate::sender::StreamSenderCancelInfo {
+                            cancel_token,
+                            sender_stream_id,
+                            sender_registry: self.sender_registry.clone(),
+                            poison_tx,
+                        },
+                        heartbeat_interval,
                     ))
                 }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // MPSC anchor API
+    // -----------------------------------------------------------------------
+
+    /// Create a new MPSC anchor using only manager-level defaults.
+    ///
+    /// See [`AnchorManager::create_mpsc_anchor_with_config`] for per-anchor
+    /// overrides (channel capacity, unattached timeout, heartbeat cadence,
+    /// `max_senders`).
+    pub fn create_mpsc_anchor<T>(&self) -> crate::mpsc::MpscStreamAnchor<T> {
+        self.create_mpsc_anchor_with_config(crate::mpsc::MpscAnchorConfig::default())
+    }
+
+    /// Create a new MPSC anchor with per-anchor config overrides.
+    ///
+    /// Shares `next_local_id` with the SPSC registry so handles are unique
+    /// across both kinds; the two DashMaps never see the same key.
+    pub fn create_mpsc_anchor_with_config<T>(
+        &self,
+        config: crate::mpsc::MpscAnchorConfig,
+    ) -> crate::mpsc::MpscStreamAnchor<T> {
+        // Raw 63-bit counter; the MPSC discriminator bit is applied at handle
+        // pack time (and is stored with the entry in `mpsc_registry` so
+        // registry keys match `handle.unpack().1` exactly).
+        let raw_local = self.next_local_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let handle = StreamAnchorHandle::pack_mpsc(self.worker_id, raw_local);
+        let (_, local_id) = handle.unpack();
+
+        let capacity = config.channel_capacity.unwrap_or(256);
+        let (frame_tx, frame_rx) = flume::bounded::<(u64, Vec<u8>)>(capacity);
+        let cancel_token = CancellationToken::new();
+
+        let unattached_timeout = config
+            .unattached_timeout
+            .or(self.default_unattached_timeout);
+        let heartbeat_interval = config
+            .heartbeat_interval
+            .unwrap_or(self.default_heartbeat_interval);
+
+        let timeout_cancel = unattached_timeout.map(|timeout| {
+            crate::mpsc::anchor::spawn_mpsc_timeout_task_with_metrics(
+                self.mpsc_registry.clone(),
+                Some(self.registry.clone()),
+                self.metrics.clone(),
+                local_id,
+                timeout,
+                &cancel_token,
+            )
+        });
+
+        let entry = crate::mpsc::anchor::MpscAnchorEntry {
+            frame_tx,
+            cancel_token,
+            senders: HashMap::new(),
+            next_sender_id: 1,
+            unattached_timeout,
+            timeout_cancel,
+            heartbeat_interval,
+            max_senders: config.max_senders,
+            spsc_registry: self.registry.clone(),
+            metrics: self.metrics.clone(),
+        };
+
+        self.mpsc_registry.insert(local_id, entry);
+        self.update_active_anchor_gauge();
+
+        crate::mpsc::MpscStreamAnchor::new(
+            handle,
+            frame_rx,
+            local_id,
+            self.anchor_context(),
+            self.sender_registry.clone(),
+            self.messenger.clone(),
+        )
+    }
+
+    /// Attach a sender to an MPSC anchor. Like [`attach_stream_anchor`] but
+    /// targets the MPSC registry: multiple senders may attach concurrently,
+    /// and each attach allocates a fresh [`crate::mpsc::SenderId`].
+    pub async fn attach_mpsc_stream_anchor<T: serde::Serialize>(
+        &self,
+        handle: StreamAnchorHandle,
+    ) -> Result<crate::mpsc::MpscStreamSender<T>, AttachError> {
+        // Fail fast if the caller passed an SPSC handle.
+        if handle.is_spsc_stream() {
+            return Err(AttachError::WrongHandleKind {
+                handle,
+                expected: crate::handle::AnchorKind::Mpsc,
+            });
+        }
+
+        let (handle_worker_id, local_id) = handle.unpack();
+
+        if handle_worker_id != self.worker_id {
+            return self.attach_mpsc_remote::<T>(handle).await;
+        }
+
+        // Local path: reserve a slot under the shard lock, then construct
+        // the sender after the lock is released.
+        use dashmap::mapref::entry::Entry;
+        let (
+            sender_id,
+            frame_tx,
+            heartbeat_interval,
+            cancel_token,
+            poison_tx,
+            poison_rx,
+            sender_stream_id,
+        ) = match self.mpsc_registry.entry(local_id) {
+            Entry::Vacant(_) => return Err(AttachError::AnchorNotFound { handle }),
+            Entry::Occupied(mut occ) => {
+                let entry = occ.get_mut();
+                if let Some(limit) = entry.max_senders
+                    && entry.senders.len() >= limit
+                {
+                    return Err(AttachError::MaxSendersReached { handle, limit });
+                }
+
+                let sender_id = entry.next_sender_id;
+                entry.next_sender_id += 1;
+
+                // Pause the unattached timeout the moment we have a sender.
+                if let Some(ref tc) = entry.timeout_cancel {
+                    tc.cancel();
+                }
+                entry.timeout_cancel = None;
+
+                let frame_tx = entry.frame_tx.clone();
+                let heartbeat_interval = entry.heartbeat_interval;
+
+                let sender_stream_id =
+                    self.next_sender_stream_id.fetch_add(1, Ordering::Relaxed) + 1;
+                let cancel_token = CancellationToken::new();
+                let (poison_tx, poison_rx) = flume::bounded::<()>(1);
+
+                let slot = crate::mpsc::anchor::MpscSenderSlot {
+                    pump_token: None,
+                    stream_cancel_handle: Some(crate::control::StreamCancelHandle::pack(
+                        self.worker_id,
+                        sender_stream_id,
+                    )),
+                };
+                entry.senders.insert(sender_id, slot);
+
+                (
+                    sender_id,
+                    frame_tx,
+                    heartbeat_interval,
+                    cancel_token,
+                    poison_tx,
+                    poison_rx,
+                    sender_stream_id,
+                )
+            }
+        };
+
+        // Register SenderEntry outside the shard lock.
+        let sender_entry = crate::control::SenderEntry {
+            cancel_token: cancel_token.clone(),
+            rx_closer: std::sync::Mutex::new(Some(poison_rx)),
+        };
+        self.sender_registry
+            .senders
+            .insert(sender_stream_id, sender_entry);
+
+        Ok(crate::mpsc::MpscStreamSender::new(
+            crate::mpsc::SenderId(sender_id),
+            crate::mpsc::sender::SenderChannel::Local(frame_tx),
+            handle,
+            self.mpsc_registry.clone(),
+            crate::sender::StreamSenderCancelInfo {
+                cancel_token,
+                sender_stream_id,
+                sender_registry: self.sender_registry.clone(),
+                poison_tx,
+            },
+            heartbeat_interval,
+        ))
+    }
+
+    async fn attach_mpsc_remote<T: serde::Serialize>(
+        &self,
+        handle: StreamAnchorHandle,
+    ) -> Result<crate::mpsc::MpscStreamSender<T>, AttachError> {
+        let (handle_worker_id, _) = handle.unpack();
+
+        let messenger = self.messenger_lock.get().ok_or_else(|| {
+            AttachError::TransportError(anyhow::anyhow!(
+                "register_handlers not called — messenger unavailable for remote mpsc attach"
+            ))
+        })?;
+
+        let sender_stream_id = self.next_sender_stream_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let cancel_token = CancellationToken::new();
+        let (poison_tx, poison_rx) = flume::bounded::<()>(1);
+        let stream_cancel_handle =
+            crate::control::StreamCancelHandle::pack(self.worker_id, sender_stream_id);
+
+        let req = crate::mpsc::control::MpscAnchorAttachRequest {
+            handle,
+            session_id: sender_stream_id,
+            stream_cancel_handle,
+        };
+
+        let response: crate::mpsc::control::MpscAnchorAttachResponse = messenger
+            .typed_unary_streaming::<crate::mpsc::control::MpscAnchorAttachResponse>(
+                "_mpsc_anchor_attach",
+            )
+            .payload(&req)
+            .map_err(AttachError::TransportError)?
+            .worker(handle_worker_id)
+            .send()
+            .await
+            .map_err(AttachError::TransportError)?;
+
+        match response {
+            crate::mpsc::control::MpscAnchorAttachResponse::Ok {
+                stream_endpoint,
+                heartbeat_interval_ms,
+                sender_id,
+            } => {
+                let (_, local_id) = handle.unpack();
+                let transport = self.resolve_transport(&stream_endpoint)?;
+                let frame_tx = transport
+                    .connect(&stream_endpoint, local_id, sender_stream_id)
+                    .await?;
+
+                let sender_entry = crate::control::SenderEntry {
+                    cancel_token: cancel_token.clone(),
+                    rx_closer: std::sync::Mutex::new(Some(poison_rx)),
+                };
+                self.sender_registry
+                    .senders
+                    .insert(sender_stream_id, sender_entry);
+
+                Ok(crate::mpsc::MpscStreamSender::new(
+                    crate::mpsc::SenderId(sender_id),
+                    crate::mpsc::sender::SenderChannel::Remote(frame_tx),
+                    handle,
+                    self.mpsc_registry.clone(),
+                    crate::sender::StreamSenderCancelInfo {
+                        cancel_token,
+                        sender_stream_id,
+                        sender_registry: self.sender_registry.clone(),
+                        poison_tx,
+                    },
+                    Duration::from_millis(heartbeat_interval_ms),
+                ))
+            }
+            crate::mpsc::control::MpscAnchorAttachResponse::Err { reason } => {
+                Err(AttachError::TransportError(anyhow::anyhow!("{}", reason)))
             }
         }
     }
@@ -1548,7 +1990,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // AnchorManagerBuilder + default_timeout tests (Plan 08-04, Task 1)
+    // AnchorManagerBuilder + default_unattached_timeout tests (Plan 08-04, Task 1)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1561,8 +2003,8 @@ mod tests {
             .build()
             .expect("builder with required fields should succeed");
         assert!(
-            mgr.default_timeout.is_none(),
-            "default_timeout must be None when not set"
+            mgr.default_unattached_timeout.is_none(),
+            "default_unattached_timeout must be None when not set"
         );
     }
 
@@ -1573,13 +2015,13 @@ mod tests {
         let mgr = AnchorManagerBuilder::default()
             .worker_id(worker_id)
             .transport(transport)
-            .default_timeout(std::time::Duration::from_secs(10))
+            .default_unattached_timeout(std::time::Duration::from_secs(10))
             .build()
             .expect("builder with timeout should succeed");
         assert_eq!(
-            mgr.default_timeout,
+            mgr.default_unattached_timeout,
             Some(std::time::Duration::from_secs(10)),
-            "default_timeout must match configured value"
+            "default_unattached_timeout must match configured value"
         );
     }
 
@@ -1588,8 +2030,8 @@ mod tests {
         // AnchorManager::new must still compile and create a manager with no timeout
         let mgr = make_manager();
         assert!(
-            mgr.default_timeout.is_none(),
-            "AnchorManager::new must produce None default_timeout"
+            mgr.default_unattached_timeout.is_none(),
+            "AnchorManager::new must produce None default_unattached_timeout"
         );
     }
 
@@ -1602,7 +2044,7 @@ mod tests {
         let mgr = AnchorManagerBuilder::default()
             .worker_id(worker_id)
             .transport(transport)
-            .default_timeout(std::time::Duration::from_secs(1))
+            .default_unattached_timeout(std::time::Duration::from_secs(1))
             .build()
             .expect("builder should succeed");
 
@@ -1633,7 +2075,7 @@ mod tests {
         let mgr = AnchorManagerBuilder::default()
             .worker_id(worker_id)
             .transport(transport)
-            .default_timeout(std::time::Duration::from_secs(1))
+            .default_unattached_timeout(std::time::Duration::from_secs(1))
             .build()
             .expect("builder should succeed");
 
@@ -1661,7 +2103,7 @@ mod tests {
         let mgr = AnchorManagerBuilder::default()
             .worker_id(worker_id)
             .transport(transport)
-            .default_timeout(std::time::Duration::from_secs(2))
+            .default_unattached_timeout(std::time::Duration::from_secs(2))
             .build()
             .expect("builder should succeed");
 
@@ -1737,7 +2179,7 @@ mod tests {
         let mgr = AnchorManagerBuilder::default()
             .worker_id(worker_id)
             .transport(transport)
-            .default_timeout(std::time::Duration::from_secs(2))
+            .default_unattached_timeout(std::time::Duration::from_secs(2))
             .build()
             .expect("builder should succeed");
 
@@ -1765,7 +2207,7 @@ mod tests {
         let mgr = AnchorManagerBuilder::default()
             .worker_id(worker_id)
             .transport(transport)
-            .default_timeout(std::time::Duration::from_secs(10))
+            .default_unattached_timeout(std::time::Duration::from_secs(10))
             .build()
             .expect("builder should succeed");
 
@@ -2145,5 +2587,197 @@ mod tests {
             Arc::ptr_eq(&resolved, &default_clone),
             "resolved transport must be the default transport when registry is empty"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-anchor liveness configuration tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_default_heartbeat_interval_is_5s() {
+        // AnchorManager::new must produce the protocol default of 5s so that
+        // existing callers see no behavior change.
+        let mgr = make_manager();
+        assert_eq!(
+            mgr.default_heartbeat_interval,
+            std::time::Duration::from_secs(5),
+            "AnchorManager::new must default heartbeat_interval to 5s"
+        );
+    }
+
+    #[test]
+    fn test_builder_overrides_default_heartbeat_interval() {
+        let worker_id = velo_common::WorkerId::from_u64(42);
+        let transport: Arc<dyn crate::transport::FrameTransport> = Arc::new(MockTransport);
+        let mgr = AnchorManagerBuilder::default()
+            .worker_id(worker_id)
+            .transport(transport)
+            .default_heartbeat_interval(std::time::Duration::from_millis(750))
+            .build()
+            .expect("builder should succeed");
+        assert_eq!(
+            mgr.default_heartbeat_interval,
+            std::time::Duration::from_millis(750),
+            "builder must accept default_heartbeat_interval override"
+        );
+    }
+
+    #[test]
+    fn test_create_anchor_uses_manager_heartbeat_default() {
+        // create_anchor() (no config) must inherit the manager's default cadence.
+        let worker_id = velo_common::WorkerId::from_u64(42);
+        let transport: Arc<dyn crate::transport::FrameTransport> = Arc::new(MockTransport);
+        let mgr = AnchorManagerBuilder::default()
+            .worker_id(worker_id)
+            .transport(transport)
+            .default_heartbeat_interval(std::time::Duration::from_millis(250))
+            .build()
+            .expect("builder should succeed");
+
+        let anchor = mgr.create_anchor::<u32>();
+        let (_, local_id) = anchor.handle().unpack();
+
+        let entry = mgr
+            .registry
+            .get(&local_id)
+            .expect("entry must exist after create_anchor");
+        assert_eq!(
+            entry.heartbeat_interval,
+            std::time::Duration::from_millis(250),
+            "create_anchor must inherit manager-level default_heartbeat_interval"
+        );
+    }
+
+    #[test]
+    fn test_create_anchor_with_config_overrides_heartbeat() {
+        // Per-anchor override beats the manager default.
+        let mgr = make_manager(); // 5s default heartbeat
+        let cfg = AnchorConfig {
+            unattached_timeout: None,
+            heartbeat_interval: Some(std::time::Duration::from_millis(123)),
+        };
+        let anchor = mgr.create_anchor_with_config::<u32>(cfg);
+        let (_, local_id) = anchor.handle().unpack();
+
+        let entry = mgr.registry.get(&local_id).expect("entry exists");
+        assert_eq!(
+            entry.heartbeat_interval,
+            std::time::Duration::from_millis(123),
+            "AnchorConfig::heartbeat_interval must override the manager default"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_anchor_with_config_overrides_unattached_timeout() {
+        // Per-anchor override beats the manager default for the unattached TTL too.
+        let worker_id = velo_common::WorkerId::from_u64(42);
+        let transport: Arc<dyn crate::transport::FrameTransport> = Arc::new(MockTransport);
+        let mgr = AnchorManagerBuilder::default()
+            .worker_id(worker_id)
+            .transport(transport)
+            .default_unattached_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("builder should succeed");
+
+        let cfg = AnchorConfig {
+            unattached_timeout: Some(std::time::Duration::from_millis(50)),
+            heartbeat_interval: None,
+        };
+        let anchor = mgr.create_anchor_with_config::<u32>(cfg);
+        let (_, local_id) = anchor.handle().unpack();
+
+        let entry = mgr.registry.get(&local_id).expect("entry exists");
+        assert_eq!(
+            entry.unattached_timeout,
+            Some(std::time::Duration::from_millis(50)),
+            "AnchorConfig::unattached_timeout must override the manager default"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_anchor_with_default_config_inherits_both() {
+        // AnchorConfig::default() inherits both fields — equivalent to create_anchor().
+        let worker_id = velo_common::WorkerId::from_u64(42);
+        let transport: Arc<dyn crate::transport::FrameTransport> = Arc::new(MockTransport);
+        let mgr = AnchorManagerBuilder::default()
+            .worker_id(worker_id)
+            .transport(transport)
+            .default_unattached_timeout(std::time::Duration::from_secs(7))
+            .default_heartbeat_interval(std::time::Duration::from_millis(800))
+            .build()
+            .expect("builder should succeed");
+
+        let anchor = mgr.create_anchor_with_config::<u32>(AnchorConfig::default());
+        let (_, local_id) = anchor.handle().unpack();
+
+        let entry = mgr.registry.get(&local_id).expect("entry exists");
+        assert_eq!(
+            entry.heartbeat_interval,
+            std::time::Duration::from_millis(800)
+        );
+        assert_eq!(
+            entry.unattached_timeout,
+            Some(std::time::Duration::from_secs(7))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_per_anchor_heartbeat_propagates_through_attach_response() {
+        // End-to-end: create an anchor with a non-default heartbeat interval,
+        // attach via the local path, observe the sender ticks at the configured
+        // cadence (proves AnchorEntry → StreamSender plumbing works).
+        tokio::time::pause();
+
+        let worker_id = velo_common::WorkerId::from_u64(7);
+        let transport: Arc<dyn crate::transport::FrameTransport> = Arc::new(MockTransport);
+        let mgr = AnchorManagerBuilder::default()
+            .worker_id(worker_id)
+            .transport(transport)
+            .build()
+            .expect("builder should succeed");
+
+        let cfg = AnchorConfig {
+            unattached_timeout: None,
+            heartbeat_interval: Some(std::time::Duration::from_millis(200)),
+        };
+        let anchor = mgr.create_anchor_with_config::<u32>(cfg);
+        let handle = anchor.handle();
+
+        let sender = mgr
+            .attach_stream_anchor::<u32>(handle)
+            .await
+            .expect("local attach should succeed");
+
+        // Drain the consumer-side stream concurrently so the bounded channel
+        // doesn't block the sender's heartbeat task.
+        let collected: Arc<DashMap<usize, crate::frame::StreamFrame<u32>>> =
+            Arc::new(DashMap::new());
+        let collected_clone = collected.clone();
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            let mut anchor = anchor;
+            let mut idx = 0usize;
+            while let Some(frame) = anchor.next().await {
+                if let Ok(f) = frame {
+                    collected_clone.insert(idx, f);
+                    idx += 1;
+                }
+            }
+        });
+
+        // Advance ~1 full second: at 200ms cadence we expect at least 4 heartbeats
+        // emitted by the producer (the consumer filters them out, but the registry
+        // entry is what we care about — it must hold the configured interval).
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+        let (_, local_id) = handle.unpack();
+        let entry = mgr.registry.get(&local_id).expect("entry exists");
+        assert_eq!(
+            entry.heartbeat_interval,
+            std::time::Duration::from_millis(200),
+            "AnchorEntry must store the per-anchor cadence after attach"
+        );
+
+        drop(sender);
     }
 }

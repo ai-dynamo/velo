@@ -3,7 +3,7 @@
 
 [package]
 name = "velo-simulation"
-version.workspace = true
+version = "0.1.0"
 edition.workspace = true
 description = "Discrete-event simulation transport for Velo"
 authors.workspace = true
