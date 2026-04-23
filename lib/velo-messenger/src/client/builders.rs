@@ -478,6 +478,19 @@ async fn drive_send_outcome(
 ///
 /// After the frame is accepted by the wire the awaiter is simply dropped —
 /// fire-and-forget semantics mean we don't observe remote processing.
+/// Slow-path fire completion: wait for the spawned task to complete the
+/// outcome with Ok (successful enqueue) or Err (pre-wire failure), and map
+/// the result into a `Result<()>` for the caller.
+async fn finish_fire_via_awaiter(
+    mut awaiter: crate::common::responses::ResponseAwaiter,
+) -> Result<()> {
+    awaiter
+        .recv()
+        .await
+        .map(|_| ())
+        .map_err(|e| anyhow!("{}", e))
+}
+
 async fn drive_fire_send(
     send_result: Result<SendOutcome>,
     mut awaiter: crate::common::responses::ResponseAwaiter,
@@ -523,54 +536,6 @@ fn stage_from_send(
                 .response_manager
                 .complete_outcome(response_id, Err(format!("Fast-path send failed: {}", e)));
             ResponseStage::ready(awaiter)
-        }
-    }
-}
-
-/// Shared async helper for fire-and-forget: ensure peer ready, then send.
-/// Errors are logged (fire-and-forget semantics — no outcome to complete).
-async fn fire_send_after_ready(
-    client: Arc<ActiveMessageClient>,
-    target: InstanceId,
-    handler: String,
-    payload: Option<Bytes>,
-    headers: Option<HashMap<String, String>>,
-) {
-    match client.ensure_peer_ready(target, &handler).await {
-        Ok(_) => match client.register_outcome() {
-            Ok(outcome) => {
-                let response_id = outcome.response_id();
-                let message = ActiveMessage {
-                    metadata: MessageMetadata::new_fire(response_id, handler, headers),
-                    payload: payload.unwrap_or_default(),
-                };
-                // Slow path runs in a spawned task — no caller to return Err
-                // to, so log and drop.
-                if let Err(e) = drive_fire_send(client.send_message(target, message), outcome).await
-                {
-                    tracing::error!(
-                        target: "velo_messenger::client",
-                        error = %e,
-                        "Fire-and-forget send failed (slow path)"
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::error!(
-                    target: "velo_messenger::client",
-                    error = %e,
-                    "Failed to register outcome for fire-and-forget"
-                );
-            }
-        },
-        Err(e) => {
-            tracing::error!(
-                target: "velo_messenger::client",
-                error = %e,
-                handler = %handler,
-                target = %target,
-                "Failed to prepare peer for message"
-            );
         }
     }
 }
@@ -733,9 +698,9 @@ impl MessageBuilder {
                 if let Some(metrics) = self.client.observability.as_ref() {
                     metrics.record_client_resolution(ClientResolution::DirectSuccess);
                 }
-                // Fast path: send immediately. Pre-wire errors (sync send
-                // failure, or channel close during bp.await) are surfaced to
-                // the caller via the drive_fire_send Result.
+                // Fast path: send inline. Pre-wire errors (sync send failure
+                // or channel close during bp.await) are surfaced via the
+                // drive_fire_send Result; the awaiter is internal.
                 let outcome = self.client.register_outcome()?;
                 let response_id = outcome.response_id();
                 let message = ActiveMessage {
@@ -745,33 +710,48 @@ impl MessageBuilder {
                 drive_fire_send(self.client.send_message(target, message), outcome).await
             }
             Ok(target) => {
-                // Slow path: spawn handshake + send
-                let client = self.client.clone();
-                let handler = self.handler.clone();
-                let payload = self.payload.clone();
-                let headers = self.headers.clone();
-
-                tokio::spawn(fire_send_after_ready(
-                    client, target, handler, payload, headers,
-                ));
-                Ok(())
+                // Slow path: register awaiter up front, spawn
+                // discovery/handshake/send in a detached task, and wait on
+                // the awaiter. The task completes the awaiter with Ok(None)
+                // on successful enqueue or Err on any pre-wire failure.
+                // Spawning preserves cancel-safety: if the caller drops
+                // mid-wait, the frame still goes through (matching
+                // sync/unary slow-path semantics).
+                let outcome = self.client.register_outcome()?;
+                let response_id = outcome.response_id();
+                self.spawn_fire_slow_path(SlowPathKind::Handshake(target), response_id);
+                finish_fire_via_awaiter(outcome).await
             }
             Err(ResolveError::UnresolvedPeer) => {
                 let Some(worker_id) = worker_id else {
                     return Err(anyhow!("UnresolvedPeer but no worker_id set"));
                 };
+                let outcome = self.client.register_outcome()?;
+                let response_id = outcome.response_id();
+                self.spawn_fire_slow_path(SlowPathKind::Discovery(worker_id), response_id);
+                finish_fire_via_awaiter(outcome).await
+            }
+            Err(ResolveError::Other(e)) => Err(e),
+        }
+    }
 
-                // Discovery path: spawn discovery → handshake + send
-                let client = self.client.clone();
-                let handler = self.handler.clone();
-                let payload = self.payload.clone();
-                let headers = self.headers.clone();
+    fn spawn_fire_slow_path(
+        &self,
+        kind: SlowPathKind,
+        response_id: crate::common::responses::ResponseId,
+    ) {
+        let client = self.client.clone();
+        let handler = self.handler.clone();
+        let payload = self.payload.clone();
+        let headers = self.headers.clone();
 
-                tokio::spawn(async move {
+        tokio::spawn(async move {
+            // Stage 1 — resolve target.
+            let target = match kind {
+                SlowPathKind::Handshake(target) => target,
+                SlowPathKind::Discovery(worker_id) => {
                     match client.resolve_peer_via_discovery(worker_id).await {
-                        Ok(target) => {
-                            fire_send_after_ready(client, target, handler, payload, headers).await;
-                        }
+                        Ok(t) => t,
                         Err(e) => {
                             if let Some(metrics) = client.observability.as_ref() {
                                 metrics.record_client_resolution(ClientResolution::DiscoveryError);
@@ -782,13 +762,63 @@ impl MessageBuilder {
                                 worker_id = %worker_id,
                                 "Discovery failed for fire-and-forget"
                             );
+                            let _ = client.response_manager.complete_outcome(
+                                response_id,
+                                Err(format!("Discovery failed: {}", e)),
+                            );
+                            return;
                         }
                     }
-                });
-                Ok(())
+                }
+            };
+
+            // Stage 2 — handshake.
+            if let Err(e) = client.ensure_peer_ready(target, &handler).await {
+                if let Some(metrics) = client.observability.as_ref() {
+                    metrics.record_client_resolution(ClientResolution::HandshakeError);
+                }
+                tracing::error!(
+                    target: "velo_messenger::client",
+                    error = %e,
+                    "Handshake failed for fire-and-forget"
+                );
+                let _ = client
+                    .response_manager
+                    .complete_outcome(response_id, Err(format!("Handshake failed: {}", e)));
+                return;
             }
-            Err(ResolveError::Other(e)) => Err(e),
-        }
+
+            // Stage 3 — send + complete outcome.
+            let message = ActiveMessage {
+                metadata: MessageMetadata::new_fire(response_id, handler, headers),
+                payload: payload.unwrap_or_default(),
+            };
+            match client.send_message(target, message) {
+                Ok(SendOutcome::Enqueued) => {
+                    let _ = client
+                        .response_manager
+                        .complete_outcome(response_id, Ok(None));
+                }
+                Ok(SendOutcome::Backpressured(bp)) => {
+                    bp.await;
+                    // If DefaultErrorHandler already wrote Err during bp.await,
+                    // this Ok is a no-op (slot already finished).
+                    let _ = client
+                        .response_manager
+                        .complete_outcome(response_id, Ok(None));
+                }
+                Err(e) => {
+                    tracing::error!(
+                        target: "velo_messenger::client",
+                        error = %e,
+                        "Fire-and-forget send failed (slow path)"
+                    );
+                    let _ = client
+                        .response_manager
+                        .complete_outcome(response_id, Err(format!("Send failed: {}", e)));
+                }
+            }
+        });
     }
 
     /// Shared dispatch for sync/unary/typed: resolves the target, registers
@@ -1067,6 +1097,29 @@ mod tests {
             .await
             .expect_err("sync err propagates");
         assert!(err.to_string().contains("peer not registered"));
+    }
+
+    // ── finish_fire_via_awaiter (slow-path completion) ───────────────────
+
+    #[tokio::test]
+    async fn finish_fire_via_awaiter_ok_on_success_completion() {
+        let (awaiter, id, rm) = make_awaiter();
+        // Simulate the spawned slow-path task completing the outcome with
+        // Ok(None) after a successful enqueue.
+        assert!(rm.complete_outcome(id, Ok(None)));
+        assert!(finish_fire_via_awaiter(awaiter).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn finish_fire_via_awaiter_err_on_failure_completion() {
+        let (awaiter, id, rm) = make_awaiter();
+        // Simulate the spawned slow-path task completing with a discovery,
+        // handshake, or send failure.
+        assert!(rm.complete_outcome(id, Err("Handshake failed: nope".to_string())));
+        let err = finish_fire_via_awaiter(awaiter)
+            .await
+            .expect_err("err completion surfaces");
+        assert!(err.to_string().contains("Handshake failed"));
     }
 
     // ── validate_handler_name ────────────────────────────────────────────
