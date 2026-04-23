@@ -19,7 +19,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use velo_observability::VeloMetrics;
 
-use crate::transport::{HealthCheckError, ShutdownState, TransportError, TransportErrorHandler};
+use crate::transport::{
+    HealthCheckError, SendBackpressure, ShutdownState, TransportError, TransportErrorHandler,
+    try_send_or_backpressure,
+};
 use crate::{MessageType, PeerInfo, Transport, TransportAdapter, TransportKey, WorkerAddress};
 
 use super::listener::UdsListener;
@@ -195,6 +198,32 @@ impl UdsTransport {
             metrics.set_active_connections(self.connections.len());
         }
     }
+
+    /// Slow path: establish (or reuse) a connection, then enqueue via the
+    /// shared backpressure helper.
+    fn slow_path_send(
+        &self,
+        instance_id: crate::InstanceId,
+        send_msg: SendTask,
+    ) -> Result<(), SendBackpressure> {
+        if self.runtime.get().is_none() {
+            send_msg.on_error("Transport not started");
+            return Ok(());
+        }
+        let handle = match self.get_or_create_connection(instance_id) {
+            Ok(h) => h,
+            Err(e) => {
+                send_msg.on_error(format!("Failed to create connection: {}", e));
+                return Ok(());
+            }
+        };
+        try_send_or_backpressure(
+            &handle.tx,
+            send_msg,
+            |msg| msg.on_error("Connection closed immediately"),
+            |msg| msg.on_error("Connection closed"),
+        )
+    }
 }
 
 impl Transport for UdsTransport {
@@ -262,7 +291,7 @@ impl Transport for UdsTransport {
         payload: Bytes,
         message_type: MessageType,
         on_error: Arc<dyn TransportErrorHandler>,
-    ) {
+    ) -> Result<(), SendBackpressure> {
         let send_msg = SendTask {
             msg_type: message_type,
             header,
@@ -270,46 +299,28 @@ impl Transport for UdsTransport {
             on_error,
         };
 
-        // Fast path: try to send on existing connection
-        let send_msg = match self.connections.get(&instance_id) {
-            Some(handle) => match handle.tx.try_send(send_msg) {
-                Ok(()) => return,
-                Err(flume::TrySendError::Full(send_msg)) => send_msg,
-                Err(flume::TrySendError::Disconnected(send_msg)) => {
-                    // Drop the guard before mutating the map
+        // Fast path: try existing connection.
+        if let Some(handle) = self.connections.get(&instance_id) {
+            match handle.tx.try_send(send_msg) {
+                Ok(()) => return Ok(()),
+                Err(flume::TrySendError::Full(send_msg)) => {
+                    let tx = handle.tx.clone();
+                    return Err(SendBackpressure::new(Box::pin(async move {
+                        if let Err(flume::SendError(m)) = tx.send_async(send_msg).await {
+                            m.on_error("Connection closed");
+                        }
+                    })));
+                }
+                Err(flume::TrySendError::Disconnected(send_msg_out)) => {
                     drop(handle);
                     self.connections
                         .remove_if(&instance_id, |_, h| h.tx.is_disconnected());
                     self.update_connection_gauge();
-                    // Fall through to slow path to create a fresh connection
-                    send_msg
+                    return self.slow_path_send(instance_id, send_msg_out);
                 }
-            },
-            None => send_msg,
-        };
-
-        // Slow path: create new connection
-        let rt = match self.runtime.get() {
-            Some(rt) => rt,
-            None => {
-                send_msg.on_error("Transport not started");
-                return;
             }
-        };
-
-        let handle = match self.get_or_create_connection(instance_id) {
-            Ok(h) => h,
-            Err(e) => {
-                send_msg.on_error(format!("Failed to create connection: {}", e));
-                return;
-            }
-        };
-
-        rt.spawn(async move {
-            if let Err(flume::SendError(send_msg)) = handle.tx.send_async(send_msg).await {
-                send_msg.on_error("Connection closed");
-            }
-        });
+        }
+        self.slow_path_send(instance_id, send_msg)
     }
 
     fn start(
@@ -903,15 +914,20 @@ mod tests {
         // Insert a stale handle
         insert_stale_handle(&transport, iid);
 
-        // send_message should detect the stale handle and create a new one
+        // send_message should detect the stale handle and create a new one.
+        // This exercises the slow path (get_or_create_connection + try_send on
+        // a freshly-created handle) — the fresh channel has capacity so
+        // try_send succeeds; we do not expect a SendBackpressure here.
         let error_handler = Arc::new(TrackingErrorHandler::new());
-        transport.send_message(
-            iid,
-            Bytes::from_static(b"test-header"),
-            Bytes::from_static(b"test-payload"),
-            MessageType::Message,
-            error_handler.clone(),
-        );
+        transport
+            .send_message(
+                iid,
+                Bytes::from_static(b"test-header"),
+                Bytes::from_static(b"test-payload"),
+                MessageType::Message,
+                error_handler.clone(),
+            )
+            .expect("slow-path send on fresh connection should enqueue synchronously");
 
         // Accept the connection that the new writer task will establish
         let (mut stream, _) = peer_listener.accept().await.unwrap();

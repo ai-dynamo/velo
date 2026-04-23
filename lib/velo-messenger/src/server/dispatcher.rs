@@ -312,13 +312,16 @@ impl DispatcherHub {
             .get_or_init(|| Arc::new(DispatcherErrorHandler))
             .clone();
 
-        backend.send_message_to_worker(
+        let outcome = backend.send_message_to_worker(
             WorkerId::from_u64(response_id.worker_id()),
             header,
             payload,
             MessageType::Ack,
             error_handler,
         )?;
+        if let velo_transports::SendOutcome::Backpressured(bp) = outcome {
+            bp.await;
+        }
 
         Ok(())
     }

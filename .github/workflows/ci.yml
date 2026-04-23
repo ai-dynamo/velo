@@ -164,7 +164,7 @@ jobs:
     - name: Add llvm-tools component
       run: rustup component list --installed | grep -q '^llvm-tools' || rustup component add llvm-tools-preview
     - name: Generate coverage
-      run: cargo llvm-cov --all-features --workspace --codecov --output-path codecov.json
+      run: cargo llvm-cov --all-features --all-targets --workspace --codecov --output-path codecov.json
     - name: sccache stats
       if: always()
       run: /tmp/use-sccache.sh show-stats "coverage" || true

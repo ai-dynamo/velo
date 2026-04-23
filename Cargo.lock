@@ -3163,7 +3163,7 @@ dependencies = [
 
 [[package]]
 name = "velo-messenger"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bs58",
@@ -3293,7 +3293,7 @@ dependencies = [
 
 [[package]]
 name = "velo-transports"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-nats",
