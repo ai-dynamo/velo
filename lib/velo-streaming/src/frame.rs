@@ -45,6 +45,7 @@ pub enum StreamFrame<T> {
 /// transport/deserialization. The stream may or may not continue producing
 /// items after a `StreamError`, depending on the variant.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum StreamError {
     /// The sender reported a soft error via [`StreamFrame::SenderError`].
     #[error("sender error: {0}")]
@@ -62,6 +63,7 @@ pub enum StreamError {
 
 /// Errors surfaced to [`crate::sender::StreamSender`] callers when a send operation fails.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum SendError {
     /// The underlying channel is closed (receiver dropped or anchor removed).
     #[error("channel closed")]

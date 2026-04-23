@@ -3,7 +3,7 @@
 
 [package]
 name = "velo-transports"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 description.workspace = true
 authors.workspace = true

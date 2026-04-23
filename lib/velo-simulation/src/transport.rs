@@ -14,8 +14,8 @@ use futures::future::BoxFuture;
 use velo_common::{InstanceId, PeerInfo, TransportKey, WorkerAddress};
 use velo_observability::VeloMetrics;
 use velo_transports::{
-    HealthCheckError, MessageType, ShutdownState, Transport, TransportAdapter, TransportError,
-    TransportErrorHandler,
+    HealthCheckError, MessageType, SendBackpressure, ShutdownState, Transport, TransportAdapter,
+    TransportError, TransportErrorHandler,
 };
 
 use crate::fabric::SimFabric;
@@ -80,10 +80,10 @@ impl Transport for SimTransport {
         payload: Bytes,
         message_type: MessageType,
         on_error: Arc<dyn TransportErrorHandler>,
-    ) {
+    ) -> Result<(), SendBackpressure> {
         let Some(source_id) = self.instance_id.get().copied() else {
             on_error.on_error(header, payload, "SimTransport not started".into());
-            return;
+            return Ok(());
         };
 
         if !self.peers.contains_key(&instance_id) {
@@ -92,7 +92,7 @@ impl Transport for SimTransport {
                 payload,
                 format!("Peer not registered: {instance_id}"),
             );
-            return;
+            return Ok(());
         }
 
         self.fabric.enqueue(
@@ -103,6 +103,7 @@ impl Transport for SimTransport {
             message_type,
             on_error,
         );
+        Ok(())
     }
 
     fn start(

@@ -836,13 +836,16 @@ impl VeloEvents {
     async fn send_ack(&self, response_id: ResponseId) -> Result<()> {
         let header = encode_event_header(EventType::Ack(response_id, Outcome::Ok));
 
-        self.backend.send_message_to_worker(
+        let outcome = self.backend.send_message_to_worker(
             WorkerId::from_u64(response_id.worker_id()),
             header,
             Bytes::new(),
             velo_transports::MessageType::Ack,
             get_event_ack_error_handler(),
         )?;
+        if let velo_transports::SendOutcome::Backpressured(bp) = outcome {
+            bp.await;
+        }
 
         Ok(())
     }
@@ -851,13 +854,16 @@ impl VeloEvents {
         let header = encode_event_header(EventType::Ack(response_id, Outcome::Error));
         let payload = Bytes::from(error_message.into_bytes());
 
-        self.backend.send_message_to_worker(
+        let outcome = self.backend.send_message_to_worker(
             WorkerId::from_u64(response_id.worker_id()),
             header,
             payload,
             velo_transports::MessageType::Ack,
             get_event_nack_error_handler(),
         )?;
+        if let velo_transports::SendOutcome::Backpressured(bp) = outcome {
+            bp.await;
+        }
 
         Ok(())
     }

@@ -164,7 +164,7 @@ jobs:
     - name: Add llvm-tools component
       run: rustup component list --installed | grep -q '^llvm-tools' || rustup component add llvm-tools-preview
     - name: Generate coverage
-      run: cargo llvm-cov --all-features --workspace --codecov --output-path codecov.json
+      run: cargo llvm-cov --all-features --all-targets --workspace --codecov --output-path codecov.json
     - name: sccache stats
       if: always()
       run: /tmp/use-sccache.sh show-stats "coverage" || true
@@ -176,12 +176,43 @@ jobs:
       env:
         CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
+  semver:
+    name: Semver Check
+    if: github.event_name == 'pull_request'
+    runs-on: prod-velo-default-v1
+    container:
+      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.3
+    permissions:
+      contents: read
+    steps:
+    - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 #v6.0.1
+      with:
+        fetch-depth: 0
+    - name: Rust setup
+      uses: ./.github/actions/rust-setup
+    - name: sccache setup
+      uses: ./.github/actions/sccache-setup
+      with:
+        bucket: ${{ secrets.SCCACHE_S3_BUCKET }}
+    - name: Cache cargo-semver-checks binary
+      uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 #v5.0.4
+      with:
+        path: ~/.cargo/bin/cargo-semver-checks
+        key: ${{ runner.os }}-cargo-semver-checks-${{ hashFiles('scripts/check-semver.sh', 'rust-toolchain.toml') }}
+    - name: Run semver check
+      env:
+        SEMVER_SKIP: ${{ contains(github.event.pull_request.labels.*.name, 'semver:skip') }}
+      run: bash scripts/check-semver.sh
+    - name: sccache stats
+      if: always()
+      run: /tmp/use-sccache.sh show-stats "semver" || true
+
   ci-status:
     name: CI Status
     runs-on: prod-velo-default-v1
     container:
       image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.3
-    needs: [fmt, clippy, deny, test, coverage]
+    needs: [fmt, clippy, deny, test, coverage, semver]
     if: always()
     steps:
     - name: Check all jobs

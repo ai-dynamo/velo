@@ -34,8 +34,8 @@ use super::subjects;
 use crate::{
     InstanceId, MessageType, PeerInfo, TransportKey, WorkerAddress,
     transport::{
-        HealthCheckError, ShutdownState, Transport, TransportAdapter, TransportError,
-        TransportErrorHandler,
+        HealthCheckError, SendBackpressure, ShutdownState, Transport, TransportAdapter,
+        TransportError, TransportErrorHandler, try_send_or_backpressure,
     },
 };
 
@@ -138,7 +138,7 @@ impl Transport for NatsTransport {
         payload: Bytes,
         message_type: MessageType,
         on_error: Arc<dyn TransportErrorHandler>,
-    ) {
+    ) -> Result<(), SendBackpressure> {
         // Look up peer's NATS subject.
         let subject = match self.peers.get(&instance_id) {
             Some(entry) => entry.value().clone(),
@@ -148,7 +148,7 @@ impl Transport for NatsTransport {
                     payload,
                     format!("Peer not registered: {}", instance_id),
                 );
-                return;
+                return Ok(());
             }
         };
 
@@ -167,7 +167,7 @@ impl Transport for NatsTransport {
                     total_size, max, instance_id
                 ),
             );
-            return;
+            return Ok(());
         }
 
         let task = NatsSendTask {
@@ -187,39 +187,25 @@ impl Transport for NatsTransport {
                     task.payload,
                     "NATS transport not started".into(),
                 );
-                return;
+                return Ok(());
             }
         };
 
-        // Fast path: non-blocking try_send (matches ZMQ transport pattern).
-        match tx.try_send(task) {
-            Ok(()) => {}
-            Err(flume::TrySendError::Full(task)) => {
-                // Slow path: async backpressure.
-                let tx = tx.clone();
-                if let Some(rt) = self.runtime.get() {
-                    rt.spawn(async move {
-                        if let Err(flume::SendError(task)) = tx.send_async(task).await {
-                            task.on_error.on_error(
-                                task.header,
-                                task.payload,
-                                "NATS sender task exited (backpressure)".into(),
-                            );
-                        }
-                    });
-                } else {
-                    task.on_error.on_error(
-                        task.header,
-                        task.payload,
-                        "NATS transport not started".into(),
-                    );
-                }
-            }
-            Err(flume::TrySendError::Disconnected(task)) => {
+        try_send_or_backpressure(
+            tx,
+            task,
+            |task| {
                 task.on_error
                     .on_error(task.header, task.payload, "NATS sender task exited".into());
-            }
-        }
+            },
+            |task| {
+                task.on_error.on_error(
+                    task.header,
+                    task.payload,
+                    "NATS sender task exited (backpressure)".into(),
+                );
+            },
+        )
     }
 
     fn start(
