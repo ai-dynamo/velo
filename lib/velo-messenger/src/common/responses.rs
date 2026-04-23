@@ -813,6 +813,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deferred_send_failure_completes_awaiter_via_header_decode() {
+        // Simulates what DefaultErrorHandler does: a deferred send failed
+        // after the transport accepted the frame, and the handler decodes
+        // the response_id out of the request header it was given and
+        // completes the awaiter with an error. The caller's .recv() must
+        // resolve immediately with Err(...) instead of hanging.
+        use super::super::messages::{
+            ActiveMessage, MessageMetadata, decode_response_id_from_request_header,
+        };
+
+        let worker_id = 7;
+        let manager = ResponseManager::new(worker_id);
+        let mut awaiter = manager.register_outcome().expect("allocate slot");
+        let response_id = awaiter.response_id();
+
+        let (header, _payload, _mt) = ActiveMessage {
+            metadata: MessageMetadata::new_unary(response_id, "any_handler".to_string(), None),
+            payload: Bytes::from_static(b""),
+        }
+        .encode()
+        .expect("encode");
+
+        let decoded = decode_response_id_from_request_header(&header).expect("decode id");
+        assert_eq!(decoded.as_u128(), response_id.as_u128());
+
+        assert!(manager.complete_outcome(decoded, Err("peer disconnected".to_string())));
+
+        let err = awaiter.recv().await.expect_err("should be Err");
+        assert_eq!(err, "peer disconnected");
+    }
+
+    #[tokio::test]
+    async fn malformed_header_does_not_spuriously_complete_awaiter() {
+        use super::super::messages::decode_response_id_from_request_header;
+
+        let worker_id = 7;
+        let manager = ResponseManager::new(worker_id);
+        let _awaiter = manager.register_outcome().expect("allocate slot");
+
+        // Truncated header
+        let short = Bytes::from_static(&[1u8, 2, 3]);
+        assert!(decode_response_id_from_request_header(&short).is_none());
+
+        // Valid-looking header but wrong worker_id encoded in the id — even
+        // if decode succeeds, complete_outcome must refuse to complete any
+        // awaiter on this manager.
+        let bogus_id = ResponseId::from_u128(0u128);
+        assert!(!manager.complete_outcome(bogus_id, Err("x".to_string())));
+    }
+
+    #[tokio::test]
     async fn drop_recycles_slot() {
         let worker_id = 42;
         let manager = ResponseManager::new(worker_id);

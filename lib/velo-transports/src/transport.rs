@@ -197,6 +197,20 @@ pub enum ShutdownPolicy {
 ///   `send_response_*`) always `.await` the future so this case does not arise
 ///   in normal request/response flows.
 ///
+/// ### Awaiter completion on deferred-send failure
+///
+/// If a deferred send fails *after* the frame was accepted by the transport
+/// (channel closes between hand-off and wire, peer disconnects mid-write),
+/// the transport invokes its `TransportErrorHandler::on_error(header, payload,
+/// reason)` callback. The default messenger handler decodes the request
+/// header's response id and completes the corresponding awaiter on
+/// `ResponseManager` with the error, so sync/unary callers unblock
+/// immediately rather than waiting for their own timeout to fire.
+///
+/// Custom `TransportErrorHandler` implementations are responsible for
+/// completing any awaiter they care about; the trait itself does not enforce
+/// this contract.
+///
 /// Reordering: concurrent callers where one hits `Backpressured` and another
 /// fast-paths through `try_send` may land out of order at the remote. Callers
 /// that require strict FIFO must serialize their sends.
