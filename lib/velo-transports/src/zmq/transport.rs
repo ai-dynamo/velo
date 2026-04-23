@@ -174,7 +174,7 @@ impl Transport for ZmqTransport {
             }
         };
 
-        try_send_or_backpressure(
+        let r = try_send_or_backpressure(
             tx,
             SenderCommand::Send(task),
             |cmd| match cmd {
@@ -186,7 +186,11 @@ impl Transport for ZmqTransport {
                     task.on_error("Sender channel closed");
                 }
             },
-        )
+        );
+        if let Some(m) = self.metrics.get() {
+            m.record_send_backpressure_on(&r);
+        }
+        r
     }
 
     fn start(

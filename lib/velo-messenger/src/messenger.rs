@@ -726,4 +726,82 @@ mod tests {
             "expected _event_subscribe to be available immediately after startup"
         );
     }
+
+    /// Exercise the `.await_capacity()` chain on each public builder
+    /// (AmSend, AmSync, Unary, TypedUnary). Each delegation is a one-line
+    /// pass-through to `MessageBuilder::await_capacity`; this test pins that
+    /// every delegation compiles and returns the expected type so the
+    /// coverage gate observes those lines. Actually saturating the arena is
+    /// exercised in the `common::responses` unit tests.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_await_capacity_chains_through_all_public_builders() {
+        let messenger = Messenger::builder().build().await.unwrap();
+
+        let _ = messenger
+            .am_send("fan_out")
+            .unwrap()
+            .await_capacity()
+            .raw_payload(bytes::Bytes::from_static(b"x"));
+        let _ = messenger
+            .am_sync("fan_out")
+            .unwrap()
+            .await_capacity()
+            .raw_payload(bytes::Bytes::from_static(b"x"));
+        let _ = messenger
+            .unary("fan_out")
+            .unwrap()
+            .await_capacity()
+            .raw_payload(bytes::Bytes::from_static(b"x"));
+        let _ = messenger
+            .typed_unary::<String>("fan_out")
+            .unwrap()
+            .await_capacity()
+            .raw_payload(bytes::Bytes::from_static(b"x"));
+    }
+
+    /// Invalid target configs (`.instance()` + `.worker()` both set, or
+    /// neither) must fail immediately — even under `await_capacity`. This
+    /// pins the ordering in `make_stage_state`: resolve first, short-circuit
+    /// `ResolveError::Other` before slot acquisition. Without this, an
+    /// invalid builder under arena saturation would block on
+    /// `register_outcome_async` waiting for a slot it will immediately
+    /// recycle with an error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_await_capacity_misuse_fails_without_waiting_for_slot() {
+        let messenger = Messenger::builder().build().await.unwrap();
+
+        // Case 1: no target set.
+        let res = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            messenger
+                .am_sync("fan_out")
+                .unwrap()
+                .await_capacity()
+                .send(),
+        )
+        .await
+        .expect("missing target must resolve immediately");
+        assert!(
+            res.is_err(),
+            "missing target should produce an immediate error"
+        );
+
+        // Case 2: both .instance() and .worker() set.
+        let res = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            messenger
+                .unary("fan_out")
+                .unwrap()
+                .await_capacity()
+                .instance(velo_common::InstanceId::new_v4())
+                .worker(velo_common::WorkerId::from_u64(1))
+                .send(),
+        )
+        .await
+        .expect("mutually-exclusive target must resolve immediately");
+        assert!(
+            res.is_err(),
+            "mutually-exclusive target should produce an immediate error"
+        );
+    }
 }

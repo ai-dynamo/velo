@@ -68,6 +68,14 @@ impl AmSendBuilder {
         self
     }
 
+    /// Await a free response slot if the arena is at capacity (default:
+    /// fail fast with `ResponseRegistrationError::Exhausted`). See
+    /// [`MessageBuilder::await_capacity`] for rationale.
+    pub fn await_capacity(mut self) -> Self {
+        self.inner = self.inner.await_capacity();
+        self
+    }
+
     pub fn send(self) -> impl Future<Output = Result<()>> {
         self.inner.fire()
     }
@@ -111,6 +119,13 @@ impl AmSyncBuilder {
 
     pub fn headers(mut self, headers: HashMap<String, String>) -> Self {
         self.inner = self.inner.headers(headers);
+        self
+    }
+
+    /// Await a free response slot if the arena is at capacity (default:
+    /// fail fast with `ResponseRegistrationError::Exhausted`).
+    pub fn await_capacity(mut self) -> Self {
+        self.inner = self.inner.await_capacity();
         self
     }
 
@@ -163,6 +178,13 @@ impl UnaryBuilder {
 
     pub fn headers(mut self, headers: HashMap<String, String>) -> Self {
         self.inner = self.inner.headers(headers);
+        self
+    }
+
+    /// Await a free response slot if the arena is at capacity (default:
+    /// fail fast with `ResponseRegistrationError::Exhausted`).
+    pub fn await_capacity(mut self) -> Self {
+        self.inner = self.inner.await_capacity();
         self
     }
 
@@ -228,6 +250,13 @@ where
         self
     }
 
+    /// Await a free response slot if the arena is at capacity (default:
+    /// fail fast with `ResponseRegistrationError::Exhausted`).
+    pub fn await_capacity(mut self) -> Self {
+        self.inner = self.inner.await_capacity();
+        self
+    }
+
     pub fn send(self) -> TypedUnaryResult<R> {
         self.inner.typed()
     }
@@ -283,6 +312,42 @@ struct ResponseStage {
     bp: Option<SendBackpressure>,
     awaiter: Option<crate::common::responses::ResponseAwaiter>,
     immediate_error: Option<anyhow::Error>,
+}
+
+/// Two-phase state for builder result futures.
+///
+/// In the fail-fast path the stage is constructed eagerly and stored as
+/// `Ready`. In the `await_capacity` path slot acquisition is deferred into
+/// a boxed future (`Pending`); the first poll drives it to completion,
+/// produces a `ResponseStage`, and transitions to `Ready` for the rest of
+/// the bp-then-response sequence. Collapsing both modes into one state
+/// machine lets the public result types stay the same shape regardless of
+/// acquisition policy.
+enum StageState {
+    Ready(ResponseStage),
+    Pending(futures::future::BoxFuture<'static, ResponseStage>),
+}
+
+impl StageState {
+    fn ready(stage: ResponseStage) -> Self {
+        StageState::Ready(stage)
+    }
+
+    fn error(err: anyhow::Error) -> Self {
+        StageState::Ready(ResponseStage::error(err))
+    }
+
+    fn poll_raw(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<Bytes>>> {
+        loop {
+            match self {
+                StageState::Pending(fut) => match fut.as_mut().poll(cx) {
+                    Poll::Ready(stage) => *self = StageState::Ready(stage),
+                    Poll::Pending => return Poll::Pending,
+                },
+                StageState::Ready(stage) => return stage.poll_raw(cx),
+            }
+        }
+    }
 }
 
 impl ResponseStage {
@@ -346,15 +411,7 @@ impl ResponseStage {
 ///
 /// Send-side backpressure is transparent — callers just `.await` the result.
 pub struct SyncResult {
-    stage: ResponseStage,
-}
-
-impl SyncResult {
-    fn error(err: anyhow::Error) -> Self {
-        Self {
-            stage: ResponseStage::error(err),
-        }
-    }
+    stage: StageState,
 }
 
 impl Future for SyncResult {
@@ -367,15 +424,7 @@ impl Future for SyncResult {
 
 /// Result wrapper for unary operations returning raw bytes.
 pub struct UnaryResult {
-    stage: ResponseStage,
-}
-
-impl UnaryResult {
-    fn error(err: anyhow::Error) -> Self {
-        Self {
-            stage: ResponseStage::error(err),
-        }
-    }
+    stage: StageState,
 }
 
 impl Future for UnaryResult {
@@ -390,17 +439,8 @@ impl Future for UnaryResult {
 
 /// Result wrapper for typed unary operations with deserialization.
 pub struct TypedUnaryResult<R> {
-    stage: ResponseStage,
+    stage: StageState,
     _marker: std::marker::PhantomData<R>,
-}
-
-impl<R> TypedUnaryResult<R> {
-    fn error(err: anyhow::Error) -> Self {
-        Self {
-            stage: ResponseStage::error(err),
-            _marker: std::marker::PhantomData,
-        }
-    }
 }
 
 // Safe: `TypedUnaryResult` only holds `ResponseStage` (Unpin) and
@@ -429,6 +469,11 @@ pub struct MessageBuilder {
     target_instance: Option<InstanceId>,
     target_worker: Option<WorkerId>,
     headers: Option<HashMap<String, String>>,
+    // When set, slot acquisition awaits capacity instead of failing fast
+    // with `ResponseRegistrationError::Exhausted`. Mirrors the transport's
+    // `SendBackpressure` semantics: callers doing fan-out get bounded
+    // in-flight backpressure for free.
+    await_capacity: bool,
 }
 
 /// Drive a `send_message` result from inside a spawned (slow-path) task that
@@ -556,6 +601,7 @@ impl MessageBuilder {
             target_instance: None,
             target_worker: None,
             headers: None,
+            await_capacity: false,
         }
     }
 
@@ -583,6 +629,22 @@ impl MessageBuilder {
 
     pub fn headers(mut self, headers: HashMap<String, String>) -> Self {
         self.headers = Some(headers);
+        self
+    }
+
+    /// Opt into backpressure on response-slot exhaustion.
+    ///
+    /// Default: `register_outcome` fails immediately with
+    /// [`ResponseRegistrationError::Exhausted`] when the per-worker slot
+    /// arena is full. With this flag, the builder instead awaits a free slot
+    /// (matching `SendOutcome::Backpressured` ergonomics for transport-level
+    /// channel saturation).
+    ///
+    /// Use this for fan-out workloads that may legitimately exceed 64k
+    /// in-flight requests on a single worker — backpressure is preferable to
+    /// per-request error handling.
+    pub fn await_capacity(mut self) -> Self {
+        self.await_capacity = true;
         self
     }
 
@@ -695,6 +757,18 @@ impl MessageBuilder {
         let target_result = self.resolve_target();
         let worker_id = self.target_worker;
 
+        // `Other` resolution errors don't need a slot — short-circuit before
+        // any allocation.
+        let target_result = match target_result {
+            Err(ResolveError::Other(e)) => return Err(e),
+            other => other,
+        };
+
+        // Acquire per the builder's capacity policy. With `await_capacity`,
+        // wait for a free slot instead of failing fast — mirrors the
+        // SendBackpressure idiom transports already use.
+        let outcome = acquire_awaiter(&self.client, self.await_capacity).await?;
+
         match target_result {
             Ok(target) if self.client.can_send_directly(target, &self.handler) => {
                 if let Some(metrics) = self.client.observability.as_ref() {
@@ -703,7 +777,6 @@ impl MessageBuilder {
                 // Fast path: send inline. Pre-wire errors (sync send failure
                 // or channel close during bp.await) are surfaced via the
                 // drive_fire_send Result; the awaiter is internal.
-                let outcome = self.client.register_outcome()?;
                 let response_id = outcome.response_id();
                 let message = ActiveMessage {
                     metadata: MessageMetadata::new_fire(response_id, self.handler, self.headers),
@@ -712,14 +785,13 @@ impl MessageBuilder {
                 drive_fire_send(self.client.send_message(target, message), outcome).await
             }
             Ok(target) => {
-                // Slow path: register awaiter up front, spawn
+                // Slow path: awaiter already owned, spawn
                 // discovery/handshake/send in a detached task, and wait on
                 // the awaiter. The task completes the awaiter with Ok(None)
                 // on successful enqueue or Err on any pre-wire failure.
                 // Spawning preserves cancel-safety: if the caller drops
                 // mid-wait, the frame still goes through (matching
                 // sync/unary slow-path semantics).
-                let outcome = self.client.register_outcome()?;
                 let response_id = outcome.response_id();
                 self.spawn_fire_slow_path(SlowPathKind::Handshake(target), response_id);
                 finish_fire_via_awaiter(outcome).await
@@ -728,12 +800,11 @@ impl MessageBuilder {
                 let Some(worker_id) = worker_id else {
                     return Err(anyhow!("UnresolvedPeer but no worker_id set"));
                 };
-                let outcome = self.client.register_outcome()?;
                 let response_id = outcome.response_id();
                 self.spawn_fire_slow_path(SlowPathKind::Discovery(worker_id), response_id);
                 finish_fire_via_awaiter(outcome).await
             }
-            Err(ResolveError::Other(e)) => Err(e),
+            Err(ResolveError::Other(_)) => unreachable!("Other handled above"),
         }
     }
 
@@ -823,21 +894,26 @@ impl MessageBuilder {
         });
     }
 
-    /// Shared dispatch for sync/unary/typed: resolves the target, registers
-    /// the response outcome, and either sends on the fast path (returning a
-    /// `ResponseStage`) or spawns the slow path (returning a ready stage
-    /// whose awaiter will be completed by the spawned task).
-    fn dispatch(self, message_type: MsgType) -> Result<ResponseStage, anyhow::Error> {
-        let target_result = self.resolve_target();
+    /// Post-acquisition dispatch. Given a pre-resolved target and a
+    /// pre-acquired awaiter, either sends on the fast path (returning a
+    /// populated `ResponseStage`) or spawns the slow path (returning a ready
+    /// stage whose awaiter will be completed by the spawned task).
+    ///
+    /// Target resolution happens in [`MessageBuilder::make_stage_state`]
+    /// *before* slot acquisition so `ResolveError::Other` (programmer
+    /// misuse — target not set, or both `.instance()` and `.worker()` set)
+    /// fails the caller without consuming a slot or blocking on
+    /// `register_outcome_async`. This mirrors the ordering in [`fire`].
+    fn dispatch_with_awaiter(
+        self,
+        target_result: Result<InstanceId, ResolveError>,
+        awaiter: crate::common::responses::ResponseAwaiter,
+        message_type: MsgType,
+    ) -> ResponseStage {
         let worker_id = self.target_worker;
-
-        let awaiter = self
-            .client
-            .register_outcome()
-            .map_err(|e| anyhow!("Failed to register outcome: {}", e))?;
         let response_id = awaiter.response_id();
 
-        Ok(match target_result {
+        match target_result {
             Ok(target) if self.client.can_send_directly(target, &self.handler) => {
                 if let Some(metrics) = self.client.observability.as_ref() {
                     metrics.record_client_resolution(ClientResolution::DirectSuccess);
@@ -854,9 +930,12 @@ impl MessageBuilder {
                 ResponseStage::ready(awaiter)
             }
             Err(ResolveError::UnresolvedPeer) => {
+                // `resolve_target` only returns UnresolvedPeer when
+                // target_worker is Some, so this else-branch is a defensive
+                // guard — unreachable in practice.
                 let Some(worker_id) = worker_id else {
                     tracing::error!(target: "velo_messenger::client", "UnresolvedPeer but no worker_id set");
-                    return Ok(ResponseStage::ready(awaiter));
+                    return ResponseStage::ready(awaiter);
                 };
                 self.spawn_slow_path(
                     SlowPathKind::Discovery(worker_id),
@@ -865,28 +944,62 @@ impl MessageBuilder {
                 );
                 ResponseStage::ready(awaiter)
             }
-            Err(ResolveError::Other(e)) => {
-                tracing::error!(target: "velo_messenger::client", error = %e, "Target resolution failed");
-                let _ = self
-                    .client
-                    .response_manager
-                    .complete_outcome(response_id, Err(format!("Resolution failed: {}", e)));
-                ResponseStage::ready(awaiter)
+            Err(ResolveError::Other(_)) => {
+                unreachable!("ResolveError::Other is short-circuited in make_stage_state")
             }
-        })
+        }
+    }
+
+    /// Build a `StageState` according to the builder's acquisition policy.
+    ///
+    /// Target resolution runs first so `ResolveError::Other` (programmer
+    /// misuse) produces an immediate error stage and never consumes a slot.
+    /// Under `await_capacity` this is load-bearing: resolving inside the
+    /// deferred future would make the caller block on
+    /// `register_outcome_async()` under arena saturation before learning
+    /// the call can never succeed. Mirrors [`fire`]'s early return.
+    ///
+    /// - Default (fail-fast): acquire synchronously; propagate
+    ///   `ResponseRegistrationError::Exhausted` as an immediate error stage.
+    /// - `await_capacity`: defer acquisition into a boxed future that awaits
+    ///   capacity before dispatching. Mirrors the `SendOutcome::Backpressured`
+    ///   idiom transports already use.
+    fn make_stage_state(self, message_type: MsgType) -> StageState {
+        // Short-circuit programmer-misuse resolution errors before touching
+        // the slot arena. Mirrors fire()'s early return so invalid target
+        // configs never block on register_outcome_async.
+        let target_result = match self.resolve_target() {
+            Err(ResolveError::Other(e)) => return StageState::error(e),
+            other => other,
+        };
+
+        if self.await_capacity {
+            let fut = Box::pin(async move {
+                let awaiter = self.client.response_manager.register_outcome_async().await;
+                self.dispatch_with_awaiter(target_result, awaiter, message_type)
+            });
+            StageState::Pending(fut)
+        } else {
+            match self.client.register_outcome() {
+                Ok(awaiter) => StageState::ready(self.dispatch_with_awaiter(
+                    target_result,
+                    awaiter,
+                    message_type,
+                )),
+                Err(e) => StageState::error(anyhow!("Failed to register outcome: {}", e)),
+            }
+        }
     }
 
     pub fn sync(self) -> SyncResult {
-        match self.dispatch(MsgType::Sync) {
-            Ok(stage) => SyncResult { stage },
-            Err(e) => SyncResult::error(e),
+        SyncResult {
+            stage: self.make_stage_state(MsgType::Sync),
         }
     }
 
     pub fn unary(self) -> UnaryResult {
-        match self.dispatch(MsgType::Unary) {
-            Ok(stage) => UnaryResult { stage },
-            Err(e) => UnaryResult::error(e),
+        UnaryResult {
+            stage: self.make_stage_state(MsgType::Unary),
         }
     }
 
@@ -894,13 +1007,28 @@ impl MessageBuilder {
     where
         R: DeserializeOwned + Send + 'static,
     {
-        match self.dispatch(MsgType::Unary) {
-            Ok(stage) => TypedUnaryResult {
-                stage,
-                _marker: std::marker::PhantomData,
-            },
-            Err(e) => TypedUnaryResult::error(e),
+        TypedUnaryResult {
+            stage: self.make_stage_state(MsgType::Unary),
+            _marker: std::marker::PhantomData,
         }
+    }
+}
+
+/// Acquire a response awaiter, honoring `await_capacity`:
+///
+/// - `false` — fail fast; stringify `ResponseRegistrationError::Exhausted`
+///   into an `anyhow::Error` (existing behaviour).
+/// - `true` — await a free slot before returning.
+async fn acquire_awaiter(
+    client: &ActiveMessageClient,
+    await_capacity: bool,
+) -> Result<crate::common::responses::ResponseAwaiter> {
+    if await_capacity {
+        Ok(client.response_manager.register_outcome_async().await)
+    } else {
+        client
+            .register_outcome()
+            .map_err(|e| anyhow!("Failed to register outcome: {}", e))
     }
 }
 
@@ -950,7 +1078,9 @@ mod tests {
     async fn stage_ready_resolves_after_outcome_completes() {
         let (awaiter, id, rm) = make_awaiter();
         let stage = ResponseStage::ready(awaiter);
-        let mut result = SyncResult { stage };
+        let mut result = SyncResult {
+            stage: StageState::Ready(stage),
+        };
 
         // Completing the outcome lets the awaiter produce its value.
         assert!(rm.complete_outcome(id, Ok(Some(Bytes::from_static(b"ok")))));
@@ -964,7 +1094,9 @@ mod tests {
     async fn stage_with_ready_bp_proceeds_to_awaiter() {
         let (awaiter, id, rm) = make_awaiter();
         let stage = ResponseStage::with_bp(awaiter, Some(ready_bp()));
-        let mut result = UnaryResult { stage };
+        let mut result = UnaryResult {
+            stage: StageState::Ready(stage),
+        };
 
         assert!(rm.complete_outcome(id, Ok(Some(Bytes::from_static(b"hello")))));
         let r = tokio::time::timeout(std::time::Duration::from_secs(1), &mut result)
@@ -977,7 +1109,9 @@ mod tests {
     async fn stage_pending_bp_blocks_until_resolved() {
         let (awaiter, _id, _rm) = make_awaiter();
         let stage = ResponseStage::with_bp(awaiter, Some(pending_bp()));
-        let result = SyncResult { stage };
+        let result = SyncResult {
+            stage: StageState::Ready(stage),
+        };
         // Pending bp means the future itself stays pending even though the
         // response manager isn't exercised. Verify the timeout fires.
         let outcome = tokio::time::timeout(std::time::Duration::from_millis(100), result).await;
@@ -987,7 +1121,9 @@ mod tests {
     #[tokio::test]
     async fn stage_immediate_error_short_circuits() {
         let stage = ResponseStage::error(anyhow!("boom"));
-        let result = SyncResult { stage };
+        let result = SyncResult {
+            stage: StageState::Ready(stage),
+        };
         let err = result.await.expect_err("immediate_error returns Err");
         assert!(err.to_string().contains("boom"));
     }
@@ -996,7 +1132,9 @@ mod tests {
     async fn unary_result_empty_response_becomes_empty_bytes() {
         let (awaiter, id, rm) = make_awaiter();
         let stage = ResponseStage::ready(awaiter);
-        let mut result = UnaryResult { stage };
+        let mut result = UnaryResult {
+            stage: StageState::Ready(stage),
+        };
 
         assert!(rm.complete_outcome(id, Ok(None)));
         let r = tokio::time::timeout(std::time::Duration::from_secs(1), &mut result)
@@ -1011,7 +1149,7 @@ mod tests {
         let (awaiter, id, rm) = make_awaiter();
         let stage = ResponseStage::ready(awaiter);
         let mut result: TypedUnaryResult<i64> = TypedUnaryResult {
-            stage,
+            stage: StageState::Ready(stage),
             _marker: std::marker::PhantomData,
         };
 
@@ -1028,7 +1166,7 @@ mod tests {
         let (awaiter, id, rm) = make_awaiter();
         let stage = ResponseStage::ready(awaiter);
         let mut result: TypedUnaryResult<i64> = TypedUnaryResult {
-            stage,
+            stage: StageState::Ready(stage),
             _marker: std::marker::PhantomData,
         };
 
@@ -1045,7 +1183,7 @@ mod tests {
         let (awaiter, id, rm) = make_awaiter();
         let stage = ResponseStage::ready(awaiter);
         let mut result: TypedUnaryResult<i64> = TypedUnaryResult {
-            stage,
+            stage: StageState::Ready(stage),
             _marker: std::marker::PhantomData,
         };
 
@@ -1055,6 +1193,51 @@ mod tests {
             .expect("typed resolves")
             .expect_err("bad json → Err");
         assert!(err.to_string().contains("Failed to deserialize"));
+    }
+
+    // ── StageState ───────────────────────────────────────────────────────
+    //
+    // Exercises the deferred-acquisition path (`StageState::Pending`) used by
+    // `MessageBuilder::await_capacity` without requiring a full
+    // `ActiveMessageClient`. We hand-build a boxed future that yields a ready
+    // `ResponseStage` and assert the poll loop transitions Pending → Ready
+    // and surfaces the awaiter's outcome.
+
+    #[tokio::test]
+    async fn stage_state_pending_transitions_and_resolves() {
+        let (awaiter, id, rm) = make_awaiter();
+        let fut: futures::future::BoxFuture<'static, ResponseStage> =
+            Box::pin(async move { ResponseStage::ready(awaiter) });
+        let mut result = SyncResult {
+            stage: StageState::Pending(fut),
+        };
+
+        // Complete the outcome before polling so the transition proceeds.
+        assert!(rm.complete_outcome(id, Ok(None)));
+        let r = tokio::time::timeout(std::time::Duration::from_secs(1), &mut result)
+            .await
+            .expect("sync result resolves");
+        assert!(r.is_ok());
+    }
+
+    #[tokio::test]
+    async fn stage_state_pending_awaits_inner_future() {
+        // Pending future that never resolves — poll must stay Pending and
+        // never touch the awaiter slot.
+        let (awaiter, _id, _rm) = make_awaiter();
+        let fut: futures::future::BoxFuture<'static, ResponseStage> = Box::pin(async {
+            futures::future::pending::<()>().await;
+            ResponseStage::ready(awaiter)
+        });
+        let result = SyncResult {
+            stage: StageState::Pending(fut),
+        };
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_millis(50), result).await;
+        assert!(
+            outcome.is_err(),
+            "pending inner future should keep result pending"
+        );
     }
 
     // ── drive_fire_send ──────────────────────────────────────────────────

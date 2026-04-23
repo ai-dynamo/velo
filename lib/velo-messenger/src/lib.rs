@@ -23,6 +23,7 @@ pub use client::builders::{
     UnaryResult,
 };
 pub use common::MessageId;
+pub use common::responses::{RegisterOutcome, ResponseRegistrationError, SlotBackpressure};
 pub use discovery::PeerDiscovery;
 pub use events::VeloEvents;
 pub use handlers::{

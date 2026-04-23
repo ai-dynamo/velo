@@ -54,16 +54,21 @@
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use dashmap::DashSet;
+use futures::future::BoxFuture;
 use futures::task::AtomicWaker;
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::future::Future;
 use std::mem::size_of;
+use std::pin::Pin;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
+use std::task::{Context, Poll};
 use thiserror::Error;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, trace, warn};
 use uuid::Uuid;
 use velo_observability::VeloMetrics;
@@ -71,7 +76,7 @@ use velo_observability::VeloMetrics;
 use super::events::Outcome;
 
 type WorkerId = u64;
-type SlotAllocation<T, E> = (usize, u64, Arc<Slot<T, E>>);
+type ArenaAllocation<T, E> = (usize, u64, Arc<Slot<T, E>>);
 
 const RESPONSE_SLOT_CAPACITY: usize = u16::MAX as usize;
 const MAX_GENERATION: u64 = (1u64 << 48) - 1;
@@ -221,8 +226,13 @@ fn decode_response_key(raw: u128) -> (WorkerId, usize, u64) {
     (worker_id, slot_index as usize, generation)
 }
 
+/// Opaque identifier encoding the worker, slot, and generation that locate a
+/// pending response.
+///
+/// The encoding is a stable 16-byte UUID-shaped value sent on the wire; the
+/// layout is an implementation detail and callers should treat it as opaque.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct ResponseId(Uuid);
+pub struct ResponseId(Uuid);
 
 impl ResponseId {
     pub(crate) fn from_u128(val: u128) -> Self {
@@ -262,6 +272,11 @@ pub struct ResponseAwaiter {
     slot: Arc<Slot<Option<Bytes>, String>>,
     index: usize,
     consumed: bool,
+    // Capacity permit for this awaiter. Taken on recycle/drop so we can
+    // `forget()` it if the slot retired (generation wrap-around) instead of
+    // returning it to the semaphore — keeping the semaphore's permit count
+    // in lockstep with the arena's effective capacity.
+    permit: Option<OwnedSemaphorePermit>,
 }
 
 impl ResponseAwaiter {
@@ -270,6 +285,7 @@ impl ResponseAwaiter {
         slot: Arc<Slot<Option<Bytes>, String>>,
         index: usize,
         generation: u64,
+        permit: OwnedSemaphorePermit,
     ) -> Self {
         let response_id = manager.encode_key(index, generation);
         Self {
@@ -278,6 +294,7 @@ impl ResponseAwaiter {
             slot,
             index,
             consumed: false,
+            permit: Some(permit),
         }
     }
 
@@ -334,8 +351,10 @@ impl ResponseAwaiter {
         }
     }
 
-    fn recycle(&self) {
-        self.manager.recycle_slot(self.index);
+    fn recycle(&mut self) {
+        if let Some(permit) = self.permit.take() {
+            self.manager.recycle_slot(self.index, permit);
+        }
     }
 }
 
@@ -356,10 +375,58 @@ impl fmt::Debug for ResponseAwaiter {
     }
 }
 
+/// Failure returned from [`ResponseManager::register_outcome`] when the slot
+/// arena is full.
+///
+/// Pattern-match on this type (rather than stringifying) to drive backoff,
+/// shed load, or route to the async [`ResponseManager::register_outcome_async`]
+/// fallback.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum ResponseRegistrationError {
-    #[error("no free response slots")]
-    Exhausted,
+pub enum ResponseRegistrationError {
+    /// No free response slots. `capacity` is the fixed per-worker capacity;
+    /// `pending` is the in-flight count at the moment of the failed
+    /// acquisition. Both are reported for diagnostics.
+    #[error("response slot capacity ({capacity}) exhausted; {pending} in flight")]
+    Exhausted { capacity: usize, pending: usize },
+}
+
+/// Outcome of a non-blocking slot acquisition.
+///
+/// Mirrors the `SendOutcome::Enqueued` / `SendOutcome::Backpressured(_)`
+/// shape used by `velo-transports` for per-peer channel saturation, so
+/// callers can handle slot-exhaustion backpressure with the same idiom they
+/// use for transport-channel backpressure.
+#[must_use = "RegisterOutcome::Backpressured must be awaited to acquire a slot"]
+pub enum RegisterOutcome {
+    /// A slot was available and is now held by the awaiter.
+    Allocated(ResponseAwaiter),
+    /// No slot was available. Await the contained future to acquire one as
+    /// soon as another awaiter drops its slot.
+    Backpressured(SlotBackpressure),
+}
+
+/// Future that resolves to a [`ResponseAwaiter`] once a response slot is
+/// available. Analogous to `velo_transports::SendBackpressure`.
+///
+/// Dropping this future cancels the pending acquisition cleanly — no permit
+/// is leaked.
+#[must_use = "SlotBackpressure must be awaited to acquire a response slot"]
+pub struct SlotBackpressure {
+    fut: BoxFuture<'static, ResponseAwaiter>,
+}
+
+impl Future for SlotBackpressure {
+    type Output = ResponseAwaiter;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<ResponseAwaiter> {
+        self.fut.as_mut().poll(cx)
+    }
+}
+
+impl fmt::Debug for SlotBackpressure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SlotBackpressure").finish_non_exhaustive()
+    }
 }
 
 /// Correlates response outcomes (ACK/NACK/payload) using a fixed-capacity slot arena.
@@ -378,24 +445,76 @@ impl ResponseManager {
         observability: Option<Arc<VeloMetrics>>,
     ) -> Self {
         Self {
-            inner: Arc::new(ResponseManagerInner::new(worker_id, observability)),
+            inner: Arc::new(ResponseManagerInner::new(
+                worker_id,
+                observability,
+                RESPONSE_SLOT_CAPACITY,
+            )),
         }
     }
 
+    /// Construct a manager with a smaller slot arena, for exercising the
+    /// capacity-exhaustion and backpressure paths without allocating the full
+    /// per-worker ceiling.
+    ///
+    /// Test-only — not exposed in release builds. Production code must go
+    /// through [`ResponseManager::new`] / [`ResponseManager::with_observability`].
+    ///
+    /// # Panics
+    /// Panics if `capacity` is zero or exceeds [`RESPONSE_SLOT_CAPACITY`]
+    /// (the wire format encodes `slot_index` in 16 bits).
+    #[cfg(test)]
+    pub fn with_capacity(
+        worker_id: WorkerId,
+        capacity: usize,
+        observability: Option<Arc<VeloMetrics>>,
+    ) -> Self {
+        assert!(
+            (1..=RESPONSE_SLOT_CAPACITY).contains(&capacity),
+            "response slot capacity {capacity} out of range (1..={RESPONSE_SLOT_CAPACITY})"
+        );
+        Self {
+            inner: Arc::new(ResponseManagerInner::new(
+                worker_id,
+                observability,
+                capacity,
+            )),
+        }
+    }
+
+    /// Fail-fast slot acquisition. Returns [`ResponseRegistrationError::Exhausted`]
+    /// immediately when the arena is full.
     pub fn register_outcome(&self) -> Result<ResponseAwaiter, ResponseRegistrationError> {
-        let (index, generation, slot) = self
-            .inner
-            .try_allocate_slot()
-            .ok_or(ResponseRegistrationError::Exhausted)?;
+        self.inner.try_acquire().ok_or_else(|| {
+            self.inner.record_exhaustion();
+            ResponseRegistrationError::Exhausted {
+                capacity: self.inner.capacity,
+                pending: self.inner.pending_outcome_count(),
+            }
+        })
+    }
 
-        self.inner.mark_pending();
+    /// Non-blocking slot acquisition that exposes the backpressure future for
+    /// callers that want to await capacity instead of failing fast.
+    pub fn try_register_outcome(&self) -> RegisterOutcome {
+        if let Some(awaiter) = self.inner.try_acquire() {
+            RegisterOutcome::Allocated(awaiter)
+        } else {
+            self.inner.record_exhaustion();
+            RegisterOutcome::Backpressured(SlotBackpressure {
+                fut: Box::pin(ResponseManagerInner::acquire_owned(Arc::clone(&self.inner))),
+            })
+        }
+    }
 
-        Ok(ResponseAwaiter::new(
-            Arc::clone(&self.inner),
-            slot,
-            index,
-            generation,
-        ))
+    /// Await capacity, then allocate. Convenience wrapper over
+    /// [`ResponseManager::try_register_outcome`] that collapses the fast-path
+    /// and the backpressure branch.
+    pub async fn register_outcome_async(&self) -> ResponseAwaiter {
+        match self.try_register_outcome() {
+            RegisterOutcome::Allocated(a) => a,
+            RegisterOutcome::Backpressured(bp) => bp.await,
+        }
     }
 
     pub fn complete_outcome(
@@ -414,29 +533,79 @@ impl ResponseManager {
 struct ResponseManagerInner {
     worker_id: WorkerId,
     arena: Arc<SlotArena<Option<Bytes>, String>>,
+    // Capacity gate. Holds `capacity` permits; one is consumed per outstanding
+    // awaiter and released when the awaiter drops. The semaphore is the
+    // source of truth for "can we allocate right now" and provides the
+    // async-wait path. The arena's free list carries the same count in
+    // lockstep, except when a slot is retired due to generation wrap-around
+    // (see `recycle_slot`, which `forget()`s the permit in that case to
+    // permanently shrink the semaphore alongside the arena).
+    slot_sem: Arc<Semaphore>,
     pending: AtomicUsize,
     capacity: usize,
     observability: Option<Arc<VeloMetrics>>,
 }
 
 impl ResponseManagerInner {
-    fn new(worker_id: WorkerId, observability: Option<Arc<VeloMetrics>>) -> Self {
-        let arena = SlotArena::with_capacity(RESPONSE_SLOT_CAPACITY);
+    fn new(worker_id: WorkerId, observability: Option<Arc<VeloMetrics>>, capacity: usize) -> Self {
+        let arena = SlotArena::with_capacity(capacity);
         Self {
             worker_id,
             arena,
+            slot_sem: Arc::new(Semaphore::new(capacity)),
             pending: AtomicUsize::new(0),
-            capacity: RESPONSE_SLOT_CAPACITY,
+            capacity,
             observability,
         }
     }
 
-    fn try_allocate_slot(&self) -> Option<SlotAllocation<Option<Bytes>, String>> {
-        self.arena.allocate()
+    /// Non-blocking slot acquisition. Returns `None` if the arena is at
+    /// capacity (permit unavailable). When successful, pairs a semaphore
+    /// permit with a free arena slot and constructs the awaiter.
+    fn try_acquire(self: &Arc<Self>) -> Option<ResponseAwaiter> {
+        let permit = Arc::clone(&self.slot_sem).try_acquire_owned().ok()?;
+        let (index, generation, slot) = self
+            .arena
+            .allocate()
+            .expect("arena and semaphore permits must stay in sync");
+        self.mark_pending();
+        Some(ResponseAwaiter::new(
+            Arc::clone(self),
+            slot,
+            index,
+            generation,
+            permit,
+        ))
     }
 
-    fn recycle_slot(&self, index: usize) {
-        self.arena.recycle(index);
+    /// Async slot acquisition. Used as the body of
+    /// [`SlotBackpressure`]; awaits a semaphore permit, then pairs it with
+    /// an arena allocation. The `Arc<Self>` is passed by value so the
+    /// future owns the refcount and is `'static`.
+    async fn acquire_owned(inner: Arc<Self>) -> ResponseAwaiter {
+        let permit = Arc::clone(&inner.slot_sem)
+            .acquire_owned()
+            .await
+            .expect("response slot semaphore must not be closed");
+        let (index, generation, slot) = inner
+            .arena
+            .allocate()
+            .expect("arena and semaphore permits must stay in sync");
+        inner.mark_pending();
+        ResponseAwaiter::new(Arc::clone(&inner), slot, index, generation, permit)
+    }
+
+    fn recycle_slot(&self, index: usize, permit: OwnedSemaphorePermit) {
+        let retired = self.arena.recycle(index);
+        if retired {
+            // Slot's generation counter is saturated; the arena won't reuse
+            // it. Forget the permit so the semaphore's permit count shrinks
+            // to match the arena's effective capacity.
+            permit.forget();
+        }
+        // else: permit drops at end of scope, returning one permit to the
+        // semaphore alongside the arena's free-list push.
+
         let pending = self.pending.fetch_sub(1, Ordering::Release) - 1;
         if let Some(metrics) = self.observability.as_ref() {
             metrics.set_pending_responses(pending);
@@ -447,6 +616,12 @@ impl ResponseManagerInner {
         let pending = self.pending.fetch_add(1, Ordering::AcqRel) + 1;
         if let Some(metrics) = self.observability.as_ref() {
             metrics.set_pending_responses(pending);
+        }
+    }
+
+    fn record_exhaustion(&self) {
+        if let Some(metrics) = self.observability.as_ref() {
+            metrics.inc_response_slot_exhausted();
         }
     }
 
@@ -754,7 +929,7 @@ impl<T, E> SlotArena<T, E> {
         })
     }
 
-    pub fn allocate(&self) -> Option<SlotAllocation<T, E>> {
+    pub fn allocate(&self) -> Option<ArenaAllocation<T, E>> {
         let mut free = self.free.lock();
         free.pop_front().map(|i| {
             self.allocated.insert(i);
@@ -776,15 +951,21 @@ impl<T, E> SlotArena<T, E> {
         }
     }
 
-    pub fn recycle(&self, index: usize) {
+    /// Recycle a slot. Returns `true` if the slot was retired (generation
+    /// counter saturated) and will not be returned to the free list — the
+    /// caller is responsible for shrinking any paired capacity gate (e.g.
+    /// forgetting a semaphore permit).
+    pub fn recycle(&self, index: usize) -> bool {
         let new_generation = self.slots[index].recycle();
         self.allocated.remove(&index);
 
-        // Only return to free list if generation hasn't exceeded maximum
         if new_generation <= MAX_GENERATION {
             self.free.lock().push_back(index);
+            false
+        } else {
+            // Slot is permanently retired.
+            true
         }
-        // Otherwise, slot is permanently retired
     }
 
     pub fn is_allocated(&self, index: usize) -> bool {
@@ -878,21 +1059,29 @@ mod tests {
         assert_eq!(manager.pending_outcome_count(), 0);
     }
 
+    // Small capacity used by slot-saturation tests. Lets us exercise the
+    // exhaustion / backpressure paths without allocating the full per-worker
+    // ceiling on every test run.
+    const TEST_CAPACITY: usize = 16;
+
     #[tokio::test]
     async fn allocation_exhaustion() {
         let worker_id = 42;
-        let manager = ResponseManager::new(worker_id);
+        let manager = ResponseManager::with_capacity(worker_id, TEST_CAPACITY, None);
 
-        let mut awaiters = Vec::with_capacity(RESPONSE_SLOT_CAPACITY);
-        for _ in 0..RESPONSE_SLOT_CAPACITY {
+        let mut awaiters = Vec::with_capacity(TEST_CAPACITY);
+        for _ in 0..TEST_CAPACITY {
             let awaiter = manager.register_outcome().expect("allocate slot");
             awaiters.push(awaiter);
         }
 
-        assert!(matches!(
-            manager.register_outcome(),
-            Err(ResponseRegistrationError::Exhausted)
-        ));
+        match manager.register_outcome() {
+            Err(ResponseRegistrationError::Exhausted { capacity, pending }) => {
+                assert_eq!(capacity, TEST_CAPACITY);
+                assert_eq!(pending, TEST_CAPACITY);
+            }
+            other => panic!("expected Exhausted, got {:?}", other),
+        }
 
         // Recycle one slot and ensure allocation succeeds again.
         let awaiter = awaiters.pop().expect("awaiter");
@@ -900,6 +1089,181 @@ mod tests {
 
         let awaiter = manager.register_outcome().expect("allocate after recycle");
         drop(awaiter);
+    }
+
+    // ============================================================================
+    // Semaphore-backed acquisition
+    // ============================================================================
+
+    #[tokio::test]
+    async fn try_register_outcome_reports_backpressure_when_full() {
+        let manager = ResponseManager::with_capacity(0, TEST_CAPACITY, None);
+        let mut awaiters = Vec::with_capacity(TEST_CAPACITY);
+        for _ in 0..TEST_CAPACITY {
+            awaiters.push(manager.register_outcome().expect("allocate"));
+        }
+
+        match manager.try_register_outcome() {
+            RegisterOutcome::Allocated(_) => panic!("expected backpressure at capacity"),
+            RegisterOutcome::Backpressured(_) => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn slot_backpressure_resolves_after_recycle() {
+        use tokio::time::{Duration, timeout};
+
+        let manager = ResponseManager::with_capacity(0, TEST_CAPACITY, None);
+        let mut awaiters = Vec::with_capacity(TEST_CAPACITY);
+        for _ in 0..TEST_CAPACITY {
+            awaiters.push(manager.register_outcome().expect("allocate"));
+        }
+
+        let bp = match manager.try_register_outcome() {
+            RegisterOutcome::Backpressured(bp) => bp,
+            RegisterOutcome::Allocated(_) => panic!("expected backpressure"),
+        };
+
+        // Drop one after a short delay to unblock the backpressure future.
+        let mut handle = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            drop(awaiters.pop());
+            awaiters
+        });
+
+        let awaiter = timeout(Duration::from_secs(1), bp)
+            .await
+            .expect("backpressure resolved");
+        drop(awaiter);
+        let _remaining = (&mut handle).await.expect("drop task");
+    }
+
+    #[tokio::test]
+    async fn register_outcome_async_waits_for_capacity() {
+        use tokio::time::{Duration, timeout};
+
+        let manager = Arc::new(ResponseManager::with_capacity(0, TEST_CAPACITY, None));
+        let mut awaiters = Vec::with_capacity(TEST_CAPACITY);
+        for _ in 0..TEST_CAPACITY {
+            awaiters.push(manager.register_outcome().expect("allocate"));
+        }
+
+        let m = manager.clone();
+        let acquire = tokio::spawn(async move { m.register_outcome_async().await });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!acquire.is_finished(), "should block while at capacity");
+
+        drop(awaiters.pop());
+
+        let awaiter = timeout(Duration::from_secs(1), acquire)
+            .await
+            .expect("resolved")
+            .expect("task ok");
+        drop(awaiter);
+    }
+
+    #[tokio::test]
+    async fn cancelling_slot_backpressure_is_safe() {
+        let manager = ResponseManager::with_capacity(0, TEST_CAPACITY, None);
+        let mut awaiters = Vec::with_capacity(TEST_CAPACITY);
+        for _ in 0..TEST_CAPACITY {
+            awaiters.push(manager.register_outcome().expect("allocate"));
+        }
+
+        // Drop the backpressure future mid-wait. No permit must be leaked.
+        if let RegisterOutcome::Backpressured(bp) = manager.try_register_outcome() {
+            drop(bp);
+        } else {
+            panic!("expected backpressure");
+        }
+
+        // Free a slot; subsequent sync acquisition must succeed.
+        drop(awaiters.pop());
+        let awaiter = manager
+            .register_outcome()
+            .expect("allocate after bp cancel");
+        drop(awaiter);
+    }
+
+    #[tokio::test]
+    async fn slot_backpressure_debug_format() {
+        let manager = ResponseManager::with_capacity(0, TEST_CAPACITY, None);
+        let mut awaiters = Vec::with_capacity(TEST_CAPACITY);
+        for _ in 0..TEST_CAPACITY {
+            awaiters.push(manager.register_outcome().expect("allocate"));
+        }
+
+        let bp = match manager.try_register_outcome() {
+            RegisterOutcome::Backpressured(bp) => bp,
+            RegisterOutcome::Allocated(_) => panic!("expected backpressure"),
+        };
+
+        assert!(
+            format!("{:?}", bp).contains("SlotBackpressure"),
+            "Debug fmt should name the type"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_register_outcome_fires_exhaustion_metric() {
+        use velo_observability::VeloMetrics;
+        use velo_observability::test_helpers::MetricSnapshot;
+
+        // try_register_outcome's Backpressured branch increments the
+        // exhaustion counter. (The fail-fast register_outcome path is
+        // exercised by `exhaustion_records_metric_and_details`.)
+        let registry = prometheus::Registry::new();
+        let metrics = Arc::new(VeloMetrics::register(&registry).expect("metrics"));
+        let manager = ResponseManager::with_capacity(0, TEST_CAPACITY, Some(metrics));
+
+        let mut awaiters = Vec::with_capacity(TEST_CAPACITY);
+        for _ in 0..TEST_CAPACITY {
+            awaiters.push(manager.register_outcome().expect("allocate"));
+        }
+
+        for _ in 0..2 {
+            match manager.try_register_outcome() {
+                RegisterOutcome::Backpressured(_) => {}
+                RegisterOutcome::Allocated(_) => panic!("expected backpressure"),
+            }
+        }
+
+        let snapshot = MetricSnapshot::from_registry(&registry);
+        let value = snapshot.counter("velo_messenger_response_slot_exhausted_total", &[]);
+        assert!(
+            value >= 2.0,
+            "try_register_outcome should also fire the exhaustion counter"
+        );
+    }
+
+    #[tokio::test]
+    async fn exhaustion_records_metric_and_details() {
+        use velo_observability::VeloMetrics;
+        use velo_observability::test_helpers::MetricSnapshot;
+
+        let registry = prometheus::Registry::new();
+        let metrics = Arc::new(VeloMetrics::register(&registry).expect("metrics"));
+        let manager = ResponseManager::with_capacity(0, TEST_CAPACITY, Some(metrics));
+
+        let mut awaiters = Vec::with_capacity(TEST_CAPACITY);
+        for _ in 0..TEST_CAPACITY {
+            awaiters.push(manager.register_outcome().expect("allocate"));
+        }
+
+        for _ in 0..3 {
+            match manager.register_outcome() {
+                Err(ResponseRegistrationError::Exhausted { capacity, pending }) => {
+                    assert_eq!(capacity, TEST_CAPACITY);
+                    assert_eq!(pending, TEST_CAPACITY);
+                }
+                Ok(_) => panic!("expected Exhausted"),
+            }
+        }
+
+        let snapshot = MetricSnapshot::from_registry(&registry);
+        let value = snapshot.counter("velo_messenger_response_slot_exhausted_total", &[]);
+        assert!(value >= 3.0, "exhaustion counter should fire per attempt");
     }
 
     #[tokio::test]
