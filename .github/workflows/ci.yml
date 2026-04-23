@@ -164,7 +164,7 @@ jobs:
     - name: Add llvm-tools component
       run: rustup component list --installed | grep -q '^llvm-tools' || rustup component add llvm-tools-preview
     - name: Generate coverage
-      run: cargo llvm-cov --all-features --workspace --codecov --output-path codecov.json
+      run: cargo llvm-cov --all-features --all-targets --workspace --codecov --output-path codecov.json
     - name: sccache stats
       if: always()
       run: /tmp/use-sccache.sh show-stats "coverage" || true
@@ -175,6 +175,40 @@ jobs:
         fail_ci_if_error: false
       env:
         CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  examples:
+    name: Examples
+    runs-on: prod-velo-default-v1
+    container:
+      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.3
+    permissions:
+      contents: read
+    env:
+      RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
+    steps:
+    - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 #v6.0.1
+    - name: Rust setup
+      uses: ./.github/actions/rust-setup
+    - name: sccache setup
+      uses: ./.github/actions/sccache-setup
+      with:
+        bucket: ${{ secrets.SCCACHE_S3_BUCKET }}
+    - name: Build examples (release)
+      run: cargo build --manifest-path examples/Cargo.toml --release --all-features --examples --locked
+    # Examples run sequentially — each one binds loopback sockets and the
+    # next step must not race for the same port or socket.
+    - name: Run ping_pong
+      timeout-minutes: 2
+      run: cargo run --manifest-path examples/Cargo.toml --release --all-features --example ping_pong --locked -- --rounds 200
+    - name: Run throughput
+      timeout-minutes: 3
+      run: cargo run --manifest-path examples/Cargo.toml --release --all-features --example throughput --locked -- --count 1000 --payload-sizes 0,1024 --concurrency 1,10
+    - name: Run mpsc_fanin
+      timeout-minutes: 2
+      run: cargo run --manifest-path examples/Cargo.toml --release --all-features --example mpsc_fanin --locked -- --producers 4 --items 40
+    - name: sccache stats
+      if: always()
+      run: /tmp/use-sccache.sh show-stats "examples" || true
 
   semver:
     name: Semver Check
@@ -212,7 +246,7 @@ jobs:
     runs-on: prod-velo-default-v1
     container:
       image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.3
-    needs: [fmt, clippy, deny, test, coverage, semver]
+    needs: [fmt, clippy, deny, test, coverage, examples, semver]
     if: always()
     steps:
     - name: Check all jobs

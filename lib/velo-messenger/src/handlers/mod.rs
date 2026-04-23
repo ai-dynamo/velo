@@ -49,7 +49,14 @@ use crate::server::dispatcher::{
 };
 use derive_getters::Dissolve;
 use tokio_util::task::TaskTracker;
-use velo_transports::{MessageType, VeloBackend};
+use velo_transports::{MessageType, SendOutcome, VeloBackend};
+
+#[inline]
+async fn drive_bp(outcome: SendOutcome) {
+    if let SendOutcome::Backpressured(bp) = outcome {
+        bp.await;
+    }
+}
 
 // ============================================================================
 // Opaque Handles
@@ -804,13 +811,14 @@ fn get_response_error_handler() -> Arc<dyn velo_transports::TransportErrorHandle
 async fn send_ack(backend: Arc<VeloBackend>, response_id: ResponseId) -> Result<()> {
     let header = encode_event_header(EventType::Ack(response_id, Outcome::Ok));
 
-    backend.send_message_to_worker(
+    let outcome = backend.send_message_to_worker(
         WorkerId::from_u64(response_id.worker_id()),
         header,
         Bytes::new(),
         MessageType::Ack,
         get_ack_error_handler(),
     )?;
+    drive_bp(outcome).await;
 
     Ok(())
 }
@@ -840,13 +848,14 @@ async fn send_nack(
     let header = encode_event_header(EventType::Ack(response_id, Outcome::Error));
     let payload = Bytes::from(error_message.into_bytes());
 
-    backend.send_message_to_worker(
+    let outcome = backend.send_message_to_worker(
         WorkerId::from_u64(response_id.worker_id()),
         header,
         payload,
         MessageType::Ack,
         get_nack_error_handler(),
     )?;
+    drive_bp(outcome).await;
 
     Ok(())
 }
@@ -859,13 +868,14 @@ async fn send_response_ok(
     let header = encode_response_header(response_id, Outcome::Ok, headers)
         .map_err(|e| anyhow::anyhow!("Failed to encode response header: {}", e))?;
 
-    backend.send_message_to_worker(
+    let outcome = backend.send_message_to_worker(
         WorkerId::from_u64(response_id.worker_id()),
         header,
         Bytes::new(),
         MessageType::Response,
         get_response_error_handler(),
     )?;
+    drive_bp(outcome).await;
 
     Ok(())
 }
@@ -879,13 +889,14 @@ async fn send_response(
     let header = encode_response_header(response_id, Outcome::Ok, headers)
         .map_err(|e| anyhow::anyhow!("Failed to encode response header: {}", e))?;
 
-    backend.send_message_to_worker(
+    let outcome = backend.send_message_to_worker(
         WorkerId::from_u64(response_id.worker_id()),
         header,
         payload,
         MessageType::Response,
         get_response_error_handler(),
     )?;
+    drive_bp(outcome).await;
 
     Ok(())
 }
@@ -900,13 +911,14 @@ async fn send_response_error(
         .map_err(|e| anyhow::anyhow!("Failed to encode response header: {}", e))?;
     let payload = Bytes::from(error_message.into_bytes());
 
-    backend.send_message_to_worker(
+    let outcome = backend.send_message_to_worker(
         WorkerId::from_u64(response_id.worker_id()),
         header,
         payload,
         MessageType::Response,
         get_response_error_handler(),
     )?;
+    drive_bp(outcome).await;
 
     Ok(())
 }

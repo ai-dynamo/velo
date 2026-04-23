@@ -6,7 +6,10 @@ use futures::future::BoxFuture;
 
 use crate::{InstanceId, PeerInfo, TransportKey, WorkerAddress};
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -177,6 +180,126 @@ pub enum ShutdownPolicy {
     Timeout(Duration),
 }
 
+/// Signal returned by [`Transport::send_message`] when the per-peer send channel
+/// was saturated at call time.
+///
+/// Semantics:
+/// - Caller must `.await` this to drive the deferred enqueue to completion.
+/// - Output is `()` — failures during the deferred send are reported via the
+///   [`TransportErrorHandler::on_error`] callback supplied to `send_message`,
+///   not via the future's return value (preserves fire-and-forget-with-callback
+///   semantics).
+/// - Dropping the future before it resolves cancels the pending send cleanly
+///   (the underlying `flume::send_async` future is drop-safe; the message is
+///   not enqueued). **`on_error` is NOT invoked on drop** — callers that need
+///   to observe dropped frames must track cancellation themselves. Fire-path
+///   helpers in `velo-messenger` (e.g. `send_ack`, `send_nack`,
+///   `send_response_*`) always `.await` the future so this case does not arise
+///   in normal request/response flows.
+///
+/// ### Awaiter completion on deferred-send failure
+///
+/// If a deferred send fails *after* the frame was accepted by the transport
+/// (channel closes between hand-off and wire, peer disconnects mid-write),
+/// the transport invokes its `TransportErrorHandler::on_error(header, payload,
+/// reason)` callback. The default messenger handler decodes the request
+/// header's response id and completes the corresponding awaiter on
+/// `ResponseManager` with the error, so sync/unary callers unblock
+/// immediately rather than waiting for their own timeout to fire.
+///
+/// Custom `TransportErrorHandler` implementations are responsible for
+/// completing any awaiter they care about; the trait itself does not enforce
+/// this contract.
+///
+/// Reordering: concurrent callers where one hits `Backpressured` and another
+/// fast-paths through `try_send` may land out of order at the remote. Callers
+/// that require strict FIFO must serialize their sends.
+pub struct SendBackpressure {
+    fut: BoxFuture<'static, ()>,
+}
+
+impl SendBackpressure {
+    /// Wrap a boxed future that drives the deferred send to completion.
+    pub fn new(fut: BoxFuture<'static, ()>) -> Self {
+        Self { fut }
+    }
+}
+
+impl Future for SendBackpressure {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        self.fut.as_mut().poll(cx)
+    }
+}
+
+impl std::fmt::Debug for SendBackpressure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SendBackpressure").finish_non_exhaustive()
+    }
+}
+
+/// Attempt a non-blocking enqueue on a bounded flume channel, converting the
+/// `Full` variant into a `SendBackpressure` future and the `Disconnected`
+/// variant into a reported error.
+///
+/// This collapses the identical pattern every `Transport` impl used to write
+/// inline: `try_send` → on `Full` wrap `send_async` in a bp future, on
+/// `Disconnected` call `on_disconnected(task)` and return `Ok(())`.
+///
+/// The two callbacks differ only by the message string each transport wants
+/// to surface:
+/// - `on_disconnected(task)` is called synchronously when `try_send` returns
+///   `Disconnected`.
+/// - `on_closed_during_bp(task)` is called from inside the bp future if
+///   `send_async` fails (channel closed while we were waiting for space).
+#[inline]
+pub fn try_send_or_backpressure<T, FDisc, FClosed>(
+    tx: &flume::Sender<T>,
+    task: T,
+    on_disconnected: FDisc,
+    on_closed_during_bp: FClosed,
+) -> Result<(), SendBackpressure>
+where
+    T: Send + 'static,
+    FDisc: FnOnce(T),
+    FClosed: FnOnce(T) + Send + 'static,
+{
+    match tx.try_send(task) {
+        Ok(()) => Ok(()),
+        Err(flume::TrySendError::Full(task)) => {
+            let tx = tx.clone();
+            Err(SendBackpressure::new(Box::pin(async move {
+                if let Err(flume::SendError(task)) = tx.send_async(task).await {
+                    on_closed_during_bp(task);
+                }
+            })))
+        }
+        Err(flume::TrySendError::Disconnected(task)) => {
+            on_disconnected(task);
+            Ok(())
+        }
+    }
+}
+
+/// Outcome of a send through [`VeloBackend::send_message`](crate::VeloBackend::send_message).
+///
+/// The outer `Result` on `send_message` captures routing errors (peer not
+/// registered, no compatible transport). This enum captures the success case's
+/// enqueue status:
+///
+/// - [`SendOutcome::Enqueued`] — the frame was enqueued synchronously.
+/// - [`SendOutcome::Backpressured`] — the per-peer send channel was full;
+///   caller must `.await` the contained future to complete the send.
+#[derive(Debug)]
+pub enum SendOutcome {
+    /// The frame was enqueued synchronously on the per-peer send channel.
+    Enqueued,
+    /// The per-peer send channel was saturated. Callers must `.await` the
+    /// contained future to drive the deferred enqueue to completion.
+    Backpressured(SendBackpressure),
+}
+
 /// Abstraction over a single message transport (TCP, HTTP, NATS, gRPC, UCX).
 ///
 /// Implementations handle peer registration, message sending, listener lifecycle,
@@ -190,7 +313,16 @@ pub trait Transport: Send + Sync {
     /// Register a remote peer, extracting its endpoint from [`PeerInfo`].
     fn register(&self, peer_info: PeerInfo) -> Result<(), TransportError>;
 
-    /// Sends an active message to the remote instance
+    /// Send an active message to the remote instance.
+    ///
+    /// - `Ok(())` — the frame was enqueued synchronously on the per-peer send
+    ///   channel (fast path) *or* a hard error occurred and was reported via
+    ///   `on_error` (cold-start failure, transport not started, etc).
+    /// - `Err(SendBackpressure)` — the per-peer channel was full at call time;
+    ///   the caller must `.await` the returned future to complete enqueue.
+    ///
+    /// The return type signals *backpressure*, not failure. All delivery
+    /// failures continue to flow through `on_error`.
     fn send_message(
         &self,
         instance_id: InstanceId,
@@ -198,7 +330,7 @@ pub trait Transport: Send + Sync {
         payload: Bytes,
         message_type: MessageType,
         on_error: Arc<dyn TransportErrorHandler>,
-    );
+    ) -> Result<(), SendBackpressure>;
 
     /// Start the transport (bind listener, spawn tasks) for the given instance.
     fn start(
@@ -581,5 +713,138 @@ mod tests {
         assert!(!state.teardown_token().is_cancelled());
         state.teardown_token().cancel();
         assert!(state.teardown_token().is_cancelled());
+    }
+
+    // ── try_send_or_backpressure ────────────────────────────────────────
+
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn try_send_or_bp_ok_on_empty_channel() {
+        let (tx, rx) = flume::bounded::<u32>(4);
+        let disc_fired = Arc::new(AtomicBool::new(false));
+        let closed_fired = Arc::new(AtomicBool::new(false));
+        let disc_c = disc_fired.clone();
+        let closed_c = closed_fired.clone();
+
+        let r = try_send_or_backpressure(
+            &tx,
+            42,
+            move |_| disc_c.store(true, Ordering::Release),
+            move |_| closed_c.store(true, Ordering::Release),
+        );
+
+        assert!(r.is_ok(), "empty channel should return Ok");
+        assert_eq!(rx.try_recv().unwrap(), 42);
+        assert!(!disc_fired.load(Ordering::Acquire));
+        assert!(!closed_fired.load(Ordering::Acquire));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn try_send_or_bp_backpressure_on_full() {
+        let (tx, rx) = flume::bounded::<u32>(1);
+        tx.try_send(1).unwrap(); // fill it
+
+        let closed_fired = Arc::new(AtomicBool::new(false));
+        let closed_c = closed_fired.clone();
+
+        let bp = try_send_or_backpressure(
+            &tx,
+            2,
+            |_| panic!("disconnected"),
+            move |_| closed_c.store(true, Ordering::Release),
+        )
+        .expect_err("should return bp");
+
+        // Drain a slot so the bp future can complete.
+        assert_eq!(rx.recv_async().await.unwrap(), 1);
+        tokio::time::timeout(Duration::from_secs(1), bp)
+            .await
+            .expect("bp should resolve once space is available");
+        assert_eq!(rx.recv_async().await.unwrap(), 2);
+        assert!(!closed_fired.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn try_send_or_bp_disconnected_calls_handler() {
+        let (tx, rx) = flume::bounded::<u32>(1);
+        drop(rx);
+
+        let disc_fired = Arc::new(AtomicBool::new(false));
+        let disc_c = disc_fired.clone();
+
+        let r = try_send_or_backpressure(
+            &tx,
+            7,
+            move |task| {
+                assert_eq!(task, 7);
+                disc_c.store(true, Ordering::Release);
+            },
+            |_| panic!("bp path should not run"),
+        );
+        assert!(r.is_ok(), "Disconnected → Ok(()) with handler fired");
+        assert!(disc_fired.load(Ordering::Acquire));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn try_send_or_bp_drop_before_resolve_does_not_fire_closed() {
+        let (tx, _rx) = flume::bounded::<u32>(1);
+        tx.try_send(1).unwrap();
+
+        let closed_fired = Arc::new(AtomicBool::new(false));
+        let closed_c = closed_fired.clone();
+
+        let bp = try_send_or_backpressure(
+            &tx,
+            2,
+            |_| panic!("disconnected"),
+            move |_| closed_c.store(true, Ordering::Release),
+        )
+        .expect_err("should return bp");
+        drop(bp);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !closed_fired.load(Ordering::Acquire),
+            "drop-before-resolve must not invoke on_closed_during_bp"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn try_send_or_bp_channel_closed_during_wait_fires_closed() {
+        let (tx, rx) = flume::bounded::<u32>(1);
+        tx.try_send(1).unwrap();
+
+        let closed_fired = Arc::new(AtomicBool::new(false));
+        let closed_c = closed_fired.clone();
+
+        let bp = try_send_or_backpressure(
+            &tx,
+            2,
+            |_| panic!("disconnected"),
+            move |task| {
+                assert_eq!(task, 2);
+                closed_c.store(true, Ordering::Release);
+            },
+        )
+        .expect_err("should return bp");
+
+        // Close the receive side while bp is waiting — causes flume::send_async
+        // to fail with SendError, which should invoke on_closed_during_bp.
+        drop(rx);
+        tokio::time::timeout(Duration::from_secs(1), bp)
+            .await
+            .expect("bp resolves even on channel close");
+        assert!(
+            closed_fired.load(Ordering::Acquire),
+            "closed-during-wait must invoke on_closed_during_bp"
+        );
+    }
+
+    // ── SendBackpressure smoke test ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn send_backpressure_passthrough_future() {
+        let bp = SendBackpressure::new(Box::pin(async {}));
+        bp.await;
     }
 }
