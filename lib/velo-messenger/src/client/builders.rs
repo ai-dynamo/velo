@@ -465,19 +465,39 @@ async fn drive_send_outcome(
     }
 }
 
-/// Fire-path specialization of [`drive_send_outcome`] for cases that have no
-/// response outcome to fail (just logs).
-async fn drive_fire_send(send_result: Result<SendOutcome>) {
+/// Fire-path driver. Returns `Ok(())` once the frame has been handed to the
+/// transport (either fast-pathed or bp-enqueued). Returns `Err` for pre-wire
+/// failures:
+///
+/// - Synchronous `send_message` error (peer unregistered, transport-level
+///   refusal).
+/// - `on_error` fires during `bp.await` (channel closed between hand-off and
+///   drain — frame never made it to the wire). The `DefaultErrorHandler`
+///   completes the awaiter with `Err`; after `bp.await` resolves we poll
+///   the awaiter once non-blockingly and surface any completion we find.
+///
+/// After the frame is accepted by the wire the awaiter is simply dropped —
+/// fire-and-forget semantics mean we don't observe remote processing.
+async fn drive_fire_send(
+    send_result: Result<SendOutcome>,
+    mut awaiter: crate::common::responses::ResponseAwaiter,
+) -> Result<()> {
+    use futures::FutureExt;
     match send_result {
-        Ok(SendOutcome::Enqueued) => {}
-        Ok(SendOutcome::Backpressured(bp)) => bp.await,
-        Err(e) => {
-            tracing::error!(
-                target: "velo_messenger::client",
-                error = %e,
-                "Failed to send fire-and-forget message"
-            );
+        Ok(SendOutcome::Enqueued) => Ok(()),
+        Ok(SendOutcome::Backpressured(bp)) => {
+            bp.await;
+            // Transport invokes `on_error` synchronously inside the bp future
+            // before it resolves, so DefaultErrorHandler has already written
+            // Err into the awaiter's slot (if applicable) by the time we get
+            // here. `now_or_never` polls once: `Some(Err)` means we failed
+            // pre-wire; `None` or `Some(Ok(_))` means the frame was enqueued.
+            match awaiter.recv().now_or_never() {
+                Some(Err(e)) => Err(anyhow!("Send failed: {}", e)),
+                _ => Ok(()),
+            }
         }
+        Err(e) => Err(e),
     }
 }
 
@@ -519,11 +539,21 @@ async fn fire_send_after_ready(
     match client.ensure_peer_ready(target, &handler).await {
         Ok(_) => match client.register_outcome() {
             Ok(outcome) => {
+                let response_id = outcome.response_id();
                 let message = ActiveMessage {
-                    metadata: MessageMetadata::new_fire(outcome.response_id(), handler, headers),
+                    metadata: MessageMetadata::new_fire(response_id, handler, headers),
                     payload: payload.unwrap_or_default(),
                 };
-                drive_fire_send(client.send_message(target, message)).await;
+                // Slow path runs in a spawned task — no caller to return Err
+                // to, so log and drop.
+                if let Err(e) = drive_fire_send(client.send_message(target, message), outcome).await
+                {
+                    tracing::error!(
+                        target: "velo_messenger::client",
+                        error = %e,
+                        "Fire-and-forget send failed (slow path)"
+                    );
+                }
             }
             Err(e) => {
                 tracing::error!(
@@ -703,18 +733,16 @@ impl MessageBuilder {
                 if let Some(metrics) = self.client.observability.as_ref() {
                     metrics.record_client_resolution(ClientResolution::DirectSuccess);
                 }
-                // Fast path: send immediately
+                // Fast path: send immediately. Pre-wire errors (sync send
+                // failure, or channel close during bp.await) are surfaced to
+                // the caller via the drive_fire_send Result.
                 let outcome = self.client.register_outcome()?;
+                let response_id = outcome.response_id();
                 let message = ActiveMessage {
-                    metadata: MessageMetadata::new_fire(
-                        outcome.response_id(),
-                        self.handler,
-                        self.headers,
-                    ),
+                    metadata: MessageMetadata::new_fire(response_id, self.handler, self.headers),
                     payload: self.payload.unwrap_or_default(),
                 };
-                drive_fire_send(self.client.send_message(target, message)).await;
-                Ok(())
+                drive_fire_send(self.client.send_message(target, message), outcome).await
             }
             Ok(target) => {
                 // Slow path: spawn handshake + send
@@ -1000,19 +1028,45 @@ mod tests {
     // ── drive_fire_send ──────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn drive_fire_send_enqueued_is_noop() {
-        drive_fire_send(Ok(SendOutcome::Enqueued)).await;
+    async fn drive_fire_send_enqueued_is_ok() {
+        let (awaiter, _id, _rm) = make_awaiter();
+        assert!(
+            drive_fire_send(Ok(SendOutcome::Enqueued), awaiter)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
-    async fn drive_fire_send_awaits_bp() {
-        drive_fire_send(Ok(SendOutcome::Backpressured(ready_bp()))).await;
+    async fn drive_fire_send_bp_without_error_is_ok() {
+        let (awaiter, _id, _rm) = make_awaiter();
+        assert!(
+            drive_fire_send(Ok(SendOutcome::Backpressured(ready_bp())), awaiter)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
-    async fn drive_fire_send_err_logs_only() {
-        // Must not panic.
-        drive_fire_send(Err(anyhow!("x"))).await;
+    async fn drive_fire_send_bp_with_on_error_surfaces_err() {
+        // Simulate the handler completing the awaiter with Err during bp.await
+        // (i.e. on_error fired because the channel closed mid-drain). After
+        // bp resolves, drive_fire_send should return Err.
+        let (awaiter, id, rm) = make_awaiter();
+        assert!(rm.complete_outcome(id, Err("peer disconnected".to_string())));
+        let err = drive_fire_send(Ok(SendOutcome::Backpressured(ready_bp())), awaiter)
+            .await
+            .expect_err("should surface pre-wire failure");
+        assert!(err.to_string().contains("peer disconnected"));
+    }
+
+    #[tokio::test]
+    async fn drive_fire_send_sync_err_is_propagated() {
+        let (awaiter, _id, _rm) = make_awaiter();
+        let err = drive_fire_send(Err(anyhow!("peer not registered")), awaiter)
+            .await
+            .expect_err("sync err propagates");
+        assert!(err.to_string().contains("peer not registered"));
     }
 
     // ── validate_handler_name ────────────────────────────────────────────
