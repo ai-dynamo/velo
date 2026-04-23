@@ -249,6 +249,31 @@ impl Transport for UdsTransport {
             TransportError::InvalidEndpoint
         })?;
 
+        // Visibility gate: UDS is only usable if the peer's socket is reachable
+        // in our mount namespace. A missing path is the normal cross-host case;
+        // a non-socket file means the path is in use by something else (stale
+        // regular file, directory). Reject with NoEndpoint so the backend's
+        // priority sort can promote a different transport (e.g. TCP).
+        match std::fs::metadata(&path) {
+            Ok(m) if m.file_type().is_socket() => {}
+            Ok(_) => {
+                debug!(
+                    "UDS path {:?} exists but is not a socket; rejecting UDS for peer {}",
+                    path,
+                    peer_info.instance_id()
+                );
+                return Err(TransportError::NoEndpoint);
+            }
+            Err(_) => {
+                debug!(
+                    "UDS path {:?} not visible on this host; rejecting UDS for peer {}",
+                    path,
+                    peer_info.instance_id()
+                );
+                return Err(TransportError::NoEndpoint);
+            }
+        }
+
         // Store peer path
         self.peers.insert(peer_info.instance_id(), path.clone());
         self.update_peer_gauge();
@@ -1061,6 +1086,76 @@ mod tests {
         );
 
         // Cleanup
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_register_rejects_missing_path() {
+        let dir = std::env::temp_dir().join(format!("uds-reject-{}", crate::InstanceId::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket_path = dir.join("self.sock");
+        let transport = UdsTransportBuilder::new()
+            .socket_path(&socket_path)
+            .build()
+            .unwrap();
+
+        // Peer path does not exist at all.
+        let missing =
+            std::env::temp_dir().join(format!("uds-missing-{}.sock", crate::InstanceId::new_v4()));
+        assert!(!missing.exists());
+        let peer = make_uds_peer(&missing);
+        let peer_id = peer.instance_id();
+
+        let result = transport.register(peer);
+        assert!(matches!(result, Err(TransportError::NoEndpoint)));
+        assert!(!transport.peers.contains_key(&peer_id));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_register_rejects_non_socket_file() {
+        let dir = std::env::temp_dir().join(format!("uds-nonsock-{}", crate::InstanceId::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket_path = dir.join("self.sock");
+        let transport = UdsTransportBuilder::new()
+            .socket_path(&socket_path)
+            .build()
+            .unwrap();
+
+        // Create a regular file at the peer path.
+        let regular_file = dir.join("not-a-socket");
+        std::fs::write(&regular_file, b"I am not a socket").unwrap();
+
+        let peer = make_uds_peer(&regular_file);
+        let peer_id = peer.instance_id();
+
+        let result = transport.register(peer);
+        assert!(matches!(result, Err(TransportError::NoEndpoint)));
+        assert!(!transport.peers.contains_key(&peer_id));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_register_accepts_bound_socket() {
+        let dir = std::env::temp_dir().join(format!("uds-accept-{}", crate::InstanceId::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket_path = dir.join("self.sock");
+        let transport = UdsTransportBuilder::new()
+            .socket_path(&socket_path)
+            .build()
+            .unwrap();
+
+        let peer_socket = dir.join("peer.sock");
+        let _peer_listener = tokio::net::UnixListener::bind(&peer_socket).unwrap();
+
+        let peer = make_uds_peer(&peer_socket);
+        let peer_id = peer.instance_id();
+
+        transport.register(peer).expect("register should succeed");
+        assert!(transport.peers.contains_key(&peer_id));
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }
