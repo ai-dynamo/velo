@@ -147,18 +147,37 @@ impl Messenger {
         .await;
         let server = Arc::new(server);
 
-        // 4. Create client with error handler
-        struct DefaultErrorHandler;
+        // 4. Create client with error handler.
+        //
+        // DefaultErrorHandler carries a ResponseManager handle so that when a
+        // deferred send fails *after* the frame was accepted by the transport
+        // (channel closes mid-write, peer disconnects during drain), the
+        // awaiter keyed by the header's response_id is completed with the
+        // error instead of hanging until its own timeout fires. Headers that
+        // aren't active-message requests (or are malformed) decode to None
+        // and are silently ignored; ResponseManager::complete_outcome is
+        // itself defensive against recycled/mismatched slots.
+        struct DefaultErrorHandler {
+            response_manager: crate::common::responses::ResponseManager,
+        }
         impl velo_transports::TransportErrorHandler for DefaultErrorHandler {
-            fn on_error(&self, _header: bytes::Bytes, _payload: bytes::Bytes, error: String) {
+            fn on_error(&self, header: bytes::Bytes, _payload: bytes::Bytes, error: String) {
+                if let Some(response_id) =
+                    crate::common::messages::decode_response_id_from_request_header(&header)
+                {
+                    self.response_manager
+                        .complete_outcome(response_id, Err(error.clone()));
+                }
                 tracing::error!("Transport error: {}", error);
             }
         }
 
         let client = Arc::new(ActiveMessageClient::new(
-            response_manager,
+            response_manager.clone(),
             backend.clone(),
-            Arc::new(DefaultErrorHandler),
+            Arc::new(DefaultErrorHandler {
+                response_manager: response_manager.clone(),
+            }),
             discovery.clone(),
             metrics.clone(),
         ));
