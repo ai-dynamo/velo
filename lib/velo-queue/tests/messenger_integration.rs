@@ -14,7 +14,15 @@ use velo_transports::uds::UdsTransportBuilder;
 
 use velo_queue::WorkQueueBackend;
 use velo_queue::backends::messenger::{MessengerQueueBackend, MessengerQueueConfig};
-use velo_queue::options::NextOptions;
+use velo_queue::options::{AckPolicy, NextOptions};
+
+fn bytes(msg: Option<velo_queue::DeliveredMessage>) -> Option<Bytes> {
+    msg.map(|m| m.bytes)
+}
+
+fn batch_bytes(batch: Vec<velo_queue::DeliveredMessage>) -> Vec<Bytes> {
+    batch.into_iter().map(|m| m.bytes).collect()
+}
 
 /// Set up two messenger instances connected via UDS.
 async fn setup_two_messengers() -> (Arc<Messenger>, Arc<Messenger>) {
@@ -75,13 +83,16 @@ async fn test_messenger_local_send_recv() {
     );
 
     let sender = backend.sender("local-test").await.unwrap();
-    let receiver = backend.receiver("local-test").await.unwrap();
+    let receiver = backend
+        .receiver("local-test", AckPolicy::Auto)
+        .await
+        .unwrap();
 
     let data = Bytes::from_static(b"hello local");
     sender.send(data.clone()).await.unwrap();
 
     let received = receiver.recv().await.unwrap();
-    assert_eq!(received, Some(data));
+    assert_eq!(bytes(received), Some(data));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -95,7 +106,10 @@ async fn test_messenger_local_batch() {
     );
 
     let sender = backend.sender("local-batch").await.unwrap();
-    let receiver = backend.receiver("local-batch").await.unwrap();
+    let receiver = backend
+        .receiver("local-batch", AckPolicy::Auto)
+        .await
+        .unwrap();
 
     for i in 0u8..5 {
         sender.send(Bytes::from(vec![i])).await.unwrap();
@@ -104,7 +118,7 @@ async fn test_messenger_local_batch() {
     let opts = NextOptions::new()
         .batch_size(3)
         .timeout(Duration::from_millis(500));
-    let batch = receiver.recv_batch(&opts).await.unwrap();
+    let batch = batch_bytes(receiver.recv_batch(&opts).await.unwrap());
     assert_eq!(batch.len(), 3);
     assert_eq!(batch[0], Bytes::from(vec![0u8]));
     assert_eq!(batch[1], Bytes::from(vec![1u8]));
@@ -122,7 +136,10 @@ async fn test_messenger_try_send_delivers() {
     );
 
     let sender = backend.sender("try-send-test").await.unwrap();
-    let receiver = backend.receiver("try-send-test").await.unwrap();
+    let receiver = backend
+        .receiver("try-send-test", AckPolicy::Auto)
+        .await
+        .unwrap();
 
     sender.try_send(Bytes::from_static(b"try-sent")).unwrap();
 
@@ -130,7 +147,7 @@ async fn test_messenger_try_send_delivers() {
     let opts = NextOptions::new()
         .batch_size(1)
         .timeout(Duration::from_secs(2));
-    let batch = receiver.recv_batch(&opts).await.unwrap();
+    let batch = batch_bytes(receiver.recv_batch(&opts).await.unwrap());
     assert_eq!(batch.len(), 1);
     assert_eq!(batch[0], Bytes::from_static(b"try-sent"));
 }
@@ -150,7 +167,10 @@ async fn test_messenger_remote_send_recv() {
         MessengerQueueConfig::default(),
     );
     // Create receiver first so the actor+handlers are registered on B
-    let receiver = backend_b.receiver("remote-test").await.unwrap();
+    let receiver = backend_b
+        .receiver("remote-test", AckPolicy::Auto)
+        .await
+        .unwrap();
 
     // Backend on A: sends to B's actor
     let backend_a = MessengerQueueBackend::new(
@@ -167,7 +187,7 @@ async fn test_messenger_remote_send_recv() {
     let opts = NextOptions::new()
         .batch_size(1)
         .timeout(Duration::from_secs(5));
-    let batch = receiver.recv_batch(&opts).await.unwrap();
+    let batch = batch_bytes(receiver.recv_batch(&opts).await.unwrap());
     assert_eq!(batch.len(), 1);
     assert_eq!(batch[0], data);
 }
@@ -189,7 +209,10 @@ async fn test_messenger_remote_send_after_stale_handler_cache_refreshes() {
         m_b.instance_id(),
         MessengerQueueConfig::default(),
     );
-    let receiver = backend_b.receiver("stale-cache").await.unwrap();
+    let receiver = backend_b
+        .receiver("stale-cache", AckPolicy::Auto)
+        .await
+        .unwrap();
 
     // A still has stale cached handlers from the first handshake. Sending should
     // succeed because messenger refreshes on handler miss.
@@ -202,7 +225,7 @@ async fn test_messenger_remote_send_after_stale_handler_cache_refreshes() {
 
     sender.send(Bytes::from_static(b"refresh")).await.unwrap();
     assert_eq!(
-        receiver.recv().await.unwrap(),
+        bytes(receiver.recv().await.unwrap()),
         Some(Bytes::from_static(b"refresh"))
     );
 }
@@ -217,7 +240,10 @@ async fn test_messenger_remote_recv_waits() {
         m_b.instance_id(),
         MessengerQueueConfig::default(),
     );
-    let receiver = backend_b.receiver("remote-wait").await.unwrap();
+    let receiver = backend_b
+        .receiver("remote-wait", AckPolicy::Auto)
+        .await
+        .unwrap();
 
     // Sender on A → B
     let backend_a = MessengerQueueBackend::new(
@@ -240,7 +266,7 @@ async fn test_messenger_remote_recv_waits() {
     let result = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
         .await
         .expect("recv should not timeout waiting 5s for a 200ms delayed item");
-    assert_eq!(result.unwrap(), Some(Bytes::from_static(b"delayed")));
+    assert_eq!(bytes(result.unwrap()), Some(Bytes::from_static(b"delayed")));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -253,7 +279,10 @@ async fn test_messenger_remote_batch() {
         m_b.instance_id(),
         MessengerQueueConfig::default(),
     );
-    let receiver = backend_b.receiver("remote-batch").await.unwrap();
+    let receiver = backend_b
+        .receiver("remote-batch", AckPolicy::Auto)
+        .await
+        .unwrap();
 
     // Sender on A → B
     let backend_a = MessengerQueueBackend::new(
@@ -286,7 +315,10 @@ async fn test_messenger_remote_batch_delayed_arrival() {
         m_b.instance_id(),
         MessengerQueueConfig::default(),
     );
-    let receiver = backend_b.receiver("remote-delayed-batch").await.unwrap();
+    let receiver = backend_b
+        .receiver("remote-delayed-batch", AckPolicy::Auto)
+        .await
+        .unwrap();
 
     let backend_a = MessengerQueueBackend::new(
         Arc::clone(&m_a),
@@ -331,7 +363,10 @@ async fn test_messenger_remote_batch_timeout_partial() {
         m_b.instance_id(),
         MessengerQueueConfig::default(),
     );
-    let receiver = backend_b.receiver("remote-partial").await.unwrap();
+    let receiver = backend_b
+        .receiver("remote-partial", AckPolicy::Auto)
+        .await
+        .unwrap();
 
     // Sender on A → B
     let backend_a = MessengerQueueBackend::new(

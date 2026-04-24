@@ -6,18 +6,28 @@
 //! Named queues are stored in a [`DashMap`]. Calling `sender("foo")` and
 //! `receiver("foo")` both create-or-connect to the same underlying channel.
 //!
+//! Supports both [`AckPolicy::Auto`] and [`AckPolicy::Manual`]. Under Manual,
+//! each received item holds a lease tracked by a per-lease reaper task that
+//! redelivers on visibility-timeout expiry or dropped-without-ack.
+//!
 //! Useful for testing and single-process work distribution.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use bytes::Bytes;
 use dashmap::DashMap;
 
-use crate::backend::{ReceiverBackend, SenderBackend, WorkQueueBackend};
+use crate::ack::{AckFuture, AckHandle, AckHandleInner};
+use crate::backend::{DeliveredMessage, ReceiverBackend, SenderBackend, WorkQueueBackend};
 use crate::error::{WorkQueueError, WorkQueueRecvError, WorkQueueSendError};
-use crate::options::NextOptions;
+use crate::options::{AckPolicy, NextOptions};
+
+/// Default visibility timeout for manually-acked in-flight items.
+pub const DEFAULT_VISIBILITY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// An in-memory work queue backend.
 ///
@@ -26,22 +36,39 @@ use crate::options::NextOptions;
 pub struct InMemoryBackend {
     queues: DashMap<String, Arc<InMemoryQueue>>,
     capacity: usize,
+    visibility_timeout: Duration,
 }
 
 impl InMemoryBackend {
     /// Create a new in-memory backend where each queue has the given capacity.
+    ///
+    /// Uses [`DEFAULT_VISIBILITY_TIMEOUT`] for manually-acked items.
     pub fn new(capacity: usize) -> Self {
+        Self::with_visibility_timeout(capacity, DEFAULT_VISIBILITY_TIMEOUT)
+    }
+
+    /// Create a new in-memory backend with a custom visibility timeout.
+    pub fn with_visibility_timeout(capacity: usize, visibility_timeout: Duration) -> Self {
         Self {
             queues: DashMap::new(),
             capacity,
+            visibility_timeout,
         }
     }
 
     fn get_or_create(&self, name: &str) -> Arc<InMemoryQueue> {
         self.queues
             .entry(name.to_owned())
-            .or_insert_with(|| Arc::new(InMemoryQueue::new(self.capacity)))
+            .or_insert_with(|| Arc::new(InMemoryQueue::new(self.capacity, self.visibility_timeout)))
             .clone()
+    }
+
+    /// Get a receiver for the dead-letter queue associated with `name`.
+    ///
+    /// Items terminated via [`WorkItem::term`](crate::WorkItem::term) appear here.
+    /// Returns `None` if no queue named `name` exists yet.
+    pub fn dlq_receiver(&self, name: &str) -> Option<flume::Receiver<Bytes>> {
+        self.queues.get(name).map(|q| q.dlq_rx.clone())
     }
 }
 
@@ -58,23 +85,80 @@ impl WorkQueueBackend for InMemoryBackend {
     fn receiver(
         &self,
         name: &str,
+        policy: AckPolicy,
     ) -> Pin<Box<dyn Future<Output = Result<Arc<dyn ReceiverBackend>, WorkQueueError>> + Send + '_>>
     {
         let queue = self.get_or_create(name);
-        Box::pin(async move { Ok(queue as Arc<dyn ReceiverBackend>) })
+        Box::pin(async move {
+            Ok(Arc::new(InMemoryReceiver { queue, policy }) as Arc<dyn ReceiverBackend>)
+        })
     }
 }
 
 /// A single named in-memory queue backed by a bounded flume channel.
-struct InMemoryQueue {
+pub(crate) struct InMemoryQueue {
     tx: flume::Sender<Bytes>,
     rx: flume::Receiver<Bytes>,
+    /// Per-lease control channels — signal Ack/Nack/Progress/Term to a lease's reaper.
+    leases: DashMap<u64, flume::Sender<LeaseSignal>>,
+    next_lease_id: AtomicU64,
+    visibility_timeout: Duration,
+    /// Dead-letter channel — items terminated via `term()` are pushed here.
+    dlq_tx: flume::Sender<Bytes>,
+    dlq_rx: flume::Receiver<Bytes>,
 }
 
 impl InMemoryQueue {
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, visibility_timeout: Duration) -> Self {
         let (tx, rx) = flume::bounded(capacity);
-        Self { tx, rx }
+        let (dlq_tx, dlq_rx) = flume::unbounded();
+        Self {
+            tx,
+            rx,
+            leases: DashMap::new(),
+            next_lease_id: AtomicU64::new(1),
+            visibility_timeout,
+            dlq_tx,
+            dlq_rx,
+        }
+    }
+
+    /// Pop an item from the queue, registering a lease under Manual policy.
+    fn pop_with_policy(self: &Arc<Self>, payload: Bytes, policy: AckPolicy) -> DeliveredMessage {
+        match policy {
+            AckPolicy::Auto => DeliveredMessage::auto(payload),
+            AckPolicy::Manual => {
+                let lease_id = self.next_lease_id.fetch_add(1, Ordering::Relaxed);
+                let (control_tx, control_rx) = flume::bounded(1);
+                self.leases.insert(lease_id, control_tx.clone());
+
+                // Spawn reaper. Clone payload so the reaper owns the redelivery copy.
+                let queue = Arc::clone(self);
+                let reaper_payload = payload.clone();
+                let timeout = self.visibility_timeout;
+                match tokio::runtime::Handle::try_current() {
+                    Ok(rt) => {
+                        rt.spawn(async move {
+                            lease_reaper(queue, lease_id, reaper_payload, control_rx, timeout)
+                                .await;
+                        });
+                    }
+                    Err(_) => {
+                        // No runtime — clean up the lease entry; redelivery won't happen.
+                        self.leases.remove(&lease_id);
+                        tracing::warn!(
+                            "InMemoryBackend::recv called without active tokio runtime under Manual policy; lease {lease_id} will not be redelivered on drop/timeout"
+                        );
+                    }
+                }
+
+                let handle = AckHandle::new(MemoryAckHandle {
+                    lease_id,
+                    control: control_tx,
+                });
+                DeliveredMessage::manual(payload, handle)
+            }
+        }
     }
 }
 
@@ -108,13 +192,21 @@ impl SenderBackend for InMemoryQueue {
     }
 }
 
-impl ReceiverBackend for InMemoryQueue {
+/// Receiver wrapping an `Arc<InMemoryQueue>` with a fixed policy.
+struct InMemoryReceiver {
+    queue: Arc<InMemoryQueue>,
+    policy: AckPolicy,
+}
+
+impl ReceiverBackend for InMemoryReceiver {
     fn recv(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<Bytes>, WorkQueueRecvError>> + Send + '_>> {
+    ) -> Pin<
+        Box<dyn Future<Output = Result<Option<DeliveredMessage>, WorkQueueRecvError>> + Send + '_>,
+    > {
         Box::pin(async move {
-            match self.rx.recv_async().await {
-                Ok(data) => Ok(Some(data)),
+            match self.queue.rx.recv_async().await {
+                Ok(data) => Ok(Some(self.queue.pop_with_policy(data, self.policy))),
                 Err(flume::RecvError::Disconnected) => Ok(None),
             }
         })
@@ -123,7 +215,8 @@ impl ReceiverBackend for InMemoryQueue {
     fn recv_batch(
         &self,
         opts: &NextOptions,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Bytes>, WorkQueueRecvError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<DeliveredMessage>, WorkQueueRecvError>> + Send + '_>>
+    {
         let batch_size = opts.batch_size;
         let timeout = opts.timeout;
         Box::pin(async move {
@@ -132,9 +225,9 @@ impl ReceiverBackend for InMemoryQueue {
 
             while batch.len() < batch_size {
                 // Try non-blocking drain first.
-                match self.rx.try_recv() {
+                match self.queue.rx.try_recv() {
                     Ok(data) => {
-                        batch.push(data);
+                        batch.push(self.queue.pop_with_policy(data, self.policy));
                         continue;
                     }
                     Err(flume::TryRecvError::Disconnected) => return Ok(batch),
@@ -142,8 +235,8 @@ impl ReceiverBackend for InMemoryQueue {
                 }
 
                 // Wait for the next item until the deadline.
-                match tokio::time::timeout_at(deadline, self.rx.recv_async()).await {
-                    Ok(Ok(data)) => batch.push(data),
+                match tokio::time::timeout_at(deadline, self.queue.rx.recv_async()).await {
+                    Ok(Ok(data)) => batch.push(self.queue.pop_with_policy(data, self.policy)),
                     Ok(Err(flume::RecvError::Disconnected)) => return Ok(batch),
                     Err(_timeout) => return Ok(batch),
                 }
@@ -153,12 +246,124 @@ impl ReceiverBackend for InMemoryQueue {
         })
     }
 
-    fn try_recv(&self) -> Result<Option<Bytes>, WorkQueueRecvError> {
-        match self.rx.try_recv() {
-            Ok(data) => Ok(Some(data)),
+    fn try_recv(&self) -> Result<Option<DeliveredMessage>, WorkQueueRecvError> {
+        match self.queue.rx.try_recv() {
+            Ok(data) => Ok(Some(self.queue.pop_with_policy(data, self.policy))),
             Err(flume::TryRecvError::Empty) => Ok(None),
             Err(flume::TryRecvError::Disconnected) => Ok(None),
         }
+    }
+}
+
+/// Signal sent from a [`MemoryAckHandle`] to the reaper task.
+enum LeaseSignal {
+    Ack,
+    Nack(Duration),
+    Progress,
+    Term,
+}
+
+/// Per-lease reaper task. Owns the redelivery payload until resolution.
+async fn lease_reaper(
+    queue: Arc<InMemoryQueue>,
+    lease_id: u64,
+    payload: Bytes,
+    control: flume::Receiver<LeaseSignal>,
+    timeout: Duration,
+) {
+    let mut deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        tokio::select! {
+            biased;
+            signal = control.recv_async() => {
+                match signal {
+                    Ok(LeaseSignal::Ack) => {
+                        queue.leases.remove(&lease_id);
+                        return;
+                    }
+                    Ok(LeaseSignal::Nack(delay)) => {
+                        queue.leases.remove(&lease_id);
+                        if !delay.is_zero() {
+                            tokio::time::sleep(delay).await;
+                        }
+                        // Ignore send errors — queue closed means nothing to redeliver to.
+                        let _ = queue.tx.send_async(payload).await;
+                        return;
+                    }
+                    Ok(LeaseSignal::Progress) => {
+                        deadline = tokio::time::Instant::now() + timeout;
+                    }
+                    Ok(LeaseSignal::Term) => {
+                        queue.leases.remove(&lease_id);
+                        let _ = queue.dlq_tx.send_async(payload).await;
+                        return;
+                    }
+                    Err(_) => {
+                        // Control channel closed without a signal — the AckHandle was
+                        // dropped. Drop semantics on WorkItem should have sent Nack first,
+                        // but if we got here redeliver via timeout path.
+                        queue.leases.remove(&lease_id);
+                        let _ = queue.tx.send_async(payload).await;
+                        return;
+                    }
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                // Visibility timeout — redeliver.
+                queue.leases.remove(&lease_id);
+                let _ = queue.tx.send_async(payload).await;
+                return;
+            }
+        }
+    }
+}
+
+/// In-memory ack handle. Sends signals to a per-lease reaper task.
+struct MemoryAckHandle {
+    lease_id: u64,
+    control: flume::Sender<LeaseSignal>,
+}
+
+impl MemoryAckHandle {
+    fn send_signal(&self, signal: LeaseSignal) {
+        // send_async takes a Sender<T> by reference implicitly via try_send;
+        // a closed reaper (already resolved) is not an error — just log.
+        if self.control.try_send(signal).is_err() {
+            tracing::debug!(
+                "MemoryAckHandle: lease {} already resolved (reaper task exited)",
+                self.lease_id
+            );
+        }
+    }
+}
+
+impl AckHandleInner for MemoryAckHandle {
+    fn ack(self: Box<Self>) -> AckFuture<'static> {
+        Box::pin(async move {
+            self.send_signal(LeaseSignal::Ack);
+            Ok(())
+        })
+    }
+
+    fn nack(self: Box<Self>, delay: Duration) -> AckFuture<'static> {
+        Box::pin(async move {
+            self.send_signal(LeaseSignal::Nack(delay));
+            Ok(())
+        })
+    }
+
+    fn in_progress(&self) -> AckFuture<'_> {
+        Box::pin(async move {
+            self.send_signal(LeaseSignal::Progress);
+            Ok(())
+        })
+    }
+
+    fn term(self: Box<Self>) -> AckFuture<'static> {
+        Box::pin(async move {
+            self.send_signal(LeaseSignal::Term);
+            Ok(())
+        })
     }
 }
 
@@ -166,17 +371,28 @@ impl ReceiverBackend for InMemoryQueue {
 mod tests {
     use super::*;
 
+    async fn auto_receiver(backend: &InMemoryBackend, name: &str) -> Arc<dyn ReceiverBackend> {
+        backend
+            .receiver(name, AckPolicy::Auto)
+            .await
+            .expect("receiver")
+    }
+
+    fn bytes(msg: Option<DeliveredMessage>) -> Option<Bytes> {
+        msg.map(|m| m.bytes)
+    }
+
     #[tokio::test]
     async fn test_basic_send_recv() {
         let backend = InMemoryBackend::new(16);
         let sender = backend.sender("test").await.unwrap();
-        let receiver = backend.receiver("test").await.unwrap();
+        let receiver = auto_receiver(&backend, "test").await;
 
         let data = Bytes::from_static(b"hello");
         sender.send(data.clone()).await.unwrap();
 
         let received = receiver.recv().await.unwrap();
-        assert_eq!(received, Some(data));
+        assert_eq!(bytes(received), Some(data));
     }
 
     #[tokio::test]
@@ -193,7 +409,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_recv_empty() {
         let backend = InMemoryBackend::new(16);
-        let receiver = backend.receiver("test").await.unwrap();
+        let receiver = auto_receiver(&backend, "test").await;
 
         let result = receiver.try_recv().unwrap();
         assert!(result.is_none());
@@ -205,18 +421,18 @@ mod tests {
 
         let sender_a = backend.sender("a").await.unwrap();
         let sender_b = backend.sender("b").await.unwrap();
-        let receiver_a = backend.receiver("a").await.unwrap();
-        let receiver_b = backend.receiver("b").await.unwrap();
+        let receiver_a = auto_receiver(&backend, "a").await;
+        let receiver_b = auto_receiver(&backend, "b").await;
 
         sender_a.send(Bytes::from_static(b"aa")).await.unwrap();
         sender_b.send(Bytes::from_static(b"bb")).await.unwrap();
 
         assert_eq!(
-            receiver_a.recv().await.unwrap(),
+            bytes(receiver_a.recv().await.unwrap()),
             Some(Bytes::from_static(b"aa"))
         );
         assert_eq!(
-            receiver_b.recv().await.unwrap(),
+            bytes(receiver_b.recv().await.unwrap()),
             Some(Bytes::from_static(b"bb"))
         );
     }
@@ -226,22 +442,20 @@ mod tests {
         let backend = InMemoryBackend::new(16);
 
         let sender = backend.sender("shared").await.unwrap();
-        let receiver = backend.receiver("shared").await.unwrap();
+        let receiver = auto_receiver(&backend, "shared").await;
 
         sender.send(Bytes::from_static(b"data")).await.unwrap();
         assert_eq!(
-            receiver.recv().await.unwrap(),
+            bytes(receiver.recv().await.unwrap()),
             Some(Bytes::from_static(b"data"))
         );
     }
 
     #[tokio::test]
     async fn test_batch_recv() {
-        use std::time::Duration;
-
         let backend = InMemoryBackend::new(16);
         let sender = backend.sender("batch").await.unwrap();
-        let receiver = backend.receiver("batch").await.unwrap();
+        let receiver = auto_receiver(&backend, "batch").await;
 
         for i in 0u8..5 {
             sender.send(Bytes::from(vec![i])).await.unwrap();
@@ -257,11 +471,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_batch_recv_timeout_partial() {
-        use std::time::Duration;
-
         let backend = InMemoryBackend::new(16);
         let sender = backend.sender("batch-partial").await.unwrap();
-        let receiver = backend.receiver("batch-partial").await.unwrap();
+        let receiver = auto_receiver(&backend, "batch-partial").await;
 
         // Only send 2 items but request batch of 5
         sender.send(Bytes::from_static(b"a")).await.unwrap();

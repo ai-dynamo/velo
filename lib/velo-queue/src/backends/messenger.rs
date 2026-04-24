@@ -19,9 +19,9 @@ use serde::{Deserialize, Serialize};
 use velo_common::InstanceId;
 use velo_messenger::{Messenger, TypedContext};
 
-use crate::backend::{ReceiverBackend, SenderBackend, WorkQueueBackend};
+use crate::backend::{DeliveredMessage, ReceiverBackend, SenderBackend, WorkQueueBackend};
 use crate::error::{WorkQueueError, WorkQueueRecvError, WorkQueueSendError};
-use crate::options::NextOptions;
+use crate::options::{AckPolicy, NextOptions};
 
 const QUEUE_RPC_HANDLER: &str = "velo.queue.rpc";
 const REMOTE_RECV_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -112,9 +112,15 @@ impl WorkQueueBackend for MessengerQueueBackend {
     fn receiver(
         &self,
         name: &str,
+        policy: AckPolicy,
     ) -> Pin<Box<dyn Future<Output = Result<Arc<dyn ReceiverBackend>, WorkQueueError>> + Send + '_>>
     {
         let result = (|| {
+            if policy == AckPolicy::Manual {
+                return Err(WorkQueueError::Backend(
+                    "AckPolicy::Manual not yet implemented for MessengerQueueBackend".into(),
+                ));
+            }
             if self.target_instance == self.messenger.instance_id() {
                 let service = self.local_service()?;
                 return Ok(Arc::new(LocalMessengerReceiver {
@@ -557,7 +563,9 @@ struct LocalMessengerReceiver {
 impl ReceiverBackend for LocalMessengerReceiver {
     fn recv(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<Bytes>, WorkQueueRecvError>> + Send + '_>> {
+    ) -> Pin<
+        Box<dyn Future<Output = Result<Option<DeliveredMessage>, WorkQueueRecvError>> + Send + '_>,
+    > {
         let service = Arc::clone(&self.service);
         let queue = self.queue.clone();
         let capacity = self.capacity;
@@ -565,8 +573,7 @@ impl ReceiverBackend for LocalMessengerReceiver {
             service
                 .recv_async(queue, capacity)
                 .await
-                .map(Bytes::from)
-                .map(Some)
+                .map(|data| Some(DeliveredMessage::auto(Bytes::from(data))))
                 .map_err(map_service_recv_error)
         })
     }
@@ -574,7 +581,8 @@ impl ReceiverBackend for LocalMessengerReceiver {
     fn recv_batch(
         &self,
         opts: &NextOptions,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Bytes>, WorkQueueRecvError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<DeliveredMessage>, WorkQueueRecvError>> + Send + '_>>
+    {
         let service = Arc::clone(&self.service);
         let queue = self.queue.clone();
         let capacity = self.capacity;
@@ -590,14 +598,14 @@ impl ReceiverBackend for LocalMessengerReceiver {
                     .await
                     .map_err(map_service_recv_error)?
                 {
-                    batch.push(Bytes::from(data));
+                    batch.push(DeliveredMessage::auto(Bytes::from(data)));
                     continue;
                 }
 
                 match tokio::time::timeout_at(deadline, service.recv_async(queue.clone(), capacity))
                     .await
                 {
-                    Ok(Ok(data)) => batch.push(Bytes::from(data)),
+                    Ok(Ok(data)) => batch.push(DeliveredMessage::auto(Bytes::from(data))),
                     Ok(Err(err)) => return Err(map_service_recv_error(err)),
                     Err(_timeout) => return Ok(batch),
                 }
@@ -607,10 +615,10 @@ impl ReceiverBackend for LocalMessengerReceiver {
         })
     }
 
-    fn try_recv(&self) -> Result<Option<Bytes>, WorkQueueRecvError> {
+    fn try_recv(&self) -> Result<Option<DeliveredMessage>, WorkQueueRecvError> {
         self.service
             .try_recv_sync(self.queue.clone(), self.capacity)
-            .map(|data| data.map(Bytes::from))
+            .map(|data| data.map(|d| DeliveredMessage::auto(Bytes::from(d))))
             .map_err(map_service_recv_error)
     }
 }
@@ -651,11 +659,13 @@ impl RemoteMessengerReceiver {
 impl ReceiverBackend for RemoteMessengerReceiver {
     fn recv(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<Bytes>, WorkQueueRecvError>> + Send + '_>> {
+    ) -> Pin<
+        Box<dyn Future<Output = Result<Option<DeliveredMessage>, WorkQueueRecvError>> + Send + '_>,
+    > {
         Box::pin(async move {
             loop {
                 if let Some(data) = self.poll_once(REMOTE_RECV_POLL_TIMEOUT).await? {
-                    return Ok(Some(data));
+                    return Ok(Some(DeliveredMessage::auto(data)));
                 }
             }
         })
@@ -664,7 +674,8 @@ impl ReceiverBackend for RemoteMessengerReceiver {
     fn recv_batch(
         &self,
         opts: &NextOptions,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Bytes>, WorkQueueRecvError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<DeliveredMessage>, WorkQueueRecvError>> + Send + '_>>
+    {
         let batch_size = opts.batch_size;
         let timeout = opts.timeout;
         Box::pin(async move {
@@ -679,7 +690,7 @@ impl ReceiverBackend for RemoteMessengerReceiver {
 
                 let poll_timeout = (deadline - now).min(REMOTE_RECV_POLL_TIMEOUT);
                 if let Some(data) = self.poll_once(poll_timeout).await? {
-                    batch.push(data);
+                    batch.push(DeliveredMessage::auto(data));
                 }
                 // On Empty, continue polling until the deadline expires.
             }
@@ -688,7 +699,7 @@ impl ReceiverBackend for RemoteMessengerReceiver {
         })
     }
 
-    fn try_recv(&self) -> Result<Option<Bytes>, WorkQueueRecvError> {
+    fn try_recv(&self) -> Result<Option<DeliveredMessage>, WorkQueueRecvError> {
         Ok(None)
     }
 }

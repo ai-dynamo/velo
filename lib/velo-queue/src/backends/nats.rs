@@ -9,13 +9,10 @@
 //!   `{cluster_id}.queue.{name}`
 //! - A durable pull consumer named `{cluster_id}_{name}_worker`
 //!
-//! Items are auto-acknowledged on receipt (consumer uses `AckPolicy::Explicit`
-//! and the receiver acks immediately after fetching).
-//!
-//! # TODO: Acknowledgment Support
-//!
-//! A future iteration will expose `WorkItem<T>` with manual ack/nack,
-//! controlled by an `AckPolicy` config.
+//! Currently supports only [`AckPolicy::Auto`] — the consumer uses
+//! `AckPolicy::Explicit` under the hood and the receiver acks immediately
+//! after fetching. [`AckPolicy::Manual`] support is pending (see
+//! `WorkItem`-based ack in a follow-up).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -31,9 +28,9 @@ use futures::StreamExt;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::backend::{ReceiverBackend, SenderBackend, WorkQueueBackend};
+use crate::backend::{DeliveredMessage, ReceiverBackend, SenderBackend, WorkQueueBackend};
 use crate::error::{WorkQueueError, WorkQueueRecvError, WorkQueueSendError};
-use crate::options::NextOptions;
+use crate::options::{AckPolicy, NextOptions};
 
 /// NATS JetStream work queue backend.
 ///
@@ -179,11 +176,17 @@ impl WorkQueueBackend for NatsQueueBackend {
     fn receiver(
         &self,
         name: &str,
+        policy: AckPolicy,
     ) -> Pin<Box<dyn Future<Output = Result<Arc<dyn ReceiverBackend>, WorkQueueError>> + Send + '_>>
     {
         let name = name.to_owned();
         let shutdown = self.shutdown_token.child_token();
         Box::pin(async move {
+            if policy == AckPolicy::Manual {
+                return Err(WorkQueueError::Backend(
+                    "AckPolicy::Manual not yet implemented for NatsQueueBackend".into(),
+                ));
+            }
             let resources = self.get_or_create_resources(&name).await?;
             Ok(Arc::new(NatsReceiver {
                 consumer: resources.consumer.clone(),
@@ -255,7 +258,9 @@ struct NatsReceiver {
 impl ReceiverBackend for NatsReceiver {
     fn recv(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<Bytes>, WorkQueueRecvError>> + Send + '_>> {
+    ) -> Pin<
+        Box<dyn Future<Output = Result<Option<DeliveredMessage>, WorkQueueRecvError>> + Send + '_>,
+    > {
         Box::pin(async move {
             loop {
                 // Check shutdown before issuing the next fetch.
@@ -281,9 +286,9 @@ impl ReceiverBackend for NatsReceiver {
                     result = fetch_fut => {
                         match result? {
                             Some(Ok(msg)) => {
-                                // Auto-ack on receipt
+                                // Auto-ack on receipt (Manual path deferred to a later commit).
                                 msg.ack().await.map_err(WorkQueueRecvError::Backend)?;
-                                return Ok(Some(msg.payload.clone()));
+                                return Ok(Some(DeliveredMessage::auto(msg.payload.clone())));
                             }
                             Some(Err(e)) => return Err(WorkQueueRecvError::Backend(e)),
                             // Fetch expired with no message; retry
@@ -298,7 +303,8 @@ impl ReceiverBackend for NatsReceiver {
     fn recv_batch(
         &self,
         opts: &NextOptions,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Bytes>, WorkQueueRecvError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<DeliveredMessage>, WorkQueueRecvError>> + Send + '_>>
+    {
         let batch_size = opts.batch_size;
         let timeout = opts.timeout;
         Box::pin(async move {
@@ -323,7 +329,7 @@ impl ReceiverBackend for NatsReceiver {
                     match msg_result {
                         Ok(msg) => {
                             msg.ack().await.map_err(WorkQueueRecvError::Backend)?;
-                            batch.push(msg.payload.clone());
+                            batch.push(DeliveredMessage::auto(msg.payload.clone()));
                         }
                         Err(e) => {
                             tracing::warn!("NATS queue recv_batch message error: {e}");
@@ -343,7 +349,7 @@ impl ReceiverBackend for NatsReceiver {
         })
     }
 
-    fn try_recv(&self) -> Result<Option<Bytes>, WorkQueueRecvError> {
+    fn try_recv(&self) -> Result<Option<DeliveredMessage>, WorkQueueRecvError> {
         // JetStream fetch is inherently async — cannot do true non-blocking.
         Ok(None)
     }
