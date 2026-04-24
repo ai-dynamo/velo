@@ -19,7 +19,7 @@ use std::time::Duration;
 /// [`WorkItem`]: crate::WorkItem
 /// [`nack`]: crate::WorkItem::nack
 /// [`term`]: crate::WorkItem::term
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum AckPolicy {
     /// Backend acknowledges items on receipt. Default.
     #[default]
