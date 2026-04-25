@@ -15,13 +15,13 @@ const MAX_NACK_DELAY: Duration = Duration::from_secs(24 * 60 * 60);
 /// A received work item wrapping a deserialized value of type `T`.
 ///
 /// Under [`AckPolicy::Auto`](crate::AckPolicy::Auto) the backend already
-/// acknowledged the item on receipt; `handle` is `None` and drop is a no-op.
+/// acknowledged the item on receipt; `handle` is `None`.
 ///
 /// Under [`AckPolicy::Manual`](crate::AckPolicy::Manual) the caller must
-/// explicitly `ack`, `nack`, or `term` each item. Dropping without an
-/// explicit outcome triggers a best-effort `nack(0)` (redeliver) via a
-/// spawned task; if no tokio runtime is active at drop time, the backend's
-/// visibility timeout is the fallback.
+/// explicitly `ack`, `nack`, or `term` each item. Dropping a `WorkItem`
+/// without an explicit outcome triggers a best-effort `nack(0)` via
+/// [`AckHandle`]'s own [`Drop`] impl; if no tokio runtime is active at drop
+/// time, the backend's visibility timeout is the fallback.
 #[must_use = "WorkItem must be ack()'d, nack()'d, term()'d, or explicitly dropped to trigger redelivery"]
 pub struct WorkItem<T> {
     inner: T,
@@ -34,42 +34,30 @@ impl<T> WorkItem<T> {
         Self { inner, handle }
     }
 
-    /// Consume the wrapper and return the inner value without ack'ing.
+    /// Consume the wrapper and return the inner value.
     ///
-    /// Under Manual policy this behaves like drop: best-effort `nack(0)` runs
-    /// via the spawned task. Use this when you want the value but intend to
-    /// defer the ack decision — rare; prefer [`ack`](Self::ack) or
-    /// [`into_parts`](Self::into_parts) for explicit control.
-    pub fn into_inner(mut self) -> T {
-        // Leave handle in place so Drop fires its spawn logic.
-        // SAFETY: move out of `self.inner` via take-and-replace-with-zeroed is not valid;
-        // use std::ptr::read after preventing the original drop of inner.
-        let handle = self.handle.take();
-        // Reconstruct a drop guard that owns the handle but not T.
-        // Simpler: build a forgettable move.
-        let value = unsafe { std::ptr::read(&self.inner) };
-        // Put the handle back into a minimal drop guard to preserve nack-on-drop semantics.
-        let _guard = DropNackGuard { handle };
-        std::mem::forget(self);
-        value
+    /// Under Manual policy this preserves nack-on-drop semantics: the
+    /// [`AckHandle`] is dropped at the end of this call, which spawns a
+    /// best-effort `nack(0)`. Use [`into_parts`](Self::into_parts) instead if
+    /// you want to take ownership of the handle.
+    pub fn into_inner(self) -> T {
+        self.inner
+        // self.handle drops here — AckHandle::Drop fires nack-on-drop if Manual.
     }
 
     /// Consume the wrapper and return both the value and the handle.
     ///
     /// The caller becomes responsible for acking/nacking via the returned
     /// handle. Useful for passing ownership across task boundaries.
-    pub fn into_parts(mut self) -> (T, Option<AckHandle>) {
-        let handle = self.handle.take();
-        let value = unsafe { std::ptr::read(&self.inner) };
-        std::mem::forget(self);
-        (value, handle)
+    pub fn into_parts(self) -> (T, Option<AckHandle>) {
+        (self.inner, self.handle)
     }
 
     /// Acknowledge the item — remove it from the queue permanently.
     ///
     /// Under Auto policy this is a no-op.
-    pub async fn ack(mut self) -> Result<(), WorkQueueRecvError> {
-        match self.handle.take() {
+    pub async fn ack(self) -> Result<(), WorkQueueRecvError> {
+        match self.handle {
             Some(h) => h.ack().await,
             None => Ok(()),
         }
@@ -79,9 +67,9 @@ impl<T> WorkItem<T> {
     ///
     /// `delay` is clamped to 24h. Under Auto policy this is a no-op because
     /// the backend already acked the item on receipt.
-    pub async fn nack(mut self, delay: Duration) -> Result<(), WorkQueueRecvError> {
+    pub async fn nack(self, delay: Duration) -> Result<(), WorkQueueRecvError> {
         let delay = clamp_delay(delay);
-        match self.handle.take() {
+        match self.handle {
             Some(h) => h.nack(delay).await,
             None => Ok(()),
         }
@@ -100,8 +88,8 @@ impl<T> WorkItem<T> {
     /// Terminate the item — do not redeliver, optionally move to dead-letter.
     ///
     /// Under Auto policy this is a no-op.
-    pub async fn term(mut self) -> Result<(), WorkQueueRecvError> {
-        match self.handle.take() {
+    pub async fn term(self) -> Result<(), WorkQueueRecvError> {
+        match self.handle {
             Some(h) => h.term().await,
             None => Ok(()),
         }
@@ -125,47 +113,8 @@ impl<T: std::fmt::Debug> std::fmt::Debug for WorkItem<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WorkItem")
             .field("inner", &self.inner)
-            .field("acked", &self.handle.is_none())
+            .field("manual", &self.handle.is_some())
             .finish()
-    }
-}
-
-impl<T> Drop for WorkItem<T> {
-    fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            nack_on_drop(handle);
-        }
-    }
-}
-
-/// Minimal drop guard used by `into_inner` to preserve nack-on-drop
-/// semantics after the value has been moved out of the WorkItem.
-struct DropNackGuard {
-    handle: Option<AckHandle>,
-}
-
-impl Drop for DropNackGuard {
-    fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            nack_on_drop(handle);
-        }
-    }
-}
-
-fn nack_on_drop(handle: AckHandle) {
-    match tokio::runtime::Handle::try_current() {
-        Ok(rt) => {
-            rt.spawn(async move {
-                if let Err(e) = handle.nack(Duration::ZERO).await {
-                    tracing::warn!("WorkItem dropped without explicit outcome; nack failed: {e}");
-                }
-            });
-        }
-        Err(_) => {
-            tracing::warn!(
-                "WorkItem dropped without active tokio runtime; relying on backend visibility timeout for redelivery"
-            );
-        }
     }
 }
 
