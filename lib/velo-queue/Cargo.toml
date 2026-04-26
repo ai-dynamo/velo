@@ -46,5 +46,13 @@ velo-messenger = { workspace = true }
 velo-common = { workspace = true }
 async-nats = { workspace = true }
 
+[[example]]
+name = "manual_ack_nats"
+required-features = ["nats"]
+
+[[example]]
+name = "manual_ack_messenger"
+required-features = ["messenger"]
+
 [package.metadata.cargo-machete]
 ignored = ["serde"]
