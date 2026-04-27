@@ -40,7 +40,7 @@ pub trait AckHandleInner: Send + Sync {
     /// Extend the visibility timeout — signal that the item is still being processed.
     ///
     /// Can be called repeatedly as a heartbeat.
-    fn in_progress<'a>(&'a self) -> AckFuture<'a>;
+    fn in_progress(&self) -> AckFuture<'_>;
 
     /// Terminate the item — do not redeliver. Optionally moved to a dead-letter queue.
     fn term(self: Box<Self>) -> AckFuture<'static>;
