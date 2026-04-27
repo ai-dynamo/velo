@@ -38,7 +38,7 @@ velo-messenger = { path = "lib/velo-messenger", version = "0.2.0" }
 velo-observability = { path = "lib/velo-observability", version = "0.1.0" }
 velo-transports = { path = "lib/velo-transports", version = "0.2.0" }
 velo-streaming = { path = "lib/velo-streaming", version = "0.3.0" }
-velo-queue = { path = "lib/velo-queue", version = "0.1.0" }
+velo-queue = { path = "lib/velo-queue", version = "0.2.0" }
 velo-rendezvous = { path = "lib/velo-rendezvous", version = "0.1.0" }
 
 # External dependencies
