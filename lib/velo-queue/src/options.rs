@@ -10,13 +10,14 @@ use std::time::Duration;
 /// - [`AckPolicy::Auto`] (default): the backend acknowledges each item on
 ///   receipt. Items leave the queue immediately; worker crashes lose in-flight
 ///   work. Suitable for fire-and-forget workloads.
-/// - [`AckPolicy::Manual`]: the caller must call [`WorkItem::ack`], [`nack`],
-///   or [`term`] on each received item. Dropping a [`WorkItem`] without an
+/// - [`AckPolicy::Manual`]: the caller must call [`ack`], [`nack`], or
+///   [`term`] on each received item. Dropping a [`WorkItem`] without an
 ///   explicit outcome is treated as an implicit `nack(0)` (redeliver). Items
 ///   that are nack'd or time out (visibility timeout) are redelivered by the
 ///   backend. Required for at-least-once processing.
 ///
 /// [`WorkItem`]: crate::WorkItem
+/// [`ack`]: crate::WorkItem::ack
 /// [`nack`]: crate::WorkItem::nack
 /// [`term`]: crate::WorkItem::term
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
