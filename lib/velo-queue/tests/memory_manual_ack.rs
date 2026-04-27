@@ -245,10 +245,13 @@ fn drop_outside_runtime_does_not_panic() {
 // ============================================================================
 
 #[tokio::test(flavor = "multi_thread")]
-async fn auto_policy_methods_are_no_ops() {
-    // Under AckPolicy::Auto, WorkItem::handle is None. Every method on the
-    // wrapper takes the None branch and returns Ok(()) without touching the
-    // queue or any handle.
+async fn auto_policy_methods_return_ok_without_panicking() {
+    // Under AckPolicy::Auto, WorkItem::handle is None and every method on the
+    // wrapper takes the None branch. This test pins the public contract that
+    // each method returns Ok(()) and does not panic. It does NOT verify that
+    // no queue-side action happens — that property comes from inspecting the
+    // source's `None => Ok(())` arm. To verify no-op behavior directly would
+    // require either a recording backend or a queue-internal lease counter.
     let backend = InMemoryBackend::new(16);
     let tx = sender::<Job>(&backend, "q").await.unwrap();
     let rx = receiver::<Job>(&backend, "q", AckPolicy::Auto)
