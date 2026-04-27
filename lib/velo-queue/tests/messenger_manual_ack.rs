@@ -185,6 +185,70 @@ async fn local_visibility_timeout_redelivers() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn local_sweep_to_waiter_uses_real_visibility_timeout() {
+    // Regression: when sweep_expired_leases re-enqueues a payload AND there's
+    // a pending receiver at sweep time, deliver_to_waiter mints a new lease.
+    // It must use the actor's real visibility_timeout — passing 0 would
+    // create an already-expired lease and a self-perpetuating sweep loop.
+    let (m_a, _m_b) = setup_two_messengers().await;
+    let backend = MessengerQueueBackend::new(
+        Arc::clone(&m_a),
+        m_a.instance_id(),
+        local_config(Duration::from_millis(300)),
+    );
+    let tx = sender::<Job>(&backend, "local-sweep-waiter").await.unwrap();
+    let rx = receiver::<Job>(&backend, "local-sweep-waiter", AckPolicy::Manual)
+        .await
+        .unwrap();
+
+    // Step 1: enqueue, recv, leak handle to simulate stuck worker.
+    tx.enqueue(&Job { id: 1 }).await.unwrap();
+    let item1 = rx.next().await.unwrap().unwrap();
+    let (_, h1) = item1.into_parts();
+    std::mem::forget(h1);
+
+    // Step 2: spawn a recv that will block (queue empty, lease 1 still held).
+    // This puts a Command::Recv on the actor's pending_receivers list.
+    let rx_clone = rx.clone();
+    let waiter_task =
+        tokio::spawn(
+            async move { tokio::time::timeout(Duration::from_secs(2), rx_clone.next()).await },
+        );
+
+    // Give the spawned recv a moment to register as a pending receiver.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Step 3: lease 1 expires (~300ms after step 1). Sweeper finds it, pushes
+    // payload back to items, and the waiter-flush loop delivers to the
+    // pending receiver via deliver_to_waiter — this mints lease 2.
+    let item2 = waiter_task
+        .await
+        .unwrap()
+        .expect("waiter timed out — sweeper didn't deliver")
+        .unwrap()
+        .unwrap();
+    assert_eq!(item2.id, 1);
+
+    // Step 4: hold item2 without acking, well within the visibility timeout.
+    // With the fix, item2's lease deadline is ~now + 300ms, still active.
+    // Without the fix, item2's lease deadline was now+0; the next sweeper
+    // tick (a few ms later) re-expires it and pushes the payload back to
+    // items, where try_next would find it.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let opts = NextOptions::new()
+        .batch_size(1)
+        .timeout(Duration::from_millis(100));
+    let leftover = rx.next_with_options(opts).await.unwrap();
+    assert!(
+        leftover.is_empty(),
+        "lease delivered via sweep had zero timeout — re-redelivered immediately"
+    );
+
+    item2.ack().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn local_drop_without_outcome_redelivers() {
     let (m_a, _m_b) = setup_two_messengers().await;
     let backend = MessengerQueueBackend::new(

@@ -543,7 +543,7 @@ async fn run_queue_service(
             tokio::select! {
                 biased;
                 _ = tokio::time::sleep_until(deadline) => {
-                    sweep_expired_leases(&mut queues);
+                    sweep_expired_leases(&mut queues, visibility_timeout);
                     continue;
                 }
                 cmd = rx.recv_async() => cmd,
@@ -662,7 +662,11 @@ async fn run_queue_service(
 }
 
 /// Walk all queues' leases, re-enqueue any whose deadline has passed.
-fn sweep_expired_leases(queues: &mut HashMap<String, QueueState>) {
+///
+/// `visibility_timeout` is forwarded to `deliver_to_waiter` so that leases
+/// minted via the waiter-flush path (when a `Command::Recv` is pending at
+/// sweep time) get a real deadline rather than `now + 0`.
+fn sweep_expired_leases(queues: &mut HashMap<String, QueueState>, visibility_timeout: Duration) {
     let now = Instant::now();
     // Collect expired (queue, token) pairs first to avoid borrow conflicts.
     let mut expired: BTreeMap<String, Vec<u64>> = BTreeMap::new();
@@ -675,12 +679,10 @@ fn sweep_expired_leases(queues: &mut HashMap<String, QueueState>) {
     }
     for (name, tokens) in expired {
         if let Some(state) = queues.get_mut(&name) {
-            // Need visibility_timeout here for lease re-minting on redelivery —
-            // but re-enqueue doesn't mint; it goes back into items and is minted
-            // again on the next recv. We only need to push the payload back.
+            // Re-enqueue: payload goes back into items and is minted with a
+            // fresh lease (and real timeout) on the next recv.
             for token in tokens {
                 if let Some(lease) = state.leases.remove(&token) {
-                    // Re-enqueue as a fresh buffered item.
                     if let Some(capacity) = state.capacity
                         && state.items.len() >= capacity
                     {
@@ -689,12 +691,14 @@ fn sweep_expired_leases(queues: &mut HashMap<String, QueueState>) {
                     state.items.push_back(lease.payload);
                 }
             }
-            // If any receivers were waiting, flush them via deliver_or_buffer.
-            // Easier: loop pop and deliver to pending waiters here.
+            // Flush to any pending receivers. deliver_to_waiter mints a new
+            // lease here, so we must pass the actor's real visibility_timeout
+            // — passing 0 would create immediately-expired leases and a
+            // self-perpetuating sweep loop.
             while !state.pending_receivers.is_empty() && !state.items.is_empty() {
                 let data = state.items.pop_front().unwrap();
                 let (waiter, policy) = state.pending_receivers.pop_front().unwrap();
-                deliver_to_waiter(state, data, waiter, policy, Duration::from_secs(0));
+                deliver_to_waiter(state, data, waiter, policy, visibility_timeout);
             }
         }
     }
