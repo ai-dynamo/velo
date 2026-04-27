@@ -176,11 +176,17 @@ impl InMemoryQueue {
                 let rt = match tokio::runtime::Handle::try_current() {
                     Ok(rt) => rt,
                     Err(_) => {
-                        let payload_back = self.tx.try_send(payload).is_ok();
+                        // Blocking send: waits for a slot if a concurrent
+                        // producer raced us into the bounded channel. try_send
+                        // would return Err(Full) and silently drop the
+                        // payload. send only fails if the channel is closed,
+                        // which can't happen here (InMemoryQueue holds both
+                        // tx and rx) outside of teardown.
+                        let payload_back = self.tx.send(payload).is_ok();
                         let msg = if payload_back {
                             "AckPolicy::Manual requires an active tokio runtime; payload re-enqueued"
                         } else {
-                            "AckPolicy::Manual requires an active tokio runtime; payload lost (queue full)"
+                            "AckPolicy::Manual requires an active tokio runtime; payload lost (queue closed)"
                         };
                         return Err(WorkQueueRecvError::Backend(msg.into()));
                     }
