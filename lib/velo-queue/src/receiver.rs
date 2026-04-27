@@ -82,11 +82,28 @@ impl<T: DeserializeOwned> WorkQueueReceiver<T> {
     }
 }
 
+/// Deserialize the payload and wrap into a `WorkItem`. On deserialization
+/// failure under Manual policy, fire-and-forget a term on the handle so the
+/// poison bytes don't loop back via the implicit nack-on-drop path.
 fn build_work_item<T: DeserializeOwned>(
     msg: DeliveredMessage,
 ) -> Result<WorkItem<T>, WorkQueueRecvError> {
-    let value: T = deserialize(&msg.bytes)?;
-    Ok(WorkItem::new(value, msg.handle))
+    match deserialize(&msg.bytes) {
+        Ok(value) => Ok(WorkItem::new(value, msg.handle)),
+        Err(e) => {
+            // Under Auto, msg.handle is None and this branch is skipped.
+            // Under Manual, term removes the message so it isn't redelivered;
+            // best-effort spawn so we don't block the caller's error path.
+            if let Some(handle) = msg.handle
+                && let Ok(rt) = tokio::runtime::Handle::try_current()
+            {
+                rt.spawn(async move {
+                    let _ = handle.term().await;
+                });
+            }
+            Err(e)
+        }
+    }
 }
 
 fn deserialize<T: DeserializeOwned>(bytes: &Bytes) -> Result<T, WorkQueueRecvError> {

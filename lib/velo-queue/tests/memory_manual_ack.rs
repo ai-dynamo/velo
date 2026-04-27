@@ -320,6 +320,52 @@ async fn malformed_payload_returns_deserialize_error() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn manual_malformed_payload_lands_in_dlq_not_redelivered() {
+    // Under Manual, deserialize failure must term the handle (sending the
+    // poison to DLQ) rather than letting it drop into nack(0). Otherwise the
+    // same malformed bytes would be redelivered indefinitely — every next()
+    // failing to deserialize, every Drop spawning another nack.
+    let backend = InMemoryBackend::new(16);
+    let raw_sender = backend.sender("q").await.unwrap();
+    let rx = receiver::<Job>(&backend, "q", AckPolicy::Manual)
+        .await
+        .unwrap();
+
+    let poison = Bytes::from_static(b"\xFF\xFF garbage");
+    raw_sender.send(poison.clone()).await.unwrap();
+
+    // First call surfaces the deserialization error.
+    let result = rx.next().await;
+    assert!(
+        matches!(result, Err(WorkQueueRecvError::Deserialization(_))),
+        "expected Deserialization error, got {:?}",
+        result
+    );
+
+    // Poison should land in the DLQ, not in the live queue.
+    let dlq = backend.dlq_receiver("q").unwrap();
+    let dlq_bytes = tokio::time::timeout(Duration::from_secs(1), dlq.recv_async())
+        .await
+        .expect("DLQ recv timed out — poison wasn't termed")
+        .unwrap();
+    assert_eq!(dlq_bytes, poison, "DLQ should hold the poison bytes");
+
+    // Live queue should be empty — no redelivery loop.
+    let opts = velo_queue::NextOptions::new()
+        .batch_size(1)
+        .timeout(Duration::from_millis(200));
+    let leftover = rx.next_with_options(opts).await;
+    match leftover {
+        Ok(v) if v.is_empty() => {}
+        Ok(_) => panic!("poison bytes were redelivered as a successful WorkItem?!"),
+        Err(WorkQueueRecvError::Deserialization(_)) => {
+            panic!("poison was redelivered (deserialize failed again) — term didn't break the loop")
+        }
+        Err(e) => panic!("unexpected error after term: {:?}", e),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn nack_with_huge_delay_clamps_and_does_not_block() {
     // Pass 48h to nack(). clamp_delay caps it at 24h and logs a warning.
     // The nack call itself returns promptly (the actual sleep happens in
