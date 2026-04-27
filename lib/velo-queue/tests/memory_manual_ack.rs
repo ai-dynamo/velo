@@ -5,9 +5,12 @@
 
 use std::time::Duration;
 
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use velo_queue::backends::memory::InMemoryBackend;
-use velo_queue::{AckPolicy, receiver, sender};
+use velo_queue::{
+    AckPolicy, WorkQueueBackend, WorkQueueRecvError, receiver, receiver_auto, sender,
+};
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 struct Job {
@@ -234,4 +237,99 @@ fn drop_outside_runtime_does_not_panic() {
     done_rx
         .recv_timeout(Duration::from_secs(1))
         .expect("worker thread did not complete");
+}
+
+// ============================================================================
+// Coverage backfill: Auto-policy no-ops, receiver_auto helper, malformed
+// payload error path, and the 24-hour nack-delay clamp.
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn auto_policy_methods_are_no_ops() {
+    // Under AckPolicy::Auto, WorkItem::handle is None. Every method on the
+    // wrapper takes the None branch and returns Ok(()) without touching the
+    // queue or any handle.
+    let backend = InMemoryBackend::new(16);
+    let tx = sender::<Job>(&backend, "q").await.unwrap();
+    let rx = receiver::<Job>(&backend, "q", AckPolicy::Auto)
+        .await
+        .unwrap();
+
+    // Send four items so each method gets its own to consume.
+    for i in 0..4 {
+        tx.enqueue(&Job { id: i }).await.unwrap();
+    }
+
+    // ack: no-op under Auto.
+    let item = rx.next().await.unwrap().unwrap();
+    item.ack().await.unwrap();
+
+    // nack: clamp_delay still runs but the inner is None.
+    let item = rx.next().await.unwrap().unwrap();
+    item.nack(Duration::from_millis(100)).await.unwrap();
+
+    // in_progress: borrows self, no-op for Auto. ack to consume.
+    let item = rx.next().await.unwrap().unwrap();
+    item.in_progress().await.unwrap();
+    item.ack().await.unwrap();
+
+    // term: no-op under Auto.
+    let item = rx.next().await.unwrap().unwrap();
+    item.term().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn receiver_auto_helper_works() {
+    // Smoke-tests the receiver_auto<T>() free function (the Auto-policy
+    // shortcut). End-to-end equivalent to receiver<T>(backend, name, Auto).
+    let backend = InMemoryBackend::new(16);
+    let tx = sender::<Job>(&backend, "q").await.unwrap();
+    let rx = receiver_auto::<Job>(&backend, "q").await.unwrap();
+
+    tx.enqueue(&Job { id: 99 }).await.unwrap();
+    let item = rx.next().await.unwrap().unwrap();
+    assert_eq!(item.id, 99);
+    item.ack().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn malformed_payload_returns_deserialize_error() {
+    // Inject garbage bytes via the raw byte-level API and observe the typed
+    // receiver propagate WorkQueueRecvError::Deserialization.
+    let backend = InMemoryBackend::new(16);
+    let raw_sender = backend.sender("q").await.unwrap();
+    let rx = receiver::<Job>(&backend, "q", AckPolicy::Auto)
+        .await
+        .unwrap();
+
+    // Bytes that don't form a valid MessagePack-encoded `Job`.
+    raw_sender
+        .send(Bytes::from_static(b"\xFF\xFF garbage"))
+        .await
+        .unwrap();
+
+    let result = rx.next().await;
+    assert!(
+        matches!(result, Err(WorkQueueRecvError::Deserialization(_))),
+        "expected Deserialization error, got {:?}",
+        result
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn nack_with_huge_delay_clamps_and_does_not_block() {
+    // Pass 48h to nack(). clamp_delay caps it at 24h and logs a warning.
+    // The nack call itself returns promptly (the actual sleep happens in
+    // the reaper task, which we abandon when the test ends).
+    let (_backend, tx, rx) = setup(16, Duration::from_secs(30)).await;
+    tx.enqueue(&Job { id: 1 }).await.unwrap();
+
+    let item = rx.next().await.unwrap().unwrap();
+
+    // 48 hours — well past MAX_NACK_DELAY (24h).
+    let huge = Duration::from_secs(48 * 60 * 60);
+    tokio::time::timeout(Duration::from_millis(500), item.nack(huge))
+        .await
+        .expect("nack call took too long; clamp didn't trigger?")
+        .unwrap();
 }

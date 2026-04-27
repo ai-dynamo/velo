@@ -429,3 +429,140 @@ async fn remote_batch_partial_ack() {
         item.ack().await.unwrap();
     }
 }
+
+// ============================================================================
+// Remote-path coverage backfill: in_progress, term, and drop-without-ack
+// across two messenger instances. These exercise the Remote variant of
+// MessengerAckHandle and the corresponding RPC routes.
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_in_progress_extends_deadline() {
+    let (m_a, m_b) = setup_two_messengers().await;
+
+    // Tight 300ms visibility timeout so heartbeats are doing observable work.
+    let backend_b = MessengerQueueBackend::new(
+        Arc::clone(&m_b),
+        m_b.instance_id(),
+        local_config(Duration::from_millis(300)),
+    );
+    let rx = receiver::<Job>(&backend_b, "remote-progress", AckPolicy::Manual)
+        .await
+        .unwrap();
+
+    let backend_a = MessengerQueueBackend::new(
+        Arc::clone(&m_a),
+        m_b.instance_id(),
+        local_config(Duration::from_millis(300)),
+    );
+    let tx = sender::<Job>(&backend_a, "remote-progress").await.unwrap();
+
+    tx.enqueue(&Job { id: 2024 }).await.unwrap();
+
+    let item = tokio::time::timeout(Duration::from_secs(5), rx.next())
+        .await
+        .expect("no item arrived")
+        .unwrap()
+        .unwrap();
+
+    // Heartbeat for ~600ms (well past 300ms visibility timeout) via Remote
+    // Progress RPCs. If they're not actually extending the deadline on the
+    // actor, the item would be redelivered.
+    for _ in 0..5 {
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        item.in_progress().await.unwrap();
+    }
+
+    let opts = NextOptions::new()
+        .batch_size(1)
+        .timeout(Duration::from_millis(300));
+    let leftover = rx.next_with_options(opts).await.unwrap();
+    assert!(
+        leftover.is_empty(),
+        "remote in_progress did not extend deadline; item was redelivered"
+    );
+
+    item.ack().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_term_does_not_redeliver() {
+    let (m_a, m_b) = setup_two_messengers().await;
+
+    let backend_b = MessengerQueueBackend::new(
+        Arc::clone(&m_b),
+        m_b.instance_id(),
+        local_config(Duration::from_millis(300)),
+    );
+    let rx = receiver::<Job>(&backend_b, "remote-term", AckPolicy::Manual)
+        .await
+        .unwrap();
+
+    let backend_a = MessengerQueueBackend::new(
+        Arc::clone(&m_a),
+        m_b.instance_id(),
+        local_config(Duration::from_millis(300)),
+    );
+    let tx = sender::<Job>(&backend_a, "remote-term").await.unwrap();
+
+    tx.enqueue(&Job { id: 555 }).await.unwrap();
+
+    let item = tokio::time::timeout(Duration::from_secs(5), rx.next())
+        .await
+        .expect("no item arrived")
+        .unwrap()
+        .unwrap();
+    item.term().await.unwrap();
+
+    // Wait past the visibility timeout — confirm the actor did NOT redeliver.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let opts = NextOptions::new()
+        .batch_size(1)
+        .timeout(Duration::from_millis(300));
+    let leftover = rx.next_with_options(opts).await.unwrap();
+    assert!(
+        leftover.is_empty(),
+        "remote term did not suppress redelivery"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_drop_without_outcome_redelivers() {
+    let (m_a, m_b) = setup_two_messengers().await;
+
+    let backend_b = MessengerQueueBackend::new(
+        Arc::clone(&m_b),
+        m_b.instance_id(),
+        local_config(Duration::from_secs(30)),
+    );
+    let rx = receiver::<Job>(&backend_b, "remote-drop", AckPolicy::Manual)
+        .await
+        .unwrap();
+
+    let backend_a = MessengerQueueBackend::new(
+        Arc::clone(&m_a),
+        m_b.instance_id(),
+        local_config(Duration::from_secs(30)),
+    );
+    let tx = sender::<Job>(&backend_a, "remote-drop").await.unwrap();
+
+    tx.enqueue(&Job { id: 123 }).await.unwrap();
+
+    {
+        // Drop the WorkItem without ack/nack/term. AckHandle::Drop spawns a
+        // Remote Nack RPC, which the actor handles as nack(0).
+        let _item = tokio::time::timeout(Duration::from_secs(5), rx.next())
+            .await
+            .expect("no item arrived")
+            .unwrap()
+            .unwrap();
+    }
+
+    let again = tokio::time::timeout(Duration::from_secs(5), rx.next())
+        .await
+        .expect("drop-nack did not redeliver across the wire")
+        .unwrap()
+        .unwrap();
+    assert_eq!(again.id, 123);
+    again.ack().await.unwrap();
+}
