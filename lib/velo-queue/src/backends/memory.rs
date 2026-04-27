@@ -37,12 +37,16 @@ pub struct InMemoryBackend {
     queues: DashMap<String, Arc<InMemoryQueue>>,
     capacity: usize,
     visibility_timeout: Duration,
+    /// `None` = unbounded DLQ (default); `Some(n)` = bounded.
+    dlq_capacity: Option<usize>,
 }
 
 impl InMemoryBackend {
     /// Create a new in-memory backend where each queue has the given capacity.
     ///
-    /// Uses [`DEFAULT_VISIBILITY_TIMEOUT`] for manually-acked items.
+    /// Uses [`DEFAULT_VISIBILITY_TIMEOUT`] for manually-acked items. The
+    /// dead-letter queue is unbounded by default; opt in to a bounded DLQ via
+    /// [`with_dlq_capacity`](Self::with_dlq_capacity).
     pub fn new(capacity: usize) -> Self {
         Self::with_visibility_timeout(capacity, DEFAULT_VISIBILITY_TIMEOUT)
     }
@@ -53,13 +57,35 @@ impl InMemoryBackend {
             queues: DashMap::new(),
             capacity,
             visibility_timeout,
+            dlq_capacity: None,
         }
+    }
+
+    /// Bound the dead-letter queue to `dlq_capacity` items.
+    ///
+    /// Defaults to unbounded. When bounded and full, reaper tasks handling
+    /// `term()` calls back-pressure via `send_async` until a consumer drains
+    /// via [`dlq_receiver`](Self::dlq_receiver). The user-facing `term()`
+    /// call is not affected — it returns once the control signal reaches the
+    /// reaper; the DLQ insertion happens off the hot path.
+    ///
+    /// Only the reaper for the offending lease blocks; other leases and the
+    /// main queue flow are unaffected.
+    pub fn with_dlq_capacity(mut self, dlq_capacity: usize) -> Self {
+        self.dlq_capacity = Some(dlq_capacity);
+        self
     }
 
     fn get_or_create(&self, name: &str) -> Arc<InMemoryQueue> {
         self.queues
             .entry(name.to_owned())
-            .or_insert_with(|| Arc::new(InMemoryQueue::new(self.capacity, self.visibility_timeout)))
+            .or_insert_with(|| {
+                Arc::new(InMemoryQueue::new(
+                    self.capacity,
+                    self.visibility_timeout,
+                    self.dlq_capacity,
+                ))
+            })
             .clone()
     }
 
@@ -67,6 +93,9 @@ impl InMemoryBackend {
     ///
     /// Items terminated via [`WorkItem::term`](crate::WorkItem::term) appear here.
     /// Returns `None` if no queue named `name` exists yet.
+    ///
+    /// The DLQ is unbounded by default; see
+    /// [`with_dlq_capacity`](Self::with_dlq_capacity) to bound it.
     pub fn dlq_receiver(&self, name: &str) -> Option<flume::Receiver<Bytes>> {
         self.queues.get(name).map(|q| q.dlq_rx.clone())
     }
@@ -109,9 +138,12 @@ pub(crate) struct InMemoryQueue {
 }
 
 impl InMemoryQueue {
-    fn new(capacity: usize, visibility_timeout: Duration) -> Self {
+    fn new(capacity: usize, visibility_timeout: Duration, dlq_capacity: Option<usize>) -> Self {
         let (tx, rx) = flume::bounded(capacity);
-        let (dlq_tx, dlq_rx) = flume::unbounded();
+        let (dlq_tx, dlq_rx) = match dlq_capacity {
+            Some(c) => flume::bounded(c),
+            None => flume::unbounded(),
+        };
         Self {
             tx,
             rx,

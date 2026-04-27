@@ -336,3 +336,29 @@ async fn nack_with_huge_delay_clamps_and_does_not_block() {
         .expect("nack call took too long; clamp didn't trigger?")
         .unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dlq_capacity_bounds_size_and_drains_progressively() {
+    // With a bounded DLQ, terming more items than capacity must not lose
+    // payloads (reapers backpressure rather than drop) and must not
+    // deadlock. We term 5 items into a capacity-2 DLQ, then drain all 5.
+    let backend = InMemoryBackend::new(16).with_dlq_capacity(2);
+    let tx = sender::<Job>(&backend, "q").await.unwrap();
+    let rx = receiver::<Job>(&backend, "q", AckPolicy::Manual)
+        .await
+        .unwrap();
+
+    for i in 0u64..5 {
+        tx.enqueue(&Job { id: i }).await.unwrap();
+        let item = rx.next().await.unwrap().unwrap();
+        item.term().await.unwrap();
+    }
+
+    let dlq = backend.dlq_receiver("q").unwrap();
+    for _ in 0..5 {
+        tokio::time::timeout(Duration::from_secs(1), dlq.recv_async())
+            .await
+            .expect("DLQ drain timed out — bounded reapers may have deadlocked")
+            .unwrap();
+    }
+}
