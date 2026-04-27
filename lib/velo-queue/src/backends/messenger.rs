@@ -606,7 +606,22 @@ async fn run_queue_service(
                     .items
                     .pop_front()
                     .map(|data| build_recv_reply(state, data, policy, visibility_timeout));
-                let _ = reply.send(out);
+                // Mirror Command::Recv's rollback: if the reply channel was
+                // dropped (caller cancelled), restore the popped item so it
+                // isn't lost. The `Some(rr)` pattern collapses the
+                // queue-empty case (where out was None) — nothing to roll back
+                // when the queue was already empty.
+                if let Err(flume::SendError(Some(rr))) = reply.send(out) {
+                    if let Some(token) = rr.token {
+                        // Manual: remove the lease we just minted, restore the payload.
+                        if let Some(lease) = state.leases.remove(&token) {
+                            state.items.push_front(lease.payload);
+                        }
+                    } else {
+                        // Auto: just push the data back.
+                        state.items.push_front(rr.data);
+                    }
+                }
             }
             Command::Ack { queue, token } => {
                 if let Some(state) = queues.get_mut(&queue) {
