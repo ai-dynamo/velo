@@ -337,6 +337,46 @@ async fn nack_with_huge_delay_clamps_and_does_not_block() {
         .unwrap();
 }
 
+#[test]
+fn try_recv_manual_outside_runtime_returns_error_and_preserves_payload() {
+    // Calling try_recv (sync) from a non-tokio thread under Manual policy
+    // must not silently lose the payload by handing back a dead handle whose
+    // control channel has no listening reaper. Instead, the payload should
+    // be re-enqueued and an explicit error returned.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    let backend = rt.block_on(async {
+        let backend = InMemoryBackend::new(16);
+        let tx = sender::<Job>(&backend, "q").await.unwrap();
+        tx.enqueue(&Job { id: 42 }).await.unwrap();
+        backend
+    });
+
+    // Build the byte-level Manual receiver inside the runtime.
+    let recv = rt.block_on(async { backend.receiver("q", AckPolicy::Manual).await.unwrap() });
+
+    // Call try_recv from a non-tokio thread.
+    let result = std::thread::spawn(move || recv.try_recv()).join().unwrap();
+    assert!(
+        matches!(result, Err(WorkQueueRecvError::Backend(_))),
+        "expected Backend error from try_recv outside runtime, got {:?}",
+        result
+    );
+
+    // Payload should still be in the queue — re-receive via Auto from inside
+    // the runtime to confirm.
+    let job = rt.block_on(async {
+        let rx = receiver::<Job>(&backend, "q", AckPolicy::Auto)
+            .await
+            .unwrap();
+        rx.next().await.unwrap().unwrap()
+    });
+    assert_eq!(
+        job.id, 42,
+        "payload was lost on no-runtime try_recv under Manual"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn dlq_capacity_bounds_size_and_drains_progressively() {
     // With a bounded DLQ, terming more items than capacity must not lose

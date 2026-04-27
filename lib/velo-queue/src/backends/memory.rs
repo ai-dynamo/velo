@@ -156,10 +156,36 @@ impl InMemoryQueue {
     }
 
     /// Pop an item from the queue, registering a lease under Manual policy.
-    fn pop_with_policy(self: &Arc<Self>, payload: Bytes, policy: AckPolicy) -> DeliveredMessage {
+    ///
+    /// Under Manual policy this requires an active tokio runtime to spawn the
+    /// reaper. If no runtime is available (e.g., `try_recv` called from a
+    /// non-tokio thread), the payload is best-effort re-enqueued and an error
+    /// is returned — the caller is told explicitly rather than handed a dead
+    /// handle that silently swallows ack/nack/term calls.
+    fn pop_with_policy(
+        self: &Arc<Self>,
+        payload: Bytes,
+        policy: AckPolicy,
+    ) -> Result<DeliveredMessage, WorkQueueRecvError> {
         match policy {
-            AckPolicy::Auto => DeliveredMessage::auto(payload),
+            AckPolicy::Auto => Ok(DeliveredMessage::auto(payload)),
             AckPolicy::Manual => {
+                // Manual requires a runtime. Detect early and bail out with the
+                // payload re-enqueued, rather than handing back a handle whose
+                // control channel has no listener.
+                let rt = match tokio::runtime::Handle::try_current() {
+                    Ok(rt) => rt,
+                    Err(_) => {
+                        let payload_back = self.tx.try_send(payload).is_ok();
+                        let msg = if payload_back {
+                            "AckPolicy::Manual requires an active tokio runtime; payload re-enqueued"
+                        } else {
+                            "AckPolicy::Manual requires an active tokio runtime; payload lost (queue full)"
+                        };
+                        return Err(WorkQueueRecvError::Backend(msg.into()));
+                    }
+                };
+
                 let lease_id = self.next_lease_id.fetch_add(1, Ordering::Relaxed);
                 let (control_tx, control_rx) = flume::bounded(1);
                 self.leases.insert(lease_id, control_tx.clone());
@@ -168,27 +194,15 @@ impl InMemoryQueue {
                 let queue = Arc::clone(self);
                 let reaper_payload = payload.clone();
                 let timeout = self.visibility_timeout;
-                match tokio::runtime::Handle::try_current() {
-                    Ok(rt) => {
-                        rt.spawn(async move {
-                            lease_reaper(queue, lease_id, reaper_payload, control_rx, timeout)
-                                .await;
-                        });
-                    }
-                    Err(_) => {
-                        // No runtime — clean up the lease entry; redelivery won't happen.
-                        self.leases.remove(&lease_id);
-                        tracing::warn!(
-                            "InMemoryBackend::recv called without active tokio runtime under Manual policy; lease {lease_id} will not be redelivered on drop/timeout"
-                        );
-                    }
-                }
+                rt.spawn(async move {
+                    lease_reaper(queue, lease_id, reaper_payload, control_rx, timeout).await;
+                });
 
                 let handle = AckHandle::new(MemoryAckHandle {
                     lease_id,
                     control: control_tx,
                 });
-                DeliveredMessage::manual(payload, handle)
+                Ok(DeliveredMessage::manual(payload, handle))
             }
         }
     }
@@ -238,7 +252,7 @@ impl ReceiverBackend for InMemoryReceiver {
     > {
         Box::pin(async move {
             match self.queue.rx.recv_async().await {
-                Ok(data) => Ok(Some(self.queue.pop_with_policy(data, self.policy))),
+                Ok(data) => Ok(Some(self.queue.pop_with_policy(data, self.policy)?)),
                 Err(flume::RecvError::Disconnected) => Ok(None),
             }
         })
@@ -259,7 +273,7 @@ impl ReceiverBackend for InMemoryReceiver {
                 // Try non-blocking drain first.
                 match self.queue.rx.try_recv() {
                     Ok(data) => {
-                        batch.push(self.queue.pop_with_policy(data, self.policy));
+                        batch.push(self.queue.pop_with_policy(data, self.policy)?);
                         continue;
                     }
                     Err(flume::TryRecvError::Disconnected) => return Ok(batch),
@@ -268,7 +282,7 @@ impl ReceiverBackend for InMemoryReceiver {
 
                 // Wait for the next item until the deadline.
                 match tokio::time::timeout_at(deadline, self.queue.rx.recv_async()).await {
-                    Ok(Ok(data)) => batch.push(self.queue.pop_with_policy(data, self.policy)),
+                    Ok(Ok(data)) => batch.push(self.queue.pop_with_policy(data, self.policy)?),
                     Ok(Err(flume::RecvError::Disconnected)) => return Ok(batch),
                     Err(_timeout) => return Ok(batch),
                 }
@@ -280,7 +294,7 @@ impl ReceiverBackend for InMemoryReceiver {
 
     fn try_recv(&self) -> Result<Option<DeliveredMessage>, WorkQueueRecvError> {
         match self.queue.rx.try_recv() {
-            Ok(data) => Ok(Some(self.queue.pop_with_policy(data, self.policy))),
+            Ok(data) => Ok(Some(self.queue.pop_with_policy(data, self.policy)?)),
             Err(flume::TryRecvError::Empty) => Ok(None),
             Err(flume::TryRecvError::Disconnected) => Ok(None),
         }
