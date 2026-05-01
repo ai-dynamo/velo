@@ -134,10 +134,15 @@ impl Default for GrpcConfig {
 /// - call [`VeloBuilder::stream_bind_addr`] with a routable address, or
 /// - call [`VeloBuilder::stream_config`] with `Tcp(Some(TcpConfig { bind_addr }))`.
 ///
-/// `Tcp(None)` (the no-bind-addr form) binds on `0.0.0.0:<ephemeral>` and
-/// advertises the loopback counterpart — fine for single-host tests but
-/// **not reachable across hosts**, which is why TCP isn't the implicit
-/// default.
+/// `Tcp(None)` (the no-bind-addr form) binds on `0.0.0.0:<ephemeral>`. The
+/// advertised endpoint is then derived inside `TcpFrameTransport::new()` via
+/// `resolve_advertise_ip(bind_addr)`, which maps unspecified addresses
+/// (`0.0.0.0` / `::`) to their loopback counterpart. The result is fine for
+/// single-host tests but **not reachable across hosts**, which is why TCP
+/// isn't the implicit default. Supplying a specific bind IP via
+/// `Tcp(Some(TcpConfig { bind_addr }))` or [`VeloBuilder::stream_bind_addr`]
+/// passes through `resolve_advertise_ip` unchanged, so the advertised
+/// address matches the routable IP you provided.
 ///
 /// # Variants
 ///
