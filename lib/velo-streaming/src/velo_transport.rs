@@ -178,11 +178,29 @@ impl VeloFrameTransport {
                         return Ok(());
                     }
                 };
-                // Pre-fix senders don't stamp seq; deliverer treats those as
-                // "no reorder protection" (forwards in arrival order).
-                let seq = headers
-                    .get(STREAM_SEQ_HEADER)
-                    .and_then(|v| v.parse::<u64>().ok());
+                // Distinguish three cases for the seq header:
+                //   - absent     → legacy sender, forward in arrival order (back-compat).
+                //   - present+ok → enforce reorder via the deliverer.
+                //   - present+malformed → protocol error from a buggy peer; drop the
+                //     frame loudly rather than silently downgrading to legacy mode
+                //     (which would bypass the reorder buffer for the whole session).
+                let seq = match headers.get(STREAM_SEQ_HEADER) {
+                    None => None,
+                    Some(raw) => match raw.parse::<u64>() {
+                        Ok(v) => Some(v),
+                        Err(e) => {
+                            tracing::error!(
+                                anchor_id,
+                                session_id,
+                                raw = %raw,
+                                error = %e,
+                                "_stream_data: malformed {} header, dropping frame",
+                                STREAM_SEQ_HEADER
+                            );
+                            return Ok(());
+                        }
+                    },
+                };
 
                 let frame_bytes = ctx.payload.to_vec();
 
