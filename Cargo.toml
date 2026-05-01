@@ -32,14 +32,14 @@ keywords = ["nvidia", "distributed"]
 # Local crates
 velo = { path = "lib/velo", version = "0.2.0" }
 velo-common = { path = "lib/velo-common", version = "0.1.0" }
-velo-discovery = { path = "lib/velo-discovery", version = "0.1.0" }
+velo-discovery = { path = "lib/velo-discovery", version = "0.1.1" }
 velo-events = { path = "lib/velo-events", version = "0.1.0" }
 velo-messenger = { path = "lib/velo-messenger", version = "0.2.0" }
-velo-observability = { path = "lib/velo-observability", version = "0.1.0" }
+velo-observability = { path = "lib/velo-observability", version = "0.1.1" }
 velo-transports = { path = "lib/velo-transports", version = "0.2.0" }
 velo-streaming = { path = "lib/velo-streaming", version = "0.4.0" }
-velo-queue = { path = "lib/velo-queue", version = "0.1.0" }
-velo-rendezvous = { path = "lib/velo-rendezvous", version = "0.1.0" }
+velo-queue = { path = "lib/velo-queue", version = "0.1.1" }
+velo-rendezvous = { path = "lib/velo-rendezvous", version = "0.1.1" }
 
 # External dependencies.
 #
