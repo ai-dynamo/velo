@@ -83,7 +83,24 @@ type Deposit = (Option<u64>, Vec<u8>);
 /// per-session deliverer task. The deliverer owns the BTreeMap reorder buffer
 /// and the consumer's flume sender — handlers only push deposits, eliminating
 /// any cross-task locking on the hot path.
-type DispatchMap = DashMap<(u64, u64), flume::Sender<Deposit>>;
+///
+/// Each entry carries a monotonically-assigned `token` so the deliverer's
+/// cleanup guard can leave a newer same-key binding alone without having to
+/// hold a Sender clone (which would keep the deposit channel alive and
+/// prevent `recv_async` from observing close on unbind).
+type DispatchMap = DashMap<(u64, u64), DispatchEntry>;
+
+struct DispatchEntry {
+    token: u64,
+    sender: flume::Sender<Deposit>,
+}
+
+/// Source of `DispatchEntry::token` values. Monotonic, lock-free.
+static DISPATCH_TOKEN: AtomicU64 = AtomicU64::new(0);
+
+fn next_dispatch_token() -> u64 {
+    DISPATCH_TOKEN.fetch_add(1, Ordering::Relaxed)
+}
 
 pub struct VeloFrameTransport {
     messenger: Arc<Messenger>,
@@ -173,14 +190,17 @@ impl VeloFrameTransport {
                 // shard guard across an await point.
                 let deposit_tx = handler_dispatch
                     .get(&(anchor_id, session_id))
-                    .map(|entry| entry.value().clone());
+                    .map(|entry| entry.value().sender.clone());
 
                 if let Some(tx) = deposit_tx
-                    && tx.send_async((seq, frame_bytes)).await.is_err()
+                    && tx.send((seq, frame_bytes)).is_err()
                 {
                     // Deliverer exited (consumer closed or unbound). The
                     // dispatch entry has already been or will be removed by the
-                    // owner; nothing else for the handler to do.
+                    // owner; nothing else for the handler to do. Sync `send` on
+                    // an unbounded channel is non-blocking; it also drops `tx`
+                    // before this await-free path returns, narrowing how long a
+                    // stale Sender clone can pin the channel.
                 }
                 Ok(())
             }
@@ -216,6 +236,22 @@ impl VeloFrameTransport {
     }
 }
 
+/// Owned configuration handed to one [`run_deliverer`] task at spawn time.
+struct DelivererCtx {
+    deposit_rx: flume::Receiver<Deposit>,
+    /// Token of the dispatch entry we registered. Used by the Drop guard to
+    /// leave a newer same-key binding (with a different token) alone. We do
+    /// NOT store a Sender clone here — that would pin the deposit channel
+    /// open and prevent `recv_async` from observing close on unbind.
+    token: u64,
+    consumer_tx: flume::Sender<Vec<u8>>,
+    backpressure: Arc<AtomicU64>,
+    metrics: Option<StreamingTransportMetricsHandle>,
+    dispatch: Arc<DispatchMap>,
+    anchor_id: u64,
+    session_id: u64,
+}
+
 /// Per-session deliverer task.
 ///
 /// Owns the consumer flume sender and the BTreeMap reorder buffer. Receives
@@ -228,27 +264,45 @@ impl VeloFrameTransport {
 /// enforced in one place regardless of how many handler tasks deposit
 /// concurrently. Exits when the deposit channel is closed (unbind / dispatch
 /// entry replaced) or when the consumer drops the receiver.
-async fn run_deliverer(
-    deposit_rx: flume::Receiver<Deposit>,
-    consumer_tx: flume::Sender<Vec<u8>>,
-    backpressure: Arc<AtomicU64>,
-    metrics: Option<StreamingTransportMetricsHandle>,
-    dispatch: Arc<DispatchMap>,
-    anchor_id: u64,
-    session_id: u64,
-) {
+async fn run_deliverer(ctx: DelivererCtx) {
+    let DelivererCtx {
+        deposit_rx,
+        token,
+        consumer_tx,
+        backpressure,
+        metrics,
+        dispatch,
+        anchor_id,
+        session_id,
+    } = ctx;
+
     let mut pending: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
     let mut next_expected: u64 = 0;
     // On exit (overflow, consumer-close, or deposit channel close), proactively
     // remove our dispatch entry so handlers stop trying to deposit and the map
-    // does not accumulate dead entries on long-lived MPSC anchors.
-    struct Cleanup(Arc<DispatchMap>, u64, u64);
+    // does not accumulate dead entries on long-lived MPSC anchors. Guarded by
+    // generation token: if a newer bind() has replaced the entry, its token
+    // differs and the guarded remove is a no-op.
+    struct Cleanup {
+        dispatch: Arc<DispatchMap>,
+        token: u64,
+        anchor_id: u64,
+        session_id: u64,
+    }
     impl Drop for Cleanup {
         fn drop(&mut self) {
-            self.0.remove(&(self.1, self.2));
+            self.dispatch
+                .remove_if(&(self.anchor_id, self.session_id), |_, entry| {
+                    entry.token == self.token
+                });
         }
     }
-    let _cleanup = Cleanup(dispatch, anchor_id, session_id);
+    let _cleanup = Cleanup {
+        dispatch,
+        token,
+        anchor_id,
+        session_id,
+    };
 
     loop {
         let (seq_opt, bytes) = match deposit_rx.recv_async().await {
@@ -376,21 +430,29 @@ impl FrameTransport for VeloFrameTransport {
             // Drop dispatch entries whose deposit receiver is gone (deliverer
             // exited because the consumer closed). Live siblings (MPSC case:
             // multiple concurrent session_ids on the same anchor) are preserved.
-            dispatch.retain(|&(aid, _), tx| aid != anchor_id || !tx.is_disconnected());
+            dispatch.retain(|&(aid, _), entry| aid != anchor_id || !entry.sender.is_disconnected());
             // Unbounded deposit channel: the deliverer drains contiguous runs
             // eagerly, so steady-state occupancy is small. The hard memory cap
             // is enforced by REORDER_WINDOW on the reorder buffer itself.
             let (deposit_tx, deposit_rx) = flume::unbounded::<Deposit>();
-            dispatch.insert((anchor_id, session_id), deposit_tx);
-            tokio::spawn(run_deliverer(
+            let token = next_dispatch_token();
+            dispatch.insert(
+                (anchor_id, session_id),
+                DispatchEntry {
+                    token,
+                    sender: deposit_tx,
+                },
+            );
+            tokio::spawn(run_deliverer(DelivererCtx {
                 deposit_rx,
+                token,
                 consumer_tx,
                 backpressure,
                 metrics,
-                dispatch.clone(),
+                dispatch: dispatch.clone(),
                 anchor_id,
                 session_id,
-            ));
+            }));
             let endpoint = format!("velo://{}/stream/{}", worker_id.as_u64(), anchor_id);
             Ok((endpoint, consumer_rx))
         })
@@ -524,15 +586,16 @@ mod tests {
         let (consumer_tx, consumer_rx) = flume::bounded::<Vec<u8>>(64);
         let backpressure = Arc::new(AtomicU64::new(0));
         let dispatch: Arc<DispatchMap> = Arc::new(DashMap::new());
-        tokio::spawn(super::run_deliverer(
+        tokio::spawn(super::run_deliverer(super::DelivererCtx {
             deposit_rx,
+            token: super::next_dispatch_token(),
             consumer_tx,
-            backpressure.clone(),
-            None,
+            backpressure: backpressure.clone(),
+            metrics: None,
             dispatch,
-            42,
-            7,
-        ));
+            anchor_id: 42,
+            session_id: 7,
+        }));
         (deposit_tx, consumer_rx, backpressure)
     }
 
@@ -574,6 +637,66 @@ mod tests {
             Ok(Ok(b)) => panic!("expected closed channel, got frame: {b:?}"),
             Err(_) => panic!("timed out waiting for channel close"),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cleanup_does_not_evict_newer_binding_for_same_key() {
+        // Simulate: bind A, bind B replaces A's entry under same key, A's
+        // deliverer exits and runs Drop. Expect: B's entry survives.
+        let key = (1u64, 2u64);
+        let dispatch: Arc<DispatchMap> = Arc::new(DashMap::new());
+
+        // First binding.
+        let (a_tx, a_rx) = flume::unbounded::<Deposit>();
+        let (a_consumer_tx, _a_consumer_rx) = flume::bounded::<Vec<u8>>(64);
+        let a_token = super::next_dispatch_token();
+        dispatch.insert(
+            key,
+            super::DispatchEntry {
+                token: a_token,
+                sender: a_tx.clone(),
+            },
+        );
+        let a_deliverer = tokio::spawn(super::run_deliverer(super::DelivererCtx {
+            deposit_rx: a_rx,
+            token: a_token,
+            consumer_tx: a_consumer_tx,
+            backpressure: Arc::new(AtomicU64::new(0)),
+            metrics: None,
+            dispatch: dispatch.clone(),
+            anchor_id: key.0,
+            session_id: key.1,
+        }));
+
+        // Second binding under the same key: replaces A's entry with a fresh
+        // token. The dispatch map's `insert` drops A's Sender clone (the only
+        // one besides `a_tx` here, since the deliverer no longer holds one).
+        let (b_tx, _b_rx) = flume::unbounded::<Deposit>();
+        let b_token = super::next_dispatch_token();
+        dispatch.insert(
+            key,
+            super::DispatchEntry {
+                token: b_token,
+                sender: b_tx.clone(),
+            },
+        );
+
+        // Drop the test's local handle to A's Sender. With no Sender clones
+        // referencing A's channel, A's deposit_rx returns Err and A's
+        // deliverer exits, running its guarded cleanup. The timeout catches a
+        // future regression where the deliverer holds a Sender clone (which
+        // would pin the channel and block exit indefinitely — the bug this
+        // test was originally written to prevent).
+        drop(a_tx);
+        tokio::time::timeout(std::time::Duration::from_secs(5), a_deliverer)
+            .await
+            .expect("A deliverer did not exit after channel close (5s timeout)")
+            .expect("A deliverer panicked");
+
+        // The new entry must still be there.
+        let current = dispatch.get(&key).expect("B entry was clobbered");
+        assert_eq!(current.value().token, b_token);
+        assert!(current.value().sender.same_channel(&b_tx));
     }
 
     #[tokio::test(flavor = "multi_thread")]
