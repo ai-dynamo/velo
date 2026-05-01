@@ -19,7 +19,7 @@ exclude = ["examples"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "Velo Active Messenging Library"
 authors = ["NVIDIA Inc. <sw-dl-dynamo@nvidia.com>"]
@@ -37,7 +37,7 @@ velo-events = { path = "lib/velo-events", version = "0.1.0" }
 velo-messenger = { path = "lib/velo-messenger", version = "0.2.0" }
 velo-observability = { path = "lib/velo-observability", version = "0.1.0" }
 velo-transports = { path = "lib/velo-transports", version = "0.2.0" }
-velo-streaming = { path = "lib/velo-streaming", version = "0.3.0" }
+velo-streaming = { path = "lib/velo-streaming", version = "0.4.0" }
 velo-queue = { path = "lib/velo-queue", version = "0.1.0" }
 velo-rendezvous = { path = "lib/velo-rendezvous", version = "0.1.0" }
 
