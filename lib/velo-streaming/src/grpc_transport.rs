@@ -16,9 +16,9 @@
 //!
 //! # Key Design Decisions
 //!
-//! - `new()` is **async** (unlike `TcpFrameTransport::new` which is sync) because it must
-//!   `await` `TcpListener::bind` to capture the actual OS-assigned port before returning.
-//!   This is necessary so `bind()` can produce an endpoint with the correct port.
+//! - `new()` is **async** because it must `await` `TcpListener::bind` to capture the actual
+//!   OS-assigned port before returning. This is necessary so `bind()` can produce an endpoint
+//!   with the correct port. (`TcpFrameTransport::new` is async for the same reason.)
 //! - The tonic server is started eagerly inside `new()` via
 //!   `serve_with_incoming_shutdown(TcpListenerStream::new(listener), cancel.cancelled())`.
 //! - Exclusive-attach enforcement uses `DashMap::entry()` for atomic check-then-insert,
