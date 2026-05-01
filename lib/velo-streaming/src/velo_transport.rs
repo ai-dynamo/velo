@@ -310,106 +310,101 @@ async fn run_deliverer(ctx: DelivererCtx) {
             Err(_) => return, // unbound / replaced
         };
 
-        if !ingest(
-            seq_opt,
-            bytes,
-            &mut pending,
-            &mut next_expected,
-            &consumer_tx,
-            &backpressure,
-            metrics.as_ref(),
+        let mut ctx = IngestCtx {
+            pending: &mut pending,
+            next_expected: &mut next_expected,
+            consumer_tx: &consumer_tx,
+            backpressure: &backpressure,
+            metrics: metrics.as_ref(),
             anchor_id,
             session_id,
-        )
-        .await
-        {
+        };
+
+        if !ingest(seq_opt, bytes, &mut ctx).await {
             return;
         }
 
         // Drain anything else already buffered on the deposit channel before
         // re-suspending. Keeps the BTreeMap small and improves throughput.
         while let Ok((seq_opt, bytes)) = deposit_rx.try_recv() {
-            if !ingest(
-                seq_opt,
-                bytes,
-                &mut pending,
-                &mut next_expected,
-                &consumer_tx,
-                &backpressure,
-                metrics.as_ref(),
-                anchor_id,
-                session_id,
-            )
-            .await
-            {
+            if !ingest(seq_opt, bytes, &mut ctx).await {
                 return;
             }
         }
     }
 }
 
-/// Process one deposit; returns `false` if the deliverer must exit (consumer
-/// closed or window overflowed).
-#[allow(clippy::too_many_arguments)]
-async fn ingest(
-    seq_opt: Option<u64>,
-    bytes: Vec<u8>,
-    pending: &mut BTreeMap<u64, Vec<u8>>,
-    next_expected: &mut u64,
-    consumer_tx: &flume::Sender<Vec<u8>>,
-    backpressure: &AtomicU64,
-    metrics: Option<&StreamingTransportMetricsHandle>,
+/// Borrowed state shared by [`ingest`] and [`forward`] across one deposit
+/// processing call. Bundles the per-session reorder buffer, consumer sink,
+/// and observability handles so call sites stay short.
+struct IngestCtx<'a> {
+    pending: &'a mut BTreeMap<u64, Vec<u8>>,
+    next_expected: &'a mut u64,
+    consumer_tx: &'a flume::Sender<Vec<u8>>,
+    backpressure: &'a AtomicU64,
+    metrics: Option<&'a StreamingTransportMetricsHandle>,
     anchor_id: u64,
     session_id: u64,
-) -> bool {
+}
+
+/// Process one deposit; returns `false` if the deliverer must exit (consumer
+/// closed or window overflowed).
+async fn ingest(seq_opt: Option<u64>, bytes: Vec<u8>, ctx: &mut IngestCtx<'_>) -> bool {
     match seq_opt {
         // Legacy / pre-fix sender: forward immediately, no reorder protection.
-        None => forward(bytes, consumer_tx, backpressure, metrics).await,
+        None => forward(bytes, ctx).await,
 
         Some(seq) => {
-            if seq < *next_expected {
+            if seq < *ctx.next_expected {
                 // Already-delivered seq (shouldn't happen on FIFO transports,
                 // but harmless to ignore).
                 return true;
             }
-            if pending.len() >= REORDER_WINDOW && !pending.contains_key(&seq) {
+            // Fast path: the head-of-line frame is always accepted. It can
+            // never grow `pending` — it forwards directly and then drains any
+            // contiguous run that was waiting on it. Critically, this avoids
+            // a spurious overflow when `pending.len() == REORDER_WINDOW` and
+            // the missing seq=next_expected frame finally arrives.
+            if seq == *ctx.next_expected {
+                if !forward(bytes, ctx).await {
+                    return false;
+                }
+                *ctx.next_expected += 1;
+                while let Some(b) = ctx.pending.remove(ctx.next_expected) {
+                    if !forward(b, ctx).await {
+                        return false;
+                    }
+                    *ctx.next_expected += 1;
+                }
+                return true;
+            }
+            // Out-of-order arrival: enforce window cap before buffering.
+            if ctx.pending.len() >= REORDER_WINDOW && !ctx.pending.contains_key(&seq) {
                 tracing::error!(
-                    anchor_id,
-                    session_id,
+                    anchor_id = ctx.anchor_id,
+                    session_id = ctx.session_id,
                     seq,
-                    next_expected = *next_expected,
+                    next_expected = *ctx.next_expected,
                     window = REORDER_WINDOW,
                     "_stream_data: reorder window exceeded; closing stream"
                 );
                 return false;
             }
-            pending.insert(seq, bytes);
-            // Drain contiguous run.
-            while let Some(b) = pending.remove(next_expected) {
-                if !forward(b, consumer_tx, backpressure, metrics).await {
-                    return false;
-                }
-                *next_expected += 1;
-            }
+            ctx.pending.insert(seq, bytes);
             true
         }
     }
 }
 
-async fn forward(
-    bytes: Vec<u8>,
-    consumer_tx: &flume::Sender<Vec<u8>>,
-    backpressure: &AtomicU64,
-    metrics: Option<&StreamingTransportMetricsHandle>,
-) -> bool {
-    match consumer_tx.try_send(bytes) {
+async fn forward(bytes: Vec<u8>, ctx: &IngestCtx<'_>) -> bool {
+    match ctx.consumer_tx.try_send(bytes) {
         Ok(()) => true,
         Err(flume::TrySendError::Full(bytes)) => {
-            backpressure.fetch_add(1, Ordering::Relaxed);
-            if let Some(metrics) = metrics {
+            ctx.backpressure.fetch_add(1, Ordering::Relaxed);
+            if let Some(metrics) = ctx.metrics {
                 metrics.record_backpressure();
             }
-            consumer_tx.send_async(bytes).await.is_ok()
+            ctx.consumer_tx.send_async(bytes).await.is_ok()
         }
         Err(flume::TrySendError::Disconnected(_)) => false,
     }
@@ -613,6 +608,35 @@ mod tests {
                 .expect("recv timeout")
                 .expect("deliverer closed");
             assert_eq!(bytes, vec![expected], "frames out of order");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deliverer_accepts_head_of_line_at_full_window() {
+        // Pre-fix bug: pending fills to REORDER_WINDOW with seq=1..=WINDOW,
+        // then seq=0 arrives — the frame that would drain the entire buffer.
+        // The naive overflow check treated that as "full and not pending",
+        // killing the stream. Verify the fast path accepts it and drains.
+        let (tx, rx, _) = spawn_deliverer();
+        for s in 1u64..=(REORDER_WINDOW as u64) {
+            tx.send_async((Some(s), vec![(s & 0xff) as u8]))
+                .await
+                .unwrap();
+        }
+        // Now deliver the head-of-line.
+        tx.send_async((Some(0), vec![0])).await.unwrap();
+
+        // Expect WINDOW + 1 contiguous bytes in seq order.
+        for expected in 0u64..=(REORDER_WINDOW as u64) {
+            let bytes = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv_async())
+                .await
+                .expect("recv timeout — stream was wrongly closed")
+                .expect("deliverer closed prematurely");
+            assert_eq!(
+                bytes,
+                vec![(expected & 0xff) as u8],
+                "frame at seq {expected}"
+            );
         }
     }
 
