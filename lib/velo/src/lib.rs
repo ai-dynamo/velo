@@ -123,13 +123,21 @@ impl Default for GrpcConfig {
 ///
 /// # Default
 ///
-/// If [`VeloBuilder::stream_config`] is never called, the builder defaults to
-/// `Tcp(None)` — a [`TcpFrameTransport`](velo_streaming::TcpFrameTransport)
-/// bound on `0.0.0.0:<ephemeral>` with `velo` (messenger-routed) registered as
-/// a fallback scheme. TCP is preferred because it dedicates a wire connection
-/// per stream (no AM dispatcher concurrency to reorder past, no shared-bus
-/// head-of-line blocking) and the listener is shared across all streams via
-/// token demux (one fd, one ephemeral port for the whole transport).
+/// If [`VeloBuilder::stream_config`] is never called and
+/// [`VeloBuilder::stream_bind_addr`] was never invoked either, the builder
+/// defaults to [`VeloOnly`](StreamConfig::VeloOnly) — streams flow over the
+/// messenger transport that's already wired for cross-host reachability. This
+/// preserves multi-node correctness without requiring callers to know an
+/// externally routable IP.
+///
+/// To opt into the dedicated TCP transport, either:
+/// - call [`VeloBuilder::stream_bind_addr`] with a routable address, or
+/// - call [`VeloBuilder::stream_config`] with `Tcp(Some(TcpConfig { bind_addr }))`.
+///
+/// `Tcp(None)` (the no-bind-addr form) binds on `0.0.0.0:<ephemeral>` and
+/// advertises the loopback counterpart — fine for single-host tests but
+/// **not reachable across hosts**, which is why TCP isn't the implicit
+/// default.
 ///
 /// # Variants
 ///
@@ -222,16 +230,19 @@ impl VeloBuilder {
         Ok(self)
     }
 
-    /// Set the bind address for the default TCP streaming transport.
+    /// Opt into the dedicated TCP streaming transport bound to a specific
+    /// interface.
     ///
     /// Convenience wrapper around [`stream_config`](VeloBuilder::stream_config)
-    /// with `StreamConfig::Tcp(Some(TcpConfig::new(addr)))`. Useful when you
-    /// want to keep the default TCP transport but bind to a specific interface
-    /// (e.g. `127.0.0.1` to avoid exposing the listener publicly).
+    /// with `StreamConfig::Tcp(Some(TcpConfig::new(addr)))`. The address you
+    /// pass is used both for binding and as the advertised endpoint, so it
+    /// must be reachable from the peers that will connect.
     ///
-    /// `build()` always creates a [`TcpFrameTransport`](velo_streaming::TcpFrameTransport)
-    /// unless [`StreamConfig::VeloOnly`] or [`StreamConfig::Grpc`] is set; this
-    /// method only changes which interface it binds.
+    /// Without this call (and without [`stream_config`](VeloBuilder::stream_config)),
+    /// the builder defaults to [`StreamConfig::VeloOnly`] — streams flow over
+    /// the messenger transport. TCP is not chosen implicitly because the
+    /// no-bind-address form (`0.0.0.0`) would advertise loopback, breaking
+    /// multi-node reachability.
     pub fn stream_bind_addr(self, addr: std::net::IpAddr) -> Self {
         // Convenience: wraps StreamConfig::Tcp with explicit bind address.
         // stream_config() cannot fail here (only one call from this path).
@@ -259,7 +270,8 @@ impl VeloBuilder {
     /// 2. Extract WorkerId
     /// 3. Create VeloFrameTransport (always — used as fallback / opt-out)
     /// 4. Resolve the default streaming transport from `stream_config`. If
-    ///    unset, defaults to TCP on `0.0.0.0:<ephemeral>`.
+    ///    unset, defaults to [`StreamConfig::VeloOnly`] (streams over the
+    ///    messenger transport — multi-node reachable by default).
     /// 5. Create AnchorManager via builder
     /// 6. Register streaming control-plane handlers on Messenger
     /// 7. Assemble Velo struct
@@ -279,8 +291,11 @@ impl VeloBuilder {
         )?);
 
         // Step 4: Resolve transport and registry from stream_config.
-        // Default (None) is TCP on 0.0.0.0:<ephemeral>; opt out via VeloOnly.
-        let resolved = self.stream_config.unwrap_or(StreamConfig::Tcp(None));
+        // Implicit default (None) is VeloOnly — TCP without an explicit
+        // bind address advertises loopback, which would silently break
+        // multi-node streaming. Callers opt into TCP via stream_bind_addr()
+        // or stream_config(StreamConfig::Tcp(Some(..))).
+        let resolved = self.stream_config.unwrap_or(StreamConfig::VeloOnly);
         let (default_transport, transport_registry) = match resolved {
             StreamConfig::Tcp(tcp_cfg) => {
                 let bind_addr = tcp_cfg

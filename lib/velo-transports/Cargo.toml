@@ -73,7 +73,7 @@ prometheus = { workspace = true }
 velo-observability = { workspace = true, features = ["test-helpers"] }
 
 [build-dependencies]
-tonic-build = "0.13.1"
+tonic-build = "0.13"
 
 [package.metadata.cargo-machete]
 ignored = ["axum", "http", "http-body", "http-body-util", "hyper", "hyper-util", "prost", "tower"]
