@@ -64,8 +64,7 @@ Transports, discovery backends, and metrics are injected at build time. The `vel
 ## Installation
 
 ```toml
-[dependencies]
-velo = { version = "0.1" }
+cargo add velo
 ```
 
 Optional feature flags:
