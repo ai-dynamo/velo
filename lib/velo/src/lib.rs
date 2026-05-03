@@ -22,16 +22,20 @@ pub mod messenger;
 pub mod observability;
 pub mod queue;
 pub mod rendezvous;
-#[cfg(feature = "simulation")]
-pub mod simulation;
 pub mod streaming;
 pub mod transports;
+
+#[cfg(feature = "simulation")]
+pub mod simulation;
 
 // ── Convenience re-exports for the most-used public types ──────────────────
 
 // Identity / address types live in velo-ext but are re-exported here so the
 // vast majority of consumers depend only on `velo`.
 pub use velo_ext::{InstanceId, PeerInfo, Transport, WorkerAddress, WorkerId};
+
+// Public re-exports for the velo-ext crate.
+pub use velo_ext as ext;
 
 // Messenger surface
 pub use crate::messenger::{
