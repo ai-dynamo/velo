@@ -1,7 +1,11 @@
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
 # CodeRabbit Configuration for Velo
-# Velo is a Rust workspace providing a high-performance distributed messaging framework
-# with multiple transport backends (TCP, UDS, gRPC, NATS, ZMQ).
+# Velo is a Rust workspace with two crates:
+#   - `velo`     : the runtime — active messaging, transports (TCP/HTTP/NATS/gRPC/ZMQ/UDS),
+#                  streaming, discovery, rendezvous, queues, observability
+#   - `velo-ext` : the stable trait surface for out-of-tree plugin authors
+#                  (Transport, FrameTransport, PeerDiscovery, ServiceDiscovery,
+#                  TransportObservability)
 
 language: en-US
 
@@ -19,98 +23,176 @@ reviews:
       - main
 
   path_instructions:
-    # Transport implementations
-    - path: "lib/velo-transports/src/**/*.rs"
+    # velo-ext: the stable extension surface — extra scrutiny on every change
+    - path: "lib/velo-ext/**/*.rs"
+      instructions: |
+        velo-ext is the published trait surface external implementors compile against.
+        Apply maximum scrutiny to every change here:
+        - New trait methods MUST have default implementations. Adding a bare method is
+          a breaking change for every external impl and requires a coordinated `velo` release.
+        - Signature, bound, or parameter changes to existing trait items are breaking and
+          require a `velo-ext` minor bump (pre-1.0) AND a matching `velo` bump in the same PR.
+        - Removing a public item is breaking and requires a major bump.
+        - velo-ext MUST NOT depend on `prometheus`, `tonic`, `axum`, `async-nats`, or any heavy
+          runtime crate. The acceptance test is `cargo tree -p velo-ext | grep -c prometheus == 0`.
+        - The `Cargo.lock` must contain exactly one `velo-ext` entry after `cargo generate-lockfile`.
+        - velo's dep on velo-ext in `[workspace.dependencies]` is `version = "=X.Y.Z"` —
+          the `=` is load-bearing and must NOT be relaxed to a caret requirement.
+        See CONTRIBUTING.md ("velo-ext API stability") for the full contract.
+
+    # velo-ext Cargo.toml — the stability boundary
+    - path: "lib/velo-ext/Cargo.toml"
+      instructions: |
+        Changes here are version-and-stability sensitive:
+        - The `version` field must bump in coordination with any source change to `lib/velo-ext/`
+          (see CONTRIBUTING.md). The CI `semver:` job (scripts/check-semver.sh) is the structural gate.
+        - New dependencies must NOT include heavy runtime crates (prometheus, tonic, axum, async-nats,
+          etcd-client, zmq). velo-ext is the trait surface; concrete impls live in `velo`.
+        - When `velo-ext` bumps, `velo`'s `[workspace.dependencies]` exact-pin (`= "X.Y.Z"`) must
+          bump to track in the same PR.
+
+    # Transport implementations (now in lib/velo/src/transports/)
+    - path: "lib/velo/src/transports/**/*.rs"
       instructions: |
         Review transport implementations with focus on:
-        - All methods of the `Transport` trait are implemented: `key`, `address`, `register`,
-          `send_message`, `start`, `shutdown`, `check_health`
-        - Send failures use `TransportErrorHandler` callbacks — never panic, block, or silently drop
+        - All methods of the `Transport` trait (defined in `velo-ext`) are implemented:
+          `key`, `address`, `register`, `send_message`, `start`, `shutdown`, `check_health`.
+          `set_observability` and `begin_drain` have default no-op impls; override only if needed.
+        - `set_observability` takes `Arc<dyn velo_ext::TransportObservability>` — store and call
+          trait methods (`record_frame`, `record_rejection`, `set_registered_peers`,
+          `set_active_connections`, `record_send_backpressure`); never downcast to a concrete type.
+        - Send failures use `TransportErrorHandler` callbacks — never panic, block, or silently drop.
         - Graceful 3-phase shutdown is respected: Gate (`begin_drain`) → Drain (wait in-flight)
-          → Teardown (cancel tokens); use `ShutdownState.is_draining()` in listener hot paths
+          → Teardown (cancel tokens); use `ShutdownState.is_draining()` in listener hot paths.
         - Prefer `Bytes::from(vec)` (O(1) ownership transfer) over `Bytes::copy_from_slice(&vec)`
-          (O(n) memcpy) when converting from owned `Vec<u8>`
-        - Use `DashMap` for concurrent peer/connection state; avoid `Mutex` on the hot path
-        - New transports must be feature-gated in their crate's `Cargo.toml` and re-exported from
-          `lib.rs`; the feature must propagate to `velo-messenger` and the top-level `velo` crate
+          (O(n) memcpy) when converting from owned `Vec<u8>`.
+        - Use `DashMap` for concurrent peer/connection state; avoid `Mutex` on the hot path.
+        - New transports must be feature-gated in `lib/velo/Cargo.toml` and conditionally declared
+          in `lib/velo/src/transports.rs` (`#[cfg(feature = "<name>")] pub mod <name>;`).
+        - Only `velo-ext` may be added as a workspace dep; never re-introduce sibling crates
+          (velo-messenger, velo-transports, etc. are gone — they are modules inside `velo` now).
 
-    # Transport integration tests
-    - path: "lib/velo-transports/tests/**"
+    # Transport integration tests (now in lib/velo/tests/transports/)
+    - path: "lib/velo/tests/transports/**"
       instructions: |
         Review transport tests with focus on:
         - New transports must invoke `transport_integration_tests!(YourFactory)` — this generates
           20 scenarios covering messaging, message types, large payloads, concurrency, error handling,
-          and drain semantics; do not hand-roll these tests
-        - Transport-specific shutdown tests should use `transport_shutdown_tests!` macro (8 scenarios)
+          and drain semantics; do not hand-roll these tests.
+        - Transport-specific shutdown tests should use `transport_shutdown_tests!` macro.
         - The `TransportFactory` impl must provide both `create()` (single instance) and
-          `create_cluster()` (multi-instance mesh)
+          `create_cluster()` (multi-instance mesh).
         - All async test awaits must be wrapped in `tokio::time::timeout(TEST_TIMEOUT, ...)`;
-          do not use unbounded waits
-        - NATS-dependent tests must be feature-gated with `#[cfg(feature = "nats")]`
+          do not use unbounded waits.
+        - Each new top-level test file requires a matching `[[test]]` entry in `lib/velo/Cargo.toml`
+          with `name = "transports_<filename>"` and `path = "tests/transports/<filename>.rs"`.
+        - Feature-gated tests must use the post-fold flag names:
+          `#[cfg(feature = "nats-transport")]`, `#[cfg(feature = "grpc")]`, `#[cfg(feature = "zmq")]`.
 
-    # All Rust source
-    - path: "lib/**/*.rs"
+    # All other Rust source under lib/velo/
+    - path: "lib/velo/src/**/*.rs"
       instructions: |
         Review Rust code with focus on:
-        - Edition 2024 style: prefer let-chains (`if let ... && let ...`) over nested `if let`
+        - Edition 2024 style: prefer let-chains (`if let ... && let ...`) over nested `if let`.
         - Zero clippy warnings policy — `#[allow(clippy::...)]` is not acceptable on new code;
-          refactor instead (e.g., use config structs instead of `#[allow(clippy::too_many_arguments)]`)
+          refactor instead (e.g., use config structs instead of `#[allow(clippy::too_many_arguments)]`).
+        - Public API discipline: items used only inside `velo` should be `pub(crate)`, not `pub`.
+          Cross-module collaboration is not a reason for `pub`. After the workspace fold, many
+          types that were previously cross-crate `pub` should now be tightened.
         - Error types should use `thiserror::Error` and include context in variants
-          (e.g., `PeerNotRegistered(InstanceId)` not just `PeerNotRegistered`)
-        - Async trait methods return `BoxFuture<'_, anyhow::Result<()>>`
-        - Prefer `flume` bounded channels for back-pressure; `DashMap` for shared concurrent state
-        - No business logic in `main.rs` or `lib.rs` re-exports — keep layers clean
+          (e.g., `PeerNotRegistered(InstanceId)` not just `PeerNotRegistered`).
+        - Async trait methods return `BoxFuture<'_, anyhow::Result<()>>`.
+        - Prefer `flume` bounded channels for back-pressure; `DashMap` for shared concurrent state.
+        - Trait surface for external impls (Transport / FrameTransport / PeerDiscovery /
+          ServiceDiscovery / TransportObservability) lives in `velo-ext`. New extension points
+          belong there, not in `velo`. Do not invent parallel "extension hooks" inside `velo`.
+        - Identity / address / wire types referenced by extension traits live in `velo-ext`.
+          Inside `velo`, prefer `velo_ext::*` for these (e.g. `velo_ext::InstanceId`) over
+          `crate::*` re-exports to keep the boundary visible.
 
-    # Crate manifests
+    # Crate manifests (only velo + velo-ext exist)
     - path: "lib/*/Cargo.toml"
       instructions: |
         Review Cargo.toml changes with focus on:
+        - The workspace has exactly two crates: `velo` and `velo-ext`. Adding a new workspace
+          member is a structural decision — by default, new internal crates must be `publish = false`
+          to prevent the version-drift bug class that motivated the original collapse.
         - New optional deps used only behind a feature gate need
-          `[package.metadata.cargo-machete] ignored` to avoid false-positive cargo-machete failures
-        - New transport feature flags must be propagated to `velo-messenger/Cargo.toml` and the
-          top-level `velo/Cargo.toml`
+          `[package.metadata.cargo-machete] ignored` to avoid false-positive cargo-machete failures.
+        - Feature flag naming after the fold:
+          `nats-transport`, `nats-discovery`, `nats-queue` (NOT bare `nats`),
+          `queue-messenger` (NOT `messenger`),
+          `grpc` (covers both transport and streaming gRPC), `http`, `zmq`, `etcd`,
+          `distributed-tracing`, `simulation`, `test-helpers`.
         - All new dependencies must pass `cargo-deny` license and bans checks (Apache-2.0 / MIT
-          compatible licenses preferred); avoid GPL/LGPL transitive deps
-        - Pinned dependency versions (`=x.y.z`) should be justified in a comment
+          compatible licenses preferred); avoid GPL/LGPL transitive deps.
+        - Pinned dependency versions (`=x.y.z`) should be justified in a comment. The `velo-ext`
+          exact pin in the workspace deps table is the canonical example — do not relax it.
 
     # Workspace root manifest
     - path: "Cargo.toml"
       instructions: |
         Review workspace Cargo.toml changes with focus on:
-        - New workspace members must be added to the `[workspace] members` list
-        - Shared deps should use `[workspace.dependencies]` to keep versions consistent
-        - Cargo.lock must remain committed and in sync (`cargo metadata --locked`)
+        - Members list should remain `["lib/velo", "lib/velo-ext"]`. New entries require
+          a deliberate decision (publishable vs `publish = false`) — see CONTRIBUTING.md.
+        - The `velo-ext` entry in `[workspace.dependencies]` MUST keep its exact `=` pin
+          (`version = "=X.Y.Z"`). Caret pins reintroduce the lockfile-regen bug.
+        - Shared deps should use `[workspace.dependencies]` to keep versions consistent.
+        - Cargo.lock must remain committed and in sync (`cargo metadata --locked`).
 
     # CI workflows
     - path: ".github/workflows/**"
       instructions: |
         Review GitHub Actions workflows with focus on:
         - All `cargo` commands must use `--all-features`; omitting this silently skips
-          feature-gated code (zmq, grpc, nats)
-        - Test and coverage jobs need: NATS service (`nats:latest` on port 4222), and system
-          packages `cmake mold clang` (zeromq-src compiles libzmq from source)
+          feature-gated code (zmq, grpc, nats-transport, nats-discovery, nats-queue, etcd).
+        - Test and coverage jobs need: NATS service (`nats:latest` on port 4222),
+          etcd service for the `etcd` feature tests, and system packages `cmake mold clang`
+          (zeromq-src compiles libzmq from source).
         - Test and coverage jobs must set `RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"`
-          to avoid OOM with the default `ld` linker when linking all features
-        - Use pinned action versions (SHA preferred over tags)
-        - Proper `permissions` scoping per job (principle of least privilege)
+          to avoid OOM with the default `ld` linker when linking all features.
+        - The `semver:` job runs `scripts/check-semver.sh` and is the structural gate against the
+          version-drift bug class. Do not weaken or skip without a `semver:skip` PR label and
+          explicit reviewer agreement.
+        - Use pinned action versions (SHA preferred over tags).
+        - Proper `permissions` scoping per job (principle of least privilege).
         - Secrets must not be echoed or logged; `fail_ci_if_error: false` for Codecov uploads
-          (token may be absent on external PR runs)
+          (token may be absent on external PR runs).
 
     # Examples
-    - path: "lib/**/examples/**"
+    - path: "examples/**"
       instructions: |
         Review examples with focus on:
-        - New transports should be selectable in `ping_pong.rs` via a CLI flag, feature-gated
-        - Examples should compile with `--all-features` without warnings
-        - Do not add external runtime dependencies (databases, cloud services) to examples
+        - Examples depend ONLY on `velo` (and `serde` / `tokio` etc. for ergonomics) — never on
+          internal modules via direct paths that bypass the umbrella. Use `velo::transports::tcp`,
+          not deprecated paths like `velo::backend::tcp`.
+        - New transports should be selectable in `ping_pong.rs` via a CLI flag, feature-gated.
+        - Examples should compile with `--all-features` without warnings.
+        - Do not add external runtime dependencies (databases, cloud services) to examples.
 
     # Documentation
     - path: "**/*.md"
       instructions: |
         Review documentation for:
-        - Accuracy with current code (command flags, feature names, crate names)
-        - Shell commands in docs must match the canonical commands in CLAUDE.md
-        - Clear structure and examples
+        - Accuracy with current code (command flags, feature names, crate names — there are
+          only `velo` and `velo-ext`; references to `velo-messenger`, `velo-transports`,
+          `velo-streaming`, `velo-discovery`, `velo-events`, `velo-observability`,
+          `velo-rendezvous`, `velo-queue`, `velo-common`, `velo-simulation` are stale and
+          should be replaced with module paths under `velo` (e.g., `velo::messenger`).
+        - Feature flag names match the post-fold scheme (`nats-transport`, `nats-discovery`,
+          `nats-queue`, `queue-messenger`, `grpc`, etc.).
+        - Shell commands in docs must match the canonical commands in CLAUDE.md.
+        - Clear structure and examples.
+
+    # Versioning + publishing scripts
+    - path: "scripts/check-semver.sh"
+      instructions: |
+        This script is the structural gate against the version-drift bug class. Review changes
+        with focus on:
+        - It must continue to run `cargo semver-checks check-release` per changed crate against
+          `origin/main` and fail if a breaking change is not paired with a sufficient version bump.
+        - The `semver:skip` label escape hatch must remain explicit and reviewer-gated.
+        - Skipping or weakening this script without compensating protection is unacceptable.
 
   tools:
     shellcheck:
