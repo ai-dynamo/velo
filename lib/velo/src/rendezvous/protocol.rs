@@ -43,9 +43,10 @@ pub struct RvAcquireRequest {
 
 /// Response from `_rv_acquire`: transfer metadata with read lock.
 ///
-/// Data is always pulled via `_rv_pull` — even for single-chunk payloads.
-/// This avoids JSON-encoding binary data in the typed-unary response and
-/// ensures a single code path for all payload sizes.
+/// `Ready` payloads are pulled via `_rv_pull` chunk-by-chunk (used for the
+/// default in-memory `Bytes` slots). `Rdma` carries a serialized
+/// [`NixlAddrDescriptor`] that the consumer fulfills via NIXL_READ when the
+/// `nixl` feature is enabled on both sides.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum AcquireResponse {
     /// Data available via chunked pull (1 or more chunks).
@@ -56,7 +57,9 @@ pub enum AcquireResponse {
         chunk_size: u32,
         chunk_count: u32,
     },
-    /// Phase 2 placeholder: RDMA descriptor for direct memory access.
+    /// RDMA descriptor for direct memory access. The `descriptor` is an
+    /// `rmp_serde`-encoded [`NixlAddrDescriptor`] (only present when the
+    /// owner staged via `register_data_pinned`).
     Rdma { lease_id: u64, descriptor: Vec<u8> },
 }
 
@@ -132,4 +135,45 @@ impl RvHandleWire {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RvError {
     pub message: String,
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2 — NIXL/RDMA descriptor + handshake
+// ---------------------------------------------------------------------------
+
+/// Address descriptor of a remote NIXL-registered region.
+///
+/// Serialized via `rmp_serde` and packed into [`AcquireResponse::Rdma::descriptor`]
+/// when an owner returns RDMA-pinned data.
+#[cfg(feature = "nixl")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NixlAddrDescriptor {
+    /// The owner-side NIXL agent name (used as the `remote_name` for `create_xfer_req`).
+    pub agent: String,
+    /// Address of the registered region as a `u64` (host-endian usize).
+    pub addr: u64,
+    /// Size of the registered region in bytes.
+    pub size: u64,
+    /// Memory type of the region (Dram for Phase 2; Vram is on the roadmap).
+    pub mem_type: velo_nixl::MemType,
+    /// NIXL device id. 0 for host DRAM; CUDA device for VRAM; fd for File.
+    pub device_id: u64,
+}
+
+/// Request payload for the `_rv_nixl_handshake` typed-unary handler.
+///
+/// Sent once per (consumer, owner) pair to bootstrap NIXL agent metadata.
+#[cfg(feature = "nixl")]
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RvNixlHandshakeRequest;
+
+/// Response from `_rv_nixl_handshake`: the owner's NIXL agent name and the
+/// blob produced by `Agent::get_local_md()` for `Agent::load_remote_md()` on
+/// the consumer side.
+#[cfg(feature = "nixl")]
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RvNixlHandshakeResponse {
+    pub agent: String,
+    #[serde(with = "serde_bytes")]
+    pub local_md: Vec<u8>,
 }

@@ -12,6 +12,7 @@ publish = false
 default = []
 zmq = ["velo/zmq"]
 grpc = ["velo/grpc"]
+nixl = ["velo/nixl"]
 
 [dependencies]
 velo = { path = "../lib/velo", features = ["test-helpers"] }
@@ -47,3 +48,7 @@ name = "mpsc_fanin"
 name = "soak"
 path = "examples/soak/main.rs"
 required-features = ["grpc"]
+
+[[example]]
+name = "rendezvous_nixl_two_proc"
+required-features = ["nixl"]

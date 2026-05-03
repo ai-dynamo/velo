@@ -20,6 +20,13 @@ use crate::rendezvous::protocol::{
 };
 use crate::rendezvous::write::RendezvousWrite;
 
+#[cfg(feature = "nixl")]
+use crate::rendezvous::nixl_endpoint::NixlEndpoint;
+#[cfg(feature = "nixl")]
+use crate::rendezvous::protocol::{
+    NixlAddrDescriptor, RvNixlHandshakeRequest, RvNixlHandshakeResponse,
+};
+
 /// Consumer-side operations for the rendezvous protocol.
 ///
 /// These are free functions that take the necessary components as arguments,
@@ -48,6 +55,21 @@ impl Consumer {
     /// Acquires a read lock, transfers data (inline or chunked), returns owned bytes.
     /// The read lock remains held until `detach()` or `release()` is called.
     pub async fn get(messenger: &Arc<Messenger>, handle: DataHandle) -> Result<(Bytes, u64)> {
+        Self::get_with_nixl(messenger, handle, None).await
+    }
+
+    /// Pull data from a remote handle, optionally fulfilling RDMA acquires
+    /// via the supplied [`NixlEndpoint`].
+    ///
+    /// Phase 2 entry point used by [`crate::RendezvousManager::get`] when the
+    /// `nixl` feature is enabled. If `endpoint_with_remote` is `None` and the
+    /// owner returns an `Rdma` response, the call fails with a clear error.
+    pub(crate) async fn get_with_nixl(
+        messenger: &Arc<Messenger>,
+        handle: DataHandle,
+        #[cfg(feature = "nixl")] endpoint_with_remote: Option<(&Arc<NixlEndpoint>, &str)>,
+        #[cfg(not(feature = "nixl"))] endpoint_with_remote: Option<()>,
+    ) -> Result<(Bytes, u64)> {
         let target_worker = handle.worker_id();
 
         let response: AcquireResponse = messenger
@@ -91,8 +113,38 @@ impl Consumer {
                     }
                 }
             }
+            #[cfg(feature = "nixl")]
+            AcquireResponse::Rdma {
+                lease_id,
+                descriptor,
+            } => {
+                let (endpoint, remote_agent) = endpoint_with_remote.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "received Rdma acquire response but consumer has not enabled NIXL"
+                    )
+                })?;
+                match nixl_read(endpoint, remote_agent, &descriptor).await {
+                    Ok(data) => Ok((data, lease_id)),
+                    Err(e) => {
+                        if let Err(cleanup_err) =
+                            Consumer::detach(messenger, handle, lease_id).await
+                        {
+                            tracing::warn!(
+                                "Failed to detach lease {lease_id} after RDMA read failure: \
+                                 {cleanup_err}"
+                            );
+                        }
+                        Err(e)
+                    }
+                }
+            }
+            #[cfg(not(feature = "nixl"))]
             AcquireResponse::Rdma { .. } => {
-                anyhow::bail!("RDMA rendezvous not yet implemented (Phase 2)")
+                let _ = endpoint_with_remote;
+                anyhow::bail!(
+                    "received Rdma acquire response but velo-rendezvous was built without \
+                     the `nixl` feature"
+                )
             }
         }
     }
@@ -105,6 +157,17 @@ impl Consumer {
         messenger: &Arc<Messenger>,
         handle: DataHandle,
         dest: &mut impl RendezvousWrite,
+    ) -> Result<u64> {
+        Self::get_into_with_nixl(messenger, handle, dest, None).await
+    }
+
+    /// `get_into` variant that can also fulfill RDMA acquires.
+    pub(crate) async fn get_into_with_nixl(
+        messenger: &Arc<Messenger>,
+        handle: DataHandle,
+        dest: &mut impl RendezvousWrite,
+        #[cfg(feature = "nixl")] endpoint_with_remote: Option<(&Arc<NixlEndpoint>, &str)>,
+        #[cfg(not(feature = "nixl"))] endpoint_with_remote: Option<()>,
     ) -> Result<u64> {
         let target_worker = handle.worker_id();
 
@@ -150,10 +213,60 @@ impl Consumer {
                     }
                 }
             }
+            #[cfg(feature = "nixl")]
+            AcquireResponse::Rdma {
+                lease_id,
+                descriptor,
+            } => {
+                let (endpoint, remote_agent) = endpoint_with_remote.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "received Rdma acquire response but consumer has not enabled NIXL"
+                    )
+                })?;
+                match nixl_read(endpoint, remote_agent, &descriptor).await {
+                    Ok(data) => {
+                        dest.write_chunk(0, &data)?;
+                        Ok(lease_id)
+                    }
+                    Err(e) => {
+                        if let Err(cleanup_err) =
+                            Consumer::detach(messenger, handle, lease_id).await
+                        {
+                            tracing::warn!(
+                                "Failed to detach lease {lease_id} after RDMA read failure: \
+                                 {cleanup_err}"
+                            );
+                        }
+                        Err(e)
+                    }
+                }
+            }
+            #[cfg(not(feature = "nixl"))]
             AcquireResponse::Rdma { .. } => {
-                anyhow::bail!("RDMA rendezvous not yet implemented (Phase 2)")
+                let _ = endpoint_with_remote;
+                anyhow::bail!(
+                    "received Rdma acquire response but velo-rendezvous was built without \
+                     the `nixl` feature"
+                )
             }
         }
+    }
+
+    /// Send `_rv_nixl_handshake` to the owner and return their (agent_name,
+    /// local_md). The caller is responsible for `Agent::load_remote_md` and
+    /// caching.
+    #[cfg(feature = "nixl")]
+    pub(crate) async fn nixl_handshake(
+        messenger: &Arc<Messenger>,
+        target_worker: WorkerId,
+    ) -> Result<RvNixlHandshakeResponse> {
+        let resp: RvNixlHandshakeResponse = messenger
+            .typed_unary_streaming::<RvNixlHandshakeResponse>("_rv_nixl_handshake")
+            .payload(&RvNixlHandshakeRequest)?
+            .worker(target_worker)
+            .send()
+            .await?;
+        Ok(resp)
     }
 
     /// Increment the refcount on a remote handle.
@@ -252,6 +365,82 @@ async fn pull_chunks(
     }
 
     Ok(buf)
+}
+
+/// Perform a NIXL_READ from a remote-registered region into a freshly
+/// allocated [`SystemStorage`](velo_nixl::SystemStorage), then copy the
+/// result into a returned [`Bytes`].
+///
+/// Phase 2 allocates and registers per call (the "register-per-get" decision
+/// in PLAN.md §8.1). A future optimization is to cache registered destination
+/// buffers in a pool.
+#[cfg(feature = "nixl")]
+async fn nixl_read(
+    endpoint: &Arc<NixlEndpoint>,
+    remote_agent: &str,
+    descriptor: &[u8],
+) -> Result<Bytes> {
+    use velo_nixl::{MemType, NixlRegistration, SystemStorage, XferDescList, XferOp};
+
+    let desc: NixlAddrDescriptor = rmp_serde::from_slice(descriptor)
+        .map_err(|e| anyhow::anyhow!("failed to deserialize NixlAddrDescriptor: {e}"))?;
+
+    let size = desc.size as usize;
+
+    // Allocate + register a destination buffer. SystemStorage::register stores
+    // the RegistrationHandle inside `self`, and Drop auto-deregisters.
+    let mut dst = SystemStorage::new(size)
+        .map_err(|e| anyhow::anyhow!("velo-nixl: SystemStorage::new failed: {e}"))?;
+    dst.register(&endpoint.agent, Some(endpoint.opt_args()))
+        .map_err(|e| anyhow::anyhow!("velo-nixl: dst register failed: {e}"))?;
+
+    let dst_addr = dst.as_slice().as_ptr() as usize;
+
+    // Validate that the descriptor's agent matches the loaded remote name.
+    if desc.agent != remote_agent {
+        anyhow::bail!(
+            "NIXL Rdma descriptor agent {:?} does not match handshake-loaded agent {:?}",
+            desc.agent,
+            remote_agent,
+        );
+    }
+
+    // Build descriptor lists in a sub-scope so they drop before the `.await`
+    // below — `XferDescList` is not `Send` (its inner C handle is a raw
+    // pointer), but the `XferRequest` returned by `create_xfer_req` *is*
+    // `Send + Sync` and copies all needed state into libnixl.
+    let req = {
+        let mut local = XferDescList::new(MemType::Dram)
+            .map_err(|e| anyhow::anyhow!("velo-nixl: local XferDescList::new failed: {e}"))?;
+        local.add_desc(dst_addr, size, 0);
+
+        let mut remote = XferDescList::new(desc.mem_type)
+            .map_err(|e| anyhow::anyhow!("velo-nixl: remote XferDescList::new failed: {e}"))?;
+        remote.add_desc(desc.addr as usize, size, desc.device_id);
+
+        endpoint
+            .agent
+            .create_xfer_req(
+                XferOp::Read,
+                &local,
+                &remote,
+                remote_agent,
+                Some(endpoint.opt_args()),
+            )
+            .map_err(|e| anyhow::anyhow!("velo-nixl: create_xfer_req failed: {e}"))?
+    };
+
+    endpoint
+        .agent
+        .post_xfer_req(&req, Some(endpoint.opt_args()))
+        .map_err(|e| anyhow::anyhow!("velo-nixl: post_xfer_req failed: {e}"))?;
+    velo_nixl::wait_xfer(&endpoint.agent, &req)
+        .await
+        .map_err(|e| anyhow::anyhow!("velo-nixl: wait_xfer failed: {e}"))?;
+
+    // XferRequest::Drop releases + destroys the request automatically. Ditto
+    // for `dst` — Drop on SystemStorage deregisters its memory.
+    Ok(Bytes::copy_from_slice(dst.as_slice()))
 }
 
 /// Pull all chunks for a chunked transfer into an explicit destination.
