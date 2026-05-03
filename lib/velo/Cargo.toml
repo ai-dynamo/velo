@@ -189,6 +189,12 @@ path = "tests/streaming/velo_transport.rs"
 [[test]]
 name = "transports_backpressure"
 path = "tests/transports/backpressure.rs"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "observability_scenarios"
+path = "tests/observability_scenarios.rs"
+required-features = ["test-helpers"]
 
 [[test]]
 name = "transports_grpc"
