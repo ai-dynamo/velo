@@ -2655,72 +2655,46 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "velo"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
- "bytes",
- "serde",
- "tokio",
- "tokio-util",
- "velo-common",
- "velo-discovery",
- "velo-events",
- "velo-messenger",
- "velo-observability",
- "velo-queue",
- "velo-rendezvous",
- "velo-streaming",
- "velo-transports",
-]
-
-[[package]]
-name = "velo-common"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "rmp-serde",
- "serde",
- "serde_bytes",
- "serde_json",
- "thiserror 2.0.18",
- "uuid",
- "xxhash-rust",
-]
-
-[[package]]
-name = "velo-discovery"
-version = "0.1.1"
-dependencies = [
- "anyhow",
+ "async-nats",
  "async-stream",
+ "axum",
+ "bs58",
  "bytes",
+ "dashmap",
+ "derive-getters",
+ "derive_builder",
+ "flume",
  "fs4",
  "futures",
+ "http",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "lru",
+ "nix",
  "parking_lot",
+ "prometheus",
+ "prost",
  "rmp-serde",
  "serde",
  "serde_json",
+ "socket2 0.6.3",
+ "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
  "tokio-util",
+ "tonic",
+ "tonic-build",
+ "tower",
  "tracing",
  "uuid",
- "velo-common",
-]
-
-[[package]]
-name = "velo-events"
-version = "0.1.1"
-dependencies = [
- "anyhow",
- "dashmap",
- "futures",
- "parking_lot",
- "serde",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
+ "velo-ext",
  "xxhash-rust",
+ "zmq",
 ]
 
 [[package]]
@@ -2743,137 +2717,22 @@ dependencies = [
 ]
 
 [[package]]
-name = "velo-messenger"
-version = "0.2.0"
+name = "velo-ext"
+version = "0.1.0"
 dependencies = [
  "anyhow",
- "bs58",
  "bytes",
- "dashmap",
- "derive-getters",
- "derive_builder",
  "flume",
  "futures",
- "lru",
- "parking_lot",
  "rmp-serde",
  "serde",
+ "serde_bytes",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
- "tracing",
  "uuid",
- "velo-common",
- "velo-discovery",
- "velo-events",
- "velo-observability",
- "velo-transports",
-]
-
-[[package]]
-name = "velo-observability"
-version = "0.1.1"
-dependencies = [
- "prometheus",
- "tracing",
-]
-
-[[package]]
-name = "velo-queue"
-version = "0.1.1"
-dependencies = [
- "bytes",
- "dashmap",
- "flume",
- "futures",
- "rmp-serde",
- "serde",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "velo-rendezvous"
-version = "0.1.1"
-dependencies = [
- "anyhow",
- "bytes",
- "dashmap",
- "futures",
- "serde",
- "serde_json",
- "tracing",
- "velo-common",
- "velo-messenger",
- "velo-observability",
-]
-
-[[package]]
-name = "velo-streaming"
-version = "0.4.0"
-dependencies = [
- "anyhow",
- "bytes",
- "dashmap",
- "derive_builder",
- "flume",
- "futures",
- "prost",
- "rmp-serde",
- "serde",
- "serde_json",
- "socket2 0.6.3",
- "thiserror 2.0.18",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tonic",
- "tonic-build",
- "tracing",
- "uuid",
- "velo-common",
- "velo-messenger",
- "velo-observability",
- "velo-transports",
-]
-
-[[package]]
-name = "velo-transports"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "async-nats",
- "axum",
- "bs58",
- "bytes",
- "dashmap",
- "flume",
- "futures",
- "http",
- "http-body",
- "http-body-util",
- "hyper",
- "hyper-util",
- "nix",
- "parking_lot",
- "prost",
- "rmp-serde",
- "serde",
- "serde_json",
- "socket2 0.6.3",
- "thiserror 2.0.18",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tonic",
- "tonic-build",
- "tower",
- "tracing",
- "velo-common",
- "velo-observability",
- "zmq",
+ "xxhash-rust",
 ]
 
 [[package]]
