@@ -1,0 +1,49 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Typed exclusive-attachment streaming abstraction over the velo transport.
+//!
+//! Core wire types:
+//! - [`handle::StreamAnchorHandle`]: compact u128 encoding WorkerId + local anchor ID
+//! - [`frame::StreamFrame`]: seven-variant enum representing all frame types on the wire
+//!
+//! Transport abstraction:
+//! - [`transport::FrameTransport`]: pluggable ordered-delivery transport trait
+//!   returning [`flume::Receiver<Vec<u8>>`] and [`flume::Sender<Vec<u8>>`]
+//!   channel endpoints via [`futures::future::BoxFuture`]
+//!
+//! Anchor registry:
+//! - [`anchor::AnchorManager`]: creates and tracks streaming anchors
+//! - [`anchor::StreamAnchor`]: typed receive stream for anchor consumers
+//! - [`anchor::AttachError`]: errors for exclusive-attach operations
+//!
+//! Sender:
+//! - [`sender::StreamSender`]: typed sender for pushing frames with heartbeat and drop safety
+
+pub mod anchor;
+pub mod control;
+pub mod frame;
+#[cfg(feature = "grpc")]
+pub mod grpc_transport;
+pub mod handle;
+pub mod mpsc;
+pub mod sender;
+pub mod tcp_transport;
+pub mod transport;
+pub(crate) mod util;
+pub mod velo_transport;
+
+pub use anchor::{
+    AnchorConfig, AnchorManager, AnchorManagerBuilder, AttachError, StreamAnchor, StreamController,
+};
+pub use frame::{SendError, StreamError, StreamFrame};
+#[cfg(feature = "grpc")]
+pub use grpc_transport::GrpcFrameTransport;
+pub use handle::{AnchorKind, StreamAnchorHandle};
+pub use mpsc::{
+    MpscAnchorConfig, MpscFrame, MpscStreamAnchor, MpscStreamController, MpscStreamSender, SenderId,
+};
+pub use sender::StreamSender;
+pub use tcp_transport::TcpFrameTransport;
+pub use transport::FrameTransport;
+pub use velo_transport::VeloFrameTransport;

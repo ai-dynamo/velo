@@ -3,75 +3,62 @@
 
 //! # Velo
 //!
-//! High-level facade for Velo distributed systems. Wraps [`Messenger`] with
-//! builder sugar for discovery wiring and re-exports the full public API.
+//! Active messaging runtime for Velo distributed systems. Wraps [`Messenger`]
+//! with builder sugar for discovery wiring and re-exports the full public API.
+//!
+//! Out-of-tree implementors of [`Transport`], [`crate::streaming::FrameTransport`],
+//! [`PeerDiscovery`], or [`crate::discovery::ServiceDiscovery`] should depend
+//! on the smaller [`velo_ext`] crate instead of `velo`. Everything that lives
+//! here is the runtime and concrete impls.
 
 use std::sync::Arc;
 
 use anyhow::Result;
 
-pub use backend::Transport;
-pub use velo_observability::VeloMetrics;
-pub use velo_transports as backend;
+// ── Subsystem modules (each was previously a sibling crate) ────────────────
+pub mod discovery;
+pub mod events;
+pub mod messenger;
+pub mod observability;
+pub mod queue;
+pub mod rendezvous;
+#[cfg(feature = "simulation")]
+pub mod simulation;
+pub mod streaming;
+pub mod transports;
 
-// Re-exports: Messaging (from velo-messenger)
-pub use velo_messenger::{
+// ── Convenience re-exports for the most-used public types ──────────────────
+
+// Identity / address types live in velo-ext but are re-exported here so the
+// vast majority of consumers depend only on `velo`.
+pub use velo_ext::{InstanceId, PeerInfo, Transport, WorkerAddress, WorkerId};
+
+// Messenger surface
+pub use crate::messenger::{
     AmHandlerBuilder, AmSendBuilder, AmSyncBuilder, AsyncExecutor, Context, DispatchMode, Handler,
     HandlerExecutor, Messenger, MessengerBuilder, PeerDiscovery, SyncExecutor, SyncResult,
     TypedContext, TypedUnaryBuilder, TypedUnaryHandlerBuilder, TypedUnaryResult, UnaryBuilder,
     UnaryHandlerBuilder, UnaryResult, UnifiedResponse, VeloEvents,
 };
 
-// Re-exports: Identity (from velo-common)
-pub use velo_common::{InstanceId, PeerInfo, WorkerAddress, WorkerId};
-
-// Re-exports: Events (from velo-events)
-pub use velo_events::{
+// Events
+pub use crate::events::{
     Event, EventAwaiter, EventBackend, EventHandle, EventManager, EventPoison, EventStatus,
 };
 
-// Re-exports: Discovery (from velo-discovery)
-pub use velo_discovery as discovery;
-
-// Re-exports: Streaming (from velo-streaming)
-pub use velo_streaming::{
+// Streaming (flat at root for convenience; full surface still under [`streaming`])
+pub use crate::streaming::{
     AnchorManager, AttachError, SendError, StreamAnchor, StreamAnchorHandle, StreamController,
     StreamError, StreamFrame, StreamSender,
 };
 
-/// Streaming primitives (SPSC at the module root; MPSC under [`streaming::mpsc`]).
-///
-/// This namespace is strictly additive over the top-level flat re-exports
-/// above — both paths point at the same types. New code should prefer this
-/// namespace so the SPSC and MPSC surfaces live side-by-side.
-pub mod streaming {
-    pub use velo_streaming::{
-        AnchorConfig, AnchorKind, AnchorManager, AnchorManagerBuilder, AttachError, FrameTransport,
-        SendError, StreamAnchor, StreamAnchorHandle, StreamController, StreamError, StreamFrame,
-        StreamSender,
-    };
-
-    /// Multi-producer / single-consumer streaming anchors.
-    ///
-    /// See [`MpscStreamAnchor`] for semantics and
-    /// [`crate::Velo::create_mpsc_anchor`] for the facade entry point.
-    pub mod mpsc {
-        pub use velo_streaming::mpsc::{
-            MpscAnchorAttachRequest, MpscAnchorAttachResponse, MpscAnchorCancelRequest,
-            MpscAnchorConfig, MpscAnchorDetachRequest, MpscFrame, MpscStreamAnchor,
-            MpscStreamController, MpscStreamSender, SenderId, create_mpsc_anchor_attach_handler,
-            create_mpsc_anchor_cancel_handler, create_mpsc_anchor_detach_handler,
-        };
-    }
-}
-
-// Re-exports: Queue (from velo-queue)
-pub use velo_queue as queue;
-
-// Re-exports: Rendezvous (from velo-rendezvous)
-pub use velo_rendezvous::{
+// Rendezvous
+pub use crate::rendezvous::{
     DataHandle, DataMetadata, RegisterOptions, RendezvousManager, RendezvousWrite, StageMode,
 };
+
+// Observability
+pub use crate::observability::VeloMetrics;
 
 /// Configuration for TCP streaming transport.
 ///
@@ -146,18 +133,18 @@ impl Default for GrpcConfig {
 ///
 /// # Variants
 ///
-/// - [`StreamConfig::Tcp`]: TCP-based streaming via [`TcpFrameTransport`](velo_streaming::TcpFrameTransport).
+/// - [`StreamConfig::Tcp`]: TCP-based streaming via [`TcpFrameTransport`](crate::streaming::TcpFrameTransport).
 ///   Pass `None` to bind to `0.0.0.0` (OS-assigned port), or provide a
 ///   [`TcpConfig`] for an explicit bind address.
 ///
-/// - [`StreamConfig::Grpc`]: gRPC-based streaming via [`GrpcFrameTransport`](velo_streaming::GrpcFrameTransport).
+/// - [`StreamConfig::Grpc`]: gRPC-based streaming via [`GrpcFrameTransport`](crate::streaming::GrpcFrameTransport).
 ///   Only available when the `grpc` feature is enabled.
 ///   Pass `None` to bind to `0.0.0.0:0` (OS-assigned port), or provide a
 ///   [`GrpcConfig`] for an explicit bind address.
 ///
 /// - [`StreamConfig::VeloOnly`]: Skip the dedicated streaming listener entirely
 ///   and route all streams through `velo-messenger` AMs
-///   ([`VeloFrameTransport`](velo_streaming::VeloFrameTransport)). Use this when
+///   ([`VeloFrameTransport`](crate::streaming::VeloFrameTransport)). Use this when
 ///   the host cannot or should not open additional TCP ports (sandboxed
 ///   environments, restricted-network deployments, single-process tests).
 #[derive(Debug, Clone)]
@@ -186,8 +173,8 @@ pub enum StreamConfig {
 #[derive(Clone)]
 pub struct Velo {
     messenger: Arc<Messenger>,
-    anchor_manager: Arc<velo_streaming::AnchorManager>,
-    rendezvous_manager: Arc<velo_rendezvous::RendezvousManager>,
+    anchor_manager: Arc<crate::streaming::AnchorManager>,
+    rendezvous_manager: Arc<crate::rendezvous::RendezvousManager>,
 }
 
 /// Builder for configuring and creating a [`Velo`] instance.
@@ -289,7 +276,7 @@ impl VeloBuilder {
 
         // Step 3: Create VeloFrameTransport. Always constructed; serves as the
         // VeloOnly default and as the `velo://` fallback scheme alongside TCP.
-        let velo_transport = Arc::new(velo_streaming::VeloFrameTransport::new(
+        let velo_transport = Arc::new(crate::streaming::VeloFrameTransport::new(
             Arc::clone(&messenger),
             worker_id,
             self.metrics.clone(),
@@ -306,18 +293,18 @@ impl VeloBuilder {
                 let bind_addr = tcp_cfg
                     .map(|c| c.bind_addr)
                     .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
-                let tcp_transport = velo_streaming::TcpFrameTransport::new(bind_addr).await?;
+                let tcp_transport = crate::streaming::TcpFrameTransport::new(bind_addr).await?;
                 let mut registry = std::collections::HashMap::new();
                 registry.insert(
                     "tcp".to_string(),
-                    Arc::clone(&tcp_transport) as Arc<dyn velo_streaming::FrameTransport>,
+                    Arc::clone(&tcp_transport) as Arc<dyn crate::streaming::FrameTransport>,
                 );
                 registry.insert(
                     "velo".to_string(),
-                    velo_transport.clone() as Arc<dyn velo_streaming::FrameTransport>,
+                    velo_transport.clone() as Arc<dyn crate::streaming::FrameTransport>,
                 );
                 (
-                    tcp_transport as Arc<dyn velo_streaming::FrameTransport>,
+                    tcp_transport as Arc<dyn crate::streaming::FrameTransport>,
                     Arc::new(registry),
                 )
             }
@@ -327,33 +314,33 @@ impl VeloBuilder {
                     .map(|c| c.bind_addr)
                     .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
                 let grpc_transport = Arc::new(
-                    velo_streaming::GrpcFrameTransport::new(bind_addr)
+                    crate::streaming::GrpcFrameTransport::new(bind_addr)
                         .await
                         .map_err(|e| anyhow::anyhow!("Failed to start gRPC transport: {}", e))?,
                 );
                 let mut registry = std::collections::HashMap::new();
                 registry.insert(
                     "grpc".to_string(),
-                    Arc::clone(&grpc_transport) as Arc<dyn velo_streaming::FrameTransport>,
+                    Arc::clone(&grpc_transport) as Arc<dyn crate::streaming::FrameTransport>,
                 );
                 registry.insert(
                     "velo".to_string(),
-                    velo_transport.clone() as Arc<dyn velo_streaming::FrameTransport>,
+                    velo_transport.clone() as Arc<dyn crate::streaming::FrameTransport>,
                 );
                 (
-                    grpc_transport as Arc<dyn velo_streaming::FrameTransport>,
+                    grpc_transport as Arc<dyn crate::streaming::FrameTransport>,
                     Arc::new(registry),
                 )
             }
             StreamConfig::VeloOnly => (
-                velo_transport as Arc<dyn velo_streaming::FrameTransport>,
+                velo_transport as Arc<dyn crate::streaming::FrameTransport>,
                 Arc::new(std::collections::HashMap::new()),
             ),
         };
 
         // Step 5: Create AnchorManager (pass messenger for cross-worker cancel AMs)
         let anchor_manager = Arc::new(
-            velo_streaming::AnchorManagerBuilder::default()
+            crate::streaming::AnchorManagerBuilder::default()
                 .worker_id(worker_id)
                 .transport(default_transport)
                 .transport_registry(transport_registry)
@@ -368,16 +355,16 @@ impl VeloBuilder {
 
         // Step 7: Create RendezvousManager and register handlers
         let rendezvous_manager = Arc::new(match self.metrics.as_ref() {
-            Some(m) => velo_rendezvous::RendezvousManager::with_metrics(worker_id, Arc::clone(m)),
-            None => velo_rendezvous::RendezvousManager::new(worker_id),
+            Some(m) => crate::rendezvous::RendezvousManager::with_metrics(worker_id, Arc::clone(m)),
+            None => crate::rendezvous::RendezvousManager::new(worker_id),
         });
         rendezvous_manager.register_handlers(Arc::clone(&messenger))?;
 
         // Step 8: Enable transparent large payload support
-        let stager = Arc::new(velo_rendezvous::RendezvousStager::new(Arc::clone(
+        let stager = Arc::new(crate::rendezvous::RendezvousStager::new(Arc::clone(
             &rendezvous_manager,
         )));
-        let resolver = Arc::new(velo_rendezvous::RendezvousResolver::new(Arc::clone(
+        let resolver = Arc::new(crate::rendezvous::RendezvousResolver::new(Arc::clone(
             &rendezvous_manager,
         )));
         messenger.set_large_payload_support(stager, resolver);
@@ -518,7 +505,7 @@ impl Velo {
 
     /// Attach a sender to an existing anchor (local or remote).
     ///
-    /// Delegates to [`AnchorManager::attach_stream_anchor`](velo_streaming::AnchorManager::attach_stream_anchor).
+    /// Delegates to [`AnchorManager::attach_stream_anchor`](crate::streaming::AnchorManager::attach_stream_anchor).
     /// For fine-grained control, use [`anchor_manager()`](Velo::anchor_manager) directly.
     pub async fn attach_anchor<T: serde::Serialize>(
         &self,
@@ -528,7 +515,7 @@ impl Velo {
     }
 
     /// Get the underlying anchor manager for direct registry access.
-    pub fn anchor_manager(&self) -> &velo_streaming::AnchorManager {
+    pub fn anchor_manager(&self) -> &crate::streaming::AnchorManager {
         &self.anchor_manager
     }
 
@@ -629,7 +616,7 @@ impl Velo {
     }
 
     /// Get the underlying rendezvous manager for direct access.
-    pub fn rendezvous_manager(&self) -> &velo_rendezvous::RendezvousManager {
+    pub fn rendezvous_manager(&self) -> &crate::rendezvous::RendezvousManager {
         &self.rendezvous_manager
     }
 }
@@ -669,7 +656,7 @@ mod tests {
         // This test verifies the anchor_manager() method exists and returns &AnchorManager.
         // It doesn't construct a Velo (that requires async + transport), so we verify
         // the method signature exists by type-checking a function pointer.
-        let _: fn(&Velo) -> &velo_streaming::AnchorManager = Velo::anchor_manager;
+        let _: fn(&Velo) -> &crate::streaming::AnchorManager = Velo::anchor_manager;
     }
 
     /// Test 2: create_anchor method exists with correct generic signature
@@ -677,7 +664,7 @@ mod tests {
     fn velo_create_anchor_signature() {
         // Verify the method exists and has the correct type.
         // We can't call it without a Velo instance, but we can verify the signature.
-        let _: fn(&Velo) -> velo_streaming::StreamAnchor<String> = Velo::create_anchor::<String>;
+        let _: fn(&Velo) -> crate::streaming::StreamAnchor<String> = Velo::create_anchor::<String>;
     }
 
     /// Test 3: attach_anchor method exists with correct async generic signature
@@ -688,7 +675,7 @@ mod tests {
         let transport = {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             Arc::new(
-                velo_transports::tcp::TcpTransportBuilder::new()
+                crate::transports::tcp::TcpTransportBuilder::new()
                     .from_listener(listener)
                     .unwrap()
                     .build()
@@ -702,16 +689,16 @@ mod tests {
             .unwrap();
 
         // Test 1: anchor_manager() returns &AnchorManager
-        let _am: &velo_streaming::AnchorManager = velo.anchor_manager();
+        let _am: &crate::streaming::AnchorManager = velo.anchor_manager();
 
         // Test 2: create_anchor::<String>() returns StreamAnchor<String>
-        let anchor: velo_streaming::StreamAnchor<String> = velo.create_anchor::<String>();
+        let anchor: crate::streaming::StreamAnchor<String> = velo.create_anchor::<String>();
         let handle = anchor.handle();
 
         // Test 3: attach_anchor::<String>(handle) returns correct Result type
         // The local attach path no longer calls transport.connect(), so it
         // should succeed for local handles.
-        let result: Result<velo_streaming::StreamSender<String>, velo_streaming::AttachError> =
+        let result: Result<crate::streaming::StreamSender<String>, crate::streaming::AttachError> =
             velo.attach_anchor::<String>(handle).await;
 
         let _sender = result.expect("local attach should succeed");

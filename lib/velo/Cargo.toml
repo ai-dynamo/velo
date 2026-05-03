@@ -3,49 +3,229 @@
 
 [package]
 name = "velo"
-version.workspace = true
+version = "0.3.0"
 edition.workspace = true
-description = "High-level facade for Velo distributed systems"
+description = "Velo distributed-systems runtime: active messaging, peer discovery, streaming, rendezvous, and queue backends"
 authors.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
+keywords.workspace = true
 
 [features]
-etcd = ["velo-discovery/etcd"]
-grpc = ["velo-streaming/grpc"]
-zmq = ["velo-transports/zmq"]
-queue-nats = ["velo-queue/nats"]
-queue-messenger = ["velo-queue/messenger"]
-distributed-tracing = [
-    "velo-messenger/distributed-tracing",
-    "velo-streaming/distributed-tracing",
-    "velo-transports/distributed-tracing",
-]
+# `default` matches the previous workspace defaults (HTTP + NATS messaging + gRPC).
+default = ["http", "nats-transport", "grpc"]
+
+# Messenger transports
+http = ["dep:axum"]
+nats-transport = ["dep:async-nats"]
+grpc = ["dep:tonic", "dep:prost", "dep:tower", "dep:hyper", "dep:http", "dep:http-body", "dep:http-body-util", "dep:hyper-util", "dep:tokio-stream"]
+zmq = ["dep:zmq"]
+
+# Discovery backends
+nats-discovery = ["dep:async-nats"]
+etcd = ["dep:etcd-client"]
+
+# Queue backends
+nats-queue = ["dep:async-nats"]
+queue-messenger = []
+
+# Optional subsystems
+distributed-tracing = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
+simulation = ["dep:loom-rs"]
+test-helpers = []
 
 [dependencies]
-velo-common = { workspace = true }
-velo-discovery = { workspace = true }
-velo-events = { workspace = true }
-velo-messenger = { workspace = true }
-velo-observability = { workspace = true }
-velo-streaming = { workspace = true }
-velo-queue = { workspace = true }
-velo-rendezvous = { workspace = true }
-velo-transports = { workspace = true }
-bytes = { workspace = true }
+# velo-ext is the only inter-workspace runtime dep — exact-pinned at the
+# workspace level so a future "compatible" patch cannot silently re-resolve
+# downstream lockfiles.
+velo-ext = { workspace = true }
+
 anyhow = { workspace = true }
-serde = { workspace = true }
+async-stream = { workspace = true }
+bytes = { workspace = true }
+dashmap = { workspace = true }
+derive_builder = { workspace = true }
+derive-getters = { workspace = true }
+flume = { workspace = true }
+fs4 = { version = "0.13", features = ["tokio"] }
+futures = { workspace = true }
+lru = "0.18.0"
+parking_lot = { workspace = true }
+prometheus = { workspace = true }
+rmp-serde = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+socket2 = "0.6"
+thiserror = { workspace = true }
 tokio = { workspace = true }
-tokio-util = { workspace = true }
+tokio-util = { workspace = true, features = ["codec", "net", "rt", "io-util"] }
+tracing = { workspace = true }
+uuid = { workspace = true, features = ["serde", "v4"] }
+xxhash-rust = { workspace = true }
+
+# bs58 is unconditional because it's used by `WorkerAddress` encoding helpers
+# in addition to the optional NATS feature gates.
+bs58 = "0.5"
+
+# Optional dependencies — feature-gated above
+axum = { version = "0.8", optional = true }
+async-nats = { workspace = true, optional = true }
+etcd-client = { workspace = true, optional = true }
+prost = { version = "0.13", optional = true }
+tonic = { version = "0.13.1", optional = true }
+tower = { version = "0.5", optional = true }
+hyper = { version = "1.0", optional = true }
+http = { version = "1.0", optional = true }
+http-body = { version = "1.0", optional = true }
+http-body-util = { version = "0.1", optional = true }
+hyper-util = { version = "0.1", optional = true, features = ["tokio", "server", "server-auto"] }
+tokio-stream = { version = "0.1", optional = true, features = ["sync"] }
+zmq = { workspace = true, optional = true }
+opentelemetry = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+loom-rs = { version = "0.5.0", features = ["sim"], optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.31.2", features = ["sched", "net"] }
 
 [dev-dependencies]
-bytes = { workspace = true }
-futures = { workspace = true }
-prometheus = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
+paste = "1"
 tempfile = "3"
-tokio = { workspace = true }
-velo-observability = { workspace = true, features = ["test-helpers"] }
-velo-transports = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread", "time"] }
+tower = "0.5"
+tracing-subscriber = { workspace = true }
+
+[build-dependencies]
+tonic-build = "0.13.1"
+
+[package.metadata.cargo-machete]
+ignored = ["axum", "http", "http-body", "http-body-util", "hyper", "hyper-util", "prost", "tower", "bs58"]
+
+# `velo_endurance` is a rustc --cfg flag (NOT a Cargo feature) so `--all-features`
+# in CI never enables the endurance suites. Opt in locally with:
+#   RUSTFLAGS="--cfg velo_endurance" cargo test --test streaming_endurance
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(velo_endurance)'] }
+
+# ── Integration tests (subdirectory layout) ─────────────────────────────────
+# Tests inherited from the pre-fold sibling crates live under
+# `tests/<module>/` to preserve their `mod common;` support modules.
+# Each top-level `.rs` becomes a [[test]] target with an explicit path.
+
+[[test]]
+name = "discovery_etcd"
+path = "tests/discovery/etcd_discovery.rs"
+required-features = ["etcd"]
+
+[[test]]
+name = "discovery_nats"
+path = "tests/discovery/nats_discovery.rs"
+required-features = ["nats-discovery"]
+
+[[test]]
+name = "queue_messenger"
+path = "tests/queue/messenger_integration.rs"
+required-features = ["queue-messenger"]
+
+[[test]]
+name = "queue_nats"
+path = "tests/queue/nats_integration.rs"
+required-features = ["nats-queue"]
+
+[[test]]
+name = "streaming_cancel"
+path = "tests/streaming/cancel.rs"
+
+[[test]]
+name = "streaming_endurance"
+path = "tests/streaming/endurance.rs"
+
+[[test]]
+name = "streaming_endurance_remote"
+path = "tests/streaming/endurance_remote.rs"
+
+[[test]]
+name = "streaming_grpc_transport"
+path = "tests/streaming/grpc_transport.rs"
+required-features = ["grpc"]
+
+[[test]]
+name = "streaming_mock_transport"
+path = "tests/streaming/mock_transport.rs"
+
+[[test]]
+name = "streaming_mpsc_integration"
+path = "tests/streaming/mpsc_integration.rs"
+
+[[test]]
+name = "streaming_mpsc_remote_integration"
+path = "tests/streaming/mpsc_remote_integration.rs"
+
+[[test]]
+name = "streaming_ordering"
+path = "tests/streaming/ordering.rs"
+
+[[test]]
+name = "streaming_tcp_transport"
+path = "tests/streaming/tcp_transport.rs"
+
+[[test]]
+name = "streaming_timing"
+path = "tests/streaming/timing.rs"
+
+[[test]]
+name = "streaming_velo_integration"
+path = "tests/streaming/velo_integration.rs"
+
+[[test]]
+name = "streaming_velo_specific"
+path = "tests/streaming/velo_specific.rs"
+
+[[test]]
+name = "streaming_velo_transport"
+path = "tests/streaming/velo_transport.rs"
+
+[[test]]
+name = "transports_backpressure"
+path = "tests/transports/backpressure.rs"
+
+[[test]]
+name = "transports_grpc"
+path = "tests/transports/grpc_integration.rs"
+required-features = ["grpc"]
+
+[[test]]
+name = "transports_nats_health"
+path = "tests/transports/nats_health.rs"
+required-features = ["nats-transport"]
+
+[[test]]
+name = "transports_nats"
+path = "tests/transports/nats_integration.rs"
+required-features = ["nats-transport"]
+
+[[test]]
+name = "transports_tcp"
+path = "tests/transports/tcp_integration.rs"
+
+[[test]]
+name = "transports_tcp_shutdown"
+path = "tests/transports/tcp_shutdown.rs"
+
+[[test]]
+name = "transports_uds_host_affinity"
+path = "tests/transports/uds_host_affinity.rs"
+
+[[test]]
+name = "transports_uds"
+path = "tests/transports/uds_integration.rs"
+
+[[test]]
+name = "transports_uds_shutdown"
+path = "tests/transports/uds_shutdown.rs"
+
+[[test]]
+name = "transports_zmq"
+path = "tests/transports/zmq_integration.rs"
+required-features = ["zmq"]

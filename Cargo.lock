@@ -779,6 +779,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
+name = "foldhash"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
+
+[[package]]
 name = "form_urlencoded"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -965,9 +971,7 @@ version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
- "allocator-api2",
- "equivalent",
- "foldhash",
+ "foldhash 0.1.5",
 ]
 
 [[package]]
@@ -975,6 +979,11 @@ name = "hashbrown"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4f467dd6dccf739c208452f8014c75c18bb8301b050ad1cfb27153803edb0f51"
+dependencies = [
+ "allocator-api2",
+ "equivalent",
+ "foldhash 0.2.0",
+]
 
 [[package]]
 name = "heck"
@@ -1365,11 +1374,11 @@ dependencies = [
 
 [[package]]
 name = "lru"
-version = "0.12.5"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "234cf4f4a04dc1f57e24b96cc0cd600cf2af460d4161ac5ecdd0af8e1f3b2a38"
+checksum = "8a860605968fce16869fd239cf4237a82f3ac470723415db603b0e8b6c8d4fb9"
 dependencies = [
- "hashbrown 0.15.5",
+ "hashbrown 0.17.0",
 ]
 
 [[package]]
@@ -1427,9 +1436,9 @@ checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
 
 [[package]]
 name = "nix"
-version = "0.30.1"
+version = "0.31.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
+checksum = "5d6d0705320c1e6ba1d912b5e37cf18071b6c2e9b7fa8215a1e8a7651966f5d3"
 dependencies = [
  "bitflags 2.11.1",
  "cfg-if",
@@ -3088,229 +3097,30 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "velo"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "bytes",
- "futures",
- "prometheus 0.14.0",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-util",
- "velo-common",
- "velo-discovery",
- "velo-events",
- "velo-messenger",
- "velo-observability",
- "velo-queue",
- "velo-rendezvous",
- "velo-streaming",
- "velo-transports",
-]
-
-[[package]]
-name = "velo-common"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "rmp-serde",
- "serde",
- "serde_bytes",
- "serde_json",
- "thiserror 2.0.18",
- "uuid",
- "xxhash-rust",
-]
-
-[[package]]
-name = "velo-discovery"
-version = "0.1.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-nats",
  "async-stream",
- "bs58",
- "bytes",
- "etcd-client",
- "fs4",
- "futures",
- "parking_lot",
- "rmp-serde",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
- "velo-common",
-]
-
-[[package]]
-name = "velo-events"
-version = "0.1.1"
-dependencies = [
- "anyhow",
- "dashmap",
- "futures",
- "parking_lot",
- "serde",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
- "xxhash-rust",
-]
-
-[[package]]
-name = "velo-messenger"
-version = "0.2.0"
-dependencies = [
- "anyhow",
+ "axum",
  "bs58",
  "bytes",
  "dashmap",
  "derive-getters",
  "derive_builder",
+ "etcd-client",
  "flume",
- "futures",
- "lru",
- "parking_lot",
- "prometheus 0.14.0",
- "rmp-serde",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
- "velo-common",
- "velo-discovery",
- "velo-events",
- "velo-observability",
- "velo-transports",
- "xxhash-rust",
-]
-
-[[package]]
-name = "velo-observability"
-version = "0.1.1"
-dependencies = [
- "opentelemetry",
- "prometheus 0.14.0",
- "tracing",
- "tracing-opentelemetry",
-]
-
-[[package]]
-name = "velo-queue"
-version = "0.1.1"
-dependencies = [
- "async-nats",
- "bytes",
- "dashmap",
- "flume",
- "futures",
- "parking_lot",
- "rmp-serde",
- "serde",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
- "velo-common",
- "velo-messenger",
- "velo-transports",
-]
-
-[[package]]
-name = "velo-rendezvous"
-version = "0.1.1"
-dependencies = [
- "anyhow",
- "bytes",
- "dashmap",
- "futures",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "velo-common",
- "velo-messenger",
- "velo-observability",
-]
-
-[[package]]
-name = "velo-simulation"
-version = "0.1.1"
-dependencies = [
- "anyhow",
- "bytes",
- "dashmap",
- "futures",
- "loom-rs",
- "parking_lot",
- "rmp-serde",
- "tokio",
- "tracing",
- "velo",
- "velo-common",
- "velo-discovery",
- "velo-observability",
- "velo-transports",
-]
-
-[[package]]
-name = "velo-streaming"
-version = "0.4.0"
-dependencies = [
- "anyhow",
- "bytes",
- "dashmap",
- "derive_builder",
- "flume",
- "futures",
- "prost 0.13.5",
- "rmp-serde",
- "serde",
- "serde_json",
- "socket2 0.6.3",
- "thiserror 2.0.18",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tonic 0.13.1",
- "tonic-build 0.13.1",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "velo-common",
- "velo-messenger",
- "velo-observability",
- "velo-transports",
-]
-
-[[package]]
-name = "velo-transports"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "async-nats",
- "axum",
- "bs58",
- "bytes",
- "dashmap",
- "flume",
+ "fs4",
  "futures",
  "http",
  "http-body",
  "http-body-util",
  "hyper",
  "hyper-util",
+ "loom-rs",
+ "lru",
  "nix",
+ "opentelemetry",
  "parking_lot",
  "paste",
  "prometheus 0.14.0",
@@ -3319,6 +3129,7 @@ dependencies = [
  "serde",
  "serde_json",
  "socket2 0.6.3",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -3327,10 +3138,31 @@ dependencies = [
  "tonic-build 0.13.1",
  "tower",
  "tracing",
+ "tracing-opentelemetry",
  "tracing-subscriber",
- "velo-common",
- "velo-observability",
+ "uuid",
+ "velo-ext",
+ "xxhash-rust",
  "zmq",
+]
+
+[[package]]
+name = "velo-ext"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "flume",
+ "futures",
+ "rmp-serde",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "uuid",
+ "xxhash-rust",
 ]
 
 [[package]]
