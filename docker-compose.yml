@@ -1,0 +1,44 @@
+services:
+  nats:
+    image: nats:2.10-alpine
+    container_name: velo-nats
+    command:
+      - "-js"
+      - "--store_dir=/data"
+      - "--http_port=8222"
+    ports:
+      - "4222:4222"   # client
+      - "6222:6222"   # cluster
+      - "8222:8222"   # monitoring
+    volumes:
+      - /tmp/velo-nats-jetstream:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.13
+    container_name: velo-etcd
+    command:
+      - "etcd"
+      - "--name=velo-etcd"
+      - "--data-dir=/etcd-data"
+      - "--listen-client-urls=http://0.0.0.0:2379"
+      - "--advertise-client-urls=http://0.0.0.0:2379"
+      - "--listen-peer-urls=http://0.0.0.0:2380"
+      - "--initial-advertise-peer-urls=http://0.0.0.0:2380"
+      - "--initial-cluster=velo-etcd=http://0.0.0.0:2380"
+      - "--initial-cluster-state=new"
+      - "--initial-cluster-token=velo-etcd-cluster"
+    environment:
+      ETCDCTL_API: "3"
+    ports:
+      - "2379:2379"   # client
+      - "2380:2380"   # peer
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5

@@ -12,7 +12,7 @@ NOTE: Velo is an experimental repository for advanced communication patterns tha
 ## Table of Contents
 
 - [Overview](#overview)
-- [Crate Map](#crate-map)
+- [Crates](#crates)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Messaging](#messaging)
@@ -28,6 +28,7 @@ NOTE: Velo is an experimental repository for advanced communication patterns tha
 - [Transports](#transports)
 - [Discovery](#discovery)
 - [Observability](#observability)
+- [Extending Velo (out-of-tree plugins)](#extending-velo-out-of-tree-plugins)
 - [Building and Testing](#building-and-testing)
 
 ---
@@ -40,45 +41,46 @@ A `Velo` instance wraps three managers under a single API:
 - **AnchorManager** — typed exclusive-attachment streaming for moving data between workers
 - **RendezvousManager** — large payload staging and retrieval (transparent, used automatically for large message fields)
 
-Transports, discovery backends, and metrics are injected at build time. The `velo` crate re-exports the full public API so a single dependency is sufficient for most applications.
+Transports, discovery backends, and metrics are injected at build time. The `velo` crate is the runtime — depend on it and you have everything.
 
 ---
 
-## Crate Map
+## Crates
 
-| Crate | Purpose |
-|---|---|
-| `velo` | Facade — re-exports everything below |
-| `velo-messenger` | Active messaging: fire-and-forget, sync, unary, typed-unary |
-| `velo-events` | Generational event system (local + distributed) |
-| `velo-streaming` | Typed exclusive-attachment streaming (anchors + senders) |
-| `velo-transports` | Transport backends: TCP, NATS, gRPC, ZMQ, UDS |
-| `velo-discovery` | Peer discovery: filesystem, NATS, etcd |
-| `velo-observability` | Prometheus metrics + optional OpenTelemetry tracing |
-| `velo-rendezvous` | Large payload staging and retrieval |
-| `velo-queue` | Named work queues (in-memory, NATS, messenger-backed) |
-| `velo-common` | Core types: InstanceId, PeerInfo, WorkerId, WorkerAddress |
+Velo ships **two** crates. Application authors depend only on `velo`; only out-of-tree plugin authors reach for `velo-ext`.
+
+| Crate | Audience | Purpose |
+|---|---|---|
+| `velo` | Application authors | Runtime — active messaging, streaming, rendezvous, discovery backends, all in-tree transports (TCP, NATS, gRPC, ZMQ, UDS), Prometheus metrics, work queues |
+| `velo-ext` | Out-of-tree plugin authors | Stable trait surface — `Transport`, `FrameTransport`, `PeerDiscovery`, `ServiceDiscovery`, `TransportObservability`, plus the ID/value/error types those traits reference |
+
+`velo-ext` is `=`-pinned in `velo`'s `[dependencies]` and is the only crate that can be safely depended on alongside `velo` (see [versioning rules in CONTRIBUTING.md](CONTRIBUTING.md#velo-ext-api-stability)). The internal modules (`velo::messenger`, `velo::transports`, `velo::streaming`, `velo::discovery`, `velo::events`, `velo::observability`, `velo::rendezvous`, `velo::queue`) are all reachable through the `velo` umbrella.
 
 ---
 
 ## Installation
 
-```toml
+```bash
 cargo add velo
 ```
 
-Optional feature flags:
+Default features enable HTTP, NATS messaging, and gRPC transports. Optional / additional feature flags:
 
 | Feature               | Description                                          |
 |-----------------------|------------------------------------------------------|
-| `grpc`                | gRPC streaming transport                             |
+| `http` *(default)*    | HTTP messenger transport                             |
+| `nats-transport` *(default)* | NATS messenger transport                      |
+| `grpc` *(default)*    | gRPC messenger + streaming transport                 |
 | `zmq`                 | ZeroMQ transport                                     |
-| `etcd`                | etcd peer discovery backend                          |
-| `queue-nats`          | NATS JetStream work queue backend                    |
+| `nats-discovery`      | NATS peer discovery backend                          |
+| `etcd`                | etcd peer + service discovery backend                |
+| `nats-queue`          | NATS JetStream work queue backend                    |
 | `queue-messenger`     | Active-message-backed work queue backend             |
 | `distributed-tracing` | OpenTelemetry trace context propagation              |
+| `simulation`          | Discrete-event simulation transport (loom-rs)        |
+| `test-helpers`        | Prometheus snapshot helpers for integration tests    |
 
-TCP and NATS transports are always available (no feature gate required).
+UDS is available unconditionally on Unix targets. Filesystem peer/service discovery is unconditional.
 
 ---
 
@@ -89,7 +91,7 @@ Two instances connected over TCP, with a typed handler and a request-response ca
 ```rust
 use std::sync::Arc;
 use velo::{Handler, TypedContext, Velo};
-use velo::backend::tcp::TcpTransportBuilder;
+use velo::transports::tcp::TcpTransportBuilder;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
@@ -364,7 +366,7 @@ Transports are injected at build time. Each peer is routed via the highest-prior
 ```rust
 use std::sync::Arc;
 use velo::Velo;
-use velo::backend::tcp::TcpTransportBuilder;
+use velo::transports::tcp::TcpTransportBuilder;
 
 let node = Velo::builder()
     .add_transport(Arc::new(TcpTransportBuilder::new().build()?))
@@ -374,15 +376,14 @@ let node = Velo::builder()
 
 Available transports:
 
-| Transport | Feature Gate | Protocol          | Notes                                             |
-|-----------|--------------|-------------------|---------------------------------------------------|
-| TCP       | _(always)_   | Raw TCP           | Default, lowest latency for direct connections    |
-| NATS      | _(always)_   | NATS pub-sub      | Subject scheme `velo.{id}.{type}`                 |
-| gRPC      | `grpc`       | HTTP/2 streaming  | Bidirectional, exponential backoff reconnect      |
-| ZMQ       | `zmq`        | ZMQ DEALER/ROUTER | Automatic reconnection and message queuing        |
-| UDS       | Unix only    | Unix Domain Socket | Local-only, lower overhead than TCP              |
-
-For detailed wire format, shutdown behavior, and priority-based routing, see [`lib/velo-transports/README.md`](lib/velo-transports/README.md).
+| Transport | Feature Gate           | Protocol           | Notes                                            |
+|-----------|------------------------|--------------------|--------------------------------------------------|
+| TCP       | _(always)_             | Raw TCP            | Default, lowest latency for direct connections   |
+| HTTP      | `http` *(default)*     | axum-based         | HTTP messenger transport                         |
+| NATS      | `nats-transport` *(default)* | NATS pub-sub | Subject scheme `velo.{id}.{type}`                |
+| gRPC      | `grpc` *(default)*     | HTTP/2 streaming   | Bidirectional, exponential backoff reconnect    |
+| ZMQ       | `zmq`                  | ZMQ DEALER/ROUTER  | Automatic reconnection and message queuing       |
+| UDS       | Unix only              | Unix Domain Socket | Local-only, lower overhead than TCP              |
 
 ---
 
@@ -407,13 +408,13 @@ let node = Velo::builder()
 node.discover_and_register_peer(peer_instance_id).await?;
 ```
 
-Available backends:
+Available backends (all in `velo::discovery`):
 
-| Backend                     | Crate              | Use case                                        |
+| Backend                     | Feature Gate       | Use case                                        |
 |-----------------------------|--------------------|-------------------------------------------------|
-| `FilesystemPeerDiscovery`   | `velo-discovery`   | Development, testing, single-host deployments   |
-| NATS-backed discovery       | `velo-discovery`   | Multi-host deployments using NATS               |
-| etcd-backed discovery       | `velo-discovery` + `etcd` feature | Production multi-host deployments |
+| `FilesystemPeerDiscovery`   | _(always)_         | Development, testing, single-host deployments   |
+| NATS peer/service discovery | `nats-discovery`   | Multi-host deployments using NATS               |
+| etcd peer/service discovery | `etcd`             | Production multi-host deployments               |
 
 Without a discovery backend, peers must be registered manually:
 
@@ -425,7 +426,7 @@ node_a.register_peer(node_b.peer_info())?;
 
 ## Observability
 
-`velo-observability` provides Prometheus metrics for all Velo subsystems. Create a `Registry`, register `VeloMetrics` into it, and expose or scrape that registry however your application requires. Velo itself does not run an exporter.
+`velo::observability` provides Prometheus metrics for all Velo subsystems. Create a `Registry`, register `VeloMetrics` into it, and expose or scrape that registry however your application requires. Velo itself does not run an exporter.
 
 ```rust
 use std::sync::Arc;
@@ -457,8 +458,45 @@ Metric families covered:
 
 ```toml
 [dependencies]
-velo = { version = "0.1", features = ["distributed-tracing"] }
+velo = { version = "0.3", features = ["distributed-tracing"] }
 ```
+
+---
+
+## Extending Velo (out-of-tree plugins)
+
+If you want to write a custom transport, frame transport, or discovery backend that lives outside this repository, depend on `velo-ext` instead of `velo`. `velo-ext` is the small, stable trait surface — it has no Prometheus, no Tonic, no NATS, and no transitive `velo` dependency.
+
+```toml
+[dependencies]
+velo-ext = "0.1"
+```
+
+Implement one of:
+
+| Trait                                  | What you provide                                     |
+|----------------------------------------|------------------------------------------------------|
+| `velo_ext::Transport`                  | A messenger transport (alternative to TCP/NATS/gRPC) |
+| `velo_ext::FrameTransport`             | A streaming-frame transport                          |
+| `velo_ext::PeerDiscovery`              | A peer-discovery backend                             |
+| `velo_ext::ServiceDiscovery`           | A named-service discovery backend                    |
+| `velo_ext::TransportObservability`     | (rarely needed) the runtime hands you one of these — implement to publish metrics into the same `velo_transport_*` Prometheus series as in-tree transports |
+
+```rust
+use std::sync::Arc;
+use velo_ext::{Transport, TransportObservability, MessageType, Direction};
+
+struct MyTransport { /* ... */ }
+
+impl Transport for MyTransport {
+    // ... required methods ...
+    fn set_observability(&self, obs: Arc<dyn TransportObservability>) {
+        // Store and publish into the shared metrics series
+    }
+}
+```
+
+`velo-ext` is `=`-pinned to a specific exact version inside `velo`. New trait methods always land with default implementations; signature changes require a coordinated release. See [`CONTRIBUTING.md`](CONTRIBUTING.md#velo-ext-api-stability) for the full stability contract.
 
 ---
 
@@ -468,8 +506,11 @@ velo = { version = "0.1", features = ["distributed-tracing"] }
 # Build (all features, including zmq which requires cmake)
 cargo build --all-features
 
-# Run all tests (NATS tests require a server on localhost:4222)
+# Run all tests (NATS tests require a server on localhost:4222, etcd on :2379)
 cargo test --all-features --all-targets
+
+# Run a single integration test (test names are <module>_<filename>)
+cargo test --features zmq --test transports_zmq
 
 # Lint (zero warnings)
 cargo clippy --all-features --no-deps --all-targets -- -D warnings
@@ -479,6 +520,9 @@ cargo fmt --check
 
 # Unused dependency check
 cargo machete
+
+# Semver-check the velo-ext extension surface
+bash scripts/check-semver.sh
 ```
 
-> **CI note**: the `zmq` feature compiles libzmq from source and requires `cmake`. See [`CLAUDE.md`](CLAUDE.md) for full CI requirements including the `mold` linker recommendation.
+> **CI note**: the `zmq` feature compiles libzmq from source and requires `cmake`. See [`CLAUDE.md`](CLAUDE.md) for full CI requirements including the `mold` linker recommendation and the velo-ext stability rules.

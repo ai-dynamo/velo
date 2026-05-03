@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use clap::ValueEnum;
-use velo::backend::Transport;
+use velo::transports::Transport;
 
 /// Transport backends selectable at the CLI.
 ///
@@ -41,7 +41,7 @@ pub async fn new_transport(ty: TransportType, tag: &str) -> Result<Arc<dyn Trans
         TransportType::Tcp => {
             let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
             Ok(Arc::new(
-                velo::backend::tcp::TcpTransportBuilder::new()
+                velo::transports::tcp::TcpTransportBuilder::new()
                     .from_listener(listener)?
                     .build()?,
             ))
@@ -51,32 +51,32 @@ pub async fn new_transport(ty: TransportType, tag: &str) -> Result<Arc<dyn Trans
             let socket_path =
                 std::env::temp_dir().join(format!("velo-{tag}-{}.sock", uuid::Uuid::new_v4()));
             Ok(Arc::new(
-                velo::backend::uds::UdsTransportBuilder::new()
+                velo::transports::uds::UdsTransportBuilder::new()
                     .socket_path(&socket_path)
                     .build()?,
             ))
         }
         #[cfg(feature = "zmq")]
         TransportType::Zmq => Ok(Arc::new(
-            velo::backend::zmq::ZmqTransportBuilder::new()
+            velo::transports::zmq::ZmqTransportBuilder::new()
                 .bind_endpoint("tcp://127.0.0.1:0")
                 .build()?,
         )),
         TransportType::Nats => {
-            let client = velo::backend::nats::utils::connect("nats://127.0.0.1:4222")
+            let client = velo::transports::nats::utils::connect("nats://127.0.0.1:4222")
                 .await
                 .map_err(|e| {
                     anyhow::anyhow!("failed to connect to NATS at 127.0.0.1:4222: {e}")
                 })?;
             Ok(Arc::new(
-                velo::backend::nats::NatsTransportBuilder::new(client, tag).build(),
+                velo::transports::nats::NatsTransportBuilder::new(client, tag).build(),
             ))
         }
         #[cfg(feature = "grpc")]
         TransportType::Grpc => {
             let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
             Ok(Arc::new(
-                velo::backend::grpc::GrpcTransportBuilder::new()
+                velo::transports::grpc::GrpcTransportBuilder::new()
                     .from_listener(listener)?
                     .build()?,
             ))

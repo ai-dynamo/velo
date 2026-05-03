@@ -9,9 +9,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use velo::discovery::FilesystemPeerDiscovery;
+use velo::transports::tcp::TcpTransportBuilder;
 use velo::*;
-use velo_discovery::FilesystemPeerDiscovery;
-use velo_transports::tcp::TcpTransportBuilder;
 
 async fn poll_until(timeout: Duration, mut condition: impl FnMut() -> bool) {
     let start = tokio::time::Instant::now();
@@ -25,7 +25,7 @@ async fn poll_until(timeout: Duration, mut condition: impl FnMut() -> bool) {
     }
 }
 
-fn new_transport() -> Arc<velo_transports::tcp::TcpTransport> {
+fn new_transport() -> Arc<velo::transports::tcp::TcpTransport> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     Arc::new(
         TcpTransportBuilder::new()
