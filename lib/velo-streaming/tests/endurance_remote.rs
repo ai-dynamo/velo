@@ -130,8 +130,10 @@ async fn make_remote_pair_tcp() -> RemotePair {
     let worker_consumer = m_consumer.instance_id().worker_id();
     let worker_producer = m_producer.instance_id().worker_id();
 
-    let make_side = |worker_id: WorkerId| {
-        let tcp = Arc::new(TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into()));
+    async fn make_side(worker_id: WorkerId) -> Arc<velo_streaming::AnchorManager> {
+        let tcp = TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into())
+            .await
+            .unwrap();
         let mut registry = HashMap::new();
         registry.insert("tcp".to_string(), tcp.clone() as Arc<dyn FrameTransport>);
         Arc::new(
@@ -142,10 +144,10 @@ async fn make_remote_pair_tcp() -> RemotePair {
                 .build()
                 .expect("build AM"),
         )
-    };
+    }
 
-    let consumer = make_side(worker_consumer);
-    let producer = make_side(worker_producer);
+    let consumer = make_side(worker_consumer).await;
+    let producer = make_side(worker_producer).await;
 
     consumer
         .register_handlers(Arc::clone(&m_consumer))

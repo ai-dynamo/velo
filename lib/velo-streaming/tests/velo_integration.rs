@@ -173,13 +173,10 @@ async fn test_02_remote_attach() {
         .await
         .expect("timed out waiting for Worker A to receive all items");
 
-    // Content check (order may vary under concurrent AM delivery — Phase 09-02 decision)
-    let mut items_sorted = items.clone();
-    items_sorted.sort_unstable();
     assert_eq!(
-        items_sorted,
+        items,
         vec![0u32, 1, 2, 3, 4],
-        "Worker A must receive all 5 items from Worker B"
+        "Worker A must receive all 5 items from Worker B in send order"
     );
 }
 

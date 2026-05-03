@@ -40,7 +40,9 @@ fn finalized_bytes() -> Vec<u8> {
 /// sender close.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_local_round_trip() {
-    let transport = TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into());
+    let transport = TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into())
+        .await
+        .unwrap();
 
     let (endpoint, rx) = transport.bind(1, 0).await.unwrap();
     let tx = transport.connect(&endpoint, 1, 1).await.unwrap();
@@ -99,7 +101,9 @@ async fn test_local_round_trip() {
 /// the bind-side read loop detects TCP EOF and injects a Dropped sentinel.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_connection_drop() {
-    let transport = TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into());
+    let transport = TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into())
+        .await
+        .unwrap();
 
     let (endpoint, rx) = transport.bind(1, 0).await.unwrap();
     let tx = transport.connect(&endpoint, 1, 1).await.unwrap();
@@ -149,7 +153,9 @@ async fn test_connection_drop() {
 /// Sender drops tx (initiating FIN), receiver detects and cleans up.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_sender_close_first() {
-    let transport = TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into());
+    let transport = TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into())
+        .await
+        .unwrap();
 
     let (endpoint, rx) = transport.bind(1, 0).await.unwrap();
     let tx = transport.connect(&endpoint, 1, 1).await.unwrap();
@@ -209,9 +215,13 @@ async fn test_sender_close_first() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_remote_attach() {
     // Transport A (receiver side): binds a listener
-    let transport_a = TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into());
+    let transport_a = TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into())
+        .await
+        .unwrap();
     // Transport B (sender side): connects to transport A's endpoint
-    let transport_b = TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into());
+    let transport_b = TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into())
+        .await
+        .unwrap();
 
     let (endpoint, rx) = transport_a.bind(42, 0).await.unwrap();
 
@@ -258,7 +268,9 @@ async fn test_remote_attach() {
 /// transport for bind/connect operations.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_anchor_manager_tcp_registry() {
-    let transport = Arc::new(TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into()));
+    let transport = TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into())
+        .await
+        .unwrap();
     let mut registry = HashMap::new();
     registry.insert(
         "tcp".to_string(),
@@ -405,7 +417,9 @@ async fn test_remote_attach_am_dispatch() {
 
     // --- Worker A setup ---
     // TcpFrameTransport is the DEFAULT transport (used by _anchor_attach handler's bind())
-    let tcp_a = Arc::new(TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into()));
+    let tcp_a = TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into())
+        .await
+        .unwrap();
     let mut registry_a = HashMap::new();
     registry_a.insert("tcp".to_string(), tcp_a.clone() as Arc<dyn FrameTransport>);
 
@@ -437,7 +451,9 @@ async fn test_remote_attach_am_dispatch() {
     assert_eq!(recovered_worker, worker_id_a);
 
     // --- Worker B setup ---
-    let tcp_b = Arc::new(TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into()));
+    let tcp_b = TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into())
+        .await
+        .unwrap();
     let mut registry_b = HashMap::new();
     registry_b.insert("tcp".to_string(), tcp_b.clone() as Arc<dyn FrameTransport>);
 

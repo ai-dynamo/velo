@@ -121,6 +121,29 @@ impl Default for GrpcConfig {
 /// Only one `StreamConfig` may be set per [`VeloBuilder`] instance —
 /// one streaming server per Velo instance is enforced.
 ///
+/// # Default
+///
+/// If [`VeloBuilder::stream_config`] is never called and
+/// [`VeloBuilder::stream_bind_addr`] was never invoked either, the builder
+/// defaults to [`VeloOnly`](StreamConfig::VeloOnly) — streams flow over the
+/// messenger transport that's already wired for cross-host reachability. This
+/// preserves multi-node correctness without requiring callers to know an
+/// externally routable IP.
+///
+/// To opt into the dedicated TCP transport, either:
+/// - call [`VeloBuilder::stream_bind_addr`] with a routable address, or
+/// - call [`VeloBuilder::stream_config`] with `Tcp(Some(TcpConfig { bind_addr }))`.
+///
+/// `Tcp(None)` (the no-bind-addr form) binds on `0.0.0.0:<ephemeral>`. The
+/// advertised endpoint is then derived inside `TcpFrameTransport::new()` via
+/// `resolve_advertise_ip(bind_addr)`, which maps unspecified addresses
+/// (`0.0.0.0` / `::`) to their loopback counterpart. The result is fine for
+/// single-host tests but **not reachable across hosts**, which is why TCP
+/// isn't the implicit default. Supplying a specific bind IP via
+/// `Tcp(Some(TcpConfig { bind_addr }))` or [`VeloBuilder::stream_bind_addr`]
+/// passes through `resolve_advertise_ip` unchanged, so the advertised
+/// address matches the routable IP you provided.
+///
 /// # Variants
 ///
 /// - [`StreamConfig::Tcp`]: TCP-based streaming via [`TcpFrameTransport`](velo_streaming::TcpFrameTransport).
@@ -131,6 +154,12 @@ impl Default for GrpcConfig {
 ///   Only available when the `grpc` feature is enabled.
 ///   Pass `None` to bind to `0.0.0.0:0` (OS-assigned port), or provide a
 ///   [`GrpcConfig`] for an explicit bind address.
+///
+/// - [`StreamConfig::VeloOnly`]: Skip the dedicated streaming listener entirely
+///   and route all streams through `velo-messenger` AMs
+///   ([`VeloFrameTransport`](velo_streaming::VeloFrameTransport)). Use this when
+///   the host cannot or should not open additional TCP ports (sandboxed
+///   environments, restricted-network deployments, single-process tests).
 #[derive(Debug, Clone)]
 pub enum StreamConfig {
     /// TCP-based streaming transport (TcpFrameTransport).
@@ -145,6 +174,9 @@ pub enum StreamConfig {
     /// or `Some(GrpcConfig)` for an explicit bind address.
     #[cfg(feature = "grpc")]
     Grpc(Option<GrpcConfig>),
+    /// Opt out of the dedicated streaming listener: all streams flow through
+    /// the `velo` (messenger-routed) transport. No TCP listener is opened.
+    VeloOnly,
 }
 
 /// High-level facade for the Velo distributed system.
@@ -203,15 +235,19 @@ impl VeloBuilder {
         Ok(self)
     }
 
-    /// Set the bind address for TCP streaming transport.
+    /// Opt into the dedicated TCP streaming transport bound to a specific
+    /// interface.
     ///
     /// Convenience wrapper around [`stream_config`](VeloBuilder::stream_config)
-    /// with `StreamConfig::Tcp(Some(TcpConfig::new(addr)))`.
+    /// with `StreamConfig::Tcp(Some(TcpConfig::new(addr)))`. The address you
+    /// pass is used both for binding and as the advertised endpoint, so it
+    /// must be reachable from the peers that will connect.
     ///
-    /// When set, `build()` creates a [`TcpFrameTransport`](velo_streaming::TcpFrameTransport)
-    /// bound to this address and registers both `tcp` and `velo` schemes in the
-    /// transport registry. When not set (default), only `VeloFrameTransport` is
-    /// created (backward compatible).
+    /// Without this call (and without [`stream_config`](VeloBuilder::stream_config)),
+    /// the builder defaults to [`StreamConfig::VeloOnly`] — streams flow over
+    /// the messenger transport. TCP is not chosen implicitly because the
+    /// no-bind-address form (`0.0.0.0`) would advertise loopback, breaking
+    /// multi-node reachability.
     pub fn stream_bind_addr(self, addr: std::net::IpAddr) -> Self {
         // Convenience: wraps StreamConfig::Tcp with explicit bind address.
         // stream_config() cannot fail here (only one call from this path).
@@ -237,8 +273,10 @@ impl VeloBuilder {
     /// Construction order:
     /// 1. Build Messenger (async)
     /// 2. Extract WorkerId
-    /// 3. Create VeloFrameTransport
-    /// 4. Optionally create TcpFrameTransport or GrpcFrameTransport and transport registry (from stream_config)
+    /// 3. Create VeloFrameTransport (always — used as fallback / opt-out)
+    /// 4. Resolve the default streaming transport from `stream_config`. If
+    ///    unset, defaults to [`StreamConfig::VeloOnly`] (streams over the
+    ///    messenger transport — multi-node reachable by default).
     /// 5. Create AnchorManager via builder
     /// 6. Register streaming control-plane handlers on Messenger
     /// 7. Assemble Velo struct
@@ -249,20 +287,26 @@ impl VeloBuilder {
         // Step 2: Extract worker_id
         let worker_id = messenger.instance_id().worker_id();
 
-        // Step 3: Create VeloFrameTransport
+        // Step 3: Create VeloFrameTransport. Always constructed; serves as the
+        // VeloOnly default and as the `velo://` fallback scheme alongside TCP.
         let velo_transport = Arc::new(velo_streaming::VeloFrameTransport::new(
             Arc::clone(&messenger),
             worker_id,
             self.metrics.clone(),
         )?);
 
-        // Step 4: Resolve transport and registry from stream_config
-        let (default_transport, transport_registry) = match self.stream_config {
-            Some(StreamConfig::Tcp(tcp_cfg)) => {
+        // Step 4: Resolve transport and registry from stream_config.
+        // Implicit default (None) is VeloOnly — TCP without an explicit
+        // bind address advertises loopback, which would silently break
+        // multi-node streaming. Callers opt into TCP via stream_bind_addr()
+        // or stream_config(StreamConfig::Tcp(Some(..))).
+        let resolved = self.stream_config.unwrap_or(StreamConfig::VeloOnly);
+        let (default_transport, transport_registry) = match resolved {
+            StreamConfig::Tcp(tcp_cfg) => {
                 let bind_addr = tcp_cfg
                     .map(|c| c.bind_addr)
                     .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
-                let tcp_transport = Arc::new(velo_streaming::TcpFrameTransport::new(bind_addr));
+                let tcp_transport = velo_streaming::TcpFrameTransport::new(bind_addr).await?;
                 let mut registry = std::collections::HashMap::new();
                 registry.insert(
                     "tcp".to_string(),
@@ -272,14 +316,13 @@ impl VeloBuilder {
                     "velo".to_string(),
                     velo_transport.clone() as Arc<dyn velo_streaming::FrameTransport>,
                 );
-                // Default transport is TCP when stream_config is set
                 (
                     tcp_transport as Arc<dyn velo_streaming::FrameTransport>,
                     Arc::new(registry),
                 )
             }
             #[cfg(feature = "grpc")]
-            Some(StreamConfig::Grpc(grpc_cfg)) => {
+            StreamConfig::Grpc(grpc_cfg) => {
                 let bind_addr = grpc_cfg
                     .map(|c| c.bind_addr)
                     .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
@@ -302,7 +345,7 @@ impl VeloBuilder {
                     Arc::new(registry),
                 )
             }
-            None => (
+            StreamConfig::VeloOnly => (
                 velo_transport as Arc<dyn velo_streaming::FrameTransport>,
                 Arc::new(std::collections::HashMap::new()),
             ),
