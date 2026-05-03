@@ -30,6 +30,10 @@ etcd = ["dep:etcd-client"]
 nats-queue = ["dep:async-nats"]
 queue-messenger = []
 
+# Phase 2: NIXL/RDMA support for rendezvous. Requires libnixl + a UCX
+# plugin at runtime; see the velo-nixl crate's README for env setup.
+nixl = ["dep:velo-nixl", "dep:serde_bytes"]
+
 # Optional subsystems
 distributed-tracing = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
 simulation = ["dep:loom-rs"]
@@ -85,6 +89,8 @@ zmq = { workspace = true, optional = true }
 opentelemetry = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 loom-rs = { version = "0.5.0", features = ["sim"], optional = true }
+velo-nixl = { workspace = true, optional = true }
+serde_bytes = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.31.2", features = ["sched", "net"] }
@@ -100,7 +106,10 @@ tracing-subscriber = { workspace = true }
 tonic-build = "0.13.1"
 
 [package.metadata.cargo-machete]
-ignored = ["axum", "http", "http-body", "http-body-util", "hyper", "hyper-util", "prost", "tower", "bs58"]
+# `serde_bytes` is used via `#[serde(with = "serde_bytes")]` attribute paths in
+# the nixl-feature-gated rendezvous protocol (see `rendezvous/protocol.rs`),
+# which cargo-machete cannot detect.
+ignored = ["axum", "http", "http-body", "http-body-util", "hyper", "hyper-util", "prost", "tower", "bs58", "serde_bytes"]
 
 # `velo_endurance` is a rustc --cfg flag (NOT a Cargo feature) so `--all-features`
 # in CI never enables the endurance suites. Opt in locally with:
@@ -235,3 +244,13 @@ path = "tests/transports/uds_shutdown.rs"
 name = "transports_zmq"
 path = "tests/transports/zmq_integration.rs"
 required-features = ["zmq"]
+
+[[test]]
+name = "rendezvous_nixl_integration"
+path = "tests/rendezvous_nixl_integration.rs"
+required-features = ["nixl"]
+
+[[test]]
+name = "rendezvous_nixl_loopback"
+path = "tests/rendezvous_nixl_loopback.rs"
+required-features = ["nixl"]
