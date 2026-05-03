@@ -9,13 +9,12 @@
 //!   `{cluster_id}.queue.{name}`
 //! - A durable pull consumer named `{cluster_id}_{name}_worker`
 //!
-//! Items are auto-acknowledged on receipt (consumer uses `AckPolicy::Explicit`
-//! and the receiver acks immediately after fetching).
-//!
-//! # TODO: Acknowledgment Support
-//!
-//! A future iteration will expose `WorkItem<T>` with manual ack/nack,
-//! controlled by an `AckPolicy` config.
+//! Supports both [`AckPolicy::Auto`] (backend acks on receipt) and
+//! [`AckPolicy::Manual`] (caller drives ack / nack(delay) / in_progress / term
+//! via the [`AckHandle`](crate::queue::AckHandle) attached to each delivered item).
+//! Visibility timeout is driven by the consumer's `AckWait`
+//! ([`DEFAULT_NATS_ACK_WAIT`] by default, override via
+//! [`NatsQueueBackend::with_ack_wait`]).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -23,7 +22,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_nats::jetstream;
+use async_nats::jetstream::AckKind;
 use async_nats::jetstream::consumer::PullConsumer;
+use async_nats::jetstream::message::Acker;
 use async_nats::jetstream::stream::RetentionPolicy;
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -31,9 +32,13 @@ use futures::StreamExt;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::queue::backend::{ReceiverBackend, SenderBackend, WorkQueueBackend};
+use crate::queue::ack::{AckFuture, AckHandle, AckHandleInner};
+use crate::queue::backend::{DeliveredMessage, ReceiverBackend, SenderBackend, WorkQueueBackend};
 use crate::queue::error::{WorkQueueError, WorkQueueRecvError, WorkQueueSendError};
-use crate::queue::options::NextOptions;
+use crate::queue::options::{AckPolicy, NextOptions};
+
+/// Default visibility timeout (server-side `AckWait`) for unacked messages.
+pub const DEFAULT_NATS_ACK_WAIT: Duration = Duration::from_secs(30);
 
 /// NATS JetStream work queue backend.
 ///
@@ -42,6 +47,7 @@ use crate::queue::options::NextOptions;
 pub struct NatsQueueBackend {
     jetstream: jetstream::Context,
     cluster_id: String,
+    ack_wait: Duration,
     /// Cache of created stream/consumer resources per queue name.
     resources: DashMap<String, Arc<NatsQueueResources>>,
     /// Cancellation token shared with all receivers created from this backend.
@@ -57,11 +63,15 @@ struct NatsQueueResources {
 
 impl NatsQueueBackend {
     /// Create a new NATS queue backend from an existing client.
+    ///
+    /// Uses [`DEFAULT_NATS_ACK_WAIT`] for the consumer's visibility timeout.
+    /// Override with [`with_ack_wait`](Self::with_ack_wait).
     pub fn new(client: Arc<async_nats::Client>, cluster_id: String) -> Self {
         let jetstream = jetstream::new((*client).clone());
         Self {
             jetstream,
             cluster_id,
+            ack_wait: DEFAULT_NATS_ACK_WAIT,
             resources: DashMap::new(),
             shutdown_token: CancellationToken::new(),
         }
@@ -76,9 +86,19 @@ impl NatsQueueBackend {
         Ok(Self {
             jetstream,
             cluster_id,
+            ack_wait: DEFAULT_NATS_ACK_WAIT,
             resources: DashMap::new(),
             shutdown_token: CancellationToken::new(),
         })
+    }
+
+    /// Override the consumer's `AckWait` (visibility timeout) before the first queue is used.
+    ///
+    /// The value takes effect at consumer-creation time; for already-created
+    /// queues the existing consumer's `AckWait` persists.
+    pub fn with_ack_wait(mut self, ack_wait: Duration) -> Self {
+        self.ack_wait = ack_wait;
+        self
     }
 
     fn stream_name(&self, queue_name: &str) -> String {
@@ -128,6 +148,7 @@ impl NatsQueueBackend {
                 jetstream::consumer::pull::Config {
                     durable_name: Some(consumer_name.clone()),
                     ack_policy: jetstream::consumer::AckPolicy::Explicit,
+                    ack_wait: self.ack_wait,
                     ..Default::default()
                 },
             )
@@ -179,6 +200,7 @@ impl WorkQueueBackend for NatsQueueBackend {
     fn receiver(
         &self,
         name: &str,
+        policy: AckPolicy,
     ) -> Pin<Box<dyn Future<Output = Result<Arc<dyn ReceiverBackend>, WorkQueueError>> + Send + '_>>
     {
         let name = name.to_owned();
@@ -188,6 +210,7 @@ impl WorkQueueBackend for NatsQueueBackend {
             Ok(Arc::new(NatsReceiver {
                 consumer: resources.consumer.clone(),
                 shutdown,
+                policy,
             }) as Arc<dyn ReceiverBackend>)
         })
     }
@@ -242,7 +265,8 @@ impl SenderBackend for NatsSender {
 }
 
 // ============================================================================
-// Receiver: fetches from JetStream pull consumer and auto-acks
+// Receiver: fetches from JetStream pull consumer. Under Auto the receiver
+// acks on receipt; under Manual it hands the Acker to a WorkItem via AckHandle.
 // ============================================================================
 
 struct NatsReceiver {
@@ -250,12 +274,36 @@ struct NatsReceiver {
     /// Child token of NatsQueueBackend::shutdown_token.
     /// Cancelled when the parent backend closes or drops.
     shutdown: CancellationToken,
+    policy: AckPolicy,
+}
+
+/// Split a fetched JetStream message into a `DeliveredMessage` per the policy.
+///
+/// Under Auto: ack immediately and return a handle-less delivery.
+/// Under Manual: split off an `Acker` for the caller to drive.
+async fn deliver_message(
+    msg: jetstream::Message,
+    policy: AckPolicy,
+) -> Result<DeliveredMessage, WorkQueueRecvError> {
+    match policy {
+        AckPolicy::Auto => {
+            msg.ack().await.map_err(WorkQueueRecvError::Backend)?;
+            Ok(DeliveredMessage::auto(msg.payload.clone()))
+        }
+        AckPolicy::Manual => {
+            let (inner, acker) = msg.split();
+            let handle = AckHandle::new(NatsAckHandle { acker });
+            Ok(DeliveredMessage::manual(inner.payload, handle))
+        }
+    }
 }
 
 impl ReceiverBackend for NatsReceiver {
     fn recv(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<Bytes>, WorkQueueRecvError>> + Send + '_>> {
+    ) -> Pin<
+        Box<dyn Future<Output = Result<Option<DeliveredMessage>, WorkQueueRecvError>> + Send + '_>,
+    > {
         Box::pin(async move {
             loop {
                 // Check shutdown before issuing the next fetch.
@@ -281,9 +329,7 @@ impl ReceiverBackend for NatsReceiver {
                     result = fetch_fut => {
                         match result? {
                             Some(Ok(msg)) => {
-                                // Auto-ack on receipt
-                                msg.ack().await.map_err(WorkQueueRecvError::Backend)?;
-                                return Ok(Some(msg.payload.clone()));
+                                return Ok(Some(deliver_message(msg, self.policy).await?));
                             }
                             Some(Err(e)) => return Err(WorkQueueRecvError::Backend(e)),
                             // Fetch expired with no message; retry
@@ -298,7 +344,8 @@ impl ReceiverBackend for NatsReceiver {
     fn recv_batch(
         &self,
         opts: &NextOptions,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Bytes>, WorkQueueRecvError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<DeliveredMessage>, WorkQueueRecvError>> + Send + '_>>
+    {
         let batch_size = opts.batch_size;
         let timeout = opts.timeout;
         Box::pin(async move {
@@ -322,8 +369,7 @@ impl ReceiverBackend for NatsReceiver {
                 while let Some(msg_result) = messages.next().await {
                     match msg_result {
                         Ok(msg) => {
-                            msg.ack().await.map_err(WorkQueueRecvError::Backend)?;
-                            batch.push(msg.payload.clone());
+                            batch.push(deliver_message(msg, self.policy).await?);
                         }
                         Err(e) => {
                             tracing::warn!("NATS queue recv_batch message error: {e}");
@@ -343,8 +389,49 @@ impl ReceiverBackend for NatsReceiver {
         })
     }
 
-    fn try_recv(&self) -> Result<Option<Bytes>, WorkQueueRecvError> {
+    fn try_recv(&self) -> Result<Option<DeliveredMessage>, WorkQueueRecvError> {
         // JetStream fetch is inherently async — cannot do true non-blocking.
         Ok(None)
+    }
+}
+
+// ============================================================================
+// AckHandle: maps to JetStream AckKind variants via `Acker`.
+// ============================================================================
+
+/// Backend-specific ack handle wrapping a JetStream `Acker`.
+struct NatsAckHandle {
+    acker: Acker,
+}
+
+impl NatsAckHandle {
+    async fn send(&self, kind: AckKind) -> Result<(), WorkQueueRecvError> {
+        self.acker
+            .ack_with(kind)
+            .await
+            .map_err(WorkQueueRecvError::Backend)
+    }
+}
+
+impl AckHandleInner for NatsAckHandle {
+    fn ack(self: Box<Self>) -> AckFuture<'static> {
+        Box::pin(async move { self.acker.ack().await.map_err(WorkQueueRecvError::Backend) })
+    }
+
+    fn nack(self: Box<Self>, delay: Duration) -> AckFuture<'static> {
+        let kind = if delay.is_zero() {
+            AckKind::Nak(None)
+        } else {
+            AckKind::Nak(Some(delay))
+        };
+        Box::pin(async move { self.send(kind).await })
+    }
+
+    fn in_progress(&self) -> AckFuture<'_> {
+        Box::pin(async move { self.send(AckKind::Progress).await })
+    }
+
+    fn term(self: Box<Self>) -> AckFuture<'static> {
+        Box::pin(async move { self.send(AckKind::Term).await })
     }
 }

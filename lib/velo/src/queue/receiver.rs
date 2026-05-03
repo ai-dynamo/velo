@@ -9,20 +9,20 @@ use std::sync::Arc;
 use bytes::Bytes;
 use serde::de::DeserializeOwned;
 
-use crate::queue::backend::ReceiverBackend;
+use crate::queue::backend::{DeliveredMessage, ReceiverBackend};
 use crate::queue::error::WorkQueueRecvError;
 use crate::queue::options::NextOptions;
+use crate::queue::work_item::WorkItem;
 
 /// A typed receiver handle for a named work queue.
 ///
-/// Deserializes items of type `T` from MessagePack bytes received from the
-/// underlying [`ReceiverBackend`].
-///
-/// # TODO: Acknowledgment Support
-///
-/// Currently items are auto-acknowledged on receipt. A future version will
-/// return `WorkItem<T>` wrappers with explicit `ack()` / `nack()` /
-/// `in_progress()` methods, controlled by an `AckPolicy` configuration.
+/// Deserializes items of type `T` from MessagePack bytes and returns them
+/// wrapped in [`WorkItem<T>`]. Under
+/// [`AckPolicy::Auto`](crate::queue::AckPolicy::Auto) the wrapper is effectively
+/// transparent (drop is a no-op); under
+/// [`AckPolicy::Manual`](crate::queue::AckPolicy::Manual) the caller must call
+/// [`WorkItem::ack`], [`nack`](WorkItem::nack), or [`term`](WorkItem::term)
+/// on each item.
 pub struct WorkQueueReceiver<T: DeserializeOwned> {
     backend: Arc<dyn ReceiverBackend>,
     _marker: PhantomData<fn() -> T>,
@@ -49,15 +49,16 @@ impl<T: DeserializeOwned> WorkQueueReceiver<T> {
     /// Get the next item, blocking until one is available.
     ///
     /// Returns `Ok(None)` when the queue is closed and fully drained.
-    pub async fn next(&self) -> Result<Option<T>, WorkQueueRecvError> {
+    pub async fn next(&self) -> Result<Option<WorkItem<T>>, WorkQueueRecvError> {
         match self.backend.recv().await? {
-            Some(bytes) => Ok(Some(deserialize(&bytes)?)),
+            Some(msg) => Ok(Some(build_work_item(msg)?)),
             None => Ok(None),
         }
     }
 
     /// Get the next batch of items according to the given options.
     ///
+    /// Blocks until `batch_size` items are collected **or** `timeout` elapses,
     /// whichever comes first. May return fewer than `batch_size` items,
     /// including an empty `Vec`, for example when the timeout expires or when
     /// the queue has been closed and fully drained. Callers MUST NOT treat an
@@ -65,18 +66,42 @@ impl<T: DeserializeOwned> WorkQueueReceiver<T> {
     pub async fn next_with_options(
         &self,
         options: NextOptions,
-    ) -> Result<Vec<T>, WorkQueueRecvError> {
+    ) -> Result<Vec<WorkItem<T>>, WorkQueueRecvError> {
         let raw = self.backend.recv_batch(&options).await?;
-        raw.iter().map(|b| deserialize(b)).collect()
+        raw.into_iter().map(build_work_item).collect()
     }
 
     /// Try to get the next item without blocking.
     ///
     /// Returns `Ok(None)` if no items are currently available.
-    pub fn try_next(&self) -> Result<Option<T>, WorkQueueRecvError> {
+    pub fn try_next(&self) -> Result<Option<WorkItem<T>>, WorkQueueRecvError> {
         match self.backend.try_recv()? {
-            Some(bytes) => Ok(Some(deserialize(&bytes)?)),
+            Some(msg) => Ok(Some(build_work_item(msg)?)),
             None => Ok(None),
+        }
+    }
+}
+
+/// Deserialize the payload and wrap into a `WorkItem`. On deserialization
+/// failure under Manual policy, fire-and-forget a term on the handle so the
+/// poison bytes don't loop back via the implicit nack-on-drop path.
+fn build_work_item<T: DeserializeOwned>(
+    msg: DeliveredMessage,
+) -> Result<WorkItem<T>, WorkQueueRecvError> {
+    match deserialize(&msg.bytes) {
+        Ok(value) => Ok(WorkItem::new(value, msg.handle)),
+        Err(e) => {
+            // Under Auto, msg.handle is None and this branch is skipped.
+            // Under Manual, term removes the message so it isn't redelivered;
+            // best-effort spawn so we don't block the caller's error path.
+            if let Some(handle) = msg.handle
+                && let Ok(rt) = tokio::runtime::Handle::try_current()
+            {
+                rt.spawn(async move {
+                    let _ = handle.term().await;
+                });
+            }
+            Err(e)
         }
     }
 }

@@ -21,7 +21,7 @@ keywords = ["nvidia", "distributed"]
 
 [workspace.dependencies]
 # Local crates — only the two published surfaces remain after the fold.
-velo = { path = "lib/velo", version = "0.3.0" }
+velo = { path = "lib/velo", version = "0.4.0" }
 # Exact-pin (`=`) is intentional: velo-ext is the published trait surface
 # external implementors compile against. A non-`=` requirement would let a
 # future "compatible" patch silently re-resolve downstream lockfiles, which
