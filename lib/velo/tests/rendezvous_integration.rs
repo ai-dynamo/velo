@@ -10,14 +10,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
+use velo::transports::tcp::TcpTransportBuilder;
 use velo::*;
-use velo_transports::tcp::TcpTransportBuilder;
 
 // ---------------------------------------------------------------------------
 // Helper: create two connected Velo instances over TCP
 // ---------------------------------------------------------------------------
 
-fn new_tcp_transport() -> Arc<velo_transports::tcp::TcpTransport> {
+fn new_tcp_transport() -> Arc<velo::transports::tcp::TcpTransport> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     Arc::new(
         TcpTransportBuilder::new()

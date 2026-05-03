@@ -12,11 +12,11 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use prometheus::Registry;
+use velo::observability::VeloMetrics;
+use velo::observability::test_helpers::MetricSnapshot;
+use velo::transports::tcp::{TcpTransport, TcpTransportBuilder};
+use velo::transports::uds::UdsTransportBuilder;
 use velo::*;
-use velo_observability::VeloMetrics;
-use velo_observability::test_helpers::MetricSnapshot;
-use velo_transports::tcp::{TcpTransport, TcpTransportBuilder};
-use velo_transports::uds::UdsTransportBuilder;
 
 // ---------------------------------------------------------------------------
 // Transport factories
@@ -33,7 +33,7 @@ fn new_tcp_transport() -> Arc<TcpTransport> {
     )
 }
 
-fn new_uds_transport(dir: &tempfile::TempDir) -> Arc<velo_transports::uds::UdsTransport> {
+fn new_uds_transport(dir: &tempfile::TempDir) -> Arc<velo::transports::uds::UdsTransport> {
     let id = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -59,7 +59,7 @@ struct VeloPair {
 }
 
 impl VeloPair {
-    async fn new(t1: Arc<dyn backend::Transport>, t2: Arc<dyn backend::Transport>) -> Self {
+    async fn new(t1: Arc<dyn Transport>, t2: Arc<dyn Transport>) -> Self {
         let server_reg = Registry::new();
         let server_metrics = Arc::new(VeloMetrics::register(&server_reg).unwrap());
         let client_reg = Registry::new();

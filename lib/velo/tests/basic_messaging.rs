@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use velo::transports::tcp::{TcpTransport, TcpTransportBuilder};
 use velo::*;
-use velo_transports::tcp::{TcpTransport, TcpTransportBuilder};
 
 fn new_transport() -> Arc<TcpTransport> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

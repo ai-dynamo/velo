@@ -1,0 +1,39 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "velo-ext"
+version = "0.1.0"
+edition.workspace = true
+description = "Extension trait surface for Velo. External crates implement Transport, FrameTransport, and PeerDiscovery against this stable contract without depending on the Velo runtime."
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+keywords.workspace = true
+
+# Stability contract: this crate is the API boundary that out-of-tree
+# implementors of Transport / FrameTransport / PeerDiscovery / ServiceDiscovery
+# depend on. Changes here ripple to every downstream impl, so:
+#
+#   1. New trait methods MUST land with default implementations.
+#   2. Signature, bound, and parameter changes are minor bumps and require a
+#      coordinated bump of `velo`'s exact pin to this crate.
+#   3. Removing a public item is a major bump.
+#   4. The version of velo-ext referenced from velo MUST be an exact `=` pin
+#      to prevent a "compatible" patch from silently re-resolving the lockfile.
+
+[dependencies]
+anyhow = { workspace = true }
+bytes = { workspace = true }
+flume = { workspace = true }
+futures = { workspace = true }
+rmp-serde = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_bytes = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+uuid = { workspace = true, features = ["serde", "v4"] }
+xxhash-rust = { workspace = true }

@@ -24,7 +24,7 @@ async fn test_velo_builder_tcp_transport() {
     let transport = {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         Arc::new(
-            velo_transports::tcp::TcpTransportBuilder::new()
+            velo::transports::tcp::TcpTransportBuilder::new()
                 .from_listener(listener)
                 .unwrap()
                 .build()
@@ -75,7 +75,7 @@ async fn test_velo_builder_grpc_transport() {
     let transport = {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         Arc::new(
-            velo_transports::tcp::TcpTransportBuilder::new()
+            velo::transports::tcp::TcpTransportBuilder::new()
                 .from_listener(listener)
                 .unwrap()
                 .build()
@@ -128,7 +128,7 @@ async fn test_velo_facade_mpsc_create_and_attach() {
     let transport = {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         Arc::new(
-            velo_transports::tcp::TcpTransportBuilder::new()
+            velo::transports::tcp::TcpTransportBuilder::new()
                 .from_listener(listener)
                 .unwrap()
                 .build()
@@ -193,7 +193,7 @@ async fn test_velo_facade_mpsc_with_config() {
     let transport = {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         Arc::new(
-            velo_transports::tcp::TcpTransportBuilder::new()
+            velo::transports::tcp::TcpTransportBuilder::new()
                 .from_listener(listener)
                 .unwrap()
                 .build()
