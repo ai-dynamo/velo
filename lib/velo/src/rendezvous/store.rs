@@ -14,6 +14,56 @@ use dashmap::DashMap;
 
 use crate::rendezvous::protocol::DataMetadata;
 
+/// Pinned (NIXL-registered) staging variants. Owner-side; held inside a
+/// [`DataSlot`] when [`StageMode::Pinned`].
+///
+/// Arena-buffer Drop releases the slice back to the arena (no NIXL
+/// deregistration — the arena registers the entire backing storage once at
+/// `enable_nixl()` time).
+#[cfg(feature = "nixl")]
+pub(crate) enum PinnedStorage {
+    /// Host (DRAM) arena slice.
+    Host(super::nixl_endpoint::HostArenaBuffer),
+    /// Device (VRAM) arena slice.
+    Device(super::nixl_endpoint::DeviceArenaBuffer),
+}
+
+#[cfg(feature = "nixl")]
+impl PinnedStorage {
+    /// Build a wire-format `NixlAddrDescriptor` for this slot.
+    pub(crate) fn descriptor(&self, agent_name: &str) -> super::protocol::NixlAddrDescriptor {
+        let d = match self {
+            Self::Host(buf) => buf.registered_descriptor(),
+            Self::Device(buf) => buf.registered_descriptor(),
+        };
+        super::protocol::NixlAddrDescriptor {
+            agent: agent_name.to_string(),
+            addr: d.addr,
+            size: d.size as u64,
+            mem_type: d.mem_type,
+            device_id: d.device_id,
+        }
+    }
+
+    pub(crate) fn total_len(&self) -> u64 {
+        use dynamo_memory::MemoryDescriptor as _;
+        match self {
+            Self::Host(buf) => buf.size() as u64,
+            Self::Device(buf) => buf.size() as u64,
+        }
+    }
+}
+
+#[cfg(feature = "nixl")]
+impl std::fmt::Debug for PinnedStorage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Host(_) => f.debug_struct("PinnedStorage::Host").finish(),
+            Self::Device(_) => f.debug_struct("PinnedStorage::Device").finish(),
+        }
+    }
+}
+
 /// Default chunk size for chunked transfers (512 KiB).
 pub const DEFAULT_CHUNK_SIZE: u32 = 512 * 1024;
 
@@ -31,8 +81,12 @@ pub enum StageMode {
 /// A single slot in the data store registry.
 #[allow(dead_code)]
 pub(crate) struct DataSlot {
-    /// The staged payload.
-    pub data: Bytes,
+    /// In-memory chunked-pull payload. Present when `mode == InMemory`,
+    /// `None` when the slot is `Pinned` (data lives in `pinned`).
+    pub data: Option<Bytes>,
+    /// NIXL-registered arena slice. Present when `mode == Pinned`.
+    #[cfg(feature = "nixl")]
+    pub pinned: Option<PinnedStorage>,
     /// How the data is stored.
     pub mode: StageMode,
     /// Reference count. Defaults to 1. Decremented by release, freed at 0.
@@ -45,11 +99,6 @@ pub(crate) struct DataSlot {
     pub created_at: Instant,
     /// Optional time-to-live. Data is eligible for reaping after this duration.
     pub ttl: Option<std::time::Duration>,
-    /// NIXL registration handle for `StageMode::Pinned` slots. Held alongside
-    /// `data` so they drop together; the registration is auto-deregistered on
-    /// drop.
-    #[cfg(feature = "nixl")]
-    pub _registration: Option<velo_nixl::RegistrationHandle>,
 }
 
 /// State for an active chunked transfer.
@@ -130,46 +179,45 @@ impl DataStore {
         self.slots.insert(
             local_id,
             DataSlot {
-                data,
+                data: Some(data),
+                #[cfg(feature = "nixl")]
+                pinned: None,
                 mode: StageMode::InMemory,
                 refcount: AtomicU32::new(1),
                 read_lock_count: AtomicU32::new(0),
                 total_len,
                 created_at: Instant::now(),
                 ttl,
-                #[cfg(feature = "nixl")]
-                _registration: None,
             },
         );
         local_id
     }
 
-    /// Register pinned (NIXL-registered) data and return the local slot ID.
+    /// Register a pinned (NIXL-registered) slot backed by an arena slice.
     ///
-    /// `registration` ties the lifetime of the NIXL registration to the slot:
-    /// when the slot is freed, both `data` and `registration` drop together,
-    /// and the registration auto-deregisters via `Drop`.
+    /// The arena buffer's Drop releases its allocation back to the arena;
+    /// no NIXL deregistration happens per-slot since the arena registered
+    /// its entire backing storage once at endpoint creation.
     #[cfg(feature = "nixl")]
-    pub fn register_pinned(
+    pub(crate) fn register_pinned(
         &self,
-        data: Bytes,
-        registration: velo_nixl::RegistrationHandle,
+        pinned: PinnedStorage,
         opts: Option<RegisterOptions>,
     ) -> u64 {
         let local_id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let total_len = data.len() as u64;
+        let total_len = pinned.total_len();
         let ttl = opts.as_ref().and_then(|o| o.ttl);
         self.slots.insert(
             local_id,
             DataSlot {
-                data,
+                data: None,
+                pinned: Some(pinned),
                 mode: StageMode::Pinned,
                 refcount: AtomicU32::new(1),
                 read_lock_count: AtomicU32::new(0),
                 total_len,
                 created_at: Instant::now(),
                 ttl,
-                _registration: Some(registration),
             },
         );
         local_id
@@ -277,9 +325,12 @@ impl DataStore {
         }
     }
 
-    /// Remove a slot from the registry and return its data.
+    /// Remove a slot from the registry and return its in-memory bytes (if any).
+    ///
+    /// Pinned slots return `None` here — their backing arena buffer drops
+    /// when the slot is removed.
     pub fn remove(&self, local_id: u64) -> Option<Bytes> {
-        self.slots.remove(&local_id).map(|(_, slot)| slot.data)
+        self.slots.remove(&local_id).and_then(|(_, slot)| slot.data)
     }
 
     /// Try to free a slot if both refcount and read_lock_count are zero.
@@ -291,9 +342,48 @@ impl DataStore {
         });
     }
 
-    /// Get the data bytes for a slot (for inline responses or local fast-path).
+    /// Get the in-memory data bytes for a slot (for inline responses or
+    /// local fast-path).
+    ///
+    /// For `InMemory` slots: cheap `Bytes::clone()` (refcount bump).
+    /// For `Pinned::Host` slots: memcpys out of the host arena. The local
+    ///   fast-path is rare for pinned slots (it requires owner == consumer)
+    ///   so the copy isn't a hot-path concern.
+    /// For `Pinned::Device` slots: returns `None` — VRAM can't be expressed
+    ///   as host `Bytes`. Local callers should use `get_into_device_arena`.
     pub fn get_data(&self, local_id: u64) -> Option<Bytes> {
-        self.slots.get(&local_id).map(|slot| slot.data.clone())
+        let slot = self.slots.get(&local_id)?;
+        if let Some(data) = &slot.data {
+            return Some(data.clone());
+        }
+        #[cfg(feature = "nixl")]
+        if let Some(PinnedStorage::Host(buf)) = &slot.pinned {
+            use dynamo_memory::MemoryDescriptor as _;
+            // SAFETY: `buf.addr()` is the base of a host arena slice, valid
+            // for `buf.size()` bytes for the lifetime of `buf` (which the
+            // slot owns and is held alive by `self.slots.get`'s ref-guard).
+            let slice =
+                unsafe { std::slice::from_raw_parts(buf.addr() as *const u8, buf.size()) };
+            return Some(Bytes::copy_from_slice(slice));
+        }
+        None
+    }
+
+    /// Build a wire-format NIXL descriptor for a pinned slot.
+    ///
+    /// Returns `None` if the slot is not pinned (or doesn't exist). The
+    /// descriptor's `addr`/`size`/`mem_type`/`device_id` come from the arena
+    /// buffer's `registered_descriptor()`; the agent name is filled in by
+    /// the caller.
+    #[cfg(feature = "nixl")]
+    pub(crate) fn pinned_descriptor(
+        &self,
+        local_id: u64,
+        agent_name: &str,
+    ) -> Option<crate::rendezvous::protocol::NixlAddrDescriptor> {
+        self.slots
+            .get(&local_id)
+            .and_then(|slot| slot.pinned.as_ref().map(|p| p.descriptor(agent_name)))
     }
 
     /// Get the total length of data in a slot.
@@ -330,9 +420,13 @@ impl DataStore {
     }
 
     /// Get a specific chunk from an active transfer.
+    ///
+    /// Only valid for chunked (in-memory) transfers; pinned transfers do
+    /// not register a `TransferState` — they go directly through NIXL_READ.
     pub fn get_chunk(&self, transfer_id: u64, chunk_index: u32) -> Option<Bytes> {
         let transfer = self.transfers.get(&transfer_id)?;
         let slot = self.slots.get(&transfer.slot_local_id)?;
+        let data = slot.data.as_ref()?;
 
         let offset = chunk_index as u64 * transfer.chunk_size as u64;
         let end = (offset + transfer.chunk_size as u64).min(slot.total_len);
@@ -341,7 +435,7 @@ impl DataStore {
             return None;
         }
 
-        Some(slot.data.slice(offset as usize..end as usize))
+        Some(data.slice(offset as usize..end as usize))
     }
 
     /// Remove a completed transfer.

@@ -367,34 +367,26 @@ async fn pull_chunks(
     Ok(buf)
 }
 
-/// Perform a NIXL_READ from a remote-registered region into a freshly
-/// allocated [`SystemStorage`](velo_nixl::SystemStorage), then copy the
-/// result into a returned [`Bytes`].
+/// Perform a NIXL_READ from a remote-registered region into a host arena
+/// slice, then copy the result into a returned [`Bytes`].
 ///
-/// Phase 2 allocates and registers per call (the "register-per-get" decision
-/// in PLAN.md §8.1). A future optimization is to cache registered destination
-/// buffers in a pool.
+/// The destination is allocated from the endpoint's pre-registered host
+/// arena (`alloc_host_dst`), so no per-call `register_memory` is paid — the
+/// arena's backing `SystemStorage` was registered once at endpoint creation.
+/// The remote descriptor's `mem_type` and `device_id` are honored verbatim,
+/// so VRAM-source transfers work as long as both sides have CUDA-aware UCX.
 #[cfg(feature = "nixl")]
 async fn nixl_read(
     endpoint: &Arc<NixlEndpoint>,
     remote_agent: &str,
     descriptor: &[u8],
 ) -> Result<Bytes> {
-    use velo_nixl::{MemType, NixlRegistration, SystemStorage, XferDescList, XferOp};
+    use velo_nixl::{XferDescList, XferOp};
 
     let desc: NixlAddrDescriptor = rmp_serde::from_slice(descriptor)
         .map_err(|e| anyhow::anyhow!("failed to deserialize NixlAddrDescriptor: {e}"))?;
 
     let size = desc.size as usize;
-
-    // Allocate + register a destination buffer. SystemStorage::register stores
-    // the RegistrationHandle inside `self`, and Drop auto-deregisters.
-    let mut dst = SystemStorage::new(size)
-        .map_err(|e| anyhow::anyhow!("velo-nixl: SystemStorage::new failed: {e}"))?;
-    dst.register(&endpoint.agent, Some(endpoint.opt_args()))
-        .map_err(|e| anyhow::anyhow!("velo-nixl: dst register failed: {e}"))?;
-
-    let dst_addr = dst.as_slice().as_ptr() as usize;
 
     // Validate that the descriptor's agent matches the loaded remote name.
     if desc.agent != remote_agent {
@@ -405,14 +397,21 @@ async fn nixl_read(
         );
     }
 
+    let dst = endpoint.alloc_host_dst(size)?;
+    let local_descriptor = dst.registered_descriptor();
+
     // Build descriptor lists in a sub-scope so they drop before the `.await`
     // below — `XferDescList` is not `Send` (its inner C handle is a raw
     // pointer), but the `XferRequest` returned by `create_xfer_req` *is*
     // `Send + Sync` and copies all needed state into libnixl.
     let req = {
-        let mut local = XferDescList::new(MemType::Dram)
+        let mut local = XferDescList::new(local_descriptor.mem_type)
             .map_err(|e| anyhow::anyhow!("velo-nixl: local XferDescList::new failed: {e}"))?;
-        local.add_desc(dst_addr, size, 0);
+        local.add_desc(
+            local_descriptor.addr as usize,
+            size,
+            local_descriptor.device_id,
+        );
 
         let mut remote = XferDescList::new(desc.mem_type)
             .map_err(|e| anyhow::anyhow!("velo-nixl: remote XferDescList::new failed: {e}"))?;
@@ -438,9 +437,89 @@ async fn nixl_read(
         .await
         .map_err(|e| anyhow::anyhow!("velo-nixl: wait_xfer failed: {e}"))?;
 
-    // XferRequest::Drop releases + destroys the request automatically. Ditto
-    // for `dst` — Drop on SystemStorage deregisters its memory.
-    Ok(Bytes::copy_from_slice(dst.as_slice()))
+    // Copy out of the arena slice into a freshly-allocated Bytes (existing
+    // contract). The arena buffer drops at end of function, releasing the
+    // slice back to the arena.
+    //
+    // SAFETY: `local_descriptor.addr` is the base pointer of the arena
+    // slice, valid for `size` bytes for the lifetime of `dst`.
+    let host_slice =
+        unsafe { std::slice::from_raw_parts(local_descriptor.addr as *const u8, size) };
+    let out = Bytes::copy_from_slice(host_slice);
+    drop(dst);
+    Ok(out)
+}
+
+/// Perform a NIXL_READ from a remote-registered region into a device arena
+/// slice on the specified CUDA device. Returns the arena buffer; the caller
+/// is responsible for keeping it alive while the data is in use, and may
+/// `cudaMemcpy` it to host or pass its `registered_descriptor()` on for
+/// further GPU-side use.
+///
+/// Both DRAM-source (`MemType::Dram` in the wire descriptor) and VRAM-source
+/// (`MemType::Vram`) transfers are supported — UCX's `cuda_copy` /
+/// `cuda_ipc` transports handle the cross. Requires a UCX build with
+/// `--with-cuda` against the CUDA toolkit.
+#[cfg(feature = "nixl")]
+pub(crate) async fn nixl_read_into_device(
+    endpoint: &Arc<NixlEndpoint>,
+    remote_agent: &str,
+    descriptor: &[u8],
+    device_id: u32,
+) -> Result<crate::rendezvous::nixl_endpoint::DeviceArenaBuffer> {
+    use velo_nixl::{MemType, XferDescList, XferOp};
+
+    let desc: NixlAddrDescriptor = rmp_serde::from_slice(descriptor)
+        .map_err(|e| anyhow::anyhow!("failed to deserialize NixlAddrDescriptor: {e}"))?;
+
+    let size = desc.size as usize;
+
+    if desc.agent != remote_agent {
+        anyhow::bail!(
+            "NIXL Rdma descriptor agent {:?} does not match handshake-loaded agent {:?}",
+            desc.agent,
+            remote_agent,
+        );
+    }
+
+    let dst = endpoint.alloc_device_dst(size, device_id)?;
+    let local_descriptor = dst.registered_descriptor();
+    debug_assert_eq!(local_descriptor.mem_type, MemType::Vram);
+
+    let req = {
+        let mut local = XferDescList::new(local_descriptor.mem_type)
+            .map_err(|e| anyhow::anyhow!("velo-nixl: local XferDescList::new failed: {e}"))?;
+        local.add_desc(
+            local_descriptor.addr as usize,
+            size,
+            local_descriptor.device_id,
+        );
+
+        let mut remote = XferDescList::new(desc.mem_type)
+            .map_err(|e| anyhow::anyhow!("velo-nixl: remote XferDescList::new failed: {e}"))?;
+        remote.add_desc(desc.addr as usize, size, desc.device_id);
+
+        endpoint
+            .agent
+            .create_xfer_req(
+                XferOp::Read,
+                &local,
+                &remote,
+                remote_agent,
+                Some(endpoint.opt_args()),
+            )
+            .map_err(|e| anyhow::anyhow!("velo-nixl: create_xfer_req failed: {e}"))?
+    };
+
+    endpoint
+        .agent
+        .post_xfer_req(&req, Some(endpoint.opt_args()))
+        .map_err(|e| anyhow::anyhow!("velo-nixl: post_xfer_req failed: {e}"))?;
+    velo_nixl::wait_xfer(&endpoint.agent, &req)
+        .await
+        .map_err(|e| anyhow::anyhow!("velo-nixl: wait_xfer failed: {e}"))?;
+
+    Ok(dst)
 }
 
 /// Pull all chunks for a chunked transfer into an explicit destination.

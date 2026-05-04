@@ -78,7 +78,7 @@ async fn rendezvous_nixl_pinned_1mib() {
 
     let handle = pair
         .owner
-        .register_data_pinned(payload.clone())
+        .register_data_pinned(&payload)
         .expect("register_data_pinned");
 
     // Metadata query should report the slot as pinned.
@@ -110,10 +110,7 @@ async fn rendezvous_nixl_coexists_with_chunked() {
     let pinned_payload = Bytes::from(vec![0xAA; 8 * 1024]);
     let chunked_payload = Bytes::from(vec![0xBB; 8 * 1024]);
 
-    let pinned_handle = pair
-        .owner
-        .register_data_pinned(pinned_payload.clone())
-        .unwrap();
+    let pinned_handle = pair.owner.register_data_pinned(&pinned_payload).unwrap();
     let chunked_handle = pair.owner.register_data(chunked_payload.clone());
 
     let (pinned_bytes, pinned_lease) = pair.consumer.get(pinned_handle).await.unwrap();

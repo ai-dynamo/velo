@@ -32,7 +32,9 @@ queue-messenger = []
 
 # Phase 2: NIXL/RDMA support for rendezvous. Requires libnixl + a UCX
 # plugin at runtime; see the velo-nixl crate's README for env setup.
-nixl = ["dep:velo-nixl", "dep:serde_bytes"]
+# Pulls in dynamo-memory for the arena allocator + NixlRegistered<T> +
+# typed storage (System/Pinned/Device) used by the rendezvous nixl path.
+nixl = ["dep:velo-nixl", "dep:serde_bytes", "dep:dynamo-memory"]
 
 # Optional subsystems
 distributed-tracing = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
@@ -90,6 +92,7 @@ opentelemetry = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 loom-rs = { version = "0.5.0", features = ["sim"], optional = true }
 velo-nixl = { workspace = true, optional = true }
+dynamo-memory = { workspace = true, optional = true }
 serde_bytes = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]

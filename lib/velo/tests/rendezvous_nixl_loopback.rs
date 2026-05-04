@@ -74,7 +74,7 @@ async fn pinned_register_and_remote_get() {
     let payload = Bytes::from((0..64u32 * 1024).map(|i| i as u8).collect::<Vec<u8>>());
     let handle = owner
         .manager
-        .register_data_pinned(payload.clone())
+        .register_data_pinned(&payload)
         .expect("register_data_pinned");
 
     let (data, lease_id) = consumer
@@ -99,7 +99,7 @@ async fn pinned_local_fast_path_skips_nixl() {
     let node = RvNode::new().await;
 
     let payload = Bytes::from(vec![0xCC; 1024]);
-    let handle = node.manager.register_data_pinned(payload.clone()).unwrap();
+    let handle = node.manager.register_data_pinned(&payload).unwrap();
 
     let (data, lease_id) = node.manager.get(handle).await.unwrap();
     assert_eq!(data.len(), payload.len());
@@ -132,10 +132,7 @@ async fn pinned_get_without_consumer_nixl_errors_cleanly() {
 
     connect(&owner, &consumer).await;
 
-    let handle = owner
-        .manager
-        .register_data_pinned(Bytes::from(vec![1u8; 256]))
-        .unwrap();
+    let handle = owner.manager.register_data_pinned(&[1u8; 256]).unwrap();
 
     let err = consumer
         .manager

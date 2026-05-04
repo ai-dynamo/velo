@@ -679,8 +679,33 @@ impl Velo {
     ///
     /// Requires [`enable_nixl`](Self::enable_nixl).
     #[cfg(feature = "nixl")]
-    pub fn register_data_pinned(&self, data: bytes::Bytes) -> Result<DataHandle> {
+    pub fn register_data_pinned(&self, data: &[u8]) -> Result<DataHandle> {
         self.rendezvous_manager.register_data_pinned(data)
+    }
+
+    /// Stage `data` (host slice) into the owner's NIXL-registered VRAM
+    /// arena on the given CUDA device, and return a [`DataHandle`].
+    ///
+    /// Requires [`enable_nixl`](Self::enable_nixl) and a UCX build with
+    /// `--with-cuda` against the CUDA toolkit.
+    #[cfg(feature = "nixl")]
+    pub fn register_data_pinned_device(&self, data: &[u8], device_id: u32) -> Result<DataHandle> {
+        self.rendezvous_manager
+            .register_data_pinned_device(data, device_id)
+    }
+
+    /// Pull a remote pinned slot directly into a NIXL-registered VRAM
+    /// buffer on the given CUDA device. See
+    /// [`crate::rendezvous::RendezvousManager::get_into_device_arena`].
+    #[cfg(feature = "nixl")]
+    pub async fn get_into_device_arena(
+        &self,
+        handle: DataHandle,
+        device_id: u32,
+    ) -> Result<(crate::rendezvous::DeviceArenaBuffer, u64)> {
+        self.rendezvous_manager
+            .get_into_device_arena(handle, device_id)
+            .await
     }
 }
 

@@ -152,7 +152,7 @@ async fn run_owner(handshake: &Path, size_bytes: usize, timeout: Duration) -> Re
     // local_md (registrations are reflected in get_local_md per the
     // PLAN §8.4 / nixl_endpoint comments).
     let payload = make_pattern(size_bytes);
-    let handle = velo.register_data_pinned(payload.clone())?;
+    let handle = velo.register_data_pinned(&payload)?;
     eprintln!(
         "[owner pid={}] register_data_pinned: {} bytes, handle = {handle}",
         std::process::id(),

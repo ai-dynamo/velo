@@ -25,9 +25,7 @@ use std::sync::OnceLock;
 #[cfg(feature = "nixl")]
 use crate::rendezvous::nixl_endpoint::NixlEndpoint;
 #[cfg(feature = "nixl")]
-use crate::rendezvous::protocol::{
-    NixlAddrDescriptor, RvNixlHandshakeRequest, RvNixlHandshakeResponse,
-};
+use crate::rendezvous::protocol::{RvNixlHandshakeRequest, RvNixlHandshakeResponse};
 #[cfg(feature = "nixl")]
 use crate::rendezvous::store::StageMode;
 
@@ -152,16 +150,16 @@ pub(crate) fn create_rv_acquire_handler_with_slot(
                              on this owner"
                         )
                     })?;
-                    let slot_data = store
-                        .get_data(local_id)
-                        .ok_or_else(|| anyhow::anyhow!("slot vanished after lock acquire"))?;
-                    let descriptor = NixlAddrDescriptor {
-                        agent: endpoint.agent_name.clone(),
-                        addr: slot_data.as_ptr() as u64,
-                        size: slot_data.len() as u64,
-                        mem_type: velo_nixl::MemType::Dram,
-                        device_id: 0,
-                    };
+                    // Pull the on-the-wire descriptor from the slot's arena
+                    // buffer. This carries the correct mem_type/device_id —
+                    // host slots become MemType::Dram, device slots become
+                    // MemType::Vram with the CUDA device ordinal in
+                    // device_id, so consumers route the NIXL_READ correctly.
+                    let descriptor = store
+                        .pinned_descriptor(local_id, &endpoint.agent_name)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("pinned slot vanished after lock acquire")
+                        })?;
                     let bytes = rmp_serde::to_vec(&descriptor).map_err(|e| {
                         anyhow::anyhow!("failed to serialize NixlAddrDescriptor: {e}")
                     })?;

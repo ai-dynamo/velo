@@ -15,11 +15,25 @@ repository.workspace = true
 # silent semver-bump bug class that motivated the workspace collapse.
 publish = false
 
+[features]
+# Gates the VRAM smoke test, which depends on a CUDA-capable GPU and a
+# CUDA-aware UCX (see docs/setup; wheel-bundled UCX 1.20.0 has no CUDA
+# support).
+cuda-tests = []
+
 [dependencies]
-nixl-sys = { path = "../../../nixl/src/bindings/rust" }
+# Pinned to match dynamo-memory's `=0.10.1` constraint so we can co-resolve
+# both crates against a single nixl-sys version (the historical bug class
+# that motivated the velo workspace collapse: silent multi-version
+# resolution producing two distinct copies of NIXL types).
+nixl-sys = { version = "=0.10.1" }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["time", "rt", "macros"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+
+[[test]]
+name = "vram_smoke"
+required-features = ["cuda-tests"]

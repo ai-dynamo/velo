@@ -40,7 +40,7 @@ pub use transparent::{RendezvousResolver, RendezvousStager};
 pub use write::RendezvousWrite;
 
 #[cfg(feature = "nixl")]
-pub use nixl_endpoint::NixlEndpoint;
+pub use nixl_endpoint::{DeviceArenaBuffer, NixlEndpoint, NixlEndpointConfig};
 
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
@@ -444,14 +444,19 @@ impl RendezvousManager {
     /// on the owner side, which a NIXL-enabled consumer fulfills via direct
     /// `NIXL_READ` rather than the chunked-pull control path.
     ///
+    /// The bytes are copied into the endpoint's pre-registered host arena;
+    /// no per-call NIXL `register_memory` is performed.
+    ///
     /// Requires [`enable_nixl`](Self::enable_nixl) on the owner.
     #[cfg(feature = "nixl")]
-    pub fn register_data_pinned(self: &Arc<Self>, data: Bytes) -> Result<DataHandle> {
+    pub fn register_data_pinned(self: &Arc<Self>, data: &[u8]) -> Result<DataHandle> {
         let started = Instant::now();
         let data_len = data.len();
         let endpoint = self.nixl()?;
-        let (registration, data) = endpoint.register_bytes(data)?;
-        let local_id = self.store.register_pinned(data, registration, None);
+        let buf = endpoint.stage_host_bytes(data)?;
+        let local_id = self
+            .store
+            .register_pinned(crate::rendezvous::store::PinnedStorage::Host(buf), None);
         if let Some(m) = &self.metrics {
             m.record_rendezvous_operation(
                 RendezvousOp::Register,
@@ -462,6 +467,121 @@ impl RendezvousManager {
             m.set_rendezvous_active_slots(self.store.slots.len());
         }
         Ok(DataHandle::pack(self.worker_id, local_id))
+    }
+
+    /// Stage `data` (a host slice) into the owner's VRAM arena on the
+    /// specified CUDA device and return a [`DataHandle`]. The bytes are
+    /// `cudaMemcpy`'d host→device into a NIXL-registered slice; the
+    /// resulting handle's `AcquireResponse::Rdma` descriptor advertises
+    /// `MemType::Vram` with this device_id, so consumers know to NIXL_READ
+    /// it as device memory.
+    ///
+    /// Requires [`enable_nixl`](Self::enable_nixl). The first call for a
+    /// given `device_id` lazily allocates a `DEFAULT_DEVICE_ARENA_BYTES`
+    /// arena on that device.
+    #[cfg(feature = "nixl")]
+    pub fn register_data_pinned_device(
+        self: &Arc<Self>,
+        data: &[u8],
+        device_id: u32,
+    ) -> Result<DataHandle> {
+        let started = Instant::now();
+        let data_len = data.len();
+        let endpoint = self.nixl()?;
+        let buf = endpoint.stage_device_bytes(data, device_id)?;
+        let local_id = self
+            .store
+            .register_pinned(crate::rendezvous::store::PinnedStorage::Device(buf), None);
+        if let Some(m) = &self.metrics {
+            m.record_rendezvous_operation(
+                RendezvousOp::Register,
+                HandlerOutcome::Success,
+                started.elapsed(),
+            );
+            m.record_rendezvous_bytes(RendezvousOp::Register, data_len);
+            m.set_rendezvous_active_slots(self.store.slots.len());
+        }
+        Ok(DataHandle::pack(self.worker_id, local_id))
+    }
+
+    /// Pull a remote pinned slot directly into a NIXL-registered VRAM
+    /// buffer on the specified CUDA device.
+    ///
+    /// Returns a [`DeviceArenaBuffer`] holding the freshly-transferred data
+    /// in device memory; the caller can `cudaMemcpy` it back to host, hand
+    /// it to a CUDA kernel, or expose `registered_descriptor()` for further
+    /// NIXL forwarding. The slice is released when the buffer drops; the
+    /// underlying VRAM arena stays registered for the life of the endpoint.
+    ///
+    /// Both DRAM-source and VRAM-source pinned slots are supported — UCX's
+    /// `cuda_copy` / `cuda_ipc` transports route the cross. Requires:
+    /// (1) [`enable_nixl`](Self::enable_nixl) on this consumer,
+    /// (2) the owner has registered the handle via `register_data_pinned`
+    ///     or `register_data_pinned_device`,
+    /// (3) UCX built with `--with-cuda` against the CUDA toolkit.
+    ///
+    /// For chunked-pull (non-pinned) slots this returns an error — chunked
+    /// transfers serve `Bytes` and have no zero-copy device path. Use
+    /// [`Self::get`] in that case and `cudaMemcpy` host→device yourself.
+    #[cfg(feature = "nixl")]
+    pub async fn get_into_device_arena(
+        self: &Arc<Self>,
+        handle: DataHandle,
+        device_id: u32,
+    ) -> Result<(DeviceArenaBuffer, u64)> {
+        use crate::rendezvous::protocol::{AcquireResponse, RvAcquireRequest, RvHandleWire};
+
+        let target_worker = handle.worker_id();
+        let endpoint = self.nixl()?;
+        let remote_agent = self.ensure_remote_md(target_worker).await?;
+        let messenger = self.messenger();
+
+        let response: AcquireResponse = messenger
+            .typed_unary_streaming::<AcquireResponse>("_rv_acquire")
+            .payload(&RvAcquireRequest {
+                handle: RvHandleWire::from_handle(handle),
+            })?
+            .worker(target_worker)
+            .send()
+            .await?;
+
+        match response {
+            AcquireResponse::Ready { lease_id, .. } => {
+                // Best-effort cleanup before erroring.
+                let _ = consumer::Consumer::detach(messenger, handle, lease_id).await;
+                anyhow::bail!(
+                    "get_into_device_arena: owner returned chunked Ready response; this \
+                     entry point only supports pinned slots (use register_data_pinned* on \
+                     the owner, or use get() for chunked transfers and cudaMemcpy yourself)"
+                );
+            }
+            AcquireResponse::Rdma {
+                lease_id,
+                descriptor,
+            } => {
+                match consumer::nixl_read_into_device(
+                    endpoint,
+                    remote_agent.as_str(),
+                    &descriptor,
+                    device_id,
+                )
+                .await
+                {
+                    Ok(buf) => Ok((buf, lease_id)),
+                    Err(e) => {
+                        if let Err(cleanup_err) =
+                            consumer::Consumer::detach(messenger, handle, lease_id).await
+                        {
+                            tracing::warn!(
+                                "Failed to detach lease {lease_id} after device read failure: \
+                                 {cleanup_err}"
+                            );
+                        }
+                        Err(e)
+                    }
+                }
+            }
+        }
     }
 
     /// Inner consumer dispatch for `get`. With `nixl` enabled, performs the

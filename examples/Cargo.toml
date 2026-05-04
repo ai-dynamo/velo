@@ -16,6 +16,10 @@ nixl = ["velo/nixl"]
 
 [dependencies]
 velo = { path = "../lib/velo", features = ["test-helpers"] }
+# Used only by the GPU example (`rendezvous_nixl_gpu_two_proc`) for the
+# `MemoryDescriptor` extension trait — calling `.size()` / `.addr()` on the
+# `DeviceArenaBuffer` returned from `get_into_device_arena`.
+dynamo-memory = { path = "../../dynamo/lib/memory" }
 
 anyhow = "1"
 bytes = "1"
@@ -51,4 +55,8 @@ required-features = ["grpc"]
 
 [[example]]
 name = "rendezvous_nixl_two_proc"
+required-features = ["nixl"]
+
+[[example]]
+name = "rendezvous_nixl_gpu_two_proc"
 required-features = ["nixl"]
