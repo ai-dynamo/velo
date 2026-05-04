@@ -20,9 +20,11 @@ pub const DEFAULT_CHUNK_SIZE: u32 = 512 * 1024;
 /// How data is staged in memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StageMode {
-    /// Phase 1: plain heap bytes, served via chunked pull.
+    /// Plain heap bytes, served via chunked pull over active messages.
     InMemory,
-    /// Phase 2 (placeholder): RDMA-pinned arena memory via dynamo-memory + NIXL.
+    /// RDMA-pinned bytes (libnixl-registered). Served via direct NIXL_READ
+    /// on the consumer when the `nixl` feature is enabled. See
+    /// `RendezvousManager::register_data_pinned`.
     Pinned,
 }
 
@@ -43,6 +45,11 @@ pub(crate) struct DataSlot {
     pub created_at: Instant,
     /// Optional time-to-live. Data is eligible for reaping after this duration.
     pub ttl: Option<std::time::Duration>,
+    /// NIXL registration handle for `StageMode::Pinned` slots. Held alongside
+    /// `data` so they drop together; the registration is auto-deregistered on
+    /// drop.
+    #[cfg(feature = "nixl")]
+    pub _registration: Option<velo_nixl::RegistrationHandle>,
 }
 
 /// State for an active chunked transfer.
@@ -130,9 +137,48 @@ impl DataStore {
                 total_len,
                 created_at: Instant::now(),
                 ttl,
+                #[cfg(feature = "nixl")]
+                _registration: None,
             },
         );
         local_id
+    }
+
+    /// Register pinned (NIXL-registered) data and return the local slot ID.
+    ///
+    /// `registration` ties the lifetime of the NIXL registration to the slot:
+    /// when the slot is freed, both `data` and `registration` drop together,
+    /// and the registration auto-deregisters via `Drop`.
+    #[cfg(feature = "nixl")]
+    pub fn register_pinned(
+        &self,
+        data: Bytes,
+        registration: velo_nixl::RegistrationHandle,
+        opts: Option<RegisterOptions>,
+    ) -> u64 {
+        let local_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let total_len = data.len() as u64;
+        let ttl = opts.as_ref().and_then(|o| o.ttl);
+        self.slots.insert(
+            local_id,
+            DataSlot {
+                data,
+                mode: StageMode::Pinned,
+                refcount: AtomicU32::new(1),
+                read_lock_count: AtomicU32::new(0),
+                total_len,
+                created_at: Instant::now(),
+                ttl,
+                _registration: Some(registration),
+            },
+        );
+        local_id
+    }
+
+    /// Inspect an existing slot's stage mode.
+    #[cfg(feature = "nixl")]
+    pub fn stage_mode(&self, local_id: u64) -> Option<StageMode> {
+        self.slots.get(&local_id).map(|slot| slot.mode)
     }
 
     /// Query metadata for a slot (no lock acquired).

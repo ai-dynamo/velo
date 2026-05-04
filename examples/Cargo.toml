@@ -12,6 +12,7 @@ publish = false
 default = []
 zmq = ["velo/zmq"]
 grpc = ["velo/grpc"]
+nixl = ["velo/nixl"]
 
 [dependencies]
 velo = { path = "../lib/velo" }
@@ -38,3 +39,7 @@ name = "throughput"
 
 [[example]]
 name = "mpsc_fanin"
+
+[[example]]
+name = "rendezvous_nixl_two_proc"
+required-features = ["nixl"]

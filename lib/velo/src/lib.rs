@@ -623,6 +623,24 @@ impl Velo {
     pub fn rendezvous_manager(&self) -> &crate::rendezvous::RendezvousManager {
         &self.rendezvous_manager
     }
+
+    /// Enable NIXL/RDMA on the underlying rendezvous manager.
+    ///
+    /// Required on both the owner (before [`register_data_pinned`](Self::register_data_pinned))
+    /// and the consumer (before pulling from a pinned handle). See
+    /// `velo-rendezvous`'s `nixl` feature for environment requirements.
+    #[cfg(feature = "nixl")]
+    pub fn enable_nixl(&self) -> Result<()> {
+        self.rendezvous_manager.enable_nixl()
+    }
+
+    /// Stage RDMA-pinned data and return a [`DataHandle`].
+    ///
+    /// Requires [`enable_nixl`](Self::enable_nixl).
+    #[cfg(feature = "nixl")]
+    pub fn register_data_pinned(&self, data: bytes::Bytes) -> Result<DataHandle> {
+        self.rendezvous_manager.register_data_pinned(data)
+    }
 }
 
 #[cfg(test)]
