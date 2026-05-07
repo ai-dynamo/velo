@@ -12,14 +12,14 @@ publish = false
 default = []
 zmq = ["velo/zmq"]
 grpc = ["velo/grpc"]
-nixl = ["velo/nixl"]
+nixl = ["velo/nixl", "dep:dynamo-memory"]
 
 [dependencies]
 velo = { path = "../lib/velo", features = ["test-helpers"] }
 # Used only by the GPU example (`rendezvous_nixl_gpu_two_proc`) for the
 # `MemoryDescriptor` extension trait — calling `.size()` / `.addr()` on the
 # `DeviceArenaBuffer` returned from `get_into_device_arena`.
-dynamo-memory = "1.1.0"
+dynamo-memory = { version = "1.1.0", optional = true }
 
 anyhow = "1"
 bytes = "1"
