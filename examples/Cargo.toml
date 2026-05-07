@@ -19,7 +19,7 @@ velo = { path = "../lib/velo", features = ["test-helpers"] }
 # Used only by the GPU example (`rendezvous_nixl_gpu_two_proc`) for the
 # `MemoryDescriptor` extension trait — calling `.size()` / `.addr()` on the
 # `DeviceArenaBuffer` returned from `get_into_device_arena`.
-dynamo-memory = { path = "../../dynamo/lib/memory" }
+dynamo-memory = "1.1.0"
 
 anyhow = "1"
 bytes = "1"

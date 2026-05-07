@@ -737,7 +737,9 @@ dependencies = [
 
 [[package]]
 name = "dynamo-memory"
-version = "1.2.0"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0de5a077daeab71e27722d3682eef0971e265df104d5c8bf0a5679d3dee242f0"
 dependencies = [
  "anyhow",
  "cudarc",

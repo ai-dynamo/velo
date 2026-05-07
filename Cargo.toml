@@ -30,17 +30,11 @@ velo-ext = { path = "lib/velo-ext", version = "=0.2.0" }
 # hard rule #1).
 velo-nixl = { path = "lib/velo-nixl", version = "0.1.0" }
 
-# Sibling-repo path dep — used only when the `nixl` feature is on. Provides
-# the arena allocator + NixlRegistered<T> wrapper that velo-rendezvous's
-# Phase 2 NIXL/RDMA path uses to amortize NIXL `register_memory` cost across
-# many transfers, and to support typed (DRAM/Pinned/Device) staging buffers.
-#
-# This is a deliberate WIP shape: dynamo-memory is currently versioned 1.2.0
-# inside the dynamo workspace and is not on crates.io. While that's true,
-# `velo` cannot publish with the `nixl` feature enabled. Long-term seam: per
-# `velo_dynamo_seam.md`, the NIXL-related bits of dynamo-memory should move
-# into velo-nixl.
-dynamo-memory = { path = "../dynamo/lib/memory" }
+# Used only when the `nixl` feature is on. Provides the arena allocator +
+# NixlRegistered<T> wrapper that velo-rendezvous's Phase 2 NIXL/RDMA path
+# uses to amortize NIXL `register_memory` cost across many transfers, and
+# to support typed (DRAM/Pinned/Device) staging buffers.
+dynamo-memory = "1.1.0"
 
 # External dependencies.
 #
