@@ -72,22 +72,30 @@ pub fn create_rv_acquire_handler(store: Arc<DataStore>) -> crate::messenger::Han
                 .acquire_read_lock(local_id)
                 .ok_or_else(|| anyhow::anyhow!("rendezvous handle not found: {handle}"))?;
 
-            let total_len = store
-                .get_total_len(local_id)
-                .ok_or_else(|| anyhow::anyhow!("slot vanished after lock acquire"))?;
+            // After acquire_read_lock, any error path must release the lease
+            // or the slot is left with a dangling read lock and never freed.
+            let result = (|| -> anyhow::Result<AcquireResponse> {
+                let total_len = store
+                    .get_total_len(local_id)
+                    .ok_or_else(|| anyhow::anyhow!("slot vanished after lock acquire"))?;
 
-            // Always use chunked transfer (even for 1 chunk) to avoid
-            // JSON-encoding binary data in the typed-unary response.
-            let (transfer_id, chunk_size, chunk_count) = store
-                .create_transfer(local_id, lease_id, DEFAULT_CHUNK_SIZE)
-                .ok_or_else(|| anyhow::anyhow!("slot vanished after lock acquire"))?;
-            Ok(AcquireResponse::Ready {
-                lease_id,
-                transfer_id,
-                total_len,
-                chunk_size,
-                chunk_count,
-            })
+                // Always use chunked transfer (even for 1 chunk) to avoid
+                // JSON-encoding binary data in the typed-unary response.
+                let (transfer_id, chunk_size, chunk_count) = store
+                    .create_transfer(local_id, lease_id, DEFAULT_CHUNK_SIZE)
+                    .ok_or_else(|| anyhow::anyhow!("slot vanished after lock acquire"))?;
+                Ok(AcquireResponse::Ready {
+                    lease_id,
+                    transfer_id,
+                    total_len,
+                    chunk_size,
+                    chunk_count,
+                })
+            })();
+            if result.is_err() && store.consume_lease(lease_id).is_some() {
+                store.release_read_lock(local_id);
+            }
+            result
         },
     )
     .build()
@@ -127,48 +135,56 @@ pub(crate) fn create_rv_acquire_handler_with_slot(
                 .acquire_read_lock(local_id)
                 .ok_or_else(|| anyhow::anyhow!("rendezvous handle not found: {handle}"))?;
 
-            match mode {
-                StageMode::InMemory => {
-                    let total_len = store
-                        .get_total_len(local_id)
-                        .ok_or_else(|| anyhow::anyhow!("slot vanished after lock acquire"))?;
-                    let (transfer_id, chunk_size, chunk_count) = store
-                        .create_transfer(local_id, lease_id, DEFAULT_CHUNK_SIZE)
-                        .ok_or_else(|| anyhow::anyhow!("slot vanished after lock acquire"))?;
-                    Ok(AcquireResponse::Ready {
-                        lease_id,
-                        transfer_id,
-                        total_len,
-                        chunk_size,
-                        chunk_count,
-                    })
-                }
-                StageMode::Pinned => {
-                    let endpoint = nixl_slot.get().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "pinned slot {handle} requested but NIXL endpoint is not enabled \
-                             on this owner"
-                        )
-                    })?;
-                    // Pull the on-the-wire descriptor from the slot's arena
-                    // buffer. This carries the correct mem_type/device_id —
-                    // host slots become MemType::Dram, device slots become
-                    // MemType::Vram with the CUDA device ordinal in
-                    // device_id, so consumers route the NIXL_READ correctly.
-                    let descriptor = store
-                        .pinned_descriptor(local_id, &endpoint.agent_name)
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("pinned slot vanished after lock acquire")
+            // After acquire_read_lock, any error path must release the lease
+            // or the slot is left with a dangling read lock and never freed.
+            let result = (|| -> anyhow::Result<AcquireResponse> {
+                match mode {
+                    StageMode::InMemory => {
+                        let total_len = store
+                            .get_total_len(local_id)
+                            .ok_or_else(|| anyhow::anyhow!("slot vanished after lock acquire"))?;
+                        let (transfer_id, chunk_size, chunk_count) = store
+                            .create_transfer(local_id, lease_id, DEFAULT_CHUNK_SIZE)
+                            .ok_or_else(|| anyhow::anyhow!("slot vanished after lock acquire"))?;
+                        Ok(AcquireResponse::Ready {
+                            lease_id,
+                            transfer_id,
+                            total_len,
+                            chunk_size,
+                            chunk_count,
+                        })
+                    }
+                    StageMode::Pinned => {
+                        let endpoint = nixl_slot.get().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "pinned slot {handle} requested but NIXL endpoint is not \
+                                 enabled on this owner"
+                            )
                         })?;
-                    let bytes = rmp_serde::to_vec(&descriptor).map_err(|e| {
-                        anyhow::anyhow!("failed to serialize NixlAddrDescriptor: {e}")
-                    })?;
-                    Ok(AcquireResponse::Rdma {
-                        lease_id,
-                        descriptor: bytes,
-                    })
+                        // Pull the on-the-wire descriptor from the slot's arena
+                        // buffer. This carries the correct mem_type/device_id —
+                        // host slots become MemType::Dram, device slots become
+                        // MemType::Vram with the CUDA device ordinal in
+                        // device_id, so consumers route the NIXL_READ correctly.
+                        let descriptor = store
+                            .pinned_descriptor(local_id, &endpoint.agent_name)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("pinned slot vanished after lock acquire")
+                            })?;
+                        let bytes = rmp_serde::to_vec(&descriptor).map_err(|e| {
+                            anyhow::anyhow!("failed to serialize NixlAddrDescriptor: {e}")
+                        })?;
+                        Ok(AcquireResponse::Rdma {
+                            lease_id,
+                            descriptor: bytes,
+                        })
+                    }
                 }
+            })();
+            if result.is_err() && store.consume_lease(lease_id).is_some() {
+                store.release_read_lock(local_id);
             }
+            result
         },
     )
     .build()

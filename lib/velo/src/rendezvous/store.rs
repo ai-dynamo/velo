@@ -362,8 +362,7 @@ impl DataStore {
             // SAFETY: `buf.addr()` is the base of a host arena slice, valid
             // for `buf.size()` bytes for the lifetime of `buf` (which the
             // slot owns and is held alive by `self.slots.get`'s ref-guard).
-            let slice =
-                unsafe { std::slice::from_raw_parts(buf.addr() as *const u8, buf.size()) };
+            let slice = unsafe { std::slice::from_raw_parts(buf.addr() as *const u8, buf.size()) };
             return Some(Bytes::copy_from_slice(slice));
         }
         None
