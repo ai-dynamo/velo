@@ -112,7 +112,7 @@ tonic-build = "0.13.1"
 # `serde_bytes` is used via `#[serde(with = "serde_bytes")]` attribute paths in
 # the nixl-feature-gated rendezvous protocol (see `rendezvous/protocol.rs`),
 # which cargo-machete cannot detect.
-ignored = ["axum", "http", "http-body", "http-body-util", "hyper", "hyper-util", "prost", "tower", "bs58", "serde_bytes"]
+ignored = ["axum", "http", "http-body", "http-body-util", "hyper", "hyper-util", "prost", "tower", "bs58", "serde_bytes", "velo-nixl", "dynamo-memory"]
 
 # `velo_endurance` is a rustc --cfg flag (NOT a Cargo feature) so `--all-features`
 # in CI never enables the endurance suites. Opt in locally with:
