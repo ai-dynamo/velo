@@ -225,7 +225,7 @@ impl DataStore {
 
     /// Inspect an existing slot's stage mode.
     #[cfg(feature = "nixl")]
-    pub fn stage_mode(&self, local_id: u64) -> Option<StageMode> {
+    pub(crate) fn stage_mode(&self, local_id: u64) -> Option<StageMode> {
         self.slots.get(&local_id).map(|slot| slot.mode)
     }
 
