@@ -74,7 +74,7 @@ async fn rendezvous_nixl_pinned_1mib() {
     for (i, byte) in payload_vec.iter_mut().enumerate() {
         *byte = (i % 256) as u8;
     }
-    let payload = Bytes::from(payload_vec.clone());
+    let payload = Bytes::from(payload_vec);
 
     let handle = pair
         .owner
