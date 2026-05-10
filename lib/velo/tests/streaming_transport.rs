@@ -236,3 +236,82 @@ async fn test_velo_facade_mpsc_with_config() {
     drop(s2);
     anchor.cancel();
 }
+
+// ---------------------------------------------------------------------------
+// discover_and_register_peer fan-out (Item A regression)
+// ---------------------------------------------------------------------------
+
+/// Regression: `Velo::discover_and_register_peer` must fan out to the
+/// streaming transport. If it only registers the peer with the messenger,
+/// the next `attach_anchor` for that peer fails with "TCP streaming: peer
+/// not registered" — a silent production breakage for any caller using a
+/// PeerDiscovery backend (etcd / NATS / filesystem).
+///
+/// The test wires two Velos through a `FilesystemPeerDiscovery`, registers
+/// each with discovery, has worker B resolve worker A via
+/// `discover_and_register_peer`, and then drives a full attach + send cycle
+/// across the streaming transport. A pre-fix Velo fails at the attach step.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_discover_and_register_peer_fans_out_to_streaming() {
+    use futures::StreamExt;
+    use velo::PeerDiscovery;
+    use velo::discovery::FilesystemPeerDiscovery;
+    use velo::streaming::StreamFrame;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let discovery = Arc::new(FilesystemPeerDiscovery::new(tmp.path().join("peers.json")).unwrap());
+
+    let mk = || async {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let transport = Arc::new(
+            velo::transports::tcp::TcpTransportBuilder::new()
+                .from_listener(listener)
+                .unwrap()
+                .build()
+                .unwrap(),
+        );
+        velo::Velo::builder()
+            .add_transport(transport)
+            .discovery(discovery.clone() as Arc<dyn PeerDiscovery>)
+            .build()
+            .await
+            .unwrap()
+    };
+    let a = mk().await;
+    let b = mk().await;
+
+    // Both register themselves into discovery using the *merged* address
+    // (messenger + streaming), so the streaming entry is visible to the
+    // discovering side. Velo doesn't auto-publish — that's the caller's job.
+    let _guard_a = discovery.register_peer_info(&a.peer_info()).await.unwrap();
+    let _guard_b = discovery.register_peer_info(&b.peer_info()).await.unwrap();
+
+    // A discovers B through PeerDiscovery. The streaming transport on A must
+    // see B via this call — otherwise the attach below fails.
+    a.discover_and_register_peer(b.instance_id()).await.unwrap();
+
+    // B must also know about A so the messenger-side _anchor_attach AM and
+    // the reverse data path resolve. Both directions matter here because
+    // attach_anchor sends a control AM from A to B, and the bound TCP socket
+    // is reached from A's side using B's streaming endpoint.
+    b.discover_and_register_peer(a.instance_id()).await.unwrap();
+
+    // Drive a full attach + send + finalize cycle to confirm the streaming
+    // path is actually usable, not just that register() didn't error.
+    let mut anchor = b.create_anchor::<u32>();
+    let handle = anchor.handle();
+    let sender = a.attach_anchor::<u32>(handle).await.expect(
+        "attach_anchor must succeed when discover_and_register_peer fanned out to streaming",
+    );
+
+    sender.send(7).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    sender.finalize().unwrap();
+
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(5), anchor.next())
+        .await
+        .expect("no stall")
+        .expect("frame")
+        .expect("stream ok");
+    assert!(matches!(frame, StreamFrame::Item(7)));
+}

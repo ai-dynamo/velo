@@ -431,8 +431,22 @@ impl Velo {
     }
 
     /// Discover a peer by instance_id and register it for communication.
+    ///
+    /// Resolves the [`PeerInfo`] through the configured [`PeerDiscovery`]
+    /// backend and routes it through [`Self::register_peer`] so the streaming
+    /// transport sees the peer alongside the messenger transports. Calling
+    /// `messenger.discover_and_register_peer` directly would skip the
+    /// streaming-side `register()` and surface as "peer not registered" on
+    /// the next [`AnchorManager::attach_anchor`](crate::streaming::AnchorManager::attach_anchor).
     pub async fn discover_and_register_peer(&self, instance_id: InstanceId) -> Result<()> {
-        self.messenger.discover_and_register_peer(instance_id).await
+        let discovery = self.messenger.discovery().ok_or_else(|| {
+            anyhow::anyhow!(
+                "No discovery backend configured. Cannot discover instance {}",
+                instance_id
+            )
+        })?;
+        let peer_info = discovery.discover_by_instance_id(instance_id).await?;
+        self.register_peer(peer_info)
     }
 
     /// Check whether a specific instance has subscribed to a locally-owned event.
