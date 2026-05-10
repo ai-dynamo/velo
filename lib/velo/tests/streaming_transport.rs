@@ -238,6 +238,55 @@ async fn test_velo_facade_mpsc_with_config() {
 }
 
 // ---------------------------------------------------------------------------
+// Default-config coverage
+// ---------------------------------------------------------------------------
+
+/// `Velo::builder().add_transport(t).build()` — no `.stream_config()` call —
+/// must wire a TCP streaming transport and populate the registry under the
+/// `tcp-stream` key. The default-config path otherwise has zero coverage:
+/// every other test in this file calls `.stream_config(...)` explicitly, so
+/// a regression that swapped the builder default would slip through CI.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_velo_builder_default_stream_config_is_tcp() {
+    let transport = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        Arc::new(
+            velo::transports::tcp::TcpTransportBuilder::new()
+                .from_listener(listener)
+                .unwrap()
+                .build()
+                .unwrap(),
+        )
+    };
+
+    let velo = velo::Velo::builder()
+        .add_transport(transport)
+        .build()
+        .await
+        .unwrap();
+
+    let registry = &velo.anchor_manager().transport_registry;
+    assert!(
+        registry.contains_key("tcp-stream"),
+        "default StreamConfig must wire TcpFrameTransport (key='tcp-stream'); registry: {:?}",
+        registry.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(registry.len(), 1);
+
+    // The local PeerInfo's WorkerAddress must include the streaming entry too,
+    // so peers can resolve our streaming endpoint via PeerDiscovery.
+    let advertised = velo
+        .peer_info()
+        .worker_address()
+        .available_transports()
+        .expect("decode advertised transports");
+    assert!(
+        advertised.iter().any(|k| k.as_str() == "tcp-stream"),
+        "default-config peer_info must advertise 'tcp-stream' alongside messenger keys; got {advertised:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // discover_and_register_peer fan-out (Item A regression)
 // ---------------------------------------------------------------------------
 
