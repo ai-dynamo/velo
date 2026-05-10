@@ -40,20 +40,18 @@ async fn test_velo_builder_tcp_transport() {
         .await
         .unwrap();
 
-    // Verify transport_registry contains both schemes
+    // Registry now holds a single entry keyed by the streaming-transport key
+    // (post-WorkerAddress refactor). Velo no longer constructs a fallback
+    // VeloFrameTransport; the StreamConfig branch is the only entry.
     let registry = &velo.anchor_manager().transport_registry;
     assert!(
-        registry.contains_key("tcp"),
-        "transport_registry should contain 'tcp' scheme"
-    );
-    assert!(
-        registry.contains_key("velo"),
-        "transport_registry should contain 'velo' scheme"
+        registry.contains_key("tcp-stream"),
+        "transport_registry should contain 'tcp-stream' key"
     );
     assert_eq!(
         registry.len(),
-        2,
-        "transport_registry should have exactly 2 entries"
+        1,
+        "transport_registry should have exactly 1 entry post-refactor"
     );
 
     // Create an anchor to verify the setup works end-to-end
@@ -91,20 +89,16 @@ async fn test_velo_builder_grpc_transport() {
         .await
         .expect("VeloBuilder with Grpc config should build successfully");
 
-    // Verify transport_registry contains "grpc" and "velo"
+    // Single entry for the chosen streaming transport (post-refactor).
     let registry = &velo.anchor_manager().transport_registry;
     assert!(
-        registry.contains_key("grpc"),
-        "transport_registry should contain 'grpc' scheme"
-    );
-    assert!(
-        registry.contains_key("velo"),
-        "transport_registry should contain 'velo' scheme"
+        registry.contains_key("grpc-stream"),
+        "transport_registry should contain 'grpc-stream' key"
     );
     assert_eq!(
         registry.len(),
-        2,
-        "transport_registry should have exactly 2 entries"
+        1,
+        "transport_registry should have exactly 1 entry post-refactor"
     );
 
     let _anchor = velo.create_anchor::<String>();

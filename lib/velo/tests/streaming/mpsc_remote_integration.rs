@@ -62,8 +62,7 @@ async fn make_two_messengers() -> (Arc<Messenger>, Arc<Messenger>) {
 
 async fn make_am(messenger: Arc<Messenger>) -> Arc<AnchorManager> {
     let worker_id = messenger.instance_id().worker_id();
-    let vft =
-        Arc::new(VeloFrameTransport::new(Arc::clone(&messenger), worker_id, None).expect("VFT"));
+    let vft = Arc::new(VeloFrameTransport::new(Arc::clone(&messenger), None).expect("VFT"));
     let am: Arc<AnchorManager> = Arc::new(
         AnchorManagerBuilder::default()
             .worker_id(worker_id)
@@ -190,10 +189,7 @@ async fn test_mpsc_heartbeat_timeout_per_sender() {
     let mut items_s2 = Vec::new();
     let mut dropped_s1 = false;
     let collect = async {
-        loop {
-            let Some(frame) = anchor.next().await else {
-                break;
-            };
+        while let Some(frame) = anchor.next().await {
             match frame.expect("stream error") {
                 (SenderId(1), MpscFrame::Item(v)) => items_s1.push(v),
                 (SenderId(2), MpscFrame::Item(v)) => items_s2.push(v),

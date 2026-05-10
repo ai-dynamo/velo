@@ -171,14 +171,10 @@ async fn make_remote_pair_uds() -> RemotePair {
     let worker_consumer = m_consumer.instance_id().worker_id();
     let worker_producer = m_producer.instance_id().worker_id();
 
-    let vft_consumer = Arc::new(
-        VeloFrameTransport::new(Arc::clone(&m_consumer), worker_consumer, None)
-            .expect("VFT consumer"),
-    );
-    let vft_producer = Arc::new(
-        VeloFrameTransport::new(Arc::clone(&m_producer), worker_producer, None)
-            .expect("VFT producer"),
-    );
+    let vft_consumer =
+        Arc::new(VeloFrameTransport::new(Arc::clone(&m_consumer), None).expect("VFT consumer"));
+    let vft_producer =
+        Arc::new(VeloFrameTransport::new(Arc::clone(&m_producer), None).expect("VFT producer"));
 
     let consumer = Arc::new(
         AnchorManagerBuilder::default()
