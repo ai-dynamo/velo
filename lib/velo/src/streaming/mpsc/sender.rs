@@ -61,6 +61,7 @@ pub struct MpscStreamSender<T> {
     sender_stream_id: u64,
     sender_registry: Arc<crate::streaming::control::SenderRegistry>,
     poison_tx: flume::Sender<()>,
+    metrics: Option<Arc<crate::observability::VeloMetrics>>,
     _phantom: PhantomData<T>,
 }
 
@@ -88,6 +89,7 @@ impl<T: Serialize> MpscStreamSender<T> {
         mpsc_registry: Arc<DashMap<u64, MpscAnchorEntry>>,
         cancel: StreamSenderCancelInfo,
         heartbeat_interval: Duration,
+        metrics: Option<Arc<crate::observability::VeloMetrics>>,
     ) -> Self {
         let StreamSenderCancelInfo {
             cancel_token,
@@ -136,6 +138,7 @@ impl<T: Serialize> MpscStreamSender<T> {
             sender_stream_id,
             sender_registry,
             poison_tx,
+            metrics,
             _phantom: PhantomData,
         }
     }
@@ -158,15 +161,29 @@ impl<T: Serialize> MpscStreamSender<T> {
         }
         let bytes = rmp_serde::to_vec(&StreamFrame::Item(item))
             .map_err(|e| SendError::SerializationError(e.to_string()))?;
+        // try_send first so producer-side backpressure ticks before the
+        // awaited send. Mirrors SPSC StreamSender::send.
         match &self.channel {
-            SenderChannel::Local(tx) => tx
-                .send_async((self.sender_id.0, bytes))
-                .await
-                .map_err(|_| SendError::ChannelClosed),
-            SenderChannel::Remote(tx) => tx
-                .send_async(bytes)
-                .await
-                .map_err(|_| SendError::ChannelClosed),
+            SenderChannel::Local(tx) => match tx.try_send((self.sender_id.0, bytes)) {
+                Ok(()) => Ok(()),
+                Err(flume::TrySendError::Full(b)) => {
+                    if let Some(m) = self.metrics.as_ref() {
+                        m.record_producer_send_backpressure();
+                    }
+                    tx.send_async(b).await.map_err(|_| SendError::ChannelClosed)
+                }
+                Err(flume::TrySendError::Disconnected(_)) => Err(SendError::ChannelClosed),
+            },
+            SenderChannel::Remote(tx) => match tx.try_send(bytes) {
+                Ok(()) => Ok(()),
+                Err(flume::TrySendError::Full(b)) => {
+                    if let Some(m) = self.metrics.as_ref() {
+                        m.record_producer_send_backpressure();
+                    }
+                    tx.send_async(b).await.map_err(|_| SendError::ChannelClosed)
+                }
+                Err(flume::TrySendError::Disconnected(_)) => Err(SendError::ChannelClosed),
+            },
         }
     }
 

@@ -1406,6 +1406,7 @@ impl AnchorManager {
                 poison_tx,
             },
             heartbeat_interval,
+            self.metrics.clone(),
         ))
     }
 
@@ -1476,6 +1477,7 @@ impl AnchorManager {
                         poison_tx,
                     },
                     Duration::from_millis(heartbeat_interval_ms),
+                    self.metrics.clone(),
                 ))
             }
             crate::streaming::mpsc::control::MpscAnchorAttachResponse::Err { reason } => {
