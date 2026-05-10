@@ -131,6 +131,31 @@ jobs:
       if: always()
       run: /tmp/use-sccache.sh show-stats "tests" || true
 
+  soak-smoke:
+    name: Soak smoke
+    needs: test
+    runs-on: prod-velo-default-v1
+    container:
+      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.3
+    permissions:
+      contents: read
+    env:
+      RUST_LOG: error
+    timeout-minutes: 5
+    steps:
+    - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 #v6.0.1
+    - name: Rust setup
+      uses: ./.github/actions/rust-setup
+    - name: sccache setup
+      uses: ./.github/actions/sccache-setup
+      with:
+        bucket: ${{ secrets.SCCACHE_S3_BUCKET }}
+    - name: Run soak smoke
+      run: bash scripts/soak-smoke.sh
+    - name: sccache stats
+      if: always()
+      run: /tmp/use-sccache.sh show-stats "soak-smoke" || true
+
   coverage:
     name: Coverage
     runs-on: prod-velo-default-v1

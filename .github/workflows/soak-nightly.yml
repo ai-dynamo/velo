@@ -1,0 +1,50 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Nightly soak — runs the full scenario set on a cron, including the ones
+# the PR smoke gate skips because of known flakes (e.g. concurrent
+# multi-stream S2). The intent is for this job to surface real correctness
+# regressions in the messenger / streaming / rendezvous surfaces; flake-level
+# failures here are *signal*, not noise, and should open an issue.
+
+name: Soak (nightly)
+
+on:
+  schedule:
+  - cron: '0 7 * * *'   # 07:00 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: soak-nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  soak:
+    name: soak ${{ matrix.transport }}
+    runs-on: prod-velo-default-v1
+    container:
+      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.3
+    permissions:
+      contents: read
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        transport: [tcp, grpc]
+    steps:
+    - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 #v6.0.1
+    - name: Rust setup
+      uses: ./.github/actions/rust-setup
+    - name: Build soak
+      run: cargo build --release --example soak --features grpc --manifest-path examples/Cargo.toml
+    - name: Run nightly soak (${{ matrix.transport }})
+      env:
+        RUST_LOG: error
+      run: |
+        examples/target/release/examples/soak all \
+          --transport ${{ matrix.transport }} \
+          --tier nightly \
+          --faults
