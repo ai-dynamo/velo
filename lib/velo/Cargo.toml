@@ -150,6 +150,11 @@ name = "streaming_mock_transport"
 path = "tests/streaming/mock_transport.rs"
 
 [[test]]
+name = "streaming_observability"
+path = "tests/streaming/observability.rs"
+required-features = ["test-helpers"]
+
+[[test]]
 name = "streaming_mpsc_integration"
 path = "tests/streaming/mpsc_integration.rs"
 
