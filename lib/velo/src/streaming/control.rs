@@ -706,6 +706,92 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Watchdog firing test
+    // -----------------------------------------------------------------------
+
+    /// The reader pump's heartbeat watchdog branch must (1) increment the
+    /// `streaming_heartbeat_watchdog_firings_total` counter and (2) inject a
+    /// `Dropped` sentinel into `frame_tx` once `DETECTION_MULTIPLIER`
+    /// consecutive `heartbeat_deadline` windows pass with no frames.
+    ///
+    /// Without a positive test, a regression that detached the metric tick
+    /// from the watchdog branch (or moved it behind a feature flag) would
+    /// silently let the lagging-indicator counter go dark — exactly the
+    /// failure mode this counter set was created to catch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reader_pump_watchdog_firing_increments_counter() {
+        let registry = prometheus::Registry::new();
+        let metrics = Arc::new(crate::observability::VeloMetrics::register(&registry).unwrap());
+
+        let manager = make_test_manager();
+        let base_ctx = manager.anchor_context();
+        let ctx = crate::streaming::anchor::AnchorContext {
+            registry: base_ctx.registry,
+            mpsc_registry: base_ctx.mpsc_registry,
+            metrics: Some(metrics.clone()),
+        };
+
+        // Open transport channel that never delivers a frame: the receiver
+        // sits idle, hitting the heartbeat timeout DETECTION_MULTIPLIER times.
+        let (_transport_tx, transport_rx) = flume::bounded::<Vec<u8>>(4);
+        let (frame_tx, frame_rx) = flume::bounded::<Vec<u8>>(4);
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        // Short heartbeat so the test runs in well under a second.
+        // DETECTION_MULTIPLIER=3 × 50ms = ~150ms minimum.
+        let deadline = std::time::Duration::from_millis(50);
+        let pump = tokio::spawn(reader_pump(
+            transport_rx,
+            frame_tx,
+            cancel,
+            ctx,
+            999,
+            deadline,
+        ));
+
+        // 4× deadline of slack so timer scheduling jitter doesn't flake on busy CI.
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(800), pump)
+            .await
+            .expect("reader_pump must terminate after watchdog fires");
+
+        let snap = registry.gather();
+        let watchdog_value = snap
+            .iter()
+            .find(|f| f.name() == "velo_streaming_heartbeat_watchdog_firings_total")
+            .map(|f| f.get_metric()[0].get_counter().value())
+            .unwrap_or(0.0);
+        assert_eq!(
+            watchdog_value, 1.0,
+            "watchdog counter must increment exactly once when DETECTION_MULTIPLIER deadlines pass"
+        );
+
+        // Dropped sentinel must reach the consumer so the saturation kill
+        // surfaces instead of silently stalling.
+        let frame_bytes = frame_rx
+            .try_recv()
+            .expect("watchdog must inject a Dropped sentinel before exiting");
+        let dropped: crate::streaming::frame::StreamFrame<()> =
+            rmp_serde::from_slice(&frame_bytes).expect("decode Dropped");
+        assert!(
+            matches!(dropped, crate::streaming::frame::StreamFrame::Dropped),
+            "injected sentinel must be StreamFrame::Dropped, got {dropped:?}"
+        );
+
+        // Backpressure counter stays at 0: the per-anchor channel never
+        // filled in this scenario (we sent no frames).
+        let bp_value = snap
+            .iter()
+            .find(|f| f.name() == "velo_streaming_reader_pump_backpressure_total")
+            .map(|f| f.get_metric()[0].get_counter().value())
+            .unwrap_or(0.0);
+        assert_eq!(
+            bp_value, 0.0,
+            "reader_pump backpressure must stay 0 when no frames are sent; got {bp_value}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Test helpers for calling handler logic directly
     // -----------------------------------------------------------------------
 
