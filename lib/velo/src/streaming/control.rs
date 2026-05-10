@@ -192,16 +192,23 @@ pub struct AnchorAttachRequest {
 /// Response from the attach handler.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum AnchorAttachResponse {
-    /// Attach succeeded; caller can connect to `stream_endpoint`.
+    /// Attach succeeded.
+    ///
+    /// `streaming_transport_key` tells the client which `FrameTransport` it
+    /// should call `connect()` on (looked up in the local
+    /// [`crate::streaming::AnchorManager`]'s transport registry). Endpoint
+    /// resolution is no longer string-based — the chosen transport extracts
+    /// the peer's listener address from the cached WorkerAddress entry it
+    /// stored on `register()`.
     ///
     /// `heartbeat_interval_ms` tells the sender how often it must emit a
     /// [`crate::streaming::frame::StreamFrame::Heartbeat`] when no data frames are flowing.
     /// The consumer's reader pump will tolerate `DETECTION_MULTIPLIER * heartbeat_interval_ms`
     /// of total silence before injecting `Dropped`. The field is carried as `u64` ms
     /// (rather than `Duration`) for stable msgpack encoding, and defaults to 5000ms
-    /// when absent so older clients continue to deserialize new responses unchanged.
+    /// when absent.
     Ok {
-        stream_endpoint: String,
+        streaming_transport_key: velo_ext::TransportKey,
         #[serde(default = "default_heartbeat_interval_ms")]
         heartbeat_interval_ms: u64,
     },
@@ -279,6 +286,11 @@ pub(crate) async fn reader_pump(
                         missed_heartbeats += 1;
                         if missed_heartbeats >= DETECTION_MULTIPLIER {
                             // Inject Dropped sentinel -- sender is dead
+                            tracing::warn!(
+                                local_id,
+                                "reader_pump: heartbeat watchdog fired ({}× missed), injecting Dropped",
+                                DETECTION_MULTIPLIER
+                            );
                             let dropped_bytes = crate::streaming::sender::cached_dropped().clone();
                             let _ = frame_tx.send_async(dropped_bytes).await;
                             // LIVE-02: Full anchor cleanup -- remove from registry
@@ -372,21 +384,21 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::messe
                 } // DashMap ref dropped here
 
                 // Step 2: Async bind OUTSIDE shard lock
-                let (endpoint, receiver) =
-                    match manager.transport.bind(local_id, req.session_id).await {
-                        Ok(pair) => pair,
-                        Err(e) => {
-                            manager.record_streaming_operation(
-                                StreamingOp::Attach,
-                                HandlerOutcome::Error,
-                                "unknown",
-                                started,
-                            );
-                            return Ok(AnchorAttachResponse::Err {
-                                reason: format!("transport error: {}", e),
-                            });
-                        }
-                    };
+                let receiver = match manager.transport.bind(local_id, req.session_id).await {
+                    Ok(rx) => rx,
+                    Err(e) => {
+                        manager.record_streaming_operation(
+                            StreamingOp::Attach,
+                            HandlerOutcome::Error,
+                            "unknown",
+                            started,
+                        );
+                        return Ok(AnchorAttachResponse::Err {
+                            reason: format!("transport error: {}", e),
+                        });
+                    }
+                };
+                let streaming_transport_key = manager.transport.key();
 
                 // Step 3: Atomically set attachment under shard lock
                 use dashmap::mapref::entry::Entry;
@@ -441,17 +453,15 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::messe
                                 heartbeat_interval,
                             ));
 
-                            let transport_scheme =
-                                endpoint.split("://").next().unwrap_or("unknown");
                             manager.record_streaming_operation(
                                 StreamingOp::Attach,
                                 HandlerOutcome::Success,
-                                transport_scheme,
+                                streaming_transport_key.as_str(),
                                 started,
                             );
 
                             Ok(AnchorAttachResponse::Ok {
-                                stream_endpoint: endpoint,
+                                streaming_transport_key,
                                 heartbeat_interval_ms: heartbeat_interval.as_millis() as u64,
                             })
                         }
@@ -630,22 +640,25 @@ mod tests {
     struct MockFrameTransport;
 
     impl crate::streaming::transport::FrameTransport for MockFrameTransport {
+        fn key(&self) -> velo_ext::TransportKey {
+            velo_ext::TransportKey::new("mock-stream")
+        }
+
+        fn address(&self) -> velo_ext::WorkerAddress {
+            velo_ext::WorkerAddress::empty()
+        }
+
         fn bind(
             &self,
             _anchor_id: u64,
             _session_id: u64,
-        ) -> BoxFuture<'_, AnyhowResult<(String, flume::Receiver<Vec<u8>>)>> {
-            Box::pin(async {
-                Ok((
-                    "mock://test-endpoint".to_string(),
-                    flume::bounded::<Vec<u8>>(256).1,
-                ))
-            })
+        ) -> BoxFuture<'_, AnyhowResult<flume::Receiver<Vec<u8>>>> {
+            Box::pin(async { Ok(flume::bounded::<Vec<u8>>(256).1) })
         }
 
         fn connect(
             &self,
-            _endpoint: &str,
+            _peer: velo_ext::WorkerId,
             _anchor_id: u64,
             _session_id: u64,
         ) -> BoxFuture<'_, AnyhowResult<flume::Sender<Vec<u8>>>> {
@@ -679,17 +692,17 @@ mod tests {
     #[test]
     fn test_anchor_attach_response_serde_ok() {
         let resp = AnchorAttachResponse::Ok {
-            stream_endpoint: "mock://test-endpoint".to_string(),
+            streaming_transport_key: velo_ext::TransportKey::new("mock-stream"),
             heartbeat_interval_ms: 5000,
         };
         let json = serde_json::to_string(&resp).expect("serialize Ok");
         let decoded: AnchorAttachResponse = serde_json::from_str(&json).expect("deserialize Ok");
         match decoded {
             AnchorAttachResponse::Ok {
-                stream_endpoint,
+                streaming_transport_key,
                 heartbeat_interval_ms,
             } => {
-                assert_eq!(stream_endpoint, "mock://test-endpoint");
+                assert_eq!(streaming_transport_key.as_str(), "mock-stream");
                 assert_eq!(heartbeat_interval_ms, 5000);
             }
             other => panic!("expected Ok, got {:?}", other),
@@ -701,7 +714,7 @@ mod tests {
         // msgpack must carry the negotiated interval losslessly so the sender
         // gets the cadence the consumer dictated.
         let resp = AnchorAttachResponse::Ok {
-            stream_endpoint: "tcp://10.0.0.1:9000".to_string(),
+            streaming_transport_key: velo_ext::TransportKey::new("tcp-stream"),
             heartbeat_interval_ms: 1234,
         };
         let bytes = rmp_serde::to_vec(&resp).expect("rmp serialize Ok");
@@ -709,10 +722,10 @@ mod tests {
             rmp_serde::from_slice(&bytes).expect("rmp deserialize Ok");
         match decoded {
             AnchorAttachResponse::Ok {
-                stream_endpoint,
+                streaming_transport_key,
                 heartbeat_interval_ms,
             } => {
-                assert_eq!(stream_endpoint, "tcp://10.0.0.1:9000");
+                assert_eq!(streaming_transport_key.as_str(), "tcp-stream");
                 assert_eq!(heartbeat_interval_ms, 1234);
             }
             other => panic!("expected Ok, got {:?}", other),
@@ -720,20 +733,17 @@ mod tests {
     }
 
     #[test]
-    fn test_anchor_attach_response_serde_ok_backcompat_default_heartbeat() {
-        // An older client/server that has no `heartbeat_interval_ms` field
-        // must still deserialize cleanly into the 5000ms default. Construct
-        // the legacy shape directly via JSON so we don't need a frozen wire
-        // sample.
-        let legacy_json = r#"{"Ok":{"stream_endpoint":"mock://legacy"}}"#;
+    fn test_anchor_attach_response_serde_ok_default_heartbeat() {
+        // A response that omits `heartbeat_interval_ms` must default to 5000ms.
+        let legacy_json = r#"{"Ok":{"streaming_transport_key":"mock-stream"}}"#;
         let decoded: AnchorAttachResponse =
-            serde_json::from_str(legacy_json).expect("legacy Ok response must deserialize");
+            serde_json::from_str(legacy_json).expect("Ok response must deserialize");
         match decoded {
             AnchorAttachResponse::Ok {
-                stream_endpoint,
+                streaming_transport_key,
                 heartbeat_interval_ms,
             } => {
-                assert_eq!(stream_endpoint, "mock://legacy");
+                assert_eq!(streaming_transport_key.as_str(), "mock-stream");
                 assert_eq!(
                     heartbeat_interval_ms, 5000,
                     "missing field must default to 5000ms"
@@ -771,7 +781,8 @@ mod tests {
 
         // Simulate bind-then-lock attach handler logic:
         // Step 1: async bind outside shard lock
-        let (endpoint, _receiver) = manager.transport.bind(local_id, 0).await.unwrap();
+        let _receiver = manager.transport.bind(local_id, 0).await.unwrap();
+        let key = manager.transport.key();
 
         // Step 2: atomically set attachment under shard lock
         use dashmap::mapref::entry::Entry;
@@ -788,7 +799,7 @@ mod tests {
                 } else {
                     entry.attachment = true;
                     AnchorAttachResponse::Ok {
-                        stream_endpoint: endpoint,
+                        streaming_transport_key: key,
                         heartbeat_interval_ms: 5000,
                     }
                 }
@@ -797,9 +808,10 @@ mod tests {
 
         match result {
             AnchorAttachResponse::Ok {
-                stream_endpoint, ..
+                streaming_transport_key,
+                ..
             } => {
-                assert_eq!(stream_endpoint, "mock://test-endpoint");
+                assert_eq!(streaming_transport_key.as_str(), "mock-stream");
             }
             other => panic!("expected Ok, got {:?}", other),
         }
@@ -848,7 +860,7 @@ mod tests {
                     }
                 } else {
                     AnchorAttachResponse::Ok {
-                        stream_endpoint: "unreachable".to_string(),
+                        streaming_transport_key: velo_ext::TransportKey::new("unreachable"),
                         heartbeat_interval_ms: 5000,
                     }
                 }

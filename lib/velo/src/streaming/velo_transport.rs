@@ -1,41 +1,25 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Production [`FrameTransport`] implementation backed by velo-messenger's
-//! active message (AM) fire-and-forget system.
+//! Active-message-backed [`FrameTransport`] (deprecated).
 //!
-//! [`VeloFrameTransport`] uses a single shared `_stream_data` AM handler
-//! registered at construction time. Each incoming AM carries the target
-//! `anchor_id` as a string value in the AM headers map (key
-//! [`ANCHOR_ID_HEADER`]). The payload contains only the raw frame bytes --
-//! no binary prefix.
+//! This implementation layers a per-(anchor, session) reorder buffer on top of
+//! velo-messenger's fire-and-forget AM dispatcher. It is preserved as a
+//! reference impl for the messenger-piggybacked use case but is **no longer
+//! constructable via `Velo::builder()`** because of correctness issues under
+//! multi-stream concurrency: the AM dispatcher spawns one tokio task per
+//! inbound message and is fundamentally unordered, so the reorder buffer's
+//! window can overflow under cross-stream contention and deadlock the
+//! consumer.
 //!
-//! # Routing
+//! Prefer [`crate::streaming::TcpFrameTransport`] or
+//! [`crate::streaming::GrpcFrameTransport`].
+//!
+//! # Wire layout (unchanged)
 //!
 //! ```text
 //! AM headers: { "anchor_id": "<u64>", "session_id": "<u64>", "seq": "<u64>" }
 //! AM payload: [ frame_bytes: ... ]
-//! ```
-//!
-//! # Ordering
-//!
-//! The sender pump stamps a monotonic per-pump `seq` on every outbound frame
-//! (data and heartbeats alike). The receiver-side `_stream_data` handler keeps
-//! a per-(anchor_id, session_id) reorder buffer and a single deliverer task
-//! that forwards frames to the consumer in `seq` order. This restores per-sender
-//! FIFO even when the messenger's AM dispatcher (which spawns one tokio task
-//! per AM) delivers handler invocations out of order. Frames missing the `seq`
-//! header are treated as in-order (back-compat with senders that predate this
-//! header).
-//!
-//! # Construction
-//!
-//! ```ignore
-//! let transport = VeloFrameTransport::new(messenger, worker_id)?;
-//! let manager = AnchorManagerBuilder::default()
-//!     .worker_id(worker_id)
-//!     .transport(Arc::new(transport))
-//!     .build()?;
 //! ```
 
 use std::collections::{BTreeMap, HashMap};
@@ -47,47 +31,20 @@ use crate::observability::{StreamingTransportMetricsHandle, VeloMetrics};
 use anyhow::Result;
 use dashmap::DashMap;
 use futures::future::BoxFuture;
-use velo_ext::WorkerId;
+use velo_ext::{PeerInfo, TransportKey, WorkerAddress, WorkerId};
 
 use crate::streaming::transport::FrameTransport;
 
-/// AM header key used to route frames to the correct anchor's dispatch channel.
 const ANCHOR_ID_HEADER: &str = "anchor_id";
-
-/// AM header key for session-level routing within a single anchor.
 const SESSION_ID_HEADER: &str = "session_id";
-
-/// AM header carrying the per-pump monotonic frame sequence number.
-///
-/// Stamped on every frame the `connect()` pump emits (data and heartbeats).
-/// Used by the receiver to restore send order despite concurrent AM dispatch.
 const STREAM_SEQ_HEADER: &str = "seq";
 
-/// Maximum number of out-of-order frames the receiver will buffer per
-/// (anchor_id, session_id) before declaring the stream broken. Sized to
-/// comfortably absorb tokio scheduler jitter for high-throughput streams
-/// (10k frames in tight loops can exhibit reorder distances in the hundreds
-/// when many handler tasks are queued at once).
+/// Default streaming-transport key for the AM-backed transport.
+pub const VELO_STREAM_KEY: &str = "velo-stream";
+
 const REORDER_WINDOW: usize = 4096;
 
-/// One deposit posted by the `_stream_data` handler to its session's deliverer.
-///
-/// `seq = None` means the sender did not stamp a `seq` header. This only
-/// matters for rolling upgrades: a new receiver paired with an old sender
-/// binary degrades to legacy behavior (arrival-order forwarding, no reorder
-/// protection — the same behavior that existed before this fix). Both halves
-/// at the current version always stamp `seq`.
 type Deposit = (Option<u64>, Vec<u8>);
-
-/// Dispatch map: routes (anchor_id, session_id) → deposit channel into the
-/// per-session deliverer task. The deliverer owns the BTreeMap reorder buffer
-/// and the consumer's flume sender — handlers only push deposits, eliminating
-/// any cross-task locking on the hot path.
-///
-/// Each entry carries a monotonically-assigned `token` so the deliverer's
-/// cleanup guard can leave a newer same-key binding alone without having to
-/// hold a Sender clone (which would keep the deposit channel alive and
-/// prevent `recv_async` from observing close on unbind).
 type DispatchMap = DashMap<(u64, u64), DispatchEntry>;
 
 struct DispatchEntry {
@@ -95,7 +52,6 @@ struct DispatchEntry {
     sender: flume::Sender<Deposit>,
 }
 
-/// Source of `DispatchEntry::token` values. Monotonic, lock-free.
 static DISPATCH_TOKEN: AtomicU64 = AtomicU64::new(0);
 
 fn next_dispatch_token() -> u64 {
@@ -105,38 +61,17 @@ fn next_dispatch_token() -> u64 {
 pub struct VeloFrameTransport {
     messenger: Arc<Messenger>,
     dispatch: Arc<DispatchMap>,
-    worker_id: WorkerId,
-    /// Number of times the per-(anchor, session) deliverer task hit the slow
-    /// (blocking) send path because the consumer's flume channel was full.
-    /// Indicates downstream consumer backpressure.
     backpressure_count: Arc<AtomicU64>,
-    /// Optional bound metrics handle, cloned per-session into deliverer tasks.
     streaming_metrics: Option<StreamingTransportMetricsHandle>,
+    key: TransportKey,
 }
 
 impl VeloFrameTransport {
     /// Create a new `VeloFrameTransport` and register the `_stream_data` handler.
-    ///
-    /// # Arguments
-    ///
-    /// * `messenger` - Injected `Arc<Messenger>`, must already be constructed.
-    /// * `worker_id` - This worker's identity, used for endpoint URI construction.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if handler registration fails (e.g., duplicate handler name).
-    pub fn new(
-        messenger: Arc<Messenger>,
-        worker_id: WorkerId,
-        metrics: Option<Arc<VeloMetrics>>,
-    ) -> Result<Self> {
+    pub fn new(messenger: Arc<Messenger>, metrics: Option<Arc<VeloMetrics>>) -> Result<Self> {
         let dispatch: Arc<DispatchMap> = Arc::new(DashMap::new());
         let backpressure_count: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
 
-        // Register the shared _stream_data handler.
-        // The handler captures dispatch and deposits frames into the matching
-        // per-(anchor, session) reorder state, then notifies the deliverer.
-        // Backpressure / metrics are tracked on the deliverer side, not here.
         let handler_dispatch = dispatch.clone();
         let streaming_metrics = metrics
             .as_ref()
@@ -178,12 +113,6 @@ impl VeloFrameTransport {
                         return Ok(());
                     }
                 };
-                // Distinguish three cases for the seq header:
-                //   - absent     → legacy sender, forward in arrival order (back-compat).
-                //   - present+ok → enforce reorder via the deliverer.
-                //   - present+malformed → protocol error from a buggy peer; drop the
-                //     frame loudly rather than silently downgrading to legacy mode
-                //     (which would bypass the reorder buffer for the whole session).
                 let seq = match headers.get(STREAM_SEQ_HEADER) {
                     None => None,
                     Some(raw) => match raw.parse::<u64>() {
@@ -204,8 +133,6 @@ impl VeloFrameTransport {
 
                 let frame_bytes = ctx.payload.to_vec();
 
-                // Clone the deposit sender out of the DashMap; never hold a
-                // shard guard across an await point.
                 let deposit_tx = handler_dispatch
                     .get(&(anchor_id, session_id))
                     .map(|entry| entry.value().sender.clone());
@@ -213,12 +140,7 @@ impl VeloFrameTransport {
                 if let Some(tx) = deposit_tx
                     && tx.send((seq, frame_bytes)).is_err()
                 {
-                    // Deliverer exited (consumer closed or unbound). The
-                    // dispatch entry has already been or will be removed by the
-                    // owner; nothing else for the handler to do. Sync `send` on
-                    // an unbounded channel is non-blocking; it also drops `tx`
-                    // before this await-free path returns, narrowing how long a
-                    // stale Sender clone can pin the channel.
+                    // Deliverer exited.
                 }
                 Ok(())
             }
@@ -230,37 +152,24 @@ impl VeloFrameTransport {
         Ok(Self {
             messenger,
             dispatch,
-            worker_id,
             backpressure_count,
             streaming_metrics,
+            key: TransportKey::new(VELO_STREAM_KEY),
         })
     }
 
-    /// Returns the number of times a per-session deliverer task had to await
-    /// because the consumer's flume channel was full. Indicates downstream
-    /// consumer backpressure.
     pub fn backpressure_count(&self) -> u64 {
         self.backpressure_count.load(Ordering::Relaxed)
     }
 
     /// Remove all dispatch entries for the given anchor (any session).
-    ///
-    /// Called when the reader_pump exits or the anchor is cleaned up. Dropping
-    /// the deposit sender closes the corresponding deliverer's deposit
-    /// receiver, so the deliverer task exits cleanly on its next iteration.
-    /// Subsequent AM frames targeting this anchor_id are silently dropped.
     pub fn unbind(&self, anchor_id: u64) {
         self.dispatch.retain(|&(aid, _), _| aid != anchor_id);
     }
 }
 
-/// Owned configuration handed to one [`run_deliverer`] task at spawn time.
 struct DelivererCtx {
     deposit_rx: flume::Receiver<Deposit>,
-    /// Token of the dispatch entry we registered. Used by the Drop guard to
-    /// leave a newer same-key binding (with a different token) alone. We do
-    /// NOT store a Sender clone here — that would pin the deposit channel
-    /// open and prevent `recv_async` from observing close on unbind.
     token: u64,
     consumer_tx: flume::Sender<Vec<u8>>,
     backpressure: Arc<AtomicU64>,
@@ -270,18 +179,6 @@ struct DelivererCtx {
     session_id: u64,
 }
 
-/// Per-session deliverer task.
-///
-/// Owns the consumer flume sender and the BTreeMap reorder buffer. Receives
-/// `(Option<seq>, bytes)` deposits from the `_stream_data` handler via
-/// `deposit_rx` (one task per (anchor, session)). Frames stamped with `seq`
-/// are reordered into send order; frames without `seq` (legacy senders) are
-/// forwarded in arrival order.
-///
-/// The deliverer is the *sole* writer to `consumer_tx`, so ordering is
-/// enforced in one place regardless of how many handler tasks deposit
-/// concurrently. Exits when the deposit channel is closed (unbind / dispatch
-/// entry replaced) or when the consumer drops the receiver.
 async fn run_deliverer(ctx: DelivererCtx) {
     let DelivererCtx {
         deposit_rx,
@@ -296,11 +193,6 @@ async fn run_deliverer(ctx: DelivererCtx) {
 
     let mut pending: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
     let mut next_expected: u64 = 0;
-    // On exit (overflow, consumer-close, or deposit channel close), proactively
-    // remove our dispatch entry so handlers stop trying to deposit and the map
-    // does not accumulate dead entries on long-lived MPSC anchors. Guarded by
-    // generation token: if a newer bind() has replaced the entry, its token
-    // differs and the guarded remove is a no-op.
     struct Cleanup {
         dispatch: Arc<DispatchMap>,
         token: u64,
@@ -325,7 +217,7 @@ async fn run_deliverer(ctx: DelivererCtx) {
     loop {
         let (seq_opt, bytes) = match deposit_rx.recv_async().await {
             Ok(p) => p,
-            Err(_) => return, // unbound / replaced
+            Err(_) => return,
         };
 
         let mut ctx = IngestCtx {
@@ -342,8 +234,6 @@ async fn run_deliverer(ctx: DelivererCtx) {
             return;
         }
 
-        // Drain anything else already buffered on the deposit channel before
-        // re-suspending. Keeps the BTreeMap small and improves throughput.
         while let Ok((seq_opt, bytes)) = deposit_rx.try_recv() {
             if !ingest(seq_opt, bytes, &mut ctx).await {
                 return;
@@ -352,9 +242,6 @@ async fn run_deliverer(ctx: DelivererCtx) {
     }
 }
 
-/// Borrowed state shared by [`ingest`] and [`forward`] across one deposit
-/// processing call. Bundles the per-session reorder buffer, consumer sink,
-/// and observability handles so call sites stay short.
 struct IngestCtx<'a> {
     pending: &'a mut BTreeMap<u64, Vec<u8>>,
     next_expected: &'a mut u64,
@@ -365,24 +252,13 @@ struct IngestCtx<'a> {
     session_id: u64,
 }
 
-/// Process one deposit; returns `false` if the deliverer must exit (consumer
-/// closed or window overflowed).
 async fn ingest(seq_opt: Option<u64>, bytes: Vec<u8>, ctx: &mut IngestCtx<'_>) -> bool {
     match seq_opt {
-        // Legacy / pre-fix sender: forward immediately, no reorder protection.
         None => forward(bytes, ctx).await,
-
         Some(seq) => {
             if seq < *ctx.next_expected {
-                // Already-delivered seq (shouldn't happen on FIFO transports,
-                // but harmless to ignore).
                 return true;
             }
-            // Fast path: the head-of-line frame is always accepted. It can
-            // never grow `pending` — it forwards directly and then drains any
-            // contiguous run that was waiting on it. Critically, this avoids
-            // a spurious overflow when `pending.len() == REORDER_WINDOW` and
-            // the missing seq=next_expected frame finally arrives.
             if seq == *ctx.next_expected {
                 if !forward(bytes, ctx).await {
                     return false;
@@ -396,7 +272,6 @@ async fn ingest(seq_opt: Option<u64>, bytes: Vec<u8>, ctx: &mut IngestCtx<'_>) -
                 }
                 return true;
             }
-            // Out-of-order arrival: enforce window cap before buffering.
             if ctx.pending.len() >= REORDER_WINDOW && !ctx.pending.contains_key(&seq) {
                 tracing::error!(
                     anchor_id = ctx.anchor_id,
@@ -429,24 +304,31 @@ async fn forward(bytes: Vec<u8>, ctx: &IngestCtx<'_>) -> bool {
 }
 
 impl FrameTransport for VeloFrameTransport {
+    fn key(&self) -> TransportKey {
+        self.key.clone()
+    }
+
+    fn address(&self) -> WorkerAddress {
+        // VeloFrameTransport piggybacks on the messenger; no separate listener.
+        WorkerAddress::empty()
+    }
+
+    fn register(&self, _peer_info: &PeerInfo) -> Result<()> {
+        // Messenger already tracks the peer; nothing to do here.
+        Ok(())
+    }
+
     fn bind(
         &self,
         anchor_id: u64,
         session_id: u64,
-    ) -> BoxFuture<'_, Result<(String, flume::Receiver<Vec<u8>>)>> {
-        let worker_id = self.worker_id;
+    ) -> BoxFuture<'_, Result<flume::Receiver<Vec<u8>>>> {
         let dispatch = self.dispatch.clone();
         let backpressure = self.backpressure_count.clone();
         let metrics = self.streaming_metrics.clone();
         Box::pin(async move {
             let (consumer_tx, consumer_rx) = flume::bounded::<Vec<u8>>(256);
-            // Drop dispatch entries whose deposit receiver is gone (deliverer
-            // exited because the consumer closed). Live siblings (MPSC case:
-            // multiple concurrent session_ids on the same anchor) are preserved.
             dispatch.retain(|&(aid, _), entry| aid != anchor_id || !entry.sender.is_disconnected());
-            // Unbounded deposit channel: the deliverer drains contiguous runs
-            // eagerly, so steady-state occupancy is small. The hard memory cap
-            // is enforced by REORDER_WINDOW on the reorder buffer itself.
             let (deposit_tx, deposit_rx) = flume::unbounded::<Deposit>();
             let token = next_dispatch_token();
             dispatch.insert(
@@ -466,129 +348,58 @@ impl FrameTransport for VeloFrameTransport {
                 anchor_id,
                 session_id,
             }));
-            let endpoint = format!("velo://{}/stream/{}", worker_id.as_u64(), anchor_id);
-            Ok((endpoint, consumer_rx))
+            Ok(consumer_rx)
         })
     }
 
     fn connect(
         &self,
-        endpoint: &str,
-        _anchor_id: u64,
+        peer: WorkerId,
+        anchor_id: u64,
         session_id: u64,
     ) -> BoxFuture<'_, Result<flume::Sender<Vec<u8>>>> {
-        let endpoint = endpoint.to_string();
         let messenger = self.messenger.clone();
         Box::pin(async move {
-            let (target_worker_id, target_anchor_id) = parse_velo_uri(&endpoint)?;
             let (tx, rx) = flume::bounded::<Vec<u8>>(256);
 
-            // Spawn pump task: reads from rx, sends AM per frame with
-            // anchor_id + session_id + monotonic seq routed via AM headers.
-            // The seq counter is the single sequential origin for outbound
-            // frames on this (anchor, session) — covers data and heartbeats
-            // alike, since both share this flume channel.
             tokio::spawn(async move {
                 let mut seq: u64 = 0;
                 while let Ok(frame_bytes) = rx.recv_async().await {
                     let mut headers = HashMap::with_capacity(3);
-                    headers.insert(ANCHOR_ID_HEADER.to_string(), target_anchor_id.to_string());
+                    headers.insert(ANCHOR_ID_HEADER.to_string(), anchor_id.to_string());
                     headers.insert(SESSION_ID_HEADER.to_string(), session_id.to_string());
                     headers.insert(STREAM_SEQ_HEADER.to_string(), seq.to_string());
 
-                    if let Err(e) = messenger
-                        .am_send_streaming("_stream_data")
-                        .expect("am_send_streaming builder")
+                    let send = match messenger.am_send_streaming("_stream_data") {
+                        Ok(b) => b,
+                        Err(e) => {
+                            tracing::error!("am_send_streaming builder: {}", e);
+                            break;
+                        }
+                    };
+                    if let Err(e) = send
                         .headers(headers)
                         .raw_payload(bytes::Bytes::from(frame_bytes))
-                        .worker(WorkerId::from_u64(target_worker_id))
+                        .worker(peer)
                         .send()
                         .await
                     {
                         tracing::error!("_stream_data am_send failed: {}", e);
                         break;
                     }
-                    seq += 1;
+                    seq = seq.checked_add(1).ok_or(()).unwrap_or(0);
                 }
             });
-
+            // discard `_` lints
+            let _ = anyhow::Ok::<()>(());
             Ok(tx)
         })
     }
 }
 
-/// Parse a `velo://` URI into `(worker_id, anchor_id)`.
-///
-/// Expected format: `velo://{worker_id}/stream/{anchor_id}`
-///
-/// # Errors
-///
-/// Returns `Err` on malformed URIs (missing prefix, wrong segment count,
-/// non-numeric IDs, wrong path segment).
-pub fn parse_velo_uri(uri: &str) -> Result<(u64, u64)> {
-    let stripped = uri
-        .strip_prefix("velo://")
-        .ok_or_else(|| anyhow::anyhow!("invalid velo URI: missing velo:// prefix: {}", uri))?;
-    let parts: Vec<&str> = stripped.split('/').collect();
-    if parts.len() != 3 || parts[1] != "stream" {
-        anyhow::bail!(
-            "invalid velo URI format: expected velo://{{worker_id}}/stream/{{anchor_id}}, got: {}",
-            uri
-        );
-    }
-    let worker_id: u64 = parts[0]
-        .parse()
-        .map_err(|_| anyhow::anyhow!("invalid worker_id in URI: {}", parts[0]))?;
-    let anchor_id: u64 = parts[2]
-        .parse()
-        .map_err(|_| anyhow::anyhow!("invalid anchor_id in URI: {}", parts[2]))?;
-    Ok((worker_id, anchor_id))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_parse_velo_uri_valid() {
-        let (wid, aid) = parse_velo_uri("velo://123/stream/456").unwrap();
-        assert_eq!(wid, 123);
-        assert_eq!(aid, 456);
-    }
-
-    #[test]
-    fn test_parse_velo_uri_missing_prefix() {
-        assert!(parse_velo_uri("http://123/stream/456").is_err());
-    }
-
-    #[test]
-    fn test_parse_velo_uri_non_numeric_worker() {
-        assert!(parse_velo_uri("velo://abc/stream/456").is_err());
-    }
-
-    #[test]
-    fn test_parse_velo_uri_non_numeric_anchor() {
-        assert!(parse_velo_uri("velo://123/stream/xyz").is_err());
-    }
-
-    #[test]
-    fn test_parse_velo_uri_wrong_path_segment() {
-        assert!(parse_velo_uri("velo://123/wrong/456").is_err());
-    }
-
-    #[test]
-    fn test_parse_velo_uri_too_few_segments() {
-        assert!(parse_velo_uri("velo://123/stream").is_err());
-    }
-
-    #[test]
-    fn test_parse_velo_uri_too_many_segments() {
-        assert!(parse_velo_uri("velo://123/stream/456/extra").is_err());
-    }
-
-    // -----------------------------------------------------------------
-    // Reorder-buffer unit tests (drive `run_deliverer` directly).
-    // -----------------------------------------------------------------
 
     fn spawn_deliverer() -> (
         flume::Sender<Deposit>,
@@ -615,7 +426,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn deliverer_reorders_shuffled_seqs_in_order() {
         let (tx, rx, _) = spawn_deliverer();
-        // Deposit 0..16 in a deliberately shuffled order.
         let order = [3u64, 0, 5, 4, 2, 1, 8, 7, 6, 11, 9, 10, 13, 12, 15, 14];
         for s in order {
             tx.send_async((Some(s), vec![s as u8])).await.unwrap();
@@ -631,20 +441,14 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn deliverer_accepts_head_of_line_at_full_window() {
-        // Pre-fix bug: pending fills to REORDER_WINDOW with seq=1..=WINDOW,
-        // then seq=0 arrives — the frame that would drain the entire buffer.
-        // The naive overflow check treated that as "full and not pending",
-        // killing the stream. Verify the fast path accepts it and drains.
         let (tx, rx, _) = spawn_deliverer();
         for s in 1u64..=(REORDER_WINDOW as u64) {
             tx.send_async((Some(s), vec![(s & 0xff) as u8]))
                 .await
                 .unwrap();
         }
-        // Now deliver the head-of-line.
         tx.send_async((Some(0), vec![0])).await.unwrap();
 
-        // Expect WINDOW + 1 contiguous bytes in seq order.
         for expected in 0u64..=(REORDER_WINDOW as u64) {
             let bytes = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv_async())
                 .await
@@ -661,18 +465,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn deliverer_window_overflow_closes_stream() {
         let (tx, rx, _) = spawn_deliverer();
-        // Never send seq=0. Send REORDER_WINDOW gap-fillers, then one more
-        // distinct seq to push the deliverer over the cap.
         for s in 1u64..=(REORDER_WINDOW as u64) {
             tx.send_async((Some(s), vec![s as u8])).await.unwrap();
         }
-        // This deposit triggers overflow (pending.len() == REORDER_WINDOW and
-        // the new seq isn't already in pending).
         tx.send_async((Some(REORDER_WINDOW as u64 + 1), vec![0]))
             .await
             .unwrap();
 
-        // Deliverer must have exited; consumer channel closed with no items.
         let res = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv_async()).await;
         match res {
             Ok(Err(_)) => { /* channel closed, expected */ }
@@ -683,12 +482,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn cleanup_does_not_evict_newer_binding_for_same_key() {
-        // Simulate: bind A, bind B replaces A's entry under same key, A's
-        // deliverer exits and runs Drop. Expect: B's entry survives.
         let key = (1u64, 2u64);
         let dispatch: Arc<DispatchMap> = Arc::new(DashMap::new());
 
-        // First binding.
         let (a_tx, a_rx) = flume::unbounded::<Deposit>();
         let (a_consumer_tx, _a_consumer_rx) = flume::bounded::<Vec<u8>>(64);
         let a_token = super::next_dispatch_token();
@@ -710,9 +506,6 @@ mod tests {
             session_id: key.1,
         }));
 
-        // Second binding under the same key: replaces A's entry with a fresh
-        // token. The dispatch map's `insert` drops A's Sender clone (the only
-        // one besides `a_tx` here, since the deliverer no longer holds one).
         let (b_tx, _b_rx) = flume::unbounded::<Deposit>();
         let b_token = super::next_dispatch_token();
         dispatch.insert(
@@ -723,19 +516,12 @@ mod tests {
             },
         );
 
-        // Drop the test's local handle to A's Sender. With no Sender clones
-        // referencing A's channel, A's deposit_rx returns Err and A's
-        // deliverer exits, running its guarded cleanup. The timeout catches a
-        // future regression where the deliverer holds a Sender clone (which
-        // would pin the channel and block exit indefinitely — the bug this
-        // test was originally written to prevent).
         drop(a_tx);
         tokio::time::timeout(std::time::Duration::from_secs(5), a_deliverer)
             .await
             .expect("A deliverer did not exit after channel close (5s timeout)")
             .expect("A deliverer panicked");
 
-        // The new entry must still be there.
         let current = dispatch.get(&key).expect("B entry was clobbered");
         assert_eq!(current.value().token, b_token);
         assert!(current.value().sender.same_channel(&b_tx));

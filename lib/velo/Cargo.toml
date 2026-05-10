@@ -3,7 +3,7 @@
 
 [package]
 name = "velo"
-version = "0.3.0"
+version = "0.4.0"
 edition.workspace = true
 description = "Velo distributed-systems runtime: active messaging, peer discovery, streaming, rendezvous, and queue backends"
 authors.workspace = true
@@ -146,11 +146,6 @@ name = "streaming_endurance_remote"
 path = "tests/streaming/endurance_remote.rs"
 
 [[test]]
-name = "streaming_grpc_transport"
-path = "tests/streaming/grpc_transport.rs"
-required-features = ["grpc"]
-
-[[test]]
 name = "streaming_mock_transport"
 path = "tests/streaming/mock_transport.rs"
 
@@ -167,10 +162,6 @@ name = "streaming_ordering"
 path = "tests/streaming/ordering.rs"
 
 [[test]]
-name = "streaming_tcp_transport"
-path = "tests/streaming/tcp_transport.rs"
-
-[[test]]
 name = "streaming_timing"
 path = "tests/streaming/timing.rs"
 
@@ -181,10 +172,6 @@ path = "tests/streaming/velo_integration.rs"
 [[test]]
 name = "streaming_velo_specific"
 path = "tests/streaming/velo_specific.rs"
-
-[[test]]
-name = "streaming_velo_transport"
-path = "tests/streaming/velo_transport.rs"
 
 [[test]]
 name = "transports_backpressure"

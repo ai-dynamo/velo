@@ -30,7 +30,6 @@ pub mod mpsc;
 pub mod sender;
 pub mod tcp_transport;
 pub mod transport;
-pub(crate) mod util;
 pub mod velo_transport;
 
 pub use anchor::{
@@ -46,4 +45,11 @@ pub use mpsc::{
 pub use sender::StreamSender;
 pub use tcp_transport::TcpFrameTransport;
 pub use transport::FrameTransport;
+#[deprecated(
+    since = "0.4.0",
+    note = "VeloFrameTransport has known correctness issues under multi-stream concurrency \
+            (the messenger AM dispatcher is fundamentally unordered, and the per-session reorder \
+            buffer can deadlock the consumer above ~16 concurrent streams). \
+            Prefer TcpFrameTransport or GrpcFrameTransport. Removal targeted for the next velo minor."
+)]
 pub use velo_transport::VeloFrameTransport;

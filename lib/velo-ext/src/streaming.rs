@@ -5,19 +5,33 @@
 //!
 //! This module defines the [`FrameTransport`] trait boundary consumed by the
 //! Velo streaming runtime and implemented by the in-tree
-//! `VeloFrameTransport`, `TcpFrameTransport`, and `GrpcFrameTransport`. Out-of-tree
-//! implementors (custom RDMA, hardware transports, alternative streaming
-//! substrates) should `impl FrameTransport for MyTransport` against this
-//! contract.
+//! `TcpFrameTransport`, `GrpcFrameTransport`, and (deprecated) `VeloFrameTransport`.
+//! Out-of-tree implementors (custom RDMA, hardware transports, alternative
+//! streaming substrates) should `impl FrameTransport for MyTransport` against
+//! this contract.
 //!
-//! Transport endpoints are concrete [`flume::Receiver<Vec<u8>>`] and
-//! [`flume::Sender<Vec<u8>>`] channel halves rather than trait objects. This
-//! enables mixed sync/async usage: synchronous `send()` in `Drop` impls,
-//! `send_async().await` on the normal data path, and `recv_async().await` in
-//! the reader pump.
+//! # Endpoint resolution
+//!
+//! Streaming transports advertise their listener endpoint(s) into the local
+//! [`WorkerAddress`] via [`FrameTransport::address`], keyed by the same
+//! [`TransportKey`] returned by [`FrameTransport::key`]. The Velo builder
+//! merges streaming entries into the local PeerInfo's WorkerAddress alongside
+//! messenger transport entries.
+//!
+//! When a peer is registered (via `Velo::register_peer` or discovery), the
+//! runtime calls [`FrameTransport::register`] on every installed streaming
+//! transport. The transport extracts its own entry from the peer's
+//! WorkerAddress, decodes the endpoint(s), and caches the resolved socket
+//! address keyed by the peer's [`WorkerId`].
+//!
+//! [`FrameTransport::connect`] then looks up the cached address by
+//! [`WorkerId`] — no endpoint string is exchanged on the streaming attach
+//! handshake.
 
 use anyhow::Result;
 use futures::future::BoxFuture;
+
+use crate::id::{PeerInfo, TransportKey, WorkerAddress, WorkerId};
 
 /// Transport abstraction for frame-level ordered delivery.
 ///
@@ -47,16 +61,49 @@ use futures::future::BoxFuture;
 /// implementations (e.g., network setup). The heap allocation is acceptable
 /// because these are setup-path calls, not per-frame hot-path operations.
 pub trait FrameTransport: Send + Sync {
-    /// Bind a new receive endpoint for the given anchor.
+    /// Identifies this transport's entry in [`WorkerAddress`].
     ///
-    /// Returns `(endpoint_address, receiver)` where `endpoint_address` is an
-    /// opaque string the sender passes to [`connect`][FrameTransport::connect]
-    /// and `receiver` is the receive half of the frame channel.
+    /// Mirrors [`crate::Transport::key`]. Used by the streaming attach
+    /// handshake to tell the client which `FrameTransport` to call
+    /// [`connect`](Self::connect) on, and by [`register`](Self::register) to
+    /// look up the peer's matching endpoint entry.
+    fn key(&self) -> TransportKey;
+
+    /// This transport's local listener endpoints, encoded for inclusion in the
+    /// local [`WorkerAddress`].
+    ///
+    /// Mirrors [`crate::Transport::address`]. Returned at builder time so the
+    /// Velo builder can merge it into the local PeerInfo's WorkerAddress.
+    /// Implementations that do not open their own listener (e.g., a transport
+    /// that piggybacks on the messenger) should return
+    /// [`WorkerAddress::default`].
+    fn address(&self) -> WorkerAddress;
+
+    /// Notify this transport that a peer's [`PeerInfo`] is now known.
+    ///
+    /// Mirrors [`crate::Transport::register`]. The transport extracts its own
+    /// entry from `peer_info.worker_address()` (using [`Self::key`]), decodes
+    /// the endpoint(s), and caches a resolved socket address keyed by the
+    /// peer's [`WorkerId`] for later use by [`Self::connect`].
+    ///
+    /// Default implementation is a no-op for transports that do not require
+    /// per-peer state (e.g., a transport that piggybacks on the messenger
+    /// which already tracks peers).
+    fn register(&self, _peer_info: &PeerInfo) -> Result<()> {
+        Ok(())
+    }
+
+    /// Bind a receive endpoint for the given anchor.
     ///
     /// - `anchor_id`: identifies which anchor this binding is for.
     /// - `session_id`: unique session identifier for this attachment; used by
     ///   the transport to discriminate between successive sessions on the same
     ///   anchor so that stale frames from a prior session are not delivered.
+    ///
+    /// Returns the receiver half of the per-session frame channel. Endpoint
+    /// resolution is no longer string-based — the connecting peer resolves the
+    /// listener address from the bound worker's [`WorkerAddress`] entry for
+    /// this transport's [`Self::key`].
     ///
     /// The channel established by `bind` / `connect` MUST provide ordered,
     /// loss-free delivery of all frames including sentinels.
@@ -64,22 +111,22 @@ pub trait FrameTransport: Send + Sync {
         &self,
         anchor_id: u64,
         session_id: u64,
-    ) -> BoxFuture<'_, Result<(String, flume::Receiver<Vec<u8>>)>>;
+    ) -> BoxFuture<'_, Result<flume::Receiver<Vec<u8>>>>;
 
-    /// Connect a write endpoint to the given anchor.
+    /// Connect a write endpoint to the given peer's bound anchor.
     ///
-    /// - `endpoint`: the address string returned by a prior [`bind`][FrameTransport::bind] call.
-    ///   **Implementations must convert this `&str` to an owned `String` before
-    ///   entering the async block** (the future's lifetime is tied to `&self`,
-    ///   not to `endpoint`).
+    /// - `peer`: the [`WorkerId`] of the worker that called [`Self::bind`].
+    ///   The transport looks up the peer's cached endpoint (populated via
+    ///   [`Self::register`]) to determine the actual socket address.
     /// - `anchor_id`: identifies which anchor this writer is attached to.
     /// - `session_id`: unique session identifier for this attachment; used by
     ///   the transport to route frames to the correct reader.
     ///
-    /// Returns a [`flume::Sender<Vec<u8>>`] for sending frames to the bound receiver.
+    /// Returns a [`flume::Sender<Vec<u8>>`] for sending frames to the bound
+    /// receiver.
     fn connect(
         &self,
-        endpoint: &str,
+        peer: WorkerId,
         anchor_id: u64,
         session_id: u64,
     ) -> BoxFuture<'_, Result<flume::Sender<Vec<u8>>>>;

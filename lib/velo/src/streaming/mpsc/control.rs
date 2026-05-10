@@ -47,7 +47,7 @@ pub struct MpscAnchorAttachRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum MpscAnchorAttachResponse {
     Ok {
-        stream_endpoint: String,
+        streaming_transport_key: velo_ext::TransportKey,
         heartbeat_interval_ms: u64,
         /// Newly allocated sender-id within the anchor's MPSC set.
         sender_id: u64,
@@ -203,15 +203,15 @@ pub fn create_mpsc_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::
                 };
 
                 // Step 2: async bind outside the shard lock.
-                let (endpoint, transport_rx) =
-                    match manager.transport.bind(local_id, req.session_id).await {
-                        Ok(pair) => pair,
-                        Err(e) => {
-                            return Ok(MpscAnchorAttachResponse::Err {
-                                reason: format!("transport error: {}", e),
-                            });
-                        }
-                    };
+                let transport_rx = match manager.transport.bind(local_id, req.session_id).await {
+                    Ok(rx) => rx,
+                    Err(e) => {
+                        return Ok(MpscAnchorAttachResponse::Err {
+                            reason: format!("transport error: {}", e),
+                        });
+                    }
+                };
+                let streaming_transport_key = manager.transport.key();
 
                 // Step 3: atomic slot insertion.
                 use dashmap::mapref::entry::Entry;
@@ -268,7 +268,7 @@ pub fn create_mpsc_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::
                 ));
 
                 Ok(MpscAnchorAttachResponse::Ok {
-                    stream_endpoint: endpoint,
+                    streaming_transport_key,
                     heartbeat_interval_ms: heartbeat_interval.as_millis() as u64,
                     sender_id,
                 })

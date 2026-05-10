@@ -89,6 +89,17 @@ impl WorkerAddress {
         Self(bytes.into())
     }
 
+    /// Create an empty WorkerAddress.
+    ///
+    /// Encodes an empty `HashMap<String, Vec<u8>>` as MessagePack. Useful for
+    /// transports that do not advertise their own endpoint into WorkerAddress
+    /// (e.g., a streaming transport that piggybacks on the messenger).
+    pub fn empty() -> Self {
+        let empty: HashMap<String, Vec<u8>> = HashMap::new();
+        let encoded = rmp_serde::to_vec(&empty).expect("encoding empty HashMap cannot fail");
+        Self(Bytes::from(encoded))
+    }
+
     /// Get the underlying bytes.
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
