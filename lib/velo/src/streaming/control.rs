@@ -276,20 +276,49 @@ pub(crate) async fn reader_pump(
                     Ok(Ok(bytes)) => {
                         // Any frame (data or heartbeat) proves liveness
                         missed_heartbeats = 0;
-                        // Forward to anchor's frame channel
-                        if frame_tx.send_async(bytes).await.is_err() {
-                            break; // consumer dropped
+                        // Forward to anchor's frame channel.
+                        //
+                        // The per-anchor frame_tx is bounded(256) — the smallest
+                        // channel in the saturation cascade and the first to fill
+                        // when the consumer can't keep up. We try_send first so we
+                        // can record a leading-indicator counter on the slow path
+                        // before falling through to the awaited send.
+                        match frame_tx.try_send(bytes) {
+                            Ok(()) => {}
+                            Err(flume::TrySendError::Full(b)) => {
+                                if let Some(m) = metrics.as_ref() {
+                                    m.record_reader_pump_backpressure();
+                                }
+                                if frame_tx.send_async(b).await.is_err() {
+                                    break; // consumer dropped
+                                }
+                            }
+                            Err(flume::TrySendError::Disconnected(_)) => break,
                         }
                     }
                     Ok(Err(_)) => break, // transport channel closed
                     Err(_timeout) => {
                         missed_heartbeats += 1;
                         if missed_heartbeats >= DETECTION_MULTIPLIER {
-                            // Inject Dropped sentinel -- sender is dead
+                            if let Some(m) = metrics.as_ref() {
+                                m.record_heartbeat_watchdog_firing();
+                            }
+                            // Inject Dropped sentinel -- sender is dead.
+                            // The diagnostic context here is what the saturation
+                            // runbook tells operators to grep for: anchor channel
+                            // depth at the moment of firing tells you whether the
+                            // session was sitting at the bound (cascade) or empty
+                            // (real producer crash).
                             tracing::warn!(
                                 local_id,
-                                "reader_pump: heartbeat watchdog fired ({}× missed), injecting Dropped",
-                                DETECTION_MULTIPLIER
+                                anchor_frame_tx_len = frame_tx.len(),
+                                anchor_frame_tx_cap = frame_tx.capacity().unwrap_or_default(),
+                                transport_rx_len = transport_rx.len(),
+                                transport_rx_cap = transport_rx.capacity().unwrap_or_default(),
+                                heartbeat_deadline_ms = heartbeat_deadline.as_millis() as u64,
+                                detection_multiplier = DETECTION_MULTIPLIER,
+                                "reader_pump: heartbeat watchdog fired, injecting Dropped \
+                                 (saturation indicator: see velo_streaming_*_backpressure_total)"
                             );
                             let dropped_bytes = crate::streaming::sender::cached_dropped().clone();
                             let _ = frame_tx.send_async(dropped_bytes).await;

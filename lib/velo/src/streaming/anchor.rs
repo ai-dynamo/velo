@@ -1102,6 +1102,7 @@ impl AnchorManager {
                         poison_tx,
                     },
                     Duration::from_millis(heartbeat_interval_ms),
+                    self.metrics.clone(),
                 ))
             }
             crate::streaming::control::AnchorAttachResponse::Err { reason } => {
@@ -1219,6 +1220,7 @@ impl AnchorManager {
                             poison_tx,
                         },
                         heartbeat_interval,
+                        self.metrics.clone(),
                     ))
                 }
             }

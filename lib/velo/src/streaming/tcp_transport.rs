@@ -97,6 +97,10 @@ pub struct TcpFrameTransport {
     registry: Arc<SessionRegistry>,
     /// Cancellation handle for the accept loop. Tripped on `Drop`.
     cancel: CancellationToken,
+    /// Optional metrics handle. Set once by the Velo builder via
+    /// [`Self::set_metrics`] before any bind/connect; read on the hot path
+    /// by the accept loop and the pump tasks.
+    metrics: Arc<std::sync::OnceLock<Arc<crate::observability::VeloMetrics>>>,
 }
 
 impl TcpFrameTransport {
@@ -128,11 +132,14 @@ impl TcpFrameTransport {
 
         let registry: Arc<SessionRegistry> = Arc::new(DashMap::new());
         let cancel = CancellationToken::new();
+        let metrics: Arc<std::sync::OnceLock<Arc<crate::observability::VeloMetrics>>> =
+            Arc::new(std::sync::OnceLock::new());
 
         tokio::spawn(run_accept_loop(
             Arc::new(listener),
             registry.clone(),
             cancel.clone(),
+            metrics.clone(),
         ));
 
         Ok(Arc::new(Self {
@@ -145,7 +152,14 @@ impl TcpFrameTransport {
             peers: Arc::new(DashMap::new()),
             registry,
             cancel,
+            metrics,
         }))
+    }
+
+    /// Install a metrics handle. Called by the Velo builder before any
+    /// `bind`/`connect`. No-op if already set; safe to call multiple times.
+    pub fn set_metrics(&self, metrics: Arc<crate::observability::VeloMetrics>) {
+        let _ = self.metrics.set(metrics);
     }
 
     /// Construct a TCP streaming transport with default key (`"tcp-stream"`),
@@ -184,6 +198,7 @@ async fn run_accept_loop(
     listener: Arc<TcpListener>,
     registry: Arc<SessionRegistry>,
     cancel: CancellationToken,
+    metrics: Arc<std::sync::OnceLock<Arc<crate::observability::VeloMetrics>>>,
 ) {
     loop {
         tokio::select! {
@@ -194,7 +209,8 @@ async fn run_accept_loop(
             }
             res = listener.accept() => match res {
                 Ok((stream, _peer)) => {
-                    tokio::spawn(handle_one_connection(stream, registry.clone()));
+                    let pump_metrics = metrics.get().cloned();
+                    tokio::spawn(handle_one_connection(stream, registry.clone(), pump_metrics));
                 }
                 Err(e) => {
                     tracing::warn!("TCP streaming accept error: {}", e);
@@ -206,7 +222,11 @@ async fn run_accept_loop(
 }
 
 /// Per-connection task: 16-byte handshake (anchor_id BE + session_id BE) + frame pump.
-async fn handle_one_connection(mut stream: TcpStream, registry: Arc<SessionRegistry>) {
+async fn handle_one_connection(
+    mut stream: TcpStream,
+    registry: Arc<SessionRegistry>,
+    metrics: Option<Arc<crate::observability::VeloMetrics>>,
+) {
     let mut handshake = [0u8; 16];
     let read_result = tokio::time::timeout(
         TOKEN_READ_TIMEOUT,
@@ -245,11 +265,15 @@ async fn handle_one_connection(mut stream: TcpStream, registry: Arc<SessionRegis
     };
 
     configure_socket(&stream);
-    pump_frames(stream, pending.frame_tx).await;
+    pump_frames(stream, pending.frame_tx, metrics).await;
 }
 
 /// Read frames off the stream and forward them to the per-stream channel.
-async fn pump_frames(stream: TcpStream, frame_tx: flume::Sender<Vec<u8>>) {
+async fn pump_frames(
+    stream: TcpStream,
+    frame_tx: flume::Sender<Vec<u8>>,
+    metrics: Option<Arc<crate::observability::VeloMetrics>>,
+) {
     let mut framed = Framed::new(stream, TcpFrameCodec::new());
     let mut last_was_terminal = false;
     let mut consumer_dropped = false;
@@ -259,9 +283,26 @@ async fn pump_frames(stream: TcpStream, frame_tx: flume::Sender<Vec<u8>>) {
             Ok((_msg_type, _header, payload)) => {
                 let payload_vec = payload.to_vec();
                 last_was_terminal = is_terminal_sentinel(&payload_vec);
-                if frame_tx.send_async(payload_vec).await.is_err() {
-                    consumer_dropped = true;
-                    break;
+                // Try non-blocking first so we can record server-pump
+                // backpressure on the slow path before falling through to
+                // the awaited send. The bind-side frame channel is
+                // bounded(4096); it begins to fill once reader_pump has
+                // already saturated the per-anchor channel above it.
+                match frame_tx.try_send(payload_vec) {
+                    Ok(()) => {}
+                    Err(flume::TrySendError::Full(b)) => {
+                        if let Some(m) = metrics.as_ref() {
+                            m.record_server_pump_backpressure();
+                        }
+                        if frame_tx.send_async(b).await.is_err() {
+                            consumer_dropped = true;
+                            break;
+                        }
+                    }
+                    Err(flume::TrySendError::Disconnected(_)) => {
+                        consumer_dropped = true;
+                        break;
+                    }
                 }
             }
             Err(e) => {

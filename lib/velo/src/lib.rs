@@ -244,24 +244,37 @@ impl VeloBuilder {
         // bind on 0.0.0.0:0 and advertise every UP non-loopback interface
         // via Vec<InterfaceEndpoint> in WorkerAddress. Multi-node correctness
         // comes from the advertise list, not from defaulting away from TCP.
+        //
+        // Metrics are installed before the transport is type-erased into
+        // `Arc<dyn FrameTransport>` because `set_metrics` is a concrete
+        // method (the FrameTransport trait stays observability-free so
+        // out-of-tree implementors don't take a `prometheus` dep).
         let resolved = self.stream_config.unwrap_or(StreamConfig::Tcp(None));
         let stream_transport: Arc<dyn crate::streaming::FrameTransport> = match resolved {
             StreamConfig::Tcp(tcp_cfg) => {
                 let bind_addr = tcp_cfg
                     .map(|c| c.bind_addr)
                     .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
-                crate::streaming::TcpFrameTransport::new(bind_addr).await? as _
+                let tcp = crate::streaming::TcpFrameTransport::new(bind_addr).await?;
+                if let Some(m) = self.metrics.as_ref() {
+                    tcp.set_metrics(Arc::clone(m));
+                }
+                tcp as _
             }
             #[cfg(feature = "grpc")]
             StreamConfig::Grpc(grpc_cfg) => {
                 let bind_addr = grpc_cfg
                     .map(|c| c.bind_addr)
                     .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
-                crate::streaming::GrpcFrameTransport::new(bind_addr)
+                let grpc = crate::streaming::GrpcFrameTransport::new(bind_addr)
                     .await
                     .map_err(|e| {
                         anyhow::anyhow!("Failed to start gRPC streaming transport: {}", e)
-                    })? as _
+                    })?;
+                if let Some(m) = self.metrics.as_ref() {
+                    grpc.set_metrics(Arc::clone(m));
+                }
+                grpc as _
             }
         };
 

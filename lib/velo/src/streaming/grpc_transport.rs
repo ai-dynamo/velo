@@ -89,6 +89,7 @@ type SessionRouting = DashMap<(u64, u64), flume::Sender<Vec<u8>>>;
 #[derive(Clone)]
 struct GrpcStreamingService {
     routing: Arc<SessionRouting>,
+    metrics: Arc<std::sync::OnceLock<Arc<crate::observability::VeloMetrics>>>,
 }
 
 #[tonic::async_trait]
@@ -113,6 +114,7 @@ impl VeloStreaming for GrpcStreamingService {
         };
 
         let mut stream = request.into_inner();
+        let metrics = self.metrics.get().cloned();
         tokio::spawn(async move {
             let mut last_was_terminal = false;
             while let Some(result) = stream.next().await {
@@ -120,8 +122,24 @@ impl VeloStreaming for GrpcStreamingService {
                     Ok(framed) => {
                         let payload = framed.payload;
                         last_was_terminal = is_terminal_sentinel(&payload);
-                        if frame_tx.send_async(payload).await.is_err() {
-                            return; // consumer dropped, no Dropped injection
+                        // Try non-blocking first so we can record server-pump
+                        // backpressure on the slow path before falling through
+                        // to send_async. The bind-side frame channel is
+                        // bounded(4096); it begins to fill once reader_pump
+                        // has saturated the per-anchor channel above it.
+                        match frame_tx.try_send(payload) {
+                            Ok(()) => {}
+                            Err(flume::TrySendError::Full(b)) => {
+                                if let Some(m) = metrics.as_ref() {
+                                    m.record_server_pump_backpressure();
+                                }
+                                if frame_tx.send_async(b).await.is_err() {
+                                    return; // consumer dropped, no Dropped injection
+                                }
+                            }
+                            Err(flume::TrySendError::Disconnected(_)) => {
+                                return;
+                            }
                         }
                     }
                     Err(e) => {
@@ -175,6 +193,9 @@ pub struct GrpcFrameTransport {
     peers: Arc<DashMap<WorkerId, SocketAddr>>,
     routing: Arc<SessionRouting>,
     cancel: CancellationToken,
+    /// Optional metrics handle. Set once by the Velo builder via
+    /// [`Self::set_metrics`] before any bind/connect.
+    metrics: Arc<std::sync::OnceLock<Arc<crate::observability::VeloMetrics>>>,
 }
 
 impl GrpcFrameTransport {
@@ -187,6 +208,8 @@ impl GrpcFrameTransport {
     ) -> Result<Arc<Self>> {
         let routing: Arc<SessionRouting> = Arc::new(DashMap::new());
         let cancel = CancellationToken::new();
+        let metrics: Arc<std::sync::OnceLock<Arc<crate::observability::VeloMetrics>>> =
+            Arc::new(std::sync::OnceLock::new());
 
         let listener = tokio::net::TcpListener::bind(bind_addr).await?;
         let bound_addr = listener.local_addr()?;
@@ -204,6 +227,7 @@ impl GrpcFrameTransport {
 
         let service = GrpcStreamingService {
             routing: routing.clone(),
+            metrics: metrics.clone(),
         };
 
         let cancel_clone = cancel.clone();
@@ -231,7 +255,14 @@ impl GrpcFrameTransport {
             peers: Arc::new(DashMap::new()),
             routing,
             cancel,
+            metrics,
         }))
+    }
+
+    /// Install a metrics handle. Called by the Velo builder before any
+    /// `bind`/`connect`. No-op if already set.
+    pub fn set_metrics(&self, metrics: Arc<crate::observability::VeloMetrics>) {
+        let _ = self.metrics.set(metrics);
     }
 
     /// Convenience constructor: `grpc-stream` key, `InterfaceFilter::All`,
