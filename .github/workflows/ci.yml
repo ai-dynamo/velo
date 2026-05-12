@@ -223,18 +223,18 @@ jobs:
       with:
         bucket: ${{ secrets.SCCACHE_S3_BUCKET }}
     - name: Build examples (release)
-      run: cargo build --manifest-path examples/Cargo.toml --release --all-features --examples --locked
+      run: cargo build --manifest-path examples/Cargo.toml --release --all-features --examples --offline
     # Examples run sequentially — each one binds loopback sockets and the
     # next step must not race for the same port or socket.
     - name: Run ping_pong
       timeout-minutes: 2
-      run: cargo run --manifest-path examples/Cargo.toml --release --all-features --example ping_pong --locked -- --rounds 200
+      run: cargo run --manifest-path examples/Cargo.toml --release --all-features --example ping_pong --offline -- --rounds 200
     - name: Run throughput
       timeout-minutes: 3
-      run: cargo run --manifest-path examples/Cargo.toml --release --all-features --example throughput --locked -- --count 1000 --payload-sizes 0,1024 --concurrency 1,10
+      run: cargo run --manifest-path examples/Cargo.toml --release --all-features --example throughput --offline -- --count 1000 --payload-sizes 0,1024 --concurrency 1,10
     - name: Run mpsc_fanin
       timeout-minutes: 2
-      run: cargo run --manifest-path examples/Cargo.toml --release --all-features --example mpsc_fanin --locked -- --producers 4 --items 40
+      run: cargo run --manifest-path examples/Cargo.toml --release --all-features --example mpsc_fanin --offline -- --producers 4 --items 40
     - name: sccache stats
       if: always()
       run: /tmp/use-sccache.sh show-stats "examples" || true
