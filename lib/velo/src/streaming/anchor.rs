@@ -638,6 +638,15 @@ pub struct AnchorManager {
     #[builder(setter(skip), default = "AtomicU64::new(0)")]
     next_sender_stream_id: AtomicU64,
 
+    /// Receiver-allocated counter for transport routing session ids. Each
+    /// remote attach reserves a unique routing slot from this counter so the
+    /// `(anchor_id, session_id)` pair used by the transport layer cannot
+    /// collide across senders from different worker_ids (their local
+    /// `next_sender_stream_id` counters are independent and both start at 0).
+    /// See the cross-worker MPSC attach regression test for the bug class.
+    #[builder(setter(skip), default = "AtomicU64::new(0)")]
+    pub(crate) next_routing_session_id: AtomicU64,
+
     /// Sender-side registry: maps sender_stream_id -> SenderEntry.
     /// Shared with the _stream_cancel handler registered on this AnchorManager.
     /// Also accessed by StreamSender::Drop / finalize / detach for cleanup.
@@ -814,36 +823,27 @@ impl AnchorManager {
         }
     }
 
-    /// Resolve a FrameTransport from an endpoint's scheme.
+    /// Resolve a FrameTransport by streaming-transport key.
     ///
-    /// Parses the scheme from `endpoint` (everything before `://`), looks it up
-    /// in the transport registry. Falls back to `self.transport` if the registry
-    /// is empty (backward compatibility for callers that don't populate the registry).
+    /// Looks up `key` in the transport registry. Falls back to `self.transport`
+    /// if the registry is empty (test/legacy convenience for callers that don't
+    /// populate the registry).
     ///
-    /// Returns `Err(AttachError::TransportError)` if the scheme is not found
-    /// in a non-empty registry.
+    /// Returns `Err(AttachError::TransportError)` if the key is not found in a
+    /// non-empty registry.
     fn resolve_transport(
         &self,
-        endpoint: &str,
+        key: &velo_ext::TransportKey,
     ) -> Result<Arc<dyn crate::streaming::transport::FrameTransport>, AttachError> {
-        let scheme = endpoint.split("://").next().ok_or_else(|| {
-            AttachError::TransportError(anyhow::anyhow!("no scheme in endpoint: {}", endpoint))
-        })?;
-
-        // Check registry first
-        if let Some(transport) = self.transport_registry.get(scheme) {
+        if let Some(transport) = self.transport_registry.get(key.as_str()) {
             return Ok(Arc::clone(transport));
         }
-
-        // Fallback: if registry is empty, use default transport (backward compat)
         if self.transport_registry.is_empty() {
             return Ok(Arc::clone(&self.transport));
         }
-
         Err(AttachError::TransportError(anyhow::anyhow!(
-            "unsupported transport scheme: {} (endpoint: {})",
-            scheme,
-            endpoint
+            "unsupported streaming transport key: {}",
+            key
         )))
     }
 
@@ -1077,16 +1077,28 @@ impl AnchorManager {
 
         match response {
             crate::streaming::control::AnchorAttachResponse::Ok {
-                stream_endpoint,
+                streaming_transport_key,
                 heartbeat_interval_ms,
+                routing_session_id,
             } => {
                 let (_, local_id) = handle.unpack();
 
-                // Resolve transport from endpoint scheme, then connect
-                let transport = self.resolve_transport(&stream_endpoint)?;
+                // Resolve the local FrameTransport that matches the remote
+                // worker's bound streaming transport, then connect by WorkerId.
+                // Use the receiver-allocated routing_session_id so the
+                // transport-layer routing slot is unique across senders from
+                // different worker_ids (legacy senders set the field to 0 via
+                // serde-default and fall back to the collision-prone
+                // sender_stream_id).
+                let connect_session_id = if routing_session_id != 0 {
+                    routing_session_id
+                } else {
+                    sender_stream_id
+                };
+                let transport = self.resolve_transport(&streaming_transport_key)?;
                 let frame_tx = transport
-                    .connect(&stream_endpoint, local_id, sender_stream_id)
-                    .await?; // maps to AttachError::TransportError via From<anyhow::Error>
+                    .connect(handle_worker_id, local_id, connect_session_id)
+                    .await?;
 
                 // Register SenderEntry for _stream_cancel routing
                 let sender_entry = crate::streaming::control::SenderEntry {
@@ -1110,6 +1122,7 @@ impl AnchorManager {
                         poison_tx,
                     },
                     Duration::from_millis(heartbeat_interval_ms),
+                    self.metrics.clone(),
                 ))
             }
             crate::streaming::control::AnchorAttachResponse::Err { reason } => {
@@ -1227,6 +1240,7 @@ impl AnchorManager {
                             poison_tx,
                         },
                         heartbeat_interval,
+                        self.metrics.clone(),
                     ))
                 }
             }
@@ -1412,6 +1426,7 @@ impl AnchorManager {
                 poison_tx,
             },
             heartbeat_interval,
+            self.metrics.clone(),
         ))
     }
 
@@ -1452,14 +1467,22 @@ impl AnchorManager {
 
         match response {
             crate::streaming::mpsc::control::MpscAnchorAttachResponse::Ok {
-                stream_endpoint,
+                streaming_transport_key,
                 heartbeat_interval_ms,
                 sender_id,
+                routing_session_id,
             } => {
                 let (_, local_id) = handle.unpack();
-                let transport = self.resolve_transport(&stream_endpoint)?;
+                // See the SPSC remote attach above for routing_session_id
+                // rationale and the legacy-zero fallback.
+                let connect_session_id = if routing_session_id != 0 {
+                    routing_session_id
+                } else {
+                    sender_stream_id
+                };
+                let transport = self.resolve_transport(&streaming_transport_key)?;
                 let frame_tx = transport
-                    .connect(&stream_endpoint, local_id, sender_stream_id)
+                    .connect(handle_worker_id, local_id, connect_session_id)
                     .await?;
 
                 let sender_entry = crate::streaming::control::SenderEntry {
@@ -1482,6 +1505,7 @@ impl AnchorManager {
                         poison_tx,
                     },
                     Duration::from_millis(heartbeat_interval_ms),
+                    self.metrics.clone(),
                 ))
             }
             crate::streaming::mpsc::control::MpscAnchorAttachResponse::Err { reason } => {
@@ -1511,22 +1535,25 @@ mod tests {
     struct MockTransport;
 
     impl crate::streaming::transport::FrameTransport for MockTransport {
+        fn key(&self) -> velo_ext::TransportKey {
+            velo_ext::TransportKey::new("mock-stream")
+        }
+
+        fn address(&self) -> velo_ext::WorkerAddress {
+            velo_ext::WorkerAddress::empty()
+        }
+
         fn bind(
             &self,
             _anchor_id: u64,
             _session_id: u64,
-        ) -> BoxFuture<'_, AnyhowResult<(String, flume::Receiver<Vec<u8>>)>> {
-            Box::pin(async {
-                Ok((
-                    "mock://endpoint".to_string(),
-                    flume::bounded::<Vec<u8>>(256).1,
-                ))
-            })
+        ) -> BoxFuture<'_, AnyhowResult<flume::Receiver<Vec<u8>>>> {
+            Box::pin(async { Ok(flume::bounded::<Vec<u8>>(256).1) })
         }
 
         fn connect(
             &self,
-            _endpoint: &str,
+            _peer: velo_ext::WorkerId,
             _anchor_id: u64,
             _session_id: u64,
         ) -> BoxFuture<'_, AnyhowResult<flume::Sender<Vec<u8>>>> {
@@ -2506,17 +2533,25 @@ mod tests {
     struct NoopTransport;
 
     impl crate::streaming::transport::FrameTransport for NoopTransport {
+        fn key(&self) -> velo_ext::TransportKey {
+            velo_ext::TransportKey::new("noop-stream")
+        }
+
+        fn address(&self) -> velo_ext::WorkerAddress {
+            velo_ext::WorkerAddress::empty()
+        }
+
         fn bind(
             &self,
             _anchor_id: u64,
             _session_id: u64,
-        ) -> BoxFuture<'_, AnyhowResult<(String, flume::Receiver<Vec<u8>>)>> {
-            Box::pin(async { Ok(("noop://".to_string(), flume::bounded(1).1)) })
+        ) -> BoxFuture<'_, AnyhowResult<flume::Receiver<Vec<u8>>>> {
+            Box::pin(async { Ok(flume::bounded(1).1) })
         }
 
         fn connect(
             &self,
-            _endpoint: &str,
+            _peer: velo_ext::WorkerId,
             _anchor_id: u64,
             _session_id: u64,
         ) -> BoxFuture<'_, AnyhowResult<flume::Sender<Vec<u8>>>> {
@@ -2533,7 +2568,7 @@ mod tests {
             Arc::new(NoopTransport);
 
         let mut registry = HashMap::new();
-        registry.insert("tcp".to_string(), Arc::clone(&tcp_transport));
+        registry.insert("noop-stream".to_string(), Arc::clone(&tcp_transport));
 
         let mgr = AnchorManagerBuilder::default()
             .worker_id(worker_id)
@@ -2542,37 +2577,37 @@ mod tests {
             .build()
             .expect("builder should succeed");
 
-        // "tcp" scheme should resolve to the registered NoopTransport
+        // "noop-stream" key should resolve to the registered NoopTransport
         let resolved = mgr
-            .resolve_transport("tcp://127.0.0.1:1234/token")
-            .expect("tcp scheme must resolve");
+            .resolve_transport(&velo_ext::TransportKey::new("noop-stream"))
+            .expect("noop-stream key must resolve");
         assert!(
             Arc::ptr_eq(&resolved, &tcp_transport),
-            "resolved transport must be the registered tcp transport"
+            "resolved transport must be the registered noop transport"
         );
 
-        // "velo" scheme is NOT registered; registry is non-empty, so fallback is NOT used
-        let err = match mgr.resolve_transport("velo://123/stream/456") {
+        // Unregistered key in a non-empty registry must error (no fallback).
+        let err = match mgr.resolve_transport(&velo_ext::TransportKey::new("missing-stream")) {
             Err(e) => e,
-            Ok(_) => panic!("unregistered scheme in non-empty registry must error"),
+            Ok(_) => panic!("unregistered key in non-empty registry must error"),
         };
         let msg = format!("{}", err);
         assert!(
-            msg.contains("unsupported transport scheme"),
-            "error message must mention unsupported scheme, got: {}",
+            msg.contains("unsupported streaming transport key"),
+            "error message must mention unsupported key, got: {}",
             msg
         );
     }
 
     #[test]
-    fn test_unsupported_scheme() {
+    fn test_unsupported_key() {
         let worker_id = velo_ext::WorkerId::from_u64(42);
         let default_transport: Arc<dyn crate::streaming::transport::FrameTransport> =
             Arc::new(MockTransport);
 
         let mut registry = HashMap::new();
         registry.insert(
-            "tcp".to_string(),
+            "noop-stream".to_string(),
             Arc::new(NoopTransport) as Arc<dyn crate::streaming::transport::FrameTransport>,
         );
 
@@ -2583,14 +2618,14 @@ mod tests {
             .build()
             .expect("builder should succeed");
 
-        let err = match mgr.resolve_transport("unknown://some-host:1234/path") {
+        let err = match mgr.resolve_transport(&velo_ext::TransportKey::new("unknown")) {
             Err(e) => e,
-            Ok(_) => panic!("unknown scheme must return error"),
+            Ok(_) => panic!("unknown key must return error"),
         };
         let msg = format!("{}", err);
         assert!(
-            msg.contains("unsupported transport scheme: unknown"),
-            "error must name the unsupported scheme, got: {}",
+            msg.contains("unknown"),
+            "error must name the unsupported key, got: {}",
             msg
         );
     }
@@ -2602,7 +2637,7 @@ mod tests {
             Arc::new(MockTransport);
         let default_clone = Arc::clone(&default_transport);
 
-        // Empty registry -- backward compat: resolve_transport falls back to self.transport
+        // Empty registry -- backward compat: resolve_transport falls back to self.transport.
         let mgr = AnchorManagerBuilder::default()
             .worker_id(worker_id)
             .transport(default_transport)
@@ -2610,7 +2645,7 @@ mod tests {
             .expect("builder should succeed");
 
         let resolved = mgr
-            .resolve_transport("anything://host:1234/path")
+            .resolve_transport(&velo_ext::TransportKey::new("anything"))
             .expect("empty registry must fall back to default transport");
         assert!(
             Arc::ptr_eq(&resolved, &default_clone),

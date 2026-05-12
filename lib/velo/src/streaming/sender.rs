@@ -116,6 +116,10 @@ pub struct StreamSender<T> {
     /// this becomes disconnected and send() returns ChannelClosed.
     poison_tx: flume::Sender<()>,
     // --- end Phase 11 ---
+    /// Optional metrics handle for producer-side backpressure observability.
+    /// `None` for in-process AnchorManager constructions that skip metrics
+    /// (test fixtures and direct AnchorManagerBuilder users).
+    metrics: Option<Arc<crate::observability::VeloMetrics>>,
     _phantom: std::marker::PhantomData<T>,
 }
 
@@ -145,6 +149,7 @@ impl<T: Serialize> StreamSender<T> {
         registry: Arc<DashMap<u64, AnchorEntry>>,
         cancel: StreamSenderCancelInfo,
         heartbeat_interval: Duration,
+        metrics: Option<Arc<crate::observability::VeloMetrics>>,
     ) -> Self {
         let StreamSenderCancelInfo {
             cancel_token,
@@ -186,6 +191,7 @@ impl<T: Serialize> StreamSender<T> {
             sender_stream_id,
             sender_registry,
             poison_tx,
+            metrics,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -226,10 +232,23 @@ impl<T: Serialize> StreamSender<T> {
         }
         let bytes = rmp_serde::to_vec(&StreamFrame::Item(item))
             .map_err(|e| SendError::SerializationError(e.to_string()))?;
-        self.tx
-            .send_async(bytes)
-            .await
-            .map_err(|_| SendError::ChannelClosed)
+        // Try non-blocking first so we can record producer-side backpressure
+        // before falling through to the awaited send. The connect-side flume
+        // is bounded(4096) — by the time it's full the consumer has already
+        // saturated the per-anchor channel and the cascade is in flight.
+        match self.tx.try_send(bytes) {
+            Ok(()) => Ok(()),
+            Err(flume::TrySendError::Full(b)) => {
+                if let Some(m) = self.metrics.as_ref() {
+                    m.record_producer_send_backpressure();
+                }
+                self.tx
+                    .send_async(b)
+                    .await
+                    .map_err(|_| SendError::ChannelClosed)
+            }
+            Err(flume::TrySendError::Disconnected(_)) => Err(SendError::ChannelClosed),
+        }
     }
 
     /// Send a soft error through the channel.
@@ -366,6 +385,7 @@ mod tests {
                 poison_tx,
             },
             Duration::from_secs(5),
+            None,
         );
         (sender, rx, poison_rx)
     }
@@ -402,6 +422,7 @@ mod tests {
                 poison_tx,
             },
             Duration::from_secs(5),
+            None,
         );
         (sender, sender_registry)
     }
@@ -585,6 +606,7 @@ mod tests {
                 poison_tx,
             },
             Duration::from_secs(5),
+            None,
         );
 
         // Put an item in the channel to fill it
@@ -627,6 +649,7 @@ mod tests {
                 poison_tx,
             },
             Duration::from_secs(5),
+            None,
         );
 
         // Drop the receiver to close the channel
@@ -723,6 +746,7 @@ mod tests {
                 poison_tx,
             },
             Duration::from_secs(5),
+            None,
         );
 
         // Drop the receiver (simulating rx_closer drop in _stream_cancel handler)
