@@ -1,0 +1,39 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "velo-nixl"
+version = "0.1.0"
+edition.workspace = true
+description = "NIXL-backed transfer helpers for velo (Phase 2)"
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+# Workspace-internal helper. Per CLAUDE.md hard rule #1, only `velo` and
+# `velo-ext` are publishable — adding a third publishable crate reopens the
+# silent semver-bump bug class that motivated the workspace collapse.
+publish = false
+
+[features]
+# Gates the VRAM smoke test, which depends on a CUDA-capable GPU and a
+# CUDA-aware UCX (see docs/setup; wheel-bundled UCX 1.20.0 has no CUDA
+# support).
+cuda-tests = []
+
+[dependencies]
+# Pinned to match dynamo-memory's `=0.10.1` constraint so we can co-resolve
+# both crates against a single nixl-sys version (the historical bug class
+# that motivated the velo workspace collapse: silent multi-version
+# resolution producing two distinct copies of NIXL types).
+nixl-sys = { version = "=0.10.1" }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["time", "rt", "macros"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+
+[[test]]
+name = "vram_smoke"
+required-features = ["cuda-tests"]

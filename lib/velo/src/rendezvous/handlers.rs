@@ -19,6 +19,23 @@ use crate::rendezvous::protocol::{
 };
 use crate::rendezvous::store::{DEFAULT_CHUNK_SIZE, DataStore};
 
+#[cfg(feature = "nixl")]
+use std::sync::OnceLock;
+
+#[cfg(feature = "nixl")]
+use crate::rendezvous::nixl_endpoint::NixlEndpoint;
+#[cfg(feature = "nixl")]
+use crate::rendezvous::protocol::{RvNixlHandshakeRequest, RvNixlHandshakeResponse};
+#[cfg(feature = "nixl")]
+use crate::rendezvous::store::StageMode;
+
+/// Shared, lazily-initialized NIXL endpoint slot.
+///
+/// `RendezvousManager` holds one of these and clones the `Arc` into every
+/// handler closure that needs to observe `enable_nixl()`.
+#[cfg(feature = "nixl")]
+pub(crate) type NixlEndpointSlot = Arc<OnceLock<Arc<NixlEndpoint>>>;
+
 /// Build the `_rv_metadata` handler: returns [`DataMetadata`](crate::rendezvous::protocol::DataMetadata)
 /// without acquiring a read lock.
 pub fn create_rv_metadata_handler(store: Arc<DataStore>) -> crate::messenger::Handler {
@@ -38,6 +55,11 @@ pub fn create_rv_metadata_handler(store: Arc<DataStore>) -> crate::messenger::Ha
 
 /// Build the `_rv_acquire` handler: acquires a read lock and returns data
 /// inline (small) or chunked transfer metadata (large).
+///
+/// When the `nixl` feature is enabled, this handler also takes the manager's
+/// [`NixlEndpoint`] so it can answer pinned slots with an
+/// [`AcquireResponse::Rdma`] descriptor pointing at the registered region.
+#[cfg(not(feature = "nixl"))]
 pub fn create_rv_acquire_handler(store: Arc<DataStore>) -> crate::messenger::Handler {
     crate::messenger::Handler::typed_unary(
         "_rv_acquire",
@@ -50,21 +72,145 @@ pub fn create_rv_acquire_handler(store: Arc<DataStore>) -> crate::messenger::Han
                 .acquire_read_lock(local_id)
                 .ok_or_else(|| anyhow::anyhow!("rendezvous handle not found: {handle}"))?;
 
-            let total_len = store
-                .get_total_len(local_id)
-                .ok_or_else(|| anyhow::anyhow!("slot vanished after lock acquire"))?;
+            // After acquire_read_lock, any error path must release the lease
+            // or the slot is left with a dangling read lock and never freed.
+            let result = (|| -> anyhow::Result<AcquireResponse> {
+                let total_len = store
+                    .get_total_len(local_id)
+                    .ok_or_else(|| anyhow::anyhow!("slot vanished after lock acquire"))?;
 
-            // Always use chunked transfer (even for 1 chunk) to avoid
-            // JSON-encoding binary data in the typed-unary response.
-            let (transfer_id, chunk_size, chunk_count) = store
-                .create_transfer(local_id, lease_id, DEFAULT_CHUNK_SIZE)
-                .ok_or_else(|| anyhow::anyhow!("slot vanished after lock acquire"))?;
-            Ok(AcquireResponse::Ready {
-                lease_id,
-                transfer_id,
-                total_len,
-                chunk_size,
-                chunk_count,
+                // Always use chunked transfer (even for 1 chunk) to avoid
+                // JSON-encoding binary data in the typed-unary response.
+                let (transfer_id, chunk_size, chunk_count) = store
+                    .create_transfer(local_id, lease_id, DEFAULT_CHUNK_SIZE)
+                    .ok_or_else(|| anyhow::anyhow!("slot vanished after lock acquire"))?;
+                Ok(AcquireResponse::Ready {
+                    lease_id,
+                    transfer_id,
+                    total_len,
+                    chunk_size,
+                    chunk_count,
+                })
+            })();
+            if result.is_err() && store.consume_lease(lease_id).is_some() {
+                store.release_read_lock(local_id);
+            }
+            result
+        },
+    )
+    .build()
+}
+
+/// `nixl`-feature variant: branches on slot mode and returns
+/// [`AcquireResponse::Rdma`] for pinned slots when the slot is shared with an
+/// initialized [`NixlEndpoint`].
+#[cfg(feature = "nixl")]
+pub fn create_rv_acquire_handler(store: Arc<DataStore>) -> crate::messenger::Handler {
+    create_rv_acquire_handler_with_slot(store, Arc::new(OnceLock::new()))
+}
+
+/// Build the acquire handler with a shared NIXL endpoint slot.
+///
+/// `nixl_slot` is read on every invocation, so callers may set it after
+/// handler registration via
+/// [`RendezvousManager::enable_nixl`](crate::RendezvousManager::enable_nixl).
+/// If unset when a pinned slot's acquire arrives, the request fails with a
+/// clear error.
+#[cfg(feature = "nixl")]
+pub(crate) fn create_rv_acquire_handler_with_slot(
+    store: Arc<DataStore>,
+    nixl_slot: NixlEndpointSlot,
+) -> crate::messenger::Handler {
+    crate::messenger::Handler::typed_unary(
+        "_rv_acquire",
+        move |ctx: crate::messenger::TypedContext<RvAcquireRequest>| {
+            let handle = ctx.input.handle.to_handle();
+            let (_, local_id) = handle.unpack();
+
+            let mode = store
+                .stage_mode(local_id)
+                .ok_or_else(|| anyhow::anyhow!("rendezvous handle not found: {handle}"))?;
+
+            let lease_id = store
+                .acquire_read_lock(local_id)
+                .ok_or_else(|| anyhow::anyhow!("rendezvous handle not found: {handle}"))?;
+
+            // After acquire_read_lock, any error path must release the lease
+            // or the slot is left with a dangling read lock and never freed.
+            let result = (|| -> anyhow::Result<AcquireResponse> {
+                match mode {
+                    StageMode::InMemory => {
+                        let total_len = store
+                            .get_total_len(local_id)
+                            .ok_or_else(|| anyhow::anyhow!("slot vanished after lock acquire"))?;
+                        let (transfer_id, chunk_size, chunk_count) = store
+                            .create_transfer(local_id, lease_id, DEFAULT_CHUNK_SIZE)
+                            .ok_or_else(|| anyhow::anyhow!("slot vanished after lock acquire"))?;
+                        Ok(AcquireResponse::Ready {
+                            lease_id,
+                            transfer_id,
+                            total_len,
+                            chunk_size,
+                            chunk_count,
+                        })
+                    }
+                    StageMode::Pinned => {
+                        let endpoint = nixl_slot.get().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "pinned slot {handle} requested but NIXL endpoint is not \
+                                 enabled on this owner"
+                            )
+                        })?;
+                        // Pull the on-the-wire descriptor from the slot's arena
+                        // buffer. This carries the correct mem_type/device_id —
+                        // host slots become MemType::Dram, device slots become
+                        // MemType::Vram with the CUDA device ordinal in
+                        // device_id, so consumers route the NIXL_READ correctly.
+                        let descriptor = store
+                            .pinned_descriptor(local_id, &endpoint.agent_name)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("pinned slot vanished after lock acquire")
+                            })?;
+                        let bytes = rmp_serde::to_vec(&descriptor).map_err(|e| {
+                            anyhow::anyhow!("failed to serialize NixlAddrDescriptor: {e}")
+                        })?;
+                        Ok(AcquireResponse::Rdma {
+                            lease_id,
+                            descriptor: bytes,
+                        })
+                    }
+                }
+            })();
+            if result.is_err() && store.consume_lease(lease_id).is_some() {
+                store.release_read_lock(local_id);
+            }
+            result
+        },
+    )
+    .build()
+}
+
+/// Build the `_rv_nixl_handshake` handler: returns the local agent name and
+/// `get_local_md()` blob for a peer to call `Agent::load_remote_md` on.
+///
+/// Reads the endpoint from a shared slot so the handler stays valid whether
+/// `enable_nixl()` was called before or after handler registration.
+#[cfg(feature = "nixl")]
+pub(crate) fn create_rv_nixl_handshake_handler(
+    nixl_slot: NixlEndpointSlot,
+) -> crate::messenger::Handler {
+    crate::messenger::Handler::typed_unary(
+        "_rv_nixl_handshake",
+        move |_ctx: crate::messenger::TypedContext<RvNixlHandshakeRequest>| {
+            let endpoint = nixl_slot.get().ok_or_else(|| {
+                anyhow::anyhow!("NIXL handshake requested but enable_nixl was not called")
+            })?;
+            // Re-snapshot local_md per request so it includes registrations
+            // that happened between `enable_nixl()` and now.
+            let local_md = endpoint.current_local_md()?;
+            Ok(RvNixlHandshakeResponse {
+                agent: endpoint.agent_name.clone(),
+                local_md,
             })
         },
     )

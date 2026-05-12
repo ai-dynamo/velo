@@ -5,6 +5,7 @@
 members = [
     "lib/velo",
     "lib/velo-ext",
+    "lib/velo-nixl",
 ]
 exclude = ["examples"]
 resolver = "3"
@@ -25,6 +26,15 @@ keywords = ["nvidia", "distributed"]
 # future "compatible" patch silently re-resolve downstream lockfiles, which
 # is exactly the bug that motivated the velo / velo-ext split.
 velo-ext = { path = "lib/velo-ext", version = "=0.2.0" }
+# `velo-nixl` is a workspace-internal helper (publish = false, see CLAUDE.md
+# hard rule #1).
+velo-nixl = { path = "lib/velo-nixl", version = "0.1.0" }
+
+# Used only when the `nixl` feature is on. Provides the arena allocator +
+# NixlRegistered<T> wrapper that velo-rendezvous's Phase 2 NIXL/RDMA path
+# uses to amortize NIXL `register_memory` cost across many transfers, and
+# to support typed (DRAM/Pinned/Device) staging buffers.
+dynamo-memory = "1.1.0"
 
 # External dependencies.
 #
