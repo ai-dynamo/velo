@@ -270,6 +270,47 @@ jobs:
       if: always()
       run: /tmp/use-sccache.sh show-stats "semver" || true
 
+  # TEMPORARY: one-shot diagnostic to inventory CUDA/NIXL/UCX availability on
+  # the velo CI runner. Used to decide how to gate cudart link directives in
+  # the rendezvous-nixl branch. Remove once we've captured the output.
+  probe-runtime-deps:
+    name: Probe runtime deps (diagnostic)
+    runs-on: prod-velo-default-v1
+    container:
+      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.3
+    permissions:
+      contents: read
+    steps:
+    - name: Probe CUDA / NIXL / UCX
+      run: |
+        set +e
+        echo "=== host ==="
+        uname -m
+        cat /etc/os-release 2>/dev/null | grep -E '^(NAME|VERSION)=' || true
+        echo
+        echo "=== CUDA ==="
+        nvidia-smi 2>&1 | head -10 || echo "no nvidia-smi"
+        ls -la /usr/local/cuda 2>&1 | head -5 || echo "no /usr/local/cuda"
+        find /usr /opt /lib -maxdepth 6 -name 'libcudart*' 2>/dev/null | head -10
+        lspci 2>/dev/null | grep -i nvidia || echo "no nvidia pci entries"
+        echo
+        echo "=== NIXL ==="
+        echo "NIXL_PREFIX=${NIXL_PREFIX:-<unset>}  NIXL_PLUGIN_DIR=${NIXL_PLUGIN_DIR:-<unset>}"
+        find /usr /opt /lib /home -maxdepth 6 -name 'libnixl*' 2>/dev/null | head -10
+        find /usr /opt /lib /home -maxdepth 6 -name 'nixl_plugin_*' 2>/dev/null | head -10
+        ls -la /opt/nixl 2>&1 | head -3 || echo "no /opt/nixl"
+        echo
+        echo "=== UCX ==="
+        command -v ucx_info && ucx_info -v 2>&1 | head -5 || echo "no ucx_info"
+        find /usr /opt /lib -maxdepth 6 \( -name 'libucp*' -o -name 'libucs*' \) 2>/dev/null | head -10
+        pkg-config --modversion ucx 2>&1 || echo "no ucx pkg-config entry"
+        echo
+        echo "=== env (filtered) ==="
+        env | grep -E '^(LD_LIBRARY_PATH|UCX_|NIXL_|CUDA_)=' | sort || echo "no relevant env vars"
+        echo
+        echo "=== diagnostic complete ==="
+        exit 0
+
   ci-status:
     name: CI Status
     runs-on: prod-velo-default-v1
