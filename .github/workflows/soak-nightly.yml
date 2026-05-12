@@ -39,12 +39,13 @@ jobs:
     - name: Rust setup
       uses: ./.github/actions/rust-setup
     - name: Build soak
-      run: cargo build --release --example soak --features grpc --manifest-path examples/Cargo.toml
+      run: cargo build --release --example soak --all-features --manifest-path examples/Cargo.toml
     - name: Run nightly soak (${{ matrix.transport }})
       env:
         RUST_LOG: error
       run: |
         examples/target/release/examples/soak all \
           --transport ${{ matrix.transport }} \
+          --stream-transport ${{ matrix.transport }} \
           --tier nightly \
           --faults

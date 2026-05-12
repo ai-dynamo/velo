@@ -211,6 +211,15 @@ pub enum AnchorAttachResponse {
         streaming_transport_key: velo_ext::TransportKey,
         #[serde(default = "default_heartbeat_interval_ms")]
         heartbeat_interval_ms: u64,
+        /// Receiver-allocated routing slot id. The sender uses this for the
+        /// `transport.connect(...)` call so the transport-layer
+        /// `(anchor_id, session_id)` routing key is globally unique on the
+        /// receiver, independent of the sender's local stream counter.
+        /// `#[serde(default)]` so older senders (which never set it) still
+        /// deserialize; in that case the sender falls back to its local
+        /// `sender_stream_id` (the legacy collision-prone behavior).
+        #[serde(default)]
+        routing_session_id: u64,
     },
     /// Attach failed; `reason` describes why.
     Err { reason: String },
@@ -429,8 +438,20 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::messe
                     }
                 } // DashMap ref dropped here
 
-                // Step 2: Async bind OUTSIDE shard lock
-                let receiver = match manager.transport.bind(local_id, req.session_id).await {
+                // Step 2: Async bind OUTSIDE shard lock.
+                //
+                // Allocate a receiver-side routing_session_id rather than
+                // reusing the sender's local stream counter (req.session_id):
+                // two senders from different workers both attaching to the
+                // same anchor would otherwise hit the same `(local_id,
+                // session_id)` routing slot and silently overwrite each
+                // other at the transport layer. See
+                // [`crate::streaming::AnchorManager::next_routing_session_id`].
+                let routing_session_id = manager
+                    .next_routing_session_id
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                let receiver = match manager.transport.bind(local_id, routing_session_id).await {
                     Ok(rx) => rx,
                     Err(e) => {
                         manager.record_streaming_operation(
@@ -509,6 +530,7 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::messe
                             Ok(AnchorAttachResponse::Ok {
                                 streaming_transport_key,
                                 heartbeat_interval_ms: heartbeat_interval.as_millis() as u64,
+                                routing_session_id,
                             })
                         }
                     }
@@ -808,6 +830,100 @@ mod tests {
         );
     }
 
+    /// Watchdog fires while the per-anchor channel is already saturated:
+    /// the `try_send(Dropped)` cannot land, so the consumer sees a clean EOF
+    /// instead of `StreamFrame::Dropped`. The watchdog firing counter is the
+    /// authoritative operator signal — it must still tick. See
+    /// `lib/velo/src/streaming/SATURATION.md` for the documented behavior
+    /// this test pins in place.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reader_pump_watchdog_saturated_channel_drops_sentinel_silently() {
+        let registry = prometheus::Registry::new();
+        let metrics = Arc::new(crate::observability::VeloMetrics::register(&registry).unwrap());
+
+        let manager = make_test_manager();
+        let base_ctx = manager.anchor_context();
+        let ctx = crate::streaming::anchor::AnchorContext {
+            registry: base_ctx.registry,
+            mpsc_registry: base_ctx.mpsc_registry,
+            metrics: Some(metrics.clone()),
+        };
+
+        // Transport channel that never delivers: watchdog will fire after
+        // DETECTION_MULTIPLIER deadlines.
+        let (_transport_tx, transport_rx) = flume::bounded::<Vec<u8>>(4);
+        // Pre-saturate the anchor channel: capacity 1, push one byte so
+        // try_send returns Full when the watchdog attempts to inject the
+        // Dropped sentinel.
+        let (frame_tx, frame_rx) = flume::bounded::<Vec<u8>>(1);
+        frame_tx
+            .try_send(b"pre-existing".to_vec())
+            .expect("pre-fill frame_tx so it is saturated when watchdog fires");
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let deadline = std::time::Duration::from_millis(50);
+        let pump = tokio::spawn(reader_pump(
+            transport_rx,
+            frame_tx,
+            cancel,
+            ctx,
+            7777,
+            deadline,
+        ));
+
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(800), pump)
+            .await
+            .expect("reader_pump must terminate after watchdog fires");
+
+        // Watchdog ticked exactly once.
+        let snap = registry.gather();
+        let watchdog_value = snap
+            .iter()
+            .find(|f| f.name() == "velo_streaming_heartbeat_watchdog_firings_total")
+            .map(|f| f.get_metric()[0].get_counter().value())
+            .unwrap_or(0.0);
+        assert_eq!(
+            watchdog_value, 1.0,
+            "watchdog counter must increment exactly once even when sentinel injection fails"
+        );
+
+        // Consumer drains the pre-filled byte, then sees clean EOF -- not a
+        // Dropped sentinel. This is the documented saturated-cascade behavior
+        // (SATURATION.md): the warn-log + watchdog firing counter are
+        // authoritative; the consumer-visible terminal frame is best-effort.
+        let pre_existing = frame_rx
+            .try_recv()
+            .expect("the pre-filled byte must be drainable");
+        assert_eq!(
+            pre_existing,
+            b"pre-existing".to_vec(),
+            "first frame must be the pre-filled byte, not the Dropped sentinel"
+        );
+
+        // After draining, no further frames: the watchdog cleanup dropped its
+        // frame_tx so the channel closes cleanly.
+        match frame_rx.try_recv() {
+            Err(flume::TryRecvError::Disconnected) => {} // EOF
+            Err(flume::TryRecvError::Empty) => {
+                // The watchdog may have already exited but the closer drop
+                // hasn't propagated yet on this thread. Wait briefly.
+                let res = tokio::time::timeout(
+                    std::time::Duration::from_millis(200),
+                    frame_rx.recv_async(),
+                )
+                .await;
+                assert!(
+                    matches!(res, Ok(Err(_)) | Err(_)),
+                    "post-saturation frame_rx must reach EOF, not yield a Dropped sentinel"
+                );
+            }
+            Ok(extra) => panic!(
+                "after watchdog fire under saturation, no further frame must arrive; \
+                 got {extra:?} (Dropped sentinel would mean the silent-drop guard is gone)"
+            ),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Test helpers for calling handler logic directly
     // -----------------------------------------------------------------------
@@ -826,6 +942,7 @@ mod tests {
         let resp = AnchorAttachResponse::Ok {
             streaming_transport_key: velo_ext::TransportKey::new("mock-stream"),
             heartbeat_interval_ms: 5000,
+            routing_session_id: 7,
         };
         let json = serde_json::to_string(&resp).expect("serialize Ok");
         let decoded: AnchorAttachResponse = serde_json::from_str(&json).expect("deserialize Ok");
@@ -833,9 +950,11 @@ mod tests {
             AnchorAttachResponse::Ok {
                 streaming_transport_key,
                 heartbeat_interval_ms,
+                routing_session_id,
             } => {
                 assert_eq!(streaming_transport_key.as_str(), "mock-stream");
                 assert_eq!(heartbeat_interval_ms, 5000);
+                assert_eq!(routing_session_id, 7);
             }
             other => panic!("expected Ok, got {:?}", other),
         }
@@ -848,6 +967,7 @@ mod tests {
         let resp = AnchorAttachResponse::Ok {
             streaming_transport_key: velo_ext::TransportKey::new("tcp-stream"),
             heartbeat_interval_ms: 1234,
+            routing_session_id: 42,
         };
         let bytes = rmp_serde::to_vec(&resp).expect("rmp serialize Ok");
         let decoded: AnchorAttachResponse =
@@ -856,9 +976,11 @@ mod tests {
             AnchorAttachResponse::Ok {
                 streaming_transport_key,
                 heartbeat_interval_ms,
+                routing_session_id,
             } => {
                 assert_eq!(streaming_transport_key.as_str(), "tcp-stream");
                 assert_eq!(heartbeat_interval_ms, 1234);
+                assert_eq!(routing_session_id, 42);
             }
             other => panic!("expected Ok, got {:?}", other),
         }
@@ -874,11 +996,16 @@ mod tests {
             AnchorAttachResponse::Ok {
                 streaming_transport_key,
                 heartbeat_interval_ms,
+                routing_session_id,
             } => {
                 assert_eq!(streaming_transport_key.as_str(), "mock-stream");
                 assert_eq!(
                     heartbeat_interval_ms, 5000,
                     "missing field must default to 5000ms"
+                );
+                assert_eq!(
+                    routing_session_id, 0,
+                    "missing routing_session_id must default to 0 for legacy senders"
                 );
             }
             other => panic!("expected Ok, got {:?}", other),
@@ -933,6 +1060,7 @@ mod tests {
                     AnchorAttachResponse::Ok {
                         streaming_transport_key: key,
                         heartbeat_interval_ms: 5000,
+                        routing_session_id: 1,
                     }
                 }
             }
@@ -994,6 +1122,7 @@ mod tests {
                     AnchorAttachResponse::Ok {
                         streaming_transport_key: velo_ext::TransportKey::new("unreachable"),
                         heartbeat_interval_ms: 5000,
+                        routing_session_id: 1,
                     }
                 }
             }

@@ -218,6 +218,123 @@ async fn test_mpsc_heartbeat_timeout_per_sender() {
     anchor.cancel();
 }
 
+/// Regression: two senders living on *different* worker_ids both attach to the
+/// same MPSC anchor. Each worker's local `next_sender_stream_id` starts at 1,
+/// so before the receiver-side `routing_session_id` allocation lands, both
+/// `transport.bind`/`transport.connect` calls would collide on the same
+/// `(anchor_id, session_id)` routing key — the second bind would silently
+/// overwrite the first and one sender's frames would route to the wrong
+/// consumer slot (cross-talk) or be lost.
+///
+/// With the fix, the receiver allocates a unique `routing_session_id` per
+/// attach. Each sender's items must reach the anchor under its own `SenderId`,
+/// with no crossover.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_mpsc_remote_two_workers_no_routing_collision() {
+    // Three messengers: A hosts the anchor; B and C are two distinct
+    // sender-side workers. Each gets its own VeloFrameTransport stack and a
+    // fresh `next_sender_stream_id` starting at 0 -- the first attach on each
+    // would, without the fix, reuse session_id == 1 on A's transport.
+    let t_a = new_tcp_transport();
+    let t_b = new_tcp_transport();
+    let t_c = new_tcp_transport();
+    let messenger_a = Messenger::builder()
+        .add_transport(t_a)
+        .build()
+        .await
+        .unwrap();
+    let messenger_b = Messenger::builder()
+        .add_transport(t_b)
+        .build()
+        .await
+        .unwrap();
+    let messenger_c = Messenger::builder()
+        .add_transport(t_c)
+        .build()
+        .await
+        .unwrap();
+
+    let p_a = messenger_a.peer_info();
+    let p_b = messenger_b.peer_info();
+    let p_c = messenger_c.peer_info();
+    messenger_a.register_peer(p_b.clone()).unwrap();
+    messenger_a.register_peer(p_c.clone()).unwrap();
+    messenger_b.register_peer(p_a.clone()).unwrap();
+    messenger_c.register_peer(p_a.clone()).unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let am_a = make_am(messenger_a).await;
+    let am_b = make_am(messenger_b).await;
+    let am_c = make_am(messenger_c).await;
+
+    let mut anchor = am_a.create_mpsc_anchor::<u32>();
+    let handle = anchor.handle();
+    let transferred = roundtrip_handle(handle);
+
+    let s_b = am_b
+        .attach_mpsc_stream_anchor::<u32>(transferred)
+        .await
+        .expect("worker B attach");
+    let s_c = am_c
+        .attach_mpsc_stream_anchor::<u32>(transferred)
+        .await
+        .expect("worker C attach");
+
+    // Per-worker sender_stream_id counters are independent: both senders'
+    // local counters yield 1. The regression manifests as one bind clobbering
+    // the other in the receiver's transport routing table.
+    const N: u32 = 50;
+    for i in 0..N {
+        s_b.send(i).await.expect("worker B send");
+        s_c.send(1000 + i).await.expect("worker C send");
+    }
+
+    let mut b_items: Vec<u32> = Vec::new();
+    let mut c_items: Vec<u32> = Vec::new();
+    let collect = async {
+        while b_items.len() < N as usize || c_items.len() < N as usize {
+            let Some(frame) = anchor.next().await else {
+                break;
+            };
+            match frame.expect("no stream error") {
+                (sid, MpscFrame::Item(v)) => {
+                    // The two senders must produce disjoint value ranges --
+                    // worker B's items are 0..N, worker C's are 1000..(1000+N).
+                    // SenderId is anchor-local, so we cannot test which worker
+                    // produced an item by sid alone; the value ranges are the
+                    // ground truth, and the SenderId mapping must be 1:1 with
+                    // those ranges (no cross-talk).
+                    if v < 1000 {
+                        b_items.push(v);
+                        assert_eq!(sid, SenderId(1), "B's items must all carry SenderId(1)");
+                    } else {
+                        c_items.push(v);
+                        assert_eq!(sid, SenderId(2), "C's items must all carry SenderId(2)");
+                    }
+                }
+                (_, MpscFrame::SenderError(m)) => panic!("sender error: {m}"),
+                (_, MpscFrame::Detached | MpscFrame::Dropped(_)) => {}
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), collect)
+        .await
+        .expect("consumer timed out -- routing collision likely lost frames");
+
+    assert_eq!(b_items.len(), N as usize, "all B items must arrive");
+    assert_eq!(c_items.len(), N as usize, "all C items must arrive");
+    // Sorted comparison: ordering within a single sender is preserved by the
+    // pump, but cross-sender ordering is up to AM interleaving.
+    b_items.sort_unstable();
+    c_items.sort_unstable();
+    assert_eq!(b_items, (0..N).collect::<Vec<_>>());
+    assert_eq!(c_items, (1000..1000 + N).collect::<Vec<_>>());
+
+    let _ = s_b.detach().await;
+    let _ = s_c.detach().await;
+    anchor.cancel();
+}
+
 /// Remote detach must surface exactly one `Detached` event and release
 /// `max_senders` capacity immediately.
 #[tokio::test(flavor = "multi_thread")]

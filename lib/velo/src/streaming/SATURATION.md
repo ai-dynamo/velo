@@ -48,7 +48,21 @@ leading-indicator counter tick. Pressure then walks back up:
 8. `StreamSender::send`'s `try_send` returns `Full` → `velo_streaming_producer_send_backpressure_total` ticks →
 9. After `DETECTION_MULTIPLIER × heartbeat_interval_ms` (default 3 × 5s = 15s) of no frames,
    reader_pump's heartbeat watchdog fires → `velo_streaming_heartbeat_watchdog_firings_total`
-   ticks, the consumer sees `Dropped`, and the streaming session terminates.
+   ticks, and the streaming session terminates. The consumer sees one of two
+   things, depending on the cascade state at fire time:
+   - **Anchor channel had room** (the common case — empty cascade because the
+     producer truly died): consumer receives a `Dropped` terminal frame, which
+     surfaces as `StreamError::SenderDropped` from `StreamAnchor::next()`.
+   - **Anchor channel was already full** (the saturated-cascade case): the
+     watchdog uses a non-blocking `try_send` so registry/cancel cleanup cannot
+     deadlock, so the `Dropped` sentinel is silently lost. The consumer drains
+     any queued frames and then receives `None` (clean EOF). A `tracing::warn!`
+     fires with `local_id` so operators can correlate.
+
+   In **both** cases, `velo_streaming_heartbeat_watchdog_firings_total` is the
+   authoritative operator signal: if it ticks, a session was killed by the
+   watchdog regardless of how the consumer saw the termination. Do not rely on
+   `StreamError::SenderDropped` alone to detect watchdog kills.
 
 ## Counters and how to read them
 

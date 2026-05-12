@@ -39,6 +39,7 @@ for transport in "${ROUNDS[@]}"; do
     RUST_LOG="${RUST_LOG:-error}" \
         examples/target/release/examples/soak all \
             --transport "${transport}" \
+            --stream-transport "${transport}" \
             --tier ci \
             --scenarios "${SCENARIOS}"
 done

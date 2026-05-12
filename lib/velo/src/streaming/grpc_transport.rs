@@ -416,12 +416,23 @@ impl FrameTransport for GrpcFrameTransport {
                 // cancels the inbound side of the call.
                 let _response = response;
                 while let Ok(payload) = frame_rx.recv_async().await {
+                    let is_terminal = is_terminal_sentinel(&payload);
                     let framed = FramedData {
                         preamble: vec![],
                         header: vec![],
                         payload,
                     };
                     if mpsc_tx.send(framed).await.is_err() {
+                        break;
+                    }
+                    // Mirror TCP: after pushing a terminal sentinel (Finalized
+                    // / Dropped / Detached / TransportError), exit the pump.
+                    // Any frame still queued behind the terminal (e.g. a
+                    // heartbeat that snuck through between cancel and drop)
+                    // would otherwise reach the server and be interpreted as
+                    // the new last frame, causing the server to inject Dropped
+                    // on close -- which kills a reattached session.
+                    if is_terminal {
                         break;
                     }
                 }
@@ -459,5 +470,123 @@ mod tests {
             .expect("recv timeout")
             .expect("channel closed");
         assert_eq!(received, payload);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bind_overwrite_emits_warn_and_returns_new_rx() {
+        let server = GrpcFrameTransport::default_new().await.unwrap();
+        // First bind grabs the slot.
+        let rx1 = server.bind(42, 7).await.unwrap();
+        // Second bind for the same (anchor_id, session_id) overwrites; the
+        // previous frame_tx is dropped, so rx1's channel closes.
+        let _rx2 = server.bind(42, 7).await.unwrap();
+        // rx1 should observe the close (no more frames will arrive on it).
+        let res = tokio::time::timeout(std::time::Duration::from_millis(200), rx1.recv_async())
+            .await
+            .expect("rx1 should have closed promptly");
+        assert!(res.is_err(), "rx1 must observe channel closed");
+    }
+
+    #[test]
+    fn read_u64_meta_missing_header_returns_invalid_argument() {
+        let req: Request<()> = Request::new(());
+        let err = read_u64_meta(&req, "x-missing").unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            err.message().contains("missing x-missing"),
+            "got: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn read_u64_meta_non_u64_value_returns_invalid_argument() {
+        let mut req: Request<()> = Request::new(());
+        req.metadata_mut()
+            .insert("x-bad", "not-a-number".parse().unwrap());
+        let err = read_u64_meta(&req, "x-bad").unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            err.message().contains("not a valid u64"),
+            "got: {}",
+            err.message()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn register_rejects_peer_without_grpc_entry() {
+        let transport = GrpcFrameTransport::default_new().await.unwrap();
+        // PeerInfo with an empty WorkerAddress has no "grpc-stream" entry.
+        let (_, peer) = fresh_peer(WorkerAddress::empty());
+        let err = transport.register(&peer).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("has no") && msg.contains("streaming endpoint entry"),
+            "got: {msg}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_to_unregistered_peer_errors() {
+        let transport = GrpcFrameTransport::default_new().await.unwrap();
+        let bogus = InstanceId::new_v4().worker_id();
+        let err = transport.connect(bogus, 1, 1).await.unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("not registered"), "got: {msg}");
+    }
+
+    /// Mirror of `tcp_transport::tests::no_extra_dropped_after_finalized` —
+    /// once the client-side forwarder writes a terminal sentinel (Finalized
+    /// / Dropped / Detached / TransportError), it must exit immediately so
+    /// any frame queued behind the terminal (e.g. a late heartbeat) cannot
+    /// reach the server. Without the per-frame `is_terminal_sentinel` check
+    /// in the forwarder, the server would see the late heartbeat as the
+    /// last frame and inject `Dropped` on stream close, which would kill a
+    /// reattached session sharing the routing slot.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn grpc_client_pump_breaks_after_terminal_sentinel() {
+        let server = GrpcFrameTransport::default_new().await.unwrap();
+        let client = GrpcFrameTransport::default_new().await.unwrap();
+        let (server_worker, server_peer) = fresh_peer(server.address());
+        client.register(&server_peer).unwrap();
+
+        let rx = server.bind(11, 3).await.unwrap();
+        let tx = client.connect(server_worker, 11, 3).await.unwrap();
+
+        let finalized =
+            rmp_serde::to_vec(&crate::streaming::frame::StreamFrame::<()>::Finalized).unwrap();
+        tx.send_async(finalized.clone()).await.unwrap();
+
+        // Queue a heartbeat behind the terminal. With the terminal-break in
+        // place this should never reach the server.
+        let heartbeat =
+            rmp_serde::to_vec(&crate::streaming::frame::StreamFrame::<()>::Heartbeat).unwrap();
+        let _ = tx.send_async(heartbeat.clone()).await;
+        drop(tx);
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv_async())
+            .await
+            .expect("recv timeout")
+            .expect("channel closed");
+        assert_eq!(
+            received, finalized,
+            "first frame on the server side must be the Finalized sentinel"
+        );
+
+        // No further frame should arrive (channel either silent or closed).
+        let next =
+            tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv_async()).await;
+        if let Ok(Ok(extra)) = next {
+            assert_ne!(
+                extra, heartbeat,
+                "heartbeat queued behind Finalized must not reach the server"
+            );
+            assert_ne!(
+                extra.as_slice(),
+                crate::streaming::sender::cached_dropped().as_slice(),
+                "server must not inject Dropped after Finalized"
+            );
+        }
+        // Ok(Err(_)) (channel closed) and Err(_) (timeout) are both fine.
     }
 }

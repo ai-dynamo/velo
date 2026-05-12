@@ -51,6 +51,12 @@ pub enum MpscAnchorAttachResponse {
         heartbeat_interval_ms: u64,
         /// Newly allocated sender-id within the anchor's MPSC set.
         sender_id: u64,
+        /// Receiver-allocated routing slot id; see
+        /// [`crate::streaming::control::AnchorAttachResponse::Ok`] for
+        /// rationale. `#[serde(default)]` for backwards compatibility with
+        /// senders that haven't been updated.
+        #[serde(default)]
+        routing_session_id: u64,
     },
     Err {
         reason: String,
@@ -203,7 +209,19 @@ pub fn create_mpsc_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::
                 };
 
                 // Step 2: async bind outside the shard lock.
-                let transport_rx = match manager.transport.bind(local_id, req.session_id).await {
+                //
+                // Allocate a receiver-side routing_session_id rather than
+                // reusing req.session_id (sender's local stream counter):
+                // two MPSC senders from different workers both start at 1
+                // and would otherwise collide on the same `(local_id,
+                // session_id)` transport routing slot. See
+                // [`crate::streaming::AnchorManager::next_routing_session_id`].
+                let routing_session_id = manager
+                    .next_routing_session_id
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                let transport_rx = match manager.transport.bind(local_id, routing_session_id).await
+                {
                     Ok(rx) => rx,
                     Err(e) => {
                         return Ok(MpscAnchorAttachResponse::Err {
@@ -271,6 +289,7 @@ pub fn create_mpsc_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::
                     streaming_transport_key,
                     heartbeat_interval_ms: heartbeat_interval.as_millis() as u64,
                     sender_id,
+                    routing_session_id,
                 })
             }
         },

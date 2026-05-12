@@ -437,4 +437,16 @@ mod tests {
         let entry = deserialized.worker_address().get_entry("endpoint").unwrap();
         assert_eq!(entry, Some(Bytes::from_static(b"tcp://127.0.0.1:5555")));
     }
+
+    #[test]
+    fn test_worker_address_empty() {
+        let empty = WorkerAddress::empty();
+        // get_entry on any key returns Ok(None).
+        assert!(empty.get_entry("anything").unwrap().is_none());
+        // available_transports decodes to an empty list.
+        assert!(empty.available_transports().unwrap().is_empty());
+        // Two empties round-trip equal (deterministic encoding).
+        assert_eq!(empty, WorkerAddress::empty());
+        assert_eq!(empty.checksum(), WorkerAddress::empty().checksum());
+    }
 }

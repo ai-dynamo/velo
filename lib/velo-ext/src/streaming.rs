@@ -135,7 +135,48 @@ pub trait FrameTransport: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::id::InstanceId;
+    use futures::FutureExt;
 
     /// Compile-time proof that [`FrameTransport`] is object-safe.
     fn _assert_object_safe(_transport: &dyn FrameTransport) {}
+
+    /// A minimal `FrameTransport` impl that exercises the trait's default
+    /// `register()` no-op. The other methods are stubs; the point is purely
+    /// to give the default body coverage.
+    struct DefaultRegisterTransport;
+
+    impl FrameTransport for DefaultRegisterTransport {
+        fn key(&self) -> TransportKey {
+            TransportKey::new("default-register-test")
+        }
+        fn address(&self) -> WorkerAddress {
+            WorkerAddress::empty()
+        }
+        fn bind(
+            &self,
+            _anchor_id: u64,
+            _session_id: u64,
+        ) -> BoxFuture<'_, Result<flume::Receiver<Vec<u8>>>> {
+            async { Err(anyhow::anyhow!("bind stub")) }.boxed()
+        }
+        fn connect(
+            &self,
+            _peer: WorkerId,
+            _anchor_id: u64,
+            _session_id: u64,
+        ) -> BoxFuture<'_, Result<flume::Sender<Vec<u8>>>> {
+            async { Err(anyhow::anyhow!("connect stub")) }.boxed()
+        }
+    }
+
+    #[test]
+    fn default_register_returns_ok() {
+        // The trait-default `register` must accept any PeerInfo and return
+        // Ok. Used by transports that piggyback on a higher layer (e.g.,
+        // VeloFrameTransport on the messenger) and need no per-peer cache.
+        let transport = DefaultRegisterTransport;
+        let peer = PeerInfo::new(InstanceId::new_v4(), WorkerAddress::empty());
+        assert!(transport.register(&peer).is_ok());
+    }
 }

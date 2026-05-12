@@ -3,10 +3,12 @@
 
 //! Linux RSS sampler with a linear-regression slope check.
 //!
-//! Runs only on Linux. Samples `/proc/self/statm` every `step`; once the
-//! sample window is long enough, fits a least-squares line through the
-//! second half of the samples and asserts `slope_bytes_per_sec < threshold`.
-//! Skipped on short runs — the slope is too noisy on <60 s windows.
+//! Runs only on Linux. Samples `/proc/self/status` every `step` and reads the
+//! `VmRSS` field (already in kB) so we don't depend on a hardcoded page-size
+//! assumption — 4K/16K/64K page kernels all work. Once the sample window is
+//! long enough, fits a least-squares line through the second half of the
+//! samples and asserts `slope_bytes_per_sec < threshold`. Skipped on short
+//! runs — the slope is too noisy on <60 s windows.
 
 use std::time::{Duration, Instant};
 
@@ -44,8 +46,26 @@ pub fn spawn(
 
         let start = Instant::now();
         let mut samples: Vec<(f64, u64)> = Vec::new();
+        let mut warned = false;
         loop {
-            let kb = read_rss_kb().unwrap_or(0);
+            let kb = match read_rss_kb() {
+                Some(v) => v,
+                None => {
+                    // Only warn once per sampler run — non-Linux or a malformed
+                    // /proc/self/status would otherwise spam the log every
+                    // `step`. The slope check uses these zeros so a soak that
+                    // can't read RSS will report slope=0 (i.e. pass) rather
+                    // than silently mislead.
+                    if !warned {
+                        tracing::warn!(
+                            "rss sampler: read_rss_kb() returned None (failed to read /proc/self/status \
+                             VmRSS); recording 0 and continuing"
+                        );
+                        warned = true;
+                    }
+                    0
+                }
+            };
             samples.push((start.elapsed().as_secs_f64(), kb));
             tokio::select! {
                 _ = cancel.cancelled() => break,
@@ -54,7 +74,17 @@ pub fn spawn(
         }
 
         // Final sample so end_kb is fresh.
-        let kb = read_rss_kb().unwrap_or(0);
+        let kb = match read_rss_kb() {
+            Some(v) => v,
+            None => {
+                if !warned {
+                    tracing::warn!(
+                        "rss sampler: final read_rss_kb() returned None; recording 0"
+                    );
+                }
+                0
+            }
+        };
         samples.push((start.elapsed().as_secs_f64(), kb));
 
         if samples.is_empty() {

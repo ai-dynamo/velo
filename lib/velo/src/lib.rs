@@ -373,16 +373,38 @@ impl Velo {
             return messenger_peer;
         }
         let mut builder = crate::transports::address::WorkerAddressBuilder::new();
-        if builder.merge(messenger_peer.worker_address()).is_err()
-            || builder.merge(&stream_addr).is_err()
-        {
-            // Key collision (shouldn't happen with the stream-key naming
-            // convention) — fall back to the messenger-only address.
+        if let Err(e) = builder.merge(messenger_peer.worker_address()) {
+            tracing::warn!(
+                instance_id = %messenger_peer.instance_id(),
+                error = %e,
+                "peer_info: failed to merge messenger WorkerAddress into builder; \
+                 falling back to messenger-only PeerInfo (streaming peers will not \
+                 see this worker's streaming endpoint)"
+            );
+            return messenger_peer;
+        }
+        if let Err(e) = builder.merge(&stream_addr) {
+            tracing::warn!(
+                instance_id = %messenger_peer.instance_id(),
+                streaming_key = %self.stream_transport.key(),
+                error = %e,
+                "peer_info: failed to merge streaming WorkerAddress into builder; \
+                 falling back to messenger-only PeerInfo (likely a key collision \
+                 with a messenger transport key)"
+            );
             return messenger_peer;
         }
         match builder.build() {
             Ok(merged) => PeerInfo::new(messenger_peer.instance_id(), merged),
-            Err(_) => messenger_peer,
+            Err(e) => {
+                tracing::warn!(
+                    instance_id = %messenger_peer.instance_id(),
+                    error = %e,
+                    "peer_info: WorkerAddressBuilder::build() failed; falling back \
+                     to messenger-only PeerInfo"
+                );
+                messenger_peer
+            }
         }
     }
 

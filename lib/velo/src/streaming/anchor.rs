@@ -638,6 +638,15 @@ pub struct AnchorManager {
     #[builder(setter(skip), default = "AtomicU64::new(0)")]
     next_sender_stream_id: AtomicU64,
 
+    /// Receiver-allocated counter for transport routing session ids. Each
+    /// remote attach reserves a unique routing slot from this counter so the
+    /// `(anchor_id, session_id)` pair used by the transport layer cannot
+    /// collide across senders from different worker_ids (their local
+    /// `next_sender_stream_id` counters are independent and both start at 0).
+    /// See the cross-worker MPSC attach regression test for the bug class.
+    #[builder(setter(skip), default = "AtomicU64::new(0)")]
+    pub(crate) next_routing_session_id: AtomicU64,
+
     /// Sender-side registry: maps sender_stream_id -> SenderEntry.
     /// Shared with the _stream_cancel handler registered on this AnchorManager.
     /// Also accessed by StreamSender::Drop / finalize / detach for cleanup.
@@ -1070,14 +1079,25 @@ impl AnchorManager {
             crate::streaming::control::AnchorAttachResponse::Ok {
                 streaming_transport_key,
                 heartbeat_interval_ms,
+                routing_session_id,
             } => {
                 let (_, local_id) = handle.unpack();
 
                 // Resolve the local FrameTransport that matches the remote
                 // worker's bound streaming transport, then connect by WorkerId.
+                // Use the receiver-allocated routing_session_id so the
+                // transport-layer routing slot is unique across senders from
+                // different worker_ids (legacy senders set the field to 0 via
+                // serde-default and fall back to the collision-prone
+                // sender_stream_id).
+                let connect_session_id = if routing_session_id != 0 {
+                    routing_session_id
+                } else {
+                    sender_stream_id
+                };
                 let transport = self.resolve_transport(&streaming_transport_key)?;
                 let frame_tx = transport
-                    .connect(handle_worker_id, local_id, sender_stream_id)
+                    .connect(handle_worker_id, local_id, connect_session_id)
                     .await?;
 
                 // Register SenderEntry for _stream_cancel routing
@@ -1450,11 +1470,19 @@ impl AnchorManager {
                 streaming_transport_key,
                 heartbeat_interval_ms,
                 sender_id,
+                routing_session_id,
             } => {
                 let (_, local_id) = handle.unpack();
+                // See the SPSC remote attach above for routing_session_id
+                // rationale and the legacy-zero fallback.
+                let connect_session_id = if routing_session_id != 0 {
+                    routing_session_id
+                } else {
+                    sender_stream_id
+                };
                 let transport = self.resolve_transport(&streaming_transport_key)?;
                 let frame_tx = transport
-                    .connect(handle_worker_id, local_id, sender_stream_id)
+                    .connect(handle_worker_id, local_id, connect_session_id)
                     .await?;
 
                 let sender_entry = crate::streaming::control::SenderEntry {

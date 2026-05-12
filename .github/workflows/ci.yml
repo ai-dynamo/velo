@@ -141,6 +141,10 @@ jobs:
       contents: read
     env:
       RUST_LOG: error
+      # Mold linker: --all-features pulls in libzmq + tonic; the default ld
+      # can OOM on GitHub runners during the link step. Mirrors the
+      # RUSTFLAGS used by test / coverage / examples jobs.
+      RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
     timeout-minutes: 5
     steps:
     - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 #v6.0.1
