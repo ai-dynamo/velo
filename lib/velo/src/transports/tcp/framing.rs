@@ -15,7 +15,7 @@ use bytes::{Buf, Bytes, BytesMut};
 use std::io;
 use std::io::Write;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tokio_util::codec::Decoder;
+use tokio_util::codec::{Decoder, Framed};
 
 use velo_ext::MessageType;
 
@@ -27,6 +27,71 @@ const DEFAULT_MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 
 /// Minimum frame header size (version + type + 2 lengths)
 const MIN_HEADER_SIZE: usize = 2 + 1 + 4 + 4; // 11 bytes
+
+/// Threshold below which encode_frame coalesces preamble + header + payload into
+/// a single buffer and emits one write_all. Above this we keep the three-segment
+/// path so the extra memcpy doesn't dominate large payloads. 64 KB sits well
+/// under the typical kernel send buffer (~128 KB) so the coalesced write almost
+/// always lands in a single syscall.
+const COALESCE_THRESHOLD: usize = 64 * 1024;
+
+/// Fallback shrink threshold (8 MB) when neither the builder nor an env var
+/// supplies one. Shared across the TCP / UDS / streaming TCP code paths that
+/// all decode through this codec via `tokio_util::codec::Framed`.
+pub(crate) const DEFAULT_SHRINK_THRESHOLD: usize = 8 * 1024 * 1024;
+
+/// Capacity a per-connection read buffer is reset to after exceeding
+/// [`DEFAULT_SHRINK_THRESHOLD`] (or a transport-specific threshold) and
+/// emptying. Sized so a few typical frames still fit without re-growing.
+pub(crate) const SHRINK_RESET_CAPACITY: usize = 256 * 1024;
+
+/// Pure parser for shrink-threshold env values. Returns
+/// [`DEFAULT_SHRINK_THRESHOLD`] when input is None, empty, or unparseable.
+/// Shared by every transport that wires an env override.
+pub(crate) fn parse_shrink_threshold(raw: Option<&str>) -> usize {
+    raw.and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_SHRINK_THRESHOLD)
+}
+
+/// Reclaim memory if a one-time large frame inflated the read buffer.
+///
+/// Replaces the underlying `BytesMut` with a fresh [`SHRINK_RESET_CAPACITY`]-
+/// sized buffer when it has emptied after a one-time growth. Called after each
+/// successfully decoded frame from a [`Framed<T, TcpFrameCodec>`] — TCP, UDS,
+/// and the streaming TCP pump all share this codec and the same buffer-growth
+/// pattern.
+///
+/// `last_frame_total_size` is the header + payload byte count of the frame
+/// just decoded (the preamble's 11 bytes are negligible and can be omitted).
+/// It's used to skip reclamation under sustained large traffic where shrinking
+/// would just be undone by the next frame.
+///
+/// The four conditions together prevent per-frame reallocation churn:
+///   1. `buf.is_empty()` — never lose bytes belonging to the next frame.
+///   2. `buf.capacity() > threshold` — user has opted in to reclaiming this
+///      buffer size.
+///   3. `buf.capacity() > 2 * SHRINK_RESET_CAPACITY` — the realloc actually
+///      saves meaningful memory. Stops a small user-configured `threshold`
+///      from triggering pointless 256 KB → 256 KB reallocations.
+///   4. `last_frame_total_size * 2 <= buf.capacity()` — the most recent
+///      frame was small enough relative to current capacity that resetting
+///      won't be immediately undone by the next frame. Avoids churn when a
+///      caller sustains large frames above the threshold.
+#[inline]
+pub(crate) fn maybe_shrink_read_buffer<T>(
+    framed: &mut Framed<T, TcpFrameCodec>,
+    threshold: usize,
+    last_frame_total_size: usize,
+) {
+    let buf = framed.read_buffer_mut();
+    if buf.is_empty()
+        && buf.capacity() > threshold
+        && buf.capacity() > 2 * SHRINK_RESET_CAPACITY
+        && last_frame_total_size.saturating_mul(2) <= buf.capacity()
+    {
+        *buf = BytesMut::with_capacity(SHRINK_RESET_CAPACITY);
+    }
+}
 
 /// Zero-copy frame decoder for TCP transport
 ///
@@ -128,12 +193,14 @@ impl TcpFrameCodec {
         })
     }
 
-    /// Encode and write a frame asynchronously
+    /// Encode and write a frame asynchronously.
     ///
-    /// Uses `write_all()` for each segment to handle partial writes correctly.
-    /// TCP `write_vectored()` doesn't guarantee writing all bytes in one call —
-    /// for payloads exceeding the kernel send buffer (~128KB), it returns a short
-    /// write count. Using `write_all()` per segment ensures correctness for all sizes.
+    /// Small frames (header + payload <= COALESCE_THRESHOLD) are packed into a
+    /// single buffer and written with one `write_all` — 3× fewer syscalls per
+    /// frame on the hot path for typical control/event traffic. Above the
+    /// threshold the three-segment path avoids the extra memcpy for large
+    /// payloads. `write_all` is used in both cases because TCP
+    /// `write_vectored()` is allowed to short-write past ~128KB.
     #[inline]
     pub async fn encode_frame<W: AsyncWrite + Unpin>(
         writer: &mut W,
@@ -142,15 +209,22 @@ impl TcpFrameCodec {
         payload: &[u8],
     ) -> tokio::io::Result<()> {
         let preamble = Self::build_preamble(msg_type, header.len() as u32, payload.len() as u32)?;
-        writer.write_all(&preamble).await?;
-        writer.write_all(header).await?;
-        writer.write_all(payload).await?;
+        if header.len() + payload.len() <= COALESCE_THRESHOLD {
+            let mut buf = BytesMut::with_capacity(MIN_HEADER_SIZE + header.len() + payload.len());
+            buf.extend_from_slice(&preamble);
+            buf.extend_from_slice(header);
+            buf.extend_from_slice(payload);
+            writer.write_all(&buf).await?;
+        } else {
+            writer.write_all(&preamble).await?;
+            writer.write_all(header).await?;
+            writer.write_all(payload).await?;
+        }
         Ok(())
     }
 
-    /// Encode and write a frame synchronously
-    ///
-    /// Uses `write_all()` for each segment to handle partial writes correctly.
+    /// Encode and write a frame synchronously. See [`encode_frame`] for the
+    /// coalescing rationale.
     #[inline]
     pub fn encode_frame_sync<W: Write>(
         writer: &mut W,
@@ -159,9 +233,17 @@ impl TcpFrameCodec {
         payload: &[u8],
     ) -> std::io::Result<()> {
         let preamble = Self::build_preamble(msg_type, header.len() as u32, payload.len() as u32)?;
-        writer.write_all(&preamble)?;
-        writer.write_all(header)?;
-        writer.write_all(payload)?;
+        if header.len() + payload.len() <= COALESCE_THRESHOLD {
+            let mut buf = BytesMut::with_capacity(MIN_HEADER_SIZE + header.len() + payload.len());
+            buf.extend_from_slice(&preamble);
+            buf.extend_from_slice(header);
+            buf.extend_from_slice(payload);
+            writer.write_all(&buf)?;
+        } else {
+            writer.write_all(&preamble)?;
+            writer.write_all(header)?;
+            writer.write_all(payload)?;
+        }
         Ok(())
     }
 
@@ -703,5 +785,134 @@ mod tests {
 
         // Both should produce identical output
         assert_eq!(sync_framed, async_framed);
+    }
+
+    /// Helper: build a Framed with a manually inflated read buffer to simulate
+    /// a one-time large frame having grown the buffer past `capacity_bytes`.
+    fn framed_with_grown_buffer(
+        capacity_bytes: usize,
+    ) -> Framed<tokio::io::DuplexStream, TcpFrameCodec> {
+        let (read_half, _write_half) = tokio::io::duplex(64);
+        let mut framed = Framed::new(read_half, TcpFrameCodec::new());
+        framed.read_buffer_mut().resize(capacity_bytes, 0);
+        framed.read_buffer_mut().clear(); // len=0, capacity retained
+        framed
+    }
+
+    #[tokio::test]
+    async fn test_maybe_shrink_resets_oversized_empty_buffer() {
+        let mut framed = framed_with_grown_buffer(2 * 1024 * 1024);
+        let pre_capacity = framed.read_buffer_mut().capacity();
+        assert!(pre_capacity > 2 * SHRINK_RESET_CAPACITY);
+        // last_frame was small relative to capacity → shrink applies.
+        maybe_shrink_read_buffer(&mut framed, 1024 * 1024, 1024);
+        let post_capacity = framed.read_buffer_mut().capacity();
+        assert!(
+            post_capacity < pre_capacity,
+            "expected capacity to drop: pre={} post={}",
+            pre_capacity,
+            post_capacity
+        );
+        assert_eq!(post_capacity, SHRINK_RESET_CAPACITY);
+    }
+
+    #[tokio::test]
+    async fn test_maybe_shrink_skips_when_not_empty() {
+        // The helper must not discard in-flight bytes belonging to the next frame.
+        let (read_half, _write_half) = tokio::io::duplex(64);
+        let mut framed = Framed::new(read_half, TcpFrameCodec::new());
+        framed.read_buffer_mut().resize(2 * 1024 * 1024, 0xAB);
+        let pre_capacity = framed.read_buffer_mut().capacity();
+        maybe_shrink_read_buffer(&mut framed, 1024 * 1024, 1024);
+        assert_eq!(framed.read_buffer_mut().capacity(), pre_capacity);
+    }
+
+    #[tokio::test]
+    async fn test_maybe_shrink_skips_under_threshold() {
+        let (read_half, _write_half) = tokio::io::duplex(64);
+        let mut framed = Framed::new(read_half, TcpFrameCodec::new());
+        // Default Framed buffer capacity is well under DEFAULT_SHRINK_THRESHOLD.
+        let pre_capacity = framed.read_buffer_mut().capacity();
+        maybe_shrink_read_buffer(&mut framed, DEFAULT_SHRINK_THRESHOLD, 1024);
+        assert_eq!(framed.read_buffer_mut().capacity(), pre_capacity);
+    }
+
+    /// Sustained large traffic: when the most recent frame is comparable in
+    /// size to current capacity, shrinking would just be undone by the next
+    /// frame. The helper must skip to avoid per-frame realloc churn.
+    #[tokio::test]
+    async fn test_maybe_shrink_skips_under_sustained_large_frames() {
+        let cap = 2 * 1024 * 1024;
+        let mut framed = framed_with_grown_buffer(cap);
+        let pre = framed.read_buffer_mut().capacity();
+        // last_frame_size * 2 > capacity → skip (don't churn).
+        maybe_shrink_read_buffer(&mut framed, 1024 * 1024, cap * 3 / 4);
+        assert_eq!(framed.read_buffer_mut().capacity(), pre);
+    }
+
+    /// Small user-configured threshold must not provoke reallocations when
+    /// the buffer is already close to (or below) the reset target. Without
+    /// the `capacity > 2 * SHRINK_RESET_CAPACITY` gate the helper would
+    /// repeatedly replace a 256 KB buffer with another 256 KB buffer.
+    #[tokio::test]
+    async fn test_maybe_shrink_skips_when_capacity_not_meaningfully_oversized() {
+        // Buffer slightly above SHRINK_RESET_CAPACITY but below 2× — savings
+        // are negligible and re-growth on the next frame is likely.
+        let cap = SHRINK_RESET_CAPACITY + 4096;
+        let mut framed = framed_with_grown_buffer(cap);
+        let pre = framed.read_buffer_mut().capacity();
+        maybe_shrink_read_buffer(&mut framed, 1024, 100); // small threshold, tiny frame
+        assert_eq!(framed.read_buffer_mut().capacity(), pre);
+    }
+
+    #[test]
+    fn test_parse_shrink_threshold() {
+        // Pure parser exercised without touching the process env (which is
+        // not thread-safe and would race with parallel test execution).
+        assert_eq!(parse_shrink_threshold(Some("12345")), 12345);
+        assert_eq!(parse_shrink_threshold(Some("0")), 0);
+        assert_eq!(
+            parse_shrink_threshold(Some("not-a-number")),
+            DEFAULT_SHRINK_THRESHOLD
+        );
+        assert_eq!(parse_shrink_threshold(Some("")), DEFAULT_SHRINK_THRESHOLD);
+        assert_eq!(parse_shrink_threshold(None), DEFAULT_SHRINK_THRESHOLD);
+    }
+
+    /// The coalesced fast path (small frames) and the three-segment slow path
+    /// (large frames) must produce byte-identical wire output, and decode back
+    /// to the same (type, header, payload) tuple.
+    #[test]
+    fn test_coalesce_and_segmented_paths_agree() {
+        // Sizes chosen to straddle COALESCE_THRESHOLD (64 KB):
+        //   below: 100 B  → fast path
+        //   at:    threshold - HEADER_SIZE → fast path edge
+        //   above: threshold + 1 KB → slow path
+        let sizes = [
+            100usize,
+            COALESCE_THRESHOLD - 16,
+            COALESCE_THRESHOLD,
+            COALESCE_THRESHOLD + 1024,
+        ];
+        for total in sizes {
+            // Split total roughly half header / half payload.
+            let header_len = total / 2;
+            let payload_len = total - header_len;
+            let header: Vec<u8> = (0..header_len).map(|i| (i % 251) as u8).collect();
+            let payload: Vec<u8> = (0..payload_len).map(|i| (i % 253) as u8).collect();
+
+            let framed =
+                encode_frame_to_bytes_sync(MessageType::Message, &header, &payload).unwrap();
+            assert_eq!(framed.len(), MIN_HEADER_SIZE + header_len + payload_len);
+
+            // Roundtrip through the decoder.
+            let mut codec = TcpFrameCodec::new();
+            let mut buf = BytesMut::from(&framed[..]);
+            let (msg_type, decoded_header, decoded_payload) =
+                codec.decode(&mut buf).unwrap().unwrap();
+            assert_eq!(msg_type, MessageType::Message);
+            assert_eq!(&decoded_header[..], header.as_slice());
+            assert_eq!(&decoded_payload[..], payload.as_slice());
+        }
     }
 }

@@ -68,6 +68,10 @@ pub struct TcpTransport {
 
     // Optional shared metrics.
     metrics: OnceLock<std::sync::Arc<dyn velo_ext::TransportObservability>>,
+
+    // Listener read-buffer shrink threshold (bytes). Plumbed into TcpListener
+    // at start() time. Resolved from env or default in new().
+    shrink_threshold: usize,
 }
 
 /// Handle to a connection's writer task
@@ -121,6 +125,7 @@ impl TcpTransport {
             local_interfaces: OnceLock::new(),
             numa_hint,
             metrics: OnceLock::new(),
+            shrink_threshold: super::listener::default_shrink_threshold(),
         }
     }
 
@@ -377,6 +382,7 @@ impl Transport for TcpTransport {
                 .listener(listener)
                 .transport_key(self.key.as_str())
                 .metrics(self.metrics.get().cloned())
+                .shrink_threshold(self.shrink_threshold)
                 .build()?;
 
             rt.spawn(async move {
@@ -556,6 +562,8 @@ async fn connection_writer_inner(
 
     loop {
         let msg = tokio::select! {
+            // Prioritize cancellation so a hot send queue cannot starve shutdown.
+            biased;
             _ = cancel_token.cancelled() => break,
             res = rx.recv_async() => match res {
                 Ok(msg) => msg,
@@ -603,6 +611,7 @@ pub struct TcpTransportBuilder {
     listener: Option<std::net::TcpListener>,
     interface_filter: InterfaceFilter,
     numa_hint: Option<u32>,
+    shrink_threshold: Option<usize>,
 }
 
 impl TcpTransportBuilder {
@@ -616,6 +625,7 @@ impl TcpTransportBuilder {
             listener: None,
             interface_filter: InterfaceFilter::default(),
             numa_hint: None,
+            shrink_threshold: None,
         }
     }
 
@@ -654,6 +664,17 @@ impl TcpTransportBuilder {
     /// Callers typically resolve this via `dynamo_memory::numa::get_device_numa_node(gpu_id)`.
     pub fn numa_hint(mut self, node: u32) -> Self {
         self.numa_hint = Some(node);
+        self
+    }
+
+    /// Override the per-connection read-buffer shrink threshold (bytes).
+    ///
+    /// If a single oversized inbound frame causes the listener's `BytesMut`
+    /// read buffer to grow past this many bytes, the buffer will be reset back
+    /// to a small capacity the next time it fully drains. Defaults to 8 MB,
+    /// overridable at process start via `VELO_TCP_SHRINK_THRESHOLD`.
+    pub fn shrink_threshold(mut self, bytes: usize) -> Self {
+        self.shrink_threshold = Some(bytes);
         self
     }
 
@@ -722,7 +743,7 @@ impl TcpTransportBuilder {
         addr_builder.add_entry(key.clone(), encoded)?;
         let local_address = addr_builder.build()?;
 
-        Ok(TcpTransport::new(
+        let mut transport = TcpTransport::new(
             bind_addr,
             key,
             local_address,
@@ -730,7 +751,11 @@ impl TcpTransportBuilder {
             self.connect_timeout,
             listener,
             self.numa_hint,
-        ))
+        );
+        if let Some(t) = self.shrink_threshold {
+            transport.shrink_threshold = t;
+        }
+        Ok(transport)
     }
 }
 
@@ -1011,17 +1036,35 @@ mod tests {
         drop(stream);
         drop(listener);
 
-        // Send a message — the writer should hit a broken-pipe error
-        tx.send(SendTask {
-            msg_type: MessageType::Message,
-            header: Bytes::from_static(b"hdr"),
-            payload: Bytes::from_static(b"pay"),
-            on_error: Arc::new(NullErrorHandler),
-        })
-        .unwrap();
+        // Send messages until the writer's rx is dropped. A single small write
+        // can land entirely in the kernel send buffer before the peer's RST is
+        // observed; the EPIPE is then surfaced on the *next* write. We loop
+        // (with yields) so the broken-pipe path is exercised deterministically.
+        for _ in 0..256 {
+            if tx
+                .send(SendTask {
+                    msg_type: MessageType::Message,
+                    header: Bytes::from_static(b"hdr"),
+                    payload: Bytes::from_static(b"pay"),
+                    on_error: Arc::new(NullErrorHandler),
+                })
+                .is_err()
+            {
+                break; // writer's rx dropped — it has already exited
+            }
+            tokio::task::yield_now().await;
+        }
 
-        // Wait for writer task to finish
-        let _ = writer.await;
+        // Wait for writer task to finish, bounded so a stuck test fails loudly.
+        let join_result = tokio::time::timeout(Duration::from_secs(5), writer)
+            .await
+            .expect("writer task did not exit within 5s of peer disconnect")
+            .expect("writer task panicked");
+        // The writer returns Ok(()) once its inner loop has cleanly exited;
+        // a write error inside the loop is handled (logged + on_error) and
+        // doesn't propagate, so this assertion mostly guards against a future
+        // refactor that surfaces the error through the join.
+        join_result.expect("writer task returned an error");
 
         // The writer should have removed the stale entry from the map
         assert!(

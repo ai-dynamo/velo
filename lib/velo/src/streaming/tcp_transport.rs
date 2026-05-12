@@ -39,6 +39,7 @@ use std::time::Duration;
 use crate::transports::MessageType;
 use crate::transports::address::WorkerAddressBuilder;
 use crate::transports::tcp::TcpFrameCodec;
+use crate::transports::tcp::framing::{DEFAULT_SHRINK_THRESHOLD, maybe_shrink_read_buffer};
 use crate::transports::utils::interfaces::{
     InterfaceEndpoint, InterfaceFilter, parse_endpoints, resolve_advertise_endpoints,
     select_best_endpoint,
@@ -280,7 +281,8 @@ async fn pump_frames(
 
     while let Some(result) = framed.next().await {
         match result {
-            Ok((_msg_type, _header, payload)) => {
+            Ok((_msg_type, header, payload)) => {
+                let frame_size = header.len() + payload.len();
                 let payload_vec = payload.to_vec();
                 last_was_terminal = is_terminal_sentinel(&payload_vec);
                 // Try non-blocking first so we can record server-pump
@@ -304,6 +306,8 @@ async fn pump_frames(
                         break;
                     }
                 }
+
+                maybe_shrink_read_buffer(&mut framed, DEFAULT_SHRINK_THRESHOLD, frame_size);
             }
             Err(e) => {
                 tracing::warn!("TCP streaming read error: {}", e);

@@ -22,7 +22,17 @@ use crate::observability::{Direction, TransportRejection};
 
 use velo_ext::{MessageType, ShutdownState, TransportAdapter, TransportErrorHandler};
 
-use super::framing::TcpFrameCodec;
+use super::framing::{TcpFrameCodec, maybe_shrink_read_buffer, parse_shrink_threshold};
+
+/// Per-connection configuration handed to [`TcpListener::handle_connection`].
+struct ConnectionContext {
+    adapter: TransportAdapter,
+    error_handler: Arc<dyn TransportErrorHandler>,
+    shutdown_state: ShutdownState,
+    transport_key: String,
+    metrics: Option<std::sync::Arc<dyn velo_ext::TransportObservability>>,
+    shrink_threshold: usize,
+}
 
 /// Runtime configuration for the TCP listener
 pub enum RuntimeConfig {
@@ -47,6 +57,10 @@ pub struct TcpListener {
     listener: Option<std::net::TcpListener>,
     transport_key: String,
     metrics: Option<std::sync::Arc<dyn velo_ext::TransportObservability>>,
+    /// If the per-connection read buffer grows past this size, reset it back to
+    /// [`SHRINK_RESET_CAPACITY`] once it next empties. Bounds long-lived memory
+    /// after a single oversized frame.
+    shrink_threshold: usize,
 }
 
 impl TcpListener {
@@ -160,23 +174,17 @@ impl TcpListener {
                         Ok((stream, peer_addr)) => {
                             debug!("Accepted TCP connection from {}", peer_addr);
 
-                            let adapter = self.adapter.clone();
-                            let error_handler = self.error_handler.clone();
-                            let shutdown_state = self.shutdown_state.clone();
-                            let transport_key = self.transport_key.clone();
-                            let metrics = self.metrics.clone();
+                            let ctx = ConnectionContext {
+                                adapter: self.adapter.clone(),
+                                error_handler: self.error_handler.clone(),
+                                shutdown_state: self.shutdown_state.clone(),
+                                transport_key: self.transport_key.clone(),
+                                metrics: self.metrics.clone(),
+                                shrink_threshold: self.shrink_threshold,
+                            };
 
                             tokio::spawn(async move {
-                                if let Err(e) = Self::handle_connection(
-                                    stream,
-                                    peer_addr,
-                                    adapter,
-                                    error_handler,
-                                    shutdown_state,
-                                    transport_key,
-                                    metrics,
-                                )
-                                .await
+                                if let Err(e) = Self::handle_connection(stream, peer_addr, ctx).await
                                 {
                                     warn!("Error handling connection from {}: {}", peer_addr, e);
                                 }
@@ -201,12 +209,16 @@ impl TcpListener {
     async fn handle_connection(
         stream: TcpStream,
         peer_addr: SocketAddr,
-        adapter: TransportAdapter,
-        error_handler: Arc<dyn TransportErrorHandler>,
-        shutdown_state: ShutdownState,
-        transport_key: String,
-        metrics: Option<std::sync::Arc<dyn velo_ext::TransportObservability>>,
+        ctx: ConnectionContext,
     ) -> Result<()> {
+        let ConnectionContext {
+            adapter,
+            error_handler,
+            shutdown_state,
+            transport_key,
+            metrics,
+            shrink_threshold,
+        } = ctx;
         debug!("Configuring connection from {}", peer_addr);
 
         // Configure socket for high performance
@@ -246,6 +258,12 @@ impl TcpListener {
 
         loop {
             tokio::select! {
+                // Prioritize teardown so a saturated connection cannot starve shutdown.
+                biased;
+                _ = teardown_token.cancelled() => {
+                    debug!("Connection handler for {} torn down", peer_addr);
+                    break;
+                }
                 frame_result = framed.next() => {
                     match frame_result {
                         Some(Ok((msg_type, header, payload))) => {
@@ -276,6 +294,7 @@ impl TcpListener {
                                 continue;
                             }
 
+                            let frame_size = header.len() + payload.len();
                             // Route frame to appropriate stream based on type
                             if let Err(e) = Self::route_frame(
                                 msg_type,
@@ -293,6 +312,8 @@ impl TcpListener {
                                     msg_type, peer_addr, e
                                 );
                             }
+
+                            maybe_shrink_read_buffer(&mut framed, shrink_threshold, frame_size);
                         }
                         Some(Err(e)) => {
                             if let Some(metrics) = metrics.as_ref() {
@@ -307,10 +328,6 @@ impl TcpListener {
                             break;
                         }
                     }
-                }
-                _ = teardown_token.cancelled() => {
-                    debug!("Connection handler for {} torn down", peer_addr);
-                    break;
                 }
             }
         }
@@ -393,6 +410,7 @@ pub struct TcpListenerBuilder {
     listener: Option<std::net::TcpListener>,
     transport_key: Option<String>,
     metrics: Option<std::sync::Arc<dyn velo_ext::TransportObservability>>,
+    shrink_threshold: Option<usize>,
 }
 
 impl TcpListenerBuilder {
@@ -407,6 +425,7 @@ impl TcpListenerBuilder {
             listener: None,
             transport_key: None,
             metrics: None,
+            shrink_threshold: None,
         }
     }
 
@@ -476,6 +495,16 @@ impl TcpListenerBuilder {
         self
     }
 
+    /// Override the read-buffer shrink threshold (default 8 MB).
+    ///
+    /// When a per-connection read buffer's capacity grows past this many bytes,
+    /// it will be reset back to a small capacity the next time it drains. This
+    /// bounds long-lived memory after a single oversized frame.
+    pub fn shrink_threshold(mut self, bytes: usize) -> Self {
+        self.shrink_threshold = Some(bytes);
+        self
+    }
+
     /// Build the TcpListener
     pub fn build(self) -> Result<TcpListener> {
         let bind_addr = self
@@ -501,8 +530,18 @@ impl TcpListenerBuilder {
             listener: self.listener,
             transport_key: self.transport_key.unwrap_or_else(|| "tcp".to_string()),
             metrics: self.metrics,
+            shrink_threshold: self
+                .shrink_threshold
+                .unwrap_or_else(default_shrink_threshold),
         })
     }
+}
+
+/// Resolve the default read-buffer shrink threshold for the TCP listener
+/// from `VELO_TCP_SHRINK_THRESHOLD` (in bytes), falling back to the codec-
+/// level default.
+pub(super) fn default_shrink_threshold() -> usize {
+    parse_shrink_threshold(std::env::var("VELO_TCP_SHRINK_THRESHOLD").ok().as_deref())
 }
 
 impl Default for TcpListenerBuilder {

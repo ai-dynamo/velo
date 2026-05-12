@@ -22,6 +22,23 @@ use crate::observability::{Direction, TransportRejection};
 use velo_ext::{MessageType, ShutdownState, TransportAdapter, TransportErrorHandler};
 
 use crate::transports::tcp::TcpFrameCodec;
+use crate::transports::tcp::framing::{maybe_shrink_read_buffer, parse_shrink_threshold};
+
+/// Per-connection configuration handed to [`UdsListener::handle_connection`].
+struct UdsConnectionContext {
+    adapter: TransportAdapter,
+    error_handler: Arc<dyn TransportErrorHandler>,
+    shutdown_state: ShutdownState,
+    transport_key: String,
+    metrics: Option<std::sync::Arc<dyn velo_ext::TransportObservability>>,
+    shrink_threshold: usize,
+}
+
+/// Resolve the UDS listener shrink threshold from `VELO_UDS_SHRINK_THRESHOLD`
+/// (in bytes), falling back to the codec-level default.
+pub(super) fn default_shrink_threshold() -> usize {
+    parse_shrink_threshold(std::env::var("VELO_UDS_SHRINK_THRESHOLD").ok().as_deref())
+}
 
 /// UDS listener for ActiveMessage transport
 ///
@@ -36,6 +53,10 @@ pub struct UdsListener {
     shutdown_state: ShutdownState,
     transport_key: String,
     metrics: Option<std::sync::Arc<dyn velo_ext::TransportObservability>>,
+    /// If the per-connection `Framed` read buffer grows past this many bytes,
+    /// it is reset to a small fresh `BytesMut` the next time it fully drains.
+    /// Bounds long-lived memory after a single oversized frame.
+    shrink_threshold: usize,
 }
 
 /// UDS listener that has been bound to a socket path, ready to accept connections.
@@ -50,6 +71,7 @@ pub struct BoundUdsListener {
     listener: TokioUnixListener,
     transport_key: String,
     metrics: Option<std::sync::Arc<dyn velo_ext::TransportObservability>>,
+    shrink_threshold: usize,
 }
 
 impl UdsListener {
@@ -75,6 +97,7 @@ impl UdsListener {
             listener,
             transport_key: self.transport_key,
             metrics: self.metrics,
+            shrink_threshold: self.shrink_threshold,
         })
     }
 
@@ -84,14 +107,16 @@ impl UdsListener {
     }
 
     /// Handle a single UDS connection
-    async fn handle_connection(
-        stream: UnixStream,
-        adapter: TransportAdapter,
-        error_handler: Arc<dyn TransportErrorHandler>,
-        shutdown_state: ShutdownState,
-        transport_key: String,
-        metrics: Option<std::sync::Arc<dyn velo_ext::TransportObservability>>,
-    ) -> Result<()> {
+    async fn handle_connection(stream: UnixStream, ctx: UdsConnectionContext) -> Result<()> {
+        let UdsConnectionContext {
+            adapter,
+            error_handler,
+            shutdown_state,
+            transport_key,
+            metrics,
+            shrink_threshold,
+        } = ctx;
+
         debug!("Configuring UDS connection");
 
         // Create framed stream with zero-copy codec (same as TCP)
@@ -102,6 +127,12 @@ impl UdsListener {
 
         loop {
             tokio::select! {
+                // Prioritize teardown so a saturated connection cannot starve shutdown.
+                biased;
+                _ = teardown_token.cancelled() => {
+                    debug!("UDS connection handler torn down");
+                    break;
+                }
                 frame_result = framed.next() => {
                     match frame_result {
                         Some(Ok((msg_type, header, payload))) => {
@@ -131,6 +162,7 @@ impl UdsListener {
                                 continue;
                             }
 
+                            let frame_size = header.len() + payload.len();
                             if let Err(e) = Self::route_frame(
                                 msg_type,
                                 header,
@@ -147,6 +179,8 @@ impl UdsListener {
                                     msg_type, e
                                 );
                             }
+
+                            maybe_shrink_read_buffer(&mut framed, shrink_threshold, frame_size);
                         }
                         Some(Err(e)) => {
                             if let Some(metrics) = metrics.as_ref() {
@@ -160,10 +194,6 @@ impl UdsListener {
                             break;
                         }
                     }
-                }
-                _ = teardown_token.cancelled() => {
-                    debug!("UDS connection handler torn down");
-                    break;
                 }
             }
         }
@@ -233,28 +263,28 @@ impl BoundUdsListener {
 
         loop {
             tokio::select! {
+                // Prioritize teardown so the accept loop exits promptly under shutdown.
+                biased;
+                _ = teardown_token.cancelled() => {
+                    info!("UDS listener shutting down (teardown)");
+                    break;
+                }
                 accept_result = self.listener.accept() => {
                     match accept_result {
                         Ok((stream, _addr)) => {
                             debug!("Accepted UDS connection");
 
-                            let adapter = self.adapter.clone();
-                            let error_handler = self.error_handler.clone();
-                            let shutdown_state = self.shutdown_state.clone();
-                            let transport_key = self.transport_key.clone();
-                            let metrics = self.metrics.clone();
+                            let ctx = UdsConnectionContext {
+                                adapter: self.adapter.clone(),
+                                error_handler: self.error_handler.clone(),
+                                shutdown_state: self.shutdown_state.clone(),
+                                transport_key: self.transport_key.clone(),
+                                metrics: self.metrics.clone(),
+                                shrink_threshold: self.shrink_threshold,
+                            };
 
                             tokio::spawn(async move {
-                                if let Err(e) = UdsListener::handle_connection(
-                                    stream,
-                                    adapter,
-                                    error_handler,
-                                    shutdown_state,
-                                    transport_key,
-                                    metrics,
-                                )
-                                .await
-                                {
+                                if let Err(e) = UdsListener::handle_connection(stream, ctx).await {
                                     warn!("Error handling UDS connection: {}", e);
                                 }
                             });
@@ -263,10 +293,6 @@ impl BoundUdsListener {
                             error!("Failed to accept UDS connection: {}", e);
                         }
                     }
-                }
-                _ = teardown_token.cancelled() => {
-                    info!("UDS listener shutting down (teardown)");
-                    break;
                 }
             }
         }
@@ -286,6 +312,7 @@ pub struct UdsListenerBuilder {
     shutdown_state: Option<ShutdownState>,
     transport_key: Option<String>,
     metrics: Option<std::sync::Arc<dyn velo_ext::TransportObservability>>,
+    shrink_threshold: Option<usize>,
 }
 
 impl UdsListenerBuilder {
@@ -298,6 +325,7 @@ impl UdsListenerBuilder {
             shutdown_state: None,
             transport_key: None,
             metrics: None,
+            shrink_threshold: None,
         }
     }
 
@@ -340,6 +368,13 @@ impl UdsListenerBuilder {
         self
     }
 
+    /// Override the read-buffer shrink threshold (default resolves from
+    /// `VELO_UDS_SHRINK_THRESHOLD`, falling back to the codec-level default).
+    pub fn shrink_threshold(mut self, bytes: usize) -> Self {
+        self.shrink_threshold = Some(bytes);
+        self
+    }
+
     /// Build the UdsListener
     pub fn build(self) -> Result<UdsListener> {
         let socket_path = self
@@ -360,6 +395,9 @@ impl UdsListenerBuilder {
             shutdown_state,
             transport_key: self.transport_key.unwrap_or_else(|| "uds".to_string()),
             metrics: self.metrics,
+            shrink_threshold: self
+                .shrink_threshold
+                .unwrap_or_else(default_shrink_threshold),
         })
     }
 }
