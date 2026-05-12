@@ -2733,7 +2733,6 @@ dependencies = [
  "futures",
  "hdrhistogram",
  "humantime",
- "parking_lot",
  "prometheus",
  "rmp-serde",
  "serde",
@@ -2743,7 +2742,6 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "velo",
- "velo-ext",
 ]
 
 [[package]]

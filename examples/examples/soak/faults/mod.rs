@@ -34,7 +34,10 @@ impl Dice {
         if self.period == 0 {
             return false;
         }
-        let n = self.counter.fetch_add(1, Ordering::Relaxed);
+        // fetch_add returns the pre-increment value; use the post-increment
+        // value so the first hit lands on the configured period instead of
+        // immediately (counter starts at 0).
+        let n = self.counter.fetch_add(1, Ordering::Relaxed) + 1;
         n.is_multiple_of(self.period)
     }
 }

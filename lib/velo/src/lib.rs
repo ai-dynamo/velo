@@ -430,15 +430,29 @@ impl Velo {
     /// streaming transport, so each can extract its own entry from the peer's
     /// [`WorkerAddress`] and cache the resolved endpoint.
     pub fn register_peer(&self, peer_info: PeerInfo) -> Result<()> {
-        // Streaming-transport register is best-effort: a peer that does not
-        // advertise a streaming entry (e.g., VeloFrameTransport on the other
-        // side) is logged at debug level rather than treated as a hard error.
-        if let Err(e) = self.stream_transport.register(&peer_info) {
-            tracing::debug!(
-                peer = %peer_info.worker_id(),
-                error = %e,
-                "streaming transport register: peer has no matching streaming endpoint"
-            );
+        // Streaming-transport register: skip the "no matching entry" case at
+        // debug (e.g., a messenger-only peer or a peer using a different
+        // streaming transport key). Any other failure -- WorkerAddress decode,
+        // endpoint parse, NUMA mismatch -- is a real problem and must propagate
+        // so it surfaces at register time, not at first attach.
+        let stream_key = self.stream_transport.key();
+        match peer_info.worker_address().get_entry(stream_key.as_str()) {
+            Ok(Some(_)) => {
+                self.stream_transport.register(&peer_info)?;
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    peer = %peer_info.worker_id(),
+                    streaming_key = %stream_key,
+                    "streaming transport register: peer has no matching streaming endpoint"
+                );
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "decoding peer WorkerAddress for streaming key '{}': {e}",
+                    stream_key
+                ));
+            }
         }
         self.messenger.register_peer(peer_info)
     }

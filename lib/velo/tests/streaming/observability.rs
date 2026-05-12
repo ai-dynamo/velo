@@ -111,17 +111,25 @@ async fn reader_pump_backpressure_ticks_under_consumer_starvation() {
         sender.finalize().ok();
     });
 
-    // Give the cascade time to walk: producer pumps, channels fill, the
-    // consumer-side reader_pump hits Full on the per-anchor channel and
-    // ticks the counter. 300ms is well under the 15s heartbeat watchdog
-    // window so we won't see watchdog firings in this test.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    let snap = MetricSnapshot::from_registry(&consumer_reg);
-    let reader_pump_bp = snap.counter("velo_streaming_reader_pump_backpressure_total", &[]);
+    // Poll for the counter rather than sleeping a fixed window: slow CI runners
+    // may need longer than 300ms for the cascade (producer -> transport ->
+    // reader_pump) to fill the bounded(256) anchor channel and tick this counter.
+    // Cap at 2s, which is still well under the 15s heartbeat watchdog window
+    // so this test never trips the watchdog.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut reader_pump_bp = 0.0;
+    let mut snap = MetricSnapshot::from_registry(&consumer_reg);
+    while std::time::Instant::now() < deadline {
+        snap = MetricSnapshot::from_registry(&consumer_reg);
+        reader_pump_bp = snap.counter("velo_streaming_reader_pump_backpressure_total", &[]);
+        if reader_pump_bp > 0.0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     assert!(
         reader_pump_bp > 0.0,
-        "reader_pump backpressure counter must tick when consumer can't keep up; got {reader_pump_bp}"
+        "reader_pump backpressure counter must tick when consumer can't keep up within 2s; got {reader_pump_bp}"
     );
 
     // Watchdog must NOT have fired yet (we slept 300ms; deadline is 15s).

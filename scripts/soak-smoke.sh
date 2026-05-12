@@ -28,7 +28,7 @@ ROUNDS=(tcp grpc)
 SCENARIOS="M1,M2,M3,M5,S1,S4,S6,R1,R2,R3,R4"
 
 cargo build --release --example soak \
-    --features grpc \
+    --all-features \
     --manifest-path examples/Cargo.toml
 
 for transport in "${ROUNDS[@]}"; do

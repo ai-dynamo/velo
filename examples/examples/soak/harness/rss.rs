@@ -99,37 +99,23 @@ pub fn spawn(
 
 #[cfg(target_os = "linux")]
 fn read_rss_kb() -> Option<u64> {
-    let s = std::fs::read_to_string("/proc/self/statm").ok()?;
-    // statm: size resident shared text lib data dt — all in pages.
-    let mut it = s.split_whitespace();
-    let _size = it.next()?;
-    let resident_pages: u64 = it.next()?.parse().ok()?;
-    let page_kb = page_size_kb()?;
-    Some(resident_pages * page_kb)
+    // /proc/self/status reports VmRSS already in kB, which sidesteps any
+    // hardcoded page-size assumption (4K/16K/64K kernels all work).
+    let s = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            // Format: "VmRSS:\t   12345 kB"
+            let mut it = rest.split_whitespace();
+            let n: u64 = it.next()?.parse().ok()?;
+            return Some(n);
+        }
+    }
+    None
 }
 
 #[cfg(not(target_os = "linux"))]
 fn read_rss_kb() -> Option<u64> {
     None
-}
-
-#[cfg(target_os = "linux")]
-fn page_size_kb() -> Option<u64> {
-    // SAFETY: sysconf is async-signal-safe and re-entrant.
-    let p = unsafe { libc_sysconf_pagesize() };
-    if p <= 0 {
-        None
-    } else {
-        Some((p as u64) / 1024)
-    }
-}
-
-#[cfg(target_os = "linux")]
-unsafe fn libc_sysconf_pagesize() -> i64 {
-    // Avoid pulling in libc as a dep — read /proc/self/auxv? No, simplest is
-    // to read from /proc/meminfo's PageSize? Not portable. Default to 4 KB,
-    // which matches every Linux configuration we care about.
-    4096
 }
 
 /// Least-squares slope of `(x_secs, y_kb)` samples.

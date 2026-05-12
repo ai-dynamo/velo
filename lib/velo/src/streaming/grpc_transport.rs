@@ -100,8 +100,8 @@ impl VeloStreaming for GrpcStreamingService {
         &self,
         request: Request<Streaming<FramedData>>,
     ) -> Result<Response<Self::StreamStream>, Status> {
-        let anchor_id = read_u64_meta(&request, ANCHOR_ID_META)?;
-        let session_id = read_u64_meta(&request, SESSION_ID_META)?;
+        let anchor_id = read_u64_meta(&request, ANCHOR_ID_META).map_err(|boxed| *boxed)?;
+        let session_id = read_u64_meta(&request, SESSION_ID_META).map_err(|boxed| *boxed)?;
 
         let frame_tx = match self.routing.remove(&(anchor_id, session_id)) {
             Some((_, tx)) => tx,
@@ -164,17 +164,25 @@ impl VeloStreaming for GrpcStreamingService {
     }
 }
 
-#[allow(clippy::result_large_err)] // tonic::Status is the standard return type for the gRPC handler.
-fn read_u64_meta<T>(request: &Request<T>, name: &str) -> Result<u64, Status> {
-    let meta = request
-        .metadata()
-        .get(name)
-        .ok_or_else(|| Status::invalid_argument(format!("missing {} metadata header", name)))?;
-    let s = meta
-        .to_str()
-        .map_err(|_| Status::invalid_argument(format!("{} metadata is not valid UTF-8", name)))?;
-    s.parse::<u64>()
-        .map_err(|_| Status::invalid_argument(format!("{} is not a valid u64", name)))
+fn read_u64_meta<T>(request: &Request<T>, name: &str) -> Result<u64, Box<Status>> {
+    let meta = request.metadata().get(name).ok_or_else(|| {
+        Box::new(Status::invalid_argument(format!(
+            "missing {} metadata header",
+            name
+        )))
+    })?;
+    let s = meta.to_str().map_err(|_| {
+        Box::new(Status::invalid_argument(format!(
+            "{} metadata is not valid UTF-8",
+            name
+        )))
+    })?;
+    s.parse::<u64>().map_err(|_| {
+        Box::new(Status::invalid_argument(format!(
+            "{} is not a valid u64",
+            name
+        )))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -261,7 +269,7 @@ impl GrpcFrameTransport {
 
     /// Install a metrics handle. Called by the Velo builder before any
     /// `bind`/`connect`. No-op if already set.
-    pub fn set_metrics(&self, metrics: Arc<crate::observability::VeloMetrics>) {
+    pub(crate) fn set_metrics(&self, metrics: Arc<crate::observability::VeloMetrics>) {
         let _ = self.metrics.set(metrics);
     }
 
@@ -343,7 +351,14 @@ impl FrameTransport for GrpcFrameTransport {
         let routing = self.routing.clone();
         Box::pin(async move {
             let (frame_tx, frame_rx) = flume::bounded::<Vec<u8>>(4096);
-            routing.insert((anchor_id, session_id), frame_tx);
+            if routing.insert((anchor_id, session_id), frame_tx).is_some() {
+                tracing::warn!(
+                    anchor_id,
+                    session_id,
+                    "GrpcFrameTransport::bind overwrote an existing routing entry; \
+                     previous frame_tx dropped (consumer will see channel close)"
+                );
+            }
             Ok(frame_rx)
         })
     }
@@ -390,12 +405,16 @@ impl FrameTransport for GrpcFrameTransport {
                     .map_err(|_| anyhow!("failed to encode session_id as metadata"))?,
             );
 
-            let _response = client
+            let response = client
                 .stream(request)
                 .await
                 .map_err(|status| anyhow!("gRPC stream rejected: {}", status))?;
 
             tokio::spawn(async move {
+                // Hold the Response (and thus the underlying H2 bidi call) for as
+                // long as we are pumping frames; dropping it sends RST_STREAM and
+                // cancels the inbound side of the call.
+                let _response = response;
                 while let Ok(payload) = frame_rx.recv_async().await {
                     let framed = FramedData {
                         preamble: vec![],

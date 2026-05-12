@@ -321,7 +321,24 @@ pub(crate) async fn reader_pump(
                                  (saturation indicator: see velo_streaming_*_backpressure_total)"
                             );
                             let dropped_bytes = crate::streaming::sender::cached_dropped().clone();
-                            let _ = frame_tx.send_async(dropped_bytes).await;
+                            // Non-blocking: an anchor channel that is already
+                            // full when the watchdog fires would deadlock a
+                            // blocking await here -- registry cleanup and the
+                            // cancel_token would never run, leaking a dead
+                            // anchor. We accept that the consumer may see a
+                            // plain channel-close (EOF) instead of an explicit
+                            // SenderDropped in the saturated edge case; the
+                            // watchdog firing metric + the warn! above are the
+                            // authoritative signal for operators.
+                            if frame_tx.try_send(dropped_bytes).is_err() {
+                                tracing::warn!(
+                                    local_id,
+                                    "reader_pump: anchor channel saturated at watchdog-fire; \
+                                     Dropped sentinel could not be injected, consumer will see \
+                                     channel close (EOF) -- watchdog firing counter is the \
+                                     authoritative signal here"
+                                );
+                            }
                             // LIVE-02: Full anchor cleanup -- remove from registry
                             // so no stale entry remains (ANCR-04)
                             if let Some((_, entry)) = registry.remove(&local_id) {

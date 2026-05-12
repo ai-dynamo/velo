@@ -15,7 +15,6 @@ grpc = ["velo/grpc"]
 
 [dependencies]
 velo = { path = "../lib/velo", features = ["test-helpers"] }
-velo-ext = { path = "../lib/velo-ext" }
 
 anyhow = "1"
 bytes = "1"
@@ -32,7 +31,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 hdrhistogram = { version = "7", default-features = false }
 prometheus = "0.14"
-parking_lot = "0.12"
 crc32fast = "1"
 humantime = "2"
 

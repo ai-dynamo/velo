@@ -387,11 +387,12 @@ impl FrameTransport for VeloFrameTransport {
                         tracing::error!("_stream_data am_send failed: {}", e);
                         break;
                     }
-                    seq = seq.checked_add(1).ok_or(()).unwrap_or(0);
+                    // Saturating: 2^64 frames is unreachable in practice, but
+                    // wrapping to 0 would break the deliverer's monotonic-seq
+                    // assumption inside a session and silently corrupt ordering.
+                    seq = seq.saturating_add(1);
                 }
             });
-            // discard `_` lints
-            let _ = anyhow::Ok::<()>(());
             Ok(tx)
         })
     }

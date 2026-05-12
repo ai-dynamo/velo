@@ -271,7 +271,7 @@ jobs:
     runs-on: prod-velo-default-v1
     container:
       image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.3
-    needs: [fmt, clippy, deny, test, coverage, examples, semver]
+    needs: [fmt, clippy, deny, test, soak-smoke, coverage, examples, semver]
     if: always()
     steps:
     - name: Check all jobs

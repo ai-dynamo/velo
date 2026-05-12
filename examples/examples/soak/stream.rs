@@ -213,8 +213,9 @@ pub async fn run_s2_many_streams(ctx: &ScenarioCtx) -> Result<ScenarioReport> {
     let pair = fresh_pair(ctx, "s2").await?;
     let started = Instant::now();
     let anchors = ctx.tier.budget().stream_anchors;
-    // Cap per-stream frame count so total work is bounded.
-    let per_stream = (ctx.tier.budget().stream_frames / anchors as u64).max(64);
+    // Cap per-stream frame count so total work is bounded; clamp the divisor
+    // to >=1 so a tier with stream_anchors == 0 doesn't divide-by-zero.
+    let per_stream = (ctx.tier.budget().stream_frames / (anchors as u64).max(1)).max(64);
 
     let mut set: JoinSet<Result<()>> = JoinSet::new();
     for _ in 0..anchors {
@@ -507,9 +508,21 @@ pub async fn run_f2s_cancel_storm(ctx: &ScenarioCtx) -> Result<ScenarioReport> {
     }
     while joiners.join_next().await.is_some() {}
 
-    // Drain the anchor.
+    // Drain the anchor, bounded by a scenario-local timeout: if cancellation
+    // ever stops producing a terminal frame, surface that as "drain timed out"
+    // here while the stack is still warm rather than hanging the harness.
+    let drain_budget = std::time::Duration::from_secs(10);
     let mut stream = anchor;
-    while stream.next().await.is_some() {}
+    let drained = tokio::time::timeout(drain_budget, async {
+        while stream.next().await.is_some() {}
+    })
+    .await;
+    if drained.is_err() {
+        return Err(anyhow!(
+            "F2s post-cancel drain timed out after {:?}",
+            drain_budget
+        ));
+    }
     let _ = producer_task.await;
 
     drop(pair);

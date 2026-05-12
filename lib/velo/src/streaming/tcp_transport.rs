@@ -158,7 +158,7 @@ impl TcpFrameTransport {
 
     /// Install a metrics handle. Called by the Velo builder before any
     /// `bind`/`connect`. No-op if already set; safe to call multiple times.
-    pub fn set_metrics(&self, metrics: Arc<crate::observability::VeloMetrics>) {
+    pub(crate) fn set_metrics(&self, metrics: Arc<crate::observability::VeloMetrics>) {
         let _ = self.metrics.set(metrics);
     }
 
@@ -456,12 +456,33 @@ impl FrameTransport for TcpFrameTransport {
                 )
             })?;
 
-            let mut stream = TcpStream::connect(addr).await?;
+            // Bound the dial and handshake write so an unreachable / stalled
+            // peer surfaces as a fast `connect timed out` instead of hanging
+            // an attach for the full kernel SYN backoff or longer.
+            let mut stream = tokio::time::timeout(TOKEN_READ_TIMEOUT, TcpStream::connect(addr))
+                .await
+                .map_err(|_| {
+                    anyhow!(
+                        "TCP streaming: connect to peer {} ({}) timed out after {:?}",
+                        peer,
+                        addr,
+                        TOKEN_READ_TIMEOUT
+                    )
+                })??;
             configure_socket(&stream);
             let mut handshake = [0u8; 16];
             handshake[..8].copy_from_slice(&anchor_id.to_be_bytes());
             handshake[8..].copy_from_slice(&session_id.to_be_bytes());
-            stream.write_all(&handshake).await?;
+            tokio::time::timeout(TOKEN_READ_TIMEOUT, stream.write_all(&handshake))
+                .await
+                .map_err(|_| {
+                    anyhow!(
+                        "TCP streaming: handshake write to peer {} ({}) timed out after {:?}",
+                        peer,
+                        addr,
+                        TOKEN_READ_TIMEOUT
+                    )
+                })??;
 
             let (tx, rx) = flume::bounded::<Vec<u8>>(4096);
 
