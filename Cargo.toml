@@ -10,7 +10,7 @@ exclude = ["examples"]
 resolver = "3"
 
 [workspace.package]
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 description = "Velo Active Messenging Library"
 authors = ["NVIDIA Inc. <sw-dl-dynamo@nvidia.com>"]
@@ -20,8 +20,6 @@ repository = "https://github.com/ai-dynamo/velo.git"
 keywords = ["nvidia", "distributed"]
 
 [workspace.dependencies]
-# Local crates — only the two published surfaces remain after the fold.
-velo = { path = "lib/velo", version = "0.4.0" }
 # Exact-pin (`=`) is intentional: velo-ext is the published trait surface
 # external implementors compile against. A non-`=` requirement would let a
 # future "compatible" patch silently re-resolve downstream lockfiles, which

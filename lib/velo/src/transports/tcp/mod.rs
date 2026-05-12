@@ -10,7 +10,7 @@
 //! - Graceful shutdown with proper FIN handling
 //! - Keep-alive for dead connection detection
 
-mod framing;
+pub(crate) mod framing;
 mod listener;
 mod transport;
 

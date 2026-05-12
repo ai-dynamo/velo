@@ -594,6 +594,8 @@ async fn connection_writer_inner(
     // Main send loop: receive from flume, wrap in FramedData, send via mpsc.
     loop {
         let msg = tokio::select! {
+            // Prioritize cancellation so a hot send queue cannot starve shutdown.
+            biased;
             _ = cancel_token.cancelled() => break,
             res = rx.recv_async() => match res {
                 Ok(msg) => msg,

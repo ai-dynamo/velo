@@ -3,7 +3,7 @@
 
 [package]
 name = "velo"
-version = "0.4.0"
+version.workspace = true
 edition.workspace = true
 description = "Velo distributed-systems runtime: active messaging, peer discovery, streaming, rendezvous, and queue backends"
 authors.workspace = true
