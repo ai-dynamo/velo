@@ -502,6 +502,10 @@ pub struct VeloMetrics {
     streaming_anchor_operation_duration_seconds: HistogramVec,
     streaming_active_anchors: Gauge,
     streaming_backpressure_total: CounterVec,
+    streaming_reader_pump_backpressure_total: Counter,
+    streaming_server_pump_backpressure_total: Counter,
+    streaming_producer_send_backpressure_total: Counter,
+    streaming_heartbeat_watchdog_firings_total: Counter,
     // Rendezvous metrics
     rendezvous_operations_total: CounterVec,
     rendezvous_operation_duration_seconds: HistogramVec,
@@ -703,6 +707,47 @@ impl VeloMetrics {
                 &["transport_scheme"],
             )?,
         )?;
+        let streaming_reader_pump_backpressure_total = register_collector(
+            registry,
+            Counter::with_opts(Opts::new(
+                "velo_streaming_reader_pump_backpressure_total",
+                "Reader-pump forwards that hit the per-anchor frame channel's Full \
+                 branch and fell through to send_async. Leading indicator of \
+                 consumer-side saturation: this channel (bounded(256)) is the first \
+                 to fill in the saturation cascade.",
+            ))?,
+        )?;
+        let streaming_server_pump_backpressure_total = register_collector(
+            registry,
+            Counter::with_opts(Opts::new(
+                "velo_streaming_server_pump_backpressure_total",
+                "Server-side stream pump forwards that hit the bind-side frame \
+                 channel's Full branch (bounded(4096)) and fell through to send_async. \
+                 Ticks once the per-anchor channel is saturated and the transport-level \
+                 channel begins to fill.",
+            ))?,
+        )?;
+        let streaming_producer_send_backpressure_total = register_collector(
+            registry,
+            Counter::with_opts(Opts::new(
+                "velo_streaming_producer_send_backpressure_total",
+                "StreamSender::send calls that hit the connect-side channel's Full \
+                 branch (bounded(4096)) and fell through to send_async. Surfaces \
+                 producer-application visibility into the back-of-cascade backpressure \
+                 from a saturating consumer.",
+            ))?,
+        )?;
+        let streaming_heartbeat_watchdog_firings_total = register_collector(
+            registry,
+            Counter::with_opts(Opts::new(
+                "velo_streaming_heartbeat_watchdog_firings_total",
+                "Reader-pump heartbeat-watchdog firings: a session went \
+                 DETECTION_MULTIPLIER × heartbeat_deadline with no data or heartbeat \
+                 frames and was force-cleaned with a Dropped sentinel. Confirmed \
+                 saturation event — typically the lagging indicator of the cascade \
+                 surfaced by the *_backpressure_total counters above.",
+            ))?,
+        )?;
 
         // -- Rendezvous metrics --
         let rendezvous_operations_total = register_collector(
@@ -764,6 +809,10 @@ impl VeloMetrics {
             streaming_anchor_operation_duration_seconds,
             streaming_active_anchors,
             streaming_backpressure_total,
+            streaming_reader_pump_backpressure_total,
+            streaming_server_pump_backpressure_total,
+            streaming_producer_send_backpressure_total,
+            streaming_heartbeat_watchdog_firings_total,
             rendezvous_operations_total,
             rendezvous_operation_duration_seconds,
             rendezvous_bytes_total,
@@ -957,6 +1006,31 @@ impl VeloMetrics {
         self.streaming_backpressure_total
             .with_label_values(&[transport_scheme])
             .inc();
+    }
+
+    /// Record reader-pump backpressure: the per-anchor frame channel's
+    /// `try_send` returned `Full` and we fell through to `send_async`.
+    /// Leading indicator of consumer-side saturation.
+    pub(crate) fn record_reader_pump_backpressure(&self) {
+        self.streaming_reader_pump_backpressure_total.inc();
+    }
+
+    /// Record server-side stream pump backpressure: the bind-side frame
+    /// channel's `try_send` returned `Full`. Ticks once the per-anchor
+    /// channel is saturated and the transport-level channel is filling.
+    pub(crate) fn record_server_pump_backpressure(&self) {
+        self.streaming_server_pump_backpressure_total.inc();
+    }
+
+    /// Record producer-side send backpressure: a `StreamSender::send` saw
+    /// the connect-side channel `Full` and fell through to `send_async`.
+    pub(crate) fn record_producer_send_backpressure(&self) {
+        self.streaming_producer_send_backpressure_total.inc();
+    }
+
+    /// Record a heartbeat-watchdog firing in the reader pump.
+    pub(crate) fn record_heartbeat_watchdog_firing(&self) {
+        self.streaming_heartbeat_watchdog_firings_total.inc();
     }
 
     /// Record a rendezvous operation (register, get, release, etc.).

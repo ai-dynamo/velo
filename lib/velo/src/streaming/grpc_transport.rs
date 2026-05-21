@@ -1,43 +1,37 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! gRPC-based [`FrameTransport`] implementation backed by the VeloStreaming proto service.
+//! gRPC-based [`FrameTransport`] backed by the VeloStreaming proto service.
 //!
-//! [`GrpcFrameTransport`] hosts a single shared tonic server per instance with per-anchor
-//! routing via [`dashmap::DashMap`]. Each `bind()` call registers a routing slot; each
-//! `connect()` call opens a bidirectional gRPC stream and routes frames to the bound receiver.
+//! Hosts a single shared tonic server per instance with per-(anchor, session)
+//! routing via [`dashmap::DashMap`]. Each `bind()` call registers a routing
+//! slot keyed by `(anchor_id, session_id)`; each `connect()` call opens a
+//! bidirectional gRPC stream and routes frames to the bound receiver.
 //!
-//! # Endpoint Format
-//!
-//! ```text
-//! grpc://{ip}:{port}/{anchor_id}           (IPv4)
-//! grpc://[{ip}]:{port}/{anchor_id}         (IPv6)
-//! ```
-//!
-//! # Key Design Decisions
-//!
-//! - `new()` is **async** because it must `await` `TcpListener::bind` to capture the actual
-//!   OS-assigned port before returning. This is necessary so `bind()` can produce an endpoint
-//!   with the correct port. (`TcpFrameTransport::new` is async for the same reason.)
-//! - The tonic server is started eagerly inside `new()` via
-//!   `serve_with_incoming_shutdown(TcpListenerStream::new(listener), cancel.cancelled())`.
-//! - Exclusive-attach enforcement uses `DashMap::entry()` for atomic check-then-insert,
-//!   preventing TOCTOU races on the `active` map.
-//! - The server-side pump task injects `cached_dropped()` only when the stream ends without
-//!   a terminal sentinel, mirroring the TCP transport's drop-safety contract.
+//! Endpoint resolution: there is no endpoint string in the streaming attach
+//! handshake. The transport advertises its listener interface(s) via
+//! [`Self::address`]. Peers are registered via [`Self::register`], which
+//! caches a [`SocketAddr`] keyed by [`WorkerId`]. [`Self::connect`] looks up
+//! the cached SocketAddr and dials it.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use dashmap::DashMap;
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status, Streaming};
+use velo_ext::{PeerInfo, TransportKey, WorkerAddress, WorkerId};
 
 use crate::streaming::transport::FrameTransport;
+use crate::transports::address::WorkerAddressBuilder;
+use crate::transports::utils::interfaces::{
+    InterfaceEndpoint, InterfaceFilter, parse_endpoints, resolve_advertise_endpoints,
+    select_best_endpoint,
+};
 
 // ---------------------------------------------------------------------------
 // Proto-generated code
@@ -53,15 +47,18 @@ use proto::{
     velo_streaming_server::{VeloStreaming, VeloStreamingServer},
 };
 
+/// Default streaming-transport key for gRPC. Matches the `tcp-stream`
+/// convention so streaming entries don't collide with messenger entries in
+/// the WorkerAddress map.
+pub const GRPC_STREAM_KEY: &str = "grpc-stream";
+
+const ANCHOR_ID_META: &str = "x-anchor-id";
+const SESSION_ID_META: &str = "x-session-id";
+
 // ---------------------------------------------------------------------------
-// Terminal sentinel check (module-private, independent of tcp_transport copy)
+// Terminal sentinel check (module-private)
 // ---------------------------------------------------------------------------
 
-/// Check if the given raw frame bytes represent a terminal sentinel.
-///
-/// Terminal sentinels are Dropped, Detached, Finalized, and TransportError.
-/// We compare against cached sentinel bytes for the common cases and fall
-/// back to deserialization for TransportError (which carries a string payload).
 fn is_terminal_sentinel(bytes: &[u8]) -> bool {
     use crate::streaming::sender::{cached_detached, cached_dropped, cached_finalized};
 
@@ -72,7 +69,6 @@ fn is_terminal_sentinel(bytes: &[u8]) -> bool {
         return true;
     }
 
-    // TransportError carries a dynamic string, so we must try to deserialize
     if let Ok(frame) = rmp_serde::from_slice::<crate::streaming::frame::StreamFrame<()>>(bytes) {
         matches!(
             frame,
@@ -87,17 +83,13 @@ fn is_terminal_sentinel(bytes: &[u8]) -> bool {
 // GrpcStreamingService (server-side handler)
 // ---------------------------------------------------------------------------
 
-/// Server-side gRPC service implementation.
-///
-/// Routes incoming streams to bound anchor receivers via DashMap lookup.
-/// Enforces exclusive-attach: a second `Stream` call for the same anchor_id
-/// returns `Status::already_exists`.
+/// Routing key: (anchor_id, session_id) -> per-stream Sender.
+type SessionRouting = DashMap<(u64, u64), flume::Sender<Vec<u8>>>;
+
 #[derive(Clone)]
 struct GrpcStreamingService {
-    /// Routes anchor_id -> frame_tx for data delivery
-    routing: Arc<DashMap<u64, flume::Sender<Vec<u8>>>>,
-    /// Tracks actively-attached anchor_ids (exclusive-attach enforcement)
-    active: Arc<DashMap<u64, ()>>,
+    routing: Arc<SessionRouting>,
+    metrics: Arc<std::sync::OnceLock<Arc<crate::observability::VeloMetrics>>>,
 }
 
 #[tonic::async_trait]
@@ -108,144 +100,148 @@ impl VeloStreaming for GrpcStreamingService {
         &self,
         request: Request<Streaming<FramedData>>,
     ) -> Result<Response<Self::StreamStream>, Status> {
-        // Extract anchor_id from metadata header "x-anchor-id"
-        let anchor_id: u64 = {
-            let meta = request
-                .metadata()
-                .get("x-anchor-id")
-                .ok_or_else(|| Status::invalid_argument("missing x-anchor-id metadata header"))?;
-            let s = meta
-                .to_str()
-                .map_err(|_| Status::invalid_argument("x-anchor-id metadata is not valid UTF-8"))?;
-            s.parse::<u64>()
-                .map_err(|_| Status::invalid_argument("x-anchor-id is not a valid u64"))?
-        };
+        let anchor_id = read_u64_meta(&request, ANCHOR_ID_META).map_err(|boxed| *boxed)?;
+        let session_id = read_u64_meta(&request, SESSION_ID_META).map_err(|boxed| *boxed)?;
 
-        // Exclusive-attach: use DashMap::entry() for atomic check-then-insert
-        let entry = self.active.entry(anchor_id);
-        match entry {
-            dashmap::Entry::Occupied(_) => {
-                return Err(Status::already_exists(format!(
-                    "anchor_id {} is already attached",
-                    anchor_id
-                )));
-            }
-            dashmap::Entry::Vacant(v) => {
-                v.insert(());
-            }
-        }
-
-        // Look up routing slot (must exist -- bind() was called first)
-        let frame_tx = match self.routing.get(&anchor_id) {
-            Some(tx) => tx.clone(),
+        let frame_tx = match self.routing.remove(&(anchor_id, session_id)) {
+            Some((_, tx)) => tx,
             None => {
-                // Remove from active since we failed to route
-                self.active.remove(&anchor_id);
                 return Err(Status::not_found(format!(
-                    "no routing slot for anchor_id {}",
-                    anchor_id
+                    "no routing slot for (anchor_id={}, session_id={})",
+                    anchor_id, session_id
                 )));
             }
         };
 
-        // Spawn pump task: drain incoming FramedData stream -> frame_tx
-        let active_ref = self.active.clone();
         let mut stream = request.into_inner();
-
+        let metrics = self.metrics.get().cloned();
         tokio::spawn(async move {
             let mut last_was_terminal = false;
-
             while let Some(result) = stream.next().await {
                 match result {
                     Ok(framed) => {
                         let payload = framed.payload;
                         last_was_terminal = is_terminal_sentinel(&payload);
-                        if frame_tx.send_async(payload).await.is_err() {
-                            // Consumer dropped -- clean shutdown, no Dropped injection
-                            active_ref.remove(&anchor_id);
-                            return;
+                        // Try non-blocking first so we can record server-pump
+                        // backpressure on the slow path before falling through
+                        // to send_async. The bind-side frame channel is
+                        // bounded(4096); it begins to fill once reader_pump
+                        // has saturated the per-anchor channel above it.
+                        match frame_tx.try_send(payload) {
+                            Ok(()) => {}
+                            Err(flume::TrySendError::Full(b)) => {
+                                if let Some(m) = metrics.as_ref() {
+                                    m.record_server_pump_backpressure();
+                                }
+                                if frame_tx.send_async(b).await.is_err() {
+                                    return; // consumer dropped, no Dropped injection
+                                }
+                            }
+                            Err(flume::TrySendError::Disconnected(_)) => {
+                                return;
+                            }
                         }
                     }
                     Err(e) => {
-                        tracing::warn!("gRPC streaming recv error for anchor {}: {}", anchor_id, e);
+                        tracing::warn!(
+                            "gRPC streaming recv error for anchor={} session={}: {}",
+                            anchor_id,
+                            session_id,
+                            e
+                        );
                         break;
                     }
                 }
             }
-
-            // Stream ended -- inject Dropped if no terminal sentinel was last
             if !last_was_terminal {
                 let _ = frame_tx
                     .send_async(crate::streaming::sender::cached_dropped().clone())
                     .await;
             }
-
-            active_ref.remove(&anchor_id);
         });
 
         Ok(Response::new(futures::stream::empty()))
     }
 }
 
+fn read_u64_meta<T>(request: &Request<T>, name: &str) -> Result<u64, Box<Status>> {
+    let meta = request.metadata().get(name).ok_or_else(|| {
+        Box::new(Status::invalid_argument(format!(
+            "missing {} metadata header",
+            name
+        )))
+    })?;
+    let s = meta.to_str().map_err(|_| {
+        Box::new(Status::invalid_argument(format!(
+            "{} metadata is not valid UTF-8",
+            name
+        )))
+    })?;
+    s.parse::<u64>().map_err(|_| {
+        Box::new(Status::invalid_argument(format!(
+            "{} is not a valid u64",
+            name
+        )))
+    })
+}
+
 // ---------------------------------------------------------------------------
 // GrpcFrameTransport (public API)
 // ---------------------------------------------------------------------------
 
-/// gRPC-based [`FrameTransport`] providing per-anchor routing via a shared tonic server.
-///
-/// # Async Construction
-///
-/// Unlike `TcpFrameTransport` which is constructed synchronously, `GrpcFrameTransport::new()`
-/// is `async` because it must await `TcpListener::bind()` to obtain the actual OS-assigned
-/// port before the server can accept connections. This is a one-time setup cost.
-///
-/// # Thread Safety
-///
-/// `GrpcFrameTransport` is `Send + Sync` (required by `FrameTransport`) and can be shared
-/// via `Arc<GrpcFrameTransport>`.
+/// gRPC-based [`FrameTransport`] providing per-(anchor, session) routing via
+/// a shared tonic server.
 pub struct GrpcFrameTransport {
-    /// Routes anchor_id -> frame_tx, populated by bind(), consumed by server pump task
-    routing: Arc<DashMap<u64, flume::Sender<Vec<u8>>>>,
-    /// Actively-attached anchor_ids for exclusive-attach enforcement.
-    /// Shared with `GrpcStreamingService`; kept here to hold an `Arc` reference
-    /// (keeps the DashMap alive) and for potential inspection in tests.
-    #[allow(dead_code)]
-    active: Arc<DashMap<u64, ()>>,
-    /// The actual bound address of the tonic server (captured after TcpListener::bind)
-    bound_addr: SocketAddr,
-    /// CancellationToken to gracefully shut down the tonic server
+    key: TransportKey,
+    bind_addr: SocketAddr,
+    local_address: WorkerAddress,
+    local_interfaces: std::sync::OnceLock<Vec<InterfaceEndpoint>>,
+    interface_filter: InterfaceFilter,
+    numa_hint: Option<u32>,
+    peers: Arc<DashMap<WorkerId, SocketAddr>>,
+    routing: Arc<SessionRouting>,
     cancel: CancellationToken,
+    /// Optional metrics handle. Set once by the Velo builder via
+    /// [`Self::set_metrics`] before any bind/connect.
+    metrics: Arc<std::sync::OnceLock<Arc<crate::observability::VeloMetrics>>>,
 }
 
 impl GrpcFrameTransport {
-    /// Create a new `GrpcFrameTransport` and start the tonic server on `bind_addr`.
-    ///
-    /// The server is started eagerly: `TcpListener::bind(bind_addr)` is awaited, the
-    /// actual port is captured, and the server is spawned in the background. Use
-    /// `0.0.0.0:0` (or `default_new()`) to let the OS assign an ephemeral port.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err` if `TcpListener::bind(bind_addr)` fails.
-    pub async fn new(bind_addr: SocketAddr) -> Result<Self> {
-        let routing: Arc<DashMap<u64, flume::Sender<Vec<u8>>>> = Arc::new(DashMap::new());
-        let active: Arc<DashMap<u64, ()>> = Arc::new(DashMap::new());
+    /// Construct with a custom transport key, interface filter, and NUMA hint.
+    pub async fn with_config(
+        bind_addr: SocketAddr,
+        key: TransportKey,
+        interface_filter: InterfaceFilter,
+        numa_hint: Option<u32>,
+    ) -> Result<Arc<Self>> {
+        let routing: Arc<SessionRouting> = Arc::new(DashMap::new());
         let cancel = CancellationToken::new();
+        let metrics: Arc<std::sync::OnceLock<Arc<crate::observability::VeloMetrics>>> =
+            Arc::new(std::sync::OnceLock::new());
 
-        // Bind listener eagerly to capture actual port
         let listener = tokio::net::TcpListener::bind(bind_addr).await?;
         let bound_addr = listener.local_addr()?;
 
+        let endpoints = resolve_advertise_endpoints(bound_addr, &interface_filter)?;
+        let encoded = rmp_serde::to_vec(&endpoints)
+            .map_err(|e| anyhow!("Failed to encode interface endpoints: {e}"))?;
+        let mut addr_builder = WorkerAddressBuilder::new();
+        addr_builder
+            .add_entry(key.as_str(), encoded)
+            .map_err(|e| anyhow!("Failed to build WorkerAddress entry: {e}"))?;
+        let local_address = addr_builder
+            .build()
+            .map_err(|e| anyhow!("Failed to build WorkerAddress: {e}"))?;
+
         let service = GrpcStreamingService {
             routing: routing.clone(),
-            active: active.clone(),
+            metrics: metrics.clone(),
         };
 
         let cancel_clone = cancel.clone();
         tokio::spawn(async move {
             let server =
                 tonic::transport::Server::builder().add_service(VeloStreamingServer::new(service));
-
             if let Err(e) = server
                 .serve_with_incoming_shutdown(
                     TcpListenerStream::new(listener),
@@ -257,24 +253,45 @@ impl GrpcFrameTransport {
             }
         });
 
-        Ok(Self {
+        Ok(Arc::new(Self {
+            key,
+            bind_addr: bound_addr,
+            local_address,
+            local_interfaces: std::sync::OnceLock::new(),
+            interface_filter,
+            numa_hint,
+            peers: Arc::new(DashMap::new()),
             routing,
-            active,
-            bound_addr,
             cancel,
-        })
+            metrics,
+        }))
     }
 
-    /// Create a `GrpcFrameTransport` bound to `0.0.0.0:0` (OS-assigned ephemeral port).
-    pub async fn default_new() -> Result<Self> {
+    /// Install a metrics handle. Called by the Velo builder before any
+    /// `bind`/`connect`. No-op if already set.
+    pub(crate) fn set_metrics(&self, metrics: Arc<crate::observability::VeloMetrics>) {
+        let _ = self.metrics.set(metrics);
+    }
+
+    /// Convenience constructor: `grpc-stream` key, `InterfaceFilter::All`,
+    /// no NUMA hint, bound on the given IP at port 0.
+    pub async fn new(bind_addr: SocketAddr) -> Result<Arc<Self>> {
+        Self::with_config(
+            bind_addr,
+            TransportKey::new(GRPC_STREAM_KEY),
+            InterfaceFilter::All,
+            None,
+        )
+        .await
+    }
+
+    /// Convenience: bind on `0.0.0.0:0`.
+    pub async fn default_new() -> Result<Arc<Self>> {
         Self::new("0.0.0.0:0".parse().unwrap()).await
     }
 
-    /// Returns the actual bound `SocketAddr` of the tonic server.
-    ///
-    /// This is always available after `new()` returns (OnceLock is populated in `new()`).
     pub fn bound_addr(&self) -> SocketAddr {
-        self.bound_addr
+        self.bind_addr
     }
 }
 
@@ -284,112 +301,122 @@ impl Drop for GrpcFrameTransport {
     }
 }
 
-/// Parse a `grpc://` endpoint into `(SocketAddr, anchor_id)`.
-///
-/// Expected format: `grpc://{host}:{port}/{anchor_id}`
-///
-/// # Errors
-///
-/// Returns `Err` on malformed URIs (missing prefix, invalid address, invalid anchor_id).
-///
-/// # Examples
-///
-/// ```
-/// # use crate::streaming::grpc_transport::parse_grpc_endpoint;
-/// let (addr, anchor_id) = parse_grpc_endpoint("grpc://127.0.0.1:50051/42").unwrap();
-/// assert_eq!(addr.port(), 50051);
-/// assert_eq!(anchor_id, 42);
-/// ```
-pub fn parse_grpc_endpoint(endpoint: &str) -> Result<(SocketAddr, u64)> {
-    let stripped = endpoint
-        .strip_prefix("grpc://")
-        .ok_or_else(|| anyhow::anyhow!("missing grpc:// prefix: {}", endpoint))?;
-    let slash_pos = stripped
-        .rfind('/')
-        .ok_or_else(|| anyhow::anyhow!("missing anchor_id in endpoint: {}", endpoint))?;
-    let addr_str = &stripped[..slash_pos];
-    let anchor_id_str = &stripped[slash_pos + 1..];
-    let addr: SocketAddr = addr_str
-        .parse()
-        .map_err(|e| anyhow::anyhow!("invalid address '{}': {}", addr_str, e))?;
-    let anchor_id: u64 = anchor_id_str
-        .parse()
-        .map_err(|e| anyhow::anyhow!("invalid anchor_id '{}': {}", anchor_id_str, e))?;
-    Ok((addr, anchor_id))
-}
-
 impl FrameTransport for GrpcFrameTransport {
+    fn key(&self) -> TransportKey {
+        self.key.clone()
+    }
+
+    fn address(&self) -> WorkerAddress {
+        self.local_address.clone()
+    }
+
+    fn register(&self, peer_info: &PeerInfo) -> Result<()> {
+        let raw = peer_info
+            .worker_address()
+            .get_entry(self.key.as_str())
+            .map_err(|e| anyhow!("decoding peer WorkerAddress: {e}"))?
+            .ok_or_else(|| {
+                anyhow!(
+                    "peer {} has no '{}' streaming endpoint entry",
+                    peer_info.worker_id(),
+                    self.key
+                )
+            })?;
+
+        let remote_endpoints =
+            parse_endpoints(&raw).map_err(|e| anyhow!("Failed to parse gRPC endpoints: {e}"))?;
+
+        let local = self.local_interfaces.get_or_init(|| {
+            resolve_advertise_endpoints(self.bind_addr, &self.interface_filter).unwrap_or_default()
+        });
+
+        let addr =
+            select_best_endpoint(&remote_endpoints, local, self.numa_hint).ok_or_else(|| {
+                anyhow!(
+                    "no suitable endpoint for peer {} from {:?}",
+                    peer_info.worker_id(),
+                    remote_endpoints
+                )
+            })?;
+
+        self.peers.insert(peer_info.worker_id(), addr);
+        Ok(())
+    }
+
     fn bind(
         &self,
         anchor_id: u64,
-        _session_id: u64,
-    ) -> BoxFuture<'_, Result<(String, flume::Receiver<Vec<u8>>)>> {
-        let addr = self.bound_addr;
+        session_id: u64,
+    ) -> BoxFuture<'_, Result<flume::Receiver<Vec<u8>>>> {
         let routing = self.routing.clone();
         Box::pin(async move {
-            let (frame_tx, frame_rx) = flume::bounded::<Vec<u8>>(256);
-
-            // Insert routing slot synchronously (no race with connect)
-            routing.insert(anchor_id, frame_tx);
-
-            let advertise_addr = std::net::SocketAddr::new(
-                crate::streaming::util::resolve_advertise_ip(addr.ip()),
-                addr.port(),
-            );
-            let endpoint = format!("grpc://{}/{}", advertise_addr, anchor_id);
-            Ok((endpoint, frame_rx))
+            let (frame_tx, frame_rx) = flume::bounded::<Vec<u8>>(4096);
+            if routing.insert((anchor_id, session_id), frame_tx).is_some() {
+                tracing::warn!(
+                    anchor_id,
+                    session_id,
+                    "GrpcFrameTransport::bind overwrote an existing routing entry; \
+                     previous frame_tx dropped (consumer will see channel close)"
+                );
+            }
+            Ok(frame_rx)
         })
     }
 
     fn connect(
         &self,
-        endpoint: &str,
-        _anchor_id: u64,
-        _session_id: u64,
+        peer: WorkerId,
+        anchor_id: u64,
+        session_id: u64,
     ) -> BoxFuture<'_, Result<flume::Sender<Vec<u8>>>> {
-        let endpoint = endpoint.to_string();
+        let peers = self.peers.clone();
         Box::pin(async move {
-            let (addr, anchor_id) = parse_grpc_endpoint(&endpoint)?;
+            let addr = *peers.get(&peer).ok_or_else(|| {
+                anyhow!(
+                    "gRPC streaming: peer {} not registered (call register_peer first)",
+                    peer
+                )
+            })?;
 
-            // Build tonic channel to the server
             let channel = tonic::transport::Channel::from_shared(format!("http://{}", addr))?
                 .connect()
                 .await?;
 
             let mut client = VeloStreamingClient::new(channel);
 
-            // Create frame channels:
-            //   - mpsc: bridges flume frames into the gRPC request stream
-            //   - flume: returned to caller for sending frames
             let (mpsc_tx, mpsc_rx) = tokio::sync::mpsc::channel::<FramedData>(256);
-            let (frame_tx, frame_rx) = flume::bounded::<Vec<u8>>(256);
+            let (frame_tx, frame_rx) = flume::bounded::<Vec<u8>>(4096);
 
-            // Build the gRPC request stream from the mpsc receiver
             let request_stream = tokio_stream::wrappers::ReceiverStream::new(mpsc_rx);
 
-            // Attach x-anchor-id metadata header
             let mut request = Request::new(request_stream);
             request.metadata_mut().insert(
-                "x-anchor-id",
+                ANCHOR_ID_META,
                 anchor_id
                     .to_string()
                     .parse()
-                    .map_err(|_| anyhow::anyhow!("failed to encode anchor_id as metadata value"))?,
+                    .map_err(|_| anyhow!("failed to encode anchor_id as metadata"))?,
+            );
+            request.metadata_mut().insert(
+                SESSION_ID_META,
+                session_id
+                    .to_string()
+                    .parse()
+                    .map_err(|_| anyhow!("failed to encode session_id as metadata"))?,
             );
 
-            // Call client.stream() and await the server's initial response.
-            // This is where the server performs its exclusive-attach check:
-            // - Ok(_) means the server accepted the stream
-            // - Err(status) means the server rejected it (e.g., ALREADY_EXISTS)
-            let _response = client
+            let response = client
                 .stream(request)
                 .await
-                .map_err(|status| anyhow::anyhow!("gRPC stream rejected: {}", status))?;
+                .map_err(|status| anyhow!("gRPC stream rejected: {}", status))?;
 
-            // Server accepted. Spawn a pump task that forwards frames from the
-            // flume channel to the mpsc channel (which feeds the gRPC request stream).
             tokio::spawn(async move {
+                // Hold the Response (and thus the underlying H2 bidi call) for as
+                // long as we are pumping frames; dropping it sends RST_STREAM and
+                // cancels the inbound side of the call.
+                let _response = response;
                 while let Ok(payload) = frame_rx.recv_async().await {
+                    let is_terminal = is_terminal_sentinel(&payload);
                     let framed = FramedData {
                         preamble: vec![],
                         header: vec![],
@@ -398,8 +425,17 @@ impl FrameTransport for GrpcFrameTransport {
                     if mpsc_tx.send(framed).await.is_err() {
                         break;
                     }
+                    // Mirror TCP: after pushing a terminal sentinel (Finalized
+                    // / Dropped / Detached / TransportError), exit the pump.
+                    // Any frame still queued behind the terminal (e.g. a
+                    // heartbeat that snuck through between cancel and drop)
+                    // would otherwise reach the server and be interpreted as
+                    // the new last frame, causing the server to inject Dropped
+                    // on close -- which kills a reattached session.
+                    if is_terminal {
+                        break;
+                    }
                 }
-                // mpsc_tx dropped here -> gRPC stream body ends -> server pump sees EOF
             });
 
             Ok(frame_tx)
@@ -410,12 +446,147 @@ impl FrameTransport for GrpcFrameTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use velo_ext::InstanceId;
+
+    fn fresh_peer(address: WorkerAddress) -> (WorkerId, PeerInfo) {
+        let inst = InstanceId::new_v4();
+        let wid = inst.worker_id();
+        (wid, PeerInfo::new(inst, address))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn round_trip_via_register_and_connect() {
+        let server = GrpcFrameTransport::default_new().await.unwrap();
+        let client = GrpcFrameTransport::default_new().await.unwrap();
+        let (server_worker, server_peer) = fresh_peer(server.address());
+        client.register(&server_peer).unwrap();
+
+        let rx = server.bind(7, 1).await.unwrap();
+        let tx = client.connect(server_worker, 7, 1).await.unwrap();
+        let payload = b"hello".to_vec();
+        tx.send_async(payload.clone()).await.unwrap();
+        let received = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv_async())
+            .await
+            .expect("recv timeout")
+            .expect("channel closed");
+        assert_eq!(received, payload);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bind_overwrite_emits_warn_and_returns_new_rx() {
+        let server = GrpcFrameTransport::default_new().await.unwrap();
+        // First bind grabs the slot.
+        let rx1 = server.bind(42, 7).await.unwrap();
+        // Second bind for the same (anchor_id, session_id) overwrites; the
+        // previous frame_tx is dropped, so rx1's channel closes.
+        let _rx2 = server.bind(42, 7).await.unwrap();
+        // rx1 should observe the close (no more frames will arrive on it).
+        let res = tokio::time::timeout(std::time::Duration::from_millis(200), rx1.recv_async())
+            .await
+            .expect("rx1 should have closed promptly");
+        assert!(res.is_err(), "rx1 must observe channel closed");
+    }
 
     #[test]
-    fn test_parse_grpc_endpoint_ipv6() {
-        let endpoint = "grpc://[::1]:50051/42";
-        let (addr, anchor_id) = parse_grpc_endpoint(endpoint).unwrap();
-        assert_eq!(addr, "[::1]:50051".parse::<SocketAddr>().unwrap());
-        assert_eq!(anchor_id, 42);
+    fn read_u64_meta_missing_header_returns_invalid_argument() {
+        let req: Request<()> = Request::new(());
+        let err = read_u64_meta(&req, "x-missing").unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            err.message().contains("missing x-missing"),
+            "got: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn read_u64_meta_non_u64_value_returns_invalid_argument() {
+        let mut req: Request<()> = Request::new(());
+        req.metadata_mut()
+            .insert("x-bad", "not-a-number".parse().unwrap());
+        let err = read_u64_meta(&req, "x-bad").unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            err.message().contains("not a valid u64"),
+            "got: {}",
+            err.message()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn register_rejects_peer_without_grpc_entry() {
+        let transport = GrpcFrameTransport::default_new().await.unwrap();
+        // PeerInfo with an empty WorkerAddress has no "grpc-stream" entry.
+        let (_, peer) = fresh_peer(WorkerAddress::empty());
+        let err = transport.register(&peer).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("has no") && msg.contains("streaming endpoint entry"),
+            "got: {msg}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_to_unregistered_peer_errors() {
+        let transport = GrpcFrameTransport::default_new().await.unwrap();
+        let bogus = InstanceId::new_v4().worker_id();
+        let err = transport.connect(bogus, 1, 1).await.unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("not registered"), "got: {msg}");
+    }
+
+    /// Mirror of `tcp_transport::tests::no_extra_dropped_after_finalized` —
+    /// once the client-side forwarder writes a terminal sentinel (Finalized
+    /// / Dropped / Detached / TransportError), it must exit immediately so
+    /// any frame queued behind the terminal (e.g. a late heartbeat) cannot
+    /// reach the server. Without the per-frame `is_terminal_sentinel` check
+    /// in the forwarder, the server would see the late heartbeat as the
+    /// last frame and inject `Dropped` on stream close, which would kill a
+    /// reattached session sharing the routing slot.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn grpc_client_pump_breaks_after_terminal_sentinel() {
+        let server = GrpcFrameTransport::default_new().await.unwrap();
+        let client = GrpcFrameTransport::default_new().await.unwrap();
+        let (server_worker, server_peer) = fresh_peer(server.address());
+        client.register(&server_peer).unwrap();
+
+        let rx = server.bind(11, 3).await.unwrap();
+        let tx = client.connect(server_worker, 11, 3).await.unwrap();
+
+        let finalized =
+            rmp_serde::to_vec(&crate::streaming::frame::StreamFrame::<()>::Finalized).unwrap();
+        tx.send_async(finalized.clone()).await.unwrap();
+
+        // Queue a heartbeat behind the terminal. With the terminal-break in
+        // place this should never reach the server.
+        let heartbeat =
+            rmp_serde::to_vec(&crate::streaming::frame::StreamFrame::<()>::Heartbeat).unwrap();
+        let _ = tx.send_async(heartbeat.clone()).await;
+        drop(tx);
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv_async())
+            .await
+            .expect("recv timeout")
+            .expect("channel closed");
+        assert_eq!(
+            received, finalized,
+            "first frame on the server side must be the Finalized sentinel"
+        );
+
+        // No further frame should arrive (channel either silent or closed).
+        let next =
+            tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv_async()).await;
+        if let Ok(Ok(extra)) = next {
+            assert_ne!(
+                extra, heartbeat,
+                "heartbeat queued behind Finalized must not reach the server"
+            );
+            assert_ne!(
+                extra.as_slice(),
+                crate::streaming::sender::cached_dropped().as_slice(),
+                "server must not inject Dropped after Finalized"
+            );
+        }
+        // Ok(Err(_)) (channel closed) and Err(_) (timeout) are both fine.
     }
 }

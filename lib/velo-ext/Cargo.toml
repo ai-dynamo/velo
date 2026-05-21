@@ -3,7 +3,7 @@
 
 [package]
 name = "velo-ext"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 description = "Extension trait surface for Velo. External crates implement Transport, FrameTransport, and PeerDiscovery against this stable contract without depending on the Velo runtime."
 authors.workspace = true

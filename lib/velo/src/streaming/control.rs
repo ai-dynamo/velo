@@ -192,18 +192,34 @@ pub struct AnchorAttachRequest {
 /// Response from the attach handler.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum AnchorAttachResponse {
-    /// Attach succeeded; caller can connect to `stream_endpoint`.
+    /// Attach succeeded.
+    ///
+    /// `streaming_transport_key` tells the client which `FrameTransport` it
+    /// should call `connect()` on (looked up in the local
+    /// [`crate::streaming::AnchorManager`]'s transport registry). Endpoint
+    /// resolution is no longer string-based — the chosen transport extracts
+    /// the peer's listener address from the cached WorkerAddress entry it
+    /// stored on `register()`.
     ///
     /// `heartbeat_interval_ms` tells the sender how often it must emit a
     /// [`crate::streaming::frame::StreamFrame::Heartbeat`] when no data frames are flowing.
     /// The consumer's reader pump will tolerate `DETECTION_MULTIPLIER * heartbeat_interval_ms`
     /// of total silence before injecting `Dropped`. The field is carried as `u64` ms
     /// (rather than `Duration`) for stable msgpack encoding, and defaults to 5000ms
-    /// when absent so older clients continue to deserialize new responses unchanged.
+    /// when absent.
     Ok {
-        stream_endpoint: String,
+        streaming_transport_key: velo_ext::TransportKey,
         #[serde(default = "default_heartbeat_interval_ms")]
         heartbeat_interval_ms: u64,
+        /// Receiver-allocated routing slot id. The sender uses this for the
+        /// `transport.connect(...)` call so the transport-layer
+        /// `(anchor_id, session_id)` routing key is globally unique on the
+        /// receiver, independent of the sender's local stream counter.
+        /// `#[serde(default)]` so older senders (which never set it) still
+        /// deserialize; in that case the sender falls back to its local
+        /// `sender_stream_id` (the legacy collision-prone behavior).
+        #[serde(default)]
+        routing_session_id: u64,
     },
     /// Attach failed; `reason` describes why.
     Err { reason: String },
@@ -269,18 +285,69 @@ pub(crate) async fn reader_pump(
                     Ok(Ok(bytes)) => {
                         // Any frame (data or heartbeat) proves liveness
                         missed_heartbeats = 0;
-                        // Forward to anchor's frame channel
-                        if frame_tx.send_async(bytes).await.is_err() {
-                            break; // consumer dropped
+                        // Forward to anchor's frame channel.
+                        //
+                        // The per-anchor frame_tx is bounded(256) — the smallest
+                        // channel in the saturation cascade and the first to fill
+                        // when the consumer can't keep up. We try_send first so we
+                        // can record a leading-indicator counter on the slow path
+                        // before falling through to the awaited send.
+                        match frame_tx.try_send(bytes) {
+                            Ok(()) => {}
+                            Err(flume::TrySendError::Full(b)) => {
+                                if let Some(m) = metrics.as_ref() {
+                                    m.record_reader_pump_backpressure();
+                                }
+                                if frame_tx.send_async(b).await.is_err() {
+                                    break; // consumer dropped
+                                }
+                            }
+                            Err(flume::TrySendError::Disconnected(_)) => break,
                         }
                     }
                     Ok(Err(_)) => break, // transport channel closed
                     Err(_timeout) => {
                         missed_heartbeats += 1;
                         if missed_heartbeats >= DETECTION_MULTIPLIER {
-                            // Inject Dropped sentinel -- sender is dead
+                            if let Some(m) = metrics.as_ref() {
+                                m.record_heartbeat_watchdog_firing();
+                            }
+                            // Inject Dropped sentinel -- sender is dead.
+                            // The diagnostic context here is what the saturation
+                            // runbook tells operators to grep for: anchor channel
+                            // depth at the moment of firing tells you whether the
+                            // session was sitting at the bound (cascade) or empty
+                            // (real producer crash).
+                            tracing::warn!(
+                                local_id,
+                                anchor_frame_tx_len = frame_tx.len(),
+                                anchor_frame_tx_cap = frame_tx.capacity().unwrap_or_default(),
+                                transport_rx_len = transport_rx.len(),
+                                transport_rx_cap = transport_rx.capacity().unwrap_or_default(),
+                                heartbeat_deadline_ms = heartbeat_deadline.as_millis() as u64,
+                                detection_multiplier = DETECTION_MULTIPLIER,
+                                "reader_pump: heartbeat watchdog fired, injecting Dropped \
+                                 (saturation indicator: see velo_streaming_*_backpressure_total)"
+                            );
                             let dropped_bytes = crate::streaming::sender::cached_dropped().clone();
-                            let _ = frame_tx.send_async(dropped_bytes).await;
+                            // Non-blocking: an anchor channel that is already
+                            // full when the watchdog fires would deadlock a
+                            // blocking await here -- registry cleanup and the
+                            // cancel_token would never run, leaking a dead
+                            // anchor. We accept that the consumer may see a
+                            // plain channel-close (EOF) instead of an explicit
+                            // SenderDropped in the saturated edge case; the
+                            // watchdog firing metric + the warn! above are the
+                            // authoritative signal for operators.
+                            if frame_tx.try_send(dropped_bytes).is_err() {
+                                tracing::warn!(
+                                    local_id,
+                                    "reader_pump: anchor channel saturated at watchdog-fire; \
+                                     Dropped sentinel could not be injected, consumer will see \
+                                     channel close (EOF) -- watchdog firing counter is the \
+                                     authoritative signal here"
+                                );
+                            }
                             // LIVE-02: Full anchor cleanup -- remove from registry
                             // so no stale entry remains (ANCR-04)
                             if let Some((_, entry)) = registry.remove(&local_id) {
@@ -371,22 +438,34 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::messe
                     }
                 } // DashMap ref dropped here
 
-                // Step 2: Async bind OUTSIDE shard lock
-                let (endpoint, receiver) =
-                    match manager.transport.bind(local_id, req.session_id).await {
-                        Ok(pair) => pair,
-                        Err(e) => {
-                            manager.record_streaming_operation(
-                                StreamingOp::Attach,
-                                HandlerOutcome::Error,
-                                "unknown",
-                                started,
-                            );
-                            return Ok(AnchorAttachResponse::Err {
-                                reason: format!("transport error: {}", e),
-                            });
-                        }
-                    };
+                // Step 2: Async bind OUTSIDE shard lock.
+                //
+                // Allocate a receiver-side routing_session_id rather than
+                // reusing the sender's local stream counter (req.session_id):
+                // two senders from different workers both attaching to the
+                // same anchor would otherwise hit the same `(local_id,
+                // session_id)` routing slot and silently overwrite each
+                // other at the transport layer. See
+                // [`crate::streaming::AnchorManager::next_routing_session_id`].
+                let routing_session_id = manager
+                    .next_routing_session_id
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                let receiver = match manager.transport.bind(local_id, routing_session_id).await {
+                    Ok(rx) => rx,
+                    Err(e) => {
+                        manager.record_streaming_operation(
+                            StreamingOp::Attach,
+                            HandlerOutcome::Error,
+                            "unknown",
+                            started,
+                        );
+                        return Ok(AnchorAttachResponse::Err {
+                            reason: format!("transport error: {}", e),
+                        });
+                    }
+                };
+                let streaming_transport_key = manager.transport.key();
 
                 // Step 3: Atomically set attachment under shard lock
                 use dashmap::mapref::entry::Entry;
@@ -441,18 +520,17 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::messe
                                 heartbeat_interval,
                             ));
 
-                            let transport_scheme =
-                                endpoint.split("://").next().unwrap_or("unknown");
                             manager.record_streaming_operation(
                                 StreamingOp::Attach,
                                 HandlerOutcome::Success,
-                                transport_scheme,
+                                streaming_transport_key.as_str(),
                                 started,
                             );
 
                             Ok(AnchorAttachResponse::Ok {
-                                stream_endpoint: endpoint,
+                                streaming_transport_key,
                                 heartbeat_interval_ms: heartbeat_interval.as_millis() as u64,
+                                routing_session_id,
                             })
                         }
                     }
@@ -630,22 +708,25 @@ mod tests {
     struct MockFrameTransport;
 
     impl crate::streaming::transport::FrameTransport for MockFrameTransport {
+        fn key(&self) -> velo_ext::TransportKey {
+            velo_ext::TransportKey::new("mock-stream")
+        }
+
+        fn address(&self) -> velo_ext::WorkerAddress {
+            velo_ext::WorkerAddress::empty()
+        }
+
         fn bind(
             &self,
             _anchor_id: u64,
             _session_id: u64,
-        ) -> BoxFuture<'_, AnyhowResult<(String, flume::Receiver<Vec<u8>>)>> {
-            Box::pin(async {
-                Ok((
-                    "mock://test-endpoint".to_string(),
-                    flume::bounded::<Vec<u8>>(256).1,
-                ))
-            })
+        ) -> BoxFuture<'_, AnyhowResult<flume::Receiver<Vec<u8>>>> {
+            Box::pin(async { Ok(flume::bounded::<Vec<u8>>(256).1) })
         }
 
         fn connect(
             &self,
-            _endpoint: &str,
+            _peer: velo_ext::WorkerId,
             _anchor_id: u64,
             _session_id: u64,
         ) -> BoxFuture<'_, AnyhowResult<flume::Sender<Vec<u8>>>> {
@@ -664,6 +745,186 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Watchdog firing test
+    // -----------------------------------------------------------------------
+
+    /// The reader pump's heartbeat watchdog branch must (1) increment the
+    /// `streaming_heartbeat_watchdog_firings_total` counter and (2) inject a
+    /// `Dropped` sentinel into `frame_tx` once `DETECTION_MULTIPLIER`
+    /// consecutive `heartbeat_deadline` windows pass with no frames.
+    ///
+    /// Without a positive test, a regression that detached the metric tick
+    /// from the watchdog branch (or moved it behind a feature flag) would
+    /// silently let the lagging-indicator counter go dark — exactly the
+    /// failure mode this counter set was created to catch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reader_pump_watchdog_firing_increments_counter() {
+        let registry = prometheus::Registry::new();
+        let metrics = Arc::new(crate::observability::VeloMetrics::register(&registry).unwrap());
+
+        let manager = make_test_manager();
+        let base_ctx = manager.anchor_context();
+        let ctx = crate::streaming::anchor::AnchorContext {
+            registry: base_ctx.registry,
+            mpsc_registry: base_ctx.mpsc_registry,
+            metrics: Some(metrics.clone()),
+        };
+
+        // Open transport channel that never delivers a frame: the receiver
+        // sits idle, hitting the heartbeat timeout DETECTION_MULTIPLIER times.
+        let (_transport_tx, transport_rx) = flume::bounded::<Vec<u8>>(4);
+        let (frame_tx, frame_rx) = flume::bounded::<Vec<u8>>(4);
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        // Short heartbeat so the test runs in well under a second.
+        // DETECTION_MULTIPLIER=3 × 50ms = ~150ms minimum.
+        let deadline = std::time::Duration::from_millis(50);
+        let pump = tokio::spawn(reader_pump(
+            transport_rx,
+            frame_tx,
+            cancel,
+            ctx,
+            999,
+            deadline,
+        ));
+
+        // 4× deadline of slack so timer scheduling jitter doesn't flake on busy CI.
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(800), pump)
+            .await
+            .expect("reader_pump must terminate after watchdog fires");
+
+        let snap = registry.gather();
+        let watchdog_value = snap
+            .iter()
+            .find(|f| f.name() == "velo_streaming_heartbeat_watchdog_firings_total")
+            .map(|f| f.get_metric()[0].get_counter().value())
+            .unwrap_or(0.0);
+        assert_eq!(
+            watchdog_value, 1.0,
+            "watchdog counter must increment exactly once when DETECTION_MULTIPLIER deadlines pass"
+        );
+
+        // Dropped sentinel must reach the consumer so the saturation kill
+        // surfaces instead of silently stalling.
+        let frame_bytes = frame_rx
+            .try_recv()
+            .expect("watchdog must inject a Dropped sentinel before exiting");
+        let dropped: crate::streaming::frame::StreamFrame<()> =
+            rmp_serde::from_slice(&frame_bytes).expect("decode Dropped");
+        assert!(
+            matches!(dropped, crate::streaming::frame::StreamFrame::Dropped),
+            "injected sentinel must be StreamFrame::Dropped, got {dropped:?}"
+        );
+
+        // Backpressure counter stays at 0: the per-anchor channel never
+        // filled in this scenario (we sent no frames).
+        let bp_value = snap
+            .iter()
+            .find(|f| f.name() == "velo_streaming_reader_pump_backpressure_total")
+            .map(|f| f.get_metric()[0].get_counter().value())
+            .unwrap_or(0.0);
+        assert_eq!(
+            bp_value, 0.0,
+            "reader_pump backpressure must stay 0 when no frames are sent; got {bp_value}"
+        );
+    }
+
+    /// Watchdog fires while the per-anchor channel is already saturated:
+    /// the `try_send(Dropped)` cannot land, so the consumer sees a clean EOF
+    /// instead of `StreamFrame::Dropped`. The watchdog firing counter is the
+    /// authoritative operator signal — it must still tick. See
+    /// `lib/velo/src/streaming/SATURATION.md` for the documented behavior
+    /// this test pins in place.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reader_pump_watchdog_saturated_channel_drops_sentinel_silently() {
+        let registry = prometheus::Registry::new();
+        let metrics = Arc::new(crate::observability::VeloMetrics::register(&registry).unwrap());
+
+        let manager = make_test_manager();
+        let base_ctx = manager.anchor_context();
+        let ctx = crate::streaming::anchor::AnchorContext {
+            registry: base_ctx.registry,
+            mpsc_registry: base_ctx.mpsc_registry,
+            metrics: Some(metrics.clone()),
+        };
+
+        // Transport channel that never delivers: watchdog will fire after
+        // DETECTION_MULTIPLIER deadlines.
+        let (_transport_tx, transport_rx) = flume::bounded::<Vec<u8>>(4);
+        // Pre-saturate the anchor channel: capacity 1, push one byte so
+        // try_send returns Full when the watchdog attempts to inject the
+        // Dropped sentinel.
+        let (frame_tx, frame_rx) = flume::bounded::<Vec<u8>>(1);
+        frame_tx
+            .try_send(b"pre-existing".to_vec())
+            .expect("pre-fill frame_tx so it is saturated when watchdog fires");
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let deadline = std::time::Duration::from_millis(50);
+        let pump = tokio::spawn(reader_pump(
+            transport_rx,
+            frame_tx,
+            cancel,
+            ctx,
+            7777,
+            deadline,
+        ));
+
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(800), pump)
+            .await
+            .expect("reader_pump must terminate after watchdog fires");
+
+        // Watchdog ticked exactly once.
+        let snap = registry.gather();
+        let watchdog_value = snap
+            .iter()
+            .find(|f| f.name() == "velo_streaming_heartbeat_watchdog_firings_total")
+            .map(|f| f.get_metric()[0].get_counter().value())
+            .unwrap_or(0.0);
+        assert_eq!(
+            watchdog_value, 1.0,
+            "watchdog counter must increment exactly once even when sentinel injection fails"
+        );
+
+        // Consumer drains the pre-filled byte, then sees clean EOF -- not a
+        // Dropped sentinel. This is the documented saturated-cascade behavior
+        // (SATURATION.md): the warn-log + watchdog firing counter are
+        // authoritative; the consumer-visible terminal frame is best-effort.
+        let pre_existing = frame_rx
+            .try_recv()
+            .expect("the pre-filled byte must be drainable");
+        assert_eq!(
+            pre_existing,
+            b"pre-existing".to_vec(),
+            "first frame must be the pre-filled byte, not the Dropped sentinel"
+        );
+
+        // After draining, no further frames: the watchdog cleanup dropped its
+        // frame_tx so the channel closes cleanly.
+        match frame_rx.try_recv() {
+            Err(flume::TryRecvError::Disconnected) => {} // EOF
+            Err(flume::TryRecvError::Empty) => {
+                // The watchdog may have already exited but the closer drop
+                // hasn't propagated yet on this thread. Wait briefly.
+                let res = tokio::time::timeout(
+                    std::time::Duration::from_millis(200),
+                    frame_rx.recv_async(),
+                )
+                .await;
+                assert!(
+                    matches!(res, Ok(Err(_)) | Err(_)),
+                    "post-saturation frame_rx must reach EOF, not yield a Dropped sentinel"
+                );
+            }
+            Ok(extra) => panic!(
+                "after watchdog fire under saturation, no further frame must arrive; \
+                 got {extra:?} (Dropped sentinel would mean the silent-drop guard is gone)"
+            ),
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Test helpers for calling handler logic directly
     // -----------------------------------------------------------------------
 
@@ -679,18 +940,21 @@ mod tests {
     #[test]
     fn test_anchor_attach_response_serde_ok() {
         let resp = AnchorAttachResponse::Ok {
-            stream_endpoint: "mock://test-endpoint".to_string(),
+            streaming_transport_key: velo_ext::TransportKey::new("mock-stream"),
             heartbeat_interval_ms: 5000,
+            routing_session_id: 7,
         };
         let json = serde_json::to_string(&resp).expect("serialize Ok");
         let decoded: AnchorAttachResponse = serde_json::from_str(&json).expect("deserialize Ok");
         match decoded {
             AnchorAttachResponse::Ok {
-                stream_endpoint,
+                streaming_transport_key,
                 heartbeat_interval_ms,
+                routing_session_id,
             } => {
-                assert_eq!(stream_endpoint, "mock://test-endpoint");
+                assert_eq!(streaming_transport_key.as_str(), "mock-stream");
                 assert_eq!(heartbeat_interval_ms, 5000);
+                assert_eq!(routing_session_id, 7);
             }
             other => panic!("expected Ok, got {:?}", other),
         }
@@ -701,42 +965,47 @@ mod tests {
         // msgpack must carry the negotiated interval losslessly so the sender
         // gets the cadence the consumer dictated.
         let resp = AnchorAttachResponse::Ok {
-            stream_endpoint: "tcp://10.0.0.1:9000".to_string(),
+            streaming_transport_key: velo_ext::TransportKey::new("tcp-stream"),
             heartbeat_interval_ms: 1234,
+            routing_session_id: 42,
         };
         let bytes = rmp_serde::to_vec(&resp).expect("rmp serialize Ok");
         let decoded: AnchorAttachResponse =
             rmp_serde::from_slice(&bytes).expect("rmp deserialize Ok");
         match decoded {
             AnchorAttachResponse::Ok {
-                stream_endpoint,
+                streaming_transport_key,
                 heartbeat_interval_ms,
+                routing_session_id,
             } => {
-                assert_eq!(stream_endpoint, "tcp://10.0.0.1:9000");
+                assert_eq!(streaming_transport_key.as_str(), "tcp-stream");
                 assert_eq!(heartbeat_interval_ms, 1234);
+                assert_eq!(routing_session_id, 42);
             }
             other => panic!("expected Ok, got {:?}", other),
         }
     }
 
     #[test]
-    fn test_anchor_attach_response_serde_ok_backcompat_default_heartbeat() {
-        // An older client/server that has no `heartbeat_interval_ms` field
-        // must still deserialize cleanly into the 5000ms default. Construct
-        // the legacy shape directly via JSON so we don't need a frozen wire
-        // sample.
-        let legacy_json = r#"{"Ok":{"stream_endpoint":"mock://legacy"}}"#;
+    fn test_anchor_attach_response_serde_ok_default_heartbeat() {
+        // A response that omits `heartbeat_interval_ms` must default to 5000ms.
+        let legacy_json = r#"{"Ok":{"streaming_transport_key":"mock-stream"}}"#;
         let decoded: AnchorAttachResponse =
-            serde_json::from_str(legacy_json).expect("legacy Ok response must deserialize");
+            serde_json::from_str(legacy_json).expect("Ok response must deserialize");
         match decoded {
             AnchorAttachResponse::Ok {
-                stream_endpoint,
+                streaming_transport_key,
                 heartbeat_interval_ms,
+                routing_session_id,
             } => {
-                assert_eq!(stream_endpoint, "mock://legacy");
+                assert_eq!(streaming_transport_key.as_str(), "mock-stream");
                 assert_eq!(
                     heartbeat_interval_ms, 5000,
                     "missing field must default to 5000ms"
+                );
+                assert_eq!(
+                    routing_session_id, 0,
+                    "missing routing_session_id must default to 0 for legacy senders"
                 );
             }
             other => panic!("expected Ok, got {:?}", other),
@@ -771,7 +1040,8 @@ mod tests {
 
         // Simulate bind-then-lock attach handler logic:
         // Step 1: async bind outside shard lock
-        let (endpoint, _receiver) = manager.transport.bind(local_id, 0).await.unwrap();
+        let _receiver = manager.transport.bind(local_id, 0).await.unwrap();
+        let key = manager.transport.key();
 
         // Step 2: atomically set attachment under shard lock
         use dashmap::mapref::entry::Entry;
@@ -788,8 +1058,9 @@ mod tests {
                 } else {
                     entry.attachment = true;
                     AnchorAttachResponse::Ok {
-                        stream_endpoint: endpoint,
+                        streaming_transport_key: key,
                         heartbeat_interval_ms: 5000,
+                        routing_session_id: 1,
                     }
                 }
             }
@@ -797,9 +1068,10 @@ mod tests {
 
         match result {
             AnchorAttachResponse::Ok {
-                stream_endpoint, ..
+                streaming_transport_key,
+                ..
             } => {
-                assert_eq!(stream_endpoint, "mock://test-endpoint");
+                assert_eq!(streaming_transport_key.as_str(), "mock-stream");
             }
             other => panic!("expected Ok, got {:?}", other),
         }
@@ -848,8 +1120,9 @@ mod tests {
                     }
                 } else {
                     AnchorAttachResponse::Ok {
-                        stream_endpoint: "unreachable".to_string(),
+                        streaming_transport_key: velo_ext::TransportKey::new("unreachable"),
                         heartbeat_interval_ms: 5000,
+                        routing_session_id: 1,
                     }
                 }
             }

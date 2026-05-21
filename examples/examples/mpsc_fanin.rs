@@ -54,20 +54,28 @@ struct Args {
 struct LoopbackTransport;
 
 impl FrameTransport for LoopbackTransport {
+    fn key(&self) -> velo::ext::TransportKey {
+        velo::ext::TransportKey::new("loopback-stream")
+    }
+
+    fn address(&self) -> velo::ext::WorkerAddress {
+        velo::ext::WorkerAddress::empty()
+    }
+
     fn bind(
         &self,
-        anchor_id: u64,
+        _anchor_id: u64,
         _session_id: u64,
-    ) -> futures::future::BoxFuture<'_, anyhow::Result<(String, flume::Receiver<Vec<u8>>)>> {
+    ) -> futures::future::BoxFuture<'_, anyhow::Result<flume::Receiver<Vec<u8>>>> {
         Box::pin(async move {
             let (_tx, rx) = flume::bounded::<Vec<u8>>(256);
-            Ok((format!("loopback://{anchor_id}"), rx))
+            Ok(rx)
         })
     }
 
     fn connect(
         &self,
-        _endpoint: &str,
+        _peer: velo::ext::WorkerId,
         _anchor_id: u64,
         _session_id: u64,
     ) -> futures::future::BoxFuture<'_, anyhow::Result<flume::Sender<Vec<u8>>>> {

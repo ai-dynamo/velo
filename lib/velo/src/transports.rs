@@ -27,7 +27,7 @@
 //! 2. **Drain** — wait for all in-flight requests to complete.
 //! 3. **Teardown** — cancel listeners/writers and call `shutdown()` on each transport.
 
-mod address;
+pub(crate) mod address;
 
 pub mod tcp;
 

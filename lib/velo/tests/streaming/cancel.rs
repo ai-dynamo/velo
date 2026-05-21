@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 use velo::streaming::{AnchorManager, AnchorManagerBuilder, AttachError};
-use velo_ext::WorkerId;
+use velo_ext::{TransportKey, WorkerAddress, WorkerId};
 
 // ---------------------------------------------------------------------------
 // LocalMockTransport — in-memory transport for local (non-TCP) cancel tests
@@ -22,20 +22,28 @@ use velo_ext::WorkerId;
 struct LocalMockTransport;
 
 impl velo::streaming::FrameTransport for LocalMockTransport {
+    fn key(&self) -> TransportKey {
+        TransportKey::new("mock-stream")
+    }
+
+    fn address(&self) -> WorkerAddress {
+        WorkerAddress::empty()
+    }
+
     fn bind(
         &self,
-        anchor_id: u64,
+        _anchor_id: u64,
         _session_id: u64,
-    ) -> BoxFuture<'_, anyhow::Result<(String, flume::Receiver<Vec<u8>>)>> {
+    ) -> BoxFuture<'_, anyhow::Result<flume::Receiver<Vec<u8>>>> {
         Box::pin(async move {
             let (_tx, rx) = flume::bounded::<Vec<u8>>(256);
-            Ok((format!("mock://{}", anchor_id), rx))
+            Ok(rx)
         })
     }
 
     fn connect(
         &self,
-        _endpoint: &str,
+        _peer: WorkerId,
         _anchor_id: u64,
         _session_id: u64,
     ) -> BoxFuture<'_, anyhow::Result<flume::Sender<Vec<u8>>>> {

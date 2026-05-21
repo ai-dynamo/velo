@@ -114,60 +114,34 @@ impl Default for GrpcConfig {
 ///
 /// # Default
 ///
-/// If [`VeloBuilder::stream_config`] is never called and
-/// [`VeloBuilder::stream_bind_addr`] was never invoked either, the builder
-/// defaults to [`VeloOnly`](StreamConfig::VeloOnly) — streams flow over the
-/// messenger transport that's already wired for cross-host reachability. This
-/// preserves multi-node correctness without requiring callers to know an
-/// externally routable IP.
-///
-/// To opt into the dedicated TCP transport, either:
-/// - call [`VeloBuilder::stream_bind_addr`] with a routable address, or
-/// - call [`VeloBuilder::stream_config`] with `Tcp(Some(TcpConfig { bind_addr }))`.
-///
-/// `Tcp(None)` (the no-bind-addr form) binds on `0.0.0.0:<ephemeral>`. The
-/// advertised endpoint is then derived inside `TcpFrameTransport::new()` via
-/// `resolve_advertise_ip(bind_addr)`, which maps unspecified addresses
-/// (`0.0.0.0` / `::`) to their loopback counterpart. The result is fine for
-/// single-host tests but **not reachable across hosts**, which is why TCP
-/// isn't the implicit default. Supplying a specific bind IP via
-/// `Tcp(Some(TcpConfig { bind_addr }))` or [`VeloBuilder::stream_bind_addr`]
-/// passes through `resolve_advertise_ip` unchanged, so the advertised
-/// address matches the routable IP you provided.
+/// If neither [`VeloBuilder::stream_config`] nor [`VeloBuilder::stream_bind_addr`]
+/// is called, the builder defaults to [`StreamConfig::Tcp(None)`](StreamConfig::Tcp)
+/// — bind `0.0.0.0:<ephemeral>` and advertise every UP non-loopback interface
+/// via [`Vec<InterfaceEndpoint>`](crate::transports::utils::interfaces::InterfaceEndpoint)
+/// in the local [`WorkerAddress`]. The peer-side `register()` walks the
+/// advertised list and calls `select_best_endpoint` (NUMA + subnet match)
+/// against its own interfaces to choose a routable address — multi-node
+/// correctness comes from interface advertisement, not from defaulting away
+/// from TCP.
 ///
 /// # Variants
 ///
-/// - [`StreamConfig::Tcp`]: TCP-based streaming via [`TcpFrameTransport`](crate::streaming::TcpFrameTransport).
-///   Pass `None` to bind to `0.0.0.0` (OS-assigned port), or provide a
-///   [`TcpConfig`] for an explicit bind address.
+/// - [`StreamConfig::Tcp`]: TCP-based streaming via
+///   [`TcpFrameTransport`](crate::streaming::TcpFrameTransport). Pass `None`
+///   to bind on `0.0.0.0:0`, or provide a [`TcpConfig`] for an explicit
+///   single-interface bind.
 ///
-/// - [`StreamConfig::Grpc`]: gRPC-based streaming via [`GrpcFrameTransport`](crate::streaming::GrpcFrameTransport).
-///   Only available when the `grpc` feature is enabled.
-///   Pass `None` to bind to `0.0.0.0:0` (OS-assigned port), or provide a
-///   [`GrpcConfig`] for an explicit bind address.
-///
-/// - [`StreamConfig::VeloOnly`]: Skip the dedicated streaming listener entirely
-///   and route all streams through `velo-messenger` AMs
-///   ([`VeloFrameTransport`](crate::streaming::VeloFrameTransport)). Use this when
-///   the host cannot or should not open additional TCP ports (sandboxed
-///   environments, restricted-network deployments, single-process tests).
+/// - [`StreamConfig::Grpc`]: gRPC-based streaming via
+///   [`GrpcFrameTransport`](crate::streaming::GrpcFrameTransport). Only
+///   available when the `grpc` feature is enabled. Same advertise-and-select
+///   semantics as `Tcp`.
 #[derive(Debug, Clone)]
 pub enum StreamConfig {
     /// TCP-based streaming transport (TcpFrameTransport).
-    ///
-    /// Pass `None` to use the default bind address (`0.0.0.0`),
-    /// or `Some(TcpConfig)` for an explicit bind address.
     Tcp(Option<TcpConfig>),
     /// gRPC-based streaming transport (GrpcFrameTransport).
-    ///
-    /// Only available with the `grpc` feature.
-    /// Pass `None` to bind to `0.0.0.0:0` (OS-assigned port),
-    /// or `Some(GrpcConfig)` for an explicit bind address.
     #[cfg(feature = "grpc")]
     Grpc(Option<GrpcConfig>),
-    /// Opt out of the dedicated streaming listener: all streams flow through
-    /// the `velo` (messenger-routed) transport. No TCP listener is opened.
-    VeloOnly,
 }
 
 /// High-level facade for the Velo distributed system.
@@ -179,6 +153,11 @@ pub struct Velo {
     messenger: Arc<Messenger>,
     anchor_manager: Arc<crate::streaming::AnchorManager>,
     rendezvous_manager: Arc<crate::rendezvous::RendezvousManager>,
+    /// The single streaming transport bound for this instance. Held here so
+    /// `register_peer` can fan out to it (the messenger does not know about
+    /// `FrameTransport`s) and so `peer_info()` can merge the streaming
+    /// listener's WorkerAddress entry into the messenger-side WorkerAddress.
+    stream_transport: Arc<dyn crate::streaming::FrameTransport>,
 }
 
 /// Builder for configuring and creating a [`Velo`] instance.
@@ -208,14 +187,6 @@ impl VeloBuilder {
     ///
     /// Only one transport server is allowed per Velo instance. Returns [`Err`]
     /// if called more than once on the same builder.
-    ///
-    /// Use [`StreamConfig::Tcp(None)`](StreamConfig::Tcp) for TCP with default
-    /// bind address (`0.0.0.0`), or `StreamConfig::Tcp(Some(TcpConfig::new(addr)))`
-    /// for an explicit bind address.
-    ///
-    /// Use [`StreamConfig::Grpc(None)`](StreamConfig::Grpc) for gRPC streaming
-    /// (requires the `grpc` feature), or `StreamConfig::Grpc(Some(GrpcConfig { bind_addr }))`
-    /// for an explicit bind address.
     pub fn stream_config(mut self, config: StreamConfig) -> Result<Self> {
         if self.stream_config.is_some() {
             return Err(anyhow::anyhow!(
@@ -226,22 +197,9 @@ impl VeloBuilder {
         Ok(self)
     }
 
-    /// Opt into the dedicated TCP streaming transport bound to a specific
-    /// interface.
-    ///
-    /// Convenience wrapper around [`stream_config`](VeloBuilder::stream_config)
-    /// with `StreamConfig::Tcp(Some(TcpConfig::new(addr)))`. The address you
-    /// pass is used both for binding and as the advertised endpoint, so it
-    /// must be reachable from the peers that will connect.
-    ///
-    /// Without this call (and without [`stream_config`](VeloBuilder::stream_config)),
-    /// the builder defaults to [`StreamConfig::VeloOnly`] — streams flow over
-    /// the messenger transport. TCP is not chosen implicitly because the
-    /// no-bind-address form (`0.0.0.0`) would advertise loopback, breaking
-    /// multi-node reachability.
+    /// Convenience: pin the TCP streaming listener to a single interface IP
+    /// (instead of the default `0.0.0.0` + multi-interface advertise).
     pub fn stream_bind_addr(self, addr: std::net::IpAddr) -> Self {
-        // Convenience: wraps StreamConfig::Tcp with explicit bind address.
-        // stream_config() cannot fail here (only one call from this path).
         self.stream_config(StreamConfig::Tcp(Some(TcpConfig::new(addr))))
             .unwrap()
     }
@@ -264,90 +222,80 @@ impl VeloBuilder {
     /// Construction order:
     /// 1. Build Messenger (async)
     /// 2. Extract WorkerId
-    /// 3. Create VeloFrameTransport (always — used as fallback / opt-out)
-    /// 4. Resolve the default streaming transport from `stream_config`. If
-    ///    unset, defaults to [`StreamConfig::VeloOnly`] (streams over the
-    ///    messenger transport — multi-node reachable by default).
-    /// 5. Create AnchorManager via builder
-    /// 6. Register streaming control-plane handlers on Messenger
-    /// 7. Assemble Velo struct
+    /// 3. Resolve the streaming transport from `stream_config` (default: TCP
+    ///    on `0.0.0.0:0` with multi-interface advertise via WorkerAddress).
+    /// 4. Merge the streaming transport's `address()` into the local
+    ///    PeerInfo's WorkerAddress (so peers can discover the streaming
+    ///    listener alongside messenger endpoints).
+    /// 5. Create AnchorManager via builder, with the streaming transport
+    ///    wired in as both the default and the only registry entry (keyed by
+    ///    its TransportKey).
+    /// 6. Register streaming control-plane handlers on Messenger.
+    /// 7. Assemble Velo struct, holding a clone of the streaming transport
+    ///    so `register_peer` can fan out to it on every newly-known peer.
     pub async fn build(self) -> Result<Arc<Velo>> {
-        // Step 1: Build Messenger
+        // Step 1: Build Messenger.
         let messenger = self.inner.build().await?;
 
-        // Step 2: Extract worker_id
+        // Step 2: Extract worker_id (carried on the local PeerInfo).
         let worker_id = messenger.instance_id().worker_id();
 
-        // Step 3: Create VeloFrameTransport. Always constructed; serves as the
-        // VeloOnly default and as the `velo://` fallback scheme alongside TCP.
-        let velo_transport = Arc::new(crate::streaming::VeloFrameTransport::new(
-            Arc::clone(&messenger),
-            worker_id,
-            self.metrics.clone(),
-        )?);
-
-        // Step 4: Resolve transport and registry from stream_config.
-        // Implicit default (None) is VeloOnly — TCP without an explicit
-        // bind address advertises loopback, which would silently break
-        // multi-node streaming. Callers opt into TCP via stream_bind_addr()
-        // or stream_config(StreamConfig::Tcp(Some(..))).
-        let resolved = self.stream_config.unwrap_or(StreamConfig::VeloOnly);
-        let (default_transport, transport_registry) = match resolved {
+        // Step 3: Resolve the streaming transport. Default is Tcp(None) —
+        // bind on 0.0.0.0:0 and advertise every UP non-loopback interface
+        // via Vec<InterfaceEndpoint> in WorkerAddress. Multi-node correctness
+        // comes from the advertise list, not from defaulting away from TCP.
+        //
+        // Metrics are installed before the transport is type-erased into
+        // `Arc<dyn FrameTransport>` because `set_metrics` is a concrete
+        // method (the FrameTransport trait stays observability-free so
+        // out-of-tree implementors don't take a `prometheus` dep).
+        let resolved = self.stream_config.unwrap_or(StreamConfig::Tcp(None));
+        let stream_transport: Arc<dyn crate::streaming::FrameTransport> = match resolved {
             StreamConfig::Tcp(tcp_cfg) => {
                 let bind_addr = tcp_cfg
                     .map(|c| c.bind_addr)
                     .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
-                let tcp_transport = crate::streaming::TcpFrameTransport::new(bind_addr).await?;
-                let mut registry = std::collections::HashMap::new();
-                registry.insert(
-                    "tcp".to_string(),
-                    Arc::clone(&tcp_transport) as Arc<dyn crate::streaming::FrameTransport>,
-                );
-                registry.insert(
-                    "velo".to_string(),
-                    velo_transport.clone() as Arc<dyn crate::streaming::FrameTransport>,
-                );
-                (
-                    tcp_transport as Arc<dyn crate::streaming::FrameTransport>,
-                    Arc::new(registry),
-                )
+                let tcp = crate::streaming::TcpFrameTransport::new(bind_addr).await?;
+                if let Some(m) = self.metrics.as_ref() {
+                    tcp.set_metrics(Arc::clone(m));
+                }
+                tcp as _
             }
             #[cfg(feature = "grpc")]
             StreamConfig::Grpc(grpc_cfg) => {
                 let bind_addr = grpc_cfg
                     .map(|c| c.bind_addr)
                     .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
-                let grpc_transport = Arc::new(
-                    crate::streaming::GrpcFrameTransport::new(bind_addr)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("Failed to start gRPC transport: {}", e))?,
-                );
-                let mut registry = std::collections::HashMap::new();
-                registry.insert(
-                    "grpc".to_string(),
-                    Arc::clone(&grpc_transport) as Arc<dyn crate::streaming::FrameTransport>,
-                );
-                registry.insert(
-                    "velo".to_string(),
-                    velo_transport.clone() as Arc<dyn crate::streaming::FrameTransport>,
-                );
-                (
-                    grpc_transport as Arc<dyn crate::streaming::FrameTransport>,
-                    Arc::new(registry),
-                )
+                let grpc = crate::streaming::GrpcFrameTransport::new(bind_addr)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!("Failed to start gRPC streaming transport: {}", e)
+                    })?;
+                if let Some(m) = self.metrics.as_ref() {
+                    grpc.set_metrics(Arc::clone(m));
+                }
+                grpc as _
             }
-            StreamConfig::VeloOnly => (
-                velo_transport as Arc<dyn crate::streaming::FrameTransport>,
-                Arc::new(std::collections::HashMap::new()),
-            ),
         };
 
-        // Step 5: Create AnchorManager (pass messenger for cross-worker cancel AMs)
+        // Step 4: Build the streaming-transport registry (single entry keyed
+        // by the chosen transport's TransportKey). The AnchorManager passes
+        // the response's `streaming_transport_key` through this map to find
+        // the FrameTransport on the client side at attach time.
+        let mut registry: std::collections::HashMap<
+            String,
+            Arc<dyn crate::streaming::FrameTransport>,
+        > = std::collections::HashMap::new();
+        registry.insert(
+            stream_transport.key().as_str().to_string(),
+            Arc::clone(&stream_transport),
+        );
+
         let anchor_manager = Arc::new(
             crate::streaming::AnchorManagerBuilder::default()
                 .worker_id(worker_id)
-                .transport(default_transport)
-                .transport_registry(transport_registry)
+                .transport(Arc::clone(&stream_transport))
+                .transport_registry(Arc::new(registry))
                 .messenger(Some(Arc::clone(&messenger)))
                 .metrics(self.metrics.clone())
                 .build()
@@ -378,6 +326,7 @@ impl VeloBuilder {
             messenger,
             anchor_manager,
             rendezvous_manager,
+            stream_transport,
         }))
     }
 }
@@ -405,8 +354,58 @@ impl Velo {
     }
 
     /// Get the peer information for this instance.
+    ///
+    /// The returned [`PeerInfo`] carries a [`WorkerAddress`] with both the
+    /// messenger transport entries (TCP / gRPC / NATS / etc.) and the
+    /// streaming transport entry (e.g., `tcp-stream` / `grpc-stream`). The
+    /// streaming entry is required for peers to resolve the streaming
+    /// listener via [`crate::streaming::FrameTransport::register`].
     pub fn peer_info(&self) -> PeerInfo {
-        self.messenger.peer_info()
+        let messenger_peer = self.messenger.peer_info();
+        let stream_addr = self.stream_transport.address();
+        // Empty streaming address (e.g., VeloFrameTransport) → no merge needed.
+        if stream_addr.as_bytes().is_empty()
+            || stream_addr
+                .available_transports()
+                .map(|v| v.is_empty())
+                .unwrap_or(true)
+        {
+            return messenger_peer;
+        }
+        let mut builder = crate::transports::address::WorkerAddressBuilder::new();
+        if let Err(e) = builder.merge(messenger_peer.worker_address()) {
+            tracing::warn!(
+                instance_id = %messenger_peer.instance_id(),
+                error = %e,
+                "peer_info: failed to merge messenger WorkerAddress into builder; \
+                 falling back to messenger-only PeerInfo (streaming peers will not \
+                 see this worker's streaming endpoint)"
+            );
+            return messenger_peer;
+        }
+        if let Err(e) = builder.merge(&stream_addr) {
+            tracing::warn!(
+                instance_id = %messenger_peer.instance_id(),
+                streaming_key = %self.stream_transport.key(),
+                error = %e,
+                "peer_info: failed to merge streaming WorkerAddress into builder; \
+                 falling back to messenger-only PeerInfo (likely a key collision \
+                 with a messenger transport key)"
+            );
+            return messenger_peer;
+        }
+        match builder.build() {
+            Ok(merged) => PeerInfo::new(messenger_peer.instance_id(), merged),
+            Err(e) => {
+                tracing::warn!(
+                    instance_id = %messenger_peer.instance_id(),
+                    error = %e,
+                    "peer_info: WorkerAddressBuilder::build() failed; falling back \
+                     to messenger-only PeerInfo"
+                );
+                messenger_peer
+            }
+        }
     }
 
     /// Get the distributed event system.
@@ -448,13 +447,55 @@ impl Velo {
     }
 
     /// Connect to a peer by registering their peer information.
+    ///
+    /// Fans out to every messenger transport (via the messenger) and to the
+    /// streaming transport, so each can extract its own entry from the peer's
+    /// [`WorkerAddress`] and cache the resolved endpoint.
     pub fn register_peer(&self, peer_info: PeerInfo) -> Result<()> {
+        // Streaming-transport register: skip the "no matching entry" case at
+        // debug (e.g., a messenger-only peer or a peer using a different
+        // streaming transport key). Any other failure -- WorkerAddress decode,
+        // endpoint parse, NUMA mismatch -- is a real problem and must propagate
+        // so it surfaces at register time, not at first attach.
+        let stream_key = self.stream_transport.key();
+        match peer_info.worker_address().get_entry(stream_key.as_str()) {
+            Ok(Some(_)) => {
+                self.stream_transport.register(&peer_info)?;
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    peer = %peer_info.worker_id(),
+                    streaming_key = %stream_key,
+                    "streaming transport register: peer has no matching streaming endpoint"
+                );
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "decoding peer WorkerAddress for streaming key '{}': {e}",
+                    stream_key
+                ));
+            }
+        }
         self.messenger.register_peer(peer_info)
     }
 
     /// Discover a peer by instance_id and register it for communication.
+    ///
+    /// Resolves the [`PeerInfo`] through the configured [`PeerDiscovery`]
+    /// backend and routes it through [`Self::register_peer`] so the streaming
+    /// transport sees the peer alongside the messenger transports. Calling
+    /// `messenger.discover_and_register_peer` directly would skip the
+    /// streaming-side `register()` and surface as "peer not registered" on
+    /// the next [`AnchorManager::attach_anchor`](crate::streaming::AnchorManager::attach_anchor).
     pub async fn discover_and_register_peer(&self, instance_id: InstanceId) -> Result<()> {
-        self.messenger.discover_and_register_peer(instance_id).await
+        let discovery = self.messenger.discovery().ok_or_else(|| {
+            anyhow::anyhow!(
+                "No discovery backend configured. Cannot discover instance {}",
+                instance_id
+            )
+        })?;
+        let peer_info = discovery.discover_by_instance_id(instance_id).await?;
+        self.register_peer(peer_info)
     }
 
     /// Check whether a specific instance has subscribed to a locally-owned event.

@@ -24,7 +24,7 @@ use crate::transports::transport::{
 };
 use velo_ext::{MessageType, PeerInfo, Transport, TransportAdapter, TransportKey, WorkerAddress};
 
-use super::listener::UdsListener;
+use super::listener::{UdsListener, default_shrink_threshold};
 use crate::transports::tcp::TcpFrameCodec;
 
 /// UDS transport with lock-free concurrent access
@@ -52,6 +52,10 @@ pub struct UdsTransport {
     // Connect timeout for outbound connections
     connect_timeout: Duration,
     metrics: OnceLock<std::sync::Arc<dyn velo_ext::TransportObservability>>,
+
+    // Listener read-buffer shrink threshold (bytes). Plumbed into UdsListener
+    // at start() time. Resolved from env or default in new().
+    shrink_threshold: usize,
 }
 
 /// Handle to a connection's writer task
@@ -96,6 +100,7 @@ impl UdsTransport {
             channel_capacity,
             connect_timeout,
             metrics: OnceLock::new(),
+            shrink_threshold: default_shrink_threshold(),
         }
     }
 
@@ -393,6 +398,7 @@ impl Transport for UdsTransport {
                 .shutdown_state(shutdown_state)
                 .transport_key(self.key.as_str())
                 .metrics(self.metrics.get().cloned())
+                .shrink_threshold(self.shrink_threshold)
                 .build()?;
 
             let bound_listener = uds_listener.bind()?;
@@ -548,6 +554,8 @@ async fn connection_writer_inner(
     // Main send loop
     loop {
         let msg = tokio::select! {
+            // Prioritize cancellation so a hot send queue cannot starve shutdown.
+            biased;
             _ = cancel_token.cancelled() => break,
             res = rx.recv_async() => match res {
                 Ok(msg) => msg,
@@ -590,6 +598,7 @@ pub struct UdsTransportBuilder {
     key: Option<TransportKey>,
     channel_capacity: usize,
     connect_timeout: Duration,
+    shrink_threshold: Option<usize>,
 }
 
 impl UdsTransportBuilder {
@@ -600,6 +609,7 @@ impl UdsTransportBuilder {
             key: None,
             channel_capacity: 256,
             connect_timeout: Duration::from_secs(5),
+            shrink_threshold: None,
         }
     }
 
@@ -627,6 +637,17 @@ impl UdsTransportBuilder {
         self
     }
 
+    /// Override the per-connection read-buffer shrink threshold (bytes).
+    ///
+    /// If a single oversized inbound frame causes the listener's `BytesMut`
+    /// read buffer to grow past this many bytes, the buffer will be reset back
+    /// to a small capacity the next time it fully drains. Defaults to 8 MB,
+    /// overridable at process start via `VELO_UDS_SHRINK_THRESHOLD`.
+    pub fn shrink_threshold(mut self, bytes: usize) -> Self {
+        self.shrink_threshold = Some(bytes);
+        self
+    }
+
     /// Build the UdsTransport
     pub fn build(self) -> Result<UdsTransport> {
         let socket_path = self
@@ -639,13 +660,17 @@ impl UdsTransportBuilder {
         addr_builder.add_entry(key.clone(), local_endpoint.as_bytes().to_vec())?;
         let local_address = addr_builder.build()?;
 
-        Ok(UdsTransport::new(
+        let mut transport = UdsTransport::new(
             socket_path,
             key,
             local_address,
             self.channel_capacity,
             self.connect_timeout,
-        ))
+        );
+        if let Some(t) = self.shrink_threshold {
+            transport.shrink_threshold = t;
+        }
+        Ok(transport)
     }
 }
 

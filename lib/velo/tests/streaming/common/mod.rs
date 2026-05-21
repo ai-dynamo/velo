@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use velo::streaming::{AnchorManager, FrameTransport};
-use velo_ext::WorkerId;
+use velo_ext::{TransportKey, WorkerAddress, WorkerId};
 
 /// In-memory [`FrameTransport`] implementation for local integration tests.
 ///
@@ -31,25 +31,33 @@ impl MockFrameTransport {
 }
 
 impl FrameTransport for MockFrameTransport {
+    fn key(&self) -> TransportKey {
+        TransportKey::new("mock-stream")
+    }
+
+    fn address(&self) -> WorkerAddress {
+        WorkerAddress::empty()
+    }
+
     fn bind(
         &self,
-        anchor_id: u64,
+        _anchor_id: u64,
         _session_id: u64,
-    ) -> BoxFuture<'_, anyhow::Result<(String, flume::Receiver<Vec<u8>>)>> {
+    ) -> BoxFuture<'_, anyhow::Result<flume::Receiver<Vec<u8>>>> {
         Box::pin(async move {
             let (_tx, rx) = flume::bounded::<Vec<u8>>(256);
             // tx dropped immediately — bind receiver is for reader_pump only.
             // StreamSender writes to frame_tx (the StreamAnchor's internal channel),
             // not to this transport channel.
-            Ok((format!("mock://{}", anchor_id), rx))
+            Ok(rx)
         })
     }
 
     fn connect(
         &self,
-        _endpoint: &str,
+        _peer: WorkerId,
         _anchor_id: u64,
-        _worker_id: u64,
+        _session_id: u64,
     ) -> BoxFuture<'_, anyhow::Result<flume::Sender<Vec<u8>>>> {
         Box::pin(async move {
             // StreamSender writes to frame_tx (not this sender), so returning a

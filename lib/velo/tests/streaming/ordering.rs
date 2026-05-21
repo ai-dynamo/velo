@@ -77,9 +77,8 @@ async fn test_remote_stream_preserves_send_order() {
     let worker_id_b = messenger_b.instance_id().worker_id();
 
     // Worker A: receiver
-    let vft_a = Arc::new(
-        VeloFrameTransport::new(Arc::clone(&messenger_a), worker_id_a, None).expect("VFT worker A"),
-    );
+    let vft_a =
+        Arc::new(VeloFrameTransport::new(Arc::clone(&messenger_a), None).expect("VFT worker A"));
     let am_a: Arc<velo::streaming::AnchorManager> = Arc::new(
         AnchorManagerBuilder::default()
             .worker_id(worker_id_a)
@@ -100,9 +99,8 @@ async fn test_remote_stream_preserves_send_order() {
     let handle_transferred = StreamAnchorHandle::pack(WorkerId::from_u64(hi), lo);
 
     // Worker B: sender
-    let vft_b = Arc::new(
-        VeloFrameTransport::new(Arc::clone(&messenger_b), worker_id_b, None).expect("VFT worker B"),
-    );
+    let vft_b =
+        Arc::new(VeloFrameTransport::new(Arc::clone(&messenger_b), None).expect("VFT worker B"));
     let am_b: Arc<velo::streaming::AnchorManager> = Arc::new(
         AnchorManagerBuilder::default()
             .worker_id(worker_id_b)

@@ -89,9 +89,8 @@ async fn test_02_remote_attach() {
     let worker_id_b = messenger_b.instance_id().worker_id();
 
     // Worker A: create VeloFrameTransport and AnchorManager
-    let vft_a = Arc::new(
-        VeloFrameTransport::new(Arc::clone(&messenger_a), worker_id_a, None).expect("VFT worker A"),
-    );
+    let vft_a =
+        Arc::new(VeloFrameTransport::new(Arc::clone(&messenger_a), None).expect("VFT worker A"));
     let am_a: Arc<velo::streaming::AnchorManager> = Arc::new(
         AnchorManagerBuilder::default()
             .worker_id(worker_id_a)
@@ -119,9 +118,8 @@ async fn test_02_remote_attach() {
     assert_eq!(recovered_worker, worker_id_a);
 
     // Worker B: create VeloFrameTransport and AnchorManager
-    let vft_b = Arc::new(
-        VeloFrameTransport::new(Arc::clone(&messenger_b), worker_id_b, None).expect("VFT worker B"),
-    );
+    let vft_b =
+        Arc::new(VeloFrameTransport::new(Arc::clone(&messenger_b), None).expect("VFT worker B"));
     let am_b: Arc<velo::streaming::AnchorManager> = Arc::new(
         AnchorManagerBuilder::default()
             .worker_id(worker_id_b)

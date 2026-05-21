@@ -3,6 +3,7 @@
 
 //! Transport key type for type-safe transport identification.
 
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::Arc;
 
@@ -28,7 +29,8 @@ use std::sync::Arc;
 /// let mut transports = HashMap::new();
 /// transports.insert(TransportKey::from("tcp"), "tcp://127.0.0.1:5555");
 /// ```
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct TransportKey(Arc<str>);
 
 impl TransportKey {
