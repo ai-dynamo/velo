@@ -161,9 +161,16 @@ impl<K: Eq + Hash, V> PendingMap<K, V> {
 
     /// Resolve the pending operation for `key` with `value`.
     ///
-    /// Returns `true` if an entry was found and the value was delivered.
-    /// Returns `false` if the map is closed, the key is absent, or the
-    /// [`Waiter`] has been dropped.
+    /// Returns `true` if a pending entry was found and removed — i.e. the
+    /// completion matched a registered operation. Returns `false` if the map
+    /// is closed or the key is absent (already resolved, cancelled, or never
+    /// registered), making late completions a silent no-op.
+    ///
+    /// Delivery is best-effort: if the [`Waiter`] was dropped (e.g. the
+    /// awaiting future was cancelled) the value is discarded but this still
+    /// returns `true`, because the completion did match a pending entry —
+    /// callers using `false` to detect *stray* completions would otherwise
+    /// misreport that race.
     ///
     /// # Panics
     ///
@@ -345,6 +352,19 @@ mod tests {
     async fn resolve_absent_returns_false() {
         let map: PendingMap<u32, &str> = PendingMap::new();
         assert!(!map.resolve(&99, "nope"));
+    }
+
+    /// resolve returns true when the entry existed even if the Waiter was
+    /// dropped: the contract is entry-removed, not delivered. A second
+    /// resolve for the same key is then absent and returns false.
+    #[tokio::test]
+    async fn resolve_dropped_waiter_still_true() {
+        let map: PendingMap<u32, &str> = PendingMap::new();
+        let waiter = map.register(1).expect("register");
+        drop(waiter);
+        assert!(map.resolve(&1, "late"));
+        assert!(!map.resolve(&1, "stray"));
+        assert_eq!(map.len(), 0);
     }
 
     /// close drains all waiters with the given reason; len() == 0 after.
