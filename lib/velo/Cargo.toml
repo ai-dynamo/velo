@@ -227,3 +227,11 @@ path = "tests/transports/uds_shutdown.rs"
 name = "transports_zmq"
 path = "tests/transports/zmq_integration.rs"
 required-features = ["zmq"]
+
+[[test]]
+name = "sync_pending_map"
+path = "tests/sync/pending_map.rs"
+
+[[test]]
+name = "sync_close_signal"
+path = "tests/sync/close_signal.rs"
