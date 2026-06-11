@@ -30,6 +30,9 @@ use velo_ext::{InstanceId, PeerInfo};
 #[cfg(unix)]
 use velo::transports::uds::{UdsTransport, UdsTransportBuilder};
 
+#[cfg(all(feature = "tipc", target_os = "linux"))]
+use velo::transports::tipc::{TipcTransport, TipcTransportBuilder};
+
 use std::sync::Once;
 use tracing_subscriber::FmtSubscriber;
 
@@ -289,6 +292,15 @@ impl TestTransportHandle<UdsTransport> {
     }
 }
 
+// TIPC-specific convenience constructors
+#[cfg(all(feature = "tipc", target_os = "linux"))]
+impl TestTransportHandle<TipcTransport> {
+    /// Create a new TIPC transport using a random service instance.
+    pub async fn new_tipc() -> anyhow::Result<Self> {
+        Self::with_factory(|| TipcTransportBuilder::new().build()).await
+    }
+}
+
 // // UCX-specific convenience constructors
 // #[cfg(feature = "ucx")]
 // impl TestTransportHandle<UcxTransport> {
@@ -448,6 +460,15 @@ impl TestCluster<UdsTransport> {
             UdsTransportBuilder::new().socket_path(&socket_path).build()
         })
         .await
+    }
+}
+
+// TIPC-specific convenience constructor
+#[cfg(all(feature = "tipc", target_os = "linux"))]
+impl TestCluster<TipcTransport> {
+    /// Create a new TIPC test cluster with the specified number of transports.
+    pub async fn new_tipc(size: usize) -> anyhow::Result<Self> {
+        Self::with_factory(size, || TipcTransportBuilder::new().build()).await
     }
 }
 
@@ -667,6 +688,61 @@ impl ShutdownTestClient for UdsShutdownClient {
     }
 }
 
+/// TIPC shutdown test client
+#[cfg(all(feature = "tipc", target_os = "linux"))]
+pub struct TipcShutdownClient;
+
+#[cfg(all(feature = "tipc", target_os = "linux"))]
+impl ShutdownTestClient for TipcShutdownClient {
+    type Transport = TipcTransport;
+    type Stream = velo::transports::tipc::TipcStream;
+
+    async fn new_handle() -> anyhow::Result<TestTransportHandle<Self::Transport>> {
+        TestTransportHandle::new_tipc().await
+    }
+
+    async fn connect_and_send_frame(
+        handle: &TestTransportHandle<Self::Transport>,
+        msg_type: MessageType,
+        header: &[u8],
+        payload: &[u8],
+    ) -> Self::Stream {
+        use velo::transports::tcp::TcpFrameCodec;
+        use velo::transports::tipc::TipcEndpoint;
+        use velo_ext::TransportKey;
+
+        let ep = {
+            let wa = handle.transport.address();
+            let key = TransportKey::from("tipc");
+            let bytes = wa.get_entry(&key).unwrap().unwrap();
+            rmp_serde::from_slice::<TipcEndpoint>(&bytes).unwrap()
+        };
+
+        let mut stream = velo::transports::tipc::TipcStream::connect(
+            ep.socket_ref,
+            ep.node,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("TipcStream::connect should succeed in shutdown tests");
+
+        TcpFrameCodec::encode_frame(&mut stream, msg_type, header, payload)
+            .await
+            .expect("encode_frame should succeed in shutdown tests");
+
+        stream
+    }
+
+    async fn read_one_frame(stream: &mut Self::Stream) -> (MessageType, Bytes, Bytes) {
+        use futures::StreamExt;
+        use tokio_util::codec::Framed;
+        use velo::transports::tcp::TcpFrameCodec;
+
+        let mut framed = Framed::new(stream, TcpFrameCodec::new());
+        framed.next().await.unwrap().unwrap()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Test generation macros
 // ---------------------------------------------------------------------------
@@ -845,6 +921,23 @@ impl TransportFactory for UdsFactory {
 
     async fn create_cluster(size: usize) -> anyhow::Result<TestCluster<Self::Transport>> {
         TestCluster::new_uds(size).await
+    }
+}
+
+/// TIPC transport factory
+#[cfg(all(feature = "tipc", target_os = "linux"))]
+pub struct TipcFactory;
+
+#[cfg(all(feature = "tipc", target_os = "linux"))]
+impl TransportFactory for TipcFactory {
+    type Transport = TipcTransport;
+
+    async fn create() -> anyhow::Result<TestTransportHandle<Self::Transport>> {
+        TestTransportHandle::new_tipc().await
+    }
+
+    async fn create_cluster(size: usize) -> anyhow::Result<TestCluster<Self::Transport>> {
+        TestCluster::new_tipc(size).await
     }
 }
 

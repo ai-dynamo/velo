@@ -160,11 +160,31 @@ pub struct Velo {
     stream_transport: Arc<dyn crate::streaming::FrameTransport>,
 }
 
+/// Closure type for TIPC re-register hook installation (invariant 7).
+///
+/// Each closure captures a `TopologyState` and installs the provided
+/// `Arc<dyn Fn(PeerInfo) + Send + Sync>` hook onto it.  Using a type alias
+/// avoids a `clippy::type_complexity` lint on the `VeloBuilder` field.
+#[cfg(all(target_os = "linux", feature = "tipc"))]
+type TipcHookInstaller = Box<dyn Fn(Arc<dyn Fn(PeerInfo) + Send + Sync>) + Send + Sync>;
+
 /// Builder for configuring and creating a [`Velo`] instance.
 pub struct VeloBuilder {
     inner: MessengerBuilder,
     stream_config: Option<StreamConfig>,
     metrics: Option<Arc<VeloMetrics>>,
+    /// Hook-installer closures for TIPC transports (invariant 7).
+    ///
+    /// Each closure accepts the re-register hook
+    /// (`Arc<dyn Fn(PeerInfo) + Send + Sync>`) and installs it on the
+    /// corresponding transport's `TopologyState`.  The closure captures the
+    /// `TopologyState` internally, avoiding the need to expose the `topology`
+    /// module from the `tipc` crate.
+    ///
+    /// Populated by [`add_tipc_transport`]; consumed (and drained) during
+    /// [`build`].
+    #[cfg(all(target_os = "linux", feature = "tipc"))]
+    tipc_hook_installers: Vec<TipcHookInstaller>,
 }
 
 impl VeloBuilder {
@@ -174,7 +194,43 @@ impl VeloBuilder {
             inner: MessengerBuilder::new(),
             stream_config: None,
             metrics: None,
+            #[cfg(all(target_os = "linux", feature = "tipc"))]
+            tipc_hook_installers: Vec::new(),
         }
+    }
+
+    /// Register a TIPC transport and record it for re-register hook wiring.
+    ///
+    /// ## Why this method instead of `add_transport`?
+    ///
+    /// After the Velo messenger is built, the TIPC topology watcher needs a
+    /// callback — `Arc<dyn Fn(PeerInfo) + Send + Sync>` — to re-drive
+    /// cold-start registrations that were parked while the TIPC name table
+    /// was converging (design invariant 7).  Wiring this from `add_transport`
+    /// is impossible because the `Transport` trait (in `velo-ext`) has no
+    /// `Any` downcast, and `VeloBackend.transports` is a private `HashMap`.
+    ///
+    /// `add_tipc_transport` side-steps the problem by recording the
+    /// `TopologyState` in `tipc_hook_targets` (available before `build()`)
+    /// while also calling `inner.add_transport(transport)` so the transport
+    /// is registered in the messenger as usual.
+    ///
+    /// The hook is installed in [`VeloBuilder::build`] after `Messenger` is
+    /// constructed; see the "TIPC re-register hooks" comment there.
+    #[cfg(all(target_os = "linux", feature = "tipc"))]
+    pub fn add_tipc_transport(
+        mut self,
+        transport: Arc<crate::transports::tipc::TipcTransport>,
+    ) -> Self {
+        // Capture the TopologyState in a closure that accepts the hook.
+        // This avoids exposing the `topology` module from the `tipc` crate —
+        // the hook installer is the only contract lib.rs needs.
+        let topo = transport.topology_state();
+        self.tipc_hook_installers.push(Box::new(move |hook| {
+            topo.set_reregister_hook(hook);
+        }));
+        self.inner = self.inner.add_transport(transport);
+        self
     }
 
     /// Add a transport to the system.
@@ -236,6 +292,26 @@ impl VeloBuilder {
     pub async fn build(self) -> Result<Arc<Velo>> {
         // Step 1: Build Messenger.
         let messenger = self.inner.build().await?;
+
+        // TIPC re-register hooks (invariant 7): install an Arc<Fn(PeerInfo)>
+        // on each TipcTransport's TopologyState that calls messenger.register_peer.
+        // This enables cold-start recovery: peers that were parked during TIPC
+        // name-table convergence are automatically re-driven when their
+        // publication appears (TIPC_PUBLISHED) or their node comes up.
+        //
+        // Implementation note: the `Transport` trait (in velo-ext) has no
+        // downcast, and VeloBackend.transports is private.  The side-channel
+        // is add_tipc_transport() which stores TopologyState in tipc_hook_targets
+        // before type-erasing the transport into Arc<dyn Transport>.
+        #[cfg(all(target_os = "linux", feature = "tipc"))]
+        for installer in &self.tipc_hook_installers {
+            let m = Arc::clone(&messenger);
+            installer(Arc::new(move |peer_info: PeerInfo| {
+                if let Err(e) = m.register_peer(peer_info) {
+                    tracing::warn!("TIPC re-register hook: messenger.register_peer failed: {e}");
+                }
+            }));
+        }
 
         // Step 2: Extract worker_id (carried on the local PeerInfo).
         let worker_id = messenger.instance_id().worker_id();

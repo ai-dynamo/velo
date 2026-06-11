@@ -111,7 +111,7 @@ impl NodeStateWatch {
     ///
     /// O(1), lock-free read via `DashMap`.
     pub fn is_up(&self, node: u32) -> bool {
-        self.map.get(&node).map_or(false, |r| *r)
+        self.map.get(&node).is_some_and(|r| *r)
     }
 
     fn set(&self, node: u32, up: bool) {
@@ -149,7 +149,7 @@ impl VeloServiceWatch {
     pub fn publication_matches(&self, instance: u32, socket_ref: u32, node: u32) -> bool {
         self.map
             .get(&instance)
-            .map_or(false, |r| *r == (socket_ref, node))
+            .is_some_and(|r| *r == (socket_ref, node))
     }
 
     fn set(&self, instance: u32, socket_ref: u32, node: u32) {
@@ -432,10 +432,10 @@ fn process_event(
                 debug!("TIPC topology: initial replay complete; caches are now fresh");
                 redrive_pending(state);
                 // Signal fires only once; subsequent reconnects find ready_tx empty.
-                if let Ok(mut guard) = ready_tx.lock() {
-                    if let Some(tx) = guard.take() {
-                        let _ = tx.send(());
-                    }
+                if let Ok(mut guard) = ready_tx.lock()
+                    && let Some(tx) = guard.take()
+                {
+                    let _ = tx.send(());
                 }
             }
             // Permanent subscriptions (HANDLE_NODE_STATE, HANDLE_VELO_SERVICE) use

@@ -30,6 +30,9 @@ pub enum TransportType {
     /// gRPC transport.
     #[cfg(feature = "grpc")]
     Grpc,
+    /// TIPC transport. Requires the `tipc` feature and `tipc.ko` loaded on Linux.
+    #[cfg(all(feature = "tipc", target_os = "linux"))]
+    Tipc,
 }
 
 /// Build a transport on loopback for an example.
@@ -81,6 +84,10 @@ pub async fn new_transport(ty: TransportType, tag: &str) -> Result<Arc<dyn Trans
                     .build()?,
             ))
         }
+        #[cfg(all(feature = "tipc", target_os = "linux"))]
+        TransportType::Tipc => Ok(Arc::new(
+            velo::transports::tipc::TipcTransportBuilder::new().build()?,
+        )),
     }
 }
 

@@ -12,7 +12,7 @@ mod sys;
 mod topology;
 mod transport;
 
-// TODO: uncomment re-exports once the items are defined in their respective modules.
-// pub use endpoint::TipcEndpoint;
-// pub use stream::TipcStream;
-// pub use transport::{TipcTransport, TipcTransportBuilder};
+pub use endpoint::TipcEndpoint;
+pub use stream::TipcStream;
+pub use topology::TopologyState;
+pub use transport::{TipcScope, TipcTransport, TipcTransportBuilder};

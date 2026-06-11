@@ -270,12 +270,73 @@ jobs:
       if: always()
       run: /tmp/use-sccache.sh show-stats "semver" || true
 
+  # ── TIPC transport — probe + integration tests ──────────────────────────────
+  # Step zero of §9: verify the runner-host kernel can load tipc.ko.
+  # The job always exits success; when the module is absent it records
+  # tipc_available=false and tipc-tests is skipped (not failed).
+  tipc-probe:
+    name: TIPC Module Probe
+    runs-on: prod-velo-default-v1
+    # No container: modprobe and lsmod must run on the runner host directly.
+    permissions:
+      contents: read
+    outputs:
+      tipc_available: ${{ steps.probe.outputs.tipc_available }}
+    steps:
+    - name: Probe TIPC kernel module
+      id: probe
+      run: |
+        sudo -n modprobe tipc 2>/dev/null || true
+        if lsmod | grep -q "^tipc"; then
+          echo "tipc_available=true" >> "$GITHUB_OUTPUT"
+          echo "TIPC module loaded — tipc-tests will run"
+        else
+          echo "tipc_available=false" >> "$GITHUB_OUTPUT"
+          echo "TIPC module not available — tipc-tests skipped (§9 step zero: verify runner-host kernel)"
+        fi
+
+  # Runs only when the probe confirmed tipc.ko is loaded.
+  # TIPC_CI=1 activates the canary test that hard-fails when the module probe
+  # lied. RUSTFLAGS carries --cfg velo_tipc (velo_endurance precedent) which
+  # enables the #[cfg(velo_tipc)]-gated integration test bodies; the companion
+  # check-cfg = ['cfg(velo_tipc)'] entry in lib/velo/Cargo.toml [lints.rust]
+  # silences the unexpected_cfg warning under -D warnings.
+  tipc-tests:
+    name: TIPC Integration Tests
+    needs: tipc-probe
+    if: needs.tipc-probe.outputs.tipc_available == 'true'
+    runs-on: prod-velo-default-v1
+    container:
+      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.3
+    permissions:
+      contents: read
+    env:
+      TIPC_CI: "1"
+      RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold --cfg velo_tipc"
+    steps:
+    - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 #v6.0.1
+    - name: Rust setup
+      uses: ./.github/actions/rust-setup
+    - name: sccache setup
+      uses: ./.github/actions/sccache-setup
+      with:
+        bucket: ${{ secrets.SCCACHE_S3_BUCKET }}
+    - name: Run TIPC integration tests
+      run: |
+        cargo test --locked --features tipc \
+          --test transports_tipc \
+          --test transports_tipc_shutdown \
+          --test transports_tipc_node_affinity
+    - name: sccache stats
+      if: always()
+      run: /tmp/use-sccache.sh show-stats "tipc-tests" || true
+
   ci-status:
     name: CI Status
     runs-on: prod-velo-default-v1
     container:
       image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.3
-    needs: [fmt, clippy, deny, test, soak-smoke, coverage, examples, semver]
+    needs: [fmt, clippy, deny, test, soak-smoke, coverage, examples, semver, tipc-probe, tipc-tests]
     if: always()
     steps:
     - name: Check all jobs
