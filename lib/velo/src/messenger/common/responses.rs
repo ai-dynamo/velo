@@ -51,6 +51,10 @@
 //! - `AckNack` (`am_sync`): ACK on success, NACK on error
 //!
 //! For request-response patterns with payloads, use `unary`/`unary_handler_async`.
+//!
+//! For session-scoped caller-keyed correlation with atomic drain-on-close, see
+//! [`crate::sync::PendingMap`]. This manager intentionally stays `pub(crate)` —
+//! see the boundary documentation in [`crate::sync`] for the reasoning.
 
 use crate::observability::VeloMetrics;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
