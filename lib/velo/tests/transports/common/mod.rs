@@ -698,7 +698,14 @@ impl ShutdownTestClient for TipcShutdownClient {
     type Stream = velo::transports::tipc::TipcStream;
 
     async fn new_handle() -> anyhow::Result<TestTransportHandle<Self::Transport>> {
-        TestTransportHandle::new_tipc().await
+        let result = TestTransportHandle::new_tipc().await;
+        if result.is_err() && std::env::var("TIPC_CI").as_deref() == Ok("1") {
+            panic!(
+                "TIPC_CI=1 is set but TipcTransportBuilder::build() failed — \
+                 the tipc-probe job reported tipc.ko as loaded but it is absent."
+            );
+        }
+        result
     }
 
     async fn connect_and_send_frame(
@@ -933,7 +940,19 @@ impl TransportFactory for TipcFactory {
     type Transport = TipcTransport;
 
     async fn create() -> anyhow::Result<TestTransportHandle<Self::Transport>> {
-        TestTransportHandle::new_tipc().await
+        // TIPC_CI=1 canary: the tipc-tests CI job sets this env var after the
+        // tipc-probe job confirmed that tipc.ko is loaded.  If TipcTransportBuilder
+        // fails here with TIPC_CI=1 set, the probe lied and we hard-fail so the
+        // dedicated job cannot silently skip all TIPC tests.
+        let result = TestTransportHandle::new_tipc().await;
+        if result.is_err() && std::env::var("TIPC_CI").as_deref() == Ok("1") {
+            panic!(
+                "TIPC_CI=1 is set but TipcTransportBuilder::build() failed — \
+                 the tipc-probe job reported tipc.ko as loaded but it is absent. \
+                 Check the runner host's kernel module state."
+            );
+        }
+        result
     }
 
     async fn create_cluster(size: usize) -> anyhow::Result<TestCluster<Self::Transport>> {

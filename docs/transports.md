@@ -206,7 +206,7 @@ remote endpoint:
 - **`ep.node == local.node` with unequal nonce** → foreign stack claiming our node identity
   (misconfiguration) → `Never`.
 - **Node alive AND live name-table publication matches** (`{service_instance, socket_ref, node}`)
-  → `Never`.
+  → `Reachable` (bearer path: zero-RTT confirmation via kernel name table).
 - **Otherwise** → name-table still converging or stale endpoint → `NotYet`; the endpoint is
   parked and automatically re-driven through the re-register hook when a matching
   `TIPC_PUBLISHED` or node-up event arrives.  TCP is used in the interim; the flip to TIPC is

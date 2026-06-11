@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-#![cfg(all(feature = "tipc", target_os = "linux"))]
-
 //! Integration tests for TIPC graceful shutdown.
 //!
 //! * Standard shutdown scenarios via the `transport_shutdown_tests!` macro with
@@ -10,6 +8,10 @@
 //! * TIPC-specific invariant 2 pin: a plain `close()` (no `shutdown(Both)`) produces
 //!   `ECONNRESET` at the listener, which must be treated as a graceful close — no
 //!   `DecodeError` metric, no error log (proposal §2.3 / invariant 2).
+//!
+//! Gated on `#[cfg(velo_tipc)]` — see `tipc_integration.rs` for rationale.
+
+#![cfg(velo_tipc)]
 
 #[macro_use]
 mod common;

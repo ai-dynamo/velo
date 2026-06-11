@@ -41,7 +41,7 @@ use velo_ext::{
 };
 
 use super::endpoint::TipcEndpoint;
-use super::listener::{BoundTipcListener, default_shrink_threshold};
+use super::listener::{BoundTipcListener, BoundTipcListenerConfig, default_shrink_threshold};
 use super::socket::{
     bind_service_range_and_listen, compute_netns_nonce, create_tipc_stream, getsockname_ref_node,
     tipc_available,
@@ -501,12 +501,14 @@ impl Transport for TipcTransport {
 
             let bound = BoundTipcListener::new(
                 listener_sock,
-                channels,
-                Arc::new(DefaultErrHandler),
-                shutdown_state,
-                self.key.as_str().to_string(),
-                self.metrics.get().cloned(),
-                self.shrink_threshold,
+                BoundTipcListenerConfig {
+                    adapter: channels,
+                    error_handler: Arc::new(DefaultErrHandler),
+                    shutdown_state,
+                    transport_key: self.key.as_str().to_string(),
+                    metrics: self.metrics.get().cloned(),
+                    shrink_threshold: self.shrink_threshold,
+                },
             );
 
             rt.spawn(async move {
@@ -539,7 +541,7 @@ impl Transport for TipcTransport {
         }
     }
 
-    /// Phase-3 teardown: cancel listeners and writer tasks, clear state.
+    /// Phase-3 teardown: cancel listeners, writer tasks, topology watcher; clear state.
     fn shutdown(&self) {
         info!("Shutting down TIPC transport");
         // Cancel teardown token → accept loop + per-connection readers exit.
@@ -548,6 +550,9 @@ impl Transport for TipcTransport {
         }
         // Cancel transport token → all writer tasks exit.
         self.cancel_token.cancel();
+        // Cancel topology-watcher task → exits its read/reconnect loop promptly,
+        // releasing the SEQPACKET topology-server connection.
+        self.topology.cancel();
         self.connections.clear();
         self.update_connection_gauge();
     }
@@ -601,7 +606,14 @@ impl Transport for TipcTransport {
                 .clone();
 
             // Zero-RTT fast miss: node is known down.
-            if ep.node != 0 && !self.topology.node_state.is_up(ep.node) {
+            // Only applies when caches are fresh — a stale cache (topology server
+            // reconnecting) has an empty node_state map, so is_up returns false for
+            // every node.  Treating a stale miss as ConnectionFailed would falsely
+            // fail health checks for all bearer-cluster peers during any reconnect
+            // window.  Fall through to the probe-connect instead, mirroring the
+            // register() gate's stale → NotYet discipline.
+            if !self.topology.is_stale() && ep.node != 0 && !self.topology.node_state.is_up(ep.node)
+            {
                 return Err(HealthCheckError::ConnectionFailed);
             }
 
@@ -1384,6 +1396,166 @@ mod tests {
         assert!(
             Arc::ptr_eq(&ts, &topology),
             "topology_state() must return the same Arc as was passed in"
+        );
+    }
+
+    // ── Gate arm 5 tests: bearer path with fresh caches ───────────────────────
+    //
+    // These tests require the `mark_fresh_for_test` / `test_mark_node_up` /
+    // `test_publish_service` seams added to `TopologyState` for exactly this
+    // purpose (proposal §9, finding 5).  They exercise the code path that was
+    // previously unreachable in the no-bearer CI environment:
+    //
+    //   !is_stale() && node_state.is_up(ep.node)
+    //   && service_watch.publication_matches(instance, ref, node)
+    //   → Gate::Reachable
+    //
+    // Without these tests a regression in the publication_matches triple-check
+    // or the is_stale guard ordering would pass the entire suite.
+
+    /// `Gate::Reachable` — arm 5: fresh caches, node up, publication matches.
+    #[test]
+    fn gate_reachable_bearer_fresh_cache_node_up_publication_matches() {
+        let local_node = 0x1111_1111u32;
+        let remote_node = 0x2222_2222u32;
+        let remote_ref = 0x5678u32;
+        let remote_instance = 200u32;
+
+        let local = make_ep(TEST_NETID, 0xAAAA, local_node, 0xAAAA, 100);
+        let topology = TopologyState::new(TEST_SVC_TYPE);
+
+        // Simulate barrier TIPC_SUBSCR_TIMEOUT (initial replay complete).
+        topology.mark_fresh_for_test();
+        // Simulate the remote node coming up.
+        topology.test_mark_node_up(remote_node);
+        // Simulate the remote service being published.
+        topology.test_publish_service(remote_instance, remote_ref, remote_node);
+
+        let transport = make_transport_for_test(local, Arc::clone(&topology));
+
+        let remote = make_ep(TEST_NETID, 0xBBBB, remote_node, remote_ref, remote_instance);
+        let peer = peer_info_from_ep(&remote);
+        let iid = peer.instance_id();
+
+        transport
+            .register(peer)
+            .expect("arm 5: fresh + node_up + publication_matches → Gate::Reachable");
+        assert!(
+            transport.peers.contains_key(&iid),
+            "Reachable peer must be stored in peers map"
+        );
+        assert!(
+            !topology.pending.contains_key(&iid),
+            "Reachable peer must not be left in pending"
+        );
+    }
+
+    /// `Gate::NotYet` — arm 5 miss: fresh caches, node up, publication absent.
+    ///
+    /// The service watch does not contain the peer's {instance, socket_ref, node},
+    /// so `publication_matches` returns false → `Gate::NotYet` (parked).
+    #[test]
+    fn gate_not_yet_bearer_fresh_cache_node_up_no_publication() {
+        let local_node = 0x1111_1111u32;
+        let remote_node = 0x2222_2222u32;
+
+        let local = make_ep(TEST_NETID, 0xAAAA, local_node, 0xAAAA, 100);
+        let topology = TopologyState::new(TEST_SVC_TYPE);
+
+        topology.mark_fresh_for_test();
+        topology.test_mark_node_up(remote_node);
+        // Do NOT publish the service → publication_matches returns false.
+
+        let transport = make_transport_for_test(local, Arc::clone(&topology));
+
+        let remote = make_ep(TEST_NETID, 0xBBBB, remote_node, 0x5678, 200);
+        let peer = peer_info_from_ep(&remote);
+        let iid = peer.instance_id();
+
+        let result = transport.register(peer);
+        assert!(
+            matches!(result, Err(TransportError::NoEndpoint)),
+            "arm 5 miss (no publication): must return NoEndpoint (Gate::NotYet)"
+        );
+        assert!(
+            topology.pending.contains_key(&iid),
+            "Gate::NotYet must park the peer in topology.pending"
+        );
+    }
+
+    /// `Gate::NotYet` — arm 5 miss: fresh caches, node down, publication present.
+    ///
+    /// The node-state watch does not show the node as up even though the service
+    /// is published.  Both checks must pass for `Gate::Reachable`; missing either
+    /// yields `Gate::NotYet`.
+    #[test]
+    fn gate_not_yet_bearer_fresh_cache_node_down_publication_present() {
+        let local_node = 0x1111_1111u32;
+        let remote_node = 0x2222_2222u32;
+        let remote_ref = 0x5678u32;
+        let remote_instance = 200u32;
+
+        let local = make_ep(TEST_NETID, 0xAAAA, local_node, 0xAAAA, 100);
+        let topology = TopologyState::new(TEST_SVC_TYPE);
+
+        topology.mark_fresh_for_test();
+        // Do NOT mark the node as up (is_up returns false for absent entries).
+        // Publish the service — but node-down makes this irrelevant.
+        topology.test_publish_service(remote_instance, remote_ref, remote_node);
+
+        let transport = make_transport_for_test(local, Arc::clone(&topology));
+
+        let remote = make_ep(TEST_NETID, 0xBBBB, remote_node, remote_ref, remote_instance);
+        let peer = peer_info_from_ep(&remote);
+        let iid = peer.instance_id();
+
+        let result = transport.register(peer);
+        assert!(
+            matches!(result, Err(TransportError::NoEndpoint)),
+            "arm 5 miss (node down): must return NoEndpoint (Gate::NotYet)"
+        );
+        assert!(
+            topology.pending.contains_key(&iid),
+            "Gate::NotYet must park the peer in topology.pending"
+        );
+    }
+
+    /// `Gate::NotYet` — arm 5 miss: fresh caches, node up, wrong socket_ref.
+    ///
+    /// `publication_matches` checks the full triple {instance, socket_ref, node}.
+    /// A stale ref (recycled socket, crashed-and-restarted peer) must not be
+    /// treated as reachable — `Gate::NotYet` (parked) instead.
+    #[test]
+    fn gate_not_yet_bearer_fresh_cache_publication_wrong_socket_ref() {
+        let local_node = 0x1111_1111u32;
+        let remote_node = 0x2222_2222u32;
+        let remote_instance = 200u32;
+        let published_ref = 0xAAAAu32;
+        let stale_ref = 0xBBBBu32; // endpoint carries a different socket_ref
+
+        let local = make_ep(TEST_NETID, 0xAAAA, local_node, 0xAAAA, 100);
+        let topology = TopologyState::new(TEST_SVC_TYPE);
+
+        topology.mark_fresh_for_test();
+        topology.test_mark_node_up(remote_node);
+        // Publish with published_ref; the peer advertises stale_ref.
+        topology.test_publish_service(remote_instance, published_ref, remote_node);
+
+        let transport = make_transport_for_test(local, Arc::clone(&topology));
+
+        // Remote endpoint carries the old stale_ref.
+        let remote = make_ep(TEST_NETID, 0xBBBB, remote_node, stale_ref, remote_instance);
+        let peer = peer_info_from_ep(&remote);
+        let iid = peer.instance_id();
+
+        let result = transport.register(peer);
+        assert!(
+            matches!(result, Err(TransportError::NoEndpoint)),
+            "arm 5 miss (wrong socket_ref): triple-check must reject a stale ref"
+        );
+        assert!(
+            topology.pending.contains_key(&iid),
+            "Gate::NotYet must park the peer in topology.pending"
         );
     }
 

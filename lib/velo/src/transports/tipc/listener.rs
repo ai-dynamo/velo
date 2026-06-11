@@ -74,6 +74,21 @@ struct TipcConnectionContext {
     shrink_threshold: usize,
 }
 
+// ── BoundTipcListenerConfig ───────────────────────────────────────────────────
+
+/// Configuration bundle for [`BoundTipcListener::new`].
+///
+/// Avoids a many-argument constructor while keeping the listener construction
+/// readable at the call site in `transport.rs`.
+pub(super) struct BoundTipcListenerConfig {
+    pub(super) adapter: TransportAdapter,
+    pub(super) error_handler: Arc<dyn TransportErrorHandler>,
+    pub(super) shutdown_state: ShutdownState,
+    pub(super) transport_key: String,
+    pub(super) metrics: Option<Arc<dyn velo_ext::TransportObservability>>,
+    pub(super) shrink_threshold: usize,
+}
+
 // ── BoundTipcListener ─────────────────────────────────────────────────────────
 
 /// A pre-bound TIPC `SOCK_STREAM` listener, ready to accept connections.
@@ -104,24 +119,15 @@ impl BoundTipcListener {
     /// `socket::bind_service_range_and_listen` on `listener`.  This constructor
     /// does not touch the socket; it is stored and registered with the tokio
     /// reactor when [`serve`][`BoundTipcListener::serve`] is called.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        listener: socket2::Socket,
-        adapter: TransportAdapter,
-        error_handler: Arc<dyn TransportErrorHandler>,
-        shutdown_state: ShutdownState,
-        transport_key: String,
-        metrics: Option<Arc<dyn velo_ext::TransportObservability>>,
-        shrink_threshold: usize,
-    ) -> Self {
+    pub(super) fn new(listener: socket2::Socket, config: BoundTipcListenerConfig) -> Self {
         Self {
             listener,
-            adapter,
-            error_handler,
-            shutdown_state,
-            transport_key,
-            metrics,
-            shrink_threshold,
+            adapter: config.adapter,
+            error_handler: config.error_handler,
+            shutdown_state: config.shutdown_state,
+            transport_key: config.transport_key,
+            metrics: config.metrics,
+            shrink_threshold: config.shrink_threshold,
         }
     }
 
@@ -442,12 +448,14 @@ mod tests {
 
         let _listener = BoundTipcListener::new(
             s2,
-            adapter,
-            error_handler,
-            ShutdownState::default(),
-            "tipc".to_string(),
-            None,
-            default_shrink_threshold(),
+            BoundTipcListenerConfig {
+                adapter,
+                error_handler,
+                shutdown_state: ShutdownState::default(),
+                transport_key: "tipc".to_string(),
+                metrics: None,
+                shrink_threshold: default_shrink_threshold(),
+            },
         );
         // If we got here without panicking, the constructor is correct.
     }

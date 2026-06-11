@@ -104,11 +104,15 @@ tonic-build = "0.13.1"
 [package.metadata.cargo-machete]
 ignored = ["axum", "http", "http-body", "http-body-util", "hyper", "hyper-util", "prost", "tower", "bs58"]
 
-# `velo_endurance` is a rustc --cfg flag (NOT a Cargo feature) so `--all-features`
-# in CI never enables the endurance suites. Opt in locally with:
-#   RUSTFLAGS="--cfg velo_endurance" cargo test --test streaming_endurance
+# `velo_endurance` and `velo_tipc` are rustc --cfg flags (NOT Cargo features) so
+# `--all-features` in CI never enables the associated test suites.
+#
+# velo_endurance: opt in with RUSTFLAGS="--cfg velo_endurance" cargo test --test streaming_endurance
+# velo_tipc:      set by the dedicated tipc-tests CI job via RUSTFLAGS="--cfg velo_tipc";
+#                 gates the TIPC integration test binaries so --all-features on
+#                 module-less Linux hosts does not run them and panic on EAFNOSUPPORT.
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(velo_endurance)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(velo_endurance)', 'cfg(velo_tipc)'] }
 
 # ── Integration tests (subdirectory layout) ─────────────────────────────────
 # Tests inherited from the pre-fold sibling crates live under

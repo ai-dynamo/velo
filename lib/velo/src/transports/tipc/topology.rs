@@ -52,6 +52,7 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 use tokio::io::unix::AsyncFd;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use velo_ext::{InstanceId, PeerInfo};
 
@@ -213,9 +214,17 @@ pub struct TopologyState {
     ///
     /// Typically wires to `VeloBackend::register_peer` (invariant 7).
     /// Stored in `OnceLock` for lock-free reads on the topology-event hot path.
-    /// Set by the velo builder after constructing `VeloBackend`; must be set
-    /// before `start()` is called.
+    /// Set by the velo builder after constructing `VeloBackend`; calling
+    /// [`set_reregister_hook`] immediately re-drives any already-pending entries,
+    /// so the install order relative to `start()` does not create a lost-event window.
     reregister_hook: OnceLock<Arc<dyn Fn(PeerInfo) + Send + Sync>>,
+    /// Cancellation token for the topology-watcher task.
+    ///
+    /// Cancelled by [`cancel`] (called from `TipcTransport::shutdown()`).
+    /// The topology task selects on this token in its reconnect-backoff loop and
+    /// in its per-event read loop so that shutdown does not leave an orphaned task
+    /// or a live SEQPACKET connection to the topology server.
+    cancel_token: CancellationToken,
 }
 
 impl TopologyState {
@@ -232,6 +241,7 @@ impl TopologyState {
             pending: DashMap::new(),
             cache_stale: AtomicBool::new(true),
             reregister_hook: OnceLock::new(),
+            cancel_token: CancellationToken::new(),
         })
     }
 
@@ -252,10 +262,65 @@ impl TopologyState {
     /// now succeed.  In-tree usage: wires to `VeloBackend::register_peer`.
     ///
     /// A second call is a caller bug; it logs a warning and is ignored.
+    ///
+    /// After installing the hook, any entries already in `pending` are immediately
+    /// re-driven through it.  This closes the window that would otherwise exist
+    /// between `Transport::start()` returning (which seeds pending via topology
+    /// replay) and `VeloBuilder::build()` calling this method: registrations
+    /// attempted in that window are re-tried synchronously on install.
     pub fn set_reregister_hook(&self, hook: Arc<dyn Fn(PeerInfo) + Send + Sync>) {
         if self.reregister_hook.set(hook).is_err() {
             warn!("TIPC topology: set_reregister_hook called more than once; second call ignored");
+            return;
         }
+        // Immediately re-drive any pending entries that accumulated before the hook
+        // was installed.  The OnceLock was just populated above; get() cannot fail.
+        let hook = self
+            .reregister_hook
+            .get()
+            .expect("hook was just installed via OnceLock::set");
+        let entries: Vec<PeerInfo> = self.pending.iter().map(|r| r.value().clone()).collect();
+        for peer_info in entries {
+            debug!(
+                "TIPC topology: re-driving pending peer {} on hook install",
+                peer_info.instance_id()
+            );
+            hook(peer_info);
+        }
+    }
+
+    /// Cancel the topology-watcher task.
+    ///
+    /// Called from `TipcTransport::shutdown()`.  Signals the long-running
+    /// `topology_task` to exit its read loop and reconnect-backoff loop so the
+    /// task — and the SEQPACKET connection it holds — are released promptly.
+    pub fn cancel(&self) {
+        self.cancel_token.cancel();
+    }
+
+    /// Mark the topology caches as fresh (test seam only).
+    ///
+    /// Simulates the barrier `TIPC_SUBSCR_TIMEOUT` arriving — i.e., the initial
+    /// topology replay is complete and `is_stale()` returns `false`.
+    ///
+    /// Used in unit tests to drive the bearer-path arm of the `register()` gate
+    /// (arm 5: fresh + node_up + publication_matches → `Gate::Reachable`) without
+    /// a live topology-server connection.
+    #[cfg(test)]
+    pub fn mark_fresh_for_test(&self) {
+        self.cache_stale.store(false, Ordering::Release);
+    }
+
+    /// Mark a node as up in the node-state cache (test seam only).
+    #[cfg(test)]
+    pub fn test_mark_node_up(&self, node: u32) {
+        self.node_state.set(node, true);
+    }
+
+    /// Publish a service in the service-watch cache (test seam only).
+    #[cfg(test)]
+    pub fn test_publish_service(&self, instance: u32, socket_ref: u32, node: u32) {
+        self.service_watch.set(instance, socket_ref, node);
     }
 
     /// Start the topology watcher.
@@ -317,7 +382,14 @@ async fn topology_task(
         let afd = if let Some(a) = maybe_afd.take() {
             a
         } else {
-            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            // Backoff before reconnect — cancelled immediately on transport shutdown
+            // so the task does not hang for up to RECONNECT_MAX_MS (5 s) after the
+            // transport is torn down.
+            tokio::select! {
+                biased;
+                _ = state.cancel_token.cancelled() => return,
+                _ = tokio::time::sleep(Duration::from_millis(backoff_ms)) => {}
+            }
             match connect_and_subscribe(state.service_type).await {
                 Ok(a) => {
                     backoff_ms = RECONNECT_INITIAL_MS;
@@ -332,8 +404,14 @@ async fn topology_task(
             }
         };
 
-        // Read events until the connection is lost.
+        // Read events until the connection is lost or the task is cancelled.
         reader_loop(&state, afd, &ready_tx).await;
+
+        // reader_loop returns on connection loss OR on cancel.
+        // Check cancellation before marking caches stale / attempting reconnect.
+        if state.cancel_token.is_cancelled() {
+            return;
+        }
 
         // Mark caches stale and clear them so the gate returns Gate::NotYet
         // rather than serving stale data from a dead topology connection.
@@ -347,18 +425,27 @@ async fn topology_task(
     }
 }
 
-/// Read events from `afd` until an error occurs (connection lost → return).
+/// Read events from `afd` until an error occurs (connection lost) or the
+/// topology watcher is cancelled.
 async fn reader_loop(
     state: &Arc<TopologyState>,
     afd: AsyncFd<socket2::Socket>,
     ready_tx: &Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
 ) {
     loop {
-        match read_event(&afd).await {
-            Ok(event) => process_event(state, &event, ready_tx),
-            Err(e) => {
-                debug!("TIPC topology: read error (connection lost): {e}");
-                return;
+        tokio::select! {
+            // Prioritise cancellation so transport shutdown exits promptly even
+            // when the topology server is sending a flood of events.
+            biased;
+            _ = state.cancel_token.cancelled() => return,
+            result = read_event(&afd) => {
+                match result {
+                    Ok(event) => process_event(state, &event, ready_tx),
+                    Err(e) => {
+                        debug!("TIPC topology: read error (connection lost): {e}");
+                        return;
+                    }
+                }
             }
         }
     }

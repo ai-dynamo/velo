@@ -296,8 +296,10 @@ jobs:
         fi
 
   # Runs only when the probe confirmed tipc.ko is loaded.
-  # TIPC_CI=1 activates the canary test that hard-fails when the module probe
-  # lied. RUSTFLAGS carries --cfg velo_tipc (velo_endurance precedent) which
+  # TIPC_CI=1 activates the canary assertion in TipcFactory::create /
+  # TipcShutdownClient::new_handle that hard-panics when the module probe lied —
+  # ensuring the dedicated job cannot silently skip all TIPC tests.
+  # RUSTFLAGS carries --cfg velo_tipc (same pattern as velo_endurance) which
   # enables the #[cfg(velo_tipc)]-gated integration test bodies; the companion
   # check-cfg = ['cfg(velo_tipc)'] entry in lib/velo/Cargo.toml [lints.rust]
   # silences the unexpected_cfg warning under -D warnings.

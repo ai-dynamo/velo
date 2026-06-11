@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-#![cfg(all(feature = "tipc", target_os = "linux"))]
-
 //! TIPC node-affinity and reachability-gate tests.
 //!
 //! Tests the `Gate::{Reachable, Never, NotYet}` verdicts from proposal §5.3
@@ -22,6 +20,10 @@
 //! The cold-start recovery test works around this limitation by manually inserting
 //! into `topology.pending` (the public test seam, proposal §9) to simulate the
 //! parked state, then verifying the hook fires and re-registration succeeds.
+//!
+//! Gated on `#[cfg(velo_tipc)]` — see `tipc_integration.rs` for rationale.
+
+#![cfg(velo_tipc)]
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
