@@ -1,11 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Allow dead_code during phased development: transport.rs (companion module being
-// developed concurrently) will consume BoundTipcListener and the helper functions
-// once the full TIPC module lands.  Remove this attribute when that module ships.
-#![allow(dead_code)]
-
 //! Two-phase bind, accept/serve/route/drain loop, and graceful-close handling
 //! (ECONNRESET with empty partial-frame buffer treated as graceful peer close).
 //!
@@ -257,13 +252,20 @@ async fn handle_connection(stream: TipcStream, ctx: TipcConnectionContext) {
     let mut framed = Framed::new(stream, TcpFrameCodec::new());
     let teardown_token = shutdown_state.teardown_token().clone();
 
-    loop {
+    // `owned_close` is true when we initiated the close (teardown token fired or
+    // a decode error occurred with partial data): we must call shutdown(Both) to
+    // send a clean EOF to the peer, then drop the socket via spawn_blocking because
+    // close(2) can block up to 8 s under link congestion.
+    //
+    // `owned_close` is false when the peer already closed the connection (clean EOF
+    // or ECONNRESET + empty buffer): inline drop is safe; no shutdown needed.
+    let owned_close = loop {
         tokio::select! {
             // Prioritise teardown so a saturated connection cannot starve shutdown.
             biased;
             _ = teardown_token.cancelled() => {
                 debug!("TIPC connection: torn down via teardown token");
-                break;
+                break true; // we own the close → shutdown + spawn_blocking
             }
             frame_result = framed.next() => {
                 match frame_result {
@@ -313,8 +315,10 @@ async fn handle_connection(stream: TipcStream, ctx: TipcConnectionContext) {
                     Some(Err(e)) => {
                         // Invariant 2: plain close() → ECONNRESET at peer.
                         // Empty buffer means no partial frame was in flight — all data
-                        // was delivered before the close signal.  Treat as graceful.
-                        // Non-empty buffer → partial frame = real decode error.
+                        // was delivered before the close signal.  Treat as graceful;
+                        // peer already closed, so inline drop is safe.
+                        // Non-empty buffer → partial frame in flight = real decode error;
+                        // we must close our end cleanly.
                         if e.kind() == io::ErrorKind::ConnectionReset
                             && framed.read_buffer().is_empty()
                         {
@@ -322,24 +326,37 @@ async fn handle_connection(stream: TipcStream, ctx: TipcConnectionContext) {
                                 "TIPC connection: graceful close \
                                  (ECONNRESET + empty buffer — peer used plain close())"
                             );
+                            break false; // peer already closed → inline drop
                         } else {
                             if let Some(m) = metrics.as_ref() {
                                 m.record_rejection(TransportRejection::DecodeError);
                             }
                             error!("TIPC connection: frame decode error: {e}");
+                            break true; // decode error → we close → shutdown + spawn_blocking
                         }
-                        break;
                     }
 
                     None => {
                         // Clean EOF from explicit shutdown(Both) by the peer.
                         debug!("TIPC connection: clean EOF (peer called shutdown(Both))");
-                        break;
+                        break false; // peer already shut down → inline drop
                     }
                 }
             }
         }
+    };
+
+    // Extract the stream from Framed for teardown.
+    let stream = framed.into_inner();
+    if owned_close {
+        // Explicit shutdown(Both): send clean EOF to the peer (invariant 1).
+        // The shutdown(2) syscall is fast (non-blocking); only the subsequent
+        // close(2) can block up to 8 s under link congestion.  Use spawn_blocking
+        // so the tokio worker thread is not stalled.
+        let _ = stream.shutdown_both();
+        let _ = tokio::task::spawn_blocking(move || drop(stream)).await;
     }
+    // else: peer already closed the connection; drop inline is safe.
 }
 
 // ── Frame router ─────────────────────────────────────────────────────────────

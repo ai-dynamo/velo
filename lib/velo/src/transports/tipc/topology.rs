@@ -1,11 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Allow dead_code during phased development: transport.rs (companion module being
-// developed concurrently) will consume TopologyState, NodeStateWatch, and
-// VeloServiceWatch once the full TIPC transport lands.  Remove when that module ships.
-#![allow(dead_code)]
-
 //! Topology-server watch: `NodeStateWatch` (node up/down) and `VeloServiceWatch`
 //! (live Velo service publications), plus the shared `TopologyState` that wires them
 //! into the register()-time reachability gate and the event-driven re-registration
@@ -56,6 +51,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use velo_ext::{InstanceId, PeerInfo};
 
+use super::endpoint::TipcEndpoint;
 use super::socket::create_tipc_seqpacket;
 use super::sys::{
     AF_TIPC, SockaddrTipc, TIPC_NODE_STATE, TIPC_PUBLISHED, TIPC_SERVICE_ADDR, TIPC_SUB_PORTS,
@@ -203,6 +199,14 @@ pub struct TopologyState {
     /// A fresh `register()` for the same `InstanceId` overwrites the entry.
     /// Bounded by the number of known peers.
     pub pending: DashMap<InstanceId, PeerInfo>,
+    /// Decoded TIPC endpoints for pending registrations, stored at park time.
+    ///
+    /// Mirrors `pending` but holds the pre-decoded [`TipcEndpoint`] so the
+    /// hot-path re-drive helpers can filter by `service_instance` or `node`
+    /// without decoding the `WorkerAddress` bytes on every topology event.
+    /// Absent for entries inserted directly into `pending` by test code (those
+    /// are conservatively re-driven on every event).
+    pending_decoded: DashMap<InstanceId, TipcEndpoint>,
     /// `true` while the topology-server connection is absent or being re-established.
     ///
     /// The `register()` gate treats stale caches as `Gate::NotYet`.  Set to `true`
@@ -239,6 +243,7 @@ impl TopologyState {
             node_state: NodeStateWatch::new(),
             service_watch: VeloServiceWatch::new(),
             pending: DashMap::new(),
+            pending_decoded: DashMap::new(),
             cache_stale: AtomicBool::new(true),
             reregister_hook: OnceLock::new(),
             cancel_token: CancellationToken::new(),
@@ -296,6 +301,30 @@ impl TopologyState {
     /// task — and the SEQPACKET connection it holds — are released promptly.
     pub fn cancel(&self) {
         self.cancel_token.cancel();
+    }
+
+    /// Park a pending registration together with its pre-decoded endpoint.
+    ///
+    /// Stores the `PeerInfo` in [`Self::pending`] (for the re-register hook)
+    /// and the decoded [`TipcEndpoint`] in the internal `pending_decoded` index
+    /// (for selective filtering in [`redrive_pending_for_service`] and
+    /// [`redrive_pending_for_node`]).
+    ///
+    /// A second call for the same `iid` overwrites the previous entry (e.g. on
+    /// repeated cold-start re-registration attempts).
+    pub fn park_pending(&self, iid: InstanceId, peer_info: PeerInfo, ep: TipcEndpoint) {
+        self.pending_decoded.insert(iid, ep);
+        self.pending.insert(iid, peer_info);
+    }
+
+    /// Remove a peer from all pending registration maps.
+    ///
+    /// Called by the transport when a previously-parked peer's registration
+    /// succeeds (`Gate::Reachable` after an event-driven retry), so the entry
+    /// is not re-driven on subsequent topology events.
+    pub fn unpark_pending(&self, iid: &InstanceId) {
+        self.pending.remove(iid);
+        self.pending_decoded.remove(iid);
     }
 
     /// Mark the topology caches as fresh (test seam only).
@@ -467,7 +496,8 @@ fn process_event(
                 let node = event.found_lower;
                 state.node_state.set(node, true);
                 debug!("TIPC topology: node {node:#010x} up");
-                redrive_pending(state);
+                // Re-drive only peers parked for this specific node, not all pending.
+                redrive_pending_for_node(state, node);
             }
             HANDLE_VELO_SERVICE => {
                 // Velo service binding appeared.  For TIPC_SUB_PORTS on a
@@ -480,7 +510,8 @@ fn process_event(
                     "TIPC topology: velo instance {instance:#010x} published by \
                      {{ref={socket_ref:#010x}, node={node:#010x}}}"
                 );
-                redrive_pending(state);
+                // Re-drive only the peer whose service_instance matches this event.
+                redrive_pending_for_service(state, instance);
             }
             HANDLE_BARRIER => {
                 // The barrier subscription covers the same service range; its
@@ -513,11 +544,11 @@ fn process_event(
             if handle == HANDLE_BARRIER {
                 // All initial-replay PUBLISHED events from subscriptions 1 and 2 have
                 // been delivered (ordered SEQPACKET guarantees this).  Mark caches fresh,
-                // re-drive any pending entries that were inserted before start() returned,
-                // then signal the start() future.
+                // re-drive ALL pending entries (safety valve: initial replay or reconnect
+                // replay is complete, so we retry every parked peer unconditionally).
                 state.cache_stale.store(false, Ordering::Release);
                 debug!("TIPC topology: initial replay complete; caches are now fresh");
-                redrive_pending(state);
+                redrive_pending_all(state);
                 // Signal fires only once; subsequent reconnects find ready_tx empty.
                 if let Ok(mut guard) = ready_tx.lock()
                     && let Some(tx) = guard.take()
@@ -537,10 +568,10 @@ fn process_event(
 
 /// Re-drive all pending `PeerInfo`s through the re-register hook.
 ///
-/// Called on every `TIPC_PUBLISHED` / node-up event and after reconnect replay.
-/// The hook calls `VeloBackend::register_peer`, which re-runs the full gate with
-/// warm caches; succeeded entries leave `pending`, failed ones overwrite it.
-fn redrive_pending(state: &Arc<TopologyState>) {
+/// Safety valve: called on barrier `TIPC_SUBSCR_TIMEOUT` (initial replay complete)
+/// and after a topology reconnect replay, when every pending peer should be retried
+/// regardless of which event arrived.
+fn redrive_pending_all(state: &Arc<TopologyState>) {
     let hook = match state.reregister_hook.get() {
         Some(h) => h,
         None => return,
@@ -550,8 +581,76 @@ fn redrive_pending(state: &Arc<TopologyState>) {
     let entries: Vec<PeerInfo> = state.pending.iter().map(|r| r.value().clone()).collect();
     for peer_info in entries {
         debug!(
-            "TIPC topology: re-driving pending peer {}",
+            "TIPC topology: re-driving pending peer {} (full sweep)",
             peer_info.instance_id()
+        );
+        hook(peer_info);
+    }
+}
+
+/// Re-drive only the pending peer whose `TipcEndpoint.service_instance` matches
+/// `service_instance`.
+///
+/// Called on `TIPC_PUBLISHED` for the Velo service subscription so that a single
+/// publication event triggers at most one register() call, not O(pending) calls.
+///
+/// Entries without a pre-decoded endpoint in `pending_decoded` (e.g., inserted
+/// directly by test code) are re-driven conservatively.
+fn redrive_pending_for_service(state: &Arc<TopologyState>, service_instance: u32) {
+    let hook = match state.reregister_hook.get() {
+        Some(h) => h,
+        None => return,
+    };
+    let entries: Vec<PeerInfo> = state
+        .pending
+        .iter()
+        .filter(|r| {
+            state
+                .pending_decoded
+                .get(r.key())
+                .map(|ep| ep.service_instance == service_instance)
+                .unwrap_or(true) // conservative: re-drive if no decoded endpoint cached
+        })
+        .map(|r| r.value().clone())
+        .collect();
+    for peer_info in entries {
+        debug!(
+            "TIPC topology: re-driving pending peer {} (service_instance={:#010x})",
+            peer_info.instance_id(),
+            service_instance
+        );
+        hook(peer_info);
+    }
+}
+
+/// Re-drive only pending peers whose `TipcEndpoint.node` matches `node`.
+///
+/// Called on `TIPC_PUBLISHED` for the node-state subscription (node up) so that
+/// a node-up event only re-tries peers on that specific node.
+///
+/// Entries without a pre-decoded endpoint are re-driven conservatively.
+fn redrive_pending_for_node(state: &Arc<TopologyState>, node: u32) {
+    let hook = match state.reregister_hook.get() {
+        Some(h) => h,
+        None => return,
+    };
+    let entries: Vec<PeerInfo> = state
+        .pending
+        .iter()
+        .filter(|r| {
+            state
+                .pending_decoded
+                .get(r.key())
+                .map(|ep| ep.node == node)
+                .unwrap_or(true) // conservative: re-drive if no decoded endpoint cached
+        })
+        .map(|r| r.value().clone())
+        .collect();
+    for peer_info in entries {
+        debug!(
+            "TIPC topology: re-driving pending peer {} (node={:#010x} up)",
+            peer_info.instance_id(),
+            node
         );
         hook(peer_info);
     }

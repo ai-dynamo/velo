@@ -1,11 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Allow dead_code during phased development: transport.rs / stream.rs / topology.rs
-// (companion TIPC modules being developed concurrently) will consume these items once
-// complete.  Remove this attribute when the full TIPC module lands.
-#![allow(dead_code)]
-
 //! Socket creation, `setsockopt`/`getsockopt` helpers, `getsockname`, and `tipc_available()` probe.
 //!
 //! All public functions in this module are thin, safe wrappers around raw TIPC syscalls.
@@ -137,6 +132,8 @@ pub fn bind_service_range_and_listen(
 /// (a single-instance range) with cluster scope, then listen.
 ///
 /// Convenience wrapper for the common single-instance binding.
+// Used only in unit tests; kept pub for test-module access across files.
+#[allow(dead_code)]
 pub fn bind_single_instance_and_listen(
     sock: &socket2::Socket,
     type_: u32,

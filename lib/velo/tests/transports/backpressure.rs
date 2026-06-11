@@ -448,3 +448,316 @@ async fn bp_increments_send_backpressure_counter() {
     drop(bps);
     assert_eq!(err.count(), 0);
 }
+
+// ── TIPC flood: non-reading receiver fills conn-window → SendBackpressure ─────
+//
+// Unlike the SlowSendTransport tests above (which use an artificial fake
+// transport), this section exercises a *real* TipcTransport against a raw
+// TIPC socket that accepts the connection but never reads.  The approach is:
+//
+// 1. Build a TipcTransport sender (channel_capacity = 4).
+// 2. Create a raw AF_TIPC SOCK_STREAM listener, bind it, and listen.
+// 3. Build a TipcEndpoint for the raw listener with the sender's own
+//    netns_nonce so `register()` yields Gate::Reachable immediately.
+// 4. Accept the connect in spawn_blocking without reading from the socket.
+// 5. Flood with 32 × 64 KiB sends.  The channel fills to capacity (writer
+//    hasn't run yet — no yields in the flood loop), causing subsequent
+//    try_send calls to return TrySendError::Full → Err(SendBackpressure).
+// 6. Start a drain thread (non-blocking reads) to clear the kernel buffer.
+// 7. Await all bp futures (they resolve as the writer drains the channel).
+// 8. Assert zero on_error losses.
+
+#[cfg(all(feature = "tipc", target_os = "linux"))]
+mod tipc_flood {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use bytes::Bytes;
+
+    use velo::transports::tipc::{TipcEndpoint, TipcTransportBuilder};
+    use velo::transports::{MessageType, Transport, make_channels};
+    use velo_ext::{InstanceId, PeerInfo, WorkerAddress};
+
+    // ── Minimal TIPC sockaddr ─────────────────────────────────────────────
+    //
+    // Mirrors `velo::transports::tipc::sys::SockaddrTipc` (16 bytes).
+    // Defined here so the test is self-contained with no velo internals.
+    #[repr(C)]
+    #[derive(Copy, Clone, Default)]
+    struct TipcSa {
+        family: u16,  // AF_TIPC = 30
+        addrtype: u8, // 1 = SERVICE_RANGE, 3 = SOCKET_ADDR
+        scope: i8,    // 2 = TIPC_CLUSTER_SCOPE
+        f1: u32,      // service_range.type  |  socket_addr.ref
+        f2: u32,      // service_range.lower |  socket_addr.node
+        f3: u32,      // service_range.upper |  socket_addr.pad
+    }
+
+    const AF_TIPC: i32 = 30;
+    const TIPC_SERVICE_RANGE: u8 = 1;
+    const TIPC_SOCKET_ADDR: u8 = 3;
+    const TIPC_CLUSTER_SCOPE: i8 = 2;
+
+    // ── Helpers ───────────────────────────────────────────────────────────
+
+    /// Create a blocking `AF_TIPC / SOCK_STREAM` listener, bind it to
+    /// `{service_type, instance..=instance}`, listen, and return
+    /// `(listener_fd, socket_ref, node)` from `getsockname`.
+    ///
+    /// Returns `None` when TIPC is not available or `bind` fails.
+    fn bind_raw_tipc_listener(service_type: u32, instance: u32) -> Option<(libc::c_int, u32, u32)> {
+        // SAFETY: standard POSIX socket syscalls; all fds and pointers are valid
+        // within the call site.  Errors are checked via return-value comparison.
+        unsafe {
+            let fd = libc::socket(AF_TIPC, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+            if fd < 0 {
+                return None; // EAFNOSUPPORT: TIPC module not loaded
+            }
+
+            let sa = TipcSa {
+                family: AF_TIPC as u16,
+                addrtype: TIPC_SERVICE_RANGE,
+                scope: TIPC_CLUSTER_SCOPE,
+                f1: service_type,
+                f2: instance,
+                f3: instance,
+            };
+            let sa_len = std::mem::size_of::<TipcSa>() as libc::socklen_t;
+
+            if libc::bind(fd, &sa as *const TipcSa as *const libc::sockaddr, sa_len) < 0 {
+                libc::close(fd);
+                return None;
+            }
+            libc::listen(fd, 1);
+
+            // getsockname → SOCKET_ADDR { f1 = socket_ref, f2 = node }
+            let mut sa_out = TipcSa::default();
+            let mut out_len = sa_len;
+            libc::getsockname(
+                fd,
+                &mut sa_out as *mut TipcSa as *mut libc::sockaddr,
+                &mut out_len,
+            );
+            if sa_out.addrtype != TIPC_SOCKET_ADDR {
+                libc::close(fd);
+                return None;
+            }
+            Some((fd, sa_out.f1, sa_out.f2))
+        }
+    }
+
+    /// Decode a `TipcEndpoint` from a `WorkerAddress`.
+    fn decode_tipc_ep(addr: &WorkerAddress) -> Option<TipcEndpoint> {
+        let bytes = addr.get_entry("tipc").ok()??;
+        rmp_serde::from_slice(&bytes).ok()
+    }
+
+    /// Build a `PeerInfo` whose `WorkerAddress` carries only a `"tipc"` entry.
+    fn peer_info_for(ep: &TipcEndpoint, peer_id: InstanceId) -> PeerInfo {
+        let ep_bytes = rmp_serde::to_vec_named(ep).expect("TipcEndpoint encode");
+        let mut map = HashMap::<String, Vec<u8>>::new();
+        map.insert("tipc".to_string(), ep_bytes);
+        let encoded = rmp_serde::to_vec(&map).expect("WorkerAddress map encode");
+        PeerInfo::new(peer_id, WorkerAddress::from_encoded(Bytes::from(encoded)))
+    }
+
+    // ── Flood test ────────────────────────────────────────────────────────
+
+    /// Flood a TIPC peer whose connection cannot complete (no `accept()` yet),
+    /// proving the per-peer flume channel fills and `send_message` returns
+    /// `Err(SendBackpressure)` — deterministically, with no scheduler
+    /// assumptions.  Then accept + drain and prove every pending send completes
+    /// with zero `on_error` losses.
+    ///
+    /// Determinism: TIPC completes a connect only when the remote application
+    /// calls `accept()` (proposal §2.3, verified on this kernel), and the writer
+    /// task connects *before* entering its send loop
+    /// (`tipc_connection_writer_inner`).  By deferring `accept()` until after
+    /// the flood, the writer provably dequeues nothing, so exactly
+    /// `MAX_SENDS - CHANNEL_CAP` sends observe a full channel regardless of how
+    /// the tokio workers schedule the writer task.
+    ///
+    /// Skips silently when `tipc.ko` is not loaded (`EAFNOSUPPORT`).
+    ///
+    /// Run with: `cargo test --features tipc,test-helpers --test transports_backpressure
+    ///               tipc_flood`
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tipc_conn_window_flood_fills_channel() {
+        const CHANNEL_CAP: usize = 4;
+        const PAYLOAD_SIZE: usize = 64 * 1024; // 64 KiB per message
+        const MAX_SENDS: usize = 32;
+
+        // ── Build sender ──────────────────────────────────────────────────
+        let sender = match TipcTransportBuilder::new()
+            .channel_capacity(CHANNEL_CAP)
+            // Generous: the writer's connect is pending (unaccepted) for the
+            // duration of the flood loop; a loaded CI box must not time it out.
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+        {
+            Ok(t) => Arc::new(t),
+            Err(_) => return, // TIPC module not loaded — skip
+        };
+
+        let sender_ep = match decode_tipc_ep(&sender.address()) {
+            Some(ep) => ep,
+            None => return,
+        };
+
+        // ── Create raw non-reading listener ───────────────────────────────
+        // Use a distinct service instance so we don't collide with other tests.
+        let test_instance = sender_ep.service_instance.wrapping_add(0xCAFE_0001);
+        let (listener_fd, recv_ref, recv_node) =
+            match bind_raw_tipc_listener(sender_ep.service_type, test_instance) {
+                Some(r) => r,
+                None => return, // TIPC unavailable
+            };
+
+        // Build a receiver endpoint.  Using the sender's own netns_nonce
+        // (same process → same TIPC stack) ensures register() yields
+        // Gate::Reachable without needing a topology watch.
+        let recv_ep = TipcEndpoint {
+            version: 1,
+            service_type: sender_ep.service_type,
+            service_instance: test_instance,
+            node: recv_node,
+            socket_ref: recv_ref,
+            netid: sender_ep.netid,
+            node_id: [0u8; 16],
+            netns_nonce: sender_ep.netns_nonce, // same process = same nonce
+            scope: TIPC_CLUSTER_SCOPE as u8,
+        };
+
+        let peer_id = InstanceId::new_v4();
+        let peer_info = peer_info_for(&recv_ep, peer_id);
+
+        // ── Start sender + register non-reading receiver ──────────────────
+        let (adapter, _streams) = make_channels();
+        sender
+            .start(
+                InstanceId::new_v4(),
+                adapter,
+                tokio::runtime::Handle::current(),
+            )
+            .await
+            .expect("TipcTransport::start must succeed");
+
+        sender
+            .register(peer_info)
+            .expect("same-nonce peer must register with Gate::Reachable");
+
+        // ── Flood BEFORE accepting ────────────────────────────────────────
+        // The first send_message spawns the writer task, whose
+        // TipcStream::connect() cannot complete until accept() is called on the
+        // listener (TIPC has no kernel-backlog handshake completion — proposal
+        // §2.3, verified).  The connect SYN queues in the kernel.  With the
+        // writer provably unable to dequeue, sends 1..=CHANNEL_CAP enqueue Ok
+        // and every later try_send observes Full → Err(SendBackpressure).
+        let err = super::CountingHandler::new();
+        let payload = Bytes::from(vec![0u8; PAYLOAD_SIZE]);
+        let header = Bytes::from_static(b"flood-hdr");
+        let mut bps = Vec::new();
+
+        for _ in 0..MAX_SENDS {
+            match sender.send_message(
+                peer_id,
+                header.clone(),
+                payload.clone(),
+                MessageType::Message,
+                err.clone(),
+            ) {
+                Ok(()) => {}
+                Err(bp) => bps.push(bp),
+            }
+        }
+
+        // ── Assert backpressure — exact, scheduler-independent ────────────
+        assert_eq!(
+            bps.len(),
+            MAX_SENDS - CHANNEL_CAP,
+            "with accept() deferred the writer cannot drain, so exactly \
+             MAX_SENDS - CHANNEL_CAP sends must observe a full channel \
+             (got {} of {} backpressured, channel_capacity = {})",
+            bps.len(),
+            MAX_SENDS,
+            CHANNEL_CAP,
+        );
+
+        // ── Accept the queued connection ──────────────────────────────────
+        // spawn_blocking runs the blocking libc::accept on a dedicated OS
+        // thread; the writer's queued SYN completes immediately.
+        let accept_task = tokio::task::spawn_blocking(move || {
+            let afd =
+                unsafe { libc::accept(listener_fd, std::ptr::null_mut(), std::ptr::null_mut()) };
+            // Close the listener; we accept only one connection.
+            unsafe { libc::close(listener_fd) };
+            afd
+        });
+        let accepted_fd = accept_task.await.expect("accept task should not panic");
+        if accepted_fd < 0 {
+            return; // accept failed unexpectedly; skip
+        }
+
+        // ── Drain: read until every flooded byte has arrived ──────────────
+        // Frame layout (docs/transports.md): 11-byte preamble + header +
+        // payload.  Reading clears the receiver's kernel buffer → the writer
+        // unblocks → the flume channel empties → the bp futures' send_async
+        // enqueues complete.  TARGET is a floor: any extra protocol bytes only
+        // push the total higher.
+        const PREAMBLE: usize = 11;
+        let target: usize = MAX_SENDS * (PREAMBLE + b"flood-hdr".len() + PAYLOAD_SIZE);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+
+        let drain_thread = std::thread::spawn(move || {
+            unsafe { libc::fcntl(accepted_fd, libc::F_SETFL, libc::O_NONBLOCK) };
+            let mut buf = vec![0u8; 65536];
+            let mut total: usize = 0;
+            while total < target && std::time::Instant::now() < deadline {
+                let n = unsafe {
+                    libc::read(
+                        accepted_fd,
+                        buf.as_mut_ptr() as *mut libc::c_void,
+                        buf.len(),
+                    )
+                };
+                if n > 0 {
+                    total += n as usize;
+                } else if n == 0 {
+                    break; // EOF
+                } else {
+                    let code = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                    if code == libc::EAGAIN || code == libc::EWOULDBLOCK {
+                        std::thread::sleep(Duration::from_millis(1));
+                    } else {
+                        break; // real error
+                    }
+                }
+            }
+            unsafe { libc::close(accepted_fd) };
+            total
+        });
+
+        // ── Await all backpressure futures ────────────────────────────────
+        // Each future resolves once the drain thread has cleared enough of
+        // the kernel buffer that the writer drains the channel and the
+        // send_async enqueue can proceed.
+        for bp in bps {
+            tokio::time::timeout(Duration::from_secs(10), bp)
+                .await
+                .expect("bp future must resolve within 10 s after receiver starts draining");
+        }
+
+        // ── Assert complete delivery, zero losses ─────────────────────────
+        let total = drain_thread.join().expect("drain thread should not panic");
+        assert!(
+            total >= target,
+            "receiver must observe every flooded byte: read {total} of >= {target}"
+        );
+        assert_eq!(
+            err.count(),
+            0,
+            "all sends must complete with zero on_error after draining the receiver"
+        );
+    }
+}

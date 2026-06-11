@@ -1,11 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Allow dead_code during phased development: transport.rs and listener.rs will
-// consume TipcStream once the full TIPC module is complete.
-// Remove this attribute when the full TIPC module lands.
-#![allow(dead_code)]
-
 //! `TipcStream`: `AsyncFd`-backed `AsyncRead`/`AsyncWrite` wrapper with non-blocking
 //! connect and `poll_shutdown` mapped to `Shutdown::Both` (TIPC has no half-close).
 //!
@@ -77,6 +72,9 @@ impl TipcStream {
     }
 
     /// Return a shared reference to the underlying [`socket2::Socket`].
+    // Currently unused; retained as the low-level escape hatch (sockopt tweaks,
+    // diagnostics). Drop the allow if it gains a caller.
+    #[allow(dead_code)]
     pub fn socket(&self) -> &socket2::Socket {
         self.inner.get_ref()
     }
@@ -112,9 +110,11 @@ impl TipcStream {
     pub async fn connect(ref_: u32, node: u32, timeout: Duration) -> io::Result<Self> {
         let sock = create_tipc_stream()?;
 
-        // Set the kernel connect timeout slightly above the application timeout so
-        // our `tokio::time::timeout` always fires first.  Cap at 30 s to avoid
-        // exceeding the TIPC maximum.
+        // Set the kernel TIPC_CONN_TIMEOUT slightly above the application timeout so
+        // our tokio::time::timeout normally fires first.  The kernel silently caps
+        // TIPC_CONN_TIMEOUT at 30 s (tipc_sock.c); for application timeouts > ~29 s
+        // the kernel's ETIMEDOUT arrives via SO_ERROR before the tokio timeout — the
+        // SO_ERROR check below remaps it to the same io::ErrorKind::TimedOut.
         let kernel_timeout_ms = u32::try_from(timeout.as_millis())
             .unwrap_or(u32::MAX)
             .saturating_add(1_000)
@@ -139,10 +139,22 @@ impl TipcStream {
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TIPC connect timed out"))??;
 
             // SO_ERROR == 0 → connect succeeded; anything else is the connect error.
+            //
+            // Kernel cap: TIPC_CONN_TIMEOUT is silently clamped to ~30 s by the kernel.
+            // For caller timeouts > ~29 s, the kernel's ETIMEDOUT arrives via SO_ERROR
+            // before our tokio::time::timeout fires.  Remap it to the same error kind so
+            // callers (e.g. check_health) see io::ErrorKind::TimedOut consistently.
             if let Some(err) = stream.inner.get_ref().take_error()? {
+                if err.raw_os_error() == Some(libc::ETIMEDOUT) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "TIPC connect timed out",
+                    ));
+                }
                 return Err(err);
             }
-            // `_guard` dropped here; WRITE readiness cleared; borrow of `stream.inner` ends.
+            // `_guard` dropped here without clear_ready() — WRITE readiness retained;
+            // borrow of `stream.inner` ends.
         }
 
         Ok(stream)

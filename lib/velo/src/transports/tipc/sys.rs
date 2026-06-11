@@ -1,11 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Allow dead_code during phased development: transport.rs / stream.rs / topology.rs
-// (companion TIPC modules being developed concurrently) will consume these items once
-// complete.  Remove this attribute when the full TIPC module lands.
-#![allow(dead_code)]
-
 //! TIPC UAPI constants, `#[repr(C)]` structs, socket2 bridge, and compile-time layout assertions.
 //!
 //! All constants and struct definitions are transcribed verbatim from
@@ -63,6 +58,8 @@ pub const TIPC_NODE_STATE: u32 = 0;
 /// `TIPC_TOP_SRV = 1` — topology server service type; connect SEQPACKET to `{1,1}`.
 pub const TIPC_TOP_SRV: u32 = 1;
 /// `TIPC_LINK_STATE = 2` — topology subscription type that yields per-link events.
+// Retained for UAPI/ABI completeness; velo uses TIPC_NODE_STATE, not link-state subs.
+#[allow(dead_code)]
 pub const TIPC_LINK_STATE: u32 = 2;
 
 // ── Datagram size limit ───────────────────────────────────────────────────────
@@ -71,12 +68,16 @@ pub const TIPC_LINK_STATE: u32 = 2;
 ///
 /// This cap applies to SOCK_SEQPACKET and SOCK_RDM. SOCK_STREAM is a byte stream;
 /// the kernel chunks internally at 66,000 B but the cap is invisible to the application.
+// Retained for UAPI/ABI completeness; velo SOCK_STREAM has no per-send size cap.
+#[allow(dead_code)]
 pub const TIPC_MAX_USER_MSG_SIZE: u32 = 66_000;
 
 // ── Socket options (SOL_TIPC level) ──────────────────────────────────────────
 
 /// `TIPC_IMPORTANCE = 127` — message importance for prioritised delivery.
 /// Ignored for connected sockets' receive limits; not set on the hot path.
+// Retained for UAPI/ABI completeness; velo accepts the kernel default importance.
+#[allow(dead_code)]
 pub const TIPC_IMPORTANCE: libc::c_int = 127;
 /// `TIPC_CONN_TIMEOUT = 130` — connection timeout in milliseconds (default 8,000).
 /// Velo sets 5,000 ms via the builder to ensure the 5 s connect_timeout fires first.
@@ -90,8 +91,12 @@ pub const TIPC_NODELAY: libc::c_int = 138;
 /// `TIPC_SUB_PORTS = 0x01` — receive one event per matching binding (fine-grained).
 pub const TIPC_SUB_PORTS: u32 = 0x01;
 /// `TIPC_SUB_SERVICE = 0x02` — edge-triggered: event at first publication / last withdrawal.
+// Retained for UAPI/ABI completeness; velo always uses TIPC_SUB_PORTS for fine-grained events.
+#[allow(dead_code)]
 pub const TIPC_SUB_SERVICE: u32 = 0x02;
 /// `TIPC_SUB_CANCEL = 0x04` — cancel an existing subscription.
+// Retained for UAPI/ABI completeness; velo uses TIPC_WAIT_FOREVER, never cancels mid-run.
+#[allow(dead_code)]
 pub const TIPC_SUB_CANCEL: u32 = 0x04;
 
 /// `TIPC_WAIT_FOREVER = ~0u32` — infinite subscription duration.

@@ -25,3 +25,6 @@ codecov.json
 *.log
 core
 .envrc
+
+# examples is excluded from the workspace; its lockfile is a local build byproduct
+examples/Cargo.lock

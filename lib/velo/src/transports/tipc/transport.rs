@@ -386,7 +386,8 @@ impl Transport for TipcTransport {
                 // Save debug values before moving ep into the DashMap.
                 let iid = peer_info.instance_id();
                 let (socket_ref, node) = (ep.socket_ref, ep.node);
-                self.topology.pending.remove(&iid);
+                // unpark_pending removes from both pending and pending_decoded.
+                self.topology.unpark_pending(&iid);
                 self.peers.insert(iid, ep);
                 self.update_peer_gauge();
                 debug!(
@@ -397,14 +398,15 @@ impl Transport for TipcTransport {
             }
             Gate::NotYet => {
                 // Park: topology watch re-drives this through the re-register
-                // hook on TIPC_PUBLISHED / node-up events.
+                // hook on TIPC_PUBLISHED / node-up events.  Store the decoded
+                // endpoint alongside PeerInfo so the re-drive can filter by
+                // service_instance or node without re-decoding on each event.
+                let iid = peer_info.instance_id();
                 debug!(
                     "TIPC: parking peer {} (publication absent or node down)",
-                    peer_info.instance_id()
+                    iid
                 );
-                self.topology
-                    .pending
-                    .insert(peer_info.instance_id(), peer_info);
+                self.topology.park_pending(iid, peer_info, ep);
                 Err(TransportError::NoEndpoint)
             }
             Gate::Never => {
@@ -763,6 +765,7 @@ async fn tipc_connection_writer_inner(
 /// | `service_type` | `0x56454C4F` ("VELO") |
 /// | `service_instance` | random `u32` |
 /// | `scope` | [`TipcScope::Cluster`] |
+/// | `netid` | `4711` (TIPC's compiled-in default) |
 /// | `channel_capacity` | 256 |
 /// | `connect_timeout` | 5 s |
 pub struct TipcTransportBuilder {
@@ -770,6 +773,7 @@ pub struct TipcTransportBuilder {
     service_type: u32,
     service_instance: Option<u32>,
     scope: TipcScope,
+    netid: u32,
     channel_capacity: usize,
     connect_timeout: Duration,
     shrink_threshold: Option<usize>,
@@ -783,6 +787,7 @@ impl TipcTransportBuilder {
             service_type: 0x56454C4F, // "VELO" in ASCII
             service_instance: None,
             scope: TipcScope::Cluster,
+            netid: 4711,
             channel_capacity: 256,
             connect_timeout: Duration::from_secs(5),
             shrink_threshold: None,
@@ -818,6 +823,21 @@ impl TipcTransportBuilder {
     /// remote peers will always see `Gate::NotYet` for this transport.
     pub fn scope(mut self, scope: TipcScope) -> Self {
         self.scope = scope;
+        self
+    }
+
+    /// Set the TIPC cluster network ID (default: `4711`, TIPC's compiled-in default).
+    ///
+    /// The `netid` is an operator-assigned 32-bit cluster identity.  Two nodes with
+    /// different `netid` values will never exchange bearer traffic; the register gate
+    /// returns `Gate::Never` for any endpoint whose `netid` differs from this one.
+    ///
+    /// **Deployment requirement**: velo cannot read the kernel's live netid without
+    /// issuing TIPC-specific netlink messages.  Any deployment that sets a custom netid
+    /// via `tipc node set netid <id>` MUST pass the same value here, or all cross-node
+    /// peers will be permanently rejected at `register()` time.
+    pub fn netid(mut self, netid: u32) -> Self {
+        self.netid = netid;
         self
     }
 
@@ -910,15 +930,11 @@ impl TipcTransportBuilder {
         //    readlink("/proc/self/ns/net") = "net:[<u64>]" — not stat().
         let netns_nonce = compute_netns_nonce().context("Failed to compute TIPC netns nonce")?;
 
-        // Cluster netid: default 4711 (TIPC's default; operator-configurable
-        // at bearer-enable time via `tipc bearer enable`).
-        //
-        // TODO (deviation): reading the actual configured netid would require
-        // either a TIPC-specific netlink message or parsing /proc/tipc.
-        // 4711 is correct for the vast majority of single-cluster deployments.
-        // Multi-cluster / netid != 4711 deployments must override via a future
-        // `TipcTransportBuilder::netid(u32)` API.
-        let netid = 4711u32;
+        // Cluster netid: operator-configurable via TipcTransportBuilder::netid().
+        // Defaults to 4711 (TIPC's compiled-in default).  velo cannot read the
+        // kernel's live netid without TIPC-specific netlink; callers using
+        // `tipc node set netid <id>` MUST pass the matching value here.
+        let netid = self.netid;
 
         // node_id (128-bit): requires ioctl(SIOCGETNODEID) which is not
         // in sys.rs yet.  Zero-init is safe: the field is informational only;
@@ -1085,6 +1101,41 @@ mod tests {
         assert!(
             !transport.topology.pending.contains_key(&iid),
             "peer must not be parked after Gate::Never (netid mismatch is permanent)"
+        );
+    }
+
+    /// `Gate::Never` — non-default netid mismatch (multi-cluster deployment).
+    ///
+    /// Two clusters each configured with a custom netid via
+    /// `tipc node set netid <id>` / `TipcTransportBuilder::netid(<id>)`.
+    /// An endpoint from cluster B (netid 3000) seen by a transport in cluster A
+    /// (netid 2000) must be permanently rejected — no parking, no retry.
+    #[test]
+    fn gate_never_multi_cluster_netid() {
+        const CLUSTER_A_NETID: u32 = 2000;
+        const CLUSTER_B_NETID: u32 = 3000;
+
+        let local = make_ep(CLUSTER_A_NETID, 0xAAAA, 0x1111, 0xABCD, 100);
+        let topology = TopologyState::new(TEST_SVC_TYPE);
+        let transport = make_transport_for_test(local, topology);
+
+        // Peer belongs to cluster B — different custom netid.
+        let remote = make_ep(CLUSTER_B_NETID, 0xBBBB, 0x2222, 0x1234, 200);
+        let peer = peer_info_from_ep(&remote);
+        let iid = peer.instance_id();
+
+        let result = transport.register(peer);
+        assert!(
+            matches!(result, Err(TransportError::NoEndpoint)),
+            "cross-cluster netid mismatch must return NoEndpoint (Gate::Never)"
+        );
+        assert!(
+            !transport.peers.contains_key(&iid),
+            "peer must not be stored after Gate::Never"
+        );
+        assert!(
+            !transport.topology.pending.contains_key(&iid),
+            "cross-cluster rejection is permanent — must not be parked"
         );
     }
 

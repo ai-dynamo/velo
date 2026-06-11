@@ -185,6 +185,13 @@ pub struct VeloBuilder {
     /// [`build`].
     #[cfg(all(target_os = "linux", feature = "tipc"))]
     tipc_hook_installers: Vec<TipcHookInstaller>,
+    /// Set to `true` when a transport with key `"tipc"` is registered via the
+    /// plain [`add_transport`] path (missing the re-register hook side-channel).
+    ///
+    /// Checked in [`build`] to emit a runtime warning so the cold-start bug is
+    /// surfaced at startup rather than silently corrupting routing.
+    #[cfg(all(target_os = "linux", feature = "tipc"))]
+    tipc_added_without_hook: bool,
 }
 
 impl VeloBuilder {
@@ -196,6 +203,8 @@ impl VeloBuilder {
             metrics: None,
             #[cfg(all(target_os = "linux", feature = "tipc"))]
             tipc_hook_installers: Vec::new(),
+            #[cfg(all(target_os = "linux", feature = "tipc"))]
+            tipc_added_without_hook: false,
         }
     }
 
@@ -211,9 +220,13 @@ impl VeloBuilder {
     /// `Any` downcast, and `VeloBackend.transports` is a private `HashMap`.
     ///
     /// `add_tipc_transport` side-steps the problem by recording the
-    /// `TopologyState` in `tipc_hook_targets` (available before `build()`)
+    /// `TopologyState` in `tipc_hook_installers` (available before `build()`)
     /// while also calling `inner.add_transport(transport)` so the transport
     /// is registered in the messenger as usual.
+    ///
+    /// **Do not** use [`add_transport`](VeloBuilder::add_transport) for TIPC
+    /// transports: the re-register hook (invariant 7) will not be wired,
+    /// permanently re-opening the cold-start demotion bug.
     ///
     /// The hook is installed in [`VeloBuilder::build`] after `Messenger` is
     /// constructed; see the "TIPC re-register hooks" comment there.
@@ -234,7 +247,18 @@ impl VeloBuilder {
     }
 
     /// Add a transport to the system.
+    ///
+    /// **TIPC caution**: do not use this method for TIPC transports.  The
+    /// re-register hook (design invariant 7) that heals cold-start demotions
+    /// requires a side-channel that only [`add_tipc_transport`](VeloBuilder::add_tipc_transport)
+    /// provides.  Registering a TIPC transport here silently disables cold-start
+    /// recovery; a runtime warning is emitted at [`build`](VeloBuilder::build) time.
     pub fn add_transport(mut self, transport: Arc<dyn Transport>) -> Self {
+        // Detect TIPC transport registered via the wrong path (missing hook installer).
+        #[cfg(all(target_os = "linux", feature = "tipc"))]
+        if transport.key().as_str() == "tipc" {
+            self.tipc_added_without_hook = true;
+        }
         self.inner = self.inner.add_transport(transport);
         self
     }
@@ -301,7 +325,7 @@ impl VeloBuilder {
         //
         // Implementation note: the `Transport` trait (in velo-ext) has no
         // downcast, and VeloBackend.transports is private.  The side-channel
-        // is add_tipc_transport() which stores TopologyState in tipc_hook_targets
+        // is add_tipc_transport() which stores TopologyState in tipc_hook_installers
         // before type-erasing the transport into Arc<dyn Transport>.
         #[cfg(all(target_os = "linux", feature = "tipc"))]
         for installer in &self.tipc_hook_installers {
@@ -311,6 +335,21 @@ impl VeloBuilder {
                     tracing::warn!("TIPC re-register hook: messenger.register_peer failed: {e}");
                 }
             }));
+        }
+
+        // Runtime guard: a transport with key "tipc" registered via add_transport()
+        // (instead of add_tipc_transport()) lacks the re-register hook side-channel.
+        // Cold-start demotions will never self-heal.  Warn loudly so this misconfiguration
+        // is surfaced at startup rather than silently corrupting routing under load.
+        #[cfg(all(target_os = "linux", feature = "tipc"))]
+        if self.tipc_added_without_hook && self.tipc_hook_installers.is_empty() {
+            tracing::warn!(
+                "A transport with key \"tipc\" was registered via add_transport() \
+                 but no add_tipc_transport() call was made. \
+                 The re-register hook (design invariant 7) is not wired: \
+                 cold-start peers parked during TIPC name-table convergence will \
+                 never be promoted. Use add_tipc_transport() instead."
+            );
         }
 
         // Step 2: Extract worker_id (carried on the local PeerInfo).

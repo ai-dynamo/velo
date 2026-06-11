@@ -174,7 +174,9 @@ tipc bearer enable media udp name udp1 localip 10.0.0.1 remoteip 10.0.0.255
 ```
 
 All nodes with the same `netid` (default `4711`) on a shared bearer auto-form one cluster.
-Set a unique `netid` per deployment: `tipc node set netid <id>`.
+Set a unique `netid` per deployment: `tipc node set netid <id>`.  Pass the same value to
+`TipcTransportBuilder::netid(<id>)` — velo cannot read the kernel's configured netid without
+TIPC netlink; mismatched values cause all cross-node `register()` calls to return `Gate::Never`.
 
 ### Usage
 
@@ -186,6 +188,8 @@ let transport = Arc::new(
         // .service_type(0x56454C4F)   // default: "VELO" in ASCII; must be ≥ 64
         // .scope(TipcScope::Cluster)  // default; Node scope hides from remote peers
         // .connect_timeout(Duration::from_secs(5))
+        // .netid(4711)                // default 4711; MUST match `tipc node set netid <id>`
+        //                            // on every node — velo cannot read the kernel value
         .build()?
 );
 ```
@@ -238,7 +242,10 @@ TIPC cluster membership is **unauthenticated**: any node on the bearer domain sh
 configured `netid` auto-joins the cluster.  Two unrelated deployments on the same L2 segment
 silently merge under the default `netid 4711`.  Operators **must**:
 
-1. Set a unique `netid` per deployment (`tipc node set netid <unique-id>`).
+1. Set a unique `netid` per deployment (`tipc node set netid <unique-id>`) and pass the
+   same value to `TipcTransportBuilder::netid(<unique-id>)` — velo cannot read the kernel's
+   configured netid without TIPC netlink; a mismatch silently prevents all cross-node peers
+   from registering (`Gate::Never`).
 2. Consider TIPC AEAD encryption (`tipc node set key`, kernel ≥ 5.5,
    `CONFIG_TIPC_CRYPTO=y`) for confidentiality and as an additional membership gate.
 3. Be aware that CIS Level 2 baselines require `tipc.ko` to be unavailable — loading the
@@ -252,12 +259,15 @@ required), CVE-2024-36886 (≤ 6.8, fixed 2024-05).  Recommended kernel floor: �
 ```sh
 sudo modprobe tipc
 RUSTFLAGS="--cfg velo_tipc" cargo test --features tipc --test transports_tipc
-cargo test --features tipc --test transports_tipc_shutdown
-cargo test --features tipc --test transports_tipc_node_affinity
+RUSTFLAGS="--cfg velo_tipc" cargo test --features tipc --test transports_tipc_shutdown
+RUSTFLAGS="--cfg velo_tipc" cargo test --features tipc --test transports_tipc_node_affinity
 ```
 
-`cargo test --all-features` (without `--cfg velo_tipc`) compiles all TIPC code but runs zero
-kernel-dependent tests — green on module-less machines with full clippy coverage.
+The `--cfg velo_tipc` rustc flag is load-bearing (the `velo_endurance` pattern): the three
+test files are gated `#![cfg(velo_tipc)]`, so `cargo test --all-features` *compiles* all
+TIPC code but runs zero kernel-dependent tests — green on module-less machines with full
+clippy coverage. Without the flag the test binaries build empty and report `0 tests`; CI's
+`tipc-tests` job sets it after probing for the module.
 
 ### Public test seam
 
