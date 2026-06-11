@@ -23,6 +23,7 @@ pub mod observability;
 pub mod queue;
 pub mod rendezvous;
 pub mod streaming;
+pub mod sync;
 pub mod transports;
 
 #[cfg(feature = "simulation")]
@@ -63,6 +64,9 @@ pub use crate::rendezvous::{
 
 // Observability
 pub use crate::observability::VeloMetrics;
+
+// Sync primitives (PendingMap, CloseSignal, Closed, etc.)
+pub use crate::sync::{CloseSignal, Closed, PendingMap, RegisterError, Waiter};
 
 /// Configuration for TCP streaming transport.
 ///
