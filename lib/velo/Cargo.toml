@@ -21,6 +21,7 @@ http = ["dep:axum"]
 nats-transport = ["dep:async-nats"]
 grpc = ["dep:tonic", "dep:prost", "dep:tower", "dep:hyper", "dep:http", "dep:http-body", "dep:http-body-util", "dep:hyper-util", "dep:tokio-stream"]
 zmq = ["dep:zmq"]
+tipc = []
 
 # Discovery backends
 nats-discovery = ["dep:async-nats"]
@@ -87,6 +88,7 @@ tracing-opentelemetry = { workspace = true, optional = true }
 loom-rs = { version = "0.5.0", features = ["sim"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 nix = { version = "0.31.2", features = ["sched", "net"] }
 
 [dev-dependencies]
@@ -227,3 +229,18 @@ path = "tests/transports/uds_shutdown.rs"
 name = "transports_zmq"
 path = "tests/transports/zmq_integration.rs"
 required-features = ["zmq"]
+
+[[test]]
+name = "transports_tipc"
+path = "tests/transports/tipc_integration.rs"
+required-features = ["tipc"]
+
+[[test]]
+name = "transports_tipc_shutdown"
+path = "tests/transports/tipc_shutdown.rs"
+required-features = ["tipc"]
+
+[[test]]
+name = "transports_tipc_node_affinity"
+path = "tests/transports/tipc_node_affinity.rs"
+required-features = ["tipc"]

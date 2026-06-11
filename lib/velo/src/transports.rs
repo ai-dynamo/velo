@@ -52,6 +52,9 @@ pub mod grpc;
 #[cfg(feature = "zmq")]
 pub mod zmq;
 
+#[cfg(all(target_os = "linux", feature = "tipc"))]
+pub mod tipc;
+
 mod transport;
 
 use std::{collections::HashMap, sync::Arc};
