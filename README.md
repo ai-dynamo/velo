@@ -469,7 +469,7 @@ If you want to write a custom transport, frame transport, or discovery backend t
 
 ```toml
 [dependencies]
-velo-ext = "0.1"
+velo-ext = "0.2"
 ```
 
 Implement one of:
