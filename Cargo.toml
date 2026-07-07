@@ -10,7 +10,7 @@ exclude = ["examples"]
 resolver = "3"
 
 [workspace.package]
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 description = "Velo Active Messenging Library"
 authors = ["NVIDIA Inc. <sw-dl-dynamo@nvidia.com>"]
@@ -36,7 +36,7 @@ velo-ext = { path = "lib/velo-ext", version = "=0.2.0" }
 # the build-time pinning.
 
 anyhow = { version = "1.0.0" }
-async-nats = { version = "0.45.0", features = ["service"] }
+async-nats = { version = "0.49.1", features = ["service"] }
 async-stream = { version = "0.3" }
 bytes = { version = "1" }
 dashmap = { version = "6.1" }
