@@ -15,8 +15,13 @@
 #   * rendezvous R1..R4     — inline + chunked + refcount + gauge
 #
 # What is NOT run here (run in nightly instead):
-#   * S2 (concurrent multi-stream) — known intermittent SenderDropped under
-#     cross-stream contention; tracked as a follow-up.
+#   * S2 (concurrent multi-stream) — historically excluded for "intermittent
+#     SenderDropped under cross-stream contention". That diagnosis was wrong:
+#     S2 and S4 share `run_one_stream`, which labelled every failure "S2", so
+#     the gRPC terminal-sentinel loss that actually lived in S4 was attributed
+#     to S2. The transport bug is fixed and the labels are now per-scenario;
+#     the exclusion is kept only because nothing has re-qualified S2 at nightly
+#     scale on this gate's time budget. Revisit it.
 #   * --faults — handler panics dump to stderr in the smoke output and the
 #     fault-mode scenarios add several seconds; nightly is the right place.
 
