@@ -27,7 +27,8 @@ pub use common::MessageId;
 pub use discovery::PeerDiscovery;
 pub use events::VeloEvents;
 pub use handlers::{
-    AmHandlerBuilder, AsyncExecutor, Context, DispatchMode, Handler, HandlerExecutor, SyncExecutor,
-    TypedContext, TypedUnaryHandlerBuilder, UnaryHandlerBuilder, UnifiedResponse,
+    AmHandlerBuilder, AsyncExecutor, Context, DispatchMode, Handler, HandlerExecutor,
+    OrderedConfig, OrderingKey, OverflowPolicy, SyncExecutor, TypedContext,
+    TypedUnaryHandlerBuilder, UnaryHandlerBuilder, UnifiedResponse,
 };
 pub use messenger::{Messenger, MessengerBuilder};
