@@ -222,7 +222,9 @@ pub async fn run_s2_many_streams(ctx: &ScenarioCtx) -> Result<ScenarioReport> {
         let consumer = Arc::clone(&pair.server.velo);
         let producer = Arc::clone(&pair.client.velo);
         let oracle = Arc::clone(&oracle);
-        set.spawn(async move { run_one_stream(consumer, producer, oracle, per_stream).await });
+        set.spawn(
+            async move { run_one_stream("S2", consumer, producer, oracle, per_stream).await },
+        );
     }
     while let Some(r) = set.join_next().await {
         r??;
@@ -252,7 +254,14 @@ pub async fn run_s2_many_streams(ctx: &ScenarioCtx) -> Result<ScenarioReport> {
     ))
 }
 
+/// Drive one create → attach → pump → finalize cycle.
+///
+/// `scenario` labels the failure messages. It is a parameter rather than a
+/// hardcoded string because both S2 and S4 drive their streams through here —
+/// when this reported every failure as "S2" an S4 regression read as an S2
+/// flake, which sent the last investigation at the wrong scenario entirely.
 async fn run_one_stream(
+    scenario: &'static str,
     consumer: Arc<Velo>,
     producer: Arc<Velo>,
     oracle: Arc<Oracle>,
@@ -282,23 +291,37 @@ async fn run_one_stream(
     });
 
     let mut stream = anchor;
+    // `expected` is the next sequence number the stream must produce;
+    // `received` is how many item frames actually arrived. They only diverge
+    // once ordering breaks, which is exactly when the distinction matters —
+    // every failure below reports `received` so "how far did this stream get"
+    // is answerable straight from the soak log.
     let mut expected: u64 = 0;
+    let mut received: u64 = 0;
     let stream_outcome: Result<()> = loop {
         let Some(frame) = stream.next().await else {
-            break Err(anyhow!("S2: stream ended without sentinel"));
+            break Err(anyhow!(
+                "{scenario}: stream ended without sentinel (after {received} items)"
+            ));
         };
         match frame {
             Ok(StreamFrame::Item(item)) => {
+                received += 1;
                 if item.seq != expected {
-                    break Err(anyhow!("S2/order: expected {expected}, got {}", item.seq));
+                    break Err(anyhow!(
+                        "{scenario}/order: expected {expected}, got {} (after {received} items)",
+                        item.seq
+                    ));
                 }
                 expected += 1;
                 oracle.inc_received();
             }
             Ok(StreamFrame::Finalized) => break Ok(()),
             Ok(StreamFrame::Heartbeat) => unreachable!(),
-            Ok(other) => break Err(anyhow!("S2/unexpected: {other:?}")),
-            Err(e) => break Err(anyhow!("S2/error: {e}")),
+            Ok(other) => break Err(anyhow!(
+                "{scenario}/unexpected: {other:?} (after {received} items)"
+            )),
+            Err(e) => break Err(anyhow!("{scenario}/error: {e} (after {received} items)")),
         }
     };
 
@@ -312,7 +335,7 @@ async fn run_one_stream(
     match (stream_outcome, producer_outcome) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(consumer_err), Err(producer_err)) => Err(anyhow!(
-            "S2: consumer={consumer_err}; producer={producer_err}"
+            "{scenario}: consumer={consumer_err}; producer={producer_err}"
         )),
         (Err(e), Ok(())) => Err(e),
         (Ok(()), Err(e)) => Err(e),
@@ -332,6 +355,7 @@ pub async fn run_s4_rapid_cycle(ctx: &ScenarioCtx) -> Result<ScenarioReport> {
 
     for _ in 0..cycles {
         run_one_stream(
+            "S4",
             Arc::clone(&pair.server.velo),
             Arc::clone(&pair.client.velo),
             Arc::clone(&oracle),
