@@ -93,6 +93,115 @@ pub(crate) fn maybe_shrink_read_buffer<T>(
     }
 }
 
+/// Default cap on how many bytes one coalesced write may carry.
+///
+/// Sized at [`COALESCE_THRESHOLD`] so a full batch still lands in roughly one
+/// kernel send-buffer's worth of data. `write_all` loops internally, so
+/// exceeding this is correct but starts costing extra syscalls — which is the
+/// cost coalescing exists to avoid.
+pub(crate) const DEFAULT_MAX_BATCH_BYTES: usize = COALESCE_THRESHOLD;
+
+/// Default cap on how many frames one coalesced write may carry.
+///
+/// Bounds worst-case error attribution: a failed write must report the error
+/// for every frame it was carrying, so an unbounded batch would mean an
+/// unbounded error fan-out on a single connection fault.
+pub(crate) const DEFAULT_MAX_BATCH_FRAMES: usize = 1024;
+
+/// Accumulates several encoded frames into one buffer so they can be handed to
+/// the socket with a single `write_all`.
+///
+/// # Why this is wire-compatible
+///
+/// Frames are self-delimiting: each carries its own [`MIN_HEADER_SIZE`]-byte
+/// preamble with explicit lengths, and [`TcpFrameCodec`]'s `Decoder` is driven
+/// in a loop by `Framed`, which already handles several frames arriving in one
+/// read. So a coalescing writer talks to an *unmodified* reader, and a
+/// non-coalescing writer talks to a reader that supports coalescing. No
+/// negotiation, no version bump, no wire-format change — the only thing that
+/// changes is how many `write` syscalls produce the same bytes.
+///
+/// # Bounds
+///
+/// Staging stops at [`DEFAULT_MAX_BATCH_BYTES`] and
+/// [`DEFAULT_MAX_BATCH_FRAMES`] (see [`Self::would_overflow`]). A single frame
+/// larger than the byte cap is still accepted when the batch is empty — it just
+/// gets a batch to itself — so no message is ever undeliverable because of
+/// batching.
+pub(crate) struct FrameBatchBuffer {
+    buf: BytesMut,
+    frames: usize,
+    max_bytes: usize,
+    max_frames: usize,
+}
+
+impl FrameBatchBuffer {
+    pub(crate) fn new() -> Self {
+        Self::with_limits(DEFAULT_MAX_BATCH_BYTES, DEFAULT_MAX_BATCH_FRAMES)
+    }
+
+    pub(crate) fn with_limits(max_bytes: usize, max_frames: usize) -> Self {
+        Self {
+            // Start small; `append_frame` reserves what it needs and the
+            // allocation is reused across flushes for the connection's life.
+            buf: BytesMut::with_capacity(8 * 1024),
+            frames: 0,
+            max_bytes,
+            max_frames,
+        }
+    }
+
+    /// Number of frames staged but not yet written.
+    #[inline]
+    pub(crate) fn frame_count(&self) -> usize {
+        self.frames
+    }
+
+    /// Whether staging one more frame of this size would exceed a cap.
+    ///
+    /// Always `false` when the batch is empty, so an oversized frame is never
+    /// rejected outright — it takes a solo batch instead.
+    #[inline]
+    pub(crate) fn would_overflow(&self, header_len: usize, payload_len: usize) -> bool {
+        if self.frames == 0 {
+            return false;
+        }
+        self.frames + 1 > self.max_frames
+            || self.buf.len() + MIN_HEADER_SIZE + header_len + payload_len > self.max_bytes
+    }
+
+    /// Stage one frame. Does not touch the socket.
+    #[inline]
+    pub(crate) fn push(
+        &mut self,
+        msg_type: MessageType,
+        header: &[u8],
+        payload: &[u8],
+    ) -> io::Result<()> {
+        TcpFrameCodec::append_frame(&mut self.buf, msg_type, header, payload)?;
+        self.frames += 1;
+        Ok(())
+    }
+
+    /// Write every staged frame with a single `write_all` and reset.
+    ///
+    /// The buffer is cleared whether or not the write succeeded: on failure the
+    /// caller owns error reporting for the frames it staged, and retrying a
+    /// partially-written frame stream would corrupt the peer's decoder.
+    pub(crate) async fn flush_to<W: AsyncWrite + Unpin>(
+        &mut self,
+        writer: &mut W,
+    ) -> io::Result<()> {
+        if self.frames == 0 {
+            return Ok(());
+        }
+        let result = writer.write_all(&self.buf).await;
+        self.buf.clear();
+        self.frames = 0;
+        result
+    }
+}
+
 /// Zero-copy frame decoder for TCP transport
 ///
 /// This decoder maintains state across multiple calls to support partial
@@ -220,6 +329,28 @@ impl TcpFrameCodec {
             writer.write_all(header).await?;
             writer.write_all(payload).await?;
         }
+        Ok(())
+    }
+
+    /// Append one encoded frame to `buf` without writing anything.
+    ///
+    /// The bytes produced are byte-identical to what [`encode_frame`] would
+    /// write, so a peer decoding with [`TcpFrameCodec`] cannot tell whether a
+    /// frame arrived alone or packed alongside others. This is what makes
+    /// write coalescing wire-compatible in both directions — see
+    /// [`FrameBatchBuffer`].
+    #[inline]
+    pub(crate) fn append_frame(
+        buf: &mut BytesMut,
+        msg_type: MessageType,
+        header: &[u8],
+        payload: &[u8],
+    ) -> io::Result<()> {
+        let preamble = Self::build_preamble(msg_type, header.len() as u32, payload.len() as u32)?;
+        buf.reserve(MIN_HEADER_SIZE + header.len() + payload.len());
+        buf.extend_from_slice(&preamble);
+        buf.extend_from_slice(header);
+        buf.extend_from_slice(payload);
         Ok(())
     }
 
@@ -914,5 +1045,120 @@ mod tests {
             assert_eq!(&decoded_header[..], header.as_slice());
             assert_eq!(&decoded_payload[..], payload.as_slice());
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // FrameBatchBuffer — write coalescing
+    // -----------------------------------------------------------------------
+
+    /// The load-bearing property of write coalescing: a batch of N frames
+    /// produces exactly the bytes N separate `encode_frame` calls would. That
+    /// is what makes a coalescing writer wire-compatible with an unmodified
+    /// peer, with no negotiation and no version bump.
+    #[tokio::test]
+    async fn batch_bytes_identical_to_sequential_writes() {
+        let frames: Vec<(MessageType, Vec<u8>, Vec<u8>)> = vec![
+            (
+                MessageType::Message,
+                b"h1".to_vec(),
+                b"payload-one".to_vec(),
+            ),
+            (MessageType::Response, Vec::new(), b"two".to_vec()),
+            (MessageType::Event, b"hdr3".to_vec(), Vec::new()),
+            (MessageType::Ack, Vec::new(), Vec::new()),
+        ];
+
+        let mut sequential = Vec::new();
+        for (t, h, p) in &frames {
+            TcpFrameCodec::encode_frame_sync(&mut sequential, *t, h, p).unwrap();
+        }
+
+        let mut batch = FrameBatchBuffer::new();
+        for (t, h, p) in &frames {
+            batch.push(*t, h, p).unwrap();
+        }
+        assert_eq!(batch.frame_count(), frames.len());
+        let mut batched = Vec::new();
+        batch.flush_to(&mut batched).await.unwrap();
+
+        assert_eq!(batched, sequential, "batched bytes must match sequential");
+        assert_eq!(batch.frame_count(), 0, "flush resets the buffer");
+    }
+
+    /// An unmodified `TcpFrameCodec` decoder must recover every frame from a
+    /// coalesced write — this is what the receiving peer actually does.
+    #[tokio::test]
+    async fn coalesced_batch_decodes_frame_by_frame() {
+        let mut batch = FrameBatchBuffer::new();
+        for i in 0..32u8 {
+            batch
+                .push(MessageType::Message, &[], &[i; 24])
+                .expect("push");
+        }
+        let mut wire = Vec::new();
+        batch.flush_to(&mut wire).await.unwrap();
+
+        let mut codec = TcpFrameCodec::new();
+        let mut buf = BytesMut::from(&wire[..]);
+        for i in 0..32u8 {
+            let (msg_type, header, payload) = codec
+                .decode(&mut buf)
+                .unwrap()
+                .unwrap_or_else(|| panic!("frame {i} missing from coalesced batch"));
+            assert_eq!(msg_type, MessageType::Message);
+            assert!(header.is_empty());
+            assert_eq!(&payload[..], &[i; 24]);
+        }
+        assert!(buf.is_empty(), "decoder should consume the whole batch");
+        assert!(codec.decode(&mut buf).unwrap().is_none());
+    }
+
+    #[test]
+    fn would_overflow_respects_byte_cap() {
+        let mut batch = FrameBatchBuffer::with_limits(128, 64);
+        // Empty batch never overflows — an oversized frame must still be
+        // deliverable, in a batch of its own.
+        assert!(!batch.would_overflow(0, 10_000));
+
+        batch.push(MessageType::Message, &[], &[0u8; 64]).unwrap();
+        assert!(!batch.would_overflow(0, 8));
+        assert!(batch.would_overflow(0, 128));
+    }
+
+    #[test]
+    fn would_overflow_respects_frame_cap() {
+        let mut batch = FrameBatchBuffer::with_limits(1 << 20, 3);
+        for _ in 0..3 {
+            assert!(!batch.would_overflow(0, 1));
+            batch.push(MessageType::Message, &[], &[0u8; 1]).unwrap();
+        }
+        assert!(batch.would_overflow(0, 1), "frame cap reached");
+    }
+
+    #[tokio::test]
+    async fn flush_of_empty_batch_writes_nothing() {
+        let mut batch = FrameBatchBuffer::new();
+        let mut sink = Vec::new();
+        batch.flush_to(&mut sink).await.unwrap();
+        assert!(sink.is_empty());
+    }
+
+    /// An oversized frame is rejected without corrupting frames already staged,
+    /// because `append_frame` validates lengths before touching the buffer.
+    #[tokio::test]
+    async fn rejected_frame_leaves_batch_intact() {
+        let mut batch = FrameBatchBuffer::new();
+        batch.push(MessageType::Message, &[], b"good").unwrap();
+
+        let too_big = vec![0u8; (DEFAULT_MAX_FRAME_SIZE as usize) + 1];
+        assert!(batch.push(MessageType::Message, &[], &too_big).is_err());
+        assert_eq!(batch.frame_count(), 1, "staged frame must survive");
+
+        let mut wire = Vec::new();
+        batch.flush_to(&mut wire).await.unwrap();
+        let mut codec = TcpFrameCodec::new();
+        let mut buf = BytesMut::from(&wire[..]);
+        let (_, _, payload) = codec.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(&payload[..], b"good");
     }
 }

@@ -26,7 +26,7 @@ use crate::transports::utils::interfaces::{
 };
 use velo_ext::{MessageType, PeerInfo, Transport, TransportAdapter, TransportKey, WorkerAddress};
 
-use super::framing::TcpFrameCodec;
+use super::framing::FrameBatchBuffer;
 use super::listener::TcpListener;
 
 /// High-performance TCP transport with lock-free concurrent access
@@ -560,7 +560,21 @@ async fn connection_writer_inner(
 
     debug!("Connected to {}", addr);
 
-    loop {
+    // Coalescing writer. See `FrameBatchBuffer` for why packing several frames
+    // into one `write_all` is wire-compatible with an unmodified peer, and
+    // `lib/velo/src/streaming/BATCHING.md` for the wider rationale.
+    //
+    // The loop still blocks on `recv_async` for the first message, then takes
+    // more only via `try_recv` — it never waits for work that has not arrived,
+    // so this adds no latency. Under light load each message still gets its own
+    // write; under load, batches form on their own.
+    let mut batch = FrameBatchBuffer::new();
+    // Messages staged into `batch` but not yet written. Held so that a failed
+    // write can report `on_error` for every message it was carrying, not just
+    // the last one.
+    let mut staged: Vec<SendTask> = Vec::new();
+
+    'writer: loop {
         let msg = tokio::select! {
             // Prioritize cancellation so a hot send queue cannot starve shutdown.
             biased;
@@ -570,16 +584,81 @@ async fn connection_writer_inner(
                 Err(_) => break,
             },
         };
-        if let Err(e) =
-            TcpFrameCodec::encode_frame(&mut stream, msg.msg_type, &msg.header, &msg.payload).await
-        {
-            error!("Write error to {} ({}): {}", instance_id, addr, e);
-            msg.on_error(format!("Failed to write to stream: {}", e));
-            break;
+
+        let mut pending = Some(msg);
+        while let Some(msg) = pending.take() {
+            if batch.would_overflow(msg.header.len(), msg.payload.len())
+                && !flush_batch(&mut batch, &mut staged, &mut stream, instance_id, addr).await
+            {
+                // The overflowing message never made it into the batch, so it
+                // is not in `staged` and needs its own notification.
+                msg.on_error("Failed to write to stream: batch flush failed");
+                break 'writer;
+            }
+
+            if let Err(e) = batch.push(msg.msg_type, &msg.header, &msg.payload) {
+                // Only reachable for a frame above the codec's 16 MiB limit.
+                error!("Encode error to {} ({}): {}", instance_id, addr, e);
+                msg.on_error(format!("Failed to write to stream: {}", e));
+                // Anything already staged is still valid — get it out.
+                flush_batch(&mut batch, &mut staged, &mut stream, instance_id, addr).await;
+                break 'writer;
+            }
+            staged.push(msg);
+
+            // Take anything already queued. Never blocks.
+            pending = rx.try_recv().ok();
+        }
+
+        if !flush_batch(&mut batch, &mut staged, &mut stream, instance_id, addr).await {
+            break 'writer;
         }
     }
 
+    // Cancellation can leave a staged batch behind; it was never written, so
+    // its messages must be reported rather than silently dropped.
+    for msg in staged.drain(..) {
+        msg.on_error("Connection closed");
+    }
+
     Ok(())
+}
+
+/// Write the staged batch with a single `write_all`.
+///
+/// On failure every message the batch was carrying gets `on_error` — batching
+/// must not weaken the per-message error-reporting contract. Returns `false` if
+/// the writer loop should stop.
+async fn flush_batch(
+    batch: &mut FrameBatchBuffer,
+    staged: &mut Vec<SendTask>,
+    stream: &mut TcpStream,
+    instance_id: crate::InstanceId,
+    addr: SocketAddr,
+) -> bool {
+    if staged.is_empty() {
+        return true;
+    }
+    match batch.flush_to(stream).await {
+        Ok(()) => {
+            staged.clear();
+            true
+        }
+        Err(e) => {
+            error!(
+                "Write error to {} ({}): {} ({} message(s) in batch)",
+                instance_id,
+                addr,
+                e,
+                staged.len()
+            );
+            let reason = format!("Failed to write to stream: {}", e);
+            for msg in staged.drain(..) {
+                msg.on_error(reason.clone());
+            }
+            false
+        }
+    }
 }
 
 /// Parse a TCP endpoint string into a SocketAddr (legacy format, used in tests).
