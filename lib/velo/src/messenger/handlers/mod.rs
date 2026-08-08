@@ -264,8 +264,13 @@ impl OrderedConfig {
     /// The permit is taken per message *inside* the lane, so per-lane ordering
     /// is unaffected: a lane that cannot get a permit parks with its queue
     /// intact. `None` (the default) means cross-lane parallelism is bounded
-    /// only by the number of senders with queued work.
+    /// only by the number of senders with queued work. `Some(0)` is rejected
+    /// immediately because it would park every lane forever.
     pub fn with_max_concurrent(mut self, limit: Option<usize>) -> Self {
+        assert!(
+            limit.is_none_or(|limit| limit > 0),
+            "max_concurrent must be greater than zero"
+        );
         self.max_concurrent = limit;
         self
     }
@@ -1146,7 +1151,8 @@ macro_rules! impl_dispatch_mode_setters {
             /// Cap how many lanes may be running the handler at once.
             ///
             /// Only meaningful in ordered mode; call it after `.ordered()`.
-            /// Ignored (with a warning) in any other mode.
+            /// Ignored (with a warning) in any other mode. `0` is rejected
+            /// immediately because it would park every lane forever.
             pub fn max_concurrent(mut self, limit: usize) -> Self {
                 match self.ordered.take() {
                     Some(config) => {
@@ -1584,5 +1590,11 @@ mod tests {
         let builder = am_handler("unlimited", |_ctx| Ok(())).max_concurrent(32);
         assert_eq!(builder.dispatch_mode, DispatchMode::Spawn);
         assert!(builder.ordered.is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "max_concurrent must be greater than zero")]
+    fn test_ordered_config_rejects_zero_concurrency() {
+        let _ = OrderedConfig::by_sender().with_max_concurrent(Some(0));
     }
 }

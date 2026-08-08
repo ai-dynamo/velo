@@ -510,14 +510,6 @@ impl OrderedMetricsHandle {
     pub(crate) fn observe_wait(&self, wait: Duration) {
         self.lane_wait.observe(wait.as_secs_f64());
     }
-
-    /// Current total queue depth across this handler's lanes.
-    ///
-    /// Used to evaluate `max_queue_depth`; the gauge doubles as the accounting
-    /// so there is no second counter to keep in step.
-    pub(crate) fn lane_depth(&self) -> f64 {
-        self.lane_depth.get()
-    }
 }
 
 // ---------------------------------------------------------------------------

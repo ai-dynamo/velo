@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -346,6 +346,74 @@ async fn max_concurrent_caps_cross_lane_parallelism() {
             "sender {worker} was reordered under a concurrency limit"
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn max_queue_depth_rejects_without_metrics() {
+    // `new_node` deliberately does not install Prometheus metrics. Queue
+    // admission is a dispatcher concern, so Reject must still protect this
+    // default configuration.
+    let (receiver, senders) = cluster(1).await;
+    let sender = &senders[0];
+
+    let started = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let handler_started = Arc::clone(&started);
+    let handler_release = Arc::clone(&release);
+    let handler = Handler::unary_handler_async("queue_cap", move |_ctx: Context| {
+        let started = Arc::clone(&handler_started);
+        let release = Arc::clone(&handler_release);
+        async move {
+            started.store(true, Ordering::Release);
+            release.notified().await;
+            Ok(Some(Bytes::from_static(b"first response")))
+        }
+    })
+    .ordered_with(
+        OrderedConfig::by_sender()
+            .with_max_queue_depth(Some(1))
+            .with_overflow(OverflowPolicy::Reject),
+    )
+    .build();
+    receiver.register_handler(handler).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let first_sender = Arc::clone(sender);
+    let first_target = receiver.instance_id();
+    let first = tokio::spawn(async move {
+        first_sender
+            .unary("queue_cap")
+            .unwrap()
+            .raw_payload(seq_payload(0))
+            .instance(first_target)
+            .send()
+            .await
+    });
+
+    wait_for("first handler started", || started.load(Ordering::Acquire)).await;
+
+    let second = tokio::time::timeout(
+        Duration::from_secs(1),
+        sender
+            .unary("queue_cap")
+            .unwrap()
+            .raw_payload(seq_payload(1))
+            .instance(receiver.instance_id())
+            .send(),
+    )
+    .await
+    .expect("queue rejection must fail the caller promptly")
+    .expect_err("second request must be rejected while the first is in flight");
+    assert!(
+        second.to_string().contains("ordered lane queue full"),
+        "unexpected queue rejection: {second}"
+    );
+
+    release.notify_one();
+    assert_eq!(
+        first.await.unwrap().unwrap(),
+        Bytes::from_static(b"first response")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
