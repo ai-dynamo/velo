@@ -25,7 +25,7 @@ use crate::transports::transport::{
 use velo_ext::{MessageType, PeerInfo, Transport, TransportAdapter, TransportKey, WorkerAddress};
 
 use super::listener::{UdsListener, default_shrink_threshold};
-use crate::transports::tcp::TcpFrameCodec;
+use crate::transports::tcp::framing::FrameBatchBuffer;
 
 /// UDS transport with lock-free concurrent access
 ///
@@ -551,8 +551,16 @@ async fn connection_writer_inner(
 
     debug!("Connected to UDS {:?}", path);
 
-    // Main send loop
-    loop {
+    // Main send loop. Coalescing writer — see `FrameBatchBuffer` for why
+    // packing several frames into one `write_all` is wire-compatible with an
+    // unmodified peer, and `lib/velo/src/streaming/BATCHING.md` for the wider
+    // rationale. Mirrors the TCP writer loop.
+    let mut batch = FrameBatchBuffer::new();
+    // Messages staged into `batch` but not yet written, held so a failed write
+    // can report `on_error` for every message it was carrying.
+    let mut staged: Vec<SendTask> = Vec::new();
+
+    'writer: loop {
         let msg = tokio::select! {
             // Prioritize cancellation so a hot send queue cannot starve shutdown.
             biased;
@@ -562,16 +570,80 @@ async fn connection_writer_inner(
                 Err(_) => break,
             },
         };
-        if let Err(e) =
-            TcpFrameCodec::encode_frame(&mut stream, msg.msg_type, &msg.header, &msg.payload).await
-        {
-            error!("Write error to {} ({:?}): {}", instance_id, path, e);
-            msg.on_error(format!("Failed to write to UDS stream: {}", e));
-            break;
+
+        let mut pending = Some(msg);
+        while let Some(msg) = pending.take() {
+            if batch.would_overflow(msg.header.len(), msg.payload.len())
+                && !flush_batch(&mut batch, &mut staged, &mut stream, instance_id, path).await
+            {
+                // The overflowing message never entered the batch, so it is not
+                // in `staged` and needs its own notification.
+                msg.on_error("Failed to write to UDS stream: batch flush failed");
+                break 'writer;
+            }
+
+            if let Err(e) = batch.push(msg.msg_type, &msg.header, &msg.payload) {
+                // Only reachable for a frame above the codec's 16 MiB limit.
+                error!("Encode error to {} ({:?}): {}", instance_id, path, e);
+                msg.on_error(format!("Failed to write to UDS stream: {}", e));
+                flush_batch(&mut batch, &mut staged, &mut stream, instance_id, path).await;
+                break 'writer;
+            }
+            staged.push(msg);
+
+            // Take anything already queued. Never blocks.
+            pending = rx.try_recv().ok();
+        }
+
+        if !flush_batch(&mut batch, &mut staged, &mut stream, instance_id, path).await {
+            break 'writer;
         }
     }
 
+    // Cancellation can leave a staged batch behind; it was never written, so
+    // report rather than silently drop.
+    for msg in staged.drain(..) {
+        msg.on_error("Connection closed");
+    }
+
     Ok(())
+}
+
+/// Write the staged batch with a single `write_all`.
+///
+/// On failure every message the batch was carrying gets `on_error` — batching
+/// must not weaken the per-message error-reporting contract. Returns `false` if
+/// the writer loop should stop.
+async fn flush_batch(
+    batch: &mut FrameBatchBuffer,
+    staged: &mut Vec<SendTask>,
+    stream: &mut UnixStream,
+    instance_id: crate::InstanceId,
+    path: &Path,
+) -> bool {
+    if staged.is_empty() {
+        return true;
+    }
+    match batch.flush_to(stream).await {
+        Ok(()) => {
+            staged.clear();
+            true
+        }
+        Err(e) => {
+            error!(
+                "Write error to {} ({:?}): {} ({} message(s) in batch)",
+                instance_id,
+                path,
+                e,
+                staged.len()
+            );
+            let reason = format!("Failed to write to UDS stream: {}", e);
+            for msg in staged.drain(..) {
+                msg.on_error(reason.clone());
+            }
+            false
+        }
+    }
 }
 
 /// Parse a UDS endpoint string into a PathBuf
