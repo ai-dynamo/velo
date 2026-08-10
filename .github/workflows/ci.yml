@@ -19,7 +19,6 @@ on:
   push:
     branches:
     - main
-    - release/*
     - "pull-request/[0-9]+"
 
 concurrency:
