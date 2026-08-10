@@ -19,17 +19,47 @@ on:
   push:
     branches:
     - main
-  pull_request:
+    - release/*
+    - "pull-request/[0-9]+"
 
 concurrency:
-  group: ${{ github.event_name == 'pull_request' && format('{0}-{1}', github.workflow, github.event.pull_request.number) || format('{0}-{1}', github.workflow, github.run_id) }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/heads/pull-request/') }}
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
   PROTOC_VERSION: "30.2"
 
 jobs:
+  pr-metadata:
+    name: Read copied PR metadata
+    if: startsWith(github.ref, 'refs/heads/pull-request/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      semver-skip: ${{ steps.metadata.outputs.semver-skip }}
+    steps:
+    - name: Read labels
+      id: metadata
+      uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+      with:
+        script: |
+          const pull_number = Number(context.ref.split('/').at(-1));
+          const { data: pull } = await github.rest.pulls.get({
+            ...context.repo,
+            pull_number,
+          });
+
+          core.setOutput(
+            'semver-skip',
+            String(pull.labels.some((label) => label.name === 'semver:skip')),
+          );
+
   fmt:
     name: Formatting
     runs-on: prod-velo-default-v1
@@ -241,7 +271,8 @@ jobs:
 
   semver:
     name: Semver Check
-    if: github.event_name == 'pull_request'
+    needs: pr-metadata
+    if: startsWith(github.ref, 'refs/heads/pull-request/')
     runs-on: prod-velo-default-v1
     container:
       image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.3
@@ -264,7 +295,7 @@ jobs:
         key: ${{ runner.os }}-cargo-semver-checks-${{ hashFiles('scripts/check-semver.sh', 'rust-toolchain.toml') }}
     - name: Run semver check
       env:
-        SEMVER_SKIP: ${{ contains(github.event.pull_request.labels.*.name, 'semver:skip') }}
+        SEMVER_SKIP: ${{ needs.pr-metadata.outputs.semver-skip }}
       run: bash scripts/check-semver.sh
     - name: sccache stats
       if: always()
@@ -275,7 +306,7 @@ jobs:
     runs-on: prod-velo-default-v1
     container:
       image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.3
-    needs: [fmt, clippy, deny, test, soak-smoke, coverage, examples, semver]
+    needs: [pr-metadata, fmt, clippy, deny, test, soak-smoke, coverage, examples, semver]
     if: always()
     steps:
     - name: Check all jobs
