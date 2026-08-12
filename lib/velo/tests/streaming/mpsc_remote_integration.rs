@@ -499,6 +499,7 @@ async fn test_mpsc_remote_handler_rejects_spsc_handle() {
         handle: spsc_handle,
         session_id: 9999,
         stream_cancel_handle: StreamCancelHandle::pack(WorkerId::from_u64(99), 9999),
+        supported_transport_keys: Vec::new(),
     };
     let response: MpscAnchorAttachResponse = messenger_b
         .typed_unary_streaming::<MpscAnchorAttachResponse>("_mpsc_anchor_attach")
@@ -535,6 +536,7 @@ async fn test_mpsc_remote_handler_anchor_not_found() {
         handle: fake,
         session_id: 1,
         stream_cancel_handle: StreamCancelHandle::pack(WorkerId::from_u64(99), 1),
+        supported_transport_keys: Vec::new(),
     };
     let response: MpscAnchorAttachResponse = messenger_b
         .typed_unary_streaming::<MpscAnchorAttachResponse>("_mpsc_anchor_attach")

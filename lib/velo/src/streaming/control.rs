@@ -187,6 +187,17 @@ pub struct AnchorAttachRequest {
     /// Encodes the sender's WorkerId + sender_stream_id. Stored in the anchor entry
     /// on successful attach so the anchor knows where to route upstream cancel AMs.
     pub stream_cancel_handle: StreamCancelHandle,
+    /// Streaming transports this sender has installed and can therefore be
+    /// asked to `connect()` on.
+    ///
+    /// The receiver intersects this with its own installed set and prefers
+    /// `messenger-mux-v1` when it appears in both. `#[serde(default)]` means a
+    /// sender that predates negotiation deserializes as one advertising
+    /// nothing, which is exactly right: an empty list can never intersect, so
+    /// such a sender is always answered with the receiver's default transport
+    /// key — the behaviour it already expects.
+    #[serde(default)]
+    pub supported_transport_keys: Vec<velo_ext::TransportKey>,
 }
 
 /// Response from the attach handler.
@@ -220,6 +231,28 @@ pub enum AnchorAttachResponse {
         /// `sender_stream_id` (the legacy collision-prone behavior).
         #[serde(default)]
         routing_session_id: u64,
+        /// Data credit the receiver grants each new mux slot — and therefore
+        /// the depth of the buffer it sized behind that slot.
+        ///
+        /// Zero is **not** a small window. It means *this peer is not offering
+        /// the mux*, and the sender must not drive one even if
+        /// `streaming_transport_key` matched: a sender that guessed a window
+        /// would push into a buffer the receiver never sized. Every older peer
+        /// deserializes as exactly that, because `#[serde(default)]` fills the
+        /// absent field with zero.
+        #[serde(default)]
+        initial_credit: u32,
+        /// Bytes one mux slot may hold in flight.
+        ///
+        /// Zero here means something different from zero above: *use the
+        /// default*. The asymmetry is deliberate and `BATCHING.md` is its
+        /// authority — a credit window cannot be defaulted safely because only
+        /// the receiver knows what it allocated, whereas the byte cap is a
+        /// memory bound both sides can agree on without being told.
+        /// [`crate::streaming::messenger_mux::flow_control::NegotiatedLimits::from_wire`]
+        /// is the one place that split is encoded.
+        #[serde(default)]
+        slot_byte_budget: u32,
     },
     /// Attach failed; `reason` describes why.
     Err { reason: String },
@@ -531,6 +564,8 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::messe
                                 streaming_transport_key,
                                 heartbeat_interval_ms: heartbeat_interval.as_millis() as u64,
                                 routing_session_id,
+                                initial_credit: 0,
+                                slot_byte_budget: 0,
                             })
                         }
                     }
@@ -943,6 +978,8 @@ mod tests {
             streaming_transport_key: velo_ext::TransportKey::new("mock-stream"),
             heartbeat_interval_ms: 5000,
             routing_session_id: 7,
+            initial_credit: 0,
+            slot_byte_budget: 0,
         };
         let json = serde_json::to_string(&resp).expect("serialize Ok");
         let decoded: AnchorAttachResponse = serde_json::from_str(&json).expect("deserialize Ok");
@@ -951,6 +988,7 @@ mod tests {
                 streaming_transport_key,
                 heartbeat_interval_ms,
                 routing_session_id,
+                ..
             } => {
                 assert_eq!(streaming_transport_key.as_str(), "mock-stream");
                 assert_eq!(heartbeat_interval_ms, 5000);
@@ -968,6 +1006,8 @@ mod tests {
             streaming_transport_key: velo_ext::TransportKey::new("tcp-stream"),
             heartbeat_interval_ms: 1234,
             routing_session_id: 42,
+            initial_credit: 64,
+            slot_byte_budget: 4096,
         };
         let bytes = rmp_serde::to_vec(&resp).expect("rmp serialize Ok");
         let decoded: AnchorAttachResponse =
@@ -977,10 +1017,14 @@ mod tests {
                 streaming_transport_key,
                 heartbeat_interval_ms,
                 routing_session_id,
+                initial_credit,
+                slot_byte_budget,
             } => {
                 assert_eq!(streaming_transport_key.as_str(), "tcp-stream");
                 assert_eq!(heartbeat_interval_ms, 1234);
                 assert_eq!(routing_session_id, 42);
+                assert_eq!(initial_credit, 64);
+                assert_eq!(slot_byte_budget, 4096);
             }
             other => panic!("expected Ok, got {:?}", other),
         }
@@ -997,6 +1041,8 @@ mod tests {
                 streaming_transport_key,
                 heartbeat_interval_ms,
                 routing_session_id,
+                initial_credit,
+                slot_byte_budget,
             } => {
                 assert_eq!(streaming_transport_key.as_str(), "mock-stream");
                 assert_eq!(
@@ -1007,9 +1053,60 @@ mod tests {
                     routing_session_id, 0,
                     "missing routing_session_id must default to 0 for legacy senders"
                 );
+                assert_eq!(
+                    initial_credit, 0,
+                    "an absent credit window is a peer not offering the mux"
+                );
+                assert_eq!(
+                    slot_byte_budget, 0,
+                    "an absent byte cap means the default, resolved by NegotiatedLimits"
+                );
             }
             other => panic!("expected Ok, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn an_attach_request_from_before_negotiation_advertises_nothing() {
+        // The wire shape a sender that predates negotiation emits. It must
+        // still deserialize, and it must land on an empty key list rather than
+        // on anything that could intersect: an older sender has no mux to
+        // drive, and answering it with one would break it.
+        let legacy_json = r#"{
+            "handle": {"hi": 1, "lo": 2},
+            "session_id": 3,
+            "stream_cancel_handle": {"hi": 4, "lo": 5}
+        }"#;
+        let decoded: AnchorAttachRequest =
+            serde_json::from_str(legacy_json).expect("legacy request must deserialize");
+        assert!(
+            decoded.supported_transport_keys.is_empty(),
+            "an absent key list is a sender advertising nothing"
+        );
+    }
+
+    #[test]
+    fn an_attach_request_round_trips_its_advertised_keys() {
+        let req = AnchorAttachRequest {
+            handle: StreamAnchorHandle::pack(velo_ext::WorkerId::from_u64(1), 2),
+            session_id: 3,
+            stream_cancel_handle: StreamCancelHandle::pack(velo_ext::WorkerId::from_u64(4), 5),
+            supported_transport_keys: vec![
+                velo_ext::TransportKey::new("messenger-mux-v1"),
+                velo_ext::TransportKey::new("tcp-stream"),
+            ],
+        };
+        let bytes = rmp_serde::to_vec(&req).expect("rmp serialize request");
+        let decoded: AnchorAttachRequest =
+            rmp_serde::from_slice(&bytes).expect("rmp deserialize request");
+        assert_eq!(
+            decoded
+                .supported_transport_keys
+                .iter()
+                .map(velo_ext::TransportKey::as_str)
+                .collect::<Vec<_>>(),
+            ["messenger-mux-v1", "tcp-stream"],
+        );
     }
 
     #[test]
@@ -1061,6 +1158,8 @@ mod tests {
                         streaming_transport_key: key,
                         heartbeat_interval_ms: 5000,
                         routing_session_id: 1,
+                        initial_credit: 0,
+                        slot_byte_budget: 0,
                     }
                 }
             }
@@ -1123,6 +1222,8 @@ mod tests {
                         streaming_transport_key: velo_ext::TransportKey::new("unreachable"),
                         heartbeat_interval_ms: 5000,
                         routing_session_id: 1,
+                        initial_credit: 0,
+                        slot_byte_budget: 0,
                     }
                 }
             }

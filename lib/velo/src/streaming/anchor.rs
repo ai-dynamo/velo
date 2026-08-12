@@ -1062,6 +1062,7 @@ impl AnchorManager {
             handle,
             session_id: sender_stream_id,
             stream_cancel_handle,
+            supported_transport_keys: Vec::new(),
         };
 
         // Send _anchor_attach AM to the remote worker (typed request-response)
@@ -1081,6 +1082,9 @@ impl AnchorManager {
                 streaming_transport_key,
                 heartbeat_interval_ms,
                 routing_session_id,
+                // The negotiated mux limits ride here; nothing reads them
+                // until the selection path lands.
+                ..
             } => {
                 let (_, local_id) = handle.unpack();
 
@@ -1453,6 +1457,7 @@ impl AnchorManager {
             handle,
             session_id: sender_stream_id,
             stream_cancel_handle,
+            supported_transport_keys: Vec::new(),
         };
 
         let response: crate::streaming::mpsc::control::MpscAnchorAttachResponse = messenger
@@ -1472,6 +1477,7 @@ impl AnchorManager {
                 heartbeat_interval_ms,
                 sender_id,
                 routing_session_id,
+                ..
             } => {
                 let (_, local_id) = handle.unpack();
                 // See the SPSC remote attach above for routing_session_id
