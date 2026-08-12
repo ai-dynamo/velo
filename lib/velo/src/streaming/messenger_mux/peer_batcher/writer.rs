@@ -34,6 +34,41 @@ use crate::transports::tcp::framing::COALESCE_THRESHOLD;
 /// answer for them.
 pub(super) const MIN_BATCH_CAP: usize = BATCH_HEADER_LEN + 13;
 
+/// `min(configured cap, effective eager budget, COALESCE_THRESHOLD)`, floored
+/// at [`MIN_BATCH_CAP`].
+///
+/// The threshold is the packing *target*: the shared coalescing writer stages a
+/// frame into one buffered `write_all` only while it fits, so a batch above it
+/// gives back what batching bought. The eager budget is the ceiling above it —
+/// exceed it and the batch quietly becomes a rendezvous transfer, paying a round
+/// trip on behalf of every slot packed into it.
+///
+/// Split out from the caller because the eager term is the one an in-process
+/// pair cannot make bind: every messenger transport's budget is the 256 KiB
+/// rendezvous threshold or its own smaller limit, both far above the 64 KiB
+/// coalescing threshold, so end to end the other two terms always win. The
+/// arithmetic is where that arm is reachable.
+pub(super) const fn batch_cap(configured: usize, eager: usize) -> usize {
+    let clamped = if configured < eager {
+        configured
+    } else {
+        eager
+    };
+    let clamped = if clamped < COALESCE_THRESHOLD {
+        clamped
+    } else {
+        COALESCE_THRESHOLD
+    };
+    // Not `clamp`: the floor is applied *after* the three ceilings, and a
+    // configured cap below the floor is a legitimate (if useless) setting rather
+    // than the panic `clamp` would give it.
+    if clamped > MIN_BATCH_CAP {
+        clamped
+    } else {
+        MIN_BATCH_CAP
+    }
+}
+
 /// A batch was handed to the messenger and never admitted.
 ///
 /// The writer reports it rather than acting on it: what it means — that every
@@ -120,31 +155,18 @@ impl BatchWriter {
         self.encoder.as_mut()
     }
 
-    /// `min(configured cap, effective eager budget, COALESCE_THRESHOLD)`.
+    /// The cap for the next batch to this peer.
     ///
-    /// The threshold is the packing *target*: the shared coalescing writer
-    /// stages a frame into one buffered `write_all` only while it fits, so a
-    /// batch above it gives back what batching bought. The eager budget is the
-    /// ceiling above it — exceed it and the batch quietly becomes a rendezvous
-    /// transfer, paying a round trip on behalf of every slot packed into it.
-    ///
-    /// Asked here, on the batcher's task, because `effective_eager_payload`
-    /// accounts for the ambient trace context the send will inject. An
-    /// unresolved peer costs the conservative clamp rather than a failed flush.
+    /// The eager budget is asked here, on the batcher's task, because
+    /// `effective_eager_payload` accounts for the ambient trace context the send
+    /// will inject. An unresolved peer costs the conservative clamp rather than
+    /// a failed flush.
     fn compute_cap(&mut self) -> usize {
         let eager = self.peer_instance().map_or(usize::MAX, |instance| {
             self.messenger
                 .effective_eager_payload(instance, STREAM_BATCH_HANDLER, None)
         });
-        let clamped = self
-            .config
-            .max_batch_bytes
-            .min(eager)
-            .min(COALESCE_THRESHOLD);
-        // Not `clamp`: the floor is applied *after* the three ceilings, and a
-        // configured cap below the floor is a legitimate (if useless) setting
-        // rather than the panic `clamp` would give it.
-        clamped.max(MIN_BATCH_CAP)
+        batch_cap(self.config.max_batch_bytes, eager)
     }
 
     fn peer_instance(&mut self) -> Option<InstanceId> {

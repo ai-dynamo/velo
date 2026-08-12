@@ -155,6 +155,11 @@ path = "tests/streaming/observability.rs"
 required-features = ["test-helpers"]
 
 [[test]]
+name = "streaming_mux_negotiation"
+path = "tests/streaming/mux_negotiation.rs"
+required-features = ["test-helpers"]
+
+[[test]]
 name = "streaming_mpsc_integration"
 path = "tests/streaming/mpsc_integration.rs"
 

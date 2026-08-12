@@ -15,6 +15,7 @@
 //! taking everything that is *already* queued, exactly as it does under a
 //! forward pass.
 
+mod clamp;
 mod control;
 mod egress;
 mod support;
