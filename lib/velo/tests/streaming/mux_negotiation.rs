@@ -34,7 +34,6 @@ use velo_ext::WorkerId;
 const LEGACY_KEY: &str = "tcp-stream";
 const MUX_KEY: &str = "messenger-mux-v1";
 
-const SETTLE: Duration = Duration::from_millis(200);
 const PATIENCE: Duration = Duration::from_secs(30);
 
 /// A window far smaller than the traffic every test pushes through it.
@@ -165,8 +164,20 @@ async fn pair(consumer: Option<MuxConfig>, producer: Option<MuxConfig>) -> (Node
         .velo
         .register_peer(consumer.velo.peer_info())
         .expect("register consumer on producer");
-    tokio::time::sleep(SETTLE).await;
+    // Wait on the handler the attach actually needs rather than on a fixed
+    // sleep: under a loaded machine a fixed settle is a flake, and every arm
+    // here begins with an attach.
+    ready(&producer, consumer.velo.instance_id(), "_anchor_attach").await;
+    ready(&consumer, producer.velo.instance_id(), "_anchor_attach").await;
     (consumer, producer)
+}
+
+/// Block until `node` can see `handler` on `peer`.
+async fn ready(node: &Node, peer: velo_ext::InstanceId, handler: &str) {
+    tokio::time::timeout(PATIENCE, node.velo.wait_for_handler(peer, handler))
+        .await
+        .expect("timed out waiting for the peer's control plane")
+        .expect("peer never advertised the handler");
 }
 
 fn transfer(handle: StreamAnchorHandle) -> StreamAnchorHandle {
@@ -691,7 +702,12 @@ async fn wire_up(producer: &Node, receiver: &LegacyReceiver) {
         .expect("the producer runs the legacy transport too")
         .register(&receiver.stream_peer)
         .expect("register the receiver's streaming endpoint");
-    tokio::time::sleep(SETTLE).await;
+    ready(
+        producer,
+        receiver.messenger.instance_id(),
+        "_mpsc_anchor_attach",
+    )
+    .await;
 }
 
 /// (d) A response that genuinely omits the credit fields keeps a mux sender on
@@ -774,12 +790,9 @@ async fn a_mux_key_answered_without_a_window_fails_the_attach() {
     wire_up(&producer, &receiver).await;
 
     let handle = StreamAnchorHandle::pack_mpsc(receiver.messenger.instance_id().worker_id(), 7);
-    let error = producer
-        .velo
-        .attach_mpsc_anchor::<u32>(handle)
-        .await
-        .err()
-        .expect("an attach naming the mux with no window must fail");
+    let Err(error) = producer.velo.attach_mpsc_anchor::<u32>(handle).await else {
+        panic!("an attach naming the mux with no window must fail");
+    };
     let message = error.to_string();
     assert!(
         message.contains(MUX_KEY) && message.contains("initial_credit = 0"),
