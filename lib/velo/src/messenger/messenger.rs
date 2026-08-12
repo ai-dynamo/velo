@@ -383,11 +383,13 @@ impl Messenger {
     /// belongs to the context it was asked from: size a batch and send it from
     /// the same place.
     ///
-    /// Callers that pack many small sends into one message — the streaming mux
-    /// batcher, or an application batching its own work — size a batch against
-    /// this so it neither overruns the target's transport (a hard failure) nor
+    /// Callers that pack many small sends into one message — today the
+    /// streaming mux batcher, its only consumer — size a batch against this so
+    /// it neither overruns the target's transport (a hard failure) nor
     /// silently becomes a staged transfer, paying a round trip on behalf of
-    /// everything packed into it.
+    /// everything packed into it. Crate-private on purpose: exposing a batch
+    /// hint to applications is the P9 hint-API design question, and publishing
+    /// this signature early would commit it before that design happens.
     ///
     /// Advisory, not enforced — but what an over-budget send does depends on
     /// which of the two ceilings produced the number:
@@ -412,7 +414,7 @@ impl Messenger {
     /// [`Messenger`] sends through. It says nothing about an alternative
     /// transport reached by some other route, which may have a different
     /// limit.
-    pub fn effective_eager_payload(
+    pub(crate) fn effective_eager_payload(
         &self,
         target: InstanceId,
         handler_name: &str,
