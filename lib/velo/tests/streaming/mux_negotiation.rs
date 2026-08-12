@@ -597,6 +597,12 @@ enum PreNegotiationMpscAttachResponse {
 
 /// A worker that answers `_mpsc_anchor_attach` the way one did before
 /// negotiation, and really binds its legacy transport behind the answer.
+///
+/// The key it answers with is the caller's choice, because that is what
+/// separates the two arms below: naming the legacy transport is the ordinary
+/// mixed-deployment case, and naming the mux with the same field-less payload is
+/// the only way to reach the branch where the *absent credit fields* are what
+/// decides.
 struct LegacyReceiver {
     messenger: Arc<velo::messenger::Messenger>,
     /// Carries only the `tcp-stream` entry, for the producer's frame transport.
@@ -606,7 +612,7 @@ struct LegacyReceiver {
     _stream: Arc<velo::streaming::TcpFrameTransport>,
 }
 
-async fn legacy_mpsc_receiver() -> LegacyReceiver {
+async fn legacy_mpsc_receiver(answers_with: &str) -> LegacyReceiver {
     let messenger = velo::messenger::Messenger::builder()
         .add_transport(tcp_transport())
         .build()
@@ -619,11 +625,13 @@ async fn legacy_mpsc_receiver() -> LegacyReceiver {
 
     let (frame_tx, frames) = flume::unbounded::<Vec<u8>>();
     let bind_stream = Arc::clone(&stream);
+    let answered_key = velo_ext::TransportKey::new(answers_with);
     let handler = velo::messenger::Handler::typed_unary_async(
         "_mpsc_anchor_attach",
         move |ctx: velo::messenger::TypedContext<MpscAnchorAttachRequest>| {
             let stream = Arc::clone(&bind_stream);
             let frame_tx = frame_tx.clone();
+            let answered_key = answered_key.clone();
             async move {
                 let (_, local_id) = ctx.input.handle.unpack();
                 let routing_session_id = 1;
@@ -636,7 +644,7 @@ async fn legacy_mpsc_receiver() -> LegacyReceiver {
                     }
                 });
                 Ok(PreNegotiationMpscAttachResponse::Ok {
-                    streaming_transport_key: velo_ext::TransportKey::new(LEGACY_KEY),
+                    streaming_transport_key: answered_key,
                     heartbeat_interval_ms: 5_000,
                     sender_id: 1,
                     routing_session_id,
@@ -660,24 +668,13 @@ async fn legacy_mpsc_receiver() -> LegacyReceiver {
     }
 }
 
-/// (d) A response that genuinely omits the credit fields keeps a mux sender on
-/// the legacy path — and the stream still runs.
+/// Cross-register a `Velo` producer with a stand-in receiver.
 ///
-/// The other direction of the compatibility claim, and the one no pair of
-/// current nodes can produce: every receiver in this build writes both fields,
-/// so the only way to exercise the sender's decode of a response without them
-/// is to have something else answer. `#[serde(default)]` filling the absent
-/// window with zero is what makes the sender refuse to open a mux slot, and the
-/// batches-sent counter is what fails if it opened one anyway.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_response_from_before_negotiation_keeps_an_mpsc_sender_on_the_legacy_path() {
-    const FRAMES: u32 = 20;
-    let producer = node(Some(mux_config())).await;
-    let receiver = legacy_mpsc_receiver().await;
-
-    // The control plane both ways, then the producer's frame transport is told
-    // where the receiver's streaming listener is. `Velo::register_peer` does
-    // both at once for a `Velo` peer; this peer is not one.
+/// The control plane both ways, then the producer's frame transport is told
+/// where the receiver's streaming listener is. `Velo::register_peer` does both
+/// at once for a `Velo` peer; this peer is not one, and its messenger
+/// `PeerInfo` carries no `tcp-stream` entry to fan out.
+async fn wire_up(producer: &Node, receiver: &LegacyReceiver) {
     producer
         .velo
         .register_peer(receiver.messenger.peer_info())
@@ -695,6 +692,24 @@ async fn a_response_from_before_negotiation_keeps_an_mpsc_sender_on_the_legacy_p
         .register(&receiver.stream_peer)
         .expect("register the receiver's streaming endpoint");
     tokio::time::sleep(SETTLE).await;
+}
+
+/// (d) A response that genuinely omits the credit fields keeps a mux sender on
+/// the legacy path — and the stream still runs.
+///
+/// The other direction of the compatibility claim, and the one no pair of
+/// current nodes can produce: every receiver in this build writes both fields,
+/// so the only way to exercise the sender's decode of a response without them
+/// is to have something else answer. `#[serde(default)]` filling the absent
+/// window with zero is what makes the sender refuse to open a mux slot, and the
+/// batches-sent counter is what fails if it opened one anyway.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_response_from_before_negotiation_keeps_an_mpsc_sender_on_the_legacy_path() {
+    const FRAMES: u32 = 20;
+    let producer = node(Some(mux_config())).await;
+    let receiver = legacy_mpsc_receiver(LEGACY_KEY).await;
+
+    wire_up(&producer, &receiver).await;
 
     let handle = StreamAnchorHandle::pack_mpsc(
         receiver.messenger.instance_id().worker_id(),
@@ -736,6 +751,49 @@ async fn a_response_from_before_negotiation_keeps_an_mpsc_sender_on_the_legacy_p
         0.0,
         "a response with no window makes the mux unusable, so no slot may be \
          opened and no batch sent"
+    );
+}
+
+/// (d) The arm where the *absent credit fields* are what decides.
+///
+/// Its sibling above proves the sender still streams when a field-less response
+/// names the legacy transport — but there the key alone settles it, so the
+/// batches-sent assertion would hold even if an absent window were wrongly read
+/// as a usable one. Here the key matches, so nothing but the window is left to
+/// decide, and `#[serde(default)]` turning "no field" into "no window" is the
+/// whole difference between failing here and opening a slot into a peer that
+/// never sized a buffer for it.
+///
+/// It fails loudly rather than retrying elsewhere: a peer naming the mux has
+/// bound a mux receiver, so connecting over any other transport would reach
+/// nothing it is listening on and hang until the anchor's watchdog fires.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mux_key_answered_without_a_window_fails_the_attach() {
+    let producer = node(Some(mux_config())).await;
+    let receiver = legacy_mpsc_receiver(MUX_KEY).await;
+    wire_up(&producer, &receiver).await;
+
+    let handle = StreamAnchorHandle::pack_mpsc(receiver.messenger.instance_id().worker_id(), 7);
+    let error = producer
+        .velo
+        .attach_mpsc_anchor::<u32>(handle)
+        .await
+        .err()
+        .expect("an attach naming the mux with no window must fail");
+    let message = error.to_string();
+    assert!(
+        message.contains(MUX_KEY) && message.contains("initial_credit = 0"),
+        "the error must name both the key and why it could not be honoured: {message}"
+    );
+
+    assert_eq!(
+        producer.mux_batches_sent(),
+        0.0,
+        "the attach failed, so no slot was opened and nothing went out"
+    );
+    assert!(
+        receiver.frames.is_empty(),
+        "a failed attach must not have streamed over the legacy transport either"
     );
 }
 

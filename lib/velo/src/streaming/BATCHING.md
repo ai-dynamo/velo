@@ -830,8 +830,8 @@ State up front what would sink this, then check each:
 | **P2** | Streaming per-socket coalescing | none | implemented |
 | **P3** | Ordered per-sender AM dispatch (`DispatchMode::Ordered`) | none | implemented |
 | **P4** | gRPC `Channel` caching per peer | none | specified |
-| **P5** | Ordered transport admission, `SendOutcome::Pending` | none | specified |
-| **P6** | Eager-size guidance, `Transport::max_message_size` | none | specified |
+| **P5** | Ordered transport admission, `SendOutcome::Pending` | none | implemented |
+| **P6** | Eager-size guidance, `Transport::max_message_size` | none | implemented |
 | **P7** | `MessengerMuxTransport` — `_stream_batch`, `PeerBatcher`, slots, credit | yes | implemented |
 | **P8** | Attach-time negotiation, opt-in activation switch | additive | implemented |
 | **P9** | Hint API (`StreamBatch`), windowed policy | none | specified |
@@ -849,6 +849,21 @@ cannot size a batch the Messenger will carry inline. P7 did not start until both
 landed, and P8 is what made it reachable: before it, the attach handlers
 hardcoded the local default transport key and nothing ever answered
 `messenger-mux-v1`.
+
+Two names in the protocol specification above did not survive contact, both on
+the receive side and neither changing what happens:
+
+- **There is no `bind_muxed`.** The mux implements the plain
+  `FrameTransport::bind`, which registers `(anchor_id, session_id)` in an
+  ingress registry and hands back the `C + 1` receiver the spec describes; a
+  peer's `OpenSlot` is what claims that registration. A second bind method
+  would have had nothing to add, because the window it would have taken is not
+  known at bind time — the *receiver* chooses it, and the sender learns it from
+  the attach response. `connect_negotiated` is where that number enters, on the
+  send side.
+- **`reader_pump` is unchanged.** It drains the receiver `bind` returned into
+  `frame_tx` exactly as it does for any other transport, which is what the spec
+  asks for; the credit hook below is the part that landed differently.
 
 P8 also closed the first of the two P7 deviations this document used to record.
 **Initial credit is no longer advertised by a `CreditUpdate` on `OpenSlot`** — a
