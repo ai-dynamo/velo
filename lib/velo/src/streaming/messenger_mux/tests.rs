@@ -101,6 +101,23 @@ impl Pair {
     fn live_slots(&self) -> f64 {
         self.snapshot().gauge("velo_streaming_mux_live_slots", &[])
     }
+
+    /// The applier's `try_send` never failed on space credit had reserved.
+    ///
+    /// The `C + 1` buffer against `C` data credits plus one terminal is what
+    /// makes the ingress lane nonblocking, and this counter is the only way a
+    /// break in it is visible from outside. Every test that pushes on the credit
+    /// loop checks it, because a stall would otherwise show up as nothing at all
+    /// — the records still arrive, they just came through a path that was
+    /// supposed to be unreachable.
+    fn assert_no_reader_stall(&self) {
+        assert_eq!(
+            self.snapshot()
+                .counter("velo_streaming_mux_reader_stall_total", &[]),
+            0.0,
+            "the credit invariant broke: the applier hit a full slot buffer"
+        );
+    }
 }
 
 fn item(n: u32) -> Vec<u8> {
@@ -217,6 +234,7 @@ async fn credit_returns_let_a_producer_outrun_its_window() {
     }
     assert_eq!(recv(&rx).await, *cached_finalized());
     producer.await.expect("producer task");
+    pair.assert_no_reader_stall();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -245,6 +263,7 @@ async fn concurrent_sessions_on_one_anchor_stay_separate() {
         assert_eq!(recv(&rx_a).await, item(n));
         assert_eq!(recv(&rx_b).await, item(1000 + n));
     }
+    pair.assert_no_reader_stall();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -296,7 +315,7 @@ async fn dropping_a_producer_without_a_terminal_injects_dropped() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn live_slots_returns_to_zero_when_the_transports_go_away() {
+async fn live_slots_returns_to_zero_when_the_producers_go_away() {
     let pair = mux_pair(test_config()).await;
 
     let mut receivers = Vec::new();
@@ -323,6 +342,63 @@ async fn live_slots_returns_to_zero_when_the_transports_go_away() {
         assert_eq!(recv(rx).await, *cached_dropped());
     }
     eventually(|| pair.live_slots() == 0.0).await;
+    pair.assert_no_reader_stall();
+}
+
+/// Dropping the transports themselves has to reach zero too, and promptly.
+///
+/// The failure this guards against is a strong reference held across `bind`'s
+/// 60-second accept window: the transport would keep every slot, batcher task
+/// and ingress entry alive for a minute after its last owner let go, and the
+/// gauge would come back only when the timers did.
+#[tokio::test(flavor = "multi_thread")]
+async fn dropping_the_transports_tears_every_slot_down_promptly() {
+    let pair = mux_pair(test_config()).await;
+
+    let mut receivers = Vec::new();
+    let mut senders = Vec::new();
+    for session in 0..4u64 {
+        receivers.push(pair.consumer.bind(30, session).await.expect("bind"));
+        senders.push(
+            pair.producer
+                .connect(pair.consumer_worker, 30, session)
+                .await
+                .expect("connect"),
+        );
+    }
+    // One bind with no `connect` behind it, so an accept window really is open.
+    let _pending = pair.consumer.bind(30, 99).await.expect("pending bind");
+    for tx in &senders {
+        tx.send_async(item(1)).await.expect("send");
+    }
+    for rx in &receivers {
+        assert_eq!(recv(rx).await, item(1));
+    }
+    eventually(|| pair.live_slots() == 8.0).await;
+
+    // The producer channels and consumer receivers stay alive on purpose: the
+    // teardown under test is the transport's, not the channels'.
+    let registry = pair.registry.clone();
+    drop(pair);
+
+    for rx in &receivers {
+        assert_eq!(
+            recv(rx).await,
+            *cached_dropped(),
+            "a consumer must not wait out its heartbeat watchdog for a sender \
+             that has already been dismantled"
+        );
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        if MetricSnapshot::from_registry(&registry).gauge("velo_streaming_mux_live_slots", &[])
+            == 0.0
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("live_slots never returned to zero after the transports were dropped");
 }
 
 // ---------------------------------------------------------------------------

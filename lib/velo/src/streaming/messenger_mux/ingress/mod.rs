@@ -47,10 +47,12 @@ use crate::observability::{MuxDirection, MuxDropReason, MuxMetricsHandle};
 ///
 /// A sender allocates from a free list starting at zero, so its indices stay
 /// within a small multiple of its live slot count; a jump past this is a
-/// misbehaving or hostile peer trying to make the receiver size a `Vec` from a
-/// wire field. Far above any real fan-in — a decode engine's 1024 concurrent
-/// streams to one peer use indices 0..1024.
-const MAX_INGRESS_SLOTS_PER_PEER: usize = 1 << 20;
+/// misbehaving or hostile peer sizing a `Vec` on this node from a wire field.
+/// 64 Ki is two orders of magnitude above any real fan-in — a decode engine's
+/// 1024 concurrent streams to one peer use indices 0..1024 — and keeps the
+/// worst case one `OpenSlot` can force to a few megabytes rather than a few
+/// hundred, which is the same amplification the batch decoder refuses.
+const MAX_INGRESS_SLOTS_PER_PEER: usize = 1 << 16;
 
 /// A `bind()` waiting for the `OpenSlot` that will claim it.
 struct BindEntry {
@@ -266,9 +268,7 @@ fn accept_epoch(
             // Discarded wholesale by header inspection rather than drained
             // record by record against state that has moved on.
             if let Some(metrics) = metrics {
-                for _ in 0..header.record_count {
-                    metrics.record_dropped(MuxDropReason::StaleEpoch);
-                }
+                metrics.records_dropped(MuxDropReason::StaleEpoch, u64::from(header.record_count));
             }
             return false;
         }

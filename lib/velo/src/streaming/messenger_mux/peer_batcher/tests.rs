@@ -31,6 +31,7 @@ use crate::streaming::messenger_mux::protocol::{
 };
 use crate::streaming::sender::cached_finalized;
 use crate::transports::tcp::TcpTransportBuilder;
+use crate::transports::tcp::framing::COALESCE_THRESHOLD;
 
 const RECV_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -185,7 +186,9 @@ impl Harness {
         anchor_id: u64,
         session_id: u64,
     ) -> (flume::Sender<Vec<u8>>, (SlotId, BatchHeader)) {
-        let (inlet_tx, inlet_rx) = flume::bounded::<Vec<u8>>(64);
+        // Deep enough that a test can queue more than one batch's worth on a
+        // parked slot before granting credit.
+        let (inlet_tx, inlet_rx) = flume::bounded::<Vec<u8>>(512);
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         self.handle
             .send(Command::OpenSlot {
@@ -333,6 +336,59 @@ async fn the_configured_cap_bounds_every_batch() {
         delivered += batch.records.len();
     }
     assert_eq!(delivered, 12);
+}
+
+/// The coalescing threshold is the clamp that binds when nothing else does.
+///
+/// It is the packing *target*, not merely a ceiling: the shared coalescing
+/// writer stages a frame into one buffered `write_all` only while
+/// `header + payload` fits under it, so a batch above the threshold gives back
+/// exactly what batching bought. With a configured cap far above it and a
+/// transport reporting megabytes of eager budget, this is the arm that has to
+/// hold — and the default configuration sits just under the threshold, which
+/// would hide a regression here forever.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_coalescing_threshold_bounds_a_batch_when_the_configured_cap_does_not() {
+    let harness = harness(MuxConfig {
+        max_batch_bytes: 1 << 20,
+        ..MuxConfig::default()
+    })
+    .await;
+
+    let (inlet, id) = harness.open(1, 1).await;
+    let payload = rmp_serde::to_vec(&crate::streaming::frame::StreamFrame::Item(vec![7u8; 1000]))
+        .expect("encode payload");
+    const RECORDS: usize = 100;
+    for _ in 0..RECORDS {
+        inlet.send(payload.clone()).expect("queue record");
+    }
+    eventually(|| harness.try_next_batch().is_none()).await;
+    harness.grant(id, 256);
+
+    let mut delivered = 0;
+    let mut batches = 0;
+    let mut largest = 0;
+    while delivered < RECORDS {
+        let batch = harness.next_batch().await;
+        assert!(
+            batch.encoded_len <= COALESCE_THRESHOLD,
+            "batch of {} bytes is over the {COALESCE_THRESHOLD}-byte coalescing threshold",
+            batch.encoded_len
+        );
+        largest = largest.max(batch.encoded_len);
+        batches += 1;
+        delivered += batch.records.len();
+    }
+    assert_eq!(delivered, RECORDS);
+    assert!(
+        batches > 1,
+        "100 KiB of records has to be cut into more than one batch"
+    );
+    assert!(
+        largest > COALESCE_THRESHOLD / 2,
+        "the threshold, not some smaller clamp, is what bound these batches: \
+         largest was {largest} bytes"
+    );
 }
 
 // ---------------------------------------------------------------------------

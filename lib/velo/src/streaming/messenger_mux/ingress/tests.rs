@@ -376,6 +376,41 @@ fn terminal_then_close_delivers_the_terminal_and_injects_nothing() {
 }
 
 #[test]
+fn a_terminal_gets_through_after_the_data_credit_is_spent() {
+    // `C = 1`: one data record exhausts the window, so the terminal can only
+    // land on the reserve held back for it. One reserved credit is provably
+    // enough — `sent_terminal` guarantees at most one terminal per slot, after
+    // which the slot closes.
+    let config = MuxConfig {
+        initial_credit: 1,
+        ..config()
+    };
+    let registry = IngressRegistry::default();
+    let (tx, rx) = flume::bounded(
+        crate::streaming::messenger_mux::flow_control::slot_buffer_depth(config.initial_credit),
+    );
+    registry.register_bind(ANCHOR, SESSION, tx);
+    let id = slot(0, 0);
+    open(&registry, &config, id, 1);
+
+    let payload = batch(1, 1, |encoder| {
+        encoder.push_data(id, 1, &item(1)).unwrap();
+        encoder.push_data(id, 2, cached_finalized()).unwrap();
+        encoder
+            .push_close_slot(id, 3, CloseReason::TerminalSent)
+            .unwrap();
+    });
+    let outcome = handle_batch(&registry, &config, None, peer(), &payload);
+
+    assert_eq!(outcome.closed, 1);
+    assert_eq!(
+        drain(&rx),
+        vec![item(1), cached_finalized().clone()],
+        "data exhaustion must never be what a slot fails to deliver its terminal on"
+    );
+}
+
+#[test]
 fn a_terminal_close_defers_behind_records_still_in_the_hold() {
     let (registry, rx, config) = bound();
     let id = slot(0, 0);

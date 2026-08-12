@@ -428,10 +428,22 @@ impl FrameTransport for MessengerMuxTransport {
                 flume::bounded::<Vec<u8>>(slot_buffer_depth(core.config.initial_credit));
             core.ingress.register_bind(anchor_id, session_id, frame_tx);
 
-            let expiry = Arc::clone(&core);
+            // `Weak`, and cancellable. A strong handle here would pin the whole
+            // transport alive for the full accept window after the last owner
+            // dropped it — a minute of leaked slots, batcher tasks and ingress
+            // state per outstanding bind, and a `live_slots` gauge that only
+            // comes back to zero when the timers do.
+            let expiry = Arc::downgrade(&core);
+            let cancel = core.cancel.clone();
             tokio::spawn(async move {
-                tokio::time::sleep(ACCEPT_TIMEOUT).await;
-                if expiry.ingress.expire_bind(anchor_id, session_id) {
+                tokio::select! {
+                    () = cancel.cancelled() => return,
+                    () = tokio::time::sleep(ACCEPT_TIMEOUT) => {}
+                }
+                let Some(core) = expiry.upgrade() else {
+                    return;
+                };
+                if core.ingress.expire_bind(anchor_id, session_id) {
                     tracing::warn!(
                         anchor_id,
                         session_id,

@@ -595,12 +595,25 @@ impl MuxMetricsHandle {
 
     /// A record was discarded before delivery, for `reason`.
     pub(crate) fn record_dropped(&self, reason: MuxDropReason) {
+        self.records_dropped(reason, 1);
+    }
+
+    /// `count` records were discarded together, for `reason`.
+    ///
+    /// The counted form exists for the stale-epoch path, whose whole point is
+    /// to discard a batch *by header inspection* rather than by walking it: a
+    /// loop of single increments over an untrusted `record_count` would put
+    /// 65 535 atomic adds on the path that was supposed to skip the work.
+    pub(crate) fn records_dropped(&self, reason: MuxDropReason, count: u64) {
+        if count == 0 {
+            return;
+        }
         if reason == MuxDropReason::Generation {
-            self.generation_mismatch_total.inc();
+            self.generation_mismatch_total.inc_by(count as f64);
         }
         self.records_dropped_total
             .with_label_values(&[reason.as_str()])
-            .inc();
+            .inc_by(count as f64);
     }
 
     /// One batch of `records` crossed the wire in `direction`.
