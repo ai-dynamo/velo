@@ -3,11 +3,15 @@
 
 //! Message dispatcher for active message routing.
 
-use crate::observability::DispatchFailure;
+use crate::observability::{DispatchFailure, OrderedMetricsHandle};
 use crate::transports::VeloBackend;
 use bytes::Bytes;
 use dashmap::DashMap;
+use futures::FutureExt;
+use futures::future::BoxFuture;
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 use tokio::sync::Semaphore;
 use tokio_util::task::TaskTracker;
 use tracing::{error, trace, warn};
@@ -17,6 +21,8 @@ use crate::Messenger;
 use crate::messenger::common::events::{EventType, Outcome, encode_event_header};
 use crate::messenger::common::messages::ResponseType;
 use crate::messenger::common::responses::ResponseId;
+use crate::messenger::handlers::{OrderedConfig, OrderingKey, OverflowPolicy};
+use crate::messenger::server::lanes::{LaneObserver, LaneRouter, LaneRouterConfig};
 
 /// Context passed to handlers during dispatch.
 #[derive(Clone)]
@@ -62,7 +68,6 @@ pub(crate) trait ActiveMessageDispatcher: Send + Sync {
 pub(crate) struct SpawnedDispatcher<H: ActiveMessageHandler> {
     handler: Arc<H>,
     task_tracker: TaskTracker,
-    semaphore: Option<Arc<Semaphore>>,
 }
 
 impl<H: ActiveMessageHandler> SpawnedDispatcher<H> {
@@ -70,17 +75,6 @@ impl<H: ActiveMessageHandler> SpawnedDispatcher<H> {
         Self {
             handler: Arc::new(handler),
             task_tracker,
-            semaphore: None,
-        }
-    }
-
-    #[expect(dead_code)]
-    #[doc(hidden)]
-    pub fn with_concurrency_limit(handler: H, task_tracker: TaskTracker, limit: usize) -> Self {
-        Self {
-            handler: Arc::new(handler),
-            task_tracker,
-            semaphore: Some(Arc::new(Semaphore::new(limit))),
         }
     }
 }
@@ -92,16 +86,9 @@ impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for SpawnedDispa
 
     fn dispatch(&self, ctx: HandlerContext) {
         let handler = self.handler.clone();
-        let semaphore = self.semaphore.clone();
         let handler_name = handler.name().to_string();
 
         self.task_tracker.spawn(async move {
-            let _permit = if let Some(sem) = &semaphore {
-                Some(sem.acquire().await.expect("semaphore closed"))
-            } else {
-                None
-            };
-
             trace!(target: "crate::messenger::dispatcher", handler = %handler_name, "Handler task started");
             handler.handle(ctx).await;
             trace!(target: "crate::messenger::dispatcher", handler = %handler_name, "Handler task completed");
@@ -109,26 +96,19 @@ impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for SpawnedDispa
     }
 }
 
-/// Dispatcher implementation that executes handlers inline on the dispatcher task.
+/// Dispatcher implementation that spawns handlers on a detached task.
+///
+/// Despite the name this does not execute on the dispatcher task; it is
+/// [`SpawnedDispatcher`] without the task-tracker registration, so a graceful
+/// shutdown cannot wait for handlers dispatched this way.
 pub(crate) struct InlineDispatcher<H: ActiveMessageHandler> {
     handler: Arc<H>,
-    semaphore: Option<Arc<Semaphore>>,
 }
 
 impl<H: ActiveMessageHandler> InlineDispatcher<H> {
     pub fn new(handler: H) -> Self {
         Self {
             handler: Arc::new(handler),
-            semaphore: None,
-        }
-    }
-
-    #[expect(dead_code)]
-    #[doc(hidden)]
-    pub fn with_concurrency_limit(handler: H, limit: usize) -> Self {
-        Self {
-            handler: Arc::new(handler),
-            semaphore: Some(Arc::new(Semaphore::new(limit))),
         }
     }
 }
@@ -140,17 +120,322 @@ impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for InlineDispat
 
     fn dispatch(&self, ctx: HandlerContext) {
         let handler = self.handler.clone();
-        let semaphore = self.semaphore.clone();
 
         tokio::spawn(async move {
-            let _permit = if let Some(sem) = &semaphore {
-                Some(sem.acquire().await.expect("semaphore closed"))
-            } else {
-                None
-            };
-
             handler.handle(ctx).await;
         });
+    }
+}
+
+/// Dispatcher implementation that serialises handler execution on per-key
+/// ordering lanes.
+///
+/// Each lane is an unbounded channel drained by a single task, so messages
+/// sharing a lane key are handled strictly in arrival order. Lanes for distinct
+/// keys run concurrently, bounded by an optional semaphore.
+///
+/// Ordering is *preserved*, not created: this dispatcher hands messages to the
+/// handler in the order they reached the messenger's receive loop. If a peer is
+/// reachable over several transports, or a connection drops and reconnects
+/// mid-stream, arrival order was already scrambled upstream and no dispatcher
+/// can restore it.
+pub(crate) struct OrderedDispatcher<H: ActiveMessageHandler> {
+    handler: Arc<H>,
+    config: OrderedConfig,
+    /// Built on first dispatch — the runtime handle, task tracker, and metrics
+    /// registry it needs are only reachable via `HandlerContext::system`, which
+    /// does not exist when the handler is built.
+    bound: OnceLock<BoundRouter>,
+    /// Caps how many lanes may be mid-handler at once. Acquired per message
+    /// *inside* the lane loop, so per-lane ordering is untouched: a lane that
+    /// cannot get a permit parks with its queue intact.
+    limiter: Option<Arc<Semaphore>>,
+    /// The rendezvous-ordering caveat is worth saying once per handler, not
+    /// once per message.
+    rendezvous_warning: std::sync::Once,
+    /// Likewise for load shedding: the counter carries the rate, the log line
+    /// only needs to make it discoverable.
+    shed_warning: std::sync::Once,
+}
+
+/// The parts of an [`OrderedDispatcher`] that need a live `Messenger`.
+struct BoundRouter {
+    router: Arc<LaneRouter<LaneKey, LaneItem>>,
+    metrics: Option<OrderedMetricsHandle>,
+}
+
+/// The partition a message is routed to.
+///
+/// `None` is the single lane used by [`OrderingKey::Global`]; `Some(worker)`
+/// is the per-sender lane used by [`OrderingKey::Sender`].
+type LaneKey = Option<WorkerId>;
+
+/// A message queued on an ordering lane.
+struct LaneItem {
+    ctx: HandlerContext,
+    enqueued_at: Instant,
+}
+
+/// Bridges lane lifecycle events onto the Prometheus handle.
+struct OrderedLaneObserver {
+    metrics: OrderedMetricsHandle,
+}
+
+impl LaneObserver for OrderedLaneObserver {
+    fn lane_created(&self) {
+        self.metrics.lane_created();
+    }
+
+    fn lane_closed(&self) {
+        self.metrics.lane_closed();
+    }
+}
+
+impl<H: ActiveMessageHandler + 'static> OrderedDispatcher<H> {
+    pub fn new(handler: H, config: OrderedConfig) -> Self {
+        let limiter = config
+            .max_concurrent
+            .map(|limit| Arc::new(Semaphore::new(limit)));
+        Self {
+            handler: Arc::new(handler),
+            config,
+            bound: OnceLock::new(),
+            limiter,
+            rendezvous_warning: std::sync::Once::new(),
+            shed_warning: std::sync::Once::new(),
+        }
+    }
+
+    fn lane_key(&self, ctx: &HandlerContext) -> LaneKey {
+        match self.config.key {
+            OrderingKey::Global => None,
+            // The sender's worker id is bit-packed into the response id it
+            // minted, so this needs no wire support. `WorkerId` is a
+            // collision-resistant hash of the sender's `InstanceId`, so
+            // keying on it partitions by sending instance. It is 128 bits down
+            // to 64, so a collision would merge two peers onto one lane --
+            // harmless for ordering (it only over-serialises), which is why
+            // this is the lane key rather than the identity handlers see.
+            OrderingKey::Sender => Some(WorkerId::from_u64(ctx.message_id.worker_id())),
+        }
+    }
+
+    fn bind(&self, system: &Arc<Messenger>) -> BoundRouter {
+        let handler = self.handler.clone();
+        // `Arc<str>`, not `String`: the consumer clones this per message but
+        // only reads it on the panic branch.
+        let handler_name: Arc<str> = Arc::from(self.handler.name());
+        let limiter = self.limiter.clone();
+        let metrics = system
+            .observability()
+            .as_ref()
+            .and_then(|m| m.bind_ordered_dispatcher(&handler_name));
+
+        let consumer_metrics = metrics.clone();
+        let consumer = Arc::new(move |item: LaneItem| {
+            let handler = handler.clone();
+            let handler_name = Arc::clone(&handler_name);
+            let limiter = limiter.clone();
+            let metrics = consumer_metrics.clone();
+
+            Box::pin(async move {
+                if let Some(metrics) = metrics.as_ref() {
+                    metrics.observe_wait(item.enqueued_at.elapsed());
+                }
+
+                // Held for the duration of the handler. Tokio's semaphore is
+                // FIFO-fair, so a busy handler cannot starve any lane.
+                let _permit = match limiter.as_ref() {
+                    Some(sem) => sem.clone().acquire_owned().await.ok(),
+                    None => None,
+                };
+
+                let ctx = item.ctx;
+                let message_id = ctx.message_id;
+                let response_type = ctx.response_type;
+                let system = ctx.system.clone();
+
+                // Unlike `SpawnedDispatcher`, a panic here would take down the
+                // whole lane task rather than a single message — and every
+                // later message for that key with it. Catch it so the lane
+                // survives, and unblock the caller rather than letting it hang
+                // to timeout. (Inert under `panic = "abort"`.)
+                //
+                // `handle()` is called *inside* the async block on purpose.
+                // `AssertUnwindSafe(handler.handle(ctx))` would evaluate
+                // `handle()` first and only wrap the future it returns, leaving
+                // the adapter's synchronous prologue — context construction and
+                // the lazy `bind_handler` metrics binding — outside the guard.
+                let outcome = AssertUnwindSafe(async move { handler.handle(ctx).await })
+                    .catch_unwind()
+                    .await;
+
+                if outcome.is_err() {
+                    if let Some(metrics) = system.observability().as_ref() {
+                        metrics.record_dispatch_failure(DispatchFailure::OrderedHandlerPanic);
+                    }
+                    error!(
+                        target: "crate::messenger::dispatcher",
+                        handler = %handler_name,
+                        message_id = %message_id,
+                        "Ordered handler panicked; lane preserved"
+                    );
+                    Self::fail_fast(&system, message_id, response_type, "handler panicked");
+                }
+
+                if let Some(metrics) = metrics.as_ref() {
+                    metrics.dequeued();
+                }
+            }) as BoxFuture<'static, ()>
+        });
+
+        let observer = metrics
+            .clone()
+            .map(|metrics| Arc::new(OrderedLaneObserver { metrics }) as Arc<dyn LaneObserver>);
+
+        let router = Arc::new(LaneRouter::new(
+            consumer,
+            LaneRouterConfig {
+                idle_ttl: self.config.idle_lane_ttl,
+                runtime: system.runtime().clone(),
+                tracker: system.tracker().clone(),
+                observer,
+            },
+        ));
+
+        BoundRouter { router, metrics }
+    }
+
+    /// Send an error response so a waiting caller fails immediately instead of
+    /// hanging until its own timeout. No-op for fire-and-forget.
+    fn fail_fast(
+        system: &Arc<Messenger>,
+        message_id: ResponseId,
+        response_type: ResponseType,
+        reason: &'static str,
+    ) {
+        if matches!(response_type, ResponseType::FireAndForget) {
+            return;
+        }
+        let backend = system.backend().clone();
+        tokio::spawn(async move {
+            if let Err(e) = DispatcherHub::send_error_response_static(
+                &backend,
+                message_id,
+                format!("Handler failed: {reason}"),
+            )
+            .await
+            {
+                error!(
+                    target: "crate::messenger::dispatcher",
+                    "Failed to send error response for ordered handler: {}", e
+                );
+            }
+        });
+    }
+}
+
+impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for OrderedDispatcher<H> {
+    fn name(&self) -> &str {
+        self.handler.name()
+    }
+
+    fn dispatch(&self, ctx: HandlerContext) {
+        // One lazy init for both the router and the pre-labelled metrics, so
+        // the hot path does no `with_label_values` lookups.
+        let bound = self.bound.get_or_init(|| self.bind(&ctx.system));
+        let metrics = bound.metrics.as_ref();
+
+        // The rendezvous path resolves large payloads in a detached task before
+        // dispatching (see `create_message_handler`), so two rendezvous
+        // messages from one sender can reach us out of order. Ordered mode
+        // cannot restore that; warn once so it is not silently surprising.
+        if ctx
+            .headers
+            .as_ref()
+            .is_some_and(|h| h.contains_key(crate::messenger::large_payload::RV_HEADER_KEY))
+        {
+            self.rendezvous_warning.call_once(|| {
+                warn!(
+                    target: "crate::messenger::dispatcher",
+                    handler = %self.handler.name(),
+                    "Rendezvous (large-payload) messages resolve out-of-band and are not \
+                     ordered relative to each other, even on an ordered handler"
+                );
+            });
+        }
+
+        // `max_queue_depth` bounds a single lane, not the handler: with
+        // per-sender lanes a handler-wide cap would let one backed-up peer shed
+        // traffic from peers whose lanes are empty, defeating the isolation
+        // `OrderingKey::Sender` exists to provide. Only `Reject` passes the cap
+        // down as an admission limit; `Warn` always enqueues and inspects the
+        // resulting depth.
+        let capacity = match self.config.overflow {
+            OverflowPolicy::Reject => self.config.max_queue_depth,
+            OverflowPolicy::Warn => None,
+        };
+
+        let key = self.lane_key(&ctx);
+        let message_id = ctx.message_id;
+        let response_type = ctx.response_type;
+        let system = ctx.system.clone();
+
+        match bound.router.route(
+            key,
+            LaneItem {
+                ctx,
+                enqueued_at: Instant::now(),
+            },
+            capacity,
+        ) {
+            Ok(depth_before) => {
+                if let Some(metrics) = metrics {
+                    metrics.enqueued();
+                }
+                // Edge-triggered: `depth_before == limit` is the message that
+                // takes this lane over the cap. Deeper backlogs stay quiet
+                // until the lane drains below the limit and crosses again, so
+                // this cannot flood the receive loop the way a per-message
+                // warn would.
+                if let Some(limit) = self.config.max_queue_depth
+                    && depth_before == limit
+                {
+                    warn!(
+                        target: "crate::messenger::dispatcher",
+                        handler = %self.handler.name(),
+                        limit,
+                        lane = ?key,
+                        "Ordered lane exceeded max_queue_depth"
+                    );
+                }
+            }
+            Err(_shed) => {
+                // Every shed message is counted; the log line fires once per
+                // handler so a shed storm cannot flood. `OrderedLaneShed` is
+                // the signal to alert on.
+                if let Some(m) = system.observability().as_ref() {
+                    m.record_dispatch_failure(DispatchFailure::OrderedLaneShed);
+                }
+                self.shed_warning.call_once(|| {
+                    warn!(
+                        target: "crate::messenger::dispatcher",
+                        handler = %self.handler.name(),
+                        limit = self.config.max_queue_depth.unwrap_or_default(),
+                        lane = ?key,
+                        "Shedding messages: ordered lane is at max_queue_depth. \
+                         Logged once per handler; see velo_messenger_dispatch_failures_total \
+                         {{reason=\"ordered_lane_shed\"}} for the rate"
+                    );
+                });
+                Self::fail_fast(
+                    &system,
+                    message_id,
+                    response_type,
+                    "ordered lane queue full",
+                );
+            }
+        }
     }
 }
 

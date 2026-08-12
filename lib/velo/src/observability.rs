@@ -132,6 +132,13 @@ pub(crate) enum DispatchFailure {
     ResponseSendTypedDeserialize,
     /// Failed to send typed unary response.
     ResponseSendTypedUnary,
+    /// An ordered handler's lane queue exceeded `max_queue_depth` under
+    /// [`OverflowPolicy::Reject`](crate::OverflowPolicy::Reject) and the message
+    /// was shed.
+    OrderedLaneShed,
+    /// An ordered handler panicked. The panic was caught so the lane survives,
+    /// but the message was not handled.
+    OrderedHandlerPanic,
 }
 
 impl DispatchFailure {
@@ -147,6 +154,8 @@ impl DispatchFailure {
             Self::SerializeTypedOutput => ("serialize", "typed_output"),
             Self::ResponseSendTypedDeserialize => ("response_send", "typed_deserialize"),
             Self::ResponseSendTypedUnary => ("response_send", "typed_unary"),
+            Self::OrderedLaneShed => ("dispatch", "ordered_lane_shed"),
+            Self::OrderedHandlerPanic => ("dispatch", "ordered_handler_panic"),
         }
     }
 }
@@ -460,6 +469,50 @@ impl HandlerMetricsHandle {
 }
 
 // ---------------------------------------------------------------------------
+// OrderedMetricsHandle
+// ---------------------------------------------------------------------------
+
+/// A handler-scoped metrics handle for the ordered dispatch mode.
+///
+/// Bound once per ordered handler. All four collectors are pre-labelled, so the
+/// lane hot path does no label lookup.
+#[derive(Clone)]
+pub(crate) struct OrderedMetricsHandle {
+    lanes: Gauge,
+    lane_depth: Gauge,
+    lane_wait: Histogram,
+    lanes_created: Counter,
+}
+
+impl OrderedMetricsHandle {
+    /// A lane was spawned for a key that had none.
+    pub(crate) fn lane_created(&self) {
+        self.lanes.inc();
+        self.lanes_created.inc();
+    }
+
+    /// A lane was reaped (idle) or torn down (router dropped).
+    pub(crate) fn lane_closed(&self) {
+        self.lanes.dec();
+    }
+
+    /// A message was enqueued onto a lane.
+    pub(crate) fn enqueued(&self) {
+        self.lane_depth.inc();
+    }
+
+    /// A message finished handling and left the queue-depth accounting.
+    pub(crate) fn dequeued(&self) {
+        self.lane_depth.dec();
+    }
+
+    /// Time a message spent between enqueue and the handler starting.
+    pub(crate) fn observe_wait(&self, wait: Duration) {
+        self.lane_wait.observe(wait.as_secs_f64());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // StreamingTransportMetricsHandle
 // ---------------------------------------------------------------------------
 
@@ -494,6 +547,10 @@ pub struct VeloMetrics {
     messenger_handler_request_bytes_total: CounterVec,
     messenger_handler_response_bytes_total: CounterVec,
     messenger_handler_in_flight: GaugeVec,
+    messenger_ordered_lanes: GaugeVec,
+    messenger_ordered_lane_depth: GaugeVec,
+    messenger_ordered_lane_wait_seconds: HistogramVec,
+    messenger_ordered_lanes_created_total: CounterVec,
     messenger_dispatch_failures_total: CounterVec,
     messenger_client_resolution_total: CounterVec,
     messenger_pending_responses: Gauge,
@@ -629,6 +686,49 @@ impl VeloMetrics {
                 Opts::new(
                     "velo_messenger_handler_in_flight",
                     "Messenger handlers currently executing.",
+                ),
+                &["handler"],
+            )?,
+        )?;
+        let messenger_ordered_lanes = register_collector(
+            registry,
+            GaugeVec::new(
+                Opts::new(
+                    "velo_messenger_ordered_lanes",
+                    "Live ordering lanes held by ordered-dispatch handlers.",
+                ),
+                &["handler"],
+            )?,
+        )?;
+        let messenger_ordered_lane_depth = register_collector(
+            registry,
+            GaugeVec::new(
+                Opts::new(
+                    "velo_messenger_ordered_lane_depth",
+                    "Messages enqueued on ordering lanes but not yet handled.",
+                ),
+                &["handler"],
+            )?,
+        )?;
+        let messenger_ordered_lane_wait_seconds = register_collector(
+            registry,
+            HistogramVec::new(
+                HistogramOpts::new(
+                    "velo_messenger_ordered_lane_wait_seconds",
+                    "Time a message waited on an ordering lane before its handler started.",
+                )
+                .buckets(exponential_buckets(0.0005, 2.0, 16).map_err(|e| {
+                    prometheus::Error::Msg(format!("invalid ordered lane histogram buckets: {e}"))
+                })?),
+                &["handler"],
+            )?,
+        )?;
+        let messenger_ordered_lanes_created_total = register_collector(
+            registry,
+            CounterVec::new(
+                Opts::new(
+                    "velo_messenger_ordered_lanes_created_total",
+                    "Ordering lanes created. Subtracting the live lane gauge yields lanes reaped.",
                 ),
                 &["handler"],
             )?,
@@ -801,6 +901,10 @@ impl VeloMetrics {
             messenger_handler_request_bytes_total,
             messenger_handler_response_bytes_total,
             messenger_handler_in_flight,
+            messenger_ordered_lanes,
+            messenger_ordered_lane_depth,
+            messenger_ordered_lane_wait_seconds,
+            messenger_ordered_lanes_created_total,
             messenger_dispatch_failures_total,
             messenger_client_resolution_total,
             messenger_pending_responses,
@@ -935,6 +1039,29 @@ impl VeloMetrics {
                 .messenger_handler_in_flight
                 .with_label_values(&[handler]),
             response_types,
+        })
+    }
+
+    /// Bind ordered-dispatch collectors for a specific handler label.
+    ///
+    /// Applies the same `_`-prefix filter as [`Self::bind_handler`], so system
+    /// handlers stay out of the per-handler series.
+    pub(crate) fn bind_ordered_dispatcher(&self, handler: &str) -> Option<OrderedMetricsHandle> {
+        if !Self::should_track_handler(handler) {
+            return None;
+        }
+
+        Some(OrderedMetricsHandle {
+            lanes: self.messenger_ordered_lanes.with_label_values(&[handler]),
+            lane_depth: self
+                .messenger_ordered_lane_depth
+                .with_label_values(&[handler]),
+            lane_wait: self
+                .messenger_ordered_lane_wait_seconds
+                .with_label_values(&[handler]),
+            lanes_created: self
+                .messenger_ordered_lanes_created_total
+                .with_label_values(&[handler]),
         })
     }
 
@@ -1258,6 +1385,54 @@ mod tests {
         let metrics = VeloMetrics::register(&registry).expect("register metrics");
         assert!(metrics.bind_handler("_internal").is_none());
         assert!(metrics.bind_handler("user_handler").is_some());
+    }
+
+    #[test]
+    fn bind_ordered_dispatcher_skips_system_handlers() {
+        let registry = Registry::new();
+        let metrics = VeloMetrics::register(&registry).expect("register metrics");
+        assert!(metrics.bind_ordered_dispatcher("_internal").is_none());
+        assert!(metrics.bind_ordered_dispatcher("user_handler").is_some());
+    }
+
+    #[test]
+    fn ordered_metrics_track_lane_lifecycle() {
+        use super::test_helpers::MetricSnapshot;
+
+        let registry = Registry::new();
+        let metrics = VeloMetrics::register(&registry).expect("register metrics");
+        let handle = metrics.bind_ordered_dispatcher("ordered_handler").unwrap();
+
+        handle.lane_created();
+        handle.enqueued();
+        handle.observe_wait(Duration::from_millis(2));
+        handle.dequeued();
+        handle.lane_closed();
+
+        let snapshot = MetricSnapshot::from_registry(&registry);
+        assert_eq!(
+            snapshot.gauge(
+                "velo_messenger_ordered_lanes",
+                &[("handler", "ordered_handler")]
+            ),
+            0.0,
+            "a created-then-closed lane must return the gauge to zero"
+        );
+        assert_eq!(
+            snapshot.gauge(
+                "velo_messenger_ordered_lane_depth",
+                &[("handler", "ordered_handler")]
+            ),
+            0.0,
+            "a dequeued message must return the depth gauge to zero"
+        );
+        assert_eq!(
+            snapshot.counter(
+                "velo_messenger_ordered_lanes_created_total",
+                &[("handler", "ordered_handler")]
+            ),
+            1.0
+        );
     }
 
     #[test]

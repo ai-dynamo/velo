@@ -40,9 +40,10 @@ pub use velo_ext as ext;
 // Messenger surface
 pub use crate::messenger::{
     AmHandlerBuilder, AmSendBuilder, AmSyncBuilder, AsyncExecutor, Context, DispatchMode, Handler,
-    HandlerExecutor, Messenger, MessengerBuilder, PeerDiscovery, SyncExecutor, SyncResult,
-    TypedContext, TypedUnaryBuilder, TypedUnaryHandlerBuilder, TypedUnaryResult, UnaryBuilder,
-    UnaryHandlerBuilder, UnaryResult, UnifiedResponse, VeloEvents,
+    HandlerExecutor, Messenger, MessengerBuilder, OrderedConfig, OrderingKey, OverflowPolicy,
+    PeerDiscovery, SyncExecutor, SyncResult, TypedContext, TypedUnaryBuilder,
+    TypedUnaryHandlerBuilder, TypedUnaryResult, UnaryBuilder, UnaryHandlerBuilder, UnaryResult,
+    UnifiedResponse, VeloEvents,
 };
 
 // Events

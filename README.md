@@ -206,7 +206,7 @@ let resp: MyResponse = node_a
 
 ### Registering Handlers
 
-Handlers are registered by name. Each handler type has sync and async variants. The dispatch mode controls whether the handler runs on the dispatcher task (`.inline()`, default, lowest latency) or in a spawned task (`.spawn()`, better isolation).
+Handlers are registered by name. Each handler type has sync and async variants. The dispatch mode controls how the handler runs: `.spawn()` (the default) gives each message its own task, `.inline()` spawns without registering the task with the messenger's tracker, and `.ordered()` serialises messages per sending instance (see [Ordered handlers](#ordered-handlers)).
 
 ```rust
 use velo::{Handler, Context, TypedContext};
@@ -233,7 +233,52 @@ let h = Handler::am_handler_async("notify", |ctx: Context| async move {
 node.register_handler(h)?;
 ```
 
-Handler context objects give you access to the raw payload, message headers, and the `Messenger` itself (via `ctx.msg`) — allowing handlers to send outbound messages, register new handlers, or await events.
+Handler context objects give you access to the raw payload, message headers, and the `Messenger` itself (via `ctx.msg`) — allowing handlers to send outbound messages, register new handlers, or await events. They also identify the sender: `ctx.sender_worker_id()` is always available, and `ctx.sender_instance_id()` resolves to the peer's `InstanceId` once its handshake has landed.
+
+### Ordered handlers
+
+By default a handler gets one task per message, so two messages from the same peer may run in either order. `.ordered()` gives each *sending instance* its own unbounded queue drained by a single task: messages from one peer are handled in the order that peer sent them, while different peers still run in parallel.
+
+```rust
+// Per-sender ordering. Messages from one peer are handled in send order;
+// different peers run concurrently.
+let h = Handler::am_handler_async("apply_delta", |ctx: Context| async move {
+    let from = ctx.sender_instance_id();   // Option<InstanceId>
+    apply(from, ctx.payload).await
+}).ordered()
+  .build();
+
+// Same, but never more than 32 handlers running at once across all lanes.
+// The permit is taken per message inside the lane, so per-lane ordering is
+// unaffected — a lane that can't get one parks with its queue intact.
+let h = Handler::am_handler_async("ingest", ingest)
+    .ordered()
+    .max_concurrent(32)
+    .build();
+
+// One lane for the whole handler: total order across every sender, at the
+// cost of all cross-peer parallelism.
+let h = Handler::am_handler("append_log", |ctx: Context| log.append(ctx.payload))
+    .ordered_global()
+    .build();
+
+// Tuned: keep idle lanes alive longer, shed a sender whose own lane
+// backs up past 100k queued messages.
+let h = Handler::typed_unary_async("bulk", bulk).ordered_with(
+    OrderedConfig::by_sender()
+        .with_idle_lane_ttl(Some(Duration::from_secs(300)))
+        .with_max_queue_depth(Some(100_000))
+        .with_overflow(OverflowPolicy::Reject),
+).build();
+```
+
+Things worth knowing:
+
+- **Ordering is preserved, not created.** Ordered mode hands messages to the handler in the order they reached the messenger. If a peer is reachable over several transports, or a connection drops and reconnects mid-stream, arrival order was already lost upstream.
+- **Large payloads are exempt.** Rendezvous-staged messages resolve out-of-band before dispatch, so they are not ordered relative to each other even on an ordered handler. The dispatcher warns once when it sees one.
+- **Lane queues are unbounded.** `max_queue_depth` is a soft admission cap driving `OverflowPolicy`, not a bound on the channel. It applies **per lane**, so one backed-up peer cannot shed traffic from peers whose lanes are empty. Watch `velo_messenger_ordered_lane_depth` and `velo_messenger_ordered_lane_wait_seconds` to spot a lane falling behind; under `Reject`, `velo_messenger_dispatch_failures_total{reason="ordered_lane_shed"}` carries the shed rate (the log line fires once per handler).
+- **On a unary handler this serialises request/response per sender** — a client issuing 100 concurrent calls will have them served one at a time.
+- Idle lanes reap themselves after `idle_lane_ttl` (30s by default) so churning short-lived peers don't leak tasks.
 
 ---
 
