@@ -389,8 +389,24 @@ impl Messenger {
     /// silently becomes a staged transfer, paying a round trip on behalf of
     /// everything packed into it.
     ///
-    /// Advisory, not enforced: sending more than this still works whenever a
-    /// stager is installed, it just stops being eager.
+    /// Advisory, not enforced — but what an over-budget send does depends on
+    /// which of the two ceilings produced the number:
+    ///
+    /// - **Over the stager's threshold**: the payload is staged through
+    ///   rendezvous and the send succeeds. It just stops being eager, and the
+    ///   receiver pays a round trip to fetch it.
+    /// - **Over the budget but under the threshold**: nothing stages — the
+    ///   stager compares the raw `payload.len()` against its own threshold,
+    ///   which this payload is below — and the encoded frame is over the
+    ///   transport's capacity. The send fails: the frame never reaches the
+    ///   wire and the error surfaces on the send's awaiter. This band exists
+    ///   whenever the transport's capacity is the lower ceiling (NATS at its
+    ///   1 MiB default against the 256 KiB-and-up thresholds a stager is
+    ///   usually given), and it is the whole band when no stager is installed
+    ///   at all.
+    /// - **Transport capacity unknown**: there is no capacity to be over, so
+    ///   nothing here rejects the send. Whether the frame arrives is between
+    ///   the caller and whatever limits that transport enforces further down.
     ///
     /// The transport term is the peer's *primary* transport — the one
     /// [`Messenger`] sends through. It says nothing about an alternative

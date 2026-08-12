@@ -82,6 +82,19 @@ fn budget_saturates_rather_than_wrapping_when_the_envelope_exceeds_the_ceiling()
     assert_eq!(eager_payload_budget(Some(64), None, 4096), 0);
 }
 
+/// Install transparent large-payload support with the given threshold.
+fn install_stager(messenger: &Messenger, threshold: usize) {
+    let manager = std::sync::Arc::new(crate::RendezvousManager::new(velo_ext::WorkerId::from_u64(
+        7,
+    )));
+    messenger.set_large_payload_support(
+        std::sync::Arc::new(RendezvousStager::new(manager.clone()).with_threshold(threshold)),
+        std::sync::Arc::new(crate::rendezvous::transparent::RendezvousResolver::new(
+            manager,
+        )),
+    );
+}
+
 /// Build a messenger over a real TCP transport and register a peer on it, so
 /// the budget is read through the full backend → transport path.
 async fn tcp_messenger() -> (std::sync::Arc<Messenger>, std::sync::Arc<Messenger>) {
@@ -131,17 +144,7 @@ async fn lowering_the_rendezvous_threshold_lowers_the_budget() {
 
     // 64 KiB is far below TCP's 16 MiB ceiling, so the threshold must bind.
     const LOWERED_THRESHOLD: usize = 64 * 1024;
-    let manager = std::sync::Arc::new(crate::RendezvousManager::new(velo_ext::WorkerId::from_u64(
-        7,
-    )));
-    local.set_large_payload_support(
-        std::sync::Arc::new(
-            RendezvousStager::new(manager.clone()).with_threshold(LOWERED_THRESHOLD),
-        ),
-        std::sync::Arc::new(crate::rendezvous::transparent::RendezvousResolver::new(
-            manager,
-        )),
-    );
+    install_stager(&local, LOWERED_THRESHOLD);
 
     let after = local.effective_eager_payload(target, "_stream_batch", None);
     assert_eq!(
@@ -347,6 +350,77 @@ async fn a_budget_sized_payload_fills_the_transport_frame_exactly() {
     );
     let (header, payload) = transport.only_accepted_frame();
     assert_eq!(header.len() + payload.len(), CAPACITY);
+}
+
+/// What happens to an over-budget send depends on *which* ceiling produced the
+/// budget, and with a transport whose capacity sits below the stager's
+/// threshold there is a band between them where neither path carries the
+/// payload: the stager compares the raw payload against its own threshold and
+/// declines to stage, and the frame is then too large for the transport. The
+/// send fails — the frame never reaches the wire and the error surfaces on the
+/// awaiter.
+///
+/// The second half is the contrast that makes the first mean something: one
+/// byte past the threshold the same send succeeds, because staging replaces the
+/// payload with a handle and what goes out is small.
+#[tokio::test]
+async fn over_budget_sends_fail_below_the_threshold_and_stage_above_it() {
+    const CAPACITY: usize = 8 * 1024;
+    const THRESHOLD: usize = 64 * 1024;
+    let (local, target, transport) = capped_messenger(CAPACITY).await;
+    install_stager(&local, THRESHOLD);
+
+    let budget = local.effective_eager_payload(target, "_stream_batch", None);
+    assert!(
+        budget < CAPACITY && CAPACITY < THRESHOLD,
+        "the transport has to be the binding ceiling for this test to mean anything"
+    );
+
+    // Between the two ceilings: too large for the transport, too small to stage.
+    let error = tokio::time::timeout(
+        Duration::from_secs(2),
+        local
+            .unary_streaming("_stream_batch")
+            .raw_payload(bytes::Bytes::from(vec![0u8; (CAPACITY + THRESHOLD) / 2]))
+            .instance(target)
+            .send(),
+    )
+    .await
+    .expect("the rejection has to surface on the awaiter, not time out there")
+    .expect_err("a frame over the transport's capacity cannot be sent");
+    assert!(
+        error
+            .to_string()
+            .contains("exceeds capped transport capacity"),
+        "the failure must be the capacity rejection, got: {error}"
+    );
+    assert_eq!(transport.rejections().len(), 1);
+
+    // Past the threshold the stager takes over: the payload becomes a handle in
+    // the headers and the frame that goes out is a fraction of the capacity.
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        local
+            .am_send_streaming("_stream_batch")
+            .expect("streaming builder")
+            .raw_payload(bytes::Bytes::from(vec![0u8; THRESHOLD * 2]))
+            .instance(target)
+            .send(),
+    )
+    .await
+    .expect("a staged send is not waiting on anything remote")
+    .expect("a staged send is admitted");
+
+    let (header, payload) = transport.only_accepted_frame();
+    assert!(payload.is_empty(), "staging leaves no payload to carry");
+    let decoded = crate::messenger::common::messages::decode_active_message(header, payload)
+        .expect("the frame decodes");
+    assert!(
+        decoded.metadata.headers.is_some_and(
+            |headers| headers.contains_key(crate::messenger::large_payload::RV_HEADER_KEY)
+        ),
+        "a staged send carries its rendezvous handle in the headers"
+    );
 }
 
 // ---------------------------------------------------------------------------
