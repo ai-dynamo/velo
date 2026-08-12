@@ -75,6 +75,17 @@ const FLUSH_FAILED: &str = "batch flush failed";
 /// Implementors supply the three frame fields plus, optionally, terminal
 /// semantics and a per-item failure notification.
 pub(crate) trait Coalescable {
+    /// Whether [`Self::on_write_error`] does anything.
+    ///
+    /// When `true` the writer holds each item until its batch reaches the
+    /// wire, so a failed flush can report every item it was carrying. When
+    /// `false` it drops each item as soon as the bytes are staged — the
+    /// streaming egress pump has no per-frame error handler, and keeping a
+    /// whole batch of payloads alive alongside the copy of them in the staging
+    /// buffer would double live memory on the path coalescing exists to speed
+    /// up.
+    const REPORTS_ERRORS: bool = true;
+
     /// Frame type written in the preamble.
     fn msg_type(&self) -> MessageType;
 
@@ -329,7 +340,12 @@ pub(crate) async fn run_coalescing_writer<W, T, O>(
                 // Read before the move. `is_terminal` is consulted *after*
                 // staging so the terminal frame itself still reaches the wire.
                 let is_terminal = item.is_terminal();
-                staged.push(item);
+                if T::REPORTS_ERRORS {
+                    staged.push(item);
+                } else {
+                    // Nothing to report it to; the bytes are already staged.
+                    drop(item);
+                }
                 if is_terminal {
                     terminal = true;
                     break;
@@ -373,11 +389,16 @@ where
     T: Coalescable,
     O: WriterObserver,
 {
-    debug_assert_eq!(batch.frame_count(), staged.len());
-    if staged.is_empty() {
+    debug_assert!(
+        !T::REPORTS_ERRORS || batch.frame_count() == staged.len(),
+        "a reporting writer must hold one item per staged frame"
+    );
+    // Taken from the batch, not from `staged`: a non-reporting writer drops its
+    // items at staging time and leaves `staged` empty.
+    let frames = batch.frame_count();
+    if frames == 0 {
         return true;
     }
-    let frames = staged.len();
     match batch.flush_to(writer).await {
         Ok(()) => {
             staged.clear();
@@ -453,6 +474,7 @@ mod tests {
     use parking_lot::Mutex;
     use std::pin::Pin;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll};
     use tokio_util::codec::Decoder;
 
@@ -475,6 +497,11 @@ mod tests {
         max_per_write: Option<usize>,
         /// Cancelled on the first `poll_write`, to drive shutdown mid-drain.
         cancel_on_write: Option<CancellationToken>,
+        /// Live-item counter sampled at each `poll_write`, to observe how many
+        /// items the writer was still holding when it flushed.
+        live_items: Option<Arc<AtomicUsize>>,
+        /// One sample per `poll_write`, in order.
+        live_at_write: Vec<usize>,
     }
 
     impl RecordingSink {
@@ -505,6 +532,10 @@ mod tests {
         ) -> Poll<io::Result<usize>> {
             let idx = self.poll_writes;
             self.poll_writes += 1;
+            if let Some(live) = &self.live_items {
+                let n = live.load(Ordering::SeqCst);
+                self.live_at_write.push(n);
+            }
             if let Some(token) = self.cancel_on_write.take() {
                 token.cancel();
             }
@@ -955,6 +986,90 @@ mod tests {
         assert!(
             !rx.is_empty(),
             "items should remain queued for the caller's own drain to report"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Item retention
+    // -----------------------------------------------------------------------
+
+    /// An item that counts itself live, so a test can see how many the writer
+    /// was still holding at flush time.
+    struct CountedItem<const REPORTS: bool> {
+        payload: Vec<u8>,
+        live: Arc<AtomicUsize>,
+    }
+
+    impl<const REPORTS: bool> CountedItem<REPORTS> {
+        fn new(live: &Arc<AtomicUsize>, payload: Vec<u8>) -> Self {
+            live.fetch_add(1, Ordering::SeqCst);
+            Self {
+                payload,
+                live: Arc::clone(live),
+            }
+        }
+    }
+
+    impl<const REPORTS: bool> Drop for CountedItem<REPORTS> {
+        fn drop(&mut self) {
+            self.live.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    impl<const REPORTS: bool> Coalescable for CountedItem<REPORTS> {
+        const REPORTS_ERRORS: bool = REPORTS;
+        fn msg_type(&self) -> MessageType {
+            MessageType::Message
+        }
+        fn header(&self) -> &[u8] {
+            &[]
+        }
+        fn payload(&self) -> &[u8] {
+            &self.payload
+        }
+    }
+
+    async fn live_items_at_flush<const REPORTS: bool>() -> Vec<usize> {
+        let live = Arc::new(AtomicUsize::new(0));
+        let observer = TestObserver::default();
+        let mut sink = RecordingSink {
+            live_items: Some(Arc::clone(&live)),
+            ..Default::default()
+        };
+
+        let (tx, rx) = flume::unbounded::<CountedItem<REPORTS>>();
+        for i in 0..8u8 {
+            tx.send(CountedItem::<REPORTS>::new(&live, vec![i; 16]))
+                .expect("queue");
+        }
+        drop(tx);
+        run_coalescing_writer(&mut sink, &rx, None, &observer).await;
+
+        assert_eq!(observer.flushes(), vec![8], "all eight in one flush");
+        assert_eq!(live.load(Ordering::SeqCst), 0, "everything dropped by exit");
+        sink.live_at_write
+    }
+
+    /// A writer that reports errors has to keep every item until its batch
+    /// reaches the wire — that is what makes per-item error fan-out possible.
+    #[tokio::test]
+    async fn reporting_writer_holds_items_until_flush() {
+        assert_eq!(
+            live_items_at_flush::<true>().await,
+            vec![8],
+            "all eight items must still be alive when the batch is written"
+        );
+    }
+
+    /// A writer with no error handler must not: the staging buffer already
+    /// holds a copy of the bytes, so keeping the originals alive would double
+    /// live memory on the streaming egress hot path.
+    #[tokio::test]
+    async fn non_reporting_writer_drops_items_as_it_stages_them() {
+        assert_eq!(
+            live_items_at_flush::<false>().await,
+            vec![0],
+            "items must be dropped at staging time, not held until flush"
         );
     }
 

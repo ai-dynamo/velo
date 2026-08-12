@@ -363,10 +363,21 @@ async fn egress_pump(
 /// `Vec<u8>`, so the coalescing contract is implemented on it directly rather
 /// than on a newtype that would cost a move per frame on the hot path.
 ///
+/// **This impl is specific to the streaming egress pump**, even though the
+/// orphan rules make it crate-wide. `is_terminal` reads the streaming
+/// sentinels; any other path that ends up handing `Vec<u8>` to a coalescing
+/// writer (gRPC's `FrameTransport::connect` returns the same channel type)
+/// would silently inherit that check, and should get its own item type rather
+/// than reuse this.
+///
 /// There is no `on_write_error`: the streaming data plane has no per-frame
 /// error handler. A dead socket surfaces to the consumer as a missing terminal
 /// and is caught by the heartbeat watchdog (see `SATURATION.md`).
 impl Coalescable for Vec<u8> {
+    // No error handler, so the writer need not keep frames alive until flush —
+    // the staging buffer already holds a copy of the bytes.
+    const REPORTS_ERRORS: bool = false;
+
     fn msg_type(&self) -> MessageType {
         MessageType::Message
     }
