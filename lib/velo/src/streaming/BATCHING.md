@@ -448,6 +448,16 @@ worker thread from inside a `Drop` in async context.
 > document prefers to the watchdog kill, made deterministic; `SATURATION.md`
 > describes it from the operator's side.
 
+The batcher's own control inlet is bounded the same way, and for the same
+reason. Credit returns, closes and singleton resolutions arrive as **coalesced
+per-slot state** rather than as messages: credit accumulates into a `u32`, a
+close dominates the credit for its slot, and a failed singleton dominates a
+successful one. A queue would have been unbounded exactly when it matters — a
+flush parks on admission precisely when the peer is congested, which is when its
+ingress lane is busiest returning credit — so the batcher is *woken*, never fed.
+Attach requests keep a queue, bounded, because each carries its own channel and
+its own waiting caller and there is nothing to merge.
+
 Credit returns get their own priority lane, so a peer whose egress is congested
 never stops returning your credit.
 

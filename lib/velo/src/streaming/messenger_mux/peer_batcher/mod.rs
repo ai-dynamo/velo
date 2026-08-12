@@ -11,6 +11,9 @@
 //!
 //! ## What backpressure means here
 //!
+//! Control reaching it is **coalesced state**, not a queue — see [`control`] for
+//! why an unbounded mailbox is unbounded memory the moment a flush parks.
+//!
 //! There is no socket to fill, so the batcher learns its peer is congested the
 //! only way a messenger user can: **admission**. A fire send completes at
 //! admission, so awaiting the [`FireResult`] of a flush parks the batcher — not
@@ -37,6 +40,7 @@
 //! when the slot cannot send it — and the byte cap on that queue, which is what
 //! bounds the memory the arrangement costs.
 
+mod control;
 mod slot_stream;
 #[cfg(test)]
 mod tests;
@@ -52,6 +56,7 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use velo_ext::{InstanceId, WorkerId};
 
+use self::control::{ControlInbox, DrainedControl, OwnedControl, PeerControl};
 pub(crate) use self::slot_stream::AllocError;
 use self::slot_stream::{EgressSlots, SlotItem, SlotStream};
 use super::MuxConfig;
@@ -78,31 +83,22 @@ const MIN_BATCH_CAP: usize = BATCH_HEADER_LEN + 13;
 /// § "Why bucketing by destination is free".
 pub(crate) type BatcherMap = DashMap<WorkerId, Arc<BatcherHandle>>;
 
-/// Work handed to a batcher task from outside it.
+/// Attach requests queued for a batcher.
 ///
-/// Everything that is not a data record arrives this way, on an **unbounded**
-/// channel: control volume is O(live slots), which credit already bounds, and a
-/// bounded control lane would let data starvation block the `CloseSlot` that
-/// ends a stream.
-pub(crate) enum Command {
-    /// Allocate a slot for a `connect()` and send its eager `OpenSlot`.
-    OpenSlot {
-        anchor_id: u64,
-        session_id: u64,
-        inlet: flume::Receiver<Vec<u8>>,
-        ack: oneshot::Sender<Result<(), OpenRejected>>,
-    },
-    /// An inbound `CreditUpdate` for one of this peer's slots.
-    Grant { slot: SlotId, delta: u32 },
-    /// The receiver asked us to abandon one of our slots.
-    PeerClosed { slot: SlotId, reason: CloseReason },
-    /// Control records the ingress lane wants sent back to this peer.
-    Reply(Vec<ReplyRecord>),
-    /// A rendezvous singleton finished resolving its admission.
-    SingletonResolved { slot: SlotId, admitted: bool },
-    /// The sweep evicted this batcher from the registry.
-    Retire,
+/// The one thing that cannot coalesce — each carries its own channel and its own
+/// caller waiting on an ack — so it keeps a queue, and a **bounded** one. A full
+/// queue makes an attach wait rather than fail, which is the right answer: the
+/// caller is already `await`ing an ack, and there are only ever as many in
+/// flight as there are concurrent `connect` calls.
+pub(crate) struct OpenSlotRequest {
+    pub(crate) anchor_id: u64,
+    pub(crate) session_id: u64,
+    pub(crate) inlet: flume::Receiver<Vec<u8>>,
+    pub(crate) ack: oneshot::Sender<Result<(), OpenRejected>>,
 }
+
+/// Attach requests one batcher may have queued at once.
+const OPEN_QUEUE_DEPTH: usize = 64;
 
 /// A control record the receiving side sends back to a slot's owner.
 ///
@@ -137,16 +133,65 @@ pub(crate) enum OpenRejected {
 /// Carries the counters the eviction sweep reads, so the sweep never has to talk
 /// to the task to decide whether it is idle.
 pub(crate) struct BatcherHandle {
-    commands: flume::Sender<Command>,
+    opens: flume::Sender<OpenSlotRequest>,
+    control: Arc<ControlInbox>,
     live_slots: AtomicUsize,
     idle_ticks: AtomicU32,
     retired: AtomicBool,
+    alive: AtomicBool,
 }
 
 impl BatcherHandle {
-    /// Queue `command`. Fails only once the task has exited.
-    pub(crate) fn send(&self, command: Command) -> Result<(), flume::SendError<Command>> {
-        self.commands.send(command)
+    /// Queue an attach, waiting if this batcher already has `OPEN_QUEUE_DEPTH`
+    /// of them outstanding.
+    pub(crate) async fn open_slot(
+        &self,
+        request: OpenSlotRequest,
+    ) -> Result<(), flume::SendError<OpenSlotRequest>> {
+        self.opens.send_async(request).await
+    }
+
+    /// Whether the task is still running.
+    ///
+    /// Control is state rather than a queue, so a writer cannot learn from the
+    /// send that nobody will read it. Callers that care — the reply path — check
+    /// this and re-resolve. Nothing is lost when it races: a batcher only exits
+    /// on cancellation, which is the transport going away, or on retirement,
+    /// which requires zero live slots on both sides and therefore no credit to
+    /// return.
+    pub(crate) fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
+    }
+
+    /// An inbound `CreditUpdate` for one of this peer's slots.
+    pub(crate) fn grant(&self, slot: SlotId, delta: u32) {
+        self.control.grant(slot, delta);
+    }
+
+    /// The receiver asked us to abandon one of our slots.
+    pub(crate) fn peer_closed(&self, slot: SlotId, reason: CloseReason) {
+        self.control.peer_closed(slot, reason);
+    }
+
+    /// Queue control records to send back to this peer.
+    pub(crate) fn reply(&self, records: &[ReplyRecord]) {
+        for record in records {
+            match *record {
+                ReplyRecord::CreditUpdate { slot, delta } => self.control.reply_credit(slot, delta),
+                ReplyRecord::CloseSlot { slot, reason } => self.control.reply_close(slot, reason),
+            }
+        }
+    }
+
+    /// The sweep evicted this batcher from the registry.
+    pub(crate) fn retire(&self) {
+        self.control.retire();
+    }
+
+    /// Control entries pending, for the bound the stalled-admission test pins.
+    #[cfg(test)]
+    pub(crate) fn pending_control(&self) -> usize {
+        self.control.pending_len()
     }
 
     /// Advance the idle counter and report the new value.
@@ -188,12 +233,15 @@ pub(crate) struct BatcherContext {
 
 /// Spawn a batcher for `peer` and return its registry handle.
 pub(crate) fn spawn(peer: WorkerId, ctx: BatcherContext) -> Arc<BatcherHandle> {
-    let (commands, inbox) = flume::unbounded();
+    let (opens, open_rx) = flume::bounded(OPEN_QUEUE_DEPTH);
+    let control = Arc::new(ControlInbox::default());
     let handle = Arc::new(BatcherHandle {
-        commands: commands.clone(),
+        opens,
+        control: Arc::clone(&control),
         live_slots: AtomicUsize::new(0),
         idle_ticks: AtomicU32::new(0),
         retired: AtomicBool::new(false),
+        alive: AtomicBool::new(true),
     });
     let epoch = ctx.epochs.fetch_add(1, Ordering::Relaxed);
     let batcher = Batcher {
@@ -206,7 +254,7 @@ pub(crate) fn spawn(peer: WorkerId, ctx: BatcherContext) -> Arc<BatcherHandle> {
         epochs: ctx.epochs,
         batchers: ctx.batchers,
         cancel: ctx.cancel,
-        commands,
+        control,
         epoch,
         next_batch_seq: 0,
         cap: MIN_BATCH_CAP,
@@ -216,13 +264,14 @@ pub(crate) fn spawn(peer: WorkerId, ctx: BatcherContext) -> Arc<BatcherHandle> {
         buffer: BytesMut::new(),
         stopping: false,
     };
-    tokio::spawn(batcher.run(inbox));
+    tokio::spawn(batcher.run(open_rx));
     handle
 }
 
 /// One unit of work pulled by the main loop.
 enum Work {
-    Command(Command),
+    Open(OpenSlotRequest),
+    Control(DrainedControl),
     Slot(u32, SlotItem),
 }
 
@@ -236,10 +285,8 @@ struct Batcher {
     epochs: Arc<AtomicU64>,
     batchers: Arc<BatcherMap>,
     cancel: CancellationToken,
-    /// Our own command sender, so a detached singleton watcher has somewhere to
-    /// report. Keeping it here means the inbox never disconnects, which is why
-    /// the loop exits on `Retire` or cancellation rather than on channel close.
-    commands: flume::Sender<Command>,
+    /// The coalesced control state this task drains.
+    control: Arc<ControlInbox>,
     epoch: u64,
     next_batch_seq: u32,
     cap: usize,
@@ -253,15 +300,22 @@ struct Batcher {
 }
 
 impl Batcher {
-    async fn run(mut self, inbox: flume::Receiver<Command>) {
+    async fn run(mut self, opens: flume::Receiver<OpenSlotRequest>) {
         let cancel = self.cancel.clone();
+        let control = Arc::clone(&self.control);
         loop {
             let work = tokio::select! {
                 biased;
                 () = cancel.cancelled() => break,
-                command = inbox.recv_async() => match command {
-                    Ok(command) => Work::Command(command),
+                open = opens.recv_async() => match open {
+                    Ok(open) => Work::Open(open),
                     Err(_) => break,
+                },
+                () = control.wait() => match control.take() {
+                    Some(drained) => Work::Control(drained),
+                    // Drained by the opportunistic pass below between the wake
+                    // and the take.
+                    None => continue,
                 },
                 Some((index, item)) = self.streams.next() => Work::Slot(index, item),
             };
@@ -271,7 +325,7 @@ impl Batcher {
             // Opportunistic drain: take everything already queued before
             // writing. This is what turns a forward pass's X back-to-back sends
             // into one batch, and it never waits for work that has not arrived.
-            while !self.stopping && self.drain_once(&inbox).await {}
+            while !self.stopping && self.drain_once(&opens).await {}
 
             self.flush().await;
             if self.stopping {
@@ -283,9 +337,13 @@ impl Batcher {
     }
 
     /// Pull one already-available item, returning whether there was one.
-    async fn drain_once(&mut self, inbox: &flume::Receiver<Command>) -> bool {
-        if let Ok(command) = inbox.try_recv() {
-            self.dispatch(Work::Command(command)).await;
+    async fn drain_once(&mut self, opens: &flume::Receiver<OpenSlotRequest>) -> bool {
+        if let Ok(open) = opens.try_recv() {
+            self.dispatch(Work::Open(open)).await;
+            return true;
+        }
+        if let Some(drained) = self.control.take() {
+            self.dispatch(Work::Control(drained)).await;
             return true;
         }
         match self.streams.next().now_or_never() {
@@ -301,21 +359,54 @@ impl Batcher {
         match work {
             Work::Slot(index, SlotItem::Frame(bytes)) => self.on_frame(index, bytes).await,
             Work::Slot(index, SlotItem::InletClosed) => self.on_inlet_closed(index).await,
-            Work::Command(Command::OpenSlot {
-                anchor_id,
-                session_id,
-                inlet,
-                ack,
-            }) => self.on_open_slot(anchor_id, session_id, inlet, ack).await,
-            Work::Command(Command::Grant { slot, delta }) => self.on_grant(slot, delta).await,
-            Work::Command(Command::PeerClosed { slot, reason }) => {
-                self.on_peer_closed(slot, reason)
+            Work::Open(request) => self.on_open_slot(request).await,
+            Work::Control(drained) => self.on_control(drained).await,
+        }
+    }
+
+    /// Apply one drain's worth of coalesced control.
+    ///
+    /// Order within a drain is by kind rather than by arrival, because arrival
+    /// order is what coalescing gave up and none of these depend on it: replies
+    /// name the peer's slots, grants and closes name ours, and a close makes its
+    /// slot's grant moot either way.
+    async fn on_control(&mut self, drained: DrainedControl) {
+        for (raw, entry) in drained.peers {
+            self.on_reply(SlotId::from_raw(raw), entry).await;
+        }
+        for (raw, entry) in drained.mine {
+            self.on_owned_control(SlotId::from_raw(raw), entry).await;
+        }
+        if drained.retire {
+            self.on_retire();
+        }
+    }
+
+    /// Apply the coalesced control for one slot this side owns.
+    async fn on_owned_control(&mut self, slot: SlotId, entry: OwnedControl) {
+        // A failed singleton is epoch death; nothing else about the slot
+        // matters afterwards, because the slot does not survive the epoch.
+        if entry.singleton == Some(false) {
+            self.epoch_death();
+            return;
+        }
+        if let Some(reason) = entry.close {
+            self.on_peer_closed(slot, reason);
+            return;
+        }
+        let mut touched = false;
+        if let Some(live) = self.slots.get_mut_checked(slot) {
+            if entry.credit > 0 {
+                live.credit.grant(entry.credit);
+                touched = true;
             }
-            Work::Command(Command::Reply(records)) => self.on_reply(records).await,
-            Work::Command(Command::SingletonResolved { slot, admitted }) => {
-                self.on_singleton_resolved(slot, admitted).await
+            if entry.singleton == Some(true) {
+                live.unfence();
+                touched = true;
             }
-            Work::Command(Command::Retire) => self.on_retire(),
+        }
+        if touched {
+            self.release_withheld(slot.index()).await;
         }
     }
 
@@ -546,10 +637,9 @@ impl Batcher {
         // Deliberately not awaited here: fencing is per slot, so every other
         // slot on this peer keeps flowing while the staged transfer is in
         // flight. The resolution comes back as a command.
-        let commands = self.commands.clone();
+        let control = Arc::clone(&self.control);
         tokio::spawn(async move {
-            let admitted = fire.await.is_ok();
-            let _ = commands.send(Command::SingletonResolved { slot: id, admitted });
+            control.singleton_resolved(id, fire.await.is_ok());
         });
     }
 
@@ -557,13 +647,13 @@ impl Batcher {
     // Control path
     // -----------------------------------------------------------------------
 
-    async fn on_open_slot(
-        &mut self,
-        anchor_id: u64,
-        session_id: u64,
-        inlet: flume::Receiver<Vec<u8>>,
-        ack: oneshot::Sender<Result<(), OpenRejected>>,
-    ) {
+    async fn on_open_slot(&mut self, request: OpenSlotRequest) {
+        let OpenSlotRequest {
+            anchor_id,
+            session_id,
+            inlet,
+            ack,
+        } = request;
         if self.handle.is_retired() {
             let _ = ack.send(Err(OpenRejected::Retired));
             return;
@@ -598,14 +688,6 @@ impl Batcher {
         let _ = ack.send(Ok(()));
     }
 
-    async fn on_grant(&mut self, slot: SlotId, delta: u32) {
-        let Some(entry) = self.slots.get_mut_checked(slot) else {
-            return;
-        };
-        entry.credit.grant(delta);
-        self.release_withheld(slot.index()).await;
-    }
-
     fn on_peer_closed(&mut self, slot: SlotId, reason: CloseReason) {
         if self.slots.get_mut_checked(slot).is_some() {
             tracing::debug!(slot = ?slot, ?reason, "messenger mux: peer closed our egress slot");
@@ -613,38 +695,35 @@ impl Batcher {
         }
     }
 
-    async fn on_reply(&mut self, records: Vec<ReplyRecord>) {
-        for record in records {
-            // Control records reference the *peer's* slot ids and carry
-            // `frame_seq = 0`: they do not belong to that slot's outbound
-            // counter, and their order comes from batch position.
-            let needed = record_encoded_len(4).unwrap_or(usize::MAX);
-            self.ensure_batch();
-            if !self.fits(needed, 1) {
-                self.flush().await;
-                self.ensure_batch();
-            }
-            let Some(encoder) = self.encoder.as_mut() else {
-                continue;
-            };
-            let _ = match record {
-                ReplyRecord::CreditUpdate { slot, delta } => {
-                    encoder.push_credit_update(slot, 0, delta)
-                }
-                ReplyRecord::CloseSlot { slot, reason } => encoder.push_close_slot(slot, 0, reason),
-            };
+    /// Emit the coalesced control owed back for one of the peer's slots.
+    ///
+    /// These reference the *peer's* slot ids and carry `frame_seq = 0`: they do
+    /// not belong to that slot's outbound counter, and their order comes from
+    /// batch position.
+    async fn on_reply(&mut self, slot: SlotId, entry: PeerControl) {
+        if entry.credit > 0 {
+            self.push_reply(|encoder| encoder.push_credit_update(slot, 0, entry.credit))
+                .await;
+        }
+        if let Some(reason) = entry.close {
+            self.push_reply(|encoder| encoder.push_close_slot(slot, 0, reason))
+                .await;
         }
     }
 
-    async fn on_singleton_resolved(&mut self, slot: SlotId, admitted: bool) {
-        if !admitted {
-            self.epoch_death();
-            return;
+    async fn push_reply(
+        &mut self,
+        write: impl FnOnce(&mut BatchEncoder) -> Result<(), super::protocol::EncodeError>,
+    ) {
+        let needed = record_encoded_len(4).unwrap_or(usize::MAX);
+        self.ensure_batch();
+        if !self.fits(needed, 1) {
+            self.flush().await;
+            self.ensure_batch();
         }
-        if let Some(entry) = self.slots.get_mut_checked(slot) {
-            entry.unfence();
+        if let Some(encoder) = self.encoder.as_mut() {
+            let _ = write(encoder);
         }
-        self.release_withheld(slot.index()).await;
     }
 
     fn on_retire(&mut self) {
@@ -872,6 +951,7 @@ impl Batcher {
 
     /// Close every slot on the way out, so producers learn immediately.
     fn teardown(&mut self, unregister: bool) {
+        self.handle.alive.store(false, Ordering::Release);
         let closed = self.slots.close_all();
         self.streams = SelectAll::new();
         if let Some(metrics) = &self.metrics {

@@ -202,12 +202,13 @@ impl Harness {
         let (inlet_tx, inlet_rx) = flume::bounded::<Vec<u8>>(depth);
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         self.handle
-            .send(Command::OpenSlot {
+            .open_slot(OpenSlotRequest {
                 anchor_id,
                 session_id,
                 inlet: inlet_rx,
                 ack: ack_tx,
             })
+            .await
             .expect("queue OpenSlot");
         ack_rx
             .await
@@ -233,9 +234,7 @@ impl Harness {
     }
 
     fn grant(&self, slot: SlotId, delta: u32) {
-        self.handle
-            .send(Command::Grant { slot, delta })
-            .expect("queue grant");
+        self.handle.grant(slot, delta);
     }
 
     fn snapshot(&self) -> crate::observability::test_helpers::MetricSnapshot {
@@ -752,6 +751,212 @@ async fn an_oversized_record_goes_alone_and_fences_only_its_slot() {
 }
 
 // ---------------------------------------------------------------------------
+// Control is state, not a queue
+// ---------------------------------------------------------------------------
+
+/// A transport whose per-target send channel this test owns.
+///
+/// One admission gate over a `bounded(1)` channel nobody drains: the first send
+/// takes the fast path, every send after it parks in the gate. That is the shape
+/// of a congested peer, produced deterministically instead of waited for.
+struct StallingTransport {
+    key: velo_ext::TransportKey,
+    address: velo_ext::WorkerAddress,
+    gate: velo_ext::AdmissionGate<(Bytes, Bytes)>,
+    peers: std::sync::Mutex<std::collections::HashSet<velo_ext::InstanceId>>,
+}
+
+impl StallingTransport {
+    fn new(rt: tokio::runtime::Handle) -> (Arc<Self>, flume::Receiver<(Bytes, Bytes)>) {
+        let (tx, rx) = flume::bounded::<(Bytes, Bytes)>(1);
+        let key = velo_ext::TransportKey::new("stalling");
+        let mut entries = std::collections::HashMap::<String, Vec<u8>>::new();
+        entries.insert(key.as_str().to_string(), b"stalling".to_vec());
+        let address =
+            velo_ext::WorkerAddress::from_encoded(rmp_serde::to_vec(&entries).expect("encode"));
+        let transport = Arc::new(Self {
+            key,
+            address,
+            gate: velo_ext::AdmissionGate::new(tx, rt),
+            peers: std::sync::Mutex::new(std::collections::HashSet::new()),
+        });
+        (transport, rx)
+    }
+}
+
+impl velo_ext::Transport for StallingTransport {
+    fn key(&self) -> velo_ext::TransportKey {
+        self.key.clone()
+    }
+
+    fn address(&self) -> velo_ext::WorkerAddress {
+        self.address.clone()
+    }
+
+    fn register(&self, peer_info: velo_ext::PeerInfo) -> Result<(), velo_ext::TransportError> {
+        self.peers
+            .lock()
+            .expect("peer set poisoned")
+            .insert(peer_info.instance_id());
+        Ok(())
+    }
+
+    fn send_message(
+        &self,
+        _instance_id: velo_ext::InstanceId,
+        header: Bytes,
+        payload: Bytes,
+        _message_type: velo_ext::MessageType,
+        _on_error: Arc<dyn velo_ext::TransportErrorHandler>,
+    ) -> velo_ext::SendOutcome {
+        self.gate.send((header, payload))
+    }
+
+    fn start(
+        &self,
+        _instance_id: velo_ext::InstanceId,
+        _channels: velo_ext::TransportAdapter,
+        _rt: tokio::runtime::Handle,
+    ) -> futures::future::BoxFuture<'_, anyhow::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn shutdown(&self) {}
+
+    fn check_health(
+        &self,
+        _instance_id: velo_ext::InstanceId,
+        _timeout: Duration,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), velo_ext::HealthCheckError>> + Send + '_>,
+    > {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// A batcher stalled on admission must not grow with what arrives behind it.
+///
+/// The stall is not exotic: a flush parks whenever the peer is congested, and a
+/// congested peer is exactly when its ingress lane is busiest returning credit.
+/// An unbounded control queue in that window is unbounded memory. Coalesced
+/// state is O(live slots) whatever the arrival rate, and the deltas it merged
+/// still deliver once the peer un-parks.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stalled_batcher_coalesces_control_instead_of_queueing_it() {
+    let (transport, wire) = StallingTransport::new(tokio::runtime::Handle::current());
+    let sender = Messenger::builder()
+        .add_transport(transport)
+        .build()
+        .await
+        .expect("sender messenger");
+    // A peer id the transport accepts. Nothing ever reads the far end; the
+    // gate is the only thing under test.
+    let peer_instance = velo_ext::InstanceId::new_v4();
+    sender
+        .register_peer(velo_ext::PeerInfo::new(
+            peer_instance,
+            velo_ext::WorkerAddress::from_encoded(
+                rmp_serde::to_vec(&std::collections::HashMap::from([(
+                    "stalling".to_string(),
+                    b"stalling".to_vec(),
+                )]))
+                .expect("encode"),
+            ),
+        ))
+        .expect("register peer");
+
+    let registry = prometheus::Registry::new();
+    let metrics = Arc::new(VeloMetrics::register(&registry).expect("register metrics"));
+    let cancel = CancellationToken::new();
+    let handle = spawn(
+        peer_instance.worker_id(),
+        BatcherContext {
+            messenger: Arc::clone(&sender),
+            config: MuxConfig::default(),
+            metrics: Some(metrics.bind_mux()),
+            epochs: Arc::new(AtomicU64::new(1)),
+            batchers: Arc::new(DashMap::new()),
+            cancel: cancel.clone(),
+        },
+    );
+
+    // Open a slot. Its eager `OpenSlot` flush takes the gate's one free place.
+    let (inlet, inlet_rx) = flume::bounded::<Vec<u8>>(64);
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    handle
+        .open_slot(OpenSlotRequest {
+            anchor_id: 1,
+            session_id: 1,
+            inlet: inlet_rx,
+            ack: ack_tx,
+        })
+        .await
+        .expect("queue OpenSlot");
+    let opened = tokio::time::timeout(RECV_TIMEOUT, ack_rx)
+        .await
+        .expect("ack")
+        .expect("ack delivered");
+    assert!(opened.is_ok());
+
+    let open_batch = OwnedBatch::decode(&{
+        let (_, payload) = tokio::time::timeout(RECV_TIMEOUT, wire.recv_async())
+            .await
+            .expect("the OpenSlot flush must reach the wire")
+            .expect("wire open");
+        payload
+    });
+    let id = open_batch.records[0].slot;
+
+    // Nothing drains the channel now, so the next flush parks in the gate and
+    // the batcher parks with it.
+    handle.grant(id, 64);
+    inlet.send(item(0)).expect("queue record");
+    eventually(|| wire.is_full()).await;
+
+    // Ten thousand grants and ten thousand replies while it is stuck there.
+    for _ in 0..10_000 {
+        handle.grant(id, 1);
+        handle.reply(&[ReplyRecord::CreditUpdate { slot: id, delta: 1 }]);
+    }
+    assert!(
+        handle.pending_control() <= 2,
+        "control must coalesce per slot, not queue: {} entries pending",
+        handle.pending_control()
+    );
+
+    // Un-park the peer, one place at a time — the gate holds exactly one, so
+    // the batcher flushes, parks again, and the test keeps freeing it. The
+    // merged credit is applied as one grant and the merged reply goes out as
+    // one record; what is asserted is that both arrive and that nothing is
+    // left holding state behind them.
+    let mut records: Vec<OwnedRecord> = Vec::new();
+    let deadline = tokio::time::Instant::now() + RECV_TIMEOUT;
+    let settled = loop {
+        if tokio::time::Instant::now() >= deadline {
+            break false;
+        }
+        match wire.try_recv() {
+            Ok((_, payload)) => records.extend(OwnedBatch::decode(&payload).records),
+            Err(_) => tokio::time::sleep(Duration::from_millis(2)).await,
+        }
+        if handle.pending_control() == 0
+            && records.iter().any(|r| r.kind == RecordType::Data)
+            && records.iter().any(|r| r.kind == RecordType::CreditUpdate)
+        {
+            break true;
+        }
+    };
+    assert!(
+        settled,
+        "the coalesced control must deliver once the peer un-parks: \
+         {} entries still pending, records {:?}",
+        handle.pending_control(),
+        records.iter().map(|r| r.kind).collect::<Vec<_>>()
+    );
+    cancel.cancel();
+}
+
+// ---------------------------------------------------------------------------
 // Epoch death
 // ---------------------------------------------------------------------------
 
@@ -777,13 +982,7 @@ async fn epoch_death_fails_every_live_slot_exactly_once() {
     // A singleton whose admission never resolved. The batch it carried is gone,
     // so every slot packed into that epoch has a frame_seq gap that can never
     // close — which is why any failed admission fails the whole epoch.
-    harness
-        .handle
-        .send(Command::SingletonResolved {
-            slot: ids[0],
-            admitted: false,
-        })
-        .expect("queue resolution");
+    harness.handle.control.singleton_resolved(ids[0], false);
 
     for inlet in &inlets {
         eventually(|| inlet.is_disconnected()).await;
@@ -814,13 +1013,7 @@ async fn a_new_epoch_restarts_batch_sequences_and_bumps_generations() {
     let (_inlet, first) = harness.open_with_header(1, 1).await;
     let (first_slot, first_header) = first;
 
-    harness
-        .handle
-        .send(Command::SingletonResolved {
-            slot: first_slot,
-            admitted: false,
-        })
-        .expect("queue resolution");
+    harness.handle.control.singleton_resolved(first_slot, false);
     eventually(|| harness.handle.live_slots.load(Ordering::Relaxed) == 0).await;
 
     let (_inlet, (second_slot, second_header)) = harness.open_with_header(1, 2).await;

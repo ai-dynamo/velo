@@ -89,7 +89,9 @@ use velo_ext::{TransportKey, WorkerAddress, WorkerId};
 
 use self::flow_control::{DEFAULT_PEER_BYTE_BUDGET, DEFAULT_SLOT_BYTE_BUDGET, slot_buffer_depth};
 use self::ingress::IngressRegistry;
-use self::peer_batcher::{BatcherContext, BatcherHandle, BatcherMap, Command, OpenRejected};
+use self::peer_batcher::{
+    BatcherContext, BatcherHandle, BatcherMap, OpenRejected, OpenSlotRequest,
+};
 use crate::messenger::{Context, Handler, Messenger};
 use crate::observability::{MuxMetricsHandle, VeloMetrics};
 use crate::streaming::transport::FrameTransport;
@@ -307,31 +309,35 @@ impl MuxCore {
 
         let batcher = self.batcher(peer);
         for (slot, delta) in outcome.grants {
-            let _ = batcher.send(Command::Grant { slot, delta });
+            batcher.grant(slot, delta);
         }
         for (slot, reason) in outcome.peer_closes {
-            let _ = batcher.send(Command::PeerClosed { slot, reason });
+            batcher.peer_closed(slot, reason);
         }
         if !outcome.replies.is_empty() {
-            self.send_replies(&batcher, peer, outcome.replies);
+            self.send_replies(&batcher, peer, &outcome.replies);
         }
     }
 
     /// Queue control records back to `peer`, re-resolving once if the batcher
-    /// exited between resolution and send.
+    /// exited between resolution and the write.
+    ///
+    /// Control is coalesced state rather than a queue, so nothing here can fail
+    /// on the write — the liveness check is what stands in for a `SendError`.
+    /// Losing the race costs nothing: a batcher exits on cancellation, which is
+    /// the transport going away, or on retirement, which requires zero live
+    /// slots on both sides and so no credit anyone is waiting for.
     fn send_replies(
         &self,
         batcher: &Arc<BatcherHandle>,
         peer: WorkerId,
-        replies: Vec<peer_batcher::ReplyRecord>,
+        replies: &[peer_batcher::ReplyRecord],
     ) {
-        let Err(rejected) = batcher.send(Command::Reply(replies)) else {
+        if batcher.is_alive() {
+            batcher.reply(replies);
             return;
-        };
-        let Command::Reply(replies) = rejected.into_inner() else {
-            return;
-        };
-        let _ = self.batcher(peer).send(Command::Reply(replies));
+        }
+        self.batcher(peer).reply(replies);
     }
 
     /// One sweep tick: return credit, then age out idle batchers.
@@ -340,7 +346,7 @@ impl MuxCore {
             let replies = self.ingress.sweep_credit(peer);
             if !replies.is_empty() {
                 let batcher = self.batcher(peer);
-                self.send_replies(&batcher, peer, replies);
+                self.send_replies(&batcher, peer, &replies);
             }
         }
 
@@ -362,7 +368,7 @@ impl MuxCore {
                 .batchers
                 .remove_if(&peer, |_, handle| handle.try_retire(threshold))
             {
-                let _ = handle.send(Command::Retire);
+                handle.retire();
             }
         }
     }
@@ -469,12 +475,13 @@ impl FrameTransport for MessengerMuxTransport {
                 let (inlet_tx, inlet_rx) = flume::bounded::<Vec<u8>>(core.config.inlet_depth());
                 let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
                 if batcher
-                    .send(Command::OpenSlot {
+                    .open_slot(OpenSlotRequest {
                         anchor_id,
                         session_id,
                         inlet: inlet_rx,
                         ack: ack_tx,
                     })
+                    .await
                     .is_err()
                 {
                     continue;
