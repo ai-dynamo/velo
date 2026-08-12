@@ -12,9 +12,9 @@ frames destined for that peer into a single active message.
 
 It is written for two audiences. If you operate a velo deployment, the
 [Motivation](#motivation) and [Configuration](#configuration) sections tell you
-whether this helps you and how to switch it on. If you are implementing or
-reviewing it, the rest is the protocol specification and the argument for why
-it is correct.
+whether this helps you and what switching it on will look like once the mux
+phases land. If you are implementing or reviewing it, the rest is the protocol
+specification and the argument for why it is correct.
 
 Status: **P0–P3 implemented; P4–P11 specified.** See
 [Implementation status](#implementation-status).
@@ -88,14 +88,17 @@ of 10–40 bytes. Today each one travels alone:
 11 B velo preamble + ~40 B payload + ~66 B Ethernet/IP/TCP  →  ~13-35% efficiency
 ```
 
-Batched, with 32 tokens sharing one frame to one destination:
+Batched, with 32 tokens sharing one `_stream_batch` active message to one
+destination:
 
 ```
-11 B preamble + 8 B batch header + 32 × (9 B record + ~40 B)  =  1 segment
+16 B batch header + 32 × (13 B record + ~40 B)  =  one AM payload
 ```
 
-Roughly 4× better wire efficiency, and — the part that actually matters — **1
-syscall and 1 segment instead of 32**.
+The outer framing — preamble, syscalls, TCP segmentation — belongs to whatever
+messenger transport carries the AM, and the coalescing writer already packs
+consecutive AMs into one `write_all`. Roughly 4× better wire efficiency, and —
+the part that actually matters — **one write instead of 32**.
 
 ---
 
@@ -594,6 +597,10 @@ where one anchor kind rides the mux and the other does not.
 
 ## Configuration
 
+> **Proposed API.** Nothing in this snippet exists yet — `.messenger_mux(...)`
+> and `MuxConfig` land with P7/P8. It is written down now so the activation
+> shape is reviewed with the protocol rather than improvised after it.
+
 ```rust
 let node = Velo::builder()
     .add_transport(transport)
@@ -660,9 +667,9 @@ lines of evidence, ordered by how few assumptions each requires.
 
 ### V1 — Resource-ceiling arithmetic
 
-Pure accounting from the table in [Motivation](#what-that-costs), checked in as
-a test that opens N streams and counts `/proc/self/fd`. This identifies a **hard
-wall** — roughly 512 concurrent remote streams at default `ulimit -n` — not a
+Pure accounting from the table in [Motivation](#what-that-costs), to be pinned
+by a test that opens N streams and counts `/proc/self/fd`. This identifies a
+**hard wall** — roughly 512 concurrent remote streams at default `ulimit -n` — not a
 slope. It cannot be falsified by a small-scale null result, which is exactly why
 it leads.
 
@@ -753,7 +760,7 @@ State up front what would sink this, then check each:
 
 | Phase | Scope | Wire change | Status |
 |---|---|---|---|
-| **P0** | Batching-ratio counters, resource-ceiling test, benches | none | implemented |
+| **P0** | Batching-ratio counters, loopback batching sweep | none | implemented |
 | **P1** | Messenger TCP + UDS writer coalescing | none | implemented |
 | **P2** | Streaming per-socket coalescing | none | implemented |
 | **P3** | Ordered per-sender AM dispatch (`DispatchMode::Ordered`) | none | implemented |
