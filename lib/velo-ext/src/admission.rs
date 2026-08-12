@@ -183,11 +183,13 @@ impl SendAdmission {
     /// Observe the outcome without polling.
     ///
     /// `on_resolved` receives exactly what awaiting this admission would have
-    /// produced, and runs exactly once: at resolution if the ticket is still
-    /// pending, or immediately if it has already resolved. That makes it the
-    /// mechanism for callers who cannot await — a fire-and-forget send whose
-    /// handle is about to be dropped, or a metric that must be recorded when
-    /// the frame really lands rather than when it was offered.
+    /// produced, and runs exactly once. A hook registered before resolution —
+    /// or while earlier hooks are still being run — runs on the resolving
+    /// task, after every hook registered before it; only a hook registered
+    /// after all of that runs immediately, on the registering thread. That
+    /// makes it the mechanism for callers who cannot await — a fire-and-forget
+    /// send whose handle is about to be dropped, or a metric that must be
+    /// recorded when the frame really lands rather than when it was offered.
     ///
     /// The hook runs on whichever task resolves the ticket, normally the gate's
     /// driver, so keep it short: a slow hook delays the next frame on this
