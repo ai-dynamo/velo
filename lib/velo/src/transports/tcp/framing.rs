@@ -230,7 +230,7 @@ impl TcpFrameCodec {
     /// write, so a peer decoding with [`TcpFrameCodec`] cannot tell whether a
     /// frame arrived alone or packed alongside others. This is what makes
     /// write coalescing wire-compatible in both directions — see
-    /// [`FrameBatchBuffer`].
+    /// `transports::coalesce`.
     #[inline]
     pub(crate) fn append_frame(
         buf: &mut BytesMut,
