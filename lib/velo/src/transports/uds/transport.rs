@@ -25,7 +25,9 @@ use crate::transports::transport::{
 use velo_ext::{MessageType, PeerInfo, Transport, TransportAdapter, TransportKey, WorkerAddress};
 
 use super::listener::{UdsListener, default_shrink_threshold};
-use crate::transports::tcp::framing::FrameBatchBuffer;
+use crate::transports::coalesce::{
+    Coalescable, WriterFailure, WriterObserver, run_coalescing_writer,
+};
 
 /// UDS transport with lock-free concurrent access
 ///
@@ -551,97 +553,55 @@ async fn connection_writer_inner(
 
     debug!("Connected to UDS {:?}", path);
 
-    // Main send loop. Coalescing writer — see `FrameBatchBuffer` for why
-    // packing several frames into one `write_all` is wire-compatible with an
-    // unmodified peer, and `lib/velo/src/streaming/BATCHING.md` for the wider
-    // rationale. Mirrors the TCP writer loop.
-    let mut batch = FrameBatchBuffer::new();
-    // Messages staged into `batch` but not yet written, held so a failed write
-    // can report `on_error` for every message it was carrying.
-    let mut staged: Vec<SendTask> = Vec::new();
-
-    'writer: loop {
-        let msg = tokio::select! {
-            // Prioritize cancellation so a hot send queue cannot starve shutdown.
-            biased;
-            _ = cancel_token.cancelled() => break,
-            res = rx.recv_async() => match res {
-                Ok(msg) => msg,
-                Err(_) => break,
-            },
-        };
-
-        let mut pending = Some(msg);
-        while let Some(msg) = pending.take() {
-            if batch.would_overflow(msg.header.len(), msg.payload.len())
-                && !flush_batch(&mut batch, &mut staged, &mut stream, instance_id, path).await
-            {
-                // The overflowing message never entered the batch, so it is not
-                // in `staged` and needs its own notification.
-                msg.on_error("Failed to write to UDS stream: batch flush failed");
-                break 'writer;
-            }
-
-            if let Err(e) = batch.push(msg.msg_type, &msg.header, &msg.payload) {
-                // Only reachable for a frame above the codec's 16 MiB limit.
-                error!("Encode error to {} ({:?}): {}", instance_id, path, e);
-                msg.on_error(format!("Failed to write to UDS stream: {}", e));
-                flush_batch(&mut batch, &mut staged, &mut stream, instance_id, path).await;
-                break 'writer;
-            }
-            staged.push(msg);
-
-            // Take anything already queued. Never blocks.
-            pending = rx.try_recv().ok();
-        }
-
-        if !flush_batch(&mut batch, &mut staged, &mut stream, instance_id, path).await {
-            break 'writer;
-        }
-    }
-
-    // Cancellation can leave a staged batch behind; it was never written, so
-    // report rather than silently drop.
-    for msg in staged.drain(..) {
-        msg.on_error("Connection closed");
-    }
+    // Main send loop. Coalescing writer, identical in behaviour to the TCP one
+    // because it *is* the TCP one — see `crate::transports::coalesce`. Messages
+    // still queued when this returns are reported by the caller's drain.
+    run_coalescing_writer(
+        &mut stream,
+        rx,
+        Some(cancel_token),
+        &UdsWriterObserver { instance_id, path },
+    )
+    .await;
 
     Ok(())
 }
 
-/// Write the staged batch with a single `write_all`.
-///
-/// On failure every message the batch was carrying gets `on_error` — batching
-/// must not weaken the per-message error-reporting contract. Returns `false` if
-/// the writer loop should stop.
-async fn flush_batch(
-    batch: &mut FrameBatchBuffer,
-    staged: &mut Vec<SendTask>,
-    stream: &mut UnixStream,
-    instance_id: crate::InstanceId,
-    path: &Path,
-) -> bool {
-    if staged.is_empty() {
-        return true;
+impl Coalescable for SendTask {
+    fn msg_type(&self) -> MessageType {
+        self.msg_type
     }
-    match batch.flush_to(stream).await {
-        Ok(()) => {
-            staged.clear();
-            true
-        }
-        Err(e) => {
-            error!(
+
+    fn header(&self) -> &[u8] {
+        &self.header
+    }
+
+    fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    fn on_write_error(self, reason: &str) {
+        self.on_error(format!("Failed to write to UDS stream: {}", reason));
+    }
+}
+
+/// Attaches the connection's identity to the writer loop's log lines.
+struct UdsWriterObserver<'a> {
+    instance_id: crate::InstanceId,
+    path: &'a Path,
+}
+
+impl WriterObserver for UdsWriterObserver<'_> {
+    fn on_failure(&self, kind: WriterFailure, err: &std::io::Error, frames: usize) {
+        match kind {
+            WriterFailure::Write => error!(
                 "Write error to {} ({:?}): {} ({} message(s) in batch)",
-                instance_id,
-                path,
-                e,
-                staged.len()
-            );
-            let reason = format!("Failed to write to UDS stream: {}", e);
-            for msg in staged.drain(..) {
-                msg.on_error(reason.clone());
-            }
-            false
+                self.instance_id, self.path, err, frames
+            ),
+            WriterFailure::Encode => error!(
+                "Encode error to {} ({:?}): {}",
+                self.instance_id, self.path, err
+            ),
         }
     }
 }

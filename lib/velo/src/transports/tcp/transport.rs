@@ -26,8 +26,10 @@ use crate::transports::utils::interfaces::{
 };
 use velo_ext::{MessageType, PeerInfo, Transport, TransportAdapter, TransportKey, WorkerAddress};
 
-use super::framing::FrameBatchBuffer;
 use super::listener::TcpListener;
+use crate::transports::coalesce::{
+    Coalescable, WriterFailure, WriterObserver, run_coalescing_writer,
+};
 
 /// High-performance TCP transport with lock-free concurrent access
 ///
@@ -560,103 +562,57 @@ async fn connection_writer_inner(
 
     debug!("Connected to {}", addr);
 
-    // Coalescing writer. See `FrameBatchBuffer` for why packing several frames
-    // into one `write_all` is wire-compatible with an unmodified peer, and
-    // `lib/velo/src/streaming/BATCHING.md` for the wider rationale.
-    //
-    // The loop still blocks on `recv_async` for the first message, then takes
-    // more only via `try_recv` — it never waits for work that has not arrived,
-    // so this adds no latency. Under light load each message still gets its own
-    // write; under load, batches form on their own.
-    let mut batch = FrameBatchBuffer::new();
-    // Messages staged into `batch` but not yet written. Held so that a failed
-    // write can report `on_error` for every message it was carrying, not just
-    // the last one.
-    let mut staged: Vec<SendTask> = Vec::new();
-
-    'writer: loop {
-        let msg = tokio::select! {
-            // Prioritize cancellation so a hot send queue cannot starve shutdown.
-            biased;
-            _ = cancel_token.cancelled() => break,
-            res = rx.recv_async() => match res {
-                Ok(msg) => msg,
-                Err(_) => break,
-            },
-        };
-
-        let mut pending = Some(msg);
-        while let Some(msg) = pending.take() {
-            if batch.would_overflow(msg.header.len(), msg.payload.len())
-                && !flush_batch(&mut batch, &mut staged, &mut stream, instance_id, addr).await
-            {
-                // The overflowing message never made it into the batch, so it
-                // is not in `staged` and needs its own notification.
-                msg.on_error("Failed to write to stream: batch flush failed");
-                break 'writer;
-            }
-
-            if let Err(e) = batch.push(msg.msg_type, &msg.header, &msg.payload) {
-                // Only reachable for a frame above the codec's 16 MiB limit.
-                error!("Encode error to {} ({}): {}", instance_id, addr, e);
-                msg.on_error(format!("Failed to write to stream: {}", e));
-                // Anything already staged is still valid — get it out.
-                flush_batch(&mut batch, &mut staged, &mut stream, instance_id, addr).await;
-                break 'writer;
-            }
-            staged.push(msg);
-
-            // Take anything already queued. Never blocks.
-            pending = rx.try_recv().ok();
-        }
-
-        if !flush_batch(&mut batch, &mut staged, &mut stream, instance_id, addr).await {
-            break 'writer;
-        }
-    }
-
-    // Cancellation can leave a staged batch behind; it was never written, so
-    // its messages must be reported rather than silently dropped.
-    for msg in staged.drain(..) {
-        msg.on_error("Connection closed");
-    }
+    // Coalescing writer: several queued messages become one `write_all`. See
+    // `crate::transports::coalesce` for why that is wire-compatible with an
+    // unmodified peer and adds no latency, and `streaming/BATCHING.md` for the
+    // wider rationale. Messages still queued when this returns are reported by
+    // `connection_writer_task`'s drain.
+    run_coalescing_writer(
+        &mut stream,
+        rx,
+        Some(cancel_token),
+        &TcpWriterObserver { instance_id, addr },
+    )
+    .await;
 
     Ok(())
 }
 
-/// Write the staged batch with a single `write_all`.
-///
-/// On failure every message the batch was carrying gets `on_error` — batching
-/// must not weaken the per-message error-reporting contract. Returns `false` if
-/// the writer loop should stop.
-async fn flush_batch(
-    batch: &mut FrameBatchBuffer,
-    staged: &mut Vec<SendTask>,
-    stream: &mut TcpStream,
+impl Coalescable for SendTask {
+    fn msg_type(&self) -> MessageType {
+        self.msg_type
+    }
+
+    fn header(&self) -> &[u8] {
+        &self.header
+    }
+
+    fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    fn on_write_error(self, reason: &str) {
+        self.on_error(format!("Failed to write to stream: {}", reason));
+    }
+}
+
+/// Attaches the connection's identity to the writer loop's log lines.
+struct TcpWriterObserver {
     instance_id: crate::InstanceId,
     addr: SocketAddr,
-) -> bool {
-    if staged.is_empty() {
-        return true;
-    }
-    match batch.flush_to(stream).await {
-        Ok(()) => {
-            staged.clear();
-            true
-        }
-        Err(e) => {
-            error!(
+}
+
+impl WriterObserver for TcpWriterObserver {
+    fn on_failure(&self, kind: WriterFailure, err: &std::io::Error, frames: usize) {
+        match kind {
+            WriterFailure::Write => error!(
                 "Write error to {} ({}): {} ({} message(s) in batch)",
-                instance_id,
-                addr,
-                e,
-                staged.len()
-            );
-            let reason = format!("Failed to write to stream: {}", e);
-            for msg in staged.drain(..) {
-                msg.on_error(reason.clone());
-            }
-            false
+                self.instance_id, self.addr, err, frames
+            ),
+            WriterFailure::Encode => error!(
+                "Encode error to {} ({}): {}",
+                self.instance_id, self.addr, err
+            ),
         }
     }
 }

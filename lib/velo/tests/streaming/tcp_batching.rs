@@ -11,11 +11,18 @@
 //! 2. **Terminal sentinels** still terminate the stream, and nothing sent
 //!    before one is lost.
 //! 3. **Coalescing actually happens** under load, verified through the
-//!    `velo_streaming_{frames_written,socket_writes}_total` ratio.
+//!    `velo_streaming_{frames_written,egress_flushes}_total` ratio.
 //!
 //! Property 3 is the one that would silently rot: an ordering-only test passes
-//! just as happily when every frame gets its own syscall, which is the
-//! behaviour this work exists to remove.
+//! just as happily when every frame gets its own write, which is the behaviour
+//! this work exists to remove.
+//!
+//! The *guarantees* of the coalescing loop — batching, ordering, terminal
+//! handling, error fan-out, short writes, cancellation — are pinned
+//! deterministically against a mock `AsyncWrite` in
+//! `lib/velo/src/transports/coalesce.rs`. What is left here is the end-to-end
+//! behaviour over a real socket, where the exact packing depends on scheduler
+//! timing and only order-of-magnitude claims are sound.
 //!
 //! These go through `Velo::builder()` rather than assembling an `AnchorManager`
 //! by hand, because `Velo::register_peer` is what fans peer registration out to
@@ -142,10 +149,13 @@ async fn burst_preserves_order_and_completeness() {
 /// Under a back-to-back burst the pump must actually coalesce — otherwise the
 /// change is inert and the ordering test above would still pass.
 ///
-/// The assertion is deliberately weak (>1.5 frames per write rather than a
+/// The assertion is deliberately weak (>1.5 frames per flush rather than a
 /// specific ratio): the exact packing depends on scheduler timing, and a test
 /// that pins it would be flaky. What must not happen is a ratio of ~1.0, which
-/// means every frame still costs its own syscall.
+/// means every frame still went out on its own. The precise batching
+/// guarantees are pinned deterministically in
+/// `lib/velo/src/transports/coalesce.rs`; this only proves the wiring is live
+/// end to end.
 #[tokio::test(flavor = "multi_thread")]
 async fn burst_coalesces_writes() {
     const N: u32 = 20_000;
@@ -172,23 +182,25 @@ async fn burst_coalesces_writes() {
 
     let snap = MetricSnapshot::from_registry(&producer_registry);
     let frames = snap.counter("velo_streaming_frames_written_total", &[]);
-    let writes = snap.counter("velo_streaming_socket_writes_total", &[]);
+    let flushes = snap.counter("velo_streaming_egress_flushes_total", &[]);
 
-    assert!(writes > 0.0, "producer must have issued socket writes");
+    assert!(flushes > 0.0, "producer must have flushed batches");
     assert!(
         frames >= N as f64,
         "expected at least {N} frames written, saw {frames}"
     );
 
-    let ratio = frames / writes;
+    let ratio = frames / flushes;
     // Printed so `--nocapture` reports the achieved packing, which is the
     // number worth watching as the workload shape changes.
-    eprintln!("batching ratio: {frames} frames / {writes} writes = {ratio:.2} frames per syscall");
+    eprintln!(
+        "coalescing ratio: {frames} frames / {flushes} flushes = {ratio:.2} frames per flush"
+    );
     assert!(
         ratio > 1.5,
         "expected write coalescing under a back-to-back burst, but got \
-         {frames} frames in {writes} writes (ratio {ratio:.2}). A ratio near \
-         1.0 means every frame still costs its own syscall."
+         {frames} frames in {flushes} flushes (ratio {ratio:.2}). A ratio near \
+         1.0 means every frame still went out on its own."
     );
 }
 
@@ -238,9 +250,8 @@ async fn terminal_in_same_batch_flushes_preceding_frames() {
 /// Per-stream coalescing only packs frames that are queued on the *same*
 /// stream. A forward pass puts one frame on each of X different streams, so
 /// each stream's egress pump wakes with exactly one frame and the ratio stays
-/// near 1.0 — one syscall and one TCP segment per token, which is precisely the
-/// cost the multiplexed protocol removes by bucketing on destination worker
-/// rather than on stream.
+/// near 1.0 — one write per token, which is precisely the cost the multiplexed
+/// protocol removes by bucketing on destination worker rather than on stream.
 ///
 /// This test asserts the *limitation*, not a win. It exists so the boundary
 /// between what P2 (coalescing) and P4 (multiplexing) each buy is measured
@@ -289,11 +300,11 @@ async fn forward_pass_shape_does_not_coalesce_per_stream() {
 
     let snap = MetricSnapshot::from_registry(&producer_registry);
     let frames = snap.counter("velo_streaming_frames_written_total", &[]);
-    let writes = snap.counter("velo_streaming_socket_writes_total", &[]);
-    let ratio = frames / writes;
+    let flushes = snap.counter("velo_streaming_egress_flushes_total", &[]);
+    let ratio = frames / flushes;
     eprintln!(
-        "forward-pass shape: {frames} frames / {writes} writes = {ratio:.2} \
-         frames per syscall across {STREAMS} streams"
+        "forward-pass shape: {frames} frames / {flushes} flushes = {ratio:.2} \
+         frames per flush across {STREAMS} streams"
     );
 
     // The point of the test: coalescing does essentially nothing here, because

@@ -563,7 +563,7 @@ pub struct VeloMetrics {
     streaming_server_pump_backpressure_total: Counter,
     streaming_producer_send_backpressure_total: Counter,
     streaming_heartbeat_watchdog_firings_total: Counter,
-    streaming_socket_writes_total: Counter,
+    streaming_egress_flushes_total: Counter,
     streaming_frames_written_total: Counter,
     // Rendezvous metrics
     rendezvous_operations_total: CounterVec,
@@ -850,16 +850,18 @@ impl VeloMetrics {
                  surfaced by the *_backpressure_total counters above.",
             ))?,
         )?;
-        let streaming_socket_writes_total = register_collector(
+        let streaming_egress_flushes_total = register_collector(
             registry,
             Counter::with_opts(Opts::new(
-                "velo_streaming_socket_writes_total",
-                "write_all calls issued on the streaming data plane. Divide \
-                 velo_streaming_frames_written_total by this to get the batching \
-                 ratio: 1.0 means every frame cost its own syscall and TCP \
-                 segment, higher means frames are being coalesced. This ratio is \
-                 the direct measure of write-coalescing effectiveness and is \
-                 meaningful at any scale.",
+                "velo_streaming_egress_flushes_total",
+                "Batches flushed to the wire by the per-stream egress pump — one \
+                 completed write_all each. Divide \
+                 velo_streaming_frames_written_total by this for the coalescing \
+                 ratio: 1.0 means every frame went out on its own, higher means \
+                 frames are being packed together. This counts flushes, not \
+                 syscalls: write_all may loop over several underlying writes for \
+                 a large batch, and TCP segmentation is the kernel's decision. \
+                 Only flushes that completed successfully are counted.",
             ))?,
         )?;
         let streaming_frames_written_total = register_collector(
@@ -867,7 +869,7 @@ impl VeloMetrics {
             Counter::with_opts(Opts::new(
                 "velo_streaming_frames_written_total",
                 "Logical stream frames written to the wire. See \
-                 velo_streaming_socket_writes_total for the batching ratio.",
+                 velo_streaming_egress_flushes_total for the coalescing ratio.",
             ))?,
         )?;
 
@@ -939,7 +941,7 @@ impl VeloMetrics {
             streaming_server_pump_backpressure_total,
             streaming_producer_send_backpressure_total,
             streaming_heartbeat_watchdog_firings_total,
-            streaming_socket_writes_total,
+            streaming_egress_flushes_total,
             streaming_frames_written_total,
             rendezvous_operations_total,
             rendezvous_operation_duration_seconds,
@@ -1184,15 +1186,16 @@ impl VeloMetrics {
         self.streaming_heartbeat_watchdog_firings_total.inc();
     }
 
-    /// Record one `write_all` on the streaming data plane carrying `frames`
-    /// logical frames.
+    /// Record one completed batch flush on the streaming egress path carrying
+    /// `frames` logical frames.
     ///
-    /// `frames_written / socket_writes` is the batching ratio — the direct
+    /// `frames_written / egress_flushes` is the coalescing ratio — the direct
     /// measure of how much write coalescing is buying, and the number to check
     /// before investing in the full multiplexed protocol. See
-    /// `streaming/BATCHING.md`.
-    pub(crate) fn record_streaming_socket_write(&self, frames: usize) {
-        self.streaming_socket_writes_total.inc();
+    /// `streaming/BATCHING.md`. Only called for flushes that reached the wire,
+    /// so a failed write contributes to neither counter.
+    pub(crate) fn record_streaming_egress_flush(&self, frames: usize) {
+        self.streaming_egress_flushes_total.inc();
         self.streaming_frames_written_total.inc_by(frames as f64);
     }
 

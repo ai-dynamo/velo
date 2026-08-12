@@ -158,12 +158,17 @@ cascade:
 | Metric | What it means |
 |---|---|
 | `velo_streaming_frames_written_total` | Logical stream frames written to the wire |
-| `velo_streaming_socket_writes_total` | `write_all` calls that carried them |
+| `velo_streaming_egress_flushes_total` | Batches flushed by the egress pump that carried them |
 
-Their ratio is the **batching ratio**. The producer-side egress pump packs
-whatever is already queued on a stream into a single write, so a stream whose
-producer runs ahead reports a high ratio (hundreds of frames per syscall), while
-a stream emitting one frame at a time reports ~1.0.
+Their ratio is the **coalescing ratio**. The producer-side egress pump packs
+whatever is already queued on a stream into a single flush, so a stream whose
+producer runs ahead reports a high ratio (hundreds of frames per flush), while a
+stream emitting one frame at a time reports ~1.0.
+
+A flush is one completed `write_all`, not one syscall: `write_all` may loop over
+several underlying writes for a large batch, and how the bytes are split into
+TCP segments is the kernel's decision. Read the ratio as how much work the pump
+is batching, not as a syscall count.
 
 A ratio near 1.0 is not itself a problem — it just means there was never more
 than one frame queued when the pump woke. It becomes interesting when you are

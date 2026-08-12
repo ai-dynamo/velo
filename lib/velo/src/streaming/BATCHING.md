@@ -101,13 +101,13 @@ syscall and 1 segment instead of 32**.
 ## Measured results
 
 The validation methodology below calls the batching ratio
-(`frames_written / socket_writes`) *"the cheapest and most decisive
+(`frames_written / egress_flushes`) *"the cheapest and most decisive
 experiment."* It has been run. Both numbers come from
 `lib/velo/tests/streaming/tcp_batching.rs` on TCP loopback, and both are
 reproducible with `cargo test --all-features --test streaming_tcp_batching --
 --nocapture`.
 
-| Workload | Frames | Socket writes | Ratio |
+| Workload | Frames | Egress flushes | Ratio |
 |---|---|---|---|
 | One stream, 20 000 frames back-to-back | 20 001 | 21 | **952 : 1** |
 | 32 streams × 1 frame per pass (the LLM shape) | 3 232 | 3 232 | **1.00 : 1** |
@@ -115,13 +115,16 @@ reproducible with `cargo test --all-features --test streaming_tcp_batching --
 Read those together, because the pair is the whole argument:
 
 - **Write coalescing (P2) is enormously effective for bursty streams.** A
-  producer that runs ahead pays one syscall per ~950 frames instead of one per
-  frame. This required no wire change, no negotiation and no configuration.
+  producer that runs ahead pays one `write_all` per ~950 frames instead of one
+  per frame. This required no wire change, no negotiation and no configuration.
+  (The counter measures flushes, not syscalls — a large batch may cost more
+  than one underlying write, so treat ~950:1 as the batching factor, not as a
+  syscall-reduction factor.)
 - **Write coalescing does nothing at all for the workload that motivated this
   document.** A forward pass places one frame on each of X *different* streams.
   Per-stream coalescing can only pack frames queued on the same stream, so each
   egress pump wakes with exactly one frame and the ratio is exactly 1.00 — one
-  syscall and one TCP segment per token, unchanged.
+  write per token, unchanged.
 
 That second row is the case for multiplexing, measured rather than asserted.
 The frames are there to be batched; they are simply on the wrong axis. Bucketing
@@ -553,20 +556,23 @@ New series, alongside the existing `velo_streaming_*` collectors:
 
 | Metric | Meaning |
 |---|---|
-| `velo_streaming_socket_writes_total` | `write_all` calls issued on the streaming data plane |
+| `velo_streaming_egress_flushes_total` | Batches flushed by the per-stream egress pump (one completed `write_all` each) |
 | `velo_streaming_frames_written_total` | Logical frames written |
 | `velo_streaming_connections_open` | Gauge of open streaming connections |
 | `velo_streaming_batch_records_per_flush` | Histogram of records per batch |
 | `velo_streaming_batch_bytes_per_flush` | Histogram of bytes per batch |
-| `velo_streaming_batch_flush_total{reason}` | `opportunistic\|window\|hint\|cap\|starved\|watchdog\|terminal` |
+| `velo_streaming_batch_flush_total{reason}` | Mux-era flush reasons: `opportunistic\|window\|hint\|cap\|starved\|watchdog\|terminal`. Distinct from `egress_flushes_total`, which counts per-stream pump flushes and ships today |
 | `velo_streaming_mux_live_slots` | Gauge; must return to zero at teardown |
 | `velo_streaming_mux_reader_stall_total` | **Should always be zero.** Non-zero means the credit invariant is broken |
 | `velo_streaming_mux_generation_mismatch_total` | Stale records dropped by the generation check |
 | `velo_streaming_slot_credit_exhausted_total` | Per-slot credit starvation events |
 
-> **`frames_written / socket_writes` is the batching ratio** and the single
+> **`frames_written / egress_flushes` is the batching ratio** and the single
 > number that says whether this is working. It is meaningful at any scale, which
-> is why it ships before the protocol does.
+> is why it ships before the protocol does. It counts flushes rather than
+> syscalls -- `write_all` may loop internally and TCP segmentation is the
+> kernel's call -- so read it as "how much the pump batched", not "how many
+> syscalls were saved".
 
 ### A meaning change operators must know about
 
