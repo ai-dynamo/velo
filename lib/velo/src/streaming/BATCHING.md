@@ -6,8 +6,9 @@ SPDX-License-Identifier: Apache-2.0
 # Batched / multiplexed streaming
 
 This document proposes a transparent optimization to the streaming data plane:
-collapse the N TCP connections a producer opens to a peer down to one, and
-coalesce the frames destined for that peer into a single wire message.
+stop opening a TCP connection per stream at all, carry every stream to a peer
+over the connectivity the Messenger already maintains to it, and coalesce the
+frames destined for that peer into a single active message.
 
 It is written for two audiences. If you operate a velo deployment, the
 [Motivation](#motivation) and [Configuration](#configuration) sections tell you
@@ -15,7 +16,7 @@ whether this helps you and how to switch it on. If you are implementing or
 reviewing it, the rest is the protocol specification and the argument for why
 it is correct.
 
-Status: **P0–P2 implemented; P3–P6 specified.** See
+Status: **P0–P3 implemented; P4–P11 specified.** See
 [Implementation status](#implementation-status).
 
 ---
@@ -141,11 +142,11 @@ and will fail loudly if anyone later concludes coalescing was sufficient.
 
 Four mechanisms. Only the first is a prerequisite for the others.
 
-1. **Multiplexing** — one persistent connection per destination worker, carrying
-   many streams as *slots*.
-2. **Batching** — many records packed into one wire frame and one `write_all`.
+1. **Multiplexing** — every stream to a peer becomes a *slot* on the Messenger
+   connectivity that already exists to it. Streaming owns no sockets.
+2. **Batching** — many records packed into one active message and one `write_all`.
 3. **Flow control** — per-slot credit, so one slow consumer cannot stall the
-   shared connection.
+   peer's shared ordering lane.
 4. **Flush policy** — when to write. Three policies, one mechanism.
 
 Senders are oblivious to all of it. `StreamSender::send` enqueues exactly as it
@@ -162,57 +163,67 @@ no allocation. `handle.unpack().0` *is* the batching key.
 
 ## Protocol
 
-### Connections
+### Riding the Messenger
 
-One persistent, **bidirectional** connection per `(local worker → peer WorkerId,
-conn_index)`, dialed lazily and shared by every stream that hashes to it.
+The mux is a `MessengerMuxTransport` implementing the streaming `FrameTransport`
+contract, and it **replaces** the deprecated `VeloFrameTransport` rather than
+sitting beside it. There is no dial, listener, acceptor or connection manager:
+records for a peer are packed into `_stream_batch` active messages and handed to
+the Messenger, which already holds connectivity to every peer this node talks to
+and already knows who sent what.
 
-`connections_per_peer` defaults to 2. The reason is not primarily blast radius:
-one TCP connection is one ordered byte stream, which means one receive-side
-queue and one writer task, which caps encode throughput at a single core. A
-small fan lets multiple cores participate. Slots map to connections by hashing
-`(anchor_id, session_id)`, so a stream is pinned to one connection for its entire
-life and the `FrameTransport` ordering contract holds trivially.
+That one decision deletes most of the protocol this section used to specify. No
+`0xFFFF_FFFF_FFFF_FFFF` handshake magic — the sender's identity arrives in the AM
+envelope, so credit has somewhere to be routed without a handshake invented to
+learn it. No `connections_per_peer` fan; encode work spreads across one batcher
+per peer, which is the throughput argument the fan used to make. No 4-task
+connection lifecycle (heartbeat, egress pump, accept pump, reader), and no
+acceptor-identity problem, because there is no acceptor.
 
-> **A stream's frames are never striped across connections.** Ordering is
-> load-bearing for the streaming protocol's correctness, and TCP only orders
-> within a connection.
+Egress is **one lazy, cached, evictable `PeerBatcher` per remote instance**,
+shared by every stream to that instance, created on first send and evicted when
+idle. A node talking to Y peers holds Y batchers however many streams it holds —
+O(Y) where the per-stream design is O(X). Its key is the batching key from [Why
+bucketing by destination is free](#why-bucketing-by-destination-is-free)
+unchanged: `WorkerId` and `InstanceId` are in 1:1 correspondence, so "destination
+worker" and "remote instance" name the same bucket.
 
-Today's streaming connection is effectively unidirectional — the connector never
-reads and the acceptor never writes. Credit returns require both, so a mux
-connection runs 4 tasks instead of 2. That is O(Y), not O(X).
-
-It also requires a **connection-level handshake**, because the acceptor
-currently never learns the dialer's `WorkerId` and credit routing needs it. A
-reserved magic value in the first 8 bytes lets one listener serve both the
-legacy `(anchor_id, session_id)` handshake and the mux handshake:
-`0xFFFF_FFFF_FFFF_FFFF` is unreachable as a real `anchor_id` short of 2^63 MPSC
-anchors.
+> **The cost is that streaming no longer owns its wire.** It shares queues,
+> framing and backpressure with control traffic, and inherits whatever ordering
+> its transport gives it. Ordering stops being a TCP guarantee and becomes an
+> explicit protocol obligation — hence a per-slot sequence on every record.
 
 ### Frame envelope
 
-A batch nests **inside** the existing `TcpFrameCodec` frame. The codec, its
-decoder — which already handles many frames per read buffer — and the 16 MiB
-frame cap are all reused unchanged. The streaming transport passes an empty
-header today, so the header slot is free:
+A batch is the payload of one `_stream_batch` active message. There is no velo
+preamble to reuse and no codec to nest inside — the Messenger frames the AM as it
+frames anything else — so the batch carries its own header:
 
 ```
-TcpFrameCodec frame:
-  [11 B preamble][8 B batch header][payload]
+_stream_batch AM payload:
+  [16 B batch header][payload]
 
 batch header:
-  [u8 mux_version = 1][u8 flags][u16 record_count][u32 reserved]
+  [u8 mux_version = 1][u8 flags][u16 record_count]
+  [u64 peer_epoch][u32 batch_seq]
 
 payload = record_count × record:
-  [u8 record_type][u32 BE slot][u32 BE len][len bytes body]
+  [u8 record_type][u32 BE slot][u32 BE frame_seq][u32 BE len][len bytes body]
 
 record_type: 0 = Data, 1 = OpenSlot, 2 = CloseSlot,
-             3 = CreditUpdate, 4 = ConnHeartbeat
+             3 = CreditUpdate, 4 = SlotHeartbeat
 ```
 
-9 bytes per record. On a 40-byte token that is ~22% overhead; measure before
-optimizing to a 7-byte layout (`u16` slot, 65 536 slots per connection) or
-varint lengths.
+The epoch is bumped whenever the sender's view of the peer is re-established;
+`batch_seq` advances within it and is compared modulo, since an epoch outlives a
+`u32` on a busy pair. Together they let ingress discard a stale epoch's batches
+by header inspection rather than by draining them, and meter gaps. `frame_seq`
+is **per slot** — where `u32` is unreachable — and is the authority on stream
+order: transport and lane ordering are a fast path, not the proof.
+
+13 bytes per record: ~33% overhead on a 40-byte token, up from the 9-byte layout
+a dedicated connection could afford. The sequences are what buy ordering now that
+a private TCP connection is not providing it free. Measure before shrinking them.
 
 Record bodies:
 
@@ -225,34 +236,45 @@ Record bodies:
   `(anchor_id, session_id)` registry lookup.
 - **`CloseSlot`** = `[u8 reason]` — `0` terminal-sent, `1` peer-gone, `2`
   unknown-slot, `3` protocol-error. **Bidirectional**: the receiver must be able
-  to reject an unknown slot without killing the connection.
+  to reject an unknown slot without failing the peer.
 - **`CreditUpdate`** = `[u32 delta]`, receiver to sender.
-- **`ConnHeartbeat`** carries no body.
+- **`SlotHeartbeat`** carries no body.
 
 #### The batch size cap
 
-> **The default batch byte cap is `COALESCE_THRESHOLD` (64 KiB) minus the batch
-> header and slack — about 60 KiB.**
+> **A batch is clamped by three numbers — the configured cap, the effective
+> eager budget, and `COALESCE_THRESHOLD` (64 KiB) — whichever binds first.**
 
-This is the single most important tuning constant in the design, and it comes
-straight out of code that already exists. `encode_frame` emits **one**
-`write_all` if and only if `header + payload <= COALESCE_THRESHOLD`, and three
-segmented writes otherwise. Since amortizing the syscall is the entire point of
-batching, exceeding that threshold defeats the optimization.
+The packing *target* is still `COALESCE_THRESHOLD`, for exactly the reason it
+always was: the shared coalescing writer stages a frame into one buffered
+`write_all` if and only if `header + payload <= COALESCE_THRESHOLD`, and writes
+it segmented otherwise. Amortizing the syscall is the entire point, so a batch
+that exceeds the threshold gives back what batching bought.
 
-Any single record larger than the cap is sent in a batch of its own. Oversized
-batches must be prevented on encode: the decoder's length validation rejects
-frames over 16 MiB with an `InvalidData` error, and under mux that failure mode
-kills the connection — which means *every* slot on it.
+What changed is the ceiling above it. There is no longer a 16 MiB decoder limit
+whose breach kills a connection and every slot on it. In its place is the
+**effective eager budget** — `min(Transport::max_message_size(target) where
+known, rendezvous staging threshold)` less encoded-envelope overhead, the largest
+payload the Messenger will carry inline to this peer. A batch over that budget
+does not fail loudly; it quietly becomes a rendezvous transfer, paying a round
+trip on behalf of every slot packed into it. The cap now exists to keep batches
+*eager*, not to avoid a fatal decode.
+
+A single record larger than the eager budget is **deliberately routed** through
+rendezvous, alone in its batch. Deliberately, because the transport limit can bind
+below the staging threshold, in which case an oversized send exceeds the transport
+without ever tripping the stager. Unrelated slots keep flowing in eager batches
+while it is in flight; the ordering consequence is dealt with in [Slots](#slots).
 
 ### Slots
 
 ```
-SlotId = (u24 index, u8 generation)   packed into a u32
+SlotId = (u24 index, u8 generation)   packed into a u32,
+         scoped by the sender's peer epoch
 ```
 
 A dense index means demux is a `Vec` lookup rather than a hash. At 60 KiB
-batches this is roughly 1500 records per frame, so the per-record lookup is the
+batches this is roughly 1100 records per batch, so the per-record lookup is the
 hot path.
 
 > **Generations are a correctness requirement, not an optimization.**
@@ -261,50 +283,74 @@ Dense slot reuse without a generation tag means a stale record for a recycled
 slot is delivered to whatever stream now occupies that index — request A's
 tokens surfacing inside request B's response. Silent, cross-request, and
 invisible to every existing test. Records whose generation does not match the
-current occupant are dropped and metered. A `u8` is ample: TCP does not reorder,
-so a stale record's in-flight window is a single connection traversal.
+current occupant are dropped and metered.
+
+The epoch scopes the whole table above the generation: a generation survives slot
+reuse within one sender's lifetime, the epoch survives the sender itself. Batches
+in flight across a reconnect are therefore discarded wholesale rather than checked
+record by record against state that has moved on — and a `u8` generation stays
+ample once the epoch carries that job.
+
+#### Ordering is per-slot, not per-connection
+
+`_stream_batch` is registered with **ordered per-sender dispatch**: batches from
+one peer are handled on that peer's lane, by one task, in arrival order, so the
+general reordering problem does not arise and needs no window to solve it. That
+is precisely what the deprecated `VeloFrameTransport` lacked — it layered a
+4096-deep reorder buffer over a dispatcher that spawns a task per inbound
+message, and under cross-stream contention the window overflowed and deadlocked
+the consumer.
+
+One narrow exception survives, and it is self-inflicted. Rendezvous payloads
+resolve in a detached task *before* dispatch, so an oversized record routed that
+way is not ordered against the eager batches around it — the ordered dispatcher
+says so itself, and warns once per handler. Two mechanisms bound it. Egress
+fences the slot: at most one rendezvous record per slot is outstanding, and the
+batcher withholds that slot's later records until the staged send is admitted.
+Ingress holds records arriving ahead of `frame_seq` in that slot's own buffer,
+bounded by credit already granted, applying them when the gap closes. Overflow
+closes **that slot** with `Dropped` and meters it; other slots are untouched and
+the lane never blocks.
 
 #### `OpenSlot` is eager
 
-`OpenSlot` is sent when the stream attaches, in its own gate-overriding flush —
-not lazily piggybacked onto the first data record.
+`OpenSlot` is sent when the stream attaches, in its own gate-overriding flush,
+not piggybacked onto the first data record. `bind()` starts a 60-second
+`ACCEPT_TIMEOUT`, rescoped to measure *"time until a batch bearing this
+`OpenSlot` arrives."* Lazily, it would silently come to mean *"time until the
+producer produces its first token"* and would expire a queued request with a long
+prefill. It costs a record, not a send. The reverse race — an `OpenSlot` for an
+`(anchor_id, session_id)` that was never registered — must **not** fail the peer:
+the receiver replies `CloseSlot{unknown}` and discards that slot's records.
 
-The reason is a subtle interaction with `bind()`, which starts a 60-second
-`ACCEPT_TIMEOUT` measuring *"time until a connection bearing this handshake
-arrives."* If `OpenSlot` were lazy, that timer would silently come to mean *"time
-until the producer produces its first token"* — and for a queued request with a
-long prefill, it would expire and drop a perfectly healthy stream. Eager
-`OpenSlot` preserves today's timing semantics exactly. It costs a record, not a
-syscall, and concurrent attaches coalesce into the same batch anyway.
+#### Peer loss
 
-The reverse race — an `OpenSlot` for an `(anchor_id, session_id)` that was never
-registered — must **not** kill the connection. Today the equivalent situation
-just drops a socket. Under mux the receiver replies `CloseSlot{unknown}` and
-discards that slot's records.
-
-#### Connection loss
-
-Every live slot that has not seen a terminal receives an injected
-`StreamFrame::Dropped` — **not** `TransportError`. This reproduces the existing
-behaviour of `pump_frames` and keeps the consumer-visible contract
-(`StreamError::SenderDropped`) byte-identical. `TransportError` stays reserved
-for protocol violations.
+Every live slot in a dying epoch that has not seen a terminal receives an
+injected `StreamFrame::Dropped` — **not** `TransportError`. Loss of Messenger
+connectivity, peer eviction and batcher eviction all land here. This reproduces
+`pump_frames`' existing behaviour and keeps the consumer-visible contract
+(`StreamError::SenderDropped`) byte-identical; `TransportError` stays reserved
+for protocol violations. Reconnect bumps the epoch and slots do not survive it,
+which is what makes "exactly one `Dropped` per failed live slot" provable.
 
 ### Flow control
 
 This is the part that makes multiplexing safe, and it is worth being explicit
 about why it cannot be skipped.
 
-One socket per peer means **one slow consumer can stall every stream sharing
-that socket**. Today's receive path shows exactly how it would happen:
-`pump_frames` falls through to an awaited `frame_tx.send_async(...)` when a
-consumer's channel is full. Under mux that awaits inside the *shared* connection
-reader, so a single saturated anchor blocks delivery for all of them — and then
-every anchor's heartbeat watchdog fires at once. For inference that means one
-stuck HTTP client throttling the GPU.
+The shared resource is no longer a socket; it is the peer's **ordering lane**. A
+`_stream_batch` handler that awaits holds that lane, so every slot from that peer
+stalls behind it — the head-of-line shape a shared socket would have had, with a
+worse failure mode, because lane channels are unbounded and a blocking ingress
+converts backpressure into unbounded memory growth rather than into a full
+socket. Today's receive path shows exactly how it would happen: `pump_frames`
+falls through to an awaited `frame_tx.send_async(...)` when a consumer's channel
+is full. One saturated anchor would stall every stream from that peer, then every
+one of their heartbeat watchdogs would fire at once — for inference, one stuck
+HTTP client throttling the GPU.
 
-The fix is HTTP/2-style per-slot credit, with one critical difference from the
-obvious design.
+So **ingress is bounded and nonblocking**, on HTTP/2-style per-slot credit, with
+one critical difference from the obvious design.
 
 > **Credit is issued against a mux-owned per-slot buffer, never against the
 > anchor's `frame_tx`.**
@@ -320,8 +366,8 @@ the smallest and still fills first.
 
 **Initial credit is negotiated, not constant.** MPSC anchor capacity is
 caller-configurable, so the receiver advertises what it can absorb. Two fields
-are added to `AnchorAttachResponse::Ok`, both `#[serde(default)]` so older
-senders still deserialize:
+are added to `AnchorAttachResponse::Ok` and its MPSC twin, both
+`#[serde(default)]` so older senders still deserialize:
 
 ```rust
 #[serde(default)] initial_credit: u32,    // 0 = legacy peer, mux unusable
@@ -335,20 +381,22 @@ would reintroduce the per-stream tasks we are removing, and polling the
 receiver's length is only a sampled approximation.) A background sweep reclaims
 credit for slots whose pump died.
 
-**Reserved terminal credit.** Each slot holds back one credit spendable only by
-a record matching `is_terminal_sentinel`; data may spend only `C`; the slot
-buffer is sized `C + 1`. One reserved credit is provably sufficient because
-`sent_terminal` guarantees at most one terminal per slot, after which the slot
-closes. `SenderError` is deliberately *not* terminal and correctly spends data
-credit — the stream continues after it.
+**Reserved terminal and control capacity.** Each slot holds back one credit
+spendable only by a record matching `is_terminal_sentinel`; data may spend only
+`C`; the slot buffer is sized `C + 1`. One reserved credit is provably sufficient
+because `sent_terminal` guarantees at most one terminal per slot, after which the
+slot closes. `SenderError` is deliberately *not* terminal and correctly spends
+data credit. Control records reserve capacity the same way, so `OpenSlot`,
+`CloseSlot` and `CreditUpdate` are never what a starved slot fails to deliver.
 
-**Byte credit is also required.** Frame-count credit alone bounds memory at
-`slots × C × DEFAULT_MAX_FRAME_SIZE`, which is 256 × 256 × 16 MiB ≈ 1 TiB — a
-meaningless bound. Today the kernel socket enforces a real ~1 MiB-per-stream
-limit for free, and multiplexing deletes exactly that protection. So: a
-per-connection byte budget (default 8 MiB) and a per-slot byte cap (default
-1 MiB). Frame credit provides the no-head-of-line-blocking proof; byte credit
-provides the memory bound. They are different jobs and both are needed.
+**Byte credit is the memory bound.** Frame-count credit alone bounds memory at
+`slots × C × DEFAULT_MAX_FRAME_SIZE` — a meaningless number. Today the kernel
+socket enforces a real ~1 MiB-per-stream limit for free; riding the Messenger
+deletes exactly that protection, because the socket is now shared with control
+traffic and is not per-stream at all. So: a per-peer byte budget (default 8 MiB)
+and a per-slot byte cap (default 1 MiB). Frame credit gives the
+no-head-of-line-blocking proof, byte credit the memory bound — different jobs,
+both needed.
 
 **Control and data travel in separate lanes.** `finalize`, `detach` and `Drop`
 use a *synchronous* channel send, which must stay non-blocking under mux. The
@@ -362,10 +410,18 @@ worker thread from inside a `Drop` in async context.
 Credit returns get their own priority lane, so a peer whose egress is congested
 never stops returning your credit.
 
+**Egress backpressure is admission, not hope.** Transports expose an ordered
+per-target admission gate as `SendOutcome::{Admitted, Pending(SendAdmission)}`,
+reserving the ticket synchronously so an unpolled slow-path send cannot be
+overtaken. A batcher therefore learns at the send site, in order, that its peer is
+congested, and parks itself rather than a runtime worker. It is also what the
+rendezvous fence in [Slots](#slots) is made of.
+
 > **Invariant.** A slot never has more than `C` frames outstanding against a
-> `C + 1`-deep buffer, so the demux `try_send` always succeeds and **the
-> connection reader never blocks**. `velo_streaming_mux_reader_stall_total > 0`
-> is a bug, not a tuning signal.
+> `C + 1`-deep buffer, so the applier only `try_send`s into space credit already
+> reserved and **never blocks its lane** — which matters because the lane runs
+> each handler to completion before pulling the next batch.
+> `velo_streaming_mux_reader_stall_total > 0` is a bug, not a tuning signal.
 
 ### Terminal sentinels
 
@@ -380,18 +436,18 @@ produces spurious connection resets. Under mux this becomes per-slot:
    scoped. Other slots are untouched, which is strictly better than today.
 2. `CloseSlot{TerminalSent}` is appended **in the same batch**, immediately
    after, so terminal-then-close is atomic.
-3. The connection stays up. The slot is freed and its generation bumped; its
-   credit and byte budget are released.
+3. The peer batcher and the peer's ordering lane are untouched. The slot is
+   freed and its generation bumped; its credit and byte budget are released.
 4. On the receive side the terminal is forwarded using the reserved credit, then
    `CloseSlot` drops the mux-side sender, so `reader_pump` exits through the same
    `Err` branch it uses today when a socket closes. **Identical code path.**
 5. The existing "last frame was not terminal and the consumer is still attached,
    so inject `Dropped`" rule becomes per-slot, firing on
-   `CloseSlot{reason != TerminalSent}` and on connection death.
+   `CloseSlot{reason != TerminalSent}` and on epoch death.
 
 A `velo_streaming_mux_live_slots` gauge must return to zero in every teardown
-test. A leaked slot now leaks credit and byte budget for the life of the
-connection, whereas a leaked socket today is at least visible in `lsof`.
+test. A leaked slot now leaks credit and byte budget for the life of the epoch,
+whereas a leaked socket today is at least visible in `lsof`.
 
 ### Heartbeats
 
@@ -403,21 +459,23 @@ host death, connection death, and sustained saturation — the last because
 saturation into a watchdog kill. That is the saturation-kill path `SATURATION.md`
 documents and half-apologizes for.
 
-That makes connection-level liveness look attractive, and it is a trap: it
-gains nothing over the design below and loses the per-slot saturation signal.
-
-**Per-slot heartbeats, phase-aligned and suppressed**, get identical wire cost
-with **zero** semantic change:
+Under the Messenger, two of those three are already someone else's job: it detects
+process, host and connection death for its own peers, and the mux learns of it
+through epoch death. The only thing a streaming beat still uniquely carries is
+the **per-slot saturation signal** — exactly what a peer-level liveness beat
+would throw away. So it stays per-slot and gets cheap rather than deleted.
+**Phase-aligned and suppressed**, it costs the same wire with **zero** semantic
+change:
 
 - A per-slot "last send tick" (`AtomicU64`, one relaxed store per frame on the
   send path). A slot that sent anything this interval skips its heartbeat —
   **suppression**.
-- Each sender subscribes to a connection-level tick (`tokio::sync::watch` bumped
-  by one timer task) instead of owning a `tokio::time::interval` — **phase
-  alignment**. This is what makes heartbeats coalesce; today they are randomly
-  phased across the interval and batching cannot merge them.
-- For muxed senders, no per-sender task is spawned at all: the connection's
-  heartbeat task iterates live slots and emits for the idle ones.
+- Each sender subscribes to a peer-level tick (`tokio::sync::watch` bumped by one
+  timer task) instead of owning a `tokio::time::interval` — **phase alignment**.
+  This is what makes heartbeats coalesce; today they are randomly phased across
+  the interval and batching cannot merge them.
+- For muxed senders, no per-sender task is spawned at all: the batcher's
+  heartbeat task iterates live slots and emits `SlotHeartbeat` for the idle ones.
 
 Result: N scattered frames per interval become at most one batch, N tasks become
 one, and the receiver still sees a *per-slot* heartbeat inside its per-slot
@@ -427,7 +485,7 @@ deadline — so `reader_pump` and `DETECTION_MULTIPLIER` are untouched.
 
 ## Flush policy
 
-Senders enqueue; the per-connection egress task decides when to write.
+Senders enqueue; the peer batcher decides when to write.
 
 | Policy | Trigger | Added latency | Default |
 |---|---|---|---|
@@ -444,7 +502,7 @@ worth of bookkeeping.
 These flush reasons override an open hint gate: byte cap, record cap, credit or
 byte-budget starvation, `OpenSlot`, and the hold watchdog. This is what makes
 the hint genuinely advisory — a deployment that ignores hints entirely is a
-supported configuration, and a forgotten `close_batch()` degrades to the
+supported configuration, and a forgotten `end_batch()` degrades to the
 windowed policy rather than stalling.
 
 ### The hint API
@@ -454,13 +512,17 @@ let batch = node.stream_batch();          // == start_batch()
 for (sender, token) in outputs {
     sender.send(token).await?;
 }
-batch.flush().await?;                     // == close_batch()
+batch.flush().await?;                     // == end_batch()
 // Drop schedules a flush if flush() was never called.
 ```
 
 The guard is RAII because an early `?`-return must not strand a batch.
-`start_batch()` / `close_batch()` exist as thin wrappers for callers who prefer
+`start_batch()` / `end_batch()` exist as thin wrappers for callers who prefer
 that shape. Nesting is refcounted.
+
+A burst is a hint, not a frame boundary. Size, latency, control and credit limits
+may all cut a wire batch inside one open gate, so a caller may not assume that
+what it bracketed arrives as one `_stream_batch`.
 
 #### Deadlock, and the two rules that prevent it
 
@@ -503,25 +565,30 @@ requirement.
 
 ## Backward compatibility
 
-No new negotiation mechanism is needed; the existing one is a good fit.
-`AnchorAttachResponse::Ok` already carries `streaming_transport_key`, and the
-sender already resolves it against its transport registry. Two changes:
+The mux is selected at **attach time**, not announced by a wire magic — there is
+no first-bytes handshake left to hide one in. No new negotiation mechanism is
+needed either. `AnchorAttachResponse::Ok` and its MPSC twin already carry
+`streaming_transport_key`, and the sender already resolves it against its
+transport registry. Two changes:
 
-1. `AnchorAttachRequest` gains
-   `#[serde(default)] supported_transport_keys: Vec<TransportKey>`. Additive,
-   internal to `velo`, and `serde(default)` means older senders still
-   deserialize.
-2. The attach handler currently hardcodes the local default transport's key. It
-   instead intersects the sender's advertised keys with its own installed
-   transports, preferring the mux key.
+1. `AnchorAttachRequest` and `MpscAnchorAttachRequest` each gain
+   `#[serde(default)] supported_transport_keys: Vec<TransportKey>`. Additive and
+   internal to `velo`; `serde(default)` means an older sender still deserializes,
+   as one advertising nothing, which is exactly right.
+2. The attach handlers currently hardcode the local default transport's key.
+   They instead intersect the sender's advertised keys with their own installed
+   transports, preferring `messenger-mux-v1`.
 
-A node with mux installed registers **both** keys, so it still serves legacy
-peers. This step is required rather than optional because `resolve_transport`
-hard-errors on an unknown key in a non-empty registry — a receiver that
-unilaterally answered `mux/tcp-stream` would break every older sender.
+A node with the mux enabled registers **both** `messenger-mux-v1` and its
+configured legacy transport, so it still serves legacy peers. That is required
+rather than optional because `resolve_transport` hard-errors on an unknown key in
+a non-empty registry — a receiver that unilaterally answered `messenger-mux-v1`
+would break every older sender.
 
-The result: a mux-capable pair negotiates mux, and every mixed pair silently
-falls back to the per-stream path.
+The result: the mux is chosen only where both peers advertise it, and every other
+pair silently uses the TCP or gRPC path unchanged. SPSC and MPSC are both
+supported in the first negotiated version, so there is no half-migrated state
+where one anchor kind rides the mux and the other does not.
 
 ---
 
@@ -530,23 +597,24 @@ falls back to the per-stream path.
 ```rust
 let node = Velo::builder()
     .add_transport(transport)
-    .stream_config(StreamConfig::Tcp(Some(TcpConfig {
-        bind_addr,
-        batching: BatchConfig {
-            mode: BatchMode::Multiplexed,        // default: PerStream
-            flush: FlushPolicy::Opportunistic,   // default
-            connections_per_peer: 2,
-            max_batch_bytes: 60 * 1024,
-            ..Default::default()
-        },
-    })))?
+    // The legacy path stays configured; negotiation picks per attach.
+    .stream_config(StreamConfig::Tcp(Some(TcpConfig { bind_addr })))?
+    .messenger_mux(MuxConfig {
+        enabled: true,                       // default: false
+        flush: FlushPolicy::Opportunistic,   // default
+        max_batch_bytes: 60 * 1024,          // further clamped by the eager budget
+        ..Default::default()
+    })?
     .build()
     .await?;
 ```
 
-Defaults are chosen so that switching `mode` on is the only decision an operator
-has to make, and so that the transparent path never trades latency for
-throughput without being asked.
+Activation is opt-in and stays that way for this work; the mux is not the default
+transport. Defaults are otherwise chosen so `enabled` is the only decision an
+operator makes, and so the transparent path never trades latency for throughput
+unasked. The switch is also the rollback: set it back to `false` and the node
+stops advertising `messenger-mux-v1`, so the next attach negotiates the legacy
+path with no code or wire change. That is what makes a canary safe.
 
 ---
 
@@ -672,7 +740,7 @@ State up front what would sink this, then check each:
   fix is a cheaper codec rather than multiplexing.
 - **Measurable head-of-line blocking** under a mixed fast/slow consumer workload
   → the credit design failed.
-- **`heartbeat_watchdog_firings_total` rises after P6** → heartbeat
+- **`heartbeat_watchdog_firings_total` rises after P10** → heartbeat
   consolidation lost real failure detection.
 - **The trap:** throughput improving *because* added latency let the consumer
   catch up. Always report latency beside throughput, and watch **time-to-first-token**
@@ -688,47 +756,54 @@ State up front what would sink this, then check each:
 | **P0** | Batching-ratio counters, resource-ceiling test, benches | none | implemented |
 | **P1** | Messenger TCP + UDS writer coalescing | none | implemented |
 | **P2** | Streaming per-socket coalescing | none | implemented |
-| **P3** | gRPC `Channel` caching per peer | none | specified |
-| **P4** | Mux protocol, `FrameSink`, negotiation, MPSC | yes, negotiated | specified |
-| **P5** | Hint API (`StreamBatch`), windowed policy | none | specified |
-| **P6** | Heartbeat suppression and phase alignment | none | specified |
-| **P7** | Lift the mux surface into `velo-ext` | none | specified |
+| **P3** | Ordered per-sender AM dispatch (`DispatchMode::Ordered`) | none | implemented |
+| **P4** | gRPC `Channel` caching per peer | none | specified |
+| **P5** | Ordered transport admission, `SendOutcome::Pending` | none | specified |
+| **P6** | Eager-size guidance, `Transport::max_message_size` | none | specified |
+| **P7** | `MessengerMuxTransport` — `_stream_batch`, `PeerBatcher`, slots, credit | yes | specified |
+| **P8** | Attach-time negotiation, opt-in activation switch | additive | specified |
+| **P9** | Hint API (`StreamBatch`), windowed policy | none | specified |
+| **P10** | Heartbeat suppression and phase alignment | none | specified |
+| **P11** | Lift the mux surface into `velo-ext` | none | specified |
 
 P1 and P2 are wire-compatible in both directions and require no negotiation —
 the frame decoder already accepts many frames per read buffer, so a coalescing
 writer talks to an unmodified reader. They deliver the syscall amortization,
-which the cost model predicts is the largest single term, without any protocol
-risk.
+which the cost model predicts is the largest single term, without protocol risk.
+
+P5 and P6 are prerequisites, not preliminaries: without admission the batcher has
+no ordered per-target way to discover congestion, and without the eager budget it
+cannot size a batch the Messenger will carry inline. P7 does not start until both
+land, and until P8 lands it is dead code behind a false switch.
 
 ### Why the mux surface is not in `velo-ext` yet
 
-The obvious move is to add `open_mux` / `MuxChannel` / `set_mux_acceptor` to
-`FrameTransport` so out-of-tree transports can participate. It is deferred for
-three reasons:
+Riding the Messenger removes most of the pressure to publish anything: the mux is
+a *user* of the messenger send path, not something a transport implements, so an
+out-of-tree `Transport` inherits multiplexing without knowing it exists. Still
+tempting, and still deferred, is exposing a mux surface to out-of-tree
+`FrameTransport` implementors as `open_mux` / `MuxChannel`, for two reasons:
 
-1. **A bare channel pair cannot express connection death.** The mux layer must
-   distinguish abnormal death from clean close in order to inject `Dropped`
-   correctly — information the current code gets from whether the framed read
-   returned `Err` or `None`, and which a `flume::Receiver` destroys.
-2. **Coupled defaulted methods are a silent-failure shape.** velo-ext's rules
+1. **Coupled defaulted methods are a silent-failure shape.** velo-ext's rules
    require default implementations, which would permit a transport reporting
    `supports_mux() == true` while leaving the acceptor a no-op — senders opening
    muxes into a void. If it lands, it should be *one* method
    `as_mux() -> Option<&dyn MuxTransport>` returning a separate trait with no
    defaults.
-3. **The blob-pipe abstraction may be permanently wrong.** An RDMA transport
+2. **The blob-pipe abstraction may be permanently wrong.** An RDMA transport
    already multiplexes natively per queue pair; forcing it to serialize into a
    byte stream so velo can chop it back up is a pessimization. Removing a
    published velo-ext item is a major bump, so shipping the wrong shape is
    expensive.
 
-Until then the implementation uses inherent methods on the concrete transport —
-the pattern already established by `set_metrics`, which is deliberately kept off
-the `FrameTransport` trait so out-of-tree implementors do not inherit a
-`prometheus` dependency. Adding gRPC support is an enum variant, not a trait
-change.
+The two velo-ext additions this work *does* make are not free.
+`Transport::max_message_size(target) -> Option<usize>` is shaped to survive:
+defaulted, `None` meaning "unknown" and costing the caller a conservative budget.
+Admission is the larger commitment — `SendOutcome` gaining
+`Pending(SendAdmission)` changes a published enum, so it is a coordinated
+`velo-ext` and `velo` bump, and should land once rather than in pieces.
 
-The cost of deferring is bounded: out-of-tree transports get no multiplexing for
-a release or two, and nothing else breaks. Because the receiver never offers
-`mux/...` for a transport that cannot do it, a mux-less transport degrades
-correctly by construction.
+The cost of deferring the rest is bounded: out-of-tree `FrameTransport`s get no
+multiplexing for a release or two, and nothing else breaks. Because a receiver
+never offers `messenger-mux-v1` unless the mux is installed and enabled, a
+mux-less deployment degrades correctly by construction.
