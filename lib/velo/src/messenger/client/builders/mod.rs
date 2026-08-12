@@ -4,15 +4,16 @@
 //! Convenience builders for active message clients.
 
 use std::collections::HashMap;
-use std::future::Future;
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use bytes::Bytes;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use tokio::sync::oneshot;
 
 use super::ActiveMessageClient;
+use crate::messenger::common::responses::{ResponseAwaiter, ResponseId, SlotBackpressure};
 use crate::messenger::common::{ActiveMessage, MessageMetadata};
 use crate::observability::ClientResolution;
 use crate::transports::SendOutcome;
@@ -22,8 +23,8 @@ mod results;
 #[cfg(test)]
 mod tests;
 
-use results::{ResponseStage, StageState, drive_fire_send, drive_send_outcome};
-pub use results::{SyncResult, TypedUnaryResult, UnaryResult};
+use results::{AdmissionReport, Dispatched, SendStage, drive_send_outcome};
+pub use results::{Admitted, FireResult, SyncResult, TypedUnaryResult, UnaryResult};
 
 /// Fire-and-forget builder.
 pub struct AmSendBuilder {
@@ -76,16 +77,26 @@ impl AmSendBuilder {
     /// Await a free response slot if the arena is at capacity (default:
     /// fail fast with `ResponseRegistrationError::Exhausted`). See
     /// [`MessageBuilder::await_capacity`] for rationale.
+    ///
+    /// This is the one flag that makes a fire send depend on its result being
+    /// polled, and only while the arena really is full — see [`FireResult`].
     pub fn await_capacity(mut self) -> Self {
         self.inner = self.inner.await_capacity();
         self
     }
 
-    pub fn send(self) -> impl Future<Output = Result<()>> {
+    /// Issue the send.
+    ///
+    /// The frame is handed to the transport before this returns; awaiting the
+    /// [`FireResult`] waits for it to be *admitted* to the transport's send
+    /// channel. Dropping the result detaches from the send, it does not cancel
+    /// it — see [`FireResult`].
+    pub fn send(self) -> FireResult {
         self.inner.fire()
     }
 
-    pub fn send_to(self, target: InstanceId) -> impl Future<Output = Result<()>> {
+    /// Issue the send to `target`. See [`send`](Self::send).
+    pub fn send_to(self, target: InstanceId) -> FireResult {
         self.inner.instance(target).fire()
     }
 }
@@ -283,6 +294,8 @@ enum ResolveError {
 /// Message type for metadata creation
 #[derive(Debug, Clone, Copy)]
 enum MsgType {
+    /// `am_send`: the remote never answers, so the send is done at admission.
+    Fire,
     Sync,
     Unary,
 }
@@ -321,43 +334,147 @@ pub struct MessageBuilder {
     await_capacity: bool,
 }
 
-/// Slow-path fire completion: wait for the spawned task to complete the
-/// outcome with Ok (successful enqueue) or Err (pre-wire failure), and map
-/// the result into a `Result<()>` for the caller.
-async fn finish_fire_via_awaiter(
-    mut awaiter: crate::messenger::common::responses::ResponseAwaiter,
-) -> Result<()> {
-    awaiter
-        .recv()
-        .await
-        .map(|_| ())
-        .map_err(|e| anyhow!("{}", e))
-}
-
 /// Translate a synchronous fast-path `send_message` result into a
-/// [`ResponseStage`]. On `Err`, logs and completes the outcome with the
-/// error so the returned stage resolves via its awaiter.
-fn stage_from_send(
-    client: &ActiveMessageClient,
-    send_result: Result<SendOutcome>,
-    response_id: crate::messenger::common::responses::ResponseId,
-    awaiter: crate::messenger::common::responses::ResponseAwaiter,
-) -> ResponseStage {
+/// [`Dispatched`] send.
+///
+/// An `Err` here was diagnosed on the caller's own task, so it becomes the
+/// admission's terminal state directly — unlike the slow path there is no
+/// second task that could be parked on the response slot needing to be told.
+/// Dropping the awaiter returns the slot to the arena on the spot.
+fn stage_from_send(send_result: Result<SendOutcome>, awaiter: ResponseAwaiter) -> Dispatched {
     match send_result {
-        Ok(SendOutcome::Admitted) => ResponseStage::ready(awaiter),
-        Ok(SendOutcome::Pending(admission)) => {
-            ResponseStage::with_admission(awaiter, Some(admission))
-        }
+        Ok(outcome) => Dispatched::issued(outcome, awaiter),
         Err(e) => {
             tracing::error!(
                 target: "crate::messenger::client",
                 error = %e,
                 "Failed to send message in fast path"
             );
-            let _ = client
-                .response_manager
-                .complete_outcome(response_id, Err(format!("Fast-path send failed: {}", e)));
-            ResponseStage::ready(awaiter)
+            Dispatched::failed(format!("Fast-path send failed: {}", e))
+        }
+    }
+}
+
+/// Build the metadata for one send.
+fn build_metadata(
+    response_id: ResponseId,
+    handler: String,
+    headers: Option<HashMap<String, String>>,
+    message_type: MsgType,
+) -> MessageMetadata {
+    match message_type {
+        MsgType::Fire => MessageMetadata::new_fire(response_id, handler, headers),
+        MsgType::Sync => MessageMetadata::new_sync(response_id, handler, headers),
+        MsgType::Unary => MessageMetadata::new_unary(response_id, handler, headers),
+    }
+}
+
+/// Outcome of the builder's response-slot acquisition.
+enum Acquisition {
+    /// A slot was free, so the send can be issued right now.
+    Allocated(ResponseAwaiter),
+    /// The arena is full and the caller opted into waiting. Awaiting this
+    /// yields a slot; the send is issued behind it.
+    Deferred(SlotBackpressure),
+    /// The arena is full and the caller wants to hear about it now.
+    Exhausted(anyhow::Error),
+}
+
+/// A send whose target still needs resolving, running on its own task.
+///
+/// Everything the send needs after the builder is gone, so that discovery,
+/// handshake, and the send itself survive the caller dropping its result.
+struct SlowPath {
+    client: Arc<ActiveMessageClient>,
+    kind: SlowPathKind,
+    handler: String,
+    payload: Option<Bytes>,
+    headers: Option<HashMap<String, String>>,
+    response_id: ResponseId,
+    message_type: MsgType,
+}
+
+impl SlowPath {
+    /// Resolve, handshake, send — reporting where it stopped.
+    async fn run(self) -> AdmissionReport {
+        let target = self.resolve().await?;
+        self.handshake(target).await?;
+        self.send(target).await
+    }
+
+    /// Stage 1 — translate a worker id via discovery if that is all we have.
+    async fn resolve(&self) -> std::result::Result<InstanceId, String> {
+        let worker_id = match self.kind {
+            SlowPathKind::Handshake(target) => return Ok(target),
+            SlowPathKind::Discovery(worker_id) => worker_id,
+        };
+        match self.client.resolve_peer_via_discovery(worker_id).await {
+            Ok(instance_id) => Ok(instance_id),
+            Err(e) => {
+                self.record(ClientResolution::DiscoveryError);
+                tracing::error!(
+                    target: "crate::messenger::client",
+                    error = %e,
+                    worker_id = %worker_id,
+                    "Discovery failed"
+                );
+                Err(self.fail(format!("Discovery failed: {}", e)))
+            }
+        }
+    }
+
+    /// Stage 2 — exchange handler lists if we have not already.
+    async fn handshake(&self, target: InstanceId) -> AdmissionReport {
+        if let Err(e) = self.client.ensure_peer_ready(target, &self.handler).await {
+            self.record(ClientResolution::HandshakeError);
+            tracing::error!(
+                target: "crate::messenger::client",
+                error = %e,
+                "Failed to prepare peer in slow path"
+            );
+            return Err(self.fail(format!("Handshake failed: {}", e)));
+        }
+        Ok(())
+    }
+
+    /// Stage 3 — send, and wait for the frame to reach the send channel.
+    async fn send(self, target: InstanceId) -> AdmissionReport {
+        let metadata = build_metadata(
+            self.response_id,
+            self.handler,
+            self.headers,
+            self.message_type,
+        );
+        let message = ActiveMessage {
+            metadata,
+            payload: self.payload.unwrap_or_default(),
+        };
+        drive_send_outcome(
+            &self.client,
+            self.client.send_message(target, message),
+            self.response_id,
+            "slow-path",
+        )
+        .await
+    }
+
+    /// Report a pre-send failure to a caller already parked on the response
+    /// slot, and hand the same message back for the admission channel.
+    ///
+    /// Both, because the two are read by different waiters: a sync/unary result
+    /// that is already awaiting its response would otherwise sit there until
+    /// its own timeout.
+    fn fail(&self, reason: String) -> String {
+        let _ = self
+            .client
+            .response_manager
+            .complete_outcome(self.response_id, Err(reason.clone()));
+        reason
+    }
+
+    fn record(&self, resolution: ClientResolution) {
+        if let Some(metrics) = self.client.observability.as_ref() {
+            metrics.record_client_resolution(resolution);
         }
     }
 }
@@ -445,250 +562,82 @@ impl MessageBuilder {
         }
     }
 
-    fn create_metadata(
-        &self,
-        response_id: crate::messenger::common::responses::ResponseId,
-        message_type: MsgType,
-    ) -> MessageMetadata {
-        match message_type {
-            MsgType::Sync => {
-                MessageMetadata::new_sync(response_id, self.handler.clone(), self.headers.clone())
+    fn create_metadata(&self, response_id: ResponseId, message_type: MsgType) -> MessageMetadata {
+        build_metadata(
+            response_id,
+            self.handler.clone(),
+            self.headers.clone(),
+            message_type,
+        )
+    }
+
+    /// Acquire a response slot per the builder's capacity policy.
+    ///
+    /// Every send registers one, fire-and-forget included: the slot supplies the
+    /// `response_id` the frame carries, which is what lets the transport's error
+    /// handler correlate a failed write back to this send.
+    fn acquire(&self) -> Acquisition {
+        if self.await_capacity {
+            match self.client.response_manager.try_register_outcome() {
+                crate::messenger::common::responses::RegisterOutcome::Allocated(awaiter) => {
+                    Acquisition::Allocated(awaiter)
+                }
+                crate::messenger::common::responses::RegisterOutcome::Backpressured(
+                    backpressure,
+                ) => Acquisition::Deferred(backpressure),
             }
-            MsgType::Unary => {
-                MessageMetadata::new_unary(response_id, self.handler.clone(), self.headers.clone())
+        } else {
+            match self.client.register_outcome() {
+                Ok(awaiter) => Acquisition::Allocated(awaiter),
+                Err(e) => Acquisition::Exhausted(anyhow!("Failed to register outcome: {}", e)),
             }
         }
     }
 
+    /// Hand the send to a detached task, and return the channel it reports on.
+    ///
+    /// Detaching is what keeps delivery independent of the caller: a fire result
+    /// dropped on the spot, or a unary caller that goes away mid-handshake, must
+    /// not withdraw a frame that is already on its way.
     fn spawn_slow_path(
         &self,
         kind: SlowPathKind,
-        response_id: crate::messenger::common::responses::ResponseId,
+        response_id: ResponseId,
         message_type: MsgType,
-    ) {
-        let client = self.client.clone();
-        let handler = self.handler.clone();
-        let payload = self.payload.clone();
-        let headers = self.headers.clone();
-
-        tokio::spawn(async move {
-            // Stage 1 — resolve target (discovery if needed).
-            let target = match kind {
-                SlowPathKind::Handshake(target) => target,
-                SlowPathKind::Discovery(worker_id) => {
-                    match client.resolve_peer_via_discovery(worker_id).await {
-                        Ok(instance_id) => instance_id,
-                        Err(e) => {
-                            if let Some(metrics) = client.observability.as_ref() {
-                                metrics.record_client_resolution(ClientResolution::DiscoveryError);
-                            }
-                            tracing::error!(
-                                target: "crate::messenger::client",
-                                error = %e,
-                                worker_id = %worker_id,
-                                "Discovery failed"
-                            );
-                            let _ = client.response_manager.complete_outcome(
-                                response_id,
-                                Err(format!("Discovery failed: {}", e)),
-                            );
-                            return;
-                        }
-                    }
-                }
-            };
-
-            // Stage 2 — handshake.
-            if let Err(e) = client.ensure_peer_ready(target, &handler).await {
-                if let Some(metrics) = client.observability.as_ref() {
-                    metrics.record_client_resolution(ClientResolution::HandshakeError);
-                }
-                tracing::error!(
-                    target: "crate::messenger::client",
-                    error = %e,
-                    "Failed to prepare peer in slow path"
-                );
-                let _ = client
-                    .response_manager
-                    .complete_outcome(response_id, Err(format!("Handshake failed: {}", e)));
-                return;
-            }
-
-            // Stage 3 — send, drive bp, surface errors.
-            let metadata = match message_type {
-                MsgType::Sync => MessageMetadata::new_sync(response_id, handler, headers),
-                MsgType::Unary => MessageMetadata::new_unary(response_id, handler, headers),
-            };
-            let message = ActiveMessage {
-                metadata,
-                payload: payload.unwrap_or_default(),
-            };
-            drive_send_outcome(
-                &client,
-                client.send_message(target, message),
-                response_id,
-                "slow-path",
-            )
-            .await;
-        });
-    }
-
-    pub async fn fire(self) -> Result<()> {
-        let target_result = self.resolve_target();
-        let worker_id = self.target_worker;
-
-        // `Other` resolution errors don't need a slot — short-circuit before
-        // any allocation.
-        let target_result = match target_result {
-            Err(ResolveError::Other(e)) => return Err(e),
-            other => other,
+    ) -> oneshot::Receiver<AdmissionReport> {
+        let (report_tx, report_rx) = oneshot::channel();
+        let slow_path = SlowPath {
+            client: self.client.clone(),
+            kind,
+            handler: self.handler.clone(),
+            payload: self.payload.clone(),
+            headers: self.headers.clone(),
+            response_id,
+            message_type,
         };
 
-        // Acquire per the builder's capacity policy. With `await_capacity`,
-        // wait for a free slot instead of failing fast.
-        let outcome = acquire_awaiter(&self.client, self.await_capacity).await?;
-
-        match target_result {
-            Ok(target) if self.client.can_send_directly(target, &self.handler) => {
-                if let Some(metrics) = self.client.observability.as_ref() {
-                    metrics.record_client_resolution(ClientResolution::DirectSuccess);
-                }
-                // Fast path: send inline. Pre-wire errors (sync send failure
-                // or channel close during bp.await) are surfaced via the
-                // drive_fire_send Result; the awaiter is internal.
-                let response_id = outcome.response_id();
-                let message = ActiveMessage {
-                    metadata: MessageMetadata::new_fire(response_id, self.handler, self.headers),
-                    payload: self.payload.unwrap_or_default(),
-                };
-                drive_fire_send(self.client.send_message(target, message), outcome).await
-            }
-            Ok(target) => {
-                // Slow path: awaiter already owned, spawn
-                // discovery/handshake/send in a detached task, and wait on
-                // the awaiter. The task completes the awaiter with Ok(None)
-                // on successful enqueue or Err on any pre-wire failure.
-                // Spawning preserves cancel-safety: if the caller drops
-                // mid-wait, the frame still goes through (matching
-                // sync/unary slow-path semantics).
-                let response_id = outcome.response_id();
-                self.spawn_fire_slow_path(SlowPathKind::Handshake(target), response_id);
-                finish_fire_via_awaiter(outcome).await
-            }
-            Err(ResolveError::UnresolvedPeer) => {
-                let Some(worker_id) = worker_id else {
-                    return Err(anyhow!("UnresolvedPeer but no worker_id set"));
-                };
-                let response_id = outcome.response_id();
-                self.spawn_fire_slow_path(SlowPathKind::Discovery(worker_id), response_id);
-                finish_fire_via_awaiter(outcome).await
-            }
-            Err(ResolveError::Other(_)) => unreachable!("Other handled above"),
-        }
-    }
-
-    fn spawn_fire_slow_path(
-        &self,
-        kind: SlowPathKind,
-        response_id: crate::messenger::common::responses::ResponseId,
-    ) {
-        let client = self.client.clone();
-        let handler = self.handler.clone();
-        let payload = self.payload.clone();
-        let headers = self.headers.clone();
-
         tokio::spawn(async move {
-            // Stage 1 — resolve target.
-            let target = match kind {
-                SlowPathKind::Handshake(target) => target,
-                SlowPathKind::Discovery(worker_id) => {
-                    match client.resolve_peer_via_discovery(worker_id).await {
-                        Ok(t) => t,
-                        Err(e) => {
-                            if let Some(metrics) = client.observability.as_ref() {
-                                metrics.record_client_resolution(ClientResolution::DiscoveryError);
-                            }
-                            tracing::error!(
-                                target: "crate::messenger::client",
-                                error = %e,
-                                worker_id = %worker_id,
-                                "Discovery failed for fire-and-forget"
-                            );
-                            let _ = client.response_manager.complete_outcome(
-                                response_id,
-                                Err(format!("Discovery failed: {}", e)),
-                            );
-                            return;
-                        }
-                    }
-                }
-            };
-
-            // Stage 2 — handshake.
-            if let Err(e) = client.ensure_peer_ready(target, &handler).await {
-                if let Some(metrics) = client.observability.as_ref() {
-                    metrics.record_client_resolution(ClientResolution::HandshakeError);
-                }
-                tracing::error!(
-                    target: "crate::messenger::client",
-                    error = %e,
-                    "Handshake failed for fire-and-forget"
-                );
-                let _ = client
-                    .response_manager
-                    .complete_outcome(response_id, Err(format!("Handshake failed: {}", e)));
-                return;
-            }
-
-            // Stage 3 — send + complete outcome.
-            let message = ActiveMessage {
-                metadata: MessageMetadata::new_fire(response_id, handler, headers),
-                payload: payload.unwrap_or_default(),
-            };
-            let error = match client.send_message(target, message) {
-                Ok(SendOutcome::Admitted) => None,
-                Ok(SendOutcome::Pending(admission)) => admission.await.err().map(|e| anyhow!(e)),
-                Err(e) => Some(e),
-            };
-            match error {
-                // If DefaultErrorHandler already wrote Err (a transport that
-                // reported a hard failure and then returned `Admitted`), this
-                // Ok is a no-op — the slot has already finished.
-                None => {
-                    let _ = client
-                        .response_manager
-                        .complete_outcome(response_id, Ok(None));
-                }
-                Some(e) => {
-                    tracing::error!(
-                        target: "crate::messenger::client",
-                        error = %e,
-                        "Fire-and-forget send failed (slow path)"
-                    );
-                    let _ = client
-                        .response_manager
-                        .complete_outcome(response_id, Err(format!("Send failed: {}", e)));
-                }
-            }
+            // The receiver is long gone whenever a fire caller dropped its
+            // result. The send happened either way, which is the point.
+            let _ = report_tx.send(slow_path.run().await);
         });
+
+        report_rx
     }
 
-    /// Post-acquisition dispatch. Given a pre-resolved target and a
-    /// pre-acquired awaiter, either sends on the fast path (returning a
-    /// populated `ResponseStage`) or spawns the slow path (returning a ready
-    /// stage whose awaiter will be completed by the spawned task).
+    /// Post-acquisition dispatch: send inline when the peer is already known to
+    /// carry the handler, otherwise hand the send to a detached task.
     ///
-    /// Target resolution happens in [`MessageBuilder::make_stage_state`]
-    /// *before* slot acquisition so `ResolveError::Other` (programmer
-    /// misuse — target not set, or both `.instance()` and `.worker()` set)
-    /// fails the caller without consuming a slot or blocking on
-    /// `register_outcome_async`. This mirrors the ordering in [`fire`].
-    fn dispatch_with_awaiter(
+    /// Target resolution happens in [`MessageBuilder::make_stage`] *before* slot
+    /// acquisition so `ResolveError::Other` (programmer misuse — target not set,
+    /// or both `.instance()` and `.worker()` set) fails the caller without
+    /// consuming a slot or waiting for one.
+    fn dispatch(
         self,
         target_result: Result<InstanceId, ResolveError>,
-        awaiter: crate::messenger::common::responses::ResponseAwaiter,
+        awaiter: ResponseAwaiter,
         message_type: MsgType,
-    ) -> ResponseStage {
+    ) -> Dispatched {
         let worker_id = self.target_worker;
         let response_id = awaiter.response_id();
 
@@ -697,87 +646,96 @@ impl MessageBuilder {
                 if let Some(metrics) = self.client.observability.as_ref() {
                     metrics.record_client_resolution(ClientResolution::DirectSuccess);
                 }
+                let metadata = self.create_metadata(response_id, message_type);
                 let message = ActiveMessage {
-                    metadata: self.create_metadata(response_id, message_type),
+                    metadata,
                     payload: self.payload.unwrap_or_default(),
                 };
-                let send_result = self.client.send_message(target, message);
-                stage_from_send(&self.client, send_result, response_id, awaiter)
+                stage_from_send(self.client.send_message(target, message), awaiter)
             }
-            Ok(target) => {
-                self.spawn_slow_path(SlowPathKind::Handshake(target), response_id, message_type);
-                ResponseStage::ready(awaiter)
-            }
+            Ok(target) => Dispatched::detached(
+                self.spawn_slow_path(SlowPathKind::Handshake(target), response_id, message_type),
+                awaiter,
+            ),
             Err(ResolveError::UnresolvedPeer) => {
                 // `resolve_target` only returns UnresolvedPeer when
                 // target_worker is Some, so this else-branch is a defensive
                 // guard — unreachable in practice.
                 let Some(worker_id) = worker_id else {
                     tracing::error!(target: "crate::messenger::client", "UnresolvedPeer but no worker_id set");
-                    return ResponseStage::ready(awaiter);
+                    return Dispatched::failed("UnresolvedPeer but no worker_id set");
                 };
-                self.spawn_slow_path(
-                    SlowPathKind::Discovery(worker_id),
-                    response_id,
-                    message_type,
-                );
-                ResponseStage::ready(awaiter)
+                Dispatched::detached(
+                    self.spawn_slow_path(
+                        SlowPathKind::Discovery(worker_id),
+                        response_id,
+                        message_type,
+                    ),
+                    awaiter,
+                )
             }
             Err(ResolveError::Other(_)) => {
-                unreachable!("ResolveError::Other is short-circuited in make_stage_state")
+                unreachable!("ResolveError::Other is short-circuited in make_stage")
             }
         }
     }
 
-    /// Build a `StageState` according to the builder's acquisition policy.
+    /// Issue the send and wrap it in its [`SendStage`].
     ///
     /// Target resolution runs first so `ResolveError::Other` (programmer
-    /// misuse) produces an immediate error stage and never consumes a slot.
-    /// Under `await_capacity` this is load-bearing: resolving inside the
-    /// deferred future would make the caller block on
-    /// `register_outcome_async()` under arena saturation before learning
-    /// the call can never succeed. Mirrors [`fire`]'s early return.
+    /// misuse) fails immediately and never consumes a slot. Under
+    /// `await_capacity` that ordering is load-bearing: resolving inside the
+    /// deferred future would make the caller wait for a slot before learning
+    /// the call can never succeed.
     ///
-    /// - Default (fail-fast): acquire synchronously; propagate
-    ///   `ResponseRegistrationError::Exhausted` as an immediate error stage.
-    /// - `await_capacity`: defer acquisition into a boxed future that awaits
-    ///   capacity before dispatching.
-    fn make_stage_state(self, message_type: MsgType) -> StageState {
-        // Short-circuit programmer-misuse resolution errors before touching
-        // the slot arena. Mirrors fire()'s early return so invalid target
-        // configs never block on register_outcome_async.
+    /// The send is then issued *eagerly* whenever a slot is free — including
+    /// under `await_capacity` — so that a result nobody ever polls still
+    /// delivers, and so that two sends issued in order reach the target's
+    /// admission gate in that order. Only genuine arena exhaustion defers the
+    /// send into the result, because there waiting is exactly what the caller
+    /// asked for and spawning a task per waiting send would remove the
+    /// backpressure it wanted.
+    fn make_stage(self, message_type: MsgType) -> SendStage {
         let target_result = match self.resolve_target() {
-            Err(ResolveError::Other(e)) => return StageState::error(e),
+            Err(ResolveError::Other(e)) => return SendStage::failed(e),
             other => other,
         };
 
-        if self.await_capacity {
-            let fut = Box::pin(async move {
-                let awaiter = self.client.response_manager.register_outcome_async().await;
-                self.dispatch_with_awaiter(target_result, awaiter, message_type)
-            });
-            StageState::Pending(fut)
-        } else {
-            match self.client.register_outcome() {
-                Ok(awaiter) => StageState::ready(self.dispatch_with_awaiter(
-                    target_result,
-                    awaiter,
-                    message_type,
-                )),
-                Err(e) => StageState::error(anyhow!("Failed to register outcome: {}", e)),
+        match self.acquire() {
+            Acquisition::Allocated(awaiter) => {
+                SendStage::Dispatched(self.dispatch(target_result, awaiter, message_type))
             }
+            Acquisition::Deferred(backpressure) => {
+                let deferred = Box::pin(async move {
+                    let awaiter = backpressure.await;
+                    self.dispatch(target_result, awaiter, message_type)
+                });
+                SendStage::Acquiring(deferred)
+            }
+            Acquisition::Exhausted(e) => SendStage::failed(e),
+        }
+    }
+
+    /// Issue a fire-and-forget send.
+    ///
+    /// Synchronous: by the time this returns the frame belongs to the transport
+    /// (or to a detached task). The [`FireResult`] observes admission, it does
+    /// not drive it.
+    pub fn fire(self) -> FireResult {
+        FireResult {
+            stage: self.make_stage(MsgType::Fire),
         }
     }
 
     pub fn sync(self) -> SyncResult {
         SyncResult {
-            stage: self.make_stage_state(MsgType::Sync),
+            stage: self.make_stage(MsgType::Sync),
         }
     }
 
     pub fn unary(self) -> UnaryResult {
         UnaryResult {
-            stage: self.make_stage_state(MsgType::Unary),
+            stage: self.make_stage(MsgType::Unary),
         }
     }
 
@@ -786,27 +744,9 @@ impl MessageBuilder {
         R: DeserializeOwned + Send + 'static,
     {
         TypedUnaryResult {
-            stage: self.make_stage_state(MsgType::Unary),
+            stage: self.make_stage(MsgType::Unary),
             _marker: std::marker::PhantomData,
         }
-    }
-}
-
-/// Acquire a response awaiter, honoring `await_capacity`:
-///
-/// - `false` — fail fast; stringify `ResponseRegistrationError::Exhausted`
-///   into an `anyhow::Error` (existing behaviour).
-/// - `true` — await a free slot before returning.
-async fn acquire_awaiter(
-    client: &ActiveMessageClient,
-    await_capacity: bool,
-) -> Result<crate::messenger::common::responses::ResponseAwaiter> {
-    if await_capacity {
-        Ok(client.response_manager.register_outcome_async().await)
-    } else {
-        client
-            .register_outcome()
-            .map_err(|e| anyhow!("Failed to register outcome: {}", e))
     }
 }
 

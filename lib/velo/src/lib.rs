@@ -32,16 +32,16 @@ pub mod simulation;
 
 // Identity / address types live in velo-ext but are re-exported here so the
 // vast majority of consumers depend only on `velo`.
-pub use velo_ext::{InstanceId, PeerInfo, Transport, WorkerAddress, WorkerId};
+pub use velo_ext::{AdmissionState, InstanceId, PeerInfo, Transport, WorkerAddress, WorkerId};
 
 // Public re-exports for the velo-ext crate.
 pub use velo_ext as ext;
 
 // Messenger surface
 pub use crate::messenger::{
-    AmHandlerBuilder, AmSendBuilder, AmSyncBuilder, AsyncExecutor, Context, DispatchMode, Handler,
-    HandlerExecutor, Messenger, MessengerBuilder, OrderedConfig, OrderingKey, OverflowPolicy,
-    PeerDiscovery, SyncExecutor, SyncResult, TypedContext, TypedUnaryBuilder,
+    Admitted, AmHandlerBuilder, AmSendBuilder, AmSyncBuilder, AsyncExecutor, Context, DispatchMode,
+    FireResult, Handler, HandlerExecutor, Messenger, MessengerBuilder, OrderedConfig, OrderingKey,
+    OverflowPolicy, PeerDiscovery, SyncExecutor, SyncResult, TypedContext, TypedUnaryBuilder,
     TypedUnaryHandlerBuilder, TypedUnaryResult, UnaryBuilder, UnaryHandlerBuilder, UnaryResult,
     UnifiedResponse, VeloEvents,
 };

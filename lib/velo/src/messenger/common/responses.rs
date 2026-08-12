@@ -379,8 +379,8 @@ impl fmt::Debug for ResponseAwaiter {
 /// arena is full.
 ///
 /// Pattern-match on this type (rather than stringifying) to drive backoff,
-/// shed load, or route to the async [`ResponseManager::register_outcome_async`]
-/// fallback.
+/// shed load, or route to the [`ResponseManager::try_register_outcome`]
+/// fallback, whose `Backpressured` arm waits for a slot instead of failing.
 #[derive(Debug, thiserror::Error)]
 pub enum ResponseRegistrationError {
     /// No free response slots. `capacity` is the fixed per-worker capacity;
@@ -505,16 +505,6 @@ impl ResponseManager {
             RegisterOutcome::Backpressured(SlotBackpressure {
                 fut: Box::pin(ResponseManagerInner::acquire_owned(Arc::clone(&self.inner))),
             })
-        }
-    }
-
-    /// Await capacity, then allocate. Convenience wrapper over
-    /// [`ResponseManager::try_register_outcome`] that collapses the fast-path
-    /// and the backpressure branch.
-    pub async fn register_outcome_async(&self) -> ResponseAwaiter {
-        match self.try_register_outcome() {
-            RegisterOutcome::Allocated(a) => a,
-            RegisterOutcome::Backpressured(bp) => bp.await,
         }
     }
 
@@ -1137,31 +1127,6 @@ mod tests {
             .expect("backpressure resolved");
         drop(awaiter);
         let _remaining = (&mut handle).await.expect("drop task");
-    }
-
-    #[tokio::test]
-    async fn register_outcome_async_waits_for_capacity() {
-        use tokio::time::{Duration, timeout};
-
-        let manager = Arc::new(ResponseManager::with_capacity(0, TEST_CAPACITY, None));
-        let mut awaiters = Vec::with_capacity(TEST_CAPACITY);
-        for _ in 0..TEST_CAPACITY {
-            awaiters.push(manager.register_outcome().expect("allocate"));
-        }
-
-        let m = manager.clone();
-        let acquire = tokio::spawn(async move { m.register_outcome_async().await });
-
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(!acquire.is_finished(), "should block while at capacity");
-
-        drop(awaiters.pop());
-
-        let awaiter = timeout(Duration::from_secs(1), acquire)
-            .await
-            .expect("resolved")
-            .expect("task ok");
-        drop(awaiter);
     }
 
     #[tokio::test]
