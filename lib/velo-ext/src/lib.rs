@@ -18,6 +18,7 @@
 //! methods land with default impls; signature changes require a deliberate
 //! version bump coordinated with `velo`. See `Cargo.toml` for the full policy.
 
+pub mod admission;
 pub mod discovery;
 pub mod id;
 pub mod observability;
@@ -26,6 +27,9 @@ pub mod transport;
 
 // Convenience re-exports at the crate root for the most-used items. Plugin
 // authors typically write `use velo_ext::Transport;` or `use velo_ext::WorkerId;`.
+pub use admission::{
+    AdmissionError, AdmissionGate, AdmissionOutcome, AdmissionState, SendAdmission,
+};
 pub use discovery::{
     PeerDiscovery, PeerRegistrationGuard, ServiceDiscovery, ServiceEvent, ServiceRegistrationGuard,
 };
