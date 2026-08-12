@@ -10,6 +10,7 @@ use dashmap::DashMap;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tokio::sync::Semaphore;
@@ -155,6 +156,7 @@ pub(crate) struct OrderedDispatcher<H: ActiveMessageHandler> {
 struct BoundRouter {
     router: Arc<LaneRouter<LaneKey, LaneItem>>,
     metrics: Option<OrderedMetricsHandle>,
+    queue_depth: Arc<QueueDepth>,
 }
 
 /// The partition a message is routed to.
@@ -167,6 +169,36 @@ type LaneKey = Option<WorkerId>;
 struct LaneItem {
     ctx: HandlerContext,
     enqueued_at: Instant,
+}
+
+/// Per-handler admission accounting for ordered queues.
+///
+/// This is deliberately independent from Prometheus: overflow policy changes
+/// request handling, while metrics are optional telemetry.
+struct QueueDepth {
+    pending: AtomicUsize,
+}
+
+impl QueueDepth {
+    fn acquire(&self) -> usize {
+        self.pending.fetch_add(1, Ordering::AcqRel)
+    }
+
+    fn try_acquire(&self, limit: usize) -> bool {
+        self.pending
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |depth| {
+                if depth < limit { Some(depth + 1) } else { None }
+            })
+            .is_ok()
+    }
+
+    fn release(&self) {
+        self.pending
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |depth| {
+                depth.checked_sub(1)
+            })
+            .expect("ordered queue depth underflow");
+    }
 }
 
 /// Bridges lane lifecycle events onto the Prometheus handle.
@@ -213,17 +245,22 @@ impl<H: ActiveMessageHandler + 'static> OrderedDispatcher<H> {
         let handler = self.handler.clone();
         let handler_name = self.handler.name().to_string();
         let limiter = self.limiter.clone();
+        let queue_depth = Arc::new(QueueDepth {
+            pending: AtomicUsize::new(0),
+        });
         let metrics = system
             .observability()
             .as_ref()
             .and_then(|m| m.bind_ordered_dispatcher(&handler_name));
 
         let consumer_metrics = metrics.clone();
+        let consumer_queue_depth = Arc::clone(&queue_depth);
         let consumer = Arc::new(move |item: LaneItem| {
             let handler = handler.clone();
             let handler_name = handler_name.clone();
             let limiter = limiter.clone();
             let metrics = consumer_metrics.clone();
+            let queue_depth = Arc::clone(&consumer_queue_depth);
 
             Box::pin(async move {
                 if let Some(metrics) = metrics.as_ref() {
@@ -263,6 +300,7 @@ impl<H: ActiveMessageHandler + 'static> OrderedDispatcher<H> {
                     Self::fail_fast(&system, message_id, response_type, "handler panicked");
                 }
 
+                queue_depth.release();
                 if let Some(metrics) = metrics.as_ref() {
                     metrics.dequeued();
                 }
@@ -283,7 +321,11 @@ impl<H: ActiveMessageHandler + 'static> OrderedDispatcher<H> {
             },
         ));
 
-        BoundRouter { router, metrics }
+        BoundRouter {
+            router,
+            metrics,
+            queue_depth,
+        }
     }
 
     /// Send an error response so a waiting caller fails immediately instead of
@@ -345,20 +387,11 @@ impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for OrderedDispa
             });
         }
 
-        if let Some(limit) = self.config.max_queue_depth
-            && let Some(metrics) = metrics
-            && metrics.lane_depth() >= limit as f64
-        {
-            match self.config.overflow {
-                OverflowPolicy::Warn => {
-                    warn!(
-                        target: "crate::messenger::dispatcher",
-                        handler = %self.handler.name(),
-                        limit,
-                        "Ordered handler queue depth exceeded max_queue_depth"
-                    );
-                }
-                OverflowPolicy::Reject => {
+        let exceeded_limit = match (self.config.max_queue_depth, self.config.overflow) {
+            (Some(limit), OverflowPolicy::Reject) => {
+                if bound.queue_depth.try_acquire(limit) {
+                    false
+                } else {
                     if let Some(m) = ctx.system.observability().as_ref() {
                         m.record_dispatch_failure(DispatchFailure::OrderedLaneShed);
                     }
@@ -378,6 +411,27 @@ impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for OrderedDispa
                     return;
                 }
             }
+            (max_queue_depth, OverflowPolicy::Warn) => {
+                let depth = bound.queue_depth.acquire();
+                max_queue_depth.is_some_and(|limit| depth >= limit)
+            }
+            (None, OverflowPolicy::Reject) => {
+                bound.queue_depth.acquire();
+                false
+            }
+        };
+
+        if exceeded_limit {
+            let limit = self
+                .config
+                .max_queue_depth
+                .expect("queue limit is set when admission reports an exceedance");
+            warn!(
+                target: "crate::messenger::dispatcher",
+                handler = %self.handler.name(),
+                limit,
+                "Ordered handler queue depth exceeded max_queue_depth"
+            );
         }
 
         if let Some(metrics) = metrics {
