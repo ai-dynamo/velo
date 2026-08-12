@@ -521,6 +521,8 @@ pub(crate) enum MuxDropReason {
     UnknownSlot,
     /// The slot was closed before the record arrived.
     ClosedSlot,
+    /// An `OpenSlot` named a dense index a live slot still occupies.
+    SlotCollision,
     /// The record's `frame_seq` was behind the slot's next expected sequence.
     Duplicate,
 }
@@ -532,6 +534,7 @@ impl MuxDropReason {
             Self::Generation => "generation",
             Self::UnknownSlot => "unknown_slot",
             Self::ClosedSlot => "closed_slot",
+            Self::SlotCollision => "slot_collision",
             Self::Duplicate => "duplicate",
         }
     }

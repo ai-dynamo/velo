@@ -343,6 +343,32 @@ fn open_slot(
         });
         return;
     }
+    // Checked *before* the bind is consumed, and before anything is written.
+    //
+    // A live slot at this index means the sender opened over an occupant this
+    // side has not seen closed — it cannot have come from the free list, which
+    // only yields an index after its `CloseSlot`. Retiring the incumbent to make
+    // room would silently kill a healthy stream: its consumer would see the
+    // channel end with no `Dropped`, its held bytes would stay charged to the
+    // peer budget, and the collision would be invisible. So the *newcomer* is
+    // rejected instead, the incumbent is untouched, and the bind stays
+    // registered for the opener that is entitled to it.
+    if state
+        .slots
+        .get(index)
+        .and_then(Option::as_ref)
+        .is_some_and(|incumbent| incumbent.id != id)
+    {
+        outcome.replies.push(ReplyRecord::CloseSlot {
+            slot: id,
+            reason: CloseReason::ProtocolError,
+        });
+        if let Some(metrics) = ctx.metrics {
+            metrics.record_dropped(MuxDropReason::SlotCollision);
+        }
+        return;
+    }
+
     let Some((_, bind)) = ctx.registry.binds.remove(&(anchor_id, session_id)) else {
         // The reverse race: an `OpenSlot` for a pair that was never registered,
         // or whose accept window expired. It must **not** fail the peer — reply
@@ -360,10 +386,9 @@ fn open_slot(
     if state.slots.len() <= index {
         state.slots.resize_with(index + 1, || None);
     }
+    // A re-`OpenSlot` for the *same* id is a duplicate, not a collision: the
+    // guard above let it through, so replace it rather than leak the buffer.
     if state.slots[index].take().is_some() {
-        // A live slot at this index means the sender reused it without our
-        // having seen its close. Retire the occupant rather than deliver two
-        // streams into one buffer.
         outcome.closed += 1;
     }
 

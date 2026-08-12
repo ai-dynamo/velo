@@ -123,6 +123,85 @@ fn open_slot_for_an_unregistered_anchor_rejects_that_slot_only() {
     assert_eq!(outcome.opened, 1);
 }
 
+/// A colliding `OpenSlot` is rejected; the incumbent keeps running.
+///
+/// The sender's free list only yields an index after that slot's `CloseSlot`,
+/// so an open over a live occupant is a protocol violation however it arose.
+/// Retiring the occupant to make room would kill a healthy stream silently: no
+/// `Dropped` for its consumer, and its held bytes left charged to the peer
+/// budget forever.
+#[test]
+fn a_colliding_open_slot_is_rejected_and_the_incumbent_survives() {
+    let config = config();
+    let registry = IngressRegistry::default();
+    let depth =
+        crate::streaming::messenger_mux::flow_control::slot_buffer_depth(config.initial_credit);
+    let (incumbent_tx, incumbent_rx) = flume::bounded(depth);
+    registry.register_bind(ANCHOR, SESSION, incumbent_tx);
+    // A second bind, for the collider to try to claim.
+    let (rival_tx, rival_rx) = flume::bounded(depth);
+    registry.register_bind(ANCHOR, SESSION + 1, rival_tx);
+
+    let incumbent = slot(0, 0);
+    open(&registry, &config, incumbent, 1);
+
+    // Give the incumbent something in its ahead-of-sequence hold, so a silent
+    // eviction would leak peer byte budget as well as the stream.
+    let payload = batch(1, 1, |encoder| {
+        encoder.push_data(incumbent, 2, &item(2)).unwrap();
+    });
+    handle_batch(&registry, &config, None, peer(), &payload);
+
+    // Same dense index, next generation — a live occupant is there either way.
+    let collider = slot(0, 1);
+    let payload = batch(1, 2, |encoder| {
+        encoder
+            .push_open_slot(collider, 0, ANCHOR, SESSION + 1)
+            .unwrap();
+    });
+    let outcome = handle_batch(&registry, &config, None, peer(), &payload);
+
+    assert_eq!(outcome.opened, 0);
+    assert_eq!(outcome.closed, 0, "the incumbent must not be retired");
+    assert_eq!(
+        outcome.replies,
+        vec![ReplyRecord::CloseSlot {
+            slot: collider,
+            reason: CloseReason::ProtocolError
+        }],
+        "the newcomer is what fails, and it is told which slot id failed"
+    );
+    assert_eq!(registry.live_slots(peer()), 1);
+    assert!(
+        !incumbent_rx.is_disconnected(),
+        "the incumbent's consumer must not see its channel end"
+    );
+
+    // The incumbent still works: closing its gap delivers both records, which
+    // it could not do if its hold or its byte accounting had been disturbed.
+    let payload = batch(1, 3, |encoder| {
+        encoder.push_data(incumbent, 1, &item(1)).unwrap();
+    });
+    handle_batch(&registry, &config, None, peer(), &payload);
+    assert_eq!(drain(&incumbent_rx), vec![item(1), item(2)]);
+
+    // The rejected open did not consume the bind it named, so the opener that
+    // is entitled to it can still claim it.
+    let rightful = slot(1, 0);
+    let payload = batch(1, 4, |encoder| {
+        encoder
+            .push_open_slot(rightful, 0, ANCHOR, SESSION + 1)
+            .unwrap();
+    });
+    let outcome = handle_batch(&registry, &config, None, peer(), &payload);
+    assert_eq!(outcome.opened, 1);
+    let payload = batch(1, 5, |encoder| {
+        encoder.push_data(rightful, 1, &item(9)).unwrap();
+    });
+    handle_batch(&registry, &config, None, peer(), &payload);
+    assert_eq!(drain(&rival_rx), vec![item(9)]);
+}
+
 #[test]
 fn records_for_a_slot_that_never_opened_are_dropped() {
     let (registry, rx, config) = bound();
