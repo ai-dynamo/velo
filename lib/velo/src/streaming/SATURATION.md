@@ -149,3 +149,25 @@ These counters do not measure latency, throughput, or bytes. They count
 it means the system is at its capacity ceiling and the application
 should slow down or scale out. A zero rate means there is plenty of
 headroom.
+
+## Related: write coalescing
+
+Two further counters describe the *write* side rather than the backpressure
+cascade:
+
+| Metric | What it means |
+|---|---|
+| `velo_streaming_frames_written_total` | Logical stream frames written to the wire |
+| `velo_streaming_socket_writes_total` | `write_all` calls that carried them |
+
+Their ratio is the **batching ratio**. The producer-side egress pump packs
+whatever is already queued on a stream into a single write, so a stream whose
+producer runs ahead reports a high ratio (hundreds of frames per syscall), while
+a stream emitting one frame at a time reports ~1.0.
+
+A ratio near 1.0 is not itself a problem — it just means there was never more
+than one frame queued when the pump woke. It becomes interesting when you are
+running many concurrent anchors to the same peer: coalescing is *per stream*, so
+it cannot pack frames that are spread across streams, which is the case
+mitigation #4 above is really about. See [`BATCHING.md`](BATCHING.md) for the
+measurements and for the multiplexed protocol that addresses it.
