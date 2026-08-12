@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::messenger::PeerDiscovery;
-use crate::messenger::common::messages::envelope_overhead;
+use crate::messenger::common::messages::{EncodeError, envelope_overhead};
 use crate::messenger::common::{ActiveMessage, responses::ResponseManager};
 
 use crate::observability::{ClientResolution, VeloMetrics};
@@ -74,6 +74,36 @@ pub(crate) fn eager_payload_budget(
     ceiling.saturating_sub(envelope_overhead)
 }
 
+/// Add the headers the messenger puts on an outbound message itself, turning
+/// what a caller supplied into what the encoder will actually write.
+///
+/// Today that is the distributed-tracing context, and it is not a rounding
+/// error: a W3C `traceparent` alone is 69 bytes of MessagePack, and injection
+/// materialises a header map even when there is no context to put in it.
+///
+/// Both the encoder ([`encode_outbound`]) and the budget
+/// ([`ActiveMessageClient::effective_eager_payload`]) go through here, which is
+/// the whole point — a budget sized against the caller's headers while the
+/// encoder writes a larger set is a budget that overruns the transport by the
+/// difference.
+pub(crate) fn finalize_outbound_headers(headers: &mut Option<HashMap<String, String>>) {
+    #[cfg(feature = "distributed-tracing")]
+    crate::observability::inject_current_context(headers);
+    #[cfg(not(feature = "distributed-tracing"))]
+    let _ = headers;
+}
+
+/// Turn an outbound message into wire bytes: finalize its headers, then encode.
+///
+/// The single place a client-side send becomes a frame, so there is no second
+/// path where the headers and the budget could drift apart.
+pub(crate) fn encode_outbound(
+    mut message: ActiveMessage,
+) -> Result<(bytes::Bytes, bytes::Bytes, crate::transports::MessageType), EncodeError> {
+    finalize_outbound_headers(&mut message.metadata.headers);
+    message.encode()
+}
+
 pub(crate) struct ActiveMessageClient {
     pub(crate) response_manager: ResponseManager,
     pub(crate) backend: Arc<VeloBackend>,
@@ -107,7 +137,6 @@ impl ActiveMessageClient {
         }
     }
 
-    #[allow(unused_mut)]
     pub(crate) fn send_message(
         &self,
         target: InstanceId,
@@ -130,10 +159,7 @@ impl ActiveMessageClient {
                 );
         }
 
-        #[cfg(feature = "distributed-tracing")]
-        crate::observability::inject_current_context(&mut message.metadata.headers);
-
-        let (header, payload, message_type) = message.encode()?;
+        let (header, payload, message_type) = encode_outbound(message)?;
 
         #[cfg(feature = "distributed-tracing")]
         {
@@ -170,18 +196,33 @@ impl ActiveMessageClient {
     /// transport serves `target` and what it will carry, and the client holds
     /// the stager whose threshold decides when a payload stops going inline.
     /// See [`eager_payload_budget`] for what the number means.
+    ///
+    /// The envelope is measured against
+    /// [`finalize_outbound_headers`]-processed headers, not against `headers`
+    /// as passed: [`send_message`](Self::send_message) encodes the finalized
+    /// set, so sizing against anything else hands back a budget the encoder
+    /// will overrun. A scratch copy, because finalizing is what the send path
+    /// does to a message it owns and this one is borrowed.
+    ///
+    /// Finalizing reads ambient state — the current trace context — so the
+    /// answer belongs to the context it was asked from. Callers that size a
+    /// batch and then send it do both from the same context, which is what
+    /// makes the number hold; a budget carried across into an unrelated
+    /// context is no longer a promise about that send.
     pub(crate) fn effective_eager_payload(
         &self,
         target: InstanceId,
         handler_name: &str,
         headers: Option<&HashMap<String, String>>,
     ) -> usize {
+        let mut finalized = headers.cloned();
+        finalize_outbound_headers(&mut finalized);
         eager_payload_budget(
             self.backend.max_message_size(target),
             self.large_payload_stager
                 .get()
                 .map(|stager| stager.threshold()),
-            envelope_overhead(handler_name, headers),
+            envelope_overhead(handler_name, finalized.as_ref()),
         )
     }
 

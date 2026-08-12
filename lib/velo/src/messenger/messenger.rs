@@ -376,6 +376,13 @@ impl Messenger {
     /// ceilings can be unknown; with neither, the answer is the transparent
     /// stager's default threshold.
     ///
+    /// The envelope counts the headers the messenger adds on the way out as
+    /// well as the ones passed here — under the `distributed-tracing` feature
+    /// the current trace context is injected just before encoding, and it is
+    /// large enough to matter. Because that context is ambient, the answer
+    /// belongs to the context it was asked from: size a batch and send it from
+    /// the same place.
+    ///
     /// Callers that pack many small sends into one message — the streaming mux
     /// batcher, or an application batching its own work — size a batch against
     /// this so it neither overruns the target's transport (a hard failure) nor

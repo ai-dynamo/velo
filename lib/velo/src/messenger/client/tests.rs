@@ -7,6 +7,7 @@ use super::*;
 
 use crate::messenger::Messenger;
 use crate::rendezvous::transparent::{DEFAULT_THRESHOLD, RendezvousStager};
+use crate::transports::Transport;
 use crate::transports::tcp::{TcpTransport, TcpTransportBuilder};
 
 /// The `_stream_batch` envelope, spelled out here so a change to
@@ -18,6 +19,19 @@ const STREAM_BATCH_ENVELOPE: usize = 22 + "_stream_batch".len();
 /// reports. Written out rather than imported so the two are pinned against
 /// each other instead of being the same expression twice.
 const TCP_FRAME_CEILING: usize = 16 * 1024 * 1024;
+
+/// What [`finalize_outbound_headers`] costs a send that passed no headers at
+/// all.
+///
+/// Under `distributed-tracing` the injector materialises a header map whether
+/// or not there is a context to put in it, and an empty MessagePack `FixMap`
+/// is one byte the encoder would not otherwise have written. With the feature
+/// off nothing is added. Applies only to the `None` cases below: a caller that
+/// already passed a map pays for the map either way.
+#[cfg(feature = "distributed-tracing")]
+const INJECTED_HEADER_MAP: usize = 1;
+#[cfg(not(feature = "distributed-tracing"))]
+const INJECTED_HEADER_MAP: usize = 0;
 
 #[test]
 fn budget_falls_back_to_the_staging_threshold_when_capacity_is_unknown() {
@@ -98,14 +112,14 @@ async fn tcp_budget_is_the_frame_ceiling_less_the_envelope() {
     // No stager installed: TCP's framed ceiling is the only bound.
     assert_eq!(
         local.effective_eager_payload(remote.instance_id(), "_stream_batch", None),
-        TCP_FRAME_CEILING - STREAM_BATCH_ENVELOPE,
+        TCP_FRAME_CEILING - (STREAM_BATCH_ENVELOPE + INJECTED_HEADER_MAP),
     );
 
     // An unregistered peer has no transport to ask, which is the same "cannot
     // say" as a transport that does not know — so the conservative default.
     assert_eq!(
         local.effective_eager_payload(crate::InstanceId::new_v4(), "_stream_batch", None),
-        DEFAULT_THRESHOLD - STREAM_BATCH_ENVELOPE,
+        DEFAULT_THRESHOLD - (STREAM_BATCH_ENVELOPE + INJECTED_HEADER_MAP),
     );
 }
 
@@ -130,8 +144,14 @@ async fn lowering_the_rendezvous_threshold_lowers_the_budget() {
     );
 
     let after = local.effective_eager_payload(target, "_stream_batch", None);
-    assert_eq!(before, TCP_FRAME_CEILING - STREAM_BATCH_ENVELOPE);
-    assert_eq!(after, LOWERED_THRESHOLD - STREAM_BATCH_ENVELOPE);
+    assert_eq!(
+        before,
+        TCP_FRAME_CEILING - (STREAM_BATCH_ENVELOPE + INJECTED_HEADER_MAP)
+    );
+    assert_eq!(
+        after,
+        LOWERED_THRESHOLD - (STREAM_BATCH_ENVELOPE + INJECTED_HEADER_MAP)
+    );
 
     // A header set costs exactly what the encoder would spend on it: the `_rv`
     // key and a 39-digit handle push the envelope out by the MessagePack map.
@@ -143,5 +163,305 @@ async fn lowering_the_rendezvous_threshold_lowers_the_budget() {
     assert_eq!(
         local.effective_eager_payload(target, "_stream_batch", Some(&headers)),
         LOWERED_THRESHOLD - (STREAM_BATCH_ENVELOPE + 1 + 4 + 41),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A transport small enough to overrun
+// ---------------------------------------------------------------------------
+
+/// A transport that carries nothing and remembers everything.
+///
+/// It exists so a payload sized to the reported budget can actually be built:
+/// every real transport that reports a capacity reports megabytes of it. The
+/// size check mirrors the NATS transport, including the part that matters most
+/// here — an over-capacity frame is reported through `on_error` and the send is
+/// still [`SendOutcome::Admitted`], because nothing was queued behind it. So a
+/// fire-and-forget caller sees success either way and only the recorded frames
+/// say what reached the wire.
+struct CappedTransport {
+    key: velo_ext::TransportKey,
+    address: velo_ext::WorkerAddress,
+    capacity: usize,
+    accepted: std::sync::Mutex<Vec<(bytes::Bytes, bytes::Bytes)>>,
+    rejected: std::sync::Mutex<Vec<String>>,
+}
+
+impl CappedTransport {
+    fn new(capacity: usize) -> std::sync::Arc<Self> {
+        let key = velo_ext::TransportKey::from("capped");
+        let mut address = crate::transports::address::WorkerAddressBuilder::new();
+        address
+            .add_entry(key.as_str(), bytes::Bytes::from_static(b"capped://local"))
+            .expect("address entry");
+        std::sync::Arc::new(Self {
+            key,
+            address: address.build().expect("address"),
+            capacity,
+            accepted: std::sync::Mutex::new(Vec::new()),
+            rejected: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    /// The single frame this transport took, panicking unless there is exactly
+    /// one — a second frame would mean the test measured the wrong send.
+    fn only_accepted_frame(&self) -> (bytes::Bytes, bytes::Bytes) {
+        let accepted = self.accepted.lock().expect("accepted frames poisoned");
+        assert_eq!(accepted.len(), 1, "expected exactly one accepted frame");
+        accepted[0].clone()
+    }
+
+    fn rejections(&self) -> Vec<String> {
+        self.rejected
+            .lock()
+            .expect("rejected frames poisoned")
+            .clone()
+    }
+}
+
+impl crate::transports::Transport for CappedTransport {
+    fn key(&self) -> velo_ext::TransportKey {
+        self.key.clone()
+    }
+
+    fn address(&self) -> velo_ext::WorkerAddress {
+        self.address.clone()
+    }
+
+    fn max_message_size(&self, _target: InstanceId) -> Option<usize> {
+        Some(self.capacity)
+    }
+
+    fn register(
+        &self,
+        _peer_info: velo_ext::PeerInfo,
+    ) -> Result<(), crate::transports::TransportError> {
+        Ok(())
+    }
+
+    fn send_message(
+        &self,
+        _instance_id: InstanceId,
+        header: bytes::Bytes,
+        payload: bytes::Bytes,
+        _message_type: crate::transports::MessageType,
+        on_error: Arc<dyn TransportErrorHandler>,
+    ) -> SendOutcome {
+        let frame = header.len() + payload.len();
+        if frame > self.capacity {
+            let reason = format!(
+                "Frame size {frame} exceeds capped transport capacity {}",
+                self.capacity
+            );
+            self.rejected
+                .lock()
+                .expect("rejected frames poisoned")
+                .push(reason.clone());
+            on_error.on_error(header, payload, reason);
+            return SendOutcome::Admitted;
+        }
+        self.accepted
+            .lock()
+            .expect("accepted frames poisoned")
+            .push((header, payload));
+        SendOutcome::Admitted
+    }
+
+    fn start(
+        &self,
+        _instance_id: InstanceId,
+        _channels: crate::transports::TransportAdapter,
+        _rt: tokio::runtime::Handle,
+    ) -> futures::future::BoxFuture<'_, anyhow::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn shutdown(&self) {}
+
+    fn check_health(
+        &self,
+        _instance_id: InstanceId,
+        _timeout: Duration,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<(), crate::transports::HealthCheckError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// A messenger whose only transport reports `capacity`, plus a peer registered
+/// on it and the transport itself to read frames back from.
+async fn capped_messenger(
+    capacity: usize,
+) -> (
+    std::sync::Arc<Messenger>,
+    InstanceId,
+    std::sync::Arc<CappedTransport>,
+) {
+    let transport = CappedTransport::new(capacity);
+    let messenger = Messenger::builder()
+        .add_transport(transport.clone())
+        .build()
+        .await
+        .expect("messenger");
+    let target = InstanceId::new_v4();
+    messenger
+        .register_peer(velo_ext::PeerInfo::new(target, transport.address()))
+        .expect("register peer");
+    (messenger, target, transport)
+}
+
+/// The budget is a promise about the wire, so it has to be tested against the
+/// wire: a payload sized to the number the client reported must fill the
+/// transport's frame and not exceed it, whatever the send path did to the
+/// headers on the way. This is the promise with no trace context in the
+/// picture; the `distributed-tracing` test below is the same assertion with
+/// one.
+#[tokio::test]
+async fn a_budget_sized_payload_fills_the_transport_frame_exactly() {
+    const CAPACITY: usize = 8 * 1024;
+    let (local, target, transport) = capped_messenger(CAPACITY).await;
+
+    let budget = local.effective_eager_payload(target, "_stream_batch", None);
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        local
+            .am_send_streaming("_stream_batch")
+            .expect("streaming builder")
+            .raw_payload(bytes::Bytes::from(vec![0u8; budget]))
+            .instance(target)
+            .send(),
+    )
+    .await
+    .expect("a registered peer and an underscore handler take the fast path")
+    .expect("a budget-sized send is admitted");
+
+    assert_eq!(
+        transport.rejections(),
+        Vec::<String>::new(),
+        "a payload sized to the reported budget must fit the transport it was sized against"
+    );
+    let (header, payload) = transport.only_accepted_frame();
+    assert_eq!(header.len() + payload.len(), CAPACITY);
+}
+
+// ---------------------------------------------------------------------------
+// The budget and the encoder must agree about the headers
+// ---------------------------------------------------------------------------
+
+/// The `traceparent` a W3C propagator writes: a fixed 55 bytes.
+#[cfg(feature = "distributed-tracing")]
+const TRACEPARENT_KEY: &str = "traceparent";
+#[cfg(feature = "distributed-tracing")]
+const TRACEPARENT_VALUE: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+/// Marker the propagator below looks for before injecting anything.
+///
+/// `set_text_map_propagator` is process-global and this test shares a binary
+/// with every other budget test, so the injection has to be scoped to the
+/// context this test attaches rather than to whatever runs alongside it.
+#[cfg(feature = "distributed-tracing")]
+#[derive(Debug)]
+struct TraceThisSend;
+
+/// Stands in for whichever propagator a deployment installed. A real
+/// `TraceContextPropagator` lives in `opentelemetry-sdk`, which this crate does
+/// not depend on; what matters to the budget is only that injection puts bytes
+/// in the header map between the budget being reported and the frame being
+/// encoded.
+#[cfg(feature = "distributed-tracing")]
+#[derive(Debug)]
+struct FixedTraceparentPropagator;
+
+#[cfg(feature = "distributed-tracing")]
+impl opentelemetry::propagation::TextMapPropagator for FixedTraceparentPropagator {
+    fn inject_context(
+        &self,
+        cx: &opentelemetry::Context,
+        injector: &mut dyn opentelemetry::propagation::Injector,
+    ) {
+        if cx.get::<TraceThisSend>().is_some() {
+            injector.set(TRACEPARENT_KEY, TRACEPARENT_VALUE.to_string());
+        }
+    }
+
+    fn extract_with_context(
+        &self,
+        cx: &opentelemetry::Context,
+        _extractor: &dyn opentelemetry::propagation::Extractor,
+    ) -> opentelemetry::Context {
+        cx.clone()
+    }
+
+    fn fields(&self) -> opentelemetry::propagation::text_map_propagator::FieldIter<'_> {
+        static FIELDS: std::sync::OnceLock<[String; 1]> = std::sync::OnceLock::new();
+        opentelemetry::propagation::text_map_propagator::FieldIter::new(
+            FIELDS.get_or_init(|| [TRACEPARENT_KEY.to_string()]),
+        )
+    }
+}
+
+/// The budget has to be sized against the headers the *send path* will encode,
+/// not the ones the caller handed in. Under `distributed-tracing` the client
+/// injects the current trace context immediately before encoding, so a budget
+/// that counted only the caller's headers is short by the whole context — and a
+/// payload sized to it overruns the transport it was sized against.
+///
+/// Filling the budget exactly and watching the transport take the frame is the
+/// assertion that discriminates: before the fix the same send is rejected for
+/// being over capacity.
+#[cfg(feature = "distributed-tracing")]
+#[tokio::test]
+async fn budget_covers_the_trace_context_the_send_path_injects() {
+    const CAPACITY: usize = 8 * 1024;
+    let (local, target, transport) = capped_messenger(CAPACITY).await;
+
+    opentelemetry::global::set_text_map_propagator(FixedTraceparentPropagator);
+    let untraced = local.effective_eager_payload(target, "_stream_batch", None);
+
+    let _attached = opentelemetry::Context::current_with_value(TraceThisSend).attach();
+    let budget = local.effective_eager_payload(target, "_stream_batch", None);
+    assert!(
+        budget < untraced,
+        "an injected trace context has to cost envelope: traced {budget}, untraced {untraced}"
+    );
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        local
+            .am_send_streaming("_stream_batch")
+            .expect("streaming builder")
+            .raw_payload(bytes::Bytes::from(vec![0u8; budget]))
+            .instance(target)
+            .send(),
+    )
+    .await
+    .expect("a registered peer and an underscore handler take the fast path")
+    .expect("a budget-sized send is admitted");
+
+    assert_eq!(
+        transport.rejections(),
+        Vec::<String>::new(),
+        "a payload sized to the reported budget must fit the transport it was sized against"
+    );
+    let (header, payload) = transport.only_accepted_frame();
+    assert_eq!(
+        header.len() + payload.len(),
+        CAPACITY,
+        "the budget is exactly what the capacity leaves once the real envelope is paid for"
+    );
+
+    let decoded = crate::messenger::common::messages::decode_active_message(header, payload)
+        .expect("the frame decodes");
+    assert!(
+        decoded
+            .metadata
+            .headers
+            .is_some_and(|headers| headers.contains_key(TRACEPARENT_KEY)),
+        "nothing was injected, so this test would have passed for the wrong reason"
     );
 }
