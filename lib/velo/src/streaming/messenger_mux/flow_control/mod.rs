@@ -135,6 +135,7 @@ impl NegotiatedLimits {
     }
 
     /// An ingress account opened at these limits.
+    #[cfg(test)]
     pub(crate) const fn open_account(&self) -> SlotCreditAccount {
         SlotCreditAccount::new(self.initial_credit)
     }
@@ -190,7 +191,10 @@ impl CreditClass {
     ///
     /// Control records do not: `OpenSlot` and `CloseSlot` act on the registry
     /// and `CreditUpdate` feeds the egress ledger, so none is ever handed to a
-    /// consumer. That is precisely why the buffer cannot overflow.
+    /// consumer. That is precisely why the buffer cannot overflow — a property
+    /// `admit` encodes structurally, which leaves this the statement of it that
+    /// the tests check.
+    #[cfg(test)]
     pub(crate) const fn occupies_buffer(self) -> bool {
         !matches!(self, Self::Control)
     }
@@ -326,11 +330,13 @@ impl SlotCreditAccount {
     }
 
     /// Data credit `C` granted to the peer.
+    #[cfg(test)]
     pub(crate) const fn limit(&self) -> u32 {
         self.limit
     }
 
     /// Depth the slot buffer must have for `try_send` to be infallible.
+    #[cfg(test)]
     pub(crate) const fn buffer_depth(&self) -> usize {
         slot_buffer_depth(self.limit)
     }
@@ -345,16 +351,19 @@ impl SlotCreditAccount {
     }
 
     /// Data credit the peer has spent and not had returned.
+    #[cfg(test)]
     pub(crate) const fn data_outstanding(&self) -> u32 {
         self.data_outstanding
     }
 
     /// Data credit the peer may still spend.
+    #[cfg(test)]
     pub(crate) const fn data_free(&self) -> u32 {
         self.limit - self.data_outstanding
     }
 
     /// Credit released but not yet advertised, awaiting a `CreditUpdate`.
+    #[cfg(test)]
     pub(crate) const fn pending_grant(&self) -> u32 {
         self.ungranted
     }
@@ -435,6 +444,10 @@ pub(crate) enum ByteBudgetError {
 
 impl ByteBudgetError {
     /// Whether draining could ever admit this request.
+    ///
+    /// The routing decision itself matches the variants, so this is the
+    /// statement of the split that the tests hold it to.
+    #[cfg(test)]
     pub(crate) const fn is_transient(&self) -> bool {
         matches!(self, Self::Exhausted { .. })
     }
@@ -458,11 +471,13 @@ impl ByteBudget {
     }
 
     /// The per-peer budget across all of that peer's slots.
+    #[cfg(test)]
     pub(crate) const fn per_peer() -> Self {
         Self::new(DEFAULT_PEER_BYTE_BUDGET)
     }
 
     /// The per-slot cap at the negotiated budget.
+    #[cfg(test)]
     pub(crate) const fn per_slot(limits: &NegotiatedLimits) -> Self {
         Self::new(limits.slot_byte_budget() as u64)
     }

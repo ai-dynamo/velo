@@ -81,6 +81,8 @@ async fn a_stalled_batcher_coalesces_control_instead_of_queueing_it() {
             anchor_id: 1,
             session_id: 1,
             inlet: inlet_rx,
+            credit: SlotCredit::new(0),
+            slot_byte_budget: MuxConfig::default().slot_byte_budget,
             ack: ack_tx,
         })
         .await

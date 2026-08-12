@@ -428,17 +428,26 @@ async fn a_remote_stream_preserves_send_order_under_a_slow_consumer() {
     let am_consumer = Arc::new(
         AnchorManagerBuilder::default()
             .worker_id(consumer_worker)
-            .transport(mux_consumer as Arc<dyn FrameTransport>)
+            .transport(Arc::clone(&mux_consumer) as Arc<dyn FrameTransport>)
             .build()
             .expect("consumer anchor manager"),
     );
     let am_producer = Arc::new(
         AnchorManagerBuilder::default()
             .worker_id(producer_worker)
-            .transport(mux_producer as Arc<dyn FrameTransport>)
+            .transport(Arc::clone(&mux_producer) as Arc<dyn FrameTransport>)
             .build()
             .expect("producer anchor manager"),
     );
+    // Installed, not merely wired in as the default transport. Negotiation is
+    // what carries the credit window now, and only an installed mux has a
+    // window to advertise or a `connect_negotiated` to open a slot through.
+    am_consumer
+        .install_mux(mux_consumer)
+        .expect("install consumer mux");
+    am_producer
+        .install_mux(mux_producer)
+        .expect("install producer mux");
     am_consumer
         .register_handlers(Arc::clone(&m_consumer))
         .expect("consumer handlers");

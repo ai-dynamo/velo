@@ -33,15 +33,15 @@
 //! - [`ingress`] — receive. The `_stream_batch` handler body, ordered per
 //!   sender and nonblocking by construction.
 //!
-//! ## What this stage does and does not do
+//! ## How a deployment reaches it
 //!
-//! The transport is complete and directly usable: `bind` and `connect` work,
-//! and registering it under [`MESSENGER_MUX_KEY`] in an `AnchorManager`'s
-//! transport registry makes it reachable. What it is **not** yet is *chosen* —
-//! attach-time negotiation, the `#[serde(default)] initial_credit` /
-//! `slot_byte_budget` fields, and the builder switch that advertises the key all
-//! land in the next stage. Until then nothing offers `messenger-mux-v1` on an
-//! attach, so a deployment reaches the mux only by installing it deliberately.
+//! Opt-in, through `Velo::builder().messenger_mux(MuxConfig { enabled: true,
+//! ..Default::default() })`. That registers the transport beside the configured
+//! legacy one and lets this node advertise [`MESSENGER_MUX_KEY`] on its attach
+//! requests; [`crate::streaming::negotiation`] is where an attach then picks
+//! between the two, and picks the mux only when both peers named it. Setting
+//! `enabled` back to `false` stops the advertisement and is therefore the whole
+//! rollback.
 //!
 //! ## The producer's contract under the mux
 //!
@@ -70,32 +70,12 @@
 //! credit starvation, which nothing but the consumer can end, that the withheld
 //! queue exists for.
 //!
-//! Two consequences of the pre-negotiation ordering are visible here. Initial credit is
-//! advertised by a `CreditUpdate` on `OpenSlot` rather than in the attach
-//! response, which costs one round trip per stream open that negotiation will
-//! remove. And `reader_pump` returns credit by *reconciliation* — the mux
-//! compares the buffer's occupancy against what it admitted — rather than by the
-//! exact `credit.release(1)` hook `BATCHING.md` describes, because until
-//! negotiation lands `reader_pump` never drains a mux slot buffer at all.
-// Nothing outside `#[cfg(test)]` constructs a `MessengerMuxTransport` yet: the
-// attach handlers still hardcode the local default transport key, so no attach
-// can resolve `messenger-mux-v1` and no builder installs one. That is
-// deliberate — the mux ships unreachable and is switched on by negotiation —
-// but it makes the whole module read as dead to the plain lib build.
-//
-// `expect` rather than `allow` so the suppression cannot outlive its excuse:
-// the stage below registers the transport and advertises the key, at which
-// point this expectation goes unfulfilled and fails the build under
-// `-D warnings`. The `cfg_attr` is required — under `cfg(test)` the tests here
-// already construct and drive the transport, so an unconditional `expect` would
-// be unfulfilled today.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "reachable once Stage F attach-time negotiation registers and advertises messenger-mux-v1"
-    )
-)]
+//! One deviation from `BATCHING.md` survives: `reader_pump` returns credit by
+//! *reconciliation* — the mux compares the buffer's occupancy against what it
+//! admitted — rather than through the exact `credit.release(1)` hook the
+//! document describes. The effect is the same and the sweep bounds the latency;
+//! what it costs is that a return is one sweep tick late when no further batch
+//! arrives to drive reconciliation on the arrival path.
 
 pub(crate) mod flow_control;
 pub(crate) mod ingress;
@@ -114,7 +94,7 @@ use futures::future::BoxFuture;
 use tokio_util::sync::CancellationToken;
 use velo_ext::{TransportKey, WorkerAddress, WorkerId};
 
-use self::flow_control::{DEFAULT_PEER_BYTE_BUDGET, DEFAULT_SLOT_BYTE_BUDGET, slot_buffer_depth};
+use self::flow_control::{DEFAULT_PEER_BYTE_BUDGET, DEFAULT_SLOT_BYTE_BUDGET, NegotiatedLimits};
 use self::ingress::IngressRegistry;
 use self::peer_batcher::{
     BatcherContext, BatcherHandle, BatcherMap, OpenRejected, OpenSlotRequest,
@@ -147,39 +127,55 @@ const ACCEPT_TIMEOUT: Duration = Duration::from_secs(60);
 /// eviction sweeps inside one attach.
 const CONNECT_ATTEMPTS: usize = 3;
 
-/// Construction-time tuning for the mux.
+/// Construction-time tuning for the mux, and the switch that installs one.
 ///
-/// Deliberately not on the `Velo` builder yet: the activation switch is the next
-/// stage's business, and shipping the knobs before the switch would let a
-/// deployment tune a transport nothing selects.
+/// Reached from the `Velo` builder as `.messenger_mux(MuxConfig { enabled: true,
+/// ..Default::default() })`. Defaults are chosen so `enabled` is the only
+/// decision an operator has to make.
 #[derive(Debug, Clone)]
-pub(crate) struct MuxConfig {
+pub struct MuxConfig {
+    /// Whether to install the mux at all.
+    ///
+    /// **Defaults to `false`, and stays that way** — the mux is opt-in, not the
+    /// default transport. This flag is also the rollback: set it back to
+    /// `false` and the node stops registering `messenger-mux-v1` and stops
+    /// advertising it on attach, so the next attach negotiates the legacy path
+    /// with no code change and no wire change. That is what makes a canary
+    /// safe, and why activation is config-only.
+    pub enabled: bool,
     /// Configured ceiling on one batch. Further clamped at flush time by the
     /// effective eager budget and by `COALESCE_THRESHOLD`, whichever binds
     /// first.
-    pub(crate) max_batch_bytes: usize,
+    pub max_batch_bytes: usize,
     /// Data credit `C` granted to each new slot, and therefore the depth of the
     /// `C + 1` buffer `bind` hands the anchor.
-    pub(crate) initial_credit: u32,
+    ///
+    /// Advertised verbatim as the attach response's `initial_credit`, so it
+    /// must never be zero: zero on the wire means *this peer is not offering
+    /// the mux*. [`MessengerMuxTransport::new`] refuses a zero rather than
+    /// letting a node install a mux it then tells every peer to ignore.
+    pub initial_credit: u32,
     /// Bytes one slot may hold in flight — the replacement for the ~1 MiB the
-    /// kernel socket used to enforce per stream for free.
-    pub(crate) slot_byte_budget: u32,
+    /// kernel socket used to enforce per stream for free. Zero means the
+    /// default, which is the same thing it means on the wire.
+    pub slot_byte_budget: u32,
     /// Bytes all of one peer's slots may hold in flight between them.
-    pub(crate) peer_byte_budget: u64,
+    pub peer_byte_budget: u64,
     /// How often the credit sweep runs.
     ///
     /// The arrival path returns credit on every inbound batch, so this only
     /// matters for a slot that has parked with nothing further arriving to
     /// trigger reconciliation — where it is the difference between resuming and
     /// deadlocking, at one interval of added latency.
-    pub(crate) credit_sweep_interval: Duration,
+    pub credit_sweep_interval: Duration,
     /// How long a batcher may sit idle with no slots before it is evicted.
-    pub(crate) batcher_idle_ttl: Duration,
+    pub batcher_idle_ttl: Duration,
 }
 
 impl Default for MuxConfig {
     fn default() -> Self {
         Self {
+            enabled: false,
             max_batch_bytes: 60 * 1024,
             initial_credit: 256,
             slot_byte_budget: DEFAULT_SLOT_BYTE_BUDGET,
@@ -191,19 +187,6 @@ impl Default for MuxConfig {
 }
 
 impl MuxConfig {
-    /// Depth of the per-slot channel `connect` hands the producer.
-    ///
-    /// Sized to the credit window for symmetry with the receive buffer. It is
-    /// *not* where credit starvation backpressures a producer — the batcher
-    /// drains this channel whether or not the slot may send, so under starvation
-    /// the depth only decides how much sits here rather than in the withheld
-    /// queue. It **is** where a batcher parked on admission backpressures one,
-    /// because that park suspends the whole task, inlet drain included. See
-    /// [the producer contract](self#the-producers-contract-under-the-mux).
-    fn inlet_depth(&self) -> usize {
-        slot_buffer_depth(self.initial_credit)
-    }
-
     /// Sweep ticks a batcher must sit idle through before it may be evicted.
     fn idle_ticks(&self) -> u32 {
         let interval = self.credit_sweep_interval.as_millis().max(1);
@@ -226,6 +209,13 @@ pub(crate) struct MessengerMuxTransport {
 struct MuxCore {
     messenger: Arc<Messenger>,
     config: MuxConfig,
+    /// This node's own window, resolved once at construction.
+    ///
+    /// What a receiver advertises on attach and what a sender falls back to
+    /// when it opens a slot without having negotiated — the two are the same
+    /// numbers, so they are resolved in one place through the same
+    /// [`NegotiatedLimits::from_wire`] the wire path uses.
+    limits: NegotiatedLimits,
     metrics: Option<MuxMetricsHandle>,
     batchers: Arc<BatcherMap>,
     ingress: Arc<IngressRegistry>,
@@ -243,15 +233,30 @@ impl MessengerMuxTransport {
     ///
     /// Registration is for the messenger's lifetime: there is no
     /// handler-deregistration hook, and `register_streaming_handler` refuses a
-    /// duplicate name, so at most one mux may be installed per messenger.
+    /// duplicate name, so at most one mux may be installed per messenger — a
+    /// second attempt fails here rather than producing two batchers racing for
+    /// one handler name.
+    ///
+    /// Fails on `initial_credit = 0`, which is not a small window but the wire
+    /// encoding of *"not offering the mux"*. A node that installed one would
+    /// advertise a key and then tell every peer to ignore it.
     pub(crate) fn new(
         messenger: Arc<Messenger>,
         config: MuxConfig,
         metrics: Option<Arc<VeloMetrics>>,
     ) -> Result<Arc<Self>> {
+        let limits = NegotiatedLimits::from_wire(config.initial_credit, config.slot_byte_budget)
+            .map_err(|error| anyhow!("messenger mux: {error}"))?;
+        // Normalised so every reader of the config sees the effective budget
+        // rather than the "use the default" zero.
+        let config = MuxConfig {
+            slot_byte_budget: limits.slot_byte_budget(),
+            ..config
+        };
         let core = Arc::new(MuxCore {
             messenger: Arc::clone(&messenger),
             config,
+            limits,
             metrics: metrics.as_ref().map(|metrics| metrics.bind_mux()),
             batchers: Arc::new(DashMap::new()),
             ingress: Arc::new(IngressRegistry::default()),
@@ -460,8 +465,7 @@ impl FrameTransport for MessengerMuxTransport {
             // `C + 1`: `C` data credits plus the one reserved terminal credit.
             // Credit is issued against *this* buffer and never against the
             // anchor's `frame_tx`, which has writers other than the mux.
-            let (frame_tx, frame_rx) =
-                flume::bounded::<Vec<u8>>(slot_buffer_depth(core.config.initial_credit));
+            let (frame_tx, frame_rx) = flume::bounded::<Vec<u8>>(core.limits.slot_buffer_depth());
             core.ingress.register_bind(anchor_id, session_id, frame_tx);
 
             // `Weak`, and cancellable. A strong handle here would pin the whole
@@ -492,23 +496,67 @@ impl FrameTransport for MessengerMuxTransport {
         })
     }
 
+    /// Opens a slot at *this node's* limits.
+    ///
+    /// Only correct where both ends are configured alike, which is why the
+    /// attach path never takes it: it calls
+    /// [`connect_negotiated`](Self::connect_negotiated) with the window the
+    /// receiver actually advertised. This exists so the transport is still
+    /// usable through the bare [`FrameTransport`] trait — a mux wired in
+    /// directly, with no anchor manager between the two ends, has no attach
+    /// response to learn a window from.
     fn connect(
         &self,
         peer: WorkerId,
         anchor_id: u64,
         session_id: u64,
     ) -> BoxFuture<'_, Result<flume::Sender<Vec<u8>>>> {
+        let limits = self.core.limits;
+        self.connect_negotiated(peer, anchor_id, session_id, limits)
+    }
+}
+
+impl MessengerMuxTransport {
+    /// The window this node advertises to a peer negotiating an attach.
+    pub(crate) fn advertised_limits(&self) -> NegotiatedLimits {
+        self.core.limits
+    }
+
+    /// Open a slot to `peer` at the limits its attach response advertised.
+    ///
+    /// The negotiated window is what lets the slot open *already granted*: the
+    /// receiver sized its buffer from the same numbers it put on the wire, so
+    /// there is nothing left for it to tell the sender and no round trip in
+    /// which to tell it. Before negotiation the slot opened at zero credit and
+    /// waited for a `CreditUpdate` the receiver emitted on `OpenSlot`, which
+    /// cost one round trip per stream open.
+    pub(crate) fn connect_negotiated(
+        &self,
+        peer: WorkerId,
+        anchor_id: u64,
+        session_id: u64,
+        limits: NegotiatedLimits,
+    ) -> BoxFuture<'_, Result<flume::Sender<Vec<u8>>>> {
         let core = Arc::clone(&self.core);
         Box::pin(async move {
             for _ in 0..CONNECT_ATTEMPTS {
                 let batcher = core.batcher(peer);
-                let (inlet_tx, inlet_rx) = flume::bounded::<Vec<u8>>(core.config.inlet_depth());
+                // Sized to the credit window for symmetry with the receive
+                // buffer. It is *not* where credit starvation backpressures a
+                // producer — the batcher drains this channel whether or not the
+                // slot may send — but it **is** where a batcher parked on
+                // admission does, because that park suspends the whole task,
+                // inlet drain included. See
+                // [the producer contract](self#the-producers-contract-under-the-mux).
+                let (inlet_tx, inlet_rx) = flume::bounded::<Vec<u8>>(limits.slot_buffer_depth());
                 let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
                 if batcher
                     .open_slot(OpenSlotRequest {
                         anchor_id,
                         session_id,
                         inlet: inlet_rx,
+                        credit: limits.open_credit(),
+                        slot_byte_budget: limits.slot_byte_budget(),
                         ack: ack_tx,
                     })
                     .await

@@ -32,6 +32,7 @@ pub mod handle;
 /// attach time, so nothing outside this crate names these types.
 pub(crate) mod messenger_mux;
 pub mod mpsc;
+pub(crate) mod negotiation;
 pub mod sender;
 pub mod tcp_transport;
 pub mod transport;
@@ -43,6 +44,7 @@ pub use frame::{SendError, StreamError, StreamFrame};
 #[cfg(feature = "grpc")]
 pub use grpc_transport::GrpcFrameTransport;
 pub use handle::{AnchorKind, StreamAnchorHandle};
+pub use messenger_mux::MuxConfig;
 pub use mpsc::{
     MpscAnchorConfig, MpscFrame, MpscStreamAnchor, MpscStreamController, MpscStreamSender, SenderId,
 };

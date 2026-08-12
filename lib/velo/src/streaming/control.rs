@@ -484,7 +484,12 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::messe
                     .next_routing_session_id
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                     + 1;
-                let receiver = match manager.transport.bind(local_id, routing_session_id).await {
+                // Which transport this attach rides is decided here, from what
+                // the sender advertised: `messenger-mux-v1` when both sides
+                // named it, and otherwise exactly the local default this
+                // handler answered with before negotiation existed.
+                let selection = manager.select_streaming_transport(&req.supported_transport_keys);
+                let receiver = match selection.transport.bind(local_id, routing_session_id).await {
                     Ok(rx) => rx,
                     Err(e) => {
                         manager.record_streaming_operation(
@@ -498,7 +503,7 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::messe
                         });
                     }
                 };
-                let streaming_transport_key = manager.transport.key();
+                let streaming_transport_key = selection.key;
 
                 // Step 3: Atomically set attachment under shard lock
                 use dashmap::mapref::entry::Entry;
@@ -564,8 +569,8 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::messe
                                 streaming_transport_key,
                                 heartbeat_interval_ms: heartbeat_interval.as_millis() as u64,
                                 routing_session_id,
-                                initial_credit: 0,
-                                slot_byte_budget: 0,
+                                initial_credit: selection.initial_credit,
+                                slot_byte_budget: selection.slot_byte_budget,
                             })
                         }
                     }

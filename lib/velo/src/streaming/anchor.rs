@@ -658,6 +658,21 @@ pub struct AnchorManager {
     /// `None` until `register_handlers` succeeds; subsequent calls return `Err`.
     #[builder(setter(skip), default = "std::sync::OnceLock::new()")]
     pub(crate) messenger_lock: std::sync::OnceLock<Arc<crate::messenger::Messenger>>,
+
+    /// The `messenger-mux-v1` transport, when one is installed.
+    ///
+    /// Held as its concrete type rather than only as a registry entry because
+    /// negotiation needs two things the `FrameTransport` trait does not carry:
+    /// the window to advertise on an attach response, and a `connect` that
+    /// takes the window a peer advertised back. Keeping that off the trait is
+    /// deliberate — `FrameTransport` lives in `velo-ext` and out-of-tree
+    /// implementors should not grow a method about one in-tree transport's
+    /// credit protocol.
+    ///
+    /// Write-once, like `messenger_lock`, and skipped by the builder: it is a
+    /// crate-internal type, and a public setter naming it would leak it.
+    #[builder(setter(skip), default = "std::sync::OnceLock::new()")]
+    mux: std::sync::OnceLock<Arc<crate::streaming::messenger_mux::MessengerMuxTransport>>,
 }
 
 impl AnchorManagerBuilder {
@@ -821,6 +836,78 @@ impl AnchorManager {
         if let Some(sender) = maybe_sender {
             // Non-blocking best-effort -- control sentinels must never stall.
             let _ = sender.try_send(frame_bytes);
+        }
+    }
+
+    /// Install the mux this manager negotiates with, once.
+    ///
+    /// Separate from the transport registry, which the mux also joins: the
+    /// registry answers "can I `connect()` on this key", while this answers
+    /// "may I offer, and drive, `messenger-mux-v1`". Both are needed and they
+    /// are set together by the builder.
+    pub(crate) fn install_mux(
+        &self,
+        mux: Arc<crate::streaming::messenger_mux::MessengerMuxTransport>,
+    ) -> anyhow::Result<()> {
+        self.mux
+            .set(mux)
+            .map_err(|_| anyhow::anyhow!("a messenger mux is already installed on this manager"))
+    }
+
+    /// The transports this node advertises when it attaches to a remote anchor.
+    fn supported_transport_keys(&self) -> Vec<velo_ext::TransportKey> {
+        crate::streaming::negotiation::advertised_keys(
+            &self.transport_registry,
+            &self.transport,
+            self.mux.get(),
+        )
+    }
+
+    /// Pick the transport to bind for an incoming attach.
+    ///
+    /// Called by both attach handlers, which differ only in the response type
+    /// they pour the answer into.
+    pub(crate) fn select_streaming_transport(
+        &self,
+        offered: &[velo_ext::TransportKey],
+    ) -> crate::streaming::negotiation::Selection {
+        crate::streaming::negotiation::select(offered, self.mux.get(), &self.transport)
+    }
+
+    /// Connect the transport the receiver's attach response named.
+    ///
+    /// The mux arm is why this is not just `resolve_transport(...).connect(...)`:
+    /// a negotiated slot opens already holding the window the receiver
+    /// advertised, which is what removes the round trip an `OpenSlot`-time
+    /// `CreditUpdate` used to cost.
+    async fn connect_streaming(
+        &self,
+        key: &velo_ext::TransportKey,
+        peer: velo_ext::WorkerId,
+        anchor_id: u64,
+        session_id: u64,
+        initial_credit: u32,
+        slot_byte_budget: u32,
+    ) -> Result<flume::Sender<Vec<u8>>, AttachError> {
+        match crate::streaming::negotiation::choose(key, initial_credit, slot_byte_budget) {
+            Ok(crate::streaming::negotiation::Connect::Mux(limits)) => {
+                let mux = self.mux.get().ok_or_else(|| {
+                    AttachError::TransportError(anyhow::anyhow!(
+                        "peer answered with {key} but no messenger mux is installed here; \
+                         it can only have learned that key from an advertisement this node made"
+                    ))
+                })?;
+                Ok(mux
+                    .connect_negotiated(peer, anchor_id, session_id, limits)
+                    .await?)
+            }
+            Ok(crate::streaming::negotiation::Connect::Legacy) => {
+                let transport = self.resolve_transport(key)?;
+                Ok(transport.connect(peer, anchor_id, session_id).await?)
+            }
+            Err(error) => Err(AttachError::TransportError(anyhow::anyhow!(
+                "peer answered with {key} but {error}"
+            ))),
         }
     }
 
@@ -1062,7 +1149,7 @@ impl AnchorManager {
             handle,
             session_id: sender_stream_id,
             stream_cancel_handle,
-            supported_transport_keys: Vec::new(),
+            supported_transport_keys: self.supported_transport_keys(),
         };
 
         // Send _anchor_attach AM to the remote worker (typed request-response)
@@ -1082,9 +1169,8 @@ impl AnchorManager {
                 streaming_transport_key,
                 heartbeat_interval_ms,
                 routing_session_id,
-                // The negotiated mux limits ride here; nothing reads them
-                // until the selection path lands.
-                ..
+                initial_credit,
+                slot_byte_budget,
             } => {
                 let (_, local_id) = handle.unpack();
 
@@ -1100,9 +1186,15 @@ impl AnchorManager {
                 } else {
                     sender_stream_id
                 };
-                let transport = self.resolve_transport(&streaming_transport_key)?;
-                let frame_tx = transport
-                    .connect(handle_worker_id, local_id, connect_session_id)
+                let frame_tx = self
+                    .connect_streaming(
+                        &streaming_transport_key,
+                        handle_worker_id,
+                        local_id,
+                        connect_session_id,
+                        initial_credit,
+                        slot_byte_budget,
+                    )
                     .await?;
 
                 // Register SenderEntry for _stream_cancel routing
@@ -1457,7 +1549,7 @@ impl AnchorManager {
             handle,
             session_id: sender_stream_id,
             stream_cancel_handle,
-            supported_transport_keys: Vec::new(),
+            supported_transport_keys: self.supported_transport_keys(),
         };
 
         let response: crate::streaming::mpsc::control::MpscAnchorAttachResponse = messenger
@@ -1477,7 +1569,8 @@ impl AnchorManager {
                 heartbeat_interval_ms,
                 sender_id,
                 routing_session_id,
-                ..
+                initial_credit,
+                slot_byte_budget,
             } => {
                 let (_, local_id) = handle.unpack();
                 // See the SPSC remote attach above for routing_session_id
@@ -1487,9 +1580,15 @@ impl AnchorManager {
                 } else {
                     sender_stream_id
                 };
-                let transport = self.resolve_transport(&streaming_transport_key)?;
-                let frame_tx = transport
-                    .connect(handle_worker_id, local_id, connect_session_id)
+                let frame_tx = self
+                    .connect_streaming(
+                        &streaming_transport_key,
+                        handle_worker_id,
+                        local_id,
+                        connect_session_id,
+                        initial_credit,
+                        slot_byte_budget,
+                    )
                     .await?;
 
                 let sender_entry = crate::streaming::control::SenderEntry {

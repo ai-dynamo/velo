@@ -16,6 +16,7 @@ use super::super::*;
 use crate::messenger::{Context, Handler};
 use crate::observability::VeloMetrics;
 use crate::streaming::messenger_mux::STREAM_BATCH_HANDLER;
+use crate::streaming::messenger_mux::flow_control::SlotCredit;
 use crate::streaming::messenger_mux::protocol::{
     BatchDecoder, BatchHeader, RecordBody, RecordType,
 };
@@ -85,6 +86,9 @@ impl OwnedBatch {
 
 pub(super) struct Harness {
     pub(super) handle: Arc<BatcherHandle>,
+    /// The batcher's own configuration, so [`Harness::open`] can hand a slot
+    /// the byte budget the batcher was built with.
+    config: MuxConfig,
     pub(super) batches: flume::Receiver<Bytes>,
     pub(super) registry: prometheus::Registry,
     pub(super) cancel: CancellationToken,
@@ -148,7 +152,7 @@ pub(super) async fn harness(config: MuxConfig) -> Harness {
         peer,
         BatcherContext {
             messenger: Arc::clone(&sender),
-            config,
+            config: config.clone(),
             metrics: Some(metrics.bind_mux()),
             epochs: Arc::new(AtomicU64::new(1)),
             batchers: Arc::new(DashMap::new()),
@@ -158,6 +162,7 @@ pub(super) async fn harness(config: MuxConfig) -> Harness {
 
     Harness {
         handle,
+        config,
         batches,
         registry,
         cancel,
@@ -205,6 +210,14 @@ impl Harness {
                 anchor_id,
                 session_id,
                 inlet: inlet_rx,
+                // Deliberately starved. On the attach path a slot opens
+                // holding the window its peer advertised, but every arm below
+                // is about what the batcher does once a slot has none —
+                // withholding, fairness between a parked slot and a flowing
+                // one, the reserved terminal — and opening at zero is how a
+                // test reaches that state without first spending a window.
+                credit: SlotCredit::new(0),
+                slot_byte_budget: self.config.slot_byte_budget,
                 ack: ack_tx,
             })
             .await

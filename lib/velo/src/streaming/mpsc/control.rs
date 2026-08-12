@@ -235,16 +235,19 @@ pub fn create_mpsc_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::
                     .next_routing_session_id
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                     + 1;
-                let transport_rx = match manager.transport.bind(local_id, routing_session_id).await
-                {
-                    Ok(rx) => rx,
-                    Err(e) => {
-                        return Ok(MpscAnchorAttachResponse::Err {
-                            reason: format!("transport error: {}", e),
-                        });
-                    }
-                };
-                let streaming_transport_key = manager.transport.key();
+                // Same intersection the SPSC handler makes; MPSC negotiates in
+                // the same version so there is no half-migrated state.
+                let selection = manager.select_streaming_transport(&req.supported_transport_keys);
+                let transport_rx =
+                    match selection.transport.bind(local_id, routing_session_id).await {
+                        Ok(rx) => rx,
+                        Err(e) => {
+                            return Ok(MpscAnchorAttachResponse::Err {
+                                reason: format!("transport error: {}", e),
+                            });
+                        }
+                    };
+                let streaming_transport_key = selection.key;
 
                 // Step 3: atomic slot insertion.
                 use dashmap::mapref::entry::Entry;
@@ -305,8 +308,8 @@ pub fn create_mpsc_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::
                     heartbeat_interval_ms: heartbeat_interval.as_millis() as u64,
                     sender_id,
                     routing_session_id,
-                    initial_credit: 0,
-                    slot_byte_budget: 0,
+                    initial_credit: selection.initial_credit,
+                    slot_byte_budget: selection.slot_byte_budget,
                 })
             }
         },

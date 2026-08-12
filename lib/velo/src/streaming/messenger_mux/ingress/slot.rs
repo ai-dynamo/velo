@@ -25,7 +25,7 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use super::super::flow_control::{ByteBudget, CreditClass, SlotCreditAccount, try_reserve_pair};
-use super::super::protocol::{CloseReason, SlotId};
+use super::super::protocol::{CloseReason, RecordType, SlotId};
 use crate::streaming::sender::{cached_dropped, cached_heartbeat, is_terminal_sentinel};
 
 /// What applying a record did.
@@ -105,11 +105,6 @@ impl IngressSlot {
             hold_bytes: ByteBudget::new(u64::from(slot_byte_budget)),
             pending_close: None,
         }
-    }
-
-    /// The credit `C` this slot granted.
-    pub(super) const fn initial_credit(&self) -> u32 {
-        self.account.limit()
     }
 
     /// Records currently parked ahead of sequence.
@@ -283,11 +278,7 @@ impl IngressSlot {
 /// reason `Data` carries the existing `rmp_serde` encoding byte-for-byte — so
 /// terminal handling gains no new code path and no new place to diverge.
 fn classify(body: &[u8]) -> CreditClass {
-    if is_terminal_sentinel(body) {
-        CreditClass::Terminal
-    } else {
-        CreditClass::Data
-    }
+    CreditClass::of(RecordType::Data, is_terminal_sentinel(body))
 }
 
 fn fault_reason(fault: &DeliverFault) -> Applied {

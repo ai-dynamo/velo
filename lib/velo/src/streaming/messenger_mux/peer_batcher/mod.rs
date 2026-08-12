@@ -66,7 +66,7 @@ use super::protocol::{
 };
 use crate::messenger::Messenger;
 use crate::observability::{MuxDropReason, MuxMetricsHandle};
-use crate::streaming::messenger_mux::flow_control::CreditClass;
+use crate::streaming::messenger_mux::flow_control::{CreditClass, SlotCredit};
 use crate::streaming::sender::is_terminal_sentinel;
 
 /// The per-peer batcher registry, keyed by the batching key from `BATCHING.md`
@@ -84,6 +84,15 @@ pub(crate) struct OpenSlotRequest {
     pub(crate) anchor_id: u64,
     pub(crate) session_id: u64,
     pub(crate) inlet: flume::Receiver<Vec<u8>>,
+    /// The ledger the slot opens with — the window the receiver advertised on
+    /// its attach response, already granted.
+    ///
+    /// Per slot rather than per batcher because a batcher serves every stream
+    /// to one peer and each was negotiated separately; an MPSC anchor and an
+    /// SPSC one on the same peer need not agree.
+    pub(crate) credit: SlotCredit,
+    /// Bytes this slot may withhold, likewise negotiated.
+    pub(crate) slot_byte_budget: u32,
     pub(crate) ack: oneshot::Sender<Result<(), OpenRejected>>,
 }
 
@@ -237,13 +246,12 @@ pub(crate) fn spawn(peer: WorkerId, ctx: BatcherContext) -> Arc<BatcherHandle> {
     let writer = BatchWriter::new(
         Arc::clone(&ctx.messenger),
         peer,
-        ctx.config.clone(),
+        ctx.config,
         ctx.metrics.clone(),
         epoch,
     );
     let batcher = Batcher {
         peer,
-        config: ctx.config,
         metrics: ctx.metrics,
         handle: Arc::clone(&handle),
         epochs: ctx.epochs,
@@ -268,7 +276,6 @@ enum Work {
 
 struct Batcher {
     peer: WorkerId,
-    config: MuxConfig,
     metrics: Option<MuxMetricsHandle>,
     handle: Arc<BatcherHandle>,
     epochs: Arc<AtomicU64>,
@@ -666,13 +673,15 @@ impl Batcher {
             anchor_id,
             session_id,
             inlet,
+            credit,
+            slot_byte_budget,
             ack,
         } = request;
         if self.handle.is_retired() {
             let _ = ack.send(Err(OpenRejected::Retired));
             return;
         }
-        let (id, stream) = match self.slots.allocate(inlet, self.config.slot_byte_budget) {
+        let (id, stream) = match self.slots.allocate(inlet, credit, slot_byte_budget) {
             Ok(allocated) => allocated,
             Err(error) => {
                 let _ = ack.send(Err(error.into()));

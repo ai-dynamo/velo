@@ -329,14 +329,17 @@ impl EgressSlots {
 
     /// Allocate a slot for `(anchor_id, session_id)` and hand back its stream.
     ///
-    /// Credit opens at **zero**. Until attach-time negotiation lands (Stage F)
-    /// there is nowhere for the receiver to advertise its window ahead of time,
-    /// so the sender waits for the `CreditUpdate` the receiver emits on
-    /// `OpenSlot` rather than guessing a window the receiver never sized. A
-    /// guess is the one thing `NegotiationError::LegacyPeer` exists to forbid.
+    /// The slot opens holding whatever ledger it is handed. On the attach path
+    /// that is the **negotiated** window rather than zero: the receiver
+    /// advertised the same numbers it sized its own buffer from, so the first
+    /// record may go out immediately — no `CreditUpdate` on `OpenSlot`, and no
+    /// round trip before the first token. A window is never *guessed*;
+    /// `NegotiationError::LegacyPeer` is what makes a peer that advertised none
+    /// unreachable through this path at all.
     pub(super) fn allocate(
         &mut self,
         rx: flume::Receiver<Vec<u8>>,
+        credit: SlotCredit,
         slot_byte_budget: u32,
     ) -> Result<(SlotId, SlotStream), AllocError> {
         let index = match self.free.pop() {
@@ -364,7 +367,7 @@ impl EgressSlots {
 
         self.entries[index as usize] = Some(EgressSlot {
             id,
-            credit: SlotCredit::new(0),
+            credit,
             next_seq: 0,
             withheld: WithheldQueue::new(slot_byte_budget),
             inlet_closed: false,

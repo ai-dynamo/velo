@@ -26,6 +26,7 @@
 //! payload gets one [`DecodeError`], not a loop and not an allocation.
 
 use bytes::{BufMut, BytesMut};
+#[cfg(test)]
 use std::cmp::Ordering;
 use std::fmt;
 use std::iter::FusedIterator;
@@ -214,12 +215,14 @@ impl SlotId {
     }
 
     /// Same index, different generation.
+    #[cfg(test)]
     pub(crate) const fn with_generation(self, generation: u8) -> Self {
         Self((self.0 & !0xFF) | generation as u32)
     }
 
     /// Same index, next generation — wrapping, because the epoch above it is
     /// what makes a reused generation unreachable rather than merely unlikely.
+    #[cfg(test)]
     pub(crate) const fn next_generation(self) -> Self {
         self.with_generation(self.generation().wrapping_add(1))
     }
@@ -280,6 +283,7 @@ impl RecordType {
     /// per-slot saturation signal `reader_pump`'s `DETECTION_MULTIPLIER`
     /// watches for; granting it a reserve would delete the watchdog kill that
     /// `SATURATION.md` documents.
+    #[cfg(test)]
     pub(crate) const fn is_control(self) -> bool {
         matches!(self, Self::OpenSlot | Self::CloseSlot | Self::CreditUpdate)
     }
@@ -338,6 +342,7 @@ pub(crate) enum RecordBody<'a> {
 
 impl RecordBody<'_> {
     /// The discriminant this body encodes as.
+    #[cfg(test)]
     pub(crate) const fn record_type(&self) -> RecordType {
         match self {
             Self::Data(_) => RecordType::Data,
@@ -368,6 +373,7 @@ pub(crate) struct Record<'a> {
 
 impl Record<'_> {
     /// The discriminant this record decoded from.
+    #[cfg(test)]
     pub(crate) const fn record_type(&self) -> RecordType {
         self.body.record_type()
     }
@@ -540,6 +546,7 @@ impl BatchEncoder {
     }
 
     /// Appends a `SlotHeartbeat` record.
+    #[cfg(test)]
     pub(crate) fn push_heartbeat(
         &mut self,
         slot: SlotId,
@@ -633,11 +640,13 @@ impl<'a> BatchDecoder<'a> {
     }
 
     /// The batch header.
+    #[cfg(test)]
     pub(crate) const fn header(&self) -> BatchHeader {
         self.header
     }
 
     /// Records yielded so far.
+    #[cfg(test)]
     pub(crate) const fn decoded(&self) -> u16 {
         self.decoded
     }
@@ -813,11 +822,13 @@ impl FusedIterator for BatchDecoder<'_> {}
 /// value reads as stale from the other's vantage. Nothing sane can be said
 /// about two sequences two billion batches apart, and the alternative is a
 /// silent, arbitrary tie-break.
+#[cfg(test)]
 pub(crate) fn batch_seq_cmp(a: u32, b: u32) -> Ordering {
     (a.wrapping_sub(b) as i32).cmp(&0)
 }
 
 /// Whether `candidate` is newer than `last_seen` under [`batch_seq_cmp`].
+#[cfg(test)]
 pub(crate) fn batch_seq_is_newer(candidate: u32, last_seen: u32) -> bool {
     batch_seq_cmp(candidate, last_seen) == Ordering::Greater
 }

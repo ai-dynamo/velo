@@ -78,7 +78,7 @@ fn drain(rx: &flume::Receiver<Vec<u8>>) -> Vec<Vec<u8>> {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn open_slot_claims_the_matching_bind_and_grants_credit() {
+fn open_slot_claims_the_matching_bind_and_grants_no_credit() {
     let (registry, _rx, config) = bound();
     let id = slot(0, 0);
 
@@ -86,15 +86,12 @@ fn open_slot_claims_the_matching_bind_and_grants_credit() {
 
     assert_eq!(outcome.opened, 1);
     assert_eq!(registry.live_slots(peer()), 1);
-    assert_eq!(
-        outcome.replies,
-        vec![ReplyRecord::CreditUpdate {
-            slot: id,
-            delta: config.initial_credit
-        }],
-        "the window has to be advertised: until negotiation lands there is \
-         nowhere else to say it, and a sender that guessed would push into a \
-         buffer this side never sized"
+    assert!(
+        outcome.replies.is_empty(),
+        "the window was advertised on the attach response and the sender \
+         opened already holding it; granting it again here would hand the \
+         sender 2C against a C + 1 buffer, which is the reader stall the \
+         credit invariant exists to make impossible"
     );
 }
 

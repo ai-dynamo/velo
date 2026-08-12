@@ -89,6 +89,7 @@ impl ControlState {
     }
 
     /// Pending entries across both maps, for the bound to be asserted on.
+    #[cfg(test)]
     fn len(&self) -> usize {
         self.mine.len() + self.peers.len()
     }
@@ -182,6 +183,7 @@ impl ControlInbox {
     }
 
     /// Pending entries, for the bound the stalled-admission test asserts.
+    #[cfg(test)]
     pub(super) fn pending_len(&self) -> usize {
         self.lock().len()
     }

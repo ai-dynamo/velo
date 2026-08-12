@@ -403,6 +403,11 @@ fn open_slot(
         finish_close(state, id, CloseReason::PeerGone, ctx.metrics, outcome);
     }
 
+    // No `CreditUpdate` reply: the window was advertised on the attach
+    // response, and the sender opened its slot already holding it. Granting it
+    // again here would hand the sender `2C` against a `C + 1` buffer — the
+    // reader stall the credit invariant exists to make impossible. Credit
+    // returns from here on are the ordinary reconciliation ones.
     let slot = IngressSlot::new(
         id,
         bind.frame_tx,
@@ -410,13 +415,6 @@ fn open_slot(
         ctx.config.slot_byte_budget,
         record.frame_seq.saturating_add(1),
     );
-    // The window is advertised here rather than assumed. Until attach-time
-    // negotiation lands there is nowhere else to say it, and a sender that
-    // guessed would push into a buffer this side never sized.
-    outcome.replies.push(ReplyRecord::CreditUpdate {
-        slot: id,
-        delta: slot.initial_credit(),
-    });
     state.slots[index] = Some(slot);
     outcome.opened += 1;
 }
