@@ -135,6 +135,12 @@ pub(crate) enum WriterFailure {
 pub(crate) trait WriterObserver {
     /// One batch reached the wire carrying `frames` frames. Not called for a
     /// failed write.
+    ///
+    /// "Batch" is a unit of coalescing, not a syscall. A packed batch is one
+    /// `write_all`; a frame routed to [`Staging::WriteDirect`] is written
+    /// segmented across several and still reports once, with `frames = 1`.
+    /// Anything counting these must describe them as batches — see
+    /// `velo_streaming_egress_flushes_total`.
     fn on_flush(&self, _frames: usize) {}
 
     /// The writer is stopping. `frames` is how many items the failure
@@ -894,6 +900,34 @@ mod tests {
         assert!(decoded[3].2.iter().all(|&b| b == 0xAB));
         assert_eq!(decoded[4].2.as_slice(), &[0xCD; 8]);
         assert!(factory.errors().is_empty());
+    }
+
+    /// A frame on the direct path is reported as **one** batch even though it
+    /// takes several `write_all` calls to put on the wire.
+    ///
+    /// This is the asymmetry `velo_streaming_egress_flushes_total`'s help text
+    /// has to describe. Calling that counter "one write_all each" would be
+    /// wrong for exactly this path.
+    #[tokio::test]
+    async fn direct_write_reports_one_batch_despite_several_writes() {
+        let factory = ItemFactory::new();
+        let observer = TestObserver::default();
+        let mut sink = RecordingSink::default();
+
+        let items = vec![factory.item("big", vec![0xAB; COALESCE_THRESHOLD + 1])];
+        run_with(items, &mut sink, &observer).await;
+
+        assert_eq!(
+            observer.flushes(),
+            vec![1],
+            "one batch carrying one frame, whatever it cost to write"
+        );
+        assert!(
+            sink.poll_writes > 1,
+            "the direct path splits the frame across writes ({} here), which is \
+             why the counter must be described as batches, not syscalls",
+            sink.poll_writes
+        );
     }
 
     // -----------------------------------------------------------------------

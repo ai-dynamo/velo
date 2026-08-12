@@ -854,14 +854,15 @@ impl VeloMetrics {
             registry,
             Counter::with_opts(Opts::new(
                 "velo_streaming_egress_flushes_total",
-                "Batches flushed to the wire by the per-stream egress pump — one \
-                 completed write_all each. Divide \
-                 velo_streaming_frames_written_total by this for the coalescing \
-                 ratio: 1.0 means every frame went out on its own, higher means \
-                 frames are being packed together. This counts flushes, not \
-                 syscalls: write_all may loop over several underlying writes for \
-                 a large batch, and TCP segmentation is the kernel's decision. \
-                 Only flushes that completed successfully are counted.",
+                "Batches handed to the socket by the per-stream egress pump. \
+                 Divide velo_streaming_frames_written_total by this for the \
+                 coalescing ratio: 1.0 means every frame went out on its own, \
+                 higher means frames are being packed together. This counts \
+                 batches, not syscalls or TCP segments — write_all may loop \
+                 over several underlying writes, a frame too large to pack is \
+                 written segmented and still counts as one, and segmentation \
+                 is the kernel's decision. Only batches that reached the wire \
+                 are counted.",
             ))?,
         )?;
         let streaming_frames_written_total = register_collector(
@@ -1186,14 +1187,18 @@ impl VeloMetrics {
         self.streaming_heartbeat_watchdog_firings_total.inc();
     }
 
-    /// Record one completed batch flush on the streaming egress path carrying
-    /// `frames` logical frames.
+    /// Record one batch reaching the wire on the streaming egress path,
+    /// carrying `frames` logical frames.
     ///
     /// `frames_written / egress_flushes` is the coalescing ratio — the direct
     /// measure of how much write coalescing is buying, and the number to check
     /// before investing in the full multiplexed protocol. See
-    /// `streaming/BATCHING.md`. Only called for flushes that reached the wire,
-    /// so a failed write contributes to neither counter.
+    /// `streaming/BATCHING.md`.
+    ///
+    /// A batch is a unit of coalescing, not a syscall: a frame too large to
+    /// pack is written segmented and still counts once, with `frames = 1`. Only
+    /// called for batches that reached the wire, so a failed write contributes
+    /// to neither counter.
     pub(crate) fn record_streaming_egress_flush(&self, frames: usize) {
         self.streaming_egress_flushes_total.inc();
         self.streaming_frames_written_total.inc_by(frames as f64);

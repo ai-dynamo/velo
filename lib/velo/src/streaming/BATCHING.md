@@ -115,11 +115,11 @@ reproducible with `cargo test --all-features --test streaming_tcp_batching --
 Read those together, because the pair is the whole argument:
 
 - **Write coalescing (P2) is enormously effective for bursty streams.** A
-  producer that runs ahead pays one `write_all` per ~950 frames instead of one
-  per frame. This required no wire change, no negotiation and no configuration.
-  (The counter measures flushes, not syscalls — a large batch may cost more
-  than one underlying write, so treat ~950:1 as the batching factor, not as a
-  syscall-reduction factor.)
+  producer that runs ahead hands the socket one batch per ~950 frames instead
+  of one per frame. This required no wire change, no negotiation and no
+  configuration. (The counter measures batches, not syscalls — a large batch
+  may cost more than one underlying write — so treat ~950:1 as the batching
+  factor, not as a syscall-reduction factor.)
 - **Write coalescing does nothing at all for the workload that motivated this
   document.** A forward pass places one frame on each of X *different* streams.
   Per-stream coalescing can only pack frames queued on the same stream, so each
@@ -556,7 +556,7 @@ New series, alongside the existing `velo_streaming_*` collectors:
 
 | Metric | Meaning |
 |---|---|
-| `velo_streaming_egress_flushes_total` | Batches flushed by the per-stream egress pump (one completed `write_all` each) |
+| `velo_streaming_egress_flushes_total` | Batches the per-stream egress pump handed to the socket. A unit of coalescing, not a syscall: a frame too large to pack is written segmented and still counts as one |
 | `velo_streaming_frames_written_total` | Logical frames written |
 | `velo_streaming_connections_open` | Gauge of open streaming connections |
 | `velo_streaming_batch_records_per_flush` | Histogram of records per batch |
@@ -570,9 +570,9 @@ New series, alongside the existing `velo_streaming_*` collectors:
 > **`frames_written / egress_flushes` is the batching ratio** and the single
 > number that says whether this is working. It is meaningful at any scale, which
 > is why it ships before the protocol does. It counts flushes rather than
-> syscalls -- `write_all` may loop internally and TCP segmentation is the
-> kernel's call -- so read it as "how much the pump batched", not "how many
-> syscalls were saved".
+> syscalls -- `write_all` may loop internally, an oversized frame is written
+> segmented as a single batch, and TCP segmentation is the kernel's call -- so
+> read it as "how much the pump batched", not "how many syscalls were saved".
 
 ### A meaning change operators must know about
 
