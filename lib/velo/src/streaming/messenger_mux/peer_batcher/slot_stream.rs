@@ -227,8 +227,11 @@ pub(super) struct WithheldOverflow {
 pub(super) struct EgressSlot {
     /// Index and generation as they travel on the wire.
     pub(super) id: SlotId,
-    /// What this side may still send. Opens empty — see
-    /// [`EgressSlots::allocate`].
+    /// What this side may still send. Opens at the window the peer advertised
+    /// on its attach response — see [`EgressSlots::allocate`]. A slot opened at
+    /// zero is a test reaching the starved state directly; the attach path
+    /// never produces one, because a peer advertising no window is a peer no
+    /// slot may be opened against.
     pub(super) credit: SlotCredit,
     /// Next `frame_seq` to stamp. Advances on every record this side emits for
     /// the slot, control included, so a gap is detectable across control too.

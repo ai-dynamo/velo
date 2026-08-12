@@ -12,11 +12,12 @@ frames destined for that peer into a single active message.
 
 It is written for two audiences. If you operate a velo deployment, the
 [Motivation](#motivation) and [Configuration](#configuration) sections tell you
-whether this helps you and what switching it on will look like once the mux
-phases land. If you are implementing or reviewing it, the rest is the protocol
-specification and the argument for why it is correct.
+whether this helps you and what switching it on looks like. If you are
+implementing or reviewing it, the rest is the protocol specification and the
+argument for why it is correct.
 
-Status: **P0–P3 and P7 implemented; the rest specified.** See
+Status: **P0–P3, P7 and P8 implemented; the rest specified.** The mux is
+therefore selectable — opt-in, off by default, negotiated per attach. See
 [Implementation status](#implementation-status).
 
 ---
