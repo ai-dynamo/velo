@@ -64,29 +64,7 @@ const SESSION_ID_META: &str = "x-session-id";
 /// so the heartbeat watchdog is what reports a wedged consumer, not this.
 const TERMINAL_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
-// ---------------------------------------------------------------------------
-// Terminal sentinel check (module-private)
-// ---------------------------------------------------------------------------
-
-fn is_terminal_sentinel(bytes: &[u8]) -> bool {
-    use crate::streaming::sender::{cached_detached, cached_dropped, cached_finalized};
-
-    if bytes == cached_dropped().as_slice()
-        || bytes == cached_detached().as_slice()
-        || bytes == cached_finalized().as_slice()
-    {
-        return true;
-    }
-
-    if let Ok(frame) = rmp_serde::from_slice::<crate::streaming::frame::StreamFrame<()>>(bytes) {
-        matches!(
-            frame,
-            crate::streaming::frame::StreamFrame::TransportError(_)
-        )
-    } else {
-        false
-    }
-}
+use crate::streaming::sender::is_terminal_sentinel;
 
 // ---------------------------------------------------------------------------
 // GrpcStreamingService (server-side handler)

@@ -57,6 +57,7 @@ use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 use velo_ext::{PeerInfo, TransportKey, WorkerAddress, WorkerId};
 
+use crate::streaming::sender::is_terminal_sentinel;
 use crate::streaming::transport::FrameTransport;
 
 /// Maximum time a registered (anchor, session) slot may sit unused before its
@@ -464,27 +465,6 @@ fn configure_socket(stream: &TcpStream) {
     }
     if let Err(e) = sock.set_tcp_user_timeout(Some(Duration::from_secs(30))) {
         tracing::warn!("Failed to set TCP_USER_TIMEOUT: {}", e);
-    }
-}
-
-/// Check if the given raw frame bytes represent a terminal sentinel.
-fn is_terminal_sentinel(bytes: &[u8]) -> bool {
-    use crate::streaming::sender::{cached_detached, cached_dropped, cached_finalized};
-
-    if bytes == cached_dropped().as_slice()
-        || bytes == cached_detached().as_slice()
-        || bytes == cached_finalized().as_slice()
-    {
-        return true;
-    }
-
-    if let Ok(frame) = rmp_serde::from_slice::<crate::streaming::frame::StreamFrame<()>>(bytes) {
-        matches!(
-            frame,
-            crate::streaming::frame::StreamFrame::TransportError(_)
-        )
-    } else {
-        false
     }
 }
 

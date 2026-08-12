@@ -86,6 +86,34 @@ pub(crate) fn cached_detached() -> &'static Vec<u8> {
     })
 }
 
+/// Whether these raw frame bytes are a terminal sentinel.
+///
+/// Terminal means the stream ends here: `Dropped`, `Detached`, `Finalized` and
+/// `TransportError`. Every transport needs this verdict — the TCP and gRPC
+/// egress pumps stop after one, and the mux spends a slot's reserved terminal
+/// credit on one and closes the slot in the same batch — so it lives beside the
+/// cached sentinel bytes it compares against rather than being reimplemented per
+/// transport.
+///
+/// The three no-payload sentinels are a byte comparison against their cached
+/// encodings. `TransportError` carries a `String`, so it has no cached form and
+/// costs a decode; that decode is also why an ordinary `Item` payload is not
+/// mistaken for one — a payload that happens to deserialize as `StreamFrame<()>`
+/// can only do so as a variant this function then rejects.
+pub(crate) fn is_terminal_sentinel(bytes: &[u8]) -> bool {
+    if bytes == cached_dropped().as_slice()
+        || bytes == cached_detached().as_slice()
+        || bytes == cached_finalized().as_slice()
+    {
+        return true;
+    }
+
+    matches!(
+        rmp_serde::from_slice::<StreamFrame<()>>(bytes),
+        Ok(StreamFrame::TransportError(_))
+    )
+}
+
 /// Typed sender for pushing frames through the streaming channel.
 ///
 /// Holds a [`flume::Sender<Vec<u8>>`] for serialized frame bytes, a
