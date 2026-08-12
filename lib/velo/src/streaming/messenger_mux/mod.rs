@@ -193,11 +193,13 @@ impl Default for MuxConfig {
 impl MuxConfig {
     /// Depth of the per-slot channel `connect` hands the producer.
     ///
-    /// Sized to the credit window for symmetry with the receive buffer, **not**
-    /// as a backpressure point — see [the producer contract](self#the-producers-contract-under-the-mux).
-    /// The batcher drains this channel whether or not the slot may send, so its
-    /// depth governs how much sits here rather than in the withheld queue, and
-    /// nothing else.
+    /// Sized to the credit window for symmetry with the receive buffer. It is
+    /// *not* where credit starvation backpressures a producer — the batcher
+    /// drains this channel whether or not the slot may send, so under starvation
+    /// the depth only decides how much sits here rather than in the withheld
+    /// queue. It **is** where a batcher parked on admission backpressures one,
+    /// because that park suspends the whole task, inlet drain included. See
+    /// [the producer contract](self#the-producers-contract-under-the-mux).
     fn inlet_depth(&self) -> usize {
         slot_buffer_depth(self.initial_credit)
     }

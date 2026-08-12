@@ -43,8 +43,6 @@
 mod control;
 mod slot_stream;
 #[cfg(test)]
-mod test_support;
-#[cfg(test)]
 mod tests;
 mod writer;
 
@@ -770,6 +768,14 @@ impl Batcher {
     /// and the queue is the only thing holding `frame_seq` order. Re-reads the
     /// slot each turn: `emit_data` can close it (a terminal) or fence it (an
     /// oversized singleton).
+    ///
+    /// The terminal reserve does **not** apply here, and that is deliberate: it
+    /// buys a terminal past an *empty* queue, not past records the consumer is
+    /// still owed. A terminal behind starved predecessors therefore waits with
+    /// them, and what ends such a stream is one of the two mechanisms that
+    /// already exist for a consumer that stopped draining — the byte cap, if the
+    /// producer keeps sending, or `reader_pump`'s heartbeat watchdog if it does
+    /// not.
     async fn release_withheld(&mut self, index: u32) {
         loop {
             let next = {
