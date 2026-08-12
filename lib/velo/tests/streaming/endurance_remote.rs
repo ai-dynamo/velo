@@ -38,7 +38,7 @@ use velo::streaming::{
 };
 use velo::transports::tcp::TcpTransportBuilder;
 use velo::transports::uds::UdsTransportBuilder;
-use velo_ext::WorkerId;
+use velo_ext::{PeerInfo, WorkerId};
 
 // ---------------------------------------------------------------------------
 // Two-node fixture
@@ -130,24 +130,52 @@ async fn make_remote_pair_tcp() -> RemotePair {
     let worker_consumer = m_consumer.instance_id().worker_id();
     let worker_producer = m_producer.instance_id().worker_id();
 
-    async fn make_side(worker_id: WorkerId) -> Arc<velo::streaming::AnchorManager> {
+    // Returns the AnchorManager alongside its frame transport, because the two
+    // sides must be cross-`register`ed before `connect()` can resolve a peer.
+    async fn make_side(
+        worker_id: WorkerId,
+    ) -> (Arc<velo::streaming::AnchorManager>, Arc<TcpFrameTransport>) {
         let tcp = TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into())
             .await
             .unwrap();
+        // Key the registry by the transport's own key. `TcpFrameTransport`
+        // advertises `tcp-stream` (the `-stream` suffix keeps it distinct from
+        // the messenger TCP transport's `tcp` entry in the same WorkerAddress),
+        // and `resolve_transport` looks up exactly the key the attach response
+        // carries — a mismatch fails the attach with "unsupported streaming
+        // transport key".
         let mut registry = HashMap::new();
-        registry.insert("tcp".to_string(), tcp.clone() as Arc<dyn FrameTransport>);
-        Arc::new(
+        registry.insert(
+            tcp.key().as_str().to_string(),
+            tcp.clone() as Arc<dyn FrameTransport>,
+        );
+        let manager = Arc::new(
             AnchorManagerBuilder::default()
                 .worker_id(worker_id)
-                .transport(tcp as Arc<dyn FrameTransport>)
+                .transport(tcp.clone() as Arc<dyn FrameTransport>)
                 .transport_registry(Arc::new(registry))
                 .build()
                 .expect("build AM"),
-        )
+        );
+        (manager, tcp)
     }
 
-    let consumer = make_side(worker_consumer).await;
-    let producer = make_side(worker_producer).await;
+    let (consumer, tcp_consumer) = make_side(worker_consumer).await;
+    let (producer, tcp_producer) = make_side(worker_producer).await;
+
+    // `Messenger::register_peer` only covers the control plane. The streaming
+    // transports keep their own WorkerId -> SocketAddr cache, populated from a
+    // PeerInfo carrying the peer's `tcp-stream` entry, so register those too.
+    // (`Velo::register_peer` does this fan-out automatically; these tests build
+    // the AnchorManager directly and so must do it by hand.)
+    let peer_consumer = PeerInfo::new(m_consumer.instance_id(), tcp_consumer.address());
+    let peer_producer = PeerInfo::new(m_producer.instance_id(), tcp_producer.address());
+    tcp_producer
+        .register(&peer_consumer)
+        .expect("register consumer stream endpoint on producer");
+    tcp_consumer
+        .register(&peer_producer)
+        .expect("register producer stream endpoint on consumer");
 
     consumer
         .register_handlers(Arc::clone(&m_consumer))

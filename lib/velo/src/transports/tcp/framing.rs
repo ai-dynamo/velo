@@ -23,17 +23,18 @@ use velo_ext::MessageType;
 const SCHEMA_VERSION_V1: u16 = 1;
 
 /// Default maximum frame size (16 MB)
-const DEFAULT_MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
+pub(crate) const DEFAULT_MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 
 /// Minimum frame header size (version + type + 2 lengths)
-const MIN_HEADER_SIZE: usize = 2 + 1 + 4 + 4; // 11 bytes
+pub(crate) const MIN_HEADER_SIZE: usize = 2 + 1 + 4 + 4; // 11 bytes
 
-/// Threshold below which encode_frame coalesces preamble + header + payload into
-/// a single buffer and emits one write_all. Above this we keep the three-segment
-/// path so the extra memcpy doesn't dominate large payloads. 64 KB sits well
-/// under the typical kernel send buffer (~128 KB) so the coalesced write almost
-/// always lands in a single syscall.
-const COALESCE_THRESHOLD: usize = 64 * 1024;
+/// Threshold below which a frame is worth copying into a single buffer so it
+/// can go out as one `write_all`. Above it we keep the three-segment path so
+/// the extra memcpy doesn't dominate large payloads.
+///
+/// Also the point at which [`crate::transports::coalesce`] stops staging a
+/// frame into a shared batch, for the same reason.
+pub(crate) const COALESCE_THRESHOLD: usize = 64 * 1024;
 
 /// Fallback shrink threshold (8 MB) when neither the builder nor an env var
 /// supplies one. Shared across the TCP / UDS / streaming TCP code paths that
@@ -220,6 +221,28 @@ impl TcpFrameCodec {
             writer.write_all(header).await?;
             writer.write_all(payload).await?;
         }
+        Ok(())
+    }
+
+    /// Append one encoded frame to `buf` without writing anything.
+    ///
+    /// The bytes produced are byte-identical to what [`encode_frame`] would
+    /// write, so a peer decoding with [`TcpFrameCodec`] cannot tell whether a
+    /// frame arrived alone or packed alongside others. This is what makes
+    /// write coalescing wire-compatible in both directions — see
+    /// `transports::coalesce`.
+    #[inline]
+    pub(crate) fn append_frame(
+        buf: &mut BytesMut,
+        msg_type: MessageType,
+        header: &[u8],
+        payload: &[u8],
+    ) -> io::Result<()> {
+        let preamble = Self::build_preamble(msg_type, header.len() as u32, payload.len() as u32)?;
+        buf.reserve(MIN_HEADER_SIZE + header.len() + payload.len());
+        buf.extend_from_slice(&preamble);
+        buf.extend_from_slice(header);
+        buf.extend_from_slice(payload);
         Ok(())
     }
 

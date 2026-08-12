@@ -29,6 +29,9 @@
 
 pub(crate) mod address;
 
+/// Write coalescing shared by the TCP, UDS, and streaming writer loops.
+pub(crate) mod coalesce;
+
 pub mod tcp;
 
 /// Shared utility functions for transport implementations.

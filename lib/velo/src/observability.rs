@@ -563,6 +563,8 @@ pub struct VeloMetrics {
     streaming_server_pump_backpressure_total: Counter,
     streaming_producer_send_backpressure_total: Counter,
     streaming_heartbeat_watchdog_firings_total: Counter,
+    streaming_egress_flushes_total: Counter,
+    streaming_frames_written_total: Counter,
     // Rendezvous metrics
     rendezvous_operations_total: CounterVec,
     rendezvous_operation_duration_seconds: HistogramVec,
@@ -848,6 +850,29 @@ impl VeloMetrics {
                  surfaced by the *_backpressure_total counters above.",
             ))?,
         )?;
+        let streaming_egress_flushes_total = register_collector(
+            registry,
+            Counter::with_opts(Opts::new(
+                "velo_streaming_egress_flushes_total",
+                "Batches handed to the socket by the per-stream egress pump. \
+                 Divide velo_streaming_frames_written_total by this for the \
+                 coalescing ratio: 1.0 means every frame went out on its own, \
+                 higher means frames are being packed together. This counts \
+                 batches, not syscalls or TCP segments — write_all may loop \
+                 over several underlying writes, a frame too large to pack is \
+                 written segmented and still counts as one, and segmentation \
+                 is the kernel's decision. Only batches that reached the wire \
+                 are counted.",
+            ))?,
+        )?;
+        let streaming_frames_written_total = register_collector(
+            registry,
+            Counter::with_opts(Opts::new(
+                "velo_streaming_frames_written_total",
+                "Logical stream frames written to the wire. See \
+                 velo_streaming_egress_flushes_total for the coalescing ratio.",
+            ))?,
+        )?;
 
         // -- Rendezvous metrics --
         let rendezvous_operations_total = register_collector(
@@ -917,6 +942,8 @@ impl VeloMetrics {
             streaming_server_pump_backpressure_total,
             streaming_producer_send_backpressure_total,
             streaming_heartbeat_watchdog_firings_total,
+            streaming_egress_flushes_total,
+            streaming_frames_written_total,
             rendezvous_operations_total,
             rendezvous_operation_duration_seconds,
             rendezvous_bytes_total,
@@ -1158,6 +1185,23 @@ impl VeloMetrics {
     /// Record a heartbeat-watchdog firing in the reader pump.
     pub(crate) fn record_heartbeat_watchdog_firing(&self) {
         self.streaming_heartbeat_watchdog_firings_total.inc();
+    }
+
+    /// Record one batch reaching the wire on the streaming egress path,
+    /// carrying `frames` logical frames.
+    ///
+    /// `frames_written / egress_flushes` is the coalescing ratio — the direct
+    /// measure of how much write coalescing is buying, and the number to check
+    /// before investing in the full multiplexed protocol. See
+    /// `streaming/BATCHING.md`.
+    ///
+    /// A batch is a unit of coalescing, not a syscall: a frame too large to
+    /// pack is written segmented and still counts once, with `frames = 1`. Only
+    /// called for batches that reached the wire, so a failed write contributes
+    /// to neither counter.
+    pub(crate) fn record_streaming_egress_flush(&self, frames: usize) {
+        self.streaming_egress_flushes_total.inc();
+        self.streaming_frames_written_total.inc_by(frames as f64);
     }
 
     /// Record a rendezvous operation (register, get, release, etc.).

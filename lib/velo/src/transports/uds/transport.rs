@@ -25,7 +25,9 @@ use crate::transports::transport::{
 use velo_ext::{MessageType, PeerInfo, Transport, TransportAdapter, TransportKey, WorkerAddress};
 
 use super::listener::{UdsListener, default_shrink_threshold};
-use crate::transports::tcp::TcpFrameCodec;
+use crate::transports::coalesce::{
+    Coalescable, WriterFailure, WriterObserver, run_coalescing_writer,
+};
 
 /// UDS transport with lock-free concurrent access
 ///
@@ -551,27 +553,71 @@ async fn connection_writer_inner(
 
     debug!("Connected to UDS {:?}", path);
 
-    // Main send loop
-    loop {
-        let msg = tokio::select! {
-            // Prioritize cancellation so a hot send queue cannot starve shutdown.
-            biased;
-            _ = cancel_token.cancelled() => break,
-            res = rx.recv_async() => match res {
-                Ok(msg) => msg,
-                Err(_) => break,
-            },
-        };
-        if let Err(e) =
-            TcpFrameCodec::encode_frame(&mut stream, msg.msg_type, &msg.header, &msg.payload).await
-        {
-            error!("Write error to {} ({:?}): {}", instance_id, path, e);
-            msg.on_error(format!("Failed to write to UDS stream: {}", e));
-            break;
-        }
-    }
+    // Main send loop. Coalescing writer, identical in behaviour to the TCP one
+    // because it *is* the TCP one — see `crate::transports::coalesce`. Messages
+    // still queued when this returns are reported by the caller's drain.
+    run_coalescing_writer(
+        &mut stream,
+        rx,
+        // The channel already carries the writer's item type.
+        std::convert::identity,
+        Some(cancel_token),
+        &UdsWriterObserver { instance_id, path },
+    )
+    .await;
 
     Ok(())
+}
+
+impl Coalescable for SendTask {
+    /// A staged task *is* its own failure token: what
+    /// [`TransportErrorHandler::on_error`] needs — the header, the payload,
+    /// and the handler — is every field but a one-byte `Copy` enum, and all
+    /// three are refcounted handles. Splitting them into a second struct would
+    /// have the same footprint, so the writer just keeps the task. Retaining
+    /// it holds no payload bytes beyond the ones the sender already owns.
+    type FailureToken = Self;
+
+    fn msg_type(&self) -> MessageType {
+        self.msg_type
+    }
+
+    fn header(&self) -> &[u8] {
+        &self.header
+    }
+
+    fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    fn into_failure_token(self) -> Self {
+        self
+    }
+
+    fn fail(token: Self, reason: &str) {
+        token.on_error(format!("Failed to write to UDS stream: {}", reason));
+    }
+}
+
+/// Attaches the connection's identity to the writer loop's log lines.
+struct UdsWriterObserver<'a> {
+    instance_id: crate::InstanceId,
+    path: &'a Path,
+}
+
+impl WriterObserver for UdsWriterObserver<'_> {
+    fn on_failure(&self, kind: WriterFailure, err: &std::io::Error, frames: usize) {
+        match kind {
+            WriterFailure::Write => error!(
+                "Write error to {} ({:?}): {} ({} message(s) in batch)",
+                self.instance_id, self.path, err, frames
+            ),
+            WriterFailure::Encode => error!(
+                "Encode error to {} ({:?}): {}",
+                self.instance_id, self.path, err
+            ),
+        }
+    }
 }
 
 /// Parse a UDS endpoint string into a PathBuf

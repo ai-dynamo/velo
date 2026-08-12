@@ -38,6 +38,9 @@ use std::time::Duration;
 
 use crate::transports::MessageType;
 use crate::transports::address::WorkerAddressBuilder;
+use crate::transports::coalesce::{
+    Coalescable, WriterFailure, WriterObserver, run_coalescing_writer,
+};
 use crate::transports::tcp::TcpFrameCodec;
 use crate::transports::tcp::framing::{DEFAULT_SHRINK_THRESHOLD, maybe_shrink_read_buffer};
 use crate::transports::utils::interfaces::{
@@ -331,6 +334,115 @@ async fn pump_frames(
     }
 }
 
+/// Producer-side egress pump: drains the frame channel onto the socket,
+/// coalescing whatever is already queued into a single `write_all`.
+///
+/// The loop itself lives in [`crate::transports::coalesce`], shared with the
+/// messenger TCP and UDS writers — see that module for why coalescing is
+/// wire-compatible with an unmodified peer and why it adds no latency. The
+/// trick this path relies on is that the frames a forward pass emits
+/// back-to-back are already sitting in the channel by the time the pump wakes.
+async fn egress_pump(
+    mut stream: TcpStream,
+    rx: flume::Receiver<Vec<u8>>,
+    metrics: Option<Arc<crate::observability::VeloMetrics>>,
+) {
+    // No cancellation token: this pump stops when the channel closes, when a
+    // terminal sentinel goes out, or when the socket fails. Each frame is
+    // wrapped as it comes off the channel — see `EgressFrame`.
+    run_coalescing_writer(
+        &mut stream,
+        &rx,
+        EgressFrame,
+        None,
+        &EgressObserver { metrics },
+    )
+    .await;
+
+    if let Err(e) = stream.flush().await {
+        tracing::debug!("TCP streaming flush on close: {}", e);
+    }
+    if let Err(e) = stream.shutdown().await {
+        tracing::debug!("TCP streaming shutdown on close: {}", e);
+    }
+}
+
+/// One egress frame, as the coalescing writer sees it.
+///
+/// `FrameTransport::connect` fixes the egress channel's item type to
+/// `Vec<u8>`, so the pump wraps each frame as it comes off the channel. The
+/// wrap is a move into a transparent newtype: no allocation, no copy, and the
+/// frame's bytes are never touched.
+///
+/// Wrapping rather than implementing [`Coalescable`] on `Vec<u8>` directly is
+/// what keeps `is_terminal`'s streaming sentinel check on the streaming path.
+/// A crate-wide impl on a type this ubiquitous would hand those semantics to
+/// any future caller that happened to feed a coalescing writer a `Vec<u8>`
+/// (gRPC's `FrameTransport::connect` returns the same channel type).
+///
+/// `#[repr(transparent)]` documents the layout equivalence; nothing here
+/// depends on it, since the wrap is an ordinary move.
+#[repr(transparent)]
+struct EgressFrame(Vec<u8>);
+
+impl Coalescable for EgressFrame {
+    /// The streaming data plane has no per-frame error handler, so there is
+    /// nothing to retain: the frame is dropped the moment its bytes are staged
+    /// and `Vec<()>` costs the writer nothing. Keeping a whole batch of
+    /// payloads alive alongside the copy of them in the staging buffer would
+    /// double live memory on the path coalescing exists to speed up.
+    ///
+    /// A dead socket surfaces to the consumer as a missing terminal and is
+    /// caught by the heartbeat watchdog (see `SATURATION.md`).
+    type FailureToken = ();
+
+    fn msg_type(&self) -> MessageType {
+        MessageType::Message
+    }
+
+    fn header(&self) -> &[u8] {
+        &[]
+    }
+
+    fn payload(&self) -> &[u8] {
+        &self.0
+    }
+
+    fn into_failure_token(self) {}
+
+    fn fail(_token: (), _reason: &str) {}
+
+    /// After a terminal sentinel (Finalized / Dropped / Detached /
+    /// TransportError) the pump stops. Any frame queued behind it — e.g. a
+    /// heartbeat that landed between `heartbeat_cancel.cancel()` and the next
+    /// producer loop iteration — is discarded, because sending it would race
+    /// the consumer's post-terminal cleanup and trigger spurious "Connection
+    /// reset by peer" RSTs on the wire.
+    fn is_terminal(&self) -> bool {
+        is_terminal_sentinel(&self.0)
+    }
+}
+
+/// Feeds the egress pump's batching counters and error logs.
+struct EgressObserver {
+    metrics: Option<Arc<crate::observability::VeloMetrics>>,
+}
+
+impl WriterObserver for EgressObserver {
+    fn on_flush(&self, frames: usize) {
+        if let Some(m) = &self.metrics {
+            m.record_streaming_egress_flush(frames);
+        }
+    }
+
+    fn on_failure(&self, kind: WriterFailure, err: &std::io::Error, _frames: usize) {
+        match kind {
+            WriterFailure::Write => tracing::error!("TCP streaming write error: {}", err),
+            WriterFailure::Encode => tracing::error!("TCP streaming encode error: {}", err),
+        }
+    }
+}
+
 /// Configure TCP socket options matching TcpTransport patterns.
 fn configure_socket(stream: &TcpStream) {
     if let Err(e) = stream.set_nodelay(true) {
@@ -452,6 +564,7 @@ impl FrameTransport for TcpFrameTransport {
         session_id: u64,
     ) -> BoxFuture<'_, Result<flume::Sender<Vec<u8>>>> {
         let peers = self.peers.clone();
+        let metrics = self.metrics.clone();
         Box::pin(async move {
             let addr = *peers.get(&peer).ok_or_else(|| {
                 anyhow!(
@@ -489,40 +602,9 @@ impl FrameTransport for TcpFrameTransport {
                 })??;
 
             let (tx, rx) = flume::bounded::<Vec<u8>>(4096);
+            let pump_metrics = metrics.get().cloned();
 
-            tokio::spawn(async move {
-                while let Ok(frame_bytes) = rx.recv_async().await {
-                    let is_terminal = is_terminal_sentinel(&frame_bytes);
-                    if let Err(e) = TcpFrameCodec::encode_frame(
-                        &mut stream,
-                        MessageType::Message,
-                        &[],
-                        &frame_bytes,
-                    )
-                    .await
-                    {
-                        tracing::error!("TCP streaming write error: {}", e);
-                        break;
-                    }
-                    // After writing a terminal sentinel (Finalized / Dropped /
-                    // Detached / TransportError) on the wire, exit the pump
-                    // immediately. Any frame queued behind the terminal (e.g.
-                    // a heartbeat that landed between heartbeat_cancel.cancel()
-                    // and the next loop iteration on the producer side) is
-                    // discarded — sending it would race the consumer's
-                    // post-terminal cleanup and trigger spurious "Connection
-                    // reset by peer" RSTs at the wire level.
-                    if is_terminal {
-                        break;
-                    }
-                }
-                if let Err(e) = stream.flush().await {
-                    tracing::debug!("TCP streaming flush on close: {}", e);
-                }
-                if let Err(e) = stream.shutdown().await {
-                    tracing::debug!("TCP streaming shutdown on close: {}", e);
-                }
-            });
+            tokio::spawn(egress_pump(stream, rx, pump_metrics));
 
             Ok(tx)
         })

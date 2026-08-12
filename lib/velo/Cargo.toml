@@ -167,6 +167,11 @@ name = "streaming_ordering"
 path = "tests/streaming/ordering.rs"
 
 [[test]]
+name = "streaming_tcp_batching"
+path = "tests/streaming/tcp_batching.rs"
+required-features = ["test-helpers"]
+
+[[test]]
 name = "streaming_timing"
 path = "tests/streaming/timing.rs"
 

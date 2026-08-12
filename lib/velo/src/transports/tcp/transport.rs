@@ -26,8 +26,10 @@ use crate::transports::utils::interfaces::{
 };
 use velo_ext::{MessageType, PeerInfo, Transport, TransportAdapter, TransportKey, WorkerAddress};
 
-use super::framing::TcpFrameCodec;
 use super::listener::TcpListener;
+use crate::transports::coalesce::{
+    Coalescable, WriterFailure, WriterObserver, run_coalescing_writer,
+};
 
 /// High-performance TCP transport with lock-free concurrent access
 ///
@@ -560,26 +562,73 @@ async fn connection_writer_inner(
 
     debug!("Connected to {}", addr);
 
-    loop {
-        let msg = tokio::select! {
-            // Prioritize cancellation so a hot send queue cannot starve shutdown.
-            biased;
-            _ = cancel_token.cancelled() => break,
-            res = rx.recv_async() => match res {
-                Ok(msg) => msg,
-                Err(_) => break,
-            },
-        };
-        if let Err(e) =
-            TcpFrameCodec::encode_frame(&mut stream, msg.msg_type, &msg.header, &msg.payload).await
-        {
-            error!("Write error to {} ({}): {}", instance_id, addr, e);
-            msg.on_error(format!("Failed to write to stream: {}", e));
-            break;
-        }
-    }
+    // Coalescing writer: several queued messages become one `write_all`. See
+    // `crate::transports::coalesce` for why that is wire-compatible with an
+    // unmodified peer and adds no latency, and `streaming/BATCHING.md` for the
+    // wider rationale. Messages still queued when this returns are reported by
+    // `connection_writer_task`'s drain.
+    run_coalescing_writer(
+        &mut stream,
+        rx,
+        // The channel already carries the writer's item type.
+        std::convert::identity,
+        Some(cancel_token),
+        &TcpWriterObserver { instance_id, addr },
+    )
+    .await;
 
     Ok(())
+}
+
+impl Coalescable for SendTask {
+    /// A staged task *is* its own failure token: what
+    /// [`TransportErrorHandler::on_error`] needs — the header, the payload,
+    /// and the handler — is every field but a one-byte `Copy` enum, and all
+    /// three are refcounted handles. Splitting them into a second struct would
+    /// have the same footprint, so the writer just keeps the task. Retaining
+    /// it holds no payload bytes beyond the ones the sender already owns.
+    type FailureToken = Self;
+
+    fn msg_type(&self) -> MessageType {
+        self.msg_type
+    }
+
+    fn header(&self) -> &[u8] {
+        &self.header
+    }
+
+    fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    fn into_failure_token(self) -> Self {
+        self
+    }
+
+    fn fail(token: Self, reason: &str) {
+        token.on_error(format!("Failed to write to stream: {}", reason));
+    }
+}
+
+/// Attaches the connection's identity to the writer loop's log lines.
+struct TcpWriterObserver {
+    instance_id: crate::InstanceId,
+    addr: SocketAddr,
+}
+
+impl WriterObserver for TcpWriterObserver {
+    fn on_failure(&self, kind: WriterFailure, err: &std::io::Error, frames: usize) {
+        match kind {
+            WriterFailure::Write => error!(
+                "Write error to {} ({}): {} ({} message(s) in batch)",
+                self.instance_id, self.addr, err, frames
+            ),
+            WriterFailure::Encode => error!(
+                "Encode error to {} ({}): {}",
+                self.instance_id, self.addr, err
+            ),
+        }
+    }
 }
 
 /// Parse a TCP endpoint string into a SocketAddr (legacy format, used in tests).
