@@ -214,34 +214,43 @@ async fn test_nats_max_payload_enforcement() {
     transport_a.shutdown();
 }
 
-/// The negotiated capacity report: `max_message_size` is the server's own
+/// The negotiated capacity report: `max_message_size` is the connection's own
 /// `max_payload`, less the frame overhead this transport charges against it.
 ///
-/// Asserted against `server_info()` rather than a literal, because
-/// `max_payload` belongs to the server, not to us — a NATS started with a
-/// different `--max_payload` must move the report with it. This is the one
+/// Asserted against the client's live `max_payload()` rather than a literal,
+/// because `max_payload` belongs to the server, not to us — a NATS started with
+/// a different `--max_payload` must move the report with it. This is the one
 /// transport whose capacity is genuinely negotiated.
+///
+/// A transport that has never been started reports the same number as one that
+/// has, which is the point: the capacity is read from the connection at every
+/// use, so there is no `start()`-time snapshot left to go stale across a
+/// reconnect. (This assertion used to be `None`, which is exactly what a
+/// snapshot that had not been taken yet looked like.)
 ///
 /// The boundary is pinned from both sides: one byte past the reported capacity
 /// is rejected before the wire, and exactly the reported capacity is carried
 /// end to end. That second half is what makes the number a promise rather than
-/// an estimate.
+/// an estimate — and it is the report and the pre-wire check agreeing, which
+/// they cannot stop doing now that both read one accessor.
 #[tokio::test]
 async fn test_nats_max_message_size_reflects_negotiated_max_payload() {
     let cluster_id = format!("test-{}", InstanceId::new_v4());
 
     let client_a = Arc::new(async_nats::connect(&common::nats_url()).await.unwrap());
     let client_b = Arc::new(async_nats::connect(&common::nats_url()).await.unwrap());
-    let server_max = client_a.server_info().max_payload;
-
-    // Before `start()` nothing has been negotiated, so there is no honest
-    // number to report.
-    let unstarted = NatsTransportBuilder::new(client_a.clone(), &cluster_id).build();
+    let server_max = client_a.max_payload();
     assert_eq!(
-        unstarted.max_message_size(InstanceId::new_v4()),
-        None,
-        "capacity must read as unknown until start() has seen server_info"
+        server_max,
+        client_a.server_info().max_payload,
+        "the client's live max_payload is the server's negotiated one"
     );
+
+    let unstarted = NatsTransportBuilder::new(client_a.clone(), &cluster_id).build();
+    let unstarted_capacity = unstarted
+        .max_message_size(InstanceId::new_v4())
+        .expect("capacity comes from the connection, which is already up");
+    assert!(unstarted_capacity < server_max);
 
     let error_handler = Arc::new(common::TestErrorHandler::new());
     let (transport_a, _streams_a, _id_a) =
@@ -259,6 +268,10 @@ async fn test_nats_max_message_size_reflects_negotiated_max_payload() {
     assert!(
         capacity < server_max,
         "reported capacity {capacity} must sit below the server's max_payload {server_max}"
+    );
+    assert_eq!(
+        capacity, unstarted_capacity,
+        "starting the transport must not be what establishes the capacity"
     );
 
     // One byte past the report is rejected by the send gate, pre-wire.

@@ -13,7 +13,6 @@ use bytes::{BufMut, Bytes, BytesMut};
 use dashmap::DashMap;
 use futures::StreamExt;
 use futures::future::BoxFuture;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -57,15 +56,6 @@ const DEFAULT_SENDER_CAPACITY: usize = 1024;
 /// what the transport advertises and what it will actually accept are the same
 /// arithmetic rather than two numbers that agree today.
 const NATS_HEADER_OVERHEAD: usize = 64;
-
-/// `max_payload` value standing for "the server has not told us yet".
-///
-/// Held until `start()` reads `server_info()`. The capacity is genuinely
-/// per-connection, so before the server has spoken there is no honest number
-/// to report and [`max_message_size`](Transport::max_message_size) says
-/// `None`. The send path treats it as "no limit yet" for the same reason: a
-/// frame sent before `start()` has no connection to be too large for.
-const MAX_PAYLOAD_UNKNOWN: usize = usize::MAX;
 
 /// Task queued from [`send_message`](Transport::send_message) to the dedicated sender task.
 struct NatsSendTask {
@@ -112,13 +102,37 @@ pub struct NatsTransport {
     begin_shutdown_token: CancellationToken,
     /// Shared shutdown state, set once during `start()`.
     shutdown_state: OnceLock<ShutdownState>,
-    /// Maximum NATS payload size in bytes (queried from server on start).
-    max_payload: Arc<AtomicUsize>,
     /// Shared observability collectors installed by the backend.
     metrics: OnceLock<std::sync::Arc<dyn velo_ext::TransportObservability>>,
 }
 
 impl NatsTransport {
+    /// The largest `header + payload` this connection will carry right now.
+    ///
+    /// Read from the client at every use rather than cached, because the
+    /// number is a property of the current connection: `max_payload` is
+    /// renegotiated on every (re)connect, and a value snapshotted at `start()`
+    /// describes whichever server was answering then. Both the capacity report
+    /// and the pre-wire check call this, so what the transport advertises and
+    /// what it will accept are one expression rather than two that agree
+    /// today.
+    ///
+    /// [`async_nats::Client::max_payload`] is the same atomic async-nats
+    /// itself validates publishes against, which is the reason to prefer it
+    /// over `server_info().max_payload`: the two are refreshed together, this
+    /// one costs an atomic load instead of cloning a `ServerInfo` full of
+    /// `String`s on the send path, and reading it means we cannot reject a
+    /// frame the client would have accepted, or advertise one it would not.
+    /// Before the first `INFO` — a client built with `retry_on_initial_connect`
+    /// while the server is down — that is async-nats' 1 MiB default, which is
+    /// still exactly what this client will enforce, so the report stays honest
+    /// about what a send will do rather than reporting "unknown".
+    fn frame_capacity(&self) -> usize {
+        self.client
+            .max_payload()
+            .saturating_sub(NATS_HEADER_OVERHEAD)
+    }
+
     fn update_peer_gauge(&self) {
         if let Some(metrics) = self.metrics.get() {
             metrics.set_registered_peers(self.peers.len());
@@ -155,21 +169,18 @@ impl Transport for NatsTransport {
             .unwrap_or_else(|| WorkerAddress::from_encoded(Bytes::from_static(&[])))
     }
 
-    /// The server's negotiated `max_payload`, less the
-    /// [`NATS_HEADER_OVERHEAD`] this transport charges against it — the same
-    /// subtraction `send_message` performs before rejecting a frame, read from
-    /// the other direction.
+    /// The connection's negotiated `max_payload`, less the
+    /// [`NATS_HEADER_OVERHEAD`] this transport charges against it — literally
+    /// [`frame_capacity`](Self::frame_capacity), the same call `send_message`
+    /// makes before rejecting a frame.
     ///
     /// This is the one transport whose answer is truly negotiated: the value
-    /// arrives in `server_info()` from whichever server the client connected
-    /// to, so it can differ between deployments and between reconnects.
-    /// `None` before `start()`, when nothing has been negotiated yet.
+    /// arrives from whichever server the client is connected to *now*, so it
+    /// can differ between deployments and change under a reconnect. Never
+    /// `None` — a client that has not been told a limit yet still has one it
+    /// will enforce, and that is the number a caller needs.
     fn max_message_size(&self, _target: InstanceId) -> Option<usize> {
-        let max_payload = self.max_payload.load(Ordering::Relaxed);
-        if max_payload == MAX_PAYLOAD_UNKNOWN {
-            return None;
-        }
-        Some(max_payload.saturating_sub(NATS_HEADER_OVERHEAD))
+        Some(self.frame_capacity())
     }
 
     fn register(&self, peer_info: PeerInfo) -> Result<(), TransportError> {
@@ -213,17 +224,22 @@ impl Transport for NatsTransport {
             }
         };
 
-        // Check total frame size against max_payload (LIFECYCLE-02 enforcement).
-        // NATS max_payload covers the total HPUB size (headers + payload).
-        let total_size = header.len() + payload.len() + NATS_HEADER_OVERHEAD;
-        let max = self.max_payload.load(Ordering::Relaxed);
-        if total_size > max {
+        // Check the frame against what this connection will carry right now
+        // (LIFECYCLE-02 enforcement). NATS `max_payload` covers the total HPUB
+        // size, which is what `frame_capacity` has already discounted — and it
+        // is the same call `max_message_size` answers with, so a frame sized
+        // against the report is never rejected here.
+        let frame_size = header.len() + payload.len();
+        if frame_size > self.frame_capacity() {
+            let max = self.client.max_payload();
             on_error.on_error(
                 header,
                 payload,
                 format!(
                     "Frame size {} exceeds NATS max_payload {} for peer {}",
-                    total_size, max, instance_id
+                    frame_size + NATS_HEADER_OVERHEAD,
+                    max,
+                    instance_id
                 ),
             );
             return SendOutcome::Admitted;
@@ -266,10 +282,15 @@ impl Transport for NatsTransport {
         let _ = self.shutdown_state.set(channels.shutdown_state.clone());
 
         Box::pin(async move {
-            // LIFECYCLE-02: Read max_payload from server_info
-            let max = self.client.server_info().max_payload;
-            self.max_payload.store(max, Ordering::Relaxed);
-            tracing::info!(max_payload = max, "NATS max_payload from server_info");
+            // LIFECYCLE-02: log what this connection will carry. Nothing is
+            // cached from it — `frame_capacity` re-reads the client each time,
+            // so a reconnect that renegotiates `max_payload` moves both the
+            // report and the check without anyone having to refresh anything.
+            tracing::info!(
+                max_payload = self.client.max_payload(),
+                frame_capacity = self.frame_capacity(),
+                "NATS max_payload for this connection"
+            );
 
             // TRANSPORT-03: Build WorkerAddress with "nats" entry containing inbound subject
             let subject = subjects::inbound_subject(&self.cluster_id, instance_id);
@@ -787,7 +808,6 @@ impl NatsTransportBuilder {
             cancel_token: CancellationToken::new(),
             begin_shutdown_token: CancellationToken::new(),
             shutdown_state: OnceLock::new(),
-            max_payload: Arc::new(AtomicUsize::new(MAX_PAYLOAD_UNKNOWN)),
             metrics: OnceLock::new(),
         }
     }
