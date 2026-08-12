@@ -364,7 +364,8 @@ impl Velo {
     pub fn peer_info(&self) -> PeerInfo {
         let messenger_peer = self.messenger.peer_info();
         let stream_addr = self.stream_transport.address();
-        // Empty streaming address (e.g., VeloFrameTransport) → no merge needed.
+        // Empty streaming address (a transport that opens no listener of its
+        // own, e.g. the messenger mux) → no merge needed.
         if stream_addr.as_bytes().is_empty()
             || stream_addr
                 .available_transports()

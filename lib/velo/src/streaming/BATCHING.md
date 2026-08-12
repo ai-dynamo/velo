@@ -16,7 +16,7 @@ whether this helps you and what switching it on will look like once the mux
 phases land. If you are implementing or reviewing it, the rest is the protocol
 specification and the argument for why it is correct.
 
-Status: **P0–P3 implemented; P4–P11 specified.** See
+Status: **P0–P3 and P7 implemented; the rest specified.** See
 [Implementation status](#implementation-status).
 
 ---
@@ -169,8 +169,8 @@ no allocation. `handle.unpack().0` *is* the batching key.
 ### Riding the Messenger
 
 The mux is a `MessengerMuxTransport` implementing the streaming `FrameTransport`
-contract, and it **replaces** the deprecated `VeloFrameTransport` rather than
-sitting beside it. There is no dial, listener, acceptor or connection manager:
+contract, and it **replaced** the deprecated `VeloFrameTransport` rather than
+sitting beside it — that transport is deleted. There is no dial, listener, acceptor or connection manager:
 records for a peer are packed into `_stream_batch` active messages and handed to
 the Messenger, which already holds connectivity to every peer this node talks to
 and already knows who sent what.
@@ -211,11 +211,15 @@ batch header:
   [u64 peer_epoch][u32 batch_seq]
 
 payload = record_count × record:
-  [u8 record_type][u32 BE slot][u32 BE frame_seq][u32 BE len][len bytes body]
+  [u8 record_type][u32 slot][u32 frame_seq][u32 len][len bytes body]
 
 record_type: 0 = Data, 1 = OpenSlot, 2 = CloseSlot,
              3 = CreditUpdate, 4 = SlotHeartbeat
 ```
+
+**Every multi-byte field is big-endian, header and record alike.** Stated once
+here rather than per field, because a single exception would be the kind of
+thing an implementor discovers from a corrupted length rather than from a spec.
 
 The epoch is bumped whenever the sender's view of the peer is re-established;
 `batch_seq` advances within it and is compared modulo, since an epoch outlives a
@@ -274,7 +278,12 @@ while it is in flight; the ordering consequence is dealt with in [Slots](#slots)
 ```
 SlotId = (u24 index, u8 generation)   packed into a u32,
          scoped by the sender's peer epoch
+
+  bits 31..8 : index        bits 7..0 : generation
 ```
+
+Index in the high bits so the raw `u32` sorts by index, which is the order a
+dense table is walked in.
 
 A dense index means demux is a `Vec` lookup rather than a hash. At 60 KiB
 batches this is roughly 1100 records per batch, so the per-record lookup is the
@@ -400,6 +409,15 @@ traffic and is not per-stream at all. So: a per-peer byte budget (default 8 MiB)
 and a per-slot byte cap (default 1 MiB). Frame credit gives the
 no-head-of-line-blocking proof, byte credit the memory bound — different jobs,
 both needed.
+
+The two grants can disagree — `C` records of a megabyte each against a
+one-megabyte slot cap — and where they do, the byte side wins by **throttling
+the next grant rather than refusing a record whose frame credit was already
+given**. Refusing would break a stream for a peer that respected everything it
+was told; withholding credit stops the peer at the next window instead. The
+ahead-of-sequence hold is the one place a byte reservation may still refuse,
+because there the alternative is unbounded growth behind a gap that may never
+close.
 
 **Control and data travel in separate lanes.** `finalize`, `detach` and `Drop`
 use a *synchronous* channel send, which must stay non-blocking under mux. The
@@ -767,7 +785,7 @@ State up front what would sink this, then check each:
 | **P4** | gRPC `Channel` caching per peer | none | specified |
 | **P5** | Ordered transport admission, `SendOutcome::Pending` | none | specified |
 | **P6** | Eager-size guidance, `Transport::max_message_size` | none | specified |
-| **P7** | `MessengerMuxTransport` — `_stream_batch`, `PeerBatcher`, slots, credit | yes | specified |
+| **P7** | `MessengerMuxTransport` — `_stream_batch`, `PeerBatcher`, slots, credit | yes | implemented |
 | **P8** | Attach-time negotiation, opt-in activation switch | additive | specified |
 | **P9** | Hint API (`StreamBatch`), windowed policy | none | specified |
 | **P10** | Heartbeat suppression and phase alignment | none | specified |
@@ -780,8 +798,29 @@ which the cost model predicts is the largest single term, without protocol risk.
 
 P5 and P6 are prerequisites, not preliminaries: without admission the batcher has
 no ordered per-target way to discover congestion, and without the eager budget it
-cannot size a batch the Messenger will carry inline. P7 does not start until both
-land, and until P8 lands it is dead code behind a false switch.
+cannot size a batch the Messenger will carry inline. P7 did not start until both
+landed, and until P8 lands it is unreachable code: the attach handlers still
+hardcode the local default transport key, so nothing ever answers
+`messenger-mux-v1`.
+
+Two details of P7 differ from what this document specifies, both because P8 is
+not there yet:
+
+- **Initial credit is advertised by a `CreditUpdate` on `OpenSlot`**, not in the
+  attach response, costing one round trip per stream open. The negotiated
+  fields remove it.
+- **Credit is returned by reconciling buffer occupancy**, not by `reader_pump`
+  calling `credit.release(1)`. `reader_pump` does not drain a mux slot buffer
+  until negotiation can select the mux, so there is nothing yet to hook; the mux
+  compares what it admitted against what is still queued, on every inbound batch
+  and on a periodic sweep. The sweep is what un-parks a sender whose peer has
+  gone quiet.
+
+One detail differs on the merits rather than on ordering. `CloseSlot` is
+bidirectional with no direction bit, and both sides may hold a slot at the same
+dense index, so the **reason carries the direction**: `TerminalSent` and
+`PeerGone` travel owner → receiver, `UnknownSlot` and `ProtocolError` travel
+receiver → owner.
 
 ### Why the mux surface is not in `velo-ext` yet
 

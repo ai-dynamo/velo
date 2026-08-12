@@ -19,7 +19,7 @@
 //! Opt in locally with:
 //!
 //! ```text
-//! RUSTFLAGS="--cfg velo_endurance" cargo test -p velo-streaming --test endurance_remote
+//! RUSTFLAGS="--cfg velo_endurance" cargo test -p velo --test streaming_endurance_remote
 //! ```
 //!
 //! The *consumer* side creates the anchor; the *producer* side calls
@@ -158,7 +158,8 @@ async fn make_remote_pair_tcp() -> RemotePair {
 
 // ---------------------------------------------------------------------------
 // Generic test bodies — parameterized over the `RemotePair` fixture.
-// Per-frame AM dispatch (VeloFrameTransport) is concurrent, so tests that
+// The multiset comparisons below outlived the concurrent per-frame AM
+// dispatch they were written for, so tests that
 // care about order collect items into a set and compare by multiset.
 // TCP preserves order on a single sender; use exact-sequence comparisons there.
 // ---------------------------------------------------------------------------
@@ -178,7 +179,7 @@ async fn run_e01(pair: &RemotePair, total: u64, ordered: bool) {
         for i in 0..total {
             sender.send(i).await.expect("send");
         }
-        // Allow in-flight AMs to drain before finalize on VeloFrameTransport.
+        // Allow in-flight frames to drain before finalize.
         tokio::time::sleep(Duration::from_millis(50)).await;
         sender.finalize().expect("finalize");
     });
@@ -353,7 +354,7 @@ async fn run_e06(pair: &RemotePair, cycles: u32, batch: u32, ordered: bool) {
         }
         offset += batch;
         // Let in-flight AMs drain before detach so the cycle's Detached sentinel
-        // orders after its items on VeloFrameTransport.
+        // orders after its items.
         tokio::time::sleep(Duration::from_millis(50)).await;
         current_handle = sender.detach().expect("detach");
 

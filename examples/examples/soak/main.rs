@@ -35,10 +35,11 @@ use crate::harness::tier::Tier;
 
 /// Streaming-transport selection for the soak harness.
 ///
-/// `Velo` (the AM-backed `VeloFrameTransport`) is intentionally **not** an
-/// option — it has known correctness issues under multi-stream concurrency
-/// and is undergoing phased deprecation. See `lib/velo/src/streaming.rs` for
-/// the deprecation notice.
+/// The messenger-backed transport is not an option here. The AM-backed
+/// `VeloFrameTransport` was deleted for known correctness problems under
+/// multi-stream concurrency, and its replacement — `messenger-mux-v1`, see
+/// `lib/velo/src/streaming/BATCHING.md` — is not selectable until attach-time
+/// negotiation lands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 #[value(rename_all = "lower")]
 enum StreamTransport {

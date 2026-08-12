@@ -625,7 +625,8 @@ pub struct AnchorManager {
     pub default_heartbeat_interval: Duration,
 
     /// Optional messenger for sending `_stream_cancel` AM from the consumer side.
-    /// Set by VeloFrameTransport scenarios; `None` for local/mock transport scenarios.
+    /// Set whenever the anchor has a remote counterpart; `None` for local /
+    /// mock-transport scenarios.
     #[builder(default)]
     pub messenger: Option<Arc<crate::messenger::Messenger>>,
 

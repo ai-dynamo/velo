@@ -390,7 +390,7 @@ while let Some(frame) = anchor.next().await {
 
 **Cancellation**: the consumer can cancel upstream at any time via `anchor.cancel()` or a cloned `StreamController`. The producer observes this via `sender.cancellation_token()`.
 
-**Streaming transport**: by default, frames travel over active messages (`VeloFrameTransport`). For dedicated throughput, configure a TCP or gRPC streaming server on the builder:
+**Streaming transport**: streaming frames travel over a dedicated `FrameTransport`, configured on the builder. TCP is the default; gRPC is available behind the `grpc` feature:
 
 ```rust
 use velo::{Velo, StreamConfig};

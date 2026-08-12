@@ -4,8 +4,8 @@
 //! Frame-level transport abstraction for ordered delivery streaming.
 //!
 //! This module defines the [`FrameTransport`] trait boundary consumed by the
-//! Velo streaming runtime and implemented by the in-tree
-//! `TcpFrameTransport`, `GrpcFrameTransport`, and (deprecated) `VeloFrameTransport`.
+//! Velo streaming runtime and implemented by the in-tree `TcpFrameTransport`,
+//! `GrpcFrameTransport` and messenger mux.
 //! Out-of-tree implementors (custom RDMA, hardware transports, alternative
 //! streaming substrates) should `impl FrameTransport for MyTransport` against
 //! this contract.
@@ -174,7 +174,7 @@ mod tests {
     fn default_register_returns_ok() {
         // The trait-default `register` must accept any PeerInfo and return
         // Ok. Used by transports that piggyback on a higher layer (e.g.,
-        // VeloFrameTransport on the messenger) and need no per-peer cache.
+        // the messenger mux) and need no per-peer cache.
         let transport = DefaultRegisterTransport;
         let peer = PeerInfo::new(InstanceId::new_v4(), WorkerAddress::empty());
         assert!(transport.register(&peer).is_ok());

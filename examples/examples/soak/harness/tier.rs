@@ -45,10 +45,10 @@ impl Tier {
             // the budget.
             //
             // `stream_anchors` is 64. Previously capped at 4 to work around a
-            // `VeloFrameTransport` reorder-buffer bug that deadlocked S2 at
-            // 16 anchors; after the WorkerAddress streaming refactor (default
-            // streaming = TCP with multi-interface advertise) S2 passes cleanly
-            // at 256+ anchors.
+            // reorder-buffer bug in the since-deleted AM frame transport that
+            // deadlocked S2 at 16 anchors; after the WorkerAddress streaming
+            // refactor (default streaming = TCP with multi-interface advertise)
+            // S2 passes cleanly at 256+ anchors.
             //
             // Above ~256 anchors S2 starts to flake — but the failure mode is
             // *environmental*, not a runtime bug: the test producer pumps as
