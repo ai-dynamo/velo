@@ -526,6 +526,8 @@ pub(crate) enum MuxDropReason {
     /// A producer ran past the byte cap on a slot that could not send, and the
     /// slot was closed with everything it was holding.
     WithheldOverflow,
+    /// A rendezvous singleton resolved for a slot that had already closed.
+    StaleSingleton,
     /// The record's `frame_seq` was behind the slot's next expected sequence.
     Duplicate,
 }
@@ -539,6 +541,7 @@ impl MuxDropReason {
             Self::ClosedSlot => "closed_slot",
             Self::SlotCollision => "slot_collision",
             Self::WithheldOverflow => "withheld_overflow",
+            Self::StaleSingleton => "stale_singleton",
             Self::Duplicate => "duplicate",
         }
     }
@@ -578,7 +581,9 @@ pub(crate) struct MuxMetricsHandle {
     credit_exhausted_total: Counter,
     rendezvous_singletons_total: Counter,
     held_records: Gauge,
+    withheld_records: Gauge,
     hold_overflow_total: Counter,
+    control_refused_total: Counter,
     epoch_deaths_total: Counter,
     batch_seq_gaps_total: Counter,
 }
@@ -646,6 +651,16 @@ impl MuxMetricsHandle {
         self.held_records.add(delta as f64);
     }
 
+    /// Adjust the egress withheld-queue occupancy by `delta` records.
+    pub(crate) fn withheld_records_delta(&self, delta: i64) {
+        self.withheld_records.add(delta as f64);
+    }
+
+    /// A batcher's coalesced control state refused a new slot key at its cap.
+    pub(crate) fn control_refused(&self) {
+        self.control_refused_total.inc();
+    }
+
     /// A slot's ahead-of-sequence hold overflowed and the slot was closed.
     pub(crate) fn hold_overflow(&self) {
         self.hold_overflow_total.inc();
@@ -709,7 +724,9 @@ pub struct VeloMetrics {
     streaming_slot_credit_exhausted_total: Counter,
     streaming_mux_rendezvous_singletons_total: Counter,
     streaming_mux_held_records: Gauge,
+    streaming_mux_withheld_records: Gauge,
     streaming_mux_hold_overflow_total: Counter,
+    streaming_mux_control_refused_total: Counter,
     streaming_mux_epoch_deaths_total: Counter,
     streaming_mux_batch_seq_gaps_total: Counter,
     // Rendezvous metrics
@@ -1123,6 +1140,29 @@ impl VeloMetrics {
                  overtake the ordered lane.",
             )?,
         )?;
+        let streaming_mux_withheld_records = register_collector(
+            registry,
+            Gauge::new(
+                "velo_streaming_mux_withheld_records",
+                "Records the egress batcher has pulled from producer inlets but \
+                 may not send yet — a slot out of credit, or fencing a \
+                 rendezvous singleton. The inlet is drained regardless of \
+                 whether the slot can send, because `finalize`, `detach` and \
+                 `Drop` reach it through a synchronous send that a full channel \
+                 would block forever; this gauge is where that backpressure \
+                 became visible instead. Bounded per slot by the slot byte cap.",
+            )?,
+        )?;
+        let streaming_mux_control_refused_total = register_collector(
+            registry,
+            Counter::with_opts(Opts::new(
+                "velo_streaming_mux_control_refused_total",
+                "Coalesced control entries a peer batcher refused because its \
+                 pending-control map was at capacity. Legitimate entries are \
+                 bounded by live slots, so anything here means a peer is naming \
+                 slot ids that were never alive.",
+            ))?,
+        )?;
         let streaming_mux_hold_overflow_total = register_collector(
             registry,
             Counter::with_opts(Opts::new(
@@ -1232,7 +1272,9 @@ impl VeloMetrics {
             streaming_slot_credit_exhausted_total,
             streaming_mux_rendezvous_singletons_total,
             streaming_mux_held_records,
+            streaming_mux_withheld_records,
             streaming_mux_hold_overflow_total,
+            streaming_mux_control_refused_total,
             streaming_mux_epoch_deaths_total,
             streaming_mux_batch_seq_gaps_total,
             rendezvous_operations_total,
@@ -1399,7 +1441,9 @@ impl VeloMetrics {
             credit_exhausted_total: self.streaming_slot_credit_exhausted_total.clone(),
             rendezvous_singletons_total: self.streaming_mux_rendezvous_singletons_total.clone(),
             held_records: self.streaming_mux_held_records.clone(),
+            withheld_records: self.streaming_mux_withheld_records.clone(),
             hold_overflow_total: self.streaming_mux_hold_overflow_total.clone(),
+            control_refused_total: self.streaming_mux_control_refused_total.clone(),
             epoch_deaths_total: self.streaming_mux_epoch_deaths_total.clone(),
             batch_seq_gaps_total: self.streaming_mux_batch_seq_gaps_total.clone(),
         }

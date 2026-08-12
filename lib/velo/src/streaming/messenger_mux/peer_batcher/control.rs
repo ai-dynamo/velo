@@ -15,8 +15,13 @@
 //!
 //! - **Credit accumulates.** Ten grants of one are a `u32` add, not ten
 //!   messages. Nothing is lost, because the batcher only ever wanted the sum.
-//! - **Close dominates credit.** A closed slot has no use for a window, and the
-//!   first close is the one that ended it — a later reason adds nothing.
+//! - **Close dominates credit.** Dominance is about *state size*, not about
+//!   discarding credit: a slot's entry never becomes two, and the first close is
+//!   the one that ended it, so a later reason adds nothing. Credit that arrived
+//!   alongside is still carried and still emitted — the batcher sends the stored
+//!   `CreditUpdate` before the `CloseSlot`, which is the order they were owed in
+//!   and costs nothing, since a peer that has already stopped simply ignores a
+//!   window it will not use.
 //! - **A failed singleton dominates a successful one.** It is epoch death, and
 //!   coalescing it away would leave slots alive with an unclosable `frame_seq`
 //!   gap.
@@ -31,6 +36,7 @@ use std::sync::Mutex;
 use tokio::sync::Notify;
 
 use super::super::protocol::{CloseReason, SlotId};
+use crate::observability::MuxMetricsHandle;
 
 /// Entries either map may hold before it starts refusing new keys.
 ///
@@ -62,19 +68,24 @@ pub(super) struct PeerControl {
 
 /// Everything pending for a batcher that is not a data record or an open.
 #[derive(Debug, Default)]
-pub(super) struct ControlState {
+struct ControlState {
     /// The sweep evicted this batcher from the registry.
     pub(super) retire: bool,
     mine: HashMap<u32, OwnedControl>,
     peers: HashMap<u32, PeerControl>,
     /// Entries refused because a map was at [`MAX_PENDING_CONTROL`].
-    pub(super) refused: u64,
+    refused: u64,
 }
 
 impl ControlState {
     /// Whether the batcher has anything to do.
     fn is_idle(&self) -> bool {
         !self.retire && self.mine.is_empty() && self.peers.is_empty()
+    }
+
+    /// The sweep evicted this batcher from the registry.
+    fn retire(&mut self) {
+        self.retire = true;
     }
 
     /// Pending entries across both maps, for the bound to be asserted on.
@@ -130,13 +141,23 @@ pub(super) struct DrainedControl {
 ///
 /// `Notify` rather than a channel because a permit is exactly what is wanted:
 /// it coalesces, it costs nothing to leave set, and a writer never waits.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(super) struct ControlInbox {
     state: Mutex<ControlState>,
     notify: Notify,
+    metrics: Option<MuxMetricsHandle>,
 }
 
 impl ControlInbox {
+    /// An inbox that reports refusals into `metrics`.
+    pub(super) fn new(metrics: Option<MuxMetricsHandle>) -> Self {
+        Self {
+            state: Mutex::new(ControlState::default()),
+            notify: Notify::new(),
+            metrics,
+        }
+    }
+
     /// Wait until there is something to drain.
     pub(super) async fn wait(&self) {
         loop {
@@ -165,7 +186,11 @@ impl ControlInbox {
         self.lock().len()
     }
 
-    /// Entries refused at the cap.
+    /// Entries refused at the cap. The series
+    /// `velo_streaming_mux_control_refused_total` is the operator-facing view of
+    /// the same number; this one exists so a test can read it without a
+    /// registry.
+    #[cfg(test)]
     pub(super) fn refused(&self) -> u64 {
         self.lock().refused
     }
@@ -219,11 +244,25 @@ impl ControlInbox {
 
     /// The sweep evicted this batcher.
     pub(super) fn retire(&self) {
-        self.mutate(|state| state.retire = true);
+        self.mutate(ControlState::retire);
     }
 
     fn mutate(&self, apply: impl FnOnce(&mut ControlState)) {
-        apply(&mut self.lock());
+        let refused = {
+            let mut state = self.lock();
+            let before = state.refused;
+            apply(&mut state);
+            state.refused - before
+        };
+        // Reported outside the lock: a prometheus counter is cheap, but nothing
+        // that can be moved out of a critical section belongs inside one.
+        if refused > 0
+            && let Some(metrics) = &self.metrics
+        {
+            for _ in 0..refused {
+                metrics.control_refused();
+            }
+        }
         self.notify.notify_one();
     }
 

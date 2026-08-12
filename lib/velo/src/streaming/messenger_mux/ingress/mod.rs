@@ -134,6 +134,14 @@ impl IngressRegistry {
         self.binds.remove(&(anchor_id, session_id)).is_some()
     }
 
+    /// Bytes `peer`'s ahead-of-sequence holds have reserved between them.
+    #[cfg(test)]
+    pub(crate) fn peer_bytes_used(&self, peer: WorkerId) -> u64 {
+        self.peers
+            .get(&peer)
+            .map_or(0, |entry| lock(entry.value()).peer_bytes.used())
+    }
+
     /// Live receive-side slots for `peer`.
     pub(crate) fn live_slots(&self, peer: WorkerId) -> usize {
         self.peers
@@ -387,9 +395,12 @@ fn open_slot(
         state.slots.resize_with(index + 1, || None);
     }
     // A re-`OpenSlot` for the *same* id is a duplicate, not a collision: the
-    // guard above let it through, so replace it rather than leak the buffer.
-    if state.slots[index].take().is_some() {
-        outcome.closed += 1;
+    // guard above let it through, so it replaces the incumbent. It goes through
+    // the ordinary close first, though — taking the slot out directly would skip
+    // the held-byte release and leave the consumer's channel ending without the
+    // `Dropped` that tells it why.
+    if state.slots.get(index).and_then(Option::as_ref).is_some() {
+        finish_close(state, id, CloseReason::PeerGone, ctx.metrics, outcome);
     }
 
     let slot = IngressSlot::new(

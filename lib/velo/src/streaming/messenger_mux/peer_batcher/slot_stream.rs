@@ -171,9 +171,13 @@ impl WithheldQueue {
 
     /// Park a record, or report that the slot has run past its byte cap.
     ///
-    /// A single record larger than the whole cap is admitted rather than
-    /// rejected — it will leave as an oversized singleton, and refusing it would
-    /// kill a stream for sending one large frame, which no other path does.
+    /// The bound is **cap plus one frame**, deliberately, and it is the same
+    /// shape as the `C + 1` slot buffer on the receive side: the cap governs how
+    /// far a producer may run ahead, and the `+ 1` is there so a single record
+    /// larger than the whole cap is never what kills a stream. Such a record
+    /// leaves as an oversized singleton, which is a supported path; refusing it
+    /// would mean a stream dying for sending one large frame, which nothing else
+    /// in the protocol does.
     pub(super) fn push(&mut self, record: Vec<u8>) -> Result<(), WithheldOverflow> {
         let len = record.len() as u64;
         if !self.records.is_empty() && self.bytes.saturating_add(len) > self.cap {
@@ -194,6 +198,12 @@ impl WithheldQueue {
     /// prevent.
     pub(super) fn front(&self) -> Option<&[u8]> {
         self.records.front().map(Vec::as_slice)
+    }
+
+    /// Discard everything queued. Used when the slot is being killed.
+    pub(super) fn clear(&mut self) {
+        self.records.clear();
+        self.bytes = 0;
     }
 
     /// Take the oldest record.

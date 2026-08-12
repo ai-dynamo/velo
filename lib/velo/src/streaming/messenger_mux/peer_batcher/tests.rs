@@ -27,6 +27,7 @@ use super::test_support::StallingTransport;
 use super::*;
 use crate::messenger::{Context, Handler};
 use crate::observability::VeloMetrics;
+use crate::streaming::messenger_mux::STREAM_BATCH_HANDLER;
 use crate::streaming::messenger_mux::protocol::{
     BatchDecoder, BatchHeader, RecordBody, RecordType,
 };
@@ -46,6 +47,9 @@ struct OwnedRecord {
     frame_seq: u32,
     kind: RecordType,
     data: Vec<u8>,
+    /// The delta a `CreditUpdate` carried, so a test can assert the *value* a
+    /// coalescing merge produced rather than merely that one arrived.
+    credit: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +73,10 @@ impl OwnedBatch {
                     data: match record.body {
                         RecordBody::Data(body) => body.to_vec(),
                         _ => Vec::new(),
+                    },
+                    credit: match record.body {
+                        RecordBody::CreditUpdate { delta } => delta,
+                        _ => 0,
                     },
                 }
             })
@@ -240,6 +248,20 @@ impl Harness {
 
     fn snapshot(&self) -> crate::observability::test_helpers::MetricSnapshot {
         crate::observability::test_helpers::MetricSnapshot::from_registry(&self.registry)
+    }
+
+    /// Records the batcher has pulled from inlets and parked.
+    fn withheld(&self) -> f64 {
+        self.snapshot()
+            .gauge("velo_streaming_mux_withheld_records", &[])
+    }
+
+    /// Wait until exactly `count` records are parked.
+    ///
+    /// A positive fact to wait for, unlike "no batch has arrived yet" — which
+    /// is true before the batcher has run at all and so proves nothing.
+    async fn await_withheld(&self, count: usize) {
+        eventually(|| (self.withheld() - count as f64).abs() < f64::EPSILON).await;
     }
 }
 
@@ -523,7 +545,10 @@ async fn a_departed_producer_s_withheld_records_go_before_its_close() {
         inlet.send(item(n)).expect("queue record");
     }
     drop(inlet);
-    eventually(|| harness.try_next_batch().is_none()).await;
+    // The records are parked, not merely un-sent: the inlet drained even though
+    // the slot has no credit, which is the property the close has to wait on.
+    harness.await_withheld(4).await;
+    assert!(harness.try_next_batch().is_none());
 
     harness.grant(id, 64);
     let mut records = Vec::new();
@@ -551,7 +576,10 @@ async fn a_withheld_terminal_closes_the_slot_without_a_second_close() {
         .send(cached_finalized().clone())
         .expect("queue terminal");
     drop(inlet);
-    eventually(|| harness.try_next_batch().is_none()).await;
+    // Both parked: the terminal is behind a predecessor, so its reserve does
+    // not apply and it waits its turn.
+    harness.await_withheld(2).await;
+    assert!(harness.try_next_batch().is_none());
 
     harness.grant(id, 64);
     let mut records = Vec::new();
@@ -570,6 +598,85 @@ async fn a_withheld_terminal_closes_the_slot_without_a_second_close() {
     // `Dropped` behind a `Finalized` it has already seen.
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(harness.try_next_batch().is_none());
+}
+
+/// A terminal at the head of the queue spends the reserve without a grant.
+///
+/// The reserve exists for exactly this: a consumer that has stopped draining
+/// will never return credit, so a terminal that waited for one would wait
+/// forever and the stream would end on the heartbeat watchdog instead of on the
+/// `Finalized` its producer actually sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_terminal_spends_the_reserve_when_data_credit_is_gone() {
+    let harness = harness(MuxConfig::default()).await;
+    let (inlet, id) = harness.open(1, 1).await;
+
+    // Exactly one data credit, spent by the first record.
+    harness.grant(id, 1);
+    inlet.send(item(0)).expect("queue item");
+    let first = harness.next_batch().await;
+    assert_eq!(first.records[0].data, item(0));
+
+    // No predecessors queued, no further grant coming: the terminal must go out
+    // on the reserve alone.
+    inlet
+        .send(cached_finalized().clone())
+        .expect("queue terminal");
+    let mut records = Vec::new();
+    while records.len() < 2 {
+        records.extend(harness.next_batch().await.records);
+    }
+    assert_eq!(records[0].data, *cached_finalized());
+    assert_eq!(
+        records[1].kind,
+        RecordType::CloseSlot,
+        "the terminal's close still rides the same batch"
+    );
+    assert_eq!(harness.withheld(), 0.0, "the terminal was sent, not parked");
+}
+
+/// A grant that covers only part of the queue drains only that part, in order.
+///
+/// The path this pins is `release_withheld`'s peek-then-pop: a record inspected
+/// and found unaffordable must stay where it is. Popping it and putting it back
+/// would send it to the *back* of the queue, which is a reordering the wire has
+/// no way to detect.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_partial_grant_drains_the_queue_head_and_leaves_the_rest_in_order() {
+    let harness = harness(MuxConfig::default()).await;
+    let (inlet, id) = harness.open_with_inlet(1, 1, 64).await;
+    let id = id.0;
+
+    const RECORDS: u32 = 8;
+    for n in 0..RECORDS {
+        inlet.send(item(n)).expect("queue record");
+    }
+    harness.await_withheld(RECORDS as usize).await;
+
+    // Three credits against eight records: the fourth peek misses and the
+    // remaining five have to stay put.
+    harness.grant(id, 3);
+    let mut records = Vec::new();
+    while records.len() < 3 {
+        records.extend(harness.next_batch().await.records);
+    }
+    harness.await_withheld((RECORDS - 3) as usize).await;
+    assert!(
+        harness.try_next_batch().is_none(),
+        "a partial grant must not drain past what it paid for"
+    );
+
+    harness.grant(id, 16);
+    while records.len() < RECORDS as usize {
+        records.extend(harness.next_batch().await.records);
+    }
+    for (n, record) in records.iter().enumerate() {
+        assert_eq!(
+            record.data,
+            item(n as u32),
+            "record {n} out of order across the credit miss"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -802,7 +909,14 @@ async fn a_stalled_batcher_coalesces_control_instead_of_queueing_it() {
     );
 
     // Open a slot. Its eager `OpenSlot` flush takes the gate's one free place.
-    let (inlet, inlet_rx) = flume::bounded::<Vec<u8>>(64);
+    //
+    // The inlet is deep because a batcher parked on admission is not draining
+    // it — admission parking suspends the whole task, including the inlet
+    // drain that credit starvation cannot suspend. That park is bounded by the
+    // transport's own progress, which is the situation a socket was always in;
+    // credit starvation is the unbounded one, and that is the one the withheld
+    // queue exists for.
+    let (inlet, inlet_rx) = flume::bounded::<Vec<u8>>(512);
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
     handle
         .open_slot(OpenSlotRequest {
@@ -828,21 +942,52 @@ async fn a_stalled_batcher_coalesces_control_instead_of_queueing_it() {
     });
     let id = open_batch.records[0].slot;
 
-    // Nothing drains the channel now, so the next flush parks in the gate and
-    // the batcher parks with it.
-    handle.grant(id, 64);
+    // Fill the gate's one place and leave it filled. Nothing drains `wire`
+    // until the release phase, so every flush after this one parks.
+    handle.grant(id, 1);
     inlet.send(item(0)).expect("queue record");
     eventually(|| wire.is_full()).await;
 
+    // A control write the batcher can act on, so the flush it triggers is the
+    // one that parks. After this the batcher is inside `flush().await` and
+    // cannot take anything else off the control state.
+    handle.reply(&[ReplyRecord::CloseSlot {
+        slot: SlotId::from_raw(u32::MAX),
+        reason: CloseReason::UnknownSlot,
+    }]);
+    let batches = |registry: &prometheus::Registry| {
+        crate::observability::test_helpers::MetricSnapshot::from_registry(registry)
+            .counter("velo_streaming_mux_batches_total", &[("direction", "sent")])
+    };
+    eventually(|| batches(&registry) >= 3.0).await;
+    let parked_at = batches(&registry);
+
+    // More records than the one credit already granted, so the merged grant is
+    // what decides whether they flow.
+    const QUEUED: u32 = 100;
+    for n in 1..QUEUED {
+        inlet.send(item(n)).expect("queue record");
+    }
+
     // Ten thousand grants and ten thousand replies while it is stuck there.
-    for _ in 0..10_000 {
+    const MERGED: u32 = 10_000;
+    let mut peak_pending = 0;
+    for _ in 0..MERGED {
         handle.grant(id, 1);
         handle.reply(&[ReplyRecord::CreditUpdate { slot: id, delta: 1 }]);
+        peak_pending = peak_pending.max(handle.pending_control());
     }
+    // The stall was real: a batcher keeping up would have packed some of those
+    // twenty thousand writes into batches by now.
+    assert_eq!(
+        batches(&registry),
+        parked_at,
+        "nothing may reach the messenger while the peer's gate is full"
+    );
     assert!(
-        handle.pending_control() <= 2,
-        "control must coalesce per slot, not queue: {} entries pending",
-        handle.pending_control()
+        peak_pending <= 3,
+        "control must coalesce per slot, not queue: peaked at {peak_pending} entries \
+         against 20 000 writes"
     );
 
     // Un-park the peer, one place at a time — the gate holds exactly one, so
@@ -861,7 +1006,11 @@ async fn a_stalled_batcher_coalesces_control_instead_of_queueing_it() {
             Err(_) => tokio::time::sleep(Duration::from_millis(2)).await,
         }
         if handle.pending_control() == 0
-            && records.iter().any(|r| r.kind == RecordType::Data)
+            && records
+                .iter()
+                .filter(|r| r.kind == RecordType::Data)
+                .count()
+                == QUEUED as usize
             && records.iter().any(|r| r.kind == RecordType::CreditUpdate)
         {
             break true;
@@ -870,16 +1019,121 @@ async fn a_stalled_batcher_coalesces_control_instead_of_queueing_it() {
     assert!(
         settled,
         "the coalesced control must deliver once the peer un-parks: \
-         {} entries still pending, records {:?}",
+         {} entries still pending, {} of {QUEUED} records out",
         handle.pending_control(),
-        records.iter().map(|r| r.kind).collect::<Vec<_>>()
+        records
+            .iter()
+            .filter(|r| r.kind == RecordType::Data)
+            .count()
     );
+
+    // The merged *values*, not merely their arrival.
+    //
+    // Asserted as a sum rather than as a single record of 10 000, because the
+    // batcher is free to drain more than once — each freed place in the gate
+    // lets it flush and look again. What must hold either way is conservation:
+    // every delta written is delivered exactly once, in far fewer records than
+    // it was written in. A merge that dropped or double-counted would move the
+    // sum; a merge that did not happen would move the count.
+    let credit: Vec<u32> = records
+        .iter()
+        .filter(|r| r.kind == RecordType::CreditUpdate)
+        .map(|r| r.credit)
+        .collect();
+    assert_eq!(
+        credit.iter().sum::<u32>(),
+        MERGED,
+        "coalescing must neither drop nor duplicate a delta"
+    );
+    assert!(
+        credit.len() < MERGED as usize / 4,
+        "ten thousand replies arrived as {} records — that is not coalescing",
+        credit.len()
+    );
+    assert!(
+        records
+            .iter()
+            .any(|r| r.kind == RecordType::CloseSlot && r.slot.raw() == u32::MAX),
+        "the control written while parked has to survive the park"
+    );
+    for (n, record) in records
+        .iter()
+        .filter(|r| r.kind == RecordType::Data)
+        .enumerate()
+    {
+        assert_eq!(record.data, item(n as u32), "record {n} out of order");
+    }
     cancel.cancel();
 }
 
 // ---------------------------------------------------------------------------
 // Epoch death
 // ---------------------------------------------------------------------------
+
+/// A singleton's failure resolving after its slot closed must not fail the
+/// epoch.
+///
+/// The resolution carries the `SlotId` it was sent under, and a close-then-open
+/// recycles that dense index under a new generation while the answer is still in
+/// flight. Acting on it would take down every live slot on the peer over a
+/// stream that ended cleanly before the answer arrived — and there is no gap to
+/// protect, because the slot is gone. A connection-level failure is not lost
+/// either: the next batch to this peer meets the same failure and fails the
+/// epoch then.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_singleton_failing_after_its_slot_closed_does_not_fail_the_epoch() {
+    let harness = harness(MuxConfig::default()).await;
+
+    let (inlet, stale) = harness.open(1, 1).await;
+    harness.grant(stale, 8);
+    inlet
+        .send(cached_finalized().clone())
+        .expect("queue terminal");
+    eventually(|| inlet.is_disconnected()).await;
+    // Drain the terminal's batch so the next assertions read a quiet wire.
+    while harness.try_next_batch().is_some() {}
+
+    // The index comes back under a new generation.
+    let (reopened_inlet, reopened) = harness.open(1, 2).await;
+    assert_eq!(reopened.index(), stale.index());
+    assert_ne!(reopened.generation(), stale.generation());
+
+    // The old slot's singleton finally answers, and answers badly.
+    harness.handle.control.singleton_resolved(stale, false);
+    eventually(|| {
+        harness.snapshot().counter(
+            "velo_streaming_mux_records_dropped_total",
+            &[("reason", "stale_singleton")],
+        ) > 0.0
+    })
+    .await;
+
+    assert!(
+        !reopened_inlet.is_disconnected(),
+        "the slot that reused the index must survive its predecessor's answer"
+    );
+    assert_eq!(
+        harness
+            .snapshot()
+            .counter("velo_streaming_mux_epoch_deaths_total", &[]),
+        0.0,
+        "a stale answer is not evidence about the connection this epoch has"
+    );
+
+    // And the reopened slot still works.
+    harness.grant(reopened, 8);
+    reopened_inlet.send(item(7)).expect("send on reopened slot");
+    let mut seen = None;
+    while seen.is_none() {
+        seen = harness
+            .next_batch()
+            .await
+            .records
+            .into_iter()
+            .find(|r| r.kind == RecordType::Data);
+    }
+    assert_eq!(seen.expect("record").data, item(7));
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn epoch_death_fails_every_live_slot_exactly_once() {

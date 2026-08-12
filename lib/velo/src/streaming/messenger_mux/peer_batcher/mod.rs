@@ -46,40 +46,30 @@ mod slot_stream;
 mod test_support;
 #[cfg(test)]
 mod tests;
+mod writer;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use futures::future::FutureExt;
 use futures::stream::{SelectAll, StreamExt};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
-use velo_ext::{InstanceId, WorkerId};
+use velo_ext::WorkerId;
 
 use self::control::{ControlInbox, DrainedControl, OwnedControl, PeerControl};
 pub(crate) use self::slot_stream::AllocError;
 use self::slot_stream::{EgressSlots, SlotItem, SlotStream};
+use self::writer::BatchWriter;
 use super::MuxConfig;
 use super::protocol::{
-    BATCH_HEADER_LEN, BatchEncoder, CloseReason, MAX_RECORDS_PER_BATCH, SlotId, record_encoded_len,
+    BATCH_HEADER_LEN, BatchEncoder, CloseReason, EncodeError, SlotId, record_encoded_len,
 };
 use crate::messenger::Messenger;
-use crate::observability::{MuxDirection, MuxDropReason, MuxMetricsHandle};
-use crate::streaming::messenger_mux::STREAM_BATCH_HANDLER;
+use crate::observability::{MuxDropReason, MuxMetricsHandle};
 use crate::streaming::messenger_mux::flow_control::CreditClass;
 use crate::streaming::sender::is_terminal_sentinel;
-use crate::transports::tcp::framing::COALESCE_THRESHOLD;
-
-/// Smallest batch a clamp may produce: the header plus one empty record.
-///
-/// A transport that reports a tiny eager budget must not clamp the cap to
-/// nothing, or the batcher would route every record — including the 13-byte
-/// control ones — through rendezvous and never make progress. Records that do
-/// not fit above this floor still take the singleton path, which is the correct
-/// answer for them.
-const MIN_BATCH_CAP: usize = BATCH_HEADER_LEN + 13;
 
 /// The per-peer batcher registry, keyed by the batching key from `BATCHING.md`
 /// § "Why bucketing by destination is free".
@@ -236,7 +226,7 @@ pub(crate) struct BatcherContext {
 /// Spawn a batcher for `peer` and return its registry handle.
 pub(crate) fn spawn(peer: WorkerId, ctx: BatcherContext) -> Arc<BatcherHandle> {
     let (opens, open_rx) = flume::bounded(OPEN_QUEUE_DEPTH);
-    let control = Arc::new(ControlInbox::default());
+    let control = Arc::new(ControlInbox::new(ctx.metrics.clone()));
     let handle = Arc::new(BatcherHandle {
         opens,
         control: Arc::clone(&control),
@@ -246,10 +236,15 @@ pub(crate) fn spawn(peer: WorkerId, ctx: BatcherContext) -> Arc<BatcherHandle> {
         alive: AtomicBool::new(true),
     });
     let epoch = ctx.epochs.fetch_add(1, Ordering::Relaxed);
+    let writer = BatchWriter::new(
+        Arc::clone(&ctx.messenger),
+        peer,
+        ctx.config.clone(),
+        ctx.metrics.clone(),
+        epoch,
+    );
     let batcher = Batcher {
         peer,
-        peer_instance: None,
-        messenger: ctx.messenger,
         config: ctx.config,
         metrics: ctx.metrics,
         handle: Arc::clone(&handle),
@@ -257,13 +252,9 @@ pub(crate) fn spawn(peer: WorkerId, ctx: BatcherContext) -> Arc<BatcherHandle> {
         batchers: ctx.batchers,
         cancel: ctx.cancel,
         control,
-        epoch,
-        next_batch_seq: 0,
-        cap: MIN_BATCH_CAP,
+        writer,
         slots: EgressSlots::default(),
         streams: SelectAll::new(),
-        encoder: None,
-        buffer: BytesMut::new(),
         stopping: false,
     };
     tokio::spawn(batcher.run(open_rx));
@@ -279,8 +270,6 @@ enum Work {
 
 struct Batcher {
     peer: WorkerId,
-    peer_instance: Option<InstanceId>,
-    messenger: Arc<Messenger>,
     config: MuxConfig,
     metrics: Option<MuxMetricsHandle>,
     handle: Arc<BatcherHandle>,
@@ -289,13 +278,9 @@ struct Batcher {
     cancel: CancellationToken,
     /// The coalesced control state this task drains.
     control: Arc<ControlInbox>,
-    epoch: u64,
-    next_batch_seq: u32,
-    cap: usize,
+    writer: BatchWriter,
     slots: EgressSlots,
     streams: SelectAll<SlotStream>,
-    encoder: Option<BatchEncoder>,
-    buffer: BytesMut,
     /// Set once the task has decided to exit, so the drain loop stops pulling
     /// work it will never flush.
     stopping: bool,
@@ -385,7 +370,29 @@ impl Batcher {
     }
 
     /// Apply the coalesced control for one slot this side owns.
+    ///
+    /// The generation check comes first, and that ordering is the whole point:
+    /// a singleton's resolution carries the `SlotId` it was sent under, and a
+    /// close-then-reopen recycles that dense index under a new generation while
+    /// the resolution is still in flight. Acting on a stale failure would fail
+    /// the epoch — every live slot on the peer — over a stream that ended
+    /// cleanly before the answer arrived.
     async fn on_owned_control(&mut self, slot: SlotId, entry: OwnedControl) {
+        if self.slots.get_mut_checked(slot).is_none() {
+            // The slot is gone, so there is no `frame_seq` gap left to protect:
+            // its records are nobody's problem and its consumer has already
+            // been told. If the admission failed for a connection-level reason
+            // rather than a slot-level one, the very next batch to this peer
+            // meets the same failure and fails the epoch then — deferring to
+            // that signal costs a batch and loses nothing.
+            if entry.singleton == Some(false)
+                && let Some(metrics) = &self.metrics
+            {
+                metrics.record_dropped(MuxDropReason::StaleSingleton);
+            }
+            return;
+        }
+
         // A failed singleton is epoch death; nothing else about the slot
         // matters afterwards, because the slot does not survive the epoch.
         if entry.singleton == Some(false) {
@@ -425,18 +432,35 @@ impl Batcher {
         };
 
         // Terminal-ness costs an `rmp_serde` decode attempt on anything that is
-        // not one of the three cached sentinels, so it is asked only on the
-        // branch that needs it. Under starvation the withhold branch is the hot
-        // one, and it does not care.
+        // not one of the three cached sentinels, so it is asked only where the
+        // answer changes what happens. On the fast path a record with data
+        // credit behind it is sent either way. On the starved path it decides
+        // whether the reserve applies, and the whole reason the reserve exists
+        // is that a terminal must not wait on credit a stalled consumer will
+        // never return.
         if slot.must_withhold(CreditClass::Data) {
+            let terminal = is_terminal_sentinel(&bytes);
+            // The reserve applies to the *head* of the stream, not to any
+            // terminal: predecessors still queued go first, and a fence means a
+            // predecessor is on the wire. Otherwise the terminal would overtake
+            // records the consumer is owed.
+            if terminal
+                && slot.withheld.is_empty()
+                && !slot.is_fenced()
+                && slot.credit.can_spend(CreditClass::Terminal)
+            {
+                self.emit_data(index, bytes, true).await;
+                return;
+            }
+
             let starved = slot.credit.data_available() == 0;
             match slot.withheld.push(bytes) {
                 Ok(()) => {
-                    if starved
-                        && slot.note_starved()
-                        && let Some(metrics) = &self.metrics
-                    {
-                        metrics.credit_exhausted();
+                    if let Some(metrics) = &self.metrics {
+                        metrics.withheld_records_delta(1);
+                        if starved && slot.note_starved() {
+                            metrics.credit_exhausted();
+                        }
                     }
                 }
                 Err(error) => self.overflow_kill(index, error).await,
@@ -464,6 +488,7 @@ impl Batcher {
         let id = slot.id;
         let seq = slot.take_seq();
         let discarded = slot.withheld.len();
+        slot.withheld.clear();
         tracing::warn!(
             slot = ?id,
             %error,
@@ -472,6 +497,7 @@ impl Batcher {
         );
         if let Some(metrics) = &self.metrics {
             metrics.records_dropped(MuxDropReason::WithheldOverflow, discarded as u64 + 1);
+            metrics.withheld_records_delta(-(discarded as i64));
         }
         self.push_close(id, seq, CloseReason::PeerGone).await;
         self.close_local(index);
@@ -486,7 +512,7 @@ impl Batcher {
             self.flush().await;
             self.ensure_batch();
         }
-        if let Some(encoder) = self.encoder.as_mut() {
+        if let Some(encoder) = self.writer.encoder() {
             let _ = encoder.push_close_slot(id, seq, reason);
         }
     }
@@ -571,7 +597,7 @@ impl Batcher {
         let seq = slot.take_seq();
         let close_seq = terminal.then(|| slot.take_seq());
 
-        if let Some(encoder) = self.encoder.as_mut() {
+        if let Some(encoder) = self.writer.encoder() {
             if let Err(error) = encoder.push_data(id, seq, &bytes) {
                 tracing::error!(slot = ?id, %error, "messenger mux: dropping unencodable record");
                 return;
@@ -604,30 +630,18 @@ impl Batcher {
         let seq = slot.take_seq();
         let close_seq = terminal.then(|| slot.take_seq());
 
-        let batch_seq = self.take_batch_seq();
-        let mut encoder = BatchEncoder::new(self.epoch, batch_seq);
-        if let Err(error) = encoder.push_data(id, seq, &bytes) {
-            tracing::error!(slot = ?id, %error, "messenger mux: dropping unencodable record");
-            return;
-        }
-        if let Some(close_seq) = close_seq {
-            let _ = encoder.push_close_slot(id, close_seq, CloseReason::TerminalSent);
-        }
-        let records = usize::from(encoder.record_count());
-        let payload = encoder.finish().freeze();
-
-        if let Some(metrics) = &self.metrics {
-            metrics.rendezvous_singleton();
-            metrics.batch(MuxDirection::Sent, records);
-        }
-
-        let fire = match self.messenger.am_send_streaming(STREAM_BATCH_HANDLER) {
-            Ok(builder) => builder.raw_payload(payload).worker(self.peer).send(),
-            Err(error) => {
-                tracing::error!(%error, "messenger mux: could not build a singleton send");
-                self.epoch_death();
-                return;
+        let fire = self.writer.dispatch_singleton(|encoder| {
+            encoder.push_data(id, seq, &bytes)?;
+            match close_seq {
+                Some(close_seq) => {
+                    encoder.push_close_slot(id, close_seq, CloseReason::TerminalSent)
+                }
+                None => Ok(()),
             }
+        });
+        let Some(fire) = fire else {
+            self.epoch_death();
+            return;
         };
 
         if terminal {
@@ -638,7 +652,7 @@ impl Batcher {
 
         // Deliberately not awaited here: fencing is per slot, so every other
         // slot on this peer keeps flowing while the staged transfer is in
-        // flight. The resolution comes back as a command.
+        // flight. The resolution comes back as coalesced control.
         let control = Arc::clone(&self.control);
         tokio::spawn(async move {
             control.singleton_resolved(id, fire.await.is_ok());
@@ -678,7 +692,7 @@ impl Batcher {
             .get_mut(id.index())
             .map_or(0, |entry| entry.take_seq());
         self.ensure_batch();
-        if let Some(encoder) = self.encoder.as_mut() {
+        if let Some(encoder) = self.writer.encoder() {
             let _ = encoder.push_open_slot(id, seq, anchor_id, session_id);
         }
         // Eager, in its own flush: `bind()`'s accept timeout measures "time
@@ -715,7 +729,7 @@ impl Batcher {
 
     async fn push_reply(
         &mut self,
-        write: impl FnOnce(&mut BatchEncoder) -> Result<(), super::protocol::EncodeError>,
+        write: impl FnOnce(&mut BatchEncoder) -> Result<(), EncodeError>,
     ) {
         let needed = record_encoded_len(4).unwrap_or(usize::MAX);
         self.ensure_batch();
@@ -723,7 +737,7 @@ impl Batcher {
             self.flush().await;
             self.ensure_batch();
         }
-        if let Some(encoder) = self.encoder.as_mut() {
+        if let Some(encoder) = self.writer.encoder() {
             let _ = write(encoder);
         }
     }
@@ -776,7 +790,13 @@ impl Batcher {
                         if !slot.credit.can_spend(class) {
                             return;
                         }
-                        slot.withheld.pop().map(|bytes| (bytes, terminal))
+                        let popped = slot.withheld.pop();
+                        if popped.is_some()
+                            && let Some(metrics) = &self.metrics
+                        {
+                            metrics.withheld_records_delta(-1);
+                        }
+                        popped.map(|bytes| (bytes, terminal))
                     }
                     None => {
                         slot.note_flowing();
@@ -803,112 +823,33 @@ impl Batcher {
     }
 
     // -----------------------------------------------------------------------
-    // Batch assembly
+    // Batch assembly — see [`writer`]
     // -----------------------------------------------------------------------
 
-    /// Open a batch if none is staged, and report the byte cap it must respect.
     fn ensure_batch(&mut self) -> usize {
-        if self.encoder.is_none() {
-            self.cap = self.compute_cap();
-            let batch_seq = self.take_batch_seq();
-            let buffer = std::mem::take(&mut self.buffer);
-            self.encoder = Some(BatchEncoder::with_buffer(buffer, self.epoch, batch_seq));
-        }
-        self.cap
+        self.writer.ensure_batch()
     }
 
-    /// Whether the staged batch can take `bytes` more in `records` more records.
     fn fits(&self, bytes: usize, records: u16) -> bool {
-        let Some(encoder) = self.encoder.as_ref() else {
-            return true;
-        };
-        encoder.encoded_len().saturating_add(bytes) <= self.cap
-            && u32::from(encoder.record_count()) + u32::from(records)
-                <= u32::from(MAX_RECORDS_PER_BATCH)
+        self.writer.fits(bytes, records)
     }
 
-    /// `min(configured cap, effective eager budget, COALESCE_THRESHOLD)`.
+    /// Write the staged batch, failing the epoch if it is never admitted.
     ///
-    /// The threshold is the packing *target*: the shared coalescing writer
-    /// stages a frame into one buffered `write_all` only while it fits, so a
-    /// batch above it gives back what batching bought. The eager budget is the
-    /// ceiling above it — exceed it and the batch quietly becomes a rendezvous
-    /// transfer, paying a round trip on behalf of every slot packed into it.
-    ///
-    /// Asked here, in the batcher task, because `effective_eager_payload`
-    /// accounts for the ambient trace context the send will inject. An
-    /// unresolved peer costs the conservative clamp rather than a failed flush.
-    fn compute_cap(&mut self) -> usize {
-        let eager = self.peer_instance().map_or(usize::MAX, |instance| {
-            self.messenger
-                .effective_eager_payload(instance, STREAM_BATCH_HANDLER, None)
-        });
-        let clamped = self
-            .config
-            .max_batch_bytes
-            .min(eager)
-            .min(COALESCE_THRESHOLD);
-        // Not `clamp`: the floor is applied *after* the three ceilings, and a
-        // configured cap below the floor is a legitimate (if useless) setting
-        // rather than the panic `clamp` would give it.
-        clamped.max(MIN_BATCH_CAP)
-    }
-
-    fn peer_instance(&mut self) -> Option<InstanceId> {
-        if self.peer_instance.is_none() {
-            self.peer_instance = self
-                .messenger
-                .backend()
-                .try_translate_worker_id(self.peer)
-                .ok();
-        }
-        self.peer_instance
-    }
-
-    fn take_batch_seq(&mut self) -> u32 {
-        let seq = self.next_batch_seq;
-        self.next_batch_seq = self.next_batch_seq.wrapping_add(1);
-        seq
-    }
-
-    /// Write the staged batch, parking on admission until it is the transport's
-    /// problem. A failed admission is epoch death — see the module docs.
+    /// The writer reports the failure and this decides what it means: a batch
+    /// that never reached the wire leaves a `frame_seq` gap in every slot packed
+    /// into it, and the mux does not retransmit, so those slots can never make
+    /// progress again.
     async fn flush(&mut self) {
-        let Some(encoder) = self.encoder.take() else {
-            return;
-        };
-        if encoder.is_empty() {
-            // Nothing went out, so the sequence it reserved is not a gap.
-            self.next_batch_seq = self.next_batch_seq.wrapping_sub(1);
-            self.buffer = encoder.finish();
-            return;
-        }
-        let records = usize::from(encoder.record_count());
-        let mut finished = encoder.finish();
-        let payload = finished.split().freeze();
-        self.buffer = finished;
-
-        if let Some(metrics) = &self.metrics {
-            metrics.batch(MuxDirection::Sent, records);
-        }
-        if let Err(error) = self.send_batch(payload).await {
+        if let Err(writer::FlushFailed(error)) = self.writer.flush().await {
             tracing::warn!(
                 peer = %self.peer,
-                epoch = self.epoch,
+                epoch = self.writer.epoch(),
                 %error,
                 "messenger mux: batch was never admitted; failing the peer epoch"
             );
             self.epoch_death();
         }
-    }
-
-    async fn send_batch(&self, payload: Bytes) -> anyhow::Result<()> {
-        self.messenger
-            .am_send_streaming(STREAM_BATCH_HANDLER)?
-            .raw_payload(payload)
-            .worker(self.peer)
-            .send()
-            .await
     }
 
     // -----------------------------------------------------------------------
@@ -939,7 +880,6 @@ impl Batcher {
     fn epoch_death(&mut self) {
         let closed = self.slots.close_all();
         self.streams = SelectAll::new();
-        self.encoder = None;
         if let Some(metrics) = &self.metrics {
             metrics.epoch_death();
             for _ in 0..closed {
@@ -947,8 +887,8 @@ impl Batcher {
             }
         }
         self.publish_live_slots();
-        self.epoch = self.epochs.fetch_add(1, Ordering::Relaxed);
-        self.next_batch_seq = 0;
+        self.writer
+            .reset_epoch(self.epochs.fetch_add(1, Ordering::Relaxed));
     }
 
     /// Close every slot on the way out, so producers learn immediately.

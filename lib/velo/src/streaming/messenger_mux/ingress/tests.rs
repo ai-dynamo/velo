@@ -151,6 +151,11 @@ fn a_colliding_open_slot_is_rejected_and_the_incumbent_survives() {
         encoder.push_data(incumbent, 2, &item(2)).unwrap();
     });
     handle_batch(&registry, &config, None, peer(), &payload);
+    let held_bytes = registry.peer_bytes_used(peer());
+    assert!(
+        held_bytes > 0,
+        "the hold has to be charged for this to test anything"
+    );
 
     // Same dense index, next generation — a live occupant is there either way.
     let collider = slot(0, 1);
@@ -176,6 +181,12 @@ fn a_colliding_open_slot_is_rejected_and_the_incumbent_survives() {
         !incumbent_rx.is_disconnected(),
         "the incumbent's consumer must not see its channel end"
     );
+    assert_eq!(
+        registry.peer_bytes_used(peer()),
+        held_bytes,
+        "the incumbent's hold must still be charged to the peer budget — a \
+         silent eviction would have leaked it for the life of the epoch"
+    );
 
     // The incumbent still works: closing its gap delivers both records, which
     // it could not do if its hold or its byte accounting had been disturbed.
@@ -200,6 +211,66 @@ fn a_colliding_open_slot_is_rejected_and_the_incumbent_survives() {
     });
     handle_batch(&registry, &config, None, peer(), &payload);
     assert_eq!(drain(&rival_rx), vec![item(9)]);
+}
+
+/// A duplicate `OpenSlot` replaces the incumbent, but through the front door.
+///
+/// Replacement is right — the same slot id reopening is a retransmitted open,
+/// not a collision — but taking the slot out directly would skip the close: the
+/// consumer's channel would simply end, with no `Dropped` to say why, and the
+/// incumbent's held bytes would stay charged to the peer budget for the life of
+/// the epoch.
+#[test]
+fn a_duplicate_open_retires_the_incumbent_through_the_ordinary_close() {
+    let config = config();
+    let registry = IngressRegistry::default();
+    let depth =
+        crate::streaming::messenger_mux::flow_control::slot_buffer_depth(config.initial_credit);
+    let (first_tx, first_rx) = flume::bounded(depth);
+    let (second_tx, second_rx) = flume::bounded(depth);
+    registry.register_bind(ANCHOR, SESSION, first_tx);
+    registry.register_bind(ANCHOR, SESSION + 1, second_tx);
+
+    let id = slot(0, 0);
+    open(&registry, &config, id, 1);
+
+    // Something ahead of sequence, so the hold has bytes charged against the
+    // peer budget that only a proper close gives back.
+    let payload = batch(1, 1, |encoder| {
+        encoder.push_data(id, 2, &item(2)).unwrap();
+    });
+    handle_batch(&registry, &config, None, peer(), &payload);
+    assert!(registry.peer_bytes_used(peer()) > 0);
+
+    // The same slot id opens again, against a different bind.
+    let payload = batch(1, 2, |encoder| {
+        encoder.push_open_slot(id, 0, ANCHOR, SESSION + 1).unwrap();
+    });
+    let outcome = handle_batch(&registry, &config, None, peer(), &payload);
+
+    assert_eq!(outcome.opened, 1);
+    assert_eq!(
+        outcome.closed, 1,
+        "the incumbent was retired, not dropped on the floor"
+    );
+    assert_eq!(
+        registry.peer_bytes_used(peer()),
+        0,
+        "the incumbent's held bytes go back to the peer budget"
+    );
+    assert_eq!(
+        drain(&first_rx),
+        vec![cached_dropped().clone()],
+        "the incumbent's consumer is told why its stream ended"
+    );
+
+    // The replacement is a working slot on the bind it named.
+    let payload = batch(1, 3, |encoder| {
+        encoder.push_data(id, 1, &item(9)).unwrap();
+    });
+    handle_batch(&registry, &config, None, peer(), &payload);
+    assert_eq!(drain(&second_rx), vec![item(9)]);
+    assert_eq!(registry.live_slots(peer()), 1);
 }
 
 #[test]

@@ -43,7 +43,34 @@
 //! land in the next stage. Until then nothing offers `messenger-mux-v1` on an
 //! attach, so a deployment reaches the mux only by installing it deliberately.
 //!
-//! Two consequences of that ordering are visible here. Initial credit is
+//! ## The producer's contract under the mux
+//!
+//! `StreamSender::send` documents itself in transport-neutral terms — a bounded
+//! channel, an awaited send when it fills — and for TCP and gRPC that is exactly
+//! what happens, because those egress pumps drain at socket speed and a full
+//! channel is transient. The mux behaves differently and it is worth stating
+//! where a reader will meet it:
+//!
+//! - **`send` does not become the backpressure point.** The batcher drains a
+//!   slot's inlet whether or not the slot may send — it has to, because
+//!   `finalize`, `detach` and `Drop` reach that same channel through a
+//!   *synchronous* send, and a slot parked on credit would block one of them
+//!   forever. Records the slot cannot send wait in a mux-owned withheld queue
+//!   instead.
+//! - **The bound is bytes, and overrunning it ends the stream.** That queue is
+//!   capped at the per-slot byte budget (1 MiB by default). A producer that runs
+//!   further ahead than that on a slot nobody is draining has its slot closed:
+//!   the consumer receives `Dropped`, the producer's channel starts erroring,
+//!   and the peer's other slots are untouched. `SATURATION.md` describes it from
+//!   the operator's side.
+//!
+//! The exception is a batcher parked on *admission* rather than on credit. That
+//! suspends the task, inlet drain included — but it is bounded by the
+//! transport's own progress, which is the position a socket was always in. It is
+//! credit starvation, which nothing but the consumer can end, that the withheld
+//! queue exists for.
+//!
+//! Two consequences of the pre-negotiation ordering are visible here. Initial credit is
 //! advertised by a `CreditUpdate` on `OpenSlot` rather than in the attach
 //! response, which costs one round trip per stream open that negotiation will
 //! remove. And `reader_pump` returns credit by *reconciliation* — the mux
@@ -166,10 +193,11 @@ impl Default for MuxConfig {
 impl MuxConfig {
     /// Depth of the per-slot channel `connect` hands the producer.
     ///
-    /// Sized to the credit window so a producer that outruns its consumer feels
-    /// backpressure at roughly the point the protocol stops letting records on
-    /// to the wire, rather than buffering a second, unrelated window's worth
-    /// behind it.
+    /// Sized to the credit window for symmetry with the receive buffer, **not**
+    /// as a backpressure point — see [the producer contract](self#the-producers-contract-under-the-mux).
+    /// The batcher drains this channel whether or not the slot may send, so its
+    /// depth governs how much sits here rather than in the withheld queue, and
+    /// nothing else.
     fn inlet_depth(&self) -> usize {
         slot_buffer_depth(self.initial_credit)
     }
