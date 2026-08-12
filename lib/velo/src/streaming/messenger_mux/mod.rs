@@ -152,8 +152,8 @@ pub struct MuxConfig {
     ///
     /// Advertised verbatim as the attach response's `initial_credit`, so it
     /// must never be zero: zero on the wire means *this peer is not offering
-    /// the mux*. [`MessengerMuxTransport::new`] refuses a zero rather than
-    /// letting a node install a mux it then tells every peer to ignore.
+    /// the mux*. Building a mux refuses a zero rather than letting a node
+    /// install one it then tells every peer to ignore.
     pub initial_credit: u32,
     /// Bytes one slot may hold in flight — the replacement for the ~1 MiB the
     /// kernel socket used to enforce per stream for free. Zero means the

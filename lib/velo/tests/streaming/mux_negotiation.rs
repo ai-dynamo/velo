@@ -106,6 +106,15 @@ impl Node {
         )
     }
 
+    /// Batches this node's egress batchers handed to the messenger. Zero is
+    /// proof no slot was ever opened from here, which is what a negative
+    /// negotiation arm needs and what the `live_slots` gauge cannot give — that
+    /// gauge returns to zero on the mux path too.
+    fn mux_batches_sent(&self) -> f64 {
+        self.snapshot()
+            .counter("velo_streaming_mux_batches_total", &[("direction", "sent")])
+    }
+
     fn mux_records_received(&self) -> f64 {
         self.snapshot()
             .histogram_sum("velo_streaming_mux_records_per_batch", &[])
@@ -304,6 +313,18 @@ async fn an_mpsc_anchor_negotiates_the_mux_for_all_of_its_producers() {
 
     assert_eq!(next.len(), SENDERS as usize, "every sender must have sent");
     assert!(next.values().all(|delivered| *delivered == PER_SENDER));
+
+    // The MPSC attach handler does not label the operations counter, so the
+    // negotiated outcome is read off the ingress lane instead: nothing but a
+    // `_stream_batch` from the producer can move this, and every assertion
+    // above would hold just as well over TCP.
+    let batches = consumer.mux_batches_received();
+    assert!(batches > 0.0, "the attach did not settle on {MUX_KEY}");
+    assert!(
+        batches < f64::from(SENDERS * PER_SENDER),
+        "{batches} batches for {} records — the producers did not share any",
+        SENDERS * PER_SENDER
+    );
     consumer.assert_no_reader_stall();
     eventually(|| consumer.mux_live_slots() == 0.0).await;
 }
@@ -505,7 +526,12 @@ async fn a_mux_mpsc_sender_falls_back_when_the_receiver_has_no_mux() {
         .expect("timed out collecting items");
 
     assert_eq!(items, (0..50).collect::<Vec<_>>());
-    assert_eq!(producer.mux_live_slots(), 0.0);
+    assert_eq!(
+        producer.mux_batches_sent(),
+        0.0,
+        "the sender has a mux and advertised it, but the answer named another \
+         transport, so no slot may have been opened and no batch sent"
+    );
 }
 
 /// (d) The response half of the same story, at the wire: an MPSC response from

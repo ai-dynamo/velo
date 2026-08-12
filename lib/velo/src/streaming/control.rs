@@ -248,9 +248,9 @@ pub enum AnchorAttachResponse {
         /// default*. The asymmetry is deliberate and `BATCHING.md` is its
         /// authority — a credit window cannot be defaulted safely because only
         /// the receiver knows what it allocated, whereas the byte cap is a
-        /// memory bound both sides can agree on without being told.
-        /// [`crate::streaming::messenger_mux::flow_control::NegotiatedLimits::from_wire`]
-        /// is the one place that split is encoded.
+        /// memory bound both sides can agree on without being told. The mux's
+        /// internal `NegotiatedLimits::from_wire` is the one place that split
+        /// is encoded.
         #[serde(default)]
         slot_byte_budget: u32,
     },
