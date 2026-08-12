@@ -264,6 +264,9 @@ jobs:
     - name: Run mpsc_fanin
       timeout-minutes: 2
       run: cargo run --manifest-path examples/Cargo.toml --release --all-features --example mpsc_fanin -- --producers 4 --items 40
+    - name: Run batched_streaming
+      timeout-minutes: 2
+      run: cargo run --manifest-path examples/Cargo.toml --release --all-features --example batched_streaming -- --engines 2 --requests 24 --max-batch 8 --tokens 40
     - name: sccache stats
       if: always()
       run: /tmp/use-sccache.sh show-stats "examples" || true
