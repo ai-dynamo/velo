@@ -26,6 +26,7 @@ use crate::transports::utils::interfaces::{
 };
 use velo_ext::{MessageType, PeerInfo, Transport, TransportAdapter, TransportKey, WorkerAddress};
 
+use super::framing::DEFAULT_MAX_FRAME_SIZE;
 use super::listener::TcpListener;
 use crate::transports::coalesce::{
     Coalescable, WriterFailure, WriterObserver, run_coalescing_writer,
@@ -299,6 +300,19 @@ impl Transport for TcpTransport {
 
     fn address(&self) -> WorkerAddress {
         self.local_address.clone()
+    }
+
+    /// The codec's frame ceiling, which is already stated in the units this
+    /// method wants: `TcpFrameCodec::validate_lengths_limit` caps
+    /// `header_len + payload_len`, and the 11-byte preamble is written
+    /// *outside* that sum. There is nothing to subtract.
+    ///
+    /// Static and identical for every peer — `build_preamble` validates
+    /// against [`DEFAULT_MAX_FRAME_SIZE`] itself, so a codec constructed with
+    /// `with_max_frame_size` moves only what this process will *decode*, never
+    /// what it will encode.
+    fn max_message_size(&self, _target: crate::InstanceId) -> Option<usize> {
+        Some(DEFAULT_MAX_FRAME_SIZE as usize)
     }
 
     fn register(&self, peer_info: PeerInfo) -> Result<(), TransportError> {

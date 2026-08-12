@@ -6,11 +6,16 @@
 pub(crate) mod builders;
 mod peer_registry;
 
+#[cfg(test)]
+mod tests;
+
 use anyhow::Result;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::messenger::PeerDiscovery;
+use crate::messenger::common::messages::envelope_overhead;
 use crate::messenger::common::{ActiveMessage, responses::ResponseManager};
 
 use crate::observability::{ClientResolution, VeloMetrics};
@@ -19,6 +24,55 @@ use peer_registry::PeerRegistry;
 use velo_ext::InstanceId;
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Combine what is known about a target into the largest payload the messenger
+/// will carry to it *eagerly* — inline, in one message, without a round trip.
+///
+/// Two ceilings, either of which may be unknown:
+///
+/// - `transport_capacity` — [`Transport::max_message_size`] for this target.
+///   Exceeding it is a hard failure: the frame never reaches the wire and the
+///   send's error handler hears about it.
+/// - `staging_threshold` — the installed
+///   [`LargePayloadStager`](crate::messenger::large_payload::LargePayloadStager)'s
+///   threshold, `None` when no stager is installed. Exceeding it is not a
+///   failure; the payload is staged through rendezvous instead, which works
+///   but costs the receiver a round trip to fetch. Staying under it is what
+///   "eager" means.
+///
+/// With neither known there is still an answer to give, and it is
+/// [`DEFAULT_THRESHOLD`](crate::rendezvous::transparent::DEFAULT_THRESHOLD) —
+/// the number the transparent stager would use if it were installed, so
+/// installing the default stager later never moves the budget.
+///
+/// With a capacity but no stager the budget is the transport's, not the
+/// default threshold. That is deliberate and worth stating plainly: with no
+/// stager there is no cheaper path to fall back to, so clamping to 256 KiB
+/// would forbid sends that would have succeeded.
+///
+/// The envelope comes off the *combined* ceiling. Against the transport that
+/// is arithmetic — its limit counts header bytes. Against the staging
+/// threshold it is deliberate slack, since the stager compares the raw
+/// `payload.len()` before any encoding happens; the budget keeps one shape
+/// rather than two, and errs by the size of an envelope in the safe direction.
+///
+/// `saturating_sub` because neither ceiling bounds the envelope: a handler
+/// name plus up to 16 KiB of headers can exceed a small `with_threshold`.
+/// Wrapping there would hand back a near-`usize::MAX` budget — precisely the
+/// oversized eager send this function exists to prevent.
+pub(crate) fn eager_payload_budget(
+    transport_capacity: Option<usize>,
+    staging_threshold: Option<usize>,
+    envelope_overhead: usize,
+) -> usize {
+    let ceiling = match (transport_capacity, staging_threshold) {
+        (Some(capacity), Some(threshold)) => capacity.min(threshold),
+        (Some(capacity), None) => capacity,
+        (None, Some(threshold)) => threshold,
+        (None, None) => crate::rendezvous::transparent::DEFAULT_THRESHOLD,
+    };
+    ceiling.saturating_sub(envelope_overhead)
+}
 
 pub(crate) struct ActiveMessageClient {
     pub(crate) response_manager: ResponseManager,
@@ -106,6 +160,28 @@ impl ActiveMessageClient {
             payload,
             message_type,
             self.error_handler.clone(),
+        )
+    }
+
+    /// Largest payload this client will carry to `target` in one eager send
+    /// under `handler_name` with `headers`.
+    ///
+    /// This is the one place both inputs live: the backend knows which
+    /// transport serves `target` and what it will carry, and the client holds
+    /// the stager whose threshold decides when a payload stops going inline.
+    /// See [`eager_payload_budget`] for what the number means.
+    pub(crate) fn effective_eager_payload(
+        &self,
+        target: InstanceId,
+        handler_name: &str,
+        headers: Option<&HashMap<String, String>>,
+    ) -> usize {
+        eager_payload_budget(
+            self.backend.max_message_size(target),
+            self.large_payload_stager
+                .get()
+                .map(|stager| stager.threshold()),
+            envelope_overhead(handler_name, headers),
         )
     }
 

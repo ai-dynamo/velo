@@ -126,6 +126,10 @@ impl ZmqTransport {
     }
 }
 
+// `max_message_size` is left at the trait's `None`. The only ZMQ socket option
+// this transport sets that bounds anything is `ZMQ_SNDHWM`, which limits queued
+// *messages*, not their size; `ZMQ_MAXMSGSIZE` is left at libzmq's unlimited
+// default. There is no limit to report.
 impl Transport for ZmqTransport {
     fn key(&self) -> TransportKey {
         self.key.clone()
@@ -737,6 +741,18 @@ mod tests {
     fn test_builder_default() {
         let transport = ZmqTransportBuilder::new().build();
         assert!(transport.is_ok());
+    }
+
+    /// ZMQ reports no capacity, and that has to stay deliberate: `ZMQ_SNDHWM`
+    /// bounds queued messages rather than their size, and `ZMQ_MAXMSGSIZE` is
+    /// left at libzmq's unlimited default. There is no limit to quote.
+    #[test]
+    fn max_message_size_is_unknown() {
+        let transport = ZmqTransportBuilder::new().build().unwrap();
+        assert_eq!(
+            transport.max_message_size(crate::InstanceId::new_v4()),
+            None
+        );
     }
 
     #[test]

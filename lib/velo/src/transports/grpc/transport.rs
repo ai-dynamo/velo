@@ -260,6 +260,14 @@ impl GrpcTransport {
     }
 }
 
+// `max_message_size` is left at the trait's `None`. This setup configures no
+// tonic message-size limit, so the only ceiling in play is tonic's own default
+// decode limit — a private `const` in `tonic::codec`, not a public item, so
+// mirroring its value here would be a number that drifts silently on the next
+// tonic bump with no test able to catch it. `None` says what is true: this
+// transport does not know its limit, so the caller falls back to a
+// conservative budget, which today lands an order of magnitude below tonic's
+// default anyway.
 impl Transport for GrpcTransport {
     fn key(&self) -> TransportKey {
         self.key.clone()

@@ -14,6 +14,16 @@ const CURRENT_SCHEMA_VERSION: u8 = 1;
 const MAX_HEADER_VALUE_LEN: usize = 1024;
 const MAX_HEADERS_LEN: usize = 16384;
 
+/// Fixed-size prefix every encoded active-message header begins with:
+/// `schema_version` (1) + `response_type` (1) + `response_id` (16) +
+/// `handler_name_len` (2) + `headers_len` (2). Every remaining byte of the
+/// header is handler name or MessagePack-encoded headers.
+///
+/// [`encode_active_message`] sizes its buffer with it, [`decode_active_message`]
+/// rejects anything shorter, and [`envelope_overhead`] starts from it — one
+/// number so the three cannot drift apart.
+pub(crate) const FIXED_HEADER_SIZE: usize = 1 + 1 + 16 + 2 + 2;
+
 #[derive(Debug, Clone)]
 pub(crate) struct ActiveMessage {
     pub metadata: MessageMetadata,
@@ -131,7 +141,7 @@ impl ResponseType {
 
 #[derive(Debug, Error)]
 pub(crate) enum DecodeError {
-    #[error("Header too short: expected at least 20 bytes")]
+    #[error("Header too short: expected at least {FIXED_HEADER_SIZE} bytes")]
     HeaderTooShort,
 
     #[error("Invalid handler name length")]
@@ -202,7 +212,7 @@ pub(crate) fn encode_active_message(
 
     // Calculate total header size
     let headers_len = headers_bytes.as_ref().map(|b| b.len()).unwrap_or(0);
-    let header_size = 20 + handler_name_len + 2 + headers_len; // +2 for headers_len field
+    let header_size = FIXED_HEADER_SIZE + handler_name_len + headers_len;
     let mut header = BytesMut::with_capacity(header_size);
 
     // Encode fixed fields
@@ -220,6 +230,86 @@ pub(crate) fn encode_active_message(
 
     let message_type = message.metadata.response_type.to_message_type();
     Ok((header.freeze(), message.payload, message_type))
+}
+
+/// Largest entry count `rmp` writes with a bare `FixMap` marker.
+const MSGPACK_FIXMAP_MAX_ENTRIES: usize = 15;
+/// Largest entry count `rmp` writes with `Map16` (marker + `u16` length).
+const MSGPACK_MAP16_MAX_ENTRIES: usize = u16::MAX as usize;
+/// Longest string `rmp` writes with a bare `FixStr` marker.
+const MSGPACK_FIXSTR_MAX_LEN: usize = 31;
+/// Longest string `rmp` writes with `Str8` (marker + `u8` length).
+const MSGPACK_STR8_MAX_LEN: usize = u8::MAX as usize;
+/// Longest string `rmp` writes with `Str16` (marker + `u16` length).
+const MSGPACK_STR16_MAX_LEN: usize = u16::MAX as usize;
+/// Bytes a bare `Fix*` marker occupies — the length rides in the marker byte.
+const MSGPACK_FIX_MARKER_BYTES: usize = 1;
+/// Bytes a marker plus a `u8` length occupies.
+const MSGPACK_U8_LEN_BYTES: usize = 1 + 1;
+/// Bytes a marker plus a `u16` length occupies.
+const MSGPACK_U16_LEN_BYTES: usize = 1 + 2;
+/// Bytes a marker plus a `u32` length occupies.
+const MSGPACK_U32_LEN_BYTES: usize = 1 + 4;
+
+/// Bytes `rmp` spends on the map header for `entries` key/value pairs.
+fn msgpack_map_header_len(entries: usize) -> usize {
+    if entries <= MSGPACK_FIXMAP_MAX_ENTRIES {
+        MSGPACK_FIX_MARKER_BYTES
+    } else if entries <= MSGPACK_MAP16_MAX_ENTRIES {
+        MSGPACK_U16_LEN_BYTES
+    } else {
+        MSGPACK_U32_LEN_BYTES
+    }
+}
+
+/// Bytes `rmp` spends on a string of `len` bytes, marker included.
+fn msgpack_str_len(len: usize) -> usize {
+    let marker = if len <= MSGPACK_FIXSTR_MAX_LEN {
+        MSGPACK_FIX_MARKER_BYTES
+    } else if len <= MSGPACK_STR8_MAX_LEN {
+        MSGPACK_U8_LEN_BYTES
+    } else if len <= MSGPACK_STR16_MAX_LEN {
+        MSGPACK_U16_LEN_BYTES
+    } else {
+        MSGPACK_U32_LEN_BYTES
+    };
+    marker + len
+}
+
+/// Bytes [`encode_active_message`] puts in front of the payload for a message
+/// with this handler name and header set — the messenger's wire envelope.
+///
+/// A caller sizing a payload against a transport's
+/// [`max_message_size`](velo_ext::Transport::max_message_size) needs this,
+/// because that number bounds `header + payload` *together*: what is left for
+/// the payload is the transport's number less this one.
+///
+/// The three terms mirror the encoder exactly:
+///
+/// ```text
+/// FIXED_HEADER_SIZE (22) + handler_name.len() + rmp_serde::to_vec(headers).len()
+/// ```
+///
+/// The MessagePack term is derived from `rmp`'s marker widths rather than
+/// serialized, so this costs no allocation and can be called per send. The
+/// derivation is pinned against the real encoder in the tests, including at
+/// every marker-width boundary, which is where an analytic copy of an encoder
+/// goes wrong if it is going to.
+///
+/// Note `None` and `Some(empty map)` differ by one byte: the encoder writes no
+/// MessagePack at all for `None`, and an empty `FixMap` marker for `Some`.
+pub(crate) fn envelope_overhead(
+    handler_name: &str,
+    headers: Option<&HashMap<String, String>>,
+) -> usize {
+    let headers_len = headers.map_or(0, |headers| {
+        msgpack_map_header_len(headers.len())
+            + headers
+                .iter()
+                .map(|(key, value)| msgpack_str_len(key.len()) + msgpack_str_len(value.len()))
+                .sum::<usize>()
+    });
+    FIXED_HEADER_SIZE + handler_name.len() + headers_len
 }
 
 /// Best-effort decode of just the `ResponseId` from an active-message request
@@ -250,8 +340,8 @@ pub(crate) fn decode_active_message(
 ) -> Result<ActiveMessage, DecodeError> {
     let mut header = header;
 
-    // Validate minimum size (now 22 bytes: original 20 + 2 for headers_len)
-    if header.len() < 22 {
+    // Validate minimum size: the fixed prefix must be present in full.
+    if header.len() < FIXED_HEADER_SIZE {
         return Err(DecodeError::HeaderTooShort);
     }
 
@@ -308,6 +398,119 @@ pub(crate) fn decode_active_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Header length the real encoder produces — the ground truth
+    /// [`envelope_overhead`] is checked against.
+    fn encoded_header_len(handler_name: &str, headers: Option<&HashMap<String, String>>) -> usize {
+        let (header, _, _) = ActiveMessage {
+            metadata: MessageMetadata::new_unary(
+                ResponseId::from_u128(1),
+                handler_name.to_string(),
+                headers.cloned(),
+            ),
+            payload: Bytes::new(),
+        }
+        .encode()
+        .unwrap();
+        header.len()
+    }
+
+    /// `entries` headers with keys of `key_len` bytes and values of
+    /// `value_len`. Keys are zero-padded indices, so they stay unique;
+    /// `key_len` must leave room for the index.
+    fn header_map(entries: usize, key_len: usize, value_len: usize) -> HashMap<String, String> {
+        (0..entries)
+            .map(|i| (format!("{i:0key_len$}"), "v".repeat(value_len)))
+            .collect()
+    }
+
+    /// An analytic copy of an encoder is wrong at the marker widths if it is
+    /// wrong anywhere, so every case here sits on a transition: `None` vs
+    /// `Some(empty)`, fixmap→map16, fixstr→str8, str8→str16.
+    #[test]
+    fn envelope_overhead_matches_encoder_at_msgpack_boundaries() {
+        let cases: Vec<(String, Option<HashMap<String, String>>)> = vec![
+            ("h".to_string(), None),
+            ("_stream_batch".to_string(), None),
+            ("n".repeat(300), None),
+            ("h".to_string(), Some(HashMap::new())),
+            ("h".to_string(), Some(header_map(1, 3, 5))),
+            (
+                "h".to_string(),
+                Some(header_map(MSGPACK_FIXMAP_MAX_ENTRIES, 4, 4)),
+            ),
+            (
+                "h".to_string(),
+                Some(header_map(MSGPACK_FIXMAP_MAX_ENTRIES + 1, 4, 4)),
+            ),
+            (
+                "h".to_string(),
+                Some(header_map(1, MSGPACK_FIXSTR_MAX_LEN, 4)),
+            ),
+            (
+                "h".to_string(),
+                Some(header_map(1, MSGPACK_FIXSTR_MAX_LEN + 1, 4)),
+            ),
+            (
+                "h".to_string(),
+                Some(header_map(1, 4, MSGPACK_FIXSTR_MAX_LEN)),
+            ),
+            (
+                "h".to_string(),
+                Some(header_map(1, 4, MSGPACK_FIXSTR_MAX_LEN + 1)),
+            ),
+            (
+                "h".to_string(),
+                Some(header_map(1, MSGPACK_STR8_MAX_LEN, 4)),
+            ),
+            (
+                "h".to_string(),
+                Some(header_map(1, MSGPACK_STR8_MAX_LEN + 1, 4)),
+            ),
+            (
+                "h".to_string(),
+                Some(header_map(1, 4, MSGPACK_STR8_MAX_LEN)),
+            ),
+            (
+                "h".to_string(),
+                Some(header_map(1, 4, MSGPACK_STR8_MAX_LEN + 1)),
+            ),
+        ];
+
+        for (handler_name, headers) in &cases {
+            assert_eq!(
+                envelope_overhead(handler_name, headers.as_ref()),
+                encoded_header_len(handler_name, headers.as_ref()),
+                "handler_len={} entries={:?}",
+                handler_name.len(),
+                headers.as_ref().map(HashMap::len),
+            );
+        }
+    }
+
+    /// Exact arithmetic for the two header sets that matter downstream: the
+    /// mux batcher's bare `_stream_batch` message, and the same message once
+    /// the transparent stager has added its `_rv` handle.
+    #[test]
+    fn envelope_overhead_pins_exact_sizes() {
+        // 22 fixed + 13 handler name + no headers at all.
+        assert_eq!(envelope_overhead("_stream_batch", None), 22 + 13);
+        assert_eq!(encoded_header_len("_stream_batch", None), 35);
+
+        // A rendezvous handle is a u128 in decimal, at most 39 digits.
+        let mut headers = HashMap::new();
+        headers.insert(
+            crate::messenger::large_payload::RV_HEADER_KEY.to_string(),
+            "9".repeat(39),
+        );
+        // 22 fixed + 13 name + FixMap marker (1) + FixStr "_rv" (1 + 3)
+        // + Str8 handle (2 + 39, past the 31-byte FixStr ceiling).
+        assert_eq!(
+            envelope_overhead("_stream_batch", Some(&headers)),
+            22 + 13 + 1 + 4 + 41,
+        );
+        assert_eq!(encoded_header_len("_stream_batch", Some(&headers)), 81);
+    }
 
     #[test]
     fn decode_response_id_from_request_header_roundtrip() {

@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use velo::transports::HealthCheckError;
 use velo::transports::nats::{NatsTransport, NatsTransportBuilder};
-use velo::transports::{MessageType, Transport, make_channels};
+use velo::transports::{DataStreams, MessageType, Transport, make_channels};
 use velo_ext::InstanceId;
 
 use bytes::Bytes;
@@ -26,15 +26,15 @@ use bytes::Bytes;
 async fn make_nats_transport(
     client: Arc<async_nats::Client>,
     cluster_id: &str,
-) -> anyhow::Result<(NatsTransport, InstanceId)> {
+) -> anyhow::Result<(NatsTransport, DataStreams, InstanceId)> {
     let transport = NatsTransportBuilder::new(client, cluster_id).build();
     let instance_id = InstanceId::new_v4();
-    let (adapter, _streams) = make_channels();
+    let (adapter, streams) = make_channels();
     let rt = tokio::runtime::Handle::current();
     transport.start(instance_id, adapter, rt).await?;
     // Give subscriptions a moment to become live
     tokio::time::sleep(Duration::from_millis(50)).await;
-    Ok((transport, instance_id))
+    Ok((transport, streams, instance_id))
 }
 
 /// TEST-04: Healthy peer — check_health returns Ok when peer is alive.
@@ -45,8 +45,9 @@ async fn test_check_health_healthy_peer() {
     let client_a = Arc::new(async_nats::connect(&common::nats_url()).await.unwrap());
     let client_b = Arc::new(async_nats::connect(&common::nats_url()).await.unwrap());
 
-    let (transport_a, _id_a) = make_nats_transport(client_a, &cluster_id).await.unwrap();
-    let (transport_b, id_b) = make_nats_transport(client_b, &cluster_id).await.unwrap();
+    let (transport_a, _streams_a, _id_a) =
+        make_nats_transport(client_a, &cluster_id).await.unwrap();
+    let (transport_b, _streams_b, id_b) = make_nats_transport(client_b, &cluster_id).await.unwrap();
 
     // A registers B as a peer
     use velo::PeerInfo;
@@ -73,8 +74,9 @@ async fn test_check_health_unreachable_peer() {
     let client_a = Arc::new(async_nats::connect(&common::nats_url()).await.unwrap());
     let client_b = Arc::new(async_nats::connect(&common::nats_url()).await.unwrap());
 
-    let (transport_a, _id_a) = make_nats_transport(client_a, &cluster_id).await.unwrap();
-    let (transport_b, id_b) = make_nats_transport(client_b, &cluster_id).await.unwrap();
+    let (transport_a, _streams_a, _id_a) =
+        make_nats_transport(client_a, &cluster_id).await.unwrap();
+    let (transport_b, _streams_b, id_b) = make_nats_transport(client_b, &cluster_id).await.unwrap();
 
     // A registers B as a peer
     use velo::PeerInfo;
@@ -109,8 +111,9 @@ async fn test_check_health_timeout() {
     let client_a = Arc::new(async_nats::connect(&common::nats_url()).await.unwrap());
     let client_b = Arc::new(async_nats::connect(&common::nats_url()).await.unwrap());
 
-    let (transport_a, _id_a) = make_nats_transport(client_a, &cluster_id).await.unwrap();
-    let (transport_b, id_b) = make_nats_transport(client_b.clone(), &cluster_id)
+    let (transport_a, _streams_a, _id_a) =
+        make_nats_transport(client_a, &cluster_id).await.unwrap();
+    let (transport_b, _streams_b, id_b) = make_nats_transport(client_b.clone(), &cluster_id)
         .await
         .unwrap();
 
@@ -166,8 +169,9 @@ async fn test_nats_max_payload_enforcement() {
 
     let error_handler = Arc::new(common::TestErrorHandler::new());
 
-    let (transport_a, _id_a) = make_nats_transport(client_a, &cluster_id).await.unwrap();
-    let (transport_b, id_b) = make_nats_transport(client_b, &cluster_id).await.unwrap();
+    let (transport_a, _streams_a, _id_a) =
+        make_nats_transport(client_a, &cluster_id).await.unwrap();
+    let (transport_b, _streams_b, id_b) = make_nats_transport(client_b, &cluster_id).await.unwrap();
 
     // A registers B as a peer
     use velo::PeerInfo;
@@ -204,6 +208,105 @@ async fn test_nats_max_payload_enforcement() {
         error_msg.contains("exceeds NATS max_payload"),
         "Error message must contain 'exceeds NATS max_payload', got: {}",
         error_msg
+    );
+
+    transport_b.shutdown();
+    transport_a.shutdown();
+}
+
+/// The negotiated capacity report: `max_message_size` is the server's own
+/// `max_payload`, less the frame overhead this transport charges against it.
+///
+/// Asserted against `server_info()` rather than a literal, because
+/// `max_payload` belongs to the server, not to us — a NATS started with a
+/// different `--max_payload` must move the report with it. This is the one
+/// transport whose capacity is genuinely negotiated.
+///
+/// The boundary is pinned from both sides: one byte past the reported capacity
+/// is rejected before the wire, and exactly the reported capacity is carried
+/// end to end. That second half is what makes the number a promise rather than
+/// an estimate.
+#[tokio::test]
+async fn test_nats_max_message_size_reflects_negotiated_max_payload() {
+    let cluster_id = format!("test-{}", InstanceId::new_v4());
+
+    let client_a = Arc::new(async_nats::connect(&common::nats_url()).await.unwrap());
+    let client_b = Arc::new(async_nats::connect(&common::nats_url()).await.unwrap());
+    let server_max = client_a.server_info().max_payload;
+
+    // Before `start()` nothing has been negotiated, so there is no honest
+    // number to report.
+    let unstarted = NatsTransportBuilder::new(client_a.clone(), &cluster_id).build();
+    assert_eq!(
+        unstarted.max_message_size(InstanceId::new_v4()),
+        None,
+        "capacity must read as unknown until start() has seen server_info"
+    );
+
+    let error_handler = Arc::new(common::TestErrorHandler::new());
+    let (transport_a, _streams_a, _id_a) =
+        make_nats_transport(client_a, &cluster_id).await.unwrap();
+    let (transport_b, streams_b, id_b) = make_nats_transport(client_b, &cluster_id).await.unwrap();
+
+    use velo::PeerInfo;
+    transport_a
+        .register(PeerInfo::new(id_b, transport_b.address()))
+        .unwrap();
+
+    let capacity = transport_a
+        .max_message_size(id_b)
+        .expect("a started NATS transport has been told its max_payload");
+    assert!(
+        capacity < server_max,
+        "reported capacity {capacity} must sit below the server's max_payload {server_max}"
+    );
+
+    // One byte past the report is rejected by the send gate, pre-wire.
+    let header = Bytes::from_static(b"h");
+    let oversized = vec![0u8; capacity + 1 - header.len()];
+    transport_a.send_message(
+        id_b,
+        header.clone(),
+        Bytes::from(oversized),
+        MessageType::Message,
+        error_handler.clone(),
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        error_handler.error_count(),
+        1,
+        "capacity + 1 must be rejected: {:?}",
+        error_handler.get_errors()
+    );
+    assert!(
+        error_handler.get_errors()[0]
+            .2
+            .contains("exceeds NATS max_payload")
+    );
+
+    // Exactly the report is not rejected, and reaches the peer.
+    error_handler.clear();
+    let sized = vec![7u8; capacity - header.len()];
+    transport_a.send_message(
+        id_b,
+        header.clone(),
+        Bytes::from(sized),
+        MessageType::Message,
+        error_handler.clone(),
+    );
+    let (rx_header, rx_payload) = tokio::time::timeout(
+        Duration::from_secs(10),
+        streams_b.message_stream.recv_async(),
+    )
+    .await
+    .expect("a frame of exactly the reported capacity must reach the peer")
+    .expect("message stream stays open");
+    assert_eq!(rx_header.len() + rx_payload.len(), capacity);
+    assert_eq!(
+        error_handler.error_count(),
+        0,
+        "a frame of exactly the reported capacity must not error: {:?}",
+        error_handler.get_errors()
     );
 
     transport_b.shutdown();

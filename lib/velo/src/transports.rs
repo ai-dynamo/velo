@@ -245,6 +245,25 @@ impl VeloBackend {
             .map(|entry| entry.value().key())
     }
 
+    /// Largest `header + payload` the peer's primary transport will carry to
+    /// `target` in one send, or `None` when that cannot be established.
+    ///
+    /// `None` covers two cases that are the same answer to a caller: the
+    /// transport does not know its own limit, and `target` was never
+    /// registered so there is no transport to ask. Either way there is no
+    /// capacity to plan against and the caller falls back to its own
+    /// conservative budget.
+    ///
+    /// Reported for the *primary* transport only. An alternative reached
+    /// through [`send_message_with_transport`](Self::send_message_with_transport)
+    /// can have a different limit; sizing a send against this number and then
+    /// routing it elsewhere is the caller's business to avoid.
+    pub(crate) fn max_message_size(&self, target: InstanceId) -> Option<usize> {
+        self.primary_transport
+            .get(&target)
+            .and_then(|transport| transport.value().max_message_size(target))
+    }
+
     /// Returns the ordered list of alternative [`TransportKey`]s for `target`,
     /// or `None` if the peer has not been registered.
     pub fn alternative_transport_keys(&self, target: InstanceId) -> Option<Vec<TransportKey>> {

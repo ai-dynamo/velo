@@ -24,6 +24,8 @@ use crate::transports::transport::{
 };
 use velo_ext::{MessageType, PeerInfo, Transport, TransportAdapter, TransportKey, WorkerAddress};
 
+use crate::transports::tcp::framing::DEFAULT_MAX_FRAME_SIZE;
+
 use super::listener::{UdsListener, default_shrink_threshold};
 use crate::transports::coalesce::{
     Coalescable, WriterFailure, WriterObserver, run_coalescing_writer,
@@ -276,6 +278,15 @@ impl Transport for UdsTransport {
 
     fn address(&self) -> WorkerAddress {
         self.local_address.clone()
+    }
+
+    /// Same ceiling as TCP, because it is the same codec: UDS frames go
+    /// through `TcpFrameCodec`, whose limit caps `header_len + payload_len`
+    /// with the 11-byte preamble outside the sum. A Unix socket imposes no
+    /// message limit of its own — it is a byte stream — so the framing is the
+    /// only bound there is.
+    fn max_message_size(&self, _target: crate::InstanceId) -> Option<usize> {
+        Some(DEFAULT_MAX_FRAME_SIZE as usize)
     }
 
     fn register(&self, peer_info: PeerInfo) -> Result<(), TransportError> {

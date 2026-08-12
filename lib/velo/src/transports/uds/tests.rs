@@ -6,6 +6,7 @@
 use super::*;
 use crate::transports::AdmissionState;
 use crate::transports::address::WorkerAddressBuilder;
+use crate::transports::tcp::TcpFrameCodec;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use velo_ext::PeerInfo;
 
@@ -574,5 +575,29 @@ async fn stale_replacement_fails_the_old_epoch_and_admits_on_the_successor() {
     assert!(
         fresh.gate.send(task(errors)).is_admitted(),
         "the successor's gate is unaffected by the dead epoch"
+    );
+}
+
+/// UDS reports the same ceiling as TCP because it is the same codec, and the
+/// same pin applies: exactly the reported capacity encodes, one byte more does
+/// not. A Unix socket adds no message limit of its own.
+#[tokio::test]
+async fn max_message_size_is_exactly_what_the_codec_will_encode() {
+    let (transport, _socket_path) = make_transport();
+
+    let capacity = transport
+        .max_message_size(crate::InstanceId::new_v4())
+        .expect("UDS always knows its framed limit");
+    assert_eq!(capacity, 16 * 1024 * 1024);
+
+    let header_len = 1024u32;
+    let payload_len = capacity as u32 - header_len;
+    assert!(
+        TcpFrameCodec::build_preamble(MessageType::Message, header_len, payload_len).is_ok(),
+        "a frame of exactly the reported capacity must encode",
+    );
+    assert!(
+        TcpFrameCodec::build_preamble(MessageType::Message, header_len, payload_len + 1).is_err(),
+        "one byte past the reported capacity must not",
     );
 }

@@ -366,6 +366,39 @@ impl Messenger {
         let _ = self.large_payload_resolver.set(resolver);
     }
 
+    /// Largest payload this messenger will carry to `target` in one eager
+    /// send — inline, in a single message, without a rendezvous round trip —
+    /// for a message addressed to `handler_name` carrying `headers`.
+    ///
+    /// The number is
+    /// `min(transport capacity where known, large-payload staging threshold)`
+    /// less the encoded envelope for that handler name and header set. Both
+    /// ceilings can be unknown; with neither, the answer is the transparent
+    /// stager's default threshold.
+    ///
+    /// Callers that pack many small sends into one message — the streaming mux
+    /// batcher, or an application batching its own work — size a batch against
+    /// this so it neither overruns the target's transport (a hard failure) nor
+    /// silently becomes a staged transfer, paying a round trip on behalf of
+    /// everything packed into it.
+    ///
+    /// Advisory, not enforced: sending more than this still works whenever a
+    /// stager is installed, it just stops being eager.
+    ///
+    /// The transport term is the peer's *primary* transport — the one
+    /// [`Messenger`] sends through. It says nothing about an alternative
+    /// transport reached by some other route, which may have a different
+    /// limit.
+    pub fn effective_eager_payload(
+        &self,
+        target: InstanceId,
+        handler_name: &str,
+        headers: Option<&std::collections::HashMap<String, String>>,
+    ) -> usize {
+        self.client
+            .effective_eager_payload(target, handler_name, headers)
+    }
+
     /// Connect to a peer by registering their peer information.
     pub fn register_peer(&self, peer_info: PeerInfo) -> Result<()> {
         let instance_id = peer_info.instance_id();

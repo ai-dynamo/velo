@@ -47,6 +47,26 @@ const VELO_TYPE_STRINGS: [&str; 5] = ["0", "1", "2", "3", "4"];
 /// Default bounded-channel capacity for the sender task.
 const DEFAULT_SENDER_CAPACITY: usize = 1024;
 
+/// Bytes charged against the server's `max_payload` for Velo's own NATS
+/// framing — the `Velo-Type` / `Velo-HLen` header block plus subject and
+/// command bytes, since `max_payload` bounds the entire HPUB and not just its
+/// body. A deliberate over-estimate, inherited from the send-side check.
+///
+/// [`send_message`](Transport::send_message) rejects against this number and
+/// [`max_message_size`](Transport::max_message_size) reports against it, so
+/// what the transport advertises and what it will actually accept are the same
+/// arithmetic rather than two numbers that agree today.
+const NATS_HEADER_OVERHEAD: usize = 64;
+
+/// `max_payload` value standing for "the server has not told us yet".
+///
+/// Held until `start()` reads `server_info()`. The capacity is genuinely
+/// per-connection, so before the server has spoken there is no honest number
+/// to report and [`max_message_size`](Transport::max_message_size) says
+/// `None`. The send path treats it as "no limit yet" for the same reason: a
+/// frame sent before `start()` has no connection to be too large for.
+const MAX_PAYLOAD_UNKNOWN: usize = usize::MAX;
+
 /// Task queued from [`send_message`](Transport::send_message) to the dedicated sender task.
 struct NatsSendTask {
     subject: String,
@@ -135,6 +155,23 @@ impl Transport for NatsTransport {
             .unwrap_or_else(|| WorkerAddress::from_encoded(Bytes::from_static(&[])))
     }
 
+    /// The server's negotiated `max_payload`, less the
+    /// [`NATS_HEADER_OVERHEAD`] this transport charges against it — the same
+    /// subtraction `send_message` performs before rejecting a frame, read from
+    /// the other direction.
+    ///
+    /// This is the one transport whose answer is truly negotiated: the value
+    /// arrives in `server_info()` from whichever server the client connected
+    /// to, so it can differ between deployments and between reconnects.
+    /// `None` before `start()`, when nothing has been negotiated yet.
+    fn max_message_size(&self, _target: InstanceId) -> Option<usize> {
+        let max_payload = self.max_payload.load(Ordering::Relaxed);
+        if max_payload == MAX_PAYLOAD_UNKNOWN {
+            return None;
+        }
+        Some(max_payload.saturating_sub(NATS_HEADER_OVERHEAD))
+    }
+
     fn register(&self, peer_info: PeerInfo) -> Result<(), TransportError> {
         let instance_id = peer_info.instance_id();
         let entry = peer_info
@@ -178,8 +215,6 @@ impl Transport for NatsTransport {
 
         // Check total frame size against max_payload (LIFECYCLE-02 enforcement).
         // NATS max_payload covers the total HPUB size (headers + payload).
-        // Conservative estimate: ~64 bytes for Velo NATS header overhead.
-        const NATS_HEADER_OVERHEAD: usize = 64;
         let total_size = header.len() + payload.len() + NATS_HEADER_OVERHEAD;
         let max = self.max_payload.load(Ordering::Relaxed);
         if total_size > max {
@@ -752,7 +787,7 @@ impl NatsTransportBuilder {
             cancel_token: CancellationToken::new(),
             begin_shutdown_token: CancellationToken::new(),
             shutdown_state: OnceLock::new(),
-            max_payload: Arc::new(AtomicUsize::new(usize::MAX)),
+            max_payload: Arc::new(AtomicUsize::new(MAX_PAYLOAD_UNKNOWN)),
             metrics: OnceLock::new(),
         }
     }

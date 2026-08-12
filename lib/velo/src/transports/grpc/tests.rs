@@ -158,3 +158,17 @@ fn test_builder_multi_endpoint_format() {
         assert_eq!(ep.port, addr.port());
     }
 }
+
+/// gRPC reports no capacity, and that has to stay deliberate. The only
+/// ceiling in play is tonic's private default decode limit, which this setup
+/// never configures — so there is no number this transport can honestly quote,
+/// and the caller falls back to a conservative budget instead.
+#[test]
+fn max_message_size_is_unknown() {
+    let addr = "127.0.0.1:0".parse().unwrap();
+    let transport = GrpcTransportBuilder::new().bind_addr(addr).build().unwrap();
+    assert_eq!(
+        transport.max_message_size(crate::InstanceId::new_v4()),
+        None
+    );
+}
