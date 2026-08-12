@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::timeout;
 use velo::transports::{
-    DataStreams, MessageType, Transport, TransportErrorHandler,
+    DataStreams, MessageType, SendOutcome, Transport, TransportErrorHandler,
     tcp::{TcpTransport, TcpTransportBuilder},
 };
 use velo_ext::{InstanceId, PeerInfo};
@@ -148,12 +148,12 @@ impl<T: Transport> TestTransportHandle<T> {
         Ok(())
     }
 
-    /// Send a message to a peer.
+    /// Send a message to a peer, fire-and-forget.
     ///
-    /// This helper assumes a non-saturated per-peer channel and panics if the
-    /// transport returns `SendBackpressure`. Tests that need to exercise
-    /// backpressure should drive `Transport::send_message` directly and
-    /// `.await` the returned future (see `tests/backpressure.rs`).
+    /// The admission is dropped, which is a legitimate pattern: the frame
+    /// belongs to the target's gate from the moment `send_message` returns and
+    /// is delivered whether or not anyone waits for it. Tests that need to
+    /// observe *when* a frame lands use [`send_admission`](Self::send_admission).
     pub fn send(
         &self,
         target: InstanceId,
@@ -161,22 +161,24 @@ impl<T: Transport> TestTransportHandle<T> {
         payload: Vec<u8>,
         msg_type: MessageType,
     ) {
-        if self
-            .transport
-            .send_message(
-                target,
-                Bytes::from(header),
-                Bytes::from(payload),
-                msg_type,
-                self.error_handler.clone(),
-            )
-            .is_err()
-        {
-            panic!(
-                "TestTransportHandle::send saw SendBackpressure; the send channel is saturated. \
-                 Use Transport::send_message directly and .await the returned future for saturation-aware tests."
-            );
-        }
+        drop(self.send_admission(target, header, payload, msg_type));
+    }
+
+    /// Send a message and keep its [`SendOutcome`].
+    pub fn send_admission(
+        &self,
+        target: InstanceId,
+        header: Vec<u8>,
+        payload: Vec<u8>,
+        msg_type: MessageType,
+    ) -> SendOutcome {
+        self.transport.send_message(
+            target,
+            Bytes::from(header),
+            Bytes::from(payload),
+            msg_type,
+            self.error_handler.clone(),
+        )
     }
 
     /// Receive a message with timeout
@@ -759,6 +761,23 @@ macro_rules! transport_integration_tests {
             async fn test_health_during_drain() {
                 scenarios::health_during_drain::<$factory>().await;
             }
+            #[tokio::test]
+            async fn test_admission_ordering_under_capacity_pressure() {
+                scenarios::admission_ordering_under_capacity_pressure::<$factory>().await;
+            }
+        }
+    };
+}
+
+/// Generate the epoch-death admission test for a transport with per-connection
+/// epochs (TCP, UDS). Not part of `transport_integration_tests!` because
+/// broker-style transports have no connection to replace.
+#[allow(unused_macros)]
+macro_rules! transport_epoch_tests {
+    ($factory:ty) => {
+        #[tokio::test]
+        async fn test_admissions_fail_when_the_connection_epoch_dies() {
+            scenarios::admissions_fail_when_the_connection_epoch_dies::<$factory>().await;
         }
     };
 }

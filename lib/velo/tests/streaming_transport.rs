@@ -40,9 +40,8 @@ async fn test_velo_builder_tcp_transport() {
         .await
         .unwrap();
 
-    // Registry now holds a single entry keyed by the streaming-transport key
-    // (post-WorkerAddress refactor). Velo no longer constructs a fallback
-    // VeloFrameTransport; the StreamConfig branch is the only entry.
+    // Registry holds a single entry keyed by the streaming-transport key
+    // (post-WorkerAddress refactor): the StreamConfig branch is the only entry.
     let registry = &velo.anchor_manager().transport_registry;
     assert!(
         registry.contains_key("tcp-stream"),

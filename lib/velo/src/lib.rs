@@ -32,16 +32,16 @@ pub mod simulation;
 
 // Identity / address types live in velo-ext but are re-exported here so the
 // vast majority of consumers depend only on `velo`.
-pub use velo_ext::{InstanceId, PeerInfo, Transport, WorkerAddress, WorkerId};
+pub use velo_ext::{AdmissionState, InstanceId, PeerInfo, Transport, WorkerAddress, WorkerId};
 
 // Public re-exports for the velo-ext crate.
 pub use velo_ext as ext;
 
 // Messenger surface
 pub use crate::messenger::{
-    AmHandlerBuilder, AmSendBuilder, AmSyncBuilder, AsyncExecutor, Context, DispatchMode, Handler,
-    HandlerExecutor, Messenger, MessengerBuilder, OrderedConfig, OrderingKey, OverflowPolicy,
-    PeerDiscovery, SyncExecutor, SyncResult, TypedContext, TypedUnaryBuilder,
+    Admitted, AmHandlerBuilder, AmSendBuilder, AmSyncBuilder, AsyncExecutor, Context, DispatchMode,
+    FireResult, Handler, HandlerExecutor, Messenger, MessengerBuilder, OrderedConfig, OrderingKey,
+    OverflowPolicy, PeerDiscovery, SyncExecutor, SyncResult, TypedContext, TypedUnaryBuilder,
     TypedUnaryHandlerBuilder, TypedUnaryResult, UnaryBuilder, UnaryHandlerBuilder, UnaryResult,
     UnifiedResponse, VeloEvents,
 };
@@ -165,6 +165,7 @@ pub struct Velo {
 pub struct VeloBuilder {
     inner: MessengerBuilder,
     stream_config: Option<StreamConfig>,
+    mux_config: Option<crate::streaming::MuxConfig>,
     metrics: Option<Arc<VeloMetrics>>,
 }
 
@@ -174,6 +175,7 @@ impl VeloBuilder {
         Self {
             inner: MessengerBuilder::new(),
             stream_config: None,
+            mux_config: None,
             metrics: None,
         }
     }
@@ -203,6 +205,38 @@ impl VeloBuilder {
     pub fn stream_bind_addr(self, addr: std::net::IpAddr) -> Self {
         self.stream_config(StreamConfig::Tcp(Some(TcpConfig::new(addr))))
             .unwrap()
+    }
+
+    /// Install the batched, multiplexed streaming transport
+    /// (`messenger-mux-v1`), described in `streaming/BATCHING.md`.
+    ///
+    /// **Opt-in, and the mux is not the default transport.**
+    /// [`MuxConfig::enabled`](crate::streaming::MuxConfig::enabled) defaults to
+    /// `false`, and calling this with it left `false` is exactly the same node
+    /// as not calling it at all: nothing is registered and nothing is
+    /// advertised.
+    ///
+    /// The legacy transport stays configured either way — a mux-enabled node
+    /// registers both, and each attach picks between them from what the peer
+    /// advertised. So a canary is one node with the flag on, talking the mux to
+    /// other canaries and the legacy path to everything else, and **rollback is
+    /// the same flag**: set it back to `false` and the node stops advertising
+    /// `messenger-mux-v1`, so the next attach negotiates the legacy path. No
+    /// code change, no wire change, and no coordination with peers, because a
+    /// key that is never advertised is never selected.
+    ///
+    /// Only one mux may be installed per instance — its `_stream_batch` handler
+    /// is registered on the messenger for its lifetime and the messenger
+    /// refuses a duplicate handler name. Calling this twice fails here rather
+    /// than at the second attach.
+    pub fn messenger_mux(mut self, config: crate::streaming::MuxConfig) -> Result<Self> {
+        if self.mux_config.is_some() {
+            return Err(anyhow::anyhow!(
+                "messenger_mux called more than once: only one messenger mux is allowed per Velo instance"
+            ));
+        }
+        self.mux_config = Some(config);
+        Ok(self)
     }
 
     /// Set the peer discovery backend.
@@ -292,6 +326,28 @@ impl VeloBuilder {
             Arc::clone(&stream_transport),
         );
 
+        // Step 5: Build the mux, if it was switched on. It joins the registry
+        // *beside* the legacy transport rather than replacing it: negotiation
+        // answers `messenger-mux-v1` only to peers that advertised it, and
+        // every other peer is still answered — and must still be served — on
+        // the legacy key.
+        let mux = match self.mux_config.filter(|config| config.enabled) {
+            Some(config) => {
+                let mux = crate::streaming::messenger_mux::MessengerMuxTransport::new(
+                    Arc::clone(&messenger),
+                    config,
+                    self.metrics.clone(),
+                )?;
+                let mux_key = crate::streaming::FrameTransport::key(mux.as_ref());
+                registry.insert(
+                    mux_key.as_str().to_string(),
+                    Arc::clone(&mux) as Arc<dyn crate::streaming::FrameTransport>,
+                );
+                Some(mux)
+            }
+            None => None,
+        };
+
         let anchor_manager = Arc::new(
             crate::streaming::AnchorManagerBuilder::default()
                 .worker_id(worker_id)
@@ -302,6 +358,10 @@ impl VeloBuilder {
                 .build()
                 .map_err(|e| anyhow::anyhow!("{}", e))?,
         );
+
+        if let Some(mux) = mux {
+            anchor_manager.install_mux(mux)?;
+        }
 
         // Step 6: Register streaming control-plane handlers
         anchor_manager.register_handlers(Arc::clone(&messenger))?;
@@ -364,7 +424,8 @@ impl Velo {
     pub fn peer_info(&self) -> PeerInfo {
         let messenger_peer = self.messenger.peer_info();
         let stream_addr = self.stream_transport.address();
-        // Empty streaming address (e.g., VeloFrameTransport) → no merge needed.
+        // Empty streaming address (a transport that opens no listener of its
+        // own, e.g. the messenger mux) → no merge needed.
         if stream_addr.as_bytes().is_empty()
             || stream_addr
                 .available_transports()

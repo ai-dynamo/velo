@@ -6,6 +6,10 @@
 //! Validates the remote attach path: `_mpsc_anchor_attach` AM round-trip,
 //! transport bind/connect, per-sender `mpsc_reader_pump`, and the
 //! `(sender_id, bytes)` tagging at the anchor side.
+//!
+//! The data plane is `TcpFrameTransport`. What is under test is the MPSC
+//! control plane, which is transport-agnostic; the transport only has to be a
+//! real remote one so the frames genuinely cross a wire.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,13 +21,12 @@ use velo::streaming::mpsc::{
     MpscAnchorAttachRequest, MpscAnchorAttachResponse, MpscAnchorCancelRequest,
     MpscAnchorDetachRequest,
 };
-use velo::streaming::velo_transport::VeloFrameTransport;
 use velo::streaming::{
     AnchorManager, AnchorManagerBuilder, AttachError, FrameTransport, MpscAnchorConfig, MpscFrame,
-    SenderId, StreamAnchorHandle,
+    SenderId, StreamAnchorHandle, TcpFrameTransport,
 };
 use velo::transports::tcp::TcpTransportBuilder;
-use velo_ext::WorkerId;
+use velo_ext::{PeerInfo, WorkerId};
 
 fn new_tcp_transport() -> Arc<velo::transports::tcp::TcpTransport> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -60,13 +63,40 @@ async fn make_two_messengers() -> (Arc<Messenger>, Arc<Messenger>) {
     (m1, m2)
 }
 
+/// Every streaming endpoint this test binary has built, so a newly created side
+/// can be cross-registered against the ones already standing.
+///
+/// `Messenger::register_peer` only covers the control plane;
+/// `TcpFrameTransport` keeps its own `WorkerId -> SocketAddr` cache, populated
+/// from a `PeerInfo` carrying the peer's `tcp-stream` entry. `Velo::register_peer`
+/// fans that out automatically, but these tests build the `AnchorManager`
+/// directly and so must do it by hand — and they build sides one at a time,
+/// which is why the already-built ones are remembered here rather than passed
+/// in. Registering an endpoint from an unrelated test costs nothing: it is a map
+/// insert that nothing ever looks up.
+static STREAM_ENDPOINTS: std::sync::Mutex<Vec<(PeerInfo, Arc<TcpFrameTransport>)>> =
+    std::sync::Mutex::new(Vec::new());
+
 async fn make_am(messenger: Arc<Messenger>) -> Arc<AnchorManager> {
     let worker_id = messenger.instance_id().worker_id();
-    let vft = Arc::new(VeloFrameTransport::new(Arc::clone(&messenger), None).expect("VFT"));
+    let stream = TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into())
+        .await
+        .expect("bind streaming listener");
+    let peer_info = PeerInfo::new(messenger.instance_id(), stream.address());
+
+    {
+        let mut endpoints = STREAM_ENDPOINTS.lock().expect("endpoint registry poisoned");
+        for (other_peer, other_stream) in endpoints.iter() {
+            let _ = stream.register(other_peer);
+            let _ = other_stream.register(&peer_info);
+        }
+        endpoints.push((peer_info, Arc::clone(&stream)));
+    }
+
     let am: Arc<AnchorManager> = Arc::new(
         AnchorManagerBuilder::default()
             .worker_id(worker_id)
-            .transport(Arc::clone(&vft) as Arc<dyn FrameTransport>)
+            .transport(Arc::clone(&stream) as Arc<dyn FrameTransport>)
             // Cross-worker cancel AMs need the messenger on the builder (the
             // Velo facade does this at velo/src/lib.rs under "Step 5").
             .messenger(Some(Arc::clone(&messenger)))
@@ -232,9 +262,9 @@ async fn test_mpsc_heartbeat_timeout_per_sender() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mpsc_remote_two_workers_no_routing_collision() {
     // Three messengers: A hosts the anchor; B and C are two distinct
-    // sender-side workers. Each gets its own VeloFrameTransport stack and a
-    // fresh `next_sender_stream_id` starting at 0 -- the first attach on each
-    // would, without the fix, reuse session_id == 1 on A's transport.
+    // sender-side workers. Each gets its own streaming stack and a fresh
+    // `next_sender_stream_id` starting at 0 -- the first attach on each would,
+    // without the fix, reuse session_id == 1 on A's transport.
     let t_a = new_tcp_transport();
     let t_b = new_tcp_transport();
     let t_c = new_tcp_transport();
@@ -469,6 +499,7 @@ async fn test_mpsc_remote_handler_rejects_spsc_handle() {
         handle: spsc_handle,
         session_id: 9999,
         stream_cancel_handle: StreamCancelHandle::pack(WorkerId::from_u64(99), 9999),
+        supported_transport_keys: Vec::new(),
     };
     let response: MpscAnchorAttachResponse = messenger_b
         .typed_unary_streaming::<MpscAnchorAttachResponse>("_mpsc_anchor_attach")
@@ -505,6 +536,7 @@ async fn test_mpsc_remote_handler_anchor_not_found() {
         handle: fake,
         session_id: 1,
         stream_cancel_handle: StreamCancelHandle::pack(WorkerId::from_u64(99), 1),
+        supported_transport_keys: Vec::new(),
     };
     let response: MpscAnchorAttachResponse = messenger_b
         .typed_unary_streaming::<MpscAnchorAttachResponse>("_mpsc_anchor_attach")

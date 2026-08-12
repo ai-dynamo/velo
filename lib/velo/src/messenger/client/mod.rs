@@ -6,11 +6,16 @@
 pub(crate) mod builders;
 mod peer_registry;
 
+#[cfg(test)]
+mod tests;
+
 use anyhow::Result;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::messenger::PeerDiscovery;
+use crate::messenger::common::messages::{EncodeError, envelope_overhead};
 use crate::messenger::common::{ActiveMessage, responses::ResponseManager};
 
 use crate::observability::{ClientResolution, VeloMetrics};
@@ -19,6 +24,85 @@ use peer_registry::PeerRegistry;
 use velo_ext::InstanceId;
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Combine what is known about a target into the largest payload the messenger
+/// will carry to it *eagerly* — inline, in one message, without a round trip.
+///
+/// Two ceilings, either of which may be unknown:
+///
+/// - `transport_capacity` — [`Transport::max_message_size`] for this target.
+///   Exceeding it is a hard failure: the frame never reaches the wire and the
+///   send's error handler hears about it.
+/// - `staging_threshold` — the installed
+///   [`LargePayloadStager`](crate::messenger::large_payload::LargePayloadStager)'s
+///   threshold, `None` when no stager is installed. Exceeding it is not a
+///   failure; the payload is staged through rendezvous instead, which works
+///   but costs the receiver a round trip to fetch. Staying under it is what
+///   "eager" means.
+///
+/// With neither known there is still an answer to give, and it is
+/// [`DEFAULT_THRESHOLD`](crate::rendezvous::transparent::DEFAULT_THRESHOLD) —
+/// the number the transparent stager would use if it were installed, so
+/// installing the default stager later never moves the budget.
+///
+/// With a capacity but no stager the budget is the transport's, not the
+/// default threshold. That is deliberate and worth stating plainly: with no
+/// stager there is no cheaper path to fall back to, so clamping to 256 KiB
+/// would forbid sends that would have succeeded.
+///
+/// The envelope comes off the *combined* ceiling. Against the transport that
+/// is arithmetic — its limit counts header bytes. Against the staging
+/// threshold it is deliberate slack, since the stager compares the raw
+/// `payload.len()` before any encoding happens; the budget keeps one shape
+/// rather than two, and errs by the size of an envelope in the safe direction.
+///
+/// `saturating_sub` because neither ceiling bounds the envelope: a handler
+/// name plus up to 16 KiB of headers can exceed a small `with_threshold`.
+/// Wrapping there would hand back a near-`usize::MAX` budget — precisely the
+/// oversized eager send this function exists to prevent.
+pub(crate) fn eager_payload_budget(
+    transport_capacity: Option<usize>,
+    staging_threshold: Option<usize>,
+    envelope_overhead: usize,
+) -> usize {
+    let ceiling = match (transport_capacity, staging_threshold) {
+        (Some(capacity), Some(threshold)) => capacity.min(threshold),
+        (Some(capacity), None) => capacity,
+        (None, Some(threshold)) => threshold,
+        (None, None) => crate::rendezvous::transparent::DEFAULT_THRESHOLD,
+    };
+    ceiling.saturating_sub(envelope_overhead)
+}
+
+/// Add the headers the messenger puts on an outbound message itself, turning
+/// what a caller supplied into what the encoder will actually write.
+///
+/// Today that is the distributed-tracing context, and it is not a rounding
+/// error: a W3C `traceparent` alone is 69 bytes of MessagePack, and injection
+/// materialises a header map even when there is no context to put in it.
+///
+/// Both the encoder ([`encode_outbound`]) and the budget
+/// ([`ActiveMessageClient::effective_eager_payload`]) go through here, which is
+/// the whole point — a budget sized against the caller's headers while the
+/// encoder writes a larger set is a budget that overruns the transport by the
+/// difference.
+pub(crate) fn finalize_outbound_headers(headers: &mut Option<HashMap<String, String>>) {
+    #[cfg(feature = "distributed-tracing")]
+    crate::observability::inject_current_context(headers);
+    #[cfg(not(feature = "distributed-tracing"))]
+    let _ = headers;
+}
+
+/// Turn an outbound message into wire bytes: finalize its headers, then encode.
+///
+/// The single place a client-side send becomes a frame, so there is no second
+/// path where the headers and the budget could drift apart.
+pub(crate) fn encode_outbound(
+    mut message: ActiveMessage,
+) -> Result<(bytes::Bytes, bytes::Bytes, crate::transports::MessageType), EncodeError> {
+    finalize_outbound_headers(&mut message.metadata.headers);
+    message.encode()
+}
 
 pub(crate) struct ActiveMessageClient {
     pub(crate) response_manager: ResponseManager,
@@ -53,7 +137,6 @@ impl ActiveMessageClient {
         }
     }
 
-    #[allow(unused_mut)]
     pub(crate) fn send_message(
         &self,
         target: InstanceId,
@@ -76,10 +159,7 @@ impl ActiveMessageClient {
                 );
         }
 
-        #[cfg(feature = "distributed-tracing")]
-        crate::observability::inject_current_context(&mut message.metadata.headers);
-
-        let (header, payload, message_type) = message.encode()?;
+        let (header, payload, message_type) = encode_outbound(message)?;
 
         #[cfg(feature = "distributed-tracing")]
         {
@@ -106,6 +186,49 @@ impl ActiveMessageClient {
             payload,
             message_type,
             self.error_handler.clone(),
+        )
+    }
+
+    /// Largest payload this client will carry to `target` in one eager send
+    /// under `handler_name` with `headers`.
+    ///
+    /// This is the one place both inputs live: the backend knows which
+    /// transport serves `target` and what it will carry, and the client holds
+    /// the stager whose threshold decides when a payload stops going inline.
+    /// See [`eager_payload_budget`] for what the number means.
+    ///
+    /// The envelope counts what [`finalize_outbound_headers`] will add to
+    /// `headers`, not `headers` as passed: [`send_message`](Self::send_message)
+    /// encodes the finalized set, so sizing against anything else hands back a
+    /// budget the encoder will overrun.
+    ///
+    /// It is counted, not built. Finalizing runs against an *empty* scratch
+    /// map, which yields exactly what the send path would have merged in, and
+    /// [`envelope_overhead`] sizes the union across the two maps without
+    /// materialising it. So the caller's headers are only ever read here —
+    /// budgeting a send cannot duplicate a header set that is arbitrarily
+    /// large, or larger than the encoder would accept, since those limits are
+    /// checked at encode and not before.
+    ///
+    /// Finalizing reads ambient state — the current trace context — so the
+    /// answer belongs to the context it was asked from. Callers that size a
+    /// batch and then send it do both from the same context, which is what
+    /// makes the number hold; a budget carried across into an unrelated
+    /// context is no longer a promise about that send.
+    pub(crate) fn effective_eager_payload(
+        &self,
+        target: InstanceId,
+        handler_name: &str,
+        headers: Option<&HashMap<String, String>>,
+    ) -> usize {
+        let mut injected = None;
+        finalize_outbound_headers(&mut injected);
+        eager_payload_budget(
+            self.backend.max_message_size(target),
+            self.large_payload_stager
+                .get()
+                .map(|stager| stager.threshold()),
+            envelope_overhead(handler_name, headers, injected.as_ref()),
         )
     }
 
@@ -177,11 +300,13 @@ impl ActiveMessageClient {
 
         let send_outcome = self.send_message(target, message)?;
 
-        // Share a single handshake_timeout budget across both the send-side
-        // backpressure wait (if any) and the response receive.
+        // Share a single handshake_timeout budget across both the admission
+        // wait (if the frame was queued) and the response receive. A failed
+        // admission is left to surface through `outcome.recv()`, which the
+        // backend's completion hook has already resolved with the error.
         let result = tokio::time::timeout(self.handshake_timeout, async {
-            if let SendOutcome::Backpressured(bp) = send_outcome {
-                bp.await;
+            if let SendOutcome::Pending(admission) = send_outcome {
+                let _ = admission.await;
             }
             outcome.recv().await
         })

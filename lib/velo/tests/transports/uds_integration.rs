@@ -11,3 +11,4 @@ mod common;
 use common::{UdsFactory, scenarios};
 
 transport_integration_tests!(UdsFactory);
+transport_epoch_tests!(UdsFactory);

@@ -155,16 +155,17 @@ path = "tests/streaming/observability.rs"
 required-features = ["test-helpers"]
 
 [[test]]
+name = "streaming_mux_negotiation"
+path = "tests/streaming/mux_negotiation.rs"
+required-features = ["test-helpers"]
+
+[[test]]
 name = "streaming_mpsc_integration"
 path = "tests/streaming/mpsc_integration.rs"
 
 [[test]]
 name = "streaming_mpsc_remote_integration"
 path = "tests/streaming/mpsc_remote_integration.rs"
-
-[[test]]
-name = "streaming_ordering"
-path = "tests/streaming/ordering.rs"
 
 [[test]]
 name = "streaming_tcp_batching"
@@ -184,8 +185,8 @@ name = "streaming_velo_specific"
 path = "tests/streaming/velo_specific.rs"
 
 [[test]]
-name = "transports_backpressure"
-path = "tests/transports/backpressure.rs"
+name = "transports_admission"
+path = "tests/transports/admission.rs"
 required-features = ["test-helpers"]
 
 [[test]]

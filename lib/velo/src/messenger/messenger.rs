@@ -366,6 +366,64 @@ impl Messenger {
         let _ = self.large_payload_resolver.set(resolver);
     }
 
+    /// Largest payload this messenger will carry to `target` in one eager
+    /// send — inline, in a single message, without a rendezvous round trip —
+    /// for a message addressed to `handler_name` carrying `headers`.
+    ///
+    /// The number is
+    /// `min(transport capacity where known, large-payload staging threshold)`
+    /// less the encoded envelope for that handler name and header set. Both
+    /// ceilings can be unknown; with neither, the answer is the transparent
+    /// stager's default threshold.
+    ///
+    /// The envelope counts the headers the messenger adds on the way out as
+    /// well as the ones passed here — under the `distributed-tracing` feature
+    /// the current trace context is injected just before encoding, and it is
+    /// large enough to matter. Because that context is ambient, the answer
+    /// belongs to the context it was asked from: size a batch and send it from
+    /// the same place.
+    ///
+    /// Callers that pack many small sends into one message — today the
+    /// streaming mux batcher, its only consumer — size a batch against this so
+    /// it neither overruns the target's transport (a hard failure) nor
+    /// silently becomes a staged transfer, paying a round trip on behalf of
+    /// everything packed into it. Crate-private on purpose: exposing a batch
+    /// hint to applications is the P9 hint-API design question, and publishing
+    /// this signature early would commit it before that design happens.
+    ///
+    /// Advisory, not enforced — but what an over-budget send does depends on
+    /// which of the two ceilings produced the number:
+    ///
+    /// - **Over the stager's threshold**: the payload is staged through
+    ///   rendezvous and the send succeeds. It just stops being eager, and the
+    ///   receiver pays a round trip to fetch it.
+    /// - **Over the budget but under the threshold**: nothing stages — the
+    ///   stager compares the raw `payload.len()` against its own threshold,
+    ///   which this payload is below — and the encoded frame is over the
+    ///   transport's capacity. The send fails: the frame never reaches the
+    ///   wire and the error surfaces on the send's awaiter. This band exists
+    ///   whenever the transport's capacity is the lower ceiling (NATS at its
+    ///   1 MiB default against the 256 KiB-and-up thresholds a stager is
+    ///   usually given), and it is the whole band when no stager is installed
+    ///   at all.
+    /// - **Transport capacity unknown**: there is no capacity to be over, so
+    ///   nothing here rejects the send. Whether the frame arrives is between
+    ///   the caller and whatever limits that transport enforces further down.
+    ///
+    /// The transport term is the peer's *primary* transport — the one
+    /// [`Messenger`] sends through. It says nothing about an alternative
+    /// transport reached by some other route, which may have a different
+    /// limit.
+    pub(crate) fn effective_eager_payload(
+        &self,
+        target: InstanceId,
+        handler_name: &str,
+        headers: Option<&std::collections::HashMap<String, String>>,
+    ) -> usize {
+        self.client
+            .effective_eager_payload(target, handler_name, headers)
+    }
+
     /// Connect to a peer by registering their peer information.
     pub fn register_peer(&self, peer_info: PeerInfo) -> Result<()> {
         let instance_id = peer_info.instance_id();
@@ -471,8 +529,8 @@ mod tests {
     use super::*;
     use crate::messenger::handlers::Handler;
     use crate::transports::{
-        HealthCheckError, MessageType, SendBackpressure, Transport, TransportAdapter,
-        TransportError, TransportErrorHandler,
+        HealthCheckError, MessageType, SendOutcome, Transport, TransportAdapter, TransportError,
+        TransportErrorHandler,
     };
     use bytes::Bytes;
     use futures::future::BoxFuture;
@@ -544,7 +602,7 @@ mod tests {
             payload: Bytes,
             message_type: MessageType,
             on_error: Arc<dyn TransportErrorHandler>,
-        ) -> Result<(), SendBackpressure> {
+        ) -> SendOutcome {
             let target_endpoint = match self
                 .peers
                 .lock()
@@ -555,7 +613,7 @@ mod tests {
                 Some(endpoint) => endpoint,
                 None => {
                     on_error.on_error(header, payload, "Peer not registered".to_string());
-                    return Ok(());
+                    return SendOutcome::Admitted;
                 }
             };
 
@@ -567,7 +625,7 @@ mod tests {
 
             let Some(adapter) = maybe_adapter else {
                 on_error.on_error(header, payload, "Target transport not started".to_string());
-                return Ok(());
+                return SendOutcome::Admitted;
             };
 
             let send_result = match message_type {
@@ -584,7 +642,9 @@ mod tests {
                 let (header, payload) = err.0;
                 on_error.on_error(header, payload, "Target receive channel closed".to_string());
             }
-            Ok(())
+            // The target's inbound streams are unbounded, so there is never
+            // anything to queue behind: every send is admitted on the spot.
+            SendOutcome::Admitted
         }
 
         fn start(

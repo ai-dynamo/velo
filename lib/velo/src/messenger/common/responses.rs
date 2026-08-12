@@ -379,8 +379,8 @@ impl fmt::Debug for ResponseAwaiter {
 /// arena is full.
 ///
 /// Pattern-match on this type (rather than stringifying) to drive backoff,
-/// shed load, or route to the async [`ResponseManager::register_outcome_async`]
-/// fallback.
+/// shed load, or route to the [`ResponseManager::try_register_outcome`]
+/// fallback, whose `Backpressured` arm waits for a slot instead of failing.
 #[derive(Debug, thiserror::Error)]
 pub enum ResponseRegistrationError {
     /// No free response slots. `capacity` is the fixed per-worker capacity;
@@ -392,10 +392,11 @@ pub enum ResponseRegistrationError {
 
 /// Outcome of a non-blocking slot acquisition.
 ///
-/// Mirrors the `SendOutcome::Enqueued` / `SendOutcome::Backpressured(_)`
-/// shape used by `velo-transports` for per-peer channel saturation, so
-/// callers can handle slot-exhaustion backpressure with the same idiom they
-/// use for transport-channel backpressure.
+/// Mirrors the `SendOutcome::Admitted` / `SendOutcome::Pending(_)` shape the
+/// transports use for per-target channel saturation, so callers can handle
+/// slot-exhaustion backpressure with the same idiom. The analogy stops at the
+/// shape: dropping a `SlotBackpressure` cancels the acquisition, whereas
+/// dropping a `SendAdmission` leaves the frame on its way.
 #[must_use = "RegisterOutcome::Backpressured must be awaited to acquire a slot"]
 pub enum RegisterOutcome {
     /// A slot was available and is now held by the awaiter.
@@ -406,7 +407,7 @@ pub enum RegisterOutcome {
 }
 
 /// Future that resolves to a [`ResponseAwaiter`] once a response slot is
-/// available. Analogous to `crate::transports::SendBackpressure`.
+/// available.
 ///
 /// Dropping this future cancels the pending acquisition cleanly — no permit
 /// is leaked.
@@ -504,16 +505,6 @@ impl ResponseManager {
             RegisterOutcome::Backpressured(SlotBackpressure {
                 fut: Box::pin(ResponseManagerInner::acquire_owned(Arc::clone(&self.inner))),
             })
-        }
-    }
-
-    /// Await capacity, then allocate. Convenience wrapper over
-    /// [`ResponseManager::try_register_outcome`] that collapses the fast-path
-    /// and the backpressure branch.
-    pub async fn register_outcome_async(&self) -> ResponseAwaiter {
-        match self.try_register_outcome() {
-            RegisterOutcome::Allocated(a) => a,
-            RegisterOutcome::Backpressured(bp) => bp.await,
         }
     }
 
@@ -1136,31 +1127,6 @@ mod tests {
             .expect("backpressure resolved");
         drop(awaiter);
         let _remaining = (&mut handle).await.expect("drop task");
-    }
-
-    #[tokio::test]
-    async fn register_outcome_async_waits_for_capacity() {
-        use tokio::time::{Duration, timeout};
-
-        let manager = Arc::new(ResponseManager::with_capacity(0, TEST_CAPACITY, None));
-        let mut awaiters = Vec::with_capacity(TEST_CAPACITY);
-        for _ in 0..TEST_CAPACITY {
-            awaiters.push(manager.register_outcome().expect("allocate"));
-        }
-
-        let m = manager.clone();
-        let acquire = tokio::spawn(async move { m.register_outcome_async().await });
-
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(!acquire.is_finished(), "should block while at capacity");
-
-        drop(awaiters.pop());
-
-        let awaiter = timeout(Duration::from_secs(1), acquire)
-            .await
-            .expect("resolved")
-            .expect("task ok");
-        drop(awaiter);
     }
 
     #[tokio::test]

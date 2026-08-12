@@ -19,10 +19,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::transports::transport::{
-    HealthCheckError, SendBackpressure, ShutdownState, TransportError, TransportErrorHandler,
-    try_send_or_backpressure,
+    AdmissionError, AdmissionGate, HealthCheckError, SendOutcome, ShutdownState, TransportError,
+    TransportErrorHandler,
 };
 use velo_ext::{MessageType, PeerInfo, Transport, TransportAdapter, TransportKey, WorkerAddress};
+
+use crate::transports::tcp::framing::DEFAULT_MAX_FRAME_SIZE;
 
 use super::listener::{UdsListener, default_shrink_threshold};
 use crate::transports::coalesce::{
@@ -60,10 +62,25 @@ pub struct UdsTransport {
     shrink_threshold: usize,
 }
 
-/// Handle to a connection's writer task
+/// Handle to a connection's writer task.
+///
+/// One handle is one connection epoch. The gate is the only way frames enter
+/// `tx`, so per-connection FIFO holds no matter how many tasks are sending;
+/// `tx` is retained purely for the liveness probes (`is_disconnected`) that
+/// decide when an epoch is stale.
 #[derive(Clone)]
 struct ConnectionHandle {
     tx: flume::Sender<SendTask>,
+    gate: AdmissionGate<SendTask>,
+}
+
+impl ConnectionHandle {
+    /// Kill this epoch: every frame still queued behind the gate belonged to a
+    /// connection that no longer exists, so none of them may ride the
+    /// successor.
+    fn retire(&self) {
+        self.gate.fail_all(AdmissionError::ConnectionReplaced);
+    }
 }
 
 /// Task sent to writer task containing pre-encoded frame
@@ -117,6 +134,21 @@ impl UdsTransport {
         Ok(())
     }
 
+    /// Drop a dead connection's map entry, retiring its epoch first.
+    ///
+    /// The predicate keeps us from evicting a successor that another task
+    /// installed in the meantime; retiring before the entry disappears is what
+    /// guarantees the old epoch's queued frames fail rather than linger.
+    fn reap_stale_connection(&self, instance_id: crate::InstanceId) {
+        if let Some((_, stale)) = self
+            .connections
+            .remove_if(&instance_id, |_, h| h.tx.is_disconnected())
+        {
+            stale.retire();
+            self.update_connection_gauge();
+        }
+    }
+
     /// Get or create a connection to a peer (lazy initialization)
     fn get_or_create_connection(&self, instance_id: crate::InstanceId) -> Result<ConnectionHandle> {
         // Fast path: connection already exists and is alive
@@ -126,9 +158,7 @@ impl UdsTransport {
             }
             // Stale — drop guard before mutating the map
             drop(handle);
-            self.connections
-                .remove_if(&instance_id, |_, h| h.tx.is_disconnected());
-            self.update_connection_gauge();
+            self.reap_stale_connection(instance_id);
         }
 
         let rt = self.runtime.get().ok_or(TransportError::NotStarted)?;
@@ -139,7 +169,10 @@ impl UdsTransport {
                 if !entry.get().tx.is_disconnected() {
                     entry.get().clone()
                 } else {
-                    // Stale entry — replace in-place with a fresh connection
+                    // Stale entry — retire the dead epoch before the successor
+                    // is installed, so no frame from the old connection can be
+                    // observed as pending on the new one.
+                    entry.get().retire();
                     let handle = self.create_connection(instance_id, rt)?;
                     entry.insert(handle.clone());
                     self.update_connection_gauge();
@@ -171,7 +204,10 @@ impl UdsTransport {
             .clone();
 
         let (tx, rx) = flume::bounded(self.channel_capacity);
-        let handle = ConnectionHandle { tx };
+        let handle = ConnectionHandle {
+            gate: AdmissionGate::new(tx.clone(), rt.clone()),
+            tx,
+        };
 
         let cancel = self.cancel_token.clone();
         let conns = Arc::clone(&self.connections);
@@ -202,36 +238,36 @@ impl UdsTransport {
         }
     }
 
-    /// Slow path: establish (or reuse) a connection, then enqueue via the
-    /// shared backpressure helper.
-    fn slow_path_send(
-        &self,
-        instance_id: crate::InstanceId,
-        send_msg: SendTask,
-    ) -> Result<(), SendBackpressure> {
+    /// Slow path: establish (or reuse) a connection, then offer the frame to
+    /// its gate.
+    ///
+    /// A failure here is terminal for the frame, so it is reported through
+    /// `on_error` and the send reports [`SendOutcome::Admitted`] — there is
+    /// nothing for the caller to wait on.
+    fn slow_path_send(&self, instance_id: crate::InstanceId, send_msg: SendTask) -> SendOutcome {
         if self.runtime.get().is_none() {
             send_msg.on_error("Transport not started");
-            return Ok(());
+            return SendOutcome::Admitted;
         }
         let handle = match self.get_or_create_connection(instance_id) {
             Ok(h) => h,
             Err(e) => {
                 send_msg.on_error(format!("Failed to create connection: {}", e));
-                return Ok(());
+                return SendOutcome::Admitted;
             }
         };
-        let r = try_send_or_backpressure(
-            &handle.tx,
-            send_msg,
-            |msg| msg.on_error("Connection closed immediately"),
-            |msg| msg.on_error("Connection closed"),
-        );
+        self.admit(&handle, send_msg)
+    }
+
+    /// Offer one frame to a connection's gate, counting the saturated case.
+    fn admit(&self, handle: &ConnectionHandle, send_msg: SendTask) -> SendOutcome {
+        let outcome = handle.gate.send(send_msg);
         if let Some(m) = self.metrics.get()
-            && r.is_err()
+            && !outcome.is_admitted()
         {
             m.record_send_backpressure();
         }
-        r
+        outcome
     }
 }
 
@@ -242,6 +278,15 @@ impl Transport for UdsTransport {
 
     fn address(&self) -> WorkerAddress {
         self.local_address.clone()
+    }
+
+    /// Same ceiling as TCP, because it is the same codec: UDS frames go
+    /// through `TcpFrameCodec`, whose limit caps `header_len + payload_len`
+    /// with the 11-byte preamble outside the sum. A Unix socket imposes no
+    /// message limit of its own — it is a byte stream — so the framing is the
+    /// only bound there is.
+    fn max_message_size(&self, _target: crate::InstanceId) -> Option<usize> {
+        Some(DEFAULT_MAX_FRAME_SIZE as usize)
     }
 
     fn register(&self, peer_info: PeerInfo) -> Result<(), TransportError> {
@@ -300,7 +345,7 @@ impl Transport for UdsTransport {
         payload: Bytes,
         message_type: MessageType,
         on_error: Arc<dyn TransportErrorHandler>,
-    ) -> Result<(), SendBackpressure> {
+    ) -> SendOutcome {
         let send_msg = SendTask {
             msg_type: message_type,
             header,
@@ -308,28 +353,18 @@ impl Transport for UdsTransport {
             on_error,
         };
 
-        // Fast path: try existing connection.
+        // Fast path: an established connection. The liveness probe comes first
+        // because a dead epoch's gate would swallow the frame; the gate itself
+        // then decides admitted-vs-queued, so there is no `try_send` here that
+        // could overtake a frame already queued behind it.
         if let Some(handle) = self.connections.get(&instance_id) {
-            match handle.tx.try_send(send_msg) {
-                Ok(()) => return Ok(()),
-                Err(flume::TrySendError::Full(send_msg)) => {
-                    if let Some(m) = self.metrics.get() {
-                        m.record_send_backpressure();
-                    }
-                    let tx = handle.tx.clone();
-                    return Err(SendBackpressure::new(Box::pin(async move {
-                        if let Err(flume::SendError(m)) = tx.send_async(send_msg).await {
-                            m.on_error("Connection closed");
-                        }
-                    })));
-                }
-                Err(flume::TrySendError::Disconnected(send_msg_out)) => {
-                    drop(handle);
-                    self.connections
-                        .remove_if(&instance_id, |_, h| h.tx.is_disconnected());
-                    self.update_connection_gauge();
-                    return self.slow_path_send(instance_id, send_msg_out);
-                }
+            let live = (!handle.tx.is_disconnected()).then(|| handle.clone());
+            // Release the shard guard before either admitting (which may spawn
+            // a driver) or mutating the map.
+            drop(handle);
+            match live {
+                Some(handle) => return self.admit(&handle, send_msg),
+                None => self.reap_stale_connection(instance_id),
             }
         }
         self.slow_path_send(instance_id, send_msg)
@@ -462,8 +497,7 @@ impl Transport for UdsTransport {
                 }
                 // Channel is disconnected — drop guard and remove stale entry
                 drop(handle);
-                self.connections
-                    .remove_if(&instance_id, |_, h| h.tx.is_disconnected());
+                self.reap_stale_connection(instance_id);
             }
 
             // No existing connection or connection is dead - verify peer is reachable
@@ -514,8 +548,17 @@ async fn connection_writer_task(
     // Drop the receiver so our sender half becomes disconnected, then remove
     // the stale entry. The predicate ensures we only remove our own entry —
     // a replacement connection's tx will still be connected.
+    //
+    // Retiring the gate is what fails frames still queued behind it. Dropping
+    // `rx` would eventually fail them too (the driver's `send_async` sees a
+    // closed channel), but `ConnectionReplaced` names the cause and lands
+    // without waiting on the driver. If the entry was already replaced, the
+    // successor's gate is a different one and the old gate's frames take the
+    // closed-channel route instead.
     drop(rx);
-    connections.remove_if(&instance_id, |_, h| h.tx.is_disconnected());
+    if let Some((_, stale)) = connections.remove_if(&instance_id, |_, h| h.tx.is_disconnected()) {
+        stale.retire();
+    }
     if let Some(metrics) = metrics.as_ref() {
         metrics.set_active_connections(connections.len());
     }
@@ -726,512 +769,8 @@ impl Default for UdsTransportBuilder {
     }
 }
 
+// `#[path]` keeps the tests beside their siblings as `uds/tests.rs`; the
+// default resolution would bury them in a one-file `uds/transport/` directory.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::transports::address::WorkerAddressBuilder;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use velo_ext::PeerInfo;
-
-    /// Error handler that discards errors (for tests that don't need to track them).
-    struct NullErrorHandler;
-    impl TransportErrorHandler for NullErrorHandler {
-        fn on_error(&self, _: Bytes, _: Bytes, _: String) {}
-    }
-
-    /// Error handler that counts errors (for tests that verify error routing).
-    struct TrackingErrorHandler {
-        count: AtomicUsize,
-    }
-
-    impl TrackingErrorHandler {
-        fn new() -> Self {
-            Self {
-                count: AtomicUsize::new(0),
-            }
-        }
-
-        fn error_count(&self) -> usize {
-            self.count.load(Ordering::SeqCst)
-        }
-    }
-
-    impl TransportErrorHandler for TrackingErrorHandler {
-        fn on_error(&self, _: Bytes, _: Bytes, _: String) {
-            self.count.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    /// Build a `PeerInfo` whose UDS endpoint points at `path`.
-    fn make_uds_peer(path: &Path) -> PeerInfo {
-        let instance_id = crate::InstanceId::new_v4();
-        let mut builder = WorkerAddressBuilder::new();
-        builder
-            .add_entry("uds", format!("uds://{}", path.display()).into_bytes())
-            .unwrap();
-        PeerInfo::new(instance_id, builder.build().unwrap())
-    }
-
-    /// Build a `UdsTransport` with its runtime set, bound to a temp socket path.
-    /// Returns `(transport, socket_path)`.
-    fn make_transport() -> (UdsTransport, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("uds-test-{}", crate::InstanceId::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let socket_path = dir.join("test.sock");
-        let transport = UdsTransportBuilder::new()
-            .socket_path(&socket_path)
-            .build()
-            .unwrap();
-        transport
-            .runtime
-            .set(tokio::runtime::Handle::current())
-            .ok();
-        (transport, socket_path)
-    }
-
-    /// Insert a stale `ConnectionHandle` into the transport's connections map.
-    fn insert_stale_handle(transport: &UdsTransport, instance_id: crate::InstanceId) {
-        let (tx, _rx) = flume::bounded::<SendTask>(1);
-        // Drop _rx immediately so tx.is_disconnected() == true
-        transport
-            .connections
-            .insert(instance_id, ConnectionHandle { tx });
-    }
-
-    #[test]
-    fn test_parse_uds_endpoint() {
-        // With uds:// prefix
-        let path = parse_uds_endpoint(b"uds:///tmp/test.sock").unwrap();
-        assert_eq!(path, PathBuf::from("/tmp/test.sock"));
-
-        // Without prefix
-        let path = parse_uds_endpoint(b"/var/run/anvil.sock").unwrap();
-        assert_eq!(path, PathBuf::from("/var/run/anvil.sock"));
-
-        // Empty path
-        assert!(parse_uds_endpoint(b"").is_err());
-    }
-
-    #[test]
-    fn test_builder_requires_socket_path() {
-        let result = UdsTransportBuilder::new().build();
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_builder_with_socket_path() {
-        let result = UdsTransportBuilder::new()
-            .socket_path("/tmp/test.sock")
-            .build();
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_builder_custom_key() {
-        let transport = UdsTransportBuilder::new()
-            .socket_path("/tmp/test.sock")
-            .key(TransportKey::from("custom-uds"))
-            .build()
-            .unwrap();
-        assert_eq!(transport.key(), TransportKey::from("custom-uds"));
-    }
-
-    #[test]
-    fn test_transport_socket_path() {
-        let transport = UdsTransportBuilder::new()
-            .socket_path("/tmp/test.sock")
-            .build()
-            .unwrap();
-        assert_eq!(transport.socket_path(), Path::new("/tmp/test.sock"));
-    }
-
-    #[tokio::test]
-    async fn test_get_or_create_connection_replaces_stale_handle() {
-        let (transport, _socket_path) = make_transport();
-
-        // Start a UDS listener that the transport can connect to
-        let dir = std::env::temp_dir().join(format!("uds-peer-{}", crate::InstanceId::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let peer_socket = dir.join("peer.sock");
-        let peer_listener = tokio::net::UnixListener::bind(&peer_socket).unwrap();
-
-        let peer = make_uds_peer(&peer_socket);
-        let iid = peer.instance_id();
-        transport.register(peer).unwrap();
-
-        // Insert a stale handle
-        insert_stale_handle(&transport, iid);
-        assert!(
-            transport
-                .connections
-                .get(&iid)
-                .unwrap()
-                .tx
-                .is_disconnected()
-        );
-
-        // get_or_create_connection should replace the stale handle with a live one
-        let handle = transport.get_or_create_connection(iid).unwrap();
-        assert!(!handle.tx.is_disconnected());
-
-        // The map entry should also be live
-        let entry = transport.connections.get(&iid).unwrap();
-        assert!(!entry.tx.is_disconnected());
-
-        // Cleanup
-        drop(peer_listener);
-        std::fs::remove_file(&peer_socket).ok();
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test]
-    async fn test_check_health_removes_stale_entry() {
-        let (transport, _socket_path) = make_transport();
-
-        // Start a UDS listener so the peer is "reachable"
-        let dir = std::env::temp_dir().join(format!("uds-peer-{}", crate::InstanceId::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let peer_socket = dir.join("peer.sock");
-        let _peer_listener = tokio::net::UnixListener::bind(&peer_socket).unwrap();
-
-        let peer = make_uds_peer(&peer_socket);
-        let iid = peer.instance_id();
-        transport.register(peer).unwrap();
-
-        // Insert stale handle — simulates a dead writer task
-        insert_stale_handle(&transport, iid);
-        assert!(transport.connections.contains_key(&iid));
-
-        // check_health should remove the stale entry and verify the peer is reachable
-        let result = transport.check_health(iid, Duration::from_secs(2)).await;
-
-        // Stale entry should be gone
-        assert!(!transport.connections.contains_key(&iid));
-
-        // Since there WAS a previous connection entry, check_health returns Ok
-        assert!(result.is_ok());
-
-        // Cleanup
-        std::fs::remove_file(&peer_socket).ok();
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test]
-    async fn test_writer_task_cleans_up_on_write_error() {
-        // Bind a UDS listener, accept once, then drop everything to cause a write error
-        let dir = std::env::temp_dir().join(format!("uds-test-{}", crate::InstanceId::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let socket_path = dir.join("writer-test.sock");
-        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
-
-        let iid = crate::InstanceId::new_v4();
-        let (tx, rx) = flume::bounded::<SendTask>(8);
-
-        let connections: Arc<DashMap<crate::InstanceId, ConnectionHandle>> =
-            Arc::new(DashMap::new());
-        connections.insert(iid, ConnectionHandle { tx: tx.clone() });
-
-        let conns = Arc::clone(&connections);
-        let cancel = CancellationToken::new();
-
-        // Spawn the writer task
-        let writer = tokio::spawn(connection_writer_task(
-            socket_path.clone(),
-            iid,
-            rx,
-            conns,
-            cancel,
-            Duration::from_secs(5),
-            None,
-        ));
-
-        // Accept the connection, then immediately drop it + the listener
-        let (stream, _) = listener.accept().await.unwrap();
-        drop(stream);
-        drop(listener);
-
-        // Send a message — the writer should hit a broken-pipe error
-        tx.send(SendTask {
-            msg_type: MessageType::Message,
-            header: Bytes::from_static(b"hdr"),
-            payload: Bytes::from_static(b"pay"),
-            on_error: Arc::new(NullErrorHandler),
-        })
-        .unwrap();
-
-        // Wait for writer task to finish
-        let _ = writer.await;
-
-        // The writer should have removed the stale entry from the map
-        assert!(
-            !connections.contains_key(&iid),
-            "writer task should clean up its DashMap entry on write error"
-        );
-
-        // Cleanup
-        std::fs::remove_file(&socket_path).ok();
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test]
-    async fn test_send_message_does_not_fail_on_stale_handle() {
-        let (transport, _socket_path) = make_transport();
-
-        // Start a UDS listener that accepts connections (simulates a healthy peer)
-        let dir = std::env::temp_dir().join(format!("uds-peer-{}", crate::InstanceId::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let peer_socket = dir.join("peer.sock");
-        let peer_listener = tokio::net::UnixListener::bind(&peer_socket).unwrap();
-
-        let peer = make_uds_peer(&peer_socket);
-        let iid = peer.instance_id();
-        transport.register(peer).unwrap();
-
-        // Insert a stale handle
-        insert_stale_handle(&transport, iid);
-
-        // send_message should detect the stale handle and create a new one.
-        // This exercises the slow path (get_or_create_connection + try_send on
-        // a freshly-created handle) — the fresh channel has capacity so
-        // try_send succeeds; we do not expect a SendBackpressure here.
-        let error_handler = Arc::new(TrackingErrorHandler::new());
-        transport
-            .send_message(
-                iid,
-                Bytes::from_static(b"test-header"),
-                Bytes::from_static(b"test-payload"),
-                MessageType::Message,
-                error_handler.clone(),
-            )
-            .expect("slow-path send on fresh connection should enqueue synchronously");
-
-        // Accept the connection that the new writer task will establish
-        let (mut stream, _) = peer_listener.accept().await.unwrap();
-
-        // Read the framed message from the stream to confirm delivery
-        use tokio::io::AsyncReadExt;
-        let mut buf = [0u8; 256];
-        let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
-            .await
-            .expect("timed out waiting for data")
-            .expect("read error");
-        assert!(n > 0, "expected data from the writer task");
-
-        // No errors should have been reported
-        assert_eq!(
-            error_handler.error_count(),
-            0,
-            "send_message should retry on stale handle, not fail"
-        );
-
-        // The connections map should now contain a live handle
-        let entry = transport.connections.get(&iid).unwrap();
-        assert!(
-            !entry.tx.is_disconnected(),
-            "stale handle should have been replaced with a live one"
-        );
-
-        // Cleanup
-        std::fs::remove_file(&peer_socket).ok();
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test]
-    async fn test_double_bind_returns_err() {
-        use crate::transports::transport::make_channels;
-
-        let dir = std::env::temp_dir().join(format!("uds-test-{}", crate::InstanceId::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let socket_path = dir.join("double-bind.sock");
-
-        let transport1 = UdsTransportBuilder::new()
-            .socket_path(&socket_path)
-            .build()
-            .unwrap();
-
-        let instance_id = crate::InstanceId::new_v4();
-        let (adapter1, _streams1) = make_channels();
-        let rt = tokio::runtime::Handle::current();
-
-        // First bind must succeed.
-        transport1
-            .start(instance_id, adapter1, rt.clone())
-            .await
-            .unwrap();
-
-        // Second transport on the same path must fail.
-        let transport2 = UdsTransportBuilder::new()
-            .socket_path(&socket_path)
-            .build()
-            .unwrap();
-        let (adapter2, _streams2) = make_channels();
-        let result = transport2.start(instance_id, adapter2, rt).await;
-        assert!(
-            result.is_err(),
-            "start() should return Err when a live listener already owns the socket"
-        );
-
-        // Cleanup
-        transport1.shutdown();
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test]
-    async fn test_begin_drain_activates_draining_flag() {
-        use crate::transports::transport::make_channels;
-
-        let dir = std::env::temp_dir().join(format!("uds-test-{}", crate::InstanceId::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let socket_path = dir.join("drain-test.sock");
-
-        let transport = UdsTransportBuilder::new()
-            .socket_path(&socket_path)
-            .build()
-            .unwrap();
-
-        let instance_id = crate::InstanceId::new_v4();
-        let (adapter, _streams) = make_channels();
-        let rt = tokio::runtime::Handle::current();
-
-        transport.start(instance_id, adapter, rt).await.unwrap();
-
-        assert!(
-            !transport.shutdown_state.get().unwrap().is_draining(),
-            "should not be draining before begin_drain()"
-        );
-
-        transport.begin_drain();
-
-        assert!(
-            transport.shutdown_state.get().unwrap().is_draining(),
-            "should be draining after begin_drain()"
-        );
-
-        // Cleanup
-        transport.shutdown();
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test]
-    async fn test_writer_task_drains_on_connect_failure() {
-        // Use a socket path where nothing is listening so connect will fail.
-        let dir = std::env::temp_dir().join(format!("uds-test-{}", crate::InstanceId::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let dead_socket = dir.join("dead.sock");
-
-        let iid = crate::InstanceId::new_v4();
-        let (tx, rx) = flume::bounded::<SendTask>(8);
-
-        let connections: Arc<DashMap<crate::InstanceId, ConnectionHandle>> =
-            Arc::new(DashMap::new());
-        connections.insert(iid, ConnectionHandle { tx: tx.clone() });
-
-        // Queue a message before the writer task starts
-        let error_handler = Arc::new(TrackingErrorHandler::new());
-        tx.send(SendTask {
-            msg_type: MessageType::Message,
-            header: Bytes::from_static(b"hdr"),
-            payload: Bytes::from_static(b"pay"),
-            on_error: error_handler.clone(),
-        })
-        .unwrap();
-
-        let conns = Arc::clone(&connections);
-        let cancel = CancellationToken::new();
-
-        let writer = tokio::spawn(connection_writer_task(
-            dead_socket,
-            iid,
-            rx,
-            conns,
-            cancel,
-            Duration::from_secs(5),
-            None,
-        ));
-        let _ = writer.await;
-
-        assert_eq!(
-            error_handler.error_count(),
-            1,
-            "queued message should have its on_error called when connect fails"
-        );
-
-        assert!(
-            !connections.contains_key(&iid),
-            "writer task should clean up its DashMap entry on connect failure"
-        );
-
-        // Cleanup
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn test_register_rejects_missing_path() {
-        let dir = std::env::temp_dir().join(format!("uds-reject-{}", crate::InstanceId::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let socket_path = dir.join("self.sock");
-        let transport = UdsTransportBuilder::new()
-            .socket_path(&socket_path)
-            .build()
-            .unwrap();
-
-        // Peer path does not exist at all.
-        let missing =
-            std::env::temp_dir().join(format!("uds-missing-{}.sock", crate::InstanceId::new_v4()));
-        assert!(!missing.exists());
-        let peer = make_uds_peer(&missing);
-        let peer_id = peer.instance_id();
-
-        let result = transport.register(peer);
-        assert!(matches!(result, Err(TransportError::NoEndpoint)));
-        assert!(!transport.peers.contains_key(&peer_id));
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn test_register_rejects_non_socket_file() {
-        let dir = std::env::temp_dir().join(format!("uds-nonsock-{}", crate::InstanceId::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let socket_path = dir.join("self.sock");
-        let transport = UdsTransportBuilder::new()
-            .socket_path(&socket_path)
-            .build()
-            .unwrap();
-
-        // Create a regular file at the peer path.
-        let regular_file = dir.join("not-a-socket");
-        std::fs::write(&regular_file, b"I am not a socket").unwrap();
-
-        let peer = make_uds_peer(&regular_file);
-        let peer_id = peer.instance_id();
-
-        let result = transport.register(peer);
-        assert!(matches!(result, Err(TransportError::NoEndpoint)));
-        assert!(!transport.peers.contains_key(&peer_id));
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test]
-    async fn test_register_accepts_bound_socket() {
-        let dir = std::env::temp_dir().join(format!("uds-accept-{}", crate::InstanceId::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let socket_path = dir.join("self.sock");
-        let transport = UdsTransportBuilder::new()
-            .socket_path(&socket_path)
-            .build()
-            .unwrap();
-
-        let peer_socket = dir.join("peer.sock");
-        let _peer_listener = tokio::net::UnixListener::bind(&peer_socket).unwrap();
-
-        let peer = make_uds_peer(&peer_socket);
-        let peer_id = peer.instance_id();
-
-        transport.register(peer).expect("register should succeed");
-        assert!(transport.peers.contains_key(&peer_id));
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-}
+#[path = "tests.rs"]
+mod tests;

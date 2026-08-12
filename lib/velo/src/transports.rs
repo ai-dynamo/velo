@@ -79,9 +79,9 @@ pub use utils::interfaces::{InterfaceEndpoint, InterfaceFilter};
 // convenience for callers reaching into `velo::transports::*` for transport
 // orchestration, but `velo_ext::*` is the canonical source.
 pub use transport::{
-    DataStreams, HealthCheckError, InFlightGuard, MessageType, SendBackpressure, SendOutcome,
-    ShutdownPolicy, ShutdownState, Transport, TransportAdapter, TransportError,
-    TransportErrorHandler, make_channels, try_send_or_backpressure,
+    AdmissionError, AdmissionGate, AdmissionState, DataStreams, HealthCheckError, InFlightGuard,
+    MessageType, SendAdmission, SendOutcome, ShutdownPolicy, ShutdownState, Transport,
+    TransportAdapter, TransportError, TransportErrorHandler, make_channels,
 };
 
 /// Errors returned by [`VeloBackend`] operations.
@@ -245,6 +245,25 @@ impl VeloBackend {
             .map(|entry| entry.value().key())
     }
 
+    /// Largest `header + payload` the peer's primary transport will carry to
+    /// `target` in one send, or `None` when that cannot be established.
+    ///
+    /// `None` covers two cases that are the same answer to a caller: the
+    /// transport does not know its own limit, and `target` was never
+    /// registered so there is no transport to ask. Either way there is no
+    /// capacity to plan against and the caller falls back to its own
+    /// conservative budget.
+    ///
+    /// Reported for the *primary* transport only. An alternative reached
+    /// through [`send_message_with_transport`](Self::send_message_with_transport)
+    /// can have a different limit; sizing a send against this number and then
+    /// routing it elsewhere is the caller's business to avoid.
+    pub(crate) fn max_message_size(&self, target: InstanceId) -> Option<usize> {
+        self.primary_transport
+            .get(&target)
+            .and_then(|transport| transport.value().max_message_size(target))
+    }
+
     /// Returns the ordered list of alternative [`TransportKey`]s for `target`,
     /// or `None` if the peer has not been registered.
     pub fn alternative_transport_keys(&self, target: InstanceId) -> Option<Vec<TransportKey>> {
@@ -258,10 +277,10 @@ impl VeloBackend {
     /// Returns [`VeloBackendError::InstanceNotRegistered`] if the peer has not
     /// been registered with [`register_peer`](Self::register_peer).
     ///
-    /// The inner [`SendOutcome`] distinguishes synchronous enqueue
-    /// ([`SendOutcome::Enqueued`]) from saturated channels
-    /// ([`SendOutcome::Backpressured`]) where the caller must `.await` the
-    /// returned future to complete the send.
+    /// The [`SendOutcome`] distinguishes synchronous admission
+    /// ([`SendOutcome::Admitted`]) from a saturated per-target channel
+    /// ([`SendOutcome::Pending`]), where the frame is queued behind its
+    /// predecessors and the contained [`SendAdmission`] reports when it lands.
     pub fn send_message(
         &self,
         target: InstanceId,
@@ -278,13 +297,23 @@ impl VeloBackend {
         let transport_name = transport_key.to_string();
         #[cfg(not(feature = "distributed-tracing"))]
         let _ = &transport_name;
+        // Only the span below needs this; `finalize_send_outcome` recomputes it
+        // from the report's own frame handles.
+        #[cfg(feature = "distributed-tracing")]
         let bytes = header.len() + payload.len();
         let metrics = self.transport_metrics.get(&transport_key);
 
         let error_handler = instrument_transport_error_handler(metrics.cloned(), on_error);
+        let report = SendReport {
+            metrics: metrics.cloned(),
+            on_error: error_handler.clone(),
+            message_type,
+            header: header.clone(),
+            payload: payload.clone(),
+        };
 
         #[cfg(feature = "distributed-tracing")]
-        let send_result = {
+        let outcome = {
             let span = tracing::info_span!(
                 "velo.transport.send",
                 transport = transport_name.as_str(),
@@ -296,15 +325,9 @@ impl VeloBackend {
         };
 
         #[cfg(not(feature = "distributed-tracing"))]
-        let send_result =
-            transport.send_message(target, header, payload, message_type, error_handler);
+        let outcome = transport.send_message(target, header, payload, message_type, error_handler);
 
-        Ok(finalize_send_outcome(
-            send_result,
-            metrics.cloned(),
-            message_type,
-            bytes,
-        ))
+        Ok(finalize_send_outcome(outcome, report))
     }
 
     /// Send a message to a registered peer via a specific transport.
@@ -329,19 +352,20 @@ impl VeloBackend {
 
         if transport.value().key() == transport_key {
             let _transport_name = transport_key.to_string();
-            let bytes = header.len() + payload.len();
             let metrics = self.transport_metrics.get(&transport_key);
 
             let error_handler = instrument_transport_error_handler(metrics.cloned(), on_error);
-            let send_result =
+            let report = SendReport {
+                metrics: metrics.cloned(),
+                on_error: error_handler.clone(),
+                message_type,
+                header: header.clone(),
+                payload: payload.clone(),
+            };
+            let outcome =
                 transport.send_message(target, header, payload, message_type, error_handler);
 
-            return Ok(finalize_send_outcome(
-                send_result,
-                metrics.cloned(),
-                message_type,
-                bytes,
-            ));
+            return Ok(finalize_send_outcome(outcome, report));
         } else {
             // if we got here, we can unwrap because there is an entry in the alternative_transports map
             let alternative_transports = self
@@ -354,12 +378,18 @@ impl VeloBackend {
                     && let Some(transport) = self.transports.get(alternative_transport)
                 {
                     let _transport_name = alternative_transport.to_string();
-                    let bytes = header.len() + payload.len();
                     let metrics = self.transport_metrics.get(alternative_transport);
 
                     let error_handler =
                         instrument_transport_error_handler(metrics.cloned(), on_error);
-                    let send_result = transport.send_message(
+                    let report = SendReport {
+                        metrics: metrics.cloned(),
+                        on_error: error_handler.clone(),
+                        message_type,
+                        header: header.clone(),
+                        payload: payload.clone(),
+                    };
+                    let outcome = transport.send_message(
                         target,
                         header,
                         payload,
@@ -367,12 +397,7 @@ impl VeloBackend {
                         error_handler,
                     );
 
-                    return Ok(finalize_send_outcome(
-                        send_result,
-                        metrics.cloned(),
-                        message_type,
-                        bytes,
-                    ));
+                    return Ok(finalize_send_outcome(outcome, report));
                 }
             }
         }
@@ -388,15 +413,15 @@ impl VeloBackend {
     /// For automatic discovery, use the two-phase pattern:
     /// ```ignore
     /// match backend.send_message_to_worker(...) {
-    ///     Ok(SendOutcome::Enqueued) => { /* synchronous enqueue */ }
-    ///     Ok(SendOutcome::Backpressured(bp)) => { bp.await; }
+    ///     Ok(SendOutcome::Admitted) => { /* already on the send channel */ }
+    ///     Ok(SendOutcome::Pending(admission)) => { admission.await?; }
     ///     Err(e) if matches_worker_not_registered(&e) => {
     ///         tokio::spawn(async move {
     ///             let instance_id = backend.resolve_and_register_worker(worker_id).await?;
-    ///             if let SendOutcome::Backpressured(bp) =
+    ///             if let SendOutcome::Pending(admission) =
     ///                 backend.send_message(instance_id, ...)?
     ///             {
-    ///                 bp.await;
+    ///                 admission.await?;
     ///             }
     ///         });
     ///     }
@@ -561,522 +586,66 @@ fn instrument_transport_error_handler(
     Arc::new(InstrumentedTransportErrorHandler { metrics, inner })
 }
 
-/// Turn a transport `send_message` result into a [`SendOutcome`], recording
-/// the outbound-frame metric at the moment the frame is actually enqueued.
+/// What [`finalize_send_outcome`] needs to close the loop on one send.
 ///
-/// - On `Ok(())` (synchronous enqueue) the metric is recorded immediately.
-/// - On `Err(bp)` (backpressure) the bp future is wrapped so the metric is
-///   recorded only when the caller awaits it to completion. If the caller
-///   drops the future without awaiting, the frame was never enqueued and no
-///   outbound-frame count is recorded.
-fn finalize_send_outcome(
-    send_result: Result<(), SendBackpressure>,
+/// The frame handles are `Bytes` clones taken before the transport consumed
+/// them — two refcount bumps, so that an admission that fails can still hand
+/// the original frame to `on_error` the way a wire failure does.
+struct SendReport {
     metrics: Option<Arc<crate::observability::TransportMetricsHandle>>,
+    on_error: Arc<dyn TransportErrorHandler>,
     message_type: MessageType,
-    bytes: usize,
-) -> SendOutcome {
-    match send_result {
-        Ok(()) => {
+    header: Bytes,
+    payload: Bytes,
+}
+
+/// Attach the backend's bookkeeping to a transport's [`SendOutcome`].
+///
+/// The outbound-frame metric must count frames that reached the send channel,
+/// not frames that were offered, so:
+///
+/// - [`SendOutcome::Admitted`] records immediately — the frame is on the
+///   channel by the time the transport returned.
+/// - [`SendOutcome::Pending`] records from a completion hook, and only if the
+///   admission resolves `Ok`. A hook rather than a wrapper future because
+///   fire-and-forget senders drop the admission unpolled; the frame is still
+///   delivered, so the metric still has to fire.
+///
+/// A failed admission is a frame that never reached the wire, which is what
+/// `on_error` reports, so it is routed there — through the same instrumented
+/// handler the transport was given, so the rejection counter sees it too.
+fn finalize_send_outcome(outcome: SendOutcome, report: SendReport) -> SendOutcome {
+    let SendReport {
+        metrics,
+        on_error,
+        message_type,
+        header,
+        payload,
+    } = report;
+    let label = message_type_label(message_type);
+    let bytes = header.len() + payload.len();
+
+    match outcome {
+        SendOutcome::Admitted => {
             if let Some(metrics) = metrics {
-                metrics.record_frame(Direction::Outbound, message_type_label(message_type), bytes);
+                metrics.record_frame(Direction::Outbound, label, bytes);
             }
-            SendOutcome::Enqueued
+            SendOutcome::Admitted
         }
-        Err(bp) => {
-            let label = message_type_label(message_type);
-            SendOutcome::Backpressured(SendBackpressure::new(Box::pin(async move {
-                bp.await;
-                if let Some(metrics) = metrics {
-                    metrics.record_frame(Direction::Outbound, label, bytes);
+        SendOutcome::Pending(admission) => {
+            SendOutcome::Pending(admission.on_resolved(move |result| match result {
+                Ok(()) => {
+                    if let Some(metrics) = metrics {
+                        metrics.record_frame(Direction::Outbound, label, bytes);
+                    }
                 }
-            })))
+                Err(error) => {
+                    on_error.on_error(header, payload, format!("Send not admitted: {error}"));
+                }
+            }))
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use bytes::Bytes;
-    use futures::future::BoxFuture;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::time::Duration;
-
-    /// Mock transport for testing VeloBackend logic without real networking.
-    struct MockTransport {
-        key: TransportKey,
-        address: WorkerAddress,
-        accept_register: bool,
-        started: AtomicBool,
-        drained: AtomicBool,
-        shut_down: AtomicBool,
-        send_count: AtomicUsize,
-        /// When true, `send_message` returns `Err(SendBackpressure::new(...))`
-        /// whose inner future is immediately ready. Lets tests exercise the
-        /// backend's Backpressured path.
-        always_backpressure: bool,
-    }
-
-    impl MockTransport {
-        fn new(key: &str, accept_register: bool) -> Arc<Self> {
-            let mut builder = WorkerAddressBuilder::new();
-            builder
-                .add_entry(key, format!("mock://{}", key).into_bytes())
-                .unwrap();
-            let address = builder.build().unwrap();
-
-            Arc::new(Self {
-                key: TransportKey::from(key),
-                address,
-                accept_register,
-                started: AtomicBool::new(false),
-                drained: AtomicBool::new(false),
-                shut_down: AtomicBool::new(false),
-                send_count: AtomicUsize::new(0),
-                always_backpressure: false,
-            })
-        }
-
-        fn new_backpressured(key: &str) -> Arc<Self> {
-            let mut builder = WorkerAddressBuilder::new();
-            builder
-                .add_entry(key, format!("mock://{}", key).into_bytes())
-                .unwrap();
-            let address = builder.build().unwrap();
-
-            Arc::new(Self {
-                key: TransportKey::from(key),
-                address,
-                accept_register: true,
-                started: AtomicBool::new(false),
-                drained: AtomicBool::new(false),
-                shut_down: AtomicBool::new(false),
-                send_count: AtomicUsize::new(0),
-                always_backpressure: true,
-            })
-        }
-    }
-
-    impl Transport for MockTransport {
-        fn key(&self) -> TransportKey {
-            self.key.clone()
-        }
-        fn address(&self) -> WorkerAddress {
-            self.address.clone()
-        }
-        fn register(&self, _peer_info: PeerInfo) -> Result<(), TransportError> {
-            if self.accept_register {
-                Ok(())
-            } else {
-                Err(TransportError::NoEndpoint)
-            }
-        }
-        fn send_message(
-            &self,
-            _instance_id: InstanceId,
-            _header: Bytes,
-            _payload: Bytes,
-            _message_type: MessageType,
-            _on_error: Arc<dyn TransportErrorHandler>,
-        ) -> Result<(), SendBackpressure> {
-            self.send_count.fetch_add(1, Ordering::Relaxed);
-            if self.always_backpressure {
-                Err(SendBackpressure::new(Box::pin(async {})))
-            } else {
-                Ok(())
-            }
-        }
-        fn start(
-            &self,
-            _instance_id: InstanceId,
-            _channels: TransportAdapter,
-            _rt: tokio::runtime::Handle,
-        ) -> BoxFuture<'_, anyhow::Result<()>> {
-            self.started.store(true, Ordering::Relaxed);
-            Box::pin(async { Ok(()) })
-        }
-        fn shutdown(&self) {
-            self.shut_down.store(true, Ordering::Relaxed);
-        }
-        fn begin_drain(&self) {
-            self.drained.store(true, Ordering::Relaxed);
-        }
-        fn check_health(
-            &self,
-            _instance_id: InstanceId,
-            _timeout: Duration,
-        ) -> std::pin::Pin<
-            Box<
-                dyn std::future::Future<Output = Result<(), transport::HealthCheckError>>
-                    + Send
-                    + '_,
-            >,
-        > {
-            Box::pin(async { Ok(()) })
-        }
-    }
-
-    struct NoopErrorHandler;
-    impl TransportErrorHandler for NoopErrorHandler {
-        fn on_error(&self, _header: Bytes, _payload: Bytes, _error: String) {}
-    }
-
-    /// Helper: build a PeerInfo with entries for specified transport keys.
-    fn make_peer_info(keys: &[&str]) -> PeerInfo {
-        let instance_id = InstanceId::new_v4();
-        let mut builder = WorkerAddressBuilder::new();
-        for key in keys {
-            builder
-                .add_entry(*key, format!("mock://{}", key).into_bytes())
-                .unwrap();
-        }
-        let address = builder.build().unwrap();
-        PeerInfo::new(instance_id, address)
-    }
-
-    #[tokio::test]
-    async fn test_new_single_transport() {
-        let t = MockTransport::new("tcp", true);
-        let (backend, _streams) = VeloBackend::new(vec![t.clone() as Arc<dyn Transport>], None)
-            .await
-            .unwrap();
-
-        assert!(t.started.load(Ordering::Relaxed));
-        // instance_id should be a valid v4 UUID (non-zero)
-        assert!(!backend.instance_id().as_bytes().iter().all(|&b| b == 0));
-        assert_eq!(backend.available_transports().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_new_multiple_transports() {
-        let t1 = MockTransport::new("tcp", true);
-        let t2 = MockTransport::new("http", true);
-        let (backend, _streams) = VeloBackend::new(
-            vec![
-                t1.clone() as Arc<dyn Transport>,
-                t2.clone() as Arc<dyn Transport>,
-            ],
-            None,
-        )
-        .await
-        .unwrap();
-
-        assert!(t1.started.load(Ordering::Relaxed));
-        assert!(t2.started.load(Ordering::Relaxed));
-        assert_eq!(backend.available_transports().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn test_register_peer_selects_primary_by_priority() {
-        let t1 = MockTransport::new("tcp", true);
-        let t2 = MockTransport::new("http", true);
-        let (backend, _streams) = VeloBackend::new(
-            vec![
-                t1.clone() as Arc<dyn Transport>,
-                t2.clone() as Arc<dyn Transport>,
-            ],
-            None,
-        )
-        .await
-        .unwrap();
-
-        let peer = make_peer_info(&["tcp", "http"]);
-        let peer_id = peer.instance_id();
-        backend.register_peer(peer).unwrap();
-
-        assert!(backend.is_registered(peer_id));
-        // Primary should be "tcp" (first in priority)
-        let primary = backend.primary_transport.get(&peer_id).unwrap();
-        assert_eq!(primary.value().key(), TransportKey::from("tcp"));
-    }
-
-    #[tokio::test]
-    async fn test_register_peer_no_compatible_transports() {
-        // Transport rejects all registrations
-        let t = MockTransport::new("tcp", false);
-        let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>], None)
-            .await
-            .unwrap();
-
-        let peer = make_peer_info(&["tcp"]);
-        let result = backend.register_peer(peer);
-        assert!(matches!(
-            result,
-            Err(VeloBackendError::NoCompatibleTransports)
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_register_peer_stores_worker_mapping() {
-        let t = MockTransport::new("tcp", true);
-        let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>], None)
-            .await
-            .unwrap();
-
-        let peer = make_peer_info(&["tcp"]);
-        let peer_id = peer.instance_id();
-        let worker_id = peer_id.worker_id();
-        backend.register_peer(peer).unwrap();
-
-        let resolved = backend.try_translate_worker_id(worker_id).unwrap();
-        assert_eq!(resolved, peer_id);
-    }
-
-    #[tokio::test]
-    async fn test_send_message_routes_to_primary() {
-        let t = MockTransport::new("tcp", true);
-        let (backend, _streams) = VeloBackend::new(vec![t.clone() as Arc<dyn Transport>], None)
-            .await
-            .unwrap();
-
-        let peer = make_peer_info(&["tcp"]);
-        let peer_id = peer.instance_id();
-        backend.register_peer(peer).unwrap();
-
-        let outcome = backend
-            .send_message(
-                peer_id,
-                Bytes::from_static(&[1]),
-                Bytes::from_static(&[2]),
-                MessageType::Message,
-                Arc::new(NoopErrorHandler),
-            )
-            .unwrap();
-
-        assert!(
-            matches!(outcome, SendOutcome::Enqueued),
-            "MockTransport returns Ok(()) so backend should report Enqueued"
-        );
-        assert_eq!(t.send_count.load(Ordering::Relaxed), 1);
-    }
-
-    #[tokio::test]
-    async fn test_send_message_backpressured() {
-        // A transport that always returns Err(SendBackpressure) should cause
-        // the backend to surface SendOutcome::Backpressured; awaiting the
-        // future must resolve cleanly.
-        let t = MockTransport::new_backpressured("tcp");
-        let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>], None)
-            .await
-            .unwrap();
-
-        let peer = make_peer_info(&["tcp"]);
-        let peer_id = peer.instance_id();
-        backend.register_peer(peer).unwrap();
-
-        let outcome = backend
-            .send_message(
-                peer_id,
-                Bytes::from_static(&[1]),
-                Bytes::from_static(&[2]),
-                MessageType::Message,
-                Arc::new(NoopErrorHandler),
-            )
-            .unwrap();
-
-        match outcome {
-            SendOutcome::Backpressured(bp) => {
-                tokio::time::timeout(Duration::from_secs(1), bp)
-                    .await
-                    .expect("bp should resolve when inner future completes");
-            }
-            SendOutcome::Enqueued => {
-                panic!("backpressured mock should surface SendOutcome::Backpressured")
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn test_send_message_unregistered_peer() {
-        let t = MockTransport::new("tcp", true);
-        let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>], None)
-            .await
-            .unwrap();
-
-        let result = backend.send_message(
-            InstanceId::new_v4(),
-            Bytes::new(),
-            Bytes::new(),
-            MessageType::Message,
-            Arc::new(NoopErrorHandler),
-        );
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_send_message_with_transport_primary_match() {
-        let t = MockTransport::new("tcp", true);
-        let (backend, _streams) = VeloBackend::new(vec![t.clone() as Arc<dyn Transport>], None)
-            .await
-            .unwrap();
-
-        let peer = make_peer_info(&["tcp"]);
-        let peer_id = peer.instance_id();
-        backend.register_peer(peer).unwrap();
-
-        backend
-            .send_message_with_transport(
-                peer_id,
-                Bytes::from_static(&[1]),
-                Bytes::from_static(&[2]),
-                MessageType::Message,
-                Arc::new(NoopErrorHandler),
-                TransportKey::from("tcp"),
-            )
-            .unwrap();
-
-        assert_eq!(t.send_count.load(Ordering::Relaxed), 1);
-    }
-
-    #[tokio::test]
-    async fn test_send_message_with_transport_alternative() {
-        let t1 = MockTransport::new("tcp", true);
-        let t2 = MockTransport::new("http", true);
-        let (backend, _streams) = VeloBackend::new(
-            vec![
-                t1.clone() as Arc<dyn Transport>,
-                t2.clone() as Arc<dyn Transport>,
-            ],
-            None,
-        )
-        .await
-        .unwrap();
-
-        let peer = make_peer_info(&["tcp", "http"]);
-        let peer_id = peer.instance_id();
-        backend.register_peer(peer).unwrap();
-
-        // Send via "http" (the alternative transport)
-        backend
-            .send_message_with_transport(
-                peer_id,
-                Bytes::from_static(&[1]),
-                Bytes::from_static(&[2]),
-                MessageType::Message,
-                Arc::new(NoopErrorHandler),
-                TransportKey::from("http"),
-            )
-            .unwrap();
-
-        assert_eq!(t2.send_count.load(Ordering::Relaxed), 1);
-    }
-
-    #[tokio::test]
-    async fn test_send_message_with_transport_not_found() {
-        let t = MockTransport::new("tcp", true);
-        let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>], None)
-            .await
-            .unwrap();
-
-        let peer = make_peer_info(&["tcp"]);
-        let peer_id = peer.instance_id();
-        backend.register_peer(peer).unwrap();
-
-        let result = backend.send_message_with_transport(
-            peer_id,
-            Bytes::new(),
-            Bytes::new(),
-            MessageType::Message,
-            Arc::new(NoopErrorHandler),
-            TransportKey::from("grpc"),
-        );
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_try_translate_worker_id_not_found() {
-        let t = MockTransport::new("tcp", true);
-        let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>], None)
-            .await
-            .unwrap();
-
-        let result = backend.try_translate_worker_id(InstanceId::new_v4().worker_id());
-        assert!(matches!(
-            result,
-            Err(VeloBackendError::WorkerNotRegistered(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_set_transport_priority_valid() {
-        let t1 = MockTransport::new("tcp", true);
-        let t2 = MockTransport::new("http", true);
-        let (backend, _streams) = VeloBackend::new(
-            vec![t1 as Arc<dyn Transport>, t2 as Arc<dyn Transport>],
-            None,
-        )
-        .await
-        .unwrap();
-
-        // Reverse the priority
-        backend
-            .set_transport_priority(vec![TransportKey::from("http"), TransportKey::from("tcp")])
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_set_transport_priority_wrong_length() {
-        let t = MockTransport::new("tcp", true);
-        let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>], None)
-            .await
-            .unwrap();
-
-        let result = backend
-            .set_transport_priority(vec![TransportKey::from("tcp"), TransportKey::from("http")]);
-        assert!(matches!(
-            result,
-            Err(VeloBackendError::InvalidTransportPriority(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_set_transport_priority_unknown_key() {
-        let t = MockTransport::new("tcp", true);
-        let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>], None)
-            .await
-            .unwrap();
-
-        let result = backend.set_transport_priority(vec![TransportKey::from("unknown")]);
-        assert!(matches!(
-            result,
-            Err(VeloBackendError::InvalidTransportPriority(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_graceful_shutdown_calls_all_transports() {
-        let t1 = MockTransport::new("tcp", true);
-        let t2 = MockTransport::new("http", true);
-        let (backend, _streams) = VeloBackend::new(
-            vec![
-                t1.clone() as Arc<dyn Transport>,
-                t2.clone() as Arc<dyn Transport>,
-            ],
-            None,
-        )
-        .await
-        .unwrap();
-
-        backend
-            .graceful_shutdown(ShutdownPolicy::Timeout(Duration::from_millis(100)))
-            .await;
-
-        assert!(t1.drained.load(Ordering::Relaxed));
-        assert!(t2.drained.load(Ordering::Relaxed));
-        assert!(t1.shut_down.load(Ordering::Relaxed));
-        assert!(t2.shut_down.load(Ordering::Relaxed));
-        assert!(backend.shutdown_state().is_draining());
-        assert!(backend.shutdown_state().teardown_token().is_cancelled());
-    }
-
-    #[tokio::test]
-    async fn test_peer_info_roundtrip() {
-        let t = MockTransport::new("tcp", true);
-        let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>], None)
-            .await
-            .unwrap();
-
-        let info = backend.peer_info();
-        assert_eq!(info.instance_id(), backend.instance_id());
-    }
-}
+mod tests;

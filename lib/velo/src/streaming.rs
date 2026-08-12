@@ -26,11 +26,16 @@ pub mod frame;
 #[cfg(feature = "grpc")]
 pub mod grpc_transport;
 pub mod handle;
+/// Batched, multiplexed streaming over the Messenger (`messenger-mux-v1`).
+///
+/// Internal while it is built out: the transport is opt-in and selected at
+/// attach time, so nothing outside this crate names these types.
+pub(crate) mod messenger_mux;
 pub mod mpsc;
+pub(crate) mod negotiation;
 pub mod sender;
 pub mod tcp_transport;
 pub mod transport;
-pub mod velo_transport;
 
 pub use anchor::{
     AnchorConfig, AnchorManager, AnchorManagerBuilder, AttachError, StreamAnchor, StreamController,
@@ -39,17 +44,10 @@ pub use frame::{SendError, StreamError, StreamFrame};
 #[cfg(feature = "grpc")]
 pub use grpc_transport::GrpcFrameTransport;
 pub use handle::{AnchorKind, StreamAnchorHandle};
+pub use messenger_mux::MuxConfig;
 pub use mpsc::{
     MpscAnchorConfig, MpscFrame, MpscStreamAnchor, MpscStreamController, MpscStreamSender, SenderId,
 };
 pub use sender::StreamSender;
 pub use tcp_transport::TcpFrameTransport;
 pub use transport::FrameTransport;
-#[deprecated(
-    since = "0.4.0",
-    note = "VeloFrameTransport has known correctness issues under multi-stream concurrency \
-            (the messenger AM dispatcher is fundamentally unordered, and the per-session reorder \
-            buffer can deadlock the consumer above ~16 concurrent streams). \
-            Prefer TcpFrameTransport or GrpcFrameTransport. Removal targeted for the next velo minor."
-)]
-pub use velo_transport::VeloFrameTransport;

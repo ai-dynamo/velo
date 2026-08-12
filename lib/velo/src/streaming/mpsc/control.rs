@@ -41,6 +41,13 @@ pub struct MpscAnchorAttachRequest {
     pub handle: StreamAnchorHandle,
     pub session_id: u64,
     pub stream_cancel_handle: StreamCancelHandle,
+    /// Streaming transports this sender can drive; see
+    /// [`crate::streaming::control::AnchorAttachRequest::supported_transport_keys`].
+    /// MPSC negotiates in the same version as SPSC so there is no
+    /// half-migrated state where one anchor kind rides the mux and the other
+    /// does not.
+    #[serde(default)]
+    pub supported_transport_keys: Vec<velo_ext::TransportKey>,
 }
 
 /// Response from the MPSC attach handler.
@@ -57,6 +64,14 @@ pub enum MpscAnchorAttachResponse {
         /// senders that haven't been updated.
         #[serde(default)]
         routing_session_id: u64,
+        /// Mux credit window; zero means *not offering the mux*. See
+        /// [`crate::streaming::control::AnchorAttachResponse::Ok`] — the two
+        /// zeros mean different things and that variant documents which.
+        #[serde(default)]
+        initial_credit: u32,
+        /// Mux per-slot byte cap; zero means *use the default*.
+        #[serde(default)]
+        slot_byte_budget: u32,
     },
     Err {
         reason: String,
@@ -220,16 +235,19 @@ pub fn create_mpsc_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::
                     .next_routing_session_id
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                     + 1;
-                let transport_rx = match manager.transport.bind(local_id, routing_session_id).await
-                {
-                    Ok(rx) => rx,
-                    Err(e) => {
-                        return Ok(MpscAnchorAttachResponse::Err {
-                            reason: format!("transport error: {}", e),
-                        });
-                    }
-                };
-                let streaming_transport_key = manager.transport.key();
+                // Same intersection the SPSC handler makes; MPSC negotiates in
+                // the same version so there is no half-migrated state.
+                let selection = manager.select_streaming_transport(&req.supported_transport_keys);
+                let transport_rx =
+                    match selection.transport.bind(local_id, routing_session_id).await {
+                        Ok(rx) => rx,
+                        Err(e) => {
+                            return Ok(MpscAnchorAttachResponse::Err {
+                                reason: format!("transport error: {}", e),
+                            });
+                        }
+                    };
+                let streaming_transport_key = selection.key;
 
                 // Step 3: atomic slot insertion.
                 use dashmap::mapref::entry::Entry;
@@ -290,6 +308,8 @@ pub fn create_mpsc_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::
                     heartbeat_interval_ms: heartbeat_interval.as_millis() as u64,
                     sender_id,
                     routing_session_id,
+                    initial_credit: selection.initial_credit,
+                    slot_byte_budget: selection.slot_byte_budget,
                 })
             }
         },
@@ -360,4 +380,99 @@ pub fn create_mpsc_anchor_cancel_handler(manager: Arc<AnchorManager>) -> crate::
     )
     .spawn()
     .build()
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use velo_ext::{TransportKey, WorkerId};
+
+    /// MPSC negotiates in the same version as SPSC, so its request carries the
+    /// same key list and its response the same credit fields. What this pins is
+    /// that an older MPSC sender — which sends neither — is still understood.
+    #[test]
+    fn an_mpsc_attach_request_from_before_negotiation_advertises_nothing() {
+        let legacy_json = r#"{
+            "handle": {"hi": 1, "lo": 2},
+            "session_id": 3,
+            "stream_cancel_handle": {"hi": 4, "lo": 5}
+        }"#;
+        let decoded: MpscAnchorAttachRequest =
+            serde_json::from_str(legacy_json).expect("legacy mpsc request must deserialize");
+        assert!(decoded.supported_transport_keys.is_empty());
+    }
+
+    #[test]
+    fn an_mpsc_attach_response_from_before_negotiation_offers_no_mux() {
+        let legacy_json = r#"{"Ok":{
+            "streaming_transport_key": "tcp-stream",
+            "heartbeat_interval_ms": 5000,
+            "sender_id": 2
+        }}"#;
+        let decoded: MpscAnchorAttachResponse =
+            serde_json::from_str(legacy_json).expect("legacy mpsc response must deserialize");
+        match decoded {
+            MpscAnchorAttachResponse::Ok {
+                initial_credit,
+                slot_byte_budget,
+                ..
+            } => {
+                assert_eq!(
+                    initial_credit, 0,
+                    "an absent credit window is a peer not offering the mux"
+                );
+                assert_eq!(
+                    slot_byte_budget, 0,
+                    "an absent byte cap means the default, not a refusal"
+                );
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_mpsc_attach_exchange_round_trips_its_negotiation_fields() {
+        let req = MpscAnchorAttachRequest {
+            handle: StreamAnchorHandle::pack_mpsc(WorkerId::from_u64(1), 2),
+            session_id: 3,
+            stream_cancel_handle: StreamCancelHandle::pack(WorkerId::from_u64(4), 5),
+            supported_transport_keys: vec![TransportKey::new("messenger-mux-v1")],
+        };
+        let decoded: MpscAnchorAttachRequest =
+            rmp_serde::from_slice(&rmp_serde::to_vec(&req).expect("encode")).expect("decode");
+        assert_eq!(
+            decoded
+                .supported_transport_keys
+                .iter()
+                .map(TransportKey::as_str)
+                .collect::<Vec<_>>(),
+            ["messenger-mux-v1"],
+        );
+
+        let resp = MpscAnchorAttachResponse::Ok {
+            streaming_transport_key: TransportKey::new("messenger-mux-v1"),
+            heartbeat_interval_ms: 5000,
+            sender_id: 7,
+            routing_session_id: 8,
+            initial_credit: 256,
+            slot_byte_budget: 1024,
+        };
+        let decoded: MpscAnchorAttachResponse =
+            rmp_serde::from_slice(&rmp_serde::to_vec(&resp).expect("encode")).expect("decode");
+        match decoded {
+            MpscAnchorAttachResponse::Ok {
+                initial_credit,
+                slot_byte_budget,
+                ..
+            } => {
+                assert_eq!(initial_credit, 256);
+                assert_eq!(slot_byte_budget, 1024);
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
 }

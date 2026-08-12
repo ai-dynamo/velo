@@ -13,7 +13,6 @@ use bytes::{BufMut, Bytes, BytesMut};
 use dashmap::DashMap;
 use futures::StreamExt;
 use futures::future::BoxFuture;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -32,10 +31,10 @@ pub(crate) const HEADER_VELO_HLEN: &str = "Velo-HLen";
 
 use super::subjects;
 use velo_ext::{
-    InstanceId, MessageType, PeerInfo, TransportKey, WorkerAddress,
+    AdmissionGate, InstanceId, MessageType, PeerInfo, SendOutcome, TransportKey, WorkerAddress,
     transport::{
-        HealthCheckError, SendBackpressure, ShutdownState, Transport, TransportAdapter,
-        TransportError, TransportErrorHandler, try_send_or_backpressure,
+        HealthCheckError, ShutdownState, Transport, TransportAdapter, TransportError,
+        TransportErrorHandler,
     },
 };
 
@@ -46,6 +45,17 @@ const VELO_TYPE_STRINGS: [&str; 5] = ["0", "1", "2", "3", "4"];
 
 /// Default bounded-channel capacity for the sender task.
 const DEFAULT_SENDER_CAPACITY: usize = 1024;
+
+/// Bytes charged against the server's `max_payload` for Velo's own NATS
+/// framing — the `Velo-Type` / `Velo-HLen` header block plus subject and
+/// command bytes, since `max_payload` bounds the entire HPUB and not just its
+/// body. A deliberate over-estimate, inherited from the send-side check.
+///
+/// [`send_message`](Transport::send_message) rejects against this number and
+/// [`max_message_size`](Transport::max_message_size) reports against it, so
+/// what the transport advertises and what it will actually accept are the same
+/// arithmetic rather than two numbers that agree today.
+const NATS_HEADER_OVERHEAD: usize = 64;
 
 /// Task queued from [`send_message`](Transport::send_message) to the dedicated sender task.
 struct NatsSendTask {
@@ -72,6 +82,14 @@ pub struct NatsTransport {
     peers: Arc<DashMap<InstanceId, String>>,
     /// Sender channel for the dedicated sender task (set once during `start()`).
     sender_tx: OnceLock<flume::Sender<NatsSendTask>>,
+    /// One admission gate per peer, all feeding `sender_tx`.
+    ///
+    /// The publish channel is shared by every peer, but ordering is only ever
+    /// promised per target — so the gate is per target too. A peer whose frames
+    /// are backing up queues behind its own gate instead of serialising
+    /// everyone else's sends through it, and only the shared channel's capacity
+    /// is contended.
+    gates: DashMap<InstanceId, AdmissionGate<NatsSendTask>>,
     /// Bounded channel capacity for the sender task.
     sender_capacity: usize,
     /// Tokio runtime handle, set once during `start()`.
@@ -84,17 +102,58 @@ pub struct NatsTransport {
     begin_shutdown_token: CancellationToken,
     /// Shared shutdown state, set once during `start()`.
     shutdown_state: OnceLock<ShutdownState>,
-    /// Maximum NATS payload size in bytes (queried from server on start).
-    max_payload: Arc<AtomicUsize>,
     /// Shared observability collectors installed by the backend.
     metrics: OnceLock<std::sync::Arc<dyn velo_ext::TransportObservability>>,
 }
 
 impl NatsTransport {
+    /// The largest `header + payload` this connection will carry right now.
+    ///
+    /// Read from the client at every use rather than cached, because the
+    /// number is a property of the current connection: `max_payload` is
+    /// renegotiated on every (re)connect, and a value snapshotted at `start()`
+    /// describes whichever server was answering then. Both the capacity report
+    /// and the pre-wire check call this, so what the transport advertises and
+    /// what it will accept are one expression rather than two that agree
+    /// today.
+    ///
+    /// [`async_nats::Client::max_payload`] is the same atomic async-nats
+    /// itself validates publishes against, which is the reason to prefer it
+    /// over `server_info().max_payload`: the two are refreshed together, this
+    /// one costs an atomic load instead of cloning a `ServerInfo` full of
+    /// `String`s on the send path, and reading it means we cannot reject a
+    /// frame the client would have accepted, or advertise one it would not.
+    /// Before the first `INFO` — a client built with `retry_on_initial_connect`
+    /// while the server is down — that is async-nats' 1 MiB default, which is
+    /// still exactly what this client will enforce, so the report stays honest
+    /// about what a send will do rather than reporting "unknown".
+    fn frame_capacity(&self) -> usize {
+        self.client
+            .max_payload()
+            .saturating_sub(NATS_HEADER_OVERHEAD)
+    }
+
     fn update_peer_gauge(&self) {
         if let Some(metrics) = self.metrics.get() {
             metrics.set_registered_peers(self.peers.len());
         }
+    }
+
+    /// The gate for one peer, created on first send to it.
+    ///
+    /// Gates outlive individual publishes and are never retired: NATS has no
+    /// per-peer connection to die, so there is no epoch boundary at which
+    /// queued frames would become invalid.
+    fn gate_for(
+        &self,
+        target: InstanceId,
+        tx: &flume::Sender<NatsSendTask>,
+        rt: &tokio::runtime::Handle,
+    ) -> AdmissionGate<NatsSendTask> {
+        self.gates
+            .entry(target)
+            .or_insert_with(|| AdmissionGate::new(tx.clone(), rt.clone()))
+            .clone()
     }
 }
 
@@ -108,6 +167,20 @@ impl Transport for NatsTransport {
             .get()
             .cloned()
             .unwrap_or_else(|| WorkerAddress::from_encoded(Bytes::from_static(&[])))
+    }
+
+    /// The connection's negotiated `max_payload`, less the
+    /// [`NATS_HEADER_OVERHEAD`] this transport charges against it — literally
+    /// [`frame_capacity`](Self::frame_capacity), the same call `send_message`
+    /// makes before rejecting a frame.
+    ///
+    /// This is the one transport whose answer is truly negotiated: the value
+    /// arrives from whichever server the client is connected to *now*, so it
+    /// can differ between deployments and change under a reconnect. Never
+    /// `None` — a client that has not been told a limit yet still has one it
+    /// will enforce, and that is the number a caller needs.
+    fn max_message_size(&self, _target: InstanceId) -> Option<usize> {
+        Some(self.frame_capacity())
     }
 
     fn register(&self, peer_info: PeerInfo) -> Result<(), TransportError> {
@@ -137,7 +210,7 @@ impl Transport for NatsTransport {
         payload: Bytes,
         message_type: MessageType,
         on_error: Arc<dyn TransportErrorHandler>,
-    ) -> Result<(), SendBackpressure> {
+    ) -> SendOutcome {
         // Look up peer's NATS subject.
         let subject = match self.peers.get(&instance_id) {
             Some(entry) => entry.value().clone(),
@@ -147,26 +220,29 @@ impl Transport for NatsTransport {
                     payload,
                     format!("Peer not registered: {}", instance_id),
                 );
-                return Ok(());
+                return SendOutcome::Admitted;
             }
         };
 
-        // Check total frame size against max_payload (LIFECYCLE-02 enforcement).
-        // NATS max_payload covers the total HPUB size (headers + payload).
-        // Conservative estimate: ~64 bytes for Velo NATS header overhead.
-        const NATS_HEADER_OVERHEAD: usize = 64;
-        let total_size = header.len() + payload.len() + NATS_HEADER_OVERHEAD;
-        let max = self.max_payload.load(Ordering::Relaxed);
-        if total_size > max {
+        // Check the frame against what this connection will carry right now
+        // (LIFECYCLE-02 enforcement). NATS `max_payload` covers the total HPUB
+        // size, which is what `frame_capacity` has already discounted — and it
+        // is the same call `max_message_size` answers with, so a frame sized
+        // against the report is never rejected here.
+        let frame_size = header.len() + payload.len();
+        if frame_size > self.frame_capacity() {
+            let max = self.client.max_payload();
             on_error.on_error(
                 header,
                 payload,
                 format!(
                     "Frame size {} exceeds NATS max_payload {} for peer {}",
-                    total_size, max, instance_id
+                    frame_size + NATS_HEADER_OVERHEAD,
+                    max,
+                    instance_id
                 ),
             );
-            return Ok(());
+            return SendOutcome::Admitted;
         }
 
         let task = NatsSendTask {
@@ -177,40 +253,23 @@ impl Transport for NatsTransport {
             on_error,
         };
 
-        // Lock-free read via OnceLock — no mutex on the hot path.
-        let tx = match self.sender_tx.get() {
-            Some(tx) => tx,
-            None => {
-                task.on_error.on_error(
-                    task.header,
-                    task.payload,
-                    "NATS transport not started".into(),
-                );
-                return Ok(());
-            }
+        // Lock-free reads via OnceLock — no mutex on the hot path.
+        let (Some(tx), Some(rt)) = (self.sender_tx.get(), self.runtime.get()) else {
+            task.on_error.on_error(
+                task.header,
+                task.payload,
+                "NATS transport not started".into(),
+            );
+            return SendOutcome::Admitted;
         };
 
-        let r = try_send_or_backpressure(
-            tx,
-            task,
-            |task| {
-                task.on_error
-                    .on_error(task.header, task.payload, "NATS sender task exited".into());
-            },
-            |task| {
-                task.on_error.on_error(
-                    task.header,
-                    task.payload,
-                    "NATS sender task exited (backpressure)".into(),
-                );
-            },
-        );
+        let outcome = self.gate_for(instance_id, tx, rt).send(task);
         if let Some(m) = self.metrics.get()
-            && r.is_err()
+            && !outcome.is_admitted()
         {
             m.record_send_backpressure();
         }
-        r
+        outcome
     }
 
     fn start(
@@ -223,10 +282,15 @@ impl Transport for NatsTransport {
         let _ = self.shutdown_state.set(channels.shutdown_state.clone());
 
         Box::pin(async move {
-            // LIFECYCLE-02: Read max_payload from server_info
-            let max = self.client.server_info().max_payload;
-            self.max_payload.store(max, Ordering::Relaxed);
-            tracing::info!(max_payload = max, "NATS max_payload from server_info");
+            // LIFECYCLE-02: log what this connection will carry. Nothing is
+            // cached from it — `frame_capacity` re-reads the client each time,
+            // so a reconnect that renegotiates `max_payload` moves both the
+            // report and the check without anyone having to refresh anything.
+            tracing::info!(
+                max_payload = self.client.max_payload(),
+                frame_capacity = self.frame_capacity(),
+                "NATS max_payload for this connection"
+            );
 
             // TRANSPORT-03: Build WorkerAddress with "nats" entry containing inbound subject
             let subject = subjects::inbound_subject(&self.cluster_id, instance_id);
@@ -738,196 +802,19 @@ impl NatsTransportBuilder {
             local_address: OnceLock::new(),
             peers: Arc::new(DashMap::new()),
             sender_tx: OnceLock::new(),
+            gates: DashMap::new(),
             sender_capacity: self.sender_capacity,
             runtime: OnceLock::new(),
             cancel_token: CancellationToken::new(),
             begin_shutdown_token: CancellationToken::new(),
             shutdown_state: OnceLock::new(),
-            max_payload: Arc::new(AtomicUsize::new(usize::MAX)),
             metrics: OnceLock::new(),
         }
     }
 }
 
+// `#[path]` keeps the tests beside their siblings as `nats/tests.rs`; the
+// default resolution would bury them in a one-file `nats/transport/` directory.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::transports::transport::make_channels;
-
-    #[test]
-    fn test_begin_drain_flips_shutdown_state() {
-        // Test the begin_drain logic directly via ShutdownState.
-        // Since constructing a full NatsTransport requires a NATS client,
-        // we verify the ShutdownState component independently.
-        let state = ShutdownState::new();
-        assert!(!state.is_draining());
-        state.begin_drain();
-        assert!(state.is_draining());
-    }
-
-    #[test]
-    fn test_route_frame_response_routes_during_drain() {
-        // Verify that route_frame routes Response frames even when draining.
-        // The drain gate is in run_receive_loop, not route_frame — so route_frame
-        // should always route regardless. This confirms D-04.
-        let (adapter, streams) = make_channels();
-        adapter.shutdown_state.begin_drain();
-        assert!(adapter.shutdown_state.is_draining());
-
-        // Build a mock NATS message with Velo-Type=1 (Response), Velo-HLen=3
-        let mut headers = async_nats::HeaderMap::new();
-        headers.insert(HEADER_VELO_TYPE, "1"); // Response
-        headers.insert(HEADER_VELO_HLEN, "3");
-        let msg = async_nats::Message {
-            subject: "test".into(),
-            reply: None,
-            payload: Bytes::from_static(b"hdrpay"),
-            headers: Some(headers),
-            status: None,
-            description: None,
-            length: 0,
-        };
-
-        route_frame(&msg, &adapter, "nats", None);
-
-        // Response should be routed to response_stream
-        let result = streams.response_stream.try_recv();
-        assert!(
-            result.is_ok(),
-            "Response frame must be routed even during drain"
-        );
-        let (header, payload) = result.unwrap();
-        assert_eq!(&header[..], b"hdr");
-        assert_eq!(&payload[..], b"pay");
-    }
-
-    #[test]
-    fn test_route_frame_event_routes_during_drain() {
-        let (adapter, streams) = make_channels();
-        adapter.shutdown_state.begin_drain();
-
-        let mut headers = async_nats::HeaderMap::new();
-        headers.insert(HEADER_VELO_TYPE, "3"); // Event
-        headers.insert(HEADER_VELO_HLEN, "2");
-        let msg = async_nats::Message {
-            subject: "test".into(),
-            reply: None,
-            payload: Bytes::from_static(b"evbody"),
-            headers: Some(headers),
-            status: None,
-            description: None,
-            length: 0,
-        };
-
-        route_frame(&msg, &adapter, "nats", None);
-
-        let result = streams.event_stream.try_recv();
-        assert!(
-            result.is_ok(),
-            "Event frame must be routed even during drain"
-        );
-    }
-
-    #[test]
-    fn test_route_frame_message_routes_when_not_draining() {
-        // route_frame always routes — the drain gate is in the loop, not route_frame.
-        // This verifies Message frames do reach message_stream when NOT draining.
-        let (adapter, streams) = make_channels();
-        assert!(!adapter.shutdown_state.is_draining());
-
-        let mut headers = async_nats::HeaderMap::new();
-        headers.insert(HEADER_VELO_TYPE, "0"); // Message
-        headers.insert(HEADER_VELO_HLEN, "4");
-        let msg = async_nats::Message {
-            subject: "test".into(),
-            reply: None,
-            payload: Bytes::from_static(b"hdrrpayload"),
-            headers: Some(headers),
-            status: None,
-            description: None,
-            length: 0,
-        };
-
-        route_frame(&msg, &adapter, "nats", None);
-
-        let result = streams.message_stream.try_recv();
-        assert!(
-            result.is_ok(),
-            "Message frame must be routed when not draining"
-        );
-        let (header, payload) = result.unwrap();
-        assert_eq!(&header[..], b"hdrr");
-        assert_eq!(&payload[..], b"payload");
-    }
-
-    #[test]
-    fn test_shutting_down_response_type_value() {
-        // Verify ShuttingDown is type 4 (used in drain gate Velo-Type header)
-        assert_eq!(MessageType::ShuttingDown as u8, 4);
-    }
-
-    #[test]
-    fn test_build_nats_frame_header_and_payload() {
-        let header = Bytes::from_static(b"hdr");
-        let payload = Bytes::from_static(b"payload");
-        let (nats_headers, nats_payload) =
-            build_nats_frame(MessageType::Message, &header, &payload);
-
-        assert_eq!(nats_headers.get(HEADER_VELO_TYPE).unwrap().as_str(), "0");
-        assert_eq!(nats_headers.get(HEADER_VELO_HLEN).unwrap().as_str(), "3");
-        assert_eq!(&nats_payload[..], b"hdrpayload");
-    }
-
-    #[test]
-    fn test_build_nats_frame_empty_header() {
-        let header = Bytes::new();
-        let payload = Bytes::from_static(b"payload");
-        let (nats_headers, nats_payload) =
-            build_nats_frame(MessageType::Response, &header, &payload);
-
-        assert_eq!(nats_headers.get(HEADER_VELO_TYPE).unwrap().as_str(), "1");
-        assert_eq!(nats_headers.get(HEADER_VELO_HLEN).unwrap().as_str(), "0");
-        assert_eq!(&nats_payload[..], b"payload");
-    }
-
-    #[test]
-    fn test_build_nats_frame_empty_payload() {
-        let header = Bytes::from_static(b"hdr");
-        let payload = Bytes::new();
-        let (nats_headers, nats_payload) = build_nats_frame(MessageType::Event, &header, &payload);
-
-        assert_eq!(nats_headers.get(HEADER_VELO_TYPE).unwrap().as_str(), "3");
-        assert_eq!(nats_headers.get(HEADER_VELO_HLEN).unwrap().as_str(), "3");
-        assert_eq!(&nats_payload[..], b"hdr");
-    }
-
-    #[test]
-    fn test_build_nats_frame_both_empty() {
-        let header = Bytes::new();
-        let payload = Bytes::new();
-        let (nats_headers, nats_payload) = build_nats_frame(MessageType::Ack, &header, &payload);
-
-        assert_eq!(nats_headers.get(HEADER_VELO_TYPE).unwrap().as_str(), "2");
-        assert_eq!(nats_headers.get(HEADER_VELO_HLEN).unwrap().as_str(), "0");
-        assert!(nats_payload.is_empty());
-    }
-
-    #[test]
-    fn test_build_nats_frame_all_message_types() {
-        for (msg_type, expected) in [
-            (MessageType::Message, "0"),
-            (MessageType::Response, "1"),
-            (MessageType::Ack, "2"),
-            (MessageType::Event, "3"),
-            (MessageType::ShuttingDown, "4"),
-        ] {
-            let (headers, _) = build_nats_frame(msg_type, &Bytes::new(), &Bytes::new());
-            assert_eq!(
-                headers.get(HEADER_VELO_TYPE).unwrap().as_str(),
-                expected,
-                "Velo-Type mismatch for {:?}",
-                msg_type
-            );
-        }
-    }
-}
+#[path = "tests.rs"]
+mod tests;

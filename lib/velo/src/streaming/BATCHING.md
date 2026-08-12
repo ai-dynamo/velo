@@ -12,11 +12,12 @@ frames destined for that peer into a single active message.
 
 It is written for two audiences. If you operate a velo deployment, the
 [Motivation](#motivation) and [Configuration](#configuration) sections tell you
-whether this helps you and what switching it on will look like once the mux
-phases land. If you are implementing or reviewing it, the rest is the protocol
-specification and the argument for why it is correct.
+whether this helps you and what switching it on looks like. If you are
+implementing or reviewing it, the rest is the protocol specification and the
+argument for why it is correct.
 
-Status: **P0–P3 implemented; P4–P11 specified.** See
+Status: **P0–P3, P7 and P8 implemented; the rest specified.** The mux is
+therefore selectable — opt-in, off by default, negotiated per attach. See
 [Implementation status](#implementation-status).
 
 ---
@@ -169,8 +170,8 @@ no allocation. `handle.unpack().0` *is* the batching key.
 ### Riding the Messenger
 
 The mux is a `MessengerMuxTransport` implementing the streaming `FrameTransport`
-contract, and it **replaces** the deprecated `VeloFrameTransport` rather than
-sitting beside it. There is no dial, listener, acceptor or connection manager:
+contract, and it **replaced** the deprecated `VeloFrameTransport` rather than
+sitting beside it — that transport is deleted. There is no dial, listener, acceptor or connection manager:
 records for a peer are packed into `_stream_batch` active messages and handed to
 the Messenger, which already holds connectivity to every peer this node talks to
 and already knows who sent what.
@@ -211,11 +212,15 @@ batch header:
   [u64 peer_epoch][u32 batch_seq]
 
 payload = record_count × record:
-  [u8 record_type][u32 BE slot][u32 BE frame_seq][u32 BE len][len bytes body]
+  [u8 record_type][u32 slot][u32 frame_seq][u32 len][len bytes body]
 
 record_type: 0 = Data, 1 = OpenSlot, 2 = CloseSlot,
              3 = CreditUpdate, 4 = SlotHeartbeat
 ```
+
+**Every multi-byte field is big-endian, header and record alike.** Stated once
+here rather than per field, because a single exception would be the kind of
+thing an implementor discovers from a corrupted length rather than from a spec.
 
 The epoch is bumped whenever the sender's view of the peer is re-established;
 `batch_seq` advances within it and is compared modulo, since an epoch outlives a
@@ -274,7 +279,12 @@ while it is in flight; the ordering consequence is dealt with in [Slots](#slots)
 ```
 SlotId = (u24 index, u8 generation)   packed into a u32,
          scoped by the sender's peer epoch
+
+  bits 31..8 : index        bits 7..0 : generation
 ```
+
+Index in the high bits so the raw `u32` sorts by index, which is the order a
+dense table is walked in.
 
 A dense index means demux is a `Vec` lookup rather than a hash. At 60 KiB
 batches this is roughly 1100 records per batch, so the per-record lookup is the
@@ -401,6 +411,15 @@ and a per-slot byte cap (default 1 MiB). Frame credit gives the
 no-head-of-line-blocking proof, byte credit the memory bound — different jobs,
 both needed.
 
+The two grants can disagree — `C` records of a megabyte each against a
+one-megabyte slot cap — and where they do, the byte side wins by **throttling
+the next grant rather than refusing a record whose frame credit was already
+given**. Refusing would break a stream for a peer that respected everything it
+was told; withholding credit stops the peer at the next window instead. The
+ahead-of-sequence hold is the one place a byte reservation may still refuse,
+because there the alternative is unbounded growth behind a gap that may never
+close.
+
 **Control and data travel in separate lanes.** `finalize`, `detach` and `Drop`
 use a *synchronous* channel send, which must stay non-blocking under mux. The
 egress inlet is therefore split into an unbounded **control lane** (`OpenSlot`,
@@ -409,6 +428,36 @@ control-first. Unbounded is safe because control volume is O(live slots), which
 credit already bounds. This incidentally fixes a latent hazard that exists
 *today*: `Drop`'s synchronous send on a full 4096-deep channel blocks a runtime
 worker thread from inside a `Drop` in async context.
+
+> **The split lane is not what P7 built.** `FrameTransport::connect` hands the
+> caller one `flume::Sender<Vec<u8>>` and nothing in that seam distinguishes a
+> terminal from a token, so there is no second lane to drain first. Splitting it
+> means changing a published `velo-ext` trait — a typed sink in place of a byte
+> channel, which belongs with the P11 discussion below rather than ahead of
+> negotiation.
+>
+> What P7 does instead is **drain the inlet unconditionally**. A slot with no
+> credit still has its records pulled, into a per-slot withheld queue bounded by
+> the slot byte cap, so the channel a synchronous send targets is never the thing
+> that is full. The hazard is closed; the ordering guarantee is unchanged, since
+> the queue is FIFO and a terminal in it waits for its predecessors exactly as it
+> would have on the wire.
+>
+> The cost is that a producer running past the byte cap on a slot nobody is
+> draining **kills that slot** — consumer sees `Dropped`, other slots untouched,
+> metered as `withheld_overflow`. That is the per-slot slow-consumer kill this
+> document prefers to the watchdog kill, made deterministic; `SATURATION.md`
+> describes it from the operator's side.
+
+The batcher's own control inlet is bounded the same way, and for the same
+reason. Credit returns, closes and singleton resolutions arrive as **coalesced
+per-slot state** rather than as messages: credit accumulates into a `u32`, a
+close dominates the credit for its slot, and a failed singleton dominates a
+successful one. A queue would have been unbounded exactly when it matters — a
+flush parks on admission precisely when the peer is congested, which is when its
+ingress lane is busiest returning credit — so the batcher is *woken*, never fed.
+Attach requests keep a queue, bounded, because each carries its own channel and
+its own waiting caller and there is nothing to merge.
 
 Credit returns get their own priority lane, so a peer whose egress is congested
 never stops returning your credit.
@@ -572,15 +621,28 @@ The mux is selected at **attach time**, not announced by a wire magic — there 
 no first-bytes handshake left to hide one in. No new negotiation mechanism is
 needed either. `AnchorAttachResponse::Ok` and its MPSC twin already carry
 `streaming_transport_key`, and the sender already resolves it against its
-transport registry. Two changes:
+transport registry. Two changes, implemented in `streaming/negotiation.rs`:
 
 1. `AnchorAttachRequest` and `MpscAnchorAttachRequest` each gain
    `#[serde(default)] supported_transport_keys: Vec<TransportKey>`. Additive and
    internal to `velo`; `serde(default)` means an older sender still deserializes,
-   as one advertising nothing, which is exactly right.
-2. The attach handlers currently hardcode the local default transport's key.
-   They instead intersect the sender's advertised keys with their own installed
-   transports, preferring `messenger-mux-v1`.
+   as one advertising nothing, which is exactly right — an empty list cannot
+   intersect, so such a sender is always answered with the receiver's default
+   key.
+2. The attach handlers no longer hardcode the local default transport's key.
+   They intersect the sender's advertised keys with their own installed
+   transports, preferring `messenger-mux-v1`, and answer with the credit fields
+   above when that is what they picked.
+
+The sender then reads the answer. A key that is not `messenger-mux-v1` is the
+legacy path and the credit fields are not its business, which is where every
+older receiver lands. `messenger-mux-v1` **with** a window opens a slot already
+holding it. `messenger-mux-v1` with **no** window is refused outright rather than
+retried elsewhere: no shipped version answers that key, and a node that installs
+a mux cannot be configured to advertise a zero window, so it can only mean a peer
+that bound a mux receiver and then told us to ignore it — and connecting over any
+other transport would reach nothing it is listening on, hanging until the
+anchor's watchdog fires instead of failing where the mistake is.
 
 A node with the mux enabled registers **both** `messenger-mux-v1` and its
 configured legacy transport, so it still serves legacy peers. That is required
@@ -597,24 +659,27 @@ where one anchor kind rides the mux and the other does not.
 
 ## Configuration
 
-> **Proposed API.** Nothing in this snippet exists yet — `.messenger_mux(...)`
-> and `MuxConfig` land with P7/P8. It is written down now so the activation
-> shape is reviewed with the protocol rather than improvised after it.
-
 ```rust
 let node = Velo::builder()
     .add_transport(transport)
     // The legacy path stays configured; negotiation picks per attach.
     .stream_config(StreamConfig::Tcp(Some(TcpConfig { bind_addr })))?
     .messenger_mux(MuxConfig {
-        enabled: true,                       // default: false
-        flush: FlushPolicy::Opportunistic,   // default
-        max_batch_bytes: 60 * 1024,          // further clamped by the eager budget
+        enabled: true,                // default: false
+        max_batch_bytes: 60 * 1024,   // further clamped by the eager budget
+        initial_credit: 256,          // advertised verbatim; zero is refused
         ..Default::default()
     })?
     .build()
     .await?;
 ```
+
+> **One knob is still unwritten.** The flush policy is not configurable: the
+> batcher is opportunistic and has no `FlushPolicy` to set, because the windowed
+> and hinted alternatives arrive with P9. `initial_credit` may not be zero —
+> zero is the wire encoding of "not offering the mux", so a node configured that
+> way would advertise a key and then tell every peer to ignore it, and the build
+> refuses it.
 
 Activation is opt-in and stays that way for this work; the mux is not the default
 transport. Defaults are otherwise chosen so `enabled` is the only decision an
@@ -765,10 +830,10 @@ State up front what would sink this, then check each:
 | **P2** | Streaming per-socket coalescing | none | implemented |
 | **P3** | Ordered per-sender AM dispatch (`DispatchMode::Ordered`) | none | implemented |
 | **P4** | gRPC `Channel` caching per peer | none | specified |
-| **P5** | Ordered transport admission, `SendOutcome::Pending` | none | specified |
-| **P6** | Eager-size guidance, `Transport::max_message_size` | none | specified |
-| **P7** | `MessengerMuxTransport` — `_stream_batch`, `PeerBatcher`, slots, credit | yes | specified |
-| **P8** | Attach-time negotiation, opt-in activation switch | additive | specified |
+| **P5** | Ordered transport admission, `SendOutcome::Pending` | none | implemented |
+| **P6** | Eager-size guidance, `Transport::max_message_size` | none | implemented |
+| **P7** | `MessengerMuxTransport` — `_stream_batch`, `PeerBatcher`, slots, credit | yes | implemented |
+| **P8** | Attach-time negotiation, opt-in activation switch | additive | implemented |
 | **P9** | Hint API (`StreamBatch`), windowed policy | none | specified |
 | **P10** | Heartbeat suppression and phase alignment | none | specified |
 | **P11** | Lift the mux surface into `velo-ext` | none | specified |
@@ -780,8 +845,48 @@ which the cost model predicts is the largest single term, without protocol risk.
 
 P5 and P6 are prerequisites, not preliminaries: without admission the batcher has
 no ordered per-target way to discover congestion, and without the eager budget it
-cannot size a batch the Messenger will carry inline. P7 does not start until both
-land, and until P8 lands it is dead code behind a false switch.
+cannot size a batch the Messenger will carry inline. P7 did not start until both
+landed, and P8 is what made it reachable: before it, the attach handlers
+hardcoded the local default transport key and nothing ever answered
+`messenger-mux-v1`.
+
+Two names in the protocol specification above did not survive contact, both on
+the receive side and neither changing what happens:
+
+- **There is no `bind_muxed`.** The mux implements the plain
+  `FrameTransport::bind`, which registers `(anchor_id, session_id)` in an
+  ingress registry and hands back the `C + 1` receiver the spec describes; a
+  peer's `OpenSlot` is what claims that registration. A second bind method
+  would have had nothing to add, because the window it would have taken is not
+  known at bind time — the *receiver* chooses it, and the sender learns it from
+  the attach response. `connect_negotiated` is where that number enters, on the
+  send side.
+- **`reader_pump` is unchanged.** It drains the receiver `bind` returned into
+  `frame_tx` exactly as it does for any other transport, which is what the spec
+  asks for; the credit hook below is the part that landed differently.
+
+P8 also closed the first of the two P7 deviations this document used to record.
+**Initial credit is no longer advertised by a `CreditUpdate` on `OpenSlot`** — a
+slot opens already holding the window the attach response carried, which removes
+the round trip that cost before the first token. Keeping both would have granted
+the sender `2C` against a `C + 1` buffer, so it was a swap rather than an
+addition; ongoing credit returns still ride `CreditUpdate`.
+
+The second stands:
+
+- **Credit is returned by reconciling buffer occupancy**, not by `reader_pump`
+  calling `credit.release(1)`. The mux compares what it admitted against what is
+  still queued, on every inbound batch and on a periodic sweep. The effect is
+  the same and the sweep bounds the latency; what it costs is a return arriving
+  one sweep tick late when no further batch comes to drive reconciliation on the
+  arrival path. The sweep is also what un-parks a sender whose peer has gone
+  quiet.
+
+One detail differs on the merits rather than on ordering. `CloseSlot` is
+bidirectional with no direction bit, and both sides may hold a slot at the same
+dense index, so the **reason carries the direction**: `TerminalSent` and
+`PeerGone` travel owner → receiver, `UnknownSlot` and `ProtocolError` travel
+receiver → owner.
 
 ### Why the mux surface is not in `velo-ext` yet
 
@@ -797,6 +902,15 @@ tempting, and still deferred, is exposing a mux surface to out-of-tree
    muxes into a void. If it lands, it should be *one* method
    `as_mux() -> Option<&dyn MuxTransport>` returning a separate trait with no
    defaults.
+
+   Whatever shape it takes, **the seam should carry a typed sink rather than a
+   `flume::Sender<Vec<u8>>`**. The byte channel is why P7 cannot split control
+   from data: a terminal and a token are indistinguishable in it, so the only
+   way to keep a synchronous terminal send from blocking is to drain everything
+   and bound the overflow. A sink that accepts `Frame::{Data, Terminal, …}`
+   would let the transport reserve capacity for the records that must never
+   queue behind data, which is what "control and data travel in separate lanes"
+   above actually asks for.
 2. **The blob-pipe abstraction may be permanently wrong.** An RDMA transport
    already multiplexes natively per queue pair; forcing it to serialize into a
    byte stream so velo can chop it back up is a pessimization. Removing a

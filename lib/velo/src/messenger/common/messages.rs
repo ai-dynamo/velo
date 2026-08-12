@@ -14,6 +14,16 @@ const CURRENT_SCHEMA_VERSION: u8 = 1;
 const MAX_HEADER_VALUE_LEN: usize = 1024;
 const MAX_HEADERS_LEN: usize = 16384;
 
+/// Fixed-size prefix every encoded active-message header begins with:
+/// `schema_version` (1) + `response_type` (1) + `response_id` (16) +
+/// `handler_name_len` (2) + `headers_len` (2). Every remaining byte of the
+/// header is handler name or MessagePack-encoded headers.
+///
+/// [`encode_active_message`] sizes its buffer with it, [`decode_active_message`]
+/// rejects anything shorter, and [`envelope_overhead`] starts from it — one
+/// number so the three cannot drift apart.
+pub(crate) const FIXED_HEADER_SIZE: usize = 1 + 1 + 16 + 2 + 2;
+
 #[derive(Debug, Clone)]
 pub(crate) struct ActiveMessage {
     pub metadata: MessageMetadata,
@@ -131,7 +141,7 @@ impl ResponseType {
 
 #[derive(Debug, Error)]
 pub(crate) enum DecodeError {
-    #[error("Header too short: expected at least 20 bytes")]
+    #[error("Header too short: expected at least {FIXED_HEADER_SIZE} bytes")]
     HeaderTooShort,
 
     #[error("Invalid handler name length")]
@@ -202,7 +212,7 @@ pub(crate) fn encode_active_message(
 
     // Calculate total header size
     let headers_len = headers_bytes.as_ref().map(|b| b.len()).unwrap_or(0);
-    let header_size = 20 + handler_name_len + 2 + headers_len; // +2 for headers_len field
+    let header_size = FIXED_HEADER_SIZE + handler_name_len + headers_len;
     let mut header = BytesMut::with_capacity(header_size);
 
     // Encode fixed fields
@@ -220,6 +230,125 @@ pub(crate) fn encode_active_message(
 
     let message_type = message.metadata.response_type.to_message_type();
     Ok((header.freeze(), message.payload, message_type))
+}
+
+/// Largest entry count `rmp` writes with a bare `FixMap` marker.
+const MSGPACK_FIXMAP_MAX_ENTRIES: usize = 15;
+/// Largest entry count `rmp` writes with `Map16` (marker + `u16` length).
+const MSGPACK_MAP16_MAX_ENTRIES: usize = u16::MAX as usize;
+/// Longest string `rmp` writes with a bare `FixStr` marker.
+const MSGPACK_FIXSTR_MAX_LEN: usize = 31;
+/// Longest string `rmp` writes with `Str8` (marker + `u8` length).
+const MSGPACK_STR8_MAX_LEN: usize = u8::MAX as usize;
+/// Longest string `rmp` writes with `Str16` (marker + `u16` length).
+const MSGPACK_STR16_MAX_LEN: usize = u16::MAX as usize;
+/// Bytes a bare `Fix*` marker occupies — the length rides in the marker byte.
+const MSGPACK_FIX_MARKER_BYTES: usize = 1;
+/// Bytes a marker plus a `u8` length occupies.
+const MSGPACK_U8_LEN_BYTES: usize = 1 + 1;
+/// Bytes a marker plus a `u16` length occupies.
+const MSGPACK_U16_LEN_BYTES: usize = 1 + 2;
+/// Bytes a marker plus a `u32` length occupies.
+const MSGPACK_U32_LEN_BYTES: usize = 1 + 4;
+
+/// Bytes `rmp` spends on the map header for `entries` key/value pairs.
+fn msgpack_map_header_len(entries: usize) -> usize {
+    if entries <= MSGPACK_FIXMAP_MAX_ENTRIES {
+        MSGPACK_FIX_MARKER_BYTES
+    } else if entries <= MSGPACK_MAP16_MAX_ENTRIES {
+        MSGPACK_U16_LEN_BYTES
+    } else {
+        MSGPACK_U32_LEN_BYTES
+    }
+}
+
+/// Bytes `rmp` spends on one header entry, both markers included.
+fn msgpack_entry_len(key: &str, value: &str) -> usize {
+    msgpack_str_len(key.len()) + msgpack_str_len(value.len())
+}
+
+/// Bytes `rmp` spends on a string of `len` bytes, marker included.
+fn msgpack_str_len(len: usize) -> usize {
+    let marker = if len <= MSGPACK_FIXSTR_MAX_LEN {
+        MSGPACK_FIX_MARKER_BYTES
+    } else if len <= MSGPACK_STR8_MAX_LEN {
+        MSGPACK_U8_LEN_BYTES
+    } else if len <= MSGPACK_STR16_MAX_LEN {
+        MSGPACK_U16_LEN_BYTES
+    } else {
+        MSGPACK_U32_LEN_BYTES
+    };
+    marker + len
+}
+
+/// Bytes [`encode_active_message`] puts in front of the payload for a message
+/// with this handler name and header set — the messenger's wire envelope.
+///
+/// A caller sizing a payload against a transport's
+/// [`max_message_size`](velo_ext::Transport::max_message_size) needs this,
+/// because that number bounds `header + payload` *together*: what is left for
+/// the payload is the transport's number less this one.
+///
+/// The three terms mirror the encoder exactly:
+///
+/// ```text
+/// FIXED_HEADER_SIZE (22) + handler_name.len() + rmp_serde::to_vec(headers).len()
+/// ```
+///
+/// The MessagePack term is derived from `rmp`'s marker widths rather than
+/// serialized, so this costs no allocation and can be called per send. The
+/// derivation is pinned against the real encoder in the tests, including at
+/// every marker-width boundary, which is where an analytic copy of an encoder
+/// goes wrong if it is going to.
+///
+/// `injected` is the set the send path merges over `headers` on its way to the
+/// encoder — the distributed-tracing context — and is sized *without* the merge
+/// being performed: the union is counted across the two maps rather than built,
+/// so sizing a send never duplicates the caller's headers. That matters because
+/// the caller's map is arbitrary and unvalidated at this point: the 1 KiB per
+/// value and 16 KiB total limits are the encoder's, enforced in
+/// [`encode_active_message`] and not here.
+///
+/// Collisions go to `injected`, because the merge is
+/// [`HashMap::insert`](std::collections::HashMap::insert) and the injector runs
+/// last: a key in both is counted once, at its injected value's size.
+///
+/// Note `None` and `Some(empty map)` differ by one byte: the encoder writes no
+/// MessagePack at all for a message whose headers are `None`, and an empty
+/// `FixMap` marker for `Some`. So a message carries a map on the wire when
+/// *either* argument is `Some` — which is why `injected` is an `Option` too,
+/// rather than an empty map standing in for "nothing injected".
+pub(crate) fn envelope_overhead(
+    handler_name: &str,
+    headers: Option<&HashMap<String, String>>,
+    injected: Option<&HashMap<String, String>>,
+) -> usize {
+    let headers_len = if headers.is_none() && injected.is_none() {
+        0
+    } else {
+        // Entries the caller supplied that survive the merge, counted and
+        // measured in one pass over a map this function only ever reads.
+        let (kept_entries, kept_bytes) = headers.map_or((0, 0), |headers| {
+            headers
+                .iter()
+                .filter(|(key, _)| {
+                    injected.is_none_or(|injected| !injected.contains_key(key.as_str()))
+                })
+                .fold((0, 0), |(entries, bytes), (key, value)| {
+                    (entries + 1, bytes + msgpack_entry_len(key, value))
+                })
+        });
+        let injected_bytes: usize = injected.map_or(0, |injected| {
+            injected
+                .iter()
+                .map(|(key, value)| msgpack_entry_len(key, value))
+                .sum()
+        });
+        msgpack_map_header_len(kept_entries + injected.map_or(0, HashMap::len))
+            + kept_bytes
+            + injected_bytes
+    };
+    FIXED_HEADER_SIZE + handler_name.len() + headers_len
 }
 
 /// Best-effort decode of just the `ResponseId` from an active-message request
@@ -250,8 +379,8 @@ pub(crate) fn decode_active_message(
 ) -> Result<ActiveMessage, DecodeError> {
     let mut header = header;
 
-    // Validate minimum size (now 22 bytes: original 20 + 2 for headers_len)
-    if header.len() < 22 {
+    // Validate minimum size: the fixed prefix must be present in full.
+    if header.len() < FIXED_HEADER_SIZE {
         return Err(DecodeError::HeaderTooShort);
     }
 
@@ -306,427 +435,4 @@ pub(crate) fn decode_active_message(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn decode_response_id_from_request_header_roundtrip() {
-        let response_id = ResponseId::from_u128(0xDEAD_BEEF_CAFE_F00D_1234_5678_90AB_CDEF);
-        let (header, _, _) = ActiveMessage {
-            metadata: MessageMetadata::new_unary(response_id, "h".to_string(), None),
-            payload: Bytes::from_static(b""),
-        }
-        .encode()
-        .unwrap();
-
-        let decoded = decode_response_id_from_request_header(&header).unwrap();
-        assert_eq!(decoded.as_u128(), response_id.as_u128());
-    }
-
-    #[test]
-    fn decode_response_id_rejects_truncated_header() {
-        let short = Bytes::from_static(&[1u8, 0, 0, 0]);
-        assert!(decode_response_id_from_request_header(&short).is_none());
-    }
-
-    #[test]
-    fn decode_response_id_rejects_wrong_schema() {
-        // 18 bytes, but schema_version = 0 (invalid)
-        let mut bad = vec![0u8; 18];
-        bad[1] = 2; // valid response_type
-        let header = Bytes::from(bad);
-        assert!(decode_response_id_from_request_header(&header).is_none());
-    }
-
-    #[test]
-    fn decode_response_id_rejects_invalid_response_type() {
-        let mut bad = vec![0u8; 18];
-        bad[0] = CURRENT_SCHEMA_VERSION;
-        bad[1] = 99; // not a valid ResponseType
-        let header = Bytes::from(bad);
-        assert!(decode_response_id_from_request_header(&header).is_none());
-    }
-
-    #[test]
-    fn decode_response_id_rejects_response_format_header() {
-        // Response headers start with the 16-byte response_id directly (no
-        // schema_version byte), so interpreting byte 0 as a schema_version
-        // will almost never match 1, and byte 1 almost never matches a valid
-        // ResponseType. Verify this with a deliberate worst case: response_id
-        // whose first LE byte is 1 (looks like schema_version 1) AND second
-        // LE byte is 0 (looks like ResponseType::FireAndForget = 0). Even
-        // then, decode returns the response_id as-is — but it will not match
-        // any local awaiter because the encoded bits don't line up with
-        // ResponseManager's key layout for this worker. We assert only that
-        // decode does not panic on arbitrary bytes.
-        let header = Bytes::from(vec![1u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-        // No panic; may return Some (opaque id that won't match any awaiter).
-        let _ = decode_response_id_from_request_header(&header);
-    }
-
-    #[test]
-    fn test_handler_name_at_u16_max_succeeds() {
-        // Create a handler name with exactly u16::MAX bytes (65,535 bytes)
-        let handler_name = "a".repeat(u16::MAX as usize);
-        let response_id = ResponseId::from_u128(12345);
-
-        let message = ActiveMessage {
-            metadata: MessageMetadata::new_unary(response_id, handler_name.clone(), None),
-            payload: Bytes::from_static(b"test payload"),
-        };
-
-        // Should encode successfully
-        let result = message.encode();
-        assert!(
-            result.is_ok(),
-            "Handler name at u16::MAX should encode successfully"
-        );
-
-        let (header, payload, _) = result.unwrap();
-
-        // Decode and verify
-        let decoded = decode_active_message(header, payload).unwrap();
-        assert_eq!(decoded.metadata.handler_name, handler_name);
-    }
-
-    #[test]
-    fn test_handler_name_exceeds_u16_max_fails() {
-        // Create a handler name with u16::MAX + 1 bytes (65,536 bytes)
-        let handler_name = "a".repeat(u16::MAX as usize + 1);
-        let response_id = ResponseId::from_u128(12345);
-
-        let message = ActiveMessage {
-            metadata: MessageMetadata::new_unary(response_id, handler_name.clone(), None),
-            payload: Bytes::from_static(b"test payload"),
-        };
-
-        // Should fail to encode
-        let result = message.encode();
-        assert!(
-            result.is_err(),
-            "Handler name exceeding u16::MAX should fail to encode"
-        );
-
-        match result {
-            Err(EncodeError::HandlerNameTooLong(len)) => {
-                assert_eq!(len, u16::MAX as usize + 1);
-            }
-            _ => panic!("Expected HandlerNameTooLong error"),
-        }
-    }
-
-    #[test]
-    fn test_handler_name_way_too_long_fails() {
-        // Create a handler name that's way too long (1 MB)
-        let handler_name = "a".repeat(1024 * 1024);
-        let response_id = ResponseId::from_u128(12345);
-
-        let message = ActiveMessage {
-            metadata: MessageMetadata::new_unary(response_id, handler_name, None),
-            payload: Bytes::from_static(b"test payload"),
-        };
-
-        // Should fail to encode
-        let result = message.encode();
-        assert!(
-            result.is_err(),
-            "Very large handler name should fail to encode"
-        );
-    }
-
-    #[test]
-    fn test_normal_handler_name_succeeds() {
-        // Test a normal-sized handler name
-        let handler_name = "my_handler".to_string();
-        let response_id = ResponseId::from_u128(12345);
-
-        let message = ActiveMessage {
-            metadata: MessageMetadata::new_unary(response_id, handler_name.clone(), None),
-            payload: Bytes::from_static(b"test payload"),
-        };
-
-        // Should encode and decode successfully
-        let (header, payload, _) = message.encode().unwrap();
-        let decoded = decode_active_message(header, payload).unwrap();
-        assert_eq!(decoded.metadata.handler_name, handler_name);
-    }
-
-    // ============================================================================
-    // Headers Tests
-    // ============================================================================
-
-    #[test]
-    fn test_headers_encode_decode_round_trip() {
-        // Test encoding and decoding with headers
-        let handler_name = "test_handler".to_string();
-        let response_id = ResponseId::from_u128(12345);
-        let mut headers = HashMap::new();
-        headers.insert("trace-id".to_string(), "abc123".to_string());
-        headers.insert("span-id".to_string(), "def456".to_string());
-
-        let message = ActiveMessage {
-            metadata: MessageMetadata::new_unary(
-                response_id,
-                handler_name.clone(),
-                Some(headers.clone()),
-            ),
-            payload: Bytes::from_static(b"test payload"),
-        };
-
-        // Encode
-        let (header, payload, _) = message.encode().unwrap();
-
-        // Decode
-        let decoded = decode_active_message(header, payload).unwrap();
-
-        // Verify
-        assert_eq!(decoded.metadata.handler_name, handler_name);
-        assert_eq!(
-            decoded.metadata.response_id.as_u128(),
-            response_id.as_u128()
-        );
-        assert!(decoded.metadata.headers.is_some());
-        let decoded_headers = decoded.metadata.headers.unwrap();
-        assert_eq!(decoded_headers.len(), 2);
-        assert_eq!(decoded_headers.get("trace-id").unwrap(), "abc123");
-        assert_eq!(decoded_headers.get("span-id").unwrap(), "def456");
-    }
-
-    #[test]
-    fn test_headers_none_encodes_with_zero_length() {
-        // Test that None headers encodes with headers_len=0
-        let handler_name = "test_handler".to_string();
-        let response_id = ResponseId::from_u128(12345);
-
-        let message = ActiveMessage {
-            metadata: MessageMetadata::new_unary(response_id, handler_name.clone(), None),
-            payload: Bytes::from_static(b"test payload"),
-        };
-
-        // Encode
-        let (header, payload, _) = message.encode().unwrap();
-
-        // The header should be: 1 + 1 + 16 + 2 + handler_name.len() + 2 (for headers_len=0)
-        let expected_len = 1 + 1 + 16 + 2 + handler_name.len() + 2;
-        assert_eq!(header.len(), expected_len);
-
-        // Decode
-        let decoded = decode_active_message(header, payload).unwrap();
-        assert!(decoded.metadata.headers.is_none());
-    }
-
-    #[test]
-    fn test_headers_empty_map_encodes_successfully() {
-        // Test that empty HashMap encodes (but should be minimal)
-        let handler_name = "test_handler".to_string();
-        let response_id = ResponseId::from_u128(12345);
-        let headers = HashMap::new();
-
-        let message = ActiveMessage {
-            metadata: MessageMetadata::new_unary(response_id, handler_name.clone(), Some(headers)),
-            payload: Bytes::from_static(b"test payload"),
-        };
-
-        // Encode and decode
-        let (header, payload, _) = message.encode().unwrap();
-        let decoded = decode_active_message(header, payload).unwrap();
-
-        assert!(decoded.metadata.headers.is_some());
-        assert_eq!(decoded.metadata.headers.unwrap().len(), 0);
-    }
-
-    #[test]
-    fn test_headers_per_value_size_limit() {
-        // Test that header values exceeding 1KB are rejected
-        let handler_name = "test_handler".to_string();
-        let response_id = ResponseId::from_u128(12345);
-        let mut headers = HashMap::new();
-
-        // Create a value that's exactly 1KB (should succeed)
-        let value_1kb = "a".repeat(1024);
-        headers.insert("large-header".to_string(), value_1kb);
-
-        let message = ActiveMessage {
-            metadata: MessageMetadata::new_unary(response_id, handler_name.clone(), Some(headers)),
-            payload: Bytes::from_static(b"test payload"),
-        };
-
-        // Should succeed at exactly 1KB
-        let result = message.encode();
-        assert!(result.is_ok(), "1KB value should encode successfully");
-    }
-
-    #[test]
-    fn test_headers_per_value_size_exceeds_limit() {
-        // Test that header values exceeding 1KB are rejected
-        let handler_name = "test_handler".to_string();
-        let response_id = ResponseId::from_u128(12345);
-        let mut headers = HashMap::new();
-
-        // Create a value that's 1KB + 1 byte (should fail)
-        let value_too_large = "a".repeat(1025);
-        headers.insert("large-header".to_string(), value_too_large);
-
-        let message = ActiveMessage {
-            metadata: MessageMetadata::new_unary(response_id, handler_name.clone(), Some(headers)),
-            payload: Bytes::from_static(b"test payload"),
-        };
-
-        // Should fail
-        let result = message.encode();
-        assert!(result.is_err(), "1KB+1 value should fail to encode");
-
-        match result {
-            Err(EncodeError::HeaderValueTooLarge(key, size)) => {
-                assert_eq!(key, "large-header");
-                assert_eq!(size, 1025);
-            }
-            _ => panic!("Expected HeaderValueTooLarge error"),
-        }
-    }
-
-    #[test]
-    fn test_headers_total_size_limit() {
-        // Test that total headers exceeding 16KB are rejected
-        let handler_name = "test_handler".to_string();
-        let response_id = ResponseId::from_u128(12345);
-        let mut headers = HashMap::new();
-
-        // Create many headers that together exceed 16KB when serialized
-        // Each value is 500 bytes, which is under per-header limit
-        // But we'll add enough to exceed 16KB total
-        for i in 0..40 {
-            let key = format!("header-{}", i);
-            let value = "x".repeat(500);
-            headers.insert(key, value);
-        }
-
-        let message = ActiveMessage {
-            metadata: MessageMetadata::new_unary(response_id, handler_name.clone(), Some(headers)),
-            payload: Bytes::from_static(b"test payload"),
-        };
-
-        // Should fail due to total size
-        let result = message.encode();
-        assert!(result.is_err(), "Total size exceeding 16KB should fail");
-
-        match result {
-            Err(EncodeError::TotalHeadersTooLarge(size)) => {
-                assert!(size > 16384, "Size should exceed 16KB");
-            }
-            _ => panic!("Expected TotalHeadersTooLarge error"),
-        }
-    }
-
-    #[test]
-    fn test_headers_with_special_characters() {
-        // Test headers with special characters, unicode, etc.
-        let handler_name = "test_handler".to_string();
-        let response_id = ResponseId::from_u128(12345);
-        let mut headers = HashMap::new();
-        headers.insert("emoji".to_string(), "🚀🎉".to_string());
-        headers.insert("unicode".to_string(), "你好世界".to_string());
-        headers.insert("special".to_string(), "a\nb\tc\"d'e".to_string());
-
-        let message = ActiveMessage {
-            metadata: MessageMetadata::new_unary(
-                response_id,
-                handler_name.clone(),
-                Some(headers.clone()),
-            ),
-            payload: Bytes::from_static(b"test payload"),
-        };
-
-        // Encode and decode
-        let (header, payload, _) = message.encode().unwrap();
-        let decoded = decode_active_message(header, payload).unwrap();
-
-        // Verify special characters preserved
-        let decoded_headers = decoded.metadata.headers.unwrap();
-        assert_eq!(decoded_headers.get("emoji").unwrap(), "🚀🎉");
-        assert_eq!(decoded_headers.get("unicode").unwrap(), "你好世界");
-        assert_eq!(decoded_headers.get("special").unwrap(), "a\nb\tc\"d'e");
-    }
-
-    #[test]
-    fn test_headers_with_many_entries() {
-        // Test with many header entries (but within size limits)
-        let handler_name = "test_handler".to_string();
-        let response_id = ResponseId::from_u128(12345);
-        let mut headers = HashMap::new();
-
-        // Add 100 small headers
-        for i in 0..100 {
-            headers.insert(format!("key-{}", i), format!("value-{}", i));
-        }
-
-        let message = ActiveMessage {
-            metadata: MessageMetadata::new_unary(
-                response_id,
-                handler_name.clone(),
-                Some(headers.clone()),
-            ),
-            payload: Bytes::from_static(b"test payload"),
-        };
-
-        // Encode and decode
-        let (header, payload, _) = message.encode().unwrap();
-        let decoded = decode_active_message(header, payload).unwrap();
-
-        // Verify all headers present
-        let decoded_headers = decoded.metadata.headers.unwrap();
-        assert_eq!(decoded_headers.len(), 100);
-        assert_eq!(decoded_headers.get("key-42").unwrap(), "value-42");
-    }
-
-    #[test]
-    fn test_headers_all_response_types() {
-        // Test headers work with all response types
-        let handler_name = "test_handler".to_string();
-        let response_id = ResponseId::from_u128(12345);
-        let mut headers = HashMap::new();
-        headers.insert("test".to_string(), "value".to_string());
-
-        // FireAndForget
-        let msg_fire = ActiveMessage {
-            metadata: MessageMetadata::new_fire(
-                response_id,
-                handler_name.clone(),
-                Some(headers.clone()),
-            ),
-            payload: Bytes::from_static(b"test"),
-        };
-        let (h, p, _) = msg_fire.encode().unwrap();
-        let decoded = decode_active_message(h, p).unwrap();
-        assert_eq!(decoded.metadata.response_type, ResponseType::FireAndForget);
-        assert!(decoded.metadata.headers.is_some());
-
-        // AckNack
-        let msg_sync = ActiveMessage {
-            metadata: MessageMetadata::new_sync(
-                response_id,
-                handler_name.clone(),
-                Some(headers.clone()),
-            ),
-            payload: Bytes::from_static(b"test"),
-        };
-        let (h, p, _) = msg_sync.encode().unwrap();
-        let decoded = decode_active_message(h, p).unwrap();
-        assert_eq!(decoded.metadata.response_type, ResponseType::AckNack);
-        assert!(decoded.metadata.headers.is_some());
-
-        // Unary
-        let msg_unary = ActiveMessage {
-            metadata: MessageMetadata::new_unary(
-                response_id,
-                handler_name.clone(),
-                Some(headers.clone()),
-            ),
-            payload: Bytes::from_static(b"test"),
-        };
-        let (h, p, _) = msg_unary.encode().unwrap();
-        let decoded = decode_active_message(h, p).unwrap();
-        assert_eq!(decoded.metadata.response_type, ResponseType::Unary);
-        assert!(decoded.metadata.headers.is_some());
-    }
-}
+mod tests;

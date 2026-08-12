@@ -11,13 +11,11 @@
 use bytes::Bytes;
 use futures::future::BoxFuture;
 
+use crate::admission::SendOutcome;
 use crate::id::{InstanceId, PeerInfo, TransportKey, WorkerAddress};
 use crate::observability::TransportObservability;
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::task::{Context, Poll};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -187,102 +185,6 @@ pub enum ShutdownPolicy {
     Timeout(Duration),
 }
 
-/// Signal returned by [`Transport::send_message`] when the per-peer send channel
-/// was saturated at call time.
-///
-/// Semantics:
-/// - Caller must `.await` this to drive the deferred enqueue to completion.
-/// - Output is `()` — failures during the deferred send are reported via the
-///   [`TransportErrorHandler::on_error`] callback supplied to `send_message`,
-///   not via the future's return value (preserves fire-and-forget-with-callback
-///   semantics).
-/// - Dropping the future before it resolves cancels the pending send cleanly
-///   (the underlying `flume::send_async` future is drop-safe; the message is
-///   not enqueued). **`on_error` is NOT invoked on drop** — callers that need
-///   to observe dropped frames must track cancellation themselves.
-///
-/// Reordering: concurrent callers where one hits `Backpressured` and another
-/// fast-paths through `try_send` may land out of order at the remote. Callers
-/// that require strict FIFO must serialize their sends.
-pub struct SendBackpressure {
-    fut: BoxFuture<'static, ()>,
-}
-
-impl SendBackpressure {
-    /// Wrap a boxed future that drives the deferred send to completion.
-    pub fn new(fut: BoxFuture<'static, ()>) -> Self {
-        Self { fut }
-    }
-}
-
-impl Future for SendBackpressure {
-    type Output = ();
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        self.fut.as_mut().poll(cx)
-    }
-}
-
-impl std::fmt::Debug for SendBackpressure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SendBackpressure").finish_non_exhaustive()
-    }
-}
-
-/// Attempt a non-blocking enqueue on a bounded flume channel, converting the
-/// `Full` variant into a `SendBackpressure` future and the `Disconnected`
-/// variant into a reported error.
-///
-/// This collapses the identical pattern every `Transport` impl used to write
-/// inline: `try_send` → on `Full` wrap `send_async` in a bp future, on
-/// `Disconnected` call `on_disconnected(task)` and return `Ok(())`.
-#[inline]
-pub fn try_send_or_backpressure<T, FDisc, FClosed>(
-    tx: &flume::Sender<T>,
-    task: T,
-    on_disconnected: FDisc,
-    on_closed_during_bp: FClosed,
-) -> Result<(), SendBackpressure>
-where
-    T: Send + 'static,
-    FDisc: FnOnce(T),
-    FClosed: FnOnce(T) + Send + 'static,
-{
-    match tx.try_send(task) {
-        Ok(()) => Ok(()),
-        Err(flume::TrySendError::Full(task)) => {
-            let tx = tx.clone();
-            Err(SendBackpressure::new(Box::pin(async move {
-                if let Err(flume::SendError(task)) = tx.send_async(task).await {
-                    on_closed_during_bp(task);
-                }
-            })))
-        }
-        Err(flume::TrySendError::Disconnected(task)) => {
-            on_disconnected(task);
-            Ok(())
-        }
-    }
-}
-
-/// Outcome of a send through the runtime's backend dispatcher.
-///
-/// The outer `Result` on the dispatcher captures routing errors (peer not
-/// registered, no compatible transport). This enum captures the success case's
-/// enqueue status:
-///
-/// - [`SendOutcome::Enqueued`] — the frame was enqueued synchronously.
-/// - [`SendOutcome::Backpressured`] — the per-peer send channel was full;
-///   caller must `.await` the contained future to complete the send.
-#[derive(Debug)]
-pub enum SendOutcome {
-    /// The frame was enqueued synchronously on the per-peer send channel.
-    Enqueued,
-    /// The per-peer send channel was saturated. Callers must `.await` the
-    /// contained future to drive the deferred enqueue to completion.
-    Backpressured(SendBackpressure),
-}
-
 /// Abstraction over a single message transport (TCP, HTTP, NATS, gRPC, …).
 ///
 /// Implementations handle peer registration, message sending, listener
@@ -304,14 +206,29 @@ pub trait Transport: Send + Sync {
 
     /// Send an active message to the remote instance.
     ///
-    /// - `Ok(())` — the frame was enqueued synchronously on the per-peer send
-    ///   channel (fast path) *or* a hard error occurred and was reported via
-    ///   `on_error` (cold-start failure, transport not started, etc).
-    /// - `Err(SendBackpressure)` — the per-peer channel was full at call time;
-    ///   the caller must `.await` the returned future to complete enqueue.
+    /// The frame is taken unconditionally: implementations must not hand it
+    /// back, and the caller has no way to retract it. What the return value
+    /// reports is *when* the frame reached the per-target send channel.
     ///
-    /// The return type signals *backpressure*, not failure. All delivery
-    /// failures continue to flow through `on_error`.
+    /// - [`SendOutcome::Admitted`] — it is on the channel already. This is also
+    ///   what a hard pre-wire failure returns, once `on_error` has been called
+    ///   for it (peer unregistered, transport not started, oversized frame):
+    ///   there is nothing left for the caller to wait on either way.
+    /// - [`SendOutcome::Pending`] — the channel was saturated, so the frame is
+    ///   queued in the target's [`AdmissionGate`](crate::admission::AdmissionGate)
+    ///   behind its predecessors. The returned
+    ///   [`SendAdmission`](crate::admission::SendAdmission) resolves `Ok(())` when the frame is
+    ///   enqueued and `Err` when it never will be (the connection epoch died,
+    ///   the channel closed). Delivery does **not** depend on the caller
+    ///   polling it — dropping it is a legitimate fire-and-forget pattern.
+    ///
+    /// Implementations must route every send through one gate per target and
+    /// keep no `try_send` path around it: an admission that can be overtaken by
+    /// a later fast-path send is the reordering hazard the gate exists to
+    /// remove (see the [`admission`](crate::admission) module docs).
+    ///
+    /// Failures *after* admission — the write itself — continue to flow
+    /// through `on_error`.
     fn send_message(
         &self,
         instance_id: InstanceId,
@@ -319,7 +236,33 @@ pub trait Transport: Send + Sync {
         payload: Bytes,
         message_type: MessageType,
         on_error: Arc<dyn TransportErrorHandler>,
-    ) -> Result<(), SendBackpressure>;
+    ) -> SendOutcome;
+
+    /// Largest single message this transport will carry to `target`, in bytes.
+    ///
+    /// The number bounds `header.len() + payload.len()` for one
+    /// [`send_message`](Transport::send_message) — the *combined* frame
+    /// content, not the payload alone. A caller that prepends its own envelope
+    /// to the payload subtracts that envelope from this number; there is no
+    /// second allowance hiding behind it.
+    ///
+    /// `None` means this transport does not know its capacity: nothing was
+    /// negotiated, no limit is configured, or it has not started yet. It is
+    /// **not** a claim of unlimited capacity — a caller that reads `None` must
+    /// fall back to a conservative budget of its own choosing.
+    ///
+    /// The answer is per-target because it can be genuinely per-connection: a
+    /// NATS client learns `max_payload` from the server it happens to be
+    /// connected to, so two peers reached through two clients can differ.
+    /// Transports with a single static limit ignore the argument.
+    ///
+    /// Nothing about this method changes what `send_message` does with an
+    /// oversized frame — that still fails pre-wire through the send's
+    /// `on_error` handler. It exists so callers can size sends to avoid
+    /// meeting that failure at all.
+    fn max_message_size(&self, _target: InstanceId) -> Option<usize> {
+        None
+    }
 
     /// Start the transport (bind listener, spawn tasks) for the given instance.
     fn start(

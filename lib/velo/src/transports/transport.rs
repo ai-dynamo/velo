@@ -5,9 +5,17 @@
 //! [`velo_ext::transport`] and re-exported here for backwards compatibility
 //! while the workspace migrates to the two-crate (`velo` + `velo-ext`)
 //! layout.
+//!
+//! Send admission lives in [`velo_ext::admission`] rather than alongside the
+//! trait, because the gate is machinery a transport *uses* rather than part of
+//! the contract it implements. The types that do appear in
+//! [`Transport::send_message`]'s signature are re-exported here too, so callers
+//! reaching into `velo::transports::*` get one complete surface.
 
+pub use velo_ext::admission::{
+    AdmissionError, AdmissionGate, AdmissionState, SendAdmission, SendOutcome,
+};
 pub use velo_ext::transport::{
-    DataStreams, HealthCheckError, InFlightGuard, MessageType, SendBackpressure, SendOutcome,
-    ShutdownPolicy, ShutdownState, Transport, TransportAdapter, TransportError,
-    TransportErrorHandler, make_channels, try_send_or_backpressure,
+    DataStreams, HealthCheckError, InFlightGuard, MessageType, ShutdownPolicy, ShutdownState,
+    Transport, TransportAdapter, TransportError, TransportErrorHandler, make_channels,
 };

@@ -20,8 +20,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::transports::tcp::TcpFrameCodec;
 use crate::transports::transport::{
-    HealthCheckError, SendBackpressure, ShutdownState, TransportError, TransportErrorHandler,
-    try_send_or_backpressure,
+    AdmissionError, AdmissionGate, HealthCheckError, SendOutcome, ShutdownState, TransportError,
+    TransportErrorHandler,
 };
 use crate::transports::utils::interfaces::{
     InterfaceEndpoint, InterfaceFilter, parse_endpoints, resolve_advertise_endpoints,
@@ -82,9 +82,23 @@ pub struct GrpcTransport {
 }
 
 /// Handle to a connection's writer task.
+///
+/// One handle is one bidi stream. The gate is the only way frames enter `tx`,
+/// so per-stream FIFO holds no matter how many tasks are sending; `tx` is
+/// retained purely for the liveness probes (`is_disconnected`) that decide
+/// when a stream is stale.
 #[derive(Clone)]
 struct ConnectionHandle {
     tx: flume::Sender<SendTask>,
+    gate: AdmissionGate<SendTask>,
+}
+
+impl ConnectionHandle {
+    /// Kill this epoch: every frame still queued behind the gate belonged to a
+    /// stream that no longer exists, so none of them may ride the successor.
+    fn retire(&self) {
+        self.gate.fail_all(AdmissionError::ConnectionReplaced);
+    }
 }
 
 /// Task sent to the writer task containing frame data.
@@ -103,6 +117,21 @@ impl SendTask {
 }
 
 impl GrpcTransport {
+    /// Drop a dead connection's map entry, retiring its epoch first.
+    ///
+    /// The predicate keeps us from evicting a successor that another task
+    /// installed in the meantime; retiring before the entry disappears is what
+    /// guarantees the old epoch's queued frames fail rather than linger.
+    fn reap_stale_connection(&self, instance_id: crate::InstanceId) {
+        if let Some((_, stale)) = self
+            .connections
+            .remove_if(&instance_id, |_, h| h.tx.is_disconnected())
+        {
+            stale.retire();
+            self.update_connection_gauge();
+        }
+    }
+
     /// Get or create a connection to a peer (lazy initialization).
     fn get_or_create_connection(&self, instance_id: crate::InstanceId) -> Result<ConnectionHandle> {
         // Fast path: connection already exists and is alive.
@@ -112,9 +141,7 @@ impl GrpcTransport {
             }
             // Stale -- drop guard before mutating the map.
             drop(handle);
-            self.connections
-                .remove_if(&instance_id, |_, h| h.tx.is_disconnected());
-            self.update_connection_gauge();
+            self.reap_stale_connection(instance_id);
         }
 
         let rt = self.runtime.get().ok_or(TransportError::NotStarted)?;
@@ -124,6 +151,10 @@ impl GrpcTransport {
                 if !entry.get().tx.is_disconnected() {
                     entry.get().clone()
                 } else {
+                    // Retire the dead epoch before the successor is installed,
+                    // so no frame from the old stream can be observed as
+                    // pending on the new one.
+                    entry.get().retire();
                     let handle = self.create_connection(instance_id, rt)?;
                     entry.insert(handle.clone());
                     self.update_connection_gauge();
@@ -154,7 +185,10 @@ impl GrpcTransport {
             .value();
 
         let (tx, rx) = flume::bounded(self.channel_capacity);
-        let handle = ConnectionHandle { tx };
+        let handle = ConnectionHandle {
+            gate: AdmissionGate::new(tx.clone(), rt.clone()),
+            tx,
+        };
 
         let cancel = self.cancel_token.clone();
         let conns = Arc::clone(&self.connections);
@@ -193,39 +227,47 @@ impl GrpcTransport {
         }
     }
 
-    /// Slow path: establish (or reuse) a connection, then enqueue via the
-    /// shared backpressure helper.
-    fn slow_path_send(
-        &self,
-        instance_id: crate::InstanceId,
-        send_msg: SendTask,
-    ) -> Result<(), SendBackpressure> {
+    /// Slow path: establish (or reuse) a connection, then offer the frame to
+    /// its gate.
+    ///
+    /// A failure here is terminal for the frame, so it is reported through
+    /// `on_error` and the send reports [`SendOutcome::Admitted`] — there is
+    /// nothing for the caller to wait on.
+    fn slow_path_send(&self, instance_id: crate::InstanceId, send_msg: SendTask) -> SendOutcome {
         if self.runtime.get().is_none() {
             send_msg.on_error("Transport not started");
-            return Ok(());
+            return SendOutcome::Admitted;
         }
         let handle = match self.get_or_create_connection(instance_id) {
             Ok(h) => h,
             Err(e) => {
                 send_msg.on_error(format!("Failed to create connection: {}", e));
-                return Ok(());
+                return SendOutcome::Admitted;
             }
         };
-        let r = try_send_or_backpressure(
-            &handle.tx,
-            send_msg,
-            |msg| msg.on_error("Connection closed immediately"),
-            |msg| msg.on_error("Connection closed"),
-        );
+        self.admit(&handle, send_msg)
+    }
+
+    /// Offer one frame to a connection's gate, counting the saturated case.
+    fn admit(&self, handle: &ConnectionHandle, send_msg: SendTask) -> SendOutcome {
+        let outcome = handle.gate.send(send_msg);
         if let Some(m) = self.metrics.get()
-            && r.is_err()
+            && !outcome.is_admitted()
         {
             m.record_send_backpressure();
         }
-        r
+        outcome
     }
 }
 
+// `max_message_size` is left at the trait's `None`. This setup configures no
+// tonic message-size limit, so the only ceiling in play is tonic's own default
+// decode limit — a private `const` in `tonic::codec`, not a public item, so
+// mirroring its value here would be a number that drifts silently on the next
+// tonic bump with no test able to catch it. `None` says what is true: this
+// transport does not know its limit, so the caller falls back to a
+// conservative budget, which today lands an order of magnitude below tonic's
+// default anyway.
 impl Transport for GrpcTransport {
     fn key(&self) -> TransportKey {
         self.key.clone()
@@ -272,7 +314,7 @@ impl Transport for GrpcTransport {
         payload: Bytes,
         message_type: MessageType,
         on_error: Arc<dyn TransportErrorHandler>,
-    ) -> Result<(), SendBackpressure> {
+    ) -> SendOutcome {
         let send_msg = SendTask {
             msg_type: message_type,
             header,
@@ -280,28 +322,18 @@ impl Transport for GrpcTransport {
             on_error,
         };
 
-        // Fast path: try existing connection.
+        // Fast path: an established stream. The liveness probe comes first
+        // because a dead epoch's gate would swallow the frame; the gate itself
+        // then decides admitted-vs-queued, so there is no `try_send` here that
+        // could overtake a frame already queued behind it.
         if let Some(handle) = self.connections.get(&instance_id) {
-            match handle.tx.try_send(send_msg) {
-                Ok(()) => return Ok(()),
-                Err(flume::TrySendError::Full(send_msg)) => {
-                    if let Some(m) = self.metrics.get() {
-                        m.record_send_backpressure();
-                    }
-                    let tx = handle.tx.clone();
-                    return Err(SendBackpressure::new(Box::pin(async move {
-                        if let Err(flume::SendError(m)) = tx.send_async(send_msg).await {
-                            m.on_error("Connection closed");
-                        }
-                    })));
-                }
-                Err(flume::TrySendError::Disconnected(send_msg_out)) => {
-                    drop(handle);
-                    self.connections
-                        .remove_if(&instance_id, |_, h| h.tx.is_disconnected());
-                    self.update_connection_gauge();
-                    return self.slow_path_send(instance_id, send_msg_out);
-                }
+            let live = (!handle.tx.is_disconnected()).then(|| handle.clone());
+            // Release the shard guard before either admitting (which may spawn
+            // a driver) or mutating the map.
+            drop(handle);
+            match live {
+                Some(handle) => return self.admit(&handle, send_msg),
+                None => self.reap_stale_connection(instance_id),
             }
         }
         self.slow_path_send(instance_id, send_msg)
@@ -408,8 +440,7 @@ impl Transport for GrpcTransport {
                     return Ok(());
                 }
                 drop(handle);
-                self.connections
-                    .remove_if(&instance_id, |_, h| h.tx.is_disconnected());
+                self.reap_stale_connection(instance_id);
             }
 
             let addr = *self
@@ -476,8 +507,15 @@ async fn connection_writer_task(
 
     // Drop the receiver so our sender half becomes disconnected, then remove
     // the stale entry. The predicate ensures we only remove our own entry.
+    //
+    // Retiring the gate is what fails frames still queued behind it. Dropping
+    // `rx` would eventually fail them too (the driver's `send_async` sees a
+    // closed channel), but `ConnectionReplaced` names the cause and lands
+    // without waiting on the driver.
     drop(rx);
-    connections.remove_if(&instance_id, |_, h| h.tx.is_disconnected());
+    if let Some((_, stale)) = connections.remove_if(&instance_id, |_, h| h.tx.is_disconnected()) {
+        stale.retire();
+    }
     if let Some(metrics) = metrics.as_ref() {
         metrics.set_active_connections(connections.len());
     }
@@ -806,158 +844,8 @@ impl Default for GrpcTransportBuilder {
     }
 }
 
+// `#[path]` keeps the tests beside their siblings as `grpc/tests.rs`; the
+// default resolution would bury them in a one-file `grpc/transport/` directory.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::transports::address::WorkerAddressBuilder;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use velo_ext::PeerInfo;
-
-    struct TrackingErrorHandler {
-        count: AtomicUsize,
-    }
-
-    impl TrackingErrorHandler {
-        fn new() -> Self {
-            Self {
-                count: AtomicUsize::new(0),
-            }
-        }
-
-        fn error_count(&self) -> usize {
-            self.count.load(Ordering::SeqCst)
-        }
-    }
-
-    impl TransportErrorHandler for TrackingErrorHandler {
-        fn on_error(&self, _: Bytes, _: Bytes, _: String) {
-            self.count.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    fn make_grpc_peer(addr: SocketAddr) -> PeerInfo {
-        let instance_id = crate::InstanceId::new_v4();
-        let mut builder = WorkerAddressBuilder::new();
-        builder
-            .add_entry("grpc", format!("grpc://{}", addr).into_bytes())
-            .unwrap();
-        PeerInfo::new(instance_id, builder.build().unwrap())
-    }
-
-    #[test]
-    fn test_parse_grpc_endpoint() {
-        let addr = parse_grpc_endpoint(b"grpc://127.0.0.1:5555").unwrap();
-        assert_eq!(addr.port(), 5555);
-
-        let addr = parse_grpc_endpoint(b"127.0.0.1:6666").unwrap();
-        assert_eq!(addr.port(), 6666);
-
-        assert!(parse_grpc_endpoint(b"invalid").is_err());
-    }
-
-    #[test]
-    fn test_builder_default_prebinds() {
-        // Builder without explicit bind_addr should pre-bind to 0.0.0.0:0
-        let result = GrpcTransportBuilder::new().build();
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_builder_with_bind_addr() {
-        let addr = "127.0.0.1:0".parse().unwrap();
-        let result = GrpcTransportBuilder::new().bind_addr(addr).build();
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_builder_custom_key() {
-        let addr = "127.0.0.1:0".parse().unwrap();
-        let transport = GrpcTransportBuilder::new()
-            .bind_addr(addr)
-            .key(TransportKey::from("my-grpc"))
-            .build()
-            .unwrap();
-        assert_eq!(transport.key(), TransportKey::from("my-grpc"));
-    }
-
-    #[test]
-    fn test_register_peer_legacy_format() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let transport = GrpcTransportBuilder::new()
-            .from_listener(listener)
-            .unwrap()
-            .build()
-            .unwrap();
-
-        let peer_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
-        let peer = make_grpc_peer(peer_addr);
-        let iid = peer.instance_id();
-
-        transport.register(peer).unwrap();
-        assert!(transport.peers.contains_key(&iid));
-    }
-
-    #[test]
-    fn test_register_peer_no_endpoint() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let transport = GrpcTransportBuilder::new()
-            .from_listener(listener)
-            .unwrap()
-            .build()
-            .unwrap();
-
-        // Create a peer with a "tcp" entry, not "grpc"
-        let instance_id = crate::InstanceId::new_v4();
-        let mut builder = WorkerAddressBuilder::new();
-        builder
-            .add_entry("tcp", b"tcp://127.0.0.1:1234".to_vec())
-            .unwrap();
-        let peer = PeerInfo::new(instance_id, builder.build().unwrap());
-
-        let result = transport.register(peer);
-        assert!(matches!(result, Err(TransportError::NoEndpoint)));
-    }
-
-    #[test]
-    fn test_send_message_not_started() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let transport = GrpcTransportBuilder::new()
-            .from_listener(listener)
-            .unwrap()
-            .build()
-            .unwrap();
-
-        let error_handler = Arc::new(TrackingErrorHandler::new());
-        transport
-            .send_message(
-                crate::InstanceId::new_v4(),
-                Bytes::from_static(b"header"),
-                Bytes::from_static(b"payload"),
-                MessageType::Message,
-                error_handler.clone(),
-            )
-            .expect("send returns Ok and reports via on_error");
-
-        assert_eq!(error_handler.error_count(), 1);
-    }
-
-    #[test]
-    fn test_builder_multi_endpoint_format() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let transport = GrpcTransportBuilder::new()
-            .from_listener(listener)
-            .unwrap()
-            .build()
-            .unwrap();
-
-        // The address should contain msgpack-encoded endpoints
-        let wa = transport.address();
-        let raw = wa.get_entry("grpc").unwrap().unwrap();
-        let endpoints: Vec<InterfaceEndpoint> = rmp_serde::from_slice(&raw).unwrap();
-        assert!(!endpoints.is_empty());
-        for ep in &endpoints {
-            assert_eq!(ep.port, addr.port());
-        }
-    }
-}
+#[path = "tests.rs"]
+mod tests;

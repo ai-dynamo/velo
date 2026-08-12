@@ -17,8 +17,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::transports::transport::{
-    HealthCheckError, SendBackpressure, ShutdownState, TransportError, TransportErrorHandler,
-    try_send_or_backpressure,
+    AdmissionError, AdmissionGate, HealthCheckError, SendOutcome, ShutdownState, TransportError,
+    TransportErrorHandler,
 };
 use crate::transports::utils::interfaces::{
     InterfaceEndpoint, InterfaceFilter, parse_endpoints, resolve_advertise_endpoints,
@@ -26,6 +26,7 @@ use crate::transports::utils::interfaces::{
 };
 use velo_ext::{MessageType, PeerInfo, Transport, TransportAdapter, TransportKey, WorkerAddress};
 
+use super::framing::DEFAULT_MAX_FRAME_SIZE;
 use super::listener::TcpListener;
 use crate::transports::coalesce::{
     Coalescable, WriterFailure, WriterObserver, run_coalescing_writer,
@@ -76,10 +77,25 @@ pub struct TcpTransport {
     shrink_threshold: usize,
 }
 
-/// Handle to a connection's writer task
+/// Handle to a connection's writer task.
+///
+/// One handle is one connection epoch. The gate is the only way frames enter
+/// `tx`, so per-connection FIFO holds no matter how many tasks are sending;
+/// `tx` is retained purely for the liveness probes (`is_disconnected`) that
+/// decide when an epoch is stale.
 #[derive(Clone)]
 struct ConnectionHandle {
     tx: flume::Sender<SendTask>,
+    gate: AdmissionGate<SendTask>,
+}
+
+impl ConnectionHandle {
+    /// Kill this epoch: every frame still queued behind the gate belonged to a
+    /// connection that no longer exists, so none of them may ride the
+    /// successor.
+    fn retire(&self) {
+        self.gate.fail_all(AdmissionError::ConnectionReplaced);
+    }
 }
 
 /// Task sent to writer task containing pre-encoded frame
@@ -140,6 +156,21 @@ impl TcpTransport {
         Ok(())
     }
 
+    /// Drop a dead connection's map entry, retiring its epoch first.
+    ///
+    /// The predicate keeps us from evicting a successor that another task
+    /// installed in the meantime; retiring before the entry disappears is what
+    /// guarantees the old epoch's queued frames fail rather than linger.
+    fn reap_stale_connection(&self, instance_id: crate::InstanceId) {
+        if let Some((_, stale)) = self
+            .connections
+            .remove_if(&instance_id, |_, h| h.tx.is_disconnected())
+        {
+            stale.retire();
+            self.update_connection_gauge();
+        }
+    }
+
     /// Get or create a connection to a peer (lazy initialization)
     fn get_or_create_connection(&self, instance_id: crate::InstanceId) -> Result<ConnectionHandle> {
         // Fast path: connection already exists and is alive
@@ -149,9 +180,7 @@ impl TcpTransport {
             }
             // Stale — drop guard before mutating the map
             drop(handle);
-            self.connections
-                .remove_if(&instance_id, |_, h| h.tx.is_disconnected());
-            self.update_connection_gauge();
+            self.reap_stale_connection(instance_id);
         }
 
         let rt = self.runtime.get().ok_or(TransportError::NotStarted)?;
@@ -162,7 +191,10 @@ impl TcpTransport {
                 if !entry.get().tx.is_disconnected() {
                     entry.get().clone()
                 } else {
-                    // Stale entry — replace in-place with a fresh connection
+                    // Stale entry — retire the dead epoch before the successor
+                    // is installed, so no frame from the old connection can be
+                    // observed as pending on the new one.
+                    entry.get().retire();
                     let handle = self.create_connection(instance_id, rt)?;
                     entry.insert(handle.clone());
                     self.update_connection_gauge();
@@ -193,7 +225,10 @@ impl TcpTransport {
             .value();
 
         let (tx, rx) = flume::bounded(self.channel_capacity);
-        let handle = ConnectionHandle { tx };
+        let handle = ConnectionHandle {
+            gate: AdmissionGate::new(tx.clone(), rt.clone()),
+            tx,
+        };
 
         let cancel = self.cancel_token.clone();
         let conns = Arc::clone(&self.connections);
@@ -225,36 +260,36 @@ impl TcpTransport {
         }
     }
 
-    /// Slow path: establish (or reuse) a connection, then enqueue via the
-    /// shared backpressure helper.
-    fn slow_path_send(
-        &self,
-        instance_id: crate::InstanceId,
-        send_msg: SendTask,
-    ) -> Result<(), SendBackpressure> {
+    /// Slow path: establish (or reuse) a connection, then offer the frame to
+    /// its gate.
+    ///
+    /// A failure here is terminal for the frame, so it is reported through
+    /// `on_error` and the send reports [`SendOutcome::Admitted`] — there is
+    /// nothing for the caller to wait on.
+    fn slow_path_send(&self, instance_id: crate::InstanceId, send_msg: SendTask) -> SendOutcome {
         if self.runtime.get().is_none() {
             send_msg.on_error("Transport not started");
-            return Ok(());
+            return SendOutcome::Admitted;
         }
         let handle = match self.get_or_create_connection(instance_id) {
             Ok(h) => h,
             Err(e) => {
                 send_msg.on_error(format!("Failed to create connection: {}", e));
-                return Ok(());
+                return SendOutcome::Admitted;
             }
         };
-        let r = try_send_or_backpressure(
-            &handle.tx,
-            send_msg,
-            |msg| msg.on_error("Connection closed immediately"),
-            |msg| msg.on_error("Connection closed"),
-        );
+        self.admit(&handle, send_msg)
+    }
+
+    /// Offer one frame to a connection's gate, counting the saturated case.
+    fn admit(&self, handle: &ConnectionHandle, send_msg: SendTask) -> SendOutcome {
+        let outcome = handle.gate.send(send_msg);
         if let Some(m) = self.metrics.get()
-            && r.is_err()
+            && !outcome.is_admitted()
         {
             m.record_send_backpressure();
         }
-        r
+        outcome
     }
 }
 
@@ -265,6 +300,19 @@ impl Transport for TcpTransport {
 
     fn address(&self) -> WorkerAddress {
         self.local_address.clone()
+    }
+
+    /// The codec's frame ceiling, which is already stated in the units this
+    /// method wants: `TcpFrameCodec::validate_lengths_limit` caps
+    /// `header_len + payload_len`, and the 11-byte preamble is written
+    /// *outside* that sum. There is nothing to subtract.
+    ///
+    /// Static and identical for every peer — `build_preamble` validates
+    /// against [`DEFAULT_MAX_FRAME_SIZE`] itself, so a codec constructed with
+    /// `with_max_frame_size` moves only what this process will *decode*, never
+    /// what it will encode.
+    fn max_message_size(&self, _target: crate::InstanceId) -> Option<usize> {
+        Some(DEFAULT_MAX_FRAME_SIZE as usize)
     }
 
     fn register(&self, peer_info: PeerInfo) -> Result<(), TransportError> {
@@ -307,7 +355,7 @@ impl Transport for TcpTransport {
         payload: Bytes,
         message_type: MessageType,
         on_error: std::sync::Arc<dyn TransportErrorHandler>,
-    ) -> Result<(), SendBackpressure> {
+    ) -> SendOutcome {
         let send_msg = SendTask {
             msg_type: message_type,
             header,
@@ -315,29 +363,18 @@ impl Transport for TcpTransport {
             on_error,
         };
 
-        // Fast path: try existing connection.
+        // Fast path: an established connection. The liveness probe comes first
+        // because a dead epoch's gate would swallow the frame; the gate itself
+        // then decides admitted-vs-queued, so there is no `try_send` here that
+        // could overtake a frame already queued behind it.
         if let Some(handle) = self.connections.get(&instance_id) {
-            match handle.tx.try_send(send_msg) {
-                Ok(()) => return Ok(()),
-                Err(flume::TrySendError::Full(send_msg)) => {
-                    if let Some(m) = self.metrics.get() {
-                        m.record_send_backpressure();
-                    }
-                    let tx = handle.tx.clone();
-                    return Err(SendBackpressure::new(Box::pin(async move {
-                        if let Err(flume::SendError(m)) = tx.send_async(send_msg).await {
-                            m.on_error("Connection closed");
-                        }
-                    })));
-                }
-                Err(flume::TrySendError::Disconnected(send_msg_out)) => {
-                    // Drop the guard before mutating the map, then fall
-                    // through to the slow path to create a fresh connection.
-                    drop(handle);
-                    self.connections
-                        .remove_if(&instance_id, |_, h| h.tx.is_disconnected());
-                    return self.slow_path_send(instance_id, send_msg_out);
-                }
+            let live = (!handle.tx.is_disconnected()).then(|| handle.clone());
+            // Release the shard guard before either admitting (which may spawn
+            // a driver) or mutating the map.
+            drop(handle);
+            match live {
+                Some(handle) => return self.admit(&handle, send_msg),
+                None => self.reap_stale_connection(instance_id),
             }
         }
         self.slow_path_send(instance_id, send_msg)
@@ -445,8 +482,7 @@ impl Transport for TcpTransport {
                 }
                 // Channel is disconnected — drop guard and remove stale entry
                 drop(handle);
-                self.connections
-                    .remove_if(&instance_id, |_, h| h.tx.is_disconnected());
+                self.reap_stale_connection(instance_id);
             }
 
             // No existing connection or connection is dead - verify peer is reachable
@@ -510,8 +546,17 @@ async fn connection_writer_task(
     // Drop the receiver so our sender half becomes disconnected, then remove
     // the stale entry. The predicate ensures we only remove our own entry —
     // a replacement connection's tx will still be connected.
+    //
+    // Retiring the gate is what fails frames still queued behind it. Dropping
+    // `rx` would eventually fail them too (the driver's `send_async` sees a
+    // closed channel), but `ConnectionReplaced` names the cause and lands
+    // without waiting on the driver. If the entry was already replaced, the
+    // successor's gate is a different one and the old gate's frames take the
+    // closed-channel route instead.
     drop(rx);
-    connections.remove_if(&instance_id, |_, h| h.tx.is_disconnected());
+    if let Some((_, stale)) = connections.remove_if(&instance_id, |_, h| h.tx.is_disconnected()) {
+        stale.retire();
+    }
     if let Some(metrics) = metrics.as_ref() {
         metrics.set_active_connections(connections.len());
     }
@@ -814,420 +859,8 @@ impl Default for TcpTransportBuilder {
     }
 }
 
+// `#[path]` keeps the tests beside their siblings as `tcp/tests.rs`; the
+// default resolution would bury them in a one-file `tcp/transport/` directory.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::transports::address::WorkerAddressBuilder;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use velo_ext::PeerInfo;
-
-    /// Error handler that discards errors (for tests that don't need to track them).
-    struct NullErrorHandler;
-    impl TransportErrorHandler for NullErrorHandler {
-        fn on_error(&self, _: Bytes, _: Bytes, _: String) {}
-    }
-
-    /// Error handler that counts errors (for tests that verify error routing).
-    struct TrackingErrorHandler {
-        count: AtomicUsize,
-    }
-
-    impl TrackingErrorHandler {
-        fn new() -> Self {
-            Self {
-                count: AtomicUsize::new(0),
-            }
-        }
-
-        fn error_count(&self) -> usize {
-            self.count.load(Ordering::SeqCst)
-        }
-    }
-
-    impl TransportErrorHandler for TrackingErrorHandler {
-        fn on_error(&self, _: Bytes, _: Bytes, _: String) {
-            self.count.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    /// Build a `PeerInfo` whose TCP endpoint points at `addr` using legacy format.
-    fn make_tcp_peer(addr: SocketAddr) -> PeerInfo {
-        let instance_id = crate::InstanceId::new_v4();
-        let mut builder = WorkerAddressBuilder::new();
-        builder
-            .add_entry("tcp", format!("tcp://{}", addr).into_bytes())
-            .unwrap();
-        PeerInfo::new(instance_id, builder.build().unwrap())
-    }
-
-    /// Build a `PeerInfo` whose TCP endpoint uses the new multi-endpoint format.
-    fn make_tcp_peer_multi(endpoints: Vec<InterfaceEndpoint>) -> PeerInfo {
-        let instance_id = crate::InstanceId::new_v4();
-        let mut builder = WorkerAddressBuilder::new();
-        let encoded = rmp_serde::to_vec(&endpoints).unwrap();
-        builder.add_entry("tcp", encoded).unwrap();
-        PeerInfo::new(instance_id, builder.build().unwrap())
-    }
-
-    /// Build a `TcpTransport` with its runtime set, bound to a real listener.
-    /// Returns `(transport, listener_addr)`.
-    fn make_transport() -> (TcpTransport, SocketAddr) {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let transport = TcpTransportBuilder::new()
-            .from_listener(listener)
-            .unwrap()
-            .build()
-            .unwrap();
-        // Set the runtime handle so `get_or_create_connection` can spawn tasks.
-        transport
-            .runtime
-            .set(tokio::runtime::Handle::current())
-            .ok();
-        (transport, addr)
-    }
-
-    /// Insert a stale `ConnectionHandle` into the transport's connections map.
-    /// A "stale" handle is one whose receiver has been dropped.
-    fn insert_stale_handle(transport: &TcpTransport, instance_id: crate::InstanceId) {
-        let (tx, _rx) = flume::bounded::<SendTask>(1);
-        // Drop _rx immediately so tx.is_disconnected() == true
-        transport
-            .connections
-            .insert(instance_id, ConnectionHandle { tx });
-    }
-
-    #[test]
-    fn test_parse_tcp_endpoint() {
-        // With tcp:// prefix
-        let addr = parse_tcp_endpoint(b"tcp://127.0.0.1:5555").unwrap();
-        assert_eq!(addr.port(), 5555);
-
-        // Without prefix
-        let addr = parse_tcp_endpoint(b"127.0.0.1:6666").unwrap();
-        assert_eq!(addr.port(), 6666);
-
-        // Invalid
-        assert!(parse_tcp_endpoint(b"invalid").is_err());
-    }
-
-    #[test]
-    fn test_builder_default_prebinds() {
-        // Builder without explicit bind_addr should pre-bind to 0.0.0.0:0
-        let result = TcpTransportBuilder::new().build();
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_builder_with_bind_addr() {
-        let addr = "127.0.0.1:0".parse().unwrap();
-        let result = TcpTransportBuilder::new().bind_addr(addr).build();
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_builder_with_listener() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let result = TcpTransportBuilder::new().from_listener(listener);
-        assert!(result.is_ok());
-        let result = result.unwrap().build();
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_builder_bind_addr_and_listener_mutually_exclusive() {
-        let addr = "127.0.0.1:0".parse().unwrap();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let result = TcpTransportBuilder::new()
-            .bind_addr(addr)
-            .from_listener(listener);
-        assert!(result.is_err());
-        let err_msg = format!("{}", result.err().unwrap());
-        assert!(err_msg.contains("mutually exclusive"));
-    }
-
-    #[test]
-    fn test_builder_multi_endpoint_format() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let transport = TcpTransportBuilder::new()
-            .from_listener(listener)
-            .unwrap()
-            .build()
-            .unwrap();
-
-        // The address should contain msgpack-encoded endpoints
-        let wa = transport.address();
-        let raw = wa.get_entry("tcp").unwrap().unwrap();
-        let endpoints: Vec<InterfaceEndpoint> = rmp_serde::from_slice(&raw).unwrap();
-        assert!(!endpoints.is_empty());
-        // All endpoints should have the correct port
-        for ep in &endpoints {
-            assert_eq!(ep.port, addr.port());
-        }
-    }
-
-    #[tokio::test]
-    async fn test_register_legacy_format() {
-        let (transport, _our_addr) = make_transport();
-        let peer_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
-        let peer = make_tcp_peer(peer_addr);
-        let iid = peer.instance_id();
-        // Legacy "tcp://host:port" format should still work
-        transport.register(peer).unwrap();
-        assert!(transport.peers.contains_key(&iid));
-    }
-
-    #[tokio::test]
-    async fn test_register_multi_endpoint_format() {
-        let (transport, _our_addr) = make_transport();
-        let endpoints = vec![InterfaceEndpoint {
-            name: "eth0".to_string(),
-            ip: "127.0.0.1".to_string(),
-            port: 9999,
-            prefix_len: 8,
-            numa_node: None,
-        }];
-        let peer = make_tcp_peer_multi(endpoints);
-        let iid = peer.instance_id();
-        transport.register(peer).unwrap();
-        assert!(transport.peers.contains_key(&iid));
-    }
-
-    #[tokio::test]
-    async fn test_get_or_create_connection_replaces_stale_handle() {
-        let (transport, _our_addr) = make_transport();
-
-        // Start a listener that the transport can connect to
-        let peer_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let peer_addr = peer_listener.local_addr().unwrap();
-
-        let peer = make_tcp_peer(peer_addr);
-        let iid = peer.instance_id();
-        transport.register(peer).unwrap();
-
-        // Insert a stale handle
-        insert_stale_handle(&transport, iid);
-        assert!(
-            transport
-                .connections
-                .get(&iid)
-                .unwrap()
-                .tx
-                .is_disconnected()
-        );
-
-        // get_or_create_connection should replace the stale handle with a live one
-        let handle = transport.get_or_create_connection(iid).unwrap();
-        assert!(!handle.tx.is_disconnected());
-
-        // The map entry should also be live
-        let entry = transport.connections.get(&iid).unwrap();
-        assert!(!entry.tx.is_disconnected());
-    }
-
-    #[tokio::test]
-    async fn test_check_health_removes_stale_entry() {
-        let (transport, _our_addr) = make_transport();
-
-        // Start a listener so the peer is "reachable"
-        let peer_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let peer_addr = peer_listener.local_addr().unwrap();
-
-        let peer = make_tcp_peer(peer_addr);
-        let iid = peer.instance_id();
-        transport.register(peer).unwrap();
-
-        // Insert stale handle — simulates a dead writer task
-        insert_stale_handle(&transport, iid);
-        assert!(transport.connections.contains_key(&iid));
-
-        // check_health should remove the stale entry and verify the peer is reachable
-        let result = transport.check_health(iid, Duration::from_secs(2)).await;
-
-        // Stale entry should be gone
-        assert!(!transport.connections.contains_key(&iid));
-
-        // Since there WAS a previous connection entry, check_health returns Ok
-        // (the peer is reachable via our test listener)
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_writer_task_cleans_up_on_write_error() {
-        // Bind a listener, accept once, then drop everything to cause a write error
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let iid = crate::InstanceId::new_v4();
-        let (tx, rx) = flume::bounded::<SendTask>(8);
-
-        let connections: Arc<DashMap<crate::InstanceId, ConnectionHandle>> =
-            Arc::new(DashMap::new());
-        connections.insert(iid, ConnectionHandle { tx: tx.clone() });
-
-        let conns = Arc::clone(&connections);
-        let cancel = CancellationToken::new();
-
-        // Spawn the writer task
-        let writer = tokio::spawn(connection_writer_task(
-            addr,
-            iid,
-            rx,
-            conns,
-            cancel,
-            Duration::from_secs(5),
-            None,
-        ));
-
-        // Accept the connection, then immediately drop it + the listener
-        let (stream, _) = listener.accept().await.unwrap();
-        drop(stream);
-        drop(listener);
-
-        // Send messages until the writer's rx is dropped. A single small write
-        // can land entirely in the kernel send buffer before the peer's RST is
-        // observed; the EPIPE is then surfaced on the *next* write. We loop
-        // (with yields) so the broken-pipe path is exercised deterministically.
-        for _ in 0..256 {
-            if tx
-                .send(SendTask {
-                    msg_type: MessageType::Message,
-                    header: Bytes::from_static(b"hdr"),
-                    payload: Bytes::from_static(b"pay"),
-                    on_error: Arc::new(NullErrorHandler),
-                })
-                .is_err()
-            {
-                break; // writer's rx dropped — it has already exited
-            }
-            tokio::task::yield_now().await;
-        }
-
-        // Wait for writer task to finish, bounded so a stuck test fails loudly.
-        let join_result = tokio::time::timeout(Duration::from_secs(5), writer)
-            .await
-            .expect("writer task did not exit within 5s of peer disconnect")
-            .expect("writer task panicked");
-        // The writer returns Ok(()) once its inner loop has cleanly exited;
-        // a write error inside the loop is handled (logged + on_error) and
-        // doesn't propagate, so this assertion mostly guards against a future
-        // refactor that surfaces the error through the join.
-        join_result.expect("writer task returned an error");
-
-        // The writer should have removed the stale entry from the map
-        assert!(
-            !connections.contains_key(&iid),
-            "writer task should clean up its DashMap entry on write error"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_send_message_does_not_fail_on_stale_handle() {
-        let (transport, _our_addr) = make_transport();
-
-        // Start a listener that accepts connections (simulates a healthy peer)
-        let peer_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let peer_addr = peer_listener.local_addr().unwrap();
-
-        let peer = make_tcp_peer(peer_addr);
-        let iid = peer.instance_id();
-        transport.register(peer).unwrap();
-
-        // Insert a stale handle
-        insert_stale_handle(&transport, iid);
-
-        // send_message should detect the stale handle and create a new one,
-        // NOT immediately call on_error. This exercises the slow path
-        // (get_or_create_connection + try_send on a freshly-created handle).
-        let error_handler = Arc::new(TrackingErrorHandler::new());
-        transport
-            .send_message(
-                iid,
-                Bytes::from_static(b"test-header"),
-                Bytes::from_static(b"test-payload"),
-                MessageType::Message,
-                error_handler.clone(),
-            )
-            .expect("slow-path send on fresh connection should enqueue synchronously");
-
-        // Accept the connection that the new writer task will establish
-        let (mut stream, _) = peer_listener.accept().await.unwrap();
-
-        // Read the framed message from the stream to confirm delivery
-        use tokio::io::AsyncReadExt;
-        let mut buf = [0u8; 256];
-        // Give the async writer a moment to flush the frame
-        let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
-            .await
-            .expect("timed out waiting for data")
-            .expect("read error");
-        assert!(n > 0, "expected data from the writer task");
-
-        // No errors should have been reported
-        assert_eq!(
-            error_handler.error_count(),
-            0,
-            "send_message should retry on stale handle, not fail"
-        );
-
-        // The connections map should now contain a live handle
-        let entry = transport.connections.get(&iid).unwrap();
-        assert!(
-            !entry.tx.is_disconnected(),
-            "stale handle should have been replaced with a live one"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_writer_task_drains_on_connect_failure() {
-        // Use an address where nothing is listening so connect will fail.
-        // Binding then immediately dropping gives us a port that is guaranteed closed.
-        let tmp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = tmp.local_addr().unwrap();
-        drop(tmp);
-
-        let iid = crate::InstanceId::new_v4();
-        let (tx, rx) = flume::bounded::<SendTask>(8);
-
-        let connections: Arc<DashMap<crate::InstanceId, ConnectionHandle>> =
-            Arc::new(DashMap::new());
-        connections.insert(iid, ConnectionHandle { tx: tx.clone() });
-
-        // Queue a message *before* the writer task even starts — this simulates
-        // the race between create_connection returning and connect completing.
-        let error_handler = Arc::new(TrackingErrorHandler::new());
-        tx.send(SendTask {
-            msg_type: MessageType::Message,
-            header: Bytes::from_static(b"hdr"),
-            payload: Bytes::from_static(b"pay"),
-            on_error: error_handler.clone(),
-        })
-        .unwrap();
-
-        let conns = Arc::clone(&connections);
-        let cancel = CancellationToken::new();
-
-        let writer = tokio::spawn(connection_writer_task(
-            addr,
-            iid,
-            rx,
-            conns,
-            cancel,
-            Duration::from_secs(5),
-            None,
-        ));
-        let _ = writer.await;
-
-        assert_eq!(
-            error_handler.error_count(),
-            1,
-            "queued message should have its on_error called when connect fails"
-        );
-
-        assert!(
-            !connections.contains_key(&iid),
-            "writer task should clean up its DashMap entry on connect failure"
-        );
-    }
-}
+#[path = "tests.rs"]
+mod tests;
