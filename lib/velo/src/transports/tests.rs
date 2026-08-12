@@ -74,6 +74,12 @@ impl MockTransport {
         let (_, rx) = self.queue.get().expect("saturating transport not started");
         rx.try_recv().expect("nothing queued to drain");
     }
+
+    /// Fail every queued admission, as a dying connection's epoch would.
+    fn fail_all(&self) {
+        let (gate, _) = self.queue.get().expect("saturating transport not started");
+        gate.fail_all(velo_ext::AdmissionError::ConnectionReplaced);
+    }
 }
 
 impl Transport for MockTransport {
@@ -137,6 +143,17 @@ impl Transport for MockTransport {
 struct NoopErrorHandler;
 impl TransportErrorHandler for NoopErrorHandler {
     fn on_error(&self, _header: Bytes, _payload: Bytes, _error: String) {}
+}
+
+/// Counts `on_error` calls so a test can prove backend bookkeeping ran.
+#[derive(Default)]
+struct CountingErrorHandler {
+    calls: AtomicUsize,
+}
+impl TransportErrorHandler for CountingErrorHandler {
+    fn on_error(&self, _header: Bytes, _payload: Bytes, _error: String) {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Helper: build a PeerInfo with entries for specified transport keys.
@@ -306,6 +323,65 @@ async fn test_send_message_pending_admission() {
         .await
         .expect("admission should resolve once the channel drains")
         .expect("the frame should be admitted, not failed");
+}
+
+#[tokio::test]
+async fn test_consumer_hook_does_not_suppress_backend_bookkeeping() {
+    // The backend installs its metric/error hook on a Pending admission before
+    // handing it to the caller. Hooks used to be a last-wins slot, so a caller
+    // attaching its own observer silently disabled the backend's error
+    // reporting. This pins the additive contract end to end.
+    let t = MockTransport::new_saturating("tcp");
+    let (backend, _streams) = VeloBackend::new(vec![t.clone() as Arc<dyn Transport>], None)
+        .await
+        .unwrap();
+
+    let peer = make_peer_info(&["tcp"]);
+    let peer_id = peer.instance_id();
+    backend.register_peer(peer).unwrap();
+
+    let handler = Arc::new(CountingErrorHandler::default());
+    let send = || {
+        backend
+            .send_message(
+                peer_id,
+                Bytes::from_static(&[1]),
+                Bytes::from_static(&[2]),
+                MessageType::Message,
+                handler.clone(),
+            )
+            .unwrap()
+    };
+
+    assert!(send().is_admitted(), "the first send fills the one slot");
+    let admission = match send() {
+        SendOutcome::Pending(admission) => admission,
+        SendOutcome::Admitted => panic!("a full channel must not report Admitted"),
+    };
+
+    // The caller's observer joins the backend's hook rather than replacing it.
+    let observed = Arc::new(AtomicBool::new(false));
+    let observer = Arc::clone(&observed);
+    let admission = admission.on_resolved(move |result| {
+        assert!(result.is_err(), "this admission is about to be failed");
+        observer.store(true, Ordering::Relaxed);
+    });
+
+    t.fail_all();
+    tokio::time::timeout(Duration::from_secs(5), admission)
+        .await
+        .expect("admission should resolve on epoch failure")
+        .expect_err("a failed epoch must fail the admission");
+
+    assert!(
+        observed.load(Ordering::Relaxed),
+        "the caller's observer must run"
+    );
+    assert_eq!(
+        handler.calls.load(Ordering::Relaxed),
+        1,
+        "the backend's on_error must still run for the failed frame"
+    );
 }
 
 #[tokio::test]

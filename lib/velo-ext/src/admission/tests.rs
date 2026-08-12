@@ -293,3 +293,57 @@ async fn concurrent_senders_keep_their_own_order() {
         next[task] += 1;
     }
 }
+
+/// Hooks are additive: the runtime's bookkeeping hook and a caller's observer
+/// must both run, in registration order. A destructive last-wins slot here
+/// silently disabled the backend's outbound metric and error reporting the
+/// moment a caller attached its own observer.
+#[tokio::test]
+async fn hooks_are_additive_and_run_in_registration_order() {
+    use std::sync::Mutex;
+
+    let (tx, rx) = flume::bounded(1);
+    let gate = AdmissionGate::new(tx, Handle::current());
+
+    admitted(gate.send(0u8));
+    let fired: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let first = Arc::clone(&fired);
+    let second = Arc::clone(&fired);
+    let admission = pending(gate.send(1))
+        .on_resolved(move |result| {
+            assert!(result.is_ok());
+            first.lock().unwrap().push("backend");
+        })
+        .on_resolved(move |result| {
+            assert!(result.is_ok());
+            second.lock().unwrap().push("caller");
+        });
+
+    assert_eq!(recv(&rx).await, 0);
+    timeout(LIMIT, admission)
+        .await
+        .expect("admission timed out")
+        .expect("admission should succeed");
+    assert_eq!(recv(&rx).await, 1);
+
+    wait_until("both hooks to fire", || fired.lock().unwrap().len() == 2).await;
+    assert_eq!(*fired.lock().unwrap(), vec!["backend", "caller"]);
+
+    // A hook added after resolution still runs, immediately, without
+    // disturbing the ones that already fired.
+    let late = Arc::clone(&fired);
+    admitted(gate.send(2));
+    let resolved = pending(gate.send(3));
+    recv(&rx).await;
+    recv(&rx).await;
+    wait_until("ticket to resolve", || {
+        resolved.state() == AdmissionState::Admitted
+    })
+    .await;
+    drop(resolved.on_resolved(move |result| {
+        assert!(result.is_ok());
+        late.lock().unwrap().push("late");
+    }));
+    assert_eq!(*fired.lock().unwrap(), vec!["backend", "caller", "late"]);
+}

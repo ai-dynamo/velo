@@ -197,13 +197,15 @@ impl SendAdmission {
     /// to wait for — that variant *is* the synchronous notification, and a
     /// caller wanting "exactly once per send" handles it on the spot.
     ///
-    /// Registering a second hook replaces the first, which is then dropped
-    /// without running.
+    /// Hooks are additive and run in registration order. The runtime installs
+    /// its own bookkeeping hook (outbound-frame metric, error reporting)
+    /// before the admission reaches the caller, so a caller registering its
+    /// own observer must not — and cannot — displace it.
     pub fn on_resolved(
         self,
         on_resolved: impl FnOnce(&Result<(), AdmissionError>) + Send + 'static,
     ) -> Self {
-        self.ticket.set_hook(Box::new(on_resolved));
+        self.ticket.add_hook(Box::new(on_resolved));
         self
     }
 
@@ -278,15 +280,19 @@ fn read_outcome(outcome: &TicketOutcome) -> Option<Result<(), AdmissionError>> {
 /// Callback installed by [`SendAdmission::on_resolved`].
 type ResolveHook = Box<dyn FnOnce(&Result<(), AdmissionError>) + Send>;
 
-/// The outcome and the not-yet-fired hook share one lock.
+/// The outcome and the not-yet-fired hooks share one lock.
 ///
 /// That is what makes hook registration race-free: the "has it resolved yet?"
 /// test and the install are one critical section, so a hook can neither be
 /// stored on an already-resolved ticket (never to run) nor be missed by a
 /// `resolve` that ran a moment earlier.
+///
+/// Hooks are a `Vec`, not a slot: the runtime installs its own bookkeeping
+/// hook (outbound metric, error handler) before the admission ever reaches the
+/// caller, and the caller's hook must add to that, never replace it.
 struct TicketState {
     outcome: TicketOutcome,
-    hook: Option<ResolveHook>,
+    hooks: Vec<ResolveHook>,
 }
 
 struct Ticket {
@@ -301,7 +307,7 @@ impl Ticket {
         Self {
             state: Mutex::new(TicketState {
                 outcome: TicketOutcome::Pending,
-                hook: None,
+                hooks: Vec::new(),
             }),
             waker: AtomicWaker::new(),
             cancel: CancellationToken::new(),
@@ -324,9 +330,11 @@ impl Ticket {
     ///
     /// Never called with the gate lock held for a ticket whose waker could
     /// re-enter the gate, so the woken task cannot deadlock against us. The
-    /// hook runs last, outside the ticket lock, for the same reason.
+    /// hooks run last, outside the ticket lock, for the same reason — in
+    /// registration order, so the runtime's bookkeeping hook fires before any
+    /// caller-installed observer.
     fn resolve(&self, outcome: Result<(), AdmissionError>) {
-        let hook = {
+        let hooks = {
             let mut state = lock(&self.state);
             if !matches!(state.outcome, TicketOutcome::Pending) {
                 return;
@@ -335,22 +343,22 @@ impl Ticket {
                 Ok(()) => TicketOutcome::Admitted,
                 Err(error) => TicketOutcome::Failed(error.clone()),
             };
-            state.hook.take()
+            std::mem::take(&mut state.hooks)
         };
         self.waker.wake();
-        if let Some(hook) = hook {
+        for hook in hooks {
             hook(&outcome);
         }
     }
 
-    /// Install the completion hook, running it on the spot if the ticket has
+    /// Add a completion hook, running it on the spot if the ticket has
     /// already resolved.
-    fn set_hook(&self, hook: ResolveHook) {
+    fn add_hook(&self, hook: ResolveHook) {
         let resolved = {
             let mut state = lock(&self.state);
             match read_outcome(&state.outcome) {
                 None => {
-                    state.hook = Some(hook);
+                    state.hooks.push(hook);
                     return;
                 }
                 Some(outcome) => outcome,
