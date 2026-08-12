@@ -10,72 +10,66 @@
 //! per record, and only polls the streams that were actually woken — but it
 //! offers no way to stop pulling from one member.
 //!
-//! That gap is exactly what multiplexing needs. A slot that has run out of
-//! credit, or that is fencing a rendezvous singleton, must stop being drained so
-//! its producer feels backpressure on its own channel rather than piling into a
-//! mux-side buffer; meanwhile every other slot on the peer keeps flowing. So the
-//! stream is written here rather than composed: [`SlotStream`] consults a
-//! [`SlotGate`] before touching its receiver, and the gate is also how a closed
-//! slot terminates — the stream ends, `SelectAll` drops it, the `flume::Receiver`
-//! goes with it, and the producer's `Sender` starts erroring. That last step is
-//! the whole consumer-visible death contract, reached by dropping a receiver
-//! exactly as the TCP egress pump does.
+//! The stream is written here rather than composed for two reasons. It has to
+//! carry the slot index, because `SelectAll` erases provenance and the bytes do
+//! not carry it. And it has to end on demand: [`SlotGate::close`] terminates the
+//! stream, `SelectAll` drops it, the `flume::Receiver` goes with it, and the
+//! producer's `Sender` starts erroring — the whole consumer-visible death
+//! contract, reached by dropping a receiver exactly as the TCP egress pump does.
+//!
+//! > **The inlet is drained unconditionally.** A slot that cannot *send* — out
+//! > of credit, or fencing a rendezvous singleton — still has its records
+//! > pulled, into [`EgressSlot`]'s withheld queue.
+//!
+//! That is not an optimisation. `finalize`, `detach` and `Drop` reach the inlet
+//! through a **synchronous** `flume::Sender::send`, which blocks when the
+//! channel is full — and under mux a starved slot's channel would never drain,
+//! so the block would be permanent, on a runtime worker thread, from inside a
+//! `Drop` in async context. TCP never had this failure mode: its egress pump
+//! drains at socket speed, so a full channel is transient. Credit can park a
+//! slot indefinitely, so it is not. The withheld queue is where the backpressure
+//! goes instead, bounded by the slot's byte cap rather than by a channel that
+//! control traffic has to get through.
 
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 
 use futures::Stream;
 use futures::task::AtomicWaker;
 
 use super::super::protocol::{MAX_SLOT_INDEX, SlotId};
-use crate::streaming::messenger_mux::flow_control::SlotCredit;
+use crate::streaming::messenger_mux::flow_control::{CreditClass, SlotCredit};
 
-/// Set while the batcher does not want records from this slot.
-const PAUSED: u8 = 0b01;
-/// Set once, permanently: the slot is gone.
-const CLOSED: u8 = 0b10;
-
-/// Pause / close signalling for one slot's inlet, shared between the batcher
-/// task and the stream it polls.
+/// Close signalling for one slot's inlet, shared between the batcher task and
+/// the stream it polls.
 ///
-/// Two flags rather than two channels because both answers are needed on the
-/// poll path and neither can afford an allocation there.
+/// One flag, because there is only one thing to say: draining never stops for
+/// any reason short of the slot ending.
 pub(super) struct SlotGate {
-    state: AtomicU8,
+    closed: AtomicBool,
     waker: AtomicWaker,
 }
 
 impl SlotGate {
-    /// An open, unpaused gate.
     fn new() -> Self {
         Self {
-            state: AtomicU8::new(0),
+            closed: AtomicBool::new(false),
             waker: AtomicWaker::new(),
         }
-    }
-
-    /// Stop draining this slot. Records already pulled are the caller's problem.
-    fn pause(&self) {
-        self.state.fetch_or(PAUSED, Ordering::Release);
-    }
-
-    /// Resume draining and wake the stream.
-    fn resume(&self) {
-        self.state.fetch_and(!PAUSED, Ordering::Release);
-        self.waker.wake();
     }
 
     /// End the slot. The stream terminates on its next poll and takes the
     /// `flume::Receiver` with it.
     fn close(&self) {
-        self.state.fetch_or(CLOSED, Ordering::Release);
+        self.closed.store(true, Ordering::Release);
         self.waker.wake();
     }
 
-    fn state(&self) -> u8 {
-        self.state.load(Ordering::Acquire)
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
     }
 }
 
@@ -118,20 +112,16 @@ impl Stream for SlotStream {
             return Poll::Ready(None);
         }
 
-        // Registered on *every* poll, not only while paused. When the stream is
-        // parked on the inner receiver it is the receiver's waker that is armed,
-        // so a `close()` racing that park would otherwise be lost and the slot
-        // would linger until its producer happened to send — which, for a
-        // producer being torn down by epoch death, is never.
+        // Registered on *every* poll. When the stream is parked on the inner
+        // receiver it is the receiver's waker that is armed, so a `close()`
+        // racing that park would otherwise be lost and the slot would linger
+        // until its producer happened to send — which, for a producer being torn
+        // down by epoch death, is never.
         this.gate.waker.register(cx.waker());
 
-        let state = this.gate.state();
-        if state & CLOSED != 0 {
+        if this.gate.is_closed() {
             // The batcher closed this slot itself, so it needs no telling.
             return Poll::Ready(None);
-        }
-        if state & PAUSED != 0 {
-            return Poll::Pending;
         }
 
         match Pin::new(&mut this.inner).poll_next(cx) {
@@ -145,24 +135,82 @@ impl Stream for SlotStream {
     }
 }
 
-/// Why a slot is not being drained right now.
+/// The records a slot has pulled but may not send yet.
 ///
-/// Both reasons share one gate so there is exactly one place that can leave a
-/// slot wedged, and one place that decides it may run again.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct PauseReasons {
-    /// The slot has no credit for the record it is holding.
-    starved: bool,
-    /// A rendezvous singleton for this slot is outstanding. `BATCHING.md`
-    /// § "Slots": at most one per slot, and the slot's later records wait for
-    /// its admission so `frame_seq` order survives the unordered resolve.
-    fenced: bool,
+/// FIFO, because `frame_seq` order is the whole protocol obligation the mux took
+/// on when it gave up a private TCP connection. Bounded by **bytes**, not by
+/// records: this is the memory bound that stands in for the ~1 MiB the kernel
+/// socket used to enforce per stream for free, and riding the Messenger deleted
+/// exactly that protection.
+pub(super) struct WithheldQueue {
+    records: VecDeque<Vec<u8>>,
+    bytes: u64,
+    cap: u64,
 }
 
-impl PauseReasons {
-    const fn any(self) -> bool {
-        self.starved || self.fenced
+impl WithheldQueue {
+    fn new(cap: u32) -> Self {
+        Self {
+            records: VecDeque::new(),
+            bytes: 0,
+            cap: u64::from(cap),
+        }
     }
+
+    /// Whether anything is waiting. A non-empty queue is itself a reason to
+    /// withhold, since a record overtaking one already parked would reorder the
+    /// stream.
+    pub(super) fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    /// Records waiting.
+    pub(super) fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    /// Park a record, or report that the slot has run past its byte cap.
+    ///
+    /// A single record larger than the whole cap is admitted rather than
+    /// rejected — it will leave as an oversized singleton, and refusing it would
+    /// kill a stream for sending one large frame, which no other path does.
+    pub(super) fn push(&mut self, record: Vec<u8>) -> Result<(), WithheldOverflow> {
+        let len = record.len() as u64;
+        if !self.records.is_empty() && self.bytes.saturating_add(len) > self.cap {
+            return Err(WithheldOverflow {
+                queued: self.bytes,
+                cap: self.cap,
+            });
+        }
+        self.bytes = self.bytes.saturating_add(len);
+        self.records.push_back(record);
+        Ok(())
+    }
+
+    /// The oldest record, without removing it.
+    ///
+    /// Peek-then-pop rather than pop-then-return: a record put back would land
+    /// at the *back* of the queue, which is the one thing this type exists to
+    /// prevent.
+    pub(super) fn front(&self) -> Option<&[u8]> {
+        self.records.front().map(Vec::as_slice)
+    }
+
+    /// Take the oldest record.
+    pub(super) fn pop(&mut self) -> Option<Vec<u8>> {
+        let record = self.records.pop_front()?;
+        self.bytes = self.bytes.saturating_sub(record.len() as u64);
+        Some(record)
+    }
+}
+
+/// The producer ran further ahead of a slot that cannot send than the slot's
+/// byte cap allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("withheld {queued} bytes on a slot capped at {cap}")]
+pub(super) struct WithheldOverflow {
+    queued: u64,
+    cap: u64,
 }
 
 /// One live egress slot.
@@ -175,49 +223,54 @@ pub(super) struct EgressSlot {
     /// Next `frame_seq` to stamp. Advances on every record this side emits for
     /// the slot, control included, so a gap is detectable across control too.
     pub(super) next_seq: u32,
-    /// The single record pulled before the slot lost the right to send it.
-    ///
-    /// Bounded at one by construction: the batcher pauses the gate in the same
-    /// step that it withholds, and processes stream items one at a time, so the
-    /// stream cannot yield a second record before the pause takes effect.
-    pub(super) withheld: Option<Vec<u8>>,
+    /// Records pulled from the inlet that the slot may not send yet.
+    pub(super) withheld: WithheldQueue,
+    /// Set once the producer has gone, so the `CloseSlot{PeerGone}` that tells
+    /// the consumer can wait behind whatever is still withheld.
+    pub(super) inlet_closed: bool,
     gate: Arc<SlotGate>,
-    pause: PauseReasons,
+    /// A rendezvous singleton is outstanding. `BATCHING.md` § "Slots": at most
+    /// one per slot, and the slot's later records wait for its admission so
+    /// `frame_seq` order survives the unordered resolve.
+    fenced: bool,
+    /// Whether the slot is currently withholding for want of credit, so the
+    /// starvation meter ticks once per episode rather than once per record.
+    starved: bool,
 }
 
 impl EgressSlot {
-    /// Whether a record of this slot may be pulled and packed right now.
-    pub(super) const fn is_paused(&self) -> bool {
-        self.pause.any()
-    }
-
     /// Whether a rendezvous singleton is outstanding for this slot.
     pub(super) const fn is_fenced(&self) -> bool {
-        self.pause.fenced
+        self.fenced
     }
 
-    /// Park the slot on credit.
-    pub(super) fn park_starved(&mut self) {
-        self.pause.starved = true;
-        self.sync_gate();
+    /// Whether a record offered now has to be withheld rather than sent.
+    ///
+    /// Order first — anything already queued goes before a newcomer — then the
+    /// fence, then credit.
+    pub(super) fn must_withhold(&self, class: CreditClass) -> bool {
+        !self.withheld.is_empty() || self.fenced || !self.credit.can_spend(class)
     }
 
-    /// Release the credit park.
-    pub(super) fn unpark_starved(&mut self) {
-        self.pause.starved = false;
-        self.sync_gate();
+    /// Note that the slot is withholding for want of credit, reporting whether
+    /// this is the start of an episode.
+    pub(super) fn note_starved(&mut self) -> bool {
+        !std::mem::replace(&mut self.starved, true)
+    }
+
+    /// Clear the starvation flag once the queue has drained.
+    pub(super) fn note_flowing(&mut self) {
+        self.starved = false;
     }
 
     /// Fence the slot behind an outstanding rendezvous singleton.
     pub(super) fn fence(&mut self) {
-        self.pause.fenced = true;
-        self.sync_gate();
+        self.fenced = true;
     }
 
     /// Release the rendezvous fence.
     pub(super) fn unfence(&mut self) {
-        self.pause.fenced = false;
-        self.sync_gate();
+        self.fenced = false;
     }
 
     /// Take the next `frame_seq` for a record this side is emitting.
@@ -230,14 +283,6 @@ impl EgressSlot {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
         seq
-    }
-
-    fn sync_gate(&self) {
-        if self.pause.any() {
-            self.gate.pause();
-        } else {
-            self.gate.resume();
-        }
     }
 }
 
@@ -282,6 +327,7 @@ impl EgressSlots {
     pub(super) fn allocate(
         &mut self,
         rx: flume::Receiver<Vec<u8>>,
+        slot_byte_budget: u32,
     ) -> Result<(SlotId, SlotStream), AllocError> {
         let index = match self.free.pop() {
             Some(index) => index,
@@ -310,9 +356,11 @@ impl EgressSlots {
             id,
             credit: SlotCredit::new(0),
             next_seq: 0,
-            withheld: None,
+            withheld: WithheldQueue::new(slot_byte_budget),
+            inlet_closed: false,
             gate,
-            pause: PauseReasons::default(),
+            fenced: false,
+            starved: false,
         });
         self.live += 1;
         Ok((id, stream))

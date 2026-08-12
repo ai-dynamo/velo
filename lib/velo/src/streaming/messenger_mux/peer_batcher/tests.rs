@@ -188,7 +188,18 @@ impl Harness {
     ) -> (flume::Sender<Vec<u8>>, (SlotId, BatchHeader)) {
         // Deep enough that a test can queue more than one batch's worth on a
         // parked slot before granting credit.
-        let (inlet_tx, inlet_rx) = flume::bounded::<Vec<u8>>(512);
+        self.open_with_inlet(anchor_id, session_id, 512).await
+    }
+
+    /// As [`Self::open_with_header`], with a caller-chosen inlet depth — the
+    /// knob that decides how soon a producer meets a full channel.
+    async fn open_with_inlet(
+        &self,
+        anchor_id: u64,
+        session_id: u64,
+        depth: usize,
+    ) -> (flume::Sender<Vec<u8>>, (SlotId, BatchHeader)) {
+        let (inlet_tx, inlet_rx) = flume::bounded::<Vec<u8>>(depth);
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         self.handle
             .send(Command::OpenSlot {
@@ -392,6 +403,176 @@ async fn the_coalescing_threshold_bounds_a_batch_when_the_configured_cap_does_no
 }
 
 // ---------------------------------------------------------------------------
+// The inlet is drained unconditionally
+// ---------------------------------------------------------------------------
+
+/// A starved slot must not be able to block a producer's *synchronous* send.
+///
+/// `finalize`, `detach` and `Drop` reach the inlet through `flume::Sender::send`,
+/// which blocks on a full channel — and `Drop` does it from inside async
+/// context, on a runtime worker thread. Under TCP a full channel drains at
+/// socket speed, so the block is transient. Under mux a slot with no credit
+/// would never drain at all, so it would be permanent. The withheld queue is
+/// what keeps the channel moving.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_starved_slot_keeps_draining_so_a_synchronous_terminal_never_blocks() {
+    let harness = harness(MuxConfig::default()).await;
+    // A shallow inlet, so a producer meets the channel's limit almost at once.
+    let (inlet, (id, _)) = harness.open_with_inlet(1, 1, 4).await;
+
+    // No credit is ever granted, so nothing this slot holds may be sent.
+    const RECORDS: u32 = 32;
+    for n in 0..RECORDS {
+        tokio::time::timeout(RECV_TIMEOUT, inlet.send_async(item(n)))
+            .await
+            .expect("a starved slot must not stall its producer")
+            .expect("inlet open");
+    }
+
+    // The blocking call the hazard is about. On a blocking pool so that a
+    // regression stalls this test rather than the whole runtime.
+    let terminal_inlet = inlet.clone();
+    let sent = tokio::time::timeout(
+        RECV_TIMEOUT,
+        tokio::task::spawn_blocking(move || terminal_inlet.send(cached_finalized().clone())),
+    )
+    .await
+    .expect("a synchronous terminal send must not block on a starved slot")
+    .expect("blocking task");
+    assert!(sent.is_ok());
+
+    assert!(
+        harness.try_next_batch().is_none(),
+        "nothing may reach the wire without credit"
+    );
+
+    // Everything the producer handed over is still there, in order, and comes
+    // out the moment credit does.
+    harness.grant(id, 64);
+    let mut records = Vec::new();
+    while records.len() < RECORDS as usize + 2 {
+        records.extend(harness.next_batch().await.records);
+    }
+    for (n, record) in records.iter().take(RECORDS as usize).enumerate() {
+        assert_eq!(record.data, item(n as u32), "record {n} out of order");
+    }
+    assert_eq!(records[RECORDS as usize].data, *cached_finalized());
+    assert_eq!(records[RECORDS as usize + 1].kind, RecordType::CloseSlot);
+}
+
+/// Run-ahead past the byte cap kills that slot, and only that slot.
+///
+/// This is the per-slot slow-consumer kill `BATCHING.md` prefers to the
+/// heartbeat watchdog: deterministic, scoped, and metered.
+#[tokio::test(flavor = "multi_thread")]
+async fn withheld_overflow_closes_the_starved_slot_and_leaves_the_others_alone() {
+    let harness = harness(MuxConfig {
+        slot_byte_budget: 256,
+        ..MuxConfig::default()
+    })
+    .await;
+
+    let (starved_inlet, (starved, _)) = harness.open_with_inlet(1, 1, 256).await;
+    let (flowing_inlet, (flowing, _)) = harness.open_with_inlet(1, 2, 256).await;
+    harness.grant(flowing, 64);
+
+    // Never granted, so everything piles into the withheld queue until the cap.
+    for n in 0..64u32 {
+        let _ = starved_inlet.send(item(n));
+    }
+    eventually(|| starved_inlet.is_disconnected()).await;
+
+    let mut closed = None;
+    let mut flowing_seen = 0;
+    for n in 0..4u32 {
+        flowing_inlet.send(item(100 + n)).expect("flowing send");
+    }
+    while closed.is_none() || flowing_seen < 4 {
+        let batch = harness.next_batch().await;
+        for record in batch.records {
+            if record.slot == starved && record.kind == RecordType::CloseSlot {
+                closed = Some(record);
+            } else if record.slot == flowing {
+                flowing_seen += 1;
+            }
+        }
+    }
+    assert!(
+        closed.is_some(),
+        "the consumer has to be told, or it waits out its heartbeat watchdog"
+    );
+    assert!(
+        !flowing_inlet.is_disconnected(),
+        "the peer's other slots are untouched"
+    );
+    assert!(
+        harness.snapshot().counter(
+            "velo_streaming_mux_records_dropped_total",
+            &[("reason", "withheld_overflow")]
+        ) > 0.0
+    );
+}
+
+/// A producer that goes while records are still withheld owes them first.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_departed_producer_s_withheld_records_go_before_its_close() {
+    let harness = harness(MuxConfig::default()).await;
+    let (inlet, (id, _)) = harness.open_with_inlet(1, 1, 64).await;
+
+    for n in 0..4u32 {
+        inlet.send(item(n)).expect("queue record");
+    }
+    drop(inlet);
+    eventually(|| harness.try_next_batch().is_none()).await;
+
+    harness.grant(id, 64);
+    let mut records = Vec::new();
+    while records.len() < 5 {
+        records.extend(harness.next_batch().await.records);
+    }
+    for (n, record) in records.iter().take(4).enumerate() {
+        assert_eq!(record.data, item(n as u32), "record {n} out of order");
+    }
+    assert_eq!(
+        records[4].kind,
+        RecordType::CloseSlot,
+        "the close a departed producer owes waits behind what it enqueued"
+    );
+}
+
+/// A terminal already in the queue closes the slot; no `PeerGone` follows it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_withheld_terminal_closes_the_slot_without_a_second_close() {
+    let harness = harness(MuxConfig::default()).await;
+    let (inlet, (id, _)) = harness.open_with_inlet(1, 1, 64).await;
+
+    inlet.send(item(1)).expect("queue item");
+    inlet
+        .send(cached_finalized().clone())
+        .expect("queue terminal");
+    drop(inlet);
+    eventually(|| harness.try_next_batch().is_none()).await;
+
+    harness.grant(id, 64);
+    let mut records = Vec::new();
+    while records.len() < 3 {
+        records.extend(harness.next_batch().await.records);
+    }
+    assert_eq!(records[0].data, item(1));
+    assert_eq!(records[1].data, *cached_finalized());
+    assert_eq!(records[2].kind, RecordType::CloseSlot);
+    assert_eq!(
+        records.len(),
+        3,
+        "the terminal already closed the slot, so the departed inlet adds nothing"
+    );
+    // Nothing further: a second close would tell the consumer to inject
+    // `Dropped` behind a `Finalized` it has already seen.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(harness.try_next_batch().is_none());
+}
+
+// ---------------------------------------------------------------------------
 // Credit
 // ---------------------------------------------------------------------------
 
@@ -407,7 +588,8 @@ async fn a_starved_slot_is_withheld_while_the_others_keep_flowing() {
         flowing_inlet.send(item(100 + n)).expect("queue flowing");
     }
 
-    // Only the second slot gets credit.
+    // Only the second slot gets credit. The starved slot's records are pulled
+    // all the same — they wait in its withheld queue, not in its inlet.
     harness.grant(flowing, 8);
 
     let mut flowing_records = 0;

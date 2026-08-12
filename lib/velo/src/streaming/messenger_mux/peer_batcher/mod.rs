@@ -29,10 +29,13 @@
 //!
 //! ## Draining X channels from one task
 //!
-//! [`slot_stream`] explains the `SelectAll`-of-pausable-streams arrangement and
-//! why the gate has to exist. The batcher's half of that contract is that it
-//! processes one stream item at a time and pauses in the same step that it
-//! withholds — which is what bounds a starved slot's withheld record at one.
+//! [`slot_stream`] explains the `SelectAll` arrangement and why every inlet is
+//! drained unconditionally, credit or no credit: `finalize`, `detach` and `Drop`
+//! reach the inlet through a *synchronous* send, and a slot parked on credit
+//! would otherwise block one of them on a full channel forever. The batcher's
+//! half of that contract is the per-slot withheld queue — where a record waits
+//! when the slot cannot send it — and the byte cap on that queue, which is what
+//! bounds the memory the arrangement costs.
 
 mod slot_stream;
 #[cfg(test)]
@@ -56,7 +59,7 @@ use super::protocol::{
     BATCH_HEADER_LEN, BatchEncoder, CloseReason, MAX_RECORDS_PER_BATCH, SlotId, record_encoded_len,
 };
 use crate::messenger::Messenger;
-use crate::observability::{MuxDirection, MuxMetricsHandle};
+use crate::observability::{MuxDirection, MuxDropReason, MuxMetricsHandle};
 use crate::streaming::messenger_mux::STREAM_BATCH_HANDLER;
 use crate::streaming::messenger_mux::flow_control::CreditClass;
 use crate::streaming::sender::is_terminal_sentinel;
@@ -321,13 +324,6 @@ impl Batcher {
     // -----------------------------------------------------------------------
 
     async fn on_frame(&mut self, index: u32, bytes: Vec<u8>) {
-        let terminal = is_terminal_sentinel(&bytes);
-        let class = if terminal {
-            CreditClass::Terminal
-        } else {
-            CreditClass::Data
-        };
-
         let Some(slot) = self.slots.get_mut(index) else {
             // The slot closed between the stream yielding and this dispatch —
             // a terminal in the same drain, or a peer-side close. Today's
@@ -335,29 +331,71 @@ impl Batcher {
             return;
         };
 
-        if slot.is_paused() || slot.withheld.is_some() {
-            // Unreachable: the gate is set in the same step that withholds, and
-            // items are processed one at a time, so a paused slot's stream
-            // cannot yield. Loud rather than silent, because the alternative is
-            // dropping a record nobody counted.
-            tracing::error!(
-                slot = ?slot.id,
-                "messenger mux: egress slot yielded a record while parked; closing the slot"
-            );
-            self.close_local(index);
-            return;
-        }
-
-        if !slot.credit.can_spend(class) {
-            slot.withheld = Some(bytes);
-            slot.park_starved();
-            if let Some(metrics) = &self.metrics {
-                metrics.credit_exhausted();
+        // Terminal-ness costs an `rmp_serde` decode attempt on anything that is
+        // not one of the three cached sentinels, so it is asked only on the
+        // branch that needs it. Under starvation the withhold branch is the hot
+        // one, and it does not care.
+        if slot.must_withhold(CreditClass::Data) {
+            let starved = slot.credit.data_available() == 0;
+            match slot.withheld.push(bytes) {
+                Ok(()) => {
+                    if starved
+                        && slot.note_starved()
+                        && let Some(metrics) = &self.metrics
+                    {
+                        metrics.credit_exhausted();
+                    }
+                }
+                Err(error) => self.overflow_kill(index, error).await,
             }
             return;
         }
 
+        let terminal = is_terminal_sentinel(&bytes);
         self.emit_data(index, bytes, terminal).await;
+    }
+
+    /// The producer ran past the byte cap on a slot that cannot send.
+    ///
+    /// This is the per-slot slow-consumer kill, and it is deliberately *not* the
+    /// heartbeat watchdog: the slot dies, its consumer sees `Dropped` through the
+    /// `CloseSlot{PeerGone}` sent here, and the peer's other slots never notice.
+    /// Anything withheld goes with it — including a queued terminal, so a
+    /// consumer that would have seen `Finalized` sees `Dropped` instead. That is
+    /// the cost of not blocking the producer's synchronous terminal send, and it
+    /// is bounded by a megabyte of run-ahead on a stream nobody is draining.
+    async fn overflow_kill(&mut self, index: u32, error: slot_stream::WithheldOverflow) {
+        let Some(slot) = self.slots.get_mut(index) else {
+            return;
+        };
+        let id = slot.id;
+        let seq = slot.take_seq();
+        let discarded = slot.withheld.len();
+        tracing::warn!(
+            slot = ?id,
+            %error,
+            discarded,
+            "messenger mux: producer outran a starved slot's byte cap; closing the slot"
+        );
+        if let Some(metrics) = &self.metrics {
+            metrics.records_dropped(MuxDropReason::WithheldOverflow, discarded as u64 + 1);
+        }
+        self.push_close(id, seq, CloseReason::PeerGone).await;
+        self.close_local(index);
+    }
+
+    /// Append a `CloseSlot` for a slot this side owns, cutting the batch first
+    /// if it will not fit.
+    async fn push_close(&mut self, id: SlotId, seq: u32, reason: CloseReason) {
+        let needed = record_encoded_len(1).unwrap_or(usize::MAX);
+        self.ensure_batch();
+        if !self.fits(needed, 1) {
+            self.flush().await;
+            self.ensure_batch();
+        }
+        if let Some(encoder) = self.encoder.as_mut() {
+            let _ = encoder.push_close_slot(id, seq, reason);
+        }
     }
 
     /// Every producer handle for a slot has gone without a terminal going out.
@@ -371,17 +409,24 @@ impl Batcher {
         let Some(slot) = self.slots.get_mut(index) else {
             return;
         };
+        slot.inlet_closed = true;
+        if !slot.withheld.is_empty() {
+            // Records the producer enqueued before it went are still owed to the
+            // consumer. The close waits behind them; `release_withheld` fires it
+            // when the queue empties.
+            return;
+        }
+        self.finish_inlet_close(index).await;
+    }
+
+    /// Emit the `CloseSlot{PeerGone}` a departed producer owes its consumer.
+    async fn finish_inlet_close(&mut self, index: u32) {
+        let Some(slot) = self.slots.get_mut(index) else {
+            return;
+        };
         let id = slot.id;
         let seq = slot.take_seq();
-        let needed = record_encoded_len(1).unwrap_or(usize::MAX);
-        self.ensure_batch();
-        if !self.fits(needed, 1) {
-            self.flush().await;
-            self.ensure_batch();
-        }
-        if let Some(encoder) = self.encoder.as_mut() {
-            let _ = encoder.push_close_slot(id, seq, CloseReason::PeerGone);
-        }
+        self.push_close(id, seq, CloseReason::PeerGone).await;
         self.close_local(index);
     }
 
@@ -523,7 +568,7 @@ impl Batcher {
             let _ = ack.send(Err(OpenRejected::Retired));
             return;
         }
-        let (id, stream) = match self.slots.allocate(inlet) {
+        let (id, stream) = match self.slots.allocate(inlet, self.config.slot_byte_budget) {
             Ok(allocated) => allocated,
             Err(error) => {
                 let _ = ack.send(Err(error.into()));
@@ -624,30 +669,56 @@ impl Batcher {
         }
     }
 
-    /// Re-offer a slot's withheld record now that it may be sendable.
+    /// Drain a slot's withheld queue as far as credit and the fence allow.
+    ///
+    /// Loops rather than releasing one record, because a grant may cover several
+    /// and the queue is the only thing holding `frame_seq` order. Re-reads the
+    /// slot each turn: `emit_data` can close it (a terminal) or fence it (an
+    /// oversized singleton).
     async fn release_withheld(&mut self, index: u32) {
-        let Some(slot) = self.slots.get_mut(index) else {
-            return;
-        };
-        if slot.is_fenced() {
-            return;
+        loop {
+            let next = {
+                let Some(slot) = self.slots.get_mut(index) else {
+                    return;
+                };
+                if slot.is_fenced() {
+                    return;
+                }
+                match slot.withheld.front() {
+                    Some(front) => {
+                        let terminal = is_terminal_sentinel(front);
+                        let class = if terminal {
+                            CreditClass::Terminal
+                        } else {
+                            CreditClass::Data
+                        };
+                        if !slot.credit.can_spend(class) {
+                            return;
+                        }
+                        slot.withheld.pop().map(|bytes| (bytes, terminal))
+                    }
+                    None => {
+                        slot.note_flowing();
+                        None
+                    }
+                }
+            };
+            match next {
+                Some((bytes, terminal)) => self.emit_data(index, bytes, terminal).await,
+                // The queue is empty. A producer that left while records were
+                // still owed gets its close now.
+                None => {
+                    if self
+                        .slots
+                        .get_mut(index)
+                        .is_some_and(|slot| slot.inlet_closed)
+                    {
+                        self.finish_inlet_close(index).await;
+                    }
+                    return;
+                }
+            }
         }
-        let Some(bytes) = slot.withheld.take() else {
-            slot.unpark_starved();
-            return;
-        };
-        let terminal = is_terminal_sentinel(&bytes);
-        let class = if terminal {
-            CreditClass::Terminal
-        } else {
-            CreditClass::Data
-        };
-        if !slot.credit.can_spend(class) {
-            slot.withheld = Some(bytes);
-            return;
-        }
-        slot.unpark_starved();
-        self.emit_data(index, bytes, terminal).await;
     }
 
     // -----------------------------------------------------------------------

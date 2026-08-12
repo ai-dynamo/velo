@@ -428,6 +428,26 @@ credit already bounds. This incidentally fixes a latent hazard that exists
 *today*: `Drop`'s synchronous send on a full 4096-deep channel blocks a runtime
 worker thread from inside a `Drop` in async context.
 
+> **The split lane is not what P7 built.** `FrameTransport::connect` hands the
+> caller one `flume::Sender<Vec<u8>>` and nothing in that seam distinguishes a
+> terminal from a token, so there is no second lane to drain first. Splitting it
+> means changing a published `velo-ext` trait — a typed sink in place of a byte
+> channel, which belongs with the P11 discussion below rather than ahead of
+> negotiation.
+>
+> What P7 does instead is **drain the inlet unconditionally**. A slot with no
+> credit still has its records pulled, into a per-slot withheld queue bounded by
+> the slot byte cap, so the channel a synchronous send targets is never the thing
+> that is full. The hazard is closed; the ordering guarantee is unchanged, since
+> the queue is FIFO and a terminal in it waits for its predecessors exactly as it
+> would have on the wire.
+>
+> The cost is that a producer running past the byte cap on a slot nobody is
+> draining **kills that slot** — consumer sees `Dropped`, other slots untouched,
+> metered as `withheld_overflow`. That is the per-slot slow-consumer kill this
+> document prefers to the watchdog kill, made deterministic; `SATURATION.md`
+> describes it from the operator's side.
+
 Credit returns get their own priority lane, so a peer whose egress is congested
 never stops returning your credit.
 
@@ -836,6 +856,15 @@ tempting, and still deferred, is exposing a mux surface to out-of-tree
    muxes into a void. If it lands, it should be *one* method
    `as_mux() -> Option<&dyn MuxTransport>` returning a separate trait with no
    defaults.
+
+   Whatever shape it takes, **the seam should carry a typed sink rather than a
+   `flume::Sender<Vec<u8>>`**. The byte channel is why P7 cannot split control
+   from data: a terminal and a token are indistinguishable in it, so the only
+   way to keep a synchronous terminal send from blocking is to drain everything
+   and bound the overflow. A sink that accepts `Frame::{Data, Terminal, …}`
+   would let the transport reserve capacity for the records that must never
+   queue behind data, which is what "control and data travel in separate lanes"
+   above actually asks for.
 2. **The blob-pipe abstraction may be permanently wrong.** An RDMA transport
    already multiplexes natively per queue pair; forcing it to serialize into a
    byte stream so velo can chop it back up is a pessimization. Removing a

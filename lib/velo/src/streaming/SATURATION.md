@@ -142,6 +142,40 @@ In rough order of "easiest to apply" to "biggest hammer":
    Not currently implemented; would surface as a follow-up if real
    workloads (not stress tests) hit the watchdog.
 
+## Under the messenger mux: a per-slot kill instead of a watchdog kill
+
+Everything above describes the per-stream socket path. The `messenger-mux-v1`
+transport (`BATCHING.md`) ends the cascade differently, and the difference is
+user-visible.
+
+A muxed stream has no socket of its own. What it has is **credit**, and a
+consumer that stops draining stops credit being returned, which parks the
+stream's egress. Parking egress must not park the *producer*, because
+`finalize`, `detach` and `Drop` reach the send channel through a **synchronous**
+send — and blocking one of those means blocking a runtime worker thread from
+inside a `Drop`, forever, since credit can park a slot indefinitely. So the mux
+keeps draining the channel into a per-slot withheld queue bounded by the slot's
+byte cap (1 MiB by default).
+
+When a producer runs past that cap on a slot nobody is draining, **the mux closes
+that slot**: the consumer receives `Dropped`, the producer's channel starts
+erroring, `velo_streaming_mux_records_dropped_total{reason="withheld_overflow"}`
+ticks, and the peer's other slots carry on. Two consequences worth knowing
+before you meet them:
+
+- **A queued terminal goes with it.** A consumer that would have seen
+  `Finalized` sees `Dropped` instead. The stream was already a megabyte behind;
+  the terminal was never going to arrive on time either way.
+- **This replaces the watchdog kill for muxed streams**, and is strictly more
+  informative: deterministic rather than timing-dependent, attributed to one
+  slot rather than to a session that went quiet, and metered as a drop rather
+  than as a liveness failure. `velo_streaming_heartbeat_watchdog_firings_total`
+  remains the signal for a peer that has gone silent for reasons other than
+  saturation.
+
+The knob is the mux's per-slot byte cap. Raising it buys a slower producer more
+run-ahead before the kill; lowering it fails a wedged stream sooner.
+
 ## What this is NOT
 
 These counters do not measure latency, throughput, or bytes. They count
