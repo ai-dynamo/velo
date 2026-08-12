@@ -9,3 +9,4 @@ mod common;
 use common::{TcpFactory, scenarios};
 
 transport_integration_tests!(TcpFactory);
+transport_epoch_tests!(TcpFactory);

@@ -761,6 +761,23 @@ macro_rules! transport_integration_tests {
             async fn test_health_during_drain() {
                 scenarios::health_during_drain::<$factory>().await;
             }
+            #[tokio::test]
+            async fn test_admission_ordering_under_capacity_pressure() {
+                scenarios::admission_ordering_under_capacity_pressure::<$factory>().await;
+            }
+        }
+    };
+}
+
+/// Generate the epoch-death admission test for a transport with per-connection
+/// epochs (TCP, UDS). Not part of `transport_integration_tests!` because
+/// broker-style transports have no connection to replace.
+#[allow(unused_macros)]
+macro_rules! transport_epoch_tests {
+    ($factory:ty) => {
+        #[tokio::test]
+        async fn test_admissions_fail_when_the_connection_epoch_dies() {
+            scenarios::admissions_fail_when_the_connection_epoch_dies::<$factory>().await;
         }
     };
 }

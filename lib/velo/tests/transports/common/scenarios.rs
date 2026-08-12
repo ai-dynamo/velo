@@ -618,3 +618,139 @@ pub async fn health_during_drain<F: TransportFactory>() {
     transport_b.streams.shutdown_state.teardown_token().cancel();
     transport_b.transport.shutdown();
 }
+
+// --- Admission ordering ---
+
+/// Frames must arrive in the order their sends returned, even when nobody
+/// waits for them.
+///
+/// This is the guarantee the per-target admission gate exists to provide, and
+/// the one the old backpressure future could not: a saturated channel used to
+/// park the frame inside an unpolled future, where a later fast-path send could
+/// overtake it.
+///
+/// Saturation is provoked by issuing the whole burst from one synchronous loop.
+/// The `#[tokio::test]` runtime is single-threaded, so the loop never yields and
+/// the writer task cannot drain a single frame until the last send has
+/// returned — the channel is guaranteed full well before then (`BURST` exceeds
+/// every in-tree transport's channel capacity). Transports whose writer is an
+/// OS thread rather than a task, ZMQ today, may drain concurrently and see less
+/// pressure; the ordering assertion holds either way.
+pub async fn admission_ordering_under_capacity_pressure<F: TransportFactory>() {
+    /// Larger than the biggest in-tree send-channel capacity (NATS, 1024).
+    const BURST: usize = 1100;
+    const BURST_TIMEOUT: Duration = Duration::from_secs(30);
+
+    let transport_a = F::create().await.unwrap();
+    let transport_b = F::create().await.unwrap();
+    transport_a.register_peer(&transport_b).unwrap();
+
+    // Every outcome is dropped: delivery must not depend on anyone holding an
+    // admission, which is exactly what a fire-and-forget sender does.
+    for seq in 0..BURST {
+        transport_a.send(
+            transport_b.instance_id,
+            format!("seq-{seq:05}").into_bytes(),
+            b"p".to_vec(),
+            MessageType::Message,
+        );
+    }
+
+    let received = transport_b
+        .collect_messages(BURST, BURST_TIMEOUT)
+        .await
+        .unwrap();
+    let order: Vec<String> = received
+        .iter()
+        .map(|(header, _)| String::from_utf8(header.to_vec()).unwrap())
+        .collect();
+    let expected: Vec<String> = (0..BURST).map(|seq| format!("seq-{seq:05}")).collect();
+    assert_eq!(
+        order, expected,
+        "frames must arrive in the order their sends returned"
+    );
+
+    transport_a.shutdown();
+    transport_b.shutdown();
+}
+
+/// A connection epoch that dies must take its queued frames with it.
+///
+/// The peer is registered and then shut down, so the writer task's connect
+/// fails: frames already on the channel are reported through `on_error`, and
+/// frames still queued behind the gate resolve `Err` rather than lingering for
+/// a successor connection to deliver. The successor's own gate must be
+/// unaffected — a dead epoch does not poison the target.
+///
+/// Only meaningful for transports with a per-connection epoch, so this is wired
+/// into the TCP and UDS suites directly rather than through
+/// `transport_integration_tests!`. NATS and ZMQ multiplex a shared writer with
+/// no connection to replace.
+pub async fn admissions_fail_when_the_connection_epoch_dies<F: TransportFactory>() {
+    /// Larger than the TCP/UDS send-channel capacity (256), so the tail of the
+    /// burst has to queue in the gate.
+    const BURST: usize = 400;
+
+    let transport_a = F::create().await.unwrap();
+    let transport_b = F::create().await.unwrap();
+    transport_a.register_peer(&transport_b).unwrap();
+
+    // Register first, then kill the listener: the peer is known but
+    // unreachable, so the connection epoch dies during connect.
+    transport_b.transport.shutdown();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // One synchronous burst, so the writer task cannot drain any of it before
+    // the last send returns.
+    let mut outstanding = Vec::new();
+    for seq in 0..BURST {
+        if let velo::transports::SendOutcome::Pending(admission) = transport_a.send_admission(
+            transport_b.instance_id,
+            format!("seq-{seq:05}").into_bytes(),
+            b"p".to_vec(),
+            MessageType::Message,
+        ) {
+            outstanding.push(admission);
+        }
+    }
+    assert!(
+        !outstanding.is_empty(),
+        "a burst of {BURST} should have overflowed the send channel"
+    );
+
+    let total = outstanding.len();
+    let mut failed = 0;
+    for admission in outstanding {
+        if tokio::time::timeout(TEST_TIMEOUT, admission)
+            .await
+            .expect("every admission must resolve when the epoch dies")
+            .is_err()
+        {
+            failed += 1;
+        }
+    }
+    // The one frame the gate's driver had already handed to the channel may
+    // report `Admitted` if the channel accepted it before the epoch died —
+    // that window is documented and holds at most one frame. Everything behind
+    // it must fail.
+    assert!(
+        failed >= total - 1,
+        "expected the dead epoch's queued frames to fail, got {failed} of {total}"
+    );
+
+    // The successor epoch starts clean: a fresh connection, a fresh gate, an
+    // empty channel.
+    assert!(
+        transport_a
+            .send_admission(
+                transport_b.instance_id,
+                b"successor".to_vec(),
+                b"p".to_vec(),
+                MessageType::Message,
+            )
+            .is_admitted(),
+        "the dead epoch must not poison the target"
+    );
+
+    transport_a.shutdown();
+}
