@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use super::super::*;
 use super::support::*;
-use crate::streaming::messenger_mux::protocol::RecordType;
+use crate::streaming::messenger_mux::protocol::{BATCH_HEADER_LEN, RECORD_HEADER_LEN, RecordType};
 use crate::streaming::sender::cached_finalized;
 use crate::transports::tcp::framing::COALESCE_THRESHOLD;
 
@@ -519,6 +519,14 @@ async fn a_starved_slot_is_withheld_while_the_others_keep_flowing() {
 // Terminals
 // ---------------------------------------------------------------------------
 
+/// The terminal and its `CloseSlot` cross the wire in **one** batch.
+///
+/// Asserted against a single [`OwnedBatch`] rather than against records
+/// flattened across batches, because flattening is what makes the interesting
+/// failure invisible: a terminal that ended one batch and a close that opened
+/// the next would still read as adjacent, and that is precisely the split the
+/// atomicity rule forbids. Batch-crossing is the whole risk; adjacency within a
+/// batch was never in doubt.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_terminal_and_its_close_ride_the_same_batch() {
     let harness = harness(MuxConfig::default()).await;
@@ -533,29 +541,46 @@ async fn a_terminal_and_its_close_ride_the_same_batch() {
     inlet.send(item(2)).expect("queue after terminal");
     harness.grant(id, 8);
 
-    let mut records = Vec::new();
-    while !records
-        .iter()
-        .any(|r: &OwnedRecord| r.kind == RecordType::CloseSlot)
-    {
-        records.extend(harness.next_batch().await.records);
-    }
+    // Read batch by batch, and look inside the one that carries the close.
+    let mut seen_before = Vec::new();
+    let closing = loop {
+        let batch = harness.next_batch().await;
+        if batch
+            .records
+            .iter()
+            .any(|r| r.kind == RecordType::CloseSlot)
+        {
+            break batch;
+        }
+        seen_before.extend(batch.records);
+    };
 
-    let close_at = records
+    let close_at = closing
+        .records
         .iter()
         .position(|r| r.kind == RecordType::CloseSlot)
         .expect("close present");
-    assert_eq!(
-        records[close_at - 1].data,
-        *cached_finalized(),
-        "the close must sit immediately behind its terminal"
-    );
-    assert_eq!(records[close_at].slot, id);
     assert!(
-        !records[close_at + 1..]
+        close_at > 0,
+        "the close cannot open a batch — its terminal has to be in the same one"
+    );
+    assert_eq!(
+        closing.records[close_at - 1].data,
+        *cached_finalized(),
+        "the close must sit immediately behind its terminal, in this batch"
+    );
+    assert_eq!(closing.records[close_at].slot, id);
+    assert!(
+        !closing.records[close_at + 1..]
             .iter()
             .any(|r| r.slot == id && r.kind == RecordType::Data),
         "nothing queued behind the terminal may reach the wire"
+    );
+    assert!(
+        !seen_before
+            .iter()
+            .any(|r: &OwnedRecord| r.data == *cached_finalized()),
+        "the terminal must not have gone out in an earlier batch than its close"
     );
 
     eventually(|| inlet.is_disconnected()).await;
@@ -566,6 +591,71 @@ async fn a_terminal_and_its_close_ride_the_same_batch() {
         0.0,
         "a terminal frees its slot"
     );
+}
+
+/// At the cap boundary the pair moves together rather than splitting.
+///
+/// The invariant is "never split", not "always the first batch": a terminal that
+/// would fit in the room left over, but whose close would not, has to take its
+/// close with it into a fresh batch. Sized so that is exactly the choice
+/// production faces — one byte short of room for the close.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_terminal_with_no_room_for_its_close_defers_both_to_a_fresh_batch() {
+    const FILLERS: usize = 2;
+
+    let filler = item(1);
+    let terminal = cached_finalized().clone();
+    let filler_record = RECORD_HEADER_LEN + filler.len();
+    let terminal_record = RECORD_HEADER_LEN + terminal.len();
+    let close_record = RECORD_HEADER_LEN + 1;
+    // Room for the fillers and the terminal, one byte short of the close.
+    let cap = BATCH_HEADER_LEN + FILLERS * filler_record + terminal_record + close_record - 1;
+
+    let harness = harness(MuxConfig {
+        max_batch_bytes: cap,
+        ..MuxConfig::default()
+    })
+    .await;
+    let (inlet, id) = harness.open(1, 1).await;
+
+    for _ in 0..FILLERS {
+        inlet.send(filler.clone()).expect("queue filler");
+    }
+    inlet.send(terminal.clone()).expect("queue terminal");
+    // Everything parked before any credit, so the batcher packs the whole queue
+    // in one pass and the cut it makes is the one under test.
+    harness.await_withheld(FILLERS + 1).await;
+    harness.grant(id, 8);
+
+    let first = harness.next_batch().await;
+    assert_eq!(
+        first.records.len(),
+        FILLERS,
+        "the fillers fill the batch to the boundary: {:?}",
+        first.records.iter().map(|r| r.kind).collect::<Vec<_>>()
+    );
+    assert!(first.records.iter().all(|r| r.kind == RecordType::Data));
+    assert!(
+        first.records.iter().all(|r| r.data != terminal),
+        "the terminal must not go out ahead of the close it is paired with, \
+         even though it would have fitted"
+    );
+    assert!(
+        first.encoded_len <= cap,
+        "batch of {} bytes over the {cap}-byte cap",
+        first.encoded_len
+    );
+
+    let second = harness.next_batch().await;
+    assert_eq!(
+        second.records.len(),
+        2,
+        "the pair moved to the fresh batch together: {:?}",
+        second.records.iter().map(|r| r.kind).collect::<Vec<_>>()
+    );
+    assert_eq!(second.records[0].data, terminal);
+    assert_eq!(second.records[1].kind, RecordType::CloseSlot);
+    assert_eq!(second.records[1].slot, id);
 }
 
 // ---------------------------------------------------------------------------
