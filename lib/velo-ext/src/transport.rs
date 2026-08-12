@@ -238,6 +238,32 @@ pub trait Transport: Send + Sync {
         on_error: Arc<dyn TransportErrorHandler>,
     ) -> SendOutcome;
 
+    /// Largest single message this transport will carry to `target`, in bytes.
+    ///
+    /// The number bounds `header.len() + payload.len()` for one
+    /// [`send_message`](Transport::send_message) — the *combined* frame
+    /// content, not the payload alone. A caller that prepends its own envelope
+    /// to the payload subtracts that envelope from this number; there is no
+    /// second allowance hiding behind it.
+    ///
+    /// `None` means this transport does not know its capacity: nothing was
+    /// negotiated, no limit is configured, or it has not started yet. It is
+    /// **not** a claim of unlimited capacity — a caller that reads `None` must
+    /// fall back to a conservative budget of its own choosing.
+    ///
+    /// The answer is per-target because it can be genuinely per-connection: a
+    /// NATS client learns `max_payload` from the server it happens to be
+    /// connected to, so two peers reached through two clients can differ.
+    /// Transports with a single static limit ignore the argument.
+    ///
+    /// Nothing about this method changes what `send_message` does with an
+    /// oversized frame — that still fails pre-wire through the send's
+    /// `on_error` handler. It exists so callers can size sends to avoid
+    /// meeting that failure at all.
+    fn max_message_size(&self, _target: InstanceId) -> Option<usize> {
+        None
+    }
+
     /// Start the transport (bind listener, spawn tasks) for the given instance.
     fn start(
         &self,
