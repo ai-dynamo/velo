@@ -471,8 +471,8 @@ mod tests {
     use super::*;
     use crate::messenger::handlers::Handler;
     use crate::transports::{
-        HealthCheckError, MessageType, SendBackpressure, Transport, TransportAdapter,
-        TransportError, TransportErrorHandler,
+        HealthCheckError, MessageType, SendOutcome, Transport, TransportAdapter, TransportError,
+        TransportErrorHandler,
     };
     use bytes::Bytes;
     use futures::future::BoxFuture;
@@ -544,7 +544,7 @@ mod tests {
             payload: Bytes,
             message_type: MessageType,
             on_error: Arc<dyn TransportErrorHandler>,
-        ) -> Result<(), SendBackpressure> {
+        ) -> SendOutcome {
             let target_endpoint = match self
                 .peers
                 .lock()
@@ -555,7 +555,7 @@ mod tests {
                 Some(endpoint) => endpoint,
                 None => {
                     on_error.on_error(header, payload, "Peer not registered".to_string());
-                    return Ok(());
+                    return SendOutcome::Admitted;
                 }
             };
 
@@ -567,7 +567,7 @@ mod tests {
 
             let Some(adapter) = maybe_adapter else {
                 on_error.on_error(header, payload, "Target transport not started".to_string());
-                return Ok(());
+                return SendOutcome::Admitted;
             };
 
             let send_result = match message_type {
@@ -584,7 +584,9 @@ mod tests {
                 let (header, payload) = err.0;
                 on_error.on_error(header, payload, "Target receive channel closed".to_string());
             }
-            Ok(())
+            // The target's inbound streams are unbounded, so there is never
+            // anything to queue behind: every send is admitted on the spot.
+            SendOutcome::Admitted
         }
 
         fn start(

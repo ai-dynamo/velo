@@ -843,8 +843,10 @@ impl VeloEvents {
             crate::transports::MessageType::Ack,
             get_event_ack_error_handler(),
         )?;
-        if let crate::transports::SendOutcome::Backpressured(bp) = outcome {
-            bp.await;
+        if let crate::transports::SendOutcome::Pending(admission) = outcome {
+            // A failed admission is already reported through the backend's
+            // error handler; this path has nowhere else to put it.
+            let _ = admission.await;
         }
 
         Ok(())
@@ -861,8 +863,10 @@ impl VeloEvents {
             crate::transports::MessageType::Ack,
             get_event_nack_error_handler(),
         )?;
-        if let crate::transports::SendOutcome::Backpressured(bp) = outcome {
-            bp.await;
+        if let crate::transports::SendOutcome::Pending(admission) = outcome {
+            // A failed admission is already reported through the backend's
+            // error handler; this path has nowhere else to put it.
+            let _ = admission.await;
         }
 
         Ok(())

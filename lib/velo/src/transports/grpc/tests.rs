@@ -123,15 +123,18 @@ fn test_send_message_not_started() {
         .unwrap();
 
     let error_handler = Arc::new(TrackingErrorHandler::new());
-    transport
-        .send_message(
-            crate::InstanceId::new_v4(),
-            Bytes::from_static(b"header"),
-            Bytes::from_static(b"payload"),
-            MessageType::Message,
-            error_handler.clone(),
-        )
-        .expect("send returns Ok and reports via on_error");
+    assert!(
+        transport
+            .send_message(
+                crate::InstanceId::new_v4(),
+                Bytes::from_static(b"header"),
+                Bytes::from_static(b"payload"),
+                MessageType::Message,
+                error_handler.clone(),
+            )
+            .is_admitted(),
+        "a hard failure reports via on_error and leaves nothing to wait on"
+    );
 
     assert_eq!(error_handler.error_count(), 1);
 }

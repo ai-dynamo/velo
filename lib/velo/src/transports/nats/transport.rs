@@ -32,10 +32,10 @@ pub(crate) const HEADER_VELO_HLEN: &str = "Velo-HLen";
 
 use super::subjects;
 use velo_ext::{
-    InstanceId, MessageType, PeerInfo, TransportKey, WorkerAddress,
+    AdmissionGate, InstanceId, MessageType, PeerInfo, SendOutcome, TransportKey, WorkerAddress,
     transport::{
-        HealthCheckError, SendBackpressure, ShutdownState, Transport, TransportAdapter,
-        TransportError, TransportErrorHandler, try_send_or_backpressure,
+        HealthCheckError, ShutdownState, Transport, TransportAdapter, TransportError,
+        TransportErrorHandler,
     },
 };
 
@@ -72,6 +72,14 @@ pub struct NatsTransport {
     peers: Arc<DashMap<InstanceId, String>>,
     /// Sender channel for the dedicated sender task (set once during `start()`).
     sender_tx: OnceLock<flume::Sender<NatsSendTask>>,
+    /// One admission gate per peer, all feeding `sender_tx`.
+    ///
+    /// The publish channel is shared by every peer, but ordering is only ever
+    /// promised per target — so the gate is per target too. A peer whose frames
+    /// are backing up queues behind its own gate instead of serialising
+    /// everyone else's sends through it, and only the shared channel's capacity
+    /// is contended.
+    gates: DashMap<InstanceId, AdmissionGate<NatsSendTask>>,
     /// Bounded channel capacity for the sender task.
     sender_capacity: usize,
     /// Tokio runtime handle, set once during `start()`.
@@ -95,6 +103,23 @@ impl NatsTransport {
         if let Some(metrics) = self.metrics.get() {
             metrics.set_registered_peers(self.peers.len());
         }
+    }
+
+    /// The gate for one peer, created on first send to it.
+    ///
+    /// Gates outlive individual publishes and are never retired: NATS has no
+    /// per-peer connection to die, so there is no epoch boundary at which
+    /// queued frames would become invalid.
+    fn gate_for(
+        &self,
+        target: InstanceId,
+        tx: &flume::Sender<NatsSendTask>,
+        rt: &tokio::runtime::Handle,
+    ) -> AdmissionGate<NatsSendTask> {
+        self.gates
+            .entry(target)
+            .or_insert_with(|| AdmissionGate::new(tx.clone(), rt.clone()))
+            .clone()
     }
 }
 
@@ -137,7 +162,7 @@ impl Transport for NatsTransport {
         payload: Bytes,
         message_type: MessageType,
         on_error: Arc<dyn TransportErrorHandler>,
-    ) -> Result<(), SendBackpressure> {
+    ) -> SendOutcome {
         // Look up peer's NATS subject.
         let subject = match self.peers.get(&instance_id) {
             Some(entry) => entry.value().clone(),
@@ -147,7 +172,7 @@ impl Transport for NatsTransport {
                     payload,
                     format!("Peer not registered: {}", instance_id),
                 );
-                return Ok(());
+                return SendOutcome::Admitted;
             }
         };
 
@@ -166,7 +191,7 @@ impl Transport for NatsTransport {
                     total_size, max, instance_id
                 ),
             );
-            return Ok(());
+            return SendOutcome::Admitted;
         }
 
         let task = NatsSendTask {
@@ -177,40 +202,23 @@ impl Transport for NatsTransport {
             on_error,
         };
 
-        // Lock-free read via OnceLock — no mutex on the hot path.
-        let tx = match self.sender_tx.get() {
-            Some(tx) => tx,
-            None => {
-                task.on_error.on_error(
-                    task.header,
-                    task.payload,
-                    "NATS transport not started".into(),
-                );
-                return Ok(());
-            }
+        // Lock-free reads via OnceLock — no mutex on the hot path.
+        let (Some(tx), Some(rt)) = (self.sender_tx.get(), self.runtime.get()) else {
+            task.on_error.on_error(
+                task.header,
+                task.payload,
+                "NATS transport not started".into(),
+            );
+            return SendOutcome::Admitted;
         };
 
-        let r = try_send_or_backpressure(
-            tx,
-            task,
-            |task| {
-                task.on_error
-                    .on_error(task.header, task.payload, "NATS sender task exited".into());
-            },
-            |task| {
-                task.on_error.on_error(
-                    task.header,
-                    task.payload,
-                    "NATS sender task exited (backpressure)".into(),
-                );
-            },
-        );
+        let outcome = self.gate_for(instance_id, tx, rt).send(task);
         if let Some(m) = self.metrics.get()
-            && r.is_err()
+            && !outcome.is_admitted()
         {
             m.record_send_backpressure();
         }
-        r
+        outcome
     }
 
     fn start(
@@ -738,6 +746,7 @@ impl NatsTransportBuilder {
             local_address: OnceLock::new(),
             peers: Arc::new(DashMap::new()),
             sender_tx: OnceLock::new(),
+            gates: DashMap::new(),
             sender_capacity: self.sender_capacity,
             runtime: OnceLock::new(),
             cancel_token: CancellationToken::new(),

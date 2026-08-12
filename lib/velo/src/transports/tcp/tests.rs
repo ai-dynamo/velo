@@ -4,6 +4,7 @@
 //! Unit tests for the TCP transport's connection lifecycle and builder.
 
 use super::*;
+use crate::transports::AdmissionState;
 use crate::transports::address::WorkerAddressBuilder;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use velo_ext::PeerInfo;
@@ -74,14 +75,32 @@ fn make_transport() -> (TcpTransport, SocketAddr) {
     (transport, addr)
 }
 
+/// Build a `ConnectionHandle` over a channel of the given capacity.
+fn make_handle(capacity: usize) -> (ConnectionHandle, flume::Receiver<SendTask>) {
+    let (tx, rx) = flume::bounded::<SendTask>(capacity);
+    let handle = ConnectionHandle {
+        gate: AdmissionGate::new(tx.clone(), tokio::runtime::Handle::current()),
+        tx,
+    };
+    (handle, rx)
+}
+
 /// Insert a stale `ConnectionHandle` into the transport's connections map.
 /// A "stale" handle is one whose receiver has been dropped.
 fn insert_stale_handle(transport: &TcpTransport, instance_id: crate::InstanceId) {
-    let (tx, _rx) = flume::bounded::<SendTask>(1);
+    let (handle, _rx) = make_handle(1);
     // Drop _rx immediately so tx.is_disconnected() == true
-    transport
-        .connections
-        .insert(instance_id, ConnectionHandle { tx });
+    transport.connections.insert(instance_id, handle);
+}
+
+/// A `SendTask` whose error handler is the given one.
+fn task(on_error: Arc<dyn TransportErrorHandler>) -> SendTask {
+    SendTask {
+        msg_type: MessageType::Message,
+        header: Bytes::from_static(b"hdr"),
+        payload: Bytes::from_static(b"pay"),
+        on_error,
+    }
 }
 
 #[test]
@@ -247,10 +266,11 @@ async fn test_writer_task_cleans_up_on_write_error() {
     let addr = listener.local_addr().unwrap();
 
     let iid = crate::InstanceId::new_v4();
-    let (tx, rx) = flume::bounded::<SendTask>(8);
+    let (handle, rx) = make_handle(8);
+    let tx = handle.tx.clone();
 
     let connections: Arc<DashMap<crate::InstanceId, ConnectionHandle>> = Arc::new(DashMap::new());
-    connections.insert(iid, ConnectionHandle { tx: tx.clone() });
+    connections.insert(iid, handle);
 
     let conns = Arc::clone(&connections);
     let cancel = CancellationToken::new();
@@ -327,15 +347,18 @@ async fn test_send_message_does_not_fail_on_stale_handle() {
     // NOT immediately call on_error. This exercises the slow path
     // (get_or_create_connection + try_send on a freshly-created handle).
     let error_handler = Arc::new(TrackingErrorHandler::new());
-    transport
-        .send_message(
-            iid,
-            Bytes::from_static(b"test-header"),
-            Bytes::from_static(b"test-payload"),
-            MessageType::Message,
-            error_handler.clone(),
-        )
-        .expect("slow-path send on fresh connection should enqueue synchronously");
+    assert!(
+        transport
+            .send_message(
+                iid,
+                Bytes::from_static(b"test-header"),
+                Bytes::from_static(b"test-payload"),
+                MessageType::Message,
+                error_handler.clone(),
+            )
+            .is_admitted(),
+        "a fresh connection's channel is empty, so the send admits immediately"
+    );
 
     // Accept the connection that the new writer task will establish
     let (mut stream, _) = peer_listener.accept().await.unwrap();
@@ -374,10 +397,11 @@ async fn test_writer_task_drains_on_connect_failure() {
     drop(tmp);
 
     let iid = crate::InstanceId::new_v4();
-    let (tx, rx) = flume::bounded::<SendTask>(8);
+    let (handle, rx) = make_handle(8);
+    let tx = handle.tx.clone();
 
     let connections: Arc<DashMap<crate::InstanceId, ConnectionHandle>> = Arc::new(DashMap::new());
-    connections.insert(iid, ConnectionHandle { tx: tx.clone() });
+    connections.insert(iid, handle);
 
     // Queue a message *before* the writer task even starts — this simulates
     // the race between create_connection returning and connect completing.
@@ -413,5 +437,49 @@ async fn test_writer_task_drains_on_connect_failure() {
     assert!(
         !connections.contains_key(&iid),
         "writer task should clean up its DashMap entry on connect failure"
+    );
+}
+
+/// Replacing a stale connection must kill the old epoch's queued frames.
+///
+/// The gate is per connection, so a frame queued behind a connection that has
+/// since died must never be handed to its successor — it was addressed to a
+/// socket that no longer exists.
+#[tokio::test]
+async fn stale_replacement_fails_the_old_epoch_and_admits_on_the_successor() {
+    let (transport, _our_addr) = make_transport();
+
+    let peer_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let peer_addr = peer_listener.local_addr().unwrap();
+    let peer = make_tcp_peer(peer_addr);
+    let iid = peer.instance_id();
+    transport.register(peer).unwrap();
+
+    // A live one-slot connection, filled and then queued behind.
+    let (handle, rx) = make_handle(1);
+    transport.connections.insert(iid, handle.clone());
+    let errors = Arc::new(TrackingErrorHandler::new());
+    assert!(handle.gate.send(task(errors.clone())).is_admitted());
+    let queued = match handle.gate.send(task(errors.clone())) {
+        SendOutcome::Pending(admission) => admission,
+        SendOutcome::Admitted => panic!("a full channel must not admit"),
+    };
+
+    // Kill the connection. There is deliberately no await between here and the
+    // assertions: the gate's driver has never run, so the queued frame is still
+    // in the gate and `fail_all` resolves it synchronously.
+    drop(rx);
+    assert!(handle.tx.is_disconnected());
+    let fresh = transport.get_or_create_connection(iid).unwrap();
+
+    assert_eq!(
+        queued.state(),
+        AdmissionState::Failed,
+        "the old epoch's queued frame must not survive the replacement"
+    );
+    assert!(!fresh.tx.is_disconnected(), "the successor should be live");
+    assert!(
+        fresh.gate.send(task(errors)).is_admitted(),
+        "the successor's gate is unaffected by the dead epoch"
     );
 }

@@ -378,22 +378,11 @@ impl TransportMetricsHandle {
         self.active_connections.set(count as f64);
     }
 
-    /// Record a send that could not enqueue synchronously on the per-peer
-    /// bounded channel and fell through to the `SendBackpressure` await path.
-    /// Fires once per `try_send_or_backpressure` Full-branch return.
+    /// Record a send that could not enqueue synchronously on the per-target
+    /// bounded channel and was queued in that target's admission gate. Fires
+    /// once per `SendOutcome::Pending` a transport returns.
     pub fn record_send_backpressure(&self) {
         self.send_backpressure.inc();
-    }
-
-    /// Convenience form: inspect a send result and increment the backpressure
-    /// counter iff it's `Err`. Generic over the error type so the helper is
-    /// usable without pulling `velo-transports` types into this crate.
-    /// Every transport's `send_message` result fits (the `Err` variant is
-    /// `SendBackpressure`, but this helper cares only about Ok vs Err).
-    pub fn record_send_backpressure_on<T, E>(&self, r: &Result<T, E>) {
-        if r.is_err() {
-            self.send_backpressure.inc();
-        }
     }
 }
 
@@ -614,7 +603,7 @@ impl VeloMetrics {
             CounterVec::new(
                 Opts::new(
                     "velo_transport_send_backpressure_total",
-                    "Sends that hit the bounded per-peer channel's Full branch and fell through to the SendBackpressure await path.",
+                    "Sends that found the bounded per-target channel full and were queued in that target's admission gate.",
                 ),
                 &["transport"],
             )?,

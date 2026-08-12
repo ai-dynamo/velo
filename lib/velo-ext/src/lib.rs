@@ -27,9 +27,7 @@ pub mod transport;
 
 // Convenience re-exports at the crate root for the most-used items. Plugin
 // authors typically write `use velo_ext::Transport;` or `use velo_ext::WorkerId;`.
-pub use admission::{
-    AdmissionError, AdmissionGate, AdmissionOutcome, AdmissionState, SendAdmission,
-};
+pub use admission::{AdmissionError, AdmissionGate, AdmissionState, SendAdmission, SendOutcome};
 pub use discovery::{
     PeerDiscovery, PeerRegistrationGuard, ServiceDiscovery, ServiceEvent, ServiceRegistrationGuard,
 };
@@ -37,7 +35,6 @@ pub use id::{InstanceId, PeerInfo, TransportKey, WorkerAddress, WorkerAddressErr
 pub use observability::{Direction, TransportObservability, TransportRejection};
 pub use streaming::FrameTransport;
 pub use transport::{
-    DataStreams, HealthCheckError, InFlightGuard, MessageType, SendBackpressure, SendOutcome,
-    ShutdownPolicy, ShutdownState, Transport, TransportAdapter, TransportError,
-    TransportErrorHandler, make_channels, try_send_or_backpressure,
+    DataStreams, HealthCheckError, InFlightGuard, MessageType, ShutdownPolicy, ShutdownState,
+    Transport, TransportAdapter, TransportError, TransportErrorHandler, make_channels,
 };

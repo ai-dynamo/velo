@@ -184,8 +184,8 @@ name = "streaming_velo_specific"
 path = "tests/streaming/velo_specific.rs"
 
 [[test]]
-name = "transports_backpressure"
-path = "tests/transports/backpressure.rs"
+name = "transports_admission"
+path = "tests/transports/admission.rs"
 required-features = ["test-helpers"]
 
 [[test]]

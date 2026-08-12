@@ -12,7 +12,7 @@ use dashmap::DashMap;
 use futures::future::BoxFuture;
 
 use crate::transports::{
-    HealthCheckError, MessageType, SendBackpressure, ShutdownState, Transport, TransportAdapter,
+    HealthCheckError, MessageType, SendOutcome, ShutdownState, Transport, TransportAdapter,
     TransportError, TransportErrorHandler,
 };
 use velo_ext::{InstanceId, PeerInfo, TransportKey, WorkerAddress};
@@ -72,6 +72,12 @@ impl Transport for SimTransport {
         Ok(())
     }
 
+    /// Admission is always immediate.
+    ///
+    /// The fabric's queue is unbounded and its ordering is decided by the
+    /// discrete-event scheduler, not by a channel, so there is nothing for a
+    /// gate to serialise: every send is [`SendOutcome::Admitted`] the moment
+    /// the fabric takes it.
     fn send_message(
         &self,
         instance_id: InstanceId,
@@ -79,10 +85,10 @@ impl Transport for SimTransport {
         payload: Bytes,
         message_type: MessageType,
         on_error: Arc<dyn TransportErrorHandler>,
-    ) -> Result<(), SendBackpressure> {
+    ) -> SendOutcome {
         let Some(source_id) = self.instance_id.get().copied() else {
             on_error.on_error(header, payload, "SimTransport not started".into());
-            return Ok(());
+            return SendOutcome::Admitted;
         };
 
         if !self.peers.contains_key(&instance_id) {
@@ -91,7 +97,7 @@ impl Transport for SimTransport {
                 payload,
                 format!("Peer not registered: {instance_id}"),
             );
-            return Ok(());
+            return SendOutcome::Admitted;
         }
 
         self.fabric.enqueue(
@@ -102,7 +108,7 @@ impl Transport for SimTransport {
             message_type,
             on_error,
         );
-        Ok(())
+        SendOutcome::Admitted
     }
 
     fn start(

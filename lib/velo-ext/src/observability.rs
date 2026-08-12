@@ -104,7 +104,8 @@ pub trait TransportObservability: Send + Sync {
     /// Set the gauge for the number of active connections on this transport.
     fn set_active_connections(&self, count: usize);
 
-    /// Record a send that hit the bounded per-peer channel's `Full` branch and
-    /// fell through to the [`SendBackpressure`](crate::transport::SendBackpressure) await path.
+    /// Record a send that found the bounded per-target channel full and was
+    /// queued in the target's [`AdmissionGate`](crate::admission::AdmissionGate)
+    /// instead of admitted on the spot.
     fn record_send_backpressure(&self);
 }

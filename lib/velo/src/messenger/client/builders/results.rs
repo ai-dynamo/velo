@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Result types and send/backpressure state machinery backing the message builders.
+//! Result types and send-admission state machinery backing the message builders.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -13,17 +13,18 @@ use serde::de::DeserializeOwned;
 
 use super::super::ActiveMessageClient;
 use crate::observability::ClientResolution;
-use crate::transports::{SendBackpressure, SendOutcome};
+use crate::transports::{SendAdmission, SendOutcome};
 
 /// Shared state for all builder result futures.
 ///
-/// Drives any `SendBackpressure` to completion before polling the
-/// `ResponseAwaiter`. `immediate_error` short-circuits both. This is the one
-/// place the bp-then-response sequence lives; each public result type
+/// Waits for a queued frame's admission before polling the `ResponseAwaiter` —
+/// a response cannot arrive for a frame that has not reached the send channel.
+/// `immediate_error` short-circuits both. This is the one place the
+/// admission-then-response sequence lives; each public result type
 /// (`SyncResult`/`UnaryResult`/`TypedUnaryResult`) is a thin wrapper that
 /// maps the raw response bytes to its declared `Output`.
 pub(super) struct ResponseStage {
-    bp: Option<SendBackpressure>,
+    admission: Option<SendAdmission>,
     awaiter: Option<crate::messenger::common::responses::ResponseAwaiter>,
     immediate_error: Option<anyhow::Error>,
 }
@@ -67,18 +68,18 @@ impl StageState {
 impl ResponseStage {
     pub(super) fn ready(awaiter: crate::messenger::common::responses::ResponseAwaiter) -> Self {
         Self {
-            bp: None,
+            admission: None,
             awaiter: Some(awaiter),
             immediate_error: None,
         }
     }
 
-    pub(super) fn with_bp(
+    pub(super) fn with_admission(
         awaiter: crate::messenger::common::responses::ResponseAwaiter,
-        bp: Option<SendBackpressure>,
+        admission: Option<SendAdmission>,
     ) -> Self {
         Self {
-            bp,
+            admission,
             awaiter: Some(awaiter),
             immediate_error: None,
         }
@@ -86,22 +87,32 @@ impl ResponseStage {
 
     pub(super) fn error(err: anyhow::Error) -> Self {
         Self {
-            bp: None,
+            admission: None,
             awaiter: None,
             immediate_error: Some(err),
         }
     }
 
-    /// Drive bp (if any) then the awaiter. Returns the raw response bytes;
-    /// wrappers map this into their own `Output` type.
+    /// Await admission (if the frame was queued) then the awaiter. Returns the
+    /// raw response bytes; wrappers map this into their own `Output` type.
+    ///
+    /// A failed admission ends the call here rather than falling through to the
+    /// awaiter: the frame never reached the wire, so no response is coming. The
+    /// backend's completion hook has already released the response slot via
+    /// `on_error`.
     fn poll_raw(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<Bytes>>> {
         if let Some(err) = self.immediate_error.take() {
             return Poll::Ready(Err(err));
         }
 
-        if let Some(bp) = self.bp.as_mut() {
-            match Pin::new(bp).poll(cx) {
-                Poll::Ready(()) => self.bp = None,
+        if let Some(admission) = self.admission.as_mut() {
+            match Pin::new(admission).poll(cx) {
+                Poll::Ready(Ok(())) => self.admission = None,
+                Poll::Ready(Err(error)) => {
+                    self.admission = None;
+                    self.awaiter = None;
+                    return Poll::Ready(Err(anyhow!("Send failed: {error}")));
+                }
                 Poll::Pending => return Poll::Pending,
             }
         }
@@ -178,9 +189,11 @@ impl<R: DeserializeOwned> Future for TypedUnaryResult<R> {
 /// Drive a `send_message` result from inside a spawned (slow-path) task that
 /// owns the response outcome.
 ///
-/// - `Enqueued` → no-op; let the awaiter wait for the response.
-/// - `Backpressured(bp)` → `.await` the bp future so the frame is actually
-///   enqueued before this task returns.
+/// - `Admitted` → no-op; let the awaiter wait for the response.
+/// - `Pending(admission)` → `.await` it, so this task does not return before
+///   the frame reaches the send channel. A failed admission is reported the
+///   same way a routing error is: the frame never made it, so the caller must
+///   not be left waiting for a response.
 /// - `Err` → log, emit `ClientResolution::SendError`, and complete the
 ///   response outcome with the error so callers don't wait forever.
 pub(super) async fn drive_send_outcome(
@@ -189,36 +202,37 @@ pub(super) async fn drive_send_outcome(
     response_id: crate::messenger::common::responses::ResponseId,
     path_description: &'static str,
 ) {
-    match send_result {
-        Ok(SendOutcome::Enqueued) => {}
-        Ok(SendOutcome::Backpressured(bp)) => bp.await,
-        Err(e) => {
-            tracing::error!(
-                target: "crate::messenger::client",
-                error = %e,
-                path = path_description,
-                "Failed to send message"
-            );
-            if let Some(metrics) = client.observability.as_ref() {
-                metrics.record_client_resolution(ClientResolution::SendError);
-            }
-            let _ = client
-                .response_manager
-                .complete_outcome(response_id, Err(format!("Send failed: {}", e)));
-        }
+    let error = match send_result {
+        Ok(SendOutcome::Admitted) => return,
+        Ok(SendOutcome::Pending(admission)) => match admission.await {
+            Ok(()) => return,
+            Err(error) => anyhow!(error),
+        },
+        Err(error) => error,
+    };
+
+    tracing::error!(
+        target: "crate::messenger::client",
+        error = %error,
+        path = path_description,
+        "Failed to send message"
+    );
+    if let Some(metrics) = client.observability.as_ref() {
+        metrics.record_client_resolution(ClientResolution::SendError);
     }
+    let _ = client
+        .response_manager
+        .complete_outcome(response_id, Err(format!("Send failed: {}", error)));
 }
 
-/// Fast-path fire driver. Returns `Ok(())` once the frame has been handed to
-/// the transport (either fast-pathed or bp-enqueued). Returns `Err` for
-/// pre-wire failures:
+/// Fast-path fire driver. Returns `Ok(())` once the frame has reached the
+/// transport's send channel (immediately, or after waiting out a queue).
+/// Returns `Err` for pre-wire failures:
 ///
 /// - Synchronous `send_message` error (peer unregistered, transport-level
 ///   refusal).
-/// - `on_error` fires during `bp.await` (channel closed between hand-off and
-///   drain — frame never made it to the wire). The `DefaultErrorHandler`
-///   completes the awaiter with `Err`; after `bp.await` resolves we poll
-///   the awaiter once non-blockingly and surface any completion we find.
+/// - The admission resolves `Err` — the connection epoch died or the channel
+///   closed before the frame was enqueued.
 ///
 /// After the frame is accepted by the wire the awaiter is simply dropped —
 /// fire-and-forget semantics mean we don't observe remote processing.
@@ -227,18 +241,17 @@ pub(super) async fn drive_fire_send(
     mut awaiter: crate::messenger::common::responses::ResponseAwaiter,
 ) -> Result<()> {
     use futures::FutureExt;
-    // Some transports (e.g. TCP's `slow_path_send` via
-    // `try_send_or_backpressure` on a disconnected channel, or early-returns
-    // like "Transport not started" and "Failed to create connection") invoke
-    // `on_error` synchronously and then return `Ok(())` — which `VeloBackend`
-    // maps to `SendOutcome::Enqueued`. In those cases DefaultErrorHandler
-    // has already completed the awaiter with Err before we get here. The
-    // Backpressured arm has the same property once bp resolves (transport
-    // calls on_error inside the bp future). Poll once in both arms and
-    // surface any Err we find.
+    // A hard pre-wire failure inside a transport (peer unregistered, transport
+    // not started, connection could not be created) is reported through
+    // `on_error` and then returns `Admitted` — there is nothing left to wait
+    // on. `DefaultErrorHandler` has already completed the awaiter with `Err` by
+    // the time we get here, so poll it once, non-blockingly, and surface any
+    // completion we find.
     match send_result {
-        Ok(SendOutcome::Enqueued) => {}
-        Ok(SendOutcome::Backpressured(bp)) => bp.await,
+        Ok(SendOutcome::Admitted) => {}
+        Ok(SendOutcome::Pending(admission)) => {
+            admission.await.map_err(|e| anyhow!("Send failed: {}", e))?;
+        }
         Err(e) => return Err(e),
     }
     match awaiter.recv().now_or_never() {

@@ -177,11 +177,13 @@ impl ActiveMessageClient {
 
         let send_outcome = self.send_message(target, message)?;
 
-        // Share a single handshake_timeout budget across both the send-side
-        // backpressure wait (if any) and the response receive.
+        // Share a single handshake_timeout budget across both the admission
+        // wait (if the frame was queued) and the response receive. A failed
+        // admission is left to surface through `outcome.recv()`, which the
+        // backend's completion hook has already resolved with the error.
         let result = tokio::time::timeout(self.handshake_timeout, async {
-            if let SendOutcome::Backpressured(bp) = send_outcome {
-                bp.await;
+            if let SendOutcome::Pending(admission) = send_outcome {
+                let _ = admission.await;
             }
             outcome.recv().await
         })

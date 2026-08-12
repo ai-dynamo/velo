@@ -5,14 +5,17 @@
 //!
 //! ## The hazard this exists to fix
 //!
-//! [`try_send_or_backpressure`](crate::transport::try_send_or_backpressure)
-//! hands a caller that hit a full channel a [`SendBackpressure`] future holding
-//! the frame. Nothing enqueues that frame until somebody polls the future, so a
-//! *later* send to the same target can win the race: its `try_send` succeeds
-//! while the earlier frame is still parked in an unpolled future. Two sends
-//! issued in order A, B arrive at the remote as B, A. Fire-and-forget senders
-//! make this worse — they may never poll at all, so A's frame can sit
-//! indefinitely behind an unbounded number of successors.
+//! The obvious way to handle a full per-target channel is to hand the caller a
+//! future that owns the frame and completes the enqueue when polled. Velo
+//! shipped exactly that until 0.7 and it reorders frames: nothing enqueues the
+//! parked frame until somebody polls the future, so a *later* send to the same
+//! target can win the race — its `try_send` succeeds while the earlier frame is
+//! still sitting in an unpolled future. Two sends issued in order A, B arrive
+//! at the remote as B, A. Fire-and-forget senders make it worse; they may never
+//! poll at all, so A can sit behind an unbounded number of successors.
+//!
+//! The fix is structural rather than advisory: take the frame at `send` time
+//! and never let its delivery depend on the caller.
 //!
 //! ## The guarantee
 //!
@@ -33,23 +36,24 @@
 //!    when the queue empties and is respawned by the next queued ticket.
 //!
 //! The fast path is preserved: when the queue is empty *and* `try_send`
-//! succeeds, [`AdmissionGate::send`] returns [`AdmissionOutcome::Admitted`]
-//! without allocating a ticket, waking a driver, or touching a waker. Only
-//! contended sends pay. Crucially, a frame the driver has checked out stays in
-//! the queue (with its payload taken) until it has been enqueued or dropped, so
-//! the "queue is empty" test cannot let a newcomer overtake a frame that is
+//! succeeds, [`AdmissionGate::send`] returns [`SendOutcome::Admitted`] without
+//! allocating a ticket, waking a driver, or touching a waker. Only contended
+//! sends pay. Crucially, a frame the driver has checked out stays in the queue
+//! (with its payload taken) until it has been enqueued or dropped, so the
+//! "queue is empty" test cannot let a newcomer overtake a frame that is
 //! mid-flight.
 //!
-//! ## Divergence from `SendBackpressure`: dropping does not cancel
+//! ## Dropping an admission does not cancel it
 //!
-//! Dropping a [`SendBackpressure`] cancels the send. Dropping a
-//! [`SendAdmission`] does **not** — the frame is already in the gate and will
-//! be delivered. Cancellation is explicit, via [`SendAdmission::cancel`]. This
-//! is deliberate: fire-and-forget senders drop their handle immediately and
-//! must still see their frame delivered, which is irreconcilable with
-//! drop-cancel. Callers that want the old behaviour call `cancel()`.
+//! Dropping a [`SendAdmission`] leaves the frame in the gate, and the gate
+//! still delivers it. Cancellation is explicit, via [`SendAdmission::cancel`].
+//! This is the point of the design, not an oversight: fire-and-forget senders
+//! drop their handle on the spot and must still see their frame delivered,
+//! which is irreconcilable with drop-cancels-the-send.
 //!
-//! [`SendBackpressure`]: crate::transport::SendBackpressure
+//! Callers that want to *observe* an outcome without holding the future — a
+//! metric to record, a result channel to feed — register a
+//! [`SendAdmission::on_resolved`] hook instead of polling.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -109,13 +113,14 @@ pub enum AdmissionError {
     Failed(String),
 }
 
-/// Outcome of [`AdmissionGate::send`].
+/// Outcome of [`AdmissionGate::send`], and of
+/// [`Transport::send_message`](crate::transport::Transport::send_message).
 ///
 /// Dropping this is a legitimate fire-and-forget pattern — the frame is already
 /// owned by the gate and will be delivered either way — so it is deliberately
 /// not `#[must_use]`.
 #[derive(Debug)]
-pub enum AdmissionOutcome {
+pub enum SendOutcome {
     /// The frame was enqueued synchronously. No ticket was taken.
     Admitted,
     /// The frame was queued behind the gate's FIFO. The contained handle
@@ -123,7 +128,7 @@ pub enum AdmissionOutcome {
     Pending(SendAdmission),
 }
 
-impl AdmissionOutcome {
+impl SendOutcome {
     /// `true` if the frame took the synchronous fast path.
     pub fn is_admitted(&self) -> bool {
         matches!(self, Self::Admitted)
@@ -173,6 +178,33 @@ impl SendAdmission {
     /// non-async context.
     pub fn state(&self) -> AdmissionState {
         self.ticket.state()
+    }
+
+    /// Observe the outcome without polling.
+    ///
+    /// `on_resolved` receives exactly what awaiting this admission would have
+    /// produced, and runs exactly once: at resolution if the ticket is still
+    /// pending, or immediately if it has already resolved. That makes it the
+    /// mechanism for callers who cannot await — a fire-and-forget send whose
+    /// handle is about to be dropped, or a metric that must be recorded when
+    /// the frame really lands rather than when it was offered.
+    ///
+    /// The hook runs on whichever task resolves the ticket, normally the gate's
+    /// driver, so keep it short: a slow hook delays the next frame on this
+    /// target. It must not call back into the same gate.
+    ///
+    /// There is no hook for [`SendOutcome::Admitted`] because there is nothing
+    /// to wait for — that variant *is* the synchronous notification, and a
+    /// caller wanting "exactly once per send" handles it on the spot.
+    ///
+    /// Registering a second hook replaces the first, which is then dropped
+    /// without running.
+    pub fn on_resolved(
+        self,
+        on_resolved: impl FnOnce(&Result<(), AdmissionError>) + Send + 'static,
+    ) -> Self {
+        self.ticket.set_hook(Box::new(on_resolved));
+        self
     }
 
     /// Withdraw the frame from the gate.
@@ -235,8 +267,30 @@ enum TicketOutcome {
     Failed(AdmissionError),
 }
 
+fn read_outcome(outcome: &TicketOutcome) -> Option<Result<(), AdmissionError>> {
+    match outcome {
+        TicketOutcome::Pending => None,
+        TicketOutcome::Admitted => Some(Ok(())),
+        TicketOutcome::Failed(error) => Some(Err(error.clone())),
+    }
+}
+
+/// Callback installed by [`SendAdmission::on_resolved`].
+type ResolveHook = Box<dyn FnOnce(&Result<(), AdmissionError>) + Send>;
+
+/// The outcome and the not-yet-fired hook share one lock.
+///
+/// That is what makes hook registration race-free: the "has it resolved yet?"
+/// test and the install are one critical section, so a hook can neither be
+/// stored on an already-resolved ticket (never to run) nor be missed by a
+/// `resolve` that ran a moment earlier.
+struct TicketState {
+    outcome: TicketOutcome,
+    hook: Option<ResolveHook>,
+}
+
 struct Ticket {
-    outcome: Mutex<TicketOutcome>,
+    state: Mutex<TicketState>,
     waker: AtomicWaker,
     /// Set by [`SendAdmission::cancel`] when the driver already owns the frame.
     cancel: CancellationToken,
@@ -245,14 +299,17 @@ struct Ticket {
 impl Ticket {
     fn new() -> Self {
         Self {
-            outcome: Mutex::new(TicketOutcome::Pending),
+            state: Mutex::new(TicketState {
+                outcome: TicketOutcome::Pending,
+                hook: None,
+            }),
             waker: AtomicWaker::new(),
             cancel: CancellationToken::new(),
         }
     }
 
     fn state(&self) -> AdmissionState {
-        match *lock(&self.outcome) {
+        match lock(&self.state).outcome {
             TicketOutcome::Pending => AdmissionState::Pending,
             TicketOutcome::Admitted => AdmissionState::Admitted,
             TicketOutcome::Failed(_) => AdmissionState::Failed,
@@ -260,33 +317,50 @@ impl Ticket {
     }
 
     fn outcome(&self) -> Option<Result<(), AdmissionError>> {
-        match &*lock(&self.outcome) {
-            TicketOutcome::Pending => None,
-            TicketOutcome::Admitted => Some(Ok(())),
-            TicketOutcome::Failed(error) => Some(Err(error.clone())),
-        }
+        read_outcome(&lock(&self.state).outcome)
     }
 
     /// Resolve the ticket. First writer wins; later attempts are no-ops.
     ///
     /// Never called with the gate lock held for a ticket whose waker could
-    /// re-enter the gate, so the woken task cannot deadlock against us.
+    /// re-enter the gate, so the woken task cannot deadlock against us. The
+    /// hook runs last, outside the ticket lock, for the same reason.
     fn resolve(&self, outcome: Result<(), AdmissionError>) {
-        {
-            let mut slot = lock(&self.outcome);
-            if !matches!(*slot, TicketOutcome::Pending) {
+        let hook = {
+            let mut state = lock(&self.state);
+            if !matches!(state.outcome, TicketOutcome::Pending) {
                 return;
             }
-            *slot = match outcome {
+            state.outcome = match &outcome {
                 Ok(()) => TicketOutcome::Admitted,
-                Err(error) => TicketOutcome::Failed(error),
+                Err(error) => TicketOutcome::Failed(error.clone()),
             };
-        }
+            state.hook.take()
+        };
         self.waker.wake();
+        if let Some(hook) = hook {
+            hook(&outcome);
+        }
+    }
+
+    /// Install the completion hook, running it on the spot if the ticket has
+    /// already resolved.
+    fn set_hook(&self, hook: ResolveHook) {
+        let resolved = {
+            let mut state = lock(&self.state);
+            match read_outcome(&state.outcome) {
+                None => {
+                    state.hook = Some(hook);
+                    return;
+                }
+                Some(outcome) => outcome,
+            }
+        };
+        hook(&resolved);
     }
 
     fn is_live(&self) -> bool {
-        !self.cancel.is_cancelled() && matches!(*lock(&self.outcome), TicketOutcome::Pending)
+        !self.cancel.is_cancelled() && matches!(lock(&self.state).outcome, TicketOutcome::Pending)
     }
 }
 
@@ -388,9 +462,8 @@ impl<T: Send + 'static> TicketRegistry for GateInner<T> {
 /// broker transports. Cloning is cheap (the state is shared) so a gate can be
 /// handed to every task that sends to that target.
 ///
-/// See the [module docs](self) for the ordering guarantee and the deliberate
-/// drop-does-not-cancel divergence from
-/// [`SendBackpressure`](crate::transport::SendBackpressure).
+/// See the [module docs](self) for the ordering guarantee and for why
+/// dropping an admission does not cancel its frame.
 pub struct AdmissionGate<T: Send + 'static> {
     inner: Arc<GateInner<T>>,
 }
@@ -436,26 +509,26 @@ impl<T: Send + 'static> AdmissionGate<T> {
 
     /// Offer a frame to the channel, taking a ticket if it cannot go now.
     ///
-    /// Synchronous and non-blocking. Returns [`AdmissionOutcome::Admitted`] if
+    /// Synchronous and non-blocking. Returns [`SendOutcome::Admitted`] if
     /// the queue was empty and the channel had room; otherwise the frame joins
     /// the gate's FIFO and the returned [`SendAdmission`] observes its ticket.
     ///
     /// If the channel's receiver has already been dropped the frame is dropped
-    /// and an already-failed [`AdmissionOutcome::Pending`] carrying
+    /// and an already-failed [`SendOutcome::Pending`] carrying
     /// [`AdmissionError::ChannelClosed`] is returned — the two-variant outcome
     /// has no honest "admitted" answer for a closed channel. A caller that
     /// spawns a task per `Pending` will spawn one that finishes immediately.
-    pub fn send(&self, item: T) -> AdmissionOutcome {
+    pub fn send(&self, item: T) -> SendOutcome {
         let mut state = lock(&self.inner.state);
 
         // Fast path. The emptiness check and the try_send are one critical
         // section, so no concurrent sender can slip between them.
         let item = if state.queue.is_empty() {
             match self.inner.tx.try_send(item) {
-                Ok(()) => return AdmissionOutcome::Admitted,
+                Ok(()) => return SendOutcome::Admitted,
                 Err(flume::TrySendError::Full(item)) => item,
                 Err(flume::TrySendError::Disconnected(_)) => {
-                    return AdmissionOutcome::Pending(SendAdmission::resolved(Err(
+                    return SendOutcome::Pending(SendAdmission::resolved(Err(
                         AdmissionError::ChannelClosed,
                     )));
                 }
@@ -480,7 +553,7 @@ impl<T: Send + 'static> AdmissionGate<T> {
 
         let weak = Arc::downgrade(&self.inner);
         let gate: Weak<dyn TicketRegistry> = weak;
-        AdmissionOutcome::Pending(SendAdmission::new(ticket, gate))
+        SendOutcome::Pending(SendAdmission::new(ticket, gate))
     }
 
     /// Fail every outstanding ticket and drop the frames behind them.

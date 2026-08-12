@@ -315,8 +315,8 @@ pub struct MessageBuilder {
     target_worker: Option<WorkerId>,
     headers: Option<HashMap<String, String>>,
     // When set, slot acquisition awaits capacity instead of failing fast
-    // with `ResponseRegistrationError::Exhausted`. Mirrors the transport's
-    // `SendBackpressure` semantics: callers doing fan-out get bounded
+    // with `ResponseRegistrationError::Exhausted`. The analogue one layer
+    // down is `SendOutcome::Pending`: callers doing fan-out get bounded
     // in-flight backpressure for free.
     await_capacity: bool,
 }
@@ -344,8 +344,10 @@ fn stage_from_send(
     awaiter: crate::messenger::common::responses::ResponseAwaiter,
 ) -> ResponseStage {
     match send_result {
-        Ok(SendOutcome::Enqueued) => ResponseStage::ready(awaiter),
-        Ok(SendOutcome::Backpressured(bp)) => ResponseStage::with_bp(awaiter, Some(bp)),
+        Ok(SendOutcome::Admitted) => ResponseStage::ready(awaiter),
+        Ok(SendOutcome::Pending(admission)) => {
+            ResponseStage::with_admission(awaiter, Some(admission))
+        }
         Err(e) => {
             tracing::error!(
                 target: "crate::messenger::client",
@@ -409,9 +411,14 @@ impl MessageBuilder {
     ///
     /// Default: `register_outcome` fails immediately with
     /// [`ResponseRegistrationError::Exhausted`] when the per-worker slot
-    /// arena is full. With this flag, the builder instead awaits a free slot
-    /// (matching `SendOutcome::Backpressured` ergonomics for transport-level
-    /// channel saturation).
+    /// arena is full. With this flag, the builder instead awaits a free slot.
+    ///
+    /// This is about *response slots*, not about the transport's send channel:
+    /// a saturated send channel is handled a layer down by the target's
+    /// admission gate, which queues the frame and reports
+    /// `SendOutcome::Pending` whether or not this flag is set. The two are
+    /// independent backpressure sources that happen to feel the same to a
+    /// caller who just awaits the result.
     ///
     /// Use this for fan-out workloads that may legitimately exceed 64k
     /// in-flight requests on a single worker — backpressure is preferable to
@@ -538,8 +545,7 @@ impl MessageBuilder {
         };
 
         // Acquire per the builder's capacity policy. With `await_capacity`,
-        // wait for a free slot instead of failing fast — mirrors the
-        // SendBackpressure idiom transports already use.
+        // wait for a free slot instead of failing fast.
         let outcome = acquire_awaiter(&self.client, self.await_capacity).await?;
 
         match target_result {
@@ -639,21 +645,21 @@ impl MessageBuilder {
                 metadata: MessageMetadata::new_fire(response_id, handler, headers),
                 payload: payload.unwrap_or_default(),
             };
-            match client.send_message(target, message) {
-                Ok(SendOutcome::Enqueued) => {
+            let error = match client.send_message(target, message) {
+                Ok(SendOutcome::Admitted) => None,
+                Ok(SendOutcome::Pending(admission)) => admission.await.err().map(|e| anyhow!(e)),
+                Err(e) => Some(e),
+            };
+            match error {
+                // If DefaultErrorHandler already wrote Err (a transport that
+                // reported a hard failure and then returned `Admitted`), this
+                // Ok is a no-op — the slot has already finished.
+                None => {
                     let _ = client
                         .response_manager
                         .complete_outcome(response_id, Ok(None));
                 }
-                Ok(SendOutcome::Backpressured(bp)) => {
-                    bp.await;
-                    // If DefaultErrorHandler already wrote Err during bp.await,
-                    // this Ok is a no-op (slot already finished).
-                    let _ = client
-                        .response_manager
-                        .complete_outcome(response_id, Ok(None));
-                }
-                Err(e) => {
+                Some(e) => {
                     tracing::error!(
                         target: "crate::messenger::client",
                         error = %e,
@@ -735,8 +741,7 @@ impl MessageBuilder {
     /// - Default (fail-fast): acquire synchronously; propagate
     ///   `ResponseRegistrationError::Exhausted` as an immediate error stage.
     /// - `await_capacity`: defer acquisition into a boxed future that awaits
-    ///   capacity before dispatching. Mirrors the `SendOutcome::Backpressured`
-    ///   idiom transports already use.
+    ///   capacity before dispatching.
     fn make_stage_state(self, message_type: MsgType) -> StageState {
         // Short-circuit programmer-misuse resolution errors before touching
         // the slot arena. Mirrors fire()'s early return so invalid target

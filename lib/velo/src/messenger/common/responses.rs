@@ -392,10 +392,11 @@ pub enum ResponseRegistrationError {
 
 /// Outcome of a non-blocking slot acquisition.
 ///
-/// Mirrors the `SendOutcome::Enqueued` / `SendOutcome::Backpressured(_)`
-/// shape used by `velo-transports` for per-peer channel saturation, so
-/// callers can handle slot-exhaustion backpressure with the same idiom they
-/// use for transport-channel backpressure.
+/// Mirrors the `SendOutcome::Admitted` / `SendOutcome::Pending(_)` shape the
+/// transports use for per-target channel saturation, so callers can handle
+/// slot-exhaustion backpressure with the same idiom. The analogy stops at the
+/// shape: dropping a `SlotBackpressure` cancels the acquisition, whereas
+/// dropping a `SendAdmission` leaves the frame on its way.
 #[must_use = "RegisterOutcome::Backpressured must be awaited to acquire a slot"]
 pub enum RegisterOutcome {
     /// A slot was available and is now held by the awaiter.
@@ -406,7 +407,7 @@ pub enum RegisterOutcome {
 }
 
 /// Future that resolves to a [`ResponseAwaiter`] once a response slot is
-/// available. Analogous to `crate::transports::SendBackpressure`.
+/// available.
 ///
 /// Dropping this future cancels the pending acquisition cleanly — no permit
 /// is leaked.

@@ -53,8 +53,8 @@ The bug class that motivated the workspace collapse: a 0.1.1 "patch" of an inter
 ### What lives in `velo-ext` (and why it must stay small)
 
 - Trait definitions: `Transport`, `FrameTransport`, `PeerDiscovery`, `ServiceDiscovery`, `TransportObservability`
-- Value/error types referenced by those traits: `WorkerId`, `InstanceId`, `PeerInfo`, `WorkerAddress`, `TransportKey`, `MessageType`, `TransportError`, `HealthCheckError`, `SendBackpressure`, `SendOutcome`, `ShutdownState`, `Direction`, `TransportRejection`, etc.
-- Channel plumbing types used in trait signatures: `TransportAdapter`, `DataStreams`, `make_channels`, `try_send_or_backpressure`
+- Value/error types referenced by those traits: `WorkerId`, `InstanceId`, `PeerInfo`, `WorkerAddress`, `TransportKey`, `MessageType`, `TransportError`, `HealthCheckError`, `SendOutcome`, `SendAdmission`, `AdmissionError`, `AdmissionState`, `ShutdownState`, `Direction`, `TransportRejection`, etc.
+- Channel plumbing types used in trait signatures: `TransportAdapter`, `DataStreams`, `make_channels`, `AdmissionGate`
 
 What does **not** live in `velo-ext`:
 

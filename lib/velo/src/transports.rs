@@ -79,9 +79,9 @@ pub use utils::interfaces::{InterfaceEndpoint, InterfaceFilter};
 // convenience for callers reaching into `velo::transports::*` for transport
 // orchestration, but `velo_ext::*` is the canonical source.
 pub use transport::{
-    DataStreams, HealthCheckError, InFlightGuard, MessageType, SendBackpressure, SendOutcome,
-    ShutdownPolicy, ShutdownState, Transport, TransportAdapter, TransportError,
-    TransportErrorHandler, make_channels, try_send_or_backpressure,
+    AdmissionError, AdmissionGate, AdmissionState, DataStreams, HealthCheckError, InFlightGuard,
+    MessageType, SendAdmission, SendOutcome, ShutdownPolicy, ShutdownState, Transport,
+    TransportAdapter, TransportError, TransportErrorHandler, make_channels,
 };
 
 /// Errors returned by [`VeloBackend`] operations.
@@ -258,10 +258,10 @@ impl VeloBackend {
     /// Returns [`VeloBackendError::InstanceNotRegistered`] if the peer has not
     /// been registered with [`register_peer`](Self::register_peer).
     ///
-    /// The inner [`SendOutcome`] distinguishes synchronous enqueue
-    /// ([`SendOutcome::Enqueued`]) from saturated channels
-    /// ([`SendOutcome::Backpressured`]) where the caller must `.await` the
-    /// returned future to complete the send.
+    /// The [`SendOutcome`] distinguishes synchronous admission
+    /// ([`SendOutcome::Admitted`]) from a saturated per-target channel
+    /// ([`SendOutcome::Pending`]), where the frame is queued behind its
+    /// predecessors and the contained [`SendAdmission`] reports when it lands.
     pub fn send_message(
         &self,
         target: InstanceId,
@@ -278,13 +278,23 @@ impl VeloBackend {
         let transport_name = transport_key.to_string();
         #[cfg(not(feature = "distributed-tracing"))]
         let _ = &transport_name;
+        // Only the span below needs this; `finalize_send_outcome` recomputes it
+        // from the report's own frame handles.
+        #[cfg(feature = "distributed-tracing")]
         let bytes = header.len() + payload.len();
         let metrics = self.transport_metrics.get(&transport_key);
 
         let error_handler = instrument_transport_error_handler(metrics.cloned(), on_error);
+        let report = SendReport {
+            metrics: metrics.cloned(),
+            on_error: error_handler.clone(),
+            message_type,
+            header: header.clone(),
+            payload: payload.clone(),
+        };
 
         #[cfg(feature = "distributed-tracing")]
-        let send_result = {
+        let outcome = {
             let span = tracing::info_span!(
                 "velo.transport.send",
                 transport = transport_name.as_str(),
@@ -296,15 +306,9 @@ impl VeloBackend {
         };
 
         #[cfg(not(feature = "distributed-tracing"))]
-        let send_result =
-            transport.send_message(target, header, payload, message_type, error_handler);
+        let outcome = transport.send_message(target, header, payload, message_type, error_handler);
 
-        Ok(finalize_send_outcome(
-            send_result,
-            metrics.cloned(),
-            message_type,
-            bytes,
-        ))
+        Ok(finalize_send_outcome(outcome, report))
     }
 
     /// Send a message to a registered peer via a specific transport.
@@ -329,19 +333,20 @@ impl VeloBackend {
 
         if transport.value().key() == transport_key {
             let _transport_name = transport_key.to_string();
-            let bytes = header.len() + payload.len();
             let metrics = self.transport_metrics.get(&transport_key);
 
             let error_handler = instrument_transport_error_handler(metrics.cloned(), on_error);
-            let send_result =
+            let report = SendReport {
+                metrics: metrics.cloned(),
+                on_error: error_handler.clone(),
+                message_type,
+                header: header.clone(),
+                payload: payload.clone(),
+            };
+            let outcome =
                 transport.send_message(target, header, payload, message_type, error_handler);
 
-            return Ok(finalize_send_outcome(
-                send_result,
-                metrics.cloned(),
-                message_type,
-                bytes,
-            ));
+            return Ok(finalize_send_outcome(outcome, report));
         } else {
             // if we got here, we can unwrap because there is an entry in the alternative_transports map
             let alternative_transports = self
@@ -354,12 +359,18 @@ impl VeloBackend {
                     && let Some(transport) = self.transports.get(alternative_transport)
                 {
                     let _transport_name = alternative_transport.to_string();
-                    let bytes = header.len() + payload.len();
                     let metrics = self.transport_metrics.get(alternative_transport);
 
                     let error_handler =
                         instrument_transport_error_handler(metrics.cloned(), on_error);
-                    let send_result = transport.send_message(
+                    let report = SendReport {
+                        metrics: metrics.cloned(),
+                        on_error: error_handler.clone(),
+                        message_type,
+                        header: header.clone(),
+                        payload: payload.clone(),
+                    };
+                    let outcome = transport.send_message(
                         target,
                         header,
                         payload,
@@ -367,12 +378,7 @@ impl VeloBackend {
                         error_handler,
                     );
 
-                    return Ok(finalize_send_outcome(
-                        send_result,
-                        metrics.cloned(),
-                        message_type,
-                        bytes,
-                    ));
+                    return Ok(finalize_send_outcome(outcome, report));
                 }
             }
         }
@@ -388,15 +394,15 @@ impl VeloBackend {
     /// For automatic discovery, use the two-phase pattern:
     /// ```ignore
     /// match backend.send_message_to_worker(...) {
-    ///     Ok(SendOutcome::Enqueued) => { /* synchronous enqueue */ }
-    ///     Ok(SendOutcome::Backpressured(bp)) => { bp.await; }
+    ///     Ok(SendOutcome::Admitted) => { /* already on the send channel */ }
+    ///     Ok(SendOutcome::Pending(admission)) => { admission.await?; }
     ///     Err(e) if matches_worker_not_registered(&e) => {
     ///         tokio::spawn(async move {
     ///             let instance_id = backend.resolve_and_register_worker(worker_id).await?;
-    ///             if let SendOutcome::Backpressured(bp) =
+    ///             if let SendOutcome::Pending(admission) =
     ///                 backend.send_message(instance_id, ...)?
     ///             {
-    ///                 bp.await;
+    ///                 admission.await?;
     ///             }
     ///         });
     ///     }
@@ -561,35 +567,63 @@ fn instrument_transport_error_handler(
     Arc::new(InstrumentedTransportErrorHandler { metrics, inner })
 }
 
-/// Turn a transport `send_message` result into a [`SendOutcome`], recording
-/// the outbound-frame metric at the moment the frame is actually enqueued.
+/// What [`finalize_send_outcome`] needs to close the loop on one send.
 ///
-/// - On `Ok(())` (synchronous enqueue) the metric is recorded immediately.
-/// - On `Err(bp)` (backpressure) the bp future is wrapped so the metric is
-///   recorded only when the caller awaits it to completion. If the caller
-///   drops the future without awaiting, the frame was never enqueued and no
-///   outbound-frame count is recorded.
-fn finalize_send_outcome(
-    send_result: Result<(), SendBackpressure>,
+/// The frame handles are `Bytes` clones taken before the transport consumed
+/// them — two refcount bumps, so that an admission that fails can still hand
+/// the original frame to `on_error` the way a wire failure does.
+struct SendReport {
     metrics: Option<Arc<crate::observability::TransportMetricsHandle>>,
+    on_error: Arc<dyn TransportErrorHandler>,
     message_type: MessageType,
-    bytes: usize,
-) -> SendOutcome {
-    match send_result {
-        Ok(()) => {
+    header: Bytes,
+    payload: Bytes,
+}
+
+/// Attach the backend's bookkeeping to a transport's [`SendOutcome`].
+///
+/// The outbound-frame metric must count frames that reached the send channel,
+/// not frames that were offered, so:
+///
+/// - [`SendOutcome::Admitted`] records immediately — the frame is on the
+///   channel by the time the transport returned.
+/// - [`SendOutcome::Pending`] records from a completion hook, and only if the
+///   admission resolves `Ok`. A hook rather than a wrapper future because
+///   fire-and-forget senders drop the admission unpolled; the frame is still
+///   delivered, so the metric still has to fire.
+///
+/// A failed admission is a frame that never reached the wire, which is what
+/// `on_error` reports, so it is routed there — through the same instrumented
+/// handler the transport was given, so the rejection counter sees it too.
+fn finalize_send_outcome(outcome: SendOutcome, report: SendReport) -> SendOutcome {
+    let SendReport {
+        metrics,
+        on_error,
+        message_type,
+        header,
+        payload,
+    } = report;
+    let label = message_type_label(message_type);
+    let bytes = header.len() + payload.len();
+
+    match outcome {
+        SendOutcome::Admitted => {
             if let Some(metrics) = metrics {
-                metrics.record_frame(Direction::Outbound, message_type_label(message_type), bytes);
+                metrics.record_frame(Direction::Outbound, label, bytes);
             }
-            SendOutcome::Enqueued
+            SendOutcome::Admitted
         }
-        Err(bp) => {
-            let label = message_type_label(message_type);
-            SendOutcome::Backpressured(SendBackpressure::new(Box::pin(async move {
-                bp.await;
-                if let Some(metrics) = metrics {
-                    metrics.record_frame(Direction::Outbound, label, bytes);
+        SendOutcome::Pending(admission) => {
+            SendOutcome::Pending(admission.on_resolved(move |result| match result {
+                Ok(()) => {
+                    if let Some(metrics) = metrics {
+                        metrics.record_frame(Direction::Outbound, label, bytes);
+                    }
                 }
-            })))
+                Err(error) => {
+                    on_error.on_error(header, payload, format!("Send not admitted: {error}"));
+                }
+            }))
         }
     }
 }

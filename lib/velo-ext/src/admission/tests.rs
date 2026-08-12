@@ -11,10 +11,10 @@ use tokio::time::timeout;
 const LIMIT: Duration = Duration::from_secs(10);
 
 /// Unwrap an outcome that must have queued a ticket.
-fn pending(outcome: AdmissionOutcome) -> SendAdmission {
+fn pending(outcome: SendOutcome) -> SendAdmission {
     match outcome {
-        AdmissionOutcome::Pending(admission) => admission,
-        AdmissionOutcome::Admitted => panic!("expected a queued ticket, got Admitted"),
+        SendOutcome::Pending(admission) => admission,
+        SendOutcome::Admitted => panic!("expected a queued ticket, got Admitted"),
     }
 }
 
@@ -40,10 +40,10 @@ async fn wait_until(label: &str, mut condition: impl FnMut() -> bool) {
 }
 
 /// Assert an outcome took the synchronous fast path.
-fn admitted(outcome: AdmissionOutcome) {
+fn admitted(outcome: SendOutcome) {
     match outcome {
-        AdmissionOutcome::Admitted => {}
-        AdmissionOutcome::Pending(_) => panic!("expected Admitted, got a queued ticket"),
+        SendOutcome::Admitted => {}
+        SendOutcome::Pending(_) => panic!("expected Admitted, got a queued ticket"),
     }
 }
 
@@ -54,7 +54,7 @@ const fn assert_send_sync<T: Send + Sync>() {}
 const fn assert_unpin<T: Unpin>() {}
 const _: () = {
     assert_send_sync::<SendAdmission>();
-    assert_send_sync::<AdmissionOutcome>();
+    assert_send_sync::<SendOutcome>();
     assert_send_sync::<AdmissionError>();
     assert_send_sync::<AdmissionGate<Vec<u8>>>();
     // `(&mut admission).await` in the tests below silently requires this.

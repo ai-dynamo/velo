@@ -16,8 +16,8 @@ use std::time::Duration;
 use tracing::{debug, error, info};
 
 use crate::transports::transport::{
-    HealthCheckError, SendBackpressure, ShutdownState, TransportError, TransportErrorHandler,
-    try_send_or_backpressure,
+    AdmissionGate, HealthCheckError, SendOutcome, ShutdownState, TransportError,
+    TransportErrorHandler,
 };
 use velo_ext::{MessageType, PeerInfo, Transport, TransportAdapter, TransportKey, WorkerAddress};
 
@@ -43,6 +43,13 @@ pub struct ZmqTransport {
     /// via `OnceLock::get()` on the send hot path. Shutdown signals the sender
     /// thread by sending `SenderCommand::Shutdown` through this channel.
     sender_tx: OnceLock<flume::Sender<SenderCommand>>,
+    /// One admission gate per peer, all feeding `sender_tx`.
+    ///
+    /// The sender thread multiplexes every peer through one channel, but
+    /// ordering is only ever promised per target — so the gate is per target
+    /// too. A peer whose DEALER socket is backing up queues behind its own gate
+    /// instead of serialising everyone else's sends through it.
+    gates: DashMap<crate::InstanceId, AdmissionGate<SenderCommand>>,
     /// Tokio runtime handle, set once during `start()`.
     runtime: OnceLock<tokio::runtime::Handle>,
     /// Shared shutdown state, set once during `start()`.
@@ -100,6 +107,23 @@ impl ZmqTransport {
             metrics.set_registered_peers(self.peers.len());
         }
     }
+
+    /// The gate for one peer, created on first send to it.
+    ///
+    /// Gates are never retired: a DEALER socket that errors is rebuilt by the
+    /// sender thread on the next frame, so there is no epoch boundary at which
+    /// queued frames would become invalid.
+    fn gate_for(
+        &self,
+        target: crate::InstanceId,
+        tx: &flume::Sender<SenderCommand>,
+        rt: &tokio::runtime::Handle,
+    ) -> AdmissionGate<SenderCommand> {
+        self.gates
+            .entry(target)
+            .or_insert_with(|| AdmissionGate::new(tx.clone(), rt.clone()))
+            .clone()
+    }
 }
 
 impl Transport for ZmqTransport {
@@ -154,7 +178,7 @@ impl Transport for ZmqTransport {
         payload: Bytes,
         message_type: MessageType,
         on_error: Arc<dyn TransportErrorHandler>,
-    ) -> Result<(), SendBackpressure> {
+    ) -> SendOutcome {
         let task = OutboundTask {
             target: instance_id,
             msg_type: message_type,
@@ -163,34 +187,21 @@ impl Transport for ZmqTransport {
             on_error,
         };
 
-        // Lock-free read via OnceLock — no mutex on the hot path.
-        let tx = match self.sender_tx.get() {
-            Some(tx) => tx,
-            None => {
-                task.on_error("Transport not started");
-                return Ok(());
-            }
+        // Lock-free reads via OnceLock — no mutex on the hot path.
+        let (Some(tx), Some(rt)) = (self.sender_tx.get(), self.runtime.get()) else {
+            task.on_error("Transport not started");
+            return SendOutcome::Admitted;
         };
 
-        let r = try_send_or_backpressure(
-            tx,
-            SenderCommand::Send(task),
-            |cmd| match cmd {
-                SenderCommand::Send(task) => task.on_error("Sender thread exited"),
-                SenderCommand::Shutdown => {}
-            },
-            |cmd| {
-                if let SenderCommand::Send(task) = cmd {
-                    task.on_error("Sender channel closed");
-                }
-            },
-        );
+        let outcome = self
+            .gate_for(instance_id, tx, rt)
+            .send(SenderCommand::Send(task));
         if let Some(m) = self.metrics.get()
-            && r.is_err()
+            && !outcome.is_admitted()
         {
             m.record_send_backpressure();
         }
-        r
+        outcome
     }
 
     fn start(
@@ -312,8 +323,10 @@ impl Transport for ZmqTransport {
             let _ = ctrl.send("shutdown", 0);
         }
 
-        // Signal the sender thread to stop via the message channel.
-        // This unblocks the sender's blocking recv() without polling.
+        // Signal the sender thread to stop via the message channel. This
+        // unblocks the sender's blocking recv() without polling. It deliberately
+        // bypasses the gates: shutdown is control traffic, not a frame, and must
+        // not queue behind a saturated peer.
         if let Some(tx) = self.sender_tx.get()
             && let Err(e) = tx.try_send(SenderCommand::Shutdown)
         {
@@ -683,6 +696,7 @@ impl ZmqTransportBuilder {
             peers: Arc::new(DashMap::new()),
             zmq_context: Arc::new(ctx),
             sender_tx: OnceLock::new(),
+            gates: DashMap::new(),
             runtime: OnceLock::new(),
             shutdown_state: OnceLock::new(),
             channel_capacity: self.channel_capacity,

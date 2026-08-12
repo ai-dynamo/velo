@@ -176,15 +176,18 @@ async fn test_nats_max_payload_enforcement() {
 
     // Send an oversized payload: 1MB payload + 64 bytes overhead exceeds 1MB max_payload
     let oversized = vec![0u8; 1_048_576]; // 1MB payload + 64 overhead > 1MB limit
-    transport_a
-        .send_message(
-            id_b,
-            Bytes::from(b"test-header".to_vec()),
-            Bytes::from(oversized),
-            MessageType::Message,
-            error_handler.clone(),
-        )
-        .expect("oversized path reports via on_error and returns Ok");
+    assert!(
+        transport_a
+            .send_message(
+                id_b,
+                Bytes::from(b"test-header".to_vec()),
+                Bytes::from(oversized),
+                MessageType::Message,
+                error_handler.clone(),
+            )
+            .is_admitted(),
+        "the oversized path reports via on_error and leaves nothing to wait on"
+    );
 
     // Wait for the synchronous error callback to fire (send_message is synchronous here
     // because the max_payload check happens before spawning the async task)

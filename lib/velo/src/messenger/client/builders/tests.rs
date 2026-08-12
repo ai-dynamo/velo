@@ -7,7 +7,7 @@
 //! transport integration.
 use super::*;
 use crate::messenger::common::responses::ResponseManager;
-use crate::transports::SendBackpressure;
+use crate::transports::{AdmissionError, AdmissionGate, SendAdmission};
 
 fn make_awaiter() -> (
     crate::messenger::common::responses::ResponseAwaiter,
@@ -21,12 +21,41 @@ fn make_awaiter() -> (
     (awaiter, id, rm)
 }
 
-fn ready_bp() -> SendBackpressure {
-    SendBackpressure::new(Box::pin(async {}))
+/// A gate over a one-slot channel that is already full, so the next send
+/// queues instead of admitting.
+///
+/// The receiver and the gate are both retained so a test can choose how a
+/// queued admission ends — released, or failed with the epoch.
+struct Saturated {
+    gate: AdmissionGate<()>,
+    rx: flume::Receiver<()>,
 }
 
-fn pending_bp() -> SendBackpressure {
-    SendBackpressure::new(Box::pin(futures::future::pending::<()>()))
+impl Saturated {
+    fn new() -> Self {
+        let (tx, rx) = flume::bounded(1);
+        let gate = AdmissionGate::new(tx, tokio::runtime::Handle::current());
+        assert!(gate.send(()).is_admitted(), "the first send fills the slot");
+        Self { gate, rx }
+    }
+
+    /// Queue a frame behind the full channel.
+    fn queue(&self) -> SendAdmission {
+        match self.gate.send(()) {
+            SendOutcome::Pending(admission) => admission,
+            SendOutcome::Admitted => panic!("a full channel must not admit"),
+        }
+    }
+
+    /// Make room, so the queued frame can be enqueued.
+    fn release(&self) {
+        self.rx.try_recv().expect("a frame to release");
+    }
+
+    /// Kill the epoch, failing everything still queued.
+    fn fail(&self) {
+        self.gate.fail_all(AdmissionError::ConnectionReplaced);
+    }
 }
 
 // ── ResponseStage ────────────────────────────────────────────────────
@@ -48,31 +77,58 @@ async fn stage_ready_resolves_after_outcome_completes() {
 }
 
 #[tokio::test]
-async fn stage_with_ready_bp_proceeds_to_awaiter() {
+async fn stage_with_admitted_frame_proceeds_to_awaiter() {
     let (awaiter, id, rm) = make_awaiter();
-    let stage = ResponseStage::with_bp(awaiter, Some(ready_bp()));
+    let saturated = Saturated::new();
+    let admission = saturated.queue();
+    saturated.release();
+    let stage = ResponseStage::with_admission(awaiter, Some(admission));
     let mut result = UnaryResult {
         stage: StageState::Ready(stage),
     };
 
     assert!(rm.complete_outcome(id, Ok(Some(Bytes::from_static(b"hello")))));
-    let r = tokio::time::timeout(std::time::Duration::from_secs(1), &mut result)
+    let r = tokio::time::timeout(std::time::Duration::from_secs(5), &mut result)
         .await
         .expect("unary result completes");
     assert_eq!(r.unwrap(), Bytes::from_static(b"hello"));
 }
 
 #[tokio::test]
-async fn stage_pending_bp_blocks_until_resolved() {
-    let (awaiter, _id, _rm) = make_awaiter();
-    let stage = ResponseStage::with_bp(awaiter, Some(pending_bp()));
+async fn stage_waits_for_a_queued_frame() {
+    let (awaiter, id, rm) = make_awaiter();
+    let saturated = Saturated::new();
+    let stage = ResponseStage::with_admission(awaiter, Some(saturated.queue()));
     let result = SyncResult {
         stage: StageState::Ready(stage),
     };
-    // Pending bp means the future itself stays pending even though the
-    // response manager isn't exercised. Verify the timeout fires.
+    // The response is already available; the result must still wait, because a
+    // frame that has not reached the send channel cannot have been answered.
+    assert!(rm.complete_outcome(id, Ok(None)));
     let outcome = tokio::time::timeout(std::time::Duration::from_millis(100), result).await;
-    assert!(outcome.is_err(), "pending bp should keep result pending");
+    assert!(
+        outcome.is_err(),
+        "an unadmitted frame should keep the result pending"
+    );
+}
+
+#[tokio::test]
+async fn stage_failed_admission_short_circuits() {
+    // The frame never reached the wire, so no response is coming — the result
+    // must fail rather than wait out its caller's timeout on the awaiter.
+    let (awaiter, _id, _rm) = make_awaiter();
+    let saturated = Saturated::new();
+    let stage = ResponseStage::with_admission(awaiter, Some(saturated.queue()));
+    let result = SyncResult {
+        stage: StageState::Ready(stage),
+    };
+    saturated.fail();
+
+    let err = tokio::time::timeout(std::time::Duration::from_secs(5), result)
+        .await
+        .expect("failed admission resolves the result")
+        .expect_err("failed admission is an error");
+    assert!(err.to_string().contains("Send failed"), "{err}");
 }
 
 #[tokio::test]
@@ -200,48 +256,66 @@ async fn stage_state_pending_awaits_inner_future() {
 // ── drive_fire_send ──────────────────────────────────────────────────
 
 #[tokio::test]
-async fn drive_fire_send_enqueued_is_ok() {
+async fn drive_fire_send_admitted_is_ok() {
     let (awaiter, _id, _rm) = make_awaiter();
     assert!(
-        drive_fire_send(Ok(SendOutcome::Enqueued), awaiter)
+        drive_fire_send(Ok(SendOutcome::Admitted), awaiter)
             .await
             .is_ok()
     );
 }
 
 #[tokio::test]
-async fn drive_fire_send_bp_without_error_is_ok() {
+async fn drive_fire_send_waits_out_a_queued_frame() {
     let (awaiter, _id, _rm) = make_awaiter();
+    let saturated = Saturated::new();
+    let admission = saturated.queue();
+    saturated.release();
     assert!(
-        drive_fire_send(Ok(SendOutcome::Backpressured(ready_bp())), awaiter)
+        drive_fire_send(Ok(SendOutcome::Pending(admission)), awaiter)
             .await
             .is_ok()
     );
 }
 
 #[tokio::test]
-async fn drive_fire_send_enqueued_with_sync_on_error_surfaces_err() {
+async fn drive_fire_send_failed_admission_is_err() {
+    let (awaiter, _id, _rm) = make_awaiter();
+    let saturated = Saturated::new();
+    let admission = saturated.queue();
+    saturated.fail();
+    let err = drive_fire_send(Ok(SendOutcome::Pending(admission)), awaiter)
+        .await
+        .expect_err("a frame that never reached the channel is a failed send");
+    assert!(err.to_string().contains("Send failed"), "{err}");
+}
+
+#[tokio::test]
+async fn drive_fire_send_admitted_with_sync_on_error_surfaces_err() {
     // Transports like TCP's slow_path_send can invoke on_error
-    // synchronously (e.g. connection already disconnected, transport
-    // not started) and still return Ok(Enqueued). DefaultErrorHandler
-    // completes the awaiter with Err before drive_fire_send runs —
-    // the Enqueued arm must surface that Err, not return Ok.
+    // synchronously (e.g. transport not started, connection could not be
+    // created) and still return Admitted. DefaultErrorHandler completes the
+    // awaiter with Err before drive_fire_send runs — the Admitted arm must
+    // surface that Err, not return Ok.
     let (awaiter, id, rm) = make_awaiter();
     assert!(rm.complete_outcome(id, Err("Connection closed immediately".to_string())));
-    let err = drive_fire_send(Ok(SendOutcome::Enqueued), awaiter)
+    let err = drive_fire_send(Ok(SendOutcome::Admitted), awaiter)
         .await
         .expect_err("should surface sync on_error failure");
     assert!(err.to_string().contains("Connection closed immediately"));
 }
 
 #[tokio::test]
-async fn drive_fire_send_bp_with_on_error_surfaces_err() {
-    // Simulate the handler completing the awaiter with Err during bp.await
-    // (i.e. on_error fired because the channel closed mid-drain). After
-    // bp resolves, drive_fire_send should return Err.
+async fn drive_fire_send_admitted_frame_with_on_error_surfaces_err() {
+    // The frame was admitted, but the handler completed the awaiter with Err
+    // while it waited — the write itself failed. That is still a pre-wire
+    // failure from the caller's point of view.
     let (awaiter, id, rm) = make_awaiter();
     assert!(rm.complete_outcome(id, Err("peer disconnected".to_string())));
-    let err = drive_fire_send(Ok(SendOutcome::Backpressured(ready_bp())), awaiter)
+    let saturated = Saturated::new();
+    let admission = saturated.queue();
+    saturated.release();
+    let err = drive_fire_send(Ok(SendOutcome::Pending(admission)), awaiter)
         .await
         .expect_err("should surface pre-wire failure");
     assert!(err.to_string().contains("peer disconnected"));

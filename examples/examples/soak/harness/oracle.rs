@@ -24,7 +24,7 @@ pub struct Oracle {
     pub received: AtomicU64,
     /// `on_error` callback invocations (transport-side delivery failure).
     pub on_error_seen: AtomicU64,
-    /// SendBackpressure futures observed (resolved or dropped).
+    /// Queued send admissions observed (resolved or dropped).
     pub backpressure_seen: AtomicU64,
     /// Faults the scenario *intentionally* injected. Used to back-out from
     /// strict equality on counters.

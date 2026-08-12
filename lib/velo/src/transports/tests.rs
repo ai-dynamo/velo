@@ -6,6 +6,7 @@
 use super::*;
 use bytes::Bytes;
 use futures::future::BoxFuture;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -18,10 +19,13 @@ struct MockTransport {
     drained: AtomicBool,
     shut_down: AtomicBool,
     send_count: AtomicUsize,
-    /// When true, `send_message` returns `Err(SendBackpressure::new(...))`
-    /// whose inner future is immediately ready. Lets tests exercise the
-    /// backend's Backpressured path.
-    always_backpressure: bool,
+    /// When true, `start` builds a one-slot channel that nobody drains and
+    /// routes sends through a gate over it, so every send past the first
+    /// reports `Pending`. Lets tests exercise the backend's queued path.
+    saturating: bool,
+    /// The saturating mode's gate and its receiver. The receiver is kept alive
+    /// so the channel stays open, and draining it releases queued admissions.
+    queue: OnceLock<(AdmissionGate<()>, flume::Receiver<()>)>,
 }
 
 impl MockTransport {
@@ -40,11 +44,12 @@ impl MockTransport {
             drained: AtomicBool::new(false),
             shut_down: AtomicBool::new(false),
             send_count: AtomicUsize::new(0),
-            always_backpressure: false,
+            saturating: false,
+            queue: OnceLock::new(),
         })
     }
 
-    fn new_backpressured(key: &str) -> Arc<Self> {
+    fn new_saturating(key: &str) -> Arc<Self> {
         let mut builder = WorkerAddressBuilder::new();
         builder
             .add_entry(key, format!("mock://{}", key).into_bytes())
@@ -59,8 +64,15 @@ impl MockTransport {
             drained: AtomicBool::new(false),
             shut_down: AtomicBool::new(false),
             send_count: AtomicUsize::new(0),
-            always_backpressure: true,
+            saturating: true,
+            queue: OnceLock::new(),
         })
+    }
+
+    /// Take one frame off the saturating queue, releasing the next admission.
+    fn drain_one(&self) {
+        let (_, rx) = self.queue.get().expect("saturating transport not started");
+        rx.try_recv().expect("nothing queued to drain");
     }
 }
 
@@ -85,21 +97,24 @@ impl Transport for MockTransport {
         _payload: Bytes,
         _message_type: MessageType,
         _on_error: Arc<dyn TransportErrorHandler>,
-    ) -> Result<(), SendBackpressure> {
+    ) -> SendOutcome {
         self.send_count.fetch_add(1, Ordering::Relaxed);
-        if self.always_backpressure {
-            Err(SendBackpressure::new(Box::pin(async {})))
-        } else {
-            Ok(())
+        match self.queue.get() {
+            Some((gate, _)) => gate.send(()),
+            None => SendOutcome::Admitted,
         }
     }
     fn start(
         &self,
         _instance_id: InstanceId,
         _channels: TransportAdapter,
-        _rt: tokio::runtime::Handle,
+        rt: tokio::runtime::Handle,
     ) -> BoxFuture<'_, anyhow::Result<()>> {
         self.started.store(true, Ordering::Relaxed);
+        if self.saturating {
+            let (tx, rx) = flume::bounded(1);
+            let _ = self.queue.set((AdmissionGate::new(tx, rt), rx));
+        }
         Box::pin(async { Ok(()) })
     }
     fn shutdown(&self) {
@@ -247,19 +262,18 @@ async fn test_send_message_routes_to_primary() {
         .unwrap();
 
     assert!(
-        matches!(outcome, SendOutcome::Enqueued),
-        "MockTransport returns Ok(()) so backend should report Enqueued"
+        matches!(outcome, SendOutcome::Admitted),
+        "a transport with room reports Admitted"
     );
     assert_eq!(t.send_count.load(Ordering::Relaxed), 1);
 }
 
 #[tokio::test]
-async fn test_send_message_backpressured() {
-    // A transport that always returns Err(SendBackpressure) should cause
-    // the backend to surface SendOutcome::Backpressured; awaiting the
-    // future must resolve cleanly.
-    let t = MockTransport::new_backpressured("tcp");
-    let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>], None)
+async fn test_send_message_pending_admission() {
+    // A saturated per-target channel should surface SendOutcome::Pending, and
+    // the admission must resolve once the channel has room again.
+    let t = MockTransport::new_saturating("tcp");
+    let (backend, _streams) = VeloBackend::new(vec![t.clone() as Arc<dyn Transport>], None)
         .await
         .unwrap();
 
@@ -267,26 +281,31 @@ async fn test_send_message_backpressured() {
     let peer_id = peer.instance_id();
     backend.register_peer(peer).unwrap();
 
-    let outcome = backend
-        .send_message(
-            peer_id,
-            Bytes::from_static(&[1]),
-            Bytes::from_static(&[2]),
-            MessageType::Message,
-            Arc::new(NoopErrorHandler),
-        )
-        .unwrap();
+    let send = || {
+        backend
+            .send_message(
+                peer_id,
+                Bytes::from_static(&[1]),
+                Bytes::from_static(&[2]),
+                MessageType::Message,
+                Arc::new(NoopErrorHandler),
+            )
+            .unwrap()
+    };
 
-    match outcome {
-        SendOutcome::Backpressured(bp) => {
-            tokio::time::timeout(Duration::from_secs(1), bp)
-                .await
-                .expect("bp should resolve when inner future completes");
-        }
-        SendOutcome::Enqueued => {
-            panic!("backpressured mock should surface SendOutcome::Backpressured")
-        }
-    }
+    assert!(send().is_admitted(), "the first send fills the one slot");
+
+    let admission = match send() {
+        SendOutcome::Pending(admission) => admission,
+        SendOutcome::Admitted => panic!("a full channel must not report Admitted"),
+    };
+    assert_eq!(admission.state(), AdmissionState::Pending);
+
+    t.drain_one();
+    tokio::time::timeout(Duration::from_secs(5), admission)
+        .await
+        .expect("admission should resolve once the channel drains")
+        .expect("the frame should be admitted, not failed");
 }
 
 #[tokio::test]
