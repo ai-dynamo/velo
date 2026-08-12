@@ -163,10 +163,6 @@ name = "streaming_mpsc_remote_integration"
 path = "tests/streaming/mpsc_remote_integration.rs"
 
 [[test]]
-name = "streaming_ordering"
-path = "tests/streaming/ordering.rs"
-
-[[test]]
 name = "streaming_tcp_batching"
 path = "tests/streaming/tcp_batching.rs"
 required-features = ["test-helpers"]

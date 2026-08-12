@@ -4,7 +4,9 @@
 //! Integration tests for the full control-plane AM dispatch path (TEST-02).
 //!
 //! Tests two-worker simulation using real Messenger + TCP loopback with the complete
-//! AnchorManager control-plane wired up end-to-end:
+//! AnchorManager control-plane wired up end-to-end. The data plane is
+//! `TcpFrameTransport`; what is under test is the control plane, which is
+//! transport-agnostic:
 //! - Worker A creates an AnchorManager, calls `register_handlers`, and creates an anchor.
 //! - The handle is transferred to Worker B as a raw u128 (simulating cross-worker serialization).
 //! - Worker B calls `attach_stream_anchor` with the transferred handle (worker_id mismatch triggers
@@ -22,10 +24,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use velo::messenger::Messenger;
-use velo::streaming::velo_transport::VeloFrameTransport;
-use velo::streaming::{AnchorManagerBuilder, FrameTransport, StreamAnchorHandle, StreamFrame};
+use velo::streaming::{
+    AnchorManagerBuilder, FrameTransport, StreamAnchorHandle, StreamFrame, TcpFrameTransport,
+};
 use velo::transports::tcp::TcpTransportBuilder;
-use velo_ext::WorkerId;
+use velo_ext::{PeerInfo, WorkerId};
 
 /// Create a TcpTransport bound to an OS-assigned port (no TOCTOU race).
 fn new_tcp_transport() -> Arc<velo::transports::tcp::TcpTransport> {
@@ -88,13 +91,14 @@ async fn test_02_remote_attach() {
     let worker_id_a = messenger_a.instance_id().worker_id();
     let worker_id_b = messenger_b.instance_id().worker_id();
 
-    // Worker A: create VeloFrameTransport and AnchorManager
-    let vft_a =
-        Arc::new(VeloFrameTransport::new(Arc::clone(&messenger_a), None).expect("VFT worker A"));
+    // Worker A: create the streaming transport and AnchorManager
+    let stream_a = TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into())
+        .await
+        .expect("stream listener A");
     let am_a: Arc<velo::streaming::AnchorManager> = Arc::new(
         AnchorManagerBuilder::default()
             .worker_id(worker_id_a)
-            .transport(Arc::clone(&vft_a) as Arc<dyn FrameTransport>)
+            .transport(Arc::clone(&stream_a) as Arc<dyn FrameTransport>)
             .build()
             .expect("AM worker A"),
     );
@@ -117,13 +121,32 @@ async fn test_02_remote_attach() {
     let (recovered_worker, _) = handle_transferred.unpack();
     assert_eq!(recovered_worker, worker_id_a);
 
-    // Worker B: create VeloFrameTransport and AnchorManager
-    let vft_b =
-        Arc::new(VeloFrameTransport::new(Arc::clone(&messenger_b), None).expect("VFT worker B"));
+    // Worker B: create the streaming transport and AnchorManager.
+    //
+    // `Messenger::register_peer` only covers the control plane; the streaming
+    // transport keeps its own WorkerId -> SocketAddr cache, so the two sides
+    // have to be cross-registered before `connect()` can resolve a peer.
+    // `Velo::register_peer` fans this out automatically; this test builds the
+    // AnchorManager directly and so does it by hand.
+    let stream_b = TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into())
+        .await
+        .expect("stream listener B");
+    stream_b
+        .register(&PeerInfo::new(
+            messenger_a.instance_id(),
+            stream_a.address(),
+        ))
+        .expect("register worker A stream endpoint on B");
+    stream_a
+        .register(&PeerInfo::new(
+            messenger_b.instance_id(),
+            stream_b.address(),
+        ))
+        .expect("register worker B stream endpoint on A");
     let am_b: Arc<velo::streaming::AnchorManager> = Arc::new(
         AnchorManagerBuilder::default()
             .worker_id(worker_id_b)
-            .transport(Arc::clone(&vft_b) as Arc<dyn FrameTransport>)
+            .transport(Arc::clone(&stream_b) as Arc<dyn FrameTransport>)
             .build()
             .expect("AM worker B"),
     );
@@ -145,11 +168,6 @@ async fn test_02_remote_attach() {
     for i in 0u32..5 {
         sender.send(i).await.expect("send item");
     }
-
-    // Wait for all item AMs to be delivered to Worker A's _stream_data handler before
-    // sending Finalized. AM dispatch is concurrent (spawned handlers) so Finalized could
-    // arrive before later items without this barrier. 50ms >> loopback RTT.
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     sender.finalize().expect("finalize");
 
@@ -179,17 +197,11 @@ async fn test_02_remote_attach() {
 }
 
 // ---------------------------------------------------------------------------
-// VeloFrameTransport macro suite: NOT included
+// Shared macro suite: NOT included here
 // ---------------------------------------------------------------------------
 //
-// The run_transport_tests! macro hardcodes "mock://1" as the endpoint string in
-// all attach_stream_anchor calls. VeloFrameTransport::connect parses this as a
-// velo:// URI and returns TransportError("invalid velo URI: missing velo:// prefix: mock://1").
-//
-// Changing the macro endpoint to a valid velo:// URI would require a worker_id and
-// anchor_id that match a bound anchor — making the shared macro incompatible with
-// MockFrameTransport (which ignores the URI entirely).
-//
-// Result: velo_suite is DEFERRED. Shared scenario coverage is provided by mock_suite
-// (in mock_transport.rs), which runs all 8 macro-generated tests against MockFrameTransport.
-// TEST-02 (above) validates VeloFrameTransport end-to-end data delivery independently.
+// `run_transport_tests!` drives `attach_stream_anchor` against a transport that
+// ignores endpoint resolution entirely, which is `MockFrameTransport`'s whole
+// job. Shared scenario coverage therefore lives in `mock_transport.rs`, which
+// runs all eight macro-generated tests; TEST-02 above is what validates a real
+// remote data plane end to end.

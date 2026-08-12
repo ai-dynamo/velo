@@ -6,9 +6,13 @@
 //! Real-transport endurance tests for velo-streaming.
 //!
 //! Parallels the local endurance suite in `endurance.rs` but runs the
-//! data-flow scenarios end-to-end across two `AnchorManager`s wired through:
-//!   * **raw TCP** (`TcpFrameTransport`), and
-//!   * **UDS velo-messenger streaming** (`VeloFrameTransport` over a UDS `Messenger`).
+//! data-flow scenarios end-to-end across two `AnchorManager`s wired through
+//! **raw TCP** (`TcpFrameTransport`).
+//!
+//! The messenger-backed variants that used to sit beside them went with the
+//! deleted `VeloFrameTransport`. Their replacement rides `messenger-mux-v1`,
+//! which is crate-internal until attach-time negotiation can select it, so the
+//! mux endurance scenarios land with that stage rather than here.
 //!
 //! Gated behind the `velo_endurance` rustc cfg (NOT a Cargo feature) so CI's
 //! `cargo test --all-features --all-targets` never compiles or runs them.
@@ -22,7 +26,7 @@
 //! `attach_stream_anchor(handle)` — worker-id mismatch forces the remote path,
 //! so frames cross the wire via the transport under test.
 //!
-//! Scope: E-01, E-02, E-05, E-06 × {TCP, UDS-velo}.
+//! Scope: E-01, E-02, E-05, E-06 over TCP.
 //! E-03/E-04/E-07 exercise local registry / Drop / cancel-gate semantics and
 //! are covered by the local suite only.
 
@@ -32,12 +36,10 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use velo::messenger::Messenger;
-use velo::streaming::velo_transport::VeloFrameTransport;
 use velo::streaming::{
     AnchorManager, AnchorManagerBuilder, FrameTransport, StreamFrame, TcpFrameTransport,
 };
 use velo::transports::tcp::TcpTransportBuilder;
-use velo::transports::uds::UdsTransportBuilder;
 use velo_ext::{PeerInfo, WorkerId};
 
 // ---------------------------------------------------------------------------
@@ -66,44 +68,6 @@ async fn make_two_tcp_messengers() -> (Arc<Messenger>, Arc<Messenger>) {
     };
     let t1 = bind(());
     let t2 = bind(());
-
-    let m1 = Messenger::builder()
-        .add_transport(t1)
-        .build()
-        .await
-        .expect("build messenger 1");
-    let m2 = Messenger::builder()
-        .add_transport(t2)
-        .build()
-        .await
-        .expect("build messenger 2");
-
-    m2.register_peer(m1.peer_info()).expect("register m1 on m2");
-    m1.register_peer(m2.peer_info()).expect("register m2 on m1");
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    (m1, m2)
-}
-
-async fn make_two_uds_messengers() -> (Arc<Messenger>, Arc<Messenger>) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let pid = std::process::id();
-    let n = COUNTER.fetch_add(2, Ordering::Relaxed);
-    let sock_a = std::env::temp_dir().join(format!("velo-endurance-{pid}-{n}-a.sock"));
-    let sock_b = std::env::temp_dir().join(format!("velo-endurance-{pid}-{}-b.sock", n + 1));
-
-    let t1 = Arc::new(
-        UdsTransportBuilder::new()
-            .socket_path(&sock_a)
-            .build()
-            .expect("build UDS transport 1"),
-    );
-    let t2 = Arc::new(
-        UdsTransportBuilder::new()
-            .socket_path(&sock_b)
-            .build()
-            .expect("build UDS transport 2"),
-    );
 
     let m1 = Messenger::builder()
         .add_transport(t1)
@@ -176,48 +140,6 @@ async fn make_remote_pair_tcp() -> RemotePair {
     tcp_consumer
         .register(&peer_producer)
         .expect("register producer stream endpoint on consumer");
-
-    consumer
-        .register_handlers(Arc::clone(&m_consumer))
-        .expect("consumer register_handlers");
-    producer
-        .register_handlers(Arc::clone(&m_producer))
-        .expect("producer register_handlers");
-
-    RemotePair {
-        producer,
-        consumer,
-        _msgr_producer: m_producer,
-        _msgr_consumer: m_consumer,
-    }
-}
-
-/// Consumer side owns the anchor; producer side attaches remotely.
-/// Uses `VeloFrameTransport` as data plane with a UDS-backed `Messenger` underneath.
-async fn make_remote_pair_uds() -> RemotePair {
-    let (m_consumer, m_producer) = make_two_uds_messengers().await;
-    let worker_consumer = m_consumer.instance_id().worker_id();
-    let worker_producer = m_producer.instance_id().worker_id();
-
-    let vft_consumer =
-        Arc::new(VeloFrameTransport::new(Arc::clone(&m_consumer), None).expect("VFT consumer"));
-    let vft_producer =
-        Arc::new(VeloFrameTransport::new(Arc::clone(&m_producer), None).expect("VFT producer"));
-
-    let consumer = Arc::new(
-        AnchorManagerBuilder::default()
-            .worker_id(worker_consumer)
-            .transport(Arc::clone(&vft_consumer) as Arc<dyn FrameTransport>)
-            .build()
-            .expect("build consumer AM"),
-    );
-    let producer = Arc::new(
-        AnchorManagerBuilder::default()
-            .worker_id(worker_producer)
-            .transport(Arc::clone(&vft_producer) as Arc<dyn FrameTransport>)
-            .build()
-            .expect("build producer AM"),
-    );
 
     consumer
         .register_handlers(Arc::clone(&m_consumer))
@@ -515,33 +437,4 @@ async fn test_e05_tcp_consumer_slow_sustained() {
 async fn test_e06_tcp_five_cycle_reattach() {
     let pair = make_remote_pair_tcp().await;
     run_e06(&pair, 5, 100, true).await;
-}
-
-// ===========================================================================
-// UDS velo-messenger variants — per-frame AM dispatch is concurrent.
-// Order-by-multiset is the Phase 09-02 decision documented in velo_integration.rs.
-// ===========================================================================
-
-#[tokio::test(flavor = "multi_thread")]
-async fn test_e01_uds_velo_sustained_10k_frames() {
-    let pair = make_remote_pair_uds().await;
-    run_e01(&pair, 10_000, false).await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn test_e02_uds_velo_concurrent_100_streams() {
-    let pair = make_remote_pair_uds().await;
-    run_e02(&pair, 100, 100, false).await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn test_e05_uds_velo_consumer_slow_sustained() {
-    let pair = make_remote_pair_uds().await;
-    run_e05(&pair, 1_000, false).await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn test_e06_uds_velo_five_cycle_reattach() {
-    let pair = make_remote_pair_uds().await;
-    run_e06(&pair, 5, 100, false).await;
 }

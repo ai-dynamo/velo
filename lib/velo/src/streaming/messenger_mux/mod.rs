@@ -21,32 +21,463 @@
 //! - [`protocol`] — the wire. A 16-byte batch header carrying the peer epoch
 //!   and a modulo-compared batch sequence, then records tagged with a
 //!   `(u24 index, u8 generation)` slot and a per-slot `frame_seq` that is the
-//!   authority on stream order. Pure encode/decode; decoding a malformed batch
-//!   yields a precise error and never a panic.
+//!   authority on stream order.
 //! - [`flow_control`] — the credit. Multiplexing means the shared resource is
 //!   the peer's *ordering lane*, and a handler that awaits holds it against
 //!   every slot from that peer. So ingress is bounded and nonblocking on
 //!   per-slot credit, with one reserved terminal credit, control records that
 //!   data exhaustion cannot block, and byte budgets standing in for the
 //!   per-stream socket limit the kernel used to enforce for free.
+//! - [`peer_batcher`] — egress. One task per peer, packing every slot's records
+//!   and parking on send admission when the peer is congested.
+//! - [`ingress`] — receive. The `_stream_batch` handler body, ordered per
+//!   sender and nonblocking by construction.
 //!
-//! > **Stage E1.** These two modules are the pure, dependency-free half. The
-//! > transport itself — `MessengerMuxTransport`, the per-peer egress batcher
-//! > and the `_stream_batch` ingress handler — lands in the next commit and is
-//! > what turns these primitives into a `FrameTransport`.
-// Nothing outside `#[cfg(test)]` consumes these primitives yet, so the plain
-// lib build sees the whole module as dead. `expect` rather than `allow` so the
-// suppression cannot outlive its excuse: once the transport consumes them, the
-// expectation goes unfulfilled and fails the build under `-D warnings`. The
-// `cfg_attr` is required — under `cfg(test)` the tests already use everything,
-// so an unconditional `expect` would be unfulfilled today.
+//! ## What this stage does and does not do
+//!
+//! The transport is complete and directly usable: `bind` and `connect` work,
+//! and registering it under [`MESSENGER_MUX_KEY`] in an `AnchorManager`'s
+//! transport registry makes it reachable. What it is **not** yet is *chosen* —
+//! attach-time negotiation, the `#[serde(default)] initial_credit` /
+//! `slot_byte_budget` fields, and the builder switch that advertises the key all
+//! land in the next stage. Until then nothing offers `messenger-mux-v1` on an
+//! attach, so a deployment reaches the mux only by installing it deliberately.
+//!
+//! Two consequences of that ordering are visible here. Initial credit is
+//! advertised by a `CreditUpdate` on `OpenSlot` rather than in the attach
+//! response, which costs one round trip per stream open that negotiation will
+//! remove. And `reader_pump` returns credit by *reconciliation* — the mux
+//! compares the buffer's occupancy against what it admitted — rather than by the
+//! exact `credit.release(1)` hook `BATCHING.md` describes, because until
+//! negotiation lands `reader_pump` never drains a mux slot buffer at all.
+// Nothing outside `#[cfg(test)]` constructs a `MessengerMuxTransport` yet: the
+// attach handlers still hardcode the local default transport key, so no attach
+// can resolve `messenger-mux-v1` and no builder installs one. That is
+// deliberate — the mux ships unreachable and is switched on by negotiation —
+// but it makes the whole module read as dead to the plain lib build.
+//
+// `expect` rather than `allow` so the suppression cannot outlive its excuse:
+// the stage below registers the transport and advertises the key, at which
+// point this expectation goes unfulfilled and fails the build under
+// `-D warnings`. The `cfg_attr` is required — under `cfg(test)` the tests here
+// already construct and drive the transport, so an unconditional `expect` would
+// be unfulfilled today.
 #![cfg_attr(
     not(test),
     expect(
         dead_code,
-        reason = "consumed by the mux transport (peer batcher + ingress) landing in the next commit"
+        reason = "reachable once Stage F attach-time negotiation registers and advertises messenger-mux-v1"
     )
 )]
 
 pub(crate) mod flow_control;
+pub(crate) mod ingress;
+pub(crate) mod peer_batcher;
 pub(crate) mod protocol;
+#[cfg(test)]
+mod tests;
+
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::time::Duration;
+
+use anyhow::{Result, anyhow};
+use dashmap::DashMap;
+use futures::future::BoxFuture;
+use tokio_util::sync::CancellationToken;
+use velo_ext::{TransportKey, WorkerAddress, WorkerId};
+
+use self::flow_control::{DEFAULT_PEER_BYTE_BUDGET, DEFAULT_SLOT_BYTE_BUDGET, slot_buffer_depth};
+use self::ingress::IngressRegistry;
+use self::peer_batcher::{BatcherContext, BatcherHandle, BatcherMap, Command, OpenRejected};
+use crate::messenger::{Context, Handler, Messenger};
+use crate::observability::{MuxMetricsHandle, VeloMetrics};
+use crate::streaming::transport::FrameTransport;
+
+/// The streaming-transport key this mux answers to.
+///
+/// Versioned in the key rather than only in the batch header: negotiation
+/// matches on the key, so an incompatible wire change is a new key and two
+/// versions simply never pair up.
+pub(crate) const MESSENGER_MUX_KEY: &str = "messenger-mux-v1";
+
+/// The active-message handler every batch travels through.
+pub(crate) const STREAM_BATCH_HANDLER: &str = "_stream_batch";
+
+/// How long a `bind()` waits for the `OpenSlot` that claims it.
+///
+/// Deliberately the same 60 s the TCP transport gives a pending session, and
+/// deliberately measuring the same thing: "time until a batch bearing this
+/// `OpenSlot` arrives". `OpenSlot` is eager precisely so this cannot quietly
+/// become "time until the producer produces its first token" and expire a queued
+/// request with a long prefill.
+const ACCEPT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Attempts `connect` makes before giving up on a batcher that keeps retiring
+/// underneath it. Two is already generous — losing the race twice requires two
+/// eviction sweeps inside one attach.
+const CONNECT_ATTEMPTS: usize = 3;
+
+/// Construction-time tuning for the mux.
+///
+/// Deliberately not on the `Velo` builder yet: the activation switch is the next
+/// stage's business, and shipping the knobs before the switch would let a
+/// deployment tune a transport nothing selects.
+#[derive(Debug, Clone)]
+pub(crate) struct MuxConfig {
+    /// Configured ceiling on one batch. Further clamped at flush time by the
+    /// effective eager budget and by `COALESCE_THRESHOLD`, whichever binds
+    /// first.
+    pub(crate) max_batch_bytes: usize,
+    /// Data credit `C` granted to each new slot, and therefore the depth of the
+    /// `C + 1` buffer `bind` hands the anchor.
+    pub(crate) initial_credit: u32,
+    /// Bytes one slot may hold in flight — the replacement for the ~1 MiB the
+    /// kernel socket used to enforce per stream for free.
+    pub(crate) slot_byte_budget: u32,
+    /// Bytes all of one peer's slots may hold in flight between them.
+    pub(crate) peer_byte_budget: u64,
+    /// How often the credit sweep runs.
+    ///
+    /// The arrival path returns credit on every inbound batch, so this only
+    /// matters for a slot that has parked with nothing further arriving to
+    /// trigger reconciliation — where it is the difference between resuming and
+    /// deadlocking, at one interval of added latency.
+    pub(crate) credit_sweep_interval: Duration,
+    /// How long a batcher may sit idle with no slots before it is evicted.
+    pub(crate) batcher_idle_ttl: Duration,
+}
+
+impl Default for MuxConfig {
+    fn default() -> Self {
+        Self {
+            max_batch_bytes: 60 * 1024,
+            initial_credit: 256,
+            slot_byte_budget: DEFAULT_SLOT_BYTE_BUDGET,
+            peer_byte_budget: DEFAULT_PEER_BYTE_BUDGET,
+            credit_sweep_interval: Duration::from_millis(2),
+            batcher_idle_ttl: Duration::from_secs(60),
+        }
+    }
+}
+
+impl MuxConfig {
+    /// Depth of the per-slot channel `connect` hands the producer.
+    ///
+    /// Sized to the credit window so a producer that outruns its consumer feels
+    /// backpressure at roughly the point the protocol stops letting records on
+    /// to the wire, rather than buffering a second, unrelated window's worth
+    /// behind it.
+    fn inlet_depth(&self) -> usize {
+        slot_buffer_depth(self.initial_credit)
+    }
+
+    /// Sweep ticks a batcher must sit idle through before it may be evicted.
+    fn idle_ticks(&self) -> u32 {
+        let interval = self.credit_sweep_interval.as_millis().max(1);
+        let ttl = self.batcher_idle_ttl.as_millis();
+        u32::try_from(ttl / interval).unwrap_or(u32::MAX).max(1)
+    }
+}
+
+/// The `messenger-mux-v1` [`FrameTransport`].
+///
+/// Holds no listener and no connections. `connect` allocates a slot on the
+/// peer's batcher; `bind` registers a buffer the peer's `OpenSlot` will claim.
+/// Everything else is the two subsystems this type wires together.
+pub(crate) struct MessengerMuxTransport {
+    core: Arc<MuxCore>,
+    key: TransportKey,
+}
+
+/// State shared between the transport, its batchers and the ingress handler.
+struct MuxCore {
+    messenger: Arc<Messenger>,
+    config: MuxConfig,
+    metrics: Option<MuxMetricsHandle>,
+    batchers: Arc<BatcherMap>,
+    ingress: Arc<IngressRegistry>,
+    /// Process-wide monotonic epoch source.
+    ///
+    /// Per transport rather than per batcher on purpose: a batcher evicted and
+    /// lazily recreated must not restart its epoch, or the peer would read every
+    /// batch of the new one as stale and discard it wholesale.
+    epochs: Arc<AtomicU64>,
+    cancel: CancellationToken,
+}
+
+impl MessengerMuxTransport {
+    /// Build a mux over `messenger` and register its `_stream_batch` handler.
+    ///
+    /// Registration is for the messenger's lifetime: there is no
+    /// handler-deregistration hook, and `register_streaming_handler` refuses a
+    /// duplicate name, so at most one mux may be installed per messenger.
+    pub(crate) fn new(
+        messenger: Arc<Messenger>,
+        config: MuxConfig,
+        metrics: Option<Arc<VeloMetrics>>,
+    ) -> Result<Arc<Self>> {
+        let core = Arc::new(MuxCore {
+            messenger: Arc::clone(&messenger),
+            config,
+            metrics: metrics.as_ref().map(|metrics| metrics.bind_mux()),
+            batchers: Arc::new(DashMap::new()),
+            ingress: Arc::new(IngressRegistry::default()),
+            // Epochs start at 1 so zero is never a live epoch, which keeps a
+            // zeroed header from reading as a legitimate one.
+            epochs: Arc::new(AtomicU64::new(1)),
+            cancel: CancellationToken::new(),
+        });
+
+        let handler_core = Arc::downgrade(&core);
+        let handler = Handler::am_handler_async(STREAM_BATCH_HANDLER, move |ctx: Context| {
+            let handler_core = handler_core.clone();
+            async move {
+                if let Some(core) = handler_core.upgrade() {
+                    core.deliver_batch(ctx.sender_worker_id(), &ctx.payload);
+                }
+                Ok(())
+            }
+        })
+        // Ordered per sender. This is the whole reason the mux can drop the
+        // reorder window the deprecated AM transport needed: batches from one
+        // peer are handled on that peer's lane, by one task, in arrival order.
+        .ordered()
+        .build();
+        messenger.register_streaming_handler(handler)?;
+
+        spawn_sweep(&core);
+
+        Ok(Arc::new(Self {
+            core,
+            key: TransportKey::new(MESSENGER_MUX_KEY),
+        }))
+    }
+}
+
+impl MuxCore {
+    /// The batcher for `peer`, created on first use.
+    fn batcher(&self, peer: WorkerId) -> Arc<BatcherHandle> {
+        if let Some(existing) = self.batchers.get(&peer) {
+            return Arc::clone(existing.value());
+        }
+        Arc::clone(
+            self.batchers
+                .entry(peer)
+                .or_insert_with(|| {
+                    peer_batcher::spawn(
+                        peer,
+                        BatcherContext {
+                            messenger: Arc::clone(&self.messenger),
+                            config: self.config.clone(),
+                            metrics: self.metrics.clone(),
+                            epochs: Arc::clone(&self.epochs),
+                            batchers: Arc::clone(&self.batchers),
+                            cancel: self.cancel.clone(),
+                        },
+                    )
+                })
+                .value(),
+        )
+    }
+
+    /// Hand one decoded batch to the ingress lane and act on what it produced.
+    fn deliver_batch(&self, peer: WorkerId, payload: &bytes::Bytes) {
+        let outcome = ingress::handle_batch(
+            &self.ingress,
+            &self.config,
+            self.metrics.as_ref(),
+            peer,
+            payload,
+        );
+
+        if let Some(metrics) = &self.metrics {
+            for _ in 0..outcome.opened {
+                metrics.slot_opened();
+            }
+            for _ in 0..outcome.closed {
+                metrics.slot_closed();
+            }
+        }
+
+        if outcome.replies.is_empty() && outcome.grants.is_empty() && outcome.peer_closes.is_empty()
+        {
+            return;
+        }
+
+        let batcher = self.batcher(peer);
+        for (slot, delta) in outcome.grants {
+            let _ = batcher.send(Command::Grant { slot, delta });
+        }
+        for (slot, reason) in outcome.peer_closes {
+            let _ = batcher.send(Command::PeerClosed { slot, reason });
+        }
+        if !outcome.replies.is_empty() {
+            self.send_replies(&batcher, peer, outcome.replies);
+        }
+    }
+
+    /// Queue control records back to `peer`, re-resolving once if the batcher
+    /// exited between resolution and send.
+    fn send_replies(
+        &self,
+        batcher: &Arc<BatcherHandle>,
+        peer: WorkerId,
+        replies: Vec<peer_batcher::ReplyRecord>,
+    ) {
+        let Err(rejected) = batcher.send(Command::Reply(replies)) else {
+            return;
+        };
+        let Command::Reply(replies) = rejected.into_inner() else {
+            return;
+        };
+        let _ = self.batcher(peer).send(Command::Reply(replies));
+    }
+
+    /// One sweep tick: return credit, then age out idle batchers.
+    fn sweep(&self) {
+        for peer in self.ingress.peers() {
+            let replies = self.ingress.sweep_credit(peer);
+            if !replies.is_empty() {
+                let batcher = self.batcher(peer);
+                self.send_replies(&batcher, peer, replies);
+            }
+        }
+
+        let threshold = self.config.idle_ticks();
+        let peers: Vec<WorkerId> = self.batchers.iter().map(|entry| *entry.key()).collect();
+        for peer in peers {
+            let Some(handle) = self.batchers.get(&peer) else {
+                continue;
+            };
+            let idle = handle.tick_idle();
+            drop(handle);
+            if idle < threshold || self.ingress.live_slots(peer) > 0 {
+                continue;
+            }
+            // The claim is made under the registry's shard lock, so a `connect`
+            // resolving the same peer either sees the entry gone and creates a
+            // fresh batcher, or gets this one and has its `OpenSlot` refused.
+            if let Some((_, handle)) = self
+                .batchers
+                .remove_if(&peer, |_, handle| handle.try_retire(threshold))
+            {
+                let _ = handle.send(Command::Retire);
+            }
+        }
+    }
+}
+
+impl Drop for MuxCore {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        let closed = self.ingress.shutdown();
+        if let Some(metrics) = &self.metrics {
+            for _ in 0..closed {
+                metrics.slot_closed();
+            }
+        }
+    }
+}
+
+/// Spawn the periodic credit-return and eviction sweep.
+fn spawn_sweep(core: &Arc<MuxCore>) {
+    let weak = Arc::downgrade(core);
+    let cancel = core.cancel.clone();
+    let interval = core.config.credit_sweep_interval;
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => return,
+                _ = ticker.tick() => {}
+            }
+            let Some(core) = weak.upgrade() else {
+                return;
+            };
+            core.sweep();
+        }
+    });
+}
+
+impl FrameTransport for MessengerMuxTransport {
+    fn key(&self) -> TransportKey {
+        self.key.clone()
+    }
+
+    /// Empty: the mux piggybacks on the Messenger's connectivity and opens no
+    /// listener, so it has no endpoint to advertise. The trait anticipates
+    /// exactly this case.
+    fn address(&self) -> WorkerAddress {
+        WorkerAddress::empty()
+    }
+
+    fn bind(
+        &self,
+        anchor_id: u64,
+        session_id: u64,
+    ) -> BoxFuture<'_, Result<flume::Receiver<Vec<u8>>>> {
+        let core = Arc::clone(&self.core);
+        Box::pin(async move {
+            // `C + 1`: `C` data credits plus the one reserved terminal credit.
+            // Credit is issued against *this* buffer and never against the
+            // anchor's `frame_tx`, which has writers other than the mux.
+            let (frame_tx, frame_rx) =
+                flume::bounded::<Vec<u8>>(slot_buffer_depth(core.config.initial_credit));
+            core.ingress.register_bind(anchor_id, session_id, frame_tx);
+
+            let expiry = Arc::clone(&core);
+            tokio::spawn(async move {
+                tokio::time::sleep(ACCEPT_TIMEOUT).await;
+                if expiry.ingress.expire_bind(anchor_id, session_id) {
+                    tracing::warn!(
+                        anchor_id,
+                        session_id,
+                        "messenger mux: no OpenSlot arrived before the accept window closed"
+                    );
+                }
+            });
+
+            Ok(frame_rx)
+        })
+    }
+
+    fn connect(
+        &self,
+        peer: WorkerId,
+        anchor_id: u64,
+        session_id: u64,
+    ) -> BoxFuture<'_, Result<flume::Sender<Vec<u8>>>> {
+        let core = Arc::clone(&self.core);
+        Box::pin(async move {
+            for _ in 0..CONNECT_ATTEMPTS {
+                let batcher = core.batcher(peer);
+                let (inlet_tx, inlet_rx) = flume::bounded::<Vec<u8>>(core.config.inlet_depth());
+                let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+                if batcher
+                    .send(Command::OpenSlot {
+                        anchor_id,
+                        session_id,
+                        inlet: inlet_rx,
+                        ack: ack_tx,
+                    })
+                    .is_err()
+                {
+                    continue;
+                }
+                match ack_rx.await {
+                    Ok(Ok(())) => return Ok(inlet_tx),
+                    // Evicted between resolution and delivery. A fresh batcher
+                    // is one loop away.
+                    Ok(Err(OpenRejected::Retired)) | Err(_) => continue,
+                    Ok(Err(error)) => return Err(error.into()),
+                }
+            }
+            Err(anyhow!(
+                "messenger mux: could not open a slot to peer {peer} after {CONNECT_ATTEMPTS} attempts"
+            ))
+        })
+    }
+}

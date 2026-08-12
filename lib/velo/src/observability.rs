@@ -502,19 +502,144 @@ impl OrderedMetricsHandle {
 }
 
 // ---------------------------------------------------------------------------
-// StreamingTransportMetricsHandle
+// MuxMetricsHandle
 // ---------------------------------------------------------------------------
 
-/// A transport-scheme-scoped streaming metrics handle.
-#[derive(Clone)]
-pub(crate) struct StreamingTransportMetricsHandle {
-    backpressure: Counter,
+/// Why a mux record was thrown away before it reached a consumer.
+///
+/// Each variant is a distinct diagnosis, which is the point of separating them:
+/// `StaleEpoch` is a healthy reconnect, `Generation` is slot reuse doing its
+/// job, `UnknownSlot` is an attach that never registered, and `ClosedSlot` is
+/// traffic arriving after a close. Only the last two should worry an operator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MuxDropReason {
+    /// The batch belonged to an epoch the receiver has already moved past.
+    StaleEpoch,
+    /// The record named a live slot index at the wrong generation.
+    Generation,
+    /// No `(anchor, session)` bind was registered for the record's slot.
+    UnknownSlot,
+    /// The slot was closed before the record arrived.
+    ClosedSlot,
+    /// The record's `frame_seq` was behind the slot's next expected sequence.
+    Duplicate,
 }
 
-impl StreamingTransportMetricsHandle {
-    /// Record a backpressure event.
-    pub(crate) fn record_backpressure(&self) {
-        self.backpressure.inc();
+impl MuxDropReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::StaleEpoch => "stale_epoch",
+            Self::Generation => "generation",
+            Self::UnknownSlot => "unknown_slot",
+            Self::ClosedSlot => "closed_slot",
+            Self::Duplicate => "duplicate",
+        }
+    }
+}
+
+/// Which way a `_stream_batch` was travelling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MuxDirection {
+    /// Packed and handed to the messenger by a peer batcher.
+    Sent,
+    /// Decoded by the `_stream_batch` handler.
+    Received,
+}
+
+impl MuxDirection {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Sent => "sent",
+            Self::Received => "received",
+        }
+    }
+}
+
+/// Collectors for the `messenger-mux-v1` streaming transport.
+///
+/// Bound once per mux transport via [`VeloMetrics::bind_mux`] so the hot paths
+/// (the per-peer batcher and the `_stream_batch` ingress lane) hold concrete
+/// counters rather than looking up label values per record.
+#[derive(Clone)]
+pub(crate) struct MuxMetricsHandle {
+    live_slots: Gauge,
+    reader_stall_total: Counter,
+    generation_mismatch_total: Counter,
+    records_dropped_total: CounterVec,
+    batches_total: CounterVec,
+    records_per_batch: Histogram,
+    credit_exhausted_total: Counter,
+    rendezvous_singletons_total: Counter,
+    held_records: Gauge,
+    hold_overflow_total: Counter,
+    epoch_deaths_total: Counter,
+    batch_seq_gaps_total: Counter,
+}
+
+impl MuxMetricsHandle {
+    /// A slot came into existence on either side of the mux.
+    pub(crate) fn slot_opened(&self) {
+        self.live_slots.inc();
+    }
+
+    /// A slot was freed on either side of the mux.
+    pub(crate) fn slot_closed(&self) {
+        self.live_slots.dec();
+    }
+
+    /// The applier could not `try_send` into a slot buffer credit had already
+    /// reserved space in. Always a bug — see `BATCHING.md` § "Flow control".
+    pub(crate) fn reader_stall(&self) {
+        self.reader_stall_total.inc();
+    }
+
+    /// A record was discarded before delivery, for `reason`.
+    pub(crate) fn record_dropped(&self, reason: MuxDropReason) {
+        if reason == MuxDropReason::Generation {
+            self.generation_mismatch_total.inc();
+        }
+        self.records_dropped_total
+            .with_label_values(&[reason.as_str()])
+            .inc();
+    }
+
+    /// One batch of `records` crossed the wire in `direction`.
+    pub(crate) fn batch(&self, direction: MuxDirection, records: usize) {
+        self.batches_total
+            .with_label_values(&[direction.as_str()])
+            .inc();
+        self.records_per_batch.observe(records as f64);
+    }
+
+    /// A slot ran out of data credit and parked.
+    pub(crate) fn credit_exhausted(&self) {
+        self.credit_exhausted_total.inc();
+    }
+
+    /// A record too large for the eager budget went out alone in its batch.
+    pub(crate) fn rendezvous_singleton(&self) {
+        self.rendezvous_singletons_total.inc();
+    }
+
+    /// Adjust the ahead-of-sequence hold occupancy by `delta` records.
+    pub(crate) fn held_records_delta(&self, delta: i64) {
+        self.held_records.add(delta as f64);
+    }
+
+    /// A slot's ahead-of-sequence hold overflowed and the slot was closed.
+    pub(crate) fn hold_overflow(&self) {
+        self.hold_overflow_total.inc();
+    }
+
+    /// A peer epoch died and its live slots were failed.
+    pub(crate) fn epoch_death(&self) {
+        self.epoch_deaths_total.inc();
+    }
+
+    /// `batches` batches were skipped between the expected and received
+    /// `batch_seq`.
+    pub(crate) fn batch_seq_gap(&self, batches: u32) {
+        self.batch_seq_gaps_total.inc_by(f64::from(batches));
     }
 }
 
@@ -554,6 +679,19 @@ pub struct VeloMetrics {
     streaming_heartbeat_watchdog_firings_total: Counter,
     streaming_egress_flushes_total: Counter,
     streaming_frames_written_total: Counter,
+    // Messenger-mux metrics
+    streaming_mux_live_slots: Gauge,
+    streaming_mux_reader_stall_total: Counter,
+    streaming_mux_generation_mismatch_total: Counter,
+    streaming_mux_records_dropped_total: CounterVec,
+    streaming_mux_batches_total: CounterVec,
+    streaming_mux_records_per_batch: Histogram,
+    streaming_slot_credit_exhausted_total: Counter,
+    streaming_mux_rendezvous_singletons_total: Counter,
+    streaming_mux_held_records: Gauge,
+    streaming_mux_hold_overflow_total: Counter,
+    streaming_mux_epoch_deaths_total: Counter,
+    streaming_mux_batch_seq_gaps_total: Counter,
     // Rendezvous metrics
     rendezvous_operations_total: CounterVec,
     rendezvous_operation_duration_seconds: HistogramVec,
@@ -863,6 +1001,138 @@ impl VeloMetrics {
             ))?,
         )?;
 
+        // -- Messenger-mux metrics (streaming/BATCHING.md § "Observability") --
+        let streaming_mux_live_slots = register_collector(
+            registry,
+            Gauge::new(
+                "velo_streaming_mux_live_slots",
+                "Slots the messenger mux currently holds state for, counting \
+                 both sides: an egress slot allocated by connect() and an \
+                 ingress slot created by an OpenSlot record each add one. Must \
+                 return to zero once every stream has torn down — a leaked slot \
+                 leaks credit and byte budget for the life of the epoch, and \
+                 unlike a leaked socket it is invisible to lsof.",
+            )?,
+        )?;
+        let streaming_mux_reader_stall_total = register_collector(
+            registry,
+            Counter::with_opts(Opts::new(
+                "velo_streaming_mux_reader_stall_total",
+                "Records the applier could not try_send into a slot buffer that \
+                 credit had already reserved space in. Should always be zero: a \
+                 slot never has more than C frames outstanding against a C+1-deep \
+                 buffer, so a non-zero value means the credit invariant is broken. \
+                 A bug, not a tuning signal.",
+            ))?,
+        )?;
+        let streaming_mux_generation_mismatch_total = register_collector(
+            registry,
+            Counter::with_opts(Opts::new(
+                "velo_streaming_mux_generation_mismatch_total",
+                "Records dropped because the slot index was live but at a \
+                 different generation. This is dense slot reuse being caught: \
+                 without the generation tag these records would have been \
+                 delivered into whichever stream now occupies the index.",
+            ))?,
+        )?;
+        let streaming_mux_records_dropped_total = register_collector(
+            registry,
+            CounterVec::new(
+                Opts::new(
+                    "velo_streaming_mux_records_dropped_total",
+                    "Mux records discarded before delivery, by reason. \
+                     stale_epoch and generation are the protocol working as \
+                     designed across a reconnect or a slot reuse; unknown_slot \
+                     and closed_slot mean a sender is talking about a stream \
+                     this node does not have.",
+                ),
+                &["reason"],
+            )?,
+        )?;
+        let streaming_mux_batches_total = register_collector(
+            registry,
+            CounterVec::new(
+                Opts::new(
+                    "velo_streaming_mux_batches_total",
+                    "_stream_batch active messages packed (sent) or decoded \
+                     (received) by the mux.",
+                ),
+                &["direction"],
+            )?,
+        )?;
+        let streaming_mux_records_per_batch = register_collector(
+            registry,
+            Histogram::with_opts(
+                HistogramOpts::new(
+                    "velo_streaming_mux_records_per_batch",
+                    "Records carried by one _stream_batch. This is the \
+                     multiplexing win expressed directly: 1.0 means the mux is \
+                     paying protocol overhead for nothing.",
+                )
+                .buckets(exponential_buckets(1.0, 2.0, 12)?),
+            )?,
+        )?;
+        let streaming_slot_credit_exhausted_total = register_collector(
+            registry,
+            Counter::with_opts(Opts::new(
+                "velo_streaming_slot_credit_exhausted_total",
+                "Times a slot ran out of data credit and its egress parked. \
+                 Per-slot starvation, not peer-wide: other slots on the same \
+                 batcher keep flowing, which is the property multiplexing has to \
+                 buy back after giving up one socket per stream.",
+            ))?,
+        )?;
+        let streaming_mux_rendezvous_singletons_total = register_collector(
+            registry,
+            Counter::with_opts(Opts::new(
+                "velo_streaming_mux_rendezvous_singletons_total",
+                "Records larger than the effective eager budget, sent alone in \
+                 their batch so the messenger stages them through rendezvous. \
+                 Each one fences its own slot until admission resolves and pays \
+                 a round trip; a rising rate means frames are outgrowing the \
+                 target's eager budget.",
+            ))?,
+        )?;
+        let streaming_mux_held_records = register_collector(
+            registry,
+            Gauge::new(
+                "velo_streaming_mux_held_records",
+                "Records sitting in per-slot ahead-of-sequence holds, waiting \
+                 for a frame_seq gap to close. Non-zero only while a rendezvous \
+                 singleton is outstanding, since that is the one path that can \
+                 overtake the ordered lane.",
+            )?,
+        )?;
+        let streaming_mux_hold_overflow_total = register_collector(
+            registry,
+            Counter::with_opts(Opts::new(
+                "velo_streaming_mux_hold_overflow_total",
+                "Slots closed because their ahead-of-sequence hold exceeded the \
+                 credit or byte budget backing it. Scoped to the one slot: the \
+                 peer's ordering lane and its other slots are untouched.",
+            ))?,
+        )?;
+        let streaming_mux_epoch_deaths_total = register_collector(
+            registry,
+            Counter::with_opts(Opts::new(
+                "velo_streaming_mux_epoch_deaths_total",
+                "Peer epochs that died, each failing every live slot beneath it \
+                 exactly once. Driven by a batch send that was never admitted, \
+                 which is the only ordered per-target congestion and liveness \
+                 signal the mux has.",
+            ))?,
+        )?;
+        let streaming_mux_batch_seq_gaps_total = register_collector(
+            registry,
+            Counter::with_opts(Opts::new(
+                "velo_streaming_mux_batch_seq_gaps_total",
+                "Batches missing between the expected and received batch_seq \
+                 within one epoch. Reported and moved past — the mux does not \
+                 retransmit — so this is the count of batches whose records the \
+                 per-slot frame_seq machinery had to recover from.",
+            ))?,
+        )?;
+
         // -- Rendezvous metrics --
         let rendezvous_operations_total = register_collector(
             registry,
@@ -933,6 +1203,18 @@ impl VeloMetrics {
             streaming_heartbeat_watchdog_firings_total,
             streaming_egress_flushes_total,
             streaming_frames_written_total,
+            streaming_mux_live_slots,
+            streaming_mux_reader_stall_total,
+            streaming_mux_generation_mismatch_total,
+            streaming_mux_records_dropped_total,
+            streaming_mux_batches_total,
+            streaming_mux_records_per_batch,
+            streaming_slot_credit_exhausted_total,
+            streaming_mux_rendezvous_singletons_total,
+            streaming_mux_held_records,
+            streaming_mux_hold_overflow_total,
+            streaming_mux_epoch_deaths_total,
+            streaming_mux_batch_seq_gaps_total,
             rendezvous_operations_total,
             rendezvous_operation_duration_seconds,
             rendezvous_bytes_total,
@@ -1081,15 +1363,25 @@ impl VeloMetrics {
         })
     }
 
-    /// Bind streaming collectors for a specific transport-scheme label.
-    pub(crate) fn bind_streaming_transport(
-        &self,
-        transport_scheme: &str,
-    ) -> StreamingTransportMetricsHandle {
-        StreamingTransportMetricsHandle {
-            backpressure: self
-                .streaming_backpressure_total
-                .with_label_values(&[transport_scheme]),
+    /// Bind the messenger-mux collectors into one handle.
+    ///
+    /// The mux takes this once at construction and clones it into the per-peer
+    /// batchers and the `_stream_batch` ingress lane, so the hot paths hold
+    /// concrete collectors instead of resolving label values per record.
+    pub(crate) fn bind_mux(&self) -> MuxMetricsHandle {
+        MuxMetricsHandle {
+            live_slots: self.streaming_mux_live_slots.clone(),
+            reader_stall_total: self.streaming_mux_reader_stall_total.clone(),
+            generation_mismatch_total: self.streaming_mux_generation_mismatch_total.clone(),
+            records_dropped_total: self.streaming_mux_records_dropped_total.clone(),
+            batches_total: self.streaming_mux_batches_total.clone(),
+            records_per_batch: self.streaming_mux_records_per_batch.clone(),
+            credit_exhausted_total: self.streaming_slot_credit_exhausted_total.clone(),
+            rendezvous_singletons_total: self.streaming_mux_rendezvous_singletons_total.clone(),
+            held_records: self.streaming_mux_held_records.clone(),
+            hold_overflow_total: self.streaming_mux_hold_overflow_total.clone(),
+            epoch_deaths_total: self.streaming_mux_epoch_deaths_total.clone(),
+            batch_seq_gaps_total: self.streaming_mux_batch_seq_gaps_total.clone(),
         }
     }
 
