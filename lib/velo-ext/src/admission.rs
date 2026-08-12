@@ -290,9 +290,17 @@ type ResolveHook = Box<dyn FnOnce(&Result<(), AdmissionError>) + Send>;
 /// Hooks are a `Vec`, not a slot: the runtime installs its own bookkeeping
 /// hook (outbound metric, error handler) before the admission ever reaches the
 /// caller, and the caller's hook must add to that, never replace it.
+///
+/// `hooks_drained` is what makes registration order hold across the
+/// registration-vs-resolution race: the resolver drains the vec in batches
+/// outside the lock, and only marks it drained once a locked re-check finds
+/// the vec empty. A registration landing in that window joins the vec — and
+/// runs on the resolver, in order, behind everything registered before it —
+/// instead of jumping the queue by running on the registering thread.
 struct TicketState {
     outcome: TicketOutcome,
     hooks: Vec<ResolveHook>,
+    hooks_drained: bool,
 }
 
 struct Ticket {
@@ -308,6 +316,7 @@ impl Ticket {
             state: Mutex::new(TicketState {
                 outcome: TicketOutcome::Pending,
                 hooks: Vec::new(),
+                hooks_drained: false,
             }),
             waker: AtomicWaker::new(),
             cancel: CancellationToken::new(),
@@ -334,7 +343,7 @@ impl Ticket {
     /// registration order, so the runtime's bookkeeping hook fires before any
     /// caller-installed observer.
     fn resolve(&self, outcome: Result<(), AdmissionError>) {
-        let hooks = {
+        {
             let mut state = lock(&self.state);
             if !matches!(state.outcome, TicketOutcome::Pending) {
                 return;
@@ -343,26 +352,41 @@ impl Ticket {
                 Ok(()) => TicketOutcome::Admitted,
                 Err(error) => TicketOutcome::Failed(error.clone()),
             };
-            std::mem::take(&mut state.hooks)
-        };
+        }
         self.waker.wake();
-        for hook in hooks {
-            hook(&outcome);
+        // Drain in batches until a locked re-check finds nothing new, then
+        // mark the drain complete in the same critical section. A hook
+        // registered while a batch runs lands in the vec and is picked up by
+        // the next iteration — still on this task, still in order.
+        loop {
+            let batch = {
+                let mut state = lock(&self.state);
+                if state.hooks.is_empty() {
+                    state.hooks_drained = true;
+                    return;
+                }
+                std::mem::take(&mut state.hooks)
+            };
+            for hook in batch {
+                hook(&outcome);
+            }
         }
     }
 
-    /// Add a completion hook, running it on the spot if the ticket has
-    /// already resolved.
+    /// Add a completion hook.
+    ///
+    /// Runs on the spot only when the ticket has resolved *and* the resolver
+    /// has finished running every earlier hook; a registration racing the
+    /// resolver's drain joins the queue instead, so hooks always observe the
+    /// outcome in registration order.
     fn add_hook(&self, hook: ResolveHook) {
         let resolved = {
             let mut state = lock(&self.state);
-            match read_outcome(&state.outcome) {
-                None => {
-                    state.hooks.push(hook);
-                    return;
-                }
-                Some(outcome) => outcome,
+            if !state.hooks_drained {
+                state.hooks.push(hook);
+                return;
             }
+            read_outcome(&state.outcome).expect("hooks_drained implies resolved")
         };
         hook(&resolved);
     }

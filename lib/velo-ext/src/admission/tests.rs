@@ -347,3 +347,67 @@ async fn hooks_are_additive_and_run_in_registration_order() {
     }));
     assert_eq!(*fired.lock().unwrap(), vec!["backend", "caller", "late"]);
 }
+
+/// A hook registered while the resolver is mid-drain joins the queue and runs
+/// after the hooks registered before it — it must not jump the queue by
+/// running on the registering thread the moment it sees a resolved outcome.
+///
+/// This is the race the `hooks_drained` flag exists for: the backend's
+/// bookkeeping hook is installed before the caller ever holds the admission,
+/// and the documented order must hold even when the caller registers exactly
+/// as the driver resolves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hook_registered_during_the_drain_waits_its_turn() {
+    use std::sync::Mutex;
+
+    let (tx, rx) = flume::bounded(1);
+    let gate = AdmissionGate::new(tx, Handle::current());
+
+    admitted(gate.send(0u8));
+    let admission = pending(gate.send(1));
+
+    let order: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+    let (drain_entered_tx, drain_entered_rx) = flume::bounded::<()>(1);
+    let (release_tx, release_rx) = flume::bounded::<()>(1);
+
+    let first = Arc::clone(&order);
+    let admission = admission.on_resolved(move |_| {
+        // Announce the drain has started, then hold it open until the racing
+        // registration has landed. Blocking is fine: this runs on the gate's
+        // driver task and the test runtime has a second worker.
+        drain_entered_tx.send(()).unwrap();
+        release_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("test deadlock: release signal never arrived");
+        first.lock().unwrap().push("first");
+    });
+
+    // Free the slot so the driver admits frame 1 and starts draining hooks.
+    assert_eq!(recv(&rx).await, 0);
+    timeout(LIMIT, drain_entered_rx.recv_async())
+        .await
+        .expect("drain never started")
+        .unwrap();
+
+    // The ticket is resolved but its drain is mid-flight: this registration
+    // must queue behind "first", not run here and now.
+    let second = Arc::clone(&order);
+    let admission = admission.on_resolved(move |result| {
+        assert!(result.is_ok());
+        second.lock().unwrap().push("second");
+    });
+    assert!(
+        order.lock().unwrap().is_empty(),
+        "the racing hook must not run on the registering thread"
+    );
+
+    release_tx.send(()).unwrap();
+    timeout(LIMIT, admission)
+        .await
+        .expect("admission timed out")
+        .expect("admission should succeed");
+    assert_eq!(recv(&rx).await, 1);
+
+    wait_until("both hooks to fire", || order.lock().unwrap().len() == 2).await;
+    assert_eq!(*order.lock().unwrap(), vec!["first", "second"]);
+}
