@@ -197,12 +197,18 @@ impl ActiveMessageClient {
     /// the stager whose threshold decides when a payload stops going inline.
     /// See [`eager_payload_budget`] for what the number means.
     ///
-    /// The envelope is measured against
-    /// [`finalize_outbound_headers`]-processed headers, not against `headers`
-    /// as passed: [`send_message`](Self::send_message) encodes the finalized
-    /// set, so sizing against anything else hands back a budget the encoder
-    /// will overrun. A scratch copy, because finalizing is what the send path
-    /// does to a message it owns and this one is borrowed.
+    /// The envelope counts what [`finalize_outbound_headers`] will add to
+    /// `headers`, not `headers` as passed: [`send_message`](Self::send_message)
+    /// encodes the finalized set, so sizing against anything else hands back a
+    /// budget the encoder will overrun.
+    ///
+    /// It is counted, not built. Finalizing runs against an *empty* scratch
+    /// map, which yields exactly what the send path would have merged in, and
+    /// [`envelope_overhead`] sizes the union across the two maps without
+    /// materialising it. So the caller's headers are only ever read here —
+    /// budgeting a send cannot duplicate a header set that is arbitrarily
+    /// large, or larger than the encoder would accept, since those limits are
+    /// checked at encode and not before.
     ///
     /// Finalizing reads ambient state — the current trace context — so the
     /// answer belongs to the context it was asked from. Callers that size a
@@ -215,14 +221,14 @@ impl ActiveMessageClient {
         handler_name: &str,
         headers: Option<&HashMap<String, String>>,
     ) -> usize {
-        let mut finalized = headers.cloned();
-        finalize_outbound_headers(&mut finalized);
+        let mut injected = None;
+        finalize_outbound_headers(&mut injected);
         eager_payload_budget(
             self.backend.max_message_size(target),
             self.large_payload_stager
                 .get()
                 .map(|stager| stager.threshold()),
-            envelope_overhead(handler_name, finalized.as_ref()),
+            envelope_overhead(handler_name, headers, injected.as_ref()),
         )
     }
 

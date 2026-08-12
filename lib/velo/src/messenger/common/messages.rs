@@ -262,6 +262,11 @@ fn msgpack_map_header_len(entries: usize) -> usize {
     }
 }
 
+/// Bytes `rmp` spends on one header entry, both markers included.
+fn msgpack_entry_len(key: &str, value: &str) -> usize {
+    msgpack_str_len(key.len()) + msgpack_str_len(value.len())
+}
+
 /// Bytes `rmp` spends on a string of `len` bytes, marker included.
 fn msgpack_str_len(len: usize) -> usize {
     let marker = if len <= MSGPACK_FIXSTR_MAX_LEN {
@@ -296,19 +301,53 @@ fn msgpack_str_len(len: usize) -> usize {
 /// every marker-width boundary, which is where an analytic copy of an encoder
 /// goes wrong if it is going to.
 ///
+/// `injected` is the set the send path merges over `headers` on its way to the
+/// encoder — the distributed-tracing context — and is sized *without* the merge
+/// being performed: the union is counted across the two maps rather than built,
+/// so sizing a send never duplicates the caller's headers. That matters because
+/// the caller's map is arbitrary and unvalidated at this point: the 1 KiB per
+/// value and 16 KiB total limits are the encoder's, enforced in
+/// [`encode_active_message`] and not here.
+///
+/// Collisions go to `injected`, because the merge is
+/// [`HashMap::insert`](std::collections::HashMap::insert) and the injector runs
+/// last: a key in both is counted once, at its injected value's size.
+///
 /// Note `None` and `Some(empty map)` differ by one byte: the encoder writes no
-/// MessagePack at all for `None`, and an empty `FixMap` marker for `Some`.
+/// MessagePack at all for a message whose headers are `None`, and an empty
+/// `FixMap` marker for `Some`. So a message carries a map on the wire when
+/// *either* argument is `Some` — which is why `injected` is an `Option` too,
+/// rather than an empty map standing in for "nothing injected".
 pub(crate) fn envelope_overhead(
     handler_name: &str,
     headers: Option<&HashMap<String, String>>,
+    injected: Option<&HashMap<String, String>>,
 ) -> usize {
-    let headers_len = headers.map_or(0, |headers| {
-        msgpack_map_header_len(headers.len())
-            + headers
+    let headers_len = if headers.is_none() && injected.is_none() {
+        0
+    } else {
+        // Entries the caller supplied that survive the merge, counted and
+        // measured in one pass over a map this function only ever reads.
+        let (kept_entries, kept_bytes) = headers.map_or((0, 0), |headers| {
+            headers
                 .iter()
-                .map(|(key, value)| msgpack_str_len(key.len()) + msgpack_str_len(value.len()))
-                .sum::<usize>()
-    });
+                .filter(|(key, _)| {
+                    injected.is_none_or(|injected| !injected.contains_key(key.as_str()))
+                })
+                .fold((0, 0), |(entries, bytes), (key, value)| {
+                    (entries + 1, bytes + msgpack_entry_len(key, value))
+                })
+        });
+        let injected_bytes: usize = injected.map_or(0, |injected| {
+            injected
+                .iter()
+                .map(|(key, value)| msgpack_entry_len(key, value))
+                .sum()
+        });
+        msgpack_map_header_len(kept_entries + injected.map_or(0, HashMap::len))
+            + kept_bytes
+            + injected_bytes
+    };
     FIXED_HEADER_SIZE + handler_name.len() + headers_len
 }
 
@@ -479,11 +518,95 @@ mod tests {
 
         for (handler_name, headers) in &cases {
             assert_eq!(
-                envelope_overhead(handler_name, headers.as_ref()),
+                envelope_overhead(handler_name, headers.as_ref(), None),
                 encoded_header_len(handler_name, headers.as_ref()),
                 "handler_len={} entries={:?}",
                 handler_name.len(),
                 headers.as_ref().map(HashMap::len),
+            );
+        }
+    }
+
+    /// The merge the send path performs before encoding: the injected set is
+    /// inserted over the caller's, so a key in both survives with the injected
+    /// value. [`envelope_overhead`] has to size this without building it.
+    fn merged(
+        headers: Option<&HashMap<String, String>>,
+        injected: Option<&HashMap<String, String>>,
+    ) -> Option<HashMap<String, String>> {
+        if headers.is_none() && injected.is_none() {
+            return None;
+        }
+        let mut merged = headers.cloned().unwrap_or_default();
+        if let Some(injected) = injected {
+            for (key, value) in injected {
+                merged.insert(key.clone(), value.clone());
+            }
+        }
+        Some(merged)
+    }
+
+    /// Sizing the union without materialising it is where an analytic copy of
+    /// the encoder gets a second chance to be wrong, so every case is checked
+    /// against the encoder fed the merge it is standing in for: collisions,
+    /// the `None` caller the injector still materialises a map for, and a
+    /// union that crosses the fixmap boundary from either side of the merge.
+    #[test]
+    fn envelope_overhead_sizes_the_injected_union_like_the_encoder() {
+        let traceparent = || {
+            HashMap::from([(
+                "traceparent".to_string(),
+                "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string(),
+            )])
+        };
+        // A caller who already carries the key the injector will overwrite,
+        // at a different length so counting the wrong one is visible.
+        let mut collision = header_map(2, 4, 4);
+        collision.insert("traceparent".to_string(), "stale".to_string());
+
+        /// A caller's header set and the set the send path merges over it.
+        type MergeCase = (
+            Option<HashMap<String, String>>,
+            Option<HashMap<String, String>>,
+        );
+
+        let cases: Vec<MergeCase> = vec![
+            // Nothing at all: no map on the wire.
+            (None, None),
+            // What injection does with no context to inject — it materialises
+            // the map anyway, which the encoder charges a FixMap marker for.
+            (None, Some(HashMap::new())),
+            (None, Some(traceparent())),
+            (Some(HashMap::new()), Some(HashMap::new())),
+            (Some(HashMap::new()), Some(traceparent())),
+            (Some(header_map(2, 4, 4)), None),
+            (Some(header_map(2, 4, 4)), Some(traceparent())),
+            // Collision: counted once, at the injected value's size.
+            (Some(collision), Some(traceparent())),
+            // The union crosses fixmap→map16 even though neither side does.
+            (
+                Some(header_map(MSGPACK_FIXMAP_MAX_ENTRIES, 4, 4)),
+                Some(traceparent()),
+            ),
+            // ... and does not cross it when the extra key collides away.
+            (
+                Some({
+                    let mut headers = header_map(MSGPACK_FIXMAP_MAX_ENTRIES - 1, 4, 4);
+                    headers.insert("traceparent".to_string(), "stale".to_string());
+                    headers
+                }),
+                Some(traceparent()),
+            ),
+        ];
+
+        for (headers, injected) in &cases {
+            let merged = merged(headers.as_ref(), injected.as_ref());
+            assert_eq!(
+                envelope_overhead("h", headers.as_ref(), injected.as_ref()),
+                encoded_header_len("h", merged.as_ref()),
+                "caller={:?} injected={:?}",
+                headers.as_ref().map(HashMap::len),
+                injected.as_ref().map(HashMap::len),
             );
         }
     }
@@ -494,7 +617,7 @@ mod tests {
     #[test]
     fn envelope_overhead_pins_exact_sizes() {
         // 22 fixed + 13 handler name + no headers at all.
-        assert_eq!(envelope_overhead("_stream_batch", None), 22 + 13);
+        assert_eq!(envelope_overhead("_stream_batch", None, None), 22 + 13);
         assert_eq!(encoded_header_len("_stream_batch", None), 35);
 
         // A rendezvous handle is a u128 in decimal, at most 39 digits.
@@ -506,7 +629,7 @@ mod tests {
         // 22 fixed + 13 name + FixMap marker (1) + FixStr "_rv" (1 + 3)
         // + Str8 handle (2 + 39, past the 31-byte FixStr ceiling).
         assert_eq!(
-            envelope_overhead("_stream_batch", Some(&headers)),
+            envelope_overhead("_stream_batch", Some(&headers), None),
             22 + 13 + 1 + 4 + 41,
         );
         assert_eq!(encoded_header_len("_stream_batch", Some(&headers)), 81);

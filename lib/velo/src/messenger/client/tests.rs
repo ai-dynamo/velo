@@ -425,6 +425,39 @@ async fn over_budget_sends_fail_below_the_threshold_and_stage_above_it() {
     );
 }
 
+/// Sizing a send reads the caller's headers; it never copies them, and it never
+/// runs them past the encoder. So a header set the encoder would refuse — the
+/// per-value and total limits are checked at encode, not here — still gets a
+/// budget, and that budget accounts for every byte of it.
+///
+/// The set below is 32 KiB, twice the encoder's ceiling. What is asserted is
+/// the difference an empty caller map and this one make to the budget: 32
+/// entries of `msgpack_str_len(8) + msgpack_str_len(1024)`, plus the two bytes
+/// the map header grows by once the union passes 15 entries. Feature-
+/// independent, because whatever the send path injects is in both numbers.
+#[tokio::test]
+async fn budget_sizes_a_header_set_the_encoder_would_reject() {
+    const ENTRIES: usize = 32;
+    const KEY_LEN: usize = 8;
+    const VALUE_LEN: usize = 1024;
+    // Roomy enough that the envelope does not eat the whole budget: what is
+    // asserted is a difference, and a saturated budget has no difference left.
+    let (local, target, _transport) = capped_messenger(256 * 1024).await;
+
+    let empty = HashMap::new();
+    let oversized: HashMap<String, String> = (0..ENTRIES)
+        .map(|i| (format!("{i:0KEY_LEN$}"), "v".repeat(VALUE_LEN)))
+        .collect();
+
+    let base = local.effective_eager_payload(target, "_stream_batch", Some(&empty));
+    let charged = local.effective_eager_payload(target, "_stream_batch", Some(&oversized));
+
+    // FixStr key (1 + 8) + Str16 value (3 + 1024) per entry, and the map header
+    // going from a FixMap marker (1) to Map16 (3) as the union passes 15.
+    const PER_ENTRY: usize = (1 + KEY_LEN) + (3 + VALUE_LEN);
+    assert_eq!(base - charged, ENTRIES * PER_ENTRY + 2);
+}
+
 // ---------------------------------------------------------------------------
 // The budget and the encoder must agree about the headers
 // ---------------------------------------------------------------------------
@@ -539,5 +572,62 @@ async fn budget_covers_the_trace_context_the_send_path_injects() {
             .headers
             .is_some_and(|headers| headers.contains_key(TRACEPARENT_KEY)),
         "nothing was injected, so this test would have passed for the wrong reason"
+    );
+}
+
+/// A caller who already carries the key the injector is about to write has that
+/// value overwritten, not duplicated — the merge is a `HashMap::insert` and the
+/// injector runs last. The union is sized rather than built, so the key has to
+/// be counted once, at the injected value's length and not the caller's, or the
+/// budget drifts from the frame in whichever direction the two lengths differ.
+///
+/// Here the caller's value is deliberately much shorter than the injected one,
+/// so counting the wrong one shows up as a frame that overruns the capacity.
+#[cfg(feature = "distributed-tracing")]
+#[tokio::test]
+async fn budget_counts_a_collided_header_once_at_its_injected_size() {
+    const CAPACITY: usize = 8 * 1024;
+    let (local, target, transport) = capped_messenger(CAPACITY).await;
+
+    opentelemetry::global::set_text_map_propagator(FixedTraceparentPropagator);
+    let mut headers = HashMap::new();
+    headers.insert(TRACEPARENT_KEY.to_string(), "stale".to_string());
+
+    let _attached = opentelemetry::Context::current_with_value(TraceThisSend).attach();
+    let budget = local.effective_eager_payload(target, "_stream_batch", Some(&headers));
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        local
+            .am_send_streaming("_stream_batch")
+            .expect("streaming builder")
+            .headers(headers)
+            .raw_payload(bytes::Bytes::from(vec![0u8; budget]))
+            .instance(target)
+            .send(),
+    )
+    .await
+    .expect("a registered peer and an underscore handler take the fast path")
+    .expect("a budget-sized send is admitted");
+
+    assert_eq!(transport.rejections(), Vec::<String>::new());
+    let (header, payload) = transport.only_accepted_frame();
+    assert_eq!(
+        header.len() + payload.len(),
+        CAPACITY,
+        "the collided key must be counted once, at the length that reaches the wire"
+    );
+
+    let decoded = crate::messenger::common::messages::decode_active_message(header, payload)
+        .expect("the frame decodes");
+    assert_eq!(
+        decoded
+            .metadata
+            .headers
+            .expect("the merged headers reach the wire")
+            .get(TRACEPARENT_KEY)
+            .map(String::as_str),
+        Some(TRACEPARENT_VALUE),
+        "the injected context wins the collision"
     );
 }
