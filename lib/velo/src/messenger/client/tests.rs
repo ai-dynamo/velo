@@ -396,14 +396,16 @@ async fn over_budget_sends_fail_below_the_threshold_and_stage_above_it() {
     );
     assert_eq!(transport.rejections().len(), 1);
 
-    // Past the threshold the stager takes over: the payload becomes a handle in
-    // the headers and the frame that goes out is a fraction of the capacity.
+    // One byte past the threshold the stager takes over: the payload becomes a
+    // handle in the headers and the frame that goes out is a fraction of the
+    // capacity. The boundary is exact — the stager triggers on `>`, so this is
+    // the smallest payload that stages.
     tokio::time::timeout(
         Duration::from_secs(2),
         local
             .am_send_streaming("_stream_batch")
             .expect("streaming builder")
-            .raw_payload(bytes::Bytes::from(vec![0u8; THRESHOLD * 2]))
+            .raw_payload(bytes::Bytes::from(vec![0u8; THRESHOLD + 1]))
             .instance(target)
             .send(),
     )
