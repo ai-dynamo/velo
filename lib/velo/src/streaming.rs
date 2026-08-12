@@ -26,6 +26,11 @@ pub mod frame;
 #[cfg(feature = "grpc")]
 pub mod grpc_transport;
 pub mod handle;
+/// Batched, multiplexed streaming over the Messenger (`messenger-mux-v1`).
+///
+/// Internal while it is built out: the transport is opt-in and selected at
+/// attach time, so nothing outside this crate names these types.
+pub(crate) mod messenger_mux;
 pub mod mpsc;
 pub mod sender;
 pub mod tcp_transport;
