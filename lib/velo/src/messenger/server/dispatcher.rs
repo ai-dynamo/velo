@@ -10,7 +10,6 @@ use dashmap::DashMap;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tokio::sync::Semaphore;
@@ -97,7 +96,11 @@ impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for SpawnedDispa
     }
 }
 
-/// Dispatcher implementation that executes handlers inline on the dispatcher task.
+/// Dispatcher implementation that spawns handlers on a detached task.
+///
+/// Despite the name this does not execute on the dispatcher task; it is
+/// [`SpawnedDispatcher`] without the task-tracker registration, so a graceful
+/// shutdown cannot wait for handlers dispatched this way.
 pub(crate) struct InlineDispatcher<H: ActiveMessageHandler> {
     handler: Arc<H>,
 }
@@ -150,13 +153,15 @@ pub(crate) struct OrderedDispatcher<H: ActiveMessageHandler> {
     /// The rendezvous-ordering caveat is worth saying once per handler, not
     /// once per message.
     rendezvous_warning: std::sync::Once,
+    /// Likewise for load shedding: the counter carries the rate, the log line
+    /// only needs to make it discoverable.
+    shed_warning: std::sync::Once,
 }
 
 /// The parts of an [`OrderedDispatcher`] that need a live `Messenger`.
 struct BoundRouter {
     router: Arc<LaneRouter<LaneKey, LaneItem>>,
     metrics: Option<OrderedMetricsHandle>,
-    queue_depth: Arc<QueueDepth>,
 }
 
 /// The partition a message is routed to.
@@ -169,36 +174,6 @@ type LaneKey = Option<WorkerId>;
 struct LaneItem {
     ctx: HandlerContext,
     enqueued_at: Instant,
-}
-
-/// Per-handler admission accounting for ordered queues.
-///
-/// This is deliberately independent from Prometheus: overflow policy changes
-/// request handling, while metrics are optional telemetry.
-struct QueueDepth {
-    pending: AtomicUsize,
-}
-
-impl QueueDepth {
-    fn acquire(&self) -> usize {
-        self.pending.fetch_add(1, Ordering::AcqRel)
-    }
-
-    fn try_acquire(&self, limit: usize) -> bool {
-        self.pending
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |depth| {
-                if depth < limit { Some(depth + 1) } else { None }
-            })
-            .is_ok()
-    }
-
-    fn release(&self) {
-        self.pending
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |depth| {
-                depth.checked_sub(1)
-            })
-            .expect("ordered queue depth underflow");
-    }
 }
 
 /// Bridges lane lifecycle events onto the Prometheus handle.
@@ -227,6 +202,7 @@ impl<H: ActiveMessageHandler + 'static> OrderedDispatcher<H> {
             bound: OnceLock::new(),
             limiter,
             rendezvous_warning: std::sync::Once::new(),
+            shed_warning: std::sync::Once::new(),
         }
     }
 
@@ -235,32 +211,32 @@ impl<H: ActiveMessageHandler + 'static> OrderedDispatcher<H> {
             OrderingKey::Global => None,
             // The sender's worker id is bit-packed into the response id it
             // minted, so this needs no wire support. `WorkerId` is a
-            // deterministic bijection of the sender's `InstanceId`, so keying
-            // on it is keying on the sending instance.
+            // collision-resistant hash of the sender's `InstanceId`, so
+            // keying on it partitions by sending instance. It is 128 bits down
+            // to 64, so a collision would merge two peers onto one lane --
+            // harmless for ordering (it only over-serialises), which is why
+            // this is the lane key rather than the identity handlers see.
             OrderingKey::Sender => Some(WorkerId::from_u64(ctx.message_id.worker_id())),
         }
     }
 
     fn bind(&self, system: &Arc<Messenger>) -> BoundRouter {
         let handler = self.handler.clone();
-        let handler_name = self.handler.name().to_string();
+        // `Arc<str>`, not `String`: the consumer clones this per message but
+        // only reads it on the panic branch.
+        let handler_name: Arc<str> = Arc::from(self.handler.name());
         let limiter = self.limiter.clone();
-        let queue_depth = Arc::new(QueueDepth {
-            pending: AtomicUsize::new(0),
-        });
         let metrics = system
             .observability()
             .as_ref()
             .and_then(|m| m.bind_ordered_dispatcher(&handler_name));
 
         let consumer_metrics = metrics.clone();
-        let consumer_queue_depth = Arc::clone(&queue_depth);
         let consumer = Arc::new(move |item: LaneItem| {
             let handler = handler.clone();
-            let handler_name = handler_name.clone();
+            let handler_name = Arc::clone(&handler_name);
             let limiter = limiter.clone();
             let metrics = consumer_metrics.clone();
-            let queue_depth = Arc::clone(&consumer_queue_depth);
 
             Box::pin(async move {
                 if let Some(metrics) = metrics.as_ref() {
@@ -274,16 +250,23 @@ impl<H: ActiveMessageHandler + 'static> OrderedDispatcher<H> {
                     None => None,
                 };
 
-                let message_id = item.ctx.message_id;
-                let response_type = item.ctx.response_type;
-                let system = item.ctx.system.clone();
+                let ctx = item.ctx;
+                let message_id = ctx.message_id;
+                let response_type = ctx.response_type;
+                let system = ctx.system.clone();
 
                 // Unlike `SpawnedDispatcher`, a panic here would take down the
                 // whole lane task rather than a single message — and every
                 // later message for that key with it. Catch it so the lane
                 // survives, and unblock the caller rather than letting it hang
                 // to timeout. (Inert under `panic = "abort"`.)
-                let outcome = AssertUnwindSafe(handler.handle(item.ctx))
+                //
+                // `handle()` is called *inside* the async block on purpose.
+                // `AssertUnwindSafe(handler.handle(ctx))` would evaluate
+                // `handle()` first and only wrap the future it returns, leaving
+                // the adapter's synchronous prologue — context construction and
+                // the lazy `bind_handler` metrics binding — outside the guard.
+                let outcome = AssertUnwindSafe(async move { handler.handle(ctx).await })
                     .catch_unwind()
                     .await;
 
@@ -300,7 +283,6 @@ impl<H: ActiveMessageHandler + 'static> OrderedDispatcher<H> {
                     Self::fail_fast(&system, message_id, response_type, "handler panicked");
                 }
 
-                queue_depth.release();
                 if let Some(metrics) = metrics.as_ref() {
                     metrics.dequeued();
                 }
@@ -321,11 +303,7 @@ impl<H: ActiveMessageHandler + 'static> OrderedDispatcher<H> {
             },
         ));
 
-        BoundRouter {
-            router,
-            metrics,
-            queue_depth,
-        }
+        BoundRouter { router, metrics }
     }
 
     /// Send an error response so a waiting caller fails immediately instead of
@@ -387,65 +365,77 @@ impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for OrderedDispa
             });
         }
 
-        let exceeded_limit = match (self.config.max_queue_depth, self.config.overflow) {
-            (Some(limit), OverflowPolicy::Reject) => {
-                if bound.queue_depth.try_acquire(limit) {
-                    false
-                } else {
-                    if let Some(m) = ctx.system.observability().as_ref() {
-                        m.record_dispatch_failure(DispatchFailure::OrderedLaneShed);
-                    }
-                    warn!(
-                        target: "crate::messenger::dispatcher",
-                        handler = %self.handler.name(),
-                        limit,
-                        message_id = %ctx.message_id,
-                        "Shedding message: ordered handler queue depth exceeded max_queue_depth"
-                    );
-                    Self::fail_fast(
-                        &ctx.system,
-                        ctx.message_id,
-                        ctx.response_type,
-                        "ordered lane queue full",
-                    );
-                    return;
-                }
-            }
-            (max_queue_depth, OverflowPolicy::Warn) => {
-                let depth = bound.queue_depth.acquire();
-                max_queue_depth.is_some_and(|limit| depth >= limit)
-            }
-            (None, OverflowPolicy::Reject) => {
-                bound.queue_depth.acquire();
-                false
-            }
+        // `max_queue_depth` bounds a single lane, not the handler: with
+        // per-sender lanes a handler-wide cap would let one backed-up peer shed
+        // traffic from peers whose lanes are empty, defeating the isolation
+        // `OrderingKey::Sender` exists to provide. Only `Reject` passes the cap
+        // down as an admission limit; `Warn` always enqueues and inspects the
+        // resulting depth.
+        let capacity = match self.config.overflow {
+            OverflowPolicy::Reject => self.config.max_queue_depth,
+            OverflowPolicy::Warn => None,
         };
 
-        if exceeded_limit {
-            let limit = self
-                .config
-                .max_queue_depth
-                .expect("queue limit is set when admission reports an exceedance");
-            warn!(
-                target: "crate::messenger::dispatcher",
-                handler = %self.handler.name(),
-                limit,
-                "Ordered handler queue depth exceeded max_queue_depth"
-            );
-        }
-
-        if let Some(metrics) = metrics {
-            metrics.enqueued();
-        }
-
         let key = self.lane_key(&ctx);
-        bound.router.route(
+        let message_id = ctx.message_id;
+        let response_type = ctx.response_type;
+        let system = ctx.system.clone();
+
+        match bound.router.route(
             key,
             LaneItem {
                 ctx,
                 enqueued_at: Instant::now(),
             },
-        );
+            capacity,
+        ) {
+            Ok(depth_before) => {
+                if let Some(metrics) = metrics {
+                    metrics.enqueued();
+                }
+                // Edge-triggered: `depth_before == limit` is the message that
+                // takes this lane over the cap. Deeper backlogs stay quiet
+                // until the lane drains below the limit and crosses again, so
+                // this cannot flood the receive loop the way a per-message
+                // warn would.
+                if let Some(limit) = self.config.max_queue_depth
+                    && depth_before == limit
+                {
+                    warn!(
+                        target: "crate::messenger::dispatcher",
+                        handler = %self.handler.name(),
+                        limit,
+                        lane = ?key,
+                        "Ordered lane exceeded max_queue_depth"
+                    );
+                }
+            }
+            Err(_shed) => {
+                // Every shed message is counted; the log line fires once per
+                // handler so a shed storm cannot flood. `OrderedLaneShed` is
+                // the signal to alert on.
+                if let Some(m) = system.observability().as_ref() {
+                    m.record_dispatch_failure(DispatchFailure::OrderedLaneShed);
+                }
+                self.shed_warning.call_once(|| {
+                    warn!(
+                        target: "crate::messenger::dispatcher",
+                        handler = %self.handler.name(),
+                        limit = self.config.max_queue_depth.unwrap_or_default(),
+                        lane = ?key,
+                        "Shedding messages: ordered lane is at max_queue_depth. \
+                         Logged once per handler; see velo_messenger_dispatch_failures_total \
+                         {{reason=\"ordered_lane_shed\"}} for the rate"
+                    );
+                });
+                Self::fail_fast(
+                    &system,
+                    message_id,
+                    response_type,
+                    "ordered lane queue full",
+                );
+            }
+        }
     }
 }
 

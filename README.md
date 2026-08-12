@@ -262,7 +262,8 @@ let h = Handler::am_handler("append_log", |ctx: Context| log.append(ctx.payload)
     .ordered_global()
     .build();
 
-// Tuned: keep idle lanes alive longer, shed above 100k queued messages.
+// Tuned: keep idle lanes alive longer, shed a sender whose own lane
+// backs up past 100k queued messages.
 let h = Handler::typed_unary_async("bulk", bulk).ordered_with(
     OrderedConfig::by_sender()
         .with_idle_lane_ttl(Some(Duration::from_secs(300)))
@@ -275,7 +276,7 @@ Things worth knowing:
 
 - **Ordering is preserved, not created.** Ordered mode hands messages to the handler in the order they reached the messenger. If a peer is reachable over several transports, or a connection drops and reconnects mid-stream, arrival order was already lost upstream.
 - **Large payloads are exempt.** Rendezvous-staged messages resolve out-of-band before dispatch, so they are not ordered relative to each other even on an ordered handler. The dispatcher warns once when it sees one.
-- **Lane queues are unbounded.** `max_queue_depth` is a soft cap driving `OverflowPolicy`, not a bound on the channel. Watch `velo_messenger_ordered_lane_depth` and `velo_messenger_ordered_lane_wait_seconds` to spot a lane falling behind.
+- **Lane queues are unbounded.** `max_queue_depth` is a soft admission cap driving `OverflowPolicy`, not a bound on the channel. It applies **per lane**, so one backed-up peer cannot shed traffic from peers whose lanes are empty. Watch `velo_messenger_ordered_lane_depth` and `velo_messenger_ordered_lane_wait_seconds` to spot a lane falling behind; under `Reject`, `velo_messenger_dispatch_failures_total{reason="ordered_lane_shed"}` carries the shed rate (the log line fires once per handler).
 - **On a unary handler this serialises request/response per sender** — a client issuing 100 concurrent calls will have them served one at a time.
 - Idle lanes reap themselves after `idle_lane_ttl` (30s by default) so churning short-lived peers don't leak tasks.
 

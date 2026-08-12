@@ -159,7 +159,12 @@ pub type UnifiedResponse = Result<Option<Bytes>>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DispatchMode {
-    /// Execute handler inline on dispatcher task (minimal latency)
+    /// Spawn the handler on a detached task that is *not* registered with
+    /// the messenger's task tracker.
+    ///
+    /// Despite the name this does not run on the dispatcher task. It is
+    /// [`Spawn`](Self::Spawn) minus trackability, so a future graceful
+    /// shutdown cannot wait for these handlers.
     Inline,
     /// Spawn handler on separate task (default, safer)
     Spawn,
@@ -190,7 +195,7 @@ pub enum OrderingKey {
 }
 
 /// What an ordered handler does when a lane exceeds
-/// [`OrderedConfig::max_queue_depth`].
+/// [`OrderedConfig::with_max_queue_depth`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum OverflowPolicy {
@@ -275,11 +280,22 @@ impl OrderedConfig {
         self
     }
 
-    /// Soft cap on queued-but-unhandled messages, evaluated per handler.
+    /// Soft cap on queued-but-unhandled messages, evaluated **per lane**.
+    ///
+    /// Per-lane, not per-handler: under [`OrderingKey::Sender`] a handler-wide
+    /// cap would let one backed-up peer shed traffic from peers whose lanes are
+    /// empty, defeating the isolation per-sender lanes exist to provide. Under
+    /// [`OrderingKey::Global`] there is only one lane, so the two coincide.
     ///
     /// Lane channels are unbounded regardless; this only drives
-    /// [`OrderedConfig::with_overflow`]. `None` (the default) disables the check.
+    /// [`OrderedConfig::with_overflow`]. `None` (the default) disables the
+    /// check. `Some(0)` is rejected immediately because it would shed or warn
+    /// on every message.
     pub fn with_max_queue_depth(mut self, depth: Option<usize>) -> Self {
+        assert!(
+            depth.is_none_or(|depth| depth > 0),
+            "max_queue_depth must be greater than zero"
+        );
         self.max_queue_depth = depth;
         self
     }
@@ -344,7 +360,8 @@ macro_rules! impl_sender_accessors {
             /// Resolved from the peer registry, which is populated by the
             /// `_hello` handshake — so this can be `None` for a peer whose
             /// handshake has not landed yet. `WorkerId` is a deterministic
-            /// bijection of `InstanceId`, so prefer
+            /// hash of `InstanceId` -- collision-resistant, but 128 bits
+            /// down to 64, so not injective -- so prefer
             /// [`sender_worker_id`](Self::sender_worker_id) when you only need
             /// a stable partition key.
             pub fn sender_instance_id(&self) -> Option<InstanceId> {
@@ -1596,5 +1613,13 @@ mod tests {
     #[should_panic(expected = "max_concurrent must be greater than zero")]
     fn test_ordered_config_rejects_zero_concurrency() {
         let _ = OrderedConfig::by_sender().with_max_concurrent(Some(0));
+    }
+
+    #[test]
+    #[should_panic(expected = "max_queue_depth must be greater than zero")]
+    fn test_ordered_config_rejects_zero_queue_depth() {
+        // A cap of zero would shed or warn on every single message, so the
+        // handler would silently never run.
+        let _ = OrderedConfig::by_sender().with_max_queue_depth(Some(0));
     }
 }

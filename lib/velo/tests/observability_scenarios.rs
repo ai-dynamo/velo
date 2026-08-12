@@ -598,8 +598,15 @@ mod uds {
 mod ordered_dispatch {
     use super::*;
 
+    /// Traffic-phase handler. Reaping is disabled here so the lane-count
+    /// assertion cannot race a TTL that expires mid-send.
     const HANDLER: &str = "ordered_metrics";
     const LANE_LABEL: [(&str, &str); 1] = [("handler", HANDLER)];
+
+    /// Reap-phase handler, exercised separately with a short TTL so the two
+    /// concerns never contend.
+    const REAPED_HANDLER: &str = "ordered_metrics_reaped";
+    const REAPED_LABEL: [(&str, &str); 1] = [("handler", REAPED_HANDLER)];
 
     /// Polls `predicate` until it holds, failing rather than hanging.
     async fn wait_for(label: &str, mut predicate: impl FnMut() -> bool) {
@@ -648,11 +655,18 @@ mod ordered_dispatch {
                 Ok(())
             }
         })
-        .ordered_with(
-            OrderedConfig::by_sender().with_idle_lane_ttl(Some(Duration::from_millis(150))),
-        )
+        // Reaping off: the lane-count assertion below must not race a TTL
+        // expiring while the second client is still handshaking and sending.
+        .ordered_with(OrderedConfig::by_sender().with_idle_lane_ttl(None))
         .build();
         server.register_handler(handler).unwrap();
+
+        let reaped = Handler::am_handler_async(REAPED_HANDLER, move |_ctx| async move { Ok(()) })
+            .ordered_with(
+                OrderedConfig::by_sender().with_idle_lane_ttl(Some(Duration::from_millis(100))),
+            )
+            .build();
+        server.register_handler(reaped).unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         for client in &clients {
@@ -673,6 +687,16 @@ mod ordered_dispatch {
         })
         .await;
 
+        // `handled` is bumped inside the user closure, but `dequeued()` only
+        // runs once the whole adapter future resolves — so poll the gauge
+        // itself rather than asserting on it the instant the counter lands.
+        wait_for("queue depth drained", || {
+            MetricSnapshot::from_registry(&server_reg)
+                .gauge("velo_messenger_ordered_lane_depth", &LANE_LABEL)
+                == 0.0
+        })
+        .await;
+
         let snap = MetricSnapshot::from_registry(&server_reg);
         assert_eq!(
             snap.gauge("velo_messenger_ordered_lanes", &LANE_LABEL),
@@ -683,25 +707,43 @@ mod ordered_dispatch {
             snap.histogram_count("velo_messenger_ordered_lane_wait_seconds", &LANE_LABEL) >= 10,
             "every message should record a lane-wait observation"
         );
-        assert_eq!(
-            snap.gauge("velo_messenger_ordered_lane_depth", &LANE_LABEL),
-            0.0,
-            "queue depth must return to zero once the backlog drains"
+        assert!(
+            snap.counter("velo_messenger_ordered_lanes_created_total", &LANE_LABEL) >= 2.0,
+            "lane creations are counted per sending instance"
         );
 
-        // Idle past the TTL: both lanes reap themselves, but the creation
-        // counter is monotonic and remembers them.
-        wait_for("lanes reaped", || {
+        // Reap phase, on its own handler so nothing above can race it: one
+        // message, then idle past the TTL. The lane gauge returns to zero while
+        // the creation counter, being monotonic, remembers the lane.
+        clients[0]
+            .am_send(REAPED_HANDLER)
+            .unwrap()
+            .raw_payload(Bytes::from_static(b"x"))
+            .instance(server.instance_id())
+            .send()
+            .await
+            .unwrap();
+
+        // Wait for the lane to exist before waiting for it to go away — the
+        // gauge reads 0.0 both before creation and after reaping, so polling
+        // straight for 0.0 would pass without the lane ever having been built.
+        wait_for("lane created", || {
             MetricSnapshot::from_registry(&server_reg)
-                .gauge("velo_messenger_ordered_lanes", &LANE_LABEL)
+                .counter("velo_messenger_ordered_lanes_created_total", &REAPED_LABEL)
+                >= 1.0
+        })
+        .await;
+        wait_for("lane reaped", || {
+            MetricSnapshot::from_registry(&server_reg)
+                .gauge("velo_messenger_ordered_lanes", &REAPED_LABEL)
                 == 0.0
         })
         .await;
 
         let snap = MetricSnapshot::from_registry(&server_reg);
         assert!(
-            snap.counter("velo_messenger_ordered_lanes_created_total", &LANE_LABEL) >= 2.0,
-            "lane creations are counted even after the lanes are reaped"
+            snap.counter("velo_messenger_ordered_lanes_created_total", &REAPED_LABEL) >= 1.0,
+            "lane creations are counted even after the lane is reaped"
         );
     }
 }

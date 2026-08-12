@@ -417,6 +417,90 @@ async fn max_queue_depth_rejects_without_metrics() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn max_queue_depth_is_per_lane_not_per_handler() {
+    // The point of per-sender lanes is isolation. A handler-wide depth cap
+    // would let one backed-up peer shed traffic from peers whose lanes are
+    // empty, which is exactly the coupling `OrderingKey::Sender` exists to
+    // remove. Sender A wedges its lane far past the cap; sender B must still
+    // get every message through.
+    const CAP: usize = 2;
+    const B_MESSAGES: u32 = 5;
+
+    let (receiver, senders) = cluster(2).await;
+    let (blocked_sender, free_sender) = (&senders[0], &senders[1]);
+    let blocked_worker = blocked_sender.instance_id().worker_id().as_u64();
+
+    let release = Arc::new(AtomicBool::new(false));
+    let free_handled = Arc::new(Mutex::new(Vec::new()));
+
+    let handler_release = Arc::clone(&release);
+    let handler_free = Arc::clone(&free_handled);
+    let handler = Handler::am_handler_async("per_lane_cap", move |ctx: Context| {
+        let release = Arc::clone(&handler_release);
+        let free = Arc::clone(&handler_free);
+        async move {
+            if ctx.sender_worker_id().as_u64() == blocked_worker {
+                // Wedge sender A's lane so its queue builds past the cap.
+                while !release.load(Ordering::Acquire) {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            } else {
+                free.lock().push(read_seq(&ctx.payload));
+            }
+            Ok(())
+        }
+    })
+    .ordered_with(
+        OrderedConfig::by_sender()
+            .with_max_queue_depth(Some(CAP))
+            .with_overflow(OverflowPolicy::Reject),
+    )
+    .build();
+    receiver.register_handler(handler).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Fire-and-forget, so shed messages do not surface as client errors —
+    // sender A is meant to overflow here.
+    for seq in 0..20u32 {
+        blocked_sender
+            .am_send("per_lane_cap")
+            .unwrap()
+            .raw_payload(seq_payload(seq))
+            .instance(receiver.instance_id())
+            .send()
+            .await
+            .unwrap();
+    }
+
+    // One at a time, waiting for each to land: the cap applies to B's lane too,
+    // so a burst could legitimately overflow B's *own* queue and prove nothing
+    // about isolation. Send-and-wait keeps B's depth at 1 throughout, leaving
+    // A's saturated lane as the only thing that could shed it.
+    for seq in 0..B_MESSAGES {
+        free_sender
+            .am_send("per_lane_cap")
+            .unwrap()
+            .raw_payload(seq_payload(seq))
+            .instance(receiver.instance_id())
+            .send()
+            .await
+            .unwrap();
+        wait_for("free sender's message handled", || {
+            free_handled.lock().len() == (seq + 1) as usize
+        })
+        .await;
+    }
+
+    assert_eq!(
+        *free_handled.lock(),
+        (0..B_MESSAGES).collect::<Vec<_>>(),
+        "an unrelated sender must be neither shed nor reordered by another lane's backlog"
+    );
+
+    release.store(true, Ordering::Release);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ordered_unary_responses_are_correct() {
     let (receiver, senders) = cluster(1).await;
     let sender = &senders[0];

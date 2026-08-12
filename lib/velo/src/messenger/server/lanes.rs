@@ -119,8 +119,12 @@ where
 
     /// Enqueue `item` on `key`'s lane, creating and spawning the lane if needed.
     ///
-    /// Never blocks and never fails: lane channels are unbounded.
-    pub(crate) fn route(&self, key: K, item: T) {
+    /// Returns the lane's depth *before* this item, or gives `item` back when
+    /// `capacity` is `Some(n)` and the lane already holds `n` unhandled items.
+    /// With `capacity: None` this never rejects. Never blocks: lane channels
+    /// are unbounded, and `capacity` is an admission check, not a channel
+    /// bound.
+    pub(crate) fn route(&self, key: K, item: T, capacity: Option<usize>) -> Result<usize, T> {
         // Everything below runs while the shard's write lock is held by the
         // entry guard. That is what makes the reap predicate sound — see the
         // module docs. In particular, do NOT clone the sender out and drop the
@@ -140,10 +144,21 @@ where
             }
         };
 
+        // The entry guard serialises every producer for this key, so a plain
+        // load/compare is sufficient here — no CAS loop. The lane task may
+        // decrement concurrently, which only frees capacity, so a `depth` read
+        // here can be stale-high but never stale-low: we can reject a shade
+        // early, never admit past `capacity`.
+        let depth = lane.state.pending.load(Ordering::Acquire);
+        if capacity.is_some_and(|capacity| depth >= capacity) {
+            return Err(item);
+        }
+
         lane.state.pending.fetch_add(1, Ordering::AcqRel);
         // Unbounded: `send` only fails if every receiver is gone, which cannot
         // happen while we hold the entry guard that owns the sender.
         let _ = lane.tx.send(item);
+        Ok(depth)
     }
 
     /// Number of live lanes. Test and metrics support.
@@ -372,7 +387,7 @@ mod tests {
         const PER_KEY: u32 = 250;
         for seq in 0..PER_KEY {
             for key in 0..KEYS {
-                router.route(key, (key, seq));
+                let _ = router.route(key, (key, seq), None);
             }
         }
 
@@ -412,8 +427,8 @@ mod tests {
             config(None, Arc::clone(&observer)),
         );
 
-        router.route(1, ());
-        router.route(2, ());
+        let _ = router.route(1, (), None);
+        let _ = router.route(2, (), None);
 
         wait_for("both lanes cleared the barrier", || {
             done.load(Ordering::Acquire) == 2
@@ -437,7 +452,7 @@ mod tests {
             config(Some(Duration::from_millis(50)), Arc::clone(&observer)),
         );
 
-        router.route(7, ());
+        let _ = router.route(7, (), None);
         wait_for("item handled", || handled.load(Ordering::Acquire) == 1).await;
         wait_for("lane reaped", || router.lane_count() == 0).await;
 
@@ -465,7 +480,7 @@ mod tests {
         );
 
         for seq in 0..5 {
-            router.route(1, seq);
+            let _ = router.route(1, seq, None);
         }
 
         wait_for("all items handled", || log.lock().len() == 5).await;
@@ -498,7 +513,7 @@ mod tests {
             config(Some(Duration::from_millis(5)), Arc::clone(&observer)),
         );
 
-        router.route(1, ());
+        let _ = router.route(1, (), None);
 
         // Well past the idle TTL but well before the handler finishes.
         tokio::time::sleep(Duration::from_millis(60)).await;
@@ -529,13 +544,13 @@ mod tests {
         );
 
         for seq in 0..5 {
-            router.route(1, seq);
+            let _ = router.route(1, seq, None);
         }
         wait_for("first burst handled", || log.lock().len() == 5).await;
         wait_for("lane reaped", || router.lane_count() == 0).await;
 
         for seq in 5..10 {
-            router.route(1, seq);
+            let _ = router.route(1, seq, None);
         }
         wait_for("second burst handled", || log.lock().len() == 10).await;
 
@@ -592,7 +607,7 @@ mod tests {
             let router = Arc::clone(&router);
             handles.push(tokio::spawn(async move {
                 for i in 0..PER_PRODUCER {
-                    router.route(1, producer * PER_PRODUCER + i);
+                    let _ = router.route(1, producer * PER_PRODUCER + i, None);
                     if i % 32 == 0 {
                         tokio::task::yield_now().await;
                     }
@@ -641,7 +656,7 @@ mod tests {
         );
 
         for key in 0..3 {
-            router.route(key, ());
+            let _ = router.route(key, (), None);
         }
         wait_for("items handled", || handled.load(Ordering::Acquire) == 3).await;
         assert_eq!(observer.created.load(Ordering::Acquire), 3);
@@ -652,6 +667,89 @@ mod tests {
             observer.closed.load(Ordering::Acquire) == 3
         })
         .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn capacity_is_enforced_per_key() {
+        // Admission is per lane, not per router: filling one key's lane must
+        // not affect any other key's.
+        let observer = Arc::new(CountingObserver::default());
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handled = Arc::new(Mutex::new(Vec::new()));
+
+        let consumer_release = Arc::clone(&release);
+        let sink = Arc::clone(&handled);
+        let router: LaneRouter<u64, u32> = LaneRouter::new(
+            Arc::new(move |item| {
+                let release = Arc::clone(&consumer_release);
+                let sink = Arc::clone(&sink);
+                Box::pin(async move {
+                    while !release.load(Ordering::Acquire) {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    sink.lock().push(item);
+                })
+            }),
+            config(None, Arc::clone(&observer)),
+        );
+
+        // Key 1: one item enters the consumer and wedges, two more fill the
+        // queue to the cap, the fourth is refused.
+        assert_eq!(router.route(1, 10, Some(3)), Ok(0));
+        assert_eq!(router.route(1, 11, Some(3)), Ok(1));
+        assert_eq!(router.route(1, 12, Some(3)), Ok(2));
+        assert_eq!(
+            router.route(1, 13, Some(3)),
+            Err(13),
+            "a full lane must hand the item back"
+        );
+
+        // Key 2 is untouched by key 1's backlog.
+        assert_eq!(router.route(2, 20, Some(3)), Ok(0));
+
+        // `capacity: None` never refuses, even on the saturated lane.
+        assert_eq!(router.route(1, 14, None), Ok(3));
+
+        release.store(true, Ordering::Release);
+        wait_for("all admitted items handled", || handled.lock().len() == 5).await;
+
+        let grouped = group_by_key(
+            &handled
+                .lock()
+                .iter()
+                .map(|item| (item / 10, *item))
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(grouped[&1], vec![10, 11, 12, 14], "key 1 lost or reordered");
+        assert_eq!(grouped[&2], vec![20]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn capacity_frees_as_the_lane_drains() {
+        // The cap bounds *unhandled* items, so it must recover once the
+        // consumer works through the backlog rather than latching shut.
+        let observer = Arc::new(CountingObserver::default());
+        let handled = Arc::new(Mutex::new(Vec::new()));
+
+        let sink = Arc::clone(&handled);
+        let router: LaneRouter<u64, u32> = LaneRouter::new(
+            Arc::new(move |item| {
+                let sink = Arc::clone(&sink);
+                Box::pin(async move {
+                    sink.lock().push(item);
+                })
+            }),
+            config(None, Arc::clone(&observer)),
+        );
+
+        assert!(router.route(1, 0, Some(1)).is_ok());
+        wait_for("first item handled", || handled.lock().len() == 1).await;
+        assert!(
+            router.route(1, 1, Some(1)).is_ok(),
+            "capacity must be reusable once the lane drains"
+        );
+        wait_for("second item handled", || handled.lock().len() == 2).await;
+        assert_eq!(*handled.lock(), vec![0, 1]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -683,7 +781,7 @@ mod tests {
         );
 
         for seq in 0..8 {
-            router.route(1, seq);
+            let _ = router.route(1, seq, None);
         }
 
         wait_for("surviving items handled", || log.lock().len() == 7).await;
