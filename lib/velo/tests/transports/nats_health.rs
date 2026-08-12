@@ -217,22 +217,23 @@ async fn test_nats_max_payload_enforcement() {
 /// The negotiated capacity report: `max_message_size` is the connection's own
 /// `max_payload`, less the frame overhead this transport charges against it.
 ///
-/// Asserted against the client's live `max_payload()` rather than a literal,
-/// because `max_payload` belongs to the server, not to us — a NATS started with
-/// a different `--max_payload` must move the report with it. This is the one
-/// transport whose capacity is genuinely negotiated.
+/// Every expected number here is derived from the client's live
+/// `max_payload()` rather than written as a literal, because `max_payload`
+/// belongs to the server, not to us — a NATS started with a different
+/// `--max_payload` must move the report with it. This is the one transport
+/// whose capacity is genuinely negotiated.
+///
+/// What proves the report is that server's number rather than arithmetic on a
+/// constant is the boundary, pinned from both sides: one byte past the reported
+/// capacity is rejected before the wire, and exactly the reported capacity is
+/// carried end to end. That is also the report and the pre-wire check agreeing,
+/// which they cannot stop doing now that both read one accessor.
 ///
 /// A transport that has never been started reports the same number as one that
-/// has, which is the point: the capacity is read from the connection at every
-/// use, so there is no `start()`-time snapshot left to go stale across a
-/// reconnect. (This assertion used to be `None`, which is exactly what a
-/// snapshot that had not been taken yet looked like.)
-///
-/// The boundary is pinned from both sides: one byte past the reported capacity
-/// is rejected before the wire, and exactly the reported capacity is carried
-/// end to end. That second half is what makes the number a promise rather than
-/// an estimate — and it is the report and the pre-wire check agreeing, which
-/// they cannot stop doing now that both read one accessor.
+/// has, and that is the part that pins the staleness: the capacity is read from
+/// the connection at every use, so there is no `start()`-time snapshot left to
+/// go stale across a reconnect. This assertion used to be `None` — exactly what
+/// a snapshot that had not been taken yet looked like.
 #[tokio::test]
 async fn test_nats_max_message_size_reflects_negotiated_max_payload() {
     let cluster_id = format!("test-{}", InstanceId::new_v4());
@@ -250,7 +251,10 @@ async fn test_nats_max_message_size_reflects_negotiated_max_payload() {
     let unstarted_capacity = unstarted
         .max_message_size(InstanceId::new_v4())
         .expect("capacity comes from the connection, which is already up");
-    assert!(unstarted_capacity < server_max);
+    assert!(
+        unstarted_capacity < server_max,
+        "the transport discounts its own framing from the connection's limit"
+    );
 
     let error_handler = Arc::new(common::TestErrorHandler::new());
     let (transport_a, _streams_a, _id_a) =
@@ -265,10 +269,6 @@ async fn test_nats_max_message_size_reflects_negotiated_max_payload() {
     let capacity = transport_a
         .max_message_size(id_b)
         .expect("a started NATS transport has been told its max_payload");
-    assert!(
-        capacity < server_max,
-        "reported capacity {capacity} must sit below the server's max_payload {server_max}"
-    );
     assert_eq!(
         capacity, unstarted_capacity,
         "starting the transport must not be what establishes the capacity"
