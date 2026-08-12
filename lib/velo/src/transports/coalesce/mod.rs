@@ -34,11 +34,32 @@
 //! # The delivery-reporting invariant
 //!
 //! Every item taken off the channel gets **exactly one**
-//! [`Coalescable::on_write_error`] if it did not reach the wire, and **none**
-//! if it did. The caller's own post-loop drain (e.g. `connection_writer_task`)
-//! covers items still sitting in the channel, but it cannot see an item this
-//! loop is holding — so the three paths that hold one (a mandatory flush
-//! failing, a rejected encode, a failed direct write) report it themselves.
+//! [`Coalescable::fail`](crate::transports::coalesce::Coalescable::fail)
+//! if it did not reach the wire, and **none** if it did. The caller's own
+//! post-loop drain (e.g. `connection_writer_task`) covers items still sitting
+//! in the channel, but it cannot see an item this loop is holding — so the
+//! three paths that hold one (a mandatory flush failing, a rejected encode, a
+//! failed direct write) report it themselves.
+//!
+//! There is exactly **one** retention model. Staging an item copies its bytes
+//! into the batch buffer and converts what is left into a
+//! [`Coalescable::FailureToken`](crate::transports::coalesce::Coalescable::FailureToken),
+//! and the writer holds the batch's tokens until the batch reaches the wire. A
+//! path with no per-frame error handler sets `FailureToken = ()`, so its token
+//! vector is zero-sized, retention costs nothing, and the frame's bytes are
+//! released the instant they are staged.
+//!
+//! # Where items come from
+//!
+//! `rx` and `wrap` are a pair: the loop takes whatever the channel carries and
+//! wraps it into the item type. The messenger writers own their channel's item
+//! type and pass [`std::convert::identity`]; the streaming egress channel is
+//! fixed to `Vec<u8>` by `FrameTransport::connect`, so its pump wraps each
+//! frame into a streaming-local newtype right here. That keeps the terminal
+//! semantics `Coalescable` carries attached to one path instead of landing on
+//! a crate-wide `impl Coalescable for Vec<u8>` that any future caller would
+//! silently inherit. Wrapping is a move into a transparent newtype — no
+//! allocation, no copy.
 
 use std::io;
 
@@ -66,25 +87,28 @@ const DEFAULT_MAX_BATCH_BYTES: usize = COALESCE_THRESHOLD;
 /// unbounded error fan-out on a single connection fault.
 const DEFAULT_MAX_BATCH_FRAMES: usize = 1024;
 
-/// Reason handed to [`Coalescable::on_write_error`] when an item was dropped
-/// because the flush that had to precede it failed.
+/// Reason handed to [`Coalescable::fail`] when an item was dropped because the
+/// flush that had to precede it failed.
 const FLUSH_FAILED: &str = "batch flush failed";
 
 /// An item a coalescing writer can put on the wire.
 ///
-/// Implementors supply the three frame fields plus, optionally, terminal
-/// semantics and a per-item failure notification.
-pub(crate) trait Coalescable {
-    /// Whether [`Self::on_write_error`] does anything.
+/// Implementors supply the three frame fields, what to retain for failure
+/// reporting, and — optionally — terminal semantics.
+pub(crate) trait Coalescable: Sized {
+    /// What the writer retains per staged item so it can report a failure.
     ///
-    /// When `true` the writer holds each item until its batch reaches the
-    /// wire, so a failed flush can report every item it was carrying. When
-    /// `false` it drops each item as soon as the bytes are staged — the
-    /// streaming egress pump has no per-frame error handler, and keeping a
-    /// whole batch of payloads alive alongside the copy of them in the staging
-    /// buffer would double live memory on the path coalescing exists to speed
-    /// up.
-    const REPORTS_ERRORS: bool = true;
+    /// Staging copies an item's bytes into the batch buffer, so from that
+    /// point the item itself is dead weight: all it still owes is the
+    /// notification a failed write must produce. Naming that residue gives the
+    /// writer a single retention model — it always holds one token per staged
+    /// frame — instead of one model for paths that report errors and another
+    /// for paths that do not.
+    ///
+    /// `()` for paths with no per-frame error handler. `Vec<()>` is
+    /// zero-sized and never allocates, so retention is free and the item drops
+    /// as its bytes are staged.
+    type FailureToken: Send;
 
     /// Frame type written in the preamble.
     fn msg_type(&self) -> MessageType;
@@ -95,6 +119,20 @@ pub(crate) trait Coalescable {
     /// Frame payload bytes.
     fn payload(&self) -> &[u8];
 
+    /// Convert the item into its failure token once its bytes are staged.
+    ///
+    /// Consumes the item so an implementor can move owned fields into the
+    /// token rather than cloning them on the failure path.
+    fn into_failure_token(self) -> Self::FailureToken;
+
+    /// Report that a staged item did not reach the wire.
+    ///
+    /// `reason` is the bare cause — an `io::Error` rendering, or
+    /// [`FLUSH_FAILED`] — so implementors can add their own
+    /// transport-identifying prefix. Called at most once per token, and never
+    /// for an item that was written.
+    fn fail(token: Self::FailureToken, reason: &str);
+
     /// Whether the writer should stop after this item reaches the wire.
     ///
     /// Used by the streaming egress pump: after a terminal sentinel
@@ -103,21 +141,6 @@ pub(crate) trait Coalescable {
     /// post-terminal cleanup and trigger spurious resets on the wire.
     fn is_terminal(&self) -> bool {
         false
-    }
-
-    /// Report that this item did not reach the wire.
-    ///
-    /// `reason` is the bare cause — an `io::Error` rendering, or
-    /// [`FLUSH_FAILED`] — so implementors can add their own
-    /// transport-identifying prefix. Called at most once per item, and never
-    /// for an item that was written.
-    ///
-    /// Takes `self` so an implementor can move an owned payload straight into
-    /// its error handler rather than cloning it on the failure path.
-    fn on_write_error(self, _reason: &str)
-    where
-        Self: Sized,
-    {
     }
 }
 
@@ -268,9 +291,14 @@ impl FrameBatchBuffer {
 /// `cancel` is `None` for writers whose only stop signal is the channel
 /// closing. That case costs one `Poll::Pending` per wake and registers no
 /// waker, so it does not add work to the streaming hot path.
-pub(crate) async fn run_coalescing_writer<W, T, O>(
+///
+/// `wrap` turns a channel item into a writer item; see *Where items come from*
+/// in the module docs for why it exists. Pass [`std::convert::identity`] when
+/// the channel already carries the item type.
+pub(crate) async fn run_coalescing_writer<W, I, T, O>(
     writer: &mut W,
-    rx: &flume::Receiver<T>,
+    rx: &flume::Receiver<I>,
+    wrap: impl Fn(I) -> T,
     cancel: Option<&CancellationToken>,
     observer: &O,
 ) where
@@ -279,9 +307,10 @@ pub(crate) async fn run_coalescing_writer<W, T, O>(
     O: WriterObserver,
 {
     let mut batch = FrameBatchBuffer::new();
-    // Items staged into `batch` but not yet written. Held so a failed write can
-    // report every item it was carrying, not just the last one.
-    let mut staged: Vec<T> = Vec::new();
+    // One token per frame staged into `batch` but not yet written, so a failed
+    // write can report every frame it was carrying rather than just the last.
+    // Zero-sized, and never allocating, when `FailureToken = ()`.
+    let mut staged: Vec<T::FailureToken> = Vec::new();
 
     'writer: loop {
         // Block for the first item. Cancellation is polled first so a hot send
@@ -290,7 +319,7 @@ pub(crate) async fn run_coalescing_writer<W, T, O>(
             biased;
             _ = wait_cancelled(cancel) => break 'writer,
             recv = rx.recv_async() => match recv {
-                Ok(item) => item,
+                Ok(item) => wrap(item),
                 // `recv_async` errors only once the channel is both
                 // disconnected *and* drained, so queued items are never lost.
                 Err(_) => break 'writer,
@@ -304,17 +333,17 @@ pub(crate) async fn run_coalescing_writer<W, T, O>(
             let staging = batch.classify(item.header().len(), item.payload().len());
 
             if staging.needs_flush_first()
-                && !flush(&mut batch, &mut staged, writer, observer).await
+                && !flush::<_, T, _>(&mut batch, &mut staged, writer, observer).await
             {
                 // `item` never entered the batch, so `flush` did not report it.
-                item.on_write_error(FLUSH_FAILED);
+                T::fail(item.into_failure_token(), FLUSH_FAILED);
                 break 'writer;
             }
 
             if staging == Staging::WriteDirect {
                 if let Err((kind, e)) = write_frame_direct(writer, &item).await {
                     observer.on_failure(kind, &e, 1);
-                    item.on_write_error(&e.to_string());
+                    T::fail(item.into_failure_token(), &e.to_string());
                     break 'writer;
                 }
                 observer.on_flush(1);
@@ -330,20 +359,17 @@ pub(crate) async fn run_coalescing_writer<W, T, O>(
                     // panicking so that the two limits drifting apart degrades
                     // to a reported error instead of a corrupt wire.
                     observer.on_failure(WriterFailure::Encode, &e, 1);
-                    item.on_write_error(&e.to_string());
+                    T::fail(item.into_failure_token(), &e.to_string());
                     // Frames already staged are still valid — get them out.
-                    flush(&mut batch, &mut staged, writer, observer).await;
+                    flush::<_, T, _>(&mut batch, &mut staged, writer, observer).await;
                     break 'writer;
                 }
                 // Read before the move. `is_terminal` is consulted *after*
                 // staging so the terminal frame itself still reaches the wire.
                 let is_terminal = item.is_terminal();
-                if T::REPORTS_ERRORS {
-                    staged.push(item);
-                } else {
-                    // Nothing to report it to; the bytes are already staged.
-                    drop(item);
-                }
+                // The bytes are in the batch now; all the item still owes is
+                // its failure notification, so only that is kept.
+                staged.push(item.into_failure_token());
                 if is_terminal {
                     terminal = true;
                     break;
@@ -357,11 +383,11 @@ pub(crate) async fn run_coalescing_writer<W, T, O>(
             pending = if is_cancelled(cancel) {
                 None
             } else {
-                rx.try_recv().ok()
+                rx.try_recv().ok().map(&wrap)
             };
         }
 
-        if !flush(&mut batch, &mut staged, writer, observer).await || terminal {
+        if !flush::<_, T, _>(&mut batch, &mut staged, writer, observer).await || terminal {
             break 'writer;
         }
     }
@@ -374,11 +400,14 @@ pub(crate) async fn run_coalescing_writer<W, T, O>(
 
 /// Write the staged batch. Returns `false` if the writer should stop.
 ///
-/// On failure every item the batch was carrying is reported exactly once —
+/// On failure every frame the batch was carrying is reported exactly once —
 /// batching must not weaken the per-item error-reporting contract.
+///
+/// The item type cannot be inferred from a `Vec<T::FailureToken>` argument, so
+/// callers name it: `flush::<_, T, _>(..)`.
 async fn flush<W, T, O>(
     batch: &mut FrameBatchBuffer,
-    staged: &mut Vec<T>,
+    staged: &mut Vec<T::FailureToken>,
     writer: &mut W,
     observer: &O,
 ) -> bool
@@ -387,12 +416,13 @@ where
     T: Coalescable,
     O: WriterObserver,
 {
-    debug_assert!(
-        !T::REPORTS_ERRORS || batch.frame_count() == staged.len(),
-        "a reporting writer must hold one item per staged frame"
+    // Unconditional: there is one retention model, so a token per staged frame
+    // holds for every writer — including one whose token is `()`.
+    debug_assert_eq!(
+        staged.len(),
+        batch.frame_count(),
+        "the writer must hold one failure token per staged frame"
     );
-    // Taken from the batch, not from `staged`: a non-reporting writer drops its
-    // items at staging time and leaves `staged` empty.
     let frames = batch.frame_count();
     if frames == 0 {
         return true;
@@ -406,8 +436,8 @@ where
         Err(e) => {
             observer.on_failure(WriterFailure::Write, &e, frames);
             let reason = e.to_string();
-            for item in staged.drain(..) {
-                item.on_write_error(&reason);
+            for token in staged.drain(..) {
+                T::fail(token, &reason);
             }
             false
         }

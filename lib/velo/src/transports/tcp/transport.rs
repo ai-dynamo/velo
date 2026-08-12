@@ -570,6 +570,8 @@ async fn connection_writer_inner(
     run_coalescing_writer(
         &mut stream,
         rx,
+        // The channel already carries the writer's item type.
+        std::convert::identity,
         Some(cancel_token),
         &TcpWriterObserver { instance_id, addr },
     )
@@ -579,6 +581,14 @@ async fn connection_writer_inner(
 }
 
 impl Coalescable for SendTask {
+    /// A staged task *is* its own failure token: what
+    /// [`TransportErrorHandler::on_error`] needs — the header, the payload,
+    /// and the handler — is every field but a one-byte `Copy` enum, and all
+    /// three are refcounted handles. Splitting them into a second struct would
+    /// have the same footprint, so the writer just keeps the task. Retaining
+    /// it holds no payload bytes beyond the ones the sender already owns.
+    type FailureToken = Self;
+
     fn msg_type(&self) -> MessageType {
         self.msg_type
     }
@@ -591,8 +601,12 @@ impl Coalescable for SendTask {
         &self.payload
     }
 
-    fn on_write_error(self, reason: &str) {
-        self.on_error(format!("Failed to write to stream: {}", reason));
+    fn into_failure_token(self) -> Self {
+        self
+    }
+
+    fn fail(token: Self, reason: &str) {
+        token.on_error(format!("Failed to write to stream: {}", reason));
     }
 }
 

@@ -348,8 +348,16 @@ async fn egress_pump(
     metrics: Option<Arc<crate::observability::VeloMetrics>>,
 ) {
     // No cancellation token: this pump stops when the channel closes, when a
-    // terminal sentinel goes out, or when the socket fails.
-    run_coalescing_writer(&mut stream, &rx, None, &EgressObserver { metrics }).await;
+    // terminal sentinel goes out, or when the socket fails. Each frame is
+    // wrapped as it comes off the channel — see `EgressFrame`.
+    run_coalescing_writer(
+        &mut stream,
+        &rx,
+        EgressFrame,
+        None,
+        &EgressObserver { metrics },
+    )
+    .await;
 
     if let Err(e) = stream.flush().await {
         tracing::debug!("TCP streaming flush on close: {}", e);
@@ -359,24 +367,34 @@ async fn egress_pump(
     }
 }
 
+/// One egress frame, as the coalescing writer sees it.
+///
 /// `FrameTransport::connect` fixes the egress channel's item type to
-/// `Vec<u8>`, so the coalescing contract is implemented on it directly rather
-/// than on a newtype that would cost a move per frame on the hot path.
+/// `Vec<u8>`, so the pump wraps each frame as it comes off the channel. The
+/// wrap is a move into a transparent newtype: no allocation, no copy, and the
+/// frame's bytes are never touched.
 ///
-/// **This impl is specific to the streaming egress pump**, even though the
-/// orphan rules make it crate-wide. `is_terminal` reads the streaming
-/// sentinels; any other path that ends up handing `Vec<u8>` to a coalescing
-/// writer (gRPC's `FrameTransport::connect` returns the same channel type)
-/// would silently inherit that check, and should get its own item type rather
-/// than reuse this.
+/// Wrapping rather than implementing [`Coalescable`] on `Vec<u8>` directly is
+/// what keeps `is_terminal`'s streaming sentinel check on the streaming path.
+/// A crate-wide impl on a type this ubiquitous would hand those semantics to
+/// any future caller that happened to feed a coalescing writer a `Vec<u8>`
+/// (gRPC's `FrameTransport::connect` returns the same channel type).
 ///
-/// There is no `on_write_error`: the streaming data plane has no per-frame
-/// error handler. A dead socket surfaces to the consumer as a missing terminal
-/// and is caught by the heartbeat watchdog (see `SATURATION.md`).
-impl Coalescable for Vec<u8> {
-    // No error handler, so the writer need not keep frames alive until flush —
-    // the staging buffer already holds a copy of the bytes.
-    const REPORTS_ERRORS: bool = false;
+/// `#[repr(transparent)]` documents the layout equivalence; nothing here
+/// depends on it, since the wrap is an ordinary move.
+#[repr(transparent)]
+struct EgressFrame(Vec<u8>);
+
+impl Coalescable for EgressFrame {
+    /// The streaming data plane has no per-frame error handler, so there is
+    /// nothing to retain: the frame is dropped the moment its bytes are staged
+    /// and `Vec<()>` costs the writer nothing. Keeping a whole batch of
+    /// payloads alive alongside the copy of them in the staging buffer would
+    /// double live memory on the path coalescing exists to speed up.
+    ///
+    /// A dead socket surfaces to the consumer as a missing terminal and is
+    /// caught by the heartbeat watchdog (see `SATURATION.md`).
+    type FailureToken = ();
 
     fn msg_type(&self) -> MessageType {
         MessageType::Message
@@ -387,8 +405,12 @@ impl Coalescable for Vec<u8> {
     }
 
     fn payload(&self) -> &[u8] {
-        self
+        &self.0
     }
+
+    fn into_failure_token(self) {}
+
+    fn fail(_token: (), _reason: &str) {}
 
     /// After a terminal sentinel (Finalized / Dropped / Detached /
     /// TransportError) the pump stops. Any frame queued behind it — e.g. a
@@ -397,7 +419,7 @@ impl Coalescable for Vec<u8> {
     /// the consumer's post-terminal cleanup and trigger spurious "Connection
     /// reset by peer" RSTs on the wire.
     fn is_terminal(&self) -> bool {
-        is_terminal_sentinel(self)
+        is_terminal_sentinel(&self.0)
     }
 }
 

@@ -20,7 +20,7 @@
 //! The *guarantees* of the coalescing loop — batching, ordering, terminal
 //! handling, error fan-out, short writes, cancellation — are pinned
 //! deterministically against a mock `AsyncWrite` in
-//! `lib/velo/src/transports/coalesce.rs`. What is left here is the end-to-end
+//! `lib/velo/src/transports/coalesce/tests.rs`. What is left here is the end-to-end
 //! behaviour over a real socket, where the exact packing depends on scheduler
 //! timing and only order-of-magnitude claims are sound.
 //!
@@ -154,7 +154,7 @@ async fn burst_preserves_order_and_completeness() {
 /// that pins it would be flaky. What must not happen is a ratio of ~1.0, which
 /// means every frame still went out on its own. The precise batching
 /// guarantees are pinned deterministically in
-/// `lib/velo/src/transports/coalesce.rs`; this only proves the wiring is live
+/// `lib/velo/src/transports/coalesce/tests.rs`; this only proves the wiring is live
 /// end to end.
 #[tokio::test(flavor = "multi_thread")]
 async fn burst_coalesces_writes() {

@@ -132,7 +132,17 @@ struct TestItem {
     errors: Arc<Mutex<Vec<String>>>,
 }
 
+/// What a staged [`TestItem`] leaves behind: enough to name itself in the
+/// shared error list, and none of the frame bytes. Deliberately *not* the item
+/// itself, so the suite exercises a token distinct from its item.
+struct TestToken {
+    tag: String,
+    errors: Arc<Mutex<Vec<String>>>,
+}
+
 impl Coalescable for TestItem {
+    type FailureToken = TestToken;
+
     fn msg_type(&self) -> MessageType {
         MessageType::Message
     }
@@ -145,8 +155,14 @@ impl Coalescable for TestItem {
     fn is_terminal(&self) -> bool {
         self.terminal
     }
-    fn on_write_error(self, reason: &str) {
-        self.errors.lock().push(format!("{}: {reason}", self.tag));
+    fn into_failure_token(self) -> TestToken {
+        TestToken {
+            tag: self.tag,
+            errors: self.errors,
+        }
+    }
+    fn fail(token: TestToken, reason: &str) {
+        token.errors.lock().push(format!("{}: {reason}", token.tag));
     }
 }
 
@@ -201,7 +217,7 @@ async fn run_with(items: Vec<TestItem>, sink: &mut RecordingSink, observer: &Tes
         tx.send(item).expect("queue item");
     }
     drop(tx);
-    run_coalescing_writer(sink, &rx, None, observer).await;
+    run_coalescing_writer(sink, &rx, std::convert::identity, None, observer).await;
 }
 
 // -----------------------------------------------------------------------
@@ -536,7 +552,13 @@ async fn cancellation_interrupts_a_refilled_queue() {
 
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        run_coalescing_writer(&mut sink, &rx, Some(&cancel), &observer),
+        run_coalescing_writer(
+            &mut sink,
+            &rx,
+            std::convert::identity,
+            Some(&cancel),
+            &observer,
+        ),
     )
     .await
     .expect("cancellation must stop the writer promptly");
@@ -552,34 +574,43 @@ async fn cancellation_interrupts_a_refilled_queue() {
 }
 
 // -----------------------------------------------------------------------
-// Item retention
+// Retention — what a staged item leaves behind
 // -----------------------------------------------------------------------
 
-/// An item that counts itself live, so a test can see how many the writer
-/// was still holding at flush time.
-struct CountedItem<const REPORTS: bool> {
-    payload: Vec<u8>,
+/// Counts itself live from construction until its last owner drops it, so a
+/// test can see what the writer was still holding when it flushed.
+///
+/// The `Drop` impl lives here rather than on the items below because a type
+/// that implements `Drop` cannot have a field moved out of it — and moving the
+/// guard out is exactly what `into_failure_token` does.
+struct LiveGuard {
     live: Arc<AtomicUsize>,
 }
 
-impl<const REPORTS: bool> CountedItem<REPORTS> {
-    fn new(live: &Arc<AtomicUsize>, payload: Vec<u8>) -> Self {
+impl LiveGuard {
+    fn new(live: &Arc<AtomicUsize>) -> Self {
         live.fetch_add(1, Ordering::SeqCst);
         Self {
-            payload,
             live: Arc::clone(live),
         }
     }
 }
 
-impl<const REPORTS: bool> Drop for CountedItem<REPORTS> {
+impl Drop for LiveGuard {
     fn drop(&mut self) {
         self.live.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
-impl<const REPORTS: bool> Coalescable for CountedItem<REPORTS> {
-    const REPORTS_ERRORS: bool = REPORTS;
+/// An item whose failure token carries the guard: the TCP/UDS shape, where
+/// the token holds what the error handler will need.
+struct RetainingItem {
+    payload: Vec<u8>,
+    guard: LiveGuard,
+}
+
+impl Coalescable for RetainingItem {
+    type FailureToken = LiveGuard;
     fn msg_type(&self) -> MessageType {
         MessageType::Message
     }
@@ -589,9 +620,44 @@ impl<const REPORTS: bool> Coalescable for CountedItem<REPORTS> {
     fn payload(&self) -> &[u8] {
         &self.payload
     }
+    fn into_failure_token(self) -> LiveGuard {
+        self.guard
+    }
+    fn fail(_token: LiveGuard, _reason: &str) {}
 }
 
-async fn live_items_at_flush<const REPORTS: bool>() -> Vec<usize> {
+/// An item with no per-frame error handler: the streaming shape. Its token is
+/// `()`, so staging drops the item, its payload, and its guard.
+///
+/// The guard is never read — it exists for its `Drop`, which is the whole
+/// measurement — so it carries the leading underscore that says so.
+struct DiscardingItem {
+    payload: Vec<u8>,
+    _guard: LiveGuard,
+}
+
+impl Coalescable for DiscardingItem {
+    type FailureToken = ();
+    fn msg_type(&self) -> MessageType {
+        MessageType::Message
+    }
+    fn header(&self) -> &[u8] {
+        &[]
+    }
+    fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+    /// Takes `self` and returns `()`, so the item — payload and guard — drops
+    /// right here, as its bytes are staged.
+    fn into_failure_token(self) {}
+    fn fail(_token: (), _reason: &str) {}
+}
+
+/// Queue eight items, run the writer, and report the live-guard count sampled
+/// at each `poll_write`.
+async fn live_guards_at_flush<T: Coalescable>(
+    make: impl Fn(&Arc<AtomicUsize>, Vec<u8>) -> T,
+) -> Vec<usize> {
     let live = Arc::new(AtomicUsize::new(0));
     let observer = TestObserver::default();
     let mut sink = RecordingSink {
@@ -599,37 +665,46 @@ async fn live_items_at_flush<const REPORTS: bool>() -> Vec<usize> {
         ..Default::default()
     };
 
-    let (tx, rx) = flume::unbounded::<CountedItem<REPORTS>>();
+    let (tx, rx) = flume::unbounded::<T>();
     for i in 0..8u8 {
-        tx.send(CountedItem::<REPORTS>::new(&live, vec![i; 16]))
-            .expect("queue");
+        assert!(tx.send(make(&live, vec![i; 16])).is_ok(), "queue");
     }
     drop(tx);
-    run_coalescing_writer(&mut sink, &rx, None, &observer).await;
+    run_coalescing_writer(&mut sink, &rx, std::convert::identity, None, &observer).await;
 
     assert_eq!(observer.flushes(), vec![8], "all eight in one flush");
     assert_eq!(live.load(Ordering::SeqCst), 0, "everything dropped by exit");
     sink.live_at_write
 }
 
-/// A writer that reports errors has to keep every item until its batch
-/// reaches the wire — that is what makes per-item error fan-out possible.
+/// A token that carries state has to survive until its batch reaches the wire
+/// — that is what makes per-item error fan-out possible.
 #[tokio::test]
-async fn reporting_writer_holds_items_until_flush() {
+async fn tokens_survive_until_their_batch_is_written() {
+    let counts = live_guards_at_flush(|live, payload| RetainingItem {
+        payload,
+        guard: LiveGuard::new(live),
+    })
+    .await;
     assert_eq!(
-        live_items_at_flush::<true>().await,
+        counts,
         vec![8],
-        "all eight items must still be alive when the batch is written"
+        "all eight tokens must still be alive when the batch is written"
     );
 }
 
-/// A writer with no error handler must not: the staging buffer already
-/// holds a copy of the bytes, so keeping the originals alive would double
-/// live memory on the streaming egress hot path.
+/// A `()` token retains nothing: the staging buffer already holds a copy of
+/// the bytes, so keeping the frames alive would double live memory on the
+/// streaming egress hot path.
 #[tokio::test]
-async fn non_reporting_writer_drops_items_as_it_stages_them() {
+async fn a_unit_token_retains_nothing_past_staging() {
+    let counts = live_guards_at_flush(|live, payload| DiscardingItem {
+        payload,
+        _guard: LiveGuard::new(live),
+    })
+    .await;
     assert_eq!(
-        live_items_at_flush::<false>().await,
+        counts,
         vec![0],
         "items must be dropped at staging time, not held until flush"
     );
@@ -728,6 +803,72 @@ async fn direct_write_failure_reports_only_that_item() {
     assert_eq!(factory.errors().len(), 1, "{:?}", factory.errors());
     assert_eq!(factory.reports_for("big"), 1);
     assert_eq!(observer.failures(), vec![(WriterFailure::Write, 1)]);
+}
+
+// -----------------------------------------------------------------------
+// Wrapping at the channel boundary
+// -----------------------------------------------------------------------
+
+/// The streaming egress shape: a channel whose item type is fixed to
+/// `Vec<u8>` by `FrameTransport::connect`, wrapped into the writer's item type
+/// as each frame comes off it.
+struct WrappedFrame(Vec<u8>);
+
+impl Coalescable for WrappedFrame {
+    type FailureToken = ();
+    fn msg_type(&self) -> MessageType {
+        MessageType::Message
+    }
+    fn header(&self) -> &[u8] {
+        &[]
+    }
+    fn payload(&self) -> &[u8] {
+        &self.0
+    }
+    fn into_failure_token(self) {}
+    fn fail(_token: (), _reason: &str) {}
+    /// Stands in for `is_terminal_sentinel`: the marker the streaming pump
+    /// stops on.
+    fn is_terminal(&self) -> bool {
+        self.0.first() == Some(&0xFF)
+    }
+}
+
+/// Wrapping must not weaken anything the writer does with an item it owns
+/// outright — in particular the terminal check, which is what a refactor that
+/// moved the wrap boundary would be most likely to drop silently.
+#[tokio::test]
+async fn wrapped_channel_items_keep_their_terminal_semantics() {
+    let observer = TestObserver::default();
+    let mut sink = RecordingSink::default();
+
+    let (tx, rx) = flume::unbounded::<Vec<u8>>();
+    tx.send(vec![1u8; 8]).expect("queue");
+    tx.send(vec![0xFFu8; 8]).expect("queue terminal");
+    tx.send(vec![2u8; 8]).expect("queue after terminal");
+    // Keep the channel open so only the terminal frame can stop the writer.
+    let _tx = tx;
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        run_coalescing_writer(&mut sink, &rx, WrappedFrame, None, &observer),
+    )
+    .await
+    .expect("the terminal frame must stop the writer");
+
+    let decoded = sink.decode_frames();
+    assert_eq!(
+        decoded.len(),
+        2,
+        "the frame before the terminal and the terminal itself, nothing after"
+    );
+    assert_eq!(decoded[1].2.as_slice(), &[0xFF; 8]);
+    assert_eq!(observer.flushes(), vec![2]);
+    assert_eq!(
+        rx.len(),
+        1,
+        "the frame queued behind the terminal must be left alone"
+    );
 }
 
 /// Nothing is reported for items that reached the wire.
