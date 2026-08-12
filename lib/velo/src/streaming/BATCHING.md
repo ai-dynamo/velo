@@ -620,15 +620,28 @@ The mux is selected at **attach time**, not announced by a wire magic — there 
 no first-bytes handshake left to hide one in. No new negotiation mechanism is
 needed either. `AnchorAttachResponse::Ok` and its MPSC twin already carry
 `streaming_transport_key`, and the sender already resolves it against its
-transport registry. Two changes:
+transport registry. Two changes, implemented in `streaming/negotiation.rs`:
 
 1. `AnchorAttachRequest` and `MpscAnchorAttachRequest` each gain
    `#[serde(default)] supported_transport_keys: Vec<TransportKey>`. Additive and
    internal to `velo`; `serde(default)` means an older sender still deserializes,
-   as one advertising nothing, which is exactly right.
-2. The attach handlers currently hardcode the local default transport's key.
-   They instead intersect the sender's advertised keys with their own installed
-   transports, preferring `messenger-mux-v1`.
+   as one advertising nothing, which is exactly right — an empty list cannot
+   intersect, so such a sender is always answered with the receiver's default
+   key.
+2. The attach handlers no longer hardcode the local default transport's key.
+   They intersect the sender's advertised keys with their own installed
+   transports, preferring `messenger-mux-v1`, and answer with the credit fields
+   above when that is what they picked.
+
+The sender then reads the answer. A key that is not `messenger-mux-v1` is the
+legacy path and the credit fields are not its business, which is where every
+older receiver lands. `messenger-mux-v1` **with** a window opens a slot already
+holding it. `messenger-mux-v1` with **no** window is refused outright rather than
+retried elsewhere: no shipped version answers that key, and a node that installs
+a mux cannot be configured to advertise a zero window, so it can only mean a peer
+that bound a mux receiver and then told us to ignore it — and connecting over any
+other transport would reach nothing it is listening on, hanging until the
+anchor's watchdog fires instead of failing where the mistake is.
 
 A node with the mux enabled registers **both** `messenger-mux-v1` and its
 configured legacy transport, so it still serves legacy peers. That is required
@@ -645,24 +658,27 @@ where one anchor kind rides the mux and the other does not.
 
 ## Configuration
 
-> **Proposed API.** Nothing in this snippet exists yet — `.messenger_mux(...)`
-> and `MuxConfig` land with P7/P8. It is written down now so the activation
-> shape is reviewed with the protocol rather than improvised after it.
-
 ```rust
 let node = Velo::builder()
     .add_transport(transport)
     // The legacy path stays configured; negotiation picks per attach.
     .stream_config(StreamConfig::Tcp(Some(TcpConfig { bind_addr })))?
     .messenger_mux(MuxConfig {
-        enabled: true,                       // default: false
-        flush: FlushPolicy::Opportunistic,   // default
-        max_batch_bytes: 60 * 1024,          // further clamped by the eager budget
+        enabled: true,                // default: false
+        max_batch_bytes: 60 * 1024,   // further clamped by the eager budget
+        initial_credit: 256,          // advertised verbatim; zero is refused
         ..Default::default()
     })?
     .build()
     .await?;
 ```
+
+> **One knob is still unwritten.** The flush policy is not configurable: the
+> batcher is opportunistic and has no `FlushPolicy` to set, because the windowed
+> and hinted alternatives arrive with P9. `initial_credit` may not be zero —
+> zero is the wire encoding of "not offering the mux", so a node configured that
+> way would advertise a key and then tell every peer to ignore it, and the build
+> refuses it.
 
 Activation is opt-in and stays that way for this work; the mux is not the default
 transport. Defaults are otherwise chosen so `enabled` is the only decision an
@@ -816,7 +832,7 @@ State up front what would sink this, then check each:
 | **P5** | Ordered transport admission, `SendOutcome::Pending` | none | specified |
 | **P6** | Eager-size guidance, `Transport::max_message_size` | none | specified |
 | **P7** | `MessengerMuxTransport` — `_stream_batch`, `PeerBatcher`, slots, credit | yes | implemented |
-| **P8** | Attach-time negotiation, opt-in activation switch | additive | specified |
+| **P8** | Attach-time negotiation, opt-in activation switch | additive | implemented |
 | **P9** | Hint API (`StreamBatch`), windowed policy | none | specified |
 | **P10** | Heartbeat suppression and phase alignment | none | specified |
 | **P11** | Lift the mux surface into `velo-ext` | none | specified |
@@ -829,22 +845,26 @@ which the cost model predicts is the largest single term, without protocol risk.
 P5 and P6 are prerequisites, not preliminaries: without admission the batcher has
 no ordered per-target way to discover congestion, and without the eager budget it
 cannot size a batch the Messenger will carry inline. P7 did not start until both
-landed, and until P8 lands it is unreachable code: the attach handlers still
-hardcode the local default transport key, so nothing ever answers
+landed, and P8 is what made it reachable: before it, the attach handlers
+hardcoded the local default transport key and nothing ever answered
 `messenger-mux-v1`.
 
-Two details of P7 differ from what this document specifies, both because P8 is
-not there yet:
+P8 also closed the first of the two P7 deviations this document used to record.
+**Initial credit is no longer advertised by a `CreditUpdate` on `OpenSlot`** — a
+slot opens already holding the window the attach response carried, which removes
+the round trip that cost before the first token. Keeping both would have granted
+the sender `2C` against a `C + 1` buffer, so it was a swap rather than an
+addition; ongoing credit returns still ride `CreditUpdate`.
 
-- **Initial credit is advertised by a `CreditUpdate` on `OpenSlot`**, not in the
-  attach response, costing one round trip per stream open. The negotiated
-  fields remove it.
+The second stands:
+
 - **Credit is returned by reconciling buffer occupancy**, not by `reader_pump`
-  calling `credit.release(1)`. `reader_pump` does not drain a mux slot buffer
-  until negotiation can select the mux, so there is nothing yet to hook; the mux
-  compares what it admitted against what is still queued, on every inbound batch
-  and on a periodic sweep. The sweep is what un-parks a sender whose peer has
-  gone quiet.
+  calling `credit.release(1)`. The mux compares what it admitted against what is
+  still queued, on every inbound batch and on a periodic sweep. The effect is
+  the same and the sweep bounds the latency; what it costs is a return arriving
+  one sweep tick late when no further batch comes to drive reconciliation on the
+  arrival path. The sweep is also what un-parks a sender whose peer has gone
+  quiet.
 
 One detail differs on the merits rather than on ordering. `CloseSlot` is
 bidirectional with no direction bit, and both sides may hold a slot at the same
