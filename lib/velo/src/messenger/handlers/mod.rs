@@ -34,18 +34,18 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 #[cfg(feature = "distributed-tracing")]
 use tracing::Instrument;
 use tracing::{debug, error};
-use velo_ext::WorkerId;
+use velo_ext::{InstanceId, WorkerId};
 
 use crate::messenger::common::events::{EventType, Outcome, encode_event_header};
 use crate::messenger::common::messages::ResponseType;
 use crate::messenger::common::responses::{ResponseId, encode_response_header};
 use crate::messenger::server::dispatcher::{
     ActiveMessageDispatcher, ActiveMessageHandler, HandlerContext, InlineDispatcher,
-    SpawnedDispatcher,
+    OrderedDispatcher, SpawnedDispatcher,
 };
 use crate::transports::{MessageType, SendOutcome, VeloBackend};
 use derive_getters::Dissolve;
@@ -153,12 +153,137 @@ impl Handler {
 pub type UnifiedResponse = Result<Option<Bytes>>;
 
 /// Dispatch mode for handlers
+///
+/// Marked `#[non_exhaustive]` so future modes can be added without a breaking
+/// change. Match with a `_` arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DispatchMode {
     /// Execute handler inline on dispatcher task (minimal latency)
     Inline,
     /// Spawn handler on separate task (default, safer)
     Spawn,
+    /// Queue onto an ordering lane drained by a single task, so messages
+    /// sharing a lane key are handled in arrival order.
+    ///
+    /// Configured via [`OrderedConfig`]; see [`AmHandlerBuilder::ordered`].
+    Ordered,
+}
+
+/// How an ordered handler partitions inbound messages into lanes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum OrderingKey {
+    /// One lane per sending instance.
+    ///
+    /// Messages from a single peer are handled in arrival order; messages from
+    /// different peers run in parallel. This is the guarantee the transport
+    /// layer actually provides — one connection per peer, read sequentially —
+    /// so it is what [`AmHandlerBuilder::ordered`] selects.
+    #[default]
+    Sender,
+    /// A single lane for the whole handler.
+    ///
+    /// Total arrival order across every peer, at the cost of all cross-peer
+    /// parallelism: one slow sender blocks everyone.
+    Global,
+}
+
+/// What an ordered handler does when a lane exceeds
+/// [`OrderedConfig::max_queue_depth`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum OverflowPolicy {
+    /// Log and count, but keep enqueuing. Visibility with no behaviour change.
+    #[default]
+    Warn,
+    /// Drop the message and, for `AckNack`/`Unary`, send an error response so
+    /// the caller fails fast instead of waiting for its own timeout.
+    Reject,
+}
+
+/// Tuning for [`DispatchMode::Ordered`].
+///
+/// Fields are crate-private so new options can be added without breaking
+/// struct literals downstream; build with [`OrderedConfig::by_sender`] /
+/// [`OrderedConfig::global`] and the consuming setters.
+#[derive(Debug, Clone)]
+pub struct OrderedConfig {
+    pub(crate) key: OrderingKey,
+    pub(crate) idle_lane_ttl: Option<Duration>,
+    pub(crate) max_concurrent: Option<usize>,
+    pub(crate) max_queue_depth: Option<usize>,
+    pub(crate) overflow: OverflowPolicy,
+}
+
+impl Default for OrderedConfig {
+    fn default() -> Self {
+        Self {
+            key: OrderingKey::Sender,
+            // Reaping matters for churn, not steady state: ephemeral clients
+            // that connect, send once, and never return would otherwise leave a
+            // parked task and a channel behind forever.
+            idle_lane_ttl: Some(Duration::from_secs(30)),
+            max_concurrent: None,
+            max_queue_depth: None,
+            overflow: OverflowPolicy::Warn,
+        }
+    }
+}
+
+impl OrderedConfig {
+    /// Per-sender lanes (the default).
+    pub fn by_sender() -> Self {
+        Self::default()
+    }
+
+    /// A single lane for the whole handler.
+    pub fn global() -> Self {
+        Self {
+            key: OrderingKey::Global,
+            ..Self::default()
+        }
+    }
+
+    /// Set the lane partitioning key.
+    pub fn with_key(mut self, key: OrderingKey) -> Self {
+        self.key = key;
+        self
+    }
+
+    /// How long a lane may sit idle before it reaps itself.
+    ///
+    /// `None` keeps lanes alive for the lifetime of the handler.
+    pub fn with_idle_lane_ttl(mut self, ttl: Option<Duration>) -> Self {
+        self.idle_lane_ttl = ttl;
+        self
+    }
+
+    /// Cap how many lanes may be running the handler at the same instant.
+    ///
+    /// The permit is taken per message *inside* the lane, so per-lane ordering
+    /// is unaffected: a lane that cannot get a permit parks with its queue
+    /// intact. `None` (the default) means cross-lane parallelism is bounded
+    /// only by the number of senders with queued work.
+    pub fn with_max_concurrent(mut self, limit: Option<usize>) -> Self {
+        self.max_concurrent = limit;
+        self
+    }
+
+    /// Soft cap on queued-but-unhandled messages, evaluated per handler.
+    ///
+    /// Lane channels are unbounded regardless; this only drives
+    /// [`OrderedConfig::with_overflow`]. `None` (the default) disables the check.
+    pub fn with_max_queue_depth(mut self, depth: Option<usize>) -> Self {
+        self.max_queue_depth = depth;
+        self
+    }
+
+    /// What to do once [`OrderedConfig::with_max_queue_depth`] is exceeded.
+    pub fn with_overflow(mut self, policy: OverflowPolicy) -> Self {
+        self.overflow = policy;
+        self
+    }
 }
 
 // ============================================================================
@@ -190,6 +315,45 @@ pub struct TypedContext<I> {
     /// The messenger API
     pub msg: Arc<crate::Messenger>,
 }
+
+/// Emits the sender-provenance accessors shared by [`Context`] and
+/// [`TypedContext`].
+///
+/// These are methods rather than fields on purpose: both contexts derive
+/// `Dissolve` and expose every field publicly, so adding one would change the
+/// `.dissolve()` tuple arity *and* trip `constructible_struct_adds_field`.
+macro_rules! impl_sender_accessors {
+    ($ty:ident $(<$generic:ident>)?) => {
+        impl $(<$generic>)? $ty $(<$generic>)? {
+            /// [`WorkerId`] of the instance that sent this message.
+            ///
+            /// Always available: the sender mints the message id from its own
+            /// response-slot arena, which bit-packs its worker id. This is the
+            /// lane key used by [`OrderingKey::Sender`].
+            pub fn sender_worker_id(&self) -> WorkerId {
+                self.message_id.worker_id()
+            }
+
+            /// [`InstanceId`] of the sender, if known locally.
+            ///
+            /// Resolved from the peer registry, which is populated by the
+            /// `_hello` handshake — so this can be `None` for a peer whose
+            /// handshake has not landed yet. `WorkerId` is a deterministic
+            /// bijection of `InstanceId`, so prefer
+            /// [`sender_worker_id`](Self::sender_worker_id) when you only need
+            /// a stable partition key.
+            pub fn sender_instance_id(&self) -> Option<InstanceId> {
+                self.msg
+                    .backend()
+                    .try_translate_worker_id(self.sender_worker_id())
+                    .ok()
+            }
+        }
+    };
+}
+
+impl_sender_accessors!(Context);
+impl_sender_accessors!(TypedContext<I>);
 
 // ============================================================================
 // Core HandlerExecutor Trait (GAT-based, avoids async_trait)
@@ -927,10 +1091,105 @@ async fn send_response_error(
 // Builder Structs
 // ============================================================================
 
+/// Emits the dispatch-mode selectors shared by all three handler builders.
+///
+/// The setters need no trait bounds, so they go in their own bare `impl` block
+/// rather than being threaded through each builder's `where` clause.
+macro_rules! impl_dispatch_mode_setters {
+    ($ty:ident $(, $generic:ident)*) => {
+        impl<E $(, $generic)*> $ty<E $(, $generic)*> {
+            /// Run the handler on a task spawned per message. Default.
+            pub fn spawn(mut self) -> Self {
+                self.dispatch_mode = DispatchMode::Spawn;
+                self.ordered = None;
+                self
+            }
+
+            /// Run the handler on a task not registered with the messenger's
+            /// tracker.
+            pub fn inline(mut self) -> Self {
+                self.dispatch_mode = DispatchMode::Inline;
+                self.ordered = None;
+                self
+            }
+
+            /// Handle messages from each sending instance in arrival order,
+            /// with different senders running in parallel.
+            ///
+            /// Each sender gets an unbounded queue drained by one task. See
+            /// [`OrderingKey::Sender`].
+            ///
+            /// Ordering is preserved, not created: if a peer is reachable over
+            /// several transports, or a connection drops and reconnects
+            /// mid-stream, arrival order was already lost upstream.
+            ///
+            /// Note that on a *unary* handler this serialises request/response
+            /// per sender — a client issuing 100 concurrent calls will have
+            /// them served one at a time.
+            pub fn ordered(self) -> Self {
+                self.ordered_with(OrderedConfig::by_sender())
+            }
+
+            /// Handle every message on a single lane, in total arrival order
+            /// across all senders. See [`OrderingKey::Global`].
+            pub fn ordered_global(self) -> Self {
+                self.ordered_with(OrderedConfig::global())
+            }
+
+            /// Ordered dispatch with explicit configuration.
+            pub fn ordered_with(mut self, config: OrderedConfig) -> Self {
+                self.dispatch_mode = DispatchMode::Ordered;
+                self.ordered = Some(config);
+                self
+            }
+
+            /// Cap how many lanes may be running the handler at once.
+            ///
+            /// Only meaningful in ordered mode; call it after `.ordered()`.
+            /// Ignored (with a warning) in any other mode.
+            pub fn max_concurrent(mut self, limit: usize) -> Self {
+                match self.ordered.take() {
+                    Some(config) => {
+                        self.ordered = Some(config.with_max_concurrent(Some(limit)));
+                    }
+                    None => {
+                        tracing::warn!(
+                            target: "crate::messenger::handlers",
+                            handler = %self.name,
+                            "max_concurrent() ignored: handler is not in ordered mode. \
+                             Call .ordered() first."
+                        );
+                    }
+                }
+                self
+            }
+        }
+    };
+}
+
+/// Picks the dispatcher for a built handler.
+///
+/// `ordered` is `Some` exactly when `mode` is [`DispatchMode::Ordered`], but the
+/// fallback keeps this total rather than panicking on a future mode.
+fn make_dispatcher<H: ActiveMessageHandler + 'static>(
+    adapter: H,
+    mode: DispatchMode,
+    ordered: Option<OrderedConfig>,
+) -> Arc<dyn ActiveMessageDispatcher> {
+    match mode {
+        DispatchMode::Inline => Arc::new(InlineDispatcher::new(adapter)),
+        DispatchMode::Ordered => {
+            Arc::new(OrderedDispatcher::new(adapter, ordered.unwrap_or_default()))
+        }
+        DispatchMode::Spawn => Arc::new(SpawnedDispatcher::new(adapter, TaskTracker::new())),
+    }
+}
+
 pub struct AmHandlerBuilder<E> {
     executor: E,
     name: String,
     dispatch_mode: DispatchMode,
+    ordered: Option<OrderedConfig>,
 }
 
 impl<E> AmHandlerBuilder<E>
@@ -942,38 +1201,24 @@ where
             executor,
             name,
             dispatch_mode: DispatchMode::Spawn,
+            ordered: None,
         }
-    }
-
-    pub fn inline(mut self) -> Self {
-        self.dispatch_mode = DispatchMode::Inline;
-        self
-    }
-
-    pub fn spawn(mut self) -> Self {
-        self.dispatch_mode = DispatchMode::Spawn;
-        self
     }
 
     pub fn build(self) -> Handler {
         let adapter = AmExecutorAdapter::new(self.executor, self.name);
-
-        let dispatcher: Arc<dyn ActiveMessageDispatcher> = match self.dispatch_mode {
-            DispatchMode::Inline => Arc::new(InlineDispatcher::new(adapter)),
-            DispatchMode::Spawn => {
-                let task_tracker = TaskTracker::new();
-                Arc::new(SpawnedDispatcher::new(adapter, task_tracker))
-            }
-        };
-
+        let dispatcher = make_dispatcher(adapter, self.dispatch_mode, self.ordered);
         Handler { dispatcher }
     }
 }
+
+impl_dispatch_mode_setters!(AmHandlerBuilder);
 
 pub struct UnaryHandlerBuilder<E> {
     executor: E,
     name: String,
     dispatch_mode: DispatchMode,
+    ordered: Option<OrderedConfig>,
 }
 
 impl<E> UnaryHandlerBuilder<E>
@@ -985,38 +1230,24 @@ where
             executor,
             name,
             dispatch_mode: DispatchMode::Spawn,
+            ordered: None,
         }
-    }
-
-    pub fn inline(mut self) -> Self {
-        self.dispatch_mode = DispatchMode::Inline;
-        self
-    }
-
-    pub fn spawn(mut self) -> Self {
-        self.dispatch_mode = DispatchMode::Spawn;
-        self
     }
 
     pub fn build(self) -> Handler {
         let adapter = UnaryExecutorAdapter::new(self.executor, self.name);
-
-        let dispatcher: Arc<dyn ActiveMessageDispatcher> = match self.dispatch_mode {
-            DispatchMode::Inline => Arc::new(InlineDispatcher::new(adapter)),
-            DispatchMode::Spawn => {
-                let task_tracker = TaskTracker::new();
-                Arc::new(SpawnedDispatcher::new(adapter, task_tracker))
-            }
-        };
-
+        let dispatcher = make_dispatcher(adapter, self.dispatch_mode, self.ordered);
         Handler { dispatcher }
     }
 }
+
+impl_dispatch_mode_setters!(UnaryHandlerBuilder);
 
 pub struct TypedUnaryHandlerBuilder<E, I, O> {
     executor: E,
     name: String,
     dispatch_mode: DispatchMode,
+    ordered: Option<OrderedConfig>,
     _phantom: PhantomData<fn(I) -> O>,
 }
 
@@ -1031,34 +1262,19 @@ where
             executor,
             name,
             dispatch_mode: DispatchMode::Spawn,
+            ordered: None,
             _phantom: PhantomData,
         }
     }
 
-    pub fn inline(mut self) -> Self {
-        self.dispatch_mode = DispatchMode::Inline;
-        self
-    }
-
-    pub fn spawn(mut self) -> Self {
-        self.dispatch_mode = DispatchMode::Spawn;
-        self
-    }
-
     pub fn build(self) -> Handler {
         let adapter = TypedUnaryExecutorAdapter::new(self.executor, self.name);
-
-        let dispatcher: Arc<dyn ActiveMessageDispatcher> = match self.dispatch_mode {
-            DispatchMode::Inline => Arc::new(InlineDispatcher::new(adapter)),
-            DispatchMode::Spawn => {
-                let task_tracker = TaskTracker::new();
-                Arc::new(SpawnedDispatcher::new(adapter, task_tracker))
-            }
-        };
-
+        let dispatcher = make_dispatcher(adapter, self.dispatch_mode, self.ordered);
         Handler { dispatcher }
     }
 }
+
+impl_dispatch_mode_setters!(TypedUnaryHandlerBuilder, I, O);
 
 // ============================================================================
 // Entry Point Functions
@@ -1279,5 +1495,94 @@ mod tests {
 
         let handler = am_handler("spawn", |_ctx| Ok(())).spawn().build();
         assert_eq!(handler.name(), "spawn");
+    }
+
+    #[test]
+    fn test_ordered_dispatch_modes_build_on_every_builder() {
+        // The dispatch-mode setters come from a macro, so this pins that all
+        // three builders actually got them and that `build()` accepts the mode.
+        let handler = am_handler("am_ordered", |_ctx| Ok(())).ordered().build();
+        assert_eq!(handler.name(), "am_ordered");
+
+        let handler = unary_handler("unary_ordered", |_ctx| Ok(None))
+            .ordered_global()
+            .build();
+        assert_eq!(handler.name(), "unary_ordered");
+
+        let handler = typed_unary("typed_ordered", |ctx: TypedContext<PingRequest>| {
+            Ok(PingResponse {
+                echo: ctx.input.message,
+            })
+        })
+        .ordered()
+        .max_concurrent(4)
+        .build();
+        assert_eq!(handler.name(), "typed_ordered");
+
+        let handler = am_handler_async("am_ordered_with", |_ctx| async move { Ok(()) })
+            .ordered_with(
+                OrderedConfig::by_sender()
+                    .with_idle_lane_ttl(None)
+                    .with_max_queue_depth(Some(16))
+                    .with_overflow(OverflowPolicy::Reject),
+            )
+            .build();
+        assert_eq!(handler.name(), "am_ordered_with");
+    }
+
+    #[test]
+    fn test_ordered_defaults_to_per_sender_lanes() {
+        let builder = am_handler("defaults", |_ctx| Ok(())).ordered();
+        assert_eq!(builder.dispatch_mode, DispatchMode::Ordered);
+        let config = builder.ordered.expect("ordered config");
+        assert_eq!(config.key, OrderingKey::Sender);
+        assert_eq!(config.idle_lane_ttl, Some(Duration::from_secs(30)));
+        assert_eq!(config.max_concurrent, None, "unbounded unless asked");
+        assert_eq!(config.max_queue_depth, None, "unbounded unless asked");
+        assert_eq!(config.overflow, OverflowPolicy::Warn);
+
+        let builder = am_handler("global", |_ctx| Ok(())).ordered_global();
+        assert_eq!(
+            builder.ordered.expect("ordered config").key,
+            OrderingKey::Global
+        );
+    }
+
+    #[test]
+    fn test_dispatch_mode_last_call_wins() {
+        // `.ordered()` after `.spawn()` wins...
+        let builder = am_handler("a", |_ctx| Ok(())).spawn().ordered();
+        assert_eq!(builder.dispatch_mode, DispatchMode::Ordered);
+        assert!(builder.ordered.is_some());
+
+        // ...and `.spawn()` after `.ordered()` wins, clearing the config so a
+        // stale `max_concurrent` cannot leak into a non-ordered handler.
+        let builder = am_handler("b", |_ctx| Ok(()))
+            .ordered()
+            .max_concurrent(8)
+            .spawn();
+        assert_eq!(builder.dispatch_mode, DispatchMode::Spawn);
+        assert!(builder.ordered.is_none());
+
+        let builder = am_handler("c", |_ctx| Ok(())).ordered().inline();
+        assert_eq!(builder.dispatch_mode, DispatchMode::Inline);
+        assert!(builder.ordered.is_none());
+    }
+
+    #[test]
+    fn test_max_concurrent_applies_only_in_ordered_mode() {
+        let builder = am_handler("limited", |_ctx| Ok(()))
+            .ordered()
+            .max_concurrent(32);
+        assert_eq!(
+            builder.ordered.expect("ordered config").max_concurrent,
+            Some(32)
+        );
+
+        // Outside ordered mode there is no lane to limit, so this warns and is
+        // otherwise a no-op rather than silently switching modes.
+        let builder = am_handler("unlimited", |_ctx| Ok(())).max_concurrent(32);
+        assert_eq!(builder.dispatch_mode, DispatchMode::Spawn);
+        assert!(builder.ordered.is_none());
     }
 }

@@ -4,6 +4,7 @@
 //! Active message server.
 
 pub(crate) mod dispatcher;
+pub(crate) mod lanes;
 pub(crate) mod system_handlers;
 
 pub(crate) use system_handlers::register_system_handlers;
