@@ -367,13 +367,24 @@ async fn node(mux_enabled: bool, flush: Flush) -> Result<Arc<Node>> {
 /// Each engine's `(writes, records)` once the counters have stopped moving.
 ///
 /// Quiescence rather than an ordering argument: every producer is finished and
-/// every terminal has been received, so a total that is still changing is a
-/// write being counted, and one that has not changed across a poll is a run
-/// whose writes are all in. Bounded, because a hang here should report itself
-/// as a stale number rather than as the example never exiting — and the run's
-/// elapsed time is already stopped, so this cannot inflate it.
+/// every terminal has been received, so a total still changing is a write still
+/// being counted.
+///
+/// It takes several consecutive still polls rather than one, and the difference
+/// is not caution for its own sake: the legacy pump counts a flush *after* its
+/// write returns, so a straggler can sit between those two points for longer
+/// than any single window — one quiet poll says "nothing was counted in the
+/// last 25 ms", which on a loaded machine is not the same as "nothing is left
+/// to count". Consecutive still polls are still a heuristic, only a stronger
+/// one; there is no exact target to wait for, because the flush count includes
+/// heartbeats and is not known in advance.
+///
+/// Bounded, so a run that never settles reports a stale number rather than
+/// hanging. The elapsed time is already stopped before this, so waiting here
+/// cannot inflate what the summary reports.
 async fn settled_counters(engines: &[Arc<Node>], mux: bool) -> Vec<(f64, f64)> {
     const POLL: Duration = Duration::from_millis(25);
+    const STILL_POLLS: u32 = 3;
     const LIMIT: Duration = Duration::from_secs(5);
 
     let read = |node: &Arc<Node>| {
@@ -386,10 +397,12 @@ async fn settled_counters(engines: &[Arc<Node>], mux: bool) -> Vec<(f64, f64)> {
 
     let deadline = Instant::now() + LIMIT;
     let mut previous: Vec<(f64, f64)> = engines.iter().map(read).collect();
+    let mut still = 0;
     loop {
         tokio::time::sleep(POLL).await;
         let current: Vec<(f64, f64)> = engines.iter().map(read).collect();
-        if current == previous || Instant::now() >= deadline {
+        still = if current == previous { still + 1 } else { 0 };
+        if still >= STILL_POLLS || Instant::now() >= deadline {
             return current;
         }
         previous = current;
