@@ -37,25 +37,50 @@
 //! whichever request it belongs to, and whether or not that request was in the
 //! batch a moment ago — rides in one `_stream_batch` active message.
 //!
-//! Running it both ways is the whole argument. One developer machine, defaults:
+//! Running it every way is the whole argument. One developer machine, defaults:
 //!
 //! ```text
-//! --legacy    476 tokens, 476 per-stream egress flushes   1.00 : 1
-//! (default)   476 tokens, 217 _stream_batch AMs           2.19 : 1
+//! --legacy                    476 tokens, 476 per-stream egress flushes   1.00 : 1
+//! --flush-policy auto         476 tokens, 217 _stream_batch AMs           2.19 : 1
+//! --flush-policy manual       476 tokens, 217 _stream_batch AMs           2.19 : 1
 //! ```
 //!
 //! The 1.00 is not a number that could have come out otherwise — with a gap
 //! between passes, each stream's egress pump wakes holding exactly one frame.
 //!
-//! The mux ratio tracks how many of an engine's active requests live on the
-//! same host, so it climbs with the batch as long as there are enough requests
-//! to keep the batch full:
+//! The two mux rows agreeing is the point rather than an anticlimax: with a
+//! millisecond between passes the batcher always keeps up, so writing at every
+//! wake and writing once per pass are the same writes. What separates them is
+//! what happens when that stops being true. At a serving-shaped depth, five
+//! runs each:
+//!
+//! ```text
+//! --max-batch 32 --requests 96 --flush-policy auto     5.07  4.90  5.07  4.83  5.08
+//! --max-batch 32 --requests 96 --flush-policy manual   5.36  5.38  5.38  5.38  5.38
+//! ```
+//!
+//! `manual` is both higher and *the same number every time*. Higher because a
+//! batcher writing at every wake sometimes wakes mid-pass and writes half of
+//! one; the same every time because what a batch holds stops depending on how
+//! the runtime scheduled the batcher against the engine. That determinism is
+//! the reason to reach for it — a serving deployment can derive its batch size
+//! from its own fan-out instead of measuring it.
+//!
+//! `auto` wins on raw packing in the opposite regime, and it is worth seeing:
+//! at `--pass-delay-ms 0` the engine runs flat out, the batcher falls behind,
+//! and a batch starts absorbing the pass after it — 5.80 and 8.35 on two runs,
+//! against 3.72 and 4.25 for `manual`. That surplus is throughput bought with
+//! per-token latency, which for a decode engine is the wrong trade.
+//!
+//! Either way the ratio tracks how many of an engine's active requests live on
+//! the same host, so it climbs with the batch as long as there are enough
+//! requests to keep the batch full:
 //!
 //! ```text
 //! --max-batch 4                    1.36 : 1
 //! --max-batch 8                    2.18 : 1
 //! --max-batch 16 --requests 48     3.30 : 1
-//! --max-batch 32 --requests 96     5.08 : 1
+//! --max-batch 32 --requests 96     5.38 : 1
 //! --max-batch 64 --requests 192    7.20 : 1
 //! ```
 //!
@@ -72,6 +97,12 @@
 //! doubles as a negotiation demo: `--legacy` is the same five nodes with
 //! `MuxConfig::enabled` set back to `false`, which is the documented rollback.
 //!
+//! The flush policy is the other configuration on show. `manual` is the default
+//! here — not in `MuxConfig`, where the default stays `auto` — because it is
+//! the serving-correct mode and because it is only half a configuration: the
+//! other half is the engine calling `velo.flush_batch()` after each forward
+//! pass, which is the line worth copying out of this file.
+//!
 //! Run: `cargo run --example batched_streaming -- --engines 2 --requests 24`
 
 use std::collections::BTreeSet;
@@ -79,14 +110,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use futures::StreamExt;
 use prometheus::Registry;
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 use velo::observability::VeloMetrics;
 use velo::observability::test_helpers::MetricSnapshot;
-use velo::streaming::{MuxConfig, StreamAnchor, StreamAnchorHandle, StreamFrame, StreamSender};
+use velo::streaming::{
+    FlushPolicy, MuxConfig, StreamAnchor, StreamAnchorHandle, StreamFrame, StreamSender,
+};
 use velo::{Velo, VeloBuilder};
 use velo_examples::{TransportType, new_transport};
 
@@ -139,6 +172,38 @@ struct Args {
     /// one-TCP-connection-per-stream path.
     #[arg(long, default_value_t = false)]
     legacy: bool,
+
+    /// Who decides when a batch is written. Ignored under `--legacy`, which
+    /// has no batcher to decide anything.
+    #[arg(long = "flush-policy", value_enum, default_value_t = Flush::Manual)]
+    flush_policy: Flush,
+}
+
+/// The two flush policies, as the example exposes them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Flush {
+    /// The batcher writes at the end of every wake — velo's default, and what
+    /// every mux did before the policy was configurable.
+    Auto,
+    /// The engine writes, once per forward pass. The serving-correct mode, and
+    /// this example's default.
+    Manual,
+}
+
+impl Flush {
+    fn policy(self) -> FlushPolicy {
+        match self {
+            Self::Auto => FlushPolicy::default(),
+            Self::Manual => FlushPolicy::Manual,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Manual => "manual",
+        }
+    }
 }
 
 /// One decoded token on one request's response stream.
@@ -167,6 +232,17 @@ struct Request {
     host: usize,
     handle: StreamAnchorHandle,
     budget: u32,
+}
+
+/// The knobs one engine runs under.
+#[derive(Clone, Copy)]
+struct EngineConfig {
+    max_batch: usize,
+    pass_delay: Duration,
+    /// Whether the mux is installed, and therefore whether there is anything
+    /// for a flush to write.
+    mux: bool,
+    flush: Flush,
 }
 
 /// A request occupying a slot in an engine's active batch.
@@ -251,7 +327,7 @@ impl Node {
 /// `enabled: false` is the documented rollback, and is the same node as never
 /// calling `messenger_mux` at all: nothing is registered, nothing is
 /// advertised, and every attach negotiates the legacy path.
-async fn node(mux_enabled: bool) -> Result<Arc<Node>> {
+async fn node(mux_enabled: bool, flush: Flush) -> Result<Arc<Node>> {
     // A registry per node. Two `VeloMetrics::register` calls against one
     // registry would collide on collector names, and per-node registries are
     // what let the summary attribute writes to the engine that made them.
@@ -264,6 +340,7 @@ async fn node(mux_enabled: bool) -> Result<Arc<Node>> {
     let velo = builder
         .messenger_mux(MuxConfig {
             enabled: mux_enabled,
+            flush_policy: flush.policy(),
             ..MuxConfig::default()
         })?
         .build()
@@ -295,10 +372,14 @@ async fn engine(
     node: Arc<Node>,
     hosts: Arc<Vec<Arc<Node>>>,
     rx: flume::Receiver<Request>,
-    max_batch: usize,
-    pass_delay: Duration,
-    mux: bool,
+    config: EngineConfig,
 ) -> Result<EngineStats> {
+    let EngineConfig {
+        max_batch,
+        pass_delay,
+        mux,
+        flush,
+    } = config;
     let mut stats = EngineStats::default();
     let mut touched = BTreeSet::new();
     let mut active: Vec<Active> = Vec::new();
@@ -393,6 +474,21 @@ async fn engine(
         }
         active = still_running;
 
+        // The pass is complete, so write it: one `_stream_batch` to each host
+        // this engine touched, carrying every token that pass produced for it.
+        //
+        // After `finalize` rather than before, so a retiring request's terminal
+        // rides in the same batch as the tokens beside it instead of chasing
+        // them in one of its own.
+        //
+        // Only under `--flush-policy manual`. The call is valid under `auto`
+        // too — it forces a write ahead of the conditions — but the point of
+        // running `auto` here is to see what the batcher does when nobody tells
+        // it anything, so the example leaves it alone.
+        if mux && flush == Flush::Manual {
+            node.velo.flush_batch();
+        }
+
         // The gap a real forward pass spends computing. It keeps each pass a
         // distinct event on the wire, which is the only way the ratio below
         // measures cross-stream packing rather than an engine running ahead.
@@ -472,20 +568,26 @@ async fn main() -> Result<()> {
     let expected_tokens: u64 = (0..args.requests)
         .map(|id| u64::from(budget(id, args.tokens)))
         .sum();
+    let mode = if mux {
+        format!("mux, flush-policy {}", args.flush_policy.label())
+    } else {
+        "legacy (one TCP connection per stream)".to_string()
+    };
     println!(
         "batched_streaming: {HOSTS} anchor hosts, {} engine(s), {} requests, \
-         max-batch {}, {expected_tokens} tokens, {}ms between passes, mux={mux}",
+         max-batch {}, {expected_tokens} tokens, {}ms between passes\n\
+         mode: {mode}",
         args.engines, args.requests, args.max_batch, args.pass_delay_ms
     );
 
     // Build the deployment. Hosts own anchors; engines produce tokens.
     let mut hosts = Vec::with_capacity(HOSTS);
     for _ in 0..HOSTS {
-        hosts.push(node(mux).await?);
+        hosts.push(node(mux, args.flush_policy).await?);
     }
     let mut engines = Vec::with_capacity(args.engines);
     for _ in 0..args.engines {
-        engines.push(node(mux).await?);
+        engines.push(node(mux, args.flush_policy).await?);
     }
 
     // Engines and hosts know each other; hosts never stream to each other and
@@ -529,9 +631,12 @@ async fn main() -> Result<()> {
             Arc::clone(e),
             Arc::clone(&hosts),
             rx,
-            args.max_batch,
-            Duration::from_millis(args.pass_delay_ms),
-            mux,
+            EngineConfig {
+                max_batch: args.max_batch,
+                pass_delay: Duration::from_millis(args.pass_delay_ms),
+                mux,
+                flush: args.flush_policy,
+            },
         )));
     }
 
@@ -588,7 +693,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    println!("\n=== engines ({expected_key}) ===");
+    println!("\n=== engines ({mode}) ===");
     let write_unit = if mux {
         "_stream_batch AMs"
     } else {
@@ -630,14 +735,15 @@ async fn main() -> Result<()> {
     let mean_batch = tokens as f64 / passes.max(1) as f64;
     let ratio = tokens as f64 / writes.max(1.0);
 
+    let active_per_host = mean_batch / HOSTS as f64;
     println!("\n=== totals ===");
+    println!("  mode                 {mode}");
     println!("  tokens streamed      {tokens}");
     println!("  forward passes       {passes}");
     println!("  wire writes          {writes:.0}  ({write_unit})");
     println!("  tokens per write     {ratio:.2} : 1");
     println!(
-        "  active per host      {:.2}  (mean batch {mean_batch:.2} over {HOSTS} hosts)",
-        mean_batch / HOSTS as f64
+        "  active per host      {active_per_host:.2}  (mean batch {mean_batch:.2} over {HOSTS} hosts)"
     );
     println!(
         "  elapsed              {:.0} ms",
@@ -659,9 +765,34 @@ async fn main() -> Result<()> {
              tokens per write, and\nthe per-stream TCP path wrote {legacy:.0} times because no \
              stream ever dialled it. Every token\nstill arrived in order on its own stream: the \
              batching is on the destination axis, not\nthe stream axis, so it packs a forward \
-             pass that per-stream coalescing cannot touch.\nRun with --legacy for the same \
-             workload at one write per token."
+             pass that per-stream coalescing cannot touch."
         );
+        match args.flush_policy {
+            Flush::Manual => println!(
+                "\nThe engine wrote each pass itself: flush_batch() after the last send, one \
+                 batch to\neach host it touched, carrying that host's whole share of the pass. \
+                 Run it again and\nthe ratio comes out the same — what a batch holds is a \
+                 property of the deployment,\nnot of how the runtime scheduled the batcher \
+                 against the engine. No token waits for\nthe pass behind it, which is the part \
+                 that matters for time-to-next-token.\nRun --flush-policy auto to let the \
+                 batcher decide instead, and watch the number move."
+            ),
+            Flush::Auto => println!(
+                "\nThe batcher wrote whenever the last batch was admitted, with nobody telling \
+                 it to.\nThat number moves run to run, because what lands in a batch depends on \
+                 how the\nruntime scheduled the batcher against the engine: it can wake \
+                 mid-pass and write half\nof one, or fall behind and pack the pass after it. \
+                 Try --pass-delay-ms 0 to see the\nsecond effect at its strongest — packing \
+                 across passes is throughput bought with\nper-token latency. Run --flush-policy \
+                 manual for one write per pass instead."
+            ),
+        }
+        println!(
+            "\n(active per host, {active_per_host:.2}, averages over all {HOSTS} hosts including \
+             the ones a\ngiven pass had nothing for, so it reads a little under the tokens each \
+             written batch\nactually carried.)"
+        );
+        println!("Run with --legacy for the same workload at one write per token.");
     } else {
         // BATCHING.md defines the batching ratio as
         // `frames_written / egress_flushes`, which is the canonical number and
