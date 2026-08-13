@@ -264,12 +264,12 @@ struct EngineStats {
     /// Sum of the batch occupancy at each forward pass, for the mean.
     occupancy: u64,
     hosts_touched: usize,
-    /// Whichever counter measures this run's wire writes.
+    /// Whichever counter measures this run's wire writes. Filled once the
+    /// hosts have every terminal — see the loop that sets it.
     writes: f64,
-    /// Frames those writes carried. Legacy only, and deliberately: the mux's
-    /// equivalent is read once at the end of the run rather than here, because
-    /// `flush_batch()` returns before the batcher has written anything and a
-    /// count taken the moment an engine stops sending can be short by a batch.
+    /// Records those writes carried: frames for the legacy pump, packed
+    /// records under the mux. Filled after the run rather than by the engine,
+    /// for the same reason `writes` is.
     frames: f64,
 }
 
@@ -362,6 +362,51 @@ async fn node(mux_enabled: bool, flush: Flush) -> Result<Arc<Node>> {
         .build()
         .await?;
     Ok(Arc::new(Node { velo, registry }))
+}
+
+/// Each engine's `(writes, records)` once the counters have stopped moving.
+///
+/// Quiescence rather than an ordering argument: every producer is finished and
+/// every terminal has been received, so a total still changing is a write still
+/// being counted.
+///
+/// It takes several consecutive still polls rather than one, and the difference
+/// is not caution for its own sake: the legacy pump counts a flush *after* its
+/// write returns, so a straggler can sit between those two points for longer
+/// than any single window — one quiet poll says "nothing was counted in the
+/// last 25 ms", which on a loaded machine is not the same as "nothing is left
+/// to count". Consecutive still polls are still a heuristic, only a stronger
+/// one; there is no exact target to wait for, because the flush count includes
+/// heartbeats and is not known in advance.
+///
+/// Bounded, so a run that never settles reports a stale number rather than
+/// hanging. The elapsed time is already stopped before this, so waiting here
+/// cannot inflate what the summary reports.
+async fn settled_counters(engines: &[Arc<Node>], mux: bool) -> Vec<(f64, f64)> {
+    const POLL: Duration = Duration::from_millis(25);
+    const STILL_POLLS: u32 = 3;
+    const LIMIT: Duration = Duration::from_secs(5);
+
+    let read = |node: &Arc<Node>| {
+        if mux {
+            (node.mux_batches_sent(), node.mux_records_sent())
+        } else {
+            (node.egress_flushes(), node.frames_written())
+        }
+    };
+
+    let deadline = Instant::now() + LIMIT;
+    let mut previous: Vec<(f64, f64)> = engines.iter().map(read).collect();
+    let mut still = 0;
+    loop {
+        tokio::time::sleep(POLL).await;
+        let current: Vec<(f64, f64)> = engines.iter().map(read).collect();
+        still = if current == previous { still + 1 } else { 0 };
+        if still >= STILL_POLLS || Instant::now() >= deadline {
+            return current;
+        }
+        previous = current;
+    }
 }
 
 /// How many tokens request `id` will emit.
@@ -512,12 +557,6 @@ async fn engine(
     }
 
     stats.hosts_touched = touched.len();
-    if mux {
-        stats.writes = node.mux_batches_sent();
-    } else {
-        stats.writes = node.egress_flushes();
-        stats.frames = node.frames_written();
-    }
     Ok(stats)
 }
 
@@ -671,11 +710,12 @@ async fn main() -> Result<()> {
     drop(engine_txs);
     drop(host_txs);
 
-    let engine_stats = tokio::time::timeout(PATIENCE, futures::future::try_join_all(engine_tasks))
-        .await
-        .map_err(|_| anyhow::anyhow!("the engines did not drain within {PATIENCE:?}"))??
-        .into_iter()
-        .collect::<Result<Vec<_>>>()?;
+    let mut engine_stats =
+        tokio::time::timeout(PATIENCE, futures::future::try_join_all(engine_tasks))
+            .await
+            .map_err(|_| anyhow::anyhow!("the engines did not drain within {PATIENCE:?}"))??
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
     let host_stats = tokio::time::timeout(PATIENCE, futures::future::try_join_all(host_tasks))
         .await
         .map_err(|_| anyhow::anyhow!("the hosts did not see every terminal within {PATIENCE:?}"))??
@@ -696,17 +736,31 @@ async fn main() -> Result<()> {
         );
     }
 
+    // Every wire counter is read here rather than in `engine()`, because an
+    // engine finishing is not its writes finishing: `flush_batch()` hands the
+    // write to the batcher's own task and returns, and the legacy pump drains
+    // on a task of its own, so a count taken when an engine stops sending can
+    // be short by whatever was still in flight — understating the very ratio
+    // this example exists to report.
+    //
+    // Having every terminal is not sufficient on its own either, and the two
+    // transports differ on exactly that: the mux counts a batch *before*
+    // dispatching it, but the legacy pump counts a flush *after* its write
+    // returns, so a host can be holding the terminal while the write that
+    // carried it is still being counted. Rather than depend on which side of
+    // its await each transport counts, wait for the totals to stop moving.
+    let counters = settled_counters(&engines, mux).await;
+    for (stats, (writes, frames)) in engine_stats.iter_mut().zip(counters) {
+        stats.writes = writes;
+        stats.frames = frames;
+    }
+
     // The engines' own packing, which is only separable because the record
     // histogram carries a direction: an engine also receives batches — that is
     // how credit comes back — and their records would otherwise be summed in
     // here. Every token is a record, plus the heartbeats, slot opens and
     // terminals that no token count sees.
-    //
-    // Read here rather than in `engine()` because `flush_batch()` hands the
-    // write to the batcher's own task and returns. The batcher counts a batch
-    // before it dispatches it, so every terminal the hosts have already seen —
-    // which the await above guarantees — is a batch this sum includes.
-    let packed: f64 = engines.iter().map(|e| e.mux_records_sent()).sum();
+    let packed: f64 = engine_stats.iter().map(|s| s.frames).sum();
     if mux && packed < expected_tokens as f64 {
         bail!(
             "the engines packed {packed:.0} records for {expected_tokens} tokens — \
