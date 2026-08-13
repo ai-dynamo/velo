@@ -32,7 +32,9 @@ use velo_ext::WorkerId;
 
 /// The streaming transport a `Velo` node runs when nothing else is configured.
 const LEGACY_KEY: &str = "tcp-stream";
-const MUX_KEY: &str = "messenger-mux-v1";
+/// Aliased rather than re-typed: the literal belongs to negotiation, and a
+/// second copy of it here could agree with the first for a whole release.
+const MUX_KEY: &str = velo::streaming::MESSENGER_MUX_KEY;
 
 const PATIENCE: Duration = Duration::from_secs(30);
 
@@ -896,5 +898,79 @@ async fn a_zero_credit_window_is_refused_at_build_time() {
     assert!(
         error.to_string().contains("initial_credit = 0"),
         "unhelpful error: {error}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The outcome, from the sending side
+// ---------------------------------------------------------------------------
+
+/// The sender is told which transport its attach settled on, and it is told the
+/// same thing the receiver recorded.
+///
+/// Both arms assert the pair, not the accessor alone: the receiver labels its
+/// attach counter with the key it answered with, so a sender-side report that
+/// disagreed with it would be a report of something else. Reading only the
+/// sender would pass just as well against a hardcoded key.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sender_is_told_which_transport_the_attach_settled_on() {
+    // Both sides have the mux, so the attach settles on it.
+    let (consumer, producer) = pair(Some(mux_config()), Some(mux_config())).await;
+    let anchor = consumer.velo.create_anchor::<u32>();
+    let sender = producer
+        .velo
+        .attach_anchor::<u32>(transfer(anchor.handle()))
+        .await
+        .expect("remote attach");
+
+    assert_eq!(
+        sender.negotiated_transport().map(|key| key.as_str()),
+        Some(MUX_KEY)
+    );
+    assert_eq!(
+        consumer.attaches_over(MUX_KEY),
+        1.0,
+        "the sender named {MUX_KEY}, so that is what the receiver must have answered"
+    );
+    drop((sender, anchor, consumer, producer));
+
+    // The receiver has no mux, so the same sender settles on the legacy path.
+    let (consumer, producer) = pair(None, Some(mux_config())).await;
+    let anchor = consumer.velo.create_anchor::<u32>();
+    let sender = producer
+        .velo
+        .attach_anchor::<u32>(transfer(anchor.handle()))
+        .await
+        .expect("remote attach");
+
+    assert_eq!(
+        sender.negotiated_transport().map(|key| key.as_str()),
+        Some(LEGACY_KEY),
+        "the sender advertised the mux, but the answer is the receiver's to give"
+    );
+    assert_eq!(consumer.attaches_over(LEGACY_KEY), 1.0);
+}
+
+/// A same-worker attach settles on nothing, because nothing was negotiated.
+///
+/// `None` here is the honest answer rather than a missing one: the frames go
+/// straight into the anchor's channel and never reach a transport, so no key
+/// would describe them — including this node's own mux, which is installed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_same_worker_attach_negotiates_no_transport() {
+    let node = node(Some(mux_config())).await;
+    let anchor = node.velo.create_anchor::<u32>();
+    let sender = node
+        .velo
+        .attach_anchor::<u32>(anchor.handle())
+        .await
+        .expect("local attach");
+
+    assert!(node.registers_mux());
+    assert_eq!(sender.negotiated_transport(), None);
+    assert_eq!(
+        node.attaches_over(MUX_KEY) + node.attaches_over(LEGACY_KEY),
+        0.0,
+        "a local attach never reaches the attach handler that labels that counter"
     );
 }

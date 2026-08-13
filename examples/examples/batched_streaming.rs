@@ -132,7 +132,7 @@ use velo_examples::{TransportType, new_transport};
 const HOSTS: usize = 3;
 
 /// The streaming transport a node advertises only when the mux is switched on.
-const MUX_KEY: &str = "messenger-mux-v1";
+const MUX_KEY: &str = velo::streaming::MESSENGER_MUX_KEY;
 
 /// The streaming transport every node has: one TCP connection per stream.
 const LEGACY_KEY: &str = "tcp-stream";
@@ -280,10 +280,9 @@ struct HostStats {
 
 /// One node, plus the registry its collectors were installed into.
 ///
-/// The registry is here for one reason: **the negotiated transport is not
-/// returned by any API**. `attach_anchor` hands back a `StreamSender` that says
-/// nothing about the wire beneath it, so the only place the outcome surfaces is
-/// a label on the receiving node's attach counter.
+/// Per node rather than per run, because the summary attributes writes to the
+/// engine that made them and attaches to the host that answered them — one
+/// shared registry would sum both away.
 struct Node {
     velo: Arc<Velo>,
     registry: Registry,
@@ -374,7 +373,6 @@ fn budget(id: u32, longest: u32) -> u32 {
 async fn engine(
     index: usize,
     node: Arc<Node>,
-    hosts: Arc<Vec<Arc<Node>>>,
     rx: flume::Receiver<Request>,
     config: EngineConfig,
 ) -> Result<EngineStats> {
@@ -400,13 +398,12 @@ async fn engine(
         let sender = node.velo.attach_anchor::<Token>(request.handle).await?;
         if !*announced {
             *announced = true;
-            // The negotiated key, read off the host's attach counter because
-            // nothing in the API hands it back.
-            let key = if hosts[request.host].attaches_over(MUX_KEY) > 0.0 {
-                MUX_KEY
-            } else {
-                LEGACY_KEY
-            };
+            // The sender carries the answer, so the engine reads its own
+            // outcome — as a deployed one would, having no access to the
+            // frontend's metrics.
+            let key = sender
+                .negotiated_transport()
+                .map_or("none (same worker)", |key| key.as_str());
             println!("[engine {index}] first attach negotiated {key}");
         }
         touched.insert(request.host);
@@ -633,7 +630,6 @@ async fn main() -> Result<()> {
         engine_tasks.push(tokio::spawn(engine(
             index,
             Arc::clone(e),
-            Arc::clone(&hosts),
             rx,
             EngineConfig {
                 max_batch: args.max_batch,

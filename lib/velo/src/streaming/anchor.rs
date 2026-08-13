@@ -1231,6 +1231,7 @@ impl AnchorManager {
                     },
                     Duration::from_millis(heartbeat_interval_ms),
                     self.metrics.clone(),
+                    Some(streaming_transport_key),
                 ))
             }
             crate::streaming::control::AnchorAttachResponse::Err { reason } => {
@@ -1349,6 +1350,9 @@ impl AnchorManager {
                         },
                         heartbeat_interval,
                         self.metrics.clone(),
+                        // Same worker: the frames go straight into the anchor's
+                        // channel, so there was no transport to negotiate.
+                        None,
                     ))
                 }
             }

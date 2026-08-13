@@ -148,6 +148,10 @@ pub struct StreamSender<T> {
     /// `None` for in-process AnchorManager constructions that skip metrics
     /// (test fixtures and direct AnchorManagerBuilder users).
     metrics: Option<Arc<crate::observability::VeloMetrics>>,
+    /// The streaming transport the attach settled on, or `None` when the
+    /// attach never negotiated one. See
+    /// [`negotiated_transport`](StreamSender::negotiated_transport).
+    negotiated_transport: Option<velo_ext::TransportKey>,
     _phantom: std::marker::PhantomData<T>,
 }
 
@@ -171,6 +175,11 @@ impl<T: Serialize> StreamSender<T> {
     ///
     /// `registry` is a shared reference to the anchor registry so that
     /// [`detach`](StreamSender::detach) can atomically clear the attachment flag.
+    ///
+    /// `negotiated_transport` is the key the receiver answered the attach with,
+    /// and `None` on the same-worker path, which negotiates nothing. It is
+    /// carried rather than derived because the answer is the receiver's to give
+    /// and this side has no second copy of it.
     pub(crate) fn new(
         tx: flume::Sender<Vec<u8>>,
         handle: StreamAnchorHandle,
@@ -178,6 +187,7 @@ impl<T: Serialize> StreamSender<T> {
         cancel: StreamSenderCancelInfo,
         heartbeat_interval: Duration,
         metrics: Option<Arc<crate::observability::VeloMetrics>>,
+        negotiated_transport: Option<velo_ext::TransportKey>,
     ) -> Self {
         let StreamSenderCancelInfo {
             cancel_token,
@@ -220,8 +230,27 @@ impl<T: Serialize> StreamSender<T> {
             sender_registry,
             poison_tx,
             metrics,
+            negotiated_transport,
             _phantom: std::marker::PhantomData,
         }
+    }
+
+    /// The streaming transport this sender's frames cross, as the receiver
+    /// named it when it answered the attach.
+    ///
+    /// `Some(`[`MESSENGER_MUX_KEY`]`)` means the frames are multiplexed onto
+    /// the messenger alongside every other stream heading for the same worker;
+    /// any other key is a per-stream connection on that transport. `None` means
+    /// the attach was same-worker: the frames go straight into the anchor's
+    /// channel and no transport was negotiated because none is involved.
+    ///
+    /// This is the receiver's answer, not a lookup of what runs locally. The
+    /// two agree except on the empty-registry convenience path, where any key
+    /// resolves to this node's default transport.
+    ///
+    /// [`MESSENGER_MUX_KEY`]: crate::streaming::MESSENGER_MUX_KEY
+    pub fn negotiated_transport(&self) -> Option<&velo_ext::TransportKey> {
+        self.negotiated_transport.as_ref()
     }
 
     /// Returns a cloneable `CancellationToken` that fires when the consumer
@@ -414,6 +443,7 @@ mod tests {
             },
             Duration::from_secs(5),
             None,
+            None,
         );
         (sender, rx, poison_rx)
     }
@@ -450,6 +480,7 @@ mod tests {
                 poison_tx,
             },
             Duration::from_secs(5),
+            None,
             None,
         );
         (sender, sender_registry)
@@ -635,6 +666,7 @@ mod tests {
             },
             Duration::from_secs(5),
             None,
+            None,
         );
 
         // Put an item in the channel to fill it
@@ -677,6 +709,7 @@ mod tests {
                 poison_tx,
             },
             Duration::from_secs(5),
+            None,
             None,
         );
 
@@ -774,6 +807,7 @@ mod tests {
                 poison_tx,
             },
             Duration::from_secs(5),
+            None,
             None,
         );
 

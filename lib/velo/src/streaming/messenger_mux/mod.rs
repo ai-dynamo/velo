@@ -108,7 +108,12 @@ use crate::streaming::transport::FrameTransport;
 /// Versioned in the key rather than only in the batch header: negotiation
 /// matches on the key, so an incompatible wire change is a new key and two
 /// versions simply never pair up.
-pub(crate) const MESSENGER_MUX_KEY: &str = "messenger-mux-v1";
+///
+/// Public because it is what
+/// [`StreamSender::negotiated_transport`](crate::streaming::StreamSender::negotiated_transport)
+/// is compared against — a caller that had to spell the string itself would be
+/// re-deriving the one value negotiation is keyed on.
+pub const MESSENGER_MUX_KEY: &str = "messenger-mux-v1";
 
 /// The active-message handler every batch travels through.
 pub(crate) const STREAM_BATCH_HANDLER: &str = "_stream_batch";
