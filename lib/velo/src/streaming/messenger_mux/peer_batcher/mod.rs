@@ -55,6 +55,8 @@ mod flush_gate;
 mod records;
 mod slot_stream;
 #[cfg(test)]
+pub(crate) mod test_hooks;
+#[cfg(test)]
 mod tests;
 mod writer;
 
@@ -72,6 +74,8 @@ use self::control::{ControlInbox, DrainedControl, OwnedControl, PeerControl};
 use self::flush_gate::{FlushGate, linger_until};
 pub(crate) use self::slot_stream::AllocError;
 use self::slot_stream::{EgressSlots, SlotItem, SlotStream};
+#[cfg(test)]
+use self::test_hooks::TestHooks;
 use self::writer::BatchWriter;
 use super::MuxConfig;
 use super::protocol::{
@@ -251,6 +255,10 @@ pub(crate) struct BatcherContext {
     pub(crate) epochs: Arc<AtomicU64>,
     pub(crate) batchers: Arc<BatcherMap>,
     pub(crate) cancel: CancellationToken,
+    /// A barrier in the run loop, installed only by the tests that need to stop
+    /// it mid-wake. See [`test_hooks`].
+    #[cfg(test)]
+    pub(crate) hooks: Option<Arc<TestHooks>>,
 }
 
 /// Spawn a batcher for `peer` and return its registry handle.
@@ -287,6 +295,8 @@ pub(crate) fn spawn(peer: WorkerId, ctx: BatcherContext) -> Arc<BatcherHandle> {
         slots: EgressSlots::default(),
         streams: SelectAll::new(),
         stopping: false,
+        #[cfg(test)]
+        hooks: ctx.hooks,
     };
     tokio::spawn(batcher.run(open_rx));
     handle
@@ -320,6 +330,8 @@ struct Batcher {
     /// Set once the task has decided to exit, so the drain loop stops pulling
     /// work it will never flush.
     stopping: bool,
+    #[cfg(test)]
+    hooks: Option<Arc<TestHooks>>,
 }
 
 impl Batcher {
@@ -346,21 +358,31 @@ impl Batcher {
             self.handle.mark_active();
             self.dispatch(work).await;
 
+            // The one point a test can stop the loop at, so a record can be
+            // queued mid-wake. See [`test_hooks`].
+            #[cfg(test)]
+            if let Some(hooks) = self.hooks.clone() {
+                hooks.barrier().await;
+            }
+
             // Take everything already queued before deciding to write. Under
             // every policy: this is what turns a forward pass's X back-to-back
             // sends into one batch, and it never waits for work that has not
             // arrived.
+            //
+            // It is also what makes an application's flush *exact*, and the
+            // argument is worth writing down because it is not obvious. A kick
+            // is coalesced control, so the only way `gate.kicked` becomes true
+            // is `on_control`, reached through `dispatch` — from the select arm
+            // above, or from `drain_once` below. Either way the loop keeps
+            // draining afterwards, and `drain_once` polls the slot streams
+            // after the control state. So every record queued before the kick
+            // was queued before the drain that follows the kick's observation,
+            // and is therefore in the batch the kick writes. The loop is what
+            // carries that; a single pass would not.
             while !self.stopping && self.drain_once(&opens).await {}
 
-            // A kick still pending *here* was set after the application's sends
-            // reached their inlets, since it is the same thread that made both
-            // happen. One more drain therefore closes the only gap in "flush
-            // what I sent": a record queued between the drain above finding
-            // nothing and this point.
             let kicked = self.gate.take_kick();
-            if kicked && !self.stopping {
-                while self.drain_once(&opens).await {}
-            }
 
             if kicked || self.stopping || self.gate.should_flush() {
                 self.flush().await;

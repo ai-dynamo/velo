@@ -109,6 +109,14 @@ pub(super) fn tcp_transport() -> Arc<crate::transports::tcp::TcpTransport> {
 }
 
 pub(super) async fn harness(config: MuxConfig) -> Harness {
+    harness_with_hooks(config, None).await
+}
+
+/// As [`harness`], with a barrier installed in the batcher's run loop.
+pub(super) async fn harness_with_hooks(
+    config: MuxConfig,
+    hooks: Option<Arc<super::super::test_hooks::TestHooks>>,
+) -> Harness {
     let sender = Messenger::builder()
         .add_transport(tcp_transport())
         .build()
@@ -157,6 +165,7 @@ pub(super) async fn harness(config: MuxConfig) -> Harness {
             epochs: Arc::new(AtomicU64::new(1)),
             batchers: Arc::new(DashMap::new()),
             cancel: cancel.clone(),
+            hooks,
         },
     );
 

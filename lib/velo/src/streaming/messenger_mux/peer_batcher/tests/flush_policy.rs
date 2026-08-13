@@ -12,10 +12,11 @@
 //! Every test drives the real batcher against a real messenger, so the
 //! assertions are the decoded wire bytes rather than an accounting mirror.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::super::super::{AutoFlush, FlushPolicy};
-use super::support::{Harness, RECV_TIMEOUT, harness, item};
+use super::support::{Harness, RECV_TIMEOUT, harness, harness_with_hooks, item};
 use crate::streaming::messenger_mux::MuxConfig;
 use crate::streaming::messenger_mux::protocol::{CloseReason, RecordType, SlotId};
 use crate::streaming::sender::cached_finalized;
@@ -111,6 +112,52 @@ async fn one_kick_writes_one_batch_carrying_every_staged_record() {
         harness.try_next_batch().is_none(),
         "one kick is one batch: nothing follows it"
     );
+}
+
+/// A record queued *after* the loop drained and *before* it saw the kick still
+/// goes out in that kick's batch.
+///
+/// The property every other test here misses, because they all stage their
+/// records before kicking. What carries it is that the drain is a *loop*: a
+/// kick is coalesced control, so observing it costs one `drain_once`, and the
+/// loop then keeps going and polls the slot streams. Reaching that ordering
+/// from outside is impossible — it needs work queued while the loop is
+/// mid-wake — so the batcher offers a barrier:
+///
+/// 1. record A arrives; the loop wakes and stages it;
+/// 2. **barrier** — the loop has not started draining;
+/// 3. record B is queued and `flush_batch()` kicks;
+/// 4. released, the loop drains: the kick first, then B, then writes both.
+///
+/// A caller that did this had `send` return before it called `flush_batch`, so
+/// B is a record it sent and expects that flush to carry. Collapsing the drain
+/// loop to a single pass takes the kick and leaves B behind — which is the
+/// mutation this test is checked against.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_record_queued_between_the_drain_and_the_kick_still_makes_that_batch() {
+    let hooks = Arc::new(super::super::test_hooks::TestHooks::default());
+    let harness = harness_with_hooks(manual(), Some(Arc::clone(&hooks))).await;
+    let (inlet, _) = harness.open_credited(1, 1, CREDIT).await;
+
+    hooks.pause();
+    inlet.send(item(0)).expect("stage record A");
+    hooks.wait_until_parked().await;
+
+    // The loop is past its drain. Both of these land before it reads the kick.
+    inlet.send(item(1)).expect("queue record B");
+    harness.flush_batch();
+    hooks.release();
+
+    let batch = harness.next_batch().await;
+    assert_eq!(
+        batch.records.len(),
+        2,
+        "the first batch after the kick must carry both records — B was queued \
+         before the flush, so the flush owes it"
+    );
+    assert_eq!(batch.records[0].data, item(0));
+    assert_eq!(batch.records[1].data, item(1));
+    assert_eq!(harness.staged(), 0.0, "and nothing is left behind");
 }
 
 /// Records staged before a kick stay staged, with no timer behind them.
@@ -391,6 +438,7 @@ async fn kicks_during_an_admission_park_neither_double_send_nor_reorder() {
             epochs: Arc::new(AtomicU64::new(1)),
             batchers: Arc::new(DashMap::new()),
             cancel: cancel.clone(),
+            hooks: None,
         },
     );
 

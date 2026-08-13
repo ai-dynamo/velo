@@ -416,6 +416,8 @@ impl MuxCore {
                             epochs: Arc::clone(&self.epochs),
                             batchers: Arc::clone(&self.batchers),
                             cancel: self.cancel.clone(),
+                            #[cfg(test)]
+                            hooks: None,
                         },
                     )
                 })
