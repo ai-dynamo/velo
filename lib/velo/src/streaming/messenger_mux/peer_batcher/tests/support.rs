@@ -195,6 +195,25 @@ impl Harness {
         self.open_with_inlet(anchor_id, session_id, 512).await
     }
 
+    /// As [`Self::open`], but with the slot already holding `credit`.
+    ///
+    /// The starved open below is what most of these tests want, because they
+    /// are about withholding. The flush-policy tests are the opposite case:
+    /// they need records to reach the *staged batch*, and a slot with no credit
+    /// never gets one there — every record goes to the withheld queue instead
+    /// and the test would assert on a batch that was never going to exist.
+    pub(super) async fn open_credited(
+        &self,
+        anchor_id: u64,
+        session_id: u64,
+        credit: u32,
+    ) -> (flume::Sender<Vec<u8>>, SlotId) {
+        let (inlet, (slot, _)) = self
+            .open_inner(anchor_id, session_id, 512, SlotCredit::new(credit))
+            .await;
+        (inlet, slot)
+    }
+
     /// As [`Self::open_with_header`], with a caller-chosen inlet depth — the
     /// knob that decides how soon a producer meets a full channel.
     pub(super) async fn open_with_inlet(
@@ -203,6 +222,17 @@ impl Harness {
         session_id: u64,
         depth: usize,
     ) -> (flume::Sender<Vec<u8>>, (SlotId, BatchHeader)) {
+        self.open_inner(anchor_id, session_id, depth, SlotCredit::new(0))
+            .await
+    }
+
+    async fn open_inner(
+        &self,
+        anchor_id: u64,
+        session_id: u64,
+        depth: usize,
+        credit: SlotCredit,
+    ) -> (flume::Sender<Vec<u8>>, (SlotId, BatchHeader)) {
         let (inlet_tx, inlet_rx) = flume::bounded::<Vec<u8>>(depth);
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         self.handle
@@ -210,13 +240,15 @@ impl Harness {
                 anchor_id,
                 session_id,
                 inlet: inlet_rx,
-                // Deliberately starved. On the attach path a slot opens
-                // holding the window its peer advertised, but every arm below
-                // is about what the batcher does once a slot has none —
-                // withholding, fairness between a parked slot and a flowing
-                // one, the reserved terminal — and opening at zero is how a
-                // test reaches that state without first spending a window.
-                credit: SlotCredit::new(0),
+                // The default is deliberately starved. On the attach path a
+                // slot opens holding the window its peer advertised, but most
+                // arms below are about what the batcher does once a slot has
+                // none — withholding, fairness between a parked slot and a
+                // flowing one, the reserved terminal — and opening at zero is
+                // how a test reaches that state without first spending a
+                // window. [`Harness::open_credited`] is for the tests that
+                // need the other case.
+                credit,
                 slot_byte_budget: self.config.slot_byte_budget,
                 ack: ack_tx,
             })
@@ -265,6 +297,26 @@ impl Harness {
     /// is true before the batcher has run at all and so proves nothing.
     pub(super) async fn await_withheld(&self, count: usize) {
         eventually(|| (self.withheld() - count as f64).abs() < f64::EPSILON).await;
+    }
+
+    /// Records packed into a batch the writer has open but has not written.
+    pub(super) fn staged(&self) -> f64 {
+        self.snapshot()
+            .gauge("velo_streaming_mux_staged_records", &[])
+    }
+
+    /// Wait until exactly `count` records are staged.
+    ///
+    /// The positive fact the manual-policy tests need. "The inlet is empty"
+    /// would not do: it proves the batcher *pulled* the records, which is also
+    /// true when it withheld them, and staging is the thing being asserted.
+    pub(super) async fn await_staged(&self, count: usize) {
+        eventually(|| (self.staged() - count as f64).abs() < f64::EPSILON).await;
+    }
+
+    /// An application flush, as `Velo::flush_batch` delivers it.
+    pub(super) fn flush_batch(&self) {
+        self.handle.kick_flush();
     }
 }
 

@@ -414,6 +414,44 @@ impl Velo {
         self.messenger.instance_id()
     }
 
+    /// Write everything the messenger mux has staged, to every peer.
+    ///
+    /// This is the flush point
+    /// [`FlushPolicy::Manual`](crate::streaming::FlushPolicy::Manual) is named
+    /// for. A serving loop calls it once per forward pass:
+    ///
+    /// ```ignore
+    /// for request in &mut active {
+    ///     request.sender.send(token).await?;   // stage
+    /// }
+    /// velo.flush_batch();                      // one write per peer
+    /// ```
+    ///
+    /// **Sync and non-blocking.** It kicks each batcher and returns; it does not
+    /// wait for the write, and it is not a backpressure point. Whether a
+    /// congested peer slows the producer down stays the job of per-slot credit
+    /// and of transport admission, exactly as it is when nobody calls this.
+    ///
+    /// **Every peer, not one.** A producer holds `StreamSender`s and cannot know
+    /// which batcher each one feeds — the destination is packed into the anchor
+    /// handle and resolved several layers below. So there is nothing to name,
+    /// and the flush covers whatever this node has staged for anyone.
+    ///
+    /// **Valid under either policy, and never an error.** Under
+    /// [`FlushPolicy::Auto`](crate::streaming::FlushPolicy::Auto) it forces a
+    /// write ahead of the conditions the batcher would otherwise have waited
+    /// for; under `Manual` it is the write. It is a cheap no-op when no mux is
+    /// installed or when nothing is staged, so a call site does not have to know
+    /// how the node was configured.
+    ///
+    /// A burst between two calls is a *hint*, not a frame boundary: the size
+    /// clamps, the records that carry liveness, and credit may each cut a wire
+    /// batch in between, so a caller may not assume what it bracketed arrives as
+    /// one `_stream_batch`. See `streaming/BATCHING.md` § "Flush policy".
+    pub fn flush_batch(&self) {
+        self.anchor_manager.flush_mux_batches();
+    }
+
     /// Get the peer information for this instance.
     ///
     /// The returned [`PeerInfo`] carries a [`WorkerAddress`] with both the

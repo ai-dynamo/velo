@@ -497,3 +497,112 @@ async fn a_remote_stream_preserves_send_order_under_a_slow_consumer() {
         "frames out of order"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Flush fan-out
+// ---------------------------------------------------------------------------
+
+/// One `flush_batch()` reaches every peer this node has staged records for.
+///
+/// The batcher-level tests pin what a kick does to one batcher. This pins the
+/// property the *public* call has to have, and the reason it takes no argument:
+/// a producer holds `StreamSender`s and cannot know which batcher each one
+/// feeds, so a flush that reached only some peers would be a call whose correct
+/// use requires knowing something the API hides. Two consumers, a round of
+/// sends spread across both, one flush — and exactly one batch to each.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_flush_reaches_every_peer_batcher() {
+    const PEERS: usize = 2;
+    const SLOTS_PER_PEER: u64 = 3;
+
+    let producer_messenger = Messenger::builder()
+        .add_transport(tcp_transport())
+        .build()
+        .await
+        .expect("producer messenger");
+    let mut consumers = Vec::with_capacity(PEERS);
+    for _ in 0..PEERS {
+        let m = Messenger::builder()
+            .add_transport(tcp_transport())
+            .build()
+            .await
+            .expect("consumer messenger");
+        producer_messenger
+            .register_peer(m.peer_info())
+            .expect("register consumer");
+        m.register_peer(producer_messenger.peer_info())
+            .expect("register producer");
+        consumers.push(m);
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // The producer gets its own registry, so the batch counter below is its
+    // writes and nobody else's.
+    let registry = prometheus::Registry::new();
+    let metrics = Arc::new(VeloMetrics::register(&registry).expect("register metrics"));
+    let config = MuxConfig {
+        flush_policy: crate::streaming::FlushPolicy::Manual,
+        ..test_config()
+    };
+    let producer = MessengerMuxTransport::new(
+        Arc::clone(&producer_messenger),
+        config.clone(),
+        Some(Arc::clone(&metrics)),
+    )
+    .expect("producer mux");
+
+    let mut receivers = Vec::new();
+    let mut senders = Vec::new();
+    let mut consumer_muxes = Vec::new();
+    for (peer, messenger) in consumers.iter().enumerate() {
+        let mux = MessengerMuxTransport::new(Arc::clone(messenger), config.clone(), None)
+            .expect("consumer mux");
+        let worker = messenger.instance_id().worker_id();
+        for slot in 0..SLOTS_PER_PEER {
+            let id = (peer as u64 + 1) * 100 + slot;
+            receivers.push(mux.bind(id, id).await.expect("bind"));
+            senders.push(producer.connect(worker, id, id).await.expect("connect"));
+        }
+        consumer_muxes.push(mux);
+    }
+
+    let sent_batches = || {
+        MetricSnapshot::from_registry(&registry)
+            .counter("velo_streaming_mux_batches_total", &[("direction", "sent")])
+    };
+    // Every `OpenSlot` was flushed eagerly and on its own, so the opens are
+    // behind us and the count below starts from a known place.
+    let after_opens = sent_batches();
+    assert_eq!(
+        after_opens,
+        (PEERS as u64 * SLOTS_PER_PEER) as f64,
+        "one eager batch per OpenSlot"
+    );
+
+    // One round: a record on every slot, spread across both peers.
+    for (n, tx) in senders.iter().enumerate() {
+        tx.send_async(item(n as u32)).await.expect("send item");
+    }
+    // The records are staged, not written — that is the policy under test.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        sent_batches(),
+        after_opens,
+        "manual holds the round until the application flushes it"
+    );
+
+    producer.flush_batches();
+
+    for (n, rx) in receivers.iter().enumerate() {
+        assert_eq!(
+            recv(rx).await,
+            item(n as u32),
+            "slot {n} did not receive the record its peer's flush carried"
+        );
+    }
+    assert_eq!(
+        sent_batches(),
+        after_opens + PEERS as f64,
+        "one flush, one batch per peer — not one per slot and not only the first peer"
+    );
+}

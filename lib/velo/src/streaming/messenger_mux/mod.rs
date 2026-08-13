@@ -208,6 +208,24 @@ impl Default for FlushPolicy {
     }
 }
 
+impl FlushPolicy {
+    /// The window a staged batch is running against, if any.
+    pub(crate) const fn max_linger(self) -> Option<Duration> {
+        match self {
+            Self::Auto(auto) => auto.max_linger,
+            Self::Manual => None,
+        }
+    }
+
+    /// Whether reaching the end of a wake is itself a reason to write.
+    pub(crate) const fn on_admission(self) -> bool {
+        match self {
+            Self::Auto(auto) => auto.on_admission,
+            Self::Manual => false,
+        }
+    }
+}
+
 /// Construction-time tuning for the mux, and the switch that installs one.
 ///
 /// Reached from the `Velo` builder as `.messenger_mux(MuxConfig { enabled: true,
@@ -441,6 +459,13 @@ impl MuxCore {
         }
     }
 
+    /// Kick every live batcher into writing what it has staged.
+    fn flush_batches(&self) {
+        for entry in self.batchers.iter() {
+            entry.value().kick_flush();
+        }
+    }
+
     /// Queue control records back to `peer`, re-resolving once if the batcher
     /// exited between resolution and the write.
     ///
@@ -607,6 +632,17 @@ impl MessengerMuxTransport {
     /// The window this node advertises to a peer negotiating an attach.
     pub(crate) fn advertised_limits(&self) -> NegotiatedLimits {
         self.core.limits
+    }
+
+    /// Write what every batcher has staged, to every peer.
+    ///
+    /// All of them rather than one, because the caller cannot know the
+    /// bucketing: a producer holds `StreamSender`s, and which peer each one
+    /// lands on is a property of the anchor handle it attached to, resolved
+    /// several layers below. A per-peer flush would be an API whose correct use
+    /// requires knowing something the API deliberately hides.
+    pub(crate) fn flush_batches(&self) {
+        self.core.flush_batches();
     }
 
     /// Open a slot to `peer` at the limits its attach response advertised.
