@@ -473,15 +473,21 @@ async fn kicks_during_an_admission_park_neither_double_send_nor_reorder() {
     });
     assert_eq!(open.records[0].kind, RecordType::OpenSlot);
 
-    // Stage a record and flush it: that write fills the gate and parks there.
-    inlet.send(item(0)).expect("stage a record");
-    handle.kick_flush();
-    eventually(|| wire.is_full()).await;
-
     let batches = |registry: &prometheus::Registry| {
         crate::observability::test_helpers::MetricSnapshot::from_registry(registry)
             .counter("velo_streaming_mux_batches_total", &[("direction", "sent")])
     };
+    // The counter increments *after* a batch lands in the channel, so wait for
+    // the OpenSlot flush to be accounted before building on the number.
+    eventually(|| batches(&registry) == 1.0).await;
+
+    // Stage a record and flush it: that write fills the gate and parks there.
+    // Wait for BOTH facts — the gate being full and the batch being counted —
+    // or the baseline below races the increment (seen under llvm-cov, whose
+    // instrumentation widens the land-then-count window).
+    inlet.send(item(0)).expect("stage a record");
+    handle.kick_flush();
+    eventually(|| wire.is_full() && batches(&registry) == 2.0).await;
     let parked_at = batches(&registry);
 
     // The producer keeps going: more of the stream, and a flush per pass, all
