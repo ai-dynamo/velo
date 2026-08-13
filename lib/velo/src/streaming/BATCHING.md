@@ -662,15 +662,26 @@ already scheduled apart.
 There is a second reason, which the measurements did not anticipate and which is
 the stronger one for serving. **Opportunistic packing is not deterministic.**
 How many records share a batch depends on how the runtime scheduled the batcher
-against the producer, so the same workload gives a different distribution run to
-run — and it can pack *across* forward passes when admission is running behind,
-which is throughput bought with per-token latency. `examples/batched_streaming`
-measures both: opportunistic reaches 2.19 records per batch where the pass's own
-fan-out is 1.71, the surplus being exactly that cross-pass packing. Flushing per
-pass gives up the surplus and gets a number that is a property of the deployment
-— records per batch ≈ active requests per host — with no record ever lingering
-into the next pass. At the 32–64 active-per-host a real decode engine runs, the
-per-pass term dominates the surplus anyway.
+against the producer, so the same workload gives a different answer run to run.
+`examples/batched_streaming` measures it at a serving-shaped depth — 96 requests
+against a batch of 32 — and five runs of each policy come out:
+
+```text
+--flush-policy auto     4.88  5.08  5.08  5.14  4.67
+--flush-policy manual   5.38  5.38  5.38  5.38  5.38
+```
+
+`Manual` is the higher of the two here as well as the steady one, which the
+design of this section did not predict: a batcher writing at every wake
+sometimes wakes mid-pass and writes half of one, where a per-pass flush writes
+the pass. The cross-pass surplus opportunistic packing was expected to win by is
+real, but it needs the producer to outrun the batcher — with no gap between
+passes the same example reads 6.61–7.44 for `auto` against 3.47–4.41 for
+`Manual`. That surplus is throughput bought with per-token latency, and for a
+decode engine that is the wrong trade.
+
+Every figure above is reproducible, with its command and its unedited output, in
+[`examples/examples/batched_streaming.evidence.md`](../../../examples/examples/batched_streaming.evidence.md).
 
 So: `Auto` if you want the batcher to do the best it can with whatever it finds,
 `Manual` if you want to know what it will do.
@@ -960,13 +971,15 @@ above where they belong; what they cost is worth stating in one place.
 - **`flush_batch()` replaced `start_batch()` / `end_batch()`.** The argument is
   in [Why a call and not a guard](#why-a-call-and-not-a-guard); the price is
   that an explicit per-pass flush caps a batch at that pass's own fan-out, where
-  opportunistic packing can overshoot it by pulling in the next pass's records
-  when admission is running behind. The example measures the gap at 2.19 against
-  1.71 on a developer machine. It is a real loss of throughput, taken knowingly:
-  what it buys is that no token lingers into a pass it was not produced in, and
-  that the batch size is a number you can derive from the deployment instead of
-  one you have to measure. At serving depths the per-pass term is the larger of
-  the two anyway.
+  opportunistic packing can overshoot it by pulling in the next pass's records.
+  Measured, that price is smaller and narrower than expected: it is only paid
+  when the producer outruns the batcher, and at a serving-shaped depth `Manual`
+  is the *faster* of the two as well as the repeatable one. See
+  [Is an explicit flush actually needed?](#is-an-explicit-flush-actually-needed)
+  for the numbers. It is still a real loss of throughput in the flat-out case,
+  taken knowingly: what it buys is that no token lingers into a pass it was not
+  produced in, and that the batch size is a number you can derive from the
+  deployment instead of one you have to measure.
 - **The windowed policy became a condition rather than a variant.** `Auto` holds
   a set of conditions that compose, so "opportunistic" and "windowed" stopped
   being alternatives and became `on_admission` and `max_linger`. Nothing about

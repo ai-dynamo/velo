@@ -55,8 +55,8 @@
 //! runs each:
 //!
 //! ```text
-//! --max-batch 32 --requests 96 --flush-policy auto     5.07  4.90  5.07  4.83  5.08
-//! --max-batch 32 --requests 96 --flush-policy manual   5.36  5.38  5.38  5.38  5.38
+//! --max-batch 32 --requests 96 --flush-policy auto     4.88  5.08  5.08  5.14  4.67
+//! --max-batch 32 --requests 96 --flush-policy manual   5.38  5.38  5.38  5.38  5.38
 //! ```
 //!
 //! `manual` is both higher and *the same number every time*. Higher because a
@@ -68,9 +68,12 @@
 //!
 //! `auto` wins on raw packing in the opposite regime, and it is worth seeing:
 //! at `--pass-delay-ms 0` the engine runs flat out, the batcher falls behind,
-//! and a batch starts absorbing the pass after it — 5.80 and 8.35 on two runs,
-//! against 3.72 and 4.25 for `manual`. That surplus is throughput bought with
-//! per-token latency, which for a decode engine is the wrong trade.
+//! and a batch starts absorbing the pass after it — 6.61 to 7.44 over five
+//! runs, against 3.47 to 4.41 for `manual`. That surplus is throughput bought
+//! with per-token latency, which for a decode engine is the wrong trade.
+//!
+//! Every number above, with its command and its unedited output, is in
+//! `batched_streaming.evidence.md` beside this file.
 //!
 //! Either way the ratio tracks how many of an engine's active requests live on
 //! the same host, so it climbs with the batch as long as there are enough
