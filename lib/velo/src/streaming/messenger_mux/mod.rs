@@ -127,6 +127,105 @@ const ACCEPT_TIMEOUT: Duration = Duration::from_secs(60);
 /// eviction sweeps inside one attach.
 const CONNECT_ATTEMPTS: usize = 3;
 
+/// Conditions on which an [`FlushPolicy::Auto`] batcher writes itself.
+///
+/// A struct rather than more enum variants because these compose: a batcher may
+/// hold both, and `BATCHING.md`'s original "opportunistic" and "windowed"
+/// policies are the two of them taken one at a time.
+///
+/// Deliberately **not** `#[non_exhaustive]`, for the same reason [`MuxConfig`]
+/// is not: that attribute forbids `AutoFlush { on_admission: false,
+/// ..Default::default() }` outside this crate, and the update idiom is worth
+/// more than the bump a future condition costs. The version gate is what makes
+/// such a bump a decision rather than an accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AutoFlush {
+    /// Write whatever is staged at the end of every wake, having first taken
+    /// everything already queued.
+    ///
+    /// The historical default, and it cannot make anything worse: the batcher
+    /// never waits for work that has not arrived, it only notices that more is
+    /// *already* there and takes all of it. The name is the mechanism — a flush
+    /// parks until the transport admits it, so "at the end of every wake" is in
+    /// practice "as soon as the peer admitted the last batch".
+    pub on_admission: bool,
+    /// Also write once this long has passed since the oldest staged record.
+    ///
+    /// `Some(w)` with `on_admission: false` is the windowed policy
+    /// `BATCHING.md` specifies: a batch forms for up to `w` and then goes,
+    /// trading up to `w` of latency for packing. `None` is no timer at all.
+    pub max_linger: Option<Duration>,
+}
+
+impl Default for AutoFlush {
+    fn default() -> Self {
+        Self {
+            on_admission: true,
+            max_linger: None,
+        }
+    }
+}
+
+impl AutoFlush {
+    /// Add a linger window, so a batch also goes out `window` after its oldest
+    /// record was staged.
+    #[must_use]
+    pub const fn with_max_linger(mut self, window: Duration) -> Self {
+        self.max_linger = Some(window);
+        self
+    }
+}
+
+/// When a peer batcher writes what it has staged.
+///
+/// See `BATCHING.md` § "Flush policy". Both policies obey the same two
+/// overrides — a batch at its size clamp goes, and the records that carry
+/// liveness go — and under both,
+/// [`Velo::flush_batch`](crate::Velo::flush_batch) writes immediately. What
+/// they differ on is whether anything *else* does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FlushPolicy {
+    /// The batcher decides, on the conditions in [`AutoFlush`].
+    ///
+    /// The default is `AutoFlush::default()`, which is byte-for-byte the
+    /// behaviour every mux had before this knob existed.
+    Auto(AutoFlush),
+    /// The application decides, through
+    /// [`Velo::flush_batch`](crate::Velo::flush_batch).
+    ///
+    /// The policy a serving loop wants: one write per forward pass carrying
+    /// that pass's whole fan-out to each peer, and nothing lingering into the
+    /// next pass. **There is no timer.** A producer that stops calling
+    /// `flush_batch` leaves its last records staged until something else moves
+    /// them; `velo_streaming_mux_staged_records` is where that shows.
+    Manual,
+}
+
+impl Default for FlushPolicy {
+    fn default() -> Self {
+        Self::Auto(AutoFlush::default())
+    }
+}
+
+impl FlushPolicy {
+    /// The window a staged batch is running against, if any.
+    pub(crate) const fn max_linger(self) -> Option<Duration> {
+        match self {
+            Self::Auto(auto) => auto.max_linger,
+            Self::Manual => None,
+        }
+    }
+
+    /// Whether reaching the end of a wake is itself a reason to write.
+    pub(crate) const fn on_admission(self) -> bool {
+        match self {
+            Self::Auto(auto) => auto.on_admission,
+            Self::Manual => false,
+        }
+    }
+}
+
 /// Construction-time tuning for the mux, and the switch that installs one.
 ///
 /// Reached from the `Velo` builder as `.messenger_mux(MuxConfig { enabled: true,
@@ -170,6 +269,11 @@ pub struct MuxConfig {
     pub credit_sweep_interval: Duration,
     /// How long a batcher may sit idle with no slots before it is evicted.
     pub batcher_idle_ttl: Duration,
+    /// When a batcher writes what it has staged.
+    ///
+    /// Defaults to [`FlushPolicy::Auto`] on [`AutoFlush::default`], which is
+    /// the behaviour every mux had before this knob existed.
+    pub flush_policy: FlushPolicy,
 }
 
 impl Default for MuxConfig {
@@ -182,6 +286,7 @@ impl Default for MuxConfig {
             peer_byte_budget: DEFAULT_PEER_BYTE_BUDGET,
             credit_sweep_interval: Duration::from_millis(2),
             batcher_idle_ttl: Duration::from_secs(60),
+            flush_policy: FlushPolicy::Auto(AutoFlush::default()),
         }
     }
 }
@@ -311,6 +416,8 @@ impl MuxCore {
                             epochs: Arc::clone(&self.epochs),
                             batchers: Arc::clone(&self.batchers),
                             cancel: self.cancel.clone(),
+                            #[cfg(test)]
+                            hooks: None,
                         },
                     )
                 })
@@ -351,6 +458,13 @@ impl MuxCore {
         }
         if !outcome.replies.is_empty() {
             self.send_replies(&batcher, peer, &outcome.replies);
+        }
+    }
+
+    /// Kick every live batcher into writing what it has staged.
+    fn flush_batches(&self) {
+        for entry in self.batchers.iter() {
+            entry.value().kick_flush();
         }
     }
 
@@ -520,6 +634,17 @@ impl MessengerMuxTransport {
     /// The window this node advertises to a peer negotiating an attach.
     pub(crate) fn advertised_limits(&self) -> NegotiatedLimits {
         self.core.limits
+    }
+
+    /// Write what every batcher has staged, to every peer.
+    ///
+    /// All of them rather than one, because the caller cannot know the
+    /// bucketing: a producer holds `StreamSender`s, and which peer each one
+    /// lands on is a property of the anchor handle it attached to, resolved
+    /// several layers below. A per-peer flush would be an API whose correct use
+    /// requires knowing something the API deliberately hides.
+    pub(crate) fn flush_batches(&self) {
+        self.core.flush_batches();
     }
 
     /// Open a slot to `peer` at the limits its attach response advertised.

@@ -63,6 +63,7 @@ async fn a_stalled_batcher_coalesces_control_instead_of_queueing_it() {
             epochs: Arc::new(AtomicU64::new(1)),
             batchers: Arc::new(DashMap::new()),
             cancel: cancel.clone(),
+            hooks: None,
         },
     );
 

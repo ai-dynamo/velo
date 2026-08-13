@@ -582,6 +582,7 @@ pub(crate) struct MuxMetricsHandle {
     rendezvous_singletons_total: Counter,
     held_records: Gauge,
     withheld_records: Gauge,
+    staged_records: Gauge,
     hold_overflow_total: Counter,
     control_refused_total: Counter,
     epoch_deaths_total: Counter,
@@ -656,6 +657,12 @@ impl MuxMetricsHandle {
         self.withheld_records.add(delta as f64);
     }
 
+    /// Adjust the occupancy of the batches the writer has open by `delta`
+    /// records.
+    pub(crate) fn staged_records_delta(&self, delta: i64) {
+        self.staged_records.add(delta as f64);
+    }
+
     /// A batcher's coalesced control state refused a new slot key at its cap.
     pub(crate) fn control_refused(&self) {
         self.control_refused_total.inc();
@@ -725,6 +732,7 @@ pub struct VeloMetrics {
     streaming_mux_rendezvous_singletons_total: Counter,
     streaming_mux_held_records: Gauge,
     streaming_mux_withheld_records: Gauge,
+    streaming_mux_staged_records: Gauge,
     streaming_mux_hold_overflow_total: Counter,
     streaming_mux_control_refused_total: Counter,
     streaming_mux_epoch_deaths_total: Counter,
@@ -1153,6 +1161,19 @@ impl VeloMetrics {
                  became visible instead. Bounded per slot by the slot byte cap.",
             )?,
         )?;
+        let streaming_mux_staged_records = register_collector(
+            registry,
+            Gauge::new(
+                "velo_streaming_mux_staged_records",
+                "Records packed into batches the egress batchers have open but \
+                 have not written. Transient under `FlushPolicy::Auto`, where \
+                 every wake ends in a write. Under `FlushPolicy::Manual` the \
+                 application owns the flush and there is no timer behind it, so \
+                 a plateau here is a producer that stopped calling \
+                 `flush_batch` — the one failure mode that policy has. Bounded \
+                 by the batch clamps, so it costs latency rather than memory.",
+            )?,
+        )?;
         let streaming_mux_control_refused_total = register_collector(
             registry,
             Counter::with_opts(Opts::new(
@@ -1273,6 +1294,7 @@ impl VeloMetrics {
             streaming_mux_rendezvous_singletons_total,
             streaming_mux_held_records,
             streaming_mux_withheld_records,
+            streaming_mux_staged_records,
             streaming_mux_hold_overflow_total,
             streaming_mux_control_refused_total,
             streaming_mux_epoch_deaths_total,
@@ -1442,6 +1464,7 @@ impl VeloMetrics {
             rendezvous_singletons_total: self.streaming_mux_rendezvous_singletons_total.clone(),
             held_records: self.streaming_mux_held_records.clone(),
             withheld_records: self.streaming_mux_withheld_records.clone(),
+            staged_records: self.streaming_mux_staged_records.clone(),
             hold_overflow_total: self.streaming_mux_hold_overflow_total.clone(),
             control_refused_total: self.streaming_mux_control_refused_total.clone(),
             epoch_deaths_total: self.streaming_mux_epoch_deaths_total.clone(),

@@ -266,7 +266,12 @@ jobs:
       run: cargo run --manifest-path examples/Cargo.toml --release --all-features --example mpsc_fanin -- --producers 4 --items 40
     - name: Run batched_streaming
       timeout-minutes: 2
-      run: cargo run --manifest-path examples/Cargo.toml --release --all-features --example batched_streaming -- --engines 2 --requests 24 --max-batch 8 --tokens 40
+      # Both flush policies. The example defaults to manual, so auto — which is
+      # what MuxConfig itself defaults to — needs naming to be exercised here.
+      # Each run is ~100 ms; the build is what the two minutes are for.
+      run: |
+        cargo run --manifest-path examples/Cargo.toml --release --all-features --example batched_streaming -- --engines 2 --requests 24 --max-batch 8 --tokens 40
+        cargo run --manifest-path examples/Cargo.toml --release --all-features --example batched_streaming -- --engines 2 --requests 24 --max-batch 8 --tokens 40 --flush-policy auto
     - name: sccache stats
       if: always()
       run: /tmp/use-sccache.sh show-stats "examples" || true

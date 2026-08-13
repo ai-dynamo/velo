@@ -854,6 +854,17 @@ impl AnchorManager {
             .map_err(|_| anyhow::anyhow!("a messenger mux is already installed on this manager"))
     }
 
+    /// Write what the mux's batchers have staged, if a mux is installed.
+    ///
+    /// A no-op without one, which is the honest answer rather than an error:
+    /// the legacy per-stream transports have nothing staged to write, since
+    /// their egress pumps hand every frame straight to a socket.
+    pub(crate) fn flush_mux_batches(&self) {
+        if let Some(mux) = self.mux.get() {
+            mux.flush_batches();
+        }
+    }
+
     /// The transports this node advertises when it attaches to a remote anchor.
     fn supported_transport_keys(&self) -> Vec<velo_ext::TransportKey> {
         crate::streaming::negotiation::advertised_keys(

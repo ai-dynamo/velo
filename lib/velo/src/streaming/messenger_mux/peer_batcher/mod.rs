@@ -30,6 +30,16 @@
 //! Failing them and bumping the epoch is what makes "exactly one `Dropped` per
 //! failed live slot" provable.
 //!
+//! ## When the batch is cut
+//!
+//! [`flush_gate`] owns that decision and nothing else does. The loop below
+//! stages work, drains everything already queued behind it, and then asks the
+//! gate once. Under the default policy the answer is always yes, which is why
+//! this is a refactor of the old unconditional flush rather than a new path
+//! through it; under [`FlushPolicy::Manual`](super::FlushPolicy::Manual) the
+//! answer is no until the application says otherwise, and the kick it says it
+//! with arrives as coalesced control for the reason everything else does.
+//!
 //! ## Draining X channels from one task
 //!
 //! [`slot_stream`] explains the `SelectAll` arrangement and why every inlet is
@@ -41,7 +51,11 @@
 //! bounds the memory the arrangement costs.
 
 mod control;
+mod flush_gate;
+mod records;
 mod slot_stream;
+#[cfg(test)]
+pub(crate) mod test_hooks;
 #[cfg(test)]
 mod tests;
 mod writer;
@@ -57,8 +71,11 @@ use tokio_util::sync::CancellationToken;
 use velo_ext::WorkerId;
 
 use self::control::{ControlInbox, DrainedControl, OwnedControl, PeerControl};
+use self::flush_gate::{FlushGate, linger_until};
 pub(crate) use self::slot_stream::AllocError;
 use self::slot_stream::{EgressSlots, SlotItem, SlotStream};
+#[cfg(test)]
+use self::test_hooks::TestHooks;
 use self::writer::BatchWriter;
 use super::MuxConfig;
 use super::protocol::{
@@ -187,6 +204,16 @@ impl BatcherHandle {
         self.control.retire();
     }
 
+    /// Write whatever this batcher has staged.
+    ///
+    /// Sync and non-blocking: it sets the coalesced kick and returns, leaving
+    /// the write — and any wait for the peer to admit it — on the batcher's own
+    /// task. A producer loop calling this every forward pass therefore never
+    /// blocks on a congested peer, which stays credit and admission's job.
+    pub(crate) fn kick_flush(&self) {
+        self.control.kick_flush();
+    }
+
     /// Control entries pending, for the bound the stalled-admission test pins.
     #[cfg(test)]
     pub(crate) fn pending_control(&self) -> usize {
@@ -228,6 +255,10 @@ pub(crate) struct BatcherContext {
     pub(crate) epochs: Arc<AtomicU64>,
     pub(crate) batchers: Arc<BatcherMap>,
     pub(crate) cancel: CancellationToken,
+    /// A barrier in the run loop, installed only by the tests that need to stop
+    /// it mid-wake. See [`test_hooks`].
+    #[cfg(test)]
+    pub(crate) hooks: Option<Arc<TestHooks>>,
 }
 
 /// Spawn a batcher for `peer` and return its registry handle.
@@ -243,6 +274,7 @@ pub(crate) fn spawn(peer: WorkerId, ctx: BatcherContext) -> Arc<BatcherHandle> {
         alive: AtomicBool::new(true),
     });
     let epoch = ctx.epochs.fetch_add(1, Ordering::Relaxed);
+    let gate = FlushGate::new(ctx.config.flush_policy, ctx.metrics.clone());
     let writer = BatchWriter::new(
         Arc::clone(&ctx.messenger),
         peer,
@@ -258,10 +290,13 @@ pub(crate) fn spawn(peer: WorkerId, ctx: BatcherContext) -> Arc<BatcherHandle> {
         batchers: ctx.batchers,
         cancel: ctx.cancel,
         control,
+        gate,
         writer,
         slots: EgressSlots::default(),
         streams: SelectAll::new(),
         stopping: false,
+        #[cfg(test)]
+        hooks: ctx.hooks,
     };
     tokio::spawn(batcher.run(open_rx));
     handle
@@ -272,6 +307,10 @@ enum Work {
     Open(OpenSlotRequest),
     Control(DrainedControl),
     Slot(u32, SlotItem),
+    /// A linger window elapsed. Carries nothing: it exists to end the park, and
+    /// the decision it leads to is [`FlushGate::should_flush`] reading the
+    /// deadline as state.
+    Linger,
 }
 
 struct Batcher {
@@ -283,12 +322,16 @@ struct Batcher {
     cancel: CancellationToken,
     /// The coalesced control state this task drains.
     control: Arc<ControlInbox>,
+    /// Whether the staged batch is written at the end of this wake.
+    gate: FlushGate,
     writer: BatchWriter,
     slots: EgressSlots,
     streams: SelectAll<SlotStream>,
     /// Set once the task has decided to exit, so the drain loop stops pulling
     /// work it will never flush.
     stopping: bool,
+    #[cfg(test)]
+    hooks: Option<Arc<TestHooks>>,
 }
 
 impl Batcher {
@@ -296,6 +339,7 @@ impl Batcher {
         let cancel = self.cancel.clone();
         let control = Arc::clone(&self.control);
         loop {
+            let deadline = self.gate.deadline();
             let work = tokio::select! {
                 biased;
                 () = cancel.cancelled() => break,
@@ -305,21 +349,44 @@ impl Batcher {
                 },
                 () = control.wait() => match control.take() {
                     Some(drained) => Work::Control(drained),
-                    // Drained by the opportunistic pass below between the wake
-                    // and the take.
+                    // Drained by the pass below between the wake and the take.
                     None => continue,
                 },
                 Some((index, item)) = self.streams.next() => Work::Slot(index, item),
+                () = linger_until(deadline) => Work::Linger,
             };
             self.handle.mark_active();
             self.dispatch(work).await;
 
-            // Opportunistic drain: take everything already queued before
-            // writing. This is what turns a forward pass's X back-to-back sends
-            // into one batch, and it never waits for work that has not arrived.
+            // The one point a test can stop the loop at, so a record can be
+            // queued mid-wake. See [`test_hooks`].
+            #[cfg(test)]
+            if let Some(hooks) = self.hooks.clone() {
+                hooks.barrier().await;
+            }
+
+            // Take everything already queued before deciding to write. Under
+            // every policy: this is what turns a forward pass's X back-to-back
+            // sends into one batch, and it never waits for work that has not
+            // arrived.
+            //
+            // It is also what makes an application's flush *exact*, and the
+            // argument is worth writing down because it is not obvious. A kick
+            // is coalesced control, so the only way `gate.kicked` becomes true
+            // is `on_control`, reached through `dispatch` — from the select arm
+            // above, or from `drain_once` below. Either way the loop keeps
+            // draining afterwards, and `drain_once` polls the slot streams
+            // after the control state. So every record queued before the kick
+            // was queued before the drain that follows the kick's observation,
+            // and is therefore in the batch the kick writes. The loop is what
+            // carries that; a single pass would not.
             while !self.stopping && self.drain_once(&opens).await {}
 
-            self.flush().await;
+            let kicked = self.gate.take_kick();
+
+            if kicked || self.stopping || self.gate.should_flush() {
+                self.flush().await;
+            }
             if self.stopping {
                 // The sweep already removed the registry entry.
                 return self.teardown(false);
@@ -353,6 +420,7 @@ impl Batcher {
             Work::Slot(index, SlotItem::InletClosed) => self.on_inlet_closed(index).await,
             Work::Open(request) => self.on_open_slot(request).await,
             Work::Control(drained) => self.on_control(drained).await,
+            Work::Linger => {}
         }
     }
 
@@ -363,6 +431,9 @@ impl Batcher {
     /// name the peer's slots, grants and closes name ours, and a close makes its
     /// slot's grant moot either way.
     async fn on_control(&mut self, drained: DrainedControl) {
+        if drained.flush {
+            self.gate.kick();
+        }
         for (raw, entry) in drained.peers {
             self.on_reply(SlotId::from_raw(raw), entry).await;
         }
@@ -425,246 +496,6 @@ impl Batcher {
     }
 
     // -----------------------------------------------------------------------
-    // Data path
-    // -----------------------------------------------------------------------
-
-    async fn on_frame(&mut self, index: u32, bytes: Vec<u8>) {
-        let Some(slot) = self.slots.get_mut(index) else {
-            // The slot closed between the stream yielding and this dispatch —
-            // a terminal in the same drain, or a peer-side close. Today's
-            // egress semantics: frames queued behind a terminal are discarded.
-            return;
-        };
-
-        // Terminal-ness costs an `rmp_serde` decode attempt on anything that is
-        // not one of the three cached sentinels, so it is asked only where the
-        // answer changes what happens. On the fast path a record with data
-        // credit behind it is sent either way. On the starved path it decides
-        // whether the reserve applies, and the whole reason the reserve exists
-        // is that a terminal must not wait on credit a stalled consumer will
-        // never return.
-        if slot.must_withhold(CreditClass::Data) {
-            let terminal = is_terminal_sentinel(&bytes);
-            // The reserve applies to the *head* of the stream, not to any
-            // terminal: predecessors still queued go first, and a fence means a
-            // predecessor is on the wire. Otherwise the terminal would overtake
-            // records the consumer is owed.
-            if terminal
-                && slot.withheld.is_empty()
-                && !slot.is_fenced()
-                && slot.credit.can_spend(CreditClass::Terminal)
-            {
-                self.emit_data(index, bytes, true).await;
-                return;
-            }
-
-            let starved = slot.credit.data_available() == 0;
-            match slot.withheld.push(bytes) {
-                Ok(()) => {
-                    if let Some(metrics) = &self.metrics {
-                        metrics.withheld_records_delta(1);
-                        if starved && slot.note_starved() {
-                            metrics.credit_exhausted();
-                        }
-                    }
-                }
-                Err(error) => self.overflow_kill(index, error).await,
-            }
-            return;
-        }
-
-        let terminal = is_terminal_sentinel(&bytes);
-        self.emit_data(index, bytes, terminal).await;
-    }
-
-    /// The producer ran past the byte cap on a slot that cannot send.
-    ///
-    /// This is the per-slot slow-consumer kill, and it is deliberately *not* the
-    /// heartbeat watchdog: the slot dies, its consumer sees `Dropped` through the
-    /// `CloseSlot{PeerGone}` sent here, and the peer's other slots never notice.
-    /// Anything withheld goes with it — including a queued terminal, so a
-    /// consumer that would have seen `Finalized` sees `Dropped` instead. That is
-    /// the cost of not blocking the producer's synchronous terminal send, and it
-    /// is bounded by a megabyte of run-ahead on a stream nobody is draining.
-    async fn overflow_kill(&mut self, index: u32, error: slot_stream::WithheldOverflow) {
-        let Some(slot) = self.slots.get_mut(index) else {
-            return;
-        };
-        let id = slot.id;
-        let seq = slot.take_seq();
-        let discarded = slot.withheld.len();
-        slot.withheld.clear();
-        tracing::warn!(
-            slot = ?id,
-            %error,
-            discarded,
-            "messenger mux: producer outran a starved slot's byte cap; closing the slot"
-        );
-        if let Some(metrics) = &self.metrics {
-            metrics.records_dropped(MuxDropReason::WithheldOverflow, discarded as u64 + 1);
-            metrics.withheld_records_delta(-(discarded as i64));
-        }
-        self.push_close(id, seq, CloseReason::PeerGone).await;
-        self.close_local(index);
-    }
-
-    /// Append a `CloseSlot` for a slot this side owns, cutting the batch first
-    /// if it will not fit.
-    async fn push_close(&mut self, id: SlotId, seq: u32, reason: CloseReason) {
-        let needed = record_encoded_len(1).unwrap_or(usize::MAX);
-        self.ensure_batch();
-        if !self.fits(needed, 1) {
-            self.flush().await;
-            self.ensure_batch();
-        }
-        if let Some(encoder) = self.writer.encoder() {
-            let _ = encoder.push_close_slot(id, seq, reason);
-        }
-    }
-
-    /// Every producer handle for a slot has gone without a terminal going out.
-    ///
-    /// The consumer has to be told, or it waits out its heartbeat watchdog for a
-    /// sender that no longer exists. `CloseSlot{PeerGone}` is that telling, and
-    /// it is what makes the receive side inject `Dropped` — reproducing, per
-    /// slot, what the TCP receive pump does on an EOF with no terminal behind
-    /// it.
-    async fn on_inlet_closed(&mut self, index: u32) {
-        let Some(slot) = self.slots.get_mut(index) else {
-            return;
-        };
-        slot.inlet_closed = true;
-        if !slot.withheld.is_empty() {
-            // Records the producer enqueued before it went are still owed to the
-            // consumer. The close waits behind them; `release_withheld` fires it
-            // when the queue empties.
-            return;
-        }
-        self.finish_inlet_close(index).await;
-    }
-
-    /// Emit the `CloseSlot{PeerGone}` a departed producer owes its consumer.
-    async fn finish_inlet_close(&mut self, index: u32) {
-        let Some(slot) = self.slots.get_mut(index) else {
-            return;
-        };
-        let id = slot.id;
-        let seq = slot.take_seq();
-        self.push_close(id, seq, CloseReason::PeerGone).await;
-        self.close_local(index);
-    }
-
-    /// Pack one data record, cutting or bypassing the batch as its size demands.
-    async fn emit_data(&mut self, index: u32, bytes: Vec<u8>, terminal: bool) {
-        let record_len = record_encoded_len(bytes.len()).unwrap_or(usize::MAX);
-        // A terminal and its `CloseSlot` are atomic: same batch, adjacent. Room
-        // is therefore checked for the pair, never for the terminal alone —
-        // splitting them across batches is a silent protocol violation that
-        // only shows up at a cap boundary.
-        let close_len = record_encoded_len(1).unwrap_or(usize::MAX);
-        let needed = if terminal {
-            record_len.saturating_add(close_len)
-        } else {
-            record_len
-        };
-        let records = if terminal { 2 } else { 1 };
-
-        let mut cap = self.ensure_batch();
-        if BATCH_HEADER_LEN.saturating_add(needed) > cap {
-            // Larger than any eager batch to this peer. Flush first so the
-            // record keeps its place in the peer's send order, then send it
-            // alone and let the messenger stage it through rendezvous.
-            self.flush().await;
-            self.send_singleton(index, bytes, terminal).await;
-            return;
-        }
-        if !self.fits(needed, records) {
-            self.flush().await;
-            cap = self.ensure_batch();
-            if BATCH_HEADER_LEN.saturating_add(needed) > cap {
-                self.send_singleton(index, bytes, terminal).await;
-                return;
-            }
-        }
-
-        let class = if terminal {
-            CreditClass::Terminal
-        } else {
-            CreditClass::Data
-        };
-        let Some(slot) = self.slots.get_mut(index) else {
-            return;
-        };
-        if slot.credit.try_spend(class).is_err() {
-            return;
-        }
-        let id = slot.id;
-        let seq = slot.take_seq();
-        let close_seq = terminal.then(|| slot.take_seq());
-
-        if let Some(encoder) = self.writer.encoder() {
-            if let Err(error) = encoder.push_data(id, seq, &bytes) {
-                tracing::error!(slot = ?id, %error, "messenger mux: dropping unencodable record");
-                return;
-            }
-            if let Some(close_seq) = close_seq {
-                let _ = encoder.push_close_slot(id, close_seq, CloseReason::TerminalSent);
-            }
-        }
-
-        if terminal {
-            self.close_local(index);
-        }
-    }
-
-    /// Send one record alone, over the eager budget and therefore through
-    /// rendezvous, and fence its slot until the admission resolves.
-    async fn send_singleton(&mut self, index: u32, bytes: Vec<u8>, terminal: bool) {
-        let class = if terminal {
-            CreditClass::Terminal
-        } else {
-            CreditClass::Data
-        };
-        let Some(slot) = self.slots.get_mut(index) else {
-            return;
-        };
-        if slot.credit.try_spend(class).is_err() {
-            return;
-        }
-        let id = slot.id;
-        let seq = slot.take_seq();
-        let close_seq = terminal.then(|| slot.take_seq());
-
-        let fire = self.writer.dispatch_singleton(|encoder| {
-            encoder.push_data(id, seq, &bytes)?;
-            match close_seq {
-                Some(close_seq) => {
-                    encoder.push_close_slot(id, close_seq, CloseReason::TerminalSent)
-                }
-                None => Ok(()),
-            }
-        });
-        let Some(fire) = fire else {
-            self.epoch_death();
-            return;
-        };
-
-        if terminal {
-            self.close_local(index);
-        } else if let Some(slot) = self.slots.get_mut(index) {
-            slot.fence();
-        }
-
-        // Deliberately not awaited here: fencing is per slot, so every other
-        // slot on this peer keeps flowing while the staged transfer is in
-        // flight. The resolution comes back as coalesced control.
-        let control = Arc::clone(&self.control);
-        tokio::spawn(async move {
-            control.singleton_resolved(id, fire.await.is_ok());
-        });
-    }
-
-    // -----------------------------------------------------------------------
     // Control path
     // -----------------------------------------------------------------------
 
@@ -701,6 +532,7 @@ impl Batcher {
         self.ensure_batch();
         if let Some(encoder) = self.writer.encoder() {
             let _ = encoder.push_open_slot(id, seq, anchor_id, session_id);
+            self.gate.stage_urgent(1);
         }
         // Eager, in its own flush: `bind()`'s accept timeout measures "time
         // until a batch bearing this OpenSlot arrives", and piggybacking it on
@@ -746,6 +578,10 @@ impl Batcher {
         }
         if let Some(encoder) = self.writer.encoder() {
             let _ = write(encoder);
+            // Likewise, and more sharply: a `CreditUpdate` held back is a peer's
+            // sender starved with nothing left to rescue it, and no application
+            // on this side knows it owes that peer a flush.
+            self.gate.stage_urgent(1);
         }
     }
 
@@ -771,72 +607,6 @@ impl Batcher {
         }
     }
 
-    /// Drain a slot's withheld queue as far as credit and the fence allow.
-    ///
-    /// Loops rather than releasing one record, because a grant may cover several
-    /// and the queue is the only thing holding `frame_seq` order. Re-reads the
-    /// slot each turn: `emit_data` can close it (a terminal) or fence it (an
-    /// oversized singleton).
-    ///
-    /// The terminal reserve does **not** apply here, and that is deliberate: it
-    /// buys a terminal past an *empty* queue, not past records the consumer is
-    /// still owed. A terminal behind starved predecessors therefore waits with
-    /// them, and what ends such a stream is one of the two mechanisms that
-    /// already exist for a consumer that stopped draining — the byte cap, if the
-    /// producer keeps sending, or `reader_pump`'s heartbeat watchdog if it does
-    /// not.
-    async fn release_withheld(&mut self, index: u32) {
-        loop {
-            let next = {
-                let Some(slot) = self.slots.get_mut(index) else {
-                    return;
-                };
-                if slot.is_fenced() {
-                    return;
-                }
-                match slot.withheld.front() {
-                    Some(front) => {
-                        let terminal = is_terminal_sentinel(front);
-                        let class = if terminal {
-                            CreditClass::Terminal
-                        } else {
-                            CreditClass::Data
-                        };
-                        if !slot.credit.can_spend(class) {
-                            return;
-                        }
-                        let popped = slot.withheld.pop();
-                        if popped.is_some()
-                            && let Some(metrics) = &self.metrics
-                        {
-                            metrics.withheld_records_delta(-1);
-                        }
-                        popped.map(|bytes| (bytes, terminal))
-                    }
-                    None => {
-                        slot.note_flowing();
-                        None
-                    }
-                }
-            };
-            match next {
-                Some((bytes, terminal)) => self.emit_data(index, bytes, terminal).await,
-                // The queue is empty. A producer that left while records were
-                // still owed gets its close now.
-                None => {
-                    if self
-                        .slots
-                        .get_mut(index)
-                        .is_some_and(|slot| slot.inlet_closed)
-                    {
-                        self.finish_inlet_close(index).await;
-                    }
-                    return;
-                }
-            }
-        }
-    }
-
     // -----------------------------------------------------------------------
     // Batch assembly — see [`writer`]
     // -----------------------------------------------------------------------
@@ -856,6 +626,7 @@ impl Batcher {
     /// into it, and the mux does not retransmit, so those slots can never make
     /// progress again.
     async fn flush(&mut self) {
+        self.gate.cleared();
         if let Err(writer::FlushFailed(error)) = self.writer.flush().await {
             tracing::warn!(
                 peer = %self.peer,
@@ -902,6 +673,10 @@ impl Batcher {
             }
         }
         self.publish_live_slots();
+        // The staged batch goes with the epoch, so the gate must forget it too.
+        // Otherwise the staged gauge — the one signal a forgotten flush shows up
+        // in — drifts up by a batch per epoch death and cries wolf.
+        self.gate.discarded();
         self.writer
             .reset_epoch(self.epochs.fetch_add(1, Ordering::Relaxed));
     }
@@ -909,6 +684,10 @@ impl Batcher {
     /// Close every slot on the way out, so producers learn immediately.
     fn teardown(&mut self, unregister: bool) {
         self.handle.alive.store(false, Ordering::Release);
+        // Anything still staged dies with the task: the slots it belongs to are
+        // being closed in the next line, so their consumers learn through
+        // `Dropped` rather than through a batch nobody is left to admit.
+        self.gate.discarded();
         let closed = self.slots.close_all();
         self.streams = SelectAll::new();
         if let Some(metrics) = &self.metrics {

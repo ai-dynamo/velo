@@ -16,8 +16,9 @@ whether this helps you and what switching it on looks like. If you are
 implementing or reviewing it, the rest is the protocol specification and the
 argument for why it is correct.
 
-Status: **P0–P3, P7 and P8 implemented; the rest specified.** The mux is
-therefore selectable — opt-in, off by default, negotiated per attach. See
+Status: **P0–P3 and P7–P9 implemented; the rest specified.** The mux is
+therefore selectable — opt-in, off by default, negotiated per attach — and its
+flush policy is configurable. See
 [Implementation status](#implementation-status).
 
 ---
@@ -151,7 +152,7 @@ Four mechanisms. Only the first is a prerequisite for the others.
 2. **Batching** — many records packed into one active message and one `write_all`.
 3. **Flow control** — per-slot credit, so one slow consumer cannot stall the
    peer's shared ordering lane.
-4. **Flush policy** — when to write. Three policies, one mechanism.
+4. **Flush policy** — when to write. Two policies, one mechanism.
 
 Senders are oblivious to all of it. `StreamSender::send` enqueues exactly as it
 does today; only the layer beneath it changes.
@@ -537,66 +538,117 @@ deadline — so `reader_pump` and `DETECTION_MULTIPLIER` are untouched.
 
 ## Flush policy
 
-Senders enqueue; the peer batcher decides when to write.
+Senders enqueue; the peer batcher decides when to write. Two policies, and what
+separates them is only *who* decides.
 
 | Policy | Trigger | Added latency | Default |
 |---|---|---|---|
-| **Opportunistic** | blocking `recv`, then drain what is already queued | **none** | **on** |
-| **Windowed** | wait up to `flush_window` after the first record | ≤ window | off |
-| **Hinted** | an open `StreamBatch` gate defers flushing | ≤ hold time | off |
+| **`Auto { on_admission }`** | end of every wake, having first drained what is already queued | **none** | **on** |
+| **`Auto { max_linger }`** | up to `max_linger` after the batch's first record | ≤ window | off |
+| **`Manual`** | `flush_batch()` | the caller's | off |
 
-Opportunistic batching is the default precisely because it cannot make anything
-worse: the egress task never waits for work that has not arrived. It simply
-notices that more work is *already* queued and takes all of it. Under load,
-batches form; under no load, behaviour is identical to today minus one syscall's
-worth of bookkeeping.
+The two `Auto` conditions are a struct rather than two variants because they
+compose — a batcher may hold both, and holding neither is a legitimate if
+useless setting. `on_admission` is the opportunistic behaviour this document has
+described since P0, named for its mechanism: a flush parks until the transport
+admits it, so "at the end of every wake" is in practice "as soon as the peer took
+the last batch". `max_linger` is the windowed policy, demoted from a policy to a
+condition. `Manual` replaces the hinted one.
 
-These flush reasons override an open hint gate: byte cap, record cap, credit or
-byte-budget starvation, `OpenSlot`, and the hold watchdog. This is what makes
-the hint genuinely advisory — a deployment that ignores hints entirely is a
-supported configuration, and a forgotten `end_batch()` degrades to the
-windowed policy rather than stalling.
+Opportunistic is the default precisely because it cannot make anything worse:
+the egress task never waits for work that has not arrived. It simply notices
+that more work is *already* queued and takes all of it. Under load, batches
+form; under no load, behaviour is identical to today minus one syscall's worth
+of bookkeeping.
 
-### The hint API
+**Two reasons to write override every policy**, and they are why a burst is a
+hint rather than a frame boundary:
+
+- **A batch at a clamp goes.** The byte cap, the record cap and the eager budget
+  each cut a batch where they bind, because holding a full batch buys nothing —
+  there is no room left to batch into.
+- **Records that carry liveness go.** `OpenSlot` keeps its own eager flush, and
+  a `CloseSlot`, a `CreditUpdate` or a terminal moves the batch it was staged
+  into. A `CreditUpdate` held back is a peer's sender starved with nothing left
+  to rescue it, and no application on this side knows it owes that peer
+  anything — so this is correctness, not courtesy.
+
+Credit starvation also cuts a batch, from the other direction: a slot with no
+credit contributes nothing to the batch at all, and its records wait in the
+withheld queue instead.
+
+### The flush API
 
 ```rust
-let batch = node.stream_batch();          // == start_batch()
 for (sender, token) in outputs {
-    sender.send(token).await?;
+    sender.send(token).await?;   // stage
 }
-batch.flush().await?;                     // == end_batch()
-// Drop schedules a flush if flush() was never called.
+velo.flush_batch();              // one write per peer
 ```
 
-The guard is RAII because an early `?`-return must not strand a batch.
-`start_batch()` / `end_batch()` exist as thin wrappers for callers who prefer
-that shape. Nesting is refcounted.
+One method. It is **sync and non-blocking** — it kicks each batcher and returns,
+and it is deliberately not a backpressure point; whether a congested peer slows
+the producer stays the job of per-slot credit and transport admission. It takes
+**no argument**, because a producer holds `StreamSender`s and cannot know which
+batcher each one feeds: the destination is packed into the anchor handle and
+resolved several layers below, so a per-peer flush would be a call whose correct
+use requires knowing something the API deliberately hides. And it is **valid
+under either policy and never an error** — under `Manual` it is the write, under
+`Auto` it forces one ahead of the conditions — so a call site does not have to
+know how the node was configured.
 
-A burst is a hint, not a frame boundary. Size, latency, control and credit limits
-may all cut a wire batch inside one open gate, so a caller may not assume that
-what it bracketed arrives as one `_stream_batch`.
+A burst between two calls is a hint, not a frame boundary. The clamps and the
+liveness records above may each cut a wire batch in between, so a caller may not
+assume that what it bracketed arrives as one `_stream_batch`.
 
-#### Deadlock, and the two rules that prevent it
+#### Why a call and not a guard
 
-The hint gate introduces a genuine deadlock: a producer opens a gate and sends
-`C + 1` frames to one slot. Frames 1..C sit unflushed; frame `C + 1` blocks
-waiting for credit; credit requires a flush; the flush is gated. Two hard rules:
+This document used to specify an RAII gate — `start_batch()` / `end_batch()`
+around a `StreamBatch` guard, refcounted for nesting, flushing on `Drop` so an
+early `?`-return could not strand a batch. The imperative call replaces it, and
+deletes rather than solves most of what that design had to specify:
 
-- **F1.** Before a slot inlet may *block* on credit or byte budget, it must call
-  `egress.request_flush(FlushReason::Starved)`, and the egress task treats
-  `Starved` as gate-overriding. Concretely: `try_acquire()`, then on failure
-  `request_flush(...)`, and only *then* await.
-- **F2.** A gate watchdog (default 5 ms, configurable) force-opens the gate
-  regardless. Belt and braces for a bug in F1.
+- **No open state.** A gate can be held across an `.await`, which is what made
+  the deadlock below a *deadlock* and required two hard rules to prevent. A
+  flush has nothing to hold, nothing to nest, and nothing that can be forgotten
+  except the call itself.
+- **No guard type.** One method against a guard, a pair of wrappers for callers
+  who prefer that shape, and a refcount.
+- **It fits the loop.** A forward pass is imperative — stage sends, flush, next
+  iteration. The guard was ergonomics borrowed from synchronous mutexes for a
+  problem that is neither synchronous nor a mutex.
 
-#### Is the hint API actually needed?
+The deadlock the two rules existed for cannot arise, because there is no gate to
+close: a producer that sends `C + 1` frames to one slot has frames 1..C staged
+and frame `C + 1` in the withheld queue, and the flush that returns credit is
+one it makes itself, at the end of the pass it is already writing.
+
+#### The one failure mode
+
+Under `Manual`, records that end up staged after the last `flush_batch` wait for
+the next one, and **nothing rescues them** — there is no timer behind the policy,
+which is what makes "one write per pass, carrying that pass" a property of the
+code rather than of the scheduler. Usually that means a producer that stopped
+calling it. It also covers a subtler case: a slot starved of credit has its
+records in the withheld queue rather than the batch, so a grant arriving after
+the flush releases them into the *next* pass's batch. That one is bounded by the
+stream's own end, since a terminal and an inlet close are both records that move
+on their own.
+
+The cost is latency rather than memory either way, since staged records are
+bounded by the same clamps as any batch, and `velo_streaming_mux_staged_records`
+is where an operator sees a plateau. A deployment that wants a net should ask
+for one: `Auto { on_admission: false, max_linger: Some(w) }` is the same
+batching with a window behind it.
+
+#### Is an explicit flush actually needed?
 
 The measurement above narrows this considerably, and the answer depends on
 something worth stating precisely.
 
 A forward pass issues its X sends back-to-back with no `.await` between them, so
 under multiplexing they land in one shared egress queue and the opportunistic
-drain should see all of them — capturing most of the win with no hint at all.
+drain should see all of them — capturing most of the win with no flush at all.
 That is the same effect the 952:1 burst row demonstrates, just with the queue
 shared across streams rather than owned by one.
 
@@ -607,11 +659,32 @@ and the ratio collapses back toward 1.0 exactly as the forward-pass row shows.
 An explicit barrier is the only thing that can group sends the runtime has
 already scheduled apart.
 
-So the hint is not the primary mechanism, and it should not be enabled by
-default; but it is the difference between multiplexing working and multiplexing
-doing nothing for a producer whose send loop yields. Measure the ratio under
-mux first — if it is already high, the hint is insurance rather than a
-requirement.
+There is a second reason, which the measurements did not anticipate and which is
+the stronger one for serving. **Opportunistic packing is not deterministic.**
+How many records share a batch depends on how the runtime scheduled the batcher
+against the producer, so the same workload gives a different answer run to run.
+`examples/batched_streaming` measures it at a serving-shaped depth — 96 requests
+against a batch of 32 — and five runs of each policy come out:
+
+```text
+--flush-policy auto     4.88  5.08  5.08  5.14  4.67
+--flush-policy manual   5.38  5.38  5.38  5.38  5.38
+```
+
+`Manual` is the higher of the two here as well as the steady one, which the
+design of this section did not predict: a batcher writing at every wake
+sometimes wakes mid-pass and writes half of one, where a per-pass flush writes
+the pass. The cross-pass surplus opportunistic packing was expected to win by is
+real, but it needs the producer to outrun the batcher — with no gap between
+passes the same example reads 6.61–7.44 for `auto` against 3.47–4.41 for
+`Manual`. That surplus is throughput bought with per-token latency, and for a
+decode engine that is the wrong trade.
+
+Every figure above is reproducible, with its command and its unedited output, in
+[`examples/examples/batched_streaming.evidence.md`](../../../examples/examples/batched_streaming.evidence.md).
+
+So: `Auto` if you want the batcher to do the best it can with whatever it finds,
+`Manual` if you want to know what it will do.
 
 ---
 
@@ -668,18 +741,21 @@ let node = Velo::builder()
         enabled: true,                // default: false
         max_batch_bytes: 60 * 1024,   // further clamped by the eager budget
         initial_credit: 256,          // advertised verbatim; zero is refused
+        flush_policy: FlushPolicy::Manual,   // default: Auto, opportunistic
         ..Default::default()
     })?
     .build()
     .await?;
 ```
 
-> **One knob is still unwritten.** The flush policy is not configurable: the
-> batcher is opportunistic and has no `FlushPolicy` to set, because the windowed
-> and hinted alternatives arrive with P9. `initial_credit` may not be zero —
-> zero is the wire encoding of "not offering the mux", so a node configured that
-> way would advertise a key and then tell every peer to ignore it, and the build
-> refuses it.
+> **`initial_credit` may not be zero** — zero is the wire encoding of "not
+> offering the mux", so a node configured that way would advertise a key and
+> then tell every peer to ignore it, and the build refuses it.
+>
+> **`flush_policy` is the one knob with a call site attached.** `Manual` is only
+> half a configuration: the other half is the producer calling `flush_batch()`,
+> and a node configured this way whose producer does not is a node whose streams
+> stop. Set it where you own the send loop.
 
 Activation is opt-in and stays that way for this work; the mux is not the default
 transport. Defaults are otherwise chosen so `enabled` is the only decision an
@@ -702,6 +778,7 @@ New series, alongside the existing `velo_streaming_*` collectors:
 | `velo_streaming_batch_records_per_flush` | Histogram of records per batch |
 | `velo_streaming_batch_bytes_per_flush` | Histogram of bytes per batch |
 | `velo_streaming_batch_flush_total{reason}` | Mux-era flush reasons: `opportunistic\|window\|hint\|cap\|starved\|watchdog\|terminal`. Distinct from `egress_flushes_total`, which counts per-stream pump flushes and ships today |
+| `velo_streaming_mux_staged_records` | Gauge of records packed into batches the batchers have open but have not written. Transient under `Auto`; under `Manual` a plateau is a producer that stopped calling `flush_batch()`, which is that policy's one failure mode |
 | `velo_streaming_mux_live_slots` | Gauge; must return to zero at teardown |
 | `velo_streaming_mux_reader_stall_total` | **Should always be zero.** Non-zero means the credit invariant is broken |
 | `velo_streaming_mux_generation_mismatch_total` | Stale records dropped by the generation check |
@@ -834,7 +911,7 @@ State up front what would sink this, then check each:
 | **P6** | Eager-size guidance, `Transport::max_message_size` | none | implemented |
 | **P7** | `MessengerMuxTransport` — `_stream_batch`, `PeerBatcher`, slots, credit | yes | implemented |
 | **P8** | Attach-time negotiation, opt-in activation switch | additive | implemented |
-| **P9** | Hint API (`StreamBatch`), windowed policy | none | specified |
+| **P9** | Flush policy — `FlushPolicy`, `Velo::flush_batch()` | none | implemented |
 | **P10** | Heartbeat suppression and phase alignment | none | specified |
 | **P11** | Lift the mux surface into `velo-ext` | none | specified |
 
@@ -887,6 +964,33 @@ bidirectional with no direction bit, and both sides may hold a slot at the same
 dense index, so the **reason carries the direction**: `TerminalSent` and
 `PeerGone` travel owner → receiver, `UnknownSlot` and `ProtocolError` travel
 receiver → owner.
+
+P9 landed with its API replaced and its policy set reshaped. Both are recorded
+above where they belong; what they cost is worth stating in one place.
+
+- **`flush_batch()` replaced `start_batch()` / `end_batch()`.** The argument is
+  in [Why a call and not a guard](#why-a-call-and-not-a-guard); the price is
+  that an explicit per-pass flush caps a batch at that pass's own fan-out, where
+  opportunistic packing can overshoot it by pulling in the next pass's records.
+  Measured, that price is smaller and narrower than expected: it is only paid
+  when the producer outruns the batcher, and at a serving-shaped depth `Manual`
+  is the *faster* of the two as well as the repeatable one. See
+  [Is an explicit flush actually needed?](#is-an-explicit-flush-actually-needed)
+  for the numbers. It is still a real loss of throughput in the flat-out case,
+  taken knowingly: what it buys is that no token lingers into a pass it was not
+  produced in, and that the batch size is a number you can derive from the
+  deployment instead of one you have to measure.
+- **The windowed policy became a condition rather than a variant.** `Auto` holds
+  a set of conditions that compose, so "opportunistic" and "windowed" stopped
+  being alternatives and became `on_admission` and `max_linger`. Nothing about
+  either behaviour changed; there is simply no longer a reason to pick one.
+- **`Manual` has no watchdog.** The specification's F2 — a gate watchdog that
+  force-opens after 5 ms — is gone with the gate. Under `Manual` a forgotten
+  flush is not degraded into the windowed policy; it stalls the records it
+  staged, and the deployment that wants the old behaviour configures the window
+  explicitly. Making the manual policy quietly stop being manual is the worse
+  failure: it would mean the determinism the policy exists for holds only until
+  something is slow.
 
 ### Why the mux surface is not in `velo-ext` yet
 

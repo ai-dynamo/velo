@@ -25,6 +25,13 @@
 //! - **A failed singleton dominates a successful one.** It is epoch death, and
 //!   coalescing it away would leave slots alive with an unclosable `frame_seq`
 //!   gap.
+//! - **A flush kick is a bit.** An application calling `flush_batch` while the
+//!   batcher is parked on admission asks for the same thing however many times
+//!   it asks, so a thousand kicks are one `bool` rather than a thousand queued
+//!   commands. This is why the flush entry point is coalesced control and not a
+//!   message: a queued one would be unbounded exactly when it matters, since a
+//!   producer loop keeps flushing every pass whether or not the last batch has
+//!   been admitted.
 //!
 //! The result is O(live slots) whatever the arrival rate, and the batcher is
 //! woken rather than fed: one [`tokio::sync::Notify`] permit stands in for any
@@ -71,6 +78,8 @@ pub(super) struct PeerControl {
 struct ControlState {
     /// The sweep evicted this batcher from the registry.
     pub(super) retire: bool,
+    /// The application asked for whatever is staged to go now.
+    pub(super) flush: bool,
     mine: HashMap<u32, OwnedControl>,
     peers: HashMap<u32, PeerControl>,
     /// Entries refused because a map was at [`MAX_PENDING_CONTROL`].
@@ -80,7 +89,7 @@ struct ControlState {
 impl ControlState {
     /// Whether the batcher has anything to do.
     fn is_idle(&self) -> bool {
-        !self.retire && self.mine.is_empty() && self.peers.is_empty()
+        !self.retire && !self.flush && self.mine.is_empty() && self.peers.is_empty()
     }
 
     /// The sweep evicted this batcher from the registry.
@@ -88,7 +97,15 @@ impl ControlState {
         self.retire = true;
     }
 
+    /// The application asked for a flush.
+    fn kick_flush(&mut self) {
+        self.flush = true;
+    }
+
     /// Pending entries across both maps, for the bound to be asserted on.
+    ///
+    /// The two flags are deliberately not counted: they are `bool`s, so they
+    /// bound themselves and cannot be what a flood grows.
     #[cfg(test)]
     fn len(&self) -> usize {
         self.mine.len() + self.peers.len()
@@ -98,6 +115,7 @@ impl ControlState {
     fn drain(&mut self) -> DrainedControl {
         DrainedControl {
             retire: std::mem::take(&mut self.retire),
+            flush: std::mem::take(&mut self.flush),
             mine: std::mem::take(&mut self.mine),
             peers: std::mem::take(&mut self.peers),
         }
@@ -134,6 +152,7 @@ impl ControlState {
 /// One drain's worth of control, owned by the batcher task.
 pub(super) struct DrainedControl {
     pub(super) retire: bool,
+    pub(super) flush: bool,
     pub(super) mine: HashMap<u32, OwnedControl>,
     pub(super) peers: HashMap<u32, PeerControl>,
 }
@@ -249,6 +268,15 @@ impl ControlInbox {
         self.mutate(ControlState::retire);
     }
 
+    /// The application asked for whatever is staged to go now.
+    ///
+    /// Sync and non-blocking, because the producer calling it is a serving loop
+    /// with a forward pass to get back to: it sets a bit and leaves. Waiting for
+    /// the write is admission's job, not the caller's.
+    pub(super) fn kick_flush(&self) {
+        self.mutate(ControlState::kick_flush);
+    }
+
     fn mutate(&self, apply: impl FnOnce(&mut ControlState)) {
         let refused = {
             let mut state = self.lock();
@@ -362,6 +390,35 @@ mod tests {
         inbox.grant(slot(0, 0), 41);
         let drained = inbox.take().expect("something pending");
         assert_eq!(drained.mine[&slot(0, 0).raw()].credit, 42);
+    }
+
+    #[test]
+    fn a_thousand_flush_kicks_are_one_bit() {
+        let inbox = ControlInbox::default();
+        for _ in 0..1_000 {
+            inbox.kick_flush();
+        }
+        assert_eq!(
+            inbox.pending_len(),
+            0,
+            "a kick is a flag, so it never grows the slot maps the cap protects"
+        );
+
+        let drained = inbox.take().expect("something pending");
+        assert!(drained.flush, "the drain carries the kick");
+        assert!(
+            inbox.take().is_none(),
+            "and takes it, so one kick is not served twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_flush_kick_wakes_a_parked_batcher() {
+        let inbox = ControlInbox::default();
+        inbox.kick_flush();
+        tokio::time::timeout(std::time::Duration::from_secs(5), inbox.wait())
+            .await
+            .expect("a kick must wake the batcher like any other control");
     }
 
     #[tokio::test]
