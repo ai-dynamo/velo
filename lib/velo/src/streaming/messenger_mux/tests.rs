@@ -146,6 +146,19 @@ async fn eventually(mut predicate: impl FnMut() -> bool) {
 // Identity
 // ---------------------------------------------------------------------------
 
+/// The key is a wire constant, so its *value* is pinned here rather than only
+/// its uses.
+///
+/// Everything else in the tree reads the constant, which is what keeps the
+/// copies from drifting — and is exactly why nothing else would notice it being
+/// renamed. A rename is a silent interop break: negotiation matches on this
+/// string, so a peer built either side of it simply never selects the mux and
+/// falls back to the legacy path, with no error anywhere to say why.
+#[test]
+fn the_negotiated_key_is_the_string_that_shipped() {
+    assert_eq!(MESSENGER_MUX_KEY, "messenger-mux-v1");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_transport_answers_to_the_negotiated_key_and_advertises_no_endpoint() {
     let pair = mux_pair(test_config()).await;

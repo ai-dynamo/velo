@@ -135,7 +135,7 @@ const HOSTS: usize = 3;
 const MUX_KEY: &str = velo::streaming::MESSENGER_MUX_KEY;
 
 /// The streaming transport every node has: one TCP connection per stream.
-const LEGACY_KEY: &str = "tcp-stream";
+const LEGACY_KEY: &str = velo::streaming::tcp_transport::TCP_STREAM_KEY;
 
 /// A bound on the whole run, so a bug reports itself instead of hanging.
 const PATIENCE: Duration = Duration::from_secs(60);

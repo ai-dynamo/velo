@@ -31,9 +31,11 @@ use velo::{Velo, VeloBuilder};
 use velo_ext::WorkerId;
 
 /// The streaming transport a `Velo` node runs when nothing else is configured.
-const LEGACY_KEY: &str = "tcp-stream";
-/// Aliased rather than re-typed: the literal belongs to negotiation, and a
-/// second copy of it here could agree with the first for a whole release.
+///
+/// Both keys are aliased rather than re-typed: the literals belong to the
+/// transports that answer to them, and a second copy here could agree with the
+/// first for a whole release before anyone noticed it had stopped.
+const LEGACY_KEY: &str = velo::streaming::tcp_transport::TCP_STREAM_KEY;
 const MUX_KEY: &str = velo::streaming::MESSENGER_MUX_KEY;
 
 const PATIENCE: Duration = Duration::from_secs(30);
