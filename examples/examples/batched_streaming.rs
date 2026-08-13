@@ -264,12 +264,12 @@ struct EngineStats {
     /// Sum of the batch occupancy at each forward pass, for the mean.
     occupancy: u64,
     hosts_touched: usize,
-    /// Whichever counter measures this run's wire writes.
+    /// Whichever counter measures this run's wire writes. Filled once the
+    /// hosts have every terminal — see the loop that sets it.
     writes: f64,
-    /// Frames those writes carried. Legacy only, and deliberately: the mux's
-    /// equivalent is read once at the end of the run rather than here, because
-    /// `flush_batch()` returns before the batcher has written anything and a
-    /// count taken the moment an engine stops sending can be short by a batch.
+    /// Records those writes carried: frames for the legacy pump, packed
+    /// records under the mux. Filled after the run rather than by the engine,
+    /// for the same reason `writes` is.
     frames: f64,
 }
 
@@ -512,12 +512,6 @@ async fn engine(
     }
 
     stats.hosts_touched = touched.len();
-    if mux {
-        stats.writes = node.mux_batches_sent();
-    } else {
-        stats.writes = node.egress_flushes();
-        stats.frames = node.frames_written();
-    }
     Ok(stats)
 }
 
@@ -671,11 +665,12 @@ async fn main() -> Result<()> {
     drop(engine_txs);
     drop(host_txs);
 
-    let engine_stats = tokio::time::timeout(PATIENCE, futures::future::try_join_all(engine_tasks))
-        .await
-        .map_err(|_| anyhow::anyhow!("the engines did not drain within {PATIENCE:?}"))??
-        .into_iter()
-        .collect::<Result<Vec<_>>>()?;
+    let mut engine_stats =
+        tokio::time::timeout(PATIENCE, futures::future::try_join_all(engine_tasks))
+            .await
+            .map_err(|_| anyhow::anyhow!("the engines did not drain within {PATIENCE:?}"))??
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
     let host_stats = tokio::time::timeout(PATIENCE, futures::future::try_join_all(host_tasks))
         .await
         .map_err(|_| anyhow::anyhow!("the hosts did not see every terminal within {PATIENCE:?}"))??
@@ -696,17 +691,31 @@ async fn main() -> Result<()> {
         );
     }
 
+    // Every wire counter is read here rather than in `engine()`, and that is
+    // the whole of why: an engine finishing is not its writes finishing.
+    // `flush_batch()` hands the write to the batcher's own task and returns,
+    // and the legacy pump drains on a task of its own too, so a count taken
+    // when an engine stops sending can be short by whatever was still in
+    // flight — understating the very ratio this example exists to report. The
+    // await above is the fix: every host has seen every terminal, and both a
+    // batcher and a pump count a write before dispatching it, so nothing that
+    // has arrived is still uncounted.
+    for (stats, node) in engine_stats.iter_mut().zip(engines.iter()) {
+        if mux {
+            stats.writes = node.mux_batches_sent();
+            stats.frames = node.mux_records_sent();
+        } else {
+            stats.writes = node.egress_flushes();
+            stats.frames = node.frames_written();
+        }
+    }
+
     // The engines' own packing, which is only separable because the record
     // histogram carries a direction: an engine also receives batches — that is
     // how credit comes back — and their records would otherwise be summed in
     // here. Every token is a record, plus the heartbeats, slot opens and
     // terminals that no token count sees.
-    //
-    // Read here rather than in `engine()` because `flush_batch()` hands the
-    // write to the batcher's own task and returns. The batcher counts a batch
-    // before it dispatches it, so every terminal the hosts have already seen —
-    // which the await above guarantees — is a batch this sum includes.
-    let packed: f64 = engines.iter().map(|e| e.mux_records_sent()).sum();
+    let packed: f64 = engine_stats.iter().map(|s| s.frames).sum();
     if mux && packed < expected_tokens as f64 {
         bail!(
             "the engines packed {packed:.0} records for {expected_tokens} tokens — \
