@@ -625,15 +625,21 @@ one it makes itself, at the end of the pass it is already writing.
 
 #### The one failure mode
 
-An application under `Manual` that stops calling `flush_batch` leaves its last
-records staged, and **nothing rescues them** — there is no timer behind the
-policy, which is what makes "one write per pass, carrying that pass" a property
-of the code rather than of the scheduler. The cost is bounded to latency rather
-than memory, since staged records are bounded by the same clamps as any batch,
-and `velo_streaming_mux_staged_records` is where an operator sees a producer
-that forgot. A deployment that wants a net instead should ask for one:
-`Auto { on_admission: false, max_linger: Some(w) }` is the same batching with a
-window behind it.
+Under `Manual`, records that end up staged after the last `flush_batch` wait for
+the next one, and **nothing rescues them** — there is no timer behind the policy,
+which is what makes "one write per pass, carrying that pass" a property of the
+code rather than of the scheduler. Usually that means a producer that stopped
+calling it. It also covers a subtler case: a slot starved of credit has its
+records in the withheld queue rather than the batch, so a grant arriving after
+the flush releases them into the *next* pass's batch. That one is bounded by the
+stream's own end, since a terminal and an inlet close are both records that move
+on their own.
+
+The cost is latency rather than memory either way, since staged records are
+bounded by the same clamps as any batch, and `velo_streaming_mux_staged_records`
+is where an operator sees a plateau. A deployment that wants a net should ask
+for one: `Auto { on_admission: false, max_linger: Some(w) }` is the same
+batching with a window behind it.
 
 #### Is an explicit flush actually needed?
 

@@ -44,9 +44,10 @@ fn auto(on_admission: bool, max_linger: Option<Duration>) -> MuxConfig {
 /// Nothing arrived within a window several times the batcher's own latency.
 ///
 /// A negative fact, so it is worth being explicit about what makes it sound:
-/// every caller first waits on `await_staged`, which is a *positive* fact
-/// establishing the batcher has already run and made its decision. Without
-/// that, this would pass against a batcher that had simply not woken yet.
+/// every caller first establishes a *positive* one — `await_staged`, or the
+/// receipt of the eager `OpenSlot` batch — proving the batcher has already run
+/// and made its decision. Without that, this would pass against a batcher that
+/// had simply not woken yet.
 async fn assert_nothing_written(harness: &Harness) {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
