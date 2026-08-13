@@ -346,9 +346,10 @@ impl Batcher {
             self.handle.mark_active();
             self.dispatch(work).await;
 
-            // Opportunistic drain: take everything already queued before
-            // writing. This is what turns a forward pass's X back-to-back sends
-            // into one batch, and it never waits for work that has not arrived.
+            // Take everything already queued before deciding to write. Under
+            // every policy: this is what turns a forward pass's X back-to-back
+            // sends into one batch, and it never waits for work that has not
+            // arrived.
             while !self.stopping && self.drain_once(&opens).await {}
 
             // A kick still pending *here* was set after the application's sends
