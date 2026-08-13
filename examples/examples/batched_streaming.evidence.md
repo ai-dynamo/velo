@@ -282,7 +282,9 @@ Run with --legacy for the same workload at one write per token.
 
 ## Repeat runs
 
-Five runs of each, reporting `tokens per write`. This is where the determinism claim lives: `manual` repeats exactly, `auto` does not.
+Five runs per mux policy — three for the legacy control, whose 0.99–1.00 has no
+variance worth chasing — reporting `tokens per write`. This is where the
+determinism claim lives: `manual` repeats exactly, `auto` does not.
 
 **96 requests, max-batch 32, `--flush-policy auto`**
 

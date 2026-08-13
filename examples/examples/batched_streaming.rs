@@ -73,7 +73,8 @@
 //! with per-token latency, which for a decode engine is the wrong trade.
 //!
 //! Every number above, with its command and its unedited output, is in
-//! `batched_streaming.evidence.md` beside this file.
+//! [`batched_streaming.evidence.md`](batched_streaming.evidence.md) beside
+//! this file.
 //!
 //! Either way the ratio tracks how many of an engine's active requests live on
 //! the same host, so it climbs with the batch as long as there are enough

@@ -61,7 +61,7 @@ impl TestHooks {
         panic!("the batcher never reached the barrier within {PATIENCE:?}");
     }
 
-    /// Called by the run loop, immediately after its first drain pass.
+    /// Called by the run loop on each wake, before its drain loop runs.
     pub(super) async fn barrier(&self) {
         if !self.paused.load(Ordering::Acquire) {
             return;

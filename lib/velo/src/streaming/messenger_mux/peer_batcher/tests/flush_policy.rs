@@ -143,7 +143,8 @@ async fn a_record_queued_between_the_drain_and_the_kick_still_makes_that_batch()
     inlet.send(item(0)).expect("stage record A");
     hooks.wait_until_parked().await;
 
-    // The loop is past its drain. Both of these land before it reads the kick.
+    // The loop is parked before its drain runs. Both of these land before the
+    // drain observes the kick, so the drain loop must carry them both out.
     inlet.send(item(1)).expect("queue record B");
     harness.flush_batch();
     hooks.release();
