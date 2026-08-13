@@ -266,10 +266,10 @@ struct EngineStats {
     hosts_touched: usize,
     /// Whichever counter measures this run's wire writes.
     writes: f64,
-    /// Records those writes carried: frames for the legacy pump, packed mux
-    /// records under the mux. Both are this engine's own output — the mux
-    /// histogram is read at `direction="sent"`, which is the half of it this
-    /// node packed rather than the half its hosts sent back.
+    /// Frames those writes carried. Legacy only, and deliberately: the mux's
+    /// equivalent is read once at the end of the run rather than here, because
+    /// `flush_batch()` returns before the batcher has written anything and a
+    /// count taken the moment an engine stops sending can be short by a batch.
     frames: f64,
 }
 
@@ -514,7 +514,6 @@ async fn engine(
     stats.hosts_touched = touched.len();
     if mux {
         stats.writes = node.mux_batches_sent();
-        stats.frames = node.mux_records_sent();
     } else {
         stats.writes = node.egress_flushes();
         stats.frames = node.frames_written();
@@ -702,7 +701,12 @@ async fn main() -> Result<()> {
     // how credit comes back — and their records would otherwise be summed in
     // here. Every token is a record, plus the heartbeats, slot opens and
     // terminals that no token count sees.
-    let packed: f64 = engine_stats.iter().map(|s| s.frames).sum();
+    //
+    // Read here rather than in `engine()` because `flush_batch()` hands the
+    // write to the batcher's own task and returns. The batcher counts a batch
+    // before it dispatches it, so every terminal the hosts have already seen —
+    // which the await above guarantees — is a batch this sum includes.
+    let packed: f64 = engines.iter().map(|e| e.mux_records_sent()).sum();
     if mux && packed < expected_tokens as f64 {
         bail!(
             "the engines packed {packed:.0} records for {expected_tokens} tokens — \
