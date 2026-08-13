@@ -364,6 +364,38 @@ async fn node(mux_enabled: bool, flush: Flush) -> Result<Arc<Node>> {
     Ok(Arc::new(Node { velo, registry }))
 }
 
+/// Each engine's `(writes, records)` once the counters have stopped moving.
+///
+/// Quiescence rather than an ordering argument: every producer is finished and
+/// every terminal has been received, so a total that is still changing is a
+/// write being counted, and one that has not changed across a poll is a run
+/// whose writes are all in. Bounded, because a hang here should report itself
+/// as a stale number rather than as the example never exiting — and the run's
+/// elapsed time is already stopped, so this cannot inflate it.
+async fn settled_counters(engines: &[Arc<Node>], mux: bool) -> Vec<(f64, f64)> {
+    const POLL: Duration = Duration::from_millis(25);
+    const LIMIT: Duration = Duration::from_secs(5);
+
+    let read = |node: &Arc<Node>| {
+        if mux {
+            (node.mux_batches_sent(), node.mux_records_sent())
+        } else {
+            (node.egress_flushes(), node.frames_written())
+        }
+    };
+
+    let deadline = Instant::now() + LIMIT;
+    let mut previous: Vec<(f64, f64)> = engines.iter().map(read).collect();
+    loop {
+        tokio::time::sleep(POLL).await;
+        let current: Vec<(f64, f64)> = engines.iter().map(read).collect();
+        if current == previous || Instant::now() >= deadline {
+            return current;
+        }
+        previous = current;
+    }
+}
+
 /// How many tokens request `id` will emit.
 ///
 /// Derived from the index so the batch composition — who retires when, and
@@ -691,23 +723,23 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Every wire counter is read here rather than in `engine()`, and that is
-    // the whole of why: an engine finishing is not its writes finishing.
-    // `flush_batch()` hands the write to the batcher's own task and returns,
-    // and the legacy pump drains on a task of its own too, so a count taken
-    // when an engine stops sending can be short by whatever was still in
-    // flight — understating the very ratio this example exists to report. The
-    // await above is the fix: every host has seen every terminal, and both a
-    // batcher and a pump count a write before dispatching it, so nothing that
-    // has arrived is still uncounted.
-    for (stats, node) in engine_stats.iter_mut().zip(engines.iter()) {
-        if mux {
-            stats.writes = node.mux_batches_sent();
-            stats.frames = node.mux_records_sent();
-        } else {
-            stats.writes = node.egress_flushes();
-            stats.frames = node.frames_written();
-        }
+    // Every wire counter is read here rather than in `engine()`, because an
+    // engine finishing is not its writes finishing: `flush_batch()` hands the
+    // write to the batcher's own task and returns, and the legacy pump drains
+    // on a task of its own, so a count taken when an engine stops sending can
+    // be short by whatever was still in flight — understating the very ratio
+    // this example exists to report.
+    //
+    // Having every terminal is not sufficient on its own either, and the two
+    // transports differ on exactly that: the mux counts a batch *before*
+    // dispatching it, but the legacy pump counts a flush *after* its write
+    // returns, so a host can be holding the terminal while the write that
+    // carried it is still being counted. Rather than depend on which side of
+    // its await each transport counts, wait for the totals to stop moving.
+    let counters = settled_counters(&engines, mux).await;
+    for (stats, (writes, frames)) in engine_stats.iter_mut().zip(counters) {
+        stats.writes = writes;
+        stats.frames = frames;
     }
 
     // The engines' own packing, which is only separable because the record
