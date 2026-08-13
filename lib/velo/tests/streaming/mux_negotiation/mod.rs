@@ -31,8 +31,12 @@ use velo::{Velo, VeloBuilder};
 use velo_ext::WorkerId;
 
 /// The streaming transport a `Velo` node runs when nothing else is configured.
-const LEGACY_KEY: &str = "tcp-stream";
-const MUX_KEY: &str = "messenger-mux-v1";
+///
+/// Both keys are aliased rather than re-typed: the literals belong to the
+/// transports that answer to them, and a second copy here could agree with the
+/// first for a whole release before anyone noticed it had stopped.
+const LEGACY_KEY: &str = velo::streaming::tcp_transport::TCP_STREAM_KEY;
+const MUX_KEY: &str = velo::streaming::MESSENGER_MUX_KEY;
 
 const PATIENCE: Duration = Duration::from_secs(30);
 
@@ -114,9 +118,22 @@ impl Node {
             .counter("velo_streaming_mux_batches_total", &[("direction", "sent")])
     }
 
+    /// Records this node's ingress lane decoded out of those batches.
     fn mux_records_received(&self) -> f64 {
-        self.snapshot()
-            .histogram_sum("velo_streaming_mux_records_per_batch", &[])
+        self.mux_records("received")
+    }
+
+    /// Records this node packed into batches of its own. Non-zero on a pure
+    /// consumer too: credit rides back on `_stream_batch`.
+    fn mux_records_sent(&self) -> f64 {
+        self.mux_records("sent")
+    }
+
+    fn mux_records(&self, direction: &str) -> f64 {
+        self.snapshot().histogram_sum(
+            "velo_streaming_mux_records_per_batch",
+            &[("direction", direction)],
+        )
     }
 
     /// The applier never met a full slot buffer. Non-zero is a broken credit
@@ -898,3 +915,5 @@ async fn a_zero_credit_window_is_refused_at_build_time() {
         "unhelpful error: {error}"
     );
 }
+
+mod outcome;

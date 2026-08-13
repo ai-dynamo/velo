@@ -37,6 +37,74 @@ async fn make_nats_transport(
     Ok((transport, streams, instance_id))
 }
 
+/// What one request on a health subject met, which is what `check_health`
+/// reports on: the three states are distinguishable and each maps to one
+/// verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Health {
+    /// A responder replied → `Ok`.
+    Answered,
+    /// No interest at all, so the server bounced the request with
+    /// `NoResponders` → `ConnectionFailed`.
+    Bounced,
+    /// Interest, but no reply within the probe's own deadline → `Timeout`.
+    Absorbed,
+}
+
+/// Ask the subject once, from `client`'s connection.
+///
+/// `PROBE_TIMEOUT` is what separates `Absorbed` from `Answered`; it only has to
+/// exceed a loopback round trip, which it does by two orders of magnitude.
+async fn probe(client: &async_nats::Client, subject: &str) -> Health {
+    const PROBE_TIMEOUT: Duration = Duration::from_millis(100);
+
+    match tokio::time::timeout(
+        PROBE_TIMEOUT,
+        client.request(subject.to_string(), Bytes::new()),
+    )
+    .await
+    {
+        Err(_elapsed) => Health::Absorbed,
+        Ok(Ok(_reply)) => Health::Answered,
+        Ok(Err(_no_responders)) => Health::Bounced,
+    }
+}
+
+/// Block until `subject` is in `want`, or fail saying what it was instead.
+///
+/// The probe runs on the *requester's own connection*, so what it observes is
+/// what `check_health` will observe rather than a proxy for it. That is the
+/// whole point: a subscription's arrival and a shutdown's unsubscribe are both
+/// asynchronous, and a sleep long enough to usually cover them is evidence of
+/// nothing. The bound is wall-clock rather than a number of attempts, because
+/// both transient answers come back immediately and a count of them would
+/// expire in microseconds.
+async fn wait_for(client: &async_nats::Client, subject: &str, want: Health) {
+    const PATIENCE: Duration = Duration::from_secs(5);
+
+    // Both states worth waiting out — a responder still winding down, an
+    // absorber whose SUB has not landed — resolve in milliseconds, and both
+    // report back immediately, so probing without a pause would spend the
+    // whole budget hammering the server rather than waiting for it.
+    const BETWEEN_PROBES: Duration = Duration::from_millis(20);
+
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    let mut last = None;
+    while tokio::time::Instant::now() < deadline {
+        last = Some(probe(client, subject).await);
+        if last == Some(want) {
+            return;
+        }
+        tokio::time::sleep(BETWEEN_PROBES).await;
+    }
+
+    panic!(
+        "{subject} was {last:?} rather than {want:?} for {PATIENCE:?} — \
+         check_health cannot be reaching its verdict for the reason this test \
+         claims"
+    );
+}
+
 /// TEST-04: Healthy peer — check_health returns Ok when peer is alive.
 #[tokio::test]
 async fn test_check_health_healthy_peer() {
@@ -74,8 +142,9 @@ async fn test_check_health_unreachable_peer() {
     let client_a = Arc::new(async_nats::connect(&common::nats_url()).await.unwrap());
     let client_b = Arc::new(async_nats::connect(&common::nats_url()).await.unwrap());
 
-    let (transport_a, _streams_a, _id_a) =
-        make_nats_transport(client_a, &cluster_id).await.unwrap();
+    let (transport_a, _streams_a, _id_a) = make_nats_transport(client_a.clone(), &cluster_id)
+        .await
+        .unwrap();
     let (transport_b, _streams_b, id_b) = make_nats_transport(client_b, &cluster_id).await.unwrap();
 
     // A registers B as a peer
@@ -83,10 +152,17 @@ async fn test_check_health_unreachable_peer() {
     let peer_b = PeerInfo::new(id_b, transport_b.address());
     transport_a.register(peer_b).unwrap();
 
-    // Shutdown B so its health subscriber goes away
+    let inbound_bytes = transport_b.address().get_entry("nats").unwrap().unwrap();
+    let health_subject = format!(
+        "{}.health",
+        String::from_utf8(inbound_bytes.to_vec()).unwrap()
+    );
+
+    // Shutdown B so its health subscriber goes away, and wait for the subject
+    // to actually lose its interest rather than for a duration that usually
+    // covers it — this is the state the assertion below is about.
     transport_b.shutdown();
-    // Wait for NATS to propagate the unsubscribe
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for(&client_a, &health_subject, Health::Bounced).await;
 
     // A checks health of B — NATS returns NoResponders, maps to ConnectionFailed
     let result = transport_a.check_health(id_b, Duration::from_secs(2)).await;
@@ -104,6 +180,12 @@ async fn test_check_health_unreachable_peer() {
 /// The trick: we subscribe to B's health subject with a raw client that receives
 /// the request but never publishes on the reply subject, so the requester's
 /// `client.request()` future never resolves and the tokio timeout fires.
+///
+/// The absorber subscribes *before* B shuts down, which is load-bearing rather
+/// than tidy: the subject must never be left with zero interest, or the server
+/// answers the next request with `NoResponders` and `check_health` reports
+/// `ConnectionFailed` — the verdict of the test one function up, reached for
+/// the wrong reason.
 #[tokio::test]
 async fn test_check_health_timeout() {
     let cluster_id = format!("test-{}", InstanceId::new_v4());
@@ -111,11 +193,10 @@ async fn test_check_health_timeout() {
     let client_a = Arc::new(async_nats::connect(&common::nats_url()).await.unwrap());
     let client_b = Arc::new(async_nats::connect(&common::nats_url()).await.unwrap());
 
-    let (transport_a, _streams_a, _id_a) =
-        make_nats_transport(client_a, &cluster_id).await.unwrap();
-    let (transport_b, _streams_b, id_b) = make_nats_transport(client_b.clone(), &cluster_id)
+    let (transport_a, _streams_a, _id_a) = make_nats_transport(client_a.clone(), &cluster_id)
         .await
         .unwrap();
+    let (transport_b, _streams_b, id_b) = make_nats_transport(client_b, &cluster_id).await.unwrap();
 
     // A registers B as a peer (so A knows B's inbound subject)
     use velo::PeerInfo;
@@ -127,17 +208,15 @@ async fn test_check_health_timeout() {
     let inbound_subject = String::from_utf8(inbound_bytes.to_vec()).unwrap();
     let health_subject = format!("{}.health", inbound_subject);
 
-    // Shutdown B so its real health subscriber is gone
-    transport_b.shutdown();
-    // Wait for unsubscribe to propagate
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Subscribe to B's health subject with a raw absorber that never replies
+    // Absorber first: it holds interest in the subject across B's shutdown, so
+    // there is no window in which the subject is unsubscribed.
     let raw_client = async_nats::connect(&common::nats_url()).await.unwrap();
     let _absorber = raw_client.subscribe(health_subject.clone()).await.unwrap();
-    // Flush to ensure the server has registered the subscription before check_health fires.
-    // Without this, NATS can return NoResponders if the SUB hasn't propagated yet.
     raw_client.flush().await.unwrap();
+
+    // Now B can go: the absorber is what the subject has left.
+    transport_b.shutdown();
+    wait_for(&client_a, &health_subject, Health::Absorbed).await;
 
     // A checks health of B with a short timeout — absorber receives the request but never replies
     let result = transport_a

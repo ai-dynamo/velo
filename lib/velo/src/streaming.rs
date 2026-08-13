@@ -28,8 +28,11 @@ pub mod grpc_transport;
 pub mod handle;
 /// Batched, multiplexed streaming over the Messenger (`messenger-mux-v1`).
 ///
-/// Internal while it is built out: the transport is opt-in and selected at
-/// attach time, so nothing outside this crate names these types.
+/// The transport itself is internal — it is opt-in and selected at attach time,
+/// so nothing outside this crate constructs or names it. What is re-exported
+/// below is only what a caller must be able to say: how to configure it, and
+/// the key it answers to, which is what
+/// [`StreamSender::negotiated_transport`] is compared against.
 pub(crate) mod messenger_mux;
 pub mod mpsc;
 pub(crate) mod negotiation;
@@ -44,7 +47,7 @@ pub use frame::{SendError, StreamError, StreamFrame};
 #[cfg(feature = "grpc")]
 pub use grpc_transport::GrpcFrameTransport;
 pub use handle::{AnchorKind, StreamAnchorHandle};
-pub use messenger_mux::{AutoFlush, FlushPolicy, MuxConfig};
+pub use messenger_mux::{AutoFlush, FlushPolicy, MESSENGER_MUX_KEY, MuxConfig};
 pub use mpsc::{
     MpscAnchorConfig, MpscFrame, MpscStreamAnchor, MpscStreamController, MpscStreamSender, SenderId,
 };

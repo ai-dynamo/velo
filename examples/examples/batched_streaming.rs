@@ -132,10 +132,10 @@ use velo_examples::{TransportType, new_transport};
 const HOSTS: usize = 3;
 
 /// The streaming transport a node advertises only when the mux is switched on.
-const MUX_KEY: &str = "messenger-mux-v1";
+const MUX_KEY: &str = velo::streaming::MESSENGER_MUX_KEY;
 
 /// The streaming transport every node has: one TCP connection per stream.
-const LEGACY_KEY: &str = "tcp-stream";
+const LEGACY_KEY: &str = velo::streaming::tcp_transport::TCP_STREAM_KEY;
 
 /// A bound on the whole run, so a bug reports itself instead of hanging.
 const PATIENCE: Duration = Duration::from_secs(60);
@@ -266,8 +266,10 @@ struct EngineStats {
     hosts_touched: usize,
     /// Whichever counter measures this run's wire writes.
     writes: f64,
-    /// Frames those writes carried. Legacy only — the mux's per-batch record
-    /// histogram is not split by direction, so it cannot be read cleanly here.
+    /// Frames those writes carried. Legacy only, and deliberately: the mux's
+    /// equivalent is read once at the end of the run rather than here, because
+    /// `flush_batch()` returns before the batcher has written anything and a
+    /// count taken the moment an engine stops sending can be short by a batch.
     frames: f64,
 }
 
@@ -280,10 +282,9 @@ struct HostStats {
 
 /// One node, plus the registry its collectors were installed into.
 ///
-/// The registry is here for one reason: **the negotiated transport is not
-/// returned by any API**. `attach_anchor` hands back a `StreamSender` that says
-/// nothing about the wire beneath it, so the only place the outcome surfaces is
-/// a label on the receiving node's attach counter.
+/// Per node rather than per run, because the summary attributes writes to the
+/// engine that made them and attaches to the host that answered them — one
+/// shared registry would sum both away.
 struct Node {
     velo: Arc<Velo>,
     registry: Registry,
@@ -311,6 +312,17 @@ impl Node {
     fn mux_batches_sent(&self) -> f64 {
         self.snapshot()
             .counter("velo_streaming_mux_batches_total", &[("direction", "sent")])
+    }
+
+    /// Records this node packed into those messages. Read at `sent` because
+    /// every mux node is also a receiver — credit rides back on
+    /// `_stream_batch` — and an unlabelled sum would credit an engine with the
+    /// records its hosts packed for it.
+    fn mux_records_sent(&self) -> f64 {
+        self.snapshot().histogram_sum(
+            "velo_streaming_mux_records_per_batch",
+            &[("direction", "sent")],
+        )
     }
 
     /// Batches the legacy per-stream egress pump handed to its socket.
@@ -374,7 +386,6 @@ fn budget(id: u32, longest: u32) -> u32 {
 async fn engine(
     index: usize,
     node: Arc<Node>,
-    hosts: Arc<Vec<Arc<Node>>>,
     rx: flume::Receiver<Request>,
     config: EngineConfig,
 ) -> Result<EngineStats> {
@@ -400,13 +411,12 @@ async fn engine(
         let sender = node.velo.attach_anchor::<Token>(request.handle).await?;
         if !*announced {
             *announced = true;
-            // The negotiated key, read off the host's attach counter because
-            // nothing in the API hands it back.
-            let key = if hosts[request.host].attaches_over(MUX_KEY) > 0.0 {
-                MUX_KEY
-            } else {
-                LEGACY_KEY
-            };
+            // The sender carries the answer, so the engine reads its own
+            // outcome — as a deployed one would, having no access to the
+            // frontend's metrics.
+            let key = sender
+                .negotiated_transport()
+                .map_or("none (same worker)", |key| key.as_str());
             println!("[engine {index}] first attach negotiated {key}");
         }
         touched.insert(request.host);
@@ -633,7 +643,6 @@ async fn main() -> Result<()> {
         engine_tasks.push(tokio::spawn(engine(
             index,
             Arc::clone(e),
-            Arc::clone(&hosts),
             rx,
             EngineConfig {
                 max_batch: args.max_batch,
@@ -684,6 +693,25 @@ async fn main() -> Result<()> {
         bail!(
             "expected all {} attaches to negotiate {expected_key}, but only {negotiated:.0} did",
             args.requests
+        );
+    }
+
+    // The engines' own packing, which is only separable because the record
+    // histogram carries a direction: an engine also receives batches — that is
+    // how credit comes back — and their records would otherwise be summed in
+    // here. Every token is a record, plus the heartbeats, slot opens and
+    // terminals that no token count sees.
+    //
+    // Read here rather than in `engine()` because `flush_batch()` hands the
+    // write to the batcher's own task and returns. The batcher counts a batch
+    // before it dispatches it, so every terminal the hosts have already seen —
+    // which the await above guarantees — is a batch this sum includes.
+    let packed: f64 = engines.iter().map(|e| e.mux_records_sent()).sum();
+    if mux && packed < expected_tokens as f64 {
+        bail!(
+            "the engines packed {packed:.0} records for {expected_tokens} tokens — \
+             velo_streaming_mux_records_per_batch{{direction=\"sent\"}} is not \
+             counting what this engine sent"
         );
     }
 

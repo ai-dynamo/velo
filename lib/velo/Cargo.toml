@@ -156,7 +156,9 @@ required-features = ["test-helpers"]
 
 [[test]]
 name = "streaming_mux_negotiation"
-path = "tests/streaming/mux_negotiation.rs"
+# A directory module: the negotiation suite proper in `mod.rs`, and the
+# outcome-observability tests that share its fixtures beside it.
+path = "tests/streaming/mux_negotiation/mod.rs"
 required-features = ["test-helpers"]
 
 [[test]]
