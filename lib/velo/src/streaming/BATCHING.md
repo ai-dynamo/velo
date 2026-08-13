@@ -778,6 +778,8 @@ New series, alongside the existing `velo_streaming_*` collectors:
 | `velo_streaming_batch_records_per_flush` | Histogram of records per batch |
 | `velo_streaming_batch_bytes_per_flush` | Histogram of bytes per batch |
 | `velo_streaming_batch_flush_total{reason}` | Mux-era flush reasons: `opportunistic\|window\|hint\|cap\|starved\|watchdog\|terminal`. Distinct from `egress_flushes_total`, which counts per-stream pump flushes and ships today |
+| `velo_streaming_mux_batches_total{direction}` | `_stream_batch` active messages packed (`sent`) or decoded (`received`) |
+| `velo_streaming_mux_records_per_batch{direction}` | Histogram of records carried by one of them. Labelled like its sibling and for the same reason: every mux node is both ends at once — credit rides back on `_stream_batch` — so an unlabelled sum would mix a node's own packing with its peers' and be attributable to neither |
 | `velo_streaming_mux_staged_records` | Gauge of records packed into batches the batchers have open but have not written. Transient under `Auto`; under `Manual` a plateau is a producer that stopped calling `flush_batch()`, which is that policy's one failure mode |
 | `velo_streaming_mux_live_slots` | Gauge; must return to zero at teardown |
 | `velo_streaming_mux_reader_stall_total` | **Should always be zero.** Non-zero means the credit invariant is broken |

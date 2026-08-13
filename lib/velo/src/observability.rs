@@ -577,7 +577,7 @@ pub(crate) struct MuxMetricsHandle {
     generation_mismatch_total: Counter,
     records_dropped_total: CounterVec,
     batches_total: CounterVec,
-    records_per_batch: Histogram,
+    records_per_batch: HistogramVec,
     credit_exhausted_total: Counter,
     rendezvous_singletons_total: Counter,
     held_records: Gauge,
@@ -630,11 +630,17 @@ impl MuxMetricsHandle {
     }
 
     /// One batch of `records` crossed the wire in `direction`.
+    ///
+    /// Both series carry the direction, and for the same reason: a node packs
+    /// batches and receives them, so a count of one that summed the other in
+    /// would attribute its peers' packing to itself.
     pub(crate) fn batch(&self, direction: MuxDirection, records: usize) {
         self.batches_total
             .with_label_values(&[direction.as_str()])
             .inc();
-        self.records_per_batch.observe(records as f64);
+        self.records_per_batch
+            .with_label_values(&[direction.as_str()])
+            .observe(records as f64);
     }
 
     /// A slot ran out of data credit and parked.
@@ -727,7 +733,7 @@ pub struct VeloMetrics {
     streaming_mux_generation_mismatch_total: Counter,
     streaming_mux_records_dropped_total: CounterVec,
     streaming_mux_batches_total: CounterVec,
-    streaming_mux_records_per_batch: Histogram,
+    streaming_mux_records_per_batch: HistogramVec,
     streaming_slot_credit_exhausted_total: Counter,
     streaming_mux_rendezvous_singletons_total: Counter,
     streaming_mux_held_records: Gauge,
@@ -1107,14 +1113,18 @@ impl VeloMetrics {
         )?;
         let streaming_mux_records_per_batch = register_collector(
             registry,
-            Histogram::with_opts(
+            HistogramVec::new(
                 HistogramOpts::new(
                     "velo_streaming_mux_records_per_batch",
-                    "Records carried by one _stream_batch. This is the \
-                     multiplexing win expressed directly: 1.0 means the mux is \
-                     paying protocol overhead for nothing.",
+                    "Records carried by one _stream_batch, by direction. This \
+                     is the multiplexing win expressed directly: 1.0 means the \
+                     mux is paying protocol overhead for nothing. Every node \
+                     both sends and receives batches — credit rides back on \
+                     them — so an unlabelled sum here would mix a node's \
+                     packing with its peers'.",
                 )
                 .buckets(exponential_buckets(1.0, 2.0, 12)?),
+                &["direction"],
             )?,
         )?;
         let streaming_slot_credit_exhausted_total = register_collector(

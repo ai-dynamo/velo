@@ -266,8 +266,10 @@ struct EngineStats {
     hosts_touched: usize,
     /// Whichever counter measures this run's wire writes.
     writes: f64,
-    /// Frames those writes carried. Legacy only — the mux's per-batch record
-    /// histogram is not split by direction, so it cannot be read cleanly here.
+    /// Records those writes carried: frames for the legacy pump, packed mux
+    /// records under the mux. Both are this engine's own output — the mux
+    /// histogram is read at `direction="sent"`, which is the half of it this
+    /// node packed rather than the half its hosts sent back.
     frames: f64,
 }
 
@@ -310,6 +312,17 @@ impl Node {
     fn mux_batches_sent(&self) -> f64 {
         self.snapshot()
             .counter("velo_streaming_mux_batches_total", &[("direction", "sent")])
+    }
+
+    /// Records this node packed into those messages. Read at `sent` because
+    /// every mux node is also a receiver — credit rides back on
+    /// `_stream_batch` — and an unlabelled sum would credit an engine with the
+    /// records its hosts packed for it.
+    fn mux_records_sent(&self) -> f64 {
+        self.snapshot().histogram_sum(
+            "velo_streaming_mux_records_per_batch",
+            &[("direction", "sent")],
+        )
     }
 
     /// Batches the legacy per-stream egress pump handed to its socket.
@@ -501,6 +514,7 @@ async fn engine(
     stats.hosts_touched = touched.len();
     if mux {
         stats.writes = node.mux_batches_sent();
+        stats.frames = node.mux_records_sent();
     } else {
         stats.writes = node.egress_flushes();
         stats.frames = node.frames_written();
@@ -680,6 +694,20 @@ async fn main() -> Result<()> {
         bail!(
             "expected all {} attaches to negotiate {expected_key}, but only {negotiated:.0} did",
             args.requests
+        );
+    }
+
+    // The engines' own packing, which is only separable because the record
+    // histogram carries a direction: an engine also receives batches — that is
+    // how credit comes back — and their records would otherwise be summed in
+    // here. Every token is a record, plus the heartbeats, slot opens and
+    // terminals that no token count sees.
+    let packed: f64 = engine_stats.iter().map(|s| s.frames).sum();
+    if mux && packed < expected_tokens as f64 {
+        bail!(
+            "the engines packed {packed:.0} records for {expected_tokens} tokens — \
+             velo_streaming_mux_records_per_batch{{direction=\"sent\"}} is not \
+             counting what this engine sent"
         );
     }
 

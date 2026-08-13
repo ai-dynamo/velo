@@ -116,9 +116,22 @@ impl Node {
             .counter("velo_streaming_mux_batches_total", &[("direction", "sent")])
     }
 
+    /// Records this node's ingress lane decoded out of those batches.
     fn mux_records_received(&self) -> f64 {
-        self.snapshot()
-            .histogram_sum("velo_streaming_mux_records_per_batch", &[])
+        self.mux_records("received")
+    }
+
+    /// Records this node packed into batches of its own. Non-zero on a pure
+    /// consumer too: credit rides back on `_stream_batch`.
+    fn mux_records_sent(&self) -> f64 {
+        self.mux_records("sent")
+    }
+
+    fn mux_records(&self, direction: &str) -> f64 {
+        self.snapshot().histogram_sum(
+            "velo_streaming_mux_records_per_batch",
+            &[("direction", direction)],
+        )
     }
 
     /// The applier never met a full slot buffer. Non-zero is a broken credit
@@ -973,4 +986,43 @@ async fn a_same_worker_attach_negotiates_no_transport() {
         0.0,
         "a local attach never reaches the attach handler that labels that counter"
     );
+}
+
+/// A node's own packing is counted apart from what its peers packed for it.
+///
+/// Every mux node is both ends at once — credit rides back on `_stream_batch`,
+/// so even a pure consumer packs batches — and the per-batch record histogram
+/// used to carry no direction, which made its sum the two mixed together and
+/// attributable to neither. This asserts the split at the only place it is
+/// visible: one registry, both series, each holding its own side of the same
+/// stream.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_counts_the_records_it_packs_apart_from_the_ones_it_receives() {
+    const FRAMES: u32 = 400;
+    let (consumer, producer) = pair(Some(mux_config()), Some(mux_config())).await;
+
+    stream_spsc(&consumer, &producer, FRAMES).await;
+
+    // The consumer received the stream and packed credit for it.
+    assert!(
+        consumer.mux_records_received() >= f64::from(FRAMES),
+        "the consumer received {} records for a {FRAMES}-frame stream",
+        consumer.mux_records_received()
+    );
+    assert!(
+        consumer.mux_records_sent() > 0.0,
+        "the consumer returned credit on {} batches but packed no records \
+         into them",
+        consumer.mux_batches_sent()
+    );
+
+    // The producer is the same node the other way round: it packed the stream
+    // and received the credit.
+    assert!(producer.mux_records_sent() >= f64::from(FRAMES));
+    assert!(producer.mux_records_received() > 0.0);
+
+    // Neither side's two numbers are the same number, which is what an
+    // unlabelled histogram would have reported for both.
+    assert_ne!(consumer.mux_records_sent(), consumer.mux_records_received());
+    assert_ne!(producer.mux_records_sent(), producer.mux_records_received());
 }
