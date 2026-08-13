@@ -82,6 +82,12 @@ async fn probe(client: &async_nats::Client, subject: &str) -> Health {
 async fn wait_for(client: &async_nats::Client, subject: &str, want: Health) {
     const PATIENCE: Duration = Duration::from_secs(5);
 
+    // Both states worth waiting out — a responder still winding down, an
+    // absorber whose SUB has not landed — resolve in milliseconds, and both
+    // report back immediately, so probing without a pause would spend the
+    // whole budget hammering the server rather than waiting for it.
+    const BETWEEN_PROBES: Duration = Duration::from_millis(20);
+
     let deadline = tokio::time::Instant::now() + PATIENCE;
     let mut last = None;
     while tokio::time::Instant::now() < deadline {
@@ -89,6 +95,7 @@ async fn wait_for(client: &async_nats::Client, subject: &str, want: Health) {
         if last == Some(want) {
             return;
         }
+        tokio::time::sleep(BETWEEN_PROBES).await;
     }
 
     panic!(

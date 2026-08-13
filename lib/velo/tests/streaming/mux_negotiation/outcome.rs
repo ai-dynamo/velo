@@ -117,8 +117,9 @@ async fn a_node_counts_the_records_it_packs_apart_from_the_ones_it_receives() {
     assert!(producer.mux_records_sent() >= f64::from(FRAMES));
     assert!(producer.mux_records_received() > 0.0);
 
-    // Neither side's two numbers are the same number, which is what an
-    // unlabelled histogram would have reported for both.
-    assert_ne!(consumer.mux_records_sent(), consumer.mux_records_received());
-    assert_ne!(producer.mux_records_sent(), producer.mux_records_received());
+    // The four assertions above are what an unlabelled histogram fails: a read
+    // for a label the family does not carry matches nothing and returns zero,
+    // so all four lower bounds collapse at once. Asserting the two sums merely
+    // *differ* would add nothing — control traffic can coincide with data
+    // traffic, and a run where it did would fail for no reason.
 }
