@@ -4,8 +4,8 @@
 //! Backend trait definitions for work queue implementations.
 //!
 //! Backend traits operate on raw [`Bytes`] — serialization and deserialization
-//! are handled by the typed [`WorkQueueSender`](crate::WorkQueueSender) and
-//! [`WorkQueueReceiver`](crate::WorkQueueReceiver) wrappers.
+//! are handled by the typed [`WorkQueueSender`](crate::queue::WorkQueueSender) and
+//! [`WorkQueueReceiver`](crate::queue::WorkQueueReceiver) wrappers.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -13,8 +13,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
+use crate::queue::ack::AckHandle;
 use crate::queue::error::{WorkQueueError, WorkQueueRecvError, WorkQueueSendError};
-use crate::queue::options::NextOptions;
+use crate::queue::options::{AckPolicy, NextOptions};
 
 /// Boxed future type alias for sender backend creation.
 pub type SenderFuture<'a> =
@@ -23,6 +24,38 @@ pub type SenderFuture<'a> =
 /// Boxed future type alias for receiver backend creation.
 pub type ReceiverFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Arc<dyn ReceiverBackend>, WorkQueueError>> + Send + 'a>>;
+
+/// A single item delivered from a [`ReceiverBackend`].
+///
+/// `handle` is `Some` when the receiver was created with
+/// [`AckPolicy::Manual`](crate::queue::AckPolicy::Manual) and `None` under
+/// [`AckPolicy::Auto`](crate::queue::AckPolicy::Auto) (the backend acked the item
+/// internally on receipt).
+#[derive(Debug)]
+pub struct DeliveredMessage {
+    /// The serialized payload.
+    pub bytes: Bytes,
+    /// Acknowledgment handle under [`AckPolicy::Manual`]; `None` under `Auto`.
+    pub handle: Option<AckHandle>,
+}
+
+impl DeliveredMessage {
+    /// Construct an auto-acked delivery (no handle attached).
+    pub fn auto(bytes: Bytes) -> Self {
+        Self {
+            bytes,
+            handle: None,
+        }
+    }
+
+    /// Construct a manually-acked delivery with the given handle.
+    pub fn manual(bytes: Bytes, handle: AckHandle) -> Self {
+        Self {
+            bytes,
+            handle: Some(handle),
+        }
+    }
+}
 
 /// A backend that manages named work queues.
 ///
@@ -34,8 +67,9 @@ pub trait WorkQueueBackend: Send + Sync {
     /// Create or connect to a named queue and return a sender handle.
     fn sender(&self, name: &str) -> SenderFuture<'_>;
 
-    /// Create or connect to a named queue and return a receiver handle.
-    fn receiver(&self, name: &str) -> ReceiverFuture<'_>;
+    /// Create or connect to a named queue and return a receiver handle with
+    /// the requested acknowledgment policy.
+    fn receiver(&self, name: &str, policy: AckPolicy) -> ReceiverFuture<'_>;
 }
 
 /// Raw-bytes sender interface for a single named queue.
@@ -58,20 +92,18 @@ pub trait SenderBackend: Send + Sync {
 
 /// Raw-bytes receiver interface for a single named queue.
 ///
-/// Implementations handle fetching serialized bytes from the queue's backing
-/// storage.
-///
-/// # TODO: Acknowledgment Support
-///
-/// Currently items are auto-acknowledged on receipt. A future iteration will add:
-/// - `WorkItem<T>` wrapper with `ack()`, `nack(delay)`, `in_progress()`, `term()` methods
-/// - `AckPolicy` configuration: `None` (auto-ack, current) vs `Manual` (explicit ack)
-/// - Redelivery for nack'd or timed-out items
+/// Returns [`DeliveredMessage`] values. Under
+/// [`AckPolicy::Auto`](crate::queue::AckPolicy::Auto) the backend acks on receipt
+/// and [`DeliveredMessage::handle`] is `None`. Under
+/// [`AckPolicy::Manual`](crate::queue::AckPolicy::Manual) the handle is always
+/// `Some` and the caller is responsible for acking/nacking the item.
 pub trait ReceiverBackend: Send + Sync {
     /// Receive the next item. Returns `Ok(None)` when the queue is closed and drained.
     fn recv(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<Bytes>, WorkQueueRecvError>> + Send + '_>>;
+    ) -> Pin<
+        Box<dyn Future<Output = Result<Option<DeliveredMessage>, WorkQueueRecvError>> + Send + '_>,
+    >;
 
     /// Receive a batch of items according to the given options.
     ///
@@ -81,8 +113,8 @@ pub trait ReceiverBackend: Send + Sync {
     fn recv_batch(
         &self,
         opts: &NextOptions,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Bytes>, WorkQueueRecvError>> + Send + '_>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<DeliveredMessage>, WorkQueueRecvError>> + Send + '_>>;
 
     /// Try to receive without blocking. Returns `Ok(None)` if no items are available.
-    fn try_recv(&self) -> Result<Option<Bytes>, WorkQueueRecvError>;
+    fn try_recv(&self) -> Result<Option<DeliveredMessage>, WorkQueueRecvError>;
 }
