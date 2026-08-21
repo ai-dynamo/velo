@@ -121,8 +121,20 @@ impl TcpFrameTransport {
         interface_filter: InterfaceFilter,
         numa_hint: Option<u32>,
     ) -> Result<Arc<Self>> {
-        let listener = TcpListener::bind(bind_addr).await?;
-        configure_socket_buffers(&listener);
+        // Built by hand instead of TcpListener::bind so the socket buffers are
+        // sized before listen() — accepted sockets inherit them at handshake
+        // time, before the dialing peer's first frame can arrive (see
+        // `configure_socket_buffers`).
+        let socket = match bind_addr {
+            SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4(),
+            SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6(),
+        }?;
+        // tokio's TcpListener::bind sets SO_REUSEADDR on Unix; keep that.
+        socket.set_reuseaddr(true)?;
+        configure_socket_buffers(&socket);
+        socket.bind(bind_addr)?;
+        // 1024 matches tokio's TcpListener::bind backlog.
+        let listener = socket.listen(1024)?;
         let actual_addr = listener.local_addr()?;
         // Encode the listener's interface(s) for advertisement.
         let endpoints = resolve_advertise_endpoints(actual_addr, &interface_filter)?;
@@ -471,8 +483,9 @@ fn configure_socket(stream: &TcpStream) {
 }
 
 /// Size the socket buffers. Only safe where no data can be in flight yet: the
-/// listening socket (accepted sockets inherit the values at handshake time)
-/// and a freshly dialed socket that has not written its handshake.
+/// listening socket *before* `listen()` (accepted sockets inherit the values
+/// when the kernel creates them during the handshake) and a freshly dialed
+/// socket that has not written its handshake.
 fn configure_socket_buffers<'a>(sock: impl Into<socket2::SockRef<'a>>) {
     let sock = sock.into();
     if let Err(e) = sock.set_send_buffer_size(1_048_576) {

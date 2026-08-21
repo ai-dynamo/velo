@@ -147,6 +147,13 @@ impl TcpListener {
     async fn run_server(self) -> Result<()> {
         // Use pre-bound listener if provided, otherwise bind to the address
         let listener = if let Some(std_listener) = self.listener {
+            // Best effort for caller-provided listeners: they are already
+            // live, so connections that completed their handshake before this
+            // point keep kernel-default autotuned buffers (safe). Listeners
+            // the transport builds itself are sized before listen() instead —
+            // see `size_listener_buffers`.
+            size_listener_buffers(&std_listener);
+
             // Set non-blocking for tokio conversion
             std_listener
                 .set_nonblocking(true)
@@ -155,30 +162,22 @@ impl TcpListener {
             TokioTcpListener::from_std(std_listener)
                 .context("Failed to convert std TcpListener to tokio TcpListener")?
         } else {
-            TokioTcpListener::bind(self.bind_addr)
-                .await
-                .context(format!("Failed to bind TCP listener to {}", self.bind_addr))?
+            let socket = match self.bind_addr {
+                SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4(),
+                SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6(),
+            }
+            .context("Failed to create TCP socket")?;
+            socket
+                .set_reuseaddr(true)
+                .context("Failed to set SO_REUSEADDR")?;
+            // Before listen(), so every accepted socket inherits the sizes.
+            size_listener_buffers(&socket);
+            socket
+                .bind(self.bind_addr)
+                .context(format!("Failed to bind TCP listener to {}", self.bind_addr))?;
+            // 1024 matches tokio's TcpListener::bind backlog.
+            socket.listen(1024).context("Failed to listen")?
         };
-
-        // Size the socket buffers on the *listening* socket, never on an
-        // accepted socket. Accepted sockets inherit these values when the
-        // kernel creates them at handshake time — before the peer's first data
-        // byte arrives. Setting SO_RCVBUF on an accepted socket instead races
-        // the peer's initial burst: on Linux the setsockopt locks the buffer
-        // (disabling receive autotuning) and, applied after in-flight data has
-        // already grown the window, permanently collapses the advertised
-        // window to a few KB (observed: 32 KB stuck window, 100% rwnd-limited,
-        // ~100x throughput loss on loopback where rmem_max clamps the 2 MB
-        // request to ~416 KB). A connection accepted before serve() runs (the
-        // pre-bound listener is live from bind time) misses the inheritance
-        // and simply keeps kernel-default autotuned buffers, which is safe.
-        let sock_ref = socket2::SockRef::from(&listener);
-        if let Err(e) = sock_ref.set_recv_buffer_size(2_097_152) {
-            warn!("Failed to set listener recv buffer size: {}", e);
-        }
-        if let Err(e) = sock_ref.set_send_buffer_size(2_097_152) {
-            warn!("Failed to set listener send buffer size: {}", e);
-        }
 
         let local_addr = listener
             .local_addr()
@@ -553,6 +552,33 @@ impl TcpListenerBuilder {
 /// level default.
 pub(super) fn default_shrink_threshold() -> usize {
     parse_shrink_threshold(std::env::var("VELO_TCP_SHRINK_THRESHOLD").ok().as_deref())
+}
+
+/// Size the socket buffers on a *listening* socket, never on an accepted one.
+///
+/// The kernel snapshots the listener's buffer sizes into each child socket
+/// when it creates the child during the TCP handshake, so sizing the listener
+/// before `listen()` guarantees every accepted socket carries the values
+/// before the peer's first data byte can arrive. Setting SO_RCVBUF on an
+/// accepted socket instead races the peer's initial burst: velo connections
+/// are unidirectional and the dialer starts writing the instant `connect()`
+/// returns, while the accept handler runs a task-spawn later. On Linux the
+/// late setsockopt locks the buffer (disabling receive autotuning) and,
+/// applied after in-flight data has already grown the window, permanently
+/// collapses the advertised window to a few KB (observed: 32 KB stuck window,
+/// 100% rwnd-limited, ~100x throughput loss on loopback where rmem_max clamps
+/// the 2 MB request to ~416 KB).
+///
+/// Best effort: failure to size is logged, never fatal — kernel-default
+/// autotuned buffers are safe.
+pub(super) fn size_listener_buffers<'a>(sock: impl Into<socket2::SockRef<'a>>) {
+    let sock = sock.into();
+    if let Err(e) = sock.set_recv_buffer_size(2_097_152) {
+        warn!("Failed to set listener recv buffer size: {}", e);
+    }
+    if let Err(e) = sock.set_send_buffer_size(2_097_152) {
+        warn!("Failed to set listener send buffer size: {}", e);
+    }
 }
 
 impl Default for TcpListenerBuilder {

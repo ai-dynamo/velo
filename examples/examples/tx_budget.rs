@@ -414,6 +414,7 @@ async fn l3_transport(
             let Ok((h, _p)) = streams_c.response_stream.recv_async().await else {
                 break;
             };
+            GOT.fetch_add(1, Ordering::Relaxed);
             let seq = seq_of(&h);
             let ns = t.elapsed_ns(seq);
             if seq >= warmup {
@@ -435,9 +436,15 @@ async fn l3_transport(
                 GOT.load(Ordering::Relaxed),
             );
             if now == last && now.0 > 0 {
+                // The three counters are loaded independently, so a difference
+                // can transiently go negative; saturate rather than underflow.
                 eprintln!(
                     "STALL: sent={} echoed={} got={} (client->server lost {}, server->client lost {})",
-                    now.0, now.1, now.2, now.0 - now.1, now.1 - now.2
+                    now.0,
+                    now.1,
+                    now.2,
+                    now.0.saturating_sub(now.1),
+                    now.1.saturating_sub(now.2)
                 );
                 std::process::exit(9);
             }
@@ -764,6 +771,16 @@ fn main() -> Result<()> {
 }
 
 async fn run(args: Args) -> Result<()> {
+    anyhow::ensure!(
+        args.inflight.iter().all(|&d| d >= 1),
+        "--inflight values must be >= 1 (a depth of 0 would never issue a credit and deadlock)"
+    );
+    anyhow::ensure!(
+        args.min_iters <= args.max_iters,
+        "--min-iters ({}) must not exceed --max-iters ({})",
+        args.min_iters,
+        args.max_iters
+    );
 
     let clk = clock_overhead_ns();
     println!(
@@ -804,7 +821,10 @@ async fn run(args: Args) -> Result<()> {
                     }
                 };
                 let n = out.rtt.len();
-                let mbps = (n as f64 * flen as f64 * 2.0) / out.wall.as_secs_f64() / 1e6;
+                // `wall` covers warmup + measured iterations, so scale by the
+                // same population to keep the ratio consistent.
+                let mbps =
+                    (cell.total() as f64 * flen as f64 * 2.0) / out.wall.as_secs_f64() / 1e6;
                 println!(
                     "{:<5} {:>9} {:>4} {:>7} {:>9} {:>9} {:>10} {:>10} {:>9.1}",
                     rung,
