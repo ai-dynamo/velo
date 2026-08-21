@@ -597,6 +597,9 @@ async fn connection_writer_inner(
         warn!("Failed to set keepalive: {}", e);
     }
 
+    // Safe to size buffers here: this side dialed the connection and has not
+    // written a byte yet, so unlike the accept path there is no in-flight data
+    // to race (see the listener for why that race collapses the window).
     if let Err(e) = sock.set_send_buffer_size(2_097_152) {
         warn!("Failed to set send buffer size: {}", e);
     }

@@ -160,6 +160,26 @@ impl TcpListener {
                 .context(format!("Failed to bind TCP listener to {}", self.bind_addr))?
         };
 
+        // Size the socket buffers on the *listening* socket, never on an
+        // accepted socket. Accepted sockets inherit these values when the
+        // kernel creates them at handshake time — before the peer's first data
+        // byte arrives. Setting SO_RCVBUF on an accepted socket instead races
+        // the peer's initial burst: on Linux the setsockopt locks the buffer
+        // (disabling receive autotuning) and, applied after in-flight data has
+        // already grown the window, permanently collapses the advertised
+        // window to a few KB (observed: 32 KB stuck window, 100% rwnd-limited,
+        // ~100x throughput loss on loopback where rmem_max clamps the 2 MB
+        // request to ~416 KB). A connection accepted before serve() runs (the
+        // pre-bound listener is live from bind time) misses the inheritance
+        // and simply keeps kernel-default autotuned buffers, which is safe.
+        let sock_ref = socket2::SockRef::from(&listener);
+        if let Err(e) = sock_ref.set_recv_buffer_size(2_097_152) {
+            warn!("Failed to set listener recv buffer size: {}", e);
+        }
+        if let Err(e) = sock_ref.set_send_buffer_size(2_097_152) {
+            warn!("Failed to set listener send buffer size: {}", e);
+        }
+
         let local_addr = listener
             .local_addr()
             .context("Failed to get local address")?;
@@ -239,15 +259,6 @@ impl TcpListener {
         let sock_ref = socket2::SockRef::from(&stream);
         if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
             warn!("Failed to set TCP keepalive on {}: {}", peer_addr, e);
-        }
-
-        // Set large buffers for high throughput (2MB each)
-        if let Err(e) = sock_ref.set_recv_buffer_size(2_097_152) {
-            warn!("Failed to set receive buffer size on {}: {}", peer_addr, e);
-        }
-
-        if let Err(e) = sock_ref.set_send_buffer_size(2_097_152) {
-            warn!("Failed to set send buffer size on {}: {}", peer_addr, e);
         }
 
         // Create framed stream with zero-copy codec
