@@ -657,9 +657,8 @@ mod tests {
 
             let send_result = match message_type {
                 MessageType::Message => adapter.message_stream.send((header, payload)),
-                MessageType::Response | MessageType::ShuttingDown => {
-                    adapter.response_stream.send((header, payload))
-                }
+                MessageType::Response => adapter.response_stream.send((header, payload)),
+                MessageType::ShuttingDown => adapter.shutdown_stream.send((header, payload)),
                 MessageType::Ack | MessageType::Event => {
                     adapter.event_stream.send((header, payload))
                 }

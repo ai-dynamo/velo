@@ -378,7 +378,7 @@ async fn test_double_bind_returns_err() {
 }
 
 #[tokio::test]
-async fn test_begin_drain_activates_draining_flag() {
+async fn test_begin_drain_hook_does_not_flip_shared_state() {
     use crate::transports::transport::make_channels;
 
     let dir = std::env::temp_dir().join(format!("uds-test-{}", crate::InstanceId::new_v4()));
@@ -401,11 +401,17 @@ async fn test_begin_drain_activates_draining_flag() {
         "should not be draining before begin_drain()"
     );
 
+    // The hook is a notification, not the mechanism: the runtime flips the
+    // shared state (VeloBackend::begin_drain), and the listener gates on it.
     transport.begin_drain();
-
+    assert!(
+        !transport.shutdown_state.get().unwrap().is_draining(),
+        "begin_drain hook must not flip the shared state"
+    );
+    _streams.shutdown_state.begin_drain();
     assert!(
         transport.shutdown_state.get().unwrap().is_draining(),
-        "should be draining after begin_drain()"
+        "transport observes the runtime's flip through the shared state"
     );
 
     // Cleanup

@@ -122,7 +122,7 @@ impl VeloStreaming for VeloStreamingService {
                     MessageType::Message => &adapter.message_stream,
                     MessageType::Response => &adapter.response_stream,
                     MessageType::Ack | MessageType::Event => &adapter.event_stream,
-                    MessageType::ShuttingDown => &adapter.response_stream,
+                    MessageType::ShuttingDown => &adapter.shutdown_stream,
                 };
 
                 if let Some(metrics) = metrics.as_ref() {

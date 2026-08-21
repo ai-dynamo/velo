@@ -381,8 +381,11 @@ unsafe extern "C" fn recv_trampoline(
                             let _ = adapter.message_stream.send((header, payload));
                         }
                     }
-                    Some(MessageType::Response) | Some(MessageType::ShuttingDown) => {
+                    Some(MessageType::Response) => {
                         let _ = adapter.response_stream.send((header, payload));
+                    }
+                    Some(MessageType::ShuttingDown) => {
+                        let _ = adapter.shutdown_stream.send((header, payload));
                     }
                     Some(MessageType::Ack) | Some(MessageType::Event) => {
                         let _ = adapter.event_stream.send((header, payload));

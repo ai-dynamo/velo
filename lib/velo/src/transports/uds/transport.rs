@@ -472,9 +472,9 @@ impl Transport for UdsTransport {
     }
 
     fn begin_drain(&self) {
-        if let Some(state) = self.shutdown_state.get() {
-            state.begin_drain();
-        }
+        // Per-frame gate reads the shared ShutdownState, which the runtime
+        // flips — flipping it here would drain every sibling transport of the
+        // instance. No-op, matching TCP.
     }
 
     fn shutdown(&self) {

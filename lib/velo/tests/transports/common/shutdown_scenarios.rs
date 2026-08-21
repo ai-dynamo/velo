@@ -221,7 +221,7 @@ where
 /// The listener replies to a Message received during drain by writing a
 /// ShuttingDown frame back on the same socket the Message arrived on — the
 /// socket the sender's connection writer dialed. The sender must read that
-/// socket and route the frame to its own response_stream, or it never learns
+/// socket and route the frame to its own shutdown_stream, or it never learns
 /// the message was rejected.
 pub async fn drain_rejection_reaches_sender<C: ShutdownTestClient>()
 where
@@ -243,10 +243,10 @@ where
     );
 
     // B's listener echoes the header back in a ShuttingDown frame; A must
-    // surface it as a correlation entry on its response stream.
+    // surface it as a correlation entry on its shutdown stream.
     let (header, payload) = timeout(
         Duration::from_secs(2),
-        handle_a.streams.response_stream.recv_async(),
+        handle_a.streams.shutdown_stream.recv_async(),
     )
     .await
     .expect("sender never saw the ShuttingDown rejection")

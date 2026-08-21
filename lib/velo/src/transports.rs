@@ -17,8 +17,8 @@
 //! records any alternatives. Outbound messages are routed through the primary
 //! transport by default, or through an explicit alternative.
 //!
-//! Inbound messages arrive via [`DataStreams`] — three independent channels
-//! for messages, responses, and events.
+//! Inbound messages arrive via [`DataStreams`] — four independent channels
+//! for messages, responses, events, and drain rejections (`ShuttingDown`).
 //!
 //! # Shutdown
 //!

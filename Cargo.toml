@@ -16,7 +16,7 @@ exclude = ["examples"]
 resolver = "3"
 
 [workspace.package]
-version = "0.8.1"
+version = "0.9.0"
 edition = "2024"
 description = "Velo Active Messenging Library"
 authors = ["NVIDIA Inc. <sw-dl-dynamo@nvidia.com>"]
@@ -30,7 +30,7 @@ keywords = ["nvidia", "distributed"]
 # external implementors compile against. A non-`=` requirement would let a
 # future "compatible" patch silently re-resolve downstream lockfiles, which
 # is exactly the bug that motivated the velo / velo-ext split.
-velo-ext = { path = "lib/velo-ext", version = "=0.3.0" }
+velo-ext = { path = "lib/velo-ext", version = "=0.4.0" }
 
 # External dependencies.
 #

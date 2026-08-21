@@ -14,9 +14,9 @@
 //!
 //! [`run_dialed_reader`] is the missing read half: it decodes frames off a
 //! dialed socket and routes them through the same [`route_frame`] path the
-//! listeners use, so a drain rejection lands on the sender's response stream
-//! like any other correlated reply. It changes nothing on the wire — it only
-//! reads bytes the peer was already sending.
+//! listeners use, so a drain rejection lands on the sender's shutdown stream
+//! where the messenger correlates it. It changes nothing on the wire — it
+//! only reads bytes the peer was already sending.
 
 use std::sync::Arc;
 
@@ -55,10 +55,11 @@ pub(crate) async fn route_frame(
         MessageType::Response => &adapter.response_stream,
         MessageType::Ack | MessageType::Event => &adapter.event_stream,
         MessageType::ShuttingDown => {
-            // ShuttingDown is an outbound-only frame type; receiving it here
-            // means a remote peer rejected our request. Route to the response
-            // stream so higher layers can handle the rejection via correlation.
-            &adapter.response_stream
+            // A remote peer rejected our request during its drain. The frame
+            // carries our request header echoed back, so higher layers can
+            // correlate it; it gets its own lane because that header is
+            // request-format, not response-format.
+            &adapter.shutdown_stream
         }
     };
 

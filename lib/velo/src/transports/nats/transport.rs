@@ -361,10 +361,10 @@ impl Transport for NatsTransport {
     }
 
     fn begin_drain(&self) {
-        if let Some(state) = self.shutdown_state.get() {
-            state.begin_drain();
-        }
-        // No-op if shutdown_state not yet initialized (transport not started)
+        // Per-frame gate reads the shared ShutdownState, which the runtime
+        // flips — flipping it here would drain every sibling transport of the
+        // instance. No-op, matching TCP; the
+        // gate itself lives in run_receive_loop.
     }
 
     fn shutdown(&self) {
@@ -741,10 +741,9 @@ fn route_frame(
 
     let result = match msg_type {
         MessageType::Message => adapter.message_stream.try_send((header, body)),
-        MessageType::Response | MessageType::ShuttingDown => {
-            adapter.response_stream.try_send((header, body))
-        }
+        MessageType::Response => adapter.response_stream.try_send((header, body)),
         MessageType::Ack | MessageType::Event => adapter.event_stream.try_send((header, body)),
+        MessageType::ShuttingDown => adapter.shutdown_stream.try_send((header, body)),
     };
 
     if result.is_err()

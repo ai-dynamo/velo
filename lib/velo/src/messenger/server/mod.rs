@@ -48,7 +48,7 @@ impl ActiveMessageServer {
         >,
     ) -> Self {
         let shutdown_state = data_streams.shutdown_state.clone();
-        let (message_rx, response_rx, event_rx) = data_streams.into_parts();
+        let (message_rx, response_rx, event_rx, shutdown_rx) = data_streams.into_parts();
 
         // Create dispatcher hub (shareable)
         let hub = Arc::new(DispatcherHub::new(backend.clone()));
@@ -70,6 +70,10 @@ impl ActiveMessageServer {
             response_manager.clone(),
             event_handler,
             event_rx,
+        ));
+        tracker.spawn(create_shutdown_handler(
+            response_manager.clone(),
+            shutdown_rx,
         ));
         Self {
             _tracker: tracker,
@@ -243,25 +247,12 @@ async fn create_message_handler(
 }
 
 /// Creates a task that handles responses from the response channel.
-///
-/// The channel carries two header formats. Genuine responses use the response
-/// wire format and complete their awaiter with the decoded outcome. A
-/// transport-level drain rejection (`MessageType::ShuttingDown`) instead
-/// echoes the *request* header back with an empty payload — the transport
-/// funnels it onto this channel for correlation. So a response-format decode
-/// failure is retried as a request-format header, and on a hit the awaiter is
-/// failed immediately instead of hanging until its own timeout. A genuine
-/// response can never take the fallback (it always decodes as
-/// response-format), and a garbage id recovered from anything else misses the
-/// arena — `complete_outcome` is defensive against stale/mismatched slots.
 async fn create_response_handler(
     response_manager: ResponseManager,
     response_rx: flume::Receiver<(Bytes, Bytes)>,
 ) -> anyhow::Result<()> {
     while let Ok((header, payload)) = response_rx.recv_async().await {
-        // The clone is a refcount bump; the original is needed for the
-        // drain-rejection fallback below when this decode fails.
-        match decode_response_header(header.clone()) {
+        match decode_response_header(header) {
             Ok((response_id, outcome, _headers)) => match outcome {
                 Outcome::Ok => {
                     response_manager.complete_outcome(response_id, Ok(Some(payload)));
@@ -273,19 +264,44 @@ async fn create_response_handler(
                 }
             },
             Err(e) => {
-                if let Some(response_id) = decode_response_id_from_request_header(&header) {
-                    tracing::debug!(
-                        target: "crate::messenger::server",
-                        response_id = %response_id,
-                        "Completing awaiter for drain-rejected request"
-                    );
-                    response_manager.complete_outcome(
-                        response_id,
-                        Err("request rejected: peer is shutting down".to_string()),
-                    );
-                } else {
-                    tracing::error!(target: "crate::messenger::server", "Failed to decode response header: {}", e);
-                }
+                tracing::error!(target: "crate::messenger::server", "Failed to decode response header: {}", e);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Creates a task that handles drain rejections from the shutdown channel.
+///
+/// A peer that rejects a request during its drain echoes the *request*
+/// header back in a `ShuttingDown` frame; the transport delivers it on
+/// `DataStreams::shutdown_stream`. The awaiter keyed by that header's
+/// response id is failed immediately instead of hanging until its own
+/// timeout. Fire-and-forget ids have no awaiter and miss the arena, which
+/// `complete_outcome` tolerates.
+async fn create_shutdown_handler(
+    response_manager: ResponseManager,
+    shutdown_rx: flume::Receiver<(Bytes, Bytes)>,
+) -> anyhow::Result<()> {
+    while let Ok((header, _payload)) = shutdown_rx.recv_async().await {
+        match decode_response_id_from_request_header(&header) {
+            Some(response_id) => {
+                tracing::debug!(
+                    target: "crate::messenger::server",
+                    response_id = %response_id,
+                    "Completing awaiter for drain-rejected request"
+                );
+                response_manager.complete_outcome(
+                    response_id,
+                    Err("request rejected: peer is shutting down".to_string()),
+                );
+            }
+            None => {
+                tracing::warn!(
+                    target: "crate::messenger::server",
+                    header_len = header.len(),
+                    "ShuttingDown frame did not carry a request-format header"
+                );
             }
         }
     }
@@ -403,17 +419,17 @@ mod tests {
         Ok(())
     }
 
-    /// A transport-level drain rejection arrives on the response channel as
-    /// the echoed *request* header with an empty payload. The response handler
+    /// A transport-level drain rejection arrives on the shutdown channel as
+    /// the echoed *request* header with an empty payload. The shutdown handler
     /// must recover the response id from the request format and fail the
-    /// awaiter immediately instead of dropping the frame as undecodable.
+    /// awaiter immediately.
     #[tokio::test]
     async fn drain_rejection_echo_completes_awaiter() -> anyhow::Result<()> {
         use crate::messenger::common::messages::{ActiveMessage, MessageMetadata};
 
         let response_manager = ResponseManager::new(7);
         let (tx, rx) = flume::bounded(1);
-        let handler = tokio::spawn(create_response_handler(response_manager.clone(), rx));
+        let handler = tokio::spawn(create_shutdown_handler(response_manager.clone(), rx));
 
         let mut awaiter = response_manager.register_outcome()?;
         let response_id = awaiter.response_id();

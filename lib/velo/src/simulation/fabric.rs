@@ -257,8 +257,11 @@ impl SimFabric {
             MessageType::Message => adapter
                 .message_stream
                 .send((transfer.header, transfer.payload)),
-            MessageType::Response | MessageType::ShuttingDown => adapter
+            MessageType::Response => adapter
                 .response_stream
+                .send((transfer.header, transfer.payload)),
+            MessageType::ShuttingDown => adapter
+                .shutdown_stream
                 .send((transfer.header, transfer.payload)),
             MessageType::Ack | MessageType::Event => adapter
                 .event_stream
@@ -299,7 +302,7 @@ impl SimFabric {
         };
 
         if let Err(e) = source_adapter
-            .response_stream
+            .shutdown_stream
             .send((transfer.header, Bytes::new()))
         {
             tracing::warn!(
@@ -517,7 +520,7 @@ mod tests {
         sim.run().unwrap();
 
         assert!(target_streams.message_stream.try_recv().is_err());
-        let (header, payload) = source_streams.response_stream.try_recv().unwrap();
+        let (header, payload) = source_streams.shutdown_stream.try_recv().unwrap();
         assert_eq!(&header[..], b"hdr");
         assert!(payload.is_empty());
     }

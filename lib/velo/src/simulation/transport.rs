@@ -156,9 +156,9 @@ impl Transport for SimTransport {
     }
 
     fn begin_drain(&self) {
-        if let Some(state) = self.shutdown_state.get() {
-            state.begin_drain();
-        }
+        // Per-frame gate reads the shared ShutdownState, which the runtime
+        // flips — flipping it here would drain every sibling transport of the
+        // instance. No-op, matching the real transports.
     }
 
     fn check_health(
@@ -212,7 +212,7 @@ mod tests {
     }
 
     #[test]
-    fn begin_drain_sets_shared_shutdown_state() {
+    fn begin_drain_hook_does_not_flip_shared_shutdown_state() {
         let mut sim = SimulationRuntime::new().unwrap();
         let handle = sim.handle();
         let fabric = Arc::new(SimFabric::new(handle, BisectionBandwidth::default()));
@@ -229,7 +229,11 @@ mod tests {
         })
         .unwrap();
 
+        // The hook is a notification, not the mechanism: flipping the shared
+        // state is the runtime's job (VeloBackend::begin_drain).
         transport.begin_drain();
+        assert!(!streams.shutdown_state.is_draining());
+        streams.shutdown_state.begin_drain();
         assert!(streams.shutdown_state.is_draining());
     }
 
