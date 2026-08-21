@@ -9,6 +9,12 @@ Two crates only:
 - **`lib/velo`** — the runtime. All concrete transport / discovery / streaming / messenger / queue / rendezvous / observability code lives here as modules (`velo::transports::tcp`, `velo::discovery::etcd`, `velo::streaming`, etc.). This is what application authors depend on.
 - **`lib/velo-ext`** — the extension trait surface. Out-of-tree implementors of `Transport`, `FrameTransport`, `PeerDiscovery`, `ServiceDiscovery`, or `TransportObservability` depend only on this crate. It must remain small, free of heavy deps (especially `prometheus`), and stable.
 
+One documented exception: **`crates/ucx-rs`** — Rust bindings + a vendored static
+build of UCX, backing the `ucx` transport feature. It is a leaf FFI crate that
+exports no types shared with `velo`/`velo-ext` (so it cannot reproduce the
+dual-copy semver bug class below), versions independently, and must be published
+to crates.io before a `velo` release that enables the `ucx` feature can ship.
+
 Anything else under `lib/` or as a workspace member is a mistake — there used to be 9 sibling crates (`velo-messenger`, `velo-transports`, `velo-streaming`, …). They were collapsed into `lib/velo/src/` because independent versioning between them silently shipped broken releases. Do not reintroduce them.
 
 ## Build & Test
@@ -68,6 +74,7 @@ The acceptance test for the boundary: `cargo tree -p velo-ext | grep -c promethe
 
 - **Always use `--all-features`** for clippy, tests, and coverage. Without it, feature-gated code (zmq, grpc, nats-transport, nats-discovery, nats-queue, etcd, simulation) is silently skipped.
 - **`cmake` is required** on CI runners — `zeromq-src` (bundled with the `zmq` crate) compiles libzmq from source and needs cmake.
+- **rdma-core headers are required** for `--all-features`: the `ucx` feature builds the vendored UCX with InfiniBand support and hard-fails without `libibverbs-dev librdmacm-dev` (headers only — no RDMA hardware needed; the UCX tests run over `UCX_TLS=tcp`). UCX's own configure only *warns* and silently ships a TCP-only build, which is why `ucx-rs` refuses instead.
 - **`mold` linker** is used on CI for test/coverage compilation — linking all features (including the bundled libzmq C library) can OOM the default `ld` linker on GitHub runners. Set via `RUSTFLAGS="-C linker=clang -C link-arg=-fuse-ld=mold"`.
 - **`rustup component add rustfmt clippy`** — the toolchain pinned in `rust-toolchain.toml` does not ship these by default on CI runners.
 - **`cargo-machete`** may false-positive on feature-gated deps. Use `[package.metadata.cargo-machete] ignored` in `lib/velo/Cargo.toml` when a dep is only used behind a feature gate (e.g., `prost` for the `grpc` feature).
@@ -78,7 +85,7 @@ The acceptance test for the boundary: `cargo tree -p velo-ext | grep -c promethe
 
 `velo`'s top-level features (after the workspace collapse):
 
-- Messenger transports: `http`, `nats-transport`, `grpc`, `zmq`
+- Messenger transports: `http`, `nats-transport`, `grpc`, `zmq`, `ucx` (Linux only; UCX Active Messages over RDMA/tcp/shm via the in-workspace `ucx-rs` crate)
 - Discovery backends: `nats-discovery`, `etcd` (filesystem is unconditional)
 - Queue backends: `nats-queue`, `queue-messenger`
 - Optional subsystems: `distributed-tracing`, `simulation`, `test-helpers`

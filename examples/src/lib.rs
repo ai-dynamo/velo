@@ -30,6 +30,10 @@ pub enum TransportType {
     /// gRPC transport.
     #[cfg(feature = "grpc")]
     Grpc,
+    /// UCX transport (RDMA when hardware + rdma-core are present; tcp/shm
+    /// lanes otherwise). Linux only.
+    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    Ucx,
 }
 
 /// Build a transport on loopback for an example.
@@ -61,6 +65,10 @@ pub async fn new_transport(ty: TransportType, tag: &str) -> Result<Arc<dyn Trans
             velo::transports::zmq::ZmqTransportBuilder::new()
                 .bind_endpoint("tcp://127.0.0.1:0")
                 .build()?,
+        )),
+        #[cfg(all(target_os = "linux", feature = "ucx"))]
+        TransportType::Ucx => Ok(Arc::new(
+            velo::transports::ucx::UcxTransportBuilder::new().build()?,
         )),
         TransportType::Nats => {
             let client = velo::transports::nats::utils::connect("nats://127.0.0.1:4222")

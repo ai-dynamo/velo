@@ -5,6 +5,12 @@
 members = [
     "lib/velo",
     "lib/velo-ext",
+    # ucx-rs is the documented exception to the "only velo and velo-ext are
+    # publishable" rule: it is a leaf FFI/vendoring crate (bindings + a
+    # vendored C build of UCX) that exports NO types shared with velo or
+    # velo-ext, so it cannot reproduce the dual-copy semver bug class that
+    # rule exists to prevent. It versions independently of the workspace.
+    "crates/ucx-rs",
 ]
 exclude = ["examples"]
 resolver = "3"

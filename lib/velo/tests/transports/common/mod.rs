@@ -27,6 +27,12 @@ use velo::transports::{
 };
 use velo_ext::{InstanceId, PeerInfo};
 
+#[cfg(all(target_os = "linux", feature = "ucx"))]
+use velo::transports::ucx::{UcxTransport, UcxTransportBuilder};
+
+/// UCX context/worker creation is a few ms; a stall here is a bug, not load.
+#[cfg(all(target_os = "linux", feature = "ucx"))]
+const UCX_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(unix)]
 use velo::transports::uds::{UdsTransport, UdsTransportBuilder};
 
@@ -291,17 +297,20 @@ impl TestTransportHandle<UdsTransport> {
     }
 }
 
-// // UCX-specific convenience constructors
-// #[cfg(feature = "ucx")]
-// impl TestTransportHandle<UcxTransport> {
-//     /// Create a new UCX transport
-//     ///
-//     /// This is a convenience method for creating UCX transports.
-//     /// For other transport types, use `with_factory()`.
-//     pub async fn new_ucx() -> anyhow::Result<Self> {
-//         Self::with_factory(|| UcxTransportBuilder::new().build()).await
-//     }
-// }
+// UCX-specific convenience constructors
+#[cfg(all(target_os = "linux", feature = "ucx"))]
+impl TestTransportHandle<UcxTransport> {
+    /// Create a new UCX transport pinned to the tcp lane (deterministic on
+    /// hardware-less runners; PEER error mode excludes the shm lanes anyway).
+    pub async fn new_ucx() -> anyhow::Result<Self> {
+        tokio::time::timeout(
+            UCX_STARTUP_TIMEOUT,
+            Self::with_factory(|| UcxTransportBuilder::new().tls("tcp").build()),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("ucx transport startup timed out"))?
+    }
+}
 
 // // HTTP-specific convenience constructors
 // #[cfg(feature = "http")]
@@ -450,6 +459,20 @@ impl TestCluster<UdsTransport> {
             UdsTransportBuilder::new().socket_path(&socket_path).build()
         })
         .await
+    }
+}
+
+// UCX-specific convenience constructor
+#[cfg(all(target_os = "linux", feature = "ucx"))]
+impl TestCluster<UcxTransport> {
+    /// Create a new UCX test cluster (tcp lane; see `new_ucx`).
+    pub async fn new_ucx(size: usize) -> anyhow::Result<Self> {
+        tokio::time::timeout(
+            UCX_STARTUP_TIMEOUT,
+            Self::with_factory(size, || UcxTransportBuilder::new().tls("tcp").build()),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("ucx cluster startup timed out"))?
     }
 }
 
@@ -867,22 +890,22 @@ impl TransportFactory for UdsFactory {
     }
 }
 
-// /// UCX transport factory
-// #[cfg(feature = "ucx")]
-// pub struct UcxFactory;
+/// UCX transport factory
+#[cfg(all(target_os = "linux", feature = "ucx"))]
+pub struct UcxFactory;
 
-// #[cfg(feature = "ucx")]
-// impl TransportFactory for UcxFactory {
-//     type Transport = UcxTransport;
+#[cfg(all(target_os = "linux", feature = "ucx"))]
+impl TransportFactory for UcxFactory {
+    type Transport = UcxTransport;
 
-//     async fn create() -> anyhow::Result<TestTransportHandle<Self::Transport>> {
-//         TestTransportHandle::new_ucx().await
-//     }
+    async fn create() -> anyhow::Result<TestTransportHandle<Self::Transport>> {
+        TestTransportHandle::new_ucx().await
+    }
 
-//     async fn create_cluster(size: usize) -> anyhow::Result<TestCluster<Self::Transport>> {
-//         TestCluster::new_ucx(size).await
-//     }
-// }
+    async fn create_cluster(size: usize) -> anyhow::Result<TestCluster<Self::Transport>> {
+        TestCluster::new_ucx(size).await
+    }
+}
 
 // /// HTTP transport factory
 // #[cfg(feature = "http")]

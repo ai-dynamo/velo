@@ -40,8 +40,8 @@ pub mod utils;
 #[cfg(unix)]
 pub mod uds;
 
-// #[cfg(feature = "ucx")]
-// pub mod ucx;
+#[cfg(all(target_os = "linux", feature = "ucx"))]
+pub mod ucx;
 
 // #[cfg(feature = "http")]
 // pub mod http;
