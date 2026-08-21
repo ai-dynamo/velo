@@ -284,10 +284,24 @@ pub trait Transport: Send + Sync {
     /// no-op.
     fn set_observability(&self, _observability: std::sync::Arc<dyn TransportObservability>) {}
 
-    /// Begin draining: reject new inbound requests while allowing responses.
+    /// Notification hook for Phase 1 (Gate) of graceful shutdown.
     ///
-    /// Default implementation is a no-op. Transports that need per-frame
-    /// gating (e.g., unsubscribing from NATS subjects) should override this.
+    /// The runtime calls this *after* flipping the shared [`ShutdownState`]'s
+    /// drain flag — the flag the runtime handed this transport inside the
+    /// [`TransportAdapter`] at [`start`](Transport::start). Flipping that flag
+    /// is the runtime's job, not this method's: per-frame gating is
+    /// implemented by reading [`ShutdownState::is_draining`] on the inbound
+    /// path and rejecting new request frames with a
+    /// [`MessageType::ShuttingDown`] correlation reply.
+    ///
+    /// Override only for drain work the shared flag cannot express — e.g.,
+    /// unsubscribing from broker subjects so new requests stop arriving at
+    /// all, or pausing an accept loop. The default no-op is correct for
+    /// transports whose listeners gate per-frame off the shared flag.
+    ///
+    /// Must be idempotent. Do not flip the shared `ShutdownState` here: it is
+    /// instance-wide, shared by every transport of the instance, so flipping
+    /// it from one transport would silently drain them all.
     fn begin_drain(&self) {}
 
     /// Check if a registered peer is reachable and healthy.
@@ -360,10 +374,18 @@ impl MessageType {
 pub struct TransportAdapter {
     /// Channel for inbound [`MessageType::Message`] frames.
     pub message_stream: flume::Sender<(Bytes, Bytes)>,
-    /// Channel for inbound [`MessageType::Response`] and [`MessageType::ShuttingDown`] frames.
+    /// Channel for inbound [`MessageType::Response`] frames.
     pub response_stream: flume::Sender<(Bytes, Bytes)>,
     /// Channel for inbound [`MessageType::Ack`] and [`MessageType::Event`] frames.
     pub event_stream: flume::Sender<(Bytes, Bytes)>,
+    /// Channel for inbound [`MessageType::ShuttingDown`] frames — drain
+    /// rejections from a peer.
+    ///
+    /// Each carries the rejected *request's* header, echoed back verbatim so
+    /// the sender can correlate it, and an empty payload. The header is in
+    /// the request format, not the response format — which is why these
+    /// frames have their own lane instead of sharing `response_stream`.
+    pub shutdown_stream: flume::Sender<(Bytes, Bytes)>,
     /// Shared shutdown coordinator for drain-aware routing.
     pub shutdown_state: ShutdownState,
 }
@@ -375,10 +397,13 @@ pub struct TransportAdapter {
 pub struct DataStreams {
     /// Receiver for inbound message frames.
     pub message_stream: flume::Receiver<(Bytes, Bytes)>,
-    /// Receiver for inbound response and shutting-down frames.
+    /// Receiver for inbound response frames.
     pub response_stream: flume::Receiver<(Bytes, Bytes)>,
     /// Receiver for inbound ack and event frames.
     pub event_stream: flume::Receiver<(Bytes, Bytes)>,
+    /// Receiver for inbound shutting-down frames (drain rejections): the
+    /// rejected request's header, echoed verbatim, with an empty payload.
+    pub shutdown_stream: flume::Receiver<(Bytes, Bytes)>,
     /// Shared shutdown coordinator.
     pub shutdown_state: ShutdownState,
 }
@@ -387,12 +412,19 @@ type DataStreamTuple = (
     flume::Receiver<(Bytes, Bytes)>,
     flume::Receiver<(Bytes, Bytes)>,
     flume::Receiver<(Bytes, Bytes)>,
+    flume::Receiver<(Bytes, Bytes)>,
 );
 
 impl DataStreams {
-    /// Destructure into the three raw receivers `(message, response, event)`.
+    /// Destructure into the four raw receivers
+    /// `(message, response, event, shutdown)`.
     pub fn into_parts(self) -> DataStreamTuple {
-        (self.message_stream, self.response_stream, self.event_stream)
+        (
+            self.message_stream,
+            self.response_stream,
+            self.event_stream,
+            self.shutdown_stream,
+        )
     }
 
     /// Receive a message with an in-flight guard for drain tracking.
@@ -416,17 +448,20 @@ pub fn make_channels() -> (TransportAdapter, DataStreams) {
     let (message_tx, message_rx) = flume::unbounded();
     let (response_tx, response_rx) = flume::unbounded();
     let (event_tx, event_rx) = flume::unbounded();
+    let (shutdown_tx, shutdown_rx) = flume::unbounded();
     (
         TransportAdapter {
             message_stream: message_tx,
             response_stream: response_tx,
             event_stream: event_tx,
+            shutdown_stream: shutdown_tx,
             shutdown_state: shutdown_state.clone(),
         },
         DataStreams {
             message_stream: message_rx,
             response_stream: response_rx,
             event_stream: event_rx,
+            shutdown_stream: shutdown_rx,
             shutdown_state,
         },
     )

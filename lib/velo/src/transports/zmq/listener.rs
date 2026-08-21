@@ -207,7 +207,7 @@ pub(crate) fn run_listener(cfg: ListenerConfig) {
                 MessageType::Message => &cfg.adapter.message_stream,
                 MessageType::Response => &cfg.adapter.response_stream,
                 MessageType::Ack | MessageType::Event => &cfg.adapter.event_stream,
-                MessageType::ShuttingDown => &cfg.adapter.response_stream,
+                MessageType::ShuttingDown => &cfg.adapter.shutdown_stream,
             };
 
             if let Err(e) = sender.try_send((header, payload)) {

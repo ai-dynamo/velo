@@ -324,7 +324,11 @@ async fn pump_frames(
                     }
                 }
 
-                maybe_shrink_read_buffer(&mut framed, DEFAULT_SHRINK_THRESHOLD, frame_size);
+                maybe_shrink_read_buffer(
+                    framed.read_buffer_mut(),
+                    DEFAULT_SHRINK_THRESHOLD,
+                    frame_size,
+                );
             }
             Err(e) => {
                 tracing::warn!("TCP streaming read error: {}", e);

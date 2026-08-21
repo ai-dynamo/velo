@@ -98,7 +98,7 @@ The acceptance test for the boundary: `cargo tree -p velo-ext | grep -c promethe
 All transports implement the `Transport` trait (`lib/velo-ext/src/transport.rs`, re-exported as `velo::Transport`). Key patterns:
 
 - **Fire-and-forget sends** with `TransportErrorHandler` callbacks for failures
-- **Three inbound streams**: message, response, event — routed via `TransportAdapter` flume channels
+- **Four inbound streams**: message, response, event, shutdown — routed via `TransportAdapter` flume channels. `ShuttingDown` drain rejections carry the rejected *request's* header (request format, not response format), which is why they have their own lane
 - **3-phase graceful shutdown**: Gate (drain flag) → Drain (wait for in-flight) → Teardown (cancel tokens)
 - **`ShutdownState`** is shared between transport and adapter — use `is_draining()` for per-frame gating in listeners
 - **`WorkerAddress`** uses MessagePack-encoded maps of `TransportKey` → endpoint bytes

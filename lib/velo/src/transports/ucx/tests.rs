@@ -275,7 +275,7 @@ async fn draining_receiver_echoes_shutting_down() {
         "draining receiver must not deliver new messages"
     );
     // ...and the sender sees ShuttingDown with the echoed header.
-    let (h, _) = recv(&a.streams.response_stream, T)
+    let (h, _) = recv(&a.streams.shutdown_stream, T)
         .await
         .expect("ShuttingDown echo");
     assert_eq!(&h[..], b"corr-id");

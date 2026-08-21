@@ -579,9 +579,8 @@ async fn connection_writer_inner(
                             TcpFrameCodec::parse_message_type_from_preamble(&framed_data.preamble)
                         {
                             let sender = match msg_type {
-                                MessageType::ShuttingDown | MessageType::Response => {
-                                    &adapter.response_stream
-                                }
+                                MessageType::Response => &adapter.response_stream,
+                                MessageType::ShuttingDown => &adapter.shutdown_stream,
                                 MessageType::Ack | MessageType::Event => &adapter.event_stream,
                                 MessageType::Message => &adapter.message_stream,
                             };

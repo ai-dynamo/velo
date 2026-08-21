@@ -518,6 +518,33 @@ impl Messenger {
         &self.tracker
     }
 
+    /// Begin Phase 1 (Gate) of graceful shutdown: reject new inbound requests
+    /// while responses, acks, and events keep flowing.
+    ///
+    /// Transport listeners answer each rejected request with a ShuttingDown
+    /// correlation reply, so remote senders fail fast ("peer is shutting
+    /// down") instead of hanging until their response timeout. In-flight
+    /// handler invocations continue to completion; use
+    /// [`graceful_shutdown`](Self::graceful_shutdown) to also wait for them
+    /// and tear down. Idempotent.
+    pub fn begin_drain(&self) {
+        self.backend.begin_drain();
+    }
+
+    /// Perform a graceful 3-phase shutdown of this instance's messenger
+    /// transports.
+    ///
+    /// 1. **Gate** — new inbound requests are rejected (see
+    ///    [`begin_drain`](Self::begin_drain)).
+    /// 2. **Drain** — wait, per `policy`, for in-flight handler invocations
+    ///    to complete. Their responses still flow out through the gate.
+    /// 3. **Teardown** — cancel listeners, connections, and transports.
+    ///
+    /// After this returns the instance can no longer send or receive.
+    pub async fn graceful_shutdown(&self, policy: crate::transports::ShutdownPolicy) {
+        self.backend.graceful_shutdown(policy).await;
+    }
+
     /// Internal: create an unchecked message builder (for system messages)
     pub(crate) fn message_builder_unchecked(&self, handler: &str) -> MessageBuilder {
         MessageBuilder::new_unchecked(self.client.clone(), handler)
@@ -630,9 +657,8 @@ mod tests {
 
             let send_result = match message_type {
                 MessageType::Message => adapter.message_stream.send((header, payload)),
-                MessageType::Response | MessageType::ShuttingDown => {
-                    adapter.response_stream.send((header, payload))
-                }
+                MessageType::Response => adapter.response_stream.send((header, payload)),
+                MessageType::ShuttingDown => adapter.shutdown_stream.send((header, payload)),
                 MessageType::Ack | MessageType::Event => {
                     adapter.event_stream.send((header, payload))
                 }
