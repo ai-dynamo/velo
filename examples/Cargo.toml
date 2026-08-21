@@ -34,12 +34,16 @@ hdrhistogram = { version = "7", default-features = false }
 prometheus = "0.14"
 crc32fast = "1"
 humantime = "2"
+socket2 = "0.6"
 
 [[example]]
 name = "ping_pong"
 
 [[example]]
 name = "throughput"
+
+[[example]]
+name = "tx_budget"
 
 [[example]]
 name = "mpsc_fanin"
@@ -51,3 +55,5 @@ name = "batched_streaming"
 name = "soak"
 path = "examples/soak/main.rs"
 required-features = ["grpc"]
+
+[workspace]

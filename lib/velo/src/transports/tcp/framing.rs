@@ -36,6 +36,35 @@ pub(crate) const MIN_HEADER_SIZE: usize = 2 + 1 + 4 + 4; // 11 bytes
 /// frame into a shared batch, for the same reason.
 pub(crate) const COALESCE_THRESHOLD: usize = 64 * 1024;
 
+/// Cap on the stack buffer that stages preamble + header ahead of an
+/// above-threshold payload, so the direct path issues two writes instead of
+/// three. Sized for the headers that actually cross this path — control
+/// metadata of a few tens of bytes — with room to spare; a header that does
+/// not fit falls back to the three-segment write, where its own size
+/// amortizes the extra syscall.
+pub(crate) const DIRECT_PREFIX_CAP: usize = 256;
+
+/// Stage `preamble` and `header` contiguously into `prefix`, returning the
+/// staged length, or `None` when they do not fit [`DIRECT_PREFIX_CAP`].
+///
+/// On a `TCP_NODELAY` socket the alternative — writing the 11-byte preamble
+/// and the header as separate `write_all`s — costs two syscalls and can put
+/// two undersized segments on the wire before the payload.
+#[inline]
+pub(crate) fn stage_direct_prefix(
+    preamble: &[u8; MIN_HEADER_SIZE],
+    header: &[u8],
+    prefix: &mut [u8; DIRECT_PREFIX_CAP],
+) -> Option<usize> {
+    let len = MIN_HEADER_SIZE + header.len();
+    if len > DIRECT_PREFIX_CAP {
+        return None;
+    }
+    prefix[..MIN_HEADER_SIZE].copy_from_slice(preamble);
+    prefix[MIN_HEADER_SIZE..len].copy_from_slice(header);
+    Some(len)
+}
+
 /// Fallback shrink threshold (8 MB) when neither the builder nor an env var
 /// supplies one. Shared across the TCP / UDS / streaming TCP code paths that
 /// all decode through this codec via `tokio_util::codec::Framed`.
@@ -199,8 +228,10 @@ impl TcpFrameCodec {
     /// Small frames (header + payload <= COALESCE_THRESHOLD) are packed into a
     /// single buffer and written with one `write_all` — 3× fewer syscalls per
     /// frame on the hot path for typical control/event traffic. Above the
-    /// threshold the three-segment path avoids the extra memcpy for large
-    /// payloads. `write_all` is used in both cases because TCP
+    /// threshold the payload is never copied: preamble + header are staged
+    /// into one stack buffer and written ahead of it (two writes), falling
+    /// back to three segments only for a header too large for
+    /// [`DIRECT_PREFIX_CAP`]. `write_all` is used throughout because TCP
     /// `write_vectored()` is allowed to short-write past ~128KB.
     #[inline]
     pub async fn encode_frame<W: AsyncWrite + Unpin>(
@@ -217,9 +248,18 @@ impl TcpFrameCodec {
             buf.extend_from_slice(payload);
             writer.write_all(&buf).await?;
         } else {
-            writer.write_all(&preamble).await?;
-            writer.write_all(header).await?;
-            writer.write_all(payload).await?;
+            let mut prefix = [0u8; DIRECT_PREFIX_CAP];
+            match stage_direct_prefix(&preamble, header, &mut prefix) {
+                Some(len) => {
+                    writer.write_all(&prefix[..len]).await?;
+                    writer.write_all(payload).await?;
+                }
+                None => {
+                    writer.write_all(&preamble).await?;
+                    writer.write_all(header).await?;
+                    writer.write_all(payload).await?;
+                }
+            }
         }
         Ok(())
     }
@@ -263,9 +303,18 @@ impl TcpFrameCodec {
             buf.extend_from_slice(payload);
             writer.write_all(&buf)?;
         } else {
-            writer.write_all(&preamble)?;
-            writer.write_all(header)?;
-            writer.write_all(payload)?;
+            let mut prefix = [0u8; DIRECT_PREFIX_CAP];
+            match stage_direct_prefix(&preamble, header, &mut prefix) {
+                Some(len) => {
+                    writer.write_all(&prefix[..len])?;
+                    writer.write_all(payload)?;
+                }
+                None => {
+                    writer.write_all(&preamble)?;
+                    writer.write_all(header)?;
+                    writer.write_all(payload)?;
+                }
+            }
         }
         Ok(())
     }
@@ -367,8 +416,15 @@ impl Decoder for TcpFrameCodec {
                 } => {
                     let total_data_len = (header_len + payload_len) as usize;
 
-                    // Wait for full data
+                    // Wait for full data. Reserve the whole remainder up
+                    // front: `Framed` itself only ever grows the buffer by
+                    // doubling from 8 KB, which for a large frame means a
+                    // realloc + memcpy of everything received so far at every
+                    // step. One reservation sized from the preamble replaces
+                    // that with a single realloc (and lets each read pull as
+                    // much as the kernel has buffered).
                     if src.len() < total_data_len {
+                        src.reserve(total_data_len - src.len());
                         return Ok(None);
                     }
 
@@ -937,5 +993,86 @@ mod tests {
             assert_eq!(&decoded_header[..], header.as_slice());
             assert_eq!(&decoded_payload[..], payload.as_slice());
         }
+    }
+
+    /// Counts `write` calls so tests can pin how many segments the encoder
+    /// hands the socket.
+    #[derive(Default)]
+    struct CountingWriter {
+        data: Vec<u8>,
+        writes: usize,
+    }
+
+    impl Write for CountingWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            self.data.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Above the threshold with a typical small header, the encoder stages
+    /// preamble + header into one buffer: two writes, byte-identical output.
+    #[test]
+    fn test_direct_path_stages_prefix_into_two_writes() {
+        let header = vec![0x11u8; 64];
+        let payload = vec![0xABu8; COALESCE_THRESHOLD + 1];
+
+        let mut w = CountingWriter::default();
+        TcpFrameCodec::encode_frame_sync(&mut w, MessageType::Message, &header, &payload).unwrap();
+        assert_eq!(w.writes, 2, "staged prefix + payload");
+
+        let reference =
+            create_unsafe_frame(SCHEMA_VERSION_V1, MessageType::Message, &header, &payload);
+        assert_eq!(w.data, reference.to_vec(), "wire bytes must be unchanged");
+    }
+
+    /// A header too large for the stack prefix falls back to three segments —
+    /// same bytes on the wire.
+    #[test]
+    fn test_direct_path_oversized_header_falls_back() {
+        let header = vec![0x22u8; DIRECT_PREFIX_CAP - MIN_HEADER_SIZE + 1];
+        let payload = vec![0xABu8; COALESCE_THRESHOLD + 1];
+
+        let mut w = CountingWriter::default();
+        TcpFrameCodec::encode_frame_sync(&mut w, MessageType::Message, &header, &payload).unwrap();
+        assert_eq!(
+            w.writes, 3,
+            "preamble, header, payload each their own write"
+        );
+
+        let reference =
+            create_unsafe_frame(SCHEMA_VERSION_V1, MessageType::Message, &header, &payload);
+        assert_eq!(w.data, reference.to_vec(), "wire bytes must be unchanged");
+    }
+
+    /// Once the preamble announces a frame, the decoder reserves the whole
+    /// remainder so `Framed`'s read loop does not grow the buffer by
+    /// doubling (a realloc + memcpy of everything received so far, at every
+    /// step, for a large frame).
+    #[test]
+    fn test_decode_reserves_capacity_for_announced_frame() {
+        let mut codec = TcpFrameCodec::new();
+        let header_len = 64u32;
+        let payload_len = 4 * 1024 * 1024u32;
+
+        let mut buf = BytesMut::with_capacity(8 * 1024);
+        buf.extend_from_slice(&SCHEMA_VERSION_V1.to_be_bytes());
+        buf.extend_from_slice(&[MessageType::Message.as_u8()]);
+        buf.extend_from_slice(&header_len.to_be_bytes());
+        buf.extend_from_slice(&payload_len.to_be_bytes());
+        buf.extend_from_slice(&[0u8; 1000]); // partial data
+
+        assert!(codec.decode(&mut buf).unwrap().is_none());
+        let total = (header_len + payload_len) as usize;
+        assert!(
+            buf.capacity() >= total,
+            "decoder must reserve for the announced frame: capacity={} < {}",
+            buf.capacity(),
+            total
+        );
     }
 }

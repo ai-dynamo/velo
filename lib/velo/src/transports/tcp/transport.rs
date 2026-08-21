@@ -597,6 +597,9 @@ async fn connection_writer_inner(
         warn!("Failed to set keepalive: {}", e);
     }
 
+    // Safe to size buffers here: this side dialed the connection and has not
+    // written a byte yet, so unlike the accept path there is no in-flight data
+    // to race (see the listener for why that race collapses the window).
     if let Err(e) = sock.set_send_buffer_size(2_097_152) {
         warn!("Failed to set send buffer size: {}", e);
     }
@@ -800,14 +803,38 @@ impl TcpTransportBuilder {
 
         // If we have a listener, use its address; otherwise pre-bind to resolve port 0.
         let (bind_addr, listener) = if let Some(listener) = self.listener {
+            // Caller-provided listener: it is already live, so this is best
+            // effort — connections whose handshake completed before this point
+            // keep kernel-default autotuned buffers, which is safe.
+            super::listener::size_listener_buffers(&listener);
             let addr = listener.local_addr()?;
             (addr, Some(listener))
         } else {
             let requested = self
                 .bind_addr
                 .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
-            let std_listener = std::net::TcpListener::bind(requested)
+            // Built by hand instead of std::net::TcpListener::bind so the
+            // socket buffers are sized before listen() — accepted sockets
+            // inherit them at handshake time (see `size_listener_buffers`).
+            let domain = if requested.is_ipv4() {
+                socket2::Domain::IPV4
+            } else {
+                socket2::Domain::IPV6
+            };
+            let socket =
+                socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
+                    .context("Failed to create TCP listener socket")?;
+            // std::net::TcpListener::bind sets SO_REUSEADDR on Unix; keep that.
+            socket
+                .set_reuse_address(true)
+                .context("Failed to set SO_REUSEADDR")?;
+            super::listener::size_listener_buffers(&socket);
+            socket
+                .bind(&requested.into())
                 .context("Failed to pre-bind TCP listener")?;
+            // 128 matches std::net::TcpListener::bind's backlog.
+            socket.listen(128).context("Failed to listen")?;
+            let std_listener: std::net::TcpListener = socket.into();
             let actual = std_listener.local_addr()?;
             (actual, Some(std_listener))
         };
