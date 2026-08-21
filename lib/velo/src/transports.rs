@@ -32,6 +32,10 @@ pub(crate) mod address;
 /// Write coalescing shared by the TCP, UDS, and streaming writer loops.
 pub(crate) mod coalesce;
 
+/// Inbound frame routing shared by the TCP/UDS listeners and the read half of
+/// their dialed connections.
+pub(crate) mod ingress;
+
 pub mod tcp;
 
 /// Shared utility functions for transport implementations.
@@ -525,6 +529,21 @@ impl VeloBackend {
         &self.shutdown_state
     }
 
+    /// Begin Phase 1 (Gate) of graceful shutdown: flip the shared drain flag
+    /// and notify each transport via `begin_drain()`.
+    ///
+    /// Listeners then reject new `Message` frames with ShuttingDown
+    /// correlation replies while responses, acks, and events keep flowing.
+    /// Idempotent. Phases 2–3 are [`graceful_shutdown`](Self::graceful_shutdown)'s
+    /// job; calling this alone leaves the instance serving in-flight work
+    /// indefinitely.
+    pub fn begin_drain(&self) {
+        self.shutdown_state.begin_drain();
+        for transport in self.transports.values() {
+            transport.begin_drain();
+        }
+    }
+
     /// Perform a graceful 3-phase shutdown.
     ///
     /// 1. **Gate**: Flip the draining flag and notify each transport via `begin_drain()`.
@@ -532,10 +551,7 @@ impl VeloBackend {
     /// 3. **Teardown**: Cancel the teardown token and call `shutdown()` on each transport.
     pub async fn graceful_shutdown(&self, policy: ShutdownPolicy) {
         // Phase 1: Gate
-        self.shutdown_state.begin_drain();
-        for transport in self.transports.values() {
-            transport.begin_drain();
-        }
+        self.begin_drain();
 
         // Phase 2: Drain
         match policy {

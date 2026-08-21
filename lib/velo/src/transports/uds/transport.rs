@@ -30,6 +30,7 @@ use super::listener::{UdsListener, default_shrink_threshold};
 use crate::transports::coalesce::{
     Coalescable, WriterFailure, WriterObserver, run_coalescing_writer,
 };
+use crate::transports::ingress::{DialedReaderContext, run_dialed_reader};
 
 /// UDS transport with lock-free concurrent access
 ///
@@ -60,6 +61,12 @@ pub struct UdsTransport {
     // Listener read-buffer shrink threshold (bytes). Plumbed into UdsListener
     // at start() time. Resolved from env or default in new().
     shrink_threshold: usize,
+
+    // Context for each dialed connection's read loop (the path that surfaces
+    // the peer's ShuttingDown drain rejections). Set in start(), before
+    // `runtime` — send paths gate on `runtime`, so every connection writer
+    // observes this as set.
+    dialed_ctx: OnceLock<DialedReaderContext>,
 }
 
 /// Handle to a connection's writer task.
@@ -120,6 +127,7 @@ impl UdsTransport {
             connect_timeout,
             metrics: OnceLock::new(),
             shrink_threshold: default_shrink_threshold(),
+            dialed_ctx: OnceLock::new(),
         }
     }
 
@@ -209,19 +217,18 @@ impl UdsTransport {
             tx,
         };
 
-        let cancel = self.cancel_token.clone();
-        let conns = Arc::clone(&self.connections);
-        let connect_timeout = self.connect_timeout;
-        let metrics = self.metrics.get().cloned();
         debug!("Created new UDS connection to {} ({:?})", instance_id, path);
         rt.spawn(connection_writer_task(
             path,
             instance_id,
             rx,
-            conns,
-            cancel,
-            connect_timeout,
-            metrics,
+            WriterTaskContext {
+                connections: Arc::clone(&self.connections),
+                cancel_token: self.cancel_token.clone(),
+                connect_timeout: self.connect_timeout,
+                reader_ctx: self.dialed_ctx.get().cloned(),
+                metrics: self.metrics.get().cloned(),
+            },
         ));
         Ok(handle)
     }
@@ -376,6 +383,18 @@ impl Transport for UdsTransport {
         channels: TransportAdapter,
         rt: tokio::runtime::Handle,
     ) -> futures::future::BoxFuture<'_, anyhow::Result<()>> {
+        // Dialed-reader context first: send paths gate on `runtime`, so
+        // setting this before `runtime` guarantees every connection writer
+        // sees it.
+        self.dialed_ctx
+            .set(DialedReaderContext {
+                adapter: channels.clone(),
+                error_handler: Arc::new(DialedReaderErrorHandler),
+                transport_key: self.key.as_str().to_string(),
+                shrink_threshold: self.shrink_threshold,
+            })
+            .ok();
+
         // Store runtime handle for use in send_message
         self.runtime.set(rt.clone()).ok();
 
@@ -524,6 +543,15 @@ impl Transport for UdsTransport {
     }
 }
 
+/// Per-connection configuration handed to [`connection_writer_task`].
+struct WriterTaskContext {
+    connections: Arc<DashMap<crate::InstanceId, ConnectionHandle>>,
+    cancel_token: CancellationToken,
+    connect_timeout: Duration,
+    reader_ctx: Option<DialedReaderContext>,
+    metrics: Option<std::sync::Arc<dyn velo_ext::TransportObservability>>,
+}
+
 /// Connection writer task for UDS
 ///
 /// Mirrors the TCP connection_writer_task. Cleanup (draining queued messages
@@ -532,13 +560,25 @@ async fn connection_writer_task(
     path: PathBuf,
     instance_id: crate::InstanceId,
     rx: flume::Receiver<SendTask>,
-    connections: Arc<DashMap<crate::InstanceId, ConnectionHandle>>,
-    cancel_token: CancellationToken,
-    connect_timeout: Duration,
-    metrics: Option<std::sync::Arc<dyn velo_ext::TransportObservability>>,
+    ctx: WriterTaskContext,
 ) -> Result<()> {
-    let result =
-        connection_writer_inner(&path, instance_id, &rx, &cancel_token, connect_timeout).await;
+    let WriterTaskContext {
+        connections,
+        cancel_token,
+        connect_timeout,
+        reader_ctx,
+        metrics,
+    } = ctx;
+    let result = connection_writer_inner(
+        &path,
+        instance_id,
+        &rx,
+        &cancel_token,
+        connect_timeout,
+        reader_ctx,
+        metrics.clone(),
+    )
+    .await;
 
     // Always drain queued messages and notify their error handlers.
     while let Ok(msg) = rx.try_recv() {
@@ -568,17 +608,20 @@ async fn connection_writer_task(
     result
 }
 
-/// Inner loop: connect and send frames until the channel closes or a write error occurs.
+/// Inner loop: connect and send frames until the channel closes, a write error
+/// occurs, or the reader sees the peer close the socket.
 async fn connection_writer_inner(
     path: &Path,
     instance_id: crate::InstanceId,
     rx: &flume::Receiver<SendTask>,
     cancel_token: &CancellationToken,
     connect_timeout: Duration,
+    reader_ctx: Option<DialedReaderContext>,
+    metrics: Option<std::sync::Arc<dyn velo_ext::TransportObservability>>,
 ) -> Result<()> {
     debug!("Connecting to UDS {:?}", path);
 
-    let mut stream = tokio::select! {
+    let stream = tokio::select! {
         _ = cancel_token.cancelled() => return Ok(()),
         res = tokio::time::timeout(connect_timeout, UnixStream::connect(path)) => {
             res.context("UDS connect timeout")?.context("UDS connect failed")?
@@ -596,20 +639,56 @@ async fn connection_writer_inner(
 
     debug!("Connected to UDS {:?}", path);
 
+    // The peer's listener replies on THIS socket when it rejects a Message
+    // during drain (a ShuttingDown frame echoing the header). Split the
+    // stream so those replies are read and routed into the adapter streams
+    // instead of rotting unread in the kernel receive buffer. The reader and
+    // writer share a child token: the reader cancels it on EOF/decode error
+    // so the writer stops instead of pushing frames at a dead socket, and the
+    // transport-level `cancel_token` still stops both through propagation.
+    let (read_half, mut write_half) = stream.into_split();
+    let conn_cancel = cancel_token.child_token();
+    let reader = reader_ctx.map(|ctx| {
+        tokio::spawn(run_dialed_reader(
+            read_half,
+            ctx,
+            metrics,
+            conn_cancel.clone(),
+            format!("{} ({:?})", instance_id, path),
+        ))
+    });
+
     // Main send loop. Coalescing writer, identical in behaviour to the TCP one
     // because it *is* the TCP one — see `crate::transports::coalesce`. Messages
     // still queued when this returns are reported by the caller's drain.
     run_coalescing_writer(
-        &mut stream,
+        &mut write_half,
         rx,
         // The channel already carries the writer's item type.
         std::convert::identity,
-        Some(cancel_token),
+        Some(&conn_cancel),
         &UdsWriterObserver { instance_id, path },
     )
     .await;
 
+    // The writer ending is what ends the connection; abort the reader rather
+    // than joining it so a frame mid-route cannot pin the socket open.
+    if let Some(reader) = reader {
+        reader.abort();
+    }
+
     Ok(())
+}
+
+/// Routing failures on a dialed connection's read half have no per-send error
+/// handler to invoke, so they are logged — the same policy as the listener's
+/// default handler.
+struct DialedReaderErrorHandler;
+
+impl TransportErrorHandler for DialedReaderErrorHandler {
+    fn on_error(&self, _header: Bytes, _payload: Bytes, error: String) {
+        warn!("UDS transport error: {}", error);
+    }
 }
 
 impl Coalescable for SendTask {

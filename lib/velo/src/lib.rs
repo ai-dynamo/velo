@@ -32,7 +32,9 @@ pub mod simulation;
 
 // Identity / address types live in velo-ext but are re-exported here so the
 // vast majority of consumers depend only on `velo`.
-pub use velo_ext::{AdmissionState, InstanceId, PeerInfo, Transport, WorkerAddress, WorkerId};
+pub use velo_ext::{
+    AdmissionState, InstanceId, PeerInfo, ShutdownPolicy, Transport, WorkerAddress, WorkerId,
+};
 
 // Public re-exports for the velo-ext crate.
 pub use velo_ext as ext;
@@ -407,6 +409,23 @@ impl Velo {
     /// Get the underlying messenger.
     pub fn messenger(&self) -> &Arc<Messenger> {
         &self.messenger
+    }
+
+    /// Begin Phase 1 (Gate) of graceful shutdown: reject new inbound requests
+    /// while responses, acks, and events keep flowing. See
+    /// [`Messenger::begin_drain`].
+    pub fn begin_drain(&self) {
+        self.messenger.begin_drain();
+    }
+
+    /// Perform a graceful 3-phase shutdown of the messenger transports: gate
+    /// inbound requests, wait for in-flight handler invocations per `policy`,
+    /// then tear down. See [`Messenger::graceful_shutdown`].
+    ///
+    /// Streaming-plane teardown (anchors, stream transports) is separate and
+    /// not covered by this call.
+    pub async fn graceful_shutdown(&self, policy: ShutdownPolicy) {
+        self.messenger.graceful_shutdown(policy).await;
     }
 
     /// Get the instance ID of this system.

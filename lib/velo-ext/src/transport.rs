@@ -284,10 +284,24 @@ pub trait Transport: Send + Sync {
     /// no-op.
     fn set_observability(&self, _observability: std::sync::Arc<dyn TransportObservability>) {}
 
-    /// Begin draining: reject new inbound requests while allowing responses.
+    /// Notification hook for Phase 1 (Gate) of graceful shutdown.
     ///
-    /// Default implementation is a no-op. Transports that need per-frame
-    /// gating (e.g., unsubscribing from NATS subjects) should override this.
+    /// The runtime calls this *after* flipping the shared [`ShutdownState`]'s
+    /// drain flag — the flag the runtime handed this transport inside the
+    /// [`TransportAdapter`] at [`start`](Transport::start). Flipping that flag
+    /// is the runtime's job, not this method's: per-frame gating is
+    /// implemented by reading [`ShutdownState::is_draining`] on the inbound
+    /// path and rejecting new request frames with a
+    /// [`MessageType::ShuttingDown`] correlation reply.
+    ///
+    /// Override only for drain work the shared flag cannot express — e.g.,
+    /// unsubscribing from broker subjects so new requests stop arriving at
+    /// all, or pausing an accept loop. The default no-op is correct for
+    /// transports whose listeners gate per-frame off the shared flag.
+    ///
+    /// Must be idempotent. Do not flip the shared `ShutdownState` here: it is
+    /// instance-wide, shared by every transport of the instance, so flipping
+    /// it from one transport would silently drain them all.
     fn begin_drain(&self) {}
 
     /// Check if a registered peer is reachable and healthy.
@@ -361,6 +375,13 @@ pub struct TransportAdapter {
     /// Channel for inbound [`MessageType::Message`] frames.
     pub message_stream: flume::Sender<(Bytes, Bytes)>,
     /// Channel for inbound [`MessageType::Response`] and [`MessageType::ShuttingDown`] frames.
+    ///
+    /// The two frame types carry different header formats: a `Response` header
+    /// is written by the responding peer's protocol layer, while a
+    /// `ShuttingDown` frame is a drain rejection that echoes the rejected
+    /// *request's* header back verbatim (with an empty payload) so the sender
+    /// can correlate it. Consumers must not assume every header on this
+    /// channel is response-format.
     pub response_stream: flume::Sender<(Bytes, Bytes)>,
     /// Channel for inbound [`MessageType::Ack`] and [`MessageType::Event`] frames.
     pub event_stream: flume::Sender<(Bytes, Bytes)>,

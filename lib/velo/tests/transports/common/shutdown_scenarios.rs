@@ -216,6 +216,48 @@ where
     handle_b.streams.shutdown_state.teardown_token().cancel();
 }
 
+/// A drain rejection must reach the *sender's* response stream.
+///
+/// The listener replies to a Message received during drain by writing a
+/// ShuttingDown frame back on the same socket the Message arrived on — the
+/// socket the sender's connection writer dialed. The sender must read that
+/// socket and route the frame to its own response_stream, or it never learns
+/// the message was rejected.
+pub async fn drain_rejection_reaches_sender<C: ShutdownTestClient>()
+where
+    C::Transport: 'static,
+{
+    let handle_a = C::new_handle().await.unwrap();
+    let handle_b = C::new_handle().await.unwrap();
+
+    handle_a.register_peer(&handle_b).unwrap();
+
+    handle_b.streams.shutdown_state.begin_drain();
+    sleep(Duration::from_millis(50)).await;
+
+    handle_a.send(
+        handle_b.instance_id,
+        b"drain-reject-hdr".to_vec(),
+        b"drain-reject-pay".to_vec(),
+        MessageType::Message,
+    );
+
+    // B's listener echoes the header back in a ShuttingDown frame; A must
+    // surface it as a correlation entry on its response stream.
+    let (header, payload) = timeout(
+        Duration::from_secs(2),
+        handle_a.streams.response_stream.recv_async(),
+    )
+    .await
+    .expect("sender never saw the ShuttingDown rejection")
+    .expect("recv");
+    assert_eq!(&header[..], b"drain-reject-hdr");
+    assert_eq!(payload.len(), 0);
+
+    handle_a.streams.shutdown_state.teardown_token().cancel();
+    handle_b.streams.shutdown_state.teardown_token().cancel();
+}
+
 pub async fn connection_writer_exits_on_teardown<C: ShutdownTestClient>()
 where
     C::Transport: 'static,

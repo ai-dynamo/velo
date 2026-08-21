@@ -542,7 +542,11 @@ where
                     .and_then(|metrics| metrics.bind_handler(&self.name))
             })
             .clone();
+        let drain_guard = ctx.in_flight.clone();
         let future = async move {
+            // Held for the whole invocation, response send included —
+            // graceful shutdown's wait_for_drain waits on it.
+            let _drain_guard = drain_guard;
             let _in_flight = handler_metrics.as_ref().map(|m| m.start());
             let started = Instant::now();
             let result = executor.execute(am_ctx).await;
@@ -684,7 +688,11 @@ where
             })
             .clone();
 
+        let drain_guard = ctx.in_flight.clone();
         let future = async move {
+            // Held for the whole invocation, response send included —
+            // graceful shutdown's wait_for_drain waits on it.
+            let _drain_guard = drain_guard;
             let _in_flight = handler_metrics.as_ref().map(|m| m.start());
             let started = Instant::now();
             let result = executor.execute(unary_ctx).await;
@@ -814,7 +822,11 @@ where
             })
             .clone();
 
+        let drain_guard = ctx.in_flight.clone();
         let future = async move {
+            // Held for the whole invocation, response send included —
+            // graceful shutdown's wait_for_drain waits on it.
+            let _drain_guard = drain_guard;
             let _in_flight = handler_metrics.as_ref().map(|m| m.start());
             let started = Instant::now();
             let input: I = match if payload.is_empty() {

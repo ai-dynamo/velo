@@ -15,7 +15,7 @@ use bytes::{Buf, Bytes, BytesMut};
 use std::io;
 use std::io::Write;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tokio_util::codec::{Decoder, Framed};
+use tokio_util::codec::Decoder;
 
 use velo_ext::MessageType;
 
@@ -85,11 +85,11 @@ pub(crate) fn parse_shrink_threshold(raw: Option<&str>) -> usize {
 
 /// Reclaim memory if a one-time large frame inflated the read buffer.
 ///
-/// Replaces the underlying `BytesMut` with a fresh [`SHRINK_RESET_CAPACITY`]-
-/// sized buffer when it has emptied after a one-time growth. Called after each
-/// successfully decoded frame from a [`Framed<T, TcpFrameCodec>`] — TCP, UDS,
-/// and the streaming TCP pump all share this codec and the same buffer-growth
-/// pattern.
+/// Replaces `buf` with a fresh [`SHRINK_RESET_CAPACITY`]-sized buffer when it
+/// has emptied after a one-time growth. Called after each successfully decoded
+/// frame with the read buffer of a `Framed`/`FramedRead` running
+/// [`TcpFrameCodec`] — TCP, UDS, the dialed-connection readers, and the
+/// streaming TCP pump all share this codec and the same buffer-growth pattern.
 ///
 /// `last_frame_total_size` is the header + payload byte count of the frame
 /// just decoded (the preamble's 11 bytes are negligible and can be omitted).
@@ -108,12 +108,11 @@ pub(crate) fn parse_shrink_threshold(raw: Option<&str>) -> usize {
 ///      won't be immediately undone by the next frame. Avoids churn when a
 ///      caller sustains large frames above the threshold.
 #[inline]
-pub(crate) fn maybe_shrink_read_buffer<T>(
-    framed: &mut Framed<T, TcpFrameCodec>,
+pub(crate) fn maybe_shrink_read_buffer(
+    buf: &mut BytesMut,
     threshold: usize,
     last_frame_total_size: usize,
 ) {
-    let buf = framed.read_buffer_mut();
     if buf.is_empty()
         && buf.capacity() > threshold
         && buf.capacity() > 2 * SHRINK_RESET_CAPACITY
@@ -445,6 +444,7 @@ impl Decoder for TcpFrameCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio_util::codec::Framed;
 
     /// Test helper to encode a frame into a Vec<u8> for verification (async)
     async fn encode_frame_to_bytes(
@@ -884,7 +884,7 @@ mod tests {
         let pre_capacity = framed.read_buffer_mut().capacity();
         assert!(pre_capacity > 2 * SHRINK_RESET_CAPACITY);
         // last_frame was small relative to capacity → shrink applies.
-        maybe_shrink_read_buffer(&mut framed, 1024 * 1024, 1024);
+        maybe_shrink_read_buffer(framed.read_buffer_mut(), 1024 * 1024, 1024);
         let post_capacity = framed.read_buffer_mut().capacity();
         assert!(
             post_capacity < pre_capacity,
@@ -902,7 +902,7 @@ mod tests {
         let mut framed = Framed::new(read_half, TcpFrameCodec::new());
         framed.read_buffer_mut().resize(2 * 1024 * 1024, 0xAB);
         let pre_capacity = framed.read_buffer_mut().capacity();
-        maybe_shrink_read_buffer(&mut framed, 1024 * 1024, 1024);
+        maybe_shrink_read_buffer(framed.read_buffer_mut(), 1024 * 1024, 1024);
         assert_eq!(framed.read_buffer_mut().capacity(), pre_capacity);
     }
 
@@ -912,7 +912,7 @@ mod tests {
         let mut framed = Framed::new(read_half, TcpFrameCodec::new());
         // Default Framed buffer capacity is well under DEFAULT_SHRINK_THRESHOLD.
         let pre_capacity = framed.read_buffer_mut().capacity();
-        maybe_shrink_read_buffer(&mut framed, DEFAULT_SHRINK_THRESHOLD, 1024);
+        maybe_shrink_read_buffer(framed.read_buffer_mut(), DEFAULT_SHRINK_THRESHOLD, 1024);
         assert_eq!(framed.read_buffer_mut().capacity(), pre_capacity);
     }
 
@@ -925,7 +925,7 @@ mod tests {
         let mut framed = framed_with_grown_buffer(cap);
         let pre = framed.read_buffer_mut().capacity();
         // last_frame_size * 2 > capacity → skip (don't churn).
-        maybe_shrink_read_buffer(&mut framed, 1024 * 1024, cap * 3 / 4);
+        maybe_shrink_read_buffer(framed.read_buffer_mut(), 1024 * 1024, cap * 3 / 4);
         assert_eq!(framed.read_buffer_mut().capacity(), pre);
     }
 
@@ -940,7 +940,7 @@ mod tests {
         let cap = SHRINK_RESET_CAPACITY + 4096;
         let mut framed = framed_with_grown_buffer(cap);
         let pre = framed.read_buffer_mut().capacity();
-        maybe_shrink_read_buffer(&mut framed, 1024, 100); // small threshold, tiny frame
+        maybe_shrink_read_buffer(framed.read_buffer_mut(), 1024, 100); // small threshold, tiny frame
         assert_eq!(framed.read_buffer_mut().capacity(), pre);
     }
 

@@ -281,10 +281,13 @@ async fn test_writer_task_cleans_up_on_write_error() {
         addr,
         iid,
         rx,
-        conns,
-        cancel,
-        Duration::from_secs(5),
-        None,
+        WriterTaskContext {
+            connections: conns,
+            cancel_token: cancel,
+            connect_timeout: Duration::from_secs(5),
+            reader_ctx: None,
+            metrics: None,
+        },
     ));
 
     // Accept the connection, then immediately drop it + the listener
@@ -422,10 +425,13 @@ async fn test_writer_task_drains_on_connect_failure() {
         addr,
         iid,
         rx,
-        conns,
-        cancel,
-        Duration::from_secs(5),
-        None,
+        WriterTaskContext {
+            connections: conns,
+            cancel_token: cancel,
+            connect_timeout: Duration::from_secs(5),
+            reader_ctx: None,
+            metrics: None,
+        },
     ));
     let _ = writer.await;
 

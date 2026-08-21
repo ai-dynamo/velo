@@ -11,14 +11,14 @@ pub(crate) use system_handlers::register_system_handlers;
 
 use crate::messenger::common::{
     events::{EventType, Outcome, decode_event_header},
-    messages::decode_active_message,
+    messages::{decode_active_message, decode_response_id_from_request_header},
     responses::{ResponseManager, decode_response_header},
 };
 
 use std::sync::Arc;
 
 use crate::observability::{DispatchFailure, VeloMetrics};
-use crate::transports::{DataStreams, VeloBackend};
+use crate::transports::{DataStreams, ShutdownState, VeloBackend};
 use bytes::Bytes;
 use tokio_util::task::TaskTracker;
 
@@ -47,6 +47,7 @@ impl ActiveMessageServer {
             std::sync::OnceLock<Arc<dyn crate::messenger::large_payload::LargePayloadResolver>>,
         >,
     ) -> Self {
+        let shutdown_state = data_streams.shutdown_state.clone();
         let (message_rx, response_rx, event_rx) = data_streams.into_parts();
 
         // Create dispatcher hub (shareable)
@@ -58,6 +59,7 @@ impl ActiveMessageServer {
             hub.clone(),
             observability.clone(),
             large_payload_resolver,
+            shutdown_state,
         ));
 
         tracker.spawn(create_response_handler(
@@ -90,6 +92,7 @@ async fn create_message_handler(
     large_payload_resolver: Arc<
         std::sync::OnceLock<Arc<dyn crate::messenger::large_payload::LargePayloadResolver>>,
     >,
+    shutdown_state: ShutdownState,
 ) -> anyhow::Result<()> {
     // Wait for system initialization before processing messages
     hub.wait_for_system().await;
@@ -97,6 +100,11 @@ async fn create_message_handler(
     while let Ok((header, payload)) = message_rx.recv_async().await {
         match decode_active_message(header, payload) {
             Ok(message) => {
+                // Track this invocation for graceful shutdown: the guard rides
+                // in the HandlerContext and is held until the handler future
+                // (response send included) completes, so phase 2's
+                // wait_for_drain covers accepted-but-unfinished work.
+                let in_flight = Some(Arc::new(shutdown_state.acquire()));
                 #[cfg(feature = "distributed-tracing")]
                 let span = {
                     let span = tracing::info_span!(
@@ -146,6 +154,7 @@ async fn create_message_handler(
                                         response_type,
                                         headers,
                                         system: hub.system().clone(),
+                                        in_flight,
                                     };
                                     hub.dispatch_message(&handler_name, ctx);
                                 }
@@ -216,6 +225,7 @@ async fn create_message_handler(
                     response_type: message.metadata.response_type,
                     headers: message.metadata.headers.clone(),
                     system: hub.system().clone(),
+                    in_flight,
                 };
 
                 // Direct dispatch - inline, no channel hop!
@@ -233,12 +243,25 @@ async fn create_message_handler(
 }
 
 /// Creates a task that handles responses from the response channel.
+///
+/// The channel carries two header formats. Genuine responses use the response
+/// wire format and complete their awaiter with the decoded outcome. A
+/// transport-level drain rejection (`MessageType::ShuttingDown`) instead
+/// echoes the *request* header back with an empty payload — the transport
+/// funnels it onto this channel for correlation. So a response-format decode
+/// failure is retried as a request-format header, and on a hit the awaiter is
+/// failed immediately instead of hanging until its own timeout. A genuine
+/// response can never take the fallback (it always decodes as
+/// response-format), and a garbage id recovered from anything else misses the
+/// arena — `complete_outcome` is defensive against stale/mismatched slots.
 async fn create_response_handler(
     response_manager: ResponseManager,
     response_rx: flume::Receiver<(Bytes, Bytes)>,
 ) -> anyhow::Result<()> {
     while let Ok((header, payload)) = response_rx.recv_async().await {
-        match decode_response_header(header) {
+        // The clone is a refcount bump; the original is needed for the
+        // drain-rejection fallback below when this decode fails.
+        match decode_response_header(header.clone()) {
             Ok((response_id, outcome, _headers)) => match outcome {
                 Outcome::Ok => {
                     response_manager.complete_outcome(response_id, Ok(Some(payload)));
@@ -250,7 +273,19 @@ async fn create_response_handler(
                 }
             },
             Err(e) => {
-                tracing::error!(target: "crate::messenger::server", "Failed to decode response header: {}", e);
+                if let Some(response_id) = decode_response_id_from_request_header(&header) {
+                    tracing::debug!(
+                        target: "crate::messenger::server",
+                        response_id = %response_id,
+                        "Completing awaiter for drain-rejected request"
+                    );
+                    response_manager.complete_outcome(
+                        response_id,
+                        Err("request rejected: peer is shutting down".to_string()),
+                    );
+                } else {
+                    tracing::error!(target: "crate::messenger::server", "Failed to decode response header: {}", e);
+                }
             }
         }
     }
@@ -365,6 +400,40 @@ mod tests {
 
         handler.await??;
         assert!(event_handler.called.load(Ordering::SeqCst));
+        Ok(())
+    }
+
+    /// A transport-level drain rejection arrives on the response channel as
+    /// the echoed *request* header with an empty payload. The response handler
+    /// must recover the response id from the request format and fail the
+    /// awaiter immediately instead of dropping the frame as undecodable.
+    #[tokio::test]
+    async fn drain_rejection_echo_completes_awaiter() -> anyhow::Result<()> {
+        use crate::messenger::common::messages::{ActiveMessage, MessageMetadata};
+
+        let response_manager = ResponseManager::new(7);
+        let (tx, rx) = flume::bounded(1);
+        let handler = tokio::spawn(create_response_handler(response_manager.clone(), rx));
+
+        let mut awaiter = response_manager.register_outcome()?;
+        let response_id = awaiter.response_id();
+
+        // What the peer's listener echoes back: the request header, verbatim.
+        let (header, _payload, _mt) = ActiveMessage {
+            metadata: MessageMetadata::new_unary(response_id, "some_handler".to_string(), None),
+            payload: Bytes::new(),
+        }
+        .encode()?;
+        tx.send((header, Bytes::new())).expect("send frame");
+        drop(tx);
+
+        let err = timeout(Duration::from_secs(1), awaiter.recv())
+            .await
+            .expect("awaiter must complete promptly")
+            .expect_err("drain rejection must surface as an error");
+        assert!(err.contains("shutting down"), "unexpected error: {err}");
+
+        handler.await??;
         Ok(())
     }
 }

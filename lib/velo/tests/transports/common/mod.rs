@@ -844,6 +844,10 @@ macro_rules! transport_shutdown_tests {
             async fn [<test_ $prefix _connection_writer_exits_on_teardown>]() {
                 shutdown_scenarios::connection_writer_exits_on_teardown::<$client>().await;
             }
+            #[tokio::test]
+            async fn [<test_ $prefix _drain_rejection_reaches_sender>]() {
+                shutdown_scenarios::drain_rejection_reaches_sender::<$client>().await;
+            }
         }
     };
 }

@@ -41,6 +41,14 @@ pub(crate) struct HandlerContext {
 
     /// The messenger system for handler access
     pub system: Arc<Messenger>,
+
+    /// In-flight guard for graceful-shutdown drain tracking. Acquired when
+    /// the message is pulled off the inbound channel; the handler wrapper
+    /// moves it into the handler future so it is held until the invocation
+    /// (including its response send) completes, which is what
+    /// `ShutdownState::wait_for_drain` waits on. `Arc` so the derived `Clone`
+    /// counts a message once, not once per context clone.
+    pub in_flight: Option<Arc<velo_ext::InFlightGuard>>,
 }
 
 /// Base trait for active message handlers.

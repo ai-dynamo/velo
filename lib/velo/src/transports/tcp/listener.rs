@@ -8,7 +8,6 @@
 //! to the appropriate transport streams.
 
 use anyhow::{Context, Result};
-use bytes::Bytes;
 use futures::StreamExt;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -18,7 +17,8 @@ use tokio::runtime::{Handle, Runtime};
 use tokio_util::codec::Framed;
 use tracing::{debug, error, info, warn};
 
-use crate::observability::{Direction, TransportRejection};
+use crate::observability::TransportRejection;
+use crate::transports::ingress::route_frame;
 
 use velo_ext::{MessageType, ShutdownState, TransportAdapter, TransportErrorHandler};
 
@@ -306,7 +306,7 @@ impl TcpListener {
 
                             let frame_size = header.len() + payload.len();
                             // Route frame to appropriate stream based on type
-                            if let Err(e) = Self::route_frame(
+                            if let Err(e) = route_frame(
                                 msg_type,
                                 header,
                                 payload,
@@ -323,7 +323,7 @@ impl TcpListener {
                                 );
                             }
 
-                            maybe_shrink_read_buffer(&mut framed, shrink_threshold, frame_size);
+                            maybe_shrink_read_buffer(framed.read_buffer_mut(), shrink_threshold, frame_size);
                         }
                         Some(Err(e)) => {
                             if let Some(metrics) = metrics.as_ref() {
@@ -343,70 +343,6 @@ impl TcpListener {
         }
 
         Ok(())
-    }
-
-    /// Route a decoded frame to the appropriate stream
-    ///
-    /// This function performs zero-copy routing by transferring ownership of
-    /// the Bytes to the flume channel. On error, it invokes the error callback
-    /// with the original data (requiring a clone).
-    async fn route_frame(
-        msg_type: MessageType,
-        header: Bytes,
-        payload: Bytes,
-        adapter: &TransportAdapter,
-        error_handler: &Arc<dyn TransportErrorHandler>,
-        transport_key: &str,
-        metrics: Option<&std::sync::Arc<dyn velo_ext::TransportObservability>>,
-    ) -> Result<()> {
-        #[cfg(not(feature = "distributed-tracing"))]
-        let _ = transport_key;
-        let sender = match msg_type {
-            MessageType::Message => &adapter.message_stream,
-            MessageType::Response => &adapter.response_stream,
-            MessageType::Ack | MessageType::Event => &adapter.event_stream,
-            MessageType::ShuttingDown => {
-                // ShuttingDown is an outbound-only frame type; receiving it here
-                // means a remote peer rejected our request. Route to the response
-                // stream so higher layers can handle the rejection via correlation.
-                &adapter.response_stream
-            }
-        };
-
-        if let Some(metrics) = metrics {
-            #[cfg(feature = "distributed-tracing")]
-            let span = tracing::debug_span!(
-                "velo.transport.receive",
-                transport = transport_key,
-                message_type = crate::transports::message_type_label(msg_type),
-                bytes = header.len() + payload.len()
-            );
-            #[cfg(feature = "distributed-tracing")]
-            let _entered = span.enter();
-
-            metrics.record_frame(
-                Direction::Inbound,
-                crate::transports::message_type_label(msg_type),
-                header.len() + payload.len(),
-            );
-        }
-
-        // Try to send with ownership transfer (zero-copy)
-        match sender.send_async((header, payload)).await {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                if let Some(metrics) = metrics {
-                    metrics.record_rejection(TransportRejection::RouteFailed);
-                }
-                // Send failed - invoke error callback with the data
-                error_handler.on_error(
-                    e.0.0, // header
-                    e.0.1, // payload
-                    format!("Failed to route {:?}", msg_type),
-                );
-                Err(anyhow::anyhow!("Failed to send to stream"))
-            }
-        }
     }
 }
 
@@ -591,6 +527,7 @@ impl Default for TcpListenerBuilder {
 mod tests {
     use super::*;
     use crate::transports::transport::make_channels;
+    use bytes::Bytes;
     use std::net::{IpAddr, Ipv4Addr};
 
     struct TestErrorHandler;
