@@ -41,6 +41,11 @@ runs:
       command -v cmake >/dev/null 2>&1 || pkgs="$pkgs cmake"
       command -v mold  >/dev/null 2>&1 || pkgs="$pkgs mold"
       command -v clang >/dev/null 2>&1 || pkgs="$pkgs clang"
+      # rdma-core headers: the `ucx` feature (on under --all-features) builds
+      # the vendored UCX with InfiniBand support and hard-fails without them.
+      # Headers only — no RDMA hardware is needed; the UCX tests run over tcp.
+      [ -f /usr/include/infiniband/verbs.h ] || pkgs="$pkgs libibverbs-dev"
+      [ -f /usr/include/rdma/rdma_cma.h ]    || pkgs="$pkgs librdmacm-dev"
       [ -z "$pkgs" ] || { sudo apt-get update -qq && sudo apt-get install -y -qq $pkgs; }
 
   - name: Cache cargo registry and tools

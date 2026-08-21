@@ -11,6 +11,7 @@ publish = false
 [features]
 default = []
 zmq = ["velo/zmq"]
+ucx = ["velo/ucx"]
 grpc = ["velo/grpc"]
 
 [dependencies]

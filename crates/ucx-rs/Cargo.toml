@@ -1,0 +1,66 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ucx-rs"
+# Crate semver is independent of the vendored UCX version; the `+ucx.*` build
+# metadata records which UCX release ships inside this crate.
+version = "0.1.0+ucx.1.22.0"
+edition = "2024"
+rust-version = "1.85"
+# The crate's own code is Apache-2.0 (velo project); the vendored UCX tarball
+# and the statically-absorbed libraries are BSD-3-Clause (see LICENSE-UCX).
+# Binary redistributors must reproduce the UCX notice — `ucx_rs::UCX_LICENSE`
+# exposes it programmatically for exactly that purpose.
+license = "Apache-2.0 AND BSD-3-Clause"
+description = "Rust bindings for UCX (Unified Communication X) with a vendored static build of the UCX libraries"
+homepage = "https://github.com/ai-dynamo/velo"
+repository = "https://github.com/ai-dynamo/velo.git"
+keywords = ["ucx", "rdma", "infiniband", "roce", "hpc"]
+categories = ["external-ffi-bindings", "network-programming"]
+links = "ucx-rs"
+build = "build.rs"
+include = [
+  "build.rs",
+  "src/**",
+  "tests/**",
+  "Cargo.toml",
+  "vendor/ucx-1.22.0.tar.gz",
+  "LICENSE",
+  "LICENSE-UCX",
+  "README.md",
+]
+
+# The bindgen output carries UCX's doxygen @code examples (C, not Rust) into
+# doc comments; rustdoc would try to compile them as doctests.
+[lib]
+doctest = false
+
+[features]
+default = ["ib", "rdmacm", "mt"]
+# InfiniBand/RoCE via rdma-core. Hard-fails the build if <infiniband/verbs.h>
+# is absent — UCX's own configure only WARNS and silently ships a TCP-only UCX.
+ib = []
+rdmacm = []
+# --enable-mt: makes UCS_THREAD_MODE_MULTI usable. SINGLE-mode workers remain
+# lock-free in an MT build, so this is pure optionality at zero hot-path cost.
+mt = []
+cma = []
+# Regenerate the checked-in bindings (requires libclang). Not for consumers.
+bindgen = ["dep:bindgen"]
+
+[dependencies]
+
+[build-dependencies]
+flate2 = "1"
+sha2 = "0.10"
+tar = "0.4"
+bindgen = { version = "0.72", optional = true }
+
+[package.metadata.docs.rs]
+# docs.rs has no rdma-core headers and a hard build timeout; the build script
+# early-returns under DOCS_RS and the crate compiles as a stub.
+no-default-features = true
+
+[package.metadata.velo]
+ucx-sha256 = "258941cddd14ca60d38c0d31b9b09ec1052c901086841011a498da8b55a3cb24"

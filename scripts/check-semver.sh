@@ -20,11 +20,17 @@ if [[ -z "$changed_files" ]]; then
     exit 0
 fi
 
+# Publishable crates live under lib/ (velo, velo-ext) and crates/ (ucx-rs).
+# Track each crate's directory so the baseline lookups below do not assume lib/.
 changed_crates=()
-for crate_dir in lib/*/; do
+declare -A crate_dirs=()
+for crate_dir in lib/*/ crates/*/; do
+    [[ -d "$crate_dir" ]] || continue
+    crate_dir="${crate_dir%/}"
     crate_name=$(basename "$crate_dir")
-    if echo "$changed_files" | grep -qE "^lib/${crate_name}/src/"; then
+    if echo "$changed_files" | grep -qE "^${crate_dir}/src/"; then
         changed_crates+=("$crate_name")
+        crate_dirs["$crate_name"]="$crate_dir"
     fi
 done
 
@@ -47,10 +53,11 @@ fi
 extract_crate_version() {
     local crate_name="$1"
     local source="$2"
+    local crate_dir="${crate_dirs[$crate_name]}"
     if [[ "$source" == "HEAD" ]]; then
-        grep '^version' "lib/${crate_name}/Cargo.toml" | head -1 | sed 's/.*"\(.*\)".*/\1/'
+        grep '^version' "${crate_dir}/Cargo.toml" | head -1 | sed 's/.*"\(.*\)".*/\1/'
     else
-        git show "${source}:lib/${crate_name}/Cargo.toml" 2>/dev/null \
+        git show "${source}:${crate_dir}/Cargo.toml" 2>/dev/null \
             | grep '^version' | head -1 | sed 's/.*"\(.*\)".*/\1/'
     fi
 }
@@ -99,7 +106,7 @@ failures=()
 
 for crate_name in "${changed_crates[@]}"; do
     # New crates that don't exist on the base branch — skip semver check
-    if ! git show "${BASE_REF}:lib/${crate_name}/Cargo.toml" &>/dev/null; then
+    if ! git show "${BASE_REF}:${crate_dirs[$crate_name]}/Cargo.toml" &>/dev/null; then
         echo "  ${crate_name}: new crate, skipping semver check"
         continue
     fi
