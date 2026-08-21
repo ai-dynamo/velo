@@ -78,9 +78,9 @@ struct Args {
     #[arg(long, default_value = "256")]
     channel_capacity: usize,
 
-    /// Emit machine-readable `RESULT` lines.
-    #[arg(long, default_value = "true")]
-    csv: bool,
+    /// Suppress the machine-readable `RESULT` lines (emitted by default).
+    #[arg(long)]
+    no_csv: bool,
 
     /// Apply the TcpTransport's own socket options (SO_SNDBUF/SO_RCVBUF = 2 MiB)
     /// to the raw l1/l2 rungs, to test whether they cause the depth-64 collapse.
@@ -272,7 +272,11 @@ where
     let mut frame = raw_frame(cell.size);
     let start = Instant::now();
     for i in 0..total {
-        credit_rx.recv_async().await.ok();
+        // A closed credit channel means the reader task died (I/O error path);
+        // stop sending instead of free-running with no pacing.
+        if credit_rx.recv_async().await.is_err() {
+            break;
+        }
         put_seq(&mut frame[PREAMBLE..], i);
         timing.mark(i);
         cwr.write_all(&frame).await?;
@@ -345,7 +349,11 @@ where
     let payload = vec![0u8; cell.size];
     let start = Instant::now();
     for i in 0..total {
-        credit_rx.recv_async().await.ok();
+        // A closed credit channel means the reader task died (I/O error path);
+        // stop sending instead of free-running with no pacing.
+        if credit_rx.recv_async().await.is_err() {
+            break;
+        }
         put_seq(&mut header, i);
         timing.mark(i);
         TcpFrameCodec::encode_frame(&mut cwr, MessageType::Message, &header, &payload).await?;
@@ -457,7 +465,11 @@ async fn l3_transport(
     let mut header = vec![0u8; HEADER];
     let start = Instant::now();
     for i in 0..total {
-        credit_rx.recv_async().await.ok();
+        // A closed credit channel means the reader task died (I/O error path);
+        // stop sending instead of free-running with no pacing.
+        if credit_rx.recv_async().await.is_err() {
+            break;
+        }
         put_seq(&mut header, i);
         let hdr = Bytes::from(header.clone());
         timing.mark(i);
@@ -548,7 +560,11 @@ async fn lh_task_hop(cell: Cell) -> Result<Outcome> {
     let mut send_hist = new_hist();
     let start = Instant::now();
     for i in 0..total {
-        credit_rx.recv_async().await.ok();
+        // A closed credit channel means the reader task died (I/O error path);
+        // stop sending instead of free-running with no pacing.
+        if credit_rx.recv_async().await.is_err() {
+            break;
+        }
         put_seq(&mut header, i);
         let hdr = Bytes::from(header.clone());
         timing.mark(i);
@@ -803,9 +819,8 @@ async fn run(args: Args) -> Result<()> {
                     continue; // blocking rung is depth-1 only
                 }
                 let flen = (PREAMBLE + HEADER + size) as u64;
-                let iters = (args.bytes_per_cell / flen)
-                    .clamp(args.min_iters, args.max_iters)
-                    as usize;
+                let iters =
+                    (args.bytes_per_cell / flen).clamp(args.min_iters, args.max_iters) as usize;
                 let cell = Cell {
                     size,
                     inflight: ifl,
@@ -823,8 +838,7 @@ async fn run(args: Args) -> Result<()> {
                 let n = out.rtt.len();
                 // `wall` covers warmup + measured iterations, so scale by the
                 // same population to keep the ratio consistent.
-                let mbps =
-                    (cell.total() as f64 * flen as f64 * 2.0) / out.wall.as_secs_f64() / 1e6;
+                let mbps = (cell.total() as f64 * flen as f64 * 2.0) / out.wall.as_secs_f64() / 1e6;
                 println!(
                     "{:<5} {:>9} {:>4} {:>7} {:>9} {:>9} {:>10} {:>10} {:>9.1}",
                     rung,
@@ -846,7 +860,7 @@ async fn run(args: Args) -> Result<()> {
                         PENDING.load(Ordering::Relaxed)
                     );
                 }
-                if args.csv {
+                if !args.no_csv {
                     println!(
                         "RESULT,{},{},{},{},{},{},{},{:.1}",
                         rung,
