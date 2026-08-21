@@ -216,7 +216,7 @@ where
     handle_b.streams.shutdown_state.teardown_token().cancel();
 }
 
-/// A drain rejection must reach the *sender's* response stream.
+/// A drain rejection must reach the *sender's* `shutdown_stream`.
 ///
 /// The listener replies to a Message received during drain by writing a
 /// ShuttingDown frame back on the same socket the Message arrived on — the

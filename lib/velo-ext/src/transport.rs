@@ -133,12 +133,20 @@ impl ShutdownState {
     }
 
     /// Wait until in-flight count reaches zero. Returns immediately if already zero.
+    ///
+    /// Registers interest *before* re-checking the counter: `notify_waiters()`
+    /// stores no permit, so a guard dropping between the check and the
+    /// registration would strand this waiter forever under
+    /// [`ShutdownPolicy::WaitForever`]. Creating the `Notified` future is
+    /// enough — tokio wakes futures that exist at `notify_waiters()` time even
+    /// if they have not been polled yet.
     pub async fn wait_for_drain(&self) {
         loop {
+            let notified = self.inner.drain_complete.notified();
             if self.inner.in_flight.load(Ordering::Acquire) == 0 {
                 return;
             }
-            self.inner.drain_complete.notified().await;
+            notified.await;
         }
     }
 

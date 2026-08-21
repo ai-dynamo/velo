@@ -7,8 +7,9 @@
 //! Drain rejection chain under test: the server's listener rejects a `Message`
 //! frame during drain by echoing its header in a `ShuttingDown` frame on the
 //! socket the client dialed; the client's dialed-connection reader routes the
-//! echo onto its response stream; the messenger's response handler recovers
-//! the response id from the request-format header and fails the awaiter.
+//! echo onto its `shutdown_stream`; the messenger's dedicated shutdown
+//! handler recovers the response id from the request-format header and fails
+//! the awaiter.
 //!
 //! Phase-2 chain under test: the dispatcher acquires an in-flight guard per
 //! handler invocation, so `graceful_shutdown` waits for a running handler
