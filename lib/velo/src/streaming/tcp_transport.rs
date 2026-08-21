@@ -121,7 +121,20 @@ impl TcpFrameTransport {
         interface_filter: InterfaceFilter,
         numa_hint: Option<u32>,
     ) -> Result<Arc<Self>> {
-        let listener = TcpListener::bind(bind_addr).await?;
+        // Built by hand instead of TcpListener::bind so the socket buffers are
+        // sized before listen() — accepted sockets inherit them at handshake
+        // time, before the dialing peer's first frame can arrive (see
+        // `configure_socket_buffers`).
+        let socket = match bind_addr {
+            SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4(),
+            SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6(),
+        }?;
+        // tokio's TcpListener::bind sets SO_REUSEADDR on Unix; keep that.
+        socket.set_reuseaddr(true)?;
+        configure_socket_buffers(&socket);
+        socket.bind(bind_addr)?;
+        // 1024 matches tokio's TcpListener::bind backlog.
+        let listener = socket.listen(1024)?;
         let actual_addr = listener.local_addr()?;
         // Encode the listener's interface(s) for advertisement.
         let endpoints = resolve_advertise_endpoints(actual_addr, &interface_filter)?;
@@ -444,7 +457,14 @@ impl WriterObserver for EgressObserver {
     }
 }
 
-/// Configure TCP socket options matching TcpTransport patterns.
+/// Configure per-socket TCP options matching TcpTransport patterns.
+///
+/// Deliberately does *not* touch SO_SNDBUF/SO_RCVBUF: on the accept path this
+/// runs after the handshake, when the dialing peer's first frames may already
+/// be in flight, and applying SO_RCVBUF then permanently collapses the TCP
+/// receive window (see the messenger `TcpListener` for the full mechanism).
+/// Buffer sizing happens on the listening socket (inherited at accept) and on
+/// the dialing socket before its first write ([`configure_socket_buffers`]).
 fn configure_socket(stream: &TcpStream) {
     if let Err(e) = stream.set_nodelay(true) {
         tracing::warn!("Failed to set TCP_NODELAY: {}", e);
@@ -457,14 +477,22 @@ fn configure_socket(stream: &TcpStream) {
     ) {
         tracing::warn!("Failed to set TCP keepalive: {}", e);
     }
+    if let Err(e) = sock.set_tcp_user_timeout(Some(Duration::from_secs(30))) {
+        tracing::warn!("Failed to set TCP_USER_TIMEOUT: {}", e);
+    }
+}
+
+/// Size the socket buffers. Only safe where no data can be in flight yet: the
+/// listening socket *before* `listen()` (accepted sockets inherit the values
+/// when the kernel creates them during the handshake) and a freshly dialed
+/// socket that has not written its handshake.
+fn configure_socket_buffers<'a>(sock: impl Into<socket2::SockRef<'a>>) {
+    let sock = sock.into();
     if let Err(e) = sock.set_send_buffer_size(1_048_576) {
         tracing::warn!("Failed to set send buffer size: {}", e);
     }
     if let Err(e) = sock.set_recv_buffer_size(1_048_576) {
         tracing::warn!("Failed to set recv buffer size: {}", e);
-    }
-    if let Err(e) = sock.set_tcp_user_timeout(Some(Duration::from_secs(30))) {
-        tracing::warn!("Failed to set TCP_USER_TIMEOUT: {}", e);
     }
 }
 
@@ -567,6 +595,7 @@ impl FrameTransport for TcpFrameTransport {
                     )
                 })??;
             configure_socket(&stream);
+            configure_socket_buffers(&stream);
             let mut handshake = [0u8; 16];
             handshake[..8].copy_from_slice(&anchor_id.to_be_bytes());
             handshake[8..].copy_from_slice(&session_id.to_be_bytes());
