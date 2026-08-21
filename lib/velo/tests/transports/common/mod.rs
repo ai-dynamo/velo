@@ -29,6 +29,10 @@ use velo_ext::{InstanceId, PeerInfo};
 
 #[cfg(all(target_os = "linux", feature = "ucx"))]
 use velo::transports::ucx::{UcxTransport, UcxTransportBuilder};
+
+/// UCX context/worker creation is a few ms; a stall here is a bug, not load.
+#[cfg(all(target_os = "linux", feature = "ucx"))]
+const UCX_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(unix)]
 use velo::transports::uds::{UdsTransport, UdsTransportBuilder};
 
@@ -299,7 +303,12 @@ impl TestTransportHandle<UcxTransport> {
     /// Create a new UCX transport pinned to the tcp lane (deterministic on
     /// hardware-less runners; PEER error mode excludes the shm lanes anyway).
     pub async fn new_ucx() -> anyhow::Result<Self> {
-        Self::with_factory(|| UcxTransportBuilder::new().tls("tcp").build()).await
+        tokio::time::timeout(
+            UCX_STARTUP_TIMEOUT,
+            Self::with_factory(|| UcxTransportBuilder::new().tls("tcp").build()),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("ucx transport startup timed out"))?
     }
 }
 
@@ -458,7 +467,12 @@ impl TestCluster<UdsTransport> {
 impl TestCluster<UcxTransport> {
     /// Create a new UCX test cluster (tcp lane; see `new_ucx`).
     pub async fn new_ucx(size: usize) -> anyhow::Result<Self> {
-        Self::with_factory(size, || UcxTransportBuilder::new().tls("tcp").build()).await
+        tokio::time::timeout(
+            UCX_STARTUP_TIMEOUT,
+            Self::with_factory(size, || UcxTransportBuilder::new().tls("tcp").build()),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("ucx cluster startup timed out"))?
     }
 }
 

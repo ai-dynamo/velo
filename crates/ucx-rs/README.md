@@ -22,7 +22,7 @@ Set `UCX_DIR=/path/to/ucx` to link a preinstalled UCX (>= 1.17) instead.
 | `rdmacm` | yes     | RDMA connection manager (needs `librdmacm-dev`). |
 | `mt`     | yes     | `--enable-mt`. SINGLE-mode workers stay lock-free; this only makes MULTI usable. |
 | `cma`    | no      | Cross-memory-attach shared memory transport. |
-| `bindgen`| no      | Regenerate the checked-in bindings (needs libclang). |
+| `bindgen`| no      | Regenerate the checked-in bindings: `UCX_RS_REGEN_BINDINGS=1 cargo build --features bindgen` (needs libclang). The feature alone is a no-op, so `--all-features` CI never rewrites tracked sources. |
 
 CI without RDMA packages should build with `--no-default-features` (TCP and
 shared-memory transports are always compiled in), or install

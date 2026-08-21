@@ -15,9 +15,9 @@
 //! * **No listener.** The `WorkerAddress` blob carries the packed
 //!   `ucp_worker` address; `register()` stores it and the endpoint is created
 //!   with `ucp_ep_create` on first send. No in-band bootstrap exists.
-//! * **One progress thread** owns all UCX objects ([`worker`] module).
-//!   Sends are admitted through per-peer [`AdmissionGate`]s into its command
-//!   ring, preserving the per-target ordering contract.
+//! * **One progress thread** owns all UCX objects (the private `worker`
+//!   module). Sends are admitted through per-peer [`AdmissionGate`]s into its
+//!   command ring, preserving the per-target ordering contract.
 //! * **Eager-only AM.** Every send pins `UCP_AM_SEND_FLAG_EAGER`; the
 //!   negotiated `eager_max` (default 1 MiB) bounds AM frames and
 //!   `max_message_size` reports it, so large payloads ride the messenger's
@@ -26,7 +26,7 @@
 //!   operation until UCX completes it — dropped futures cannot free memory
 //!   UCX is still reading (the async-ucx issue #1 class, closed by design).
 //!
-//! [`AdmissionGate`]: crate::transports::transport::AdmissionGate
+//! [`AdmissionGate`]: crate::transports::AdmissionGate
 
 mod address;
 mod transport;

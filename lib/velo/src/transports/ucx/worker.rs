@@ -463,6 +463,9 @@ struct WorkerState {
     /// lifetime: UCX holds raw pointers into these allocations, and `Arc`
     /// gives each `RecvArg` the stable heap address that requires.
     _recv_args: Vec<Arc<RecvArg>>,
+    /// Endpoints superseded mid-drain (see `ensure_ep`), closed at the next
+    /// safe point by `close_parked`.
+    parked_for_close: Vec<EpEntry>,
     /// Close requests from FORCE-mode endpoint closes that did not complete
     /// inline. They are polled (and freed) from the main loop instead of
     /// being waited on with a nested `ucp_worker_progress` — see
@@ -650,6 +653,7 @@ unsafe fn init_ucx(
                 shared: Arc::clone(shared),
                 config: config.clone(),
                 _recv_args: recv_args,
+                parked_for_close: Vec::new(),
                 pending_closes: Vec::new(),
             },
             StartupOut {
@@ -741,7 +745,8 @@ fn run_loop(mut state: WorkerState, ring_rx: flume::Receiver<Cmd>) {
             break 'outer;
         }
         if observed_empty {
-            // Both close endpoints; both are only safe here (see above).
+            // All three close endpoints; all are only safe here (see above).
+            state.close_parked();
             state.revalidate_eps();
             state.reap_failed_eps();
         }
@@ -826,8 +831,11 @@ impl WorkerState {
                         self.post_am(ep, AM_KIND_PING, header, Bytes::new(), true, op);
                     }
                     Err(_) => {
-                        // Leave the pending ping to time out; check_health
-                        // maps the timeout to the right error.
+                        // No endpoint can be created for this peer: drop the
+                        // pending entry, which closes the oneshot and makes
+                        // `check_health` resolve immediately with
+                        // `ConnectionFailed` instead of waiting out its
+                        // deadline.
                         self.shared.pending_pings.remove(&token);
                     }
                 }
@@ -939,15 +947,28 @@ impl WorkerState {
     }
 
     fn ensure_ep(&mut self, peer: InstanceId) -> anyhow::Result<sys::ucp_ep_h> {
-        if let Some(entry) = self.eps.get(&peer) {
-            return Ok(entry.ep);
-        }
         let blob = self
             .shared
             .peers
             .get(&peer)
             .map(|e| e.value().clone())
             .ok_or_else(|| anyhow::anyhow!("peer {peer} not registered"))?;
+        if let Some(entry) = self.eps.get(&peer) {
+            if entry.incarnation == blob.incarnation {
+                return Ok(entry.ep);
+            }
+            // The peer was re-registered with a new incarnation. Sends must
+            // switch to a fresh endpoint NOW (the old incarnation may still be
+            // reachable), but the old endpoint cannot be closed here: we are
+            // inside a ring drain, and closing frees memory that a queued
+            // reply command may still reference. Park it for the next safe
+            // point (`close_parked`, run only after the ring is observed
+            // empty).
+            if let Some(old) = self.eps.remove(&peer) {
+                debug!("ucx: peer {peer} re-registered; replacing endpoint");
+                self.parked_for_close.push(old);
+            }
+        }
 
         let err_arg = Box::into_raw(Box::new(ErrArg {
             peer,
@@ -990,6 +1011,13 @@ impl WorkerState {
         );
         debug!("ucx: created endpoint to {peer}");
         Ok(ep)
+    }
+
+    /// Close endpoints that `ensure_ep` replaced mid-drain.
+    fn close_parked(&mut self) {
+        for entry in std::mem::take(&mut self.parked_for_close) {
+            self.close_ep(entry, true);
+        }
     }
 
     /// Drop cached endpoints whose peer was re-registered with a different
@@ -1110,7 +1138,9 @@ impl WorkerState {
         // runs on `shutdown()`'s caller-blocking path.
         let entries: Vec<EpEntry> = {
             let eps = std::mem::take(&mut self.eps);
-            eps.into_values().collect()
+            let mut all: Vec<EpEntry> = eps.into_values().collect();
+            all.append(&mut self.parked_for_close);
+            all
         };
         // Phase A: flush-mode close, all at once.
         let mut pending: Vec<(EpEntry, sys::ucs_status_ptr_t)> = Vec::new();

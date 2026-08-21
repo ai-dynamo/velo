@@ -28,7 +28,9 @@ for crate_dir in lib/*/ crates/*/; do
     [[ -d "$crate_dir" ]] || continue
     crate_dir="${crate_dir%/}"
     crate_name=$(basename "$crate_dir")
-    if echo "$changed_files" | grep -qE "^${crate_dir}/src/"; then
+    # Any file in the crate can change its public surface (src/, build.rs,
+    # Cargo.toml features/deps) — match the whole crate directory.
+    if echo "$changed_files" | grep -qE "^${crate_dir}/"; then
         changed_crates+=("$crate_name")
         crate_dirs["$crate_name"]="$crate_dir"
     fi

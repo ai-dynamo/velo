@@ -49,9 +49,10 @@
 
 /// Raw FFI bindings to the UCP/UCS API (bindgen output, checked in).
 ///
-/// Regenerate with `cargo build --features bindgen` (requires libclang); the
-/// output is written back to `src/bindings_linux_<arch>.rs` and must be
-/// committed. Both LP64 Linux targets currently produce identical bindings;
+/// Regenerate with `UCX_RS_REGEN_BINDINGS=1 cargo build --features bindgen`
+/// (requires libclang; the feature alone is deliberately a no-op so that
+/// `--all-features` builds never rewrite tracked sources). The output is
+/// written back to `src/bindings_linux_<arch>.rs` and must be committed. Both LP64 Linux targets currently produce identical bindings;
 /// per-arch files are kept so a future divergence is a diff, not a mystery.
 #[cfg(not(ucx_stub))]
 #[allow(

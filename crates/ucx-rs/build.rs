@@ -36,8 +36,10 @@ fn main() {
         "UCX_RS_REGEN_BINDINGS",
         "CC",
         "CFLAGS",
+        "CXXFLAGS",
         "AR",
         "RANLIB",
+        "STRIP",
     ] {
         println!("cargo:rerun-if-env-changed={v}");
     }
@@ -62,7 +64,10 @@ fn main() {
             let dir = PathBuf::from(dir);
             let v = check_system_version(&dir);
             // Multiarch installs use lib64 (or a triplet dir); take the first
-            // libdir that actually holds libucp.
+            // libdir that holds a SHARED libucp. The UCX_DIR path links the
+            // core libraries dynamically (transport modules are then UCX's
+            // own dlopen'd plugins); a static-only system install would need
+            // the vendored-style archive link list and is not supported.
             let libdir = [
                 "lib",
                 "lib64",
@@ -71,10 +76,12 @@ fn main() {
             ]
             .iter()
             .map(|l| dir.join(l))
-            .find(|d| d.join("libucp.so").exists() || d.join("libucp.a").exists())
+            .find(|d| d.join("libucp.so").exists())
             .unwrap_or_else(|| {
                 panic!(
-                    "ucx-rs: UCX_DIR={} has no libucp under lib/ or lib64/",
+                    "ucx-rs: UCX_DIR={} has no shared libucp.so under lib/ or lib64/ \
+                     (static-only installs are not supported via UCX_DIR; unset it to \
+                     use the vendored static build)",
                     dir.display()
                 )
             });

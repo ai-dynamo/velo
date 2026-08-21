@@ -71,10 +71,13 @@ async fn start_node() -> Node {
     );
     let instance_id = InstanceId::new_v4();
     let (adapter, streams) = make_channels();
-    transport
-        .start(instance_id, adapter, tokio::runtime::Handle::current())
-        .await
-        .expect("start ucx transport");
+    tokio::time::timeout(
+        T,
+        transport.start(instance_id, adapter, tokio::runtime::Handle::current()),
+    )
+    .await
+    .expect("ucx transport startup must not hang")
+    .expect("start ucx transport");
     Node {
         transport,
         streams,
