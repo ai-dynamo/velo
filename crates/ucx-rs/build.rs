@@ -374,12 +374,47 @@ fn emit_link_flags(lib: &Path, modules: &Path, vendored: bool, ib: bool, rdmacm:
         // Ask the TARGET compiler (CC_<target>, then CC, then cc) so a cross
         // build never adds the host's libgcc directory ahead of `-lgcc`.
         let cc = target_cc();
+        let mut found = false;
         if let Ok(o) = Command::new(&cc).arg("-print-libgcc-file-name").output()
             && o.status.success()
-            && let Some(dir) = String::from_utf8_lossy(&o.stdout).trim().rsplit_once('/')
-            && Path::new(dir.0).is_dir()
         {
-            println!("cargo:rustc-link-search=native={}", dir.0);
+            let out = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            // clang may answer with its compiler-rt builtins archive instead;
+            // only trust an actual libgcc.a.
+            if out.ends_with("libgcc.a")
+                && Path::new(&out).exists()
+                && let Some((dir, _)) = out.rsplit_once('/')
+            {
+                println!("cargo:rustc-link-search=native={dir}");
+                found = true;
+            }
+        }
+        if !found {
+            // Fall back to the GCC installation directories directly (clang
+            // wrappers such as sccache-cc do not always answer usefully).
+            let triple_dirs = [
+                "/usr/lib/gcc/aarch64-linux-gnu",
+                "/usr/lib/gcc/aarch64-unknown-linux-gnu",
+            ];
+            'search: for base in triple_dirs {
+                if let Ok(entries) = fs::read_dir(base) {
+                    let mut versions: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+                    versions.sort();
+                    for v in versions.iter().rev() {
+                        if v.join("libgcc.a").exists() {
+                            println!("cargo:rustc-link-search=native={}", v.display());
+                            found = true;
+                            break 'search;
+                        }
+                    }
+                }
+            }
+        }
+        if !found {
+            println!(
+                "cargo:warning=ucx-rs: libgcc.a not located; aarch64 outline-atomic helpers \
+                 may be unresolved at link time (install libgcc-*-dev)"
+            );
         }
         println!("cargo:rustc-link-lib=static=gcc");
     }
@@ -470,9 +505,15 @@ fn which(prog: &str) -> bool {
 }
 
 fn run(cmd: &mut Command, what: &str) {
-    let st = cmd
-        .status()
-        .unwrap_or_else(|e| panic!("ucx-rs: spawn {what}: {e}"));
+    let program = cmd.get_program().to_string_lossy().into_owned();
+    let st = cmd.status().unwrap_or_else(|e| {
+        panic!(
+            "ucx-rs: could not spawn `{program}` for {what}: {e}. The vendored UCX \
+             build needs a C compiler and GNU `make` on PATH (the release tarball \
+             ships a pre-generated configure, so autoconf/automake/libtool are NOT \
+             required)."
+        )
+    });
     assert!(st.success(), "ucx-rs: {what} failed ({st})");
 }
 

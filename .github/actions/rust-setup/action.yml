@@ -41,6 +41,9 @@ runs:
       command -v cmake >/dev/null 2>&1 || pkgs="$pkgs cmake"
       command -v mold  >/dev/null 2>&1 || pkgs="$pkgs mold"
       command -v clang >/dev/null 2>&1 || pkgs="$pkgs clang"
+      # GNU make drives the vendored UCX build (autotools; configure ships
+      # pre-generated in the release tarball, so make is the only tool needed).
+      command -v make  >/dev/null 2>&1 || pkgs="$pkgs make"
       # rdma-core headers: the `ucx` feature (on under --all-features) builds
       # the vendored UCX with InfiniBand support and hard-fails without them.
       # Headers only — no RDMA hardware is needed; the UCX tests run over tcp.
