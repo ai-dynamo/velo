@@ -16,6 +16,7 @@ pub use velo_ext::admission::{
     AdmissionError, AdmissionGate, AdmissionState, SendAdmission, SendOutcome,
 };
 pub use velo_ext::transport::{
-    DataStreams, HealthCheckError, InFlightGuard, MessageType, ShutdownPolicy, ShutdownState,
-    Transport, TransportAdapter, TransportError, TransportErrorHandler, make_channels,
+    AdmitOutcome, DataStreams, HealthCheckError, InFlightGuard, InboundMessage, MessageType,
+    ShutdownPolicy, ShutdownState, Transport, TransportAdapter, TransportError,
+    TransportErrorHandler, make_channels,
 };

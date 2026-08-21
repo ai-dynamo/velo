@@ -51,7 +51,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use tracing::{debug, warn};
 use ucx_rs::{decode_status_ptr, status_string, sys};
-use velo_ext::{InstanceId, MessageType, TransportAdapter, TransportErrorHandler};
+use velo_ext::{AdmitOutcome, InstanceId, MessageType, TransportAdapter, TransportErrorHandler};
 
 use super::address::{AM_ID_BASE, AM_KIND_COUNT, AM_KIND_PING, AM_KIND_PONG, UcxEndpoint};
 use super::transport::UcxConfig;
@@ -360,25 +360,34 @@ unsafe extern "C" fn recv_trampoline(
                 let adapter = &ra.shared.adapter;
                 match MessageType::from_u8(kind) {
                     Some(MessageType::Message) => {
-                        if adapter.shutdown_state.is_draining() {
-                            // Echo the header back as ShuttingDown, like the
-                            // TCP listener's per-frame drain gate.
-                            if !p.reply_ep.is_null()
-                                && ra
-                                    .shared
-                                    .ring_tx
-                                    .try_send(Cmd::ShuttingDownTo {
-                                        reply_ep: p.reply_ep as usize,
-                                        header,
-                                    })
-                                    .is_err()
-                            {
-                                // Best-effort: a full ring drops the echo and
-                                // the requester waits out its own timeout.
-                                debug!("ucx: drain echo dropped (ring full)");
+                        // The drain gate: `admit_message` acquires the
+                        // in-flight guard before it re-reads the draining flag
+                        // and ships the guard with the frame, so a queued
+                        // message is work `wait_for_drain` can see. Sync, so
+                        // it is callable from this AM callback.
+                        match adapter.admit_message(header, payload) {
+                            AdmitOutcome::Admitted => {}
+                            AdmitOutcome::Draining { header, .. } => {
+                                // Echo the header back as ShuttingDown, like the
+                                // TCP listener's per-frame drain gate.
+                                if !p.reply_ep.is_null()
+                                    && ra
+                                        .shared
+                                        .ring_tx
+                                        .try_send(Cmd::ShuttingDownTo {
+                                            reply_ep: p.reply_ep as usize,
+                                            header,
+                                        })
+                                        .is_err()
+                                {
+                                    // Best-effort: a full ring drops the echo and
+                                    // the requester waits out its own timeout.
+                                    debug!("ucx: drain echo dropped (ring full)");
+                                }
                             }
-                        } else {
-                            let _ = adapter.message_stream.send((header, payload));
+                            AdmitOutcome::Disconnected { .. } => {
+                                debug!("ucx: inbound Message dropped (receiver gone)");
+                            }
                         }
                     }
                     Some(MessageType::Response) => {

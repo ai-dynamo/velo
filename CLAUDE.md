@@ -48,7 +48,7 @@ The bug class that motivated the workspace collapse: a 0.1.1 "patch" of an inter
 1. **Only `velo` and `velo-ext` are publishable.** Any new crate added to the workspace must have `publish = false` in its `Cargo.toml` unless there is a deliberate, documented reason to publish it. Adding a third publishable crate reopens the bug class.
 2. **`velo-ext` is `=`-pinned in `[workspace.dependencies]`.** The line is:
    ```toml
-   velo-ext = { path = "lib/velo-ext", version = "=0.1.0" }
+   velo-ext = { path = "lib/velo-ext", version = "=0.5.0" }
    ```
    The `=` is load-bearing. Caret (the cargo default) lets a future "compatible" patch silently re-resolve downstream lockfiles. Do not relax this to a caret requirement.
 3. **Bumping `velo-ext` requires bumping `velo` in the same PR.** The `=` pin in `[workspace.dependencies]` must be updated to track. CI will fail otherwise.
@@ -119,7 +119,7 @@ External authors depend only on `velo-ext` and implement `Transport` against it.
 
 ```toml
 [dependencies]
-velo-ext = "0.1"  # exact pin tracked by velo's workspace
+velo-ext = "0.5"  # exact pin tracked by velo's workspace
 ```
 
 ## Code Style

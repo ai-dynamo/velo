@@ -8,6 +8,6 @@
 #[macro_use]
 mod common;
 
-use common::{UdsShutdownClient, shutdown_scenarios};
+use common::{OUTER_TEST_TIMEOUT, UdsShutdownClient, shutdown_scenarios};
 
 transport_shutdown_tests!(uds, UdsShutdownClient);

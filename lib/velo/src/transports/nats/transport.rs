@@ -31,7 +31,8 @@ pub(crate) const HEADER_VELO_HLEN: &str = "Velo-HLen";
 
 use super::subjects;
 use velo_ext::{
-    AdmissionGate, InstanceId, MessageType, PeerInfo, SendOutcome, TransportKey, WorkerAddress,
+    AdmissionGate, AdmitOutcome, InstanceId, MessageType, PeerInfo, SendOutcome, TransportKey,
+    WorkerAddress,
     transport::{
         HealthCheckError, ShutdownState, Transport, TransportAdapter, TransportError,
         TransportErrorHandler,
@@ -546,33 +547,16 @@ async fn run_receive_loop(
             msg = data_sub.next() => {
                 match msg {
                     Some(msg) => {
-                        // LIFECYCLE-04: Drain gate — reject Message frames during drain.
-                        // Must come BEFORE D-05 ack to avoid sending both ack and ShuttingDown.
-                        if adapter.shutdown_state.is_draining() {
-                            // Parse Velo-Type to check if this is a Message frame.
-                            let is_message = msg.headers.as_ref()
-                                .and_then(|h| h.get(HEADER_VELO_TYPE))
-                                .and_then(|v| v.as_str().parse::<u8>().ok())
-                                .map(|t| t == MessageType::Message as u8)
-                                .unwrap_or(false);
-
-                            if is_message {
-                                if let Some(metrics) = metrics.as_ref() {
-                                    metrics.record_rejection(TransportRejection::DrainRejected);
-                                }
+                        // LIFECYCLE-04: the drain gate lives inside route_frame
+                        // (it is the only place that has parsed the header out
+                        // of the payload). D-04: non-Message frames — Response,
+                        // Ack, Event — are routed regardless of drain state.
+                        match route_frame(&msg, &adapter, &transport_key, metrics.as_ref()) {
+                            NatsRouted::Done => {}
+                            NatsRouted::DrainRejected { header } => {
                                 if let Some(reply) = &msg.reply {
                                     // D-02: Send ShuttingDown response echoing original header
                                     // for correlation, with empty velo payload.
-                                    let hlen: usize = msg.headers.as_ref()
-                                        .and_then(|h| h.get(HEADER_VELO_HLEN))
-                                        .and_then(|v| v.as_str().parse().ok())
-                                        .unwrap_or(0);
-                                    let original_header = if hlen > 0 && msg.payload.len() >= hlen {
-                                        msg.payload.slice(..hlen)
-                                    } else {
-                                        Bytes::new()
-                                    };
-
                                     let mut nats_headers = async_nats::HeaderMap::new();
                                     nats_headers.insert(
                                         HEADER_VELO_TYPE,
@@ -580,13 +564,13 @@ async fn run_receive_loop(
                                     );
                                     nats_headers.insert(
                                         HEADER_VELO_HLEN,
-                                        original_header.len().to_string().as_str(),
+                                        header.len().to_string().as_str(),
                                     );
 
                                     if let Err(e) = client.publish_with_headers(
                                         reply.clone(),
                                         nats_headers,
-                                        original_header,
+                                        header,
                                     ).await {
                                         tracing::warn!(error = %e, "Failed to send ShuttingDown response");
                                     }
@@ -595,14 +579,9 @@ async fn run_receive_loop(
                                     tracing::debug!(
                                         "Discarding fire-and-forget Message during drain (no reply inbox)"
                                     );
+                                }
                             }
-                            continue;
                         }
-                            // D-04: Non-Message frames (Response, Ack, Event) fall through
-                            // to routing below.
-                        }
-
-                        route_frame(&msg, &adapter, &transport_key, metrics.as_ref());
                     }
                     None => {
                         tracing::warn!("NATS data subscription stream ended");
@@ -635,6 +614,16 @@ async fn run_receive_loop(
     tracing::debug!("NATS receive loop exited, subscriptions unsubscribed");
 }
 
+/// Outcome of routing one inbound NATS message.
+enum NatsRouted {
+    /// Delivered to its stream, or dropped as malformed. Nothing left to do.
+    Done,
+    /// LIFECYCLE-04: an inbound `Message` was refused because this instance is
+    /// draining. The caller owes the sender a `ShuttingDown` reply echoing this
+    /// header (D-02) — or, with no reply inbox, a debug line (D-03).
+    DrainRejected { header: Bytes },
+}
+
 /// Route an inbound NATS message to the correct [`TransportAdapter`] channel (D-05a).
 ///
 /// Reads frame metadata from NATS headers:
@@ -643,12 +632,19 @@ async fn run_receive_loop(
 ///
 /// The NATS payload is `velo_header_bytes ++ velo_payload_bytes` (no binary preamble).
 /// Messages missing required headers or with invalid formats are silently dropped.
+///
+/// This is also the drain gate: `Message` frames go through
+/// [`TransportAdapter::admit_message`], which acquires the in-flight guard
+/// before it re-reads the draining flag, so an admitted message is work
+/// `wait_for_drain` can see even while it is only queued. The gate lives here
+/// rather than in the receive loop because the header it must echo back is a
+/// slice of the payload this function has already validated.
 fn route_frame(
     msg: &async_nats::Message,
     adapter: &TransportAdapter,
     transport_key: &str,
     metrics: Option<&std::sync::Arc<dyn velo_ext::TransportObservability>>,
-) {
+) -> NatsRouted {
     #[cfg(not(feature = "distributed-tracing"))]
     let _ = transport_key;
     let headers = match &msg.headers {
@@ -658,7 +654,7 @@ fn route_frame(
                 metrics.record_rejection(TransportRejection::MissingHeaders);
             }
             tracing::trace!("Dropping NATS message with no headers");
-            return;
+            return NatsRouted::Done;
         }
     };
 
@@ -670,7 +666,7 @@ fn route_frame(
                 metrics.record_rejection(TransportRejection::MissingType);
             }
             tracing::trace!("Dropping NATS message missing Velo-Type header");
-            return;
+            return NatsRouted::Done;
         }
     };
     let msg_type = match type_str.parse::<u8>() {
@@ -687,7 +683,7 @@ fn route_frame(
                 velo_type = type_str,
                 "Dropping NATS message with invalid Velo-Type"
             );
-            return;
+            return NatsRouted::Done;
         }
     };
 
@@ -702,7 +698,7 @@ fn route_frame(
                 metrics.record_rejection(TransportRejection::InvalidHeaderLength);
             }
             tracing::trace!("Dropping NATS message missing or invalid Velo-HLen header");
-            return;
+            return NatsRouted::Done;
         }
     };
 
@@ -716,41 +712,69 @@ fn route_frame(
             actual = msg.payload.len(),
             "Dropping truncated NATS frame"
         );
-        return;
+        return NatsRouted::Done;
     }
     let header = msg.payload.slice(..hlen);
     let body = msg.payload.slice(hlen..);
 
-    if let Some(metrics) = metrics {
-        #[cfg(feature = "distributed-tracing")]
-        let span = tracing::debug_span!(
-            "velo.transport.receive",
-            transport = transport_key,
-            message_type = crate::transports::message_type_label(msg_type),
-            bytes = header.len() + body.len()
-        );
-        #[cfg(feature = "distributed-tracing")]
-        let _entered = span.enter();
-
-        metrics.record_frame(
-            Direction::Inbound,
-            crate::transports::message_type_label(msg_type),
-            header.len() + body.len(),
-        );
-    }
+    let frame_bytes = header.len() + body.len();
 
     let result = match msg_type {
-        MessageType::Message => adapter.message_stream.try_send((header, body)),
-        MessageType::Response => adapter.response_stream.try_send((header, body)),
-        MessageType::Ack | MessageType::Event => adapter.event_stream.try_send((header, body)),
-        MessageType::ShuttingDown => adapter.shutdown_stream.try_send((header, body)),
+        MessageType::Message => match adapter.admit_message(header, body) {
+            AdmitOutcome::Admitted => Ok(()),
+            AdmitOutcome::Draining { header, .. } => {
+                if let Some(metrics) = metrics {
+                    metrics.record_rejection(TransportRejection::DrainRejected);
+                }
+                return NatsRouted::DrainRejected { header };
+            }
+            AdmitOutcome::Disconnected { .. } => Err(()),
+        },
+        MessageType::Response => adapter
+            .response_stream
+            .try_send((header, body))
+            .map_err(|_| ()),
+        MessageType::Ack | MessageType::Event => adapter
+            .event_stream
+            .try_send((header, body))
+            .map_err(|_| ()),
+        MessageType::ShuttingDown => adapter
+            .shutdown_stream
+            .try_send((header, body))
+            .map_err(|_| ()),
     };
 
-    if result.is_err()
-        && let Some(metrics) = metrics
-    {
-        metrics.record_rejection(TransportRejection::RouteFailed);
+    match result {
+        // Counted only once the frame is actually on its stream: a
+        // drain-rejected Message returns above and counts as a rejection, not
+        // as inbound traffic.
+        Ok(()) => {
+            if let Some(metrics) = metrics {
+                #[cfg(feature = "distributed-tracing")]
+                let span = tracing::debug_span!(
+                    "velo.transport.receive",
+                    transport = transport_key,
+                    message_type = crate::transports::message_type_label(msg_type),
+                    bytes = frame_bytes
+                );
+                #[cfg(feature = "distributed-tracing")]
+                let _entered = span.enter();
+
+                metrics.record_frame(
+                    Direction::Inbound,
+                    crate::transports::message_type_label(msg_type),
+                    frame_bytes,
+                );
+            }
+        }
+        Err(()) => {
+            if let Some(metrics) = metrics {
+                metrics.record_rejection(TransportRejection::RouteFailed);
+            }
+        }
     }
+
+    NatsRouted::Done
 }
 
 /// Builder for [`NatsTransport`].

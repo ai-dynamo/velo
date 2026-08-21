@@ -11,7 +11,7 @@ use bytes::Bytes;
 use std::sync::Arc;
 use tracing::{debug, error, warn};
 
-use velo_ext::{MessageType, ShutdownState, TransportAdapter};
+use velo_ext::{AdmitOutcome, MessageType, TransportAdapter};
 
 /// Configuration bundle for the listener thread (avoids too-many-arguments).
 pub(crate) struct ListenerConfig {
@@ -19,7 +19,6 @@ pub(crate) struct ListenerConfig {
     pub bind_endpoint: String,
     pub control_endpoint: String,
     pub adapter: TransportAdapter,
-    pub shutdown_state: ShutdownState,
     pub rcvhwm: i32,
     pub linger_ms: i32,
     pub metrics: Option<std::sync::Arc<dyn velo_ext::TransportObservability>>,
@@ -33,8 +32,9 @@ pub(crate) struct ListenerConfig {
 /// Run the ROUTER listener thread.
 ///
 /// Uses a pre-bound ROUTER socket (if provided) or binds a new one. Polls for
-/// inbound messages and routes decoded frames to the adapter channels. Uses
-/// `ShutdownState` for drain gating and a control PAIR socket for shutdown.
+/// inbound messages and routes decoded frames to the adapter channels. Drain
+/// gating goes through `TransportAdapter::admit_message`; shutdown arrives on
+/// a control PAIR socket.
 pub(crate) fn run_listener(cfg: ListenerConfig) {
     // Use pre-bound socket or create + bind a new one
     let router = if let Some(sock) = cfg.router_socket {
@@ -166,49 +166,72 @@ pub(crate) fn run_listener(cfg: ListenerConfig) {
                 }
             };
 
-            // During drain: reject new Message frames with ShuttingDown reply.
-            // Echo the header for correlation, empty payload — matches TCP behavior.
-            if cfg.shutdown_state.is_draining() && msg_type == MessageType::Message {
-                if let Some(ref m) = cfg.metrics {
-                    m.record_rejection(crate::observability::TransportRejection::DrainRejected);
-                }
-                debug!("ZMQ: rejecting Message frame during drain (sending ShuttingDown)");
-                let type_byte: &[u8] = &[MessageType::ShuttingDown.as_u8()];
-                let empty: &[u8] = &[];
-                let _ = router.send_multipart(
-                    [
-                        multipart[0].as_slice(),
-                        type_byte,
-                        multipart[2].as_slice(),
-                        empty,
-                    ],
-                    0,
-                );
-                continue;
-            }
-
             // Take ownership of Vec buffers — O(1), no memcpy.
             // recv_multipart() already copied from ZMQ-owned buffers into Vecs;
             // Bytes::from(Vec<u8>) wraps the existing allocation without copying.
             let header = Bytes::from(std::mem::take(&mut multipart[2]));
             let payload = Bytes::from(std::mem::take(&mut multipart[3]));
+            let frame_bytes = header.len() + payload.len();
+
+            // Route to appropriate adapter stream
+            let sender = match msg_type {
+                // Message frames go through the drain gate. `admit_message`
+                // acquires the in-flight guard *before* it re-reads the
+                // draining flag, so a message that is merely queued is already
+                // work `wait_for_drain` can see — and a rejected one hands the
+                // frames back so we can echo ShuttingDown for correlation,
+                // matching TCP.
+                MessageType::Message => {
+                    match cfg.adapter.admit_message(header, payload) {
+                        AdmitOutcome::Admitted => {
+                            if let Some(ref m) = cfg.metrics {
+                                m.record_frame(
+                                    crate::observability::Direction::Inbound,
+                                    crate::transports::message_type_label(msg_type),
+                                    frame_bytes,
+                                );
+                            }
+                        }
+                        AdmitOutcome::Draining { header, .. } => {
+                            if let Some(ref m) = cfg.metrics {
+                                m.record_rejection(
+                                    crate::observability::TransportRejection::DrainRejected,
+                                );
+                            }
+                            debug!(
+                                "ZMQ: rejecting Message frame during drain (sending ShuttingDown)"
+                            );
+                            let type_byte: &[u8] = &[MessageType::ShuttingDown.as_u8()];
+                            let empty: &[u8] = &[];
+                            let _ = router.send_multipart(
+                                [multipart[0].as_slice(), type_byte, header.as_ref(), empty],
+                                0,
+                            );
+                        }
+                        AdmitOutcome::Disconnected { .. } => {
+                            if let Some(ref m) = cfg.metrics {
+                                m.record_rejection(
+                                    crate::observability::TransportRejection::RouteFailed,
+                                );
+                            }
+                            warn!("ZMQ: failed to route Message frame: receiver disconnected");
+                        }
+                    }
+                    continue;
+                }
+                MessageType::Response => &cfg.adapter.response_stream,
+                MessageType::Ack | MessageType::Event => &cfg.adapter.event_stream,
+                MessageType::ShuttingDown => &cfg.adapter.shutdown_stream,
+            };
 
             // Record metrics
             if let Some(ref m) = cfg.metrics {
                 m.record_frame(
                     crate::observability::Direction::Inbound,
                     crate::transports::message_type_label(msg_type),
-                    header.len() + payload.len(),
+                    frame_bytes,
                 );
             }
-
-            // Route to appropriate adapter stream
-            let sender = match msg_type {
-                MessageType::Message => &cfg.adapter.message_stream,
-                MessageType::Response => &cfg.adapter.response_stream,
-                MessageType::Ack | MessageType::Event => &cfg.adapter.event_stream,
-                MessageType::ShuttingDown => &cfg.adapter.shutdown_stream,
-            };
 
             if let Err(e) = sender.try_send((header, payload)) {
                 if let Some(ref m) = cfg.metrics {

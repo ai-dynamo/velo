@@ -15,12 +15,14 @@
 //! handler invocation, so `graceful_shutdown` waits for a running handler
 //! instead of tearing down under it.
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use velo::transports::Transport;
 use velo::transports::tcp::TcpTransportBuilder;
+use velo::transports::{AdmitOutcome, MessageType, SendOutcome, Transport};
 use velo::*;
 
 fn new_tcp_transport() -> Arc<dyn Transport> {
@@ -181,4 +183,286 @@ async fn graceful_shutdown_waits_for_in_flight_handlers() {
     // Whether the response beat the teardown is a separate race; just make
     // sure the client task winds down rather than asserting its outcome.
     let _ = tokio::time::timeout(Duration::from_millis(500), pending).await;
+}
+
+// ── Teardown-aware consumer loop ─────────────────────────────────────────
+
+/// An in-process loopback transport that can be told to *hold* one frame
+/// instead of delivering it.
+///
+/// Everything the messenger sends is fed straight back into its own inbound
+/// streams, which is enough for a single instance registered as its own peer
+/// to complete the `_hello` handshake and then talk to itself. The hold hook
+/// is what makes the test deterministic: a held frame is a real, decodable
+/// active message that the test can drop onto the inbound queue at a moment
+/// of its choosing, rather than whenever a listener task happens to run.
+#[derive(Default)]
+struct LoopbackTransport {
+    adapter: std::sync::OnceLock<velo::transports::TransportAdapter>,
+    /// Payload of the one frame to intercept rather than deliver.
+    ///
+    /// Matched by payload equality, so the marker must be distinct from every
+    /// payload the runtime sends on its own (`_hello`'s peer-info JSON, and
+    /// any future internal frame). The caller asserts that exactly one frame
+    /// matched, which is what turns a collision into a clear failure rather
+    /// than a mysterious one.
+    hold: Mutex<Option<&'static [u8]>>,
+    held: Mutex<VecDeque<(Bytes, Bytes)>>,
+}
+
+impl LoopbackTransport {
+    fn adapter(&self) -> &velo::transports::TransportAdapter {
+        self.adapter.get().expect("transport was never started")
+    }
+
+    fn hold_payload(&self, payload: &'static [u8]) {
+        *self.hold.lock().unwrap() = Some(payload);
+    }
+
+    fn take_held(&self) -> Option<(Bytes, Bytes)> {
+        self.held.lock().unwrap().pop_front()
+    }
+}
+
+impl Transport for LoopbackTransport {
+    fn key(&self) -> velo_ext::TransportKey {
+        velo_ext::TransportKey::from("loopback")
+    }
+
+    fn address(&self) -> velo_ext::WorkerAddress {
+        let mut entries = std::collections::HashMap::<String, Vec<u8>>::new();
+        entries.insert("loopback".to_string(), b"loopback://local".to_vec());
+        velo_ext::WorkerAddress::from_encoded(rmp_serde::to_vec(&entries).unwrap())
+    }
+
+    fn register(&self, _peer_info: velo_ext::PeerInfo) -> Result<(), velo_ext::TransportError> {
+        Ok(())
+    }
+
+    fn send_message(
+        &self,
+        _instance_id: InstanceId,
+        header: Bytes,
+        payload: Bytes,
+        message_type: MessageType,
+        _on_error: Arc<dyn velo::transports::TransportErrorHandler>,
+    ) -> SendOutcome {
+        let adapter = self.adapter();
+        match message_type {
+            MessageType::Message => {
+                let held = self
+                    .hold
+                    .lock()
+                    .unwrap()
+                    .is_some_and(|marker| marker == &payload[..]);
+                if held {
+                    self.held.lock().unwrap().push_back((header, payload));
+                } else {
+                    // The documented producer contract: `admit_message` owns
+                    // both the drain gate and the enqueue.
+                    let _ = adapter.admit_message(header, payload);
+                }
+            }
+            MessageType::Response => {
+                let _ = adapter.response_stream.send((header, payload));
+            }
+            MessageType::Ack | MessageType::Event => {
+                let _ = adapter.event_stream.send((header, payload));
+            }
+            MessageType::ShuttingDown => {
+                let _ = adapter.shutdown_stream.send((header, payload));
+            }
+        }
+        SendOutcome::Admitted
+    }
+
+    fn start(
+        &self,
+        _instance_id: InstanceId,
+        channels: velo::transports::TransportAdapter,
+        _rt: tokio::runtime::Handle,
+    ) -> futures::future::BoxFuture<'_, anyhow::Result<()>> {
+        let _ = self.adapter.set(channels);
+        Box::pin(async { Ok(()) })
+    }
+
+    fn shutdown(&self) {}
+
+    fn check_health(
+        &self,
+        _instance_id: InstanceId,
+        _timeout: Duration,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), velo_ext::HealthCheckError>> + Send + '_>,
+    > {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// Under `ShutdownPolicy::Timeout`, work still sitting on the inbound queue
+/// when phase 2 gives up must be dropped, not dispatched into an instance that
+/// has already torn itself down.
+///
+/// The queued message is visible to phase 2 — it holds an in-flight guard — so
+/// the policy's timeout is what ends the wait. Phase 3 then cancels the
+/// teardown token, and the consumer loop has to break on it instead of
+/// dispatching the backlog it can still see — while still *releasing* that
+/// backlog's guards on the way out, or the count it abandons wedges every
+/// later drain wait.
+///
+/// Starving the consumer is the whole trick: it dispatches within microseconds
+/// of a message landing, so the only way to still *have* a backlog at teardown
+/// is to stop it running. The instance therefore gets its own single-worker
+/// runtime, and a task blocking on a channel freezes that worker. Admission
+/// and the shutdown driver both run on the test's runtime, so neither freezes
+/// with it — which is exactly the interleaving the fix has to survive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn graceful_shutdown_timeout_drops_queued_work() {
+    let server_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let transport = Arc::new(LoopbackTransport::default());
+    let server = {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let transport = transport.clone();
+        server_rt.spawn(async move {
+            let built = Velo::builder()
+                .add_transport(transport)
+                .build()
+                .await
+                .expect("server build");
+            tx.send(built).expect("server handoff");
+        });
+        tokio::task::block_in_place(|| rx.recv_timeout(Duration::from_secs(10)))
+            .expect("server never finished building")
+    };
+
+    let ran = Arc::new(AtomicUsize::new(0));
+    let ran_handler = ran.clone();
+    let victim = Handler::unary_handler("victim", move |ctx| {
+        ran_handler.fetch_add(1, Ordering::SeqCst);
+        Ok(Some(ctx.payload))
+    })
+    .build();
+    server.register_handler(victim).unwrap();
+    server.register_peer(server.peer_info()).unwrap();
+
+    // Warm-up over the loopback. This completes the `_hello` handshake and
+    // proves the whole inbound path works, so "the handler did not run" later
+    // cannot be a never-wired handler masquerading as a pass.
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        server
+            .am_send("victim")
+            .unwrap()
+            .raw_payload(Bytes::from_static(b"warmup"))
+            .instance(server.instance_id())
+            .send(),
+    )
+    .await
+    .expect("warm-up send timed out")
+    .expect("warm-up send failed");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while ran.load(Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "warm-up message was never dispatched"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // Build the messages the consumer must never dispatch, and hold them.
+    //
+    // Two, not one, and the difference is the point: the first is what the
+    // consumer dequeues and then drops when it sees the cancelled token, so
+    // its guard is released on the loop's own path out. Only the *second* one
+    // is still sitting in the channel buffer when the loop exits, which is the
+    // guard that can be stranded there for good.
+    transport.hold_payload(b"queued");
+    for attempt in 0..2 {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            server
+                .am_send("victim")
+                .unwrap()
+                .raw_payload(Bytes::from_static(b"queued"))
+                .instance(server.instance_id())
+                .send(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("held send {attempt} timed out"))
+        .unwrap_or_else(|e| panic!("held send {attempt} failed: {e}"));
+    }
+    let first = transport.take_held().expect("frame was not intercepted");
+    let second = transport
+        .take_held()
+        .expect("second frame was not intercepted");
+    assert!(
+        transport.take_held().is_none(),
+        "the hold marker matched more than the two intended frames"
+    );
+
+    // Freeze the instance's only worker: its consumer task cannot run again
+    // until the test releases it.
+    let (frozen_tx, frozen_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    server_rt.spawn(async move {
+        frozen_tx.send(()).expect("freeze handshake");
+        let _ = release_rx.recv();
+    });
+    tokio::task::block_in_place(|| frozen_rx.recv_timeout(Duration::from_secs(5)))
+        .expect("instance worker never froze");
+
+    for (header, payload) in [first, second] {
+        assert!(matches!(
+            transport.adapter().admit_message(header, payload),
+            AdmitOutcome::Admitted
+        ));
+    }
+    assert_eq!(
+        transport.adapter().shutdown_state.in_flight_count(),
+        2,
+        "both queued messages must be counted work before shutdown starts"
+    );
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        server.graceful_shutdown(ShutdownPolicy::Timeout(Duration::from_millis(50))),
+    )
+    .await
+    .expect("graceful_shutdown must give up once its timeout expires");
+
+    // Thaw: the consumer runs again with the teardown token already cancelled
+    // and a message still on its queue.
+    release_tx.send(()).ok();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        1,
+        "messages left on the queue at teardown must be dropped, not dispatched \
+         after graceful_shutdown already returned"
+    );
+
+    // Abandoning the message must not abandon the in-flight guard riding with
+    // it. flume frees a buffered item only once *both* ends of the channel are
+    // gone, and the transport holds a sender clone for the instance's
+    // lifetime, so a guard left parked in the buffer would pin the count above
+    // zero for good — and every later or concurrent drain wait would hang on a
+    // count that can no longer reach zero.
+    let state = &transport.adapter().shutdown_state;
+    tokio::time::timeout(Duration::from_secs(5), state.wait_for_drain())
+        .await
+        .expect("a drain wait after a timed-out shutdown must not hang on abandoned work");
+    assert_eq!(
+        state.in_flight_count(),
+        0,
+        "the guard riding the abandoned message must have been released at teardown"
+    );
+
+    server_rt.shutdown_background();
 }

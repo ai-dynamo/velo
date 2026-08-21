@@ -18,7 +18,7 @@ use crate::messenger::common::{
 use std::sync::Arc;
 
 use crate::observability::{DispatchFailure, VeloMetrics};
-use crate::transports::{DataStreams, ShutdownState, VeloBackend};
+use crate::transports::{DataStreams, InboundMessage, ShutdownState, VeloBackend};
 use bytes::Bytes;
 use tokio_util::task::TaskTracker;
 
@@ -90,7 +90,7 @@ impl ActiveMessageServer {
 /// Message handler task - receives messages from backend and dispatches to handlers
 /// This is the HOT PATH - optimized for low latency with direct dispatch
 async fn create_message_handler(
-    message_rx: flume::Receiver<(Bytes, Bytes)>,
+    message_rx: flume::Receiver<InboundMessage>,
     hub: Arc<DispatcherHub>,
     observability: Option<Arc<VeloMetrics>>,
     large_payload_resolver: Arc<
@@ -101,14 +101,82 @@ async fn create_message_handler(
     // Wait for system initialization before processing messages
     hub.wait_for_system().await;
 
-    while let Ok((header, payload)) = message_rx.recv_async().await {
+    // Phase 3 of graceful shutdown. `VeloBackend::graceful_shutdown` is the
+    // only path that cancels this token *behind a drain*, so under
+    // `WaitForever` it can only fire once the queue is provably empty (every
+    // queued message holds a guard, so `in_flight == 0` implies nothing is
+    // queued). Under `Timeout` it is what stops leftover queued work from
+    // dispatching into an instance that has already declared itself dead.
+    //
+    // It is not the only caller: every in-tree `Transport::shutdown` cancels
+    // this same shared token, so a direct call on one transport of a live
+    // instance ends this task — backlog abandoned, guards released, every
+    // later admission answered `Disconnected` — for *all* transports, with no
+    // drain and no `ShuttingDown` correlations. That is documented on
+    // `Transport::shutdown` as the reason not to call it by hand.
+    //
+    // The check that makes it structural is the `is_cancelled()` *after* the
+    // dequeue, not the select's arm order. A task woken with both a message
+    // and a cancelled token pending re-polls the select from the top, so
+    // whichever arm is `biased` first decides — and a check placed before the
+    // park is stale by the time the wake arrives. Testing the token on the
+    // message's own path to dispatch is the only placement that cannot be
+    // outraced by the wake ordering; the remaining window is the instructions
+    // between the check and `dispatch_message`, which is as narrow as
+    // cancellation-versus-dispatch can be made.
+    //
+    // It is also the cheap placement. Polling a `cancelled()` future costs
+    // *two* uncontended mutex round-trips — `CancellationToken::is_cancelled`
+    // locks its tree node, and re-polling the inner `Notified` takes the
+    // `Notify` waiters lock unconditionally once it is in the waiting state —
+    // so putting the teardown arm first made the hot path pay both per
+    // message. One `is_cancelled()` is half of that, and the pinned future is
+    // now polled only when the queue is empty and this task is about to park.
+    // Pinning still earns its keep there: rebuilding the future per park would
+    // register — and on drop deregister — a waker every time.
+    let teardown = shutdown_state.teardown_token().clone();
+    let mut teardown_fut = std::pin::pin!(teardown.cancelled());
+
+    // Counts messages taken off the queue but deliberately not dispatched,
+    // for the teardown log below.
+    let mut abandoned = 0usize;
+
+    loop {
+        let inbound = tokio::select! {
+            biased;
+            received = message_rx.recv_async() => match received {
+                Ok(inbound) => inbound,
+                Err(_) => break,
+            },
+            _ = teardown_fut.as_mut() => break,
+        };
+
+        if teardown.is_cancelled() {
+            // Teardown won: this message was queued before the instance
+            // declared itself dead, so it is abandoned rather than dispatched.
+            // Dropping it releases the in-flight guard it carried.
+            drop(inbound);
+            abandoned += 1;
+            break;
+        }
+
+        // The guard was acquired by the transport at admission
+        // (`TransportAdapter::admit_message`) and travelled with the frame, so
+        // this message has been counted work since before it was queued.
+        // Taking ownership of it *before* decoding means a decode failure
+        // releases it on the spot instead of leaking it.
+        let InboundMessage {
+            header,
+            payload,
+            guard,
+            ..
+        } = inbound;
+        // Held until the handler future (response send included) completes, so
+        // phase 2's wait_for_drain covers accepted-but-unfinished work.
+        let in_flight = Some(Arc::new(guard));
+
         match decode_active_message(header, payload) {
             Ok(message) => {
-                // Track this invocation for graceful shutdown: the guard rides
-                // in the HandlerContext and is held until the handler future
-                // (response send included) completes, so phase 2's
-                // wait_for_drain covers accepted-but-unfinished work.
-                let in_flight = Some(Arc::new(shutdown_state.acquire()));
                 #[cfg(feature = "distributed-tracing")]
                 let span = {
                     let span = tracing::info_span!(
@@ -243,6 +311,34 @@ async fn create_message_handler(
             }
         }
     }
+
+    // Teardown reached with work still on the queue — only possible under
+    // `ShutdownPolicy::Timeout`, since `WaitForever` cannot cancel the token
+    // until the queue is empty. Abandoning those messages is what the timeout
+    // buys; abandoning their in-flight guards is not. flume frees a buffered
+    // item only once *both* ends of the channel are gone, and every transport
+    // holds a sender clone for the instance's lifetime, so guards left parked
+    // in the buffer would pin `in_flight` above zero forever and wedge any
+    // later or concurrent `wait_for_drain`.
+    //
+    // The sweep only has to cover what is already buffered. Anything a
+    // producer admits after `message_rx` drops at the end of this function
+    // releases its own guard: `admit_message` drops the guard on `SendError`
+    // and reports `Disconnected` to the transport.
+    while let Ok(queued) = message_rx.try_recv() {
+        drop(queued);
+        abandoned += 1;
+    }
+    if abandoned > 0 {
+        tracing::warn!(
+            target: "crate::messenger::server",
+            abandoned,
+            "Dropped inbound messages still queued at teardown; their senders \
+             were admitted, so they get no ShuttingDown reply and wait out \
+             their own response timeout"
+        );
+    }
+
     Ok(())
 }
 

@@ -39,6 +39,19 @@ use velo::transports::uds::{UdsTransport, UdsTransportBuilder};
 use std::sync::Once;
 use tracing_subscriber::FmtSubscriber;
 
+/// Outer bound wrapping every generated scenario in `transport_integration_tests!`,
+/// `transport_epoch_tests!`, and `transport_shutdown_tests!` (CodeRabbit F4:
+/// "All async test awaits must be wrapped in `tokio::time::timeout`; do not use
+/// unbounded waits", `.coderabbit.yaml` path `lib/velo/tests/transports/**`).
+///
+/// Deliberately generous — 30s, not the 5s of the inner per-assertion
+/// `TEST_TIMEOUT` in `scenarios.rs`. This bound exists only to fail a hung test
+/// with a message instead of hanging the suite forever; a tight bound risks
+/// false failures on `high_throughput` and
+/// `admission_ordering_under_capacity_pressure` under `cargo llvm-cov`, where
+/// this repo has documented instrumentation-overhead timing flakes.
+pub(crate) const OUTER_TEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[allow(dead_code)]
 static INIT: Once = Once::new();
 
@@ -188,11 +201,17 @@ impl<T: Transport> TestTransportHandle<T> {
     }
 
     /// Receive a message with timeout
+    ///
+    /// `message_stream` items carry a mandatory in-flight guard (see
+    /// `InboundMessage`); dropping it here is correct, since the caller
+    /// receiving the message is standing in for the real consumer that would
+    /// otherwise decrement the drain count on dispatch.
     pub async fn recv_message(&self, timeout_duration: Duration) -> anyhow::Result<(Bytes, Bytes)> {
-        timeout(timeout_duration, self.streams.message_stream.recv_async())
+        let msg = timeout(timeout_duration, self.streams.message_stream.recv_async())
             .await
             .map_err(|_| anyhow::anyhow!("Timeout waiting for message"))?
-            .map_err(|e| anyhow::anyhow!("Channel error: {}", e))
+            .map_err(|e| anyhow::anyhow!("Channel error: {}", e))?;
+        Ok((msg.header, msg.payload))
     }
 
     /// Receive a response with timeout
@@ -706,87 +725,129 @@ macro_rules! transport_integration_tests {
         paste::paste! {
             #[tokio::test]
             async fn test_single_message_round_trip() {
-                scenarios::single_message_round_trip::<$factory>().await;
+                tokio::time::timeout(OUTER_TEST_TIMEOUT, scenarios::single_message_round_trip::<$factory>())
+                    .await
+                    .expect("single_message_round_trip timed out");
             }
             #[tokio::test]
             async fn test_bidirectional_messaging() {
-                scenarios::bidirectional_messaging::<$factory>().await;
+                tokio::time::timeout(OUTER_TEST_TIMEOUT, scenarios::bidirectional_messaging::<$factory>())
+                    .await
+                    .expect("bidirectional_messaging timed out");
             }
             #[tokio::test]
             async fn test_multiple_messages_same_connection() {
-                scenarios::multiple_messages_same_connection::<$factory>().await;
+                tokio::time::timeout(OUTER_TEST_TIMEOUT, scenarios::multiple_messages_same_connection::<$factory>())
+                    .await
+                    .expect("multiple_messages_same_connection timed out");
             }
             #[tokio::test]
             async fn test_response_message_type() {
-                scenarios::response_message_type::<$factory>().await;
+                tokio::time::timeout(OUTER_TEST_TIMEOUT, scenarios::response_message_type::<$factory>())
+                    .await
+                    .expect("response_message_type timed out");
             }
             #[tokio::test]
             async fn test_event_message_type() {
-                scenarios::event_message_type::<$factory>().await;
+                tokio::time::timeout(OUTER_TEST_TIMEOUT, scenarios::event_message_type::<$factory>())
+                    .await
+                    .expect("event_message_type timed out");
             }
             #[tokio::test]
             async fn test_ack_message_type() {
-                scenarios::ack_message_type::<$factory>().await;
+                tokio::time::timeout(OUTER_TEST_TIMEOUT, scenarios::ack_message_type::<$factory>())
+                    .await
+                    .expect("ack_message_type timed out");
             }
             #[tokio::test]
             async fn test_mixed_message_types() {
-                scenarios::mixed_message_types::<$factory>().await;
+                tokio::time::timeout(OUTER_TEST_TIMEOUT, scenarios::mixed_message_types::<$factory>())
+                    .await
+                    .expect("mixed_message_types timed out");
             }
             #[tokio::test]
             async fn test_large_payload() {
-                scenarios::large_payload::<$factory>().await;
+                tokio::time::timeout(OUTER_TEST_TIMEOUT, scenarios::large_payload::<$factory>())
+                    .await
+                    .expect("large_payload timed out");
             }
             #[tokio::test]
             async fn test_empty_header_and_payload() {
-                scenarios::empty_header_and_payload::<$factory>().await;
+                tokio::time::timeout(OUTER_TEST_TIMEOUT, scenarios::empty_header_and_payload::<$factory>())
+                    .await
+                    .expect("empty_header_and_payload timed out");
             }
             #[tokio::test]
             async fn test_cluster_mesh_communication() {
-                scenarios::cluster_mesh_communication::<$factory>().await;
+                tokio::time::timeout(OUTER_TEST_TIMEOUT, scenarios::cluster_mesh_communication::<$factory>())
+                    .await
+                    .expect("cluster_mesh_communication timed out");
             }
             #[tokio::test]
             async fn test_concurrent_senders() {
-                scenarios::concurrent_senders::<$factory>().await;
+                tokio::time::timeout(OUTER_TEST_TIMEOUT, scenarios::concurrent_senders::<$factory>())
+                    .await
+                    .expect("concurrent_senders timed out");
             }
             #[tokio::test]
             async fn test_send_to_unregistered_peer() {
-                scenarios::send_to_unregistered_peer::<$factory>().await;
+                tokio::time::timeout(OUTER_TEST_TIMEOUT, scenarios::send_to_unregistered_peer::<$factory>())
+                    .await
+                    .expect("send_to_unregistered_peer timed out");
             }
             #[tokio::test]
             async fn test_connection_reuse() {
-                scenarios::connection_reuse::<$factory>().await;
+                tokio::time::timeout(OUTER_TEST_TIMEOUT, scenarios::connection_reuse::<$factory>())
+                    .await
+                    .expect("connection_reuse timed out");
             }
             #[tokio::test]
             async fn test_graceful_shutdown() {
-                scenarios::graceful_shutdown::<$factory>().await;
+                tokio::time::timeout(OUTER_TEST_TIMEOUT, scenarios::graceful_shutdown::<$factory>())
+                    .await
+                    .expect("graceful_shutdown timed out");
             }
             #[tokio::test]
             async fn test_high_throughput() {
-                scenarios::high_throughput::<$factory>().await;
+                tokio::time::timeout(OUTER_TEST_TIMEOUT, scenarios::high_throughput::<$factory>())
+                    .await
+                    .expect("high_throughput timed out");
             }
             #[tokio::test]
             async fn test_zero_copy_efficiency() {
-                scenarios::zero_copy_efficiency::<$factory>().await;
+                tokio::time::timeout(OUTER_TEST_TIMEOUT, scenarios::zero_copy_efficiency::<$factory>())
+                    .await
+                    .expect("zero_copy_efficiency timed out");
             }
             #[tokio::test]
             async fn test_drain_rejects_messages() {
-                scenarios::drain_rejects_messages::<$factory>().await;
+                tokio::time::timeout(OUTER_TEST_TIMEOUT, scenarios::drain_rejects_messages::<$factory>())
+                    .await
+                    .expect("drain_rejects_messages timed out");
             }
             #[tokio::test]
             async fn test_drain_accepts_responses() {
-                scenarios::drain_accepts_responses::<$factory>().await;
+                tokio::time::timeout(OUTER_TEST_TIMEOUT, scenarios::drain_accepts_responses::<$factory>())
+                    .await
+                    .expect("drain_accepts_responses timed out");
             }
             #[tokio::test]
             async fn test_drain_accepts_events() {
-                scenarios::drain_accepts_events::<$factory>().await;
+                tokio::time::timeout(OUTER_TEST_TIMEOUT, scenarios::drain_accepts_events::<$factory>())
+                    .await
+                    .expect("drain_accepts_events timed out");
             }
             #[tokio::test]
             async fn test_health_during_drain() {
-                scenarios::health_during_drain::<$factory>().await;
+                tokio::time::timeout(OUTER_TEST_TIMEOUT, scenarios::health_during_drain::<$factory>())
+                    .await
+                    .expect("health_during_drain timed out");
             }
             #[tokio::test]
             async fn test_admission_ordering_under_capacity_pressure() {
-                scenarios::admission_ordering_under_capacity_pressure::<$factory>().await;
+                tokio::time::timeout(OUTER_TEST_TIMEOUT, scenarios::admission_ordering_under_capacity_pressure::<$factory>())
+                    .await
+                    .expect("admission_ordering_under_capacity_pressure timed out");
             }
         }
     };
@@ -800,7 +861,12 @@ macro_rules! transport_epoch_tests {
     ($factory:ty) => {
         #[tokio::test]
         async fn test_admissions_fail_when_the_connection_epoch_dies() {
-            scenarios::admissions_fail_when_the_connection_epoch_dies::<$factory>().await;
+            tokio::time::timeout(
+                OUTER_TEST_TIMEOUT,
+                scenarios::admissions_fail_when_the_connection_epoch_dies::<$factory>(),
+            )
+            .await
+            .expect("admissions_fail_when_the_connection_epoch_dies timed out");
         }
     };
 }
@@ -814,39 +880,63 @@ macro_rules! transport_shutdown_tests {
         paste::paste! {
             #[tokio::test]
             async fn [<test_ $prefix _drain_rejects_messages>]() {
-                shutdown_scenarios::drain_rejects_messages::<$client>().await;
+                tokio::time::timeout(OUTER_TEST_TIMEOUT, shutdown_scenarios::drain_rejects_messages::<$client>())
+                    .await
+                    .expect("drain_rejects_messages timed out");
             }
             #[tokio::test]
             async fn [<test_ $prefix _drain_accepts_responses>]() {
-                shutdown_scenarios::drain_accepts_responses::<$client>().await;
+                tokio::time::timeout(OUTER_TEST_TIMEOUT, shutdown_scenarios::drain_accepts_responses::<$client>())
+                    .await
+                    .expect("drain_accepts_responses timed out");
             }
             #[tokio::test]
             async fn [<test_ $prefix _drain_accepts_events>]() {
-                shutdown_scenarios::drain_accepts_events::<$client>().await;
+                tokio::time::timeout(OUTER_TEST_TIMEOUT, shutdown_scenarios::drain_accepts_events::<$client>())
+                    .await
+                    .expect("drain_accepts_events timed out");
             }
             #[tokio::test]
             async fn [<test_ $prefix _new_connection_during_drain>]() {
-                shutdown_scenarios::new_connection_during_drain::<$client>().await;
+                tokio::time::timeout(OUTER_TEST_TIMEOUT, shutdown_scenarios::new_connection_during_drain::<$client>())
+                    .await
+                    .expect("new_connection_during_drain timed out");
             }
             #[tokio::test]
             async fn [<test_ $prefix _graceful_shutdown_lifecycle>]() {
-                shutdown_scenarios::graceful_shutdown_lifecycle::<$client>().await;
+                tokio::time::timeout(OUTER_TEST_TIMEOUT, shutdown_scenarios::graceful_shutdown_lifecycle::<$client>())
+                    .await
+                    .expect("graceful_shutdown_lifecycle timed out");
+            }
+            #[tokio::test]
+            async fn [<test_ $prefix _queued_message_defers_drain_completion>]() {
+                tokio::time::timeout(OUTER_TEST_TIMEOUT, shutdown_scenarios::queued_message_defers_drain_completion::<$client>())
+                    .await
+                    .expect("queued_message_defers_drain_completion timed out");
             }
             #[tokio::test]
             async fn [<test_ $prefix _shutdown_timeout_forces_teardown>]() {
-                shutdown_scenarios::shutdown_timeout_forces_teardown::<$client>().await;
+                tokio::time::timeout(OUTER_TEST_TIMEOUT, shutdown_scenarios::shutdown_timeout_forces_teardown::<$client>())
+                    .await
+                    .expect("shutdown_timeout_forces_teardown timed out");
             }
             #[tokio::test]
             async fn [<test_ $prefix _outbound_sends_during_drain>]() {
-                shutdown_scenarios::outbound_sends_during_drain::<$client>().await;
+                tokio::time::timeout(OUTER_TEST_TIMEOUT, shutdown_scenarios::outbound_sends_during_drain::<$client>())
+                    .await
+                    .expect("outbound_sends_during_drain timed out");
             }
             #[tokio::test]
             async fn [<test_ $prefix _connection_writer_exits_on_teardown>]() {
-                shutdown_scenarios::connection_writer_exits_on_teardown::<$client>().await;
+                tokio::time::timeout(OUTER_TEST_TIMEOUT, shutdown_scenarios::connection_writer_exits_on_teardown::<$client>())
+                    .await
+                    .expect("connection_writer_exits_on_teardown timed out");
             }
             #[tokio::test]
             async fn [<test_ $prefix _drain_rejection_reaches_sender>]() {
-                shutdown_scenarios::drain_rejection_reaches_sender::<$client>().await;
+                tokio::time::timeout(OUTER_TEST_TIMEOUT, shutdown_scenarios::drain_rejection_reaches_sender::<$client>())
+                    .await
+                    .expect("drain_rejection_reaches_sender timed out");
             }
         }
     };
