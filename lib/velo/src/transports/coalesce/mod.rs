@@ -69,7 +69,9 @@ use tokio_util::sync::CancellationToken;
 
 use velo_ext::MessageType;
 
-use super::tcp::framing::{COALESCE_THRESHOLD, MIN_HEADER_SIZE, TcpFrameCodec};
+use super::tcp::framing::{
+    COALESCE_THRESHOLD, DIRECT_PREFIX_CAP, MIN_HEADER_SIZE, TcpFrameCodec, stage_direct_prefix,
+};
 
 /// Default cap on how many bytes one coalesced write may carry.
 ///
@@ -446,11 +448,13 @@ where
 
 /// Write one frame straight to the socket, skipping the staging buffer.
 ///
-/// This is [`TcpFrameCodec::encode_frame`]'s above-threshold branch — preamble,
-/// header, and payload as three writes, so a large payload is never copied.
-/// It is spelled out here rather than delegated so that a frame the codec
-/// rejects is reported as [`WriterFailure::Encode`] instead of being
-/// indistinguishable from a socket error.
+/// This is [`TcpFrameCodec::encode_frame`]'s above-threshold branch — preamble
+/// and header staged into one stack buffer and written ahead of the payload
+/// (two writes; three when a header too large for [`DIRECT_PREFIX_CAP`] falls
+/// back to its own segment), so a large payload is never copied. It is spelled
+/// out here rather than delegated so that a frame the codec rejects is
+/// reported as [`WriterFailure::Encode`] instead of being indistinguishable
+/// from a socket error.
 async fn write_frame_direct<W, T>(
     writer: &mut W,
     item: &T,
@@ -473,7 +477,12 @@ where
     let preamble = TcpFrameCodec::build_preamble(item.msg_type(), header_len, payload_len)
         .map_err(|e| (WriterFailure::Encode, e))?;
 
-    for segment in [&preamble[..], header, payload] {
+    let mut prefix = [0u8; DIRECT_PREFIX_CAP];
+    let segments: &[&[u8]] = match stage_direct_prefix(&preamble, header, &mut prefix) {
+        Some(len) => &[&prefix[..len], payload],
+        None => &[&preamble[..], header, payload],
+    };
+    for segment in segments {
         writer
             .write_all(segment)
             .await

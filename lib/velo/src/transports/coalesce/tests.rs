@@ -195,6 +195,13 @@ impl ItemFactory {
         }
     }
 
+    fn item_with_header(&self, tag: &str, header: Vec<u8>, payload: Vec<u8>) -> TestItem {
+        TestItem {
+            header,
+            ..self.item(tag, payload)
+        }
+    }
+
     fn errors(&self) -> Vec<String> {
         self.errors.lock().clone()
     }
@@ -427,9 +434,10 @@ async fn large_frame_flushes_staged_frames_before_writing_direct() {
         "three staged, then the large frame alone, then the tail"
     );
     // The large frame went out segmented rather than through the staging
-    // buffer: one write for the batch of three, then preamble + payload as
-    // separate writes (the header is empty, so `write_all` skips it), then
-    // one for the tail. Staging it instead would be three writes total.
+    // buffer: one write for the batch of three, then the staged prefix (just
+    // the preamble here — the header is empty) and the payload as separate
+    // writes, then one for the tail. Staging it instead would be three
+    // writes total.
     assert_eq!(
         sink.poll_writes, 4,
         "the large frame must take the segmented direct path"
@@ -443,6 +451,57 @@ async fn large_frame_flushes_staged_frames_before_writing_direct() {
     assert_eq!(decoded[3].2.len(), COALESCE_THRESHOLD + 1);
     assert!(decoded[3].2.iter().all(|&b| b == 0xAB));
     assert_eq!(decoded[4].2.as_slice(), &[0xCD; 8]);
+    assert!(factory.errors().is_empty());
+}
+
+/// The direct path stages preamble + header into one stack buffer, so a large
+/// frame with a typical small header costs exactly two writes: the staged
+/// prefix, then the payload. Three writes here would put two undersized
+/// segments on a `TCP_NODELAY` wire before the payload.
+#[tokio::test]
+async fn direct_write_stages_preamble_and_header_into_one_write() {
+    let factory = ItemFactory::new();
+    let observer = TestObserver::default();
+    let mut sink = RecordingSink::default();
+
+    let header = vec![0x11; 64];
+    let items =
+        vec![factory.item_with_header("big", header.clone(), vec![0xAB; COALESCE_THRESHOLD + 1])];
+    run_with(items, &mut sink, &observer).await;
+
+    assert_eq!(
+        sink.poll_writes, 2,
+        "staged prefix + payload; preamble and header must not write separately"
+    );
+    let decoded = sink.decode_frames();
+    assert_eq!(decoded.len(), 1);
+    assert_eq!(decoded[0].1, header);
+    assert_eq!(decoded[0].2.len(), COALESCE_THRESHOLD + 1);
+    assert!(factory.errors().is_empty());
+}
+
+/// A header too large for [`DIRECT_PREFIX_CAP`] falls back to the
+/// three-segment write, and the wire bytes stay identical either way.
+#[tokio::test]
+async fn direct_write_oversized_header_falls_back_to_three_segments() {
+    let factory = ItemFactory::new();
+    let observer = TestObserver::default();
+    let mut sink = RecordingSink::default();
+
+    // With the preamble this exceeds the stack prefix by exactly one byte.
+    let header = vec![0x22; DIRECT_PREFIX_CAP - MIN_HEADER_SIZE + 1];
+    let items =
+        vec![factory.item_with_header("big", header.clone(), vec![0xAB; COALESCE_THRESHOLD + 1])];
+    run_with(items, &mut sink, &observer).await;
+
+    assert_eq!(
+        sink.poll_writes, 3,
+        "preamble, header, and payload each take their own write"
+    );
+    let decoded = sink.decode_frames();
+    assert_eq!(decoded.len(), 1);
+    assert_eq!(decoded[0].1, header);
+    assert_eq!(decoded[0].2.len(), COALESCE_THRESHOLD + 1);
     assert!(factory.errors().is_empty());
 }
 
