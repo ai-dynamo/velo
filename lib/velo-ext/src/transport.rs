@@ -336,12 +336,12 @@ pub trait Transport: Send + Sync {
     /// Tear down the transport, cancelling all tasks and closing connections.
     ///
     /// This is phase 3 of the runtime's graceful shutdown and the runtime calls
-    /// it only after [`ShutdownState::begin_drain`] and the drain wait. In-tree
-    /// transports also cancel the *shared*
+    /// it only after [`ShutdownState::begin_drain`] and the drain wait. Several
+    /// in-tree transports (TCP, UDS, gRPC, UCX) also cancel the *shared*
     /// [`ShutdownState::teardown_token`] here, which is instance-wide: it stops
     /// every transport's listeners **and** the runtime's inbound message
     /// consumer, which then abandons whatever is still queued. Calling
-    /// `shutdown()` directly on one transport of a live instance therefore
+    /// `shutdown()` directly on one such transport of a live instance therefore
     /// kills inbound dispatch for all of them, with no drain and no
     /// [`MessageType::ShuttingDown`] correlation for the senders. Reach for
     /// the runtime's graceful shutdown instead unless that is precisely what

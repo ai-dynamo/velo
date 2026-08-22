@@ -108,8 +108,10 @@ async fn create_message_handler(
     // queued). Under `Timeout` it is what stops leftover queued work from
     // dispatching into an instance that has already declared itself dead.
     //
-    // It is not the only caller: every in-tree `Transport::shutdown` cancels
-    // this same shared token, so a direct call on one transport of a live
+    // It is not the only caller: the TCP, UDS, gRPC, and UCX
+    // `Transport::shutdown` impls cancel this same shared token (ZMQ, NATS,
+    // and the simulation transport tear down only their own private
+    // machinery), so a direct `shutdown()` on one of those four on a live
     // instance ends this task — backlog abandoned, guards released, every
     // later admission answered `Disconnected` — for *all* transports, with no
     // drain and no `ShuttingDown` correlations. That is documented on
@@ -124,16 +126,43 @@ async fn create_message_handler(
     // outraced by the wake ordering; the remaining window is the instructions
     // between the check and `dispatch_message`, which is as narrow as
     // cancellation-versus-dispatch can be made.
+    // `graceful_shutdown_timeout_drops_queued_work` in
+    // `lib/velo/tests/drain_rejection.rs` pins it: delete the branch below
+    // and the test dispatches 3 messages where it asserts 1.
     //
-    // It is also the cheap placement. Polling a `cancelled()` future costs
-    // *two* uncontended mutex round-trips — `CancellationToken::is_cancelled`
-    // locks its tree node, and re-polling the inner `Notified` takes the
-    // `Notify` waiters lock unconditionally once it is in the waiting state —
-    // so putting the teardown arm first made the hot path pay both per
-    // message. One `is_cancelled()` is half of that, and the pinned future is
-    // now polled only when the queue is empty and this task is about to park.
-    // Pinning still earns its keep there: rebuilding the future per park would
-    // register — and on drop deregister — a waker every time.
+    // It is the *cheapest correct* placement, not a cheap one.
+    // `CancellationToken::is_cancelled()` is not an atomic load — it locks the
+    // token's `TreeNode` (a `Mutex<Inner>`; tokio-util 0.7.18/0.7.19 have no
+    // atomic fast path in that module), so this is one uncontended mutex
+    // acquire per inbound message. Measured on aarch64 (Cortex-X925, ~4 GHz,
+    // pinned): ~8 ns standalone, ~6 ns marginal once the loop body carries
+    // realistic work — a bigger body gives the core more to overlap the
+    // lock's latency with. That is ~6% of this loop's body, and at the
+    // 0.56-0.77M msg/s the fastest in-tree transport (uds) delivers
+    // (pipeline mode; run-to-run spread), the whole dispatch task is 6-9%
+    // of one core — so the check is ~0.4-0.5% of one core.
+    // Re-measure after a tokio-util bump; revisit the design only if this
+    // task ever sustains ~2M msgs/s (~20% of a core). Below that it is noise.
+    //
+    // Neither alternative is takeable, for different reasons. Putting the
+    // teardown arm first is simply dearer — ~20 ns/message, because polling
+    // a `cancelled()` future takes *two* uncontended mutex round-trips: the
+    // `is_cancelled` above, plus the `Notify` waiters lock that re-polling
+    // the inner `Notified` takes unconditionally once it is in the waiting
+    // state. So the pinned future is polled only when the queue is empty and
+    // this task is about to park; pinning still earns its keep there, since
+    // rebuilding it per park would register — and on drop deregister — a
+    // waker every time.
+    //
+    // A mirrored `AtomicBool` on `ShutdownState` is the opposite case: it
+    // measures genuinely free (0.0 ns marginal — it rides the cache line
+    // `in_flight` already pulls in, whereas the token's `TreeNode` is a
+    // separate allocation nothing else on this path touches), and it is
+    // still wrong. `teardown_token()` is `pub` in velo-ext and out-of-tree
+    // transports are documented to cancel it directly, so the mirror would
+    // read false for exactly those callers and dispatch the backlog anyway —
+    // under `Timeout` only, with a non-empty queue only, in code no test here
+    // can see. Reintroducing this bug silently is not worth 8 ns.
     let teardown = shutdown_state.teardown_token().clone();
     let mut teardown_fut = std::pin::pin!(teardown.cancelled());
 
