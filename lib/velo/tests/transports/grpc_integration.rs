@@ -8,6 +8,6 @@
 #[macro_use]
 mod common;
 
-use common::{GrpcFactory, scenarios};
+use common::{GrpcFactory, OUTER_TEST_TIMEOUT, scenarios};
 
 transport_integration_tests!(GrpcFactory);

@@ -6,6 +6,7 @@
 use super::*;
 use std::time::Duration;
 use tokio::time::{sleep, timeout};
+use velo::transports::InboundMessage;
 
 pub async fn drain_rejects_messages<C: ShutdownTestClient>() {
     let handle = C::new_handle().await.unwrap();
@@ -94,7 +95,7 @@ pub async fn graceful_shutdown_lifecycle<C: ShutdownTestClient>() {
 
     // Verify normal operation
     C::connect_and_send_frame(&handle, MessageType::Message, b"normal-msg", b"normal-pay").await;
-    let (header, _payload) = timeout(
+    let InboundMessage { header, .. } = timeout(
         Duration::from_secs(2),
         handle.streams.message_stream.recv_async(),
     )
@@ -152,6 +153,76 @@ pub async fn graceful_shutdown_lifecycle<C: ShutdownTestClient>() {
             .teardown_token()
             .is_cancelled()
     );
+}
+
+/// A `Message` that reached the inbound queue but has not been consumed yet is
+/// counted work: `wait_for_drain` must stay parked until somebody takes it off
+/// the queue and drops it.
+///
+/// This is the transport half of the drain invariant. Producers have always
+/// gated at admission, but the in-flight guard used to be acquired by the
+/// *consumer* after the dequeue, which left the queued-but-unconsumed window
+/// invisible to phase 2 — `wait_for_drain` returned, teardown ran, and the
+/// message was dispatched into an instance that had already declared itself
+/// dead. There is no dispatcher in this harness, so `in_flight_count() == 1`
+/// here means exactly "queued and counted".
+pub async fn queued_message_defers_drain_completion<C: ShutdownTestClient>() {
+    let handle = C::new_handle().await.unwrap();
+
+    // Keep the client socket open: the frame is admitted from the connection
+    // reader, and closing under it would race the assertions below.
+    let _stream =
+        C::connect_and_send_frame(&handle, MessageType::Message, b"queued-hdr", b"queued-pay")
+            .await;
+
+    // Bounded poll for arrival rather than a fixed sleep — the queue is the
+    // thing under test, so it is also the arrival signal.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while handle.streams.message_stream.is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "frame never reached the inbound queue"
+        );
+        sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        handle.streams.shutdown_state.in_flight_count(),
+        1,
+        "a queued but unconsumed Message must be counted work"
+    );
+
+    handle.streams.shutdown_state.begin_drain();
+
+    let shutdown_state = handle.streams.shutdown_state.clone();
+    let drain = tokio::spawn(async move { shutdown_state.wait_for_drain().await });
+
+    sleep(Duration::from_millis(100)).await;
+    assert!(
+        !drain.is_finished(),
+        "wait_for_drain completed with a Message still sitting on the inbound queue"
+    );
+
+    let queued = timeout(
+        Duration::from_secs(2),
+        handle.streams.message_stream.recv_async(),
+    )
+    .await
+    .expect("timeout")
+    .expect("recv");
+    assert_eq!(&queued.header[..], b"queued-hdr");
+    assert_eq!(&queued.payload[..], b"queued-pay");
+
+    // Dropping the message drops its guard: this is what the real consumer
+    // does once the handler it dispatched has finished.
+    drop(queued);
+
+    timeout(Duration::from_secs(2), drain)
+        .await
+        .expect("wait_for_drain must complete once the queued Message is released")
+        .unwrap();
+    assert_eq!(handle.streams.shutdown_state.in_flight_count(), 0);
+
+    handle.streams.shutdown_state.teardown_token().cancel();
 }
 
 pub async fn shutdown_timeout_forces_teardown<C: ShutdownTestClient>() {
@@ -216,7 +287,7 @@ where
     handle_b.streams.shutdown_state.teardown_token().cancel();
 }
 
-/// A drain rejection must reach the *sender's* response stream.
+/// A drain rejection must reach the *sender's* `shutdown_stream`.
 ///
 /// The listener replies to a Message received during drain by writing a
 /// ShuttingDown frame back on the same socket the Message arrived on — the

@@ -8,7 +8,7 @@
 #[macro_use]
 mod common;
 
-use common::{UdsFactory, scenarios};
+use common::{OUTER_TEST_TIMEOUT, UdsFactory, scenarios};
 
 transport_integration_tests!(UdsFactory);
 transport_epoch_tests!(UdsFactory);

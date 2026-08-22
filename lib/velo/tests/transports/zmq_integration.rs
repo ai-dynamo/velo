@@ -8,6 +8,6 @@
 #[macro_use]
 mod common;
 
-use common::{ZmqFactory, scenarios};
+use common::{OUTER_TEST_TIMEOUT, ZmqFactory, scenarios};
 
 transport_integration_tests!(ZmqFactory);

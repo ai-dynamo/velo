@@ -6,7 +6,7 @@
 #[macro_use]
 mod common;
 
-use common::{TcpShutdownClient, shutdown_scenarios};
+use common::{OUTER_TEST_TIMEOUT, TcpShutdownClient, shutdown_scenarios};
 
 transport_shutdown_tests!(tcp, TcpShutdownClient);
 

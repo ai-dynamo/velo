@@ -6,7 +6,7 @@
 #[macro_use]
 mod common;
 
-use common::{TcpFactory, scenarios};
+use common::{OUTER_TEST_TIMEOUT, TcpFactory, scenarios};
 
 transport_integration_tests!(TcpFactory);
 transport_epoch_tests!(TcpFactory);

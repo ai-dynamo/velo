@@ -17,7 +17,7 @@ use tokio_util::codec::Framed;
 use tracing::{debug, error, info, warn};
 
 use crate::observability::TransportRejection;
-use crate::transports::ingress::route_frame;
+use crate::transports::ingress::{Routed, route_frame};
 
 use velo_ext::{MessageType, ShutdownState, TransportAdapter, TransportErrorHandler};
 
@@ -136,34 +136,13 @@ impl UdsListener {
                 frame_result = framed.next() => {
                     match frame_result {
                         Some(Ok((msg_type, header, payload))) => {
-                            // During drain: reject new Message frames with ShuttingDown,
-                            // but always pass through Response/Ack/Event frames.
-                            if shutdown_state.is_draining() && msg_type == MessageType::Message {
-                                if let Some(metrics) = metrics.as_ref() {
-                                    metrics.record_rejection(TransportRejection::DrainRejected);
-                                }
-                                debug!(
-                                    "Rejecting Message frame during drain (sending ShuttingDown)"
-                                );
-                                // Echo original header back for correlation, empty payload
-                                if let Err(e) = TcpFrameCodec::encode_frame(
-                                    framed.get_mut(),
-                                    MessageType::ShuttingDown,
-                                    &header,
-                                    &[],
-                                )
-                                .await
-                                {
-                                    warn!(
-                                        "Failed to send ShuttingDown frame: {}",
-                                        e
-                                    );
-                                }
-                                continue;
-                            }
-
                             let frame_size = header.len() + payload.len();
-                            if let Err(e) = route_frame(
+                            // `route_frame` owns the drain gate for Message
+                            // frames: it acquires the in-flight guard before
+                            // re-reading the flag, so an admitted message is
+                            // counted work even while it is only queued.
+                            // Response/Ack/Event frames always pass through.
+                            match route_frame(
                                 msg_type,
                                 header,
                                 payload,
@@ -174,10 +153,32 @@ impl UdsListener {
                             )
                             .await
                             {
-                                warn!(
-                                    "Failed to route {:?} frame from UDS: {}",
-                                    msg_type, e
-                                );
+                                Ok(Routed::Delivered) => {}
+                                Ok(Routed::DrainRejected { header }) => {
+                                    debug!(
+                                        "Rejecting Message frame during drain (sending ShuttingDown)"
+                                    );
+                                    // Echo original header back for correlation, empty payload
+                                    if let Err(e) = TcpFrameCodec::encode_frame(
+                                        framed.get_mut(),
+                                        MessageType::ShuttingDown,
+                                        &header,
+                                        &[],
+                                    )
+                                    .await
+                                    {
+                                        warn!(
+                                            "Failed to send ShuttingDown frame: {}",
+                                            e
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to route {:?} frame from UDS: {}",
+                                        msg_type, e
+                                    );
+                                }
                             }
 
                             maybe_shrink_read_buffer(framed.read_buffer_mut(), shrink_threshold, frame_size);

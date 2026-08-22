@@ -503,7 +503,7 @@ Metric families covered:
 
 ```toml
 [dependencies]
-velo = { version = "0.3", features = ["distributed-tracing"] }
+velo = { version = "0.10", features = ["distributed-tracing"] }
 ```
 
 ---
@@ -514,7 +514,7 @@ If you want to write a custom transport, frame transport, or discovery backend t
 
 ```toml
 [dependencies]
-velo-ext = "0.1"
+velo-ext = "0.5"  # exact pin tracked by velo's workspace
 ```
 
 Implement one of:

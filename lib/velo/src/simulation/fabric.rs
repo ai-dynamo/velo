@@ -11,7 +11,7 @@ use dashmap::DashMap;
 use loom_rs::sim::SimHandle;
 use parking_lot::Mutex;
 
-use crate::transports::{MessageType, TransportAdapter, TransportErrorHandler};
+use crate::transports::{AdmitOutcome, MessageType, TransportAdapter, TransportErrorHandler};
 use velo_ext::{InstanceId, PeerInfo, WorkerId};
 
 use crate::simulation::network::NetworkModel;
@@ -226,23 +226,15 @@ impl SimFabric {
     }
 
     /// Push a completed transfer's bytes into the appropriate transport stream.
-    fn deliver_message(&self, transfer: Transfer) {
-        let target_draining = self
-            .adapters
-            .get(&transfer.target)
-            .map(|adapter| adapter.shutdown_state.is_draining())
-            .unwrap_or(false);
-
-        if transfer.message_type == MessageType::Message && target_draining {
-            self.reject_due_to_drain(transfer);
-            return;
-        }
-
+    fn deliver_message(&self, mut transfer: Transfer) {
         let header_for_error = transfer.header.clone();
         let payload_for_error = transfer.payload.clone();
         let on_error = Arc::clone(&transfer.on_error);
         let target = transfer.target;
 
+        // Looked up before the drain gate: the gate reads the *target's*
+        // shutdown state, so a missing adapter could never have been draining
+        // anyway — it always fell through to the error path below.
         let Some(adapter) = self.adapters.get(&target) else {
             tracing::warn!(target = %target, "SimFabric: no adapter registered for target instance");
             on_error.on_error(
@@ -254,9 +246,28 @@ impl SimFabric {
         };
 
         let result = match transfer.message_type {
-            MessageType::Message => adapter
-                .message_stream
-                .send((transfer.header, transfer.payload)),
+            // The drain gate. `admit_message` acquires the target's in-flight
+            // guard before it re-reads the flag, so a message that is merely
+            // queued on the target's inbound stream is work its
+            // `wait_for_drain` can see.
+            MessageType::Message => {
+                let outcome = adapter.admit_message(transfer.header, transfer.payload);
+                match outcome {
+                    AdmitOutcome::Admitted => Ok(()),
+                    AdmitOutcome::Draining { header, payload } => {
+                        // Release the target's shard guard before
+                        // `reject_due_to_drain` takes the source's.
+                        drop(adapter);
+                        transfer.header = header;
+                        transfer.payload = payload;
+                        self.reject_due_to_drain(transfer);
+                        return;
+                    }
+                    AdmitOutcome::Disconnected { header, payload } => {
+                        Err(flume::SendError((header, payload)))
+                    }
+                }
+            }
             MessageType::Response => adapter
                 .response_stream
                 .send((transfer.header, transfer.payload)),
@@ -392,7 +403,9 @@ mod tests {
 
         sim.run().unwrap();
 
-        let (header, payload) = streams.message_stream.try_recv().unwrap();
+        let crate::transports::InboundMessage {
+            header, payload, ..
+        } = streams.message_stream.try_recv().unwrap();
         assert_eq!(&header[..], b"hdr");
         assert_eq!(&payload[..], b"pay");
         assert!(sim.now() >= Duration::from_micros(10));
@@ -437,8 +450,8 @@ mod tests {
         let final_time = sim.run().unwrap();
         assert_eq!(final_time, Duration::from_micros(2));
 
-        let (h1, _) = streams.message_stream.try_recv().unwrap();
-        let (h2, _) = streams.message_stream.try_recv().unwrap();
+        let h1 = streams.message_stream.try_recv().unwrap().header;
+        let h2 = streams.message_stream.try_recv().unwrap().header;
         let headers: Vec<&[u8]> = vec![&h1[..], &h2[..]];
         assert!(headers.contains(&b"m1".as_slice()));
         assert!(headers.contains(&b"m2".as_slice()));
@@ -487,8 +500,8 @@ mod tests {
         let final_time = sim.run().unwrap();
         assert_eq!(final_time, Duration::from_micros(2));
 
-        let (h1, _) = streams.message_stream.try_recv().unwrap();
-        let (h2, _) = streams.message_stream.try_recv().unwrap();
+        let h1 = streams.message_stream.try_recv().unwrap().header;
+        let h2 = streams.message_stream.try_recv().unwrap().header;
         let headers: Vec<&[u8]> = vec![&h1[..], &h2[..]];
         assert!(headers.contains(&b"a".as_slice()));
         assert!(headers.contains(&b"b".as_slice()));

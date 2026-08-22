@@ -101,6 +101,20 @@ async fn recv(rx: &flume::Receiver<(Bytes, Bytes)>, timeout: Duration) -> Option
         .ok()
 }
 
+/// Like `recv`, but for `message_stream`, whose items carry a mandatory
+/// in-flight guard (see `InboundMessage`). The guard is dropped here — these
+/// tests only assert on header/payload content.
+async fn recv_message(
+    rx: &flume::Receiver<crate::transports::transport::InboundMessage>,
+    timeout: Duration,
+) -> Option<(Bytes, Bytes)> {
+    let msg = tokio::time::timeout(timeout, rx.recv_async())
+        .await
+        .ok()?
+        .ok()?;
+    Some((msg.header, msg.payload))
+}
+
 const T: Duration = Duration::from_secs(10);
 
 #[tokio::test(flavor = "multi_thread")]
@@ -122,7 +136,7 @@ async fn message_round_trip_and_stream_routing() {
         out,
         SendOutcome::Admitted | SendOutcome::Pending(_)
     ));
-    let (h, p) = recv(&b.streams.message_stream, T)
+    let (h, p) = recv_message(&b.streams.message_stream, T)
         .await
         .expect("message arrives");
     assert_eq!(&h[..], b"hdr");
@@ -178,7 +192,7 @@ async fn many_messages_preserve_order() {
         );
     }
     for i in 0..N {
-        let (h, p) = recv(&b.streams.message_stream, T)
+        let (h, p) = recv_message(&b.streams.message_stream, T)
             .await
             .expect("ordered message");
         assert_eq!(
@@ -254,7 +268,7 @@ async fn draining_receiver_echoes_shutting_down() {
         MessageType::Message,
         errs.clone(),
     );
-    recv(&b.streams.message_stream, T)
+    recv_message(&b.streams.message_stream, T)
         .await
         .expect("warmup arrives");
 
@@ -269,7 +283,7 @@ async fn draining_receiver_echoes_shutting_down() {
 
     // The draining receiver must not deliver the message...
     assert!(
-        recv(&b.streams.message_stream, Duration::from_millis(500))
+        recv_message(&b.streams.message_stream, Duration::from_millis(500))
             .await
             .is_none(),
         "draining receiver must not deliver new messages"
@@ -311,7 +325,7 @@ async fn health_check_semantics() {
         MessageType::Message,
         errs.clone(),
     );
-    recv(&b.streams.message_stream, T)
+    recv_message(&b.streams.message_stream, T)
         .await
         .expect("message arrives");
     assert!(a.transport.check_health(b.instance_id, T).await.is_ok());

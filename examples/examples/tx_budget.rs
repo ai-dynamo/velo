@@ -35,7 +35,9 @@ use tokio_util::codec::FramedRead;
 
 use velo::transports::tcp::{TcpFrameCodec, TcpTransportBuilder};
 use velo::transports::uds::UdsTransportBuilder;
-use velo::transports::{MessageType, Transport, TransportErrorHandler, make_channels};
+use velo::transports::{
+    InboundMessage, MessageType, Transport, TransportErrorHandler, make_channels,
+};
 use velo::{InstanceId, PeerInfo};
 
 /// Frame preamble written by `TcpFrameCodec` (version + type + 2 lengths).
@@ -401,7 +403,12 @@ async fn l3_transport(
         let server = Arc::clone(&server);
         let errh = Arc::clone(&errh);
         tokio::spawn(async move {
-            while let Ok((h, p)) = streams_s.message_stream.recv_async().await {
+            while let Ok(InboundMessage {
+                header: h,
+                payload: p,
+                ..
+            }) = streams_s.message_stream.recv_async().await
+            {
                 ECHOED.fetch_add(1, Ordering::Relaxed);
                 server.send_message(id_c, h, p, MessageType::Response, Arc::clone(&errh));
             }
