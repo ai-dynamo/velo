@@ -100,7 +100,7 @@ All transports implement the `Transport` trait (`lib/velo-ext/src/transport.rs`,
 - **Fire-and-forget sends** with `TransportErrorHandler` callbacks for failures
 - **Four inbound streams**: message, response, event, shutdown — routed via `TransportAdapter` flume channels. `ShuttingDown` drain rejections carry the rejected *request's* header (request format, not response format), which is why they have their own lane
 - **3-phase graceful shutdown**: Gate (drain flag) → Drain (wait for in-flight) → Teardown (cancel tokens)
-- **`ShutdownState`** is shared between transport and adapter — use `is_draining()` for per-frame gating in listeners
+- **`ShutdownState`** is shared between transport and adapter — `is_draining()` is a best-effort observer for reporting only; admission of inbound `MessageType::Message` frames goes through `TransportAdapter::admit_message`, which acquires the in-flight guard *first* and then re-reads the drain flag, closing the check-then-enqueue race that a bare `is_draining()` gate reopens
 - **`WorkerAddress`** uses MessagePack-encoded maps of `TransportKey` → endpoint bytes
 - **Observability** flows through `Transport::set_observability(Arc<dyn TransportObservability>)` — the runtime hands each transport a pre-bound metrics handle. In-tree transports store it in `OnceLock<Arc<dyn TransportObservability>>` and call trait methods on the hot path. External transport authors get the same handle and emit into the same `velo_transport_*` Prometheus series.
 
@@ -108,10 +108,11 @@ All transports implement the `Transport` trait (`lib/velo-ext/src/transport.rs`,
 
 1. Create `lib/velo/src/transports/<name>/` with `mod.rs`, `transport.rs`, optionally `listener.rs`
 2. Implement the `Transport` trait (from `velo_ext`)
-3. Feature-gate via a new feature in `lib/velo/Cargo.toml` and a `#[cfg(feature = "<name>")] pub mod <name>;` line in `lib/velo/src/transports.rs`
-4. Add a test factory in `lib/velo/tests/transports/common/mod.rs`, create `lib/velo/tests/transports/<name>_integration.rs` using the `transport_integration_tests!` macro, and add a matching `[[test]]` entry in `lib/velo/Cargo.toml`
-5. Update `examples/examples/ping_pong.rs` with transport selection
-6. If the transport adds public types referenced by the `Transport` trait or its surrounding contract, those types belong in `velo-ext`, not `velo` (and require a coordinated `velo-ext` version bump per the rules above)
+3. Route every inbound `MessageType::Message` through `TransportAdapter::admit_message` — never pre-filter on `ShutdownState::is_draining()`. Where the transport has a return path to the sender, answer `AdmitOutcome::Draining` with a `MessageType::ShuttingDown` frame echoing the rejected request's header (`transport_shutdown_tests!` asserts that echo reaches the sender for TCP and UDS); where it does not — gRPC's client-side read half — record the rejection and drop
+4. Feature-gate via a new feature in `lib/velo/Cargo.toml` and a `#[cfg(feature = "<name>")] pub mod <name>;` line in `lib/velo/src/transports.rs`
+5. Add a test factory in `lib/velo/tests/transports/common/mod.rs`, create `lib/velo/tests/transports/<name>_integration.rs` using the `transport_integration_tests!` macro, and add a matching `[[test]]` entry in `lib/velo/Cargo.toml`
+6. Update `examples/examples/ping_pong.rs` with transport selection
+7. If the transport adds public types referenced by the `Transport` trait or its surrounding contract, those types belong in `velo-ext`, not `velo` (and require a coordinated `velo-ext` version bump per the rules above)
 
 ### Adding an out-of-tree transport (external authors)
 

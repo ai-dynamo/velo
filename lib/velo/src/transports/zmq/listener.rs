@@ -203,10 +203,27 @@ pub(crate) fn run_listener(cfg: ListenerConfig) {
                             );
                             let type_byte: &[u8] = &[MessageType::ShuttingDown.as_u8()];
                             let empty: &[u8] = &[];
-                            let _ = router.send_multipart(
+                            // DONTWAIT, not a blocking send. This ROUTER has
+                            // ZMQ_ROUTER_MANDATORY set and no ZMQ_SNDTIMEO, so
+                            // a blocking send parks forever once the peer's
+                            // pipe hits SNDHWM — and this same thread polls the
+                            // shutdown control socket that `Transport::shutdown`
+                            // joins on, so one stalled peer would wedge both
+                            // inbound routing and shutdown, during drain, which
+                            // is exactly when this arm runs. The echo is
+                            // best-effort correlation: dropping it costs the
+                            // sender its own response timeout instead. ROUTER
+                            // resolves routing and pipe writability on the
+                            // identity frame, so the failure is all-or-nothing —
+                            // no half-written multipart is left on the socket.
+                            if let Err(e) = router.send_multipart(
                                 [multipart[0].as_slice(), type_byte, header.as_ref(), empty],
-                                0,
-                            );
+                                zmq::DONTWAIT,
+                            ) {
+                                debug!(
+                                    "ZMQ: dropped ShuttingDown echo (peer not writable or gone): {e}"
+                                );
+                            }
                         }
                         AdmitOutcome::Disconnected { .. } => {
                             if let Some(ref m) = cfg.metrics {
