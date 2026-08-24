@@ -228,7 +228,6 @@ impl Transport for ZmqTransport {
         let rcvhwm = self.rcvhwm;
         let linger_ms = self.linger_ms;
         let metrics = self.metrics.get().cloned();
-        let shutdown_state = channels.shutdown_state.clone();
         let instance_id_bytes = instance_id.as_bytes().to_vec();
 
         // Take the pre-bound ROUTER socket (if available)
@@ -250,7 +249,6 @@ impl Transport for ZmqTransport {
                 bind_endpoint,
                 control_endpoint: listener_control_ep,
                 adapter: channels,
-                shutdown_state: shutdown_state.clone(),
                 rcvhwm,
                 linger_ms,
                 metrics: metrics.clone(),
@@ -313,8 +311,9 @@ impl Transport for ZmqTransport {
     }
 
     fn begin_drain(&self) {
-        // Drain gating is handled by ShutdownState.is_draining() in the listener
-        // thread — no control signal needed. This matches TCP/gRPC behavior.
+        // Drain gating happens per frame in the listener thread, inside
+        // `TransportAdapter::admit_message` — no control signal needed. This
+        // matches TCP/gRPC behavior.
     }
 
     fn shutdown(&self) {

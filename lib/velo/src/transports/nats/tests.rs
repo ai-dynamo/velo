@@ -4,7 +4,7 @@
 //! Unit tests for the NATS transport's frame encoding, routing, and drain gate.
 
 use super::*;
-use crate::transports::transport::make_channels;
+use crate::transports::transport::{InboundMessage, make_channels};
 
 #[test]
 fn test_begin_drain_flips_shutdown_state() {
@@ -20,8 +20,9 @@ fn test_begin_drain_flips_shutdown_state() {
 #[test]
 fn test_route_frame_response_routes_during_drain() {
     // Verify that route_frame routes Response frames even when draining.
-    // The drain gate is in run_receive_loop, not route_frame — so route_frame
-    // should always route regardless. This confirms D-04.
+    // Only Message frames are drain-gated (via `admit_message` inside
+    // route_frame); Response/Ack/Event/ShuttingDown always route regardless
+    // of drain state. This confirms D-04.
     let (adapter, streams) = make_channels();
     adapter.shutdown_state.begin_drain();
     assert!(adapter.shutdown_state.is_draining());
@@ -82,8 +83,9 @@ fn test_route_frame_event_routes_during_drain() {
 
 #[test]
 fn test_route_frame_message_routes_when_not_draining() {
-    // route_frame always routes — the drain gate is in the loop, not route_frame.
-    // This verifies Message frames do reach message_stream when NOT draining.
+    // Message frames are drain-gated inside route_frame via
+    // `TransportAdapter::admit_message`. This verifies Message frames do
+    // reach message_stream when NOT draining (the Admitted outcome).
     let (adapter, streams) = make_channels();
     assert!(!adapter.shutdown_state.is_draining());
 
@@ -107,9 +109,57 @@ fn test_route_frame_message_routes_when_not_draining() {
         result.is_ok(),
         "Message frame must be routed when not draining"
     );
-    let (header, payload) = result.unwrap();
+    let InboundMessage {
+        header, payload, ..
+    } = result.unwrap();
     assert_eq!(&header[..], b"hdrr");
     assert_eq!(&payload[..], b"payload");
+}
+
+/// D-02: a `Message` refused by the drain gate comes back as
+/// `NatsRouted::DrainRejected` carrying the *velo* header — the `Velo-HLen`
+/// prefix of the NATS payload, not the whole payload — because that is what the
+/// receive loop echoes back in the `ShuttingDown` reply for the sender to
+/// correlate. An off-by-one in the slice would silently break fail-fast for
+/// every NATS peer.
+#[test]
+fn test_route_frame_message_drain_rejected_echoes_header() {
+    let (adapter, streams) = make_channels();
+    adapter.shutdown_state.begin_drain();
+
+    let mut headers = async_nats::HeaderMap::new();
+    headers.insert(HEADER_VELO_TYPE, "0"); // Message
+    headers.insert(HEADER_VELO_HLEN, "4");
+    let msg = async_nats::Message {
+        subject: "test".into(),
+        reply: Some("reply-inbox".into()),
+        payload: Bytes::from_static(b"hdrrpayload"),
+        headers: Some(headers),
+        status: None,
+        description: None,
+        length: 0,
+    };
+
+    match route_frame(&msg, &adapter, "nats", None) {
+        NatsRouted::DrainRejected { header } => assert_eq!(
+            &header[..],
+            b"hdrr",
+            "the echoed header must be exactly the Velo-HLen prefix"
+        ),
+        NatsRouted::Done => {
+            panic!("a draining instance must hand the Message back for a ShuttingDown reply")
+        }
+    }
+
+    assert!(
+        streams.message_stream.is_empty(),
+        "a rejected Message must not reach the inbound queue"
+    );
+    assert_eq!(
+        adapter.shutdown_state.in_flight_count(),
+        0,
+        "the admission probe guard must not outlive the rejection"
+    );
 }
 
 #[test]

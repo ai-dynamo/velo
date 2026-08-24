@@ -63,7 +63,10 @@ reviews:
           `set_active_connections`, `record_send_backpressure`); never downcast to a concrete type.
         - Send failures use `TransportErrorHandler` callbacks — never panic, block, or silently drop.
         - Graceful 3-phase shutdown is respected: Gate (`begin_drain`) → Drain (wait in-flight)
-          → Teardown (cancel tokens); use `ShutdownState.is_draining()` in listener hot paths.
+          → Teardown (cancel tokens); route every inbound `MessageType::Message` through
+          `TransportAdapter::admit_message` (it owns both the drain gate and the enqueue) —
+          never gate admission on a bare `ShutdownState.is_draining()` check, which is a
+          best-effort observer and reopens the check-then-enqueue race `admit_message` closes.
         - Prefer `Bytes::from(vec)` (O(1) ownership transfer) over `Bytes::copy_from_slice(&vec)`
           (O(n) memcpy) when converting from owned `Vec<u8>`.
         - Use `DashMap` for concurrent peer/connection state; avoid `Mutex` on the hot path.

@@ -16,8 +16,8 @@ use tracing::{debug, warn};
 use crate::observability::{Direction, TransportRejection};
 
 use crate::transports::tcp::TcpFrameCodec;
-use crate::transports::transport::{ShutdownState, TransportAdapter};
-use velo_ext::MessageType;
+use crate::transports::transport::TransportAdapter;
+use velo_ext::{AdmitOutcome, MessageType};
 
 use super::proto;
 use super::proto::velo_streaming_server::VeloStreaming;
@@ -28,24 +28,25 @@ use super::proto::velo_streaming_server::VeloStreaming;
 /// are decoded, routed through the [`TransportAdapter`], and drain-aware
 /// rejection is handled by sending `ShuttingDown` frames back on the
 /// response stream.
+///
+/// The drain gate lives in [`TransportAdapter::admit_message`], which reads
+/// the shared `ShutdownState` the adapter already carries — the service does
+/// not hold one of its own.
 pub struct VeloStreamingService {
     adapter: TransportAdapter,
-    shutdown_state: ShutdownState,
     transport_key: String,
     metrics: Option<std::sync::Arc<dyn velo_ext::TransportObservability>>,
 }
 
 impl VeloStreamingService {
-    /// Create a new service instance with the given adapter and shutdown state.
+    /// Create a new service instance for the given adapter.
     pub fn new(
         adapter: TransportAdapter,
-        shutdown_state: ShutdownState,
         transport_key: String,
         metrics: Option<std::sync::Arc<dyn velo_ext::TransportObservability>>,
     ) -> Self {
         Self {
             adapter,
-            shutdown_state,
             transport_key,
             metrics,
         }
@@ -62,7 +63,6 @@ impl VeloStreaming for VeloStreamingService {
     ) -> Result<Response<Self::StreamStream>, Status> {
         let mut inbound = request.into_inner();
         let adapter = self.adapter.clone();
-        let shutdown_state = self.shutdown_state.clone();
         let transport_key = self.transport_key.clone();
         let metrics = self.metrics.clone();
         #[cfg(not(feature = "distributed-tracing"))]
@@ -85,41 +85,86 @@ impl VeloStreaming for VeloStreamingService {
                         }
                     };
 
-                // During drain: reject new Message frames with ShuttingDown,
-                // but always pass through Response/Ack/Event frames.
-                if shutdown_state.is_draining() && msg_type == MessageType::Message {
-                    if let Some(metrics) = metrics.as_ref() {
-                        metrics.record_rejection(TransportRejection::DrainRejected);
-                    }
-                    debug!("gRPC server: rejecting Message during drain (sending ShuttingDown)");
-                    let preamble = match TcpFrameCodec::build_preamble(
-                        MessageType::ShuttingDown,
-                        framed_data.header.len() as u32,
-                        0,
-                    ) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            if let Some(metrics) = metrics.as_ref() {
-                                metrics.record_rejection(TransportRejection::DrainReplyBuildFailed);
-                            }
-                            warn!("gRPC server: failed to build ShuttingDown preamble: {}", e);
-                            continue;
-                        }
-                    };
-                    let reject = proto::FramedData {
-                        preamble: preamble.to_vec(),
-                        header: framed_data.header,
-                        payload: Vec::new(),
-                    };
-                    if response_tx.send(Ok(reject)).await.is_err() {
-                        break;
-                    }
-                    continue;
-                }
-
                 // Route to the appropriate adapter channel.
                 let sender = match msg_type {
-                    MessageType::Message => &adapter.message_stream,
+                    // Message frames go through the drain gate. `admit_message`
+                    // acquires the in-flight guard *before* it re-reads the
+                    // draining flag, so a message that is merely queued is
+                    // already work `wait_for_drain` can see. Response/Ack/Event
+                    // frames always pass through.
+                    MessageType::Message => {
+                        let frame_bytes = framed_data.header.len() + framed_data.payload.len();
+                        match adapter.admit_message(
+                            Bytes::from(framed_data.header),
+                            Bytes::from(framed_data.payload),
+                        ) {
+                            AdmitOutcome::Admitted => {
+                                if let Some(metrics) = metrics.as_ref() {
+                                    #[cfg(feature = "distributed-tracing")]
+                                    let span = tracing::debug_span!(
+                                        "velo.transport.receive",
+                                        transport = transport_key.as_str(),
+                                        message_type =
+                                            crate::transports::message_type_label(msg_type),
+                                        bytes = frame_bytes
+                                    );
+                                    #[cfg(feature = "distributed-tracing")]
+                                    let _entered = span.enter();
+
+                                    metrics.record_frame(
+                                        Direction::Inbound,
+                                        crate::transports::message_type_label(msg_type),
+                                        frame_bytes,
+                                    );
+                                }
+                            }
+                            AdmitOutcome::Draining { header, .. } => {
+                                if let Some(metrics) = metrics.as_ref() {
+                                    metrics.record_rejection(TransportRejection::DrainRejected);
+                                }
+                                debug!(
+                                    "gRPC server: rejecting Message during drain (sending ShuttingDown)"
+                                );
+                                let preamble = match TcpFrameCodec::build_preamble(
+                                    MessageType::ShuttingDown,
+                                    header.len() as u32,
+                                    0,
+                                ) {
+                                    Ok(p) => p,
+                                    Err(e) => {
+                                        if let Some(metrics) = metrics.as_ref() {
+                                            metrics.record_rejection(
+                                                TransportRejection::DrainReplyBuildFailed,
+                                            );
+                                        }
+                                        warn!(
+                                            "gRPC server: failed to build ShuttingDown preamble: {}",
+                                            e
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let reject = proto::FramedData {
+                                    preamble: preamble.to_vec(),
+                                    header: header.to_vec(),
+                                    payload: Vec::new(),
+                                };
+                                if response_tx.send(Ok(reject)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            AdmitOutcome::Disconnected { .. } => {
+                                if let Some(metrics) = metrics.as_ref() {
+                                    metrics.record_rejection(TransportRejection::RouteFailed);
+                                }
+                                warn!(
+                                    "gRPC server: failed to route Message frame: receiver disconnected"
+                                );
+                                break;
+                            }
+                        }
+                        continue;
+                    }
                     MessageType::Response => &adapter.response_stream,
                     MessageType::Ack | MessageType::Event => &adapter.event_stream,
                     MessageType::ShuttingDown => &adapter.shutdown_stream,

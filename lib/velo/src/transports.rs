@@ -83,9 +83,10 @@ pub use utils::interfaces::{InterfaceEndpoint, InterfaceFilter};
 // convenience for callers reaching into `velo::transports::*` for transport
 // orchestration, but `velo_ext::*` is the canonical source.
 pub use transport::{
-    AdmissionError, AdmissionGate, AdmissionState, DataStreams, HealthCheckError, InFlightGuard,
-    MessageType, SendAdmission, SendOutcome, ShutdownPolicy, ShutdownState, Transport,
-    TransportAdapter, TransportError, TransportErrorHandler, make_channels,
+    AdmissionError, AdmissionGate, AdmissionState, AdmitOutcome, DataStreams, HealthCheckError,
+    InFlightGuard, InboundMessage, MessageType, SendAdmission, SendOutcome, ShutdownPolicy,
+    ShutdownState, Transport, TransportAdapter, TransportError, TransportErrorHandler,
+    make_channels,
 };
 
 /// Errors returned by [`VeloBackend`] operations.

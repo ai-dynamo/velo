@@ -536,11 +536,35 @@ impl Messenger {
     ///
     /// 1. **Gate** — new inbound requests are rejected (see
     ///    [`begin_drain`](Self::begin_drain)).
-    /// 2. **Drain** — wait, per `policy`, for in-flight handler invocations
-    ///    to complete. Their responses still flow out through the gate.
+    /// 2. **Drain** — wait, per `policy`, for accepted work to finish: both
+    ///    in-flight handler invocations and requests still sitting on the
+    ///    inbound queue, which are counted from the moment a transport admits
+    ///    them. Their responses still flow out through the gate.
     /// 3. **Teardown** — cancel listeners, connections, and transports.
     ///
-    /// After this returns the instance can no longer send or receive.
+    /// After this returns the instance can no longer send or receive, and no
+    /// further handler is dispatched.
+    ///
+    /// Under [`ShutdownPolicy::WaitForever`](crate::transports::ShutdownPolicy)
+    /// that costs nothing: the drain wait only completes once the queue is
+    /// empty *and* every accepted handler has finished, so every admitted
+    /// request ran to completion. Under
+    /// [`ShutdownPolicy::Timeout`](crate::transports::ShutdownPolicy) it is the
+    /// point of the timeout, and two things outlive the return.
+    ///
+    /// Work still queued when the timeout expires is abandoned rather than
+    /// dispatched: the message handler drops the backlog at teardown. Their
+    /// senders were admitted, so they get no `ShuttingDown` correlation and
+    /// wait out their own response timeout. (The in-flight guards riding with
+    /// those messages *are* released as they are dropped — leaving them parked
+    /// in the channel buffer would pin the in-flight count above zero for good
+    /// and wedge every later drain wait.)
+    ///
+    /// A handler already *running* when the timeout expires is not cancelled
+    /// either — teardown stops dispatch, it does not abort tasks — so it
+    /// finishes in the background after this call has returned. Sequence
+    /// anything a handler touches accordingly. Both are the price of bounding
+    /// shutdown.
     pub async fn graceful_shutdown(&self, policy: crate::transports::ShutdownPolicy) {
         self.backend.graceful_shutdown(policy).await;
     }
@@ -656,7 +680,24 @@ mod tests {
             };
 
             let send_result = match message_type {
-                MessageType::Message => adapter.message_stream.send((header, payload)),
+                // Loopback still goes through the target's drain gate: it is
+                // the only path that acquires the in-flight guard, and a
+                // message queued without one would be invisible to the
+                // target's `wait_for_drain`.
+                MessageType::Message => match adapter.admit_message(header, payload) {
+                    velo_ext::AdmitOutcome::Admitted => Ok(()),
+                    velo_ext::AdmitOutcome::Draining { header, payload } => {
+                        on_error.on_error(
+                            header,
+                            payload,
+                            "Target is draining and rejected the message".to_string(),
+                        );
+                        Ok(())
+                    }
+                    velo_ext::AdmitOutcome::Disconnected { header, payload } => {
+                        Err(flume::SendError((header, payload)))
+                    }
+                },
                 MessageType::Response => adapter.response_stream.send((header, payload)),
                 MessageType::ShuttingDown => adapter.shutdown_stream.send((header, payload)),
                 MessageType::Ack | MessageType::Event => {

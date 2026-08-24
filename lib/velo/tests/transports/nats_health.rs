@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use velo::transports::HealthCheckError;
 use velo::transports::nats::{NatsTransport, NatsTransportBuilder};
-use velo::transports::{DataStreams, MessageType, Transport, make_channels};
+use velo::transports::{DataStreams, InboundMessage, MessageType, Transport, make_channels};
 use velo_ext::InstanceId;
 
 use bytes::Bytes;
@@ -386,7 +386,11 @@ async fn test_nats_max_message_size_reflects_negotiated_max_payload() {
         MessageType::Message,
         error_handler.clone(),
     );
-    let (rx_header, rx_payload) = tokio::time::timeout(
+    let InboundMessage {
+        header: rx_header,
+        payload: rx_payload,
+        ..
+    } = tokio::time::timeout(
         Duration::from_secs(10),
         streams_b.message_stream.recv_async(),
     )

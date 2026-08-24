@@ -11,6 +11,6 @@
 #[macro_use]
 mod common;
 
-use common::{UcxFactory, scenarios};
+use common::{OUTER_TEST_TIMEOUT, UcxFactory, scenarios};
 
 transport_integration_tests!(UcxFactory);

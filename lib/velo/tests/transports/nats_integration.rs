@@ -12,6 +12,6 @@
 #[macro_use]
 mod common;
 
-use common::{NatsFactory, scenarios};
+use common::{NatsFactory, OUTER_TEST_TIMEOUT, scenarios};
 
 transport_integration_tests!(NatsFactory);

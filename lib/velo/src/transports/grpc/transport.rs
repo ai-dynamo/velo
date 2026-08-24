@@ -27,7 +27,9 @@ use crate::transports::utils::interfaces::{
     InterfaceEndpoint, InterfaceFilter, parse_endpoints, resolve_advertise_endpoints,
     select_best_endpoint,
 };
-use velo_ext::{MessageType, PeerInfo, Transport, TransportAdapter, TransportKey, WorkerAddress};
+use velo_ext::{
+    AdmitOutcome, MessageType, PeerInfo, Transport, TransportAdapter, TransportKey, WorkerAddress,
+};
 
 use super::proto;
 use super::proto::velo_streaming_client::VeloStreamingClient;
@@ -379,7 +381,6 @@ impl Transport for GrpcTransport {
 
             let svc = VeloStreamingService::new(
                 channels,
-                shutdown_state.clone(),
                 self.key.to_string(),
                 self.metrics.get().cloned(),
             );
@@ -582,7 +583,66 @@ async fn connection_writer_inner(
                                 MessageType::Response => &adapter.response_stream,
                                 MessageType::ShuttingDown => &adapter.shutdown_stream,
                                 MessageType::Ack | MessageType::Event => &adapter.event_stream,
-                                MessageType::Message => &adapter.message_stream,
+                                // A `Message` on the client's read half is
+                                // anomalous — this stream carries the server's
+                                // replies to our sends — but it must still go
+                                // through the drain gate, or it would land on
+                                // the inbound queue uncounted and invisible to
+                                // `wait_for_drain`. There is no reply plumbing
+                                // on this path, so a rejection is recorded and
+                                // dropped and the peer waits out its own
+                                // timeout.
+                                MessageType::Message => {
+                                    let frame_bytes =
+                                        framed_data.header.len() + framed_data.payload.len();
+                                    match adapter.admit_message(
+                                        Bytes::from(framed_data.header),
+                                        Bytes::from(framed_data.payload),
+                                    ) {
+                                        AdmitOutcome::Admitted => {
+                                            if let Some(metrics) = metrics.as_ref() {
+                                                #[cfg(feature = "distributed-tracing")]
+                                                let span = tracing::debug_span!(
+                                                    "velo.transport.receive",
+                                                    transport = transport_name.as_str(),
+                                                    message_type =
+                                                        crate::transports::message_type_label(
+                                                            msg_type
+                                                        ),
+                                                    bytes = frame_bytes
+                                                );
+                                                #[cfg(feature = "distributed-tracing")]
+                                                let _entered = span.enter();
+
+                                                metrics.record_frame(
+                                                    Direction::Inbound,
+                                                    crate::transports::message_type_label(msg_type),
+                                                    frame_bytes,
+                                                );
+                                            }
+                                        }
+                                        AdmitOutcome::Draining { .. } => {
+                                            if let Some(metrics) = metrics.as_ref() {
+                                                metrics.record_rejection(
+                                                    TransportRejection::DrainRejected,
+                                                );
+                                            }
+                                            debug!(
+                                                "gRPC: dropped inbound Message from {} during drain (no reply path)",
+                                                instance_id
+                                            );
+                                        }
+                                        AdmitOutcome::Disconnected { .. } => {
+                                            if let Some(metrics) = metrics.as_ref() {
+                                                metrics.record_rejection(
+                                                    TransportRejection::RouteFailed,
+                                                );
+                                            }
+                                            break;
+                                        }
+                                    }
+                                    continue;
+                                }
                             };
                             if let Some(metrics) = metrics.as_ref() {
                                 #[cfg(feature = "distributed-tracing")]
