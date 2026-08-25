@@ -127,6 +127,8 @@ impl UcxTransport {
             inflight_ops: Arc::new(Default::default()),
             shutdown_requested: Arc::new(Default::default()),
             reg_epoch: Arc::new(Default::default()),
+            live_regions: Arc::new(Default::default()),
+            live_rkeys: Arc::new(Default::default()),
         });
         Self {
             key,

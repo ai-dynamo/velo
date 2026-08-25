@@ -37,6 +37,28 @@
 //! [`RdmaEndpoint::map_region`] and bounds-checked against that length. A
 //! caller can therefore never name a byte inside the registration but outside
 //! its own allocation, which would be a silent write into unrelated heap.
+//!
+//! ## Cancellation
+//!
+//! Every method here is a future the caller may drop (a `select!` arm, a
+//! `timeout`). Dropping one must never orphan a pinned region — the caller that
+//! saw a failure is entitled by [`map_region`](RdmaEndpoint::map_region)'s own
+//! contract to free the buffer, and freeing memory UCX still has pinned is the
+//! whole hazard class this module exists to contain. So:
+//!
+//! * **`map_region`** — the region id is minted *before* the push, so a dropped
+//!   future can compensate: a `Drop` guard pushes an [`Cmd::UnmapRegion`] for
+//!   that id. The progress thread independently rolls back when it finds the
+//!   reply channel already closed at send time. Between them, cancelling
+//!   `map_region` means "no region exists", with a full ring the only gap.
+//! * **`unmap_region`** — idempotent and fire-and-forget once pushed: the
+//!   progress thread performs the unmap whether or not anyone is still waiting,
+//!   and a repeat call for an id that is already gone answers `Ok(())`. The
+//!   advisory range entry is dropped *before* the push, so a cancelled unmap
+//!   still gates the region against new GETs.
+//! * **`get`** — dropping it abandons only the notification. The operation keeps
+//!   running and keeps the region's in-flight count raised, which is exactly
+//!   what stops the destination being unmapped underneath UCX.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -47,14 +69,31 @@ use velo_ext::InstanceId;
 
 use super::worker::{Cmd, WorkerShared};
 
-/// Largest packed rkey this side will hand to `ucp_ep_rkey_unpack`.
+/// Largest packed rkey this side will copy into the unpack buffer.
 ///
-/// `ucp_ep_rkey_unpack` parses with no length bound — the public API has no
-/// parameter for one — so a truncated or corrupt blob is an out-of-bounds read
-/// inside UCX that no Rust wrapper can make safe. Descriptors are velo-authored
-/// and a packed rkey is tens of bytes even with several memory domains, so a
-/// blob past this size is refused before the pointer reaches UCX.
+/// This bounds the *copy*, not the parse. Descriptors are velo-authored and a
+/// packed rkey is tens of bytes even with several memory domains, so a blob past
+/// this size is refused as malformed. What contains the parse is
+/// [`RKEY_UNPACK_PAD`].
 pub(crate) const MAX_PACKED_RKEY: usize = 1024;
+
+/// Zero bytes appended to a packed rkey before `ucp_ep_rkey_unpack` reads it.
+///
+/// `ucp_ep_rkey_unpack` takes no length: it reads an 8-byte `md_map` plus a
+/// memory-type byte, then walks *one entry per set bit of `md_map`*, each a
+/// length byte followed by that many raw bytes (`ucp_rkey.c:1090`, the same
+/// serialisation `ucp_rkey_packed_copy` writes). Nothing in that loop consults a
+/// buffer end, so a truncated or hostile blob with bits set in `md_map` reads
+/// arbitrarily far past its own storage, and UCX's internal assertions are
+/// compiled out of a release build. A length check cannot fix that — the length
+/// is never passed in.
+///
+/// Zero padding can, and does: a phantom entry reads its length byte as `0` and
+/// consumes exactly one byte, so a fully-set `md_map` walks at most
+/// `64 + 1` bytes past the real content. Padding every unpack buffer out to
+/// `MAX_PACKED_RKEY + RKEY_UNPACK_PAD` therefore keeps any over-read inside our
+/// own allocation and terminates it.
+pub(crate) const RKEY_UNPACK_PAD: usize = 256;
 
 /// Why an RMA operation could not be performed.
 #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
@@ -75,7 +114,12 @@ pub(crate) enum RmaError {
     #[error("rma range outside the mapped region")]
     OutOfRange,
 
-    /// The region id is unknown, or is already being unmapped.
+    /// The region id names no region on this transport — it was never minted,
+    /// or its unmap has already been performed.
+    ///
+    /// Only [`RdmaEndpoint::get`] produces this;
+    /// [`unmap_region`](RdmaEndpoint::unmap_region) is idempotent and answers
+    /// `Ok(())` for an id that is already gone.
     #[error("rma region not found")]
     RegionNotFound,
 
@@ -195,6 +239,12 @@ impl RdmaEndpoint {
     /// down): UCX holds the pages pinned and a peer holding the packed rkey can
     /// read them at any time. Phase 2's registration layer owns that contract
     /// for callers outside this module; nothing here can enforce it.
+    ///
+    /// **Cancellation rolls the registration back.** Dropping this future means
+    /// no region exists under the id it was minting — the progress thread either
+    /// never created one, or unmaps it again (see the module docs). The caller
+    /// may therefore treat a dropped `map_region` exactly like a returned error
+    /// and free the buffer.
     pub(crate) async fn map_region(
         &self,
         ptr: usize,
@@ -203,36 +253,57 @@ impl RdmaEndpoint {
         if ptr == 0 || len == 0 || ptr.checked_add(len).is_none() {
             return Err(RmaError::OutOfRange);
         }
+        self.ready()?;
+
         let region_id = self.state.next_region_id.fetch_add(1, Ordering::Relaxed);
-        let region = self
-            .submit(|reply| Cmd::MapRegion {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.shared
+            .ring_tx
+            .send_async(Cmd::MapRegion {
                 ptr,
                 len,
                 region_id,
-                reply,
+                reply: tx,
             })
-            .await?;
+            .await
+            .map_err(|_| self.gone())?;
+        self.shared.doorbell.ring();
+
+        // Armed across the only await that can be cancelled while a region may
+        // already exist. Disarmed the instant the outcome is in hand, after
+        // which there is no suspension point before the caller owns it.
+        let mut rollback = MapRollback {
+            endpoint: self,
+            region_id,
+            armed: true,
+        };
+        let outcome = rx.await.unwrap_or_else(|_| Err(self.gone()));
+        rollback.armed = false;
+
+        let region = outcome?;
         self.state
             .ranges
             .insert(region_id, (ptr as u64, len as u64));
         Ok(region)
     }
 
-    /// Deregister a region.
+    /// Deregister a region. Idempotent.
     ///
-    /// Resolves only once the region has no local RMA operation left in flight
-    /// and `ucp_mem_unmap` has returned. From the moment the command reaches the
-    /// progress thread, new GETs into the region are refused with
-    /// [`RmaError::RegionNotFound`].
+    /// Resolves once the region has no local RMA operation left in flight and
+    /// `ucp_mem_unmap` has returned. An id that names no region — never minted,
+    /// or already unmapped — answers `Ok(())`: "nothing is mapped here" is the
+    /// state the caller asked for. From the moment the command reaches the
+    /// progress thread, new GETs into the region are refused.
+    ///
+    /// Dropping this future does not cancel the unmap; it only abandons the
+    /// notification. Concurrent callers for the same id all resolve together.
     pub(crate) async fn unmap_region(&self, region_id: u64) -> Result<(), RmaError> {
-        let outcome = self
-            .submit(|reply| Cmd::UnmapRegion { region_id, reply })
-            .await;
-        // Whatever the outcome, the id is no longer usable for new operations:
-        // either it was unmapped, or the transport is going away and teardown
-        // will unmap it.
+        // Gate the region here rather than after the reply: the unmap is going
+        // to happen whatever becomes of this future, so the id must stop being
+        // usable at the same moment, not later.
         self.state.ranges.remove(&region_id);
-        outcome
+        self.submit(|reply| Cmd::UnmapRegion { region_id, reply })
+            .await
     }
 
     /// Read `req.len` bytes of `req.peer`'s memory into a local region.
@@ -240,6 +311,10 @@ impl RdmaEndpoint {
     /// Resolves when the GET has completed at *both* ends — `ucp_get_nbx`
     /// completion is authoritative for the remote side too, so no flush or
     /// fence follows.
+    ///
+    /// Dropping this future abandons the notification only. The transfer runs to
+    /// completion and holds the destination region against unmapping until it
+    /// does, which is what keeps UCX from writing into a deregistered range.
     pub(crate) async fn get(&self, req: RmaGetRequest) -> Result<(), RmaError> {
         let (_, mapped_len) = self
             .state
@@ -254,6 +329,11 @@ impl RdmaEndpoint {
         if end > mapped_len {
             return Err(RmaError::OutOfRange);
         }
+        // Ahead of the rkey check, so the documented "zero bytes touches no UCX"
+        // holds even for a request carrying no usable key.
+        if req.len == 0 {
+            return Ok(());
+        }
         validate_packed_rkey(&req.packed_rkey)?;
         self.submit(|reply| Cmd::RmaGet { req, reply }).await
     }
@@ -264,12 +344,7 @@ impl RdmaEndpoint {
         &self,
         build: impl FnOnce(tokio::sync::oneshot::Sender<Result<T, RmaError>>) -> Cmd,
     ) -> Result<T, RmaError> {
-        if !self.state.started.load(Ordering::Acquire) {
-            return Err(RmaError::NotStarted);
-        }
-        if self.shared.shutdown_requested.load(Ordering::Acquire) {
-            return Err(RmaError::ShuttingDown);
-        }
+        self.ready()?;
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.shared
             .ring_tx
@@ -278,6 +353,17 @@ impl RdmaEndpoint {
             .map_err(|_| self.gone())?;
         self.shared.doorbell.ring();
         rx.await.unwrap_or_else(|_| Err(self.gone()))
+    }
+
+    /// The two states in which a push would never be answered.
+    fn ready(&self) -> Result<(), RmaError> {
+        if !self.state.started.load(Ordering::Acquire) {
+            return Err(RmaError::NotStarted);
+        }
+        if self.shared.shutdown_requested.load(Ordering::Acquire) {
+            return Err(RmaError::ShuttingDown);
+        }
+        Ok(())
     }
 
     /// Diagnosis for a command that could not be delivered or answered.
@@ -290,7 +376,51 @@ impl RdmaEndpoint {
     }
 }
 
-/// Refuse a packed rkey that `ucp_ep_rkey_unpack` has no way to bounds-check.
+/// Compensating unmap for a [`RdmaEndpoint::map_region`] whose caller went away.
+///
+/// The region id is minted before the push, so the id of a region that may now
+/// exist is known even though the reply never arrived. Pushing an idempotent
+/// `UnmapRegion` for it is therefore always safe: the progress thread either
+/// unmaps a real region, or answers `Ok(())` for one that was never created (or
+/// that its own rollback already removed).
+///
+/// `try_send` rather than an await, because `Drop` cannot block. A full ring is
+/// the one case this cannot cover, and the progress-thread rollback in the
+/// `MapRegion` handler is what covers the common half of that gap.
+struct MapRollback<'a> {
+    endpoint: &'a RdmaEndpoint,
+    region_id: u64,
+    armed: bool,
+}
+
+impl Drop for MapRollback<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        if self
+            .endpoint
+            .shared
+            .ring_tx
+            .try_send(Cmd::UnmapRegion {
+                region_id: self.region_id,
+                reply: tx,
+            })
+            .is_ok()
+        {
+            self.endpoint.shared.doorbell.ring();
+        } else {
+            tracing::warn!(
+                "ucx: could not queue rollback for cancelled map_region (region {})",
+                self.region_id
+            );
+        }
+    }
+}
+
+/// Refuse a packed rkey that is obviously not one. This bounds the copy into the
+/// zero-padded unpack buffer; [`RKEY_UNPACK_PAD`] is what bounds the parse.
 pub(crate) fn validate_packed_rkey(packed: &[u8]) -> Result<(), RmaError> {
     if packed.is_empty() || packed.len() > MAX_PACKED_RKEY {
         Err(RmaError::InvalidRkey)

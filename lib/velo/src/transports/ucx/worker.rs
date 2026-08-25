@@ -42,41 +42,84 @@
 //!
 //! ## RMA ordering invariants
 //!
-//! The RMA path ([`super::rma`]) adds three rules that the rest of this module
-//! is written to preserve.
+//! The RMA path ([`super::rma`]) adds four rules that the rest of this module
+//! is written to preserve. All UCX line references are to 1.22.0, the version
+//! `ucx-rs` vendors.
 //!
 //! **No completion callback may enqueue onto the ring.** This thread is the
 //! ring's only consumer and the ring is bounded, so a callback that blocks on a
 //! full ring deadlocks the process. RMA completions therefore resolve a
-//! `oneshot` (never blocks, safe from any thread) and hand the one piece of
-//! main-loop work they generate — the region's in-flight decrement — over
-//! through [`WorkerState::rma_completions`], mirroring the `err_events`
-//! precedent that exists for exactly this callback-to-main-loop handoff.
+//! `oneshot` (never blocks, safe from any thread) and hand the main-loop work
+//! they generate — the region's in-flight decrement and the op's registry
+//! removal — over through [`WorkerState::rma_completions`], mirroring the
+//! `err_events` precedent that exists for exactly this handoff.
 //!
-//! **An unpacked `ucp_rkey_h` dies inside its operation's completion
-//! callback.** UCX requires an rkey to be destroyed before the endpoint it was
-//! unpacked on, and the callback is the tightest point that satisfies it: it
-//! runs on this thread inside `ucp_worker_progress`, and even on the
-//! FORCE-close path the endpoint object is still allocated — `ucp_ep_close_nbx`
-//! takes a `discard` reference on the endpoint (UCX 1.22 `ucp_worker.c:3010`)
-//! that outlives the purge which drives these callbacks with `UCS_ERR_CANCELED`.
-//! `ucp_rkey_destroy` itself dereferences no endpoint; it releases the
-//! component-owned transport keys and returns the descriptor to the *worker's*
-//! mpool, which is why destroying from the callback (always inside progress,
-//! always before `ucp_worker_destroy`) needs no further ordering rule.
+//! **An unpacked `ucp_rkey_h` dies inside its operation's completion callback.**
+//! UCX's documented rule is "destroy the rkey before the endpoint it was
+//! unpacked on". The callback is the tightest point that satisfies it, and two
+//! source facts make it safe rather than merely convenient:
+//!
+//! * `ucp_rkey_destroy` (`ucp_rkey.c:1134`) dereferences **no endpoint**. It
+//!   releases each transport key through its `uct_component_h` — a context-level
+//!   object — and returns the descriptor to `worker->rkey_mp`. The endpoint is
+//!   not involved at all, so "before the endpoint" is satisfied by any call at
+//!   all, and what actually has to outlive the rkey is the *worker*.
+//! * On the close path the endpoint is alive anyway:
+//!   `ucp_ep_close_nbx(FORCE)` → `ucp_ep_discard_lanes` →
+//!   `ucp_worker_discard_tl_uct_ep` takes `ucp_ep_refcount_add(ucp_ep, discard)`
+//!   (`ucp_worker.c:3775`), and `ucp_ep_delete` only deallocates at refcount
+//!   zero, which is after the purge that drives these callbacks with
+//!   `UCS_ERR_CANCELED`.
+//!
+//! The worker-lifetime requirement holds even on the one path where a callback
+//! fires from *inside* `ucp_worker_destroy`: that function drives purges
+//! (`ucp_worker_discard_uct_ep_cleanup`, `ucp_worker_destroy_eps`, lines
+//! 3053-3055) well before `ucp_worker_destroy_mpools` tears down `rkey_mp`
+//! (`ucp_worker.c:2129`). So the rkey outlives no endpoint and precedes no
+//! mpool, whichever path completes it.
 //!
 //! **A parked unmap gates its region.** `Cmd::UnmapRegion` for a region with
 //! operations in flight parks its reply in the region entry; from that moment
 //! new `Cmd::RmaGet`s against the region are refused, and the reply resolves
 //! from [`WorkerState::drain_rma_completions`] once the last operation lands.
-//! That drain runs on every pass, ungated by the ring being empty — an awaited
-//! GET followed immediately by an unmap parks the unmap by construction, and
-//! gating the drain would hold it there for as long as the ring stayed busy.
+//! Repeat unmaps attach as additional waiters rather than being refused, so a
+//! caller that cancels and retries cannot be told a live, DMA-active region does
+//! not exist. That drain runs on every pass, ungated by the ring being empty —
+//! an awaited GET followed immediately by an unmap parks the unmap by
+//! construction, and gating the drain would hold it there for as long as the
+//! ring stayed busy.
+//!
+//! **Every RMA reply resolves, including at teardown.** Unlike a frame send,
+//! whose failure path is a fire-and-forget `on_error` callback, an RMA operation
+//! has a caller `await`ing a `oneshot`. Teardown's in-flight drain is bounded
+//! and may expire with operations outstanding, and `ucp_worker_destroy` does not
+//! run user completion callbacks for them — so the senders would go to the grave
+//! inside UCX's request bookkeeping and the callers would await forever.
+//! [`WorkerState::rma_ops`] therefore keeps an `Arc` of every posted operation,
+//! and teardown takes the reply out of each survivor and answers
+//! `ShuttingDown`. The reply lives behind a `take`-able slot, which is what
+//! makes double-resolution impossible if the callback later fires anyway.
+//!
+//! ## What teardown cannot promise
+//!
+//! D8 asks for regions to be unmapped before endpoints are closed. That holds
+//! for every region that is idle when teardown starts, and for every region
+//! whose operations complete during the flush-close. It cannot hold for a
+//! region whose GET is posted to a peer that has stopped progressing: Phase A's
+//! flush-close never completes, and Phase B's FORCE close on that same endpoint
+//! is a **no-op** — `ucp_ep_close_nbx` returns `UCS_ERR_NOT_CONNECTED` at its
+//! `UCP_EP_FLAG_CLOSED` guard (`ucp_ep.c:2221`) because Phase A already set the
+//! flag, so no second discard and no `CANCELED` purge happen. Such an operation
+//! is completed only by the purges inside `ucp_worker_destroy`, i.e. *after*
+//! `force_unmap_regions` has already deregistered its destination. Over tcp that
+//! is silent; on IB the straggler completes with an access error. Accepted, and
+//! a hardware-checkpoint item — the caller is still answered, which is the part
+//! that had to be fixed.
 
 use std::collections::HashMap;
 use std::mem::MaybeUninit;
 use std::os::raw::{c_int, c_void};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -87,7 +130,9 @@ use ucx_rs::{decode_status_ptr, status_string, sys};
 use velo_ext::{AdmitOutcome, InstanceId, MessageType, TransportAdapter, TransportErrorHandler};
 
 use super::address::{AM_ID_BASE, AM_KIND_COUNT, AM_KIND_PING, AM_KIND_PONG, UcxEndpoint};
-use super::rma::{MappedRegion, RmaError, RmaGetRequest, validate_packed_rkey};
+use super::rma::{
+    MAX_PACKED_RKEY, MappedRegion, RKEY_UNPACK_PAD, RmaError, RmaGetRequest, validate_packed_rkey,
+};
 use super::transport::UcxConfig;
 
 /// One message staged for the progress thread.
@@ -153,7 +198,7 @@ impl Cmd {
     /// is going away. Every reply channel must be resolved rather than dropped:
     /// a dropped `oneshot` reaches the caller as `ChannelClosed`, which is a
     /// worse diagnosis than the truth.
-    fn refuse_for_shutdown(self) {
+    pub(crate) fn refuse_for_shutdown(self) {
         match self {
             Cmd::Send(task) => task.fail("ucx transport shutting down"),
             Cmd::MapRegion { reply, .. } => {
@@ -258,6 +303,18 @@ pub(crate) struct WorkerShared {
     /// re-registered peer (new incarnation) gets a fresh endpoint instead of
     /// AMs on the stale one.
     pub reg_epoch: Arc<AtomicU64>,
+    /// Regions currently held by `ucp_mem_map`. Maintained by the progress
+    /// thread only; readable from anywhere as a gauge. Phase 3's
+    /// `rdma_registered_bytes` metric reads from here, and the tests assert it
+    /// returns to zero — a non-zero value after every region has been accounted
+    /// for is a leaked registration, the failure this whole module guards.
+    pub live_regions: Arc<AtomicUsize>,
+    /// Unpacked `ucp_rkey_h`s not yet destroyed. Same discipline: incremented
+    /// after `ucp_ep_rkey_unpack`, decremented at the single `ucp_rkey_destroy`
+    /// call site, asserted back to zero by the tests. Signed because a negative
+    /// value would mean a double destroy, which is worth seeing rather than
+    /// wrapping.
+    pub live_rkeys: Arc<AtomicI64>,
 }
 
 /// What the progress thread reports back once UCX is initialised.
@@ -350,51 +407,70 @@ unsafe extern "C" fn send_trampoline(
     }
 }
 
+/// What one completed RMA operation hands to the main loop: the region whose
+/// in-flight count it was holding, and its entry in [`WorkerState::rma_ops`].
+type RmaCompletion = (u64, u64);
+
+/// The callback-to-main-loop queue of [`RmaCompletion`]s.
+type RmaCompletions = Vec<RmaCompletion>;
+
 /// Completion-owned state of one posted `ucp_get_nbx`.
 ///
 /// Rides `user_data` as `Arc::into_raw`, exactly like [`OpState`]. Unlike a
 /// frame send it owns two extra things: the single-use `ucp_rkey_h` unpacked
 /// immediately before the post, and the caller's reply channel.
+///
+/// Two `Arc`s exist while the operation is live — one leaked into `user_data`,
+/// one in [`WorkerState::rma_ops`] so teardown can find a survivor whose
+/// callback will never run. The reply is therefore behind a `take`-able slot
+/// rather than owned outright: whichever of the two resolves it first wins, and
+/// the other finds `None`. That is what makes double-resolution unrepresentable.
 struct RmaOpState {
     /// The unpacked `ucp_rkey_h` as `usize`. Raw handles are not `Send`, and
     /// this one never leaves the progress thread — the `usize` records that.
     rkey: usize,
     /// Region whose in-flight count this operation holds.
     region_id: u64,
-    reply: tokio::sync::oneshot::Sender<Result<(), RmaError>>,
+    /// Identifies this operation in [`WorkerState::rma_ops`].
+    op_id: u64,
+    reply: Mutex<Option<tokio::sync::oneshot::Sender<Result<(), RmaError>>>>,
     /// The worker-wide count teardown drains.
     inflight: Arc<AtomicUsize>,
+    /// Decremented at the single `ucp_rkey_destroy` call site below.
+    live_rkeys: Arc<AtomicI64>,
     /// Handoff to the main loop; see the module docs.
-    rma_completions: Arc<Mutex<Vec<u64>>>,
+    rma_completions: Arc<Mutex<RmaCompletions>>,
 }
 
 impl RmaOpState {
     /// Runs exactly once per posted operation, on the progress thread.
-    fn complete(self: Arc<Self>, status: sys::ucs_status_t) {
-        let Some(state) = Arc::into_inner(self) else {
-            // Unreachable: exactly one `Arc` exists between the post and this
-            // call. Returning leaks the rkey rather than double-freeing it.
-            return;
-        };
-        // SAFETY: `rkey` was produced by `ucp_ep_rkey_unpack` for this
-        // operation and no other reference to it exists. Destroying it here is
-        // what keeps it strictly inside its endpoint's lifetime — see the
-        // module docs for why the endpoint is still allocated even when this
-        // callback is driven by a FORCE close.
-        unsafe { sys::ucp_rkey_destroy(state.rkey as sys::ucp_rkey_h) };
-        state
-            .rma_completions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(state.region_id);
-        let result = if status == sys::ucs_status_t_UCS_OK {
+    fn complete(&self, status: sys::ucs_status_t) {
+        // SAFETY: `rkey` was produced by `ucp_ep_rkey_unpack` for this operation
+        // and `complete` runs exactly once, from the trampoline or from the
+        // poster's synchronous-failure exit. `ucp_rkey_destroy` dereferences no
+        // endpoint and returns the descriptor to the worker's mpool, both of
+        // which outlive this call — see the module docs for the source facts.
+        unsafe { sys::ucp_rkey_destroy(self.rkey as sys::ucp_rkey_h) };
+        self.live_rkeys.fetch_sub(1, Ordering::Relaxed);
+        self.resolve(if status == sys::ucs_status_t_UCS_OK {
             Ok(())
         } else {
             Err(RmaError::Ucx {
                 status_name: status_string(status),
             })
-        };
-        let _ = state.reply.send(result);
+        });
+        self.rma_completions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((self.region_id, self.op_id));
+    }
+
+    /// Answer the caller, at most once. Also used by teardown for operations
+    /// whose completion callback will never run.
+    fn resolve(&self, result: Result<(), RmaError>) {
+        if let Some(reply) = self.reply.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = reply.send(result);
+        }
     }
 }
 
@@ -410,7 +486,9 @@ unsafe extern "C" fn rma_trampoline(
     user_data: *mut c_void,
 ) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // SAFETY: see contract above — exactly one reclaim per posted op.
+        // SAFETY: see contract above — exactly one reclaim per posted op. The
+        // registry in `WorkerState::rma_ops` holds the *other* Arc; dropping
+        // this one here is what balances the `Arc::into_raw` at post time.
         let state = unsafe { Arc::from_raw(user_data as *const RmaOpState) };
         state.inflight.fetch_sub(1, Ordering::AcqRel);
         state.complete(status);
@@ -624,9 +702,14 @@ struct RegionEntry {
     /// Local RMA operations posted against this region and not yet completed.
     /// Plain `usize`: only the progress thread ever reads or writes it.
     inflight: usize,
-    /// A `Cmd::UnmapRegion` waiting for `inflight` to reach zero. Its presence
-    /// also refuses new GETs into the region.
-    pending_unmap: Option<tokio::sync::oneshot::Sender<Result<(), RmaError>>>,
+    /// Callers waiting for `inflight` to reach zero so the region can be
+    /// unmapped. A non-empty list also refuses new GETs into the region.
+    ///
+    /// A list rather than a single slot because a cancelled `unmap_region`
+    /// leaves the unmap in progress with nobody listening: a retry must attach
+    /// to it, not be told the still-mapped, still-DMA-active region does not
+    /// exist. All waiters resolve with the same outcome.
+    pending_unmap: Vec<tokio::sync::oneshot::Sender<Result<(), RmaError>>>,
 }
 
 /// A validated GET, one `ucp_get_nbx` away from being posted.
@@ -649,12 +732,18 @@ struct WorkerState {
     err_events: Arc<Mutex<Vec<InstanceId>>>,
     /// Locally registered regions, keyed by the id the submitter minted.
     regions: HashMap<u64, RegionEntry>,
-    /// Region ids pushed by [`rma_trampoline`] and applied by
+    /// Every posted RMA operation that has not completed, so teardown can
+    /// answer the callers of operations UCX will never complete. Entries are
+    /// removed by [`WorkerState::drain_rma_completions`].
+    rma_ops: HashMap<u64, Arc<RmaOpState>>,
+    /// Mints [`RmaOpState::op_id`]. Progress-thread-local.
+    next_op_id: u64,
+    /// Completions pushed by [`rma_trampoline`] and applied by
     /// [`WorkerState::drain_rma_completions`]. See the module docs: a
     /// completion callback must never touch the ring, and it cannot reach
     /// `WorkerState`, so this shared vector is the handoff — the same shape as
     /// `err_events`.
-    rma_completions: Arc<Mutex<Vec<u64>>>,
+    rma_completions: Arc<Mutex<RmaCompletions>>,
     /// Last observed value of `WorkerShared::reg_epoch`.
     seen_reg_epoch: u64,
     shared: Arc<WorkerShared>,
@@ -850,6 +939,8 @@ unsafe fn init_ucx(
                 eps: HashMap::new(),
                 err_events: Arc::new(Mutex::new(Vec::new())),
                 regions: HashMap::new(),
+                rma_ops: HashMap::new(),
+                next_op_id: 1,
                 rma_completions: Arc::new(Mutex::new(Vec::new())),
                 seen_reg_epoch: shared.reg_epoch.load(Ordering::Acquire),
                 shared: Arc::clone(shared),
@@ -1084,7 +1175,19 @@ impl WorkerState {
                 region_id,
                 reply,
             } => {
-                let _ = reply.send(self.map_region(ptr, len, region_id));
+                // `send` hands the value back when the receiver is already gone,
+                // which is the only signal that the caller's future was dropped.
+                // The region id died with it, so nobody can ever unmap this —
+                // roll it back here rather than pin the caller's memory forever.
+                if let Err(Ok(orphan)) = reply.send(self.map_region(ptr, len, region_id)) {
+                    debug!(
+                        "ucx: rolling back region {} (map_region caller went away)",
+                        orphan.region_id
+                    );
+                    if let Some(entry) = self.regions.remove(&orphan.region_id) {
+                        let _ = self.unmap_entry(entry);
+                    }
+                }
             }
             Cmd::UnmapRegion { region_id, reply } => self.unmap_region(region_id, reply),
             Cmd::RmaGet { req, reply } => self.rma_get(req, reply),
@@ -1454,9 +1557,10 @@ impl WorkerState {
                 effective_addr,
                 effective_len,
                 inflight: 0,
-                pending_unmap: None,
+                pending_unmap: Vec::new(),
             },
         );
+        self.shared.live_regions.fetch_add(1, Ordering::Relaxed);
         Ok(MappedRegion {
             region_id,
             effective_addr,
@@ -1465,31 +1569,40 @@ impl WorkerState {
         })
     }
 
-    /// Unmap now if the region is idle, otherwise park the reply until its last
-    /// operation completes. Either way new GETs into the region stop here.
+    /// Unmap now if the region is idle, otherwise attach the caller to the
+    /// waiters already queued behind its last operation.
+    ///
+    /// Idempotent: an id naming no region answers `Ok(())`. "Nothing is mapped
+    /// under this id" is the state the caller asked for, and reporting it as an
+    /// error would make a retry after a cancelled unmap indistinguishable from a
+    /// use-after-free bug.
     fn unmap_region(
         &mut self,
         region_id: u64,
         reply: tokio::sync::oneshot::Sender<Result<(), RmaError>>,
     ) {
         let Some(entry) = self.regions.get_mut(&region_id) else {
-            let _ = reply.send(Err(RmaError::RegionNotFound));
+            let _ = reply.send(Ok(()));
             return;
         };
-        if entry.pending_unmap.is_some() {
-            // Already on its way out; for every purpose a caller has, gone.
-            let _ = reply.send(Err(RmaError::RegionNotFound));
-            return;
-        }
+        entry.pending_unmap.push(reply);
         if entry.inflight > 0 {
-            entry.pending_unmap = Some(reply);
             return;
         }
         let entry = self
             .regions
             .remove(&region_id)
             .expect("looked up immediately above");
-        let _ = reply.send(self.unmap_entry(entry));
+        self.finish_unmap(entry);
+    }
+
+    /// Unmap an entry already out of `self.regions` and tell every waiter.
+    fn finish_unmap(&self, mut entry: RegionEntry) {
+        let waiters = std::mem::take(&mut entry.pending_unmap);
+        let result = self.unmap_entry(entry);
+        for waiter in waiters {
+            let _ = waiter.send(result.clone());
+        }
     }
 
     /// `ucp_mem_unmap` one region entry that is already out of `self.regions`.
@@ -1498,6 +1611,7 @@ impl WorkerState {
         // the entry has been removed from `self.regions`, so no further
         // operation can be posted against it.
         let st = unsafe { sys::ucp_mem_unmap(self.context, entry.memh) };
+        self.shared.live_regions.fetch_sub(1, Ordering::Relaxed);
         if st == sys::ucs_status_t_UCS_OK {
             Ok(())
         } else {
@@ -1545,7 +1659,7 @@ impl WorkerState {
                 entry.requested_len,
                 entry.effective_addr,
                 entry.effective_len,
-                entry.pending_unmap.is_some(),
+                !entry.pending_unmap.is_empty(),
             )
         };
         if unmapping {
@@ -1560,10 +1674,14 @@ impl WorkerState {
         }
         // The requested-range check above is what keeps a caller inside memory
         // the process owns; this one keeps the pointer inside what UCX pinned.
-        // Containment makes the second implied by the first, so a failure here
-        // means the bookkeeping is wrong — refuse rather than post it. The
-        // checked arithmetic exists for that same reason: with sound
-        // bookkeeping none of it can overflow.
+        //
+        // Unreachable while `describe_region`'s containment check holds — the
+        // requested range is a subset of the effective one, so anything that
+        // passed above passes here — and therefore not covered by a test. It
+        // stays because the map-time check is the only thing making it
+        // unreachable: if `ucp_mem_query` ever reported a range it does not
+        // pin, this is what stops a pointer built on that going to UCX. The
+        // checked arithmetic is there for the same reason.
         let local_addr = requested_addr
             .checked_add(req.local_offset)
             .ok_or(RmaError::OutOfRange)?;
@@ -1588,13 +1706,22 @@ impl WorkerState {
             .ensure_ep(req.peer)
             .map_err(|e| RmaError::EndpointUnavailable(e.to_string()))?;
 
-        // SAFETY: `ep` is live on this worker and the packed buffer is at least
-        // one byte and at most `MAX_PACKED_RKEY` (checked above) — UCX parses it
-        // with no length bound of its own, which is why that check exists.
+        // UCX parses the blob with no length bound at all, so it is unpacked
+        // from a zero-padded copy rather than from the `Bytes` directly: a
+        // `md_map` claiming more entries than the blob carries then walks into
+        // zeroes, where each phantom entry declares length 0 and consumes one
+        // byte. See `RKEY_UNPACK_PAD` for the format and the arithmetic. The
+        // length check above bounds this copy; the padding is what bounds UCX.
+        let mut unpack_buf = [0u8; MAX_PACKED_RKEY + RKEY_UNPACK_PAD];
+        unpack_buf[..req.packed_rkey.len()].copy_from_slice(&req.packed_rkey);
+
+        // SAFETY: `ep` is live on this worker, and `unpack_buf` is a local
+        // allocation whose tail is zeroed, so however far UCX's unbounded parse
+        // walks it stays inside this buffer and terminates within
+        // `64 + 1` bytes of the real content.
         let rkey = unsafe {
             let mut rkey: sys::ucp_rkey_h = std::ptr::null_mut();
-            let st =
-                sys::ucp_ep_rkey_unpack(ep, req.packed_rkey.as_ptr() as *const c_void, &mut rkey);
+            let st = sys::ucp_ep_rkey_unpack(ep, unpack_buf.as_ptr() as *const c_void, &mut rkey);
             if st != sys::ucs_status_t_UCS_OK {
                 return Err(RmaError::Ucx {
                     status_name: status_string(st),
@@ -1602,6 +1729,7 @@ impl WorkerState {
             }
             rkey
         };
+        self.shared.live_rkeys.fetch_add(1, Ordering::Relaxed);
 
         Ok(Some(PreparedGet {
             ep,
@@ -1627,13 +1755,21 @@ impl WorkerState {
         if let Some(entry) = self.regions.get_mut(&prepared.region_id) {
             entry.inflight += 1;
         }
+        let op_id = self.next_op_id;
+        self.next_op_id += 1;
         let op = Arc::new(RmaOpState {
             rkey: prepared.rkey as usize,
             region_id: prepared.region_id,
-            reply,
+            op_id,
+            reply: Mutex::new(Some(reply)),
             inflight: Arc::clone(&self.shared.inflight_ops),
+            live_rkeys: Arc::clone(&self.shared.live_rkeys),
             rma_completions: Arc::clone(&self.rma_completions),
         });
+        // Registered before the post, not after: the completion callback can
+        // fire from inside `ucp_get_nbx`, and "an operation UCX knows about has
+        // a registry entry" has to hold at every instant in between.
+        self.rma_ops.insert(op_id, Arc::clone(&op));
         let user_data = Arc::into_raw(op) as *mut c_void;
 
         // SAFETY: zeroed `ucp_request_param_t` is a valid "nothing set" value;
@@ -1688,10 +1824,10 @@ impl WorkerState {
         }
     }
 
-    /// Apply the region in-flight decrements handed over by [`rma_trampoline`]
-    /// and resolve any unmap they release.
+    /// Apply the region in-flight decrements handed over by [`rma_trampoline`],
+    /// retire the completed operations, and resolve any unmap they release.
     fn drain_rma_completions(&mut self) {
-        let completed: Vec<u64> = {
+        let completed: RmaCompletions = {
             let mut guard = self
                 .rma_completions
                 .lock()
@@ -1701,20 +1837,19 @@ impl WorkerState {
             }
             std::mem::take(&mut *guard)
         };
-        for region_id in completed {
+        for (region_id, op_id) in completed {
+            // The operation has already answered its caller; teardown no longer
+            // needs to know about it.
+            self.rma_ops.remove(&op_id);
             let released = match self.regions.get_mut(&region_id) {
                 Some(entry) => {
                     entry.inflight = entry.inflight.saturating_sub(1);
-                    entry.inflight == 0 && entry.pending_unmap.is_some()
+                    entry.inflight == 0 && !entry.pending_unmap.is_empty()
                 }
                 None => false,
             };
-            if released && let Some(mut entry) = self.regions.remove(&region_id) {
-                let reply = entry
-                    .pending_unmap
-                    .take()
-                    .expect("`released` implies a parked unmap");
-                let _ = reply.send(self.unmap_entry(entry));
+            if released && let Some(entry) = self.regions.remove(&region_id) {
+                self.finish_unmap(entry);
             }
         }
     }
@@ -1729,12 +1864,8 @@ impl WorkerState {
             .map(|(id, _)| *id)
             .collect();
         for region_id in idle {
-            if let Some(mut entry) = self.regions.remove(&region_id) {
-                let parked = entry.pending_unmap.take();
-                let result = self.unmap_entry(entry);
-                if let Some(reply) = parked {
-                    let _ = reply.send(result);
-                }
+            if let Some(entry) = self.regions.remove(&region_id) {
+                self.finish_unmap(entry);
             }
         }
     }
@@ -1744,31 +1875,46 @@ impl WorkerState {
     ///
     /// The unmap happens regardless of `inflight` — an operation whose callback
     /// never fired (the same case the `inflight_ops` warning covers) would
-    /// otherwise leave the mapping to `ucp_cleanup` and park its unmap reply
-    /// forever. A reply for a region that was still busy reports
-    /// [`RmaError::ShuttingDown`], because the caller's contract ("no operation
-    /// is touching this memory any more") is exactly what could not be honoured.
+    /// otherwise leave the mapping to `ucp_cleanup` and park its unmap waiters
+    /// forever. Waiters on a region that was still busy are told
+    /// [`RmaError::ShuttingDown`], because the contract they were waiting on
+    /// ("no operation is touching this memory any more") is exactly what could
+    /// not be honoured.
     fn force_unmap_regions(&mut self) {
         let remaining: Vec<u64> = self.regions.keys().copied().collect();
         for region_id in remaining {
             let Some(mut entry) = self.regions.remove(&region_id) else {
                 continue;
             };
-            let parked = entry.pending_unmap.take();
             let inflight = entry.inflight;
-            let result = self.unmap_entry(entry);
-            if inflight > 0 {
-                warn!(
-                    "ucx: force-unmapping region {region_id} with {inflight} rma op(s) in flight"
-                );
+            if inflight == 0 {
+                self.finish_unmap(entry);
+                continue;
             }
-            if let Some(reply) = parked {
-                let _ = reply.send(if inflight == 0 {
-                    result
-                } else {
-                    Err(RmaError::ShuttingDown)
-                });
+            warn!("ucx: force-unmapping region {region_id} with {inflight} rma op(s) in flight");
+            let waiters = std::mem::take(&mut entry.pending_unmap);
+            let _ = self.unmap_entry(entry);
+            for waiter in waiters {
+                let _ = waiter.send(Err(RmaError::ShuttingDown));
             }
+        }
+    }
+
+    /// Answer the caller of every operation whose completion callback will never
+    /// run, then let the registry go.
+    ///
+    /// Called once, after teardown's bounded in-flight drain has expired. An
+    /// operation still here has been abandoned inside UCX's request bookkeeping;
+    /// `ucp_worker_destroy` may or may not purge it, and the caller cannot be
+    /// left awaiting a `oneshot` that outcome decides. Taking the reply out is
+    /// safe against a late callback by construction: it finds `None` and stays
+    /// silent. The `Arc`s themselves are dropped here; the one UCX still holds
+    /// keeps the state alive, and its rkey is leaked with it — the same leak the
+    /// `inflight_ops` warning already reports.
+    fn abandon_rma_ops(&mut self) {
+        for (op_id, op) in std::mem::take(&mut self.rma_ops) {
+            debug!("ucx: abandoning rma op {op_id} at teardown");
+            op.resolve(Err(RmaError::ShuttingDown));
         }
     }
 
@@ -1843,17 +1989,24 @@ impl WorkerState {
             });
         }
         // Anything that fell idle during the flush-close goes now, still ahead
-        // of the endpoints Phase B is about to cancel. A region whose operations
-        // only Phase B can cancel cannot be unmapped before its endpoint — its
-        // completions do not exist until the endpoint is closed — so
-        // `force_unmap_regions` after the in-flight drain is the last word.
+        // of the endpoints Phase B is about to abandon.
         self.unmap_idle_regions();
 
-        // Phase B: whatever did not flush in time gets cancelled. FORCE-mode
-        // close completes outstanding ops with CANCELED, driving callbacks.
+        // Phase B: give up on whatever did not flush in time.
+        //
+        // Do not read this as "and now the outstanding operations get
+        // cancelled". `ucp_ep_close_nbx` returns `UCS_ERR_NOT_CONNECTED` at its
+        // `UCP_EP_FLAG_CLOSED` guard (`ucp_ep.c:2221`) for an endpoint Phase A
+        // already close-initiated, so the FORCE flag buys nothing here: no
+        // second discard, no `CANCELED` purge, no completion callbacks. What it
+        // does is free the request and the leaked `ErrArg`. Operations posted to
+        // a peer that stopped progressing are completed — if at all — by the
+        // purges inside `ucp_worker_destroy`, long after this point; that is why
+        // `abandon_rma_ops` below has to answer their callers directly.
         for (entry, req) in pending {
             // SAFETY: the flush-close request is abandoned; freeing it and
-            // force-closing the still-open ep is the documented fallback.
+            // issuing the (guarded, hence no-op) force close is the documented
+            // fallback.
             unsafe { sys::ucp_request_free(req) };
             self.close_ep_raw(entry, true);
         }
@@ -1873,6 +2026,11 @@ impl WorkerState {
             warn!("ucx: {leaked} operation(s) still in flight at teardown");
         }
         self.drain_rma_completions();
+        // Answer the callers of any RMA operation that outlived the drain. Their
+        // completion callbacks are UCX's to run or not; the `oneshot` senders
+        // live inside request bookkeeping this thread is about to walk away
+        // from, so nothing else will ever resolve them.
+        self.abandon_rma_ops();
         // Every remaining mapping must be gone before `ucp_worker_destroy`.
         self.force_unmap_regions();
         // Deferred FORCE-close requests: give them a bounded chance to

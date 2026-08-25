@@ -21,6 +21,7 @@ use crate::transports::transport::{
 // `super` here is the `transport` module (this file is `#[path]`-included from
 // it), so the sibling `rma` module needs its full path.
 use crate::transports::ucx::rma::{MappedRegion, RdmaEndpoint, RmaError, RmaGetRequest};
+use crate::transports::ucx::worker::Cmd;
 use velo_ext::{InstanceId, MessageType, PeerInfo};
 
 struct CountingErrors {
@@ -464,6 +465,84 @@ fn get_request(
     }
 }
 
+/// Every RMA test ends here: the progress thread must finish owning no
+/// registration and no unpacked remote key.
+///
+/// The counters live on `WorkerShared`, so they are per-transport and stay
+/// meaningful with `cargo test`'s parallel harness — a process-global counter
+/// would see every other test's traffic.
+fn assert_rma_balanced(node: &Node) {
+    assert_eq!(
+        node.transport.shared.live_regions.load(Ordering::SeqCst),
+        0,
+        "a registered region outlived the transport"
+    );
+    assert_eq!(
+        node.transport.shared.live_rkeys.load(Ordering::SeqCst),
+        0,
+        "an unpacked rkey outlived the transport"
+    );
+}
+
+fn assert_pair_balanced(pair: &RmaPair) {
+    assert_rma_balanced(&pair.owner);
+    assert_rma_balanced(&pair.puller);
+}
+
+/// Poll `cond` until it holds or `budget` expires.
+async fn wait_until(budget: Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        if cond() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_micros(200)).await;
+    }
+}
+
+/// Push a GET straight onto the progress thread's ring.
+///
+/// `RdmaEndpoint::get` validates before it submits, which means the progress
+/// thread's own defences are shadowed: with the public path alone, deleting
+/// `prepare_get`'s checks would break no test. These helpers hand the worker
+/// the requests it is supposed to refuse.
+async fn ring_get(transport: &UcxTransport, req: RmaGetRequest) -> Result<(), RmaError> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    transport
+        .shared
+        .ring_tx
+        .send_async(Cmd::RmaGet { req, reply: tx })
+        .await
+        .expect("ring accepts the command");
+    transport.shared.doorbell.ring();
+    tokio::time::timeout(T, rx)
+        .await
+        .expect("worker must answer")
+        .expect("worker must not drop the reply")
+}
+
+/// Push an unmap straight onto the ring, bypassing the submit-side range table.
+async fn ring_unmap(transport: &UcxTransport, region_id: u64) -> Result<(), RmaError> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    transport
+        .shared
+        .ring_tx
+        .send_async(Cmd::UnmapRegion {
+            region_id,
+            reply: tx,
+        })
+        .await
+        .expect("ring accepts the command");
+    transport.shared.doorbell.ring();
+    tokio::time::timeout(T, rx)
+        .await
+        .expect("worker must answer")
+        .expect("worker must not drop the reply")
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn map_get_roundtrip() {
     const LEN: usize = 256 * 1024;
@@ -508,6 +587,7 @@ async fn map_get_roundtrip() {
         .expect("unmap source");
     pair.owner.transport.shutdown();
     pair.puller.transport.shutdown();
+    assert_pair_balanced(&pair);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -531,6 +611,7 @@ async fn get_zero_length() {
 
     pair.owner.transport.shutdown();
     pair.puller.transport.shutdown();
+    assert_pair_balanced(&pair);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -579,6 +660,7 @@ async fn get_out_of_range() {
 
     pair.owner.transport.shutdown();
     pair.puller.transport.shutdown();
+    assert_pair_balanced(&pair);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -607,9 +689,22 @@ async fn unmap_waits_for_inflight() {
         };
         gets.push(tokio::spawn(async move { endpoint.get(req).await }));
     }
-    // Let the GETs occupy ring slots ahead of the unmap: the ring is FIFO, so
-    // this is what makes the unmap park rather than run first.
-    tokio::time::sleep(Duration::from_millis(2)).await;
+    // Wait until all eight are posted rather than sleeping a guessed interval.
+    // `inflight_ops` is incremented on the progress thread at post time, so
+    // reaching CHUNKS proves every GET is on the wire and the unmap that follows
+    // cannot win the FIFO race — the property a fixed sleep only made likely.
+    assert!(
+        wait_until(T, || {
+            pair.puller
+                .transport
+                .shared
+                .inflight_ops
+                .load(Ordering::SeqCst)
+                >= CHUNKS
+        })
+        .await,
+        "all {CHUNKS} GETs must be in flight before the unmap is issued"
+    );
 
     let mut unmap = Box::pin(pair.puller_rma.unmap_region(local.region_id));
     // Timing probe: 64 MiB over the tcp lane takes tens of milliseconds, so the
@@ -646,6 +741,7 @@ async fn unmap_waits_for_inflight() {
 
     pair.owner.transport.shutdown();
     pair.puller.transport.shutdown();
+    assert_pair_balanced(&pair);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -669,6 +765,7 @@ async fn get_unknown_peer() {
 
     pair.owner.transport.shutdown();
     pair.puller.transport.shutdown();
+    assert_pair_balanced(&pair);
 }
 
 /// Guards the one UCX API choice that fails loudly nowhere else.
@@ -713,12 +810,17 @@ async fn rkey_pack_canary() {
 
     rma.unmap_region(a.region_id).await.expect("unmap first");
     rma.unmap_region(b.region_id).await.expect("unmap second");
-    // A second unmap of the same id is refused, not silently accepted.
-    assert!(matches!(
-        rma.unmap_region(a.region_id).await,
-        Err(RmaError::RegionNotFound)
-    ));
+    // Unmapping is idempotent: a repeat for an id that is already gone reports
+    // the state the caller asked for, not an error a retry cannot distinguish
+    // from a use-after-free.
+    rma.unmap_region(a.region_id)
+        .await
+        .expect("repeat unmap is a no-op, not a failure");
+    rma.unmap_region(u64::MAX)
+        .await
+        .expect("unmapping an id that never existed is also a no-op");
     node.transport.shutdown();
+    assert_rma_balanced(&node);
 }
 
 /// Drives an in-flight GET into the FORCE-close cancellation path.
@@ -781,6 +883,8 @@ async fn get_cancelled_by_endpoint_replacement() {
     decoy.transport.shutdown();
     pair.owner.transport.shutdown();
     pair.puller.transport.shutdown();
+    assert_pair_balanced(&pair);
+    assert_rma_balanced(&decoy);
 }
 
 /// Shutting down under an outstanding GET must answer the caller, not hang.
@@ -833,6 +937,469 @@ async fn shutdown_with_inflight_get() {
     ));
 
     pair.owner.transport.shutdown();
+    assert_pair_balanced(&pair);
+}
+
+/// The progress thread's own validation, reached directly.
+///
+/// `RdmaEndpoint::get` rejects these before they ever occupy a ring slot, so
+/// every one of `prepare_get`'s checks is dead code from the public path's point
+/// of view — delete them and no other test notices. These push the malformed
+/// requests onto the ring by hand.
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_rejects_bad_get_commands() {
+    const LEN: usize = 64 * 1024;
+    let src = PageBuf::new(LEN);
+    let dst = PageBuf::new(LEN);
+
+    let pair = start_rma_pair().await;
+    let remote = pair.owner_rma.map_region(src.addr(), LEN).await.unwrap();
+    let local = pair.puller_rma.map_region(dst.addr(), LEN).await.unwrap();
+    let puller = &*pair.puller.transport;
+
+    // Past the end of the *requested* range — the check that keeps a caller
+    // inside memory the process owns.
+    let mut req = get_request(&pair, &src, &remote, &local);
+    req.local_offset = 1;
+    assert!(matches!(
+        ring_get(puller, req).await,
+        Err(RmaError::OutOfRange)
+    ));
+
+    // Offset arithmetic that would wrap.
+    let mut req = get_request(&pair, &src, &remote, &local);
+    req.local_offset = u64::MAX;
+    req.len = 8;
+    assert!(matches!(
+        ring_get(puller, req).await,
+        Err(RmaError::OutOfRange)
+    ));
+
+    // An id the worker never minted.
+    let mut req = get_request(&pair, &src, &remote, &local);
+    req.local_region = local.region_id + 4_096;
+    assert!(matches!(
+        ring_get(puller, req).await,
+        Err(RmaError::RegionNotFound)
+    ));
+
+    // A peer with no entry in the transport's map, checked before any endpoint
+    // is created for it.
+    let mut req = get_request(&pair, &src, &remote, &local);
+    req.peer = InstanceId::new_v4();
+    assert!(matches!(
+        ring_get(puller, req).await,
+        Err(RmaError::PeerNotRegistered(_))
+    ));
+
+    // Rkeys the worker must refuse before the pointer reaches
+    // `ucp_ep_rkey_unpack`, which parses with no length bound of its own.
+    let mut req = get_request(&pair, &src, &remote, &local);
+    req.packed_rkey = Bytes::new();
+    assert!(matches!(
+        ring_get(puller, req).await,
+        Err(RmaError::InvalidRkey)
+    ));
+
+    let mut req = get_request(&pair, &src, &remote, &local);
+    req.packed_rkey = Bytes::from(vec![0xABu8; 2048]);
+    assert!(matches!(
+        ring_get(puller, req).await,
+        Err(RmaError::InvalidRkey)
+    ));
+
+    // Zero length is the worker's own no-op path. `RdmaEndpoint::get`
+    // short-circuits it, so the ring is the only way to reach this arm.
+    let mut req = get_request(&pair, &src, &remote, &local);
+    req.len = 0;
+    req.packed_rkey = Bytes::new();
+    ring_get(puller, req)
+        .await
+        .expect("a zero-length GET is a no-op, whatever key it carries");
+
+    // Nothing above should have leaked a key or a region.
+    assert_eq!(
+        pair.puller
+            .transport
+            .shared
+            .live_rkeys
+            .load(Ordering::SeqCst),
+        0
+    );
+
+    pair.puller_rma.unmap_region(local.region_id).await.unwrap();
+    pair.owner_rma.unmap_region(remote.region_id).await.unwrap();
+    pair.owner.transport.shutdown();
+    pair.puller.transport.shutdown();
+    assert_pair_balanced(&pair);
+}
+
+/// A truncated but plausibly-sized blob reaches `ucp_ep_rkey_unpack`.
+///
+/// This is the case `MAX_PACKED_RKEY` cannot catch: nine bytes is exactly what a
+/// real tcp-lane rkey looks like, so the length check passes and UCX parses it.
+/// With `md_map` bits set and no bytes behind them, only the zero padding
+/// `prepare_get` unpacks from keeps the walk inside our own allocation. The
+/// assertion is simply that the process survives and the caller is answered.
+#[tokio::test(flavor = "multi_thread")]
+async fn worker_survives_truncated_rkey() {
+    const LEN: usize = 64 * 1024;
+    let src = PageBuf::new(LEN);
+    let dst = PageBuf::new(LEN);
+
+    let pair = start_rma_pair().await;
+    let remote = pair.owner_rma.map_region(src.addr(), LEN).await.unwrap();
+    let local = pair.puller_rma.map_region(dst.addr(), LEN).await.unwrap();
+
+    // `md_map` = every bit set, memory type 0, and nothing behind it.
+    let mut hostile = vec![0xFFu8; 8];
+    hostile.push(0);
+    let mut req = get_request(&pair, &src, &remote, &local);
+    req.packed_rkey = Bytes::from(hostile);
+    req.len = 64;
+    let outcome = ring_get(&pair.puller.transport, req).await;
+    println!("truncated-rkey GET resolved as {outcome:?}");
+
+    // Whatever UCX made of it, the accounting has to balance.
+    assert!(
+        wait_until(T, || pair
+            .puller
+            .transport
+            .shared
+            .live_rkeys
+            .load(Ordering::SeqCst)
+            == 0)
+        .await,
+        "the rkey unpacked for a refused GET must still be destroyed"
+    );
+
+    pair.puller_rma.unmap_region(local.region_id).await.unwrap();
+    pair.owner_rma.unmap_region(remote.region_id).await.unwrap();
+    pair.owner.transport.shutdown();
+    pair.puller.transport.shutdown();
+    assert_pair_balanced(&pair);
+}
+
+/// `Cmd::refuse_for_shutdown` answers every RMA command it can be handed.
+///
+/// Teardown's ring drain is the only caller, and reaching it depends on a race
+/// no test can pin, so the arms are exercised directly: without this, deleting
+/// all three would break nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn refused_rma_commands_answer_their_callers() {
+    let (map_tx, map_rx) = tokio::sync::oneshot::channel();
+    Cmd::MapRegion {
+        ptr: 0x1000,
+        len: 4096,
+        region_id: 1,
+        reply: map_tx,
+    }
+    .refuse_for_shutdown();
+    assert!(matches!(
+        map_rx.await.expect("MapRegion reply must be sent"),
+        Err(RmaError::ShuttingDown)
+    ));
+
+    let (unmap_tx, unmap_rx) = tokio::sync::oneshot::channel();
+    Cmd::UnmapRegion {
+        region_id: 1,
+        reply: unmap_tx,
+    }
+    .refuse_for_shutdown();
+    assert!(matches!(
+        unmap_rx.await.expect("UnmapRegion reply must be sent"),
+        Err(RmaError::ShuttingDown)
+    ));
+
+    let (get_tx, get_rx) = tokio::sync::oneshot::channel();
+    Cmd::RmaGet {
+        req: RmaGetRequest {
+            peer: InstanceId::new_v4(),
+            remote_addr: 0x2000,
+            packed_rkey: Bytes::from_static(&[1, 2, 3]),
+            local_region: 1,
+            local_offset: 0,
+            len: 16,
+        },
+        reply: get_tx,
+    }
+    .refuse_for_shutdown();
+    assert!(matches!(
+        get_rx.await.expect("RmaGet reply must be sent"),
+        Err(RmaError::ShuttingDown)
+    ));
+}
+
+/// A `map_region` whose caller disappears must not leave the region pinned.
+///
+/// Both halves of the rollback are covered: the progress thread's own, which
+/// fires when the reply channel is already closed at send time, and the
+/// submit-side `Drop` guard, which fires when the future is dropped after the
+/// push. Either way the caller is entitled to free the buffer, so a surviving
+/// registration would be a use-after-free waiting to happen.
+#[tokio::test(flavor = "multi_thread")]
+async fn map_region_cancel_rolls_back() {
+    const LEN: usize = 64 * 1024;
+    let buf = PageBuf::new(LEN);
+    let node = start_node().await;
+    let rma = node.transport.rdma_endpoint();
+    let live = || node.transport.shared.live_regions.load(Ordering::SeqCst);
+
+    // Half one, deterministically: the receiver is dropped *before* the command
+    // exists, so `reply.send` in the MapRegion arm cannot succeed.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    drop(rx);
+    node.transport
+        .shared
+        .ring_tx
+        .send_async(Cmd::MapRegion {
+            ptr: buf.addr(),
+            len: LEN,
+            region_id: u64::MAX / 2,
+            reply: tx,
+        })
+        .await
+        .expect("ring accepts the command");
+    node.transport.shared.doorbell.ring();
+    assert!(
+        wait_until(T, || live() == 0).await,
+        "an orphaned registration must be rolled back by the worker"
+    );
+    // The same buffer maps fine, so the command above really did register and
+    // roll back rather than failing on its way in.
+    let probe = rma.map_region(buf.addr(), LEN).await.expect("map succeeds");
+    assert_eq!(live(), 1);
+    rma.unmap_region(probe.region_id).await.expect("unmap");
+    assert_eq!(live(), 0);
+
+    // Half two: the public API, cancelled after the push. Polled exactly once —
+    // enough to put the command on the ring and start awaiting the reply — then
+    // dropped, which is what a `select!` arm losing a race looks like. A timeout
+    // would not do: tokio's timer granularity is a millisecond and the round
+    // trip is microseconds, so the map would simply win.
+    let mut pending = Box::pin(rma.map_region(buf.addr(), LEN));
+    assert!(
+        futures::poll!(pending.as_mut()).is_pending(),
+        "the first poll should submit and then await the reply"
+    );
+    drop(pending);
+    assert!(
+        wait_until(T, || live() == 0).await,
+        "a cancelled map_region must leave no region behind"
+    );
+
+    node.transport.shutdown();
+    assert_rma_balanced(&node);
+}
+
+/// A cancelled `unmap_region` still unmaps, and a retry attaches to it.
+///
+/// The dangerous shape this pins down: telling a retry "no such region" while
+/// the mapping is live and a GET is writing into it would read to the caller as
+/// permission to free the buffer.
+#[tokio::test(flavor = "multi_thread")]
+async fn unmap_cancel_then_retry() {
+    const LEN: usize = 32 * 1024 * 1024;
+    let mut src = PageBuf::new(LEN);
+    let dst = PageBuf::new(LEN);
+    src.fill_pattern();
+
+    let pair = start_rma_pair().await;
+    let remote = pair.owner_rma.map_region(src.addr(), LEN).await.unwrap();
+    let local = pair.puller_rma.map_region(dst.addr(), LEN).await.unwrap();
+
+    let endpoint = pair.puller_rma.clone();
+    let req = get_request(&pair, &src, &remote, &local);
+    let get = tokio::spawn(async move { endpoint.get(req).await });
+    assert!(
+        wait_until(T, || {
+            pair.puller
+                .transport
+                .shared
+                .inflight_ops
+                .load(Ordering::SeqCst)
+                >= 1
+        })
+        .await,
+        "the GET must be posted before the unmap is issued"
+    );
+
+    // Parks behind the GET, then the caller walks away.
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(1),
+        pair.puller_rma.unmap_region(local.region_id),
+    )
+    .await;
+    assert!(cancelled.is_err(), "the unmap must park, not resolve");
+
+    // The retry attaches to the unmap already in progress rather than being told
+    // the still-mapped region does not exist.
+    tokio::time::timeout(T, pair.puller_rma.unmap_region(local.region_id))
+        .await
+        .expect("retry must resolve")
+        .expect("retry must report success, not RegionNotFound");
+
+    get.await
+        .expect("get task")
+        .expect("the GET completes before the region goes");
+    assert_eq!(dst.as_slice(), src.as_slice());
+    assert_eq!(
+        pair.puller
+            .transport
+            .shared
+            .live_regions
+            .load(Ordering::SeqCst),
+        0,
+        "the puller's region is gone once the retry reports success"
+    );
+
+    pair.owner_rma.unmap_region(remote.region_id).await.unwrap();
+    pair.owner.transport.shutdown();
+    pair.puller.transport.shutdown();
+    assert_pair_balanced(&pair);
+}
+
+/// Shutdown must resolve an unmap parked behind a GET *and* the GET itself.
+///
+/// Before the operation registry existed, a survivor of teardown's bounded
+/// drain took its caller's `oneshot` sender into UCX's request bookkeeping and
+/// the `await` never returned.
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_resolves_parked_unmap_and_get() {
+    const LEN: usize = 32 * 1024 * 1024;
+    let mut src = PageBuf::new(LEN);
+    let dst = PageBuf::new(LEN);
+    src.fill_pattern();
+
+    let pair = start_rma_pair().await;
+    let remote = pair.owner_rma.map_region(src.addr(), LEN).await.unwrap();
+    let local = pair.puller_rma.map_region(dst.addr(), LEN).await.unwrap();
+
+    let endpoint = pair.puller_rma.clone();
+    let req = get_request(&pair, &src, &remote, &local);
+    let get = tokio::spawn(async move { endpoint.get(req).await });
+    assert!(
+        wait_until(T, || {
+            pair.puller
+                .transport
+                .shared
+                .inflight_ops
+                .load(Ordering::SeqCst)
+                >= 1
+        })
+        .await,
+        "the GET must be posted before the unmap is issued"
+    );
+
+    // Pushed through the ring so `shutdown()` cannot refuse it on the way in:
+    // the point is a waiter parked *inside* the progress thread when teardown
+    // starts.
+    let puller = Arc::clone(&pair.puller.transport);
+    let region_id = local.region_id;
+    let unmap = tokio::spawn(async move { ring_unmap(&puller, region_id).await });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    pair.puller.transport.shutdown();
+
+    let unmap_outcome = tokio::time::timeout(T, unmap)
+        .await
+        .expect("the parked unmap must resolve, not hang")
+        .expect("unmap task");
+    let get_outcome = tokio::time::timeout(T, get)
+        .await
+        .expect("the GET must resolve, not hang")
+        .expect("get task");
+    println!("shutdown: unmap={unmap_outcome:?} get={get_outcome:?}");
+
+    pair.owner.transport.shutdown();
+    assert_pair_balanced(&pair);
+}
+
+/// Dropping a `get` future must not strand the region's in-flight count.
+///
+/// The transfer keeps running — that is deliberate, and it is what stops UCX
+/// writing into a range the caller has since unmapped. What must still happen is
+/// the decrement, without which the region could never be unmapped at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_cancel_still_releases_the_region() {
+    const LEN: usize = 32 * 1024 * 1024;
+    let mut src = PageBuf::new(LEN);
+    let dst = PageBuf::new(LEN);
+    src.fill_pattern();
+
+    let pair = start_rma_pair().await;
+    let remote = pair.owner_rma.map_region(src.addr(), LEN).await.unwrap();
+    let local = pair.puller_rma.map_region(dst.addr(), LEN).await.unwrap();
+
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(1),
+        pair.puller_rma
+            .get(get_request(&pair, &src, &remote, &local)),
+    )
+    .await;
+    assert!(cancelled.is_err(), "the GET must be cancelled mid-transfer");
+
+    // Resolves only once the abandoned operation has completed and decremented.
+    tokio::time::timeout(T, pair.puller_rma.unmap_region(local.region_id))
+        .await
+        .expect("unmap must resolve after an abandoned GET")
+        .expect("unmap succeeds");
+    assert_eq!(
+        dst.as_slice(),
+        src.as_slice(),
+        "the abandoned transfer still ran to completion"
+    );
+
+    pair.owner_rma.unmap_region(remote.region_id).await.unwrap();
+    pair.owner.transport.shutdown();
+    pair.puller.transport.shutdown();
+    assert_pair_balanced(&pair);
+}
+
+/// The peer vanishing mid-transfer must still answer the GET's caller.
+///
+/// This is the closest an in-process tcp harness gets to teardown's
+/// abandoned-operation path: measured, UCX completes the GET with
+/// `Endpoint timeout` rather than leaving it outstanding, so the reply comes
+/// from the normal completion route. `WorkerState::abandon_rma_ops` remains the
+/// backstop for a peer that stops progressing without closing — a state this
+/// harness cannot produce, and a hardware-checkpoint item.
+#[tokio::test(flavor = "multi_thread")]
+async fn peer_shutdown_during_get_answers_caller() {
+    const LEN: usize = 64 * 1024 * 1024;
+    let mut src = PageBuf::new(LEN);
+    let dst = PageBuf::new(LEN);
+    src.fill_pattern();
+
+    let pair = start_rma_pair().await;
+    let remote = pair.owner_rma.map_region(src.addr(), LEN).await.unwrap();
+    let local = pair.puller_rma.map_region(dst.addr(), LEN).await.unwrap();
+
+    let endpoint = pair.puller_rma.clone();
+    let req = get_request(&pair, &src, &remote, &local);
+    let get = tokio::spawn(async move { endpoint.get(req).await });
+    assert!(
+        wait_until(T, || {
+            pair.puller
+                .transport
+                .shared
+                .inflight_ops
+                .load(Ordering::SeqCst)
+                >= 1
+        })
+        .await,
+        "the GET must be in flight before the owner goes"
+    );
+
+    pair.owner.transport.shutdown();
+    pair.puller.transport.shutdown();
+
+    let outcome = tokio::time::timeout(T, get)
+        .await
+        .expect("the GET must resolve, not hang")
+        .expect("get task must not panic");
+    println!("peer-shutdown GET resolved as {outcome:?}");
+    assert_pair_balanced(&pair);
 }
 
 /// Registration and GET cost over the tcp lane. Numbers feed the Phase-3
@@ -910,4 +1477,5 @@ async fn bench_rma() {
     pair.owner_rma.unmap_region(remote.region_id).await.unwrap();
     pair.owner.transport.shutdown();
     pair.puller.transport.shutdown();
+    assert_pair_balanced(&pair);
 }
