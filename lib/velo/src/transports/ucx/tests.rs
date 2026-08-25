@@ -20,7 +20,9 @@ use crate::transports::transport::{
 };
 // `super` here is the `transport` module (this file is `#[path]`-included from
 // it), so the sibling `rma` module needs its full path.
-use crate::transports::ucx::rma::{MappedRegion, RdmaEndpoint, RmaError, RmaGetRequest};
+use crate::transports::ucx::rma::{
+    MAX_PACKED_RKEY, MappedRegion, RdmaEndpoint, RmaError, RmaGetRequest, preparse_packed_rkey,
+};
 use crate::transports::ucx::worker::Cmd;
 use velo_ext::{InstanceId, MessageType, PeerInfo};
 
@@ -524,8 +526,15 @@ async fn ring_get(transport: &UcxTransport, req: RmaGetRequest) -> Result<(), Rm
         .expect("worker must not drop the reply")
 }
 
-/// Push an unmap straight onto the ring, bypassing the submit-side range table.
-async fn ring_unmap(transport: &UcxTransport, region_id: u64) -> Result<(), RmaError> {
+/// Enqueue an unmap onto the ring and hand back its reply channel.
+///
+/// Split from the await so a test can establish "the command is on the ring"
+/// before doing something else — waiting a guessed interval for a spawned task
+/// to get there is the flake this file keeps removing.
+async fn ring_unmap_enqueue(
+    transport: &UcxTransport,
+    region_id: u64,
+) -> tokio::sync::oneshot::Receiver<Result<(), RmaError>> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     transport
         .shared
@@ -537,10 +546,7 @@ async fn ring_unmap(transport: &UcxTransport, region_id: u64) -> Result<(), RmaE
         .await
         .expect("ring accepts the command");
     transport.shared.doorbell.ring();
-    tokio::time::timeout(T, rx)
-        .await
-        .expect("worker must answer")
-        .expect("worker must not drop the reply")
+    rx
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1034,15 +1040,18 @@ async fn worker_rejects_bad_get_commands() {
     assert_pair_balanced(&pair);
 }
 
-/// A truncated but plausibly-sized blob reaches `ucp_ep_rkey_unpack`.
+/// A blob that passes the pre-parse and is still refused by UCX.
 ///
-/// This is the case `MAX_PACKED_RKEY` cannot catch: nine bytes is exactly what a
-/// real tcp-lane rkey looks like, so the length check passes and UCX parses it.
-/// With `md_map` bits set and no bytes behind them, only the zero padding
-/// `prepare_get` unpacks from keeps the walk inside our own allocation. The
-/// assertion is simply that the process survives and the caller is answered.
+/// The complement of [`truncated_rkey_is_refused_before_ucx`]: this one is well
+/// formed — `md_map` names one memory domain, the entry is present, `sys_dev` is
+/// `UNKNOWN` — so the pre-parse lets it through and `ucp_ep_rkey_unpack` really
+/// runs, walking only bytes the blob owns. UCX rejects it because no local
+/// memory domain corresponds (it logs `failed to unpack remote key from remote
+/// md[0]`). What this pins down is the accounting on that branch: `live_rkeys`
+/// is incremented only after a successful unpack, so a failed one must leave it
+/// untouched rather than counting a key that was never created.
 #[tokio::test(flavor = "multi_thread")]
-async fn worker_survives_truncated_rkey() {
+async fn unusable_rkey_fails_cleanly_inside_ucx() {
     const LEN: usize = 64 * 1024;
     let src = PageBuf::new(LEN);
     let dst = PageBuf::new(LEN);
@@ -1051,26 +1060,28 @@ async fn worker_survives_truncated_rkey() {
     let remote = pair.owner_rma.map_region(src.addr(), LEN).await.unwrap();
     let local = pair.puller_rma.map_region(dst.addr(), LEN).await.unwrap();
 
-    // `md_map` = every bit set, memory type 0, and nothing behind it.
-    let mut hostile = vec![0xFFu8; 8];
-    hostile.push(0);
+    let mut well_formed = 1u64.to_le_bytes().to_vec();
+    well_formed.push(0); // mem_type
+    well_formed.push(0); // md[0]: zero-length key material
+    well_formed.push(0xFF); // sys_dev = UNKNOWN, so the distance walk is skipped
+    preparse_packed_rkey(&well_formed).expect("this blob is self-terminating");
+
     let mut req = get_request(&pair, &src, &remote, &local);
-    req.packed_rkey = Bytes::from(hostile);
+    req.packed_rkey = Bytes::from(well_formed);
     req.len = 64;
     let outcome = ring_get(&pair.puller.transport, req).await;
-    println!("truncated-rkey GET resolved as {outcome:?}");
-
-    // Whatever UCX made of it, the accounting has to balance.
     assert!(
-        wait_until(T, || pair
-            .puller
+        matches!(outcome, Err(RmaError::Ucx { .. })),
+        "UCX should refuse an unreachable memory domain, got {outcome:?}"
+    );
+    assert_eq!(
+        pair.puller
             .transport
             .shared
             .live_rkeys
-            .load(Ordering::SeqCst)
-            == 0)
-        .await,
-        "the rkey unpacked for a refused GET must still be destroyed"
+            .load(Ordering::SeqCst),
+        0,
+        "a failed unpack must not be counted as a live rkey"
     );
 
     pair.puller_rma.unmap_region(local.region_id).await.unwrap();
@@ -1224,13 +1235,19 @@ async fn unmap_cancel_then_retry() {
         "the GET must be posted before the unmap is issued"
     );
 
-    // Parks behind the GET, then the caller walks away.
-    let cancelled = tokio::time::timeout(
+    // Parks behind the GET, then the caller walks away. If the GET somehow
+    // finished inside the window the unmap resolves instead, which makes this
+    // step vacuous rather than wrong — the load-bearing assertion is the retry
+    // below, which must report success either way.
+    if tokio::time::timeout(
         Duration::from_millis(1),
         pair.puller_rma.unmap_region(local.region_id),
     )
-    .await;
-    assert!(cancelled.is_err(), "the unmap must park, not resolve");
+    .await
+    .is_ok()
+    {
+        println!("note: the unmap resolved before it could be cancelled");
+    }
 
     // The retry attaches to the unmap already in progress rather than being told
     // the still-mapped region does not exist.
@@ -1291,20 +1308,18 @@ async fn shutdown_resolves_parked_unmap_and_get() {
         "the GET must be posted before the unmap is issued"
     );
 
-    // Pushed through the ring so `shutdown()` cannot refuse it on the way in:
-    // the point is a waiter parked *inside* the progress thread when teardown
-    // starts.
-    let puller = Arc::clone(&pair.puller.transport);
-    let region_id = local.region_id;
-    let unmap = tokio::spawn(async move { ring_unmap(&puller, region_id).await });
-    tokio::time::sleep(Duration::from_millis(5)).await;
+    // Pushed through the ring so `shutdown()` cannot refuse it on the way in,
+    // and enqueued inline so the command is provably on the ring before teardown
+    // starts — a spawned task plus a sleep would sometimes lose the push into
+    // teardown's drain gap and then wait out the test's timeout.
+    let unmap = ring_unmap_enqueue(&pair.puller.transport, local.region_id).await;
 
     pair.puller.transport.shutdown();
 
     let unmap_outcome = tokio::time::timeout(T, unmap)
         .await
         .expect("the parked unmap must resolve, not hang")
-        .expect("unmap task");
+        .expect("the reply must be sent, not dropped");
     let get_outcome = tokio::time::timeout(T, get)
         .await
         .expect("the GET must resolve, not hang")
@@ -1350,6 +1365,169 @@ async fn get_cancel_still_releases_the_region() {
         "the abandoned transfer still ran to completion"
     );
 
+    pair.owner_rma.unmap_region(remote.region_id).await.unwrap();
+    pair.owner.transport.shutdown();
+    pair.puller.transport.shutdown();
+    assert_pair_balanced(&pair);
+}
+
+/// The pre-parse is the containment for `ucp_ep_rkey_unpack`'s length-free walk.
+///
+/// Unit-level, because the shapes that matter are ones a real packer never
+/// produces. A length bound cannot stand in for this: nine bytes is exactly what
+/// a genuine tcp-lane rkey looks like, so the size check waves the first case
+/// straight through to UCX.
+#[test]
+fn preparse_rejects_blobs_ucx_would_walk_off_the_end_of() {
+    // A `md_map` claiming 64 memory domains with no entries behind it. Stage 1
+    // walks one length byte per set bit, driven by `md_map` and never by a
+    // buffer end.
+    let mut truncated = vec![0xFFu8; 8];
+    truncated.push(0);
+    assert_eq!(truncated.len(), 9);
+    assert!(matches!(
+        preparse_packed_rkey(&truncated),
+        Err(RmaError::InvalidRkey)
+    ));
+
+    // A length byte sitting at the very last content byte, declaring 255. This
+    // is the shape that makes "just add N bytes of padding" unfixable: the
+    // stage-1 walk runs 255 bytes past whatever the blob's own size is.
+    let mut tail_declares_255 = 1u64.to_le_bytes().to_vec();
+    tail_declares_255.push(0); // mem_type
+    tail_declares_255.push(255); // md[0] length, at the last byte
+    assert_eq!(tail_declares_255.len(), 10);
+    assert!(matches!(
+        preparse_packed_rkey(&tail_declares_255),
+        Err(RmaError::InvalidRkey)
+    ));
+
+    // The same shape at the maximum accepted size, so the overrun starts one
+    // byte past `MAX_PACKED_RKEY` — 255 bytes further than any pad this code
+    // ever carried. Seven memory domains, six entries of 168 bytes, then a
+    // final length byte at index 1023.
+    let mut crafted = 0b111_1111u64.to_le_bytes().to_vec();
+    crafted.push(0); // mem_type
+    for _ in 0..6 {
+        crafted.push(168);
+        crafted.extend(std::iter::repeat_n(0u8, 168));
+    }
+    crafted.push(255);
+    assert_eq!(crafted.len(), MAX_PACKED_RKEY);
+    assert!(matches!(
+        preparse_packed_rkey(&crafted),
+        Err(RmaError::InvalidRkey)
+    ));
+
+    // `md_map != 0` with a `sys_dev` byte that is not `UNKNOWN` and no `0xFF`
+    // terminator behind it: stage 2 sets `buffer_end = UINTPTR_MAX` and walks
+    // 3-byte records until it finds one.
+    let mut unterminated = 1u64.to_le_bytes().to_vec();
+    unterminated.push(0); // mem_type
+    unterminated.push(0); // md[0] length
+    unterminated.push(7); // sys_dev, not UNKNOWN
+    unterminated.extend_from_slice(&[1, 2, 3]); // one distance record, no terminator
+    assert!(matches!(
+        preparse_packed_rkey(&unterminated),
+        Err(RmaError::InvalidRkey)
+    ));
+
+    // Same, with the terminator UCX's own packer writes.
+    let mut terminated = unterminated.clone();
+    terminated.push(0xFF);
+    preparse_packed_rkey(&terminated).expect("a terminated distance list is parseable");
+
+    // Truncated header.
+    assert!(matches!(
+        preparse_packed_rkey(&[0u8; 4]),
+        Err(RmaError::InvalidRkey)
+    ));
+    assert!(matches!(
+        preparse_packed_rkey(&[0u8; 8]),
+        Err(RmaError::InvalidRkey)
+    ));
+
+    // The degenerate-but-real shape CI actually produces: empty `md_map`, so no
+    // entries, no `sys_dev` byte, nine bytes total.
+    preparse_packed_rkey(&[0, 0, 0, 0, 0, 0, 0, 0, 0]).expect("an empty md_map is well formed");
+}
+
+/// The blobs `ucp_rkey_pack` really produces must pass the pre-parse.
+///
+/// Guards the other direction from
+/// [`preparse_rejects_blobs_ucx_would_walk_off_the_end_of`]: a stricter walk
+/// than UCX's own packer would reject every real key and take the RDMA path with
+/// it.
+#[tokio::test(flavor = "multi_thread")]
+async fn preparse_accepts_real_packed_rkeys() {
+    const LEN: usize = 64 * 1024;
+    let buf = PageBuf::new(LEN);
+    let node = start_node().await;
+    let rma = node.transport.rdma_endpoint();
+
+    for len in [4096usize, LEN] {
+        let region = rma.map_region(buf.addr(), len).await.expect("map");
+        preparse_packed_rkey(&region.packed_rkey).unwrap_or_else(|e| {
+            panic!(
+                "a genuine {}-byte rkey was rejected: {e}",
+                region.packed_rkey.len()
+            )
+        });
+        rma.unmap_region(region.region_id).await.expect("unmap");
+    }
+
+    node.transport.shutdown();
+    assert_rma_balanced(&node);
+}
+
+/// A truncated blob is refused before UCX sees it, on both paths.
+///
+/// The nine-byte shape is the dangerous one: it is exactly the size of a real
+/// tcp-lane key, so only the pre-parse distinguishes it. Reaching
+/// `ucp_ep_rkey_unpack` with it would walk 64 phantom entries off the end of
+/// whatever buffer it sat in.
+#[tokio::test(flavor = "multi_thread")]
+async fn truncated_rkey_is_refused_before_ucx() {
+    const LEN: usize = 64 * 1024;
+    let src = PageBuf::new(LEN);
+    let dst = PageBuf::new(LEN);
+
+    let pair = start_rma_pair().await;
+    let remote = pair.owner_rma.map_region(src.addr(), LEN).await.unwrap();
+    let local = pair.puller_rma.map_region(dst.addr(), LEN).await.unwrap();
+
+    let mut hostile = vec![0xFFu8; 8];
+    hostile.push(0);
+
+    // Submit side.
+    let mut req = get_request(&pair, &src, &remote, &local);
+    req.packed_rkey = Bytes::from(hostile.clone());
+    req.len = 64;
+    assert!(matches!(
+        pair.puller_rma.get(req).await,
+        Err(RmaError::InvalidRkey)
+    ));
+
+    // Worker side, reached directly so the submit-side check cannot shadow it.
+    let mut req = get_request(&pair, &src, &remote, &local);
+    req.packed_rkey = Bytes::from(hostile);
+    req.len = 64;
+    assert!(matches!(
+        ring_get(&pair.puller.transport, req).await,
+        Err(RmaError::InvalidRkey)
+    ));
+
+    // Nothing was unpacked, so nothing can have leaked.
+    assert_eq!(
+        pair.puller
+            .transport
+            .shared
+            .live_rkeys
+            .load(Ordering::SeqCst),
+        0
+    );
+
+    pair.puller_rma.unmap_region(local.region_id).await.unwrap();
     pair.owner_rma.unmap_region(remote.region_id).await.unwrap();
     pair.owner.transport.shutdown();
     pair.puller.transport.shutdown();

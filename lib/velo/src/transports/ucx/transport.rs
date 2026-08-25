@@ -403,8 +403,10 @@ impl Transport for UcxTransport {
             self.startup.set(out).ok();
             self.local_address.set(address).ok();
             // Only now is the ring being consumed: before this, an RMA command
-            // would push successfully and never be answered.
-            self.rma.mark_started();
+            // would push successfully and never be answered. The runtime handle
+            // rides along so a cancelled `map_region` can retry its rollback push
+            // rather than drop it (see `MapRollback`).
+            self.rma.mark_started(self.runtime.get().cloned());
             Ok(())
         })
     }

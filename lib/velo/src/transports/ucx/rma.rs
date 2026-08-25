@@ -60,8 +60,8 @@
 //!   running and keeps the region's in-flight count raised, which is exactly
 //!   what stops the destination being unmapped underneath UCX.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -69,31 +69,26 @@ use velo_ext::InstanceId;
 
 use super::worker::{Cmd, WorkerShared};
 
-/// Largest packed rkey this side will copy into the unpack buffer.
+/// Largest packed rkey this side will accept.
 ///
-/// This bounds the *copy*, not the parse. Descriptors are velo-authored and a
-/// packed rkey is tens of bytes even with several memory domains, so a blob past
-/// this size is refused as malformed. What contains the parse is
-/// [`RKEY_UNPACK_PAD`].
+/// Bounds the copy and the pre-parse loop. Descriptors are velo-authored and a
+/// real packed rkey is tens of bytes even with several memory domains, so a blob
+/// past this size is malformed by definition.
 pub(crate) const MAX_PACKED_RKEY: usize = 1024;
 
-/// Zero bytes appended to a packed rkey before `ucp_ep_rkey_unpack` reads it.
+/// Slack in the buffer `prepare_get` unpacks from, filled with `0xFF`.
 ///
-/// `ucp_ep_rkey_unpack` takes no length: it reads an 8-byte `md_map` plus a
-/// memory-type byte, then walks *one entry per set bit of `md_map`*, each a
-/// length byte followed by that many raw bytes (`ucp_rkey.c:1090`, the same
-/// serialisation `ucp_rkey_packed_copy` writes). Nothing in that loop consults a
-/// buffer end, so a truncated or hostile blob with bits set in `md_map` reads
-/// arbitrarily far past its own storage, and UCX's internal assertions are
-/// compiled out of a release build. A length check cannot fix that — the length
-/// is never passed in.
-///
-/// Zero padding can, and does: a phantom entry reads its length byte as `0` and
-/// consumes exactly one byte, so a fully-set `md_map` walks at most
-/// `64 + 1` bytes past the real content. Padding every unpack buffer out to
-/// `MAX_PACKED_RKEY + RKEY_UNPACK_PAD` therefore keeps any over-read inside our
-/// own allocation and terminates it.
-pub(crate) const RKEY_UNPACK_PAD: usize = 256;
+/// Belt-and-braces only — [`preparse_packed_rkey`] is the containment. See its
+/// docs for why a length bound cannot be one, and why the filler is `0xFF`
+/// rather than zero.
+pub(crate) const RKEY_UNPACK_PAD: usize = 512;
+
+/// `UCS_SYS_DEVICE_ID_UNKNOWN`: the value that terminates UCX's distance walk.
+const SYS_DEV_UNKNOWN: u8 = u8::MAX;
+
+/// `sizeof(ucp_rkey_packed_distance_t)` — `{ u8 sys_dev, fp8 latency, fp8
+/// bandwidth }`, `UCS_S_PACKED` (`ucp_rkey.c:27`).
+const PACKED_DISTANCE_LEN: usize = 3;
 
 /// Why an RMA operation could not be performed.
 #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
@@ -182,6 +177,10 @@ pub(crate) struct RmaGetRequest {
 pub(crate) struct RmaState {
     /// Set once `Transport::start` has produced a running progress thread.
     started: AtomicBool,
+    /// The transport's runtime, so a cancelled `map_region` can await its
+    /// compensating unmap onto a full ring instead of dropping it. `Drop` cannot
+    /// block, but it can spawn.
+    runtime: OnceLock<tokio::runtime::Handle>,
     /// Mints [`MappedRegion::region_id`]; monotonic, never reused.
     next_region_id: AtomicU64,
     /// `region_id -> (mapped pointer, mapped length)`.
@@ -196,6 +195,7 @@ impl RmaState {
     pub(crate) fn new() -> Self {
         Self {
             started: AtomicBool::new(false),
+            runtime: OnceLock::new(),
             next_region_id: AtomicU64::new(1),
             ranges: DashMap::new(),
         }
@@ -203,7 +203,10 @@ impl RmaState {
 
     /// Called by `UcxTransport::start` once the progress thread is consuming
     /// the ring.
-    pub(crate) fn mark_started(&self) {
+    pub(crate) fn mark_started(&self, runtime: Option<tokio::runtime::Handle>) {
+        if let Some(handle) = runtime {
+            let _ = self.runtime.set(handle);
+        }
         self.started.store(true, Ordering::Release);
     }
 }
@@ -277,7 +280,13 @@ impl RdmaEndpoint {
             region_id,
             armed: true,
         };
-        let outcome = rx.await.unwrap_or_else(|_| Err(self.gone()));
+        // Disarmed only by an answer the worker actually sent. A `RecvError`
+        // means the sender was dropped without one — the progress thread died
+        // between inserting the region and replying — which is precisely when a
+        // compensating unmap is still owed.
+        let Ok(outcome) = rx.await else {
+            return Err(self.gone());
+        };
         rollback.armed = false;
 
         let region = outcome?;
@@ -295,15 +304,31 @@ impl RdmaEndpoint {
     /// state the caller asked for. From the moment the command reaches the
     /// progress thread, new GETs into the region are refused.
     ///
-    /// Dropping this future does not cancel the unmap; it only abandons the
-    /// notification. Concurrent callers for the same id all resolve together.
+    /// Cancellation has two outcomes, split at the moment the command is
+    /// enqueued. Dropped **before** the push completes — which a full ring can
+    /// make into a real wait — nothing happens at all: the region stays mapped
+    /// and usable, and the caller must retry. Dropped **after**, the unmap
+    /// proceeds regardless and only the notification is lost. The advisory range
+    /// entry is removed at exactly that boundary, so it never claims a region is
+    /// gone while the progress thread still has it mapped and ungated.
+    ///
+    /// Concurrent callers for the same id all resolve together.
     pub(crate) async fn unmap_region(&self, region_id: u64) -> Result<(), RmaError> {
-        // Gate the region here rather than after the reply: the unmap is going
-        // to happen whatever becomes of this future, so the id must stop being
-        // usable at the same moment, not later.
-        self.state.ranges.remove(&region_id);
-        self.submit(|reply| Cmd::UnmapRegion { region_id, reply })
+        self.ready()?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.shared
+            .ring_tx
+            .send_async(Cmd::UnmapRegion {
+                region_id,
+                reply: tx,
+            })
             .await
+            .map_err(|_| self.gone())?;
+        // Enqueued: from here the unmap happens whatever becomes of this future,
+        // so the id stops being usable now and not a moment earlier.
+        self.state.ranges.remove(&region_id);
+        self.shared.doorbell.ring();
+        rx.await.unwrap_or_else(|_| Err(self.gone()))
     }
 
     /// Read `req.len` bytes of `req.peer`'s memory into a local region.
@@ -384,9 +409,11 @@ impl RdmaEndpoint {
 /// unmaps a real region, or answers `Ok(())` for one that was never created (or
 /// that its own rollback already removed).
 ///
-/// `try_send` rather than an await, because `Drop` cannot block. A full ring is
-/// the one case this cannot cover, and the progress-thread rollback in the
-/// `MapRegion` handler is what covers the common half of that gap.
+/// `try_send` rather than an await, because `Drop` cannot block — but it can
+/// spawn, so a full ring falls back to an awaited push on the transport's
+/// runtime. What is left after that is a *closed* ring, which only happens once
+/// the progress thread has begun tearing down, and teardown force-unmaps every
+/// region it still holds.
 struct MapRollback<'a> {
     endpoint: &'a RdmaEndpoint,
     region_id: u64,
@@ -399,32 +426,115 @@ impl Drop for MapRollback<'_> {
             return;
         }
         let (tx, _rx) = tokio::sync::oneshot::channel();
-        if self
-            .endpoint
-            .shared
-            .ring_tx
-            .try_send(Cmd::UnmapRegion {
-                region_id: self.region_id,
-                reply: tx,
-            })
-            .is_ok()
-        {
-            self.endpoint.shared.doorbell.ring();
-        } else {
-            tracing::warn!(
-                "ucx: could not queue rollback for cancelled map_region (region {})",
-                self.region_id
-            );
+        let region_id = self.region_id;
+        let shared = Arc::clone(&self.endpoint.shared);
+        match shared.ring_tx.try_send(Cmd::UnmapRegion {
+            region_id,
+            reply: tx,
+        }) {
+            Ok(()) => shared.doorbell.ring(),
+            Err(flume::TrySendError::Full(cmd)) => match self.endpoint.state.runtime.get() {
+                Some(runtime) => {
+                    runtime.spawn(async move {
+                        if shared.ring_tx.send_async(cmd).await.is_ok() {
+                            shared.doorbell.ring();
+                        }
+                    });
+                }
+                None => tracing::warn!(
+                    "ucx: ring full and no runtime to retry on; region {region_id} stays \
+                         mapped until teardown"
+                ),
+            },
+            // A disconnected ring means the progress thread is already tearing
+            // down, and teardown unmaps whatever it still holds.
+            Err(flume::TrySendError::Disconnected(_)) => {}
         }
     }
 }
 
-/// Refuse a packed rkey that is obviously not one. This bounds the copy into the
-/// zero-padded unpack buffer; [`RKEY_UNPACK_PAD`] is what bounds the parse.
+/// Refuse a packed rkey `ucp_ep_rkey_unpack` could not parse within its own
+/// bytes. Bounds first, then [`preparse_packed_rkey`].
 pub(crate) fn validate_packed_rkey(packed: &[u8]) -> Result<(), RmaError> {
     if packed.is_empty() || packed.len() > MAX_PACKED_RKEY {
-        Err(RmaError::InvalidRkey)
-    } else {
-        Ok(())
+        return Err(RmaError::InvalidRkey);
+    }
+    preparse_packed_rkey(packed)
+}
+
+/// Prove that UCX's parse of `packed` terminates inside `packed`.
+///
+/// `ucp_ep_rkey_unpack` takes no length — the public API has no parameter for
+/// one — so nothing stops a malformed blob walking off the end of whatever
+/// buffer it lives in, and UCX's internal assertions are compiled out of a
+/// release build. Neither a length check nor trailing padding can fix that, for
+/// two separate reasons found in the 1.22.0 source:
+///
+/// * **Stage 1** (`ucp_rkey_pack_memh`'s format, read back in
+///   `ucp_ep_rkey_unpack_internal`) is `md_map: u64le`, `mem_type: u8`, then one
+///   `len: u8` + `len` bytes per set bit of `md_map`, then `sys_dev: u8` iff
+///   `md_map != 0`. The walk is driven by `md_map`, never by a buffer end, and a
+///   length byte sitting at the last content byte may declare 255 — so no fixed
+///   pad size is provably enough.
+/// * **Stage 2** (`ucp_rkey_unpack_lanes_distance`, reached through
+///   `ucp_rkey_proto_resolve` whenever the peer is UCX >= 1.20 and the blob's
+///   `sys_dev` is not `UNKNOWN`) sets `buffer_end = UINTPTR_MAX`
+///   (`ucp_rkey.c:897`) and walks 3-byte records, breaking **only** on a `0xFF`
+///   byte (`ucp_rkey.c:820`). Zero padding does not stop it; it feeds it.
+///
+/// So containment has to come from the blob itself. This walks the same format
+/// and requires every read UCX will perform to land inside `packed`: the stage-1
+/// entries, the `sys_dev` byte, and — when that byte is not `0xFF` and stage 2
+/// therefore runs — a `0xFF` terminator reachable on the 3-byte stride. UCX's
+/// own packer always produces such a blob (`ucp_rkey_pack_memh` writes the
+/// terminator at `ucp_rkey.c:264`), so nothing legitimate is refused.
+pub(crate) fn preparse_packed_rkey(packed: &[u8]) -> Result<(), RmaError> {
+    let bad = || RmaError::InvalidRkey;
+
+    let md_map = u64::from_le_bytes(
+        packed
+            .get(..8)
+            .ok_or_else(bad)?
+            .try_into()
+            .map_err(|_| bad())?,
+    );
+    // `mem_type`.
+    let mut at = 9usize;
+    if at > packed.len() {
+        return Err(bad());
+    }
+
+    for _ in 0..md_map.count_ones() {
+        let tl_len = *packed.get(at).ok_or_else(bad)? as usize;
+        at = at
+            .checked_add(1)
+            .and_then(|a| a.checked_add(tl_len))
+            .ok_or_else(bad)?;
+        if at > packed.len() {
+            return Err(bad());
+        }
+    }
+
+    if md_map == 0 {
+        // No `sys_dev` byte is read and stage 2 never runs.
+        return Ok(());
+    }
+
+    let sys_dev = *packed.get(at).ok_or_else(bad)?;
+    at += 1;
+    if sys_dev == SYS_DEV_UNKNOWN {
+        // Stage 2 is skipped for an unknown system device.
+        return Ok(());
+    }
+
+    // Stage 2 will run unbounded from here until it reads a `0xFF` byte. Prove
+    // it reaches one without leaving the blob.
+    loop {
+        match packed.get(at) {
+            Some(&SYS_DEV_UNKNOWN) => return Ok(()),
+            // A record it will consume whole must fit.
+            Some(_) if at + PACKED_DISTANCE_LEN <= packed.len() => at += PACKED_DISTANCE_LEN,
+            _ => return Err(bad()),
+        }
     }
 }

@@ -428,7 +428,12 @@ type RmaCompletions = Vec<RmaCompletion>;
 struct RmaOpState {
     /// The unpacked `ucp_rkey_h` as `usize`. Raw handles are not `Send`, and
     /// this one never leaves the progress thread — the `usize` records that.
-    rkey: usize,
+    ///
+    /// Take-able for the same reason the reply is: `post_get` keeps defensive
+    /// reclaim arms for a UCX that ignores `FLAG_NO_IMM_CMPL`, and if one of
+    /// those ever fired alongside the callback, a plain field would be destroyed
+    /// twice. Taking makes the second attempt find `None`.
+    rkey: Mutex<Option<usize>>,
     /// Region whose in-flight count this operation holds.
     region_id: u64,
     /// Identifies this operation in [`WorkerState::rma_ops`].
@@ -445,13 +450,15 @@ struct RmaOpState {
 impl RmaOpState {
     /// Runs exactly once per posted operation, on the progress thread.
     fn complete(&self, status: sys::ucs_status_t) {
-        // SAFETY: `rkey` was produced by `ucp_ep_rkey_unpack` for this operation
-        // and `complete` runs exactly once, from the trampoline or from the
-        // poster's synchronous-failure exit. `ucp_rkey_destroy` dereferences no
-        // endpoint and returns the descriptor to the worker's mpool, both of
-        // which outlive this call — see the module docs for the source facts.
-        unsafe { sys::ucp_rkey_destroy(self.rkey as sys::ucp_rkey_h) };
-        self.live_rkeys.fetch_sub(1, Ordering::Relaxed);
+        if let Some(rkey) = self.rkey.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            // SAFETY: `rkey` was produced by `ucp_ep_rkey_unpack` for this
+            // operation and has just been taken out of its only slot, so this is
+            // the one and only destroy. `ucp_rkey_destroy` dereferences no
+            // endpoint and returns the descriptor to the worker's mpool, both of
+            // which outlive this call — see the module docs for the source facts.
+            unsafe { sys::ucp_rkey_destroy(rkey as sys::ucp_rkey_h) };
+            self.live_rkeys.fetch_sub(1, Ordering::Relaxed);
+        }
         self.resolve(if status == sys::ucs_status_t_UCS_OK {
             Ok(())
         } else {
@@ -1706,19 +1713,23 @@ impl WorkerState {
             .ensure_ep(req.peer)
             .map_err(|e| RmaError::EndpointUnavailable(e.to_string()))?;
 
-        // UCX parses the blob with no length bound at all, so it is unpacked
-        // from a zero-padded copy rather than from the `Bytes` directly: a
-        // `md_map` claiming more entries than the blob carries then walks into
-        // zeroes, where each phantom entry declares length 0 and consumes one
-        // byte. See `RKEY_UNPACK_PAD` for the format and the arithmetic. The
-        // length check above bounds this copy; the padding is what bounds UCX.
-        let mut unpack_buf = [0u8; MAX_PACKED_RKEY + RKEY_UNPACK_PAD];
+        // Containment for UCX's length-free parse comes from
+        // `preparse_packed_rkey` above, which has proved that every read the
+        // parse will perform lands inside `packed_rkey`. The copy below is
+        // belt-and-braces for a parse that somehow escapes anyway: the filler is
+        // `0xFF`, which is `UCS_SYS_DEVICE_ID_UNKNOWN` and the only byte that
+        // terminates the stage-2 distance walk (`ucp_rkey.c:820`). Zero filler
+        // would be worse than none — that walk sets `buffer_end = UINTPTR_MAX`
+        // and would consume the zeroes as 3-byte records off the stack.
+        let mut unpack_buf = [0xFFu8; MAX_PACKED_RKEY + RKEY_UNPACK_PAD];
         unpack_buf[..req.packed_rkey.len()].copy_from_slice(&req.packed_rkey);
 
-        // SAFETY: `ep` is live on this worker, and `unpack_buf` is a local
-        // allocation whose tail is zeroed, so however far UCX's unbounded parse
-        // walks it stays inside this buffer and terminates within
-        // `64 + 1` bytes of the real content.
+        // SAFETY: `ep` is live on this worker and the blob has been pre-parsed,
+        // so UCX's walk terminates within the first `packed_rkey.len()` bytes of
+        // this buffer. The `0xFF` tail bounds it even if that reasoning is ever
+        // wrong: the stage-1 walk finds max-length entries that immediately
+        // exceed the buffer's own accounting, and the stage-2 walk stops on the
+        // first filler byte it reads.
         let rkey = unsafe {
             let mut rkey: sys::ucp_rkey_h = std::ptr::null_mut();
             let st = sys::ucp_ep_rkey_unpack(ep, unpack_buf.as_ptr() as *const c_void, &mut rkey);
@@ -1758,7 +1769,7 @@ impl WorkerState {
         let op_id = self.next_op_id;
         self.next_op_id += 1;
         let op = Arc::new(RmaOpState {
-            rkey: prepared.rkey as usize,
+            rkey: Mutex::new(Some(prepared.rkey as usize)),
             region_id: prepared.region_id,
             op_id,
             reply: Mutex::new(Some(reply)),
@@ -1892,6 +1903,13 @@ impl WorkerState {
                 continue;
             }
             warn!("ucx: force-unmapping region {region_id} with {inflight} rma op(s) in flight");
+            // Deliberately not `finish_unmap`: this inlines the same
+            // take-waiters / unmap / notify sequence but discards
+            // `unmap_entry`'s result, because the honest answer here is
+            // `ShuttingDown` whether or not `ucp_mem_unmap` succeeded — the
+            // contract the waiters were promised is "nothing is touching this
+            // memory any more", and that is exactly what failed. Any change to
+            // `finish_unmap` has to be considered against this site too.
             let waiters = std::mem::take(&mut entry.pending_unmap);
             let _ = self.unmap_entry(entry);
             for waiter in waiters {
