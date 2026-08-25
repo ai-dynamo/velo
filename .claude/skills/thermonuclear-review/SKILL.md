@@ -13,6 +13,24 @@ races, FFI lifetime bugs) plus the ones RDMA work newly introduces.
 Run it on: the current branch's diff against `origin/main` (default), or an
 explicit PR number / commit range given in the arguments.
 
+## Ground rules (violations invalidate the review)
+
+- **Commit the code under review before starting.** A review of an
+  uncommitted working tree has no pinned baseline: an agent edit silently
+  corrupts every later agent's reading, and there is no diff to restore from.
+- **Finders and verifiers are strictly read-only on the repo.** They report;
+  they never Edit/Write source, not even "temporarily". State this in every
+  agent prompt.
+- **Mutation testing is allowed only in an isolated copy** (spawn with
+  `isolation: "worktree"`, or copy the files to scratch and build there).
+  A mutation applied to the live tree — even if reverted — taints every
+  verdict produced in the window, and a missed revert plants a real bug.
+  (This rule exists because it happened: a reviewer's unreverted `||`→`&&`
+  mutation was then "found" by another reviewer as a bug in the diff.)
+- After the review completes, `git status` must be clean relative to the
+  pinned commit. If it isn't, find out which agent edited what before
+  trusting anything.
+
 ## Stage 0 — Mechanical gates (run first, fail fast)
 
 Run these directly (not via agents). Any failure is a finding of severity
