@@ -54,8 +54,9 @@
 //! * **`unmap_region`** — idempotent and fire-and-forget once pushed: the
 //!   progress thread performs the unmap whether or not anyone is still waiting,
 //!   and a repeat call for an id that is already gone answers `Ok(())`. The
-//!   advisory range entry is dropped *before* the push, so a cancelled unmap
-//!   still gates the region against new GETs.
+//!   advisory range entry is dropped the moment the command is *enqueued*, not
+//!   before: a future cancelled before the push completes leaves the region
+//!   mapped and retryable, and once enqueued the id stops gating regardless.
 //! * **`get`** — dropping it abandons only the notification. The operation keeps
 //!   running and keeps the region's in-flight count raised, which is exactly
 //!   what stops the destination being unmapped underneath UCX.
@@ -84,7 +85,17 @@ pub(crate) const MAX_PACKED_RKEY: usize = 1024;
 pub(crate) const RKEY_UNPACK_PAD: usize = 512;
 
 /// `UCS_SYS_DEVICE_ID_UNKNOWN`: the value that terminates UCX's distance walk.
-const SYS_DEV_UNKNOWN: u8 = u8::MAX;
+pub(crate) const SYS_DEV_UNKNOWN: u8 = u8::MAX;
+
+/// `UCS_MEMORY_TYPE_LAST` (`ucs/memory/memory_type.h`): the enum runs
+/// `HOST = 0 .. GAUDI = 9`, then `LAST = 10`, with `UNKNOWN == LAST` a sentinel
+/// that is never *stored* on a mapped region. UCX indexes arrays sized
+/// `[UCS_MEMORY_TYPE_LAST]` (10 entries) by this byte with no bounds check —
+/// `worker->mem_type_ep[mem_type]` in proto init, `ucs_memory_type_names[..]`
+/// evaluated eagerly in `proto_common.c` — so a peer-supplied `mem_type >= 10`
+/// is an out-of-bounds read on the progress thread. Velo only maps host memory,
+/// whose packer emits `0`, so rejecting `>= LAST` refuses nothing legitimate.
+const UCS_MEMORY_TYPE_LAST: u8 = 10;
 
 /// `sizeof(ucp_rkey_packed_distance_t)` — `{ u8 sys_dev, fp8 latency, fp8
 /// bandwidth }`, `UCS_S_PACKED` (`ucp_rkey.c:27`).
@@ -462,7 +473,8 @@ pub(crate) fn validate_packed_rkey(packed: &[u8]) -> Result<(), RmaError> {
     preparse_packed_rkey(packed)
 }
 
-/// Prove that UCX's parse of `packed` terminates inside `packed`.
+/// Prove that UCX's parse of `packed` terminates inside `packed`, and that the
+/// one value UCX indexes arrays by is in range.
 ///
 /// `ucp_ep_rkey_unpack` takes no length — the public API has no parameter for
 /// one — so nothing stops a malformed blob walking off the end of whatever
@@ -482,12 +494,33 @@ pub(crate) fn validate_packed_rkey(packed: &[u8]) -> Result<(), RmaError> {
 ///   (`ucp_rkey.c:897`) and walks 3-byte records, breaking **only** on a `0xFF`
 ///   byte (`ucp_rkey.c:820`). Zero padding does not stop it; it feeds it.
 ///
-/// So containment has to come from the blob itself. This walks the same format
-/// and requires every read UCX will perform to land inside `packed`: the stage-1
-/// entries, the `sys_dev` byte, and — when that byte is not `0xFF` and stage 2
-/// therefore runs — a `0xFF` terminator reachable on the 3-byte stride. UCX's
-/// own packer always produces such a blob (`ucp_rkey_pack_memh` writes the
-/// terminator at `ucp_rkey.c:264`), so nothing legitimate is refused.
+/// So containment has to come from the blob itself. This walks the two format
+/// stages and requires every read that drives them to land inside `packed`: the
+/// stage-1 framing bytes (the `len` byte of each entry, the `sys_dev` byte) and
+/// — when `sys_dev` is not `0xFF` and stage 2 therefore runs — a `0xFF`
+/// terminator reachable on the 3-byte stride. UCX's own packer always produces
+/// such a blob (`ucp_rkey_pack_memh` writes the terminator at `ucp_rkey.c:264`),
+/// so nothing legitimate is refused.
+///
+/// Two reads are deliberately *not* covered here, and are contained elsewhere:
+///
+/// * The `mem_type` byte is not a walk position but an array index. UCX stores
+///   it unchecked and later indexes `[UCS_MEMORY_TYPE_LAST]`-sized arrays with
+///   it, so a value `>= UCS_MEMORY_TYPE_LAST` is an out-of-bounds read even
+///   though the framing is perfect. It is validated below against
+///   [`UCS_MEMORY_TYPE_LAST`].
+/// * `uct_ib_rkey_unpack` reads a full `u64` out of each transport-key entry
+///   regardless of the `len` byte, so a short IB entry makes UCX read up to
+///   8 bytes past the declared content. That over-read is bounded by
+///   [`RKEY_UNPACK_PAD`] (an entry can start at offset ≤ 1024 in a 1536-byte
+///   buffer), not by this walk — which validates framing, not per-entry content
+///   length against the transport's fixed read width.
+///
+/// The whole scheme rests on one UCX invariant: `ucp_ep_rkey_unpack` passes
+/// `length = 0`, so the two early-return exits below (`md_map == 0`,
+/// `sys_dev == UNKNOWN`) are safe against trailing bytes only because UCX itself
+/// stops there. A UCX variant that passed a real length and kept reading would
+/// break that assumption — a version bump has to re-check it.
 pub(crate) fn preparse_packed_rkey(packed: &[u8]) -> Result<(), RmaError> {
     let bad = || RmaError::InvalidRkey;
 
@@ -498,11 +531,13 @@ pub(crate) fn preparse_packed_rkey(packed: &[u8]) -> Result<(), RmaError> {
             .try_into()
             .map_err(|_| bad())?,
     );
-    // `mem_type`.
-    let mut at = 9usize;
-    if at > packed.len() {
+    // `mem_type` at byte 8 is an array index UCX never bounds-checks, not a walk
+    // position — validate its value, not just that it is present.
+    let mem_type = *packed.get(8).ok_or_else(bad)?;
+    if mem_type >= UCS_MEMORY_TYPE_LAST {
         return Err(bad());
     }
+    let mut at = 9usize;
 
     for _ in 0..md_map.count_ones() {
         let tl_len = *packed.get(at).ok_or_else(bad)? as usize;

@@ -21,7 +21,8 @@ use crate::transports::transport::{
 // `super` here is the `transport` module (this file is `#[path]`-included from
 // it), so the sibling `rma` module needs its full path.
 use crate::transports::ucx::rma::{
-    MAX_PACKED_RKEY, MappedRegion, RdmaEndpoint, RmaError, RmaGetRequest, preparse_packed_rkey,
+    MAX_PACKED_RKEY, MappedRegion, RdmaEndpoint, RmaError, RmaGetRequest, SYS_DEV_UNKNOWN,
+    preparse_packed_rkey,
 };
 use crate::transports::ucx::worker::Cmd;
 use velo_ext::{InstanceId, MessageType, PeerInfo};
@@ -1040,6 +1041,61 @@ async fn worker_rejects_bad_get_commands() {
     assert_pair_balanced(&pair);
 }
 
+/// A peer-supplied `mem_type` out of range is refused before it can index a
+/// UCX array off its end — on both the submit and the worker paths.
+///
+/// The framing is otherwise perfect, so nothing but the value check stands
+/// between this blob and `worker->mem_type_ep[0xFF]` on the progress thread.
+#[tokio::test(flavor = "multi_thread")]
+async fn out_of_range_mem_type_is_refused_before_ucx() {
+    const LEN: usize = 64 * 1024;
+    let src = PageBuf::new(LEN);
+    let dst = PageBuf::new(LEN);
+
+    let pair = start_rma_pair().await;
+    let remote = pair.owner_rma.map_region(src.addr(), LEN).await.unwrap();
+    let local = pair.puller_rma.map_region(dst.addr(), LEN).await.unwrap();
+
+    // md_map = 1, mem_type = 0xFF, one zero-length entry, sys_dev = UNKNOWN.
+    let mut blob = 1u64.to_le_bytes().to_vec();
+    blob.push(0xFF);
+    blob.push(0);
+    blob.push(0xFF);
+
+    // Submit side.
+    let mut req = get_request(&pair, &src, &remote, &local);
+    req.packed_rkey = Bytes::from(blob.clone());
+    req.len = 64;
+    assert!(matches!(
+        pair.puller_rma.get(req).await,
+        Err(RmaError::InvalidRkey)
+    ));
+
+    // Worker side, reached directly so the submit-side check cannot shadow it.
+    let mut req = get_request(&pair, &src, &remote, &local);
+    req.packed_rkey = Bytes::from(blob);
+    req.len = 64;
+    assert!(matches!(
+        ring_get(&pair.puller.transport, req).await,
+        Err(RmaError::InvalidRkey)
+    ));
+
+    assert_eq!(
+        pair.puller
+            .transport
+            .shared
+            .live_rkeys
+            .load(Ordering::SeqCst),
+        0
+    );
+
+    pair.puller_rma.unmap_region(local.region_id).await.unwrap();
+    pair.owner_rma.unmap_region(remote.region_id).await.unwrap();
+    pair.owner.transport.shutdown();
+    pair.puller.transport.shutdown();
+    assert_pair_balanced(&pair);
+}
+
 /// A blob that passes the pre-parse and is still refused by UCX.
 ///
 /// The complement of [`truncated_rkey_is_refused_before_ucx`]: this one is well
@@ -1235,19 +1291,32 @@ async fn unmap_cancel_then_retry() {
         "the GET must be posted before the unmap is issued"
     );
 
-    // Parks behind the GET, then the caller walks away. If the GET somehow
-    // finished inside the window the unmap resolves instead, which makes this
-    // step vacuous rather than wrong — the load-bearing assertion is the retry
-    // below, which must report success either way.
-    if tokio::time::timeout(
-        Duration::from_millis(1),
-        pair.puller_rma.unmap_region(local.region_id),
-    )
-    .await
-    .is_ok()
-    {
-        println!("note: the unmap resolved before it could be cancelled");
-    }
+    // Park an unmap behind the GET, then have the caller walk away: submit it
+    // straight onto the ring (guaranteed enqueued) and drop the reply receiver.
+    let orphaned = ring_unmap_enqueue(&pair.puller.transport, local.region_id).await;
+    drop(orphaned);
+
+    // Fence: an idempotent unmap of an id that never existed round-trips through
+    // the same FIFO ring, so its reply proves the worker has already processed
+    // the orphaned command above. No sleep, no guessed interval.
+    ring_unmap_enqueue(&pair.puller.transport, u64::MAX)
+        .await
+        .await
+        .expect("fence reply is sent")
+        .expect("unmapping an unknown id is a no-op");
+
+    // The region must still be mapped: the orphaned unmap parked behind the
+    // in-flight GET rather than resolving eagerly. A regression that skipped the
+    // in-flight wait would have unmapped it here, dropping the count to 0.
+    assert_eq!(
+        pair.puller
+            .transport
+            .shared
+            .live_regions
+            .load(Ordering::SeqCst),
+        1,
+        "the region must stay mapped while its GET is in flight"
+    );
 
     // The retry attaches to the unmap already in progress rather than being told
     // the still-mapped region does not exist.
@@ -1450,6 +1519,26 @@ fn preparse_rejects_blobs_ucx_would_walk_off_the_end_of() {
     // The degenerate-but-real shape CI actually produces: empty `md_map`, so no
     // entries, no `sys_dev` byte, nine bytes total.
     preparse_packed_rkey(&[0, 0, 0, 0, 0, 0, 0, 0, 0]).expect("an empty md_map is well formed");
+
+    // Perfect framing, out-of-range `mem_type`. UCX indexes
+    // `[UCS_MEMORY_TYPE_LAST]`-sized arrays by this byte with no bounds check, so
+    // a value >= 10 is a wild read even though every walk position is in bounds.
+    let mut bad_mem_type = 1u64.to_le_bytes().to_vec();
+    bad_mem_type.push(0xFF); // mem_type, out of range
+    bad_mem_type.push(0); // md[0] length
+    bad_mem_type.push(SYS_DEV_UNKNOWN); // skip stage 2
+    assert!(matches!(
+        preparse_packed_rkey(&bad_mem_type),
+        Err(RmaError::InvalidRkey)
+    ));
+
+    // The same framing with an in-range `mem_type` passes: HOST..GAUDI are 0..9,
+    // and velo's own packer emits 0.
+    let mut good_mem_type = bad_mem_type.clone();
+    good_mem_type[8] = 9; // GAUDI, the last valid index
+    preparse_packed_rkey(&good_mem_type).expect("an in-range mem_type is accepted");
+    good_mem_type[8] = 0; // HOST, what velo actually emits
+    preparse_packed_rkey(&good_mem_type).expect("host memory is accepted");
 }
 
 /// The blobs `ucp_rkey_pack` really produces must pass the pre-parse.

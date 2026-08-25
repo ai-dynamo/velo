@@ -429,10 +429,13 @@ struct RmaOpState {
     /// The unpacked `ucp_rkey_h` as `usize`. Raw handles are not `Send`, and
     /// this one never leaves the progress thread — the `usize` records that.
     ///
-    /// Take-able for the same reason the reply is: `post_get` keeps defensive
-    /// reclaim arms for a UCX that ignores `FLAG_NO_IMM_CMPL`, and if one of
-    /// those ever fired alongside the callback, a plain field would be destroyed
-    /// twice. Taking makes the second attempt find `None`.
+    /// The slot is `take`-able, but not because a double-destroy is reachable.
+    /// It isn't: `complete` runs exactly once (see its doc for why), so a plain
+    /// field would be correct. The `Option` is free insurance that costs one
+    /// branch — if the exactly-once contract were ever violated the second
+    /// caller finds `None` and destroys nothing — and it keeps this field
+    /// symmetric with `reply`, whose take *is* load-bearing (the teardown
+    /// registry gives it a second legitimate resolver).
     rkey: Mutex<Option<usize>>,
     /// Region whose in-flight count this operation holds.
     region_id: u64,
@@ -448,11 +451,33 @@ struct RmaOpState {
 }
 
 impl RmaOpState {
-    /// Runs exactly once per posted operation, on the progress thread.
+    /// Runs **exactly once** per posted operation, on the progress thread.
+    ///
+    /// This is the `ucp_get_nbx` counterpart of the AM-send three-exit contract
+    /// in the module docs, and it is just as absolute. A posted GET takes one of
+    /// three mutually exclusive exits:
+    ///
+    /// * accepted (`ucp_get_nbx` returned a request pointer) — the callback
+    ///   fires exactly once and drives this via [`rma_trampoline`]; the
+    ///   `Ok(None)`/`Err` arms in [`WorkerState::post_get`] are *not* taken;
+    /// * completed inline (`NULL`, suppressed here by `FLAG_NO_IMM_CMPL` but
+    ///   kept as a defensive arm) — the callback never fires and `post_get`
+    ///   drives this directly;
+    /// * failed synchronously (error pointer) — no callback, and `post_get`
+    ///   drives this directly.
+    ///
+    /// The callback and the two poster arms are exit-exclusive by UCX's own
+    /// contract, so `complete` is reached once. That is what makes the whole
+    /// state sound: the single `Arc::from_raw` reclaim, the one `inflight`
+    /// decrement, and the unconditional `rma_completions.push` below all assume
+    /// it. A genuine double-completion would double-free the `RmaOpState` `Arc`
+    /// and double-decrement a region's in-flight count (releasing a parked unmap
+    /// under a live op) long before the `take` below mattered — so the `take` is
+    /// insurance, not the thing keeping this correct.
     fn complete(&self, status: sys::ucs_status_t) {
         if let Some(rkey) = self.rkey.lock().unwrap_or_else(|e| e.into_inner()).take() {
             // SAFETY: `rkey` was produced by `ucp_ep_rkey_unpack` for this
-            // operation and has just been taken out of its only slot, so this is
+            // operation, and `complete` runs exactly once (see above), so this is
             // the one and only destroy. `ucp_rkey_destroy` dereferences no
             // endpoint and returns the descriptor to the worker's mpool, both of
             // which outlive this call — see the module docs for the source facts.
@@ -1713,23 +1738,37 @@ impl WorkerState {
             .ensure_ep(req.peer)
             .map_err(|e| RmaError::EndpointUnavailable(e.to_string()))?;
 
-        // Containment for UCX's length-free parse comes from
-        // `preparse_packed_rkey` above, which has proved that every read the
-        // parse will perform lands inside `packed_rkey`. The copy below is
-        // belt-and-braces for a parse that somehow escapes anyway: the filler is
-        // `0xFF`, which is `UCS_SYS_DEVICE_ID_UNKNOWN` and the only byte that
-        // terminates the stage-2 distance walk (`ucp_rkey.c:820`). Zero filler
-        // would be worse than none — that walk sets `buffer_end = UINTPTR_MAX`
-        // and would consume the zeroes as 3-byte records off the stack.
+        // Two distinct over-reads, contained two different ways.
+        //
+        // The framing walk (stage 1 + stage 2) is contained by
+        // `preparse_packed_rkey` above: it has proved every position UCX reads
+        // to *drive* the walk lands inside `packed_rkey`. But UCX also reads
+        // per-entry transport-key content past what the framing declares —
+        // `uct_ib_rkey_unpack` reads a full `u64` regardless of the entry's
+        // `len` byte — so a short IB entry sends the read up to 8 bytes past its
+        // own content. That over-read is bounded by `RKEY_UNPACK_PAD`, not by the
+        // pre-parse: an entry can begin no later than offset `MAX_PACKED_RKEY`,
+        // and the buffer is `MAX_PACKED_RKEY + 512` long. So the blob is copied
+        // into a padded buffer before it is unpacked.
+        //
+        // The `0xFF` filler is stage-2 defense-in-depth only. If the framing
+        // walk ever escaped the pre-parse (it should not), stage 2 sets
+        // `buffer_end = UINTPTR_MAX` and stops on the first `0xFF`
+        // (`UCS_SYS_DEVICE_ID_UNKNOWN`, `ucp_rkey.c:820`), so `0xFF` fill
+        // terminates it within one stride of the padding. It does NOT help a
+        // runaway stage-1 walk — there `0xFF` is strictly worse than zero, since
+        // each phantom entry then declares a 255-byte length (a ~16 KiB overrun
+        // versus ~64 bytes with zero fill). The pre-parse is the sole stage-1
+        // containment; the filler is only ever reached once stage 1 has already
+        // completed within the blob.
         let mut unpack_buf = [0xFFu8; MAX_PACKED_RKEY + RKEY_UNPACK_PAD];
         unpack_buf[..req.packed_rkey.len()].copy_from_slice(&req.packed_rkey);
 
-        // SAFETY: `ep` is live on this worker and the blob has been pre-parsed,
-        // so UCX's walk terminates within the first `packed_rkey.len()` bytes of
-        // this buffer. The `0xFF` tail bounds it even if that reasoning is ever
-        // wrong: the stage-1 walk finds max-length entries that immediately
-        // exceed the buffer's own accounting, and the stage-2 walk stops on the
-        // first filler byte it reads.
+        // SAFETY: `ep` is live on this worker; the blob has passed
+        // `preparse_packed_rkey`, so UCX's framing walk terminates within the
+        // first `packed_rkey.len()` bytes, and any fixed-width transport-key
+        // over-read past a short entry stays inside the `RKEY_UNPACK_PAD` tail of
+        // this buffer.
         let rkey = unsafe {
             let mut rkey: sys::ucp_rkey_h = std::ptr::null_mut();
             let st = sys::ucp_ep_rkey_unpack(ep, unpack_buf.as_ptr() as *const c_void, &mut rkey);
