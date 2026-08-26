@@ -51,7 +51,13 @@ use velo_ext::InstanceId;
 /// variants by [`UcxBackend`], with the original diagnosis preserved in
 /// [`RdmaError::Backend`]'s string. Callers switch on the variant; humans read
 /// the string.
+///
+/// `#[non_exhaustive]`: this enum is explicitly evolutionary. D12 admits later
+/// NIXL and libfabric backends, and Phases 3 to 5 add lease, descriptor and
+/// direction failures. Matching it exhaustively from outside the crate would
+/// make each of those a breaking change, so callers must carry a `_` arm.
 #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RdmaError {
     /// The registry, or the transport under it, is shutting down. New
     /// registrations are refused; an in-progress deregistration reached no
@@ -191,9 +197,26 @@ pub(crate) trait RdmaBackend: Send + Sync {
     /// shutdown — the one moment it makes that claim without having seen an
     /// unmap confirmed.
     ///
-    /// `None` means the backend does not track it. A backend that answers
-    /// `None` gives up that check, and the layer above falls back to trusting
-    /// its call-site ordering.
+    /// # What `Some(0)` actually establishes
+    ///
+    /// Read it precisely: *the backend attempted an unmap for every region it
+    /// held, and has finished doing so*. It is not a direct observation that
+    /// no pages are pinned. For [`UcxBackend`] the counter decrements
+    /// unconditionally in the worker's unmap path, so `Some(0)` would still be
+    /// reported if a `ucp_mem_unmap` had failed — the two are equivalent today
+    /// only because `ucp_mem_unmap` cannot fail on UCX 1.22 for a handle it
+    /// issued. A UCX version where it can, or a backend where unmap is
+    /// fallible, must decrement on success rather than on attempt, or this
+    /// precondition silently weakens into a formality.
+    ///
+    /// # `None` opts out
+    ///
+    /// The default. A backend that cannot report gives up the check entirely,
+    /// and the latch then rests solely on the call-ordering guarantee — that
+    /// `Velo::graceful_shutdown` runs it after transport teardown has joined
+    /// the progress thread. That is where the guarantee stood before this
+    /// method existed; `None` is not weaker than the status quo ante, but it is
+    /// weaker than `Some(0)`.
     fn live_registrations(&self) -> Option<usize> {
         None
     }
@@ -247,6 +270,11 @@ impl RdmaBackend for UcxBackend {
         })
     }
 
+    /// The progress thread's own region count.
+    ///
+    /// Decremented on unmap *attempt*, not on success — see the trait docs.
+    /// Sound as a precondition on UCX 1.22, where `ucp_mem_unmap` cannot fail
+    /// for a handle UCX itself issued; a UCX bump has to re-check that.
     fn live_registrations(&self) -> Option<usize> {
         Some(self.endpoint.live_regions())
     }

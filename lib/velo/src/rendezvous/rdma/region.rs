@@ -11,13 +11,18 @@
 //! # The one contract that matters
 //!
 //! Registered pages must stay allocated until velo says otherwise, and
-//! "otherwise" is exactly one event: [`RegionGuard::deregistered`] resolves.
+//! "otherwise" is one event: [`RegionGuard::deregistered`] resolves.
 //!
 //! It resolves on a confirmed unmap, or at the end of velo's own shutdown —
 //! transport teardown force-unmaps whatever is still registered, so a region
 //! the backend never confirmed is nonetheless released by the time shutdown
 //! returns, and the latch is closed for it there. One thing to await, whatever
 //! happened underneath.
+//!
+//! The exception is an abnormal teardown: if the progress thread dies and the
+//! backend still reports registrations, the latch refuses and the future never
+//! resolves. The memory is then leaked deliberately, because velo cannot
+//! establish it was released. See [`RegionGuard::deregistered`].
 //!
 //! Neither an error from [`RegionGuard::unregister`] nor dropping the guard
 //! releases anything. `Drop` cannot block (blocking in a `Drop` inside a tokio
@@ -397,11 +402,10 @@ impl RegionGuard {
     /// Resolve once the memory is no longer registered — the point at which the
     /// caller may free it.
     ///
-    /// **This is the whole release contract.** It resolves when the unmap is
+    /// **This is the release contract.** It resolves when the unmap is
     /// confirmed, or when velo shutdown has fully completed, whichever comes
-    /// first; after it resolves the memory is safe to free. There is no second
-    /// condition to reason about and no case where the right answer is to stop
-    /// waiting and guess.
+    /// first; after it resolves the memory is safe to free. In a process that
+    /// shuts down normally there is nothing else to reason about.
     ///
     /// The shutdown half is what makes it dependable. A region whose unmap
     /// could not be confirmed — a wedged backend, a transport that went down
@@ -409,6 +413,20 @@ impl RegionGuard {
     /// `Velo::graceful_shutdown` returns, because transport teardown
     /// force-unmaps everything the progress thread still holds, and that is
     /// where the latch is closed for any survivor.
+    ///
+    /// # The third outcome
+    ///
+    /// If teardown itself fails abnormally — the progress thread panics, the
+    /// join reports an error, and the backend still says it holds regions —
+    /// the latch **refuses to close** and this future stays pending forever.
+    /// That is deliberate, and it is the same leak-rather-than-free policy the
+    /// rest of the layer follows: velo cannot establish that the pages were
+    /// released, so it will not say they were. The memory is leaked for the
+    /// life of the process, which is the survivable failure; the alternative is
+    /// telling a caller to free memory a dead progress thread may still have
+    /// pinned. A caller that must bound its wait should
+    /// [`is_shutting_down`](Self::is_shutting_down) or time out and then leak
+    /// deliberately, never free on a timeout.
     ///
     /// Latched, so awaiting it late is fine: it stays resolved forever after.
     ///
@@ -460,8 +478,12 @@ impl RegionGuard {
 
     /// Deregister and take back the buffer velo was holding.
     ///
-    /// Only meaningful for a guard from `register_owned`; a guard over
-    /// caller-owned memory answers [`RdmaError::NotOwned`].
+    /// Only meaningful for a guard from `register_owned`. A guard over
+    /// caller-owned memory answers [`RdmaError::NotOwned`] **without
+    /// deregistering anything** — the check comes first, so the error never
+    /// describes the opposite of what happened. (The guard is still consumed,
+    /// so its ordinary `Drop` applies afterwards: a background deregistration
+    /// starts, exactly as it would have on any other drop.)
     ///
     /// **A confirmed unmap always returns the buffer**, including when the
     /// in-flight drain timed out — the memory is released either way, and the
@@ -477,6 +499,12 @@ impl RegionGuard {
         self,
         timeout: Duration,
     ) -> Result<(Box<[u8]>, Deregistered), RdmaError> {
+        // Before any side effect: a caller asking the wrong guard for a buffer
+        // must not have its region deregistered and then be told the call did
+        // nothing.
+        if self.inner.owned.lock().is_none() {
+            return Err(RdmaError::NotOwned);
+        }
         let outcome = deregister(&self.shared, &self.inner, timeout).await?;
         let taken = self.inner.owned.lock().take();
         taken

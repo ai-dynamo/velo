@@ -173,6 +173,22 @@ pub struct Velo {
     /// through [`VeloBuilder::add_ucx_transport`].
     #[cfg(all(target_os = "linux", feature = "ucx"))]
     rdma: Option<Arc<crate::rendezvous::rdma::RdmaRegistry>>,
+    /// Serialises [`graceful_shutdown`](Velo::graceful_shutdown).
+    ///
+    /// [`Velo`] is `Clone`, so two clones can call it at once. Without this the
+    /// second caller finds the transport's join handle already taken, skips the
+    /// join, and races ahead to declare registrations released — while the
+    /// first caller is still inside that join and the progress thread is still
+    /// running. It would free arena pages the NIC may still have. Shared, so
+    /// every clone contends on the same lock.
+    shutdown: Arc<ShutdownOnce>,
+}
+
+/// Makes [`Velo::graceful_shutdown`] run exactly once, and makes concurrent
+/// callers wait for the run rather than start their own.
+struct ShutdownOnce {
+    lock: tokio::sync::Mutex<()>,
+    done: std::sync::atomic::AtomicBool,
 }
 
 /// Builder for configuring and creating a [`Velo`] instance.
@@ -464,6 +480,10 @@ impl VeloBuilder {
             stream_transport,
             #[cfg(all(target_os = "linux", feature = "ucx"))]
             rdma,
+            shutdown: Arc::new(ShutdownOnce {
+                lock: tokio::sync::Mutex::new(()),
+                done: std::sync::atomic::AtomicBool::new(false),
+            }),
         }))
     }
 }
@@ -526,6 +546,22 @@ impl Velo {
     /// those latches would stay pending forever and a caller waiting on one
     /// would hold its memory for the life of the process.
     ///
+    /// Step 4 is itself conditional: it checks with the backend that nothing is
+    /// still registered, and declines to declare anything released if the
+    /// answer is not "none". After an abnormal teardown — a panicking progress
+    /// thread — the latches therefore stay pending and that memory is leaked on
+    /// purpose. Velo will not tell a caller to free pages it cannot establish
+    /// were released.
+    ///
+    /// # Called once, even from clones
+    ///
+    /// [`Velo`] is `Clone`, so concurrent callers are possible. They are
+    /// serialised: the first runs the sequence, the rest wait and return as
+    /// soon as it finishes. Only one caller can take the transport's join
+    /// handle, and step 4's claim rests on that join having completed — a
+    /// second caller running the tail concurrently would be declaring memory
+    /// released while the progress thread was still alive.
+    ///
     /// # One deadline, not one per phase
     ///
     /// [`ShutdownPolicy::Timeout`] names a bound on *this call*, so the sweep
@@ -536,6 +572,20 @@ impl Velo {
     /// mid-transfer must not wedge shutdown forever even when the caller is
     /// willing to wait on local work.
     pub async fn graceful_shutdown(&self, policy: ShutdownPolicy) {
+        // Serialised, and run once. `Velo` is `Clone`, so two clones can arrive
+        // here together; the sequence below takes a transport join handle and
+        // then declares memory released on the strength of that join having
+        // finished, which is only true for whoever took it. A second caller
+        // waits here and returns as soon as the first is done.
+        let _running = self.shutdown.lock.lock().await;
+        if self
+            .shutdown
+            .done
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+
         // Shadowed with what is left of the caller budget after the sweep, so
         // the two phases share one deadline instead of taking one each.
         #[cfg(all(target_os = "linux", feature = "ucx"))]
@@ -566,6 +616,10 @@ impl Velo {
         if let Some(rdma) = &self.rdma {
             rdma.latch_all_deregistered();
         }
+
+        self.shutdown
+            .done
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Get the instance ID of this system.
@@ -1020,6 +1074,12 @@ impl Velo {
             .as_ref()
             .map(|r| r.registered_bytes())
             .unwrap_or(0)
+    }
+
+    /// The registration layer, for tests that need to observe it directly.
+    #[cfg(all(target_os = "linux", feature = "ucx", test))]
+    pub(crate) fn rdma(&self) -> Option<&Arc<crate::rendezvous::rdma::RdmaRegistry>> {
+        self.rdma.as_ref()
     }
 
     /// The registration layer, for Phase 3 staging and transfers.

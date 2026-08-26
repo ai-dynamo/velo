@@ -35,6 +35,19 @@ use super::{RdmaConfig, RdmaRegistry};
 /// Generous ceiling for anything that should resolve promptly.
 const T: Duration = Duration::from_secs(10);
 
+/// Serialises the tests that assert on [`LEAKED_BUFFERS`].
+///
+/// The counter is process-global and `cargo test` runs these in parallel. One
+/// test asserts the count *rose*; the other asserts it did **not** rise across
+/// its whole body. The second is the fragile one: the first test dropping its
+/// runtime mid-way through it would push the count up and fail an assertion
+/// about a leak that is not its own. That is a false failure, not a false pass,
+/// so it cannot hide a bug — but a flaky guard on a safety property is worth
+/// less than a serialised one.
+/// Async-aware, because one of the two tests holds it across awaits.
+static LEAK_COUNTER: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 /// An [`RdmaBackend`] that registers nothing and remembers everything.
 ///
 /// `map` mints an id and a plausible packed key; `unmap` records the id. The
@@ -50,6 +63,14 @@ struct MockBackend {
     refuse_unmap: AtomicBool,
     /// Artificial delay on `map`, for racing a registration against shutdown.
     map_delay: parking_lot::Mutex<Option<Duration>>,
+    /// Extra bytes added to every reported `effective_len`.
+    ///
+    /// Lets a test produce a backend that pinned *more* than this side
+    /// estimated — a larger page size, an implementation that rounds further
+    /// out. Without it the top-up path in `Reservation::raise_to` is
+    /// unreachable through the mock, because the mock rounds exactly the way
+    /// the local estimate does.
+    extra_effective: AtomicU64,
 }
 
 impl MockBackend {
@@ -60,6 +81,7 @@ impl MockBackend {
             unmapped: AtomicUsize::new(0),
             refuse_unmap: AtomicBool::new(false),
             map_delay: parking_lot::Mutex::new(None),
+            extra_effective: AtomicU64::new(0),
         })
     }
 
@@ -101,7 +123,8 @@ impl RdmaBackend for MockBackend {
                 // anything that mistakes the effective range for the requested
                 // one is visible here rather than only on hardware.
                 effective_addr: (ptr & !(GRANULE - 1)) as u64,
-                effective_len: len.next_multiple_of(GRANULE) as u64,
+                effective_len: len.next_multiple_of(GRANULE) as u64
+                    + self.extra_effective.load(Ordering::SeqCst),
                 packed_key: Bytes::from_static(b"mock-packed-key"),
             })
         })
@@ -736,7 +759,7 @@ async fn register_external_memory_smoke() {
     assert_eq!(guard.len(), 8192);
     let (eff_addr, eff_len) = guard.effective_range();
     assert!(
-        eff_addr <= guard.addr() && eff_len >= guard.len() as u64,
+        eff_addr <= guard.addr() && eff_len >= guard.len(),
         "the effective range must cover the requested one"
     );
     assert_ne!(
@@ -992,7 +1015,7 @@ async fn ucx_backend_maps_and_unmaps() {
     );
     let (eff_addr, eff_len) = guard.effective_range();
     assert!(
-        eff_addr <= guard.addr() && eff_len >= guard.len() as u64,
+        eff_addr <= guard.addr() && eff_len >= guard.len(),
         "ucx reported an effective range that does not cover the request"
     );
 
@@ -1334,7 +1357,12 @@ async fn concurrent_registration_never_overshoots_the_budget() {
         }));
     }
     for task in tasks {
-        task.await.expect("task panicked");
+        // Bounded: a regressed CAS loop can livelock, and a hung test binary
+        // reports nothing. A timeout reports which invariant stopped holding.
+        tokio::time::timeout(T, task)
+            .await
+            .expect("a registration task did not finish; the budget CAS loop may be livelocked")
+            .expect("task panicked");
     }
 
     let live = admitted.lock().len();
@@ -1462,6 +1490,8 @@ async fn shutdown_latches_regions_whose_unmap_was_never_confirmed() {
 /// prevented, so only Miri or ASan could see it directly.
 #[test]
 fn abandoned_runtime_leaks_owned_buffers_rather_than_freeing_them() {
+    // Taken before any runtime exists, so a blocking acquire is safe here.
+    let _serialised = LEAK_COUNTER.blocking_lock();
     let before = super::region::LEAKED_BUFFERS.load(Ordering::SeqCst);
     let backend = MockBackend::new();
 
@@ -1678,6 +1708,7 @@ async fn latch_refuses_while_the_backend_still_holds_registrations() {
 /// normal path pathological.
 #[tokio::test(flavor = "multi_thread")]
 async fn latched_regions_free_their_buffers_normally() {
+    let _serialised = LEAK_COUNTER.lock().await;
     let before = super::region::LEAKED_BUFFERS.load(Ordering::SeqCst);
     let (backend, registry) = mock_registry(RdmaConfig::default());
     let guard = registry
@@ -1701,5 +1732,230 @@ async fn latched_regions_free_their_buffers_normally() {
         super::region::LEAKED_BUFFERS.load(Ordering::SeqCst),
         before,
         "an orderly shutdown leaked an owned buffer; the leak gate never closes"
+    );
+}
+
+/// `unregister_owned` on a guard that owns nothing must refuse *before*
+/// deregistering.
+///
+/// The old order deregistered successfully and then returned `NotOwned`,
+/// telling the caller the opposite of what happened: the region was gone, and
+/// the error said the call had found nothing to do.
+#[tokio::test(flavor = "multi_thread")]
+async fn unregister_owned_refuses_before_deregistering() {
+    let (backend, registry) = mock_registry(RdmaConfig::default());
+
+    // Leaked on purpose: the caller-owned path, where velo holds no buffer.
+    let leaked: &'static mut [u8] = Box::leak(vec![0u8; 4096].into_boxed_slice());
+    let ptr = std::ptr::NonNull::new(leaked.as_mut_ptr()).expect("non-null");
+    // SAFETY: a leaked allocation is never freed, so it outlives the
+    // registration unconditionally.
+    let guard = unsafe { registry.register_external(ptr, leaked.len()) }
+        .await
+        .expect("register");
+    let watch = guard.watch();
+
+    let err = guard
+        .unregister_owned(T)
+        .await
+        .expect_err("a caller-owned region has no buffer to hand back");
+    assert_eq!(err, RdmaError::NotOwned);
+    assert_eq!(
+        backend.unmap_calls(),
+        0,
+        "the region was deregistered before the ownership check; the error described the \
+         opposite of what happened"
+    );
+    assert!(!watch.is_deregistered());
+}
+
+/// Concurrent `graceful_shutdown` calls are serialised, and the sequence runs
+/// once.
+///
+/// `Velo` is `Clone`, so several clones can arrive together. Only one can take
+/// the transport join handle; another would skip the join and run straight on
+/// to declaring registrations released while the progress thread was still
+/// alive and its pages still pinned.
+///
+/// The assertion is on the *sweep count*, not on the race outcome. The
+/// dangerous interleaving needs a second caller to reach the latch inside the
+/// window where the first has force-unmapped but not yet joined — narrow enough
+/// that a test which waits for it to happen proves nothing when it does not.
+/// What is deterministic is that the sequence ran exactly once, which is the
+/// property the lock exists to provide. (The latch precondition is the
+/// independent backstop if it ever does interleave: it refuses while the
+/// backend still reports registrations.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_graceful_shutdowns_are_serialised() {
+    const CALLERS: usize = 8;
+
+    let transport = Arc::new(
+        crate::transports::ucx::UcxTransportBuilder::new()
+            .tls("tcp")
+            .build()
+            .expect("build ucx transport"),
+    );
+    let velo = crate::Velo::builder()
+        .add_ucx_transport(Arc::clone(&transport))
+        .build()
+        .await
+        .expect("build velo");
+
+    let guard = velo
+        .register_owned(vec![0u8; 128 * 1024].into_boxed_slice())
+        .await
+        .expect("register");
+    let watch = guard.watch();
+    assert_eq!(transport.live_regions(), 1);
+
+    let mut callers = Vec::new();
+    for _ in 0..CALLERS {
+        let velo = crate::Velo::clone(&velo);
+        callers.push(tokio::spawn(async move {
+            velo.graceful_shutdown(velo_ext::ShutdownPolicy::Timeout(T))
+                .await
+        }));
+    }
+    for caller in callers {
+        tokio::time::timeout(T, caller)
+            .await
+            .expect("every shutdown caller must return; a serialised one must not deadlock")
+            .expect("task panicked");
+    }
+
+    assert_eq!(
+        velo.rdma().expect("registry").sweep_count(),
+        1,
+        "the shutdown sequence ran more than once; concurrent callers were not serialised"
+    );
+    assert!(watch.is_deregistered());
+    assert_eq!(
+        transport.live_regions(),
+        0,
+        "shutdown returned with memory still registered"
+    );
+    assert_eq!(transport.live_rkeys(), 0);
+    assert_eq!(velo.rdma_registered_bytes(), 0);
+    drop(guard);
+}
+
+/// `Budget::charge` adds unconditionally and reports whether it stayed within
+/// the ceiling.
+///
+/// Unit-tested directly because it is the one place the budget is *allowed* to
+/// exceed its limit: the pages are already pinned by the time it is called, so
+/// refusing would mean unmapping a live registration over a rounding delta.
+/// The arithmetic and the verdict are what callers act on.
+#[test]
+fn budget_charge_reports_whether_it_stayed_within_the_ceiling() {
+    let budget = Arc::new(Budget::new(1000, None));
+
+    assert!(budget.charge(400), "400 of 1000 is within the ceiling");
+    assert_eq!(budget.registered(), 400);
+
+    assert!(
+        budget.charge(600),
+        "exactly at the ceiling is still within it"
+    );
+    assert_eq!(budget.registered(), 1000);
+
+    assert!(
+        !budget.charge(1),
+        "past the ceiling must report the overshoot"
+    );
+    assert_eq!(
+        budget.registered(),
+        1001,
+        "charge adds unconditionally: the pages are already pinned"
+    );
+
+    // Saturating, so an over-release cannot wrap the counter into a permanent
+    // refusal of every future registration.
+    budget.release(u64::MAX);
+    assert_eq!(budget.registered(), 0);
+}
+
+/// A backend that pinned more than this side estimated tops the claim up, and
+/// the claim is what gets released.
+///
+/// `raise_to` only ever raises, so this is the path that matters: an
+/// under-charged region releases less than it claimed and skews the budget
+/// upward for good.
+#[tokio::test]
+async fn a_backend_that_pins_more_than_estimated_tops_up_the_claim() {
+    let (backend, registry) = mock_registry(RdmaConfig::default());
+    // Two pages beyond whatever this side computes.
+    backend
+        .extra_effective
+        .store(2 * GRANULE as u64, Ordering::SeqCst);
+
+    let guard = registry
+        .register_owned(vec![0u8; 4096].into_boxed_slice())
+        .await
+        .expect("register");
+
+    let charged = registry.registered_bytes();
+    let (_, effective_len) = guard.effective_range();
+    assert_eq!(
+        charged, effective_len,
+        "the claim must match what the backend says it pinned"
+    );
+
+    assert_eq!(
+        guard.unregister(T).await.expect("unregister"),
+        Deregistered::Drained
+    );
+    assert_eq!(
+        registry.registered_bytes(),
+        0,
+        "the top-up was not released; the budget is now permanently skewed"
+    );
+}
+
+/// A refused latch retains the pool arenas too.
+///
+/// The pool side of the same rule: arena pages are freed only on evidence that
+/// nothing is pinned, and a backend still reporting registrations is that
+/// evidence being absent. Tested through `alloc_pinned` rather than
+/// `register_owned`, because the two travel different code paths to the same
+/// gate.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_latch_retains_pool_arenas() {
+    let cfg = RdmaConfig {
+        pool: small_pool_config(),
+        ..RdmaConfig::default()
+    };
+    let (backend, registry) = mock_registry(cfg);
+
+    let buf = registry.alloc_pinned(4096).await.expect("alloc");
+    let charged = registry.registered_bytes();
+    assert!(charged > 0);
+    drop(buf);
+
+    // The sweep cannot confirm, so the arena joins the unconfirmed list.
+    backend.refuse_unmap.store(true, Ordering::SeqCst);
+    registry.shutdown(Duration::from_millis(100)).await;
+    assert_eq!(
+        registry.registered_bytes(),
+        charged,
+        "an unconfirmed arena must keep its budget charge; the pages may still be pinned"
+    );
+
+    // Teardown has not happened: the latch must refuse, and the arena must stay.
+    assert_eq!(backend.live_registrations(), Some(1));
+    registry.latch_all_deregistered();
+    assert_eq!(
+        registry.registered_bytes(),
+        charged,
+        "the pool was released while the backend still held the arena"
+    );
+
+    // And once teardown really has happened, the pages are given back.
+    backend.force_teardown();
+    registry.latch_all_deregistered();
+    assert_eq!(
+        registry.registered_bytes(),
+        0,
+        "a successful latch must release the arenas the sweep could not confirm"
     );
 }

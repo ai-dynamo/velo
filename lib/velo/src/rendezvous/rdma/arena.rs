@@ -548,32 +548,40 @@ impl Reservation {
         self.bytes
     }
 
-    /// Re-charge this claim to what the backend actually pinned.
+    /// Raise this claim to `bytes`, the size the backend actually pinned.
     ///
     /// The claim is taken before the map on a locally computed page-enclosing
     /// estimate, because the budget has to be held against a concurrent
-    /// registration during the map. The backend then reports the range it
-    /// really pinned, which may differ — a different page size, an
+    /// registration while the map runs. The backend then reports the range it
+    /// really pinned, which may be larger — a bigger page size, an
     /// implementation that rounds further out. This settles the difference so
     /// the number released later is the number the kernel is holding.
     ///
-    /// A top-up past the ceiling is accepted with a warning rather than
-    /// refused; see [`Budget::charge`].
-    pub(crate) fn reconcile(&mut self, bytes: u64) {
-        match bytes.cmp(&self.bytes) {
-            std::cmp::Ordering::Greater => {
-                let extra = bytes - self.bytes;
-                if !self.budget.charge(extra) {
-                    tracing::warn!(
-                        extra,
-                        registered = self.budget.registered(),
-                        budget = self.budget.limit,
-                        "rdma: the backend pinned more than the registered-bytes budget allows;                          accepting the overshoot rather than unmapping a live registration"
-                    );
-                }
-            }
-            std::cmp::Ordering::Less => self.budget.release(self.bytes - bytes),
-            std::cmp::Ordering::Equal => {}
+    /// **Raises only.** Call sites pass `reported.max(local_estimate)`, so a
+    /// backend that under-reports cannot shrink a claim below what this side
+    /// believes is pinned — releasing less than was charged is a permanent
+    /// upward skew, and releasing *more* than the kernel holds is worse still.
+    /// There is deliberately no lowering path rather than an unreachable one.
+    ///
+    /// A top-up past the ceiling is accepted with a warning; see
+    /// [`Budget::charge`].
+    pub(crate) fn raise_to(&mut self, bytes: u64) {
+        debug_assert!(
+            bytes >= self.bytes,
+            "raise_to must never shrink a claim: {} to {bytes}",
+            self.bytes
+        );
+        let Some(extra) = bytes.checked_sub(self.bytes).filter(|e| *e != 0) else {
+            return;
+        };
+        if !self.budget.charge(extra) {
+            tracing::warn!(
+                extra,
+                registered = self.budget.registered(),
+                budget = self.budget.limit,
+                "rdma: the backend pinned more than the registered-bytes budget allows; \
+                 accepting the overshoot rather than unmapping a live registration"
+            );
         }
         self.bytes = bytes;
     }
@@ -721,6 +729,13 @@ impl ArenaSet {
             .ok()
             .and_then(|len| len.checked_next_multiple_of(GRANULE))
             .ok_or(RdmaError::OutOfRange)?;
+        // Before anything is claimed or mapped. The suballocator indexes
+        // granules with a `u32`, so an arena above 16 TiB cannot be described;
+        // finding that out *after* a successful map would strand a backend
+        // registration with nothing left holding its id to unmap it. This is
+        // also the size cap a dedicated arena is subject to, and it now fails
+        // with a reason rather than by leaking.
+        let granules = u32::try_from(len / GRANULE).map_err(|_| RdmaError::OutOfRange)?;
         let mut reservation = self.budget.try_reserve(len as u64)?;
 
         let memory = PageMemory::new(len)?;
@@ -740,8 +755,12 @@ impl ArenaSet {
         memory.mark_pinned();
         // Charge what the backend says it pinned, not what we asked for, so the
         // number released at unmap is the number the kernel is holding.
-        reservation.reconcile(region.effective_len.max(memory.len as u64));
-        let granules = u32::try_from(memory.len / GRANULE).map_err(|_| RdmaError::OutOfRange)?;
+        reservation.raise_to(region.effective_len.max(memory.len as u64));
+        debug_assert_eq!(
+            memory.len / GRANULE,
+            granules as usize,
+            "the granule count was validated against a different length than was mapped"
+        );
         let arena = Arc::new(Arena {
             backend_region_id: region.backend_region_id,
             packed_key: region.packed_key,

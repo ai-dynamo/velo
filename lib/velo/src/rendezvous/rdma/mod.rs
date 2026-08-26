@@ -99,6 +99,11 @@ impl Default for RdmaConfig {
 ///
 /// `buffer` is `Option` because the same machinery serves the caller-owned
 /// registration path, where there was never a buffer to return.
+///
+/// `#[non_exhaustive]`: velo constructs these, callers only read them. Leaving
+/// it open would let a later field — which registration path refused, how much
+/// budget was short — become a breaking change.
+#[non_exhaustive]
 pub struct RegisterOwnedError {
     /// The buffer velo did not take. `None` for a caller-owned registration.
     pub buffer: Option<Box<[u8]>>,
@@ -159,6 +164,12 @@ pub(crate) struct RegistryShared {
     shutdown_token: CancellationToken,
     next_region_id: AtomicU64,
     generations: Arc<AtomicU64>,
+    /// How many times the shutdown sweep has run.
+    ///
+    /// It should run once. `Velo::graceful_shutdown` serialises its callers, so
+    /// this is how a test observes that the serialisation is real rather than
+    /// hoping to catch the narrow interleaving it prevents.
+    sweeps: std::sync::atomic::AtomicUsize,
 }
 
 impl RegistryShared {
@@ -223,6 +234,7 @@ impl RdmaRegistry {
             shutdown_token: CancellationToken::new(),
             next_region_id: AtomicU64::new(1),
             generations,
+            sweeps: std::sync::atomic::AtomicUsize::new(0),
         });
         Self { shared, pool }
     }
@@ -352,7 +364,7 @@ impl RdmaRegistry {
             Err(e) => refuse!(e),
         };
         // What the backend says it pinned wins over the local estimate.
-        reservation.reconcile(mapped.effective_len.max(enclosing));
+        reservation.raise_to(mapped.effective_len.max(enclosing));
 
         let inner = Arc::new(RegionInner::new(RegionParts {
             id: self.shared.next_region_id.fetch_add(1, Ordering::Relaxed),
@@ -411,6 +423,7 @@ impl RdmaRegistry {
     /// risk, and the alternative — waiting forever on a peer that may have
     /// crashed — is worse.
     pub(crate) async fn shutdown(&self, budget: Duration) {
+        self.shared.sweeps.fetch_add(1, Ordering::Relaxed);
         let deadline = Instant::now() + budget;
         let remaining = |deadline: Instant| deadline.saturating_duration_since(Instant::now());
 
@@ -504,6 +517,16 @@ impl RdmaRegistry {
     ///
     /// A backend that cannot report its count (`None`) gives up the check; the
     /// ordering is then the only guarantee, which is what it was before.
+    ///
+    /// # A refusal covers the pool too
+    ///
+    /// When the check refuses, the arenas whose unmap the sweep could not
+    /// confirm stay leaked as well — `release_unconfirmed` is not called. That
+    /// coupling is deliberate and it is the same rule in both directions: those
+    /// pages are freed only on evidence that nothing is pinned, and a backend
+    /// still reporting registrations is the evidence being absent. Freeing
+    /// arena pages while the progress thread may still be alive is precisely
+    /// the hazard the leak-by-default discipline exists for.
     pub(crate) fn latch_all_deregistered(&self) {
         match self.shared.backend.live_registrations() {
             Some(0) | None => {}
@@ -557,6 +580,12 @@ impl RdmaRegistry {
     #[cfg(test)]
     pub(crate) fn pool(&self) -> &ArenaSet {
         &self.pool
+    }
+
+    /// How many times the shutdown sweep has run.
+    #[cfg(test)]
+    pub(crate) fn sweep_count(&self) -> usize {
+        self.shared.sweeps.load(Ordering::Relaxed)
     }
 
     /// The sweep budget to use when the runtime shutdown policy names none.
