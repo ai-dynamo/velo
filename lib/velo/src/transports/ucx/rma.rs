@@ -374,6 +374,17 @@ impl RdmaEndpoint {
         self.submit(|reply| Cmd::RmaGet { req, reply }).await
     }
 
+    /// Regions the progress thread currently holds mapped.
+    ///
+    /// Maintained by the progress thread itself, so it is evidence rather than
+    /// bookkeeping: the registration layer uses it to check that teardown has
+    /// really released everything before it tells callers their memory is free.
+    pub(crate) fn live_regions(&self) -> usize {
+        self.shared
+            .live_regions
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Push one command and await its reply. See the module docs for why the
     /// two state checks precede the push.
     async fn submit<T>(

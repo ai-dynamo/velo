@@ -181,6 +181,22 @@ pub(crate) trait RdmaBackend: Send + Sync {
 
     /// Read remote memory into a locally registered region.
     fn get(&self, req: BackendGet) -> BoxFuture<'_, Result<(), RdmaError>>;
+
+    /// How many registrations this backend still holds, if it can say.
+    ///
+    /// Evidence, not bookkeeping: the layer above tracks its own registrations,
+    /// and asking it whether they are gone would just be asking it to agree
+    /// with itself. This is the backend's own count, and the registration layer
+    /// uses it as the precondition for declaring memory released at the end of
+    /// shutdown — the one moment it makes that claim without having seen an
+    /// unmap confirmed.
+    ///
+    /// `None` means the backend does not track it. A backend that answers
+    /// `None` gives up that check, and the layer above falls back to trusting
+    /// its call-site ordering.
+    fn live_registrations(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// [`RdmaBackend`] over the UCX transport's Phase-1 RMA plumbing.
@@ -229,6 +245,10 @@ impl RdmaBackend for UcxBackend {
                 .await
                 .map_err(rma_error)
         })
+    }
+
+    fn live_registrations(&self) -> Option<usize> {
+        Some(self.endpoint.live_regions())
     }
 
     fn get(&self, req: BackendGet) -> BoxFuture<'_, Result<(), RdmaError>> {

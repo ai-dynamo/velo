@@ -479,20 +479,45 @@ impl RdmaRegistry {
     /// Declare every surviving registration released, at the end of velo
     /// shutdown.
     ///
-    /// This is what turns [`RegionGuard::deregistered`] into a signal a caller
-    /// can actually wait on. `shutdown` above resolves the latch only for
-    /// regions whose unmap the backend confirmed; anything else — a wedged
-    /// unmap, a transport that went down first — would otherwise leave the
-    /// future pending forever, and a caller holding memory until it resolved
-    /// would hold it for the life of the process.
+    /// This is what makes [`RegionGuard::deregistered`] a signal a caller can
+    /// depend on. `shutdown` above resolves the latch only for regions whose
+    /// unmap the backend confirmed; anything else — a wedged unmap, a transport
+    /// that went down first — would otherwise leave the future pending forever,
+    /// and a caller holding memory until it resolved would hold it for the life
+    /// of the process.
     ///
-    /// It is sound precisely *here* and nowhere earlier: `Velo::graceful_shutdown`
-    /// calls it after transport teardown has returned, and teardown
-    /// force-unmaps every region the progress thread still holds. So by this
-    /// point nothing is pinned, whatever the individual unmap replies said.
-    /// Calling it before teardown would be the lie the two-clause contract
-    /// existed to avoid.
+    /// # The latch is a claim, so it is checked
+    ///
+    /// Closing it says two things at once: callers may free their memory, and
+    /// `RegionInner::drop` may free the buffers velo owns. Both are false if
+    /// anything is still pinned, so this does not simply trust its call site.
+    /// It asks the backend how many registrations it still holds and refuses to
+    /// latch anything unless the answer is none.
+    ///
+    /// The call site is nonetheless what *makes* the answer none:
+    /// `Velo::graceful_shutdown` runs this after transport teardown, and
+    /// teardown force-unmaps every region the progress thread holds and joins
+    /// that thread before returning. The check is there so a future caller
+    /// cannot quietly move this earlier — under a `Timeout` policy the
+    /// messenger phase can be handed a budget of zero and return without
+    /// finishing — and turn a latch into a use-after-free.
+    ///
+    /// A backend that cannot report its count (`None`) gives up the check; the
+    /// ordering is then the only guarantee, which is what it was before.
     pub(crate) fn latch_all_deregistered(&self) {
+        match self.shared.backend.live_registrations() {
+            Some(0) | None => {}
+            Some(live) => {
+                tracing::error!(
+                    live,
+                    "rdma: refusing to declare registrations released while the backend still \
+                     holds {live} of them; their memory stays pinned and their deregistered() \
+                     latches stay unresolved. Shutdown ran out of order."
+                );
+                return;
+            }
+        }
+
         let regions: Vec<Arc<RegionInner>> = self
             .shared
             .regions

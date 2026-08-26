@@ -71,6 +71,15 @@ impl MockBackend {
     fn unmap_calls(&self) -> usize {
         self.unmapped.load(Ordering::SeqCst)
     }
+
+    /// Stand in for transport teardown force-unmapping everything it held.
+    ///
+    /// Not an `unmap` — it records no call and answers nobody. It is the
+    /// backend simply ceasing to hold anything, which is what a torn-down
+    /// progress thread looks like from outside.
+    fn force_teardown(&self) {
+        self.mapped.clear();
+    }
 }
 
 impl RdmaBackend for MockBackend {
@@ -109,6 +118,10 @@ impl RdmaBackend for MockBackend {
             self.mapped.remove(&backend_region_id);
             Ok(())
         })
+    }
+
+    fn live_registrations(&self) -> Option<usize> {
+        Some(self.mapped.len())
     }
 
     fn get(&self, _req: BackendGet) -> BoxFuture<'_, Result<(), RdmaError>> {
@@ -1411,7 +1424,9 @@ async fn shutdown_latches_regions_whose_unmap_was_never_confirmed() {
          being honest about what it knows"
     );
 
-    // Standing in for the transport teardown that force-unmaps everything.
+    // Standing in for the transport teardown that force-unmaps everything, and
+    // then for the end of `Velo::graceful_shutdown`.
+    backend.force_teardown();
     registry.latch_all_deregistered();
 
     assert!(
@@ -1612,4 +1627,79 @@ async fn dedicated_arenas_are_not_reused() {
         "each oversize request maps its own arena"
     );
     drop(second);
+}
+
+/// The latch refuses to open while the backend still holds registrations.
+///
+/// `latch_all_deregistered` closing the latch says two things at once: callers
+/// may free their memory, and `RegionInner::drop` may free the buffers velo
+/// owns. Both are false if anything is still pinned, so an out-of-order
+/// shutdown — the latch reached before teardown finished — must not open it.
+/// This is where the two high-severity fixes meet: the leak gate reads exactly
+/// the boolean this function sets.
+#[tokio::test(flavor = "multi_thread")]
+async fn latch_refuses_while_the_backend_still_holds_registrations() {
+    let (backend, registry) = mock_registry(RdmaConfig::default());
+    let guard = registry
+        .register_owned(vec![0u8; 8192].into_boxed_slice())
+        .await
+        .expect("register");
+    let watch = guard.watch();
+
+    backend.refuse_unmap.store(true, Ordering::SeqCst);
+    registry.shutdown(Duration::from_millis(100)).await;
+
+    // Teardown has *not* run: the backend still holds the region.
+    assert_eq!(backend.live_registrations(), Some(1));
+    registry.latch_all_deregistered();
+    assert!(
+        !watch.is_deregistered(),
+        "the latch opened while the backend still had the region pinned; a caller would now \
+         free live memory, and the owned buffer would be freed by drop glue"
+    );
+
+    // Now teardown really has happened.
+    backend.force_teardown();
+    registry.latch_all_deregistered();
+    assert!(
+        watch.is_deregistered(),
+        "the latch must open once nothing is pinned"
+    );
+    drop(guard);
+}
+
+/// After the latch opens, the owned buffer is freed normally rather than
+/// leaked.
+///
+/// The other half of the leak gate. `RegionInner::drop` leaks whenever the
+/// registration is unconfirmed, so an orderly shutdown has to be able to *close*
+/// that gate — otherwise every owned registration in a well-behaved process
+/// would leak, and the safety property would have been bought by making the
+/// normal path pathological.
+#[tokio::test(flavor = "multi_thread")]
+async fn latched_regions_free_their_buffers_normally() {
+    let before = super::region::LEAKED_BUFFERS.load(Ordering::SeqCst);
+    let (backend, registry) = mock_registry(RdmaConfig::default());
+    let guard = registry
+        .register_owned(vec![0u8; 8192].into_boxed_slice())
+        .await
+        .expect("register");
+
+    // The awkward path: the sweep cannot confirm, so only the end-of-shutdown
+    // latch releases this region.
+    backend.refuse_unmap.store(true, Ordering::SeqCst);
+    registry.shutdown(Duration::from_millis(100)).await;
+    backend.force_teardown();
+    registry.latch_all_deregistered();
+    assert!(guard.is_deregistered());
+
+    // Everything goes. The buffer must be freed, not leaked.
+    drop(guard);
+    drop(registry);
+
+    assert_eq!(
+        super::region::LEAKED_BUFFERS.load(Ordering::SeqCst),
+        before,
+        "an orderly shutdown leaked an owned buffer; the leak gate never closes"
+    );
 }
