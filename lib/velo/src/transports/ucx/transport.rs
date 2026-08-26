@@ -166,6 +166,10 @@ impl UcxTransport {
     /// the one thing that can prove a registration was really released rather
     /// than merely forgotten by a bookkeeping layer above. Phase 2 asserts on
     /// it from `rendezvous::rdma`, which cannot reach `shared` directly.
+    ///
+    /// A test and diagnostics accessor: nothing on a production path reads it,
+    /// which is why it carries an explicit allow rather than being deleted.
+    #[allow(dead_code)]
     pub(crate) fn live_regions(&self) -> usize {
         self.shared.live_regions.load(Ordering::SeqCst)
     }
@@ -173,6 +177,7 @@ impl UcxTransport {
     /// Unpacked remote keys the progress thread has not destroyed yet. Same
     /// discipline as [`live_regions`](Self::live_regions); signed, because a
     /// negative value would mean a double destroy and is worth seeing.
+    #[allow(dead_code)]
     pub(crate) fn live_rkeys(&self) -> i64 {
         self.shared.live_rkeys.load(Ordering::SeqCst)
     }

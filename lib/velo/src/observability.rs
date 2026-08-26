@@ -59,7 +59,9 @@ fn direction_index(d: Direction) -> usize {
 #[cfg(all(target_os = "linux", feature = "ucx"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RdmaRegistrationKind {
-    /// A pool arena velo allocated and registered itself.
+    /// A pool arena velo allocated and registered itself. Emitted from the
+    /// pool, whose production consumer is Phase 3.
+    #[allow(dead_code)]
     Arena,
     /// Memory a caller supplied and holds a `RegionGuard` for.
     External,

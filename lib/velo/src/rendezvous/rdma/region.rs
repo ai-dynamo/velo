@@ -62,7 +62,9 @@ pub(crate) struct RegionInner {
     pub(super) ptr: usize,
     /// The length the caller asked to register.
     pub(super) len: usize,
-    /// Packed key covering the region.
+    /// Packed key covering the region. Read by `RegionGuard::remote`, which
+    /// Phase 3 turns into the wire descriptor.
+    #[allow(dead_code)]
     pub(super) packed_key: Bytes,
     /// Start of the range the backend actually pinned. Reported, never used for
     /// offset arithmetic: the backend rounds outward to page boundaries, so it
@@ -315,6 +317,7 @@ impl RegionGuard {
 
     /// How a peer would address this region. Phase 3 builds the wire
     /// descriptor from it.
+    #[allow(dead_code)]
     pub(crate) fn remote(&self) -> RemoteRef {
         RemoteRef {
             addr: self.inner.ptr as u64,
@@ -327,6 +330,7 @@ impl RegionGuard {
     /// The region's in-flight accounting. Phase 3 acquires a guard from it per
     /// RDMA lease, which is what makes `unregister` wait for outstanding
     /// transfers rather than pulling the registration out from under them.
+    #[allow(dead_code)]
     pub(crate) fn in_flight(&self) -> &ShutdownState {
         &self.inner.in_flight
     }
@@ -397,6 +401,18 @@ impl Drop for RegionGuard {
     }
 }
 
+impl std::fmt::Debug for RegionGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegionGuard")
+            .field("region", &self.inner.id)
+            .field("addr", &self.inner.ptr)
+            .field("len", &self.inner.len)
+            .field("generation", &self.inner.generation)
+            .field("deregistered", &self.inner.is_deregistered())
+            .finish()
+    }
+}
+
 /// A clonable, observational view of a registration.
 ///
 /// Holding one does not keep the registration alive and does not oblige the
@@ -406,6 +422,15 @@ impl Drop for RegionGuard {
 #[derive(Clone)]
 pub struct RegionWatch {
     inner: Arc<RegionInner>,
+}
+
+impl std::fmt::Debug for RegionWatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegionWatch")
+            .field("region", &self.inner.id)
+            .field("deregistered", &self.inner.is_deregistered())
+            .finish()
+    }
 }
 
 impl RegionWatch {

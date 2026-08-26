@@ -563,7 +563,7 @@ impl ArenaSet {
             granules,
             free: Mutex::new(Allocator::with_max_allocs(
                 granules,
-                granules.min(MAX_ALLOCS_CAP).max(1),
+                granules.clamp(1, MAX_ALLOCS_CAP),
             )),
             live: AtomicUsize::new(0),
             dedicated,

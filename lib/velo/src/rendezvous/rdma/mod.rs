@@ -37,6 +37,12 @@
 //! `TransportAdapter::admit_message` does — the token is kept only as the
 //! observable a `RegionGuard` holder awaits.
 
+// The pool is fully exercised by this module's tests, but Phase 3 is its
+// production consumer: nothing in the runtime stages a pinned slot yet. The
+// allow is scoped to this module rather than sprinkled per item so it is one
+// decision to revisit when `StageMode::Pinned` becomes real, and it is stated
+// here rather than left as an unexplained attribute.
+#[allow(dead_code)]
 pub(crate) mod arena;
 pub(crate) mod backend;
 pub(crate) mod region;
@@ -269,6 +275,9 @@ impl RdmaRegistry {
         Ok(RegionGuard::new(inner, Arc::clone(&self.shared)))
     }
 
+    // Phase 3 stages pinned slots and issues GETs through these; the tests
+    // below are their only caller today.
+    #[allow(dead_code)]
     /// Cut `len` registered bytes out of the pool.
     ///
     /// Goes through the same admission gate as an external registration, so a
@@ -281,6 +290,7 @@ impl RdmaRegistry {
 
     /// Read remote memory into a locally registered destination. Phase 3 drives
     /// this from an owner-authored descriptor.
+    #[allow(dead_code)]
     pub(crate) async fn get(&self, req: BackendGet) -> Result<(), RdmaError> {
         self.shared.backend.get(req).await
     }
@@ -355,11 +365,13 @@ impl RdmaRegistry {
     }
 
     /// Live external registrations.
+    #[allow(dead_code)]
     pub(crate) fn region_count(&self) -> usize {
         self.shared.regions.len()
     }
 
     /// The arena pool, for diagnostics and tests.
+    #[allow(dead_code)]
     pub(crate) fn pool(&self) -> &ArenaSet {
         &self.pool
     }
@@ -369,7 +381,9 @@ impl RdmaRegistry {
         self.shared.cfg.shutdown_timeout
     }
 
-    /// Wire discriminator of the backend behind this registry.
+    /// Wire discriminator of the backend behind this registry. Phase 3 puts it
+    /// in the descriptor and matches it against the consumer offer.
+    #[allow(dead_code)]
     pub(crate) fn backend_key(&self) -> &str {
         self.shared.backend.key()
     }
