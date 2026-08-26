@@ -605,7 +605,9 @@ impl RegionWatch {
 
     /// Resolve once the memory is no longer registered — confirmed unmap or
     /// completed velo shutdown, whichever comes first. Same contract and same
-    /// latched semantics as [`RegionGuard::deregistered`].
+    /// latched semantics as [`RegionGuard::deregistered`], including its third
+    /// outcome: after an abnormal teardown this never resolves, and the memory
+    /// is leaked deliberately rather than declared safe on no evidence.
     pub async fn deregistered(&self) {
         self.inner.wait_deregistered().await;
     }
