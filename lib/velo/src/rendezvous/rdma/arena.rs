@@ -1,0 +1,626 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! The arena pool (D4): few big registrations, many cheap suballocations.
+//!
+//! Velo runs UCX with `UCX_RCACHE_ENABLE=n` and `UCX_MEM_EVENTS=n` — no malloc
+//! hooks in the process, deliberately. Under that configuration every
+//! `ucp_mem_map` is a fresh `ibv_reg_mr` whose cost is linear in the size
+//! registered, and UCX caches nothing on the way. Pre-registered arenas are
+//! therefore load-bearing rather than an optimisation: without them every
+//! staged buffer would pay a pin.
+//!
+//! So the pool registers a handful of large [`Arena`]s and suballocates inside
+//! them in 4 KiB [`GRANULE`]s using `offset-allocator` (MIT, zero `unsafe`,
+//! O(1) alloc and free). That crate allocates *offsets*, never memory: the
+//! pages come from `PageMemory` here, so a bug in the suballocator is a wrong
+//! offset, never a bad pointer.
+//!
+//! # A remote descriptor is not a free token
+//!
+//! The two are deliberately different values and must never be conflated. The
+//! free token is the private `offset_allocator::Allocation` held inside
+//! [`PinnedBuf`]; returning it is what makes the space reusable. The wire-side
+//! [`RemoteRef`] — address, length, packed key, generation — is a *description*
+//! of where some bytes currently live. A peer holding one can read the range;
+//! it cannot free it, and holding one does not keep it alive.
+//!
+//! # Pages outlive their registration, always
+//!
+//! `PageMemory` defaults to leaking rather than freeing: the flag that lets it
+//! call `dealloc` is set only once the backend has *confirmed* the unmap.
+//! Freeing pages UCX still has pinned is the hazard this whole module exists to
+//! contain, and a leak is the strictly safer failure. A registry torn down
+//! without [`shutdown`](super::RdmaRegistry::shutdown) therefore leaks its
+//! arenas, and says so at `error` level.
+//!
+//! # Reclamation is Phase 4
+//!
+//! Arenas are append-only and live until registry shutdown. Empty-arena
+//! reclamation under a low-water mark — the only kind that is safe, since
+//! nothing references an empty arena — is deliberately not in this phase.
+
+use std::alloc::Layout;
+use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+use bytes::Bytes;
+use offset_allocator::{Allocation, Allocator};
+use parking_lot::{Mutex, RwLock};
+
+use super::backend::{RdmaBackend, RdmaError};
+
+/// Suballocation unit. Matches the page size UCX pins at, so a granule never
+/// straddles a page and the float-bin round-up stays bounded at ~12.5%.
+pub(crate) const GRANULE: usize = 4096;
+
+/// Ceiling on the node metadata `offset-allocator` preallocates per arena.
+///
+/// `Allocator::new` defaults to 128 Ki allocations, which is several MB of
+/// nodes — paid per arena whether or not the arena is big enough to ever hold
+/// that many. Right-sizing to the granule count and capping here keeps a 64 KiB
+/// test arena from carrying a megabytes-sized allocator.
+const MAX_ALLOCS_CAP: u32 = 128 * 1024;
+
+/// Tuning for the arena pool (D11's new knobs).
+#[derive(Debug, Clone)]
+pub struct RdmaPoolConfig {
+    /// Size of the first pooled arena. Later arenas grow geometrically from
+    /// here up to [`max_arena_bytes`](Self::max_arena_bytes).
+    pub initial_arena_bytes: u64,
+    /// Ceiling on a single pooled arena.
+    pub max_arena_bytes: u64,
+    /// Requests at or above this size get an arena of their own, sized to the
+    /// request. Without it the float-bin round-up would cost up to 12.5% — 128
+    /// MiB on a 1 GiB object.
+    pub dedicated_arena_min: u64,
+    /// Ceiling on *mapped* bytes across the pool and external regions together.
+    ///
+    /// Note the axis: this counts what is registered with the backend, not what
+    /// is suballocated, because that is what the NIC and `RLIMIT_MEMLOCK` see.
+    /// A mostly-empty arena still costs its full size.
+    ///
+    /// Over budget, [`ArenaSet::alloc`] answers [`RdmaError::BudgetExceeded`]
+    /// and Phase 3's callers stage chunked instead — pool exhaustion is never a
+    /// hard failure of the staging operation (D4).
+    pub registered_bytes_budget: u64,
+}
+
+impl Default for RdmaPoolConfig {
+    fn default() -> Self {
+        Self {
+            initial_arena_bytes: 64 << 20,
+            max_arena_bytes: 1 << 30,
+            dedicated_arena_min: 64 << 20,
+            registered_bytes_budget: 1 << 30,
+        }
+    }
+}
+
+/// Where some registered bytes currently live, as a peer would address them.
+///
+/// Deliberately **not** `Serialize`: the wire descriptor is D7's business and
+/// ships in Phase 3. Deriving an encoding here would pre-commit a wire shape
+/// before the version / flags / backend framing exists.
+#[derive(Debug, Clone)]
+pub(crate) struct RemoteRef {
+    /// Absolute address in this process's address space.
+    pub addr: u64,
+    /// Length of the described range.
+    pub len: u64,
+    /// The backend's packed key covering `addr`.
+    pub packed_key: Bytes,
+    /// Generation of the registration behind `addr`, so a descriptor that
+    /// outlived its registration is detectable rather than silently wrong.
+    pub generation: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Backing pages
+// ---------------------------------------------------------------------------
+
+/// A page-aligned allocation that will not be freed while it might be pinned.
+///
+/// `freeable` starts `false` and is set exactly once, after the backend
+/// confirms the unmap. Every other exit — a registry dropped without
+/// `shutdown`, an unmap that answered `ShuttingDown`, a panic — leaks the
+/// pages, which is the safe direction: a leak costs memory, a premature free
+/// hands the NIC a dangling range with a peer's key still outstanding.
+struct PageMemory {
+    ptr: *mut u8,
+    len: usize,
+    freeable: AtomicBool,
+}
+
+// SAFETY: `ptr` is a unique heap allocation owned by this value for its whole
+// lifetime, with no thread affinity. Access to its contents is handed out one
+// level up, where the suballocator guarantees the ranges are non-overlapping
+// (see `PinnedBuf`). So moving a `PageMemory` between threads, and sharing
+// `&PageMemory` across them, are both sound.
+unsafe impl Send for PageMemory {}
+// SAFETY: as above.
+unsafe impl Sync for PageMemory {}
+
+impl PageMemory {
+    /// Allocate `len` bytes (rounded up to whole [`GRANULE`]s), page-aligned
+    /// and zeroed.
+    fn new(len: usize) -> Result<Self, RdmaError> {
+        let len = len
+            .checked_next_multiple_of(GRANULE)
+            .filter(|n| *n > 0)
+            .ok_or(RdmaError::OutOfRange)?;
+        let layout = Layout::from_size_align(len, GRANULE).map_err(|_| RdmaError::OutOfRange)?;
+        // SAFETY: `layout` has non-zero size (rounded up to at least one
+        // granule above) and a power-of-two alignment, so it is a valid
+        // argument to the global allocator.
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        if ptr.is_null() {
+            return Err(RdmaError::Backend(format!(
+                "allocating a {len} B rdma arena failed"
+            )));
+        }
+        Ok(Self {
+            ptr,
+            len,
+            freeable: AtomicBool::new(false),
+        })
+    }
+
+    fn addr(&self) -> usize {
+        self.ptr as usize
+    }
+
+    /// Record that the backend confirmed the unmap, so `Drop` may free.
+    fn mark_unmapped(&self) {
+        self.freeable.store(true, Ordering::Release);
+    }
+}
+
+impl Drop for PageMemory {
+    fn drop(&mut self) {
+        if !self.freeable.load(Ordering::Acquire) {
+            tracing::error!(
+                bytes = self.len,
+                "rdma arena dropped without a confirmed unmap; leaking its pages rather than \
+                 freeing memory the backend may still have pinned. The registry was torn down \
+                 without `RdmaRegistry::shutdown`."
+            );
+            return;
+        }
+        let layout = Layout::from_size_align(self.len, GRANULE).expect("layout was valid to alloc");
+        // SAFETY: same pointer and layout the allocation was made with, freed
+        // exactly once (this is `Drop`), and only after the backend confirmed
+        // the range is no longer pinned.
+        unsafe { std::alloc::dealloc(self.ptr, layout) };
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Arena
+// ---------------------------------------------------------------------------
+
+/// One backend registration plus the suballocator over it.
+pub(crate) struct Arena {
+    memory: PageMemory,
+    /// Id for the matching [`RdmaBackend::unmap`].
+    backend_region_id: u64,
+    /// Packed key covering the whole arena; every [`RemoteRef`] cut from it
+    /// carries a clone (a refcount bump, not a copy).
+    packed_key: Bytes,
+    /// Distinguishes registrations, so a stale descriptor is detectable.
+    generation: u64,
+    /// Arena length in [`GRANULE`]s — the unit the suballocator works in.
+    granules: u32,
+    free: Mutex<Allocator<u32>>,
+    /// Live [`PinnedBuf`]s cut from this arena. Phase 4's reclamation reads it;
+    /// here it makes "the pool really did give the space back" assertable.
+    live: AtomicUsize,
+    /// Dedicated arenas back exactly one oversize request and are never offered
+    /// to the general search, so the request that motivated them cannot be
+    /// crowded out by later small ones.
+    dedicated: bool,
+}
+
+impl Arena {
+    fn base(&self) -> *mut u8 {
+        self.memory.ptr
+    }
+
+    /// Arena length in bytes, as mapped.
+    pub(crate) fn len(&self) -> usize {
+        self.memory.len
+    }
+
+    /// Live suballocations.
+    pub(crate) fn live(&self) -> usize {
+        self.live.load(Ordering::Acquire)
+    }
+
+    /// Try to cut `len` bytes out of this arena.
+    ///
+    /// `None` means "not from here" — no space, or the request does not fit at
+    /// all. Never an error: the caller moves on to the next arena or grows the
+    /// set.
+    fn try_alloc(self: &Arc<Self>, len: usize) -> Option<PinnedBuf> {
+        let granules = u32::try_from(len.div_ceil(GRANULE)).ok()?;
+        if granules == 0 || granules > self.granules {
+            return None;
+        }
+        let allocation = self.free.lock().allocate(granules)?;
+        self.live.fetch_add(1, Ordering::AcqRel);
+        Some(PinnedBuf {
+            offset: allocation.offset as usize * GRANULE,
+            len,
+            allocation,
+            arena: Arc::clone(self),
+        })
+    }
+
+    /// Return a suballocation's space to the pool. Never touches the backend —
+    /// the arena stays registered, which is the point of pooling.
+    fn release(&self, allocation: Allocation<u32>) {
+        self.free.lock().free(allocation);
+        self.live.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PinnedBuf
+// ---------------------------------------------------------------------------
+
+/// An owned, registered byte range cut from an [`Arena`].
+///
+/// Derefs to its bytes, so it is usable as a plain buffer. Dropping it returns
+/// the space to the pool and nothing else: the arena stays registered, so the
+/// next allocation of that space costs no pin.
+pub(crate) struct PinnedBuf {
+    arena: Arc<Arena>,
+    /// The free token. Private, and the only thing that can return the space.
+    allocation: Allocation<u32>,
+    /// Byte offset of this range within the arena.
+    offset: usize,
+    /// Exactly what the caller asked for. The suballocator rounds up to a float
+    /// bin, so the reserved space is at least `len`; the extra bytes belong to
+    /// nobody and are never exposed.
+    len: usize,
+}
+
+impl PinnedBuf {
+    /// How a peer would address these bytes.
+    pub(crate) fn remote(&self) -> RemoteRef {
+        RemoteRef {
+            addr: self.addr(),
+            len: self.len as u64,
+            packed_key: self.arena.packed_key.clone(),
+            generation: self.arena.generation,
+        }
+    }
+
+    /// Absolute address of the first byte.
+    pub(crate) fn addr(&self) -> u64 {
+        self.arena.base() as u64 + self.offset as u64
+    }
+
+    /// Offset of this range inside its arena — what a backend GET wants when
+    /// the arena is the destination.
+    pub(crate) fn arena_offset(&self) -> u64 {
+        self.offset as u64
+    }
+
+    /// Backend region id of the arena backing these bytes.
+    pub(crate) fn backend_region_id(&self) -> u64 {
+        self.arena.backend_region_id
+    }
+
+    /// Length in bytes, exactly as requested.
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the range is empty. Never true — the pool refuses zero-length
+    /// requests — but clippy wants it beside `len`.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl Deref for PinnedBuf {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        // SAFETY: the range `offset .. offset + len` lies inside the arena's
+        // allocation — `try_alloc` sized the request in granules against the
+        // arena's own granule count — the arena is kept alive by the `Arc`, and
+        // the suballocator hands out non-overlapping ranges, so no other
+        // `PinnedBuf` aliases these bytes. Remote peers holding the arena's key
+        // may read the range concurrently; that is outside Rust's model and is
+        // the documented trust-domain assumption (see `RegionGuard`).
+        unsafe { std::slice::from_raw_parts(self.arena.base().add(self.offset), self.len) }
+    }
+}
+
+impl DerefMut for PinnedBuf {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as for `Deref`, plus `&mut self` proving this is the only
+        // handle to the range on this side.
+        unsafe { std::slice::from_raw_parts_mut(self.arena.base().add(self.offset), self.len) }
+    }
+}
+
+impl Drop for PinnedBuf {
+    fn drop(&mut self) {
+        self.arena.release(self.allocation);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Budget
+// ---------------------------------------------------------------------------
+
+/// Registered-bytes accounting shared by the pool and external regions (D9).
+///
+/// The axis is *mapped* bytes — what the backend has pinned — not suballocated
+/// bytes, for the reason given on the config field it reads.
+pub(crate) struct Budget {
+    registered: AtomicU64,
+    limit: u64,
+    metrics: Option<Arc<crate::observability::VeloMetrics>>,
+}
+
+impl Budget {
+    pub(crate) fn new(limit: u64, metrics: Option<Arc<crate::observability::VeloMetrics>>) -> Self {
+        Self {
+            registered: AtomicU64::new(0),
+            limit,
+            metrics,
+        }
+    }
+
+    /// Claim `bytes` against the budget, or refuse.
+    ///
+    /// A compare-exchange loop rather than "read, compare, add": two concurrent
+    /// registrations that each read an under-budget total and then both added
+    /// would overshoot the ceiling by construction.
+    pub(crate) fn try_reserve(&self, bytes: u64) -> Result<(), RdmaError> {
+        let mut current = self.registered.load(Ordering::Acquire);
+        loop {
+            let exceeded = || RdmaError::BudgetExceeded {
+                requested: bytes,
+                registered: current,
+                budget: self.limit,
+            };
+            let next = current.checked_add(bytes).ok_or_else(exceeded)?;
+            if next > self.limit {
+                return Err(exceeded());
+            }
+            match self.registered.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.publish(next);
+                    return Ok(());
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// Give `bytes` back after a confirmed unmap, or after a map that failed.
+    pub(crate) fn release(&self, bytes: u64) {
+        let prev = self.registered.fetch_sub(bytes, Ordering::AcqRel);
+        self.publish(prev.saturating_sub(bytes));
+    }
+
+    /// Bytes currently registered.
+    pub(crate) fn registered(&self) -> u64 {
+        self.registered.load(Ordering::Acquire)
+    }
+
+    fn publish(&self, bytes: u64) {
+        if let Some(m) = &self.metrics {
+            m.set_rdma_registered_bytes(bytes);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ArenaSet
+// ---------------------------------------------------------------------------
+
+/// The pool: an append-only set of arenas with geometric growth.
+pub(crate) struct ArenaSet {
+    backend: Arc<dyn RdmaBackend>,
+    cfg: RdmaPoolConfig,
+    budget: Arc<Budget>,
+    generations: Arc<AtomicU64>,
+    metrics: Option<Arc<crate::observability::VeloMetrics>>,
+    /// Append-only until shutdown. Read on every allocation, written only by
+    /// the task holding `grow`.
+    arenas: RwLock<Vec<Arc<Arena>>>,
+    /// Serialises growth so two concurrent misses map one arena, not two. An
+    /// async mutex because what it guards is an await point.
+    grow: tokio::sync::Mutex<()>,
+}
+
+impl ArenaSet {
+    pub(crate) fn new(
+        backend: Arc<dyn RdmaBackend>,
+        cfg: RdmaPoolConfig,
+        budget: Arc<Budget>,
+        generations: Arc<AtomicU64>,
+        metrics: Option<Arc<crate::observability::VeloMetrics>>,
+    ) -> Self {
+        Self {
+            backend,
+            cfg,
+            budget,
+            generations,
+            metrics,
+            arenas: RwLock::new(Vec::new()),
+            grow: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    /// Cut `len` registered bytes out of the pool, growing it if needed.
+    ///
+    /// [`RdmaError::BudgetExceeded`] is the expected refusal under pressure;
+    /// Phase 3's callers answer it by staging chunked, so it is a routing
+    /// decision rather than a failure.
+    pub(crate) async fn alloc(&self, len: usize) -> Result<PinnedBuf, RdmaError> {
+        if len == 0 {
+            return Err(RdmaError::OutOfRange);
+        }
+        let dedicated = len as u64 >= self.cfg.dedicated_arena_min;
+        if !dedicated && let Some(buf) = self.try_existing(len) {
+            return Ok(buf);
+        }
+        // One grower at a time. The re-check inside is not belt-and-braces:
+        // whoever held the lock before us may have mapped exactly the arena
+        // this request needs, and mapping a second one would double the pin.
+        let _grow = self.grow.lock().await;
+        if !dedicated && let Some(buf) = self.try_existing(len) {
+            return Ok(buf);
+        }
+        let arena_bytes = if dedicated {
+            (len as u64)
+                .checked_next_multiple_of(GRANULE as u64)
+                .ok_or(RdmaError::OutOfRange)?
+        } else {
+            self.next_pool_arena_bytes(len)?
+        };
+        let arena = self.map_arena(arena_bytes, dedicated).await?;
+        let buf = arena
+            .try_alloc(len)
+            .ok_or_else(|| RdmaError::Backend("a fresh arena refused its own request".into()))?;
+        self.arenas.write().push(arena);
+        Ok(buf)
+    }
+
+    /// Walk the existing pooled arenas, first fit. They are few and ordered by
+    /// creation, so the earlier (smaller) ones are tried first and the big tail
+    /// stays available for big requests.
+    fn try_existing(&self, len: usize) -> Option<PinnedBuf> {
+        let arenas = self.arenas.read();
+        arenas
+            .iter()
+            .filter(|a| !a.dedicated)
+            .find_map(|arena| arena.try_alloc(len))
+    }
+
+    /// Geometric growth from `initial_arena_bytes`, doubling per pooled arena,
+    /// capped at `max_arena_bytes` — and never smaller than the request that
+    /// forced the growth.
+    fn next_pool_arena_bytes(&self, len: usize) -> Result<u64, RdmaError> {
+        let pooled = self.arenas.read().iter().filter(|a| !a.dedicated).count();
+        let grown = u32::try_from(pooled)
+            .ok()
+            .and_then(|shift| self.cfg.initial_arena_bytes.checked_shl(shift))
+            .unwrap_or(self.cfg.max_arena_bytes)
+            .min(self.cfg.max_arena_bytes);
+        let needed = (len as u64)
+            .checked_next_multiple_of(GRANULE as u64)
+            .ok_or(RdmaError::OutOfRange)?;
+        Ok(grown.max(needed).max(GRANULE as u64))
+    }
+
+    /// Allocate pages, register them, and build the arena around them.
+    ///
+    /// The budget is claimed *before* the map and given back if the map fails,
+    /// so a concurrent registration cannot slip in against bytes this one is
+    /// about to consume.
+    async fn map_arena(&self, bytes: u64, dedicated: bool) -> Result<Arc<Arena>, RdmaError> {
+        let len = usize::try_from(bytes).map_err(|_| RdmaError::OutOfRange)?;
+        self.budget.try_reserve(bytes)?;
+
+        let memory = match PageMemory::new(len) {
+            Ok(memory) => memory,
+            Err(e) => {
+                self.budget.release(bytes);
+                return Err(e);
+            }
+        };
+        // A failed *or cancelled* map leaves nothing registered (the backend
+        // contract), so dropping `memory` on this path frees pages nobody has
+        // pinned — the one case where freeing is correct. Past this await the
+        // pages are registered and the leak-by-default in `PageMemory` takes
+        // over.
+        let region = match self.backend.map(memory.addr(), memory.len).await {
+            Ok(region) => region,
+            Err(e) => {
+                self.budget.release(bytes);
+                return Err(e);
+            }
+        };
+        let granules = u32::try_from(memory.len / GRANULE).map_err(|_| RdmaError::OutOfRange)?;
+        let arena = Arc::new(Arena {
+            backend_region_id: region.backend_region_id,
+            packed_key: region.packed_key,
+            generation: self.generations.fetch_add(1, Ordering::Relaxed),
+            granules,
+            free: Mutex::new(Allocator::with_max_allocs(
+                granules,
+                granules.min(MAX_ALLOCS_CAP).max(1),
+            )),
+            live: AtomicUsize::new(0),
+            dedicated,
+            memory,
+        });
+        if let Some(m) = &self.metrics {
+            m.record_rdma_registration(crate::observability::RdmaRegistrationKind::Arena);
+        }
+        tracing::debug!(
+            bytes = arena.len(),
+            dedicated,
+            generation = arena.generation,
+            "rdma: mapped a new arena"
+        );
+        Ok(arena)
+    }
+
+    /// Unmap every arena. Called only from the registry shutdown path, after
+    /// the registration gate is closed and drained.
+    ///
+    /// Returns the number of arenas whose unmap the backend did **not**
+    /// confirm; their pages stay leaked, which is the safe direction.
+    pub(crate) async fn unmap_all(&self) -> usize {
+        let arenas: Vec<Arc<Arena>> = std::mem::take(&mut *self.arenas.write());
+        let mut unconfirmed = 0usize;
+        for arena in arenas {
+            let live = arena.live();
+            if live != 0 {
+                tracing::warn!(
+                    live,
+                    bytes = arena.len(),
+                    "rdma: unmapping an arena that still has live suballocations; their \
+                     buffers now reference deregistered memory"
+                );
+            }
+            match self.backend.unmap(arena.backend_region_id).await {
+                Ok(()) => {
+                    arena.memory.mark_unmapped();
+                    self.budget.release(arena.len() as u64);
+                }
+                Err(e) => {
+                    unconfirmed += 1;
+                    let bytes = arena.len();
+                    tracing::warn!(%e, bytes, "rdma: arena unmap unconfirmed; pages leaked");
+                }
+            }
+        }
+        unconfirmed
+    }
+
+    /// Arenas currently mapped. Test and diagnostics surface.
+    pub(crate) fn arena_count(&self) -> usize {
+        self.arenas.read().len()
+    }
+
+    /// Live suballocations across every arena.
+    pub(crate) fn live_allocations(&self) -> usize {
+        self.arenas.read().iter().map(|a| a.live()).sum()
+    }
+}

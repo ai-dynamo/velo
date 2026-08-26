@@ -24,6 +24,9 @@ pub mod consumer;
 pub mod handle;
 pub mod handlers;
 pub mod protocol;
+// The RDMA registration layer, gated exactly as `transports::ucx` is.
+#[cfg(all(target_os = "linux", feature = "ucx"))]
+pub mod rdma;
 pub mod store;
 pub mod transparent;
 pub mod write;
