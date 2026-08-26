@@ -1096,3 +1096,130 @@ async fn velo_without_ucx_transport_refuses_registration() {
     velo.graceful_shutdown(velo_ext::ShutdownPolicy::Timeout(T))
         .await;
 }
+
+// ---------------------------------------------------------------------------
+// Budget accounting under cancellation and awkward sizes
+// ---------------------------------------------------------------------------
+
+/// A registration whose future is dropped at the map must give its budget claim
+/// back.
+///
+/// Wrapping a registration in a `timeout` is an ordinary thing for a caller to
+/// write, and a claim released only on the error arm survives it: the arm never
+/// runs. The failure is silent and permanent — enough cancellations and every
+/// later registration answers `BudgetExceeded` for the life of the process,
+/// which Phase 3 reads as "stage chunked" and never reports as broken.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelled_registration_returns_its_budget() {
+    let (backend, registry) = mock_registry(RdmaConfig::default());
+    *backend.map_delay.lock() = Some(Duration::from_millis(500));
+
+    for _ in 0..4 {
+        let attempt = registry.register_owned(vec![0u8; 64 * 1024].into_boxed_slice());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), attempt)
+                .await
+                .is_err(),
+            "the registration was supposed to be cancelled mid-map"
+        );
+    }
+
+    assert_eq!(
+        registry.registered_bytes(),
+        0,
+        "cancelled registrations leaked their budget claim"
+    );
+
+    // And the budget is genuinely usable again, not merely reported as zero.
+    *backend.map_delay.lock() = None;
+    let guard = registry
+        .register_owned(vec![0u8; 64 * 1024].into_boxed_slice())
+        .await
+        .expect("a registration after cancellations must still be admitted");
+    guard.unregister(T).await.expect("unregister");
+    assert_eq!(registry.registered_bytes(), 0);
+}
+
+/// The same property for the pool path, which claims its budget in
+/// `map_arena`.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelled_pool_alloc_returns_its_budget() {
+    let cfg = RdmaConfig {
+        pool: small_pool_config(),
+        ..RdmaConfig::default()
+    };
+    let (backend, registry) = mock_registry(cfg);
+    *backend.map_delay.lock() = Some(Duration::from_millis(500));
+
+    for _ in 0..4 {
+        let attempt = registry.alloc_pinned(4096);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), attempt)
+                .await
+                .is_err(),
+            "the allocation was supposed to be cancelled mid-map"
+        );
+    }
+
+    assert_eq!(
+        registry.registered_bytes(),
+        0,
+        "cancelled pool allocations leaked their budget claim"
+    );
+    assert_eq!(
+        registry.pool().arena_count(),
+        0,
+        "a cancelled map left an arena in the set"
+    );
+
+    *backend.map_delay.lock() = None;
+    let buf = registry
+        .alloc_pinned(4096)
+        .await
+        .expect("the pool must still be usable after cancellations");
+    drop(buf);
+}
+
+/// Arena sizes that are not granule multiples must still balance.
+///
+/// `initial_arena_bytes` is a public field wired through
+/// `VeloBuilder::rdma_config`, so nothing stops a caller passing 100_000. If
+/// the claim were taken on the requested size and the release on the
+/// page-rounded one, every arena would under-release by the difference; the
+/// counter is unsigned, so the drift accumulates until the pool refuses
+/// everything, and `publish` saturates so the gauge would keep reading zero.
+/// Every other test in this file uses granule multiples, which is exactly why
+/// this one does not.
+#[tokio::test]
+async fn unaligned_arena_sizes_balance_the_budget() {
+    let cfg = RdmaConfig {
+        pool: RdmaPoolConfig {
+            initial_arena_bytes: 100_000,
+            max_arena_bytes: 300_000,
+            dedicated_arena_min: 1 << 30,
+            registered_bytes_budget: 4_000_000,
+        },
+        ..RdmaConfig::default()
+    };
+    let (_backend, registry) = mock_registry(cfg);
+
+    let mut held = Vec::new();
+    for _ in 0..6 {
+        held.push(registry.alloc_pinned(30_000).await.expect("alloc"));
+    }
+    let registered = registry.registered_bytes();
+    assert!(registered > 0, "nothing was accounted as registered");
+    assert_eq!(
+        registered % GRANULE as u64,
+        0,
+        "the budget claim must be the page-rounded length that is actually mapped"
+    );
+
+    drop(held);
+    registry.shutdown(T).await;
+    assert_eq!(
+        registry.registered_bytes(),
+        0,
+        "reserve and release disagreed on the length; the budget is now permanently skewed"
+    );
+}

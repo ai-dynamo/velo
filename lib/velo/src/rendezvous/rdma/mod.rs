@@ -237,7 +237,10 @@ impl RdmaRegistry {
     ///
     /// The admission ticket is held across the map, so the shutdown sweep
     /// cannot reach step 3 while a registration is still in flight. The budget
-    /// is claimed before the map and returned if it fails.
+    /// claim is a [`Reservation`](arena::Reservation) rather than a manual
+    /// release on the error arm, because this future may be *cancelled* at the
+    /// map — a `timeout` around a registration is an ordinary thing for a
+    /// caller to write — and no error arm runs then.
     async fn register(
         &self,
         ptr: usize,
@@ -248,14 +251,8 @@ impl RdmaRegistry {
             return Err(RdmaError::OutOfRange);
         }
         let _ticket = self.admit()?;
-        self.shared.budget.try_reserve(len as u64)?;
-        let mapped = match self.shared.backend.map(ptr, len).await {
-            Ok(mapped) => mapped,
-            Err(e) => {
-                self.shared.budget.release(len as u64);
-                return Err(e);
-            }
-        };
+        let reservation = self.shared.budget.try_reserve(len as u64)?;
+        let mapped = self.shared.backend.map(ptr, len).await?;
         let inner = Arc::new(RegionInner::new(RegionParts {
             id: self.shared.next_region_id.fetch_add(1, Ordering::Relaxed),
             generation: self.shared.generations.fetch_add(1, Ordering::Relaxed),
@@ -269,6 +266,9 @@ impl RdmaRegistry {
             shutdown: self.shared.shutdown_token.clone(),
         }));
         self.shared.regions.insert(inner.id, Arc::clone(&inner));
+        // Tracked now, so `forget_region` owns the matching release. It uses
+        // `inner.len`, which is the same `len` claimed above.
+        reservation.commit();
         if let Some(m) = &self.shared.metrics {
             m.record_rdma_registration(crate::observability::RdmaRegistrationKind::External);
         }

@@ -74,6 +74,15 @@ pub struct RdmaPoolConfig {
     /// Requests at or above this size get an arena of their own, sized to the
     /// request. Without it the float-bin round-up would cost up to 12.5% — 128
     /// MiB on a 1 GiB object.
+    ///
+    /// A dedicated arena is never offered to the general search, and this phase
+    /// reclaims no arenas, so *every* oversize request maps a new one and holds
+    /// it until shutdown — dropping the `PinnedBuf` does not give the arena
+    /// back. A workload that repeatedly stages at or above this size therefore
+    /// walks into [`registered_bytes_budget`](Self::registered_bytes_budget)
+    /// within a single session (16 allocations at the defaults) and falls back
+    /// to chunked from then on. Empty-arena reclamation is Phase 4; until then,
+    /// raise this threshold above the sizes a hot path actually stages.
     pub dedicated_arena_min: u64,
     /// Ceiling on *mapped* bytes across the pool and external regions together.
     ///
@@ -171,9 +180,18 @@ impl PageMemory {
         self.ptr as usize
     }
 
-    /// Record that the backend confirmed the unmap, so `Drop` may free.
+    /// Record that the pages are not (or no longer) pinned, so `Drop` may free.
+    ///
+    /// Two callers, both meaning the same thing: the backend confirmed an
+    /// unmap, or the map has not been issued yet and a cancellation between
+    /// here and its completion would leave nothing pinned.
     fn mark_unmapped(&self) {
         self.freeable.store(true, Ordering::Release);
+    }
+
+    /// Record that the backend now holds these pages, so `Drop` must leak them.
+    fn mark_pinned(&self) {
+        self.freeable.store(false, Ordering::Release);
     }
 }
 
@@ -382,7 +400,15 @@ impl Budget {
     /// A compare-exchange loop rather than "read, compare, add": two concurrent
     /// registrations that each read an under-budget total and then both added
     /// would overshoot the ceiling by construction.
-    pub(crate) fn try_reserve(&self, bytes: u64) -> Result<(), RdmaError> {
+    ///
+    /// Returns a [`Reservation`] that gives the bytes back unless it is
+    /// committed. The registration it belongs to has an `await` between the
+    /// claim and the commit, and that future may simply be dropped — a
+    /// `timeout` around a registration, a `select!` arm. A manual release on
+    /// the error path does not run then, and a budget that leaks on
+    /// cancellation eventually refuses every registration for the life of the
+    /// process while reporting nothing wrong.
+    pub(crate) fn try_reserve(self: &Arc<Self>, bytes: u64) -> Result<Reservation, RdmaError> {
         let mut current = self.registered.load(Ordering::Acquire);
         loop {
             let exceeded = || RdmaError::BudgetExceeded {
@@ -402,17 +428,33 @@ impl Budget {
             ) {
                 Ok(_) => {
                     self.publish(next);
-                    return Ok(());
+                    return Ok(Reservation {
+                        budget: Arc::clone(self),
+                        bytes,
+                        committed: false,
+                    });
                 }
                 Err(observed) => current = observed,
             }
         }
     }
 
-    /// Give `bytes` back after a confirmed unmap, or after a map that failed.
+    /// Give `bytes` back after a confirmed unmap.
+    ///
+    /// Saturating rather than a bare `fetch_sub`: an accounting mistake that
+    /// released more than it claimed would wrap the counter to near `u64::MAX`
+    /// and refuse every future registration permanently, while `publish`'s own
+    /// saturation showed a reassuring zero on the gauge. One defensive
+    /// `fetch_update` turns a silent permanent-failure class into an
+    /// over-credit that self-corrects.
     pub(crate) fn release(&self, bytes: u64) {
-        let prev = self.registered.fetch_sub(bytes, Ordering::AcqRel);
-        self.publish(prev.saturating_sub(bytes));
+        let next = self
+            .registered
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.saturating_sub(bytes))
+            })
+            .unwrap_or(0);
+        self.publish(next.saturating_sub(bytes));
     }
 
     /// Bytes currently registered.
@@ -423,6 +465,45 @@ impl Budget {
     fn publish(&self, bytes: u64) {
         if let Some(m) = &self.metrics {
             m.set_rdma_registered_bytes(bytes);
+        }
+    }
+}
+
+/// A claim on the registered-bytes budget that is given back unless committed.
+///
+/// The point is cancellation. A registration claims budget, then awaits the
+/// backend map; if that future is dropped mid-await, no error arm runs, and a
+/// manually-released design leaks the claim silently and permanently. A guard
+/// releases on the drop that cancellation actually performs.
+///
+/// [`commit`](Self::commit) is called only once the bytes are genuinely
+/// registered, after which the matching [`Budget::release`] belongs to the
+/// unmap.
+#[must_use = "an uncommitted Reservation releases its claim when dropped"]
+pub(crate) struct Reservation {
+    budget: Arc<Budget>,
+    bytes: u64,
+    committed: bool,
+}
+
+impl Reservation {
+    /// The bytes are registered: stop tracking them here, and leave the
+    /// matching release to the unmap.
+    pub(crate) fn commit(mut self) {
+        self.committed = true;
+    }
+
+    /// How many bytes this claim covers. The unmap must release exactly this
+    /// number, which is why callers round *before* reserving.
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.budget.release(self.bytes);
         }
     }
 }
@@ -529,32 +610,38 @@ impl ArenaSet {
 
     /// Allocate pages, register them, and build the arena around them.
     ///
-    /// The budget is claimed *before* the map and given back if the map fails,
-    /// so a concurrent registration cannot slip in against bytes this one is
-    /// about to consume.
+    /// The budget is claimed *before* the map, so a concurrent registration
+    /// cannot slip in against bytes this one is about to consume, and the claim
+    /// is a [`Reservation`] so a cancelled registration returns it.
+    ///
+    /// The rounding happens before the reservation, not inside `PageMemory`,
+    /// so the number claimed here is the same number [`unmap_all`](Self::unmap_all)
+    /// later releases. Reserving a caller-shaped length and releasing a
+    /// page-rounded one would under-release on every arena — and since the
+    /// counter is unsigned, the drift compounds until the pool refuses
+    /// everything.
     async fn map_arena(&self, bytes: u64, dedicated: bool) -> Result<Arc<Arena>, RdmaError> {
-        let len = usize::try_from(bytes).map_err(|_| RdmaError::OutOfRange)?;
-        self.budget.try_reserve(bytes)?;
+        let len = usize::try_from(bytes)
+            .ok()
+            .and_then(|len| len.checked_next_multiple_of(GRANULE))
+            .ok_or(RdmaError::OutOfRange)?;
+        let reservation = self.budget.try_reserve(len as u64)?;
 
-        let memory = match PageMemory::new(len) {
-            Ok(memory) => memory,
-            Err(e) => {
-                self.budget.release(bytes);
-                return Err(e);
-            }
-        };
+        let memory = PageMemory::new(len)?;
+        debug_assert_eq!(
+            memory.len as u64,
+            reservation.bytes(),
+            "the budget claim and the mapped length must be the same number"
+        );
         // A failed *or cancelled* map leaves nothing registered (the backend
-        // contract), so dropping `memory` on this path frees pages nobody has
-        // pinned — the one case where freeing is correct. Past this await the
-        // pages are registered and the leak-by-default in `PageMemory` takes
-        // over.
-        let region = match self.backend.map(memory.addr(), memory.len).await {
-            Ok(region) => region,
-            Err(e) => {
-                self.budget.release(bytes);
-                return Err(e);
-            }
-        };
+        // contract), so the pages here were never pinned and freeing them is
+        // correct — but `PageMemory` leaks by default, and cancellation drops it
+        // without running any arm of this match. So the flag is set for the
+        // cancellation case *before* the await and cleared once the map has
+        // actually succeeded, after which leak-by-default takes over for real.
+        memory.mark_unmapped();
+        let region = self.backend.map(memory.addr(), memory.len).await?;
+        memory.mark_pinned();
         let granules = u32::try_from(memory.len / GRANULE).map_err(|_| RdmaError::OutOfRange)?;
         let arena = Arc::new(Arena {
             backend_region_id: region.backend_region_id,
@@ -578,6 +665,9 @@ impl ArenaSet {
             generation = arena.generation,
             "rdma: mapped a new arena"
         );
+        // Registered and tracked: the matching release now belongs to
+        // `unmap_all`, and releases exactly the length claimed above.
+        reservation.commit();
         Ok(arena)
     }
 
