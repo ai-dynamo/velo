@@ -34,6 +34,8 @@
 //! stated here rather than implied.
 
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -87,6 +89,8 @@ pub(crate) struct RegionInner {
     pub(super) dereg_lock: tokio::sync::Mutex<()>,
     /// The buffer velo took ownership of, for `register_owned`.
     pub(super) owned: parking_lot::Mutex<Option<Box<[u8]>>>,
+    /// Bytes charged against the budget for this region.
+    charged: u64,
     /// Cancelled when the registry begins shutting down.
     pub(super) shutdown: CancellationToken,
 }
@@ -104,6 +108,8 @@ pub(super) struct RegionParts {
     pub effective_len: u64,
     /// `Some` only for `register_owned`, where velo holds the allocation.
     pub owned: Option<Box<[u8]>>,
+    /// Bytes charged against the budget — the backend page-enclosing range.
+    pub charged: u64,
     pub shutdown: CancellationToken,
 }
 
@@ -123,6 +129,7 @@ impl RegionInner {
             dereg_notify: Notify::new(),
             dereg_lock: tokio::sync::Mutex::new(()),
             owned: parking_lot::Mutex::new(parts.owned),
+            charged: parts.charged,
             shutdown: parts.shutdown,
         }
     }
@@ -142,6 +149,14 @@ impl RegionInner {
         self.dereg_notify.notify_waiters();
     }
 
+    /// Bytes charged against the registered-bytes budget for this region.
+    ///
+    /// The backend page-encloses the requested range, so this is generally
+    /// larger than `len`; releasing anything else would skew the budget.
+    pub(super) fn charged(&self) -> u64 {
+        self.charged
+    }
+
     /// Resolve once the registration is gone for good.
     ///
     /// The waiter is created *before* the flag is read. `notify_waiters` stores
@@ -157,6 +172,78 @@ impl RegionInner {
             }
             notified.await;
         }
+    }
+}
+
+/// How a deregistration ended.
+///
+/// Both variants mean the same load-bearing thing: **the unmap was confirmed
+/// and the memory is released**. They differ only in whether the in-flight
+/// drain finished first. That distinction used to ride on `Err(Timeout)`, which
+/// conflated "released, but we did not wait" with "not released" — and a caller
+/// reading the error as the latter would hold memory forever, or, for an owned
+/// buffer, never get it back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "a DrainTimedOut deregistration released the memory without waiting for in-flight work"]
+pub enum Deregistered {
+    /// Every in-flight operation finished, and then the unmap was confirmed.
+    Drained,
+    /// The unmap was confirmed and the memory is released, but in-flight
+    /// operations outlasted the budget and were not waited for. On RDMA
+    /// hardware a straggling remote transfer now fails at its own end; over
+    /// `UCX_TLS=tcp` it is silently lost. D8 documents this as the accepted
+    /// cost of bounding shutdown.
+    DrainTimedOut,
+}
+
+/// Buffers leaked by [`RegionInner::drop`] because the registration was never
+/// confirmed gone.
+///
+/// The leak is the *correct* behaviour, and it is invisible: a test cannot
+/// observe that a `Box` was not freed without reading freed memory, which is
+/// the very thing being prevented. So the decision is recorded instead, which
+/// makes "leaked rather than freed" an assertable fact rather than something
+/// only Miri or ASan could catch.
+#[cfg(test)]
+pub(crate) static LEAKED_BUFFERS: AtomicUsize = AtomicUsize::new(0);
+
+impl Drop for RegionInner {
+    /// Leak the owned buffer unless the registration is confirmed gone.
+    ///
+    /// Plain drop glue here would be a use-after-free with extra steps. Drop a
+    /// `Velo` without `graceful_shutdown` — a panic, a forgotten teardown, a
+    /// test that just lets it fall out of scope — and the registry map drops,
+    /// which drops these, which would hand the allocator back pages the NIC
+    /// still has pinned and a peer still holds a key for. The peer then reads,
+    /// or writes, freed heap.
+    ///
+    /// So the same discipline as `PageMemory`: leak unless the deregistration
+    /// was confirmed. A leak costs memory; the alternative corrupts it. The
+    /// gate also opens for free at the end of `Velo::graceful_shutdown`, where
+    /// `latch_all_deregistered` marks every survivor released once transport
+    /// teardown has force-unmapped everything — so an orderly shutdown frees
+    /// these buffers normally and only a genuinely abandoned runtime leaks.
+    fn drop(&mut self) {
+        let Some(buffer) = self.owned.get_mut().take() else {
+            return;
+        };
+        if self.is_deregistered() {
+            // Confirmed released: the ordinary drop is correct.
+            return;
+        }
+        let bytes = buffer.len();
+        let region = self.id;
+        // Deliberately never freed. `Box::leak` is the whole point.
+        let _ = Box::leak(buffer);
+        #[cfg(test)]
+        LEAKED_BUFFERS.fetch_add(1, Ordering::SeqCst);
+        tracing::error!(
+            region,
+            bytes,
+            "rdma: an owned registration was dropped without a confirmed deregistration; \
+             leaking its buffer rather than freeing memory the backend may still have \
+             pinned. The registry was torn down without `RdmaRegistry::shutdown`."
+        );
     }
 }
 
@@ -178,11 +265,15 @@ impl RegionInner {
 ///   says a submitted unmap proceeds regardless. The latch stays unset, the
 ///   region stays in the registry, and the shutdown sweep will ask again and
 ///   get the idempotent `Ok`.
+///
+/// `Ok` therefore always means "confirmed released", and the variant says
+/// whether the drain finished. `Err` always means "not confirmed" — the caller
+/// must keep the memory alive.
 pub(super) async fn deregister(
     shared: &Arc<RegistryShared>,
     inner: &Arc<RegionInner>,
     budget: Duration,
-) -> Result<(), RdmaError> {
+) -> Result<Deregistered, RdmaError> {
     let deadline = Instant::now() + budget;
     let remaining = |deadline: Instant| deadline.saturating_duration_since(Instant::now());
 
@@ -190,7 +281,7 @@ pub(super) async fn deregister(
         return Err(RdmaError::Timeout);
     };
     if inner.is_deregistered() {
-        return Ok(());
+        return Ok(Deregistered::Drained);
     }
 
     // Step 1 (gate): no new operation may join this region.
@@ -221,9 +312,9 @@ pub(super) async fn deregister(
             shared.forget_region(inner);
             inner.latch_deregistered();
             if drained {
-                Ok(())
+                Ok(Deregistered::Drained)
             } else {
-                Err(RdmaError::Timeout)
+                Ok(Deregistered::DrainTimedOut)
             }
         }
         Err(e) => Err(e),
@@ -239,6 +330,7 @@ pub(super) async fn deregister(
 ///
 /// Not `Clone`: exactly one value is responsible for ending the registration.
 /// For observation without responsibility, take a [`watch`](Self::watch).
+#[must_use = "the registration lasts as long as this guard; dropping it immediately starts a background deregistration"]
 pub struct RegionGuard {
     inner: Arc<RegionInner>,
     shared: Arc<RegistryShared>,
@@ -255,8 +347,13 @@ impl RegionGuard {
     }
 
     /// Length the caller asked to register.
-    pub fn len(&self) -> usize {
-        self.inner.len
+    ///
+    /// `u64` to match [`addr`](Self::addr) and
+    /// [`effective_range`](Self::effective_range): these three describe one
+    /// range, and a caller doing arithmetic across them should not have to cast
+    /// between widths in the middle of it.
+    pub fn len(&self) -> u64 {
+        self.inner.len as u64
     }
 
     /// Whether the registered range is empty. Never true: a zero-length
@@ -337,25 +434,39 @@ impl RegionGuard {
 
     /// Deregister the memory, waiting up to `timeout` for the whole sequence.
     ///
-    /// `Ok(())` is the only answer that means the memory is free to release.
-    /// [`RdmaError::Timeout`] can mean either "in-flight operations outlasted
-    /// the budget" or "the unmap was submitted but not confirmed in time"; the
-    /// first still latches [`deregistered`](Self::deregistered), the second
-    /// does not. Either way the caller may await `deregistered()` to find out.
-    pub async fn unregister(self, timeout: Duration) -> Result<(), RdmaError> {
+    /// `Ok` means the unmap was confirmed and the memory is free to release;
+    /// the [`Deregistered`] variant says whether in-flight work was waited for.
+    /// `Err` means the deregistration reached no conclusion — the memory may
+    /// still be pinned, and the caller must keep it alive until either a later
+    /// attempt confirms it or velo shutdown completes.
+    pub async fn unregister(self, timeout: Duration) -> Result<Deregistered, RdmaError> {
         deregister(&self.shared, &self.inner, timeout).await
     }
 
     /// Deregister and take back the buffer velo was holding.
     ///
-    /// Only meaningful for a guard from `register_owned`. On any error the
-    /// buffer stays with velo, because the pages may still be pinned — handing
-    /// a `Box` back that the caller could drop is exactly the free-while-mapped
-    /// hazard this layer exists to prevent.
-    pub async fn unregister_owned(self, timeout: Duration) -> Result<Box<[u8]>, RdmaError> {
-        deregister(&self.shared, &self.inner, timeout).await?;
+    /// Only meaningful for a guard from `register_owned`; a guard over
+    /// caller-owned memory answers [`RdmaError::NotOwned`].
+    ///
+    /// **A confirmed unmap always returns the buffer**, including when the
+    /// in-flight drain timed out — the memory is released either way, and the
+    /// [`Deregistered`] variant carries the distinction. Returning `Err` there
+    /// would have destroyed the buffer with the guard while telling the caller
+    /// velo had kept it.
+    ///
+    /// On `Err` the buffer stays with velo, because the pages may still be
+    /// pinned: handing back a `Box` the caller could drop is exactly the
+    /// free-while-mapped hazard this layer exists to prevent. It is not lost —
+    /// velo frees it once shutdown confirms the release.
+    pub async fn unregister_owned(
+        self,
+        timeout: Duration,
+    ) -> Result<(Box<[u8]>, Deregistered), RdmaError> {
+        let outcome = deregister(&self.shared, &self.inner, timeout).await?;
         let taken = self.inner.owned.lock().take();
-        taken.ok_or_else(|| RdmaError::Backend("region owns no buffer".into()))
+        taken
+            .map(|buffer| (buffer, outcome))
+            .ok_or(RdmaError::NotOwned)
     }
 }
 
@@ -453,5 +564,15 @@ impl RegionWatch {
     /// as the guard's.
     pub async fn deregistered(&self) {
         self.inner.wait_deregistered().await;
+    }
+
+    /// Close the latch directly, for the adversarial wakeup scan.
+    ///
+    /// The scan needs to fire the latch from a plain thread at a precise moment
+    /// relative to a waiter, which no production path offers — every real
+    /// latch is the tail of an async deregistration.
+    #[cfg(test)]
+    pub(crate) fn latch_for_test(&self) {
+        self.inner.latch_deregistered();
     }
 }

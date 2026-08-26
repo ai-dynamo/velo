@@ -29,6 +29,7 @@ use velo_ext::Transport;
 
 use super::arena::{ArenaSet, Budget, GRANULE, RdmaPoolConfig};
 use super::backend::{BackendGet, BackendRegion, RdmaBackend, RdmaError, UcxBackend};
+use super::region::Deregistered;
 use super::{RdmaConfig, RdmaRegistry};
 
 /// Generous ceiling for anything that should resolve promptly.
@@ -432,7 +433,14 @@ async fn region_unregister_latches_deregistered() {
 
     assert_eq!(backend.live(), 1);
     assert_eq!(registry.region_count(), 1);
-    assert_eq!(registry.registered_bytes(), 8192);
+    // The budget charges the page-enclosing range, not the requested length: a
+    // heap `Box` is byte-aligned, so 8192 bytes generally straddles three pages
+    // and that is what the kernel pins.
+    let charged = registry.registered_bytes();
+    assert!(
+        charged >= 8192 && charged % GRANULE as u64 == 0,
+        "expected a page-enclosing charge, got {charged}"
+    );
     assert!(
         !guard.is_deregistered(),
         "a live registration must not claim to be deregistered"
@@ -447,7 +455,10 @@ async fn region_unregister_latches_deregistered() {
         "deregistered() resolved while the memory was still registered"
     );
 
-    guard.unregister(T).await.expect("unregister");
+    assert_eq!(
+        guard.unregister(T).await.expect("unregister"),
+        Deregistered::Drained
+    );
 
     assert_eq!(backend.live(), 0);
     assert_eq!(registry.region_count(), 0);
@@ -476,6 +487,7 @@ async fn unconfirmed_unmap_does_not_latch() {
         .await
         .expect("register");
     let watch = guard.watch();
+    let charged = registry.registered_bytes();
 
     backend.refuse_unmap.store(true, Ordering::SeqCst);
     let err = guard
@@ -495,7 +507,7 @@ async fn unconfirmed_unmap_does_not_latch() {
     );
     assert_eq!(
         registry.registered_bytes(),
-        4096,
+        charged,
         "the budget was credited back for memory that may still be pinned"
     );
 
@@ -590,11 +602,16 @@ async fn unregister_waits_for_in_flight() {
 
     drop(lease);
 
-    tokio::time::timeout(T, unregistering)
+    let outcome = tokio::time::timeout(T, unregistering)
         .await
         .expect("unregister must resolve once the last in-flight guard is released")
         .expect("task panicked")
         .expect("unregister");
+    assert_eq!(
+        outcome,
+        Deregistered::Drained,
+        "the drain completed, so this is not a timed-out deregistration"
+    );
     assert!(watch.is_deregistered());
     assert_eq!(backend.live(), 0);
 }
@@ -616,11 +633,15 @@ async fn unregister_timeout_still_unmaps() {
     // Never released: this stands in for a lease whose holder has gone away.
     let _stuck = guard.in_flight().acquire();
 
-    let err = guard
+    let outcome = guard
         .unregister(Duration::from_millis(100))
         .await
-        .expect_err("a drain that cannot complete must report Timeout");
-    assert_eq!(err, RdmaError::Timeout);
+        .expect("a confirmed unmap is Ok even when the drain was cut short");
+    assert_eq!(
+        outcome,
+        Deregistered::DrainTimedOut,
+        "the caller must be able to tell that in-flight work was not waited for"
+    );
 
     assert!(
         watch.is_deregistered(),
@@ -670,7 +691,8 @@ async fn register_owned_returns_the_buffer() {
     let guard = registry.register_owned(buf).await.expect("register");
     assert_eq!(guard.len(), 4096);
 
-    let returned = guard.unregister_owned(T).await.expect("unregister_owned");
+    let (returned, outcome) = guard.unregister_owned(T).await.expect("unregister_owned");
+    assert_eq!(outcome, Deregistered::Drained);
     assert_eq!(returned.len(), 4096);
     assert_eq!(
         returned[0], 0x5A,
@@ -709,7 +731,10 @@ async fn register_external_memory_smoke() {
         "every registration gets a generation"
     );
 
-    guard.unregister(T).await.expect("unregister");
+    assert_eq!(
+        guard.unregister(T).await.expect("unregister"),
+        Deregistered::Drained
+    );
     assert_eq!(backend.live(), 0);
 }
 
@@ -780,10 +805,16 @@ async fn shutdown_gates_new_registrations() {
     let (_backend, registry) = mock_registry(RdmaConfig::default());
     registry.shutdown(T).await;
 
-    let owned = registry
+    let refused = registry
         .register_owned(vec![0u8; 4096].into_boxed_slice())
-        .await;
-    assert_eq!(owned.err(), Some(RdmaError::ShuttingDown));
+        .await
+        .expect_err("a gated registry must refuse");
+    assert_eq!(refused.cause, RdmaError::ShuttingDown);
+    assert_eq!(
+        refused.buffer.map(|b| b.len()),
+        Some(4096),
+        "a refused registration must hand the caller buffer back"
+    );
     assert_eq!(
         registry.alloc_pinned(4096).await.err(),
         Some(RdmaError::ShuttingDown),
@@ -851,10 +882,11 @@ async fn registration_in_flight_is_not_missed_by_shutdown() {
                 "a registration admitted before the gate closed was missed by the sweep"
             );
         }
-        Err(RdmaError::ShuttingDown) => {
+        Err(e) if e.cause == RdmaError::ShuttingDown => {
             // It was refused at the gate, which is equally correct.
+            assert!(e.buffer.is_some(), "a refusal must return the buffer");
         }
-        Err(e) => panic!("unexpected registration failure: {e}"),
+        Err(e) => panic!("unexpected registration failure: {}", e.cause),
     }
     assert_eq!(
         backend.live(),
@@ -924,7 +956,7 @@ impl UcxHarness {
 
 /// The backend really registers with UCX, and really releases it.
 ///
-/// Asserted through the progress thread own `live_regions`, so a registration
+/// Asserted through the progress thread's own `live_regions`, so a registration
 /// the registry has forgotten but UCX still holds cannot pass.
 #[tokio::test(flavor = "multi_thread")]
 async fn ucx_backend_maps_and_unmaps() {
@@ -950,7 +982,10 @@ async fn ucx_backend_maps_and_unmaps() {
         "ucx reported an effective range that does not cover the request"
     );
 
-    guard.unregister(T).await.expect("unregister");
+    assert_eq!(
+        guard.unregister(T).await.expect("unregister"),
+        Deregistered::Drained
+    );
     assert_eq!(harness.live_regions(), 0, "ucx still holds the region");
     assert_eq!(harness.registry.registered_bytes(), 0);
     harness.transport.shutdown();
@@ -988,7 +1023,7 @@ async fn ucx_pool_arena_is_one_registration() {
 /// The load-bearing claim is not "the memory is eventually released" but
 /// "it is released *before* graceful_shutdown returns, and before the transport
 /// is torn down". So the assertion is taken at the moment shutdown returns,
-/// against the progress thread own region count — the one number that cannot be
+/// against the progress thread's own region count — the one number that cannot be
 /// satisfied by bookkeeping in the layer under test. If the registry sweep ran
 /// after transport teardown, or not at all, `live_regions` would be non-zero
 /// here or the unmap would have been a forced one from teardown rather than an
@@ -1013,7 +1048,10 @@ async fn velo_graceful_shutdown_deregisters_before_transport_teardown() {
         .expect("register through the velo facade");
     let watch = guard.watch();
     assert_eq!(transport.live_regions(), 1);
-    assert_eq!(velo.rdma_registered_bytes(), 128 * 1024);
+    assert!(
+        velo.rdma_registered_bytes() >= 128 * 1024,
+        "the budget must charge at least the requested length"
+    );
 
     velo.graceful_shutdown(velo_ext::ShutdownPolicy::Timeout(T))
         .await;
@@ -1086,9 +1124,14 @@ async fn velo_without_ucx_transport_refuses_registration() {
         .register_owned(vec![0u8; 4096].into_boxed_slice())
         .await
         .expect_err("registration must be refused without a ucx transport");
+    assert_eq!(
+        err.cause,
+        RdmaError::NotConfigured,
+        "a missing backend is a permanent configuration fact, not a retryable backend error"
+    );
     assert!(
-        matches!(err, RdmaError::Backend(ref why) if why.contains("add_ucx_transport")),
-        "the refusal must name the fix: {err}"
+        err.buffer.is_some(),
+        "the caller buffer must come back from a refusal"
     );
     assert_eq!(velo.rdma_registered_bytes(), 0);
 
@@ -1136,7 +1179,10 @@ async fn cancelled_registration_returns_its_budget() {
         .register_owned(vec![0u8; 64 * 1024].into_boxed_slice())
         .await
         .expect("a registration after cancellations must still be admitted");
-    guard.unregister(T).await.expect("unregister");
+    assert_eq!(
+        guard.unregister(T).await.expect("unregister"),
+        Deregistered::Drained
+    );
     assert_eq!(registry.registered_bytes(), 0);
 }
 
@@ -1222,4 +1268,347 @@ async fn unaligned_arena_sizes_balance_the_budget() {
         0,
         "reserve and release disagreed on the length; the budget is now permanently skewed"
     );
+}
+
+/// The budget ceiling holds under concurrent pressure.
+///
+/// The CAS loop in `try_reserve` is the only thing standing between N tasks
+/// each reading an under-budget total and each concluding it has room. A plain
+/// "read, compare, add" passes every sequential test in this file.
+///
+/// The assertion is on **how many registrations were admitted**, not on the
+/// counter. A lost update makes the counter under-report, so a bare
+/// "counter stays under the ceiling" check passes with the bug in place — the
+/// counter is exactly the thing the bug corrupts. What cannot be faked is the
+/// number of registrations simultaneously alive: every admitted registration
+/// pins at least its requested length, so admitting more than the ceiling
+/// allows means the ceiling did not hold, whatever the counter says.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_registration_never_overshoots_the_budget() {
+    const TASKS: usize = 24;
+    const ROUNDS: usize = 8;
+    const CHUNK: usize = 16 * GRANULE;
+    /// Room for eight concurrent registrations, so tasks genuinely race at the
+    /// ceiling rather than all fitting or all being refused.
+    const BUDGET: u64 = (8 * 16 * GRANULE) as u64;
+
+    let cfg = RdmaConfig {
+        pool: RdmaPoolConfig {
+            registered_bytes_budget: BUDGET,
+            ..small_pool_config()
+        },
+        ..RdmaConfig::default()
+    };
+    let (_backend, registry) = mock_registry(cfg);
+    let admitted = Arc::new(parking_lot::Mutex::new(Vec::new()));
+
+    let mut tasks = Vec::new();
+    for _ in 0..TASKS {
+        let registry = Arc::clone(&registry);
+        let admitted = Arc::clone(&admitted);
+        tasks.push(tokio::spawn(async move {
+            for _ in 0..ROUNDS {
+                // Guards are kept, never released, so the peak is the total.
+                if let Ok(guard) = registry
+                    .register_owned(vec![0u8; CHUNK].into_boxed_slice())
+                    .await
+                {
+                    admitted.lock().push(guard);
+                }
+                tokio::task::yield_now().await;
+            }
+        }));
+    }
+    for task in tasks {
+        task.await.expect("task panicked");
+    }
+
+    let live = admitted.lock().len();
+    assert!(
+        live > 0,
+        "nothing was admitted at all; the test proves nothing"
+    );
+    assert!(
+        (live * CHUNK) as u64 <= BUDGET,
+        "{live} concurrent registrations of {CHUNK} B were admitted against a {BUDGET} B \
+         budget: the ceiling did not hold under concurrency"
+    );
+
+    admitted.lock().clear();
+    registry.shutdown(T).await;
+    assert_eq!(registry.registered_bytes(), 0, "the budget did not balance");
+}
+
+/// An unaligned, non-granule external registration charges the enclosing pages.
+///
+/// The budget exists to be the `RLIMIT_MEMLOCK` valve, so it has to count what
+/// the kernel pins. A 4097-byte buffer at an arbitrary heap address spans three
+/// pages; charging its requested length would undercount by most of a factor of
+/// two, and the ceiling would let through roughly twice the memory the operator
+/// asked it to allow.
+#[tokio::test]
+async fn external_registration_charges_page_enclosing_bytes() {
+    let (_backend, registry) = mock_registry(RdmaConfig::default());
+
+    // Deliberately odd, and deliberately from the heap so it is not page-aligned.
+    let leaked: &'static mut [u8] = Box::leak(vec![0u8; 4097].into_boxed_slice());
+    let ptr = std::ptr::NonNull::new(leaked.as_mut_ptr()).expect("non-null");
+
+    // SAFETY: a leaked allocation is never freed, so it outlives the
+    // registration unconditionally.
+    let guard = unsafe { registry.register_external(ptr, leaked.len()) }
+        .await
+        .expect("register");
+
+    let charged = registry.registered_bytes();
+    assert!(
+        charged >= 4097,
+        "the charge must cover at least the requested range: {charged}"
+    );
+    assert_eq!(
+        charged % GRANULE as u64,
+        0,
+        "the charge must be a whole number of pages: {charged}"
+    );
+
+    assert_eq!(
+        guard.unregister(T).await.expect("unregister"),
+        Deregistered::Drained
+    );
+    assert_eq!(
+        registry.registered_bytes(),
+        0,
+        "reserve and release disagreed; the budget is now permanently skewed"
+    );
+}
+
+/// `deregistered()` resolves at the end of velo shutdown even when the unmap
+/// itself was never confirmed.
+///
+/// This is what makes the future a signal a caller can actually wait on. A
+/// backend that answers `ShuttingDown` — a transport already going down, a
+/// wedged progress thread — leaves the sweep unable to latch honestly; but by
+/// the time `graceful_shutdown` returns, transport teardown has force-unmapped
+/// everything, so the region really is released. Without the final latch the
+/// future would stay pending forever and a caller waiting on it before freeing
+/// would wait for the life of the process.
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_latches_regions_whose_unmap_was_never_confirmed() {
+    let (backend, registry) = mock_registry(RdmaConfig::default());
+    let guard = registry
+        .register_owned(vec![0u8; 8192].into_boxed_slice())
+        .await
+        .expect("register");
+    let watch = guard.watch();
+
+    // The sweep will not be able to confirm anything.
+    backend.refuse_unmap.store(true, Ordering::SeqCst);
+    registry.shutdown(Duration::from_millis(200)).await;
+    assert!(
+        !watch.is_deregistered(),
+        "an unconfirmed unmap must not latch during the sweep; that is the point of the sweep \
+         being honest about what it knows"
+    );
+
+    // Standing in for the transport teardown that force-unmaps everything.
+    registry.latch_all_deregistered();
+
+    assert!(
+        watch.is_deregistered(),
+        "the end of velo shutdown must resolve every surviving latch"
+    );
+    tokio::time::timeout(T, watch.deregistered())
+        .await
+        .expect("deregistered() must resolve once shutdown has completed");
+    assert_eq!(
+        registry.registered_bytes(),
+        0,
+        "regions released at the end of shutdown must give their budget back"
+    );
+    drop(guard);
+}
+
+/// The owned buffer survives a runtime abandoned without `shutdown`.
+///
+/// Plain drop glue on `RegionInner` would free the `Box` here while the backend
+/// still had the pages mapped, and a peer holding the key then reads or writes
+/// freed heap. The leak is the correct outcome.
+///
+/// Reproducing it faithfully needs the *last* `Arc<RegionInner>` to go while
+/// the registration is unconfirmed. Dropping the guard spawns a background
+/// deregistration that holds one, so the scenario is a runtime that dies before
+/// that task ever runs — a panicking process, a `Runtime` dropped out from
+/// under its tasks. Dropping the runtime cancels the task, releases the last
+/// reference, and runs the destructor under test.
+///
+/// The assertion is on the recorded decision rather than on the memory: proving
+/// a `Box` was not freed by reading it is the very use-after-free being
+/// prevented, so only Miri or ASan could see it directly.
+#[test]
+fn abandoned_runtime_leaks_owned_buffers_rather_than_freeing_them() {
+    let before = super::region::LEAKED_BUFFERS.load(Ordering::SeqCst);
+    let backend = MockBackend::new();
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on({
+        let backend = Arc::clone(&backend);
+        async move {
+            let registry = Arc::new(RdmaRegistry::new(
+                backend as Arc<dyn RdmaBackend>,
+                RdmaConfig::default(),
+                tokio::runtime::Handle::current(),
+                None,
+            ));
+            let guard = registry
+                .register_owned(vec![0xC5u8; 8192].into_boxed_slice())
+                .await
+                .expect("register");
+            // The background deregistration is spawned and never polled.
+            drop(guard);
+            drop(registry);
+        }
+    });
+    // Cancels the pending deregistration, releasing the last reference.
+    drop(runtime);
+
+    assert_eq!(
+        backend.unmap_calls(),
+        0,
+        "the deregistration was supposed to never run; the scenario is not what it claims"
+    );
+    assert_eq!(
+        backend.live(),
+        1,
+        "the backend still holds the registration, so the pages are still pinned"
+    );
+    assert!(
+        super::region::LEAKED_BUFFERS.load(Ordering::SeqCst) > before,
+        "the owned buffer was freed while its pages were still pinned"
+    );
+}
+
+/// `wait_deregistered` must not lose the wakeup when the latch closes while it
+/// is between reading the flag and parking.
+///
+/// `notify_waiters()` stores no permit, so a `Notified` created *after* the
+/// latch never hears it — the future would hang forever on a region that is
+/// already released, and a caller waiting before freeing would wait for the
+/// life of the process. The fix is to create the future before reading the
+/// flag; this scans the window rather than hoping to hit it, mirroring
+/// `velo_ext`'s `wait_for_drain_survives_guard_dropped_at_the_check`, whose
+/// discipline the implementation cites.
+///
+/// A lost wakeup is permanent, so the per-iteration bound is short and the
+/// first hit fails. It is a detector, not a deadline: a runner that fails to
+/// schedule the latcher inside it looks identical from here, so the latcher is
+/// joined — making the latch a fact — and the wait re-awaited under a generous
+/// grace window, which costs no detection power.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wait_deregistered_survives_a_latch_at_the_check() {
+    const ITERATIONS: usize = 4096;
+    const SPIN_SWEEP: usize = 512;
+    const WAITER_LEAD: usize = 600;
+    const GRACE: Duration = Duration::from_secs(2);
+
+    // `black_box` keeps LLVM from folding the busy-wait away and deleting the
+    // delay the scan depends on.
+    fn burn(rounds: usize) {
+        let mut sink = 0usize;
+        for k in 0..rounds {
+            sink = std::hint::black_box(sink.wrapping_add(k));
+        }
+    }
+
+    let (_backend, registry) = mock_registry(RdmaConfig::default());
+
+    for iteration in 0..ITERATIONS {
+        let guard = registry
+            .register_owned(vec![0u8; GRANULE].into_boxed_slice())
+            .await
+            .expect("register");
+        let watch = guard.watch();
+        let inner = guard.watch();
+
+        let armed = Arc::new(AtomicBool::new(false));
+        let spins = iteration % SPIN_SWEEP;
+
+        let latcher_armed = Arc::clone(&armed);
+        let latcher = std::thread::spawn(move || {
+            while !latcher_armed.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
+            burn(spins);
+            inner.latch_for_test();
+        });
+
+        let mut waiter = tokio::spawn(async move {
+            armed.store(true, Ordering::Release);
+            burn(WAITER_LEAD);
+            watch.deregistered().await;
+        });
+
+        let finished = tokio::time::timeout(Duration::from_millis(200), &mut waiter).await;
+        latcher.join().expect("latcher thread panicked");
+        let joined = match finished {
+            Ok(joined) => joined,
+            Err(_) => tokio::time::timeout(GRACE, &mut waiter)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "wait_deregistered lost the latch wakeup (iteration {iteration}, \
+                         spins {spins})"
+                    )
+                }),
+        };
+        joined.expect("waiter task panicked");
+        std::mem::forget(guard);
+    }
+    registry.shutdown(T).await;
+}
+
+/// A dedicated arena is not reused after its buffer is dropped.
+///
+/// The other direction of `pool_dedicates_an_arena_to_oversize_requests`: not
+/// only is a dedicated arena kept out of the general search, it is also not
+/// recycled for the next oversize request. That is Phase 4 work, and pinning it
+/// here means the behaviour change lands as a failing test rather than as a
+/// silent improvement nobody notices — and documents why
+/// `dedicated_arena_min` carries the warning it does.
+#[tokio::test]
+async fn dedicated_arenas_are_not_reused() {
+    let cfg = small_pool_config();
+    let (backend, pool) = mock_pool(cfg.clone());
+    let size = cfg.dedicated_arena_min as usize;
+
+    let first = pool.alloc(size).await.expect("first oversize");
+    assert_eq!(pool.arena_count(), 1);
+    let first_arena = backend.live();
+    drop(first);
+    assert_eq!(
+        pool.live_allocations(),
+        0,
+        "the suballocation was returned to its arena"
+    );
+    assert_eq!(
+        backend.live(),
+        first_arena,
+        "dropping a PinnedBuf must never unmap its arena"
+    );
+
+    let second = pool.alloc(size).await.expect("second oversize");
+    assert_eq!(
+        pool.arena_count(),
+        2,
+        "the freed dedicated arena was reused; Phase 4 reclamation has landed and \
+         `dedicated_arena_min` docs need updating"
+    );
+    assert_eq!(
+        backend.live(),
+        2,
+        "each oversize request maps its own arena"
+    );
+    drop(second);
 }

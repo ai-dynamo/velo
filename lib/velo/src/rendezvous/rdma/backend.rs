@@ -98,8 +98,26 @@ pub enum RdmaError {
     /// The backend failed. The string names which backend-level condition it
     /// was, so a mis-ordered construction (an endpoint used before its
     /// transport started, say) is diagnosable from the message alone.
+    ///
+    /// Transient or environmental by nature — a caller may reasonably retry.
+    /// Conditions a retry can never fix have their own variants below, so that
+    /// a retry loop written against this one cannot spin forever on a
+    /// configuration mistake.
     #[error("rdma backend: {0}")]
     Backend(String),
+
+    /// This instance has no RDMA backend: the UCX transport was never installed
+    /// through `VeloBuilder::add_ucx_transport`.
+    ///
+    /// A deployment fact, not a failure. Retrying cannot change it, and a
+    /// caller with a chunked fallback should take it permanently.
+    #[error("no rdma backend configured for this instance")]
+    NotConfigured,
+
+    /// The region was registered from a caller-owned pointer, so velo has no
+    /// buffer to hand back. Retrying cannot change it either.
+    #[error("region owns no buffer")]
+    NotOwned,
 
     /// The operation did not finish inside the caller's budget.
     #[error("rdma operation timed out")]

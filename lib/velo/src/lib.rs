@@ -68,7 +68,8 @@ pub use crate::rendezvous::{
 // public face of a subsystem that only exists when a UCX transport can back it.
 #[cfg(all(target_os = "linux", feature = "ucx"))]
 pub use crate::rendezvous::rdma::{
-    RdmaConfig, RdmaError, RdmaPoolConfig, RegionGuard, RegionWatch,
+    Deregistered, RdmaConfig, RdmaError, RdmaPoolConfig, RegionGuard, RegionWatch,
+    RegisterOwnedError,
 };
 
 // Observability
@@ -498,40 +499,73 @@ impl Velo {
     /// Streaming-plane teardown (anchors, stream transports) is separate and
     /// not covered by this call.
     ///
-    /// # RDMA registrations go first
+    /// # RDMA registrations go first, and are declared released last
     ///
-    /// When an RDMA registration layer is installed, its own gate-drain-
-    /// deregister sequence (D8 steps 1 to 3) runs *before* messenger teardown,
-    /// sandwiched inside the inbound gate:
+    /// When an RDMA registration layer is installed, shutdown becomes four
+    /// steps rather than three:
     ///
     /// 1. [`begin_drain`](Self::begin_drain) — idempotent, and repeated by the
     ///    messenger shutdown below. Closing the inbound gate first means no new
     ///    request can ask for an RDMA transfer while registrations are being
     ///    torn down.
-    /// 2. The registry sweep: registrations refused, in-flight transfers
-    ///    drained, every region and arena unmapped.
+    /// 2. The registry sweep (D8 steps 1 to 3): registrations refused,
+    ///    in-flight transfers drained, every region and arena unmapped.
     /// 3. Messenger gate, drain and teardown, unchanged.
+    /// 4. Every registration that survived step 2 is declared released.
     ///
-    /// The order is load-bearing, not tidiness. An RDMA GET is issued by the
+    /// Step 1 to 2 is load-bearing, not tidiness. An RDMA GET is issued by the
     /// *peer's* NIC, so it never appears in this instance's in-flight counts;
     /// tearing the transport down first and unmapping afterwards would
     /// deregister memory a peer is still reading.
     ///
-    /// The registry sweep is bounded by the policy's own deadline when it has
-    /// one, and by [`RdmaConfig::shutdown_timeout`] under
-    /// [`ShutdownPolicy::WaitForever`] — a peer that has crashed mid-transfer
-    /// must not wedge shutdown forever.
+    /// Step 4 is what makes [`RegionGuard::deregistered`] a signal worth
+    /// waiting on. A region whose unmap could not be confirmed in step 2 — a
+    /// wedged backend, a transport already going down — is nonetheless
+    /// genuinely unmapped once step 3 returns, because transport teardown
+    /// force-unmaps everything the progress thread still holds. Without step 4
+    /// those latches would stay pending forever and a caller waiting on one
+    /// would hold its memory for the life of the process.
+    ///
+    /// # One deadline, not one per phase
+    ///
+    /// [`ShutdownPolicy::Timeout`] names a bound on *this call*, so the sweep
+    /// and the messenger phase share it rather than each taking the full
+    /// duration — which would make the worst case twice what was asked for.
+    /// Under [`ShutdownPolicy::WaitForever`] the sweep still takes
+    /// [`RdmaConfig::shutdown_timeout`], because a peer that crashed
+    /// mid-transfer must not wedge shutdown forever even when the caller is
+    /// willing to wait on local work.
     pub async fn graceful_shutdown(&self, policy: ShutdownPolicy) {
+        // Shadowed with what is left of the caller budget after the sweep, so
+        // the two phases share one deadline instead of taking one each.
+        #[cfg(all(target_os = "linux", feature = "ucx"))]
+        let policy = {
+            let started = std::time::Instant::now();
+            if let Some(rdma) = &self.rdma {
+                self.begin_drain();
+                let budget = match &policy {
+                    ShutdownPolicy::Timeout(deadline) => *deadline,
+                    ShutdownPolicy::WaitForever => rdma.shutdown_timeout(),
+                };
+                rdma.shutdown(budget).await;
+            }
+            match &policy {
+                ShutdownPolicy::Timeout(deadline) => {
+                    ShutdownPolicy::Timeout(deadline.saturating_sub(started.elapsed()))
+                }
+                ShutdownPolicy::WaitForever => ShutdownPolicy::WaitForever,
+            }
+        };
+
+        self.messenger.graceful_shutdown(policy).await;
+
+        // Teardown has returned, so the progress thread has force-unmapped
+        // everything it still held: nothing is pinned any more, and every latch
+        // the sweep could not resolve honestly can be resolved now.
         #[cfg(all(target_os = "linux", feature = "ucx"))]
         if let Some(rdma) = &self.rdma {
-            self.begin_drain();
-            let budget = match &policy {
-                ShutdownPolicy::Timeout(deadline) => *deadline,
-                ShutdownPolicy::WaitForever => rdma.shutdown_timeout(),
-            };
-            rdma.shutdown(budget).await;
+            rdma.latch_all_deregistered();
         }
-        self.messenger.graceful_shutdown(policy).await;
     }
 
     /// Get the instance ID of this system.
@@ -897,30 +931,46 @@ impl Velo {
     /// Register memory this instance does not own for RDMA access.
     ///
     /// Returns a [`RegionGuard`] the caller must keep. See its documentation
-    /// for the lifecycle; the short version is that the guard, not the call,
-    /// is what holds the registration open.
+    /// for the lifecycle; the short version is that the guard, not the call, is
+    /// what holds the registration open.
     ///
     /// # Errors
     ///
-    /// [`RdmaError::Backend`] if no UCX transport was installed through
+    /// [`RdmaError::NotConfigured`] if no UCX transport was installed through
     /// [`VeloBuilder::add_ucx_transport`], [`RdmaError::ShuttingDown`] once
     /// shutdown has begun, [`RdmaError::BudgetExceeded`] over the configured
-    /// registered-bytes ceiling, [`RdmaError::OutOfRange`] for a null pointer
-    /// or a zero length.
+    /// registered-bytes ceiling, [`RdmaError::OutOfRange`] for a null pointer,
+    /// a zero length, or a range that wraps.
     ///
     /// # Safety
     ///
-    /// `ptr` must point to at least `len` initialised, readable bytes, and the
-    /// caller must keep that allocation alive, un-freed and un-remapped, until
-    /// either [`RegionGuard::deregistered`] resolves or this instance has
-    /// finished [`graceful_shutdown`](Self::graceful_shutdown). Dropping the
-    /// guard does **not** end the registration promptly — it starts a
-    /// background deregistration and returns.
+    /// The registration lasts until [`RegionGuard::deregistered`] resolves —
+    /// which happens on a confirmed unmap, or at the end of
+    /// [`graceful_shutdown`](Self::graceful_shutdown), whichever comes first.
+    /// It does **not** end when the guard is dropped, and it does not end when
+    /// an `unregister` returns `Err`. For that whole time, all of the following
+    /// must hold.
     ///
-    /// Registered memory is remotely *writable* by any holder of its key, not
-    /// merely readable: UCP carries no enforceable protection field, so the
-    /// read-only shape of the rendezvous protocol above is a convention, not a
-    /// guarantee. Registering is a trust decision about this instance peers.
+    /// * `ptr` is valid for **both reads and writes** of `len` bytes. Read
+    ///   validity is not enough: registering a range for RMA makes it remotely
+    ///   writable by any holder of its key, because UCP carries no enforceable
+    ///   protection field and the GET-only shape of the rendezvous protocol is
+    ///   a convention rather than an enforcement. Registering a read-only
+    ///   mapping is undefined behaviour even though velo never writes to it.
+    /// * `ptr + len` does not wrap the address space.
+    /// * The allocation is not freed, moved, remapped, or reallocated —
+    ///   `realloc` included, whether or not it grows in place.
+    /// * **No Rust reference into the range exists**: not `&[u8]`, not
+    ///   `&mut [u8]`, not a reference to anything stored inside it. A peer may
+    ///   write at any moment, which contradicts what a shared reference
+    ///   promises and what a mutable one claims exclusively. Use raw pointers.
+    ///
+    /// Registration pins whole pages, so bytes adjacent to the allocation share
+    /// its pinning *and its remote writability*;
+    /// [`RegionGuard::effective_range`] reports what was actually pinned.
+    ///
+    /// Registering is therefore a trust decision about the peers this instance
+    /// talks to, not merely a performance one.
     #[cfg(all(target_os = "linux", feature = "ucx"))]
     pub async unsafe fn register_external_memory(
         &self,
@@ -928,8 +978,8 @@ impl Velo {
         len: usize,
     ) -> Result<RegionGuard, RdmaError> {
         let rdma = self.rdma_registry()?;
-        // SAFETY: forwarded verbatim; this method's own contract is the
-        // registry's contract, and nothing in between touches the memory.
+        // SAFETY: forwarded verbatim. This method's contract is the registry's
+        // contract, and nothing in between touches the memory.
         unsafe { rdma.register_external(ptr, len) }.await
     }
 
@@ -937,16 +987,30 @@ impl Velo {
     ///
     /// The safe counterpart to
     /// [`register_external_memory`](Self::register_external_memory): velo holds
-    /// the allocation until a deregistration is confirmed, so there is no way
-    /// for the caller to free it early. Recover it with
-    /// [`RegionGuard::unregister_owned`], or let it drop with the region.
+    /// the allocation until a deregistration is confirmed, so the caller cannot
+    /// free it early. Recover it with [`RegionGuard::unregister_owned`], or let
+    /// it drop with the region.
     ///
-    /// Note that a `Box<[u8]>` is byte-aligned, while registration pins whole
-    /// pages: neighbouring heap shares the pinning. That is not unsound, but
-    /// [`RegionGuard::effective_range`] is how to see it.
+    /// On failure the buffer comes back inside the error.
+    /// [`RdmaError::BudgetExceeded`] is a routine refusal that a caller answers
+    /// by staging chunked, and an error that consumed the allocation would make
+    /// that fallback cost more than the path it falls back from.
+    ///
+    /// Note that a `Box<[u8]>` is byte-aligned while registration pins whole
+    /// pages, so neighbouring heap shares the pinning — and with it the remote
+    /// writability. [`RegionGuard::effective_range`] is how to see it.
     #[cfg(all(target_os = "linux", feature = "ucx"))]
-    pub async fn register_owned(&self, buf: Box<[u8]>) -> Result<RegionGuard, RdmaError> {
-        self.rdma_registry()?.register_owned(buf).await
+    pub async fn register_owned(
+        &self,
+        buf: Box<[u8]>,
+    ) -> Result<RegionGuard, crate::rendezvous::rdma::RegisterOwnedError> {
+        let Some(rdma) = self.rdma.as_ref() else {
+            return Err(crate::rendezvous::rdma::RegisterOwnedError {
+                buffer: Some(buf),
+                cause: RdmaError::NotConfigured,
+            });
+        };
+        rdma.register_owned(buf).await
     }
 
     /// Bytes currently registered for RDMA, pool and external together.
@@ -963,11 +1027,7 @@ impl Velo {
     pub(crate) fn rdma_registry(
         &self,
     ) -> Result<&Arc<crate::rendezvous::rdma::RdmaRegistry>, RdmaError> {
-        self.rdma.as_ref().ok_or_else(|| {
-            RdmaError::Backend(
-                "no ucx transport installed; use VeloBuilder::add_ucx_transport".into(),
-            )
-        })
+        self.rdma.as_ref().ok_or(RdmaError::NotConfigured)
     }
 }
 

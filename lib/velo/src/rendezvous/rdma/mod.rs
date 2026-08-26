@@ -60,7 +60,7 @@ use crate::observability::VeloMetrics;
 
 pub use arena::RdmaPoolConfig;
 pub use backend::RdmaError;
-pub use region::{RegionGuard, RegionWatch};
+pub use region::{Deregistered, RegionGuard, RegionWatch};
 
 pub(crate) use arena::{ArenaSet, Budget, PinnedBuf};
 pub(crate) use backend::{BackendGet, RdmaBackend, UcxBackend};
@@ -86,6 +86,53 @@ impl Default for RdmaConfig {
             shutdown_timeout: Duration::from_secs(30),
             drop_dereg_timeout: Duration::from_secs(30),
         }
+    }
+}
+
+/// A [`register_owned`](RdmaRegistry::register_owned) that failed, with the
+/// buffer handed back.
+///
+/// The buffer is the point. `BudgetExceeded` is a *routine* refusal — the
+/// documented signal to stage chunked instead — and an error that swallowed the
+/// allocation on the way would make the fallback path more expensive than the
+/// fast one it falls back from.
+///
+/// `buffer` is `Option` because the same machinery serves the caller-owned
+/// registration path, where there was never a buffer to return.
+pub struct RegisterOwnedError {
+    /// The buffer velo did not take. `None` for a caller-owned registration.
+    pub buffer: Option<Box<[u8]>>,
+    /// Why the registration was refused.
+    pub cause: RdmaError,
+}
+
+impl RegisterOwnedError {
+    /// Split into the buffer and the reason.
+    pub fn into_parts(self) -> (Option<Box<[u8]>>, RdmaError) {
+        (self.buffer, self.cause)
+    }
+}
+
+impl std::fmt::Debug for RegisterOwnedError {
+    /// Prints the buffer length, never its contents: these are routinely
+    /// gigabytes, and a `{:?}` in a log line should not try to render them.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegisterOwnedError")
+            .field("buffer_len", &self.buffer.as_ref().map(|b| b.len()))
+            .field("cause", &self.cause)
+            .finish()
+    }
+}
+
+impl std::fmt::Display for RegisterOwnedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.cause, f)
+    }
+}
+
+impl std::error::Error for RegisterOwnedError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
     }
 }
 
@@ -123,7 +170,10 @@ impl RegistryShared {
     /// shutdown sweep from double-crediting it.
     pub(crate) fn forget_region(&self, inner: &Arc<RegionInner>) {
         if self.regions.remove(&inner.id).is_some() {
-            self.budget.release(inner.len as u64);
+            // `charged`, not `len`: the claim was taken on the page-enclosing
+            // range the backend actually pinned, and releasing a smaller number
+            // would skew the budget permanently upward.
+            self.budget.release(inner.charged());
         }
     }
 }
@@ -199,27 +249,40 @@ impl RdmaRegistry {
     ///
     /// # Safety
     ///
-    /// `ptr` must point to at least `len` initialised, readable bytes, and the
-    /// caller must keep that allocation alive, un-freed and un-remapped, until
-    /// either the returned guard reports
-    /// [`deregistered()`](RegionGuard::deregistered) or velo shutdown has
-    /// completed. Freeing earlier hands the NIC a dangling range that a peer
-    /// holding the key can still read or write.
+    /// For the entire lifetime of the registration — which ends only when
+    /// [`RegionGuard::deregistered`] resolves, and **not** when the guard is
+    /// dropped or an `unregister` returns `Err` — all of the following must
+    /// hold.
     ///
-    /// Note "or write": registration for RMA makes the range remotely writable
-    /// regardless of the read-only protocol above it, because UCP carries no
-    /// enforceable protection field. Registering memory is therefore an
-    /// explicit trust decision about the peers this instance talks to.
+    /// * `ptr` is valid for **both reads and writes** of `len` bytes. Read
+    ///   validity is not enough: registering a range for RMA makes it remotely
+    ///   writable by any holder of its key, because UCP carries no enforceable
+    ///   protection field and the GET-only shape of the protocol above is a
+    ///   convention, not an enforcement. Registering a read-only mapping is
+    ///   undefined behaviour even though velo never writes to it itself.
+    /// * `ptr + len` does not wrap the address space.
+    /// * The allocation is not freed, moved, remapped, or reallocated —
+    ///   `realloc` included, whether or not it happens to grow in place.
+    /// * **No Rust reference into the range exists.** Not `&[u8]`, not
+    ///   `&mut [u8]`, not a reference to anything stored inside it. A peer may
+    ///   write at any moment, which contradicts the guarantees of a shared
+    ///   reference and the exclusivity of a mutable one. Access the range
+    ///   through raw pointers only.
     ///
-    /// Registration rounds outward to page boundaries, so bytes adjacent to the
-    /// allocation share its pinning; [`RegionGuard::effective_range`] reports
-    /// what was actually pinned.
+    /// Registering is therefore a trust decision about the peers this instance
+    /// talks to, not merely a performance one.
+    ///
+    /// Registration pins whole pages, so bytes adjacent to the allocation share
+    /// its pinning and its remote writability;
+    /// [`RegionGuard::effective_range`] reports what was actually pinned.
     pub(crate) async unsafe fn register_external(
         &self,
         ptr: NonNull<u8>,
         len: usize,
     ) -> Result<RegionGuard, RdmaError> {
-        self.register(ptr.as_ptr() as usize, len, None).await
+        self.register(ptr.as_ptr() as usize, len, None)
+            .await
+            .map_err(|e| e.cause)
     }
 
     /// Register a buffer velo takes ownership of.
@@ -227,7 +290,15 @@ impl RdmaRegistry {
     /// Safe because velo, not the caller, decides when the allocation is
     /// dropped: it is held until a confirmed deregistration, and handed back by
     /// [`RegionGuard::unregister_owned`].
-    pub(crate) async fn register_owned(&self, buf: Box<[u8]>) -> Result<RegionGuard, RdmaError> {
+    ///
+    /// The error carries the buffer back. [`RdmaError::BudgetExceeded`] is a
+    /// documented routine refusal that a caller answers by staging chunked —
+    /// destroying a possibly-gigabytes allocation on the way would make the
+    /// fallback path cost more than the fast one.
+    pub(crate) async fn register_owned(
+        &self,
+        buf: Box<[u8]>,
+    ) -> Result<RegionGuard, RegisterOwnedError> {
         let ptr = buf.as_ptr() as usize;
         let len = buf.len();
         self.register(ptr, len, Some(buf)).await
@@ -241,18 +312,48 @@ impl RdmaRegistry {
     /// release on the error arm, because this future may be *cancelled* at the
     /// map — a `timeout` around a registration is an ordinary thing for a
     /// caller to write — and no error arm runs then.
+    ///
+    /// The claim is taken on the page-enclosing range, not on `len`: the kernel
+    /// pins whole pages, so charging the requested length would let the budget,
+    /// whose whole job is to be the `RLIMIT_MEMLOCK` valve, undercount by
+    /// nearly half on a small unaligned buffer. It is reconciled to the
+    /// backend report once the map returns.
     async fn register(
         &self,
         ptr: usize,
         len: usize,
         owned: Option<Box<[u8]>>,
-    ) -> Result<RegionGuard, RdmaError> {
-        if ptr == 0 || len == 0 {
-            return Err(RdmaError::OutOfRange);
+    ) -> Result<RegionGuard, RegisterOwnedError> {
+        macro_rules! refuse {
+            ($cause:expr) => {
+                return Err(RegisterOwnedError {
+                    buffer: owned,
+                    cause: $cause,
+                })
+            };
         }
-        let _ticket = self.admit()?;
-        let reservation = self.shared.budget.try_reserve(len as u64)?;
-        let mapped = self.shared.backend.map(ptr, len).await?;
+
+        if ptr == 0 || len == 0 {
+            refuse!(RdmaError::OutOfRange);
+        }
+        let Some(enclosing) = arena::page_enclosing_len(ptr, len) else {
+            refuse!(RdmaError::OutOfRange);
+        };
+        let ticket = match self.admit() {
+            Ok(ticket) => ticket,
+            Err(e) => refuse!(e),
+        };
+        let mut reservation = match self.shared.budget.try_reserve(enclosing) {
+            Ok(reservation) => reservation,
+            Err(e) => refuse!(e),
+        };
+        let mapped = match self.shared.backend.map(ptr, len).await {
+            Ok(mapped) => mapped,
+            Err(e) => refuse!(e),
+        };
+        // What the backend says it pinned wins over the local estimate.
+        reservation.reconcile(mapped.effective_len.max(enclosing));
+
         let inner = Arc::new(RegionInner::new(RegionParts {
             id: self.shared.next_region_id.fetch_add(1, Ordering::Relaxed),
             generation: self.shared.generations.fetch_add(1, Ordering::Relaxed),
@@ -263,12 +364,14 @@ impl RdmaRegistry {
             effective_addr: mapped.effective_addr,
             effective_len: mapped.effective_len,
             owned,
+            charged: reservation.bytes(),
             shutdown: self.shared.shutdown_token.clone(),
         }));
         self.shared.regions.insert(inner.id, Arc::clone(&inner));
-        // Tracked now, so `forget_region` owns the matching release. It uses
-        // `inner.len`, which is the same `len` claimed above.
+        // Tracked now, so `forget_region` owns the matching release, and it
+        // releases `inner.charged` — the same number claimed above.
         reservation.commit();
+        drop(ticket);
         if let Some(m) = &self.shared.metrics {
             m.record_rdma_registration(crate::observability::RdmaRegistrationKind::External);
         }
@@ -282,7 +385,8 @@ impl RdmaRegistry {
     ///
     /// Goes through the same admission gate as an external registration, so a
     /// staging that starts during shutdown is refused rather than mapping an
-    /// arena the sweep has already walked past.
+    /// arena the sweep has already walked past. It is the *only* gated way into
+    /// the pool — see [`pool`](Self::pool) for why there is no other.
     pub(crate) async fn alloc_pinned(&self, len: usize) -> Result<PinnedBuf, RdmaError> {
         let _ticket = self.admit()?;
         self.pool.alloc(len).await
@@ -341,25 +445,72 @@ impl RdmaRegistry {
             .collect();
         for inner in regions {
             let region = inner.id;
-            let swept = region::deregister(&self.shared, &inner, remaining(deadline)).await;
-            if let Err(e) = swept {
-                tracing::warn!(
-                    region,
-                    error = %e,
-                    "rdma: region unmap unconfirmed at shutdown; the deregistered() latch \
-                     stays unresolved, and the caller is covered instead by velo shutdown \
-                     having completed"
-                );
+            match region::deregister(&self.shared, &inner, remaining(deadline)).await {
+                Ok(region::Deregistered::Drained) => {}
+                Ok(region::Deregistered::DrainTimedOut) => {
+                    tracing::warn!(
+                        region,
+                        "rdma: region unmapped without waiting out its in-flight work; the \
+                         memory is released and the latch resolved, but a straggling remote \
+                         transfer may now fail at its own end"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        region,
+                        %e,
+                        "rdma: region unmap unconfirmed; the deregistered() latch stays \
+                         unresolved until the end of velo shutdown"
+                    );
+                }
             }
         }
 
-        let leaked = self.pool.unmap_all().await;
+        let leaked = self.pool.unmap_all(deadline).await;
         if leaked != 0 {
-            tracing::warn!(arenas = leaked, "rdma: arenas left pinned at shutdown");
+            tracing::warn!(
+                arenas = leaked,
+                "rdma: arenas left pinned at shutdown; their pages are freed once velo \
+                 shutdown completes"
+            );
         }
     }
 
+    /// Declare every surviving registration released, at the end of velo
+    /// shutdown.
+    ///
+    /// This is what turns [`RegionGuard::deregistered`] into a signal a caller
+    /// can actually wait on. `shutdown` above resolves the latch only for
+    /// regions whose unmap the backend confirmed; anything else — a wedged
+    /// unmap, a transport that went down first — would otherwise leave the
+    /// future pending forever, and a caller holding memory until it resolved
+    /// would hold it for the life of the process.
+    ///
+    /// It is sound precisely *here* and nowhere earlier: `Velo::graceful_shutdown`
+    /// calls it after transport teardown has returned, and teardown
+    /// force-unmaps every region the progress thread still holds. So by this
+    /// point nothing is pinned, whatever the individual unmap replies said.
+    /// Calling it before teardown would be the lie the two-clause contract
+    /// existed to avoid.
+    pub(crate) fn latch_all_deregistered(&self) {
+        let regions: Vec<Arc<RegionInner>> = self
+            .shared
+            .regions
+            .iter()
+            .map(|e| Arc::clone(e.value()))
+            .collect();
+        for inner in regions {
+            self.shared.forget_region(&inner);
+            inner.latch_deregistered();
+        }
+        self.pool.release_unconfirmed();
+    }
+
     /// Bytes currently registered with the backend, pool and external together.
+    ///
+    /// Counts what the backend reports it pinned — the page-enclosing ranges —
+    /// not the lengths callers asked for, because that is what the kernel and
+    /// `RLIMIT_MEMLOCK` are holding.
     pub(crate) fn registered_bytes(&self) -> u64 {
         self.shared.budget.registered()
     }
@@ -370,8 +521,15 @@ impl RdmaRegistry {
         self.shared.regions.len()
     }
 
-    /// The arena pool, for diagnostics and tests.
-    #[allow(dead_code)]
+    /// The arena pool.
+    ///
+    /// `cfg(test)` deliberately. Handing this out crate-wide would be an
+    /// admission escape hatch: `pool().alloc()` skips [`admit`](Self::admit),
+    /// so a Phase-3 caller racing shutdown could map an arena after the sweep
+    /// had already walked the set — pinned memory with nothing left to unmap
+    /// it. [`alloc_pinned`](Self::alloc_pinned) is the only gated entry, and
+    /// with this restricted it is also the only entry.
+    #[cfg(test)]
     pub(crate) fn pool(&self) -> &ArenaSet {
         &self.pool
     }

@@ -34,6 +34,21 @@
 //! without [`shutdown`](super::RdmaRegistry::shutdown) therefore leaks its
 //! arenas, and says so at `error` level.
 //!
+//! # Registered means remotely writable
+//!
+//! Registering a range for RMA makes it remotely *writable* by any holder of
+//! its key, not merely readable: UCP carries no enforceable protection field,
+//! so the GET-only shape of the protocol above is a convention rather than an
+//! enforcement. Every byte in every arena is therefore exposed to peers this
+//! instance has keys out to, and the safety of a [`PinnedBuf`] rests on that
+//! trust domain — not on the borrow checker, which cannot see the NIC.
+//!
+//! A consequence for Phase 3: a GET destination should be expressed as
+//! `&mut PinnedBuf`, so the exclusion against *local* readers is carried by the
+//! borrow checker for the duration of the transfer, instead of by a convention
+//! about who holds the buffer. Handing a shared reference to a range the NIC is
+//! actively filling would be a race Rust would otherwise let through silently.
+//!
 //! # Reclamation is Phase 4
 //!
 //! Arenas are append-only and live until registry shutdown. Empty-arena
@@ -44,6 +59,7 @@ use std::alloc::Layout;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::Instant;
 
 use bytes::Bytes;
 use offset_allocator::{Allocation, Allocator};
@@ -55,19 +71,17 @@ use super::backend::{RdmaBackend, RdmaError};
 /// straddles a page and the float-bin round-up stays bounded at ~12.5%.
 pub(crate) const GRANULE: usize = 4096;
 
-/// Ceiling on the node metadata `offset-allocator` preallocates per arena.
-///
-/// `Allocator::new` defaults to 128 Ki allocations, which is several MB of
-/// nodes — paid per arena whether or not the arena is big enough to ever hold
-/// that many. Right-sizing to the granule count and capping here keeps a 64 KiB
-/// test arena from carrying a megabytes-sized allocator.
-const MAX_ALLOCS_CAP: u32 = 128 * 1024;
-
 /// Tuning for the arena pool (D11's new knobs).
 #[derive(Debug, Clone)]
 pub struct RdmaPoolConfig {
     /// Size of the first pooled arena. Later arenas grow geometrically from
     /// here up to [`max_arena_bytes`](Self::max_arena_bytes).
+    ///
+    /// Each arena carries suballocator metadata sized to its granule count —
+    /// roughly 28 bytes per 4 KiB granule, about 0.7% of the arena, so ~7 MiB
+    /// for a 1 GiB arena. That is deliberate: sizing the node pool below the
+    /// granule count trades a visible fixed cost for an invisible one, where a
+    /// fragmented arena reports "full" while it still has room.
     pub initial_arena_bytes: u64,
     /// Ceiling on a single pooled arena.
     pub max_arena_bytes: u64,
@@ -228,6 +242,10 @@ pub(crate) struct Arena {
     packed_key: Bytes,
     /// Distinguishes registrations, so a stale descriptor is detectable.
     generation: u64,
+    /// Bytes charged against the budget for this arena — the backend's
+    /// effective range, which is what `unmap_all` must release. Kept separate
+    /// from `memory.len` so the claim and the release cannot drift apart.
+    charged: u64,
     /// Arena length in [`GRANULE`]s — the unit the suballocator works in.
     granules: u32,
     free: Mutex<Allocator<u32>>,
@@ -351,17 +369,28 @@ impl Deref for PinnedBuf {
         // allocation — `try_alloc` sized the request in granules against the
         // arena's own granule count — the arena is kept alive by the `Arc`, and
         // the suballocator hands out non-overlapping ranges, so no other
-        // `PinnedBuf` aliases these bytes. Remote peers holding the arena's key
-        // may read the range concurrently; that is outside Rust's model and is
-        // the documented trust-domain assumption (see `RegionGuard`).
+        // `PinnedBuf` aliases these bytes *from this process*.
+        //
+        // What this cannot establish is that nothing else is writing. The arena
+        // is registered for RMA, so any peer holding its key can write into
+        // this range at any moment, and `prot` is dead code in UCP — the
+        // GET-only shape of the protocol above is a convention, not an
+        // enforcement. A concurrent remote write is a data race the Rust
+        // abstract machine has no vocabulary for. It is admitted as the
+        // module's trust-domain assumption, not proved away here.
         unsafe { std::slice::from_raw_parts(self.arena.base().add(self.offset), self.len) }
     }
 }
 
 impl DerefMut for PinnedBuf {
     fn deref_mut(&mut self) -> &mut [u8] {
-        // SAFETY: as for `Deref`, plus `&mut self` proving this is the only
-        // handle to the range on this side.
+        // SAFETY: as for `Deref`. `&mut self` proves this is the only *Rust*
+        // handle to the range — it proves nothing about the NIC, which is a
+        // writer the borrow checker cannot see and which needs no handle from
+        // us to write here. Exclusivity against remote writers is a property of
+        // the protocol and the trust domain, and the trust domain alone is what
+        // makes this sound; claiming `&mut self` settles it would be a lie
+        // about which writers exist.
         unsafe { std::slice::from_raw_parts_mut(self.arena.base().add(self.offset), self.len) }
     }
 }
@@ -457,6 +486,26 @@ impl Budget {
         self.publish(next.saturating_sub(bytes));
     }
 
+    /// Add `bytes` to the running total whether or not it fits.
+    ///
+    /// For reconciliation only: the backend has already pinned the pages, so
+    /// the choice is between an accurate total that briefly exceeds the ceiling
+    /// and an inaccurate one that does not. Refusing here would mean unmapping
+    /// a region that just mapped successfully over a page-rounding delta, which
+    /// is strictly worse — the overshoot is bounded by one page per
+    /// registration. Returns whether the total stayed within the ceiling.
+    pub(crate) fn charge(&self, bytes: u64) -> bool {
+        let next = self
+            .registered
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.saturating_add(bytes))
+            })
+            .unwrap_or(0)
+            .saturating_add(bytes);
+        self.publish(next);
+        next <= self.limit
+    }
+
     /// Bytes currently registered.
     pub(crate) fn registered(&self) -> u64 {
         self.registered.load(Ordering::Acquire)
@@ -498,6 +547,49 @@ impl Reservation {
     pub(crate) fn bytes(&self) -> u64 {
         self.bytes
     }
+
+    /// Re-charge this claim to what the backend actually pinned.
+    ///
+    /// The claim is taken before the map on a locally computed page-enclosing
+    /// estimate, because the budget has to be held against a concurrent
+    /// registration during the map. The backend then reports the range it
+    /// really pinned, which may differ — a different page size, an
+    /// implementation that rounds further out. This settles the difference so
+    /// the number released later is the number the kernel is holding.
+    ///
+    /// A top-up past the ceiling is accepted with a warning rather than
+    /// refused; see [`Budget::charge`].
+    pub(crate) fn reconcile(&mut self, bytes: u64) {
+        match bytes.cmp(&self.bytes) {
+            std::cmp::Ordering::Greater => {
+                let extra = bytes - self.bytes;
+                if !self.budget.charge(extra) {
+                    tracing::warn!(
+                        extra,
+                        registered = self.budget.registered(),
+                        budget = self.budget.limit,
+                        "rdma: the backend pinned more than the registered-bytes budget allows;                          accepting the overshoot rather than unmapping a live registration"
+                    );
+                }
+            }
+            std::cmp::Ordering::Less => self.budget.release(self.bytes - bytes),
+            std::cmp::Ordering::Equal => {}
+        }
+        self.bytes = bytes;
+    }
+}
+
+/// The page-enclosing range a registration of `[ptr, ptr + len)` will pin.
+///
+/// Registration pins whole pages, so the kernel charges `RLIMIT_MEMLOCK` for
+/// the enclosing range, not for what the caller asked for. A 4097-byte buffer
+/// straddling a page boundary costs three pages, not two — so charging `len`
+/// would let the budget, whose entire job is to be that valve, undercount by
+/// most of a factor of two on small unaligned registrations.
+pub(crate) fn page_enclosing_len(ptr: usize, len: usize) -> Option<u64> {
+    let start = ptr & !(GRANULE - 1);
+    let end = ptr.checked_add(len)?.checked_next_multiple_of(GRANULE)?;
+    u64::try_from(end.checked_sub(start)?).ok()
 }
 
 impl Drop for Reservation {
@@ -525,6 +617,9 @@ pub(crate) struct ArenaSet {
     /// Serialises growth so two concurrent misses map one arena, not two. An
     /// async mutex because what it guards is an await point.
     grow: tokio::sync::Mutex<()>,
+    /// Arenas the sweep could not confirm an unmap for, held so their pages can
+    /// be freed once velo shutdown completes rather than leaked for good.
+    unconfirmed: Mutex<Vec<Arc<Arena>>>,
 }
 
 impl ArenaSet {
@@ -543,6 +638,7 @@ impl ArenaSet {
             metrics,
             arenas: RwLock::new(Vec::new()),
             grow: tokio::sync::Mutex::new(()),
+            unconfirmed: Mutex::new(Vec::new()),
         }
     }
 
@@ -625,7 +721,7 @@ impl ArenaSet {
             .ok()
             .and_then(|len| len.checked_next_multiple_of(GRANULE))
             .ok_or(RdmaError::OutOfRange)?;
-        let reservation = self.budget.try_reserve(len as u64)?;
+        let mut reservation = self.budget.try_reserve(len as u64)?;
 
         let memory = PageMemory::new(len)?;
         debug_assert_eq!(
@@ -642,16 +738,25 @@ impl ArenaSet {
         memory.mark_unmapped();
         let region = self.backend.map(memory.addr(), memory.len).await?;
         memory.mark_pinned();
+        // Charge what the backend says it pinned, not what we asked for, so the
+        // number released at unmap is the number the kernel is holding.
+        reservation.reconcile(region.effective_len.max(memory.len as u64));
         let granules = u32::try_from(memory.len / GRANULE).map_err(|_| RdmaError::OutOfRange)?;
         let arena = Arc::new(Arena {
             backend_region_id: region.backend_region_id,
             packed_key: region.packed_key,
             generation: self.generations.fetch_add(1, Ordering::Relaxed),
+            charged: reservation.bytes(),
             granules,
-            free: Mutex::new(Allocator::with_max_allocs(
-                granules,
-                granules.clamp(1, MAX_ALLOCS_CAP),
-            )),
+            // `max_allocs` is the granule count, not a cap below it. Node
+            // metadata is what the allocator hands out alongside space, and
+            // sizing it smaller means a fully-fragmented arena runs out of
+            // *nodes* while it still has room — which surfaces as `allocate`
+            // returning `None`, indistinguishable from "no space". The pool
+            // then maps another arena and burns budget it did not need.
+            // `Allocator::new`'s own default (128 Ki) is exactly that trap for
+            // any arena above 512 MiB.
+            free: Mutex::new(Allocator::with_max_allocs(granules, granules)),
             live: AtomicUsize::new(0),
             dedicated,
             memory,
@@ -671,37 +776,71 @@ impl ArenaSet {
         Ok(arena)
     }
 
-    /// Unmap every arena. Called only from the registry shutdown path, after
-    /// the registration gate is closed and drained.
+    /// Unmap every arena, each bounded by `deadline`.
     ///
-    /// Returns the number of arenas whose unmap the backend did **not**
-    /// confirm; their pages stay leaked, which is the safe direction.
-    pub(crate) async fn unmap_all(&self) -> usize {
+    /// The deadline is not decoration: this runs inside
+    /// `Velo::graceful_shutdown`, and a backend whose unmap never answers would
+    /// otherwise park shutdown forever even under a `Timeout` policy — this was
+    /// the one step of the sweep with no bound. On timeout the arena joins the
+    /// unconfirmed list and the sweep moves on; the transport's own force-unmap
+    /// at teardown is the backstop.
+    ///
+    /// Returns the number of arenas whose unmap was not confirmed. Their pages
+    /// stay leaked *for now* — [`release_unconfirmed`](Self::release_unconfirmed)
+    /// frees them once velo shutdown has completed and nothing can still be
+    /// pinned.
+    pub(crate) async fn unmap_all(&self, deadline: Instant) -> usize {
         let arenas: Vec<Arc<Arena>> = std::mem::take(&mut *self.arenas.write());
-        let mut unconfirmed = 0usize;
+        let mut unconfirmed = Vec::new();
         for arena in arenas {
             let live = arena.live();
             if live != 0 {
                 tracing::warn!(
                     live,
                     bytes = arena.len(),
-                    "rdma: unmapping an arena that still has live suballocations; their \
-                     buffers now reference deregistered memory"
+                    "rdma: unmapping an arena that still has live suballocations"
                 );
             }
-            match self.backend.unmap(arena.backend_region_id).await {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let unmap = self.backend.unmap(arena.backend_region_id);
+            let outcome = match tokio::time::timeout(remaining, unmap).await {
+                Ok(result) => result,
+                Err(_) => Err(RdmaError::Timeout),
+            };
+            match outcome {
                 Ok(()) => {
                     arena.memory.mark_unmapped();
-                    self.budget.release(arena.len() as u64);
+                    self.budget.release(arena.charged);
                 }
                 Err(e) => {
-                    unconfirmed += 1;
                     let bytes = arena.len();
-                    tracing::warn!(%e, bytes, "rdma: arena unmap unconfirmed; pages leaked");
+                    tracing::warn!(
+                        %e,
+                        bytes,
+                        "rdma: arena unmap unconfirmed; its pages stay leaked until velo \
+                         shutdown completes"
+                    );
+                    unconfirmed.push(arena);
                 }
             }
         }
-        unconfirmed
+        let count = unconfirmed.len();
+        self.unconfirmed.lock().extend(unconfirmed);
+        count
+    }
+
+    /// Release the arenas whose unmap could not be confirmed.
+    ///
+    /// Called only once velo shutdown has fully completed, at which point the
+    /// transport teardown has force-unmapped everything it still held — so
+    /// nothing is pinned any more, whatever the unmap replies said. Without
+    /// this, an unconfirmed unmap would leak the arena for the life of the
+    /// process rather than for the length of the shutdown.
+    pub(crate) fn release_unconfirmed(&self) {
+        for arena in self.unconfirmed.lock().drain(..) {
+            arena.memory.mark_unmapped();
+            self.budget.release(arena.charged);
+        }
     }
 
     /// Arenas currently mapped. Test and diagnostics surface.
