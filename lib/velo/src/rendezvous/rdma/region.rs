@@ -10,15 +10,17 @@
 //!
 //! # The one contract that matters
 //!
-//! Registered pages must stay allocated until velo says otherwise. "Otherwise"
-//! is exactly two events:
+//! Registered pages must stay allocated until velo says otherwise, and
+//! "otherwise" is exactly one event: [`RegionGuard::deregistered`] resolves.
 //!
-//! * [`RegionGuard::deregistered`] resolves — the backend confirmed the unmap.
-//! * Velo's own shutdown completes — transport teardown force-unmaps whatever
-//!   is still registered, so everything is released by the time it returns.
+//! It resolves on a confirmed unmap, or at the end of velo's own shutdown —
+//! transport teardown force-unmaps whatever is still registered, so a region
+//! the backend never confirmed is nonetheless released by the time shutdown
+//! returns, and the latch is closed for it there. One thing to await, whatever
+//! happened underneath.
 //!
-//! Neither an error from [`RegionGuard::unregister`] nor dropping the guard is
-//! one of them. `Drop` cannot block (blocking in a `Drop` inside a tokio
+//! Neither an error from [`RegionGuard::unregister`] nor dropping the guard
+//! releases anything. `Drop` cannot block (blocking in a `Drop` inside a tokio
 //! runtime deadlocks the worker), so it starts the deregistration in the
 //! background and returns immediately — the memory is still pinned when `Drop`
 //! finishes. Dropping the guard early is therefore a liveness bug for the
@@ -392,14 +394,27 @@ impl RegionGuard {
         self.inner.is_deregistered()
     }
 
-    /// Resolve once the memory is no longer registered — the point at which
-    /// the caller may free it.
+    /// Resolve once the memory is no longer registered — the point at which the
+    /// caller may free it.
     ///
-    /// Latched: it stays resolved forever after, so awaiting it late is fine.
-    /// It resolves only on a *confirmed* unmap. If velo is torn down in a way
-    /// that leaves the confirmation unobtainable, this future simply never
-    /// resolves; the caller is then covered by the other clause of the
-    /// contract — velo shutdown having completed — not by this one.
+    /// **This is the whole release contract.** It resolves when the unmap is
+    /// confirmed, or when velo shutdown has fully completed, whichever comes
+    /// first; after it resolves the memory is safe to free. There is no second
+    /// condition to reason about and no case where the right answer is to stop
+    /// waiting and guess.
+    ///
+    /// The shutdown half is what makes it dependable. A region whose unmap
+    /// could not be confirmed — a wedged backend, a transport that went down
+    /// first — is nonetheless genuinely released once
+    /// `Velo::graceful_shutdown` returns, because transport teardown
+    /// force-unmaps everything the progress thread still holds, and that is
+    /// where the latch is closed for any survivor.
+    ///
+    /// Latched, so awaiting it late is fine: it stays resolved forever after.
+    ///
+    /// Note what does *not* release the memory: dropping the
+    /// [`RegionGuard`] merely starts a background deregistration, and an
+    /// `unregister` that returns `Err` reached no conclusion at all.
     pub async fn deregistered(&self) {
         self.inner.wait_deregistered().await;
     }
@@ -560,8 +575,9 @@ impl RegionWatch {
         self.inner.is_deregistered()
     }
 
-    /// Resolve once the memory is no longer registered. Same latched semantics
-    /// as the guard's.
+    /// Resolve once the memory is no longer registered — confirmed unmap or
+    /// completed velo shutdown, whichever comes first. Same contract and same
+    /// latched semantics as [`RegionGuard::deregistered`].
     pub async fn deregistered(&self) {
         self.inner.wait_deregistered().await;
     }

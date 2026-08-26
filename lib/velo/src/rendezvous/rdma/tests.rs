@@ -475,10 +475,11 @@ async fn region_unregister_latches_deregistered() {
 
 /// An unmap the backend could not confirm must **not** latch.
 ///
-/// This is the whole point of the two-clause contract. `ShuttingDown` from an
-/// unmap means *unknown*, not *unmapped*; latching on it would tell the caller
-/// it may free memory that is still pinned. The caller is instead covered by
-/// the other clause — velo shutdown having completed.
+/// `ShuttingDown` from an unmap means *unknown*, not *unmapped*; latching on it
+/// would tell the caller it may free memory that is still pinned. The latch is
+/// closed later instead, at the end of velo shutdown, once teardown has made
+/// the release a fact — see
+/// `shutdown_latches_regions_whose_unmap_was_never_confirmed`.
 #[tokio::test]
 async fn unconfirmed_unmap_does_not_latch() {
     let (backend, registry) = mock_registry(RdmaConfig::default());

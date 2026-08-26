@@ -59,7 +59,9 @@ pub enum RdmaError {
     ///
     /// **Not a statement that memory was unmapped.** A caller holding a
     /// [`RegionGuard`](super::RegionGuard) that sees this must keep its
-    /// allocation alive until velo's shutdown completes.
+    /// allocation alive until
+    /// [`deregistered()`](super::RegionGuard::deregistered) resolves — which it
+    /// will, at the latest when velo shutdown completes.
     #[error("rdma registration layer is shutting down")]
     ShuttingDown,
 
