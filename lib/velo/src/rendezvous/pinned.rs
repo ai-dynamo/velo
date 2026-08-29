@@ -55,13 +55,31 @@
 //! progress delays the latch, and a copy that starts after it sees the flag and
 //! refuses. A refused chunk is an error the consumer retries; a raw read of
 //! freed pages is not.
+//!
+//! The gate is taken per [`GATE_CHUNK`], not per request. A caller may anchor
+//! gigabytes, and a single acquisition spanning the whole range would park a
+//! deregistration — and the tokio worker running it — for the length of that
+//! copy. Chunking keeps the bound the region's own documentation claims: one
+//! chunk, not one anchor. A copy that finds the latch closed part-way through
+//! discards what it has and refuses, which is what it would have done had the
+//! latch closed one chunk earlier.
 
 use bytes::{Bytes, BytesMut};
 use velo_ext::InFlightGuard;
 
 use super::descriptor::{DescriptorBackend, RdmaDescriptor};
 use super::rdma::{PinnedBuf, RegionWatch};
-use super::store::StageMode;
+use super::store::{DEFAULT_CHUNK_SIZE, StageMode};
+
+/// The most bytes copied out of an external region under a single acquisition
+/// of its copy gate.
+///
+/// The gate blocks a deregistration's latch, so the hold time is a bound on how
+/// long `RegionGuard::deregistered` can be delayed by a reader — and on how long
+/// a tokio worker sits in a blocking `write()` acquire. Matching the chunk size
+/// the chunked path already serves means the worst case here is the worst case
+/// that path already has.
+const GATE_CHUNK: usize = DEFAULT_CHUNK_SIZE as usize;
 
 /// Where a peer would address some staged bytes, and with what key.
 ///
@@ -204,6 +222,10 @@ impl PinnedSlot {
     /// been deregistered. The copy is the point: what comes back is velo's own
     /// buffer, so the caller may hold it for as long as it likes without any
     /// relationship to the registration it came from.
+    ///
+    /// External memory is copied in [`GATE_CHUNK`]-sized pieces, each under its
+    /// own acquisition of the region's copy gate — see the module docs for what
+    /// that bound is worth.
     pub(crate) fn read_at(&self, offset: u64, len: usize) -> Option<Bytes> {
         if len == 0 {
             return Some(Bytes::new());
@@ -212,59 +234,83 @@ impl PinnedSlot {
         if end > self.remote.len {
             return None;
         }
+        let start = usize::try_from(offset).ok()?;
+        let stop = start.checked_add(len)?;
+
         match &self.staging {
-            PinnedStaging::Pool(buf) => {
-                let start = usize::try_from(offset).ok()?;
-                let stop = start.checked_add(len)?;
-                buf.get(start..stop).map(Bytes::copy_from_slice)
-            }
+            PinnedStaging::Pool(buf) => buf.get(start..stop).map(Bytes::copy_from_slice),
             PinnedStaging::External(slice) => {
-                let start = usize::try_from(offset).ok()?;
-                let stop = start.checked_add(len)?;
                 if stop > slice.len {
                     return None;
                 }
-                // The check and the copy are one step, under the region's copy
-                // gate. Splitting them would be a check-then-act against the
-                // one event that licenses the owner of this memory to free it.
-                slice.watch.with_live(|| {
-                    let mut out = BytesMut::zeroed(len);
-                    // SAFETY: three facts, and the gate is what ties them
-                    // together.
+                let mut out = BytesMut::zeroed(len);
+                let mut done = 0usize;
+                while done < len {
+                    let take = (len - done).min(GATE_CHUNK);
+                    let from = start + done;
+                    // One gate acquisition per chunk. The check and the copy
+                    // are one step — splitting them would be a check-then-act
+                    // against the one event that licenses the owner of this
+                    // memory to free it — but the *whole* range is deliberately
+                    // not one step: a caller may anchor gigabytes, and holding
+                    // the gate across all of it would park the deregistration
+                    // (and the tokio worker running it) for the length of the
+                    // copy rather than for the length of a chunk.
                     //
-                    // * **In range.** `ptr + start .. ptr + stop` lies inside
-                    //   the range the caller registered: `stop <= slice.len`,
-                    //   checked above, and `slice.len` is the length that was
-                    //   registered.
-                    // * **Still allocated.** `with_live` runs this only while
-                    //   the region's latch is closed *and* holds the gate that
-                    //   `latch_deregistered` must take to close it. So the
-                    //   caller cannot have been told it may free this memory,
-                    //   and `RegionInner` — which the watch keeps alive — has
-                    //   not dropped the buffer it owns. Note that this is
-                    //   deliberately not a claim that the range is still
-                    //   *registered*: a deregistration may be in flight, and
-                    //   reading unpinned-but-allocated memory is fine.
-                    // * **No aliasing reference.** The read is a raw copy into
-                    //   `out`, a fresh allocation of exactly `len` bytes that
-                    //   cannot overlap the source. No `&[u8]` into the
-                    //   registered range is ever formed, which the registration
-                    //   contract requires because a peer holding the region's
-                    //   key may write to it at any moment.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            (slice.ptr as *const u8).add(start),
-                            out.as_mut_ptr(),
-                            len,
-                        );
-                    }
-                    out.freeze()
-                })
+                    // Refusing part-way is correct rather than merely
+                    // tolerable: the partial buffer is dropped and the caller
+                    // gets `None`, which is exactly what it would have got had
+                    // the latch closed one chunk earlier.
+                    let copied = slice.watch.with_live(|| {
+                        // SAFETY: three facts, and the gate ties them together.
+                        //
+                        // * **In range.** `slice.ptr` and `slice.len` describe
+                        //   the sub-range this anchor stages, which
+                        //   `register_data_in_region` established lies inside
+                        //   the registration: it checks `range.end` against
+                        //   `RegionGuard::len` — the length the caller asked to
+                        //   register — and derives the pointer from
+                        //   `RegionGuard::addr`, the pointer that was
+                        //   registered. `stop <= slice.len` is checked above
+                        //   and `from + take <= stop` by construction, so this
+                        //   read stays inside the anchor and therefore inside
+                        //   the registration.
+                        // * **Still allocated.** `with_live` runs this only
+                        //   while the region's latch is closed *and* holds the
+                        //   gate that `latch_deregistered` must take to close
+                        //   it. So the caller cannot have been told it may free
+                        //   this memory, and `RegionInner` — which the watch
+                        //   keeps alive — has not dropped the buffer it owns.
+                        //   Deliberately not a claim that the range is still
+                        //   *registered*: a deregistration may be in flight,
+                        //   and reading unpinned-but-allocated memory is fine.
+                        // * **No aliasing reference.** The read is a raw copy
+                        //   into `out`, a fresh allocation that cannot overlap
+                        //   the source. No `&[u8]` into the registered range is
+                        //   ever formed, which the registration contract
+                        //   requires because a peer holding the region's key
+                        //   may write to it at any moment.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                (slice.ptr as *const u8).add(from),
+                                out[done..done + take].as_mut_ptr(),
+                                take,
+                            );
+                        }
+                    });
+                    copied?;
+                    done += take;
+                }
+                Some(out.freeze())
             }
         }
     }
 
     /// Copy the whole staged range out.
+    ///
+    /// Chunked exactly as [`read_at`](Self::read_at) is, which is the point:
+    /// this is the path a local `get` and the shutdown demotion take, and it is
+    /// the one that can be asked for the entire anchor at once.
     pub(crate) fn to_bytes(&self) -> Option<Bytes> {
         self.read_at(0, usize::try_from(self.remote.len).ok()?)
     }

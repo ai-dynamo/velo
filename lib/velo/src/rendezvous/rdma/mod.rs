@@ -496,7 +496,20 @@ impl RdmaRegistry {
 
     /// Read remote memory into a locally registered destination, from an
     /// owner-authored descriptor.
+    ///
+    /// Admission-gated like [`alloc_pinned`](Self::alloc_pinned), and for a
+    /// reason the pool paths alone do not cover. Shutdown's arena sweep samples
+    /// each arena's in-flight transfer count and waits for it to reach zero;
+    /// without a gate here that sample is a check-then-act, because a
+    /// `PinnedBuf` allocated *before* the gate closed could still take a hold
+    /// and submit a GET while the sweep was awaiting an unmap. With the gate
+    /// closed no new transfer enters, the count is monotonically
+    /// non-increasing, and the wait converges instead of racing.
+    ///
+    /// A refusal reaches the consumer as an ordinary transfer failure, which
+    /// its existing fallback answers by detaching and pulling chunks.
     pub(crate) async fn get(&self, req: BackendGet) -> Result<(), RdmaError> {
+        let _ticket = self.admit()?;
         self.shared.backend.get(req).await
     }
 

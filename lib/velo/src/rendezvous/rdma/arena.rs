@@ -367,6 +367,19 @@ impl Drop for Suballoc {
 /// buffer if the caller goes away. It has no accessors at all: it cannot read
 /// or write the range, which is what keeps [`PinnedBuf`]'s raw-pointer `Deref`
 /// pair sound while a hold is outstanding.
+///
+/// # What it survives, and what it does not
+///
+/// It survives the *caller* cancelling: the transfer is a detached task, and
+/// dropping a `JoinHandle` detaches rather than cancels. It does **not** survive
+/// the runtime going away — a task dropped mid-await drops its hold, releasing
+/// the space while the NIC may still be writing.
+///
+/// That is not a hole velo leaves open on its own account. `graceful_shutdown`
+/// orders the registration sweep so transfers are waited for before their arena
+/// is unmapped, and the arena's pages are not freed until after that. The case
+/// this cannot reach is a caller dropping the runtime out from under live
+/// transfers, which is a decision only the application can make.
 pub(crate) struct TransferHold(Arc<Suballoc>);
 
 impl Drop for TransferHold {
@@ -970,6 +983,13 @@ impl ArenaSet {
     /// unconfirmed list and the sweep moves on; the transport's own force-unmap
     /// at teardown is the backstop.
     ///
+    /// It bounds the in-flight wait below too, which means a deadline already
+    /// reached — the regions are swept from the same one, serially — skips that
+    /// wait entirely. `ShutdownPolicy::Timeout` is a promise about the whole
+    /// call, so there is deliberately no per-arena floor that could overrun it;
+    /// what the degraded path gets instead is a warning that says which of the
+    /// two happened.
+    ///
     /// Returns the number of arenas whose unmap was not confirmed. Their pages
     /// stay leaked *for now* — [`release_unconfirmed`](Self::release_unconfirmed)
     /// frees them once velo shutdown has completed and nothing can still be
@@ -988,19 +1008,46 @@ impl ArenaSet {
             // writing into it, and it may outlive the runtime — so waiting for
             // `live` would let an ordinary application burn the whole budget.
             //
+            // The wait converges because `RdmaRegistry::get` is admission
+            // gated: with the gate closed no new transfer can raise this count,
+            // so it only falls.
+            //
+            // **What the wait is worth is bounded by the budget, and past it
+            // there is no wait at all.** The regions above are swept serially
+            // from the same deadline, so a slow region can leave nothing for
+            // the arenas — and this loop's guard, evaluated once with the
+            // deadline already behind it, would then skip silently. That is the
+            // accepted D8 degradation, not an oversight: past the budget the
+            // sweep force-unmaps and the transport's own teardown is the
+            // backstop. It is said out loud below rather than left to look like
+            // a wait that happened.
+            //
             // Polled rather than notified: this runs once per arena at
             // shutdown, and a condvar on the release path would cost something
             // on every free to save nothing measurable here.
-            while arena.in_flight() != 0 && Instant::now() < deadline {
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            }
-            if arena.in_flight() != 0 {
-                tracing::warn!(
-                    in_flight = arena.in_flight(),
-                    bytes = arena.len(),
-                    "rdma: unmapping an arena with transfers still writing into it; they will \
-                     fail at their own end"
-                );
+            let budget_spent = Instant::now() >= deadline;
+            if budget_spent {
+                if arena.in_flight() != 0 {
+                    tracing::warn!(
+                        in_flight = arena.in_flight(),
+                        bytes = arena.len(),
+                        "rdma: the shutdown budget was already spent before this arena, so its \
+                         transfers were not waited for at all; force-unmapping. Transport \
+                         teardown is the backstop and a straggling transfer fails at its own end."
+                    );
+                }
+            } else {
+                while arena.in_flight() != 0 && Instant::now() < deadline {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                if arena.in_flight() != 0 {
+                    tracing::warn!(
+                        in_flight = arena.in_flight(),
+                        bytes = arena.len(),
+                        "rdma: transfers into this arena outlasted the shutdown budget; \
+                         unmapping anyway, and they will fail at their own end"
+                    );
+                }
             }
             let live = arena.live();
             if live != 0 {

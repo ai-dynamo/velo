@@ -113,9 +113,12 @@ pub(crate) struct RegionInner {
     /// keeps alive. Holding a lock across that `await` would also make every
     /// deregistration future non-`Send` for no gain.
     ///
-    /// Hold times are bounded by one chunk copy (at most
-    /// `DEFAULT_CHUNK_SIZE`), so a deregistration waiting behind live copies
-    /// waits for a memcpy, not for a transfer.
+    /// Hold times are bounded by one chunk copy, and that is enforced rather
+    /// than assumed: readers take the gate per `DEFAULT_CHUNK_SIZE` and
+    /// re-check the latch between chunks, so a request for a multi-gigabyte
+    /// anchor is many short acquisitions rather than one long one. A
+    /// deregistration waiting behind live readers therefore waits for a memcpy
+    /// of at most that size — not for a whole anchor, and not for a transfer.
     copy_gate: parking_lot::RwLock<()>,
     dereg_notify: Notify,
     /// Serialises deregistration attempts so exactly one of them does the work

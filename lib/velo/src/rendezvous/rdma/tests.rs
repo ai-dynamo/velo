@@ -2088,7 +2088,9 @@ fn an_anchor_refuses_to_read_a_region_that_has_been_released() {
     use crate::rendezvous::descriptor::DescriptorBackend;
     use crate::rendezvous::pinned::PinnedSlot;
 
-    const LEN: u64 = 4096;
+    // Several copy-gate chunks, so the loop that walks them is exercised
+    // rather than short-circuited by a single-chunk read.
+    const LEN: u64 = 3 * 512 * 1024 + 977;
     let region = bare_region(vec![0x5Au8; LEN as usize].into_boxed_slice());
     let slot = PinnedSlot::from_region(
         region.in_flight.acquire(),
@@ -2105,6 +2107,7 @@ fn an_anchor_refuses_to_read_a_region_that_has_been_released() {
     let read = slot
         .read_at(0, LEN as usize)
         .expect("read while registered");
+    assert_eq!(read.len(), LEN as usize);
     assert!(read.iter().all(|b| *b == 0x5A));
     assert!(slot.descriptor().is_some());
     assert!(slot.is_live());
@@ -2124,5 +2127,250 @@ fn an_anchor_refuses_to_read_a_region_that_has_been_released() {
     assert!(!slot.is_live());
 
     drop(slot);
+    drop(region);
+}
+
+/// A byte whose value depends on its offset with **no power-of-two period**.
+///
+/// This matters more than it looks. An arithmetic pattern like `i * 31 + i / 256`
+/// repeats every 512 KiB, which is exactly the copy-gate chunk size — so a chunk
+/// copied from the wrong offset lands on identical bytes and the test passes on
+/// a coincidence. (It did, until this was fixed.) Two coprime periods, neither a
+/// factor of the chunk size, make a misplaced chunk observable wherever it came
+/// from.
+fn chunk_pattern(i: usize) -> u8 {
+    ((i % 251) ^ ((i / 251) % 257)) as u8
+}
+
+/// A copy spanning several gate chunks reassembles in the right order.
+///
+/// The gate is taken per chunk so a multi-gigabyte anchor cannot park a
+/// deregistration for the length of its copy, which means the copy is a loop —
+/// and a loop over offsets is where an off-by-one lives. The pattern depends on
+/// position, so a chunk landing at the wrong offset, repeated, or dropped fails
+/// rather than passing on a uniform fill.
+#[test]
+fn a_copy_spanning_several_gate_chunks_reassembles_in_order() {
+    // Deliberately not a multiple of the chunk size: the tail is its own case.
+    const LEN: usize = 2 * 512 * 1024 + 1_237;
+    let backing: Vec<u8> = (0..LEN).map(chunk_pattern).collect();
+
+    let region = bare_region(backing.clone().into_boxed_slice());
+    let slot = crate::rendezvous::pinned::PinnedSlot::from_region(
+        region.in_flight.acquire(),
+        super::region::RegionWatch::for_test(Arc::clone(&region)),
+        crate::rendezvous::descriptor::DescriptorBackend::Ucx,
+        region.ptr as u64,
+        LEN as u64,
+        1,
+        Bytes::from_static(b"packed-key"),
+    );
+
+    let whole = slot.to_bytes().expect("copy the whole anchor");
+    assert_eq!(whole.len(), LEN);
+    assert_eq!(
+        &whole[..],
+        &backing[..],
+        "the chunk loop reassembled the anchor out of order"
+    );
+
+    // And a sub-range that straddles a chunk boundary.
+    let straddle = slot
+        .read_at(512 * 1024 - 7, 64)
+        .expect("read across a chunk boundary");
+    assert_eq!(&straddle[..], &backing[512 * 1024 - 7..512 * 1024 - 7 + 64]);
+
+    region.latch_deregistered();
+    drop(slot);
+    drop(region);
+}
+
+/// A GET is refused once the registration layer has closed its gate.
+///
+/// The arena sweep samples each arena's in-flight transfer count and waits for
+/// it to reach zero. Without a gate on `get` that sample is a check-then-act: a
+/// `PinnedBuf` allocated before shutdown could still raise a hold and submit a
+/// transfer while the sweep was awaiting an unmap, and the count would rise
+/// again behind it. Gated, the count only falls, and the wait converges.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transfer_is_refused_once_the_registration_gate_is_closed() {
+    let (backend, registry) = mock_registry(RdmaConfig::default());
+    let buf = registry.alloc_pinned(4096).await.expect("alloc");
+    let req = BackendGet {
+        peer: velo_ext::InstanceId::new_v4(),
+        remote_addr: 0x1000,
+        packed_key: Bytes::from_static(b"key"),
+        local_region_id: buf.backend_region_id(),
+        local_offset: buf.arena_offset(),
+        len: 4096,
+    };
+
+    // Open: the mock accepts it.
+    registry
+        .get(req.clone())
+        .await
+        .expect("get before shutdown");
+
+    registry.shutdown(T).await;
+
+    assert_eq!(
+        registry.get(req).await,
+        Err(RdmaError::ShuttingDown),
+        "a transfer submitted after the gate closed would make the arena sweep's in-flight \
+         sample a check-then-act"
+    );
+    drop(buf);
+    let _ = backend;
+}
+
+/// The arena sweep waits for a transfer hold, and proceeds when it releases.
+///
+/// The integration test asserts this end to end through `graceful_shutdown`;
+/// this one asserts it against the sweep itself, so a change to the wait fails
+/// here without needing a UCX transport to notice.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_arena_sweep_waits_for_a_transfer_hold() {
+    let (backend, registry) = mock_registry(RdmaConfig::default());
+    let buf = registry.alloc_pinned(4096).await.expect("alloc");
+    let hold = buf.hold();
+
+    // Released after the sweep has certainly started waiting.
+    let releaser = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(hold);
+    });
+
+    let started = std::time::Instant::now();
+    registry.shutdown(T).await;
+    let waited = started.elapsed();
+
+    releaser.await.expect("releaser");
+    assert!(
+        waited >= Duration::from_millis(200),
+        "the sweep unmapped after {waited:?}, without waiting for the transfer holding one of \
+         its arenas"
+    );
+    assert_eq!(
+        backend.live(),
+        0,
+        "the arena should still have been unmapped"
+    );
+    drop(buf);
+}
+
+/// Shutdown demotes a pinned slot instead of dropping it, so a pull already in
+/// flight still finishes.
+///
+/// The sweep needs the pool suballocation and the region in-flight guard back
+/// before it can drain anything — that is why the slot is touched at all — but
+/// the messenger has only just gated *new* requests. A chunked pull admitted
+/// before that gate is still entitled to complete, and dropping its slot turns
+/// a completion into "chunk not found" halfway through a transfer.
+///
+/// So the test asserts both halves at once: the region is released, and the
+/// transfer that was already open keeps returning its chunks.
+#[test]
+fn shutdown_demotes_a_pinned_slot_rather_than_dropping_it() {
+    use super::region::RegionWatch;
+    use crate::rendezvous::pinned::PinnedSlot;
+    use crate::rendezvous::store::{DEFAULT_CHUNK_SIZE, DataStore, SlotBody, StageMode};
+
+    const LEN: usize = 3 * 512 * 1024 + 41;
+    let backing: Vec<u8> = (0..LEN).map(|i| (i.wrapping_mul(17)) as u8).collect();
+    let region = bare_region(backing.clone().into_boxed_slice());
+    let store = DataStore::new();
+
+    let local_id = store.register_body(
+        SlotBody::Pinned(PinnedSlot::from_region(
+            region.in_flight.acquire(),
+            RegionWatch::for_test(Arc::clone(&region)),
+            crate::rendezvous::descriptor::DescriptorBackend::Ucx,
+            region.ptr as u64,
+            LEN as u64,
+            1,
+            Bytes::from_static(b"packed-key"),
+        )),
+        None,
+    );
+    assert_eq!(store.stage_mode(local_id), Some(StageMode::Pinned));
+    assert_eq!(
+        region.in_flight.in_flight_count(),
+        1,
+        "the anchor should be holding the region open"
+    );
+
+    // A pull that is already under way when shutdown begins.
+    let lease = store.acquire_read_lock(local_id).expect("lease");
+    let (transfer, chunk_size, chunks) = store
+        .create_transfer(local_id, lease, DEFAULT_CHUNK_SIZE)
+        .expect("transfer");
+    let first = store.get_chunk(transfer, 0).expect("the first chunk");
+    assert_eq!(&first[..], &backing[..chunk_size as usize]);
+
+    let (demoted, dropped) = store.demote_pinned_slots();
+    assert_eq!((demoted, dropped), (1, 0));
+
+    assert_eq!(
+        store.stage_mode(local_id),
+        Some(StageMode::InMemory),
+        "the slot should have moved to the heap, not vanished"
+    );
+    assert_eq!(
+        region.in_flight.in_flight_count(),
+        0,
+        "demotion did not release the region guard the sweep is waiting on"
+    );
+
+    // The rest of the pull still completes, byte for byte.
+    for index in 1..chunks {
+        let at = index as usize * chunk_size as usize;
+        let chunk = store
+            .get_chunk(transfer, index)
+            .unwrap_or_else(|| panic!("chunk {index} of an admitted pull was dropped"));
+        assert_eq!(&chunk[..], &backing[at..at + chunk.len()]);
+    }
+    assert_eq!(
+        &store.get_data(local_id).expect("the whole slot")[..],
+        &backing[..]
+    );
+
+    region.latch_deregistered();
+    drop(store);
+    drop(region);
+}
+
+/// A slot whose region is already gone is dropped rather than demoted.
+///
+/// There is nothing left to copy, and a pull against it was going to fail
+/// whatever happened — so the sweep takes the slot away rather than leaving a
+/// body it could not fill.
+#[test]
+fn shutdown_drops_a_slot_whose_region_has_already_gone() {
+    use super::region::RegionWatch;
+    use crate::rendezvous::pinned::PinnedSlot;
+    use crate::rendezvous::store::{DataStore, SlotBody};
+
+    let region = bare_region(vec![3u8; 4096].into_boxed_slice());
+    let store = DataStore::new();
+    let local_id = store.register_body(
+        SlotBody::Pinned(PinnedSlot::from_region(
+            region.in_flight.acquire(),
+            RegionWatch::for_test(Arc::clone(&region)),
+            crate::rendezvous::descriptor::DescriptorBackend::Ucx,
+            region.ptr as u64,
+            4096,
+            1,
+            Bytes::from_static(b"packed-key"),
+        )),
+        None,
+    );
+
+    region.latch_deregistered();
+
+    assert_eq!(store.demote_pinned_slots(), (0, 1));
+    assert!(
+        store.metadata(local_id).is_none(),
+        "a slot over a released region has nothing to demote to"
+    );
     drop(region);
 }

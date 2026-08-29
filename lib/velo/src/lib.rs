@@ -616,6 +616,12 @@ impl Velo {
     /// those latches would stay pending forever and a caller waiting on one
     /// would hold its memory for the life of the process.
     ///
+    /// Step 2 begins by moving anything staged in registered memory onto the
+    /// heap. That releases what the sweep's own drains wait on, and it costs
+    /// one transient copy of everything staged — the price of letting a
+    /// chunked transfer that was already admitted finish rather than fail
+    /// halfway through.
+    ///
     /// Step 4 is itself conditional: it checks with the backend that nothing is
     /// still registered, and declines to declare anything released if the
     /// answer is not "none". After an abnormal teardown — a panicking progress
@@ -665,12 +671,18 @@ impl Velo {
                 self.begin_drain();
                 // Before the sweep, and load-bearing for it. This stops the
                 // lease reaper — so it is not taking the same memory apart
-                // from the other end while the sweep walks it — and drops
-                // every pinned slot, which is what releases the pool
-                // suballocations and region in-flight guards the sweep's
+                // from the other end while the sweep walks it — and moves
+                // every pinned slot to the heap, which is what releases the
+                // pool suballocations and region in-flight guards the sweep's
                 // drains are about to wait on. A single long-lived anchor left
                 // in place would consume the entire budget below on a drain
                 // that cannot finish.
+                //
+                // The demotion copies everything currently staged in
+                // registered memory onto the heap, once. That is the cost of
+                // letting a chunked pull admitted before the gate finish
+                // rather than fail mid-transfer, and it is bounded by what was
+                // staged.
                 //
                 // Cancelling the reaper is not a join: a tick already running
                 // may still complete. That overlap is benign — both paths end

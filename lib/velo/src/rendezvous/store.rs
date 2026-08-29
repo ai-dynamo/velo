@@ -685,29 +685,82 @@ impl DataStore {
         self.transfers.remove(&transfer_id);
     }
 
-    /// Drop every slot staged in registered memory, releasing what it holds.
+    /// Move every slot out of registered memory and into the heap, releasing
+    /// what the registration layer is waiting on.
     ///
     /// Called once, from `RendezvousManager::shutdown`, before the registration
-    /// sweep. Dropping a pinned body releases its pool suballocation and, for
-    /// an anchor inside a caller's region, the in-flight guard that region's
-    /// deregistration is waiting on. Without this a single long-lived anchor
-    /// burns the *entire* shutdown budget on a drain that can never finish, and
-    /// every unmap behind it — and the messenger phase after that — is starved
-    /// of the time it needed.
+    /// sweep. A pinned body holds a pool suballocation and, for an anchor
+    /// inside a caller's region, the in-flight guard that region's
+    /// deregistration waits on. Without releasing those, a single long-lived
+    /// anchor burns the *entire* shutdown budget on a drain that can never
+    /// finish, and every unmap behind it — and the messenger phase after that —
+    /// is starved.
     ///
-    /// Heap-staged slots are deliberately left alone. They hold nothing the
-    /// sweep cares about, and the messenger has only just gated inbound
-    /// requests: a chunked pull admitted before the gate is still entitled to
-    /// finish, and clearing its slot would turn a completion into "chunk not
-    /// found".
+    /// # Demoted, not dropped
     ///
-    /// Returns how many slots were dropped.
+    /// The body is replaced with a heap copy of the same bytes rather than
+    /// removed. The messenger has only just gated *new* inbound requests; a
+    /// chunked pull admitted before that gate is still entitled to finish, and
+    /// dropping the slot underneath it would turn a completion into "chunk not
+    /// found" mid-transfer. Demotion keeps the slot, its transfer state and its
+    /// data exactly where the puller expects them, and still hands the sweep
+    /// back everything it was waiting for.
+    ///
+    /// A slot whose region has already gone is dropped, because there is
+    /// nothing left to copy — an in-flight pull against it was going to fail
+    /// either way.
+    ///
+    /// # It costs memory, once
+    ///
+    /// Every staged pinned byte is copied to the heap here. That is the price
+    /// of not breaking an admitted pull, it is bounded by what was staged, and
+    /// it is transient: the copies go when the slots do.
+    ///
+    /// Returns `(demoted, dropped)`.
     #[cfg(all(target_os = "linux", feature = "ucx"))]
-    pub(crate) fn drop_pinned_slots(&self) -> usize {
-        let before = self.slots.len();
-        self.slots
-            .retain(|_, slot| !matches!(slot.body, SlotBody::Pinned(_)));
-        before - self.slots.len()
+    pub(crate) fn demote_pinned_slots(&self) -> (usize, usize) {
+        // Collected first: the copy below happens under a *read* guard on the
+        // slot, and taking that while iterating the same map would hold a shard
+        // lock across every copy in it.
+        let pinned: Vec<u64> = self
+            .slots
+            .iter()
+            .filter(|entry| matches!(entry.value().body, SlotBody::Pinned(_)))
+            .map(|entry| *entry.key())
+            .collect();
+
+        let (mut demoted, mut dropped) = (0usize, 0usize);
+        for local_id in pinned {
+            // Read under a shared guard, so a concurrent `get_chunk` on the
+            // same shard is not blocked by the copy. Chunk-gated, so a large
+            // anchor does not park a deregistration either.
+            let copied = self.slots.get(&local_id).and_then(|slot| match &slot.body {
+                SlotBody::Pinned(pinned) => Some(pinned.to_bytes()),
+                SlotBody::InMemory(_) => None,
+            });
+            match copied {
+                Some(Some(bytes)) => {
+                    if let Some(mut slot) = self.slots.get_mut(&local_id)
+                        && matches!(slot.body, SlotBody::Pinned(_))
+                    {
+                        // The pinned body drops here, which is what releases
+                        // the pool suballocation and the region's in-flight
+                        // guard.
+                        slot.body = SlotBody::InMemory(bytes);
+                        demoted += 1;
+                    }
+                }
+                // The region behind it is already released, so there is nothing
+                // to preserve and nothing an in-flight pull could have read.
+                Some(None) => {
+                    if self.slots.remove(&local_id).is_some() {
+                        dropped += 1;
+                    }
+                }
+                None => {}
+            }
+        }
+        (demoted, dropped)
     }
 
     /// Remove all transfers associated with a given lease ID.

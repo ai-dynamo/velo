@@ -317,9 +317,15 @@ async fn connect(owner: &Node, consumer: &Node) {
 
 /// A payload whose every byte depends on its offset, so a transfer that lands
 /// shifted, short, or duplicated fails rather than passing on a lucky pattern.
+///
+/// Two coprime periods (251 and 257), neither of them a factor of the 512 KiB
+/// chunk size. An arithmetic pattern like `i * 31 + i / 256` looks
+/// position-dependent but repeats every 512 KiB *exactly*, so a block landing
+/// one chunk out is byte-identical and the check passes on a coincidence rather
+/// than on the transfer being right.
 fn pattern(len: usize) -> Vec<u8> {
     (0..len)
-        .map(|i| (i.wrapping_mul(31).wrapping_add(i >> 8)) as u8)
+        .map(|i| ((i % 251) ^ ((i / 251) % 257)) as u8)
         .collect()
 }
 
