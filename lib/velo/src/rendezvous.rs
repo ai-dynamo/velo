@@ -21,6 +21,9 @@
 //! - **Phase 2** (future): NIXL RDMA direct memory access via dynamo-memory arena
 
 pub mod consumer;
+/// The RDMA transfer descriptor. Runtime-internal: it is a wire format velo
+/// owns end to end, and nothing outside the crate constructs or reads one.
+pub(crate) mod descriptor;
 pub mod handle;
 pub mod handlers;
 pub mod protocol;
