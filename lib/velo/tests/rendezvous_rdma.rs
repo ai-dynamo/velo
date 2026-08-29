@@ -133,6 +133,17 @@ impl Node {
             .sum()
     }
 
+    /// Value of a bare gauge.
+    fn gauge(&self, name: &str) -> u64 {
+        self.registry
+            .gather()
+            .iter()
+            .filter(|family| family.name() == name)
+            .flat_map(|family| family.get_metric())
+            .map(|m| m.get_gauge().value() as u64)
+            .sum()
+    }
+
     /// Number of observations in a histogram.
     fn histogram_count(&self, name: &str) -> u64 {
         self.registry
@@ -878,6 +889,12 @@ async fn the_reaper_force_releases_an_abandoned_lease() {
             .counter("velo_rendezvous_rdma_leases_reaped_total")
             >= 1,
         "the slot went away without the reaper being credited for it"
+    );
+    // The reaper's tick is also what samples the live-region gauge, so a run
+    // that reaped something has necessarily published one.
+    assert!(
+        pair.owner.gauge("velo_rdma_live_regions") >= 1,
+        "the reaper tick did not sample the backend's region count"
     );
     shutdown(pair).await;
 }

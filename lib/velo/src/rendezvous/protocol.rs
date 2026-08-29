@@ -34,6 +34,16 @@
 //! is `#[serde(default)]`, and every default must mean *what this protocol did
 //! before the field existed*. A default that means "the new behaviour" would
 //! make an old peer's silence look like consent.
+//!
+//! One note on how much each attribute is carrying. serde's derive already
+//! treats an `Option<T>` field as absent-able, so the attribute on
+//! [`RvAcquireRequest::rdma`] restates a behaviour that would hold without it —
+//! it is there so the field's contract does not silently change if the type
+//! ever stops being an `Option`. On `lease_timeout_ms`, which is a `u64`, the
+//! attribute is the whole thing: remove it and an owner that omits the field
+//! makes the response undeserializable. The tests below cover the behaviour
+//! rather than the attributes, which is why the `u64` case fails when the
+//! attribute goes and the `Option` case does not.
 
 use serde::{Deserialize, Serialize};
 
