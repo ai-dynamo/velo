@@ -174,6 +174,10 @@ fn small_pool_config() -> RdmaPoolConfig {
         max_arena_bytes: 256 * GRANULE as u64,
         dedicated_arena_min: 128 * GRANULE as u64,
         registered_bytes_budget: 1024 * GRANULE as u64,
+        // Reclamation off and retention irrelevant, matching the production
+        // default: the tests that exercise the sweep opt in explicitly.
+        arena_reclaim_after: None,
+        retain_arena_bytes: 64 * GRANULE as u64,
     }
 }
 
@@ -350,6 +354,7 @@ async fn pool_budget_exhaustion_is_a_refusal() {
         dedicated_arena_min: 1024 * GRANULE as u64,
         // Room for exactly two arenas.
         registered_bytes_budget: 32 * GRANULE as u64,
+        ..small_pool_config()
     };
     let (backend, pool) = mock_pool(cfg);
 
@@ -398,6 +403,7 @@ async fn pool_reuses_space_after_drop() {
         max_arena_bytes: 16 * GRANULE as u64,
         dedicated_arena_min: 1024 * GRANULE as u64,
         registered_bytes_budget: 32 * GRANULE as u64,
+        ..small_pool_config()
     };
     let (backend, pool) = mock_pool(cfg);
 
@@ -475,6 +481,475 @@ async fn pool_concurrent_alloc_and_free() {
         0,
         "no arena should have been unmapped"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Pool reclamation (Phase 4)
+// ---------------------------------------------------------------------------
+
+/// A pool whose empty arenas are reclaimable almost immediately.
+///
+/// `arena_reclaim_after` is zero rather than small: the sweep is driven
+/// explicitly by these tests, not by a tick, so "how long empty" only has to
+/// clear a threshold and there is nothing to wait for.
+fn reclaiming_pool_config(retain_arena_bytes: u64) -> RdmaPoolConfig {
+    RdmaPoolConfig {
+        arena_reclaim_after: Some(Duration::ZERO),
+        retain_arena_bytes,
+        ..small_pool_config()
+    }
+}
+
+/// The default is off, and the sweep must respect that for *pooled* arenas —
+/// however long they sit empty, whatever the retention would allow.
+#[tokio::test]
+async fn reclaim_is_off_by_default_for_pooled_arenas() {
+    let (backend, pool) = mock_pool(small_pool_config());
+    assert_eq!(small_pool_config().arena_reclaim_after, None);
+
+    // Two arenas, both emptied.
+    let mut held = Vec::new();
+    for _ in 0..3 {
+        held.push(pool.alloc(32 * GRANULE).await.expect("alloc"));
+    }
+    assert!(pool.arena_count() >= 2, "the pool did not grow");
+    let arenas = pool.arena_count();
+    held.clear();
+
+    assert_eq!(pool.reclaim_idle().await, 0, "the sweep ran unconfigured");
+    assert_eq!(pool.arena_count(), arenas);
+    assert_eq!(backend.unmap_calls(), 0);
+}
+
+/// An empty pooled arena above the retention floor is unmapped, its budget is
+/// released, and the gauge behind the budget moves with it.
+#[tokio::test]
+async fn empty_pooled_arenas_above_the_floor_are_reclaimed() {
+    // One arena's worth of retention, so the first stays and the rest go.
+    let cfg = reclaiming_pool_config(64 * GRANULE as u64);
+    let (backend, pool) = mock_pool(cfg);
+
+    // Fill the pool to its ceiling, so growth really produces several arenas
+    // rather than however many a fixed allocation count happens to force.
+    let mut held = Vec::new();
+    while let Ok(buf) = pool.alloc(32 * GRANULE).await {
+        held.push(buf);
+        if held.len() > 256 {
+            panic!("the budget never refused an allocation");
+        }
+    }
+    let grown = pool.arena_count();
+    assert!(grown >= 3, "expected several arenas, got {grown}");
+    let peak = pool.registered_bytes();
+    assert!(peak > 0);
+
+    // Still in use: nothing is reclaimable, whatever the timer says.
+    assert_eq!(
+        pool.reclaim_idle().await,
+        0,
+        "an arena with live suballocations was reclaimed"
+    );
+    assert_eq!(pool.registered_bytes(), peak);
+
+    held.clear();
+    let reclaimed = pool.reclaim_idle().await;
+    assert!(
+        reclaimed > 0,
+        "nothing was reclaimed after the pool emptied"
+    );
+    assert_eq!(backend.unmap_calls(), reclaimed);
+    assert_eq!(
+        backend.live(),
+        pool.arena_count(),
+        "the backend and the pool disagree about what is mapped"
+    );
+    assert!(
+        pool.registered_bytes() < peak,
+        "the budget was not released: {} vs {peak}",
+        pool.registered_bytes()
+    );
+}
+
+/// The retention floor is the whole point of the knob: an idle pool keeps a warm
+/// arena so the next allocation does not pay a fresh registration.
+#[tokio::test]
+async fn retention_keeps_a_warm_arena_mapped() {
+    const RETAIN: u64 = 64 * GRANULE as u64;
+    let (backend, pool) = mock_pool(reclaiming_pool_config(RETAIN));
+
+    let mut held = Vec::new();
+    while let Ok(buf) = pool.alloc(32 * GRANULE).await {
+        held.push(buf);
+        if held.len() > 256 {
+            panic!("the budget never refused an allocation");
+        }
+    }
+    assert!(
+        pool.arena_count() >= 3,
+        "the pool did not grow enough to test retention"
+    );
+    held.clear();
+    pool.reclaim_idle().await;
+
+    assert!(pool.arena_count() >= 1, "retention kept nothing at all");
+    assert!(
+        pool.registered_bytes() >= RETAIN,
+        "the pool fell below its retention floor: {} < {RETAIN}",
+        pool.registered_bytes()
+    );
+    let after = pool.registered_bytes();
+    // Idempotent: a second sweep over a pool already at its floor does nothing.
+    assert_eq!(pool.reclaim_idle().await, 0);
+    assert_eq!(pool.registered_bytes(), after);
+
+    // And the floor is warm — the next allocation comes out of what was kept.
+    let before = backend.live();
+    let _buf = pool.alloc(4 * GRANULE).await.expect("alloc from the floor");
+    assert_eq!(
+        backend.live(),
+        before,
+        "the retained arena did not serve the next allocation"
+    );
+}
+
+/// Zero retention means every empty pooled arena goes, which is what a
+/// memory-tight deployment asks for.
+#[tokio::test]
+async fn zero_retention_reclaims_every_empty_arena() {
+    let (backend, pool) = mock_pool(reclaiming_pool_config(0));
+
+    let mut held = Vec::new();
+    for _ in 0..4 {
+        held.push(pool.alloc(32 * GRANULE).await.expect("alloc"));
+    }
+    held.clear();
+    pool.reclaim_idle().await;
+
+    assert_eq!(
+        pool.arena_count(),
+        0,
+        "an empty arena survived zero retention"
+    );
+    assert_eq!(backend.live(), 0);
+    assert_eq!(
+        pool.registered_bytes(),
+        0,
+        "the budget was not fully released"
+    );
+}
+
+/// The Phase-2 gap, closed: a dedicated arena is reclaimed as soon as its single
+/// suballocation drops, with no timer and no retention — because it can never
+/// serve another request, so keeping it mapped is pure charge against the
+/// budget.
+///
+/// The old behaviour is what this asserts against: sixteen oversize stagings at
+/// the production defaults exhausted the registered-bytes budget for the life of
+/// the process, and the documented mitigation was to raise
+/// `dedicated_arena_min` past the sizes a hot path used.
+#[tokio::test]
+async fn a_dedicated_arena_is_reclaimed_when_its_buffer_drops() {
+    // Reclamation *disabled*, to show dedicated arenas do not depend on it.
+    let cfg = small_pool_config();
+    assert_eq!(cfg.arena_reclaim_after, None);
+    let dedicated_min = cfg.dedicated_arena_min as usize;
+    let (backend, pool) = mock_pool(cfg);
+
+    // Enough cycles that the old never-reclaim behaviour would exhaust the
+    // budget: the config allows eight arenas of this size at most.
+    let mut peak_arenas = 0;
+    for cycle in 0..24 {
+        let buf = pool
+            .alloc(dedicated_min)
+            .await
+            .unwrap_or_else(|e| panic!("cycle {cycle}: oversize alloc refused: {e}"));
+        peak_arenas = peak_arenas.max(pool.arena_count());
+        drop(buf);
+        pool.reclaim_idle().await;
+        assert_eq!(
+            pool.registered_bytes(),
+            0,
+            "cycle {cycle}: the dedicated arena's budget was not released"
+        );
+        assert_eq!(backend.live(), 0, "cycle {cycle}: it stayed mapped");
+    }
+    assert_eq!(
+        peak_arenas, 1,
+        "dedicated arenas accumulated instead of being reclaimed each cycle"
+    );
+}
+
+/// A dedicated arena is not reclaimed while a transfer is still writing into it,
+/// even though its `PinnedBuf` is gone — a `TransferHold` outliving its buffer
+/// is exactly the cancelled-`get_pinned` case, and unmapping under it would hand
+/// the NIC a deregistered range.
+#[tokio::test]
+async fn a_hold_outliving_its_buffer_blocks_reclaim() {
+    let cfg = reclaiming_pool_config(0);
+    let (backend, pool) = mock_pool(cfg);
+
+    let buf = pool.alloc(8 * GRANULE).await.expect("alloc");
+    let hold = buf.hold();
+    drop(buf);
+
+    assert_eq!(
+        pool.reclaim_idle().await,
+        0,
+        "an arena with a transfer still holding it was reclaimed"
+    );
+    assert_eq!(backend.live(), 1);
+
+    drop(hold);
+    assert_eq!(pool.reclaim_idle().await, 1);
+    assert_eq!(backend.live(), 0);
+}
+
+/// Reclaim racing allocation: whatever the interleaving, an arena is either
+/// handed out or unmapped, never both.
+///
+/// The assertion that matters is `backend.live() == arena_count()` — the pool
+/// and the backend agreeing about what is mapped — plus every buffer handed out
+/// being readable and writable, which an arena unmapped underneath one would not
+/// be. Counting reclaims would only prove the sweep ran.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reclaim_racing_alloc_never_hands_out_a_reclaimed_arena() {
+    const TASKS: usize = 8;
+    const ROUNDS: usize = 40;
+    let (backend, pool) = mock_pool(reclaiming_pool_config(0));
+    let pool = Arc::new(pool);
+
+    let mut tasks = Vec::new();
+    for task in 0..TASKS {
+        let pool = Arc::clone(&pool);
+        tasks.push(tokio::spawn(async move {
+            for round in 0..ROUNDS {
+                if let Ok(mut buf) = pool.alloc(4 * GRANULE).await {
+                    let byte = (task * ROUNDS + round) as u8;
+                    buf.fill(byte);
+                    tokio::task::yield_now().await;
+                    assert!(
+                        buf.iter().all(|b| *b == byte),
+                        "task {task} round {round}: the buffer was overwritten"
+                    );
+                }
+            }
+        }));
+    }
+    let sweeper = {
+        let pool = Arc::clone(&pool);
+        tokio::spawn(async move {
+            for _ in 0..ROUNDS * 4 {
+                pool.reclaim_idle().await;
+                tokio::task::yield_now().await;
+            }
+        })
+    };
+
+    for task in tasks {
+        task.await.expect("allocator task must not panic");
+    }
+    sweeper.await.expect("sweeper must not panic");
+
+    assert_eq!(
+        backend.live(),
+        pool.arena_count(),
+        "the backend and the pool disagree about what is mapped"
+    );
+    // Everything that was reclaimed gave its bytes back, and everything still
+    // mapped is still charged.
+    let mapped: u64 = pool.registered_bytes();
+    assert_eq!(
+        mapped == 0,
+        pool.arena_count() == 0,
+        "registered bytes and arena count disagree: {mapped} B over {} arenas",
+        pool.arena_count()
+    );
+}
+
+/// The registry gate, not the pool policy: once shutdown has closed admission a
+/// reclaim is refused outright, so it cannot be unmapping arenas while the sweep
+/// walks them or leave one in flight when `latch_all_deregistered` asks the
+/// backend whether anything is still registered.
+#[tokio::test]
+async fn reclaim_is_refused_once_shutdown_has_gated() {
+    let cfg = RdmaConfig {
+        pool: reclaiming_pool_config(0),
+        ..RdmaConfig::default()
+    };
+    let (backend, registry) = mock_registry(cfg);
+
+    let buf = registry.alloc_pinned(8 * GRANULE).await.expect("alloc");
+    drop(buf);
+    assert_eq!(backend.live(), 1);
+
+    registry.shutdown(Duration::from_secs(5)).await;
+    assert_eq!(backend.live(), 0, "the sweep left an arena mapped");
+
+    // The gate is closed: a late tick reclaims nothing and, in particular, does
+    // not touch the backend.
+    let calls = backend.unmap_calls();
+    assert_eq!(registry.reclaim_idle_arenas().await, 0);
+    assert_eq!(
+        backend.unmap_calls(),
+        calls,
+        "a reclaim ran after the shutdown gate closed"
+    );
+}
+
+/// A reclaim the backend will not confirm must not credit the budget: `Err` from
+/// an unmap means *unknown*, not *unmapped*. The pages and their charge are held
+/// until the end of velo shutdown, which is the same rule the shutdown sweep
+/// follows and the same machinery.
+#[tokio::test]
+async fn an_unconfirmed_reclaim_holds_its_budget() {
+    let (backend, pool) = mock_pool(reclaiming_pool_config(0));
+
+    let buf = pool.alloc(8 * GRANULE).await.expect("alloc");
+    let charged = pool.registered_bytes();
+    assert!(charged > 0);
+    drop(buf);
+
+    backend.refuse_unmap.store(true, Ordering::SeqCst);
+    assert_eq!(
+        pool.reclaim_idle().await,
+        0,
+        "an unconfirmed unmap was counted as a reclaim"
+    );
+    assert_eq!(
+        pool.registered_bytes(),
+        charged,
+        "the budget was credited for pages that may still be pinned"
+    );
+    assert_eq!(pool.arena_count(), 0, "the arena stayed in the live set");
+
+    // The end-of-shutdown release is what eventually gives them back, exactly
+    // once — no double credit with the reclaim above.
+    pool.release_unconfirmed();
+    assert_eq!(pool.registered_bytes(), 0);
+}
+
+/// The wiring, end to end: nothing in this test calls `reclaim_idle` — the
+/// rendezvous tick has to do it, over a real UCX backend, from configuration
+/// alone.
+///
+/// Every other reclamation test drives the sweep directly, so all of them would
+/// pass with `set_rdma_context` never having been taught to call it. This is the
+/// one that would not.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_rendezvous_tick_reclaims_arenas_without_being_asked() {
+    let transport = Arc::new(
+        crate::transports::ucx::UcxTransportBuilder::new()
+            .tls("tcp")
+            .build()
+            .expect("build ucx transport"),
+    );
+    let velo = crate::Velo::builder()
+        .add_ucx_transport(Arc::clone(&transport))
+        .rdma_config(RdmaConfig {
+            pool: RdmaPoolConfig {
+                // Small enough that one staging maps one arena, and every
+                // staging above `dedicated_arena_min` gets its own.
+                initial_arena_bytes: 64 * GRANULE as u64,
+                max_arena_bytes: 64 * GRANULE as u64,
+                dedicated_arena_min: 16 * GRANULE as u64,
+                registered_bytes_budget: 1024 * GRANULE as u64,
+                arena_reclaim_after: Some(Duration::from_millis(10)),
+                retain_arena_bytes: 0,
+            },
+            ..RdmaConfig::default()
+        })
+        .build()
+        .await
+        .expect("build velo");
+
+    // A pooled staging and an oversize one, so both policies are on the hook.
+    let registry = velo.rdma().expect("the ucx transport gives us a registry");
+    let small = registry
+        .alloc_pinned(4 * GRANULE)
+        .await
+        .expect("pooled alloc");
+    let big = registry
+        .alloc_pinned(16 * GRANULE)
+        .await
+        .expect("dedicated alloc");
+    assert!(velo.rdma_registered_bytes() > 0);
+    assert!(transport.live_regions() >= 2, "expected two arenas");
+
+    drop(small);
+    drop(big);
+
+    // No explicit sweep: the tick is the only thing that can do this.
+    let deadline = std::time::Instant::now() + T;
+    while std::time::Instant::now() < deadline {
+        if velo.rdma_registered_bytes() == 0 && transport.live_regions() == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        velo.rdma_registered_bytes(),
+        0,
+        "the rendezvous tick never reclaimed the empty arenas"
+    );
+    assert_eq!(transport.live_regions(), 0);
+
+    velo.graceful_shutdown(velo_ext::ShutdownPolicy::Timeout(T))
+        .await;
+    assert_eq!(transport.live_rkeys(), 0);
+}
+
+/// The soak the plan names, on the mock backend so the cycle count can be high:
+/// allocate, transfer, release, sweep — and assert the registered-byte total and
+/// the arena count come back to the same place every time.
+///
+/// A leak that grows by one arena per cycle and one that appears once are
+/// different bugs; only a per-cycle assertion tells them apart.
+#[tokio::test]
+async fn pool_lifecycle_soak() {
+    const CYCLES: usize = 200;
+    let cfg = reclaiming_pool_config(0);
+    let dedicated_min = cfg.dedicated_arena_min as usize;
+    let (backend, pool) = mock_pool(cfg);
+
+    for cycle in 0..CYCLES {
+        // A pooled allocation and an oversize one, so both reclamation policies
+        // run every cycle.
+        let mut small = pool
+            .alloc(4 * GRANULE)
+            .await
+            .unwrap_or_else(|e| panic!("cycle {cycle}: pooled alloc: {e}"));
+        let big = pool
+            .alloc(dedicated_min)
+            .await
+            .unwrap_or_else(|e| panic!("cycle {cycle}: dedicated alloc: {e}"));
+
+        // Stand in for a transfer into the pooled buffer: a hold taken and
+        // released around the write, as `get_pinned` does.
+        let hold = small.hold();
+        small.fill(cycle as u8);
+        assert!(small.iter().all(|b| *b == cycle as u8));
+        drop(hold);
+
+        drop(small);
+        drop(big);
+        pool.reclaim_idle().await;
+
+        assert_eq!(
+            pool.registered_bytes(),
+            0,
+            "cycle {cycle}: registered bytes did not return to zero"
+        );
+        assert_eq!(
+            pool.arena_count(),
+            0,
+            "cycle {cycle}: an arena survived the sweep"
+        );
+        assert_eq!(
+            backend.live(),
+            0,
+            "cycle {cycle}: the backend still holds a registration"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1305,6 +1780,7 @@ async fn unaligned_arena_sizes_balance_the_budget() {
             max_arena_bytes: 300_000,
             dedicated_arena_min: 1 << 30,
             registered_bytes_budget: 4_000_000,
+            ..small_pool_config()
         },
         ..RdmaConfig::default()
     };
