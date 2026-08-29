@@ -531,9 +531,15 @@ impl RendezvousManager {
         let backend = descriptor::DescriptorBackend::from_key(&key).ok_or_else(|| {
             anyhow::anyhow!("rdma backend {key:?} has no descriptor discriminator")
         })?;
+        // Normalised *once*, here, so the owner's deadline and the milliseconds
+        // on the wire cannot come from different numbers. See
+        // `normalize_lease_timeout`.
+        let mut config = config;
+        config.lease_timeout = normalize_lease_timeout(config.lease_timeout);
+
         // Half the deadline, so a lease is force-released between one and one
-        // and a half timeouts after its last renewal. The floor keeps a config
-        // with a zero or tiny timeout from turning the reaper into a spin.
+        // and a half timeouts after its last renewal. The floor keeps a tiny
+        // timeout from turning the reaper into a spin.
         let period = (config.lease_timeout / 2).max(std::time::Duration::from_millis(10));
 
         let ctx = RdmaContext {
@@ -950,6 +956,53 @@ impl RendezvousManager {
     }
 }
 
+/// The smallest lease timeout that can be expressed on the wire.
+///
+/// `AcquireResponse::Rdma` carries the deadline in **milliseconds**, and zero is
+/// the documented "no deadline" encoding, so anything under a millisecond
+/// rounds to a value that means the opposite of what was configured.
+const MIN_LEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// Bring a configured lease timeout up to something the wire can carry.
+///
+/// # The two realities that must not diverge
+///
+/// The owner sets its reaper deadline from a `Duration` and tells the consumer
+/// about it in milliseconds. A sub-millisecond timeout satisfies the first and
+/// truncates to `0` in the second — and `0` is not "very short", it is *no
+/// deadline*, which is how an owner from before the reaper existed answers. So
+/// the owner would arm a deadline the consumer was told did not exist: no
+/// renewal ticker would start, the reaper would force-release the lease while
+/// the GET was still running, and the freed pool slice could be handed to the
+/// next allocation while a peer's NIC was still writing into it. Silent wrong
+/// data, from a config field with no validation on it.
+///
+/// Normalising here rather than at each use is the point: the deadline and the
+/// wire value are then derived from one number by construction, and a future
+/// third consumer of the timeout cannot reintroduce the split.
+///
+/// # A clamp is not an endorsement
+///
+/// This makes a degenerate config *defined*, not sensible. A one-millisecond
+/// lease is still shorter than the five-millisecond renewal floor and the
+/// ten-millisecond reaper floor, so live transfers under it will be reaped —
+/// correctly, and as configured. See
+/// [`RdmaRendezvousConfig::lease_timeout`](rdma::RdmaRendezvousConfig::lease_timeout)
+/// for the range that actually works.
+fn normalize_lease_timeout(configured: std::time::Duration) -> std::time::Duration {
+    if configured >= MIN_LEASE_TIMEOUT {
+        return configured;
+    }
+    tracing::warn!(
+        configured = ?configured,
+        clamped_to = ?MIN_LEASE_TIMEOUT,
+        "rendezvous: the configured RDMA lease timeout is below the millisecond the wire \
+         format can carry, where it would encode as \"no deadline\" while the owner still \
+         armed one. Clamping. A timeout this short will reap live transfers."
+    );
+    MIN_LEASE_TIMEOUT
+}
+
 /// Releases a lease a `get` acquired but never handed back to its caller.
 ///
 /// # Why a guard rather than cleanup on each error arm
@@ -1122,6 +1175,44 @@ async fn reap_expired_leases(
             {
                 m.set_rdma_live_regions(regions);
             }
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "ucx", test))]
+mod lease_timeout_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// The normalisation is the single point where the owner's deadline and the
+    /// wire's milliseconds are reconciled, so it is asserted on its own rather
+    /// than only through a transfer.
+    #[test]
+    fn a_lease_timeout_always_survives_the_trip_to_milliseconds() {
+        for degenerate in [
+            Duration::ZERO,
+            Duration::from_nanos(1),
+            Duration::from_micros(1),
+            Duration::from_micros(999),
+        ] {
+            let normalized = normalize_lease_timeout(degenerate);
+            assert_eq!(normalized, MIN_LEASE_TIMEOUT, "{degenerate:?}");
+            assert_ne!(
+                normalized.as_millis(),
+                0,
+                "{degenerate:?} still encodes as \"no deadline\" on the wire"
+            );
+        }
+        for sane in [
+            Duration::from_millis(1),
+            Duration::from_millis(250),
+            Duration::from_secs(30),
+        ] {
+            assert_eq!(
+                normalize_lease_timeout(sane),
+                sane,
+                "a usable timeout must be left alone"
+            );
         }
     }
 }

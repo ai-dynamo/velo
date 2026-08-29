@@ -132,6 +132,21 @@ pub struct RdmaRendezvousConfig {
     /// a keepalive every half-deadline for as long as its GET is running, so
     /// only a *silent* consumer is reaped. Chunked leases have no deadline at
     /// all and are unaffected.
+    ///
+    /// # There is a floor, and a range that actually works
+    ///
+    /// The wire carries this in milliseconds and `0` means *no deadline*, so a
+    /// sub-millisecond value is clamped to one millisecond at build time with a
+    /// warning — otherwise the owner would arm a deadline the consumer was told
+    /// did not exist.
+    ///
+    /// The clamp makes such a value defined, not sensible. Renewals are sent no
+    /// more often than every five milliseconds and the reaper scans no more
+    /// often than every ten, so a timeout that is not comfortably more than ten
+    /// renewal intervals — call it a hundred milliseconds — will reap transfers
+    /// that are perfectly alive. That is the configuration working as asked,
+    /// not a bug; the default of thirty seconds is three orders of magnitude
+    /// clear of it.
     pub lease_timeout: Duration,
 }
 

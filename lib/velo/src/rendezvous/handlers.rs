@@ -160,13 +160,23 @@ fn rdma_response(
         return decline(RdmaPathReason::NotPinned);
     };
 
-    // The lease is now the owner's only handle on a transfer it cannot observe.
-    store.set_lease_deadline(lease_id, local_id, rdma.config.lease_timeout);
+    // Derived first, and the deadline armed only if the consumer is being told
+    // about it. `set_rdma_context` normalises the timeout so this cannot be
+    // zero; the check is here because the alternative — a deadline the consumer
+    // was told did not exist, so never renews — force-releases a lease while
+    // the peer's NIC is still reading, and that is silent wrong data rather
+    // than a visible failure.
+    let lease_timeout_ms = u64::try_from(rdma.config.lease_timeout.as_millis()).unwrap_or(u64::MAX);
+    if lease_timeout_ms != 0 {
+        // The lease is now the owner's only handle on a transfer it cannot
+        // observe.
+        store.set_lease_deadline(lease_id, local_id, rdma.config.lease_timeout);
+    }
     store.record_path(RdmaPathReason::Ok);
     Some(AcquireResponse::Rdma {
         lease_id,
         descriptor: bytes,
-        lease_timeout_ms: u64::try_from(rdma.config.lease_timeout.as_millis()).unwrap_or(u64::MAX),
+        lease_timeout_ms,
     })
 }
 

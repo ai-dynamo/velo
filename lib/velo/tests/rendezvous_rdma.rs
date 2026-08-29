@@ -709,6 +709,76 @@ async fn an_acquire_without_the_offer_field_is_answered_chunked() {
     shutdown(pair).await;
 }
 
+/// A sub-millisecond lease timeout never puts `0` on the wire.
+///
+/// Zero is the "no deadline" encoding, so an owner that armed a deadline and
+/// then reported zero would get a consumer that starts no renewal ticker — and
+/// a reaper that force-releases the lease, and frees the pool slice, while the
+/// peer's NIC is still reading from it. Silent wrong data out of a config field
+/// nothing validated.
+///
+/// Read off the wire rather than inferred, because the wire value is the whole
+/// claim: the owner's deadline and the milliseconds it reports must come from
+/// one number.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sub_millisecond_lease_timeout_is_clamped_before_it_reaches_the_wire() {
+    let pair = Pair::with_configs(
+        Some(RdmaConfig {
+            rendezvous: RdmaRendezvousConfig {
+                lease_timeout: Duration::from_micros(300),
+                ..RdmaRendezvousConfig::default()
+            },
+            ..RdmaConfig::default()
+        }),
+        None,
+    )
+    .await;
+
+    let payload = pattern(512 * 1024);
+    let handle = pair.owner.velo.register_data_pinned(&payload).await;
+
+    let raw = handle.as_u128();
+    let acquire = format!(
+        r#"{{"handle":{{"hi":{},"lo":{}}},"rdma":{{"backends":["ucx"]}}}}"#,
+        (raw >> 64) as u64,
+        raw as u64
+    );
+    let bytes: Bytes = pair
+        .consumer
+        .velo
+        .messenger()
+        .unary_streaming("_rv_acquire")
+        .raw_payload(Bytes::from(acquire))
+        .instance(pair.owner.velo.instance_id())
+        .send()
+        .await
+        .expect("acquire");
+    let response: AcquireResponse = serde_json::from_slice(&bytes).expect("AcquireResponse");
+
+    match response {
+        AcquireResponse::Rdma {
+            lease_id,
+            lease_timeout_ms,
+            ..
+        } => {
+            assert!(
+                lease_timeout_ms >= 1,
+                "a deadline the consumer is told is absent means no renewal ticker, and a \
+                 reaper that frees the source under a live GET"
+            );
+            pair.consumer.velo.detach(handle, lease_id).await.unwrap();
+        }
+        AcquireResponse::Ready { .. } => panic!("expected the RDMA path for a pinned slot"),
+    }
+
+    // And the transfer still works under the clamped config.
+    let (data, lease) = pair.consumer.velo.get(handle).await.expect("get");
+    assert_pattern(&data, payload.len());
+    let _ = pair.consumer.velo.release(handle, lease).await;
+
+    shutdown(pair).await;
+}
+
 // ---------------------------------------------------------------------------
 // 4. The fallbacks
 // ---------------------------------------------------------------------------
