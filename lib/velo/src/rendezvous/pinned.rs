@@ -36,17 +36,25 @@
 //! its `Deref` already carries the trust-domain caveat, so the pool path reads
 //! through the slice it is designed to expose.
 //!
-//! # Reads re-check that the region is still there
+//! # Reads are ordered against the region going away
 //!
-//! An external slice holds a [`RegionWatch`] and refuses every read once the
-//! region is deregistered. That is not belt-and-braces. A region's
-//! deregistration drains its in-flight count under a *bounded* budget and
+//! An external slice holds a [`RegionWatch`] and reads through
+//! [`RegionWatch::with_live`], which takes the region's copy gate, checks the
+//! deregistration latch under it, and performs the copy before releasing.
+//!
+//! The in-flight guard is not enough on its own, and it is worth being exact
+//! about why. A deregistration drains that count under a *bounded* budget and
 //! unmaps regardless when the budget runs out
-//! ([`Deregistered::DrainTimedOut`](crate::rendezvous::rdma::Deregistered)), at
-//! which point the latch closes and the caller is entitled to free the memory.
-//! The in-flight guard makes that outcome unlikely; the watch is what makes the
-//! read *safe* when it happens anyway, because a refused chunk is an error the
-//! consumer retries and a raw read of freed pages is not.
+//! ([`Deregistered::DrainTimedOut`](crate::rendezvous::rdma::Deregistered)), so
+//! the guard can still be outstanding when the latch closes — and the latch is
+//! the moment the caller is told it may free the memory. A bare
+//! `is_deregistered()` check followed by a copy would be a check-then-act
+//! against exactly that event.
+//!
+//! Under the gate the two orderings that matter both hold: a copy already in
+//! progress delays the latch, and a copy that starts after it sees the flag and
+//! refuses. A refused chunk is an error the consumer retries; a raw read of
+//! freed pages is not.
 
 use bytes::{Bytes, BytesMut};
 use velo_ext::InFlightGuard;
@@ -211,36 +219,47 @@ impl PinnedSlot {
                 buf.get(start..stop).map(Bytes::copy_from_slice)
             }
             PinnedStaging::External(slice) => {
-                // Checked *before* the read, and the in-flight guard this slot
-                // holds is what keeps a deregistration from completing between
-                // the two. See the module docs for what remains and why it is
-                // bounded by D8's documented drain-timeout risk.
-                if slice.watch.is_deregistered() {
-                    return None;
-                }
                 let start = usize::try_from(offset).ok()?;
                 let stop = start.checked_add(len)?;
                 if stop > slice.len {
                     return None;
                 }
-                let mut out = BytesMut::zeroed(len);
-                // SAFETY: `ptr + start .. ptr + stop` lies inside the range the
-                // caller registered — `stop <= slice.len`, checked above — and
-                // that range is still registered, because this slot holds an
-                // in-flight guard on the region and the watch above says no
-                // deregistration has completed. `out` is a fresh allocation of
-                // exactly `len` bytes and cannot overlap it. No reference into
-                // the registered range is formed: the read is a raw copy out,
-                // which is what the registration contract requires of every
-                // access to caller-owned registered memory.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        (slice.ptr as *const u8).add(start),
-                        out.as_mut_ptr(),
-                        len,
-                    );
-                }
-                Some(out.freeze())
+                // The check and the copy are one step, under the region's copy
+                // gate. Splitting them would be a check-then-act against the
+                // one event that licenses the owner of this memory to free it.
+                slice.watch.with_live(|| {
+                    let mut out = BytesMut::zeroed(len);
+                    // SAFETY: three facts, and the gate is what ties them
+                    // together.
+                    //
+                    // * **In range.** `ptr + start .. ptr + stop` lies inside
+                    //   the range the caller registered: `stop <= slice.len`,
+                    //   checked above, and `slice.len` is the length that was
+                    //   registered.
+                    // * **Still allocated.** `with_live` runs this only while
+                    //   the region's latch is closed *and* holds the gate that
+                    //   `latch_deregistered` must take to close it. So the
+                    //   caller cannot have been told it may free this memory,
+                    //   and `RegionInner` — which the watch keeps alive — has
+                    //   not dropped the buffer it owns. Note that this is
+                    //   deliberately not a claim that the range is still
+                    //   *registered*: a deregistration may be in flight, and
+                    //   reading unpinned-but-allocated memory is fine.
+                    // * **No aliasing reference.** The read is a raw copy into
+                    //   `out`, a fresh allocation of exactly `len` bytes that
+                    //   cannot overlap the source. No `&[u8]` into the
+                    //   registered range is ever formed, which the registration
+                    //   contract requires because a peer holding the region's
+                    //   key may write to it at any moment.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            (slice.ptr as *const u8).add(start),
+                            out.as_mut_ptr(),
+                            len,
+                        );
+                    }
+                    out.freeze()
+                })
             }
         }
     }

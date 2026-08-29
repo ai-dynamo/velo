@@ -29,7 +29,7 @@ use velo_ext::Transport;
 
 use super::arena::{ArenaSet, Budget, GRANULE, RdmaPoolConfig, pool_arena_target};
 use super::backend::{BackendGet, BackendRegion, RdmaBackend, RdmaError, UcxBackend};
-use super::region::Deregistered;
+use super::region::{Deregistered, RegionInner, RegionParts};
 use super::{RdmaConfig, RdmaRegistry};
 
 /// Generous ceiling for anything that should resolve promptly.
@@ -1982,4 +1982,90 @@ async fn a_refused_latch_retains_pool_arenas() {
         0,
         "a successful latch must release the arenas the sweep could not confirm"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The copy gate
+// ---------------------------------------------------------------------------
+
+/// A `RegionInner` over a plain heap buffer, with no backend behind it.
+///
+/// The gate is pure velo ordering — it has nothing to say to the backend — so
+/// exercising it against a real registration would only add scheduling noise
+/// to the race this test is trying to lose.
+fn bare_region(buffer: Box<[u8]>) -> Arc<RegionInner> {
+    let ptr = buffer.as_ptr() as usize;
+    let len = buffer.len();
+    Arc::new(RegionInner::new(RegionParts {
+        id: 1,
+        generation: 1,
+        backend_region_id: 1,
+        ptr,
+        len,
+        packed_key: Bytes::from_static(b"key"),
+        effective_addr: ptr as u64,
+        effective_len: len as u64,
+        owned: Some(buffer),
+        charged: len as u64,
+        shutdown: tokio_util::sync::CancellationToken::new(),
+    }))
+}
+
+/// A copy can never be in progress while the deregistration latch closes.
+///
+/// The latch is the moment the region's owner is told it may free the memory,
+/// and an anchor staged inside the region copies out of it through a raw
+/// pointer. A bare `is_deregistered()` check followed by a copy is a
+/// check-then-act against exactly that event: nothing stops the latch landing
+/// between them, and the in-flight guard does not help, because a drain that
+/// times out latches with guards still outstanding.
+///
+/// So the assertion lives *inside* the copy — every reader let through
+/// re-checks the flag while holding the gate. Readers and the latch race
+/// deliberately, so a gate that does not exclude them fails within a few
+/// iterations rather than needing one unlucky interleaving.
+#[test]
+fn a_copy_never_overlaps_the_deregistration_latch() {
+    const READERS: usize = 8;
+    const ROUNDS: usize = 400;
+
+    for _ in 0..16 {
+        let region = bare_region(vec![0u8; 4096].into_boxed_slice());
+        let start = Arc::new(std::sync::Barrier::new(READERS + 1));
+
+        let readers: Vec<_> = (0..READERS)
+            .map(|_| {
+                let region = Arc::clone(&region);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    for _ in 0..ROUNDS {
+                        region.with_live(|| {
+                            assert!(
+                                !region.is_deregistered(),
+                                "the latch closed while a copy was in progress; the region's \
+                                 owner may already have freed these bytes"
+                            );
+                        });
+                    }
+                })
+            })
+            .collect();
+
+        start.wait();
+        // Latched from this thread, racing the readers rather than after them.
+        region.latch_deregistered();
+        for reader in readers {
+            reader.join().expect("a reader observed the latch mid-copy");
+        }
+
+        assert!(region.is_deregistered());
+        assert!(
+            region.with_live(|| ()).is_none(),
+            "every read after the latch must refuse"
+        );
+        // Latched, so `RegionInner::drop` frees the owned buffer normally
+        // rather than leaking it.
+        drop(region);
+    }
 }

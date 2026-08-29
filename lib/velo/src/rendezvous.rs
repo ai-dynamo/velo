@@ -449,8 +449,15 @@ impl RendezvousManager {
     /// the last `release` — is what lets the deregistration through. A caller
     /// that stages anchors and then unregisters without releasing them sees
     /// `unregister` wait and, if it runs out of budget, unmap anyway with a
-    /// warning; reads of that slot refuse from that moment rather than touching
-    /// freed pages.
+    /// warning.
+    ///
+    /// Reads of that slot refuse from the moment the region's
+    /// [`deregistered`](rdma::RegionGuard::deregistered) latch closes — which
+    /// is the moment the caller is told it may free the memory, and is what the
+    /// refusal protects. Between the unmap and the latch a read may still run:
+    /// unmapping deregisters rather than frees, so the pages are still there.
+    /// The read and the latch are ordered against each other by the region's
+    /// copy gate, so neither can catch the other half-done.
     ///
     /// # Errors
     ///
