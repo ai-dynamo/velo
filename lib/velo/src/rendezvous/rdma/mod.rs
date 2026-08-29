@@ -56,7 +56,7 @@ pub use arena::{PinnedBuf, RdmaPoolConfig};
 pub use backend::RdmaError;
 pub use region::{Deregistered, RegionGuard, RegionWatch};
 
-pub(crate) use arena::{ArenaSet, Budget};
+pub(crate) use arena::{ArenaSet, Budget, TransferHold};
 pub(crate) use backend::{BackendGet, RdmaBackend, UcxBackend};
 use region::{RegionInner, RegionParts};
 
@@ -498,6 +498,15 @@ impl RdmaRegistry {
     /// owner-authored descriptor.
     pub(crate) async fn get(&self, req: BackendGet) -> Result<(), RdmaError> {
         self.shared.backend.get(req).await
+    }
+
+    /// The runtime this registry was built on.
+    ///
+    /// An in-flight transfer must be able to outlive the caller that started
+    /// it — see [`TransferHold`] — and a detached task needs somewhere to run
+    /// that does not depend on whoever is awaiting it.
+    pub(crate) fn runtime(&self) -> &tokio::runtime::Handle {
+        &self.shared.runtime
     }
 
     /// Regions the backend currently holds registered, if it can say.

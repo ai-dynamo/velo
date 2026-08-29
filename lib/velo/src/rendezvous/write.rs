@@ -65,7 +65,20 @@ pub struct RdmaDestination<'a> {
     region_id: u64,
     offset: u64,
     capacity: u64,
-    /// Ties this destination to the `&mut` borrow it came from.
+    /// Keeps the destination's suballocation out of the pool's free list until
+    /// the *backend* reports the transfer finished.
+    ///
+    /// Without it, a caller that drops its `get_into` future would return the
+    /// granules while the NIC was still writing into them, and the next
+    /// allocation would be handed memory a cancelled transfer is about to
+    /// overwrite. The transfer takes this out of the destination before it is
+    /// submitted, so what the caller drops is no longer what keeps the space
+    /// reserved.
+    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    hold: Option<super::rdma::TransferHold>,
+    /// Ties this destination to the `&mut` borrow it came from. The borrow is
+    /// what excludes other *local* writers for as long as the destination
+    /// exists; the hold above is what survives the borrow ending.
     marker: std::marker::PhantomData<&'a mut [u8]>,
 }
 
@@ -77,14 +90,36 @@ impl RdmaDestination<'_> {
     /// would let a caller hand the backend a number it made up, which the
     /// backend would refuse — but only after the acquire had already committed
     /// to the RDMA path.
-    #[cfg_attr(not(all(target_os = "linux", feature = "ucx")), allow(dead_code))]
-    pub(crate) fn new(region_id: u64, offset: u64, capacity: u64) -> Self {
+    /// Describe a registered destination, and hand the transfer the
+    /// reservation that keeps it out of the pool's free list.
+    ///
+    /// There is deliberately no unheld constructor: every destination velo
+    /// builds is one an outstanding transfer must be able to outlive, and a
+    /// second constructor without that argument would be the easy way to
+    /// reintroduce the recycle-under-the-NIC bug.
+    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    pub(crate) fn held(
+        region_id: u64,
+        offset: u64,
+        capacity: u64,
+        hold: super::rdma::TransferHold,
+    ) -> Self {
         Self {
             region_id,
             offset,
             capacity,
+            hold: Some(hold),
             marker: std::marker::PhantomData,
         }
+    }
+
+    /// Take the reservation, to move it into the transfer.
+    ///
+    /// Called once, immediately before submitting: from then on the transfer
+    /// owns the reservation and the destination is only a description.
+    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    pub(crate) fn take_hold(&mut self) -> Option<super::rdma::TransferHold> {
+        self.hold.take()
     }
 
     /// The local backend's id for the region this destination lives in.
@@ -175,6 +210,16 @@ impl RendezvousWrite for Vec<u8> {
 ///
 /// Holding one holds pool space; drop it or take the buffer with
 /// [`into_inner`](Self::into_inner) once the bytes have been consumed.
+///
+/// # Dropping it does not cancel a transfer into it
+///
+/// If a `get_into` future is dropped while its transfer is outstanding, the
+/// transfer still completes — that is UCX's contract, not a choice — and the
+/// destination's pool space stays reserved until it does. What the writer holds
+/// is one claim among two; releasing it early is safe and simply does not free
+/// anything yet. The bytes may still change after the future is dropped, so a
+/// writer recovered from a cancelled transfer must be treated as having
+/// unspecified contents.
 #[cfg(all(target_os = "linux", feature = "ucx"))]
 pub struct PinnedWriter {
     buf: super::rdma::PinnedBuf,
@@ -250,10 +295,15 @@ impl RendezvousWrite for PinnedWriter {
     }
 
     fn rdma_destination(&mut self) -> Option<RdmaDestination<'_>> {
-        Some(RdmaDestination::new(
+        Some(RdmaDestination::held(
             self.buf.backend_region_id(),
             self.buf.arena_offset(),
             self.buf.len() as u64,
+            // The transfer's own reservation. Dropping this writer while a
+            // transfer into it is outstanding therefore returns *this* handle's
+            // claim and nothing else; the space comes back when the backend
+            // finishes.
+            self.buf.hold(),
         ))
     }
 }

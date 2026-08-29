@@ -721,6 +721,26 @@ impl RendezvousManager {
     /// instance has no RDMA registry to allocate a destination from — including
     /// for a purely local handle, which still needs somewhere pinned to copy
     /// into.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping this future does not stop the transfer. UCX has no way to
+    /// recall a submitted RMA operation, so the NIC keeps writing into the
+    /// destination until it is done; what the drop abandons is the
+    /// notification, not the work.
+    ///
+    /// Velo makes that safe rather than pretending otherwise: the destination's
+    /// pool space is reserved by the *transfer*, not by this future, so it is
+    /// returned when the backend finishes and never while a write is still
+    /// landing in it. Without that a cancelled transfer would silently
+    /// overwrite whatever the pool handed the space to next.
+    ///
+    /// The visible cost is that the space stays spoken for a little after the
+    /// cancellation. A caller that drops one of these and immediately retries
+    /// at the same size can see the retry answer
+    /// [`BudgetExceeded`](rdma::RdmaError::BudgetExceeded) under a tight pool,
+    /// until the abandoned transfer completes. That is the reservation working,
+    /// not a leak.
     #[cfg(all(target_os = "linux", feature = "ucx"))]
     pub async fn get_pinned(&self, handle: DataHandle) -> Result<(rdma::PinnedBuf, u64)> {
         let started = Instant::now();
@@ -781,6 +801,11 @@ impl RendezvousManager {
     /// specifically, and an ordinary `Vec` would silently not be one. A caller
     /// that can live with a copy should use a `Vec` directly, which works and
     /// still rides the RDMA path.
+    ///
+    /// Dropping the writer releases its claim on the pool space, but a transfer
+    /// into it that is still outstanding holds a claim of its own — so the
+    /// space comes back when the *later* of the two lets go, and never while a
+    /// NIC write is still landing.
     #[cfg(all(target_os = "linux", feature = "ucx"))]
     pub async fn alloc_pinned_writer(
         &self,
@@ -801,6 +826,15 @@ impl RendezvousManager {
     /// NIC with no copy; every other destination gets one copy out of a pooled
     /// buffer when the owner offers RDMA, and the chunk-by-chunk path when it
     /// does not.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping this future does not stop a transfer already in flight — UCX
+    /// cannot recall one — so `dest` may still be written after the drop and
+    /// must be treated as holding unspecified bytes. The destination's own pool
+    /// space, where it has some, stays reserved until the backend finishes, so
+    /// a cancelled transfer can never land in memory the pool has since handed
+    /// to somebody else.
     pub async fn get_into(
         &self,
         handle: DataHandle,
@@ -968,6 +1002,7 @@ impl RendezvousManager {
 /// `AcquireResponse::Rdma` carries the deadline in **milliseconds**, and zero is
 /// the documented "no deadline" encoding, so anything under a millisecond
 /// rounds to a value that means the opposite of what was configured.
+#[cfg(all(target_os = "linux", feature = "ucx"))]
 const MIN_LEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1);
 
 /// Bring a configured lease timeout up to something the wire can carry.
@@ -996,6 +1031,7 @@ const MIN_LEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(
 /// correctly, and as configured. See
 /// [`RdmaRendezvousConfig::lease_timeout`](rdma::RdmaRendezvousConfig::lease_timeout)
 /// for the range that actually works.
+#[cfg(all(target_os = "linux", feature = "ucx"))]
 fn normalize_lease_timeout(configured: std::time::Duration) -> std::time::Duration {
     if configured >= MIN_LEASE_TIMEOUT {
         return configured;

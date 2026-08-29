@@ -528,10 +528,14 @@ async fn rdma_pull(
         RdmaFallback::new(reason, e.to_string())
     })?;
 
-    let dest = crate::rendezvous::write::RdmaDestination::new(
+    let dest = crate::rendezvous::write::RdmaDestination::held(
         buf.backend_region_id(),
         buf.arena_offset(),
         buf.len() as u64,
+        // The transfer's claim on the pool space. If this future is dropped
+        // mid-flight, `buf` goes with it but the space does not come back until
+        // the backend has finished writing into it.
+        buf.hold(),
     );
     run_get(manager, handle, lease_id, &desc, dest, lease_timeout_ms).await?;
     Ok(buf)
@@ -635,7 +639,7 @@ async fn run_get(
     handle: DataHandle,
     lease_id: u64,
     desc: &crate::rendezvous::descriptor::RdmaDescriptor,
-    dest: crate::rendezvous::write::RdmaDestination<'_>,
+    mut dest: crate::rendezvous::write::RdmaDestination<'_>,
     lease_timeout_ms: u64,
 ) -> Result<(), RdmaFallback> {
     let store = manager.data_store();
@@ -676,13 +680,45 @@ async fn run_get(
         None => None,
     };
 
-    let started = std::time::Instant::now();
-    let transfer = ctx.registry.get(req);
-    let outcome = with_lease_renewal(manager, handle, lease_id, lease_timeout_ms, async move {
+    // The transfer is *spawned*, not awaited in place, and the destination's
+    // reservation moves into it.
+    //
+    // Dropping a `get_pinned` or `get_into` future must not free the
+    // destination's granules: the backend's cancel-safety is arena-granular —
+    // the transfer completes and the arena stays mapped — but the
+    // suballocation would go back on the free list and the next allocation
+    // would be handed memory a still-running NIC write is about to overwrite.
+    //
+    // A detached task is exactly the tool for that. Dropping a `JoinHandle`
+    // detaches the task rather than cancelling it, so the caller going away
+    // leaves the transfer running with its reservation intact, and the space
+    // comes back when the backend says the write is over. The Phase-1 contract
+    // is what makes that terminate: every submitted RMA op completes or is
+    // cancelled, and either way the completion fires.
+    let hold = dest.take_hold();
+    let registry = Arc::clone(&ctx.registry);
+    let transfer = ctx.registry.runtime().spawn(async move {
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
         }
-        transfer.await
+        let outcome = registry.get(req).await;
+        // Released here and nowhere else: after the backend has finished with
+        // the range, whether it succeeded or failed.
+        drop(hold);
+        outcome
+    });
+
+    let started = std::time::Instant::now();
+    let outcome = with_lease_renewal(manager, handle, lease_id, lease_timeout_ms, async move {
+        match transfer.await {
+            Ok(outcome) => outcome,
+            // The task panicked or the runtime is going down. The reservation
+            // went with it either way, so this is a failed transfer and not a
+            // leak.
+            Err(join) => Err(crate::rendezvous::rdma::RdmaError::Backend(format!(
+                "rdma transfer task: {join}"
+            ))),
+        }
     })
     .await;
 

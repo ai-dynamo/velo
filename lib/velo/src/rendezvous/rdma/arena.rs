@@ -286,10 +286,12 @@ impl Arena {
         let allocation = self.free.lock().allocate(granules)?;
         self.live.fetch_add(1, Ordering::AcqRel);
         Some(PinnedBuf {
-            offset: allocation.offset as usize * GRANULE,
-            len,
-            allocation,
-            arena: Arc::clone(self),
+            inner: Arc::new(Suballoc {
+                offset: allocation.offset as usize * GRANULE,
+                len,
+                allocation,
+                arena: Arc::clone(self),
+            }),
         })
     }
 
@@ -305,11 +307,60 @@ impl Arena {
 // PinnedBuf
 // ---------------------------------------------------------------------------
 
+/// A reserved range inside an [`Arena`], and the free token that returns it.
+///
+/// Shared behind an `Arc` so that an in-flight transfer into the range can hold
+/// it alive independently of whoever asked for the allocation. It exposes no
+/// way to read or write the bytes — that belongs to [`PinnedBuf`] — so holding
+/// one is a *reservation* and nothing more.
+pub(crate) struct Suballoc {
+    arena: Arc<Arena>,
+    /// The free token. Private, and the only thing that can return the space.
+    allocation: Allocation<u32>,
+    /// Byte offset of this range within the arena.
+    offset: usize,
+    /// Exactly what the caller asked for. The suballocator rounds up to a float
+    /// bin, so the reserved space is at least `len`; the extra bytes belong to
+    /// nobody and are never exposed.
+    len: usize,
+}
+
+impl Drop for Suballoc {
+    /// Return the space to the pool. Runs when the last holder lets go — the
+    /// caller's [`PinnedBuf`] *and* any [`TransferHold`] an outstanding
+    /// transfer took.
+    fn drop(&mut self) {
+        self.arena.release(self.allocation);
+    }
+}
+
+/// Keeps a suballocation out of the free list while a transfer into it may
+/// still be running.
+///
+/// # Why this exists
+///
+/// `RdmaEndpoint::get`'s cancel-safety is *arena*-granular: dropping the future
+/// abandons the notification, the transfer runs to completion, and the arena
+/// stays mapped underneath it. What that does not cover is the suballocation.
+/// A cancelled `get_pinned` would drop its `PinnedBuf`, return the granules to
+/// the free list, and let the next allocation hand them to somebody else — with
+/// a NIC still writing into them. The next tenant's data would be silently
+/// overwritten by a transfer that was cancelled, which is about as hard to
+/// diagnose as a bug gets.
+///
+/// So the in-flight transfer owns a hold, and the hold outlives the caller's
+/// buffer if the caller goes away. It has no accessors at all: it cannot read
+/// or write the range, which is what keeps [`PinnedBuf`]'s raw-pointer `Deref`
+/// pair sound while a hold is outstanding.
+pub(crate) struct TransferHold(#[allow(dead_code)] Arc<Suballoc>);
+
 /// An owned, registered byte range cut from an [`Arena`].
 ///
 /// Derefs to its bytes, so it is usable as a plain buffer. Dropping it returns
 /// the space to the pool and nothing else: the arena stays registered, so the
-/// next allocation of that space costs no pin.
+/// next allocation of that space costs no pin. If a transfer into the range is
+/// still outstanding the space is returned when *that* finishes instead — see
+/// [`TransferHold`].
 ///
 /// # This is registered memory, and that has consequences
 ///
@@ -329,15 +380,7 @@ impl Arena {
 /// long-lived reservation against
 /// [`registered_bytes_budget`](RdmaPoolConfig::registered_bytes_budget).
 pub struct PinnedBuf {
-    arena: Arc<Arena>,
-    /// The free token. Private, and the only thing that can return the space.
-    allocation: Allocation<u32>,
-    /// Byte offset of this range within the arena.
-    offset: usize,
-    /// Exactly what the caller asked for. The suballocator rounds up to a float
-    /// bin, so the reserved space is at least `len`; the extra bytes belong to
-    /// nobody and are never exposed.
-    len: usize,
+    inner: Arc<Suballoc>,
 }
 
 impl PinnedBuf {
@@ -345,37 +388,45 @@ impl PinnedBuf {
     pub(crate) fn remote(&self) -> RemoteRef {
         RemoteRef {
             addr: self.addr(),
-            len: self.len as u64,
-            packed_key: self.arena.packed_key.clone(),
-            generation: self.arena.generation,
+            len: self.inner.len as u64,
+            packed_key: self.inner.arena.packed_key.clone(),
+            generation: self.inner.arena.generation,
         }
     }
 
     /// Absolute address of the first byte.
     pub(crate) fn addr(&self) -> u64 {
-        self.arena.base() as u64 + self.offset as u64
+        self.inner.arena.base() as u64 + self.inner.offset as u64
     }
 
     /// Offset of this range inside its arena — what a backend GET wants when
     /// the arena is the destination.
     pub(crate) fn arena_offset(&self) -> u64 {
-        self.offset as u64
+        self.inner.offset as u64
     }
 
     /// Backend region id of the arena backing these bytes.
     pub(crate) fn backend_region_id(&self) -> u64 {
-        self.arena.backend_region_id
+        self.inner.arena.backend_region_id
+    }
+
+    /// Reserve this range for a transfer that may outlive the buffer.
+    ///
+    /// The hold must live until the *backend* reports the transfer finished,
+    /// not until the caller stops waiting for it. See [`TransferHold`].
+    pub(crate) fn hold(&self) -> TransferHold {
+        TransferHold(Arc::clone(&self.inner))
     }
 
     /// Length in bytes, exactly as requested.
     pub fn len(&self) -> usize {
-        self.len
+        self.inner.len
     }
 
     /// Whether the range is empty. Never true — the pool refuses zero-length
     /// requests — but clippy wants it beside `len`.
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.inner.len == 0
     }
 }
 
@@ -385,8 +436,8 @@ impl std::fmt::Debug for PinnedBuf {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PinnedBuf")
             .field("addr", &self.addr())
-            .field("len", &self.len)
-            .field("generation", &self.arena.generation)
+            .field("len", &self.inner.len)
+            .field("generation", &self.inner.arena.generation)
             .finish()
     }
 }
@@ -401,6 +452,10 @@ impl Deref for PinnedBuf {
         // the suballocator hands out non-overlapping ranges, so no other
         // `PinnedBuf` aliases these bytes *from this process*.
         //
+        // A `TransferHold` on the same `Suballoc` may exist, but it is a
+        // reservation with no accessors: it cannot produce a reference or a
+        // pointer to these bytes, so it introduces no Rust aliasing.
+        //
         // What this cannot establish is that nothing else is writing. The arena
         // is registered for RMA, so any peer holding its key can write into
         // this range at any moment, and `prot` is dead code in UCP — the
@@ -408,26 +463,38 @@ impl Deref for PinnedBuf {
         // enforcement. A concurrent remote write is a data race the Rust
         // abstract machine has no vocabulary for. It is admitted as the
         // module's trust-domain assumption, not proved away here.
-        unsafe { std::slice::from_raw_parts(self.arena.base().add(self.offset), self.len) }
+        unsafe {
+            std::slice::from_raw_parts(
+                self.inner.arena.base().add(self.inner.offset),
+                self.inner.len,
+            )
+        }
     }
 }
 
 impl DerefMut for PinnedBuf {
     fn deref_mut(&mut self) -> &mut [u8] {
-        // SAFETY: as for `Deref`. `&mut self` proves this is the only *Rust*
-        // handle to the range — it proves nothing about the NIC, which is a
-        // writer the borrow checker cannot see and which needs no handle from
-        // us to write here. Exclusivity against remote writers is a property of
-        // the protocol and the trust domain, and the trust domain alone is what
-        // makes this sound; claiming `&mut self` settles it would be a lie
-        // about which writers exist.
-        unsafe { std::slice::from_raw_parts_mut(self.arena.base().add(self.offset), self.len) }
-    }
-}
-
-impl Drop for PinnedBuf {
-    fn drop(&mut self) {
-        self.arena.release(self.allocation);
+        // SAFETY: as for `Deref`, and note what `&mut self` does and does not
+        // establish here.
+        //
+        // It proves this is the only *`PinnedBuf`* handle to the range. It does
+        // not prove there is no `TransferHold` on the same `Suballoc` — but a
+        // hold exposes no accessor of any kind, so it can never produce an
+        // aliasing reference. The hold's job is to keep the space out of the
+        // free list, not to read it.
+        //
+        // It proves nothing about the NIC either, which is a writer the borrow
+        // checker cannot see and which needs no handle from us to write here.
+        // Exclusivity against remote writers is a property of the protocol and
+        // the trust domain, and the trust domain alone is what makes this
+        // sound; claiming `&mut self` settles it would be a lie about which
+        // writers exist.
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self.inner.arena.base().add(self.inner.offset),
+                self.inner.len,
+            )
+        }
     }
 }
 

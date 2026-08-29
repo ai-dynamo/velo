@@ -1218,6 +1218,73 @@ async fn get_into_a_pinned_writer_takes_the_zero_copy_path() {
     shutdown(pair).await;
 }
 
+/// A cancelled transfer keeps its destination reserved until the NIC is done
+/// with it.
+///
+/// UCX cannot recall a submitted RMA operation, so dropping the future
+/// abandons the notification and nothing else — the write is still landing. If
+/// the destination's granules went back to the pool at that moment, the next
+/// allocation would be handed memory a cancelled transfer is about to
+/// overwrite, and the corruption would appear in somebody else's buffer with
+/// nothing to connect it to the cancellation.
+///
+/// The pool is sized so exactly one of these allocations fits, which turns
+/// "the space is still reserved" into an observable: the retry has to fail
+/// while the abandoned transfer is running, and succeed once it is not.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_transfer_does_not_release_its_destination() {
+    const ARENA: u64 = 1 << 20;
+    const CUT: usize = 768 * 1024;
+
+    let tight = RdmaConfig {
+        pool: RdmaPoolConfig {
+            initial_arena_bytes: ARENA,
+            max_arena_bytes: ARENA,
+            dedicated_arena_min: 64 << 20,
+            registered_bytes_budget: ARENA + (ARENA / 2),
+        },
+        ..RdmaConfig::default()
+    };
+    let pair = Pair::with_configs(None, Some(tight)).await;
+
+    let payload = pattern(CUT);
+    let handle = pair.owner.velo.register_data_pinned(&payload).await;
+    pair.consumer
+        .velo
+        .rendezvous_manager()
+        .arm_rdma_hook(RdmaTestHook::SlowGet(Duration::from_millis(700)));
+
+    // Dropped while the transfer is still running.
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(60),
+        pair.consumer.velo.get_pinned(handle),
+    )
+    .await;
+    assert!(
+        cancelled.is_err(),
+        "the transfer finished too fast to cancel"
+    );
+
+    // The abandoned transfer still owns the destination, and the pool has room
+    // for exactly one, so this cannot be satisfied yet.
+    let refused = pair.consumer.velo.alloc_pinned_writer(CUT).await;
+    assert!(
+        matches!(refused, Err(RdmaError::BudgetExceeded { .. })),
+        "the cancelled transfer released its destination while the NIC was still \
+         writing into it; got {refused:?}"
+    );
+
+    // ... and once it finishes, the space comes back on its own.
+    wait_until(
+        "the abandoned transfer releases its destination when the backend is done",
+        || async { pair.consumer.velo.alloc_pinned_writer(CUT).await.is_ok() },
+        || "the space never came back".to_string(),
+    )
+    .await;
+
+    shutdown(pair).await;
+}
+
 /// Dropping a pooled buffer really does return its space.
 ///
 /// Sized so the arena has room for exactly one of these at a time and the
