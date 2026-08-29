@@ -1792,6 +1792,128 @@ fn a_sub_floor_ep_idle_timeout_is_clamped() {
     );
 }
 
+/// **The load-bearing empirical fact.** For a peer we have an endpoint to, is
+/// the `reply_ep` UCX hands the recv callback the *same pointer* as the endpoint
+/// we created to that peer?
+///
+/// The inbound freshness stamp is only possible if it is. Connection matching —
+/// which the reap-disruption finding establishes UCX does — is not the same
+/// claim: UCX could route the peer's frames over our connection while handing
+/// the callback a distinct `ucp_ep_h` wrapper, and then there would be nothing
+/// at this layer to stamp.
+///
+/// The two counters split the answer. `eps_stamped_inbound` rises only when a
+/// sighting matched an endpoint this worker owns; `eps_inbound_unmatched` rises
+/// when it matched nothing. Both are ordinary in general — a peer we have never
+/// sent to replies on an endpoint UCX made and we do not own — so what settles
+/// it is the *directional* case below: A sends to B (so A owns an endpoint to
+/// B), then B sends to A, and A's stamp count must move.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_inbound_frame_refreshes_the_endpoint_it_arrived_on() {
+    // The reaper gates the stamping work, so it has to be on — at a timeout far
+    // longer than this test, since nothing here is about reaping.
+    let a = start_node_with(|b| b.ep_idle_timeout(Some(Duration::from_secs(3600)))).await;
+    let b = start_node().await;
+    cross_register(&a, &b);
+    let errs = CountingErrors::new();
+
+    // A now owns an endpoint to B.
+    ping_message(&a, &b, &errs).await;
+    assert_eq!(eps_open(&a), 1);
+    let before = a
+        .transport
+        .shared
+        .eps_stamped_inbound
+        .load(Ordering::SeqCst);
+
+    // B sends to A. If the reply endpoint A's callback sees is the one A
+    // created, this stamps it.
+    ping_message(&b, &a, &errs).await;
+
+    let stamped = wait_until(T, || {
+        a.transport
+            .shared
+            .eps_stamped_inbound
+            .load(Ordering::SeqCst)
+            > before
+    })
+    .await;
+    let unmatched = a
+        .transport
+        .shared
+        .eps_inbound_unmatched
+        .load(Ordering::SeqCst);
+    println!(
+        "reply_ep identity: stamped={} unmatched={unmatched}",
+        a.transport
+            .shared
+            .eps_stamped_inbound
+            .load(Ordering::SeqCst)
+    );
+    assert!(
+        stamped,
+        "an inbound frame from a peer we hold an endpoint to did not refresh it \
+         (unmatched sightings: {unmatched}). UCX is handing the recv callback a \
+         reply endpoint that is not the one `ucp_ep_create` gave us, so no inbound \
+         freshness stamp is possible at this layer — see the operator guidance on \
+         UcxTransportBuilder::ep_idle_timeout, which depends on this holding."
+    );
+
+    a.transport.shutdown();
+    b.transport.shutdown();
+    assert_rma_balanced(&a);
+    assert_rma_balanced(&b);
+}
+
+/// The consequence that matters operationally: a peer that only ever *sends* to
+/// us keeps its endpoint alive, instead of having it reaped and blackholed under
+/// its own traffic.
+///
+/// This is the mutation target for the inbound stamp — remove it and the
+/// endpoint here is reaped on schedule, which the assertion catches.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_that_keeps_sending_keeps_its_endpoint() {
+    let a = start_node_with(|b| b.ep_idle_timeout(Some(IDLE))).await;
+    let b = start_node().await;
+    cross_register(&a, &b);
+    let errs = CountingErrors::new();
+
+    // A owns an endpoint to B, and then never sends again.
+    ping_message(&a, &b, &errs).await;
+    assert_eq!(eps_open(&a), 1);
+
+    // B sends for comfortably longer than the idle window, at well under it.
+    let deadline = tokio::time::Instant::now() + IDLE * 3;
+    while tokio::time::Instant::now() < deadline {
+        ping_message(&b, &a, &errs).await;
+        tokio::time::sleep(IDLE / 4).await;
+    }
+
+    assert_eq!(
+        eps_closed_idle(&a),
+        0,
+        "a peer's endpoint was reaped while that peer was actively sending to us"
+    );
+    assert_eq!(
+        eps_open(&a),
+        1,
+        "the endpoint was retired under live traffic"
+    );
+    assert_eq!(errs.count(), 0);
+
+    // And once the traffic stops, it *is* reaped — the stamp refreshes idleness,
+    // it does not disable it.
+    assert!(
+        wait_until(T, || eps_closed_idle(&a) >= 1).await,
+        "the endpoint was never reaped after the inbound traffic stopped"
+    );
+
+    a.transport.shutdown();
+    b.transport.shutdown();
+    assert_rma_balanced(&a);
+    assert_rma_balanced(&b);
+}
+
 /// The default is off, and "off" has to mean *never*, not *rarely*.
 ///
 /// D9's sign-off left the reaper disabled because a reconnect costs ~14 ms of

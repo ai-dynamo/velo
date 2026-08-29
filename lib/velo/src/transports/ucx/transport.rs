@@ -159,6 +159,9 @@ impl UcxTransport {
             live_rkeys: Arc::new(Default::default()),
             eps_open: Arc::new(Default::default()),
             eps_closed_idle: Arc::new(Default::default()),
+            eps_stamped_inbound: Arc::new(Default::default()),
+            eps_inbound_unmatched: Arc::new(Default::default()),
+            reply_eps: Arc::new(super::worker::ReplyEpSightings::new()),
         });
         Self {
             key,
@@ -651,29 +654,48 @@ impl UcxTransportBuilder {
     /// triggers it. Turn it on when a process talks to far more peers over its
     /// lifetime than it talks to at any one time.
     ///
-    /// # What counts as use
+    /// # What counts as use — both directions
     ///
-    /// Anything that resolves an endpoint on the progress thread: a frame send,
-    /// an RDMA GET, an eager wireup — **and a health probe**. A runtime that
-    /// pings every peer on a shorter interval than this timeout will therefore
-    /// never reap anything, which is worth checking against
-    /// `Messenger`'s health-check cadence before concluding the knob does not
-    /// work.
+    /// Anything this side initiates: a frame send, an RDMA GET, an eager
+    /// wireup. **And anything the peer sends us** — an inbound frame refreshes
+    /// the endpoint it arrived on, so "idle" means idle in both directions and a
+    /// peer that only ever sends to us does not have its endpoint reaped under
+    /// its own traffic. `a_peer_that_keeps_sending_keeps_its_endpoint` pins that.
+    ///
+    /// # Health probes are not free here
+    ///
+    /// A `check_health` probe both counts as use *and* **creates** an endpoint
+    /// if none exists. For a peer this instance otherwise talks to, that is
+    /// harmless: the probe simply keeps a live endpoint warm, and a probe
+    /// interval shorter than this timeout means nothing is ever reaped.
+    ///
+    /// For a peer this instance *only* probes, it is a create/reap/disrupt
+    /// generator: each probe wires an endpoint up, the reaper closes it one
+    /// timeout later, and every close costs that peer a frame (see below).
+    /// Probing on an interval longer than this timeout therefore manufactures
+    /// exactly the disruption this knob is trying to be worth. There is no
+    /// periodic prober in-tree — `check_health` has no in-tree periodic caller —
+    /// so this only applies to a caller that has built one; if you have, either
+    /// probe faster than the timeout or do not enable this.
     ///
     /// # What it promises
     ///
     /// An endpoint is closed between one and one and a half timeouts after its
-    /// last use (the scan runs at half the timeout, capped at one a second), and
-    /// never while an RDMA operation to that peer is outstanding. The next use
-    /// re-establishes it transparently — no error surfaces, nothing has to be
-    /// re-registered.
+    /// last use in either direction (the scan runs at half the timeout, capped
+    /// at one a second), and never while an RDMA operation to that peer is
+    /// outstanding. The next use re-establishes it transparently — no error
+    /// surfaces, nothing has to be re-registered.
     ///
     /// What it does **not** promise is that an Active Message send admitted just
     /// before the timeout expired has landed. `last_used` records admission, not
     /// completion, so a send still on the wire when its endpoint is reaped fails
     /// through its `TransportErrorHandler` with the original buffers — the same
-    /// contract a peer-failure reap has always had. The floor below exists to
-    /// keep that a theoretical concern rather than a routine one.
+    /// contract a peer-failure reap has always had. The floor below **shrinks**
+    /// that window rather than closing it, and two residuals survive: a send
+    /// slower than the floor under congestion is still killable, and the
+    /// admission stamp is taken from a clock sampled at the top of the progress
+    /// loop's pass, so the effective budget is the timeout minus however long
+    /// that pass runs.
     ///
     /// Values below half a second are raised to it; see the transport's
     /// `MIN_EP_IDLE_TIMEOUT` for why that is the number.
@@ -697,12 +719,30 @@ impl UcxTransportBuilder {
     ///    a fresh endpoint and arrives normally.
     ///
     /// So it self-heals, at a cost of one lost frame and up to a keepalive
-    /// interval of disruption *per reaped endpoint*. Enable this only where the
-    /// traffic pattern is one-directional or bursty enough for that to be
-    /// cheaper than the connections it reclaims — which is why the default is
-    /// off, and why D9 left connection-pool policy to be revisited with exactly
-    /// this measurement in hand. `reaping_disrupts_the_peers_path_back` pins the
-    /// behaviour.
+    /// interval of disruption *per reaped endpoint*. That is what makes the
+    /// bidirectional freshness stamp above load-bearing rather than a nicety: a
+    /// peer that keeps sending is never reaped, so it never pays this.
+    ///
+    /// Which leaves the patterns where it is still paid, and they are the ones
+    /// to check before enabling:
+    ///
+    /// * **Genuinely symmetric-idle peers** — neither side has spoken for a
+    ///   timeout. Reaping costs whoever speaks first one frame. This is the case
+    ///   the knob is for.
+    /// * **Send-side-only fan-out** — this instance sends to many peers it never
+    ///   hears from. Reaping costs nothing, since the disruption is to the
+    ///   *peer's* path back and no peer is using one.
+    /// * **Probe-only peers** — see the health-probe section above. Avoid.
+    ///
+    /// Note what is *not* on that list: "one-directional" is not by itself a
+    /// safe answer, because the receiving side of a one-directional flow is the
+    /// worst case — it is the side whose path back gets disrupted. The stamp
+    /// makes that case correct now, but a deployment reasoning about the knob
+    /// should reason about it per-direction rather than per-link.
+    ///
+    /// This is why the default is off, and why D9 left connection-pool policy to
+    /// be revisited with exactly this measurement in hand.
+    /// `reaping_disrupts_the_peers_path_back` pins the behaviour.
     ///
     /// # Expected log noise
     ///
