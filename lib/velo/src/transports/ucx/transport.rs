@@ -66,7 +66,33 @@ pub struct UcxConfig {
     /// Override for `UCX_NET_DEVICES` (e.g. `"mlx5_0:1"`), applied only when
     /// the environment does not already set it.
     pub net_devices: Option<String>,
+    /// Close an endpoint nothing has used for this long. `None` (the default)
+    /// never closes one.
+    ///
+    /// See [`UcxTransportBuilder::ep_idle_timeout`] for what "used" counts as
+    /// and what the next use pays.
+    pub ep_idle_timeout: Option<Duration>,
+    /// Wire an endpoint up at [`Transport::register`] instead of at first use.
+    ///
+    /// See [`UcxTransportBuilder::eager_endpoints`]. Default `false`.
+    pub eager_endpoints: bool,
 }
+
+/// Floor on [`UcxConfig::ep_idle_timeout`].
+///
+/// Sized to **dominate endpoint wireup**, which is the one thing a short timeout
+/// actually breaks. `last_used` records when an operation was *admitted*, not
+/// when it completed, so a timeout shorter than the time a send takes on the
+/// wire lets the reaper close an endpoint out from under a send that is still
+/// establishing itself — the frame then fails through `on_error` instead of
+/// arriving. Measured wireup is ~14 ms on CX-7 InfiniBand and upwards of 10 ms
+/// over the tcp lane in CI, so half a second is roughly thirty-five times the
+/// observed cost and leaves the hazard requiring a send an order of magnitude
+/// slower than anything measured.
+///
+/// It is a builder-level ergonomic guard, not an invariant of the reaper: a test
+/// constructing a [`UcxConfig`] directly can go below it deliberately.
+const MIN_EP_IDLE_TIMEOUT: Duration = Duration::from_millis(500);
 
 impl Default for UcxConfig {
     fn default() -> Self {
@@ -76,6 +102,8 @@ impl Default for UcxConfig {
             channel_capacity: 1024,
             tls: None,
             net_devices: None,
+            ep_idle_timeout: None,
+            eager_endpoints: false,
         }
     }
 }
@@ -129,6 +157,8 @@ impl UcxTransport {
             reg_epoch: Arc::new(Default::default()),
             live_regions: Arc::new(Default::default()),
             live_rkeys: Arc::new(Default::default()),
+            eps_open: Arc::new(Default::default()),
+            eps_closed_idle: Arc::new(Default::default()),
         });
         Self {
             key,
@@ -289,6 +319,14 @@ impl Transport for UcxTransport {
         // Tell the progress thread to revalidate cached endpoints: a
         // re-registration may carry a new incarnation of the same instance.
         self.shared.reg_epoch.fetch_add(1, Ordering::AcqRel);
+        // Eager wireup (opt-in). Pushed *after* the peers map is populated —
+        // `ensure_ep` reads the blob from there, so the reverse order would
+        // wire up nothing. `try_send` rather than an await because `register` is
+        // synchronous: a full ring drops the hint and the peer is wired up at
+        // first use, which is the behaviour with the knob off.
+        if self.config.eager_endpoints && self.ring_tx.try_send(Cmd::EnsureEp { peer }).is_err() {
+            debug!("ucx: eager wireup for {peer} skipped (ring full or closed)");
+        }
         self.shared.doorbell.ring();
         if let Some(m) = self.metrics.get() {
             m.set_registered_peers(self.shared.peers.len());
@@ -596,6 +634,118 @@ impl UcxTransportBuilder {
     /// Set `UCX_NET_DEVICES` for this transport (env wins if already set).
     pub fn net_devices(mut self, devices: impl Into<String>) -> Self {
         self.config.net_devices = Some(devices.into());
+        self
+    }
+
+    /// Close endpoints idle for longer than `timeout`. `None` — the default —
+    /// keeps every endpoint until shutdown.
+    ///
+    /// # What it costs
+    ///
+    /// The first operation to a peer pays UCX's lazy endpoint wireup, measured
+    /// at roughly **14 ms** on a CX-7 InfiniBand fabric against a warm RDMA read
+    /// of 108–229 µs. Closing an idle endpoint hands that bill to whoever uses
+    /// the peer next, which is why this is off by default and why the plan's
+    /// sign-off (D9) left it that way: an idle endpoint costs NIC resources, and
+    /// a reconnect costs two orders of magnitude more than the operation that
+    /// triggers it. Turn it on when a process talks to far more peers over its
+    /// lifetime than it talks to at any one time.
+    ///
+    /// # What counts as use
+    ///
+    /// Anything that resolves an endpoint on the progress thread: a frame send,
+    /// an RDMA GET, an eager wireup — **and a health probe**. A runtime that
+    /// pings every peer on a shorter interval than this timeout will therefore
+    /// never reap anything, which is worth checking against
+    /// `Messenger`'s health-check cadence before concluding the knob does not
+    /// work.
+    ///
+    /// # What it promises
+    ///
+    /// An endpoint is closed between one and one and a half timeouts after its
+    /// last use (the scan runs at half the timeout, capped at one a second), and
+    /// never while an RDMA operation to that peer is outstanding. The next use
+    /// re-establishes it transparently — no error surfaces, nothing has to be
+    /// re-registered.
+    ///
+    /// What it does **not** promise is that an Active Message send admitted just
+    /// before the timeout expired has landed. `last_used` records admission, not
+    /// completion, so a send still on the wire when its endpoint is reaped fails
+    /// through its `TransportErrorHandler` with the original buffers — the same
+    /// contract a peer-failure reap has always had. The floor below exists to
+    /// keep that a theoretical concern rather than a routine one.
+    ///
+    /// Values below half a second are raised to it; see the transport's
+    /// `MIN_EP_IDLE_TIMEOUT` for why that is the number.
+    ///
+    /// # What it costs the peer — read this before enabling
+    ///
+    /// Closing an endpoint is not a local act. UCX pairs endpoints by remote
+    /// worker: velo's REPLY-flagged Active Messages cause UCX to create a
+    /// matching endpoint on the peer, and the peer's own `ucp_ep_create` back to
+    /// this instance is then *matched onto that same connection* instead of
+    /// building a fresh one. Closing this side leaves the peer holding an
+    /// endpoint over a connection that no longer exists. Measured over the tcp
+    /// lane, with both close modes:
+    ///
+    /// 1. The peer's next frame to us is admitted and **silently lost** — no
+    ///    error at its end, no arrival at ours. Retrying does not help, and
+    ///    neither does this side establishing a fresh endpoint of its own.
+    /// 2. UCX keepalive (default interval ~20 s) eventually declares the peer's
+    ///    endpoint failed and fires its error handler.
+    /// 3. The frame after that takes velo's existing failed-connection path onto
+    ///    a fresh endpoint and arrives normally.
+    ///
+    /// So it self-heals, at a cost of one lost frame and up to a keepalive
+    /// interval of disruption *per reaped endpoint*. Enable this only where the
+    /// traffic pattern is one-directional or bursty enough for that to be
+    /// cheaper than the connections it reclaims — which is why the default is
+    /// off, and why D9 left connection-pool policy to be revisited with exactly
+    /// this measurement in hand. `reaping_disrupts_the_peers_path_back` pins the
+    /// behaviour.
+    ///
+    /// # Expected log noise
+    ///
+    /// Over the tcp lane UCX logs `tcp_ep … recv(-1) failed: Input/output error`
+    /// at ERROR level on the peer's side for each reaped endpoint. That is UCX
+    /// reporting a close it did not initiate, not a velo fault.
+    pub fn ep_idle_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.config.ep_idle_timeout = timeout.map(|t| {
+            if t < MIN_EP_IDLE_TIMEOUT {
+                debug!("ucx: ep_idle_timeout {t:?} raised to the {MIN_EP_IDLE_TIMEOUT:?} floor");
+                MIN_EP_IDLE_TIMEOUT
+            } else {
+                t
+            }
+        });
+        self
+    }
+
+    /// Establish each peer's endpoint at [`Transport::register`] rather than at
+    /// its first use. Default `false`.
+    ///
+    /// The ~14 ms of lazy UCX wireup (measured on CX-7 InfiniBand; a warm RDMA
+    /// read is 108–229 µs) is otherwise paid by whichever operation happens to
+    /// go first — typically the first rendezvous GET, where it dwarfs the
+    /// transfer it is attached to. Registration is the natural place to spend
+    /// it: discovery has just produced the peer, and nothing is waiting.
+    ///
+    /// The wireup is a fire-and-forget hint. `register()` does not wait for it,
+    /// a failure is logged and forgotten, and a peer whose eager wireup was
+    /// dropped (a full command ring) is simply wired up at first use as before.
+    /// Nothing observable changes except when the cost is paid.
+    ///
+    /// # Composing with [`ep_idle_timeout`](Self::ep_idle_timeout)
+    ///
+    /// The two knobs deliberately pull in opposite directions and are meant to
+    /// be usable together: eager wireup amortises the connection cost away from
+    /// the first transfer, and the reaper reclaims it again if the peer turns
+    /// out never to be used. An eagerly established endpoint's idle clock starts
+    /// at registration, so with both on, a registered-but-never-used peer is
+    /// wired up once and closed one timeout later. That is the intended
+    /// behaviour, not a conflict.
+    pub fn eager_endpoints(mut self, eager: bool) -> Self {
+        self.config.eager_endpoints = eager;
         self
     }
 

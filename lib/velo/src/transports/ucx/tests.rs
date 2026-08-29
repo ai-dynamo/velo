@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
-use super::{UcxTransport, UcxTransportBuilder};
+use super::{UcxConfig, UcxTransport, UcxTransportBuilder};
 use crate::transports::transport::{
     DataStreams, HealthCheckError, SendOutcome, Transport, TransportErrorHandler, make_channels,
 };
@@ -70,12 +70,38 @@ struct Node {
 }
 
 async fn start_node() -> Node {
-    let transport = Arc::new(
-        UcxTransportBuilder::new()
-            .tls("tcp")
+    start_node_with(|b| b).await
+}
+
+/// A node whose builder has been customised — the lifecycle knobs (D9's idle
+/// reaper, eager wireup) are off by default, so every test that exercises one
+/// has to ask for it.
+async fn start_node_with(
+    configure: impl FnOnce(UcxTransportBuilder) -> UcxTransportBuilder,
+) -> Node {
+    start_transport(Arc::new(
+        configure(UcxTransportBuilder::new().tls("tcp"))
             .build()
             .expect("build ucx transport"),
-    );
+    ))
+    .await
+}
+
+/// A node built from a [`UcxConfig`] directly, bypassing the builder.
+///
+/// The one thing this can do that [`start_node_with`] cannot is set an idle
+/// timeout below `MIN_EP_IDLE_TIMEOUT`. That floor is a builder-level ergonomic
+/// guard sized to dominate endpoint wireup, not an invariant of the reaper, and
+/// a test isolating the reaper from transfer timing needs to go under it.
+async fn start_node_with_config(config: UcxConfig) -> Node {
+    start_transport(Arc::new(UcxTransport::new(
+        velo_ext::TransportKey::from("ucx"),
+        config,
+    )))
+    .await
+}
+
+async fn start_transport(transport: Arc<UcxTransport>) -> Node {
     let instance_id = InstanceId::new_v4();
     let (adapter, streams) = make_channels();
     tokio::time::timeout(
@@ -484,6 +510,16 @@ fn assert_rma_balanced(node: &Node) {
         node.transport.shared.live_rkeys.load(Ordering::SeqCst),
         0,
         "an unpacked rkey outlived the transport"
+    );
+    // Every `EpEntry` must pass through exactly one of the three sites that
+    // retire an endpoint — `close_ep_raw`, teardown Phase A's inline close, or
+    // that phase's completion loop. Asserted here, after `shutdown()` has joined
+    // the progress thread, because a counter that drifts by one is otherwise
+    // invisible and would make every idle-reaper assertion below meaningless.
+    assert_eq!(
+        node.transport.shared.eps_open.load(Ordering::SeqCst),
+        0,
+        "an endpoint outlived the transport, or its close went uncounted"
     );
 }
 
@@ -1666,6 +1702,612 @@ async fn peer_shutdown_during_get_answers_caller() {
         .expect("the GET must resolve, not hang")
         .expect("get task must not panic");
     println!("peer-shutdown GET resolved as {outcome:?}");
+    assert_pair_balanced(&pair);
+}
+
+// ---------------------------------------------------------------------------
+// Endpoint lifecycle: the idle reaper (D9) and eager wireup
+// ---------------------------------------------------------------------------
+
+/// The builder's floor exactly: the shortest idle timeout the public surface
+/// admits, so the reaper tests wait as little as the API allows.
+///
+/// A test that needs the reaper to act *faster* than endpoint wireup takes has
+/// to go under the floor with `start_node_with_config`, and only one does.
+const IDLE: Duration = Duration::from_millis(500);
+
+fn eps_open(node: &Node) -> usize {
+    node.transport.shared.eps_open.load(Ordering::SeqCst)
+}
+
+fn eps_closed_idle(node: &Node) -> u64 {
+    node.transport.shared.eps_closed_idle.load(Ordering::SeqCst)
+}
+
+/// Send one `Message` frame and wait for it to arrive, so the sender's endpoint
+/// is provably established and provably not still carrying an in-flight AM.
+async fn ping_message(from: &Node, to: &Node, errs: &Arc<CountingErrors>) {
+    ping_message_to(from, to.instance_id, to, errs, "frame").await
+}
+
+/// As [`ping_message`], but with the addressed instance and the receiving node
+/// named separately — a re-registered peer keeps its instance id while its
+/// frames arrive at a different worker.
+async fn ping_message_to(
+    from: &Node,
+    target: InstanceId,
+    arrives_at: &Node,
+    errs: &Arc<CountingErrors>,
+    what: &str,
+) {
+    let out = from.transport.send_message(
+        target,
+        Bytes::from_static(b"h"),
+        Bytes::from_static(b"p"),
+        MessageType::Message,
+        errs.clone(),
+    );
+    assert!(matches!(out, SendOutcome::Admitted));
+    assert!(
+        recv_message(&arrives_at.streams.message_stream, T)
+            .await
+            .is_some(),
+        "{what}: the frame must arrive before the endpoint is called established"
+    );
+}
+
+/// The builder raises a sub-floor idle timeout rather than honouring it.
+///
+/// Asserted on its own because every other reaper test uses a value at or above
+/// the floor, so nothing else would notice the clamp disappearing — and what it
+/// guards against is a timeout shorter than endpoint wireup, which fails as lost
+/// sends rather than as anything the reaper reports.
+#[test]
+fn a_sub_floor_ep_idle_timeout_is_clamped() {
+    let clamped = UcxTransportBuilder::new()
+        .ep_idle_timeout(Some(Duration::from_millis(1)))
+        .build()
+        .expect("build")
+        .config
+        .ep_idle_timeout;
+    assert_eq!(clamped, Some(super::MIN_EP_IDLE_TIMEOUT));
+
+    let honoured = UcxTransportBuilder::new()
+        .ep_idle_timeout(Some(Duration::from_secs(60)))
+        .build()
+        .expect("build")
+        .config
+        .ep_idle_timeout;
+    assert_eq!(honoured, Some(Duration::from_secs(60)));
+
+    assert_eq!(
+        UcxTransportBuilder::new()
+            .ep_idle_timeout(None)
+            .build()
+            .expect("build")
+            .config
+            .ep_idle_timeout,
+        None,
+        "explicitly disabling must stay disabled"
+    );
+}
+
+/// The default is off, and "off" has to mean *never*, not *rarely*.
+///
+/// D9's sign-off left the reaper disabled because a reconnect costs ~14 ms of
+/// UCX wireup against a warm RDMA read of 108–229 µs. A default that quietly
+/// closed endpoints would hand that bill to every deployment.
+#[tokio::test(flavor = "multi_thread")]
+async fn idle_reaper_is_off_by_default() {
+    let a = start_node().await;
+    let b = start_node().await;
+    cross_register(&a, &b);
+    let errs = CountingErrors::new();
+
+    ping_message(&a, &b, &errs).await;
+    // Both directions, because `reaping_disrupts_the_peers_path_back` asserts
+    // the reverse direction is *broken* after a reap and would be vacuous if it
+    // were broken here too.
+    ping_message(&b, &a, &errs).await;
+    assert_eq!(eps_open(&a), 1);
+
+    // Many scan periods' worth of idleness at any timeout a test would pick.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        eps_closed_idle(&a),
+        0,
+        "the reaper ran without being configured"
+    );
+    assert_eq!(
+        eps_open(&a),
+        1,
+        "an endpoint was closed with the reaper off"
+    );
+
+    a.transport.shutdown();
+    b.transport.shutdown();
+    assert_rma_balanced(&a);
+    assert_rma_balanced(&b);
+}
+
+/// Deliverable A's happy path, from the reaping side: an endpoint goes idle, is
+/// closed, and the next use wires a new one up with nothing to see from here.
+///
+/// What the *peer* sees is a different and much less happy story; it has its own
+/// test below.
+#[tokio::test(flavor = "multi_thread")]
+async fn idle_endpoint_closes_and_the_next_send_wires_up_again() {
+    let a = start_node_with(|b| b.ep_idle_timeout(Some(IDLE))).await;
+    let b = start_node().await;
+    cross_register(&a, &b);
+    let errs = CountingErrors::new();
+
+    ping_message_to(&a, b.instance_id, &b, &errs, "first send").await;
+    assert_eq!(eps_open(&a), 1);
+
+    assert!(
+        wait_until(T, || eps_closed_idle(&a) >= 1).await,
+        "the idle endpoint was never reaped"
+    );
+    assert_eq!(eps_open(&a), 0, "the reaped endpoint was not retired");
+
+    // The next send from our side wires up again, transparently — no error, no
+    // re-registration, and the peer is not marked failed because nothing failed.
+    ping_message_to(&a, b.instance_id, &b, &errs, "send after the reap").await;
+    assert!(
+        eps_open(&a) >= 1,
+        "the next send did not re-establish an endpoint"
+    );
+    assert_eq!(errs.count(), 0, "a send failed across the reap");
+    assert!(
+        a.transport.shared.failed_peers.is_empty(),
+        "an idle close must not mark the peer failed"
+    );
+
+    a.transport.shutdown();
+    b.transport.shutdown();
+    assert_rma_balanced(&a);
+    assert_rma_balanced(&b);
+}
+
+/// **Measured, and the reason the reaper is off by default.** Closing an idle
+/// endpoint disrupts the *peer's* path back to us.
+///
+/// UCX pairs endpoints by remote worker: our REPLY-flagged Active Messages make
+/// UCX create a matching endpoint on the peer, and the peer's own
+/// `ucp_ep_create` back to us is then *matched onto that same connection* rather
+/// than building a fresh one. Closing our side — FORCE or flush, both were
+/// measured — leaves the peer holding an endpoint over a connection that no
+/// longer exists.
+///
+/// Measured consequences, in order:
+///
+/// 1. The peer's next frame to us is admitted and **silently lost**: no
+///    `on_error`, no arrival. Re-sending does not help, and neither does our
+///    side establishing a fresh endpoint of its own.
+/// 2. UCX keepalive (default interval ~20 s) eventually declares the peer's
+///    endpoint failed, which fires its error handler and populates its
+///    `failed_peers`.
+/// 3. The frame *after* that goes through velo's existing failed-connection
+///    reaping onto a fresh endpoint and arrives normally.
+///
+/// So it self-heals, at the cost of one lost frame and up to a keepalive
+/// interval of disruption per reap — which is a real price to pay for reclaiming
+/// an idle connection, and exactly the input D9's "connection-pool policy
+/// revisited later" was waiting for.
+///
+/// This test pins the finding rather than the design intent. The window is short
+/// because step 2 cannot happen inside it; if this ever *does* arrive, UCX or
+/// velo has fixed the interaction and the caveat in
+/// [`UcxTransportBuilder::ep_idle_timeout`] should go with it.
+#[tokio::test(flavor = "multi_thread")]
+async fn reaping_disrupts_the_peers_path_back() {
+    let a = start_node_with(|b| b.ep_idle_timeout(Some(IDLE))).await;
+    let b = start_node().await;
+    cross_register(&a, &b);
+    let errs = CountingErrors::new();
+
+    ping_message_to(&a, b.instance_id, &b, &errs, "first send").await;
+    assert!(
+        wait_until(T, || eps_closed_idle(&a) >= 1).await,
+        "the idle endpoint was never reaped"
+    );
+
+    let out = b.transport.send_message(
+        a.instance_id,
+        Bytes::from_static(b"h"),
+        Bytes::from_static(b"p"),
+        MessageType::Message,
+        errs.clone(),
+    );
+    assert!(
+        matches!(out, SendOutcome::Admitted),
+        "the peer's send is admitted; the loss is downstream of admission"
+    );
+    assert!(
+        recv_message(&a.streams.message_stream, Duration::from_millis(1500))
+            .await
+            .is_none(),
+        "the peer's first frame after our reap arrived — the UCX endpoint-matching \
+         interaction this test pins has been fixed, so update the caveat on \
+         UcxTransportBuilder::ep_idle_timeout and delete this test"
+    );
+    assert_eq!(
+        errs.count(),
+        0,
+        "the loss is silent at this point; keepalive is what eventually reports it"
+    );
+
+    a.transport.shutdown();
+    b.transport.shutdown();
+    assert_rma_balanced(&a);
+    assert_rma_balanced(&b);
+}
+
+/// The in-flight exclusion, isolated: an endpoint old enough to reap is spared
+/// purely because [`WorkerState::rma_ops`] still names its peer.
+///
+/// Three deliberate choices make this neither vacuous nor flaky.
+///
+/// *Two peers.* The idle one **is** reaped, which is what proves a scan ran past
+/// the timeout while the GETs were still outstanding; the busy one is not, and
+/// exactly one close between the two is the whole claim. A single-peer version
+/// would pass trivially whenever the transfer happened to finish first.
+///
+/// *A sub-floor timeout, set on the config directly.* The reaper has to act
+/// faster than a 64 MiB transfer over the tcp lane, while the builder's floor is
+/// sized for the opposite concern — dominating endpoint wireup. Going under it
+/// isolates the exclusion from transfer timing, which is what is under test, and
+/// nothing here sends an Active Message, so the hazard the floor guards against
+/// is out of play entirely.
+///
+/// *Eager wireup, no frames.* Both endpoints are established by registration
+/// alone, so neither depends on an AM completing.
+///
+/// The two loads are ordered closed-then-inflight on purpose: nothing posts more
+/// operations after the spawn, so `inflight > 0` now implies it was `> 0` when
+/// the close count was read.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_endpoint_with_an_inflight_get_is_not_reaped() {
+    const CHUNK: usize = 8 * 1024 * 1024;
+    const CHUNKS: usize = 8;
+    const LEN: usize = CHUNK * CHUNKS;
+    let mut src = PageBuf::new(LEN);
+    let dst = PageBuf::new(LEN);
+    src.fill_pattern();
+
+    let puller = start_node_with_config(UcxConfig {
+        tls: Some("tcp".into()),
+        ep_idle_timeout: Some(Duration::from_millis(10)),
+        eager_endpoints: true,
+        ..UcxConfig::default()
+    })
+    .await;
+    let owner = start_node().await;
+    let idle_peer = start_node().await;
+    cross_register(&puller, &owner);
+
+    let owner_rma = owner.transport.rdma_endpoint();
+    let puller_rma = puller.transport.rdma_endpoint();
+
+    let remote = owner_rma
+        .map_region(src.addr(), LEN)
+        .await
+        .expect("map src");
+    let local = puller_rma
+        .map_region(dst.addr(), LEN)
+        .await
+        .expect("map dst");
+
+    let mut gets = Vec::with_capacity(CHUNKS);
+    for i in 0..CHUNKS {
+        let endpoint = puller_rma.clone();
+        let req = RmaGetRequest {
+            peer: owner.instance_id,
+            remote_addr: (src.addr() + i * CHUNK) as u64,
+            packed_rkey: remote.packed_rkey.clone(),
+            local_region: local.region_id,
+            local_offset: (i * CHUNK) as u64,
+            len: CHUNK as u64,
+        };
+        gets.push(tokio::spawn(async move { endpoint.get(req).await }));
+    }
+    assert!(
+        wait_until(T, || {
+            puller.transport.shared.inflight_ops.load(Ordering::SeqCst) >= CHUNKS
+        })
+        .await,
+        "all {CHUNKS} GETs must be posted before the idle peer is introduced"
+    );
+
+    // A delta, not an absolute: the endpoint eagerly established to the owner
+    // may already have been reaped (and recreated by the GETs) while the regions
+    // above were being mapped.
+    let baseline = eps_closed_idle(&puller);
+    // Introduced only now, so its idle window runs entirely inside the transfer.
+    cross_register(&puller, &idle_peer);
+
+    let observed = Arc::new(AtomicUsize::new(usize::MAX));
+    let seen = {
+        let observed = Arc::clone(&observed);
+        wait_until(T, || {
+            let closed = eps_closed_idle(&puller);
+            let inflight = puller.transport.shared.inflight_ops.load(Ordering::SeqCst);
+            if closed > baseline && inflight > 0 {
+                observed.store((closed - baseline) as usize, Ordering::SeqCst);
+                true
+            } else {
+                false
+            }
+        })
+        .await
+    };
+    assert!(
+        seen,
+        "no scan closed the idle endpoint while the GETs were still outstanding; \
+         64 MiB over the tcp lane finished faster than a 10 ms idle window"
+    );
+    assert_eq!(
+        observed.load(Ordering::SeqCst),
+        1,
+        "the endpoint carrying the in-flight GETs was reaped too"
+    );
+
+    // The backstop for the same property, and the one that would fail loudly if
+    // the exclusion were removed: a reaped endpoint cancels its operations.
+    for (i, task) in gets.into_iter().enumerate() {
+        task.await
+            .expect("get task must not panic")
+            .unwrap_or_else(|e| panic!("get {i} failed: {e}"));
+    }
+    assert_eq!(dst.as_slice(), src.as_slice(), "every GET must have landed");
+
+    puller_rma
+        .unmap_region(local.region_id)
+        .await
+        .expect("unmap dst");
+    owner_rma
+        .unmap_region(remote.region_id)
+        .await
+        .expect("unmap src");
+    puller.transport.shutdown();
+    owner.transport.shutdown();
+    idle_peer.transport.shutdown();
+    assert_rma_balanced(&puller);
+    assert_rma_balanced(&owner);
+    assert_rma_balanced(&idle_peer);
+}
+
+/// Teardown racing an idle close: the close may still be parked in
+/// `pending_closes` when `shutdown()` arrives, and the endpoint must be
+/// accounted for exactly once either way.
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_during_an_idle_close_is_clean() {
+    let a = start_node_with(|b| b.ep_idle_timeout(Some(IDLE))).await;
+    let b = start_node().await;
+    cross_register(&a, &b);
+    let errs = CountingErrors::new();
+
+    ping_message(&a, &b, &errs).await;
+    assert!(
+        wait_until(T, || eps_closed_idle(&a) >= 1).await,
+        "the idle endpoint was never reaped"
+    );
+
+    // Immediately, so teardown lands as close to the close request as this
+    // harness can arrange.
+    a.transport.shutdown();
+    b.transport.shutdown();
+    // `assert_rma_balanced` covers the accounting: a double-decrement would
+    // have wrapped `eps_open` rather than left it at zero.
+    assert_rma_balanced(&a);
+    assert_rma_balanced(&b);
+}
+
+/// Eager wireup pays the ~14 ms endpoint cost at registration rather than
+/// handing it to the first transfer. Off by default, so the peer node proves
+/// the default is still lazy.
+#[tokio::test(flavor = "multi_thread")]
+async fn eager_endpoints_wire_up_at_registration() {
+    let eager = start_node_with(|b| b.eager_endpoints(true)).await;
+    let lazy = start_node().await;
+    cross_register(&eager, &lazy);
+
+    assert!(
+        wait_until(T, || eps_open(&eager) == 1).await,
+        "registration did not establish an endpoint eagerly"
+    );
+    // Nothing was sent, so the default side must still have none. Given a moment
+    // for the same scheduling the assertion above waited through.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        eps_open(&lazy),
+        0,
+        "the default wired an endpoint up without being asked to"
+    );
+
+    eager.transport.shutdown();
+    lazy.transport.shutdown();
+    assert_rma_balanced(&eager);
+    assert_rma_balanced(&lazy);
+}
+
+/// A re-registration under a new incarnation must wire the *replacement* up
+/// eagerly too, not leave the peer on an endpoint the incarnation check has
+/// already condemned.
+#[tokio::test(flavor = "multi_thread")]
+async fn eager_wireup_follows_a_re_registration() {
+    let eager = start_node_with(|b| b.eager_endpoints(true)).await;
+    let first = start_node().await;
+    // A second worker address for the same instance: a restarted incarnation.
+    let restarted = start_node().await;
+    cross_register(&eager, &first);
+
+    assert!(
+        wait_until(T, || eps_open(&eager) == 1).await,
+        "the first registration did not wire up"
+    );
+
+    eager
+        .transport
+        .register(PeerInfo::new(
+            first.instance_id,
+            restarted.transport.address(),
+        ))
+        .expect("re-register under a new incarnation");
+
+    // The superseded endpoint is parked and closed at the next safe point, so
+    // the count dips through 2 and settles at 1 — a fresh endpoint for the new
+    // incarnation, established without anybody sending anything.
+    assert!(
+        wait_until(T, || eps_open(&eager) == 1
+            && eps_closed_idle(&eager) == 0
+            && eager.transport.shared.failed_peers.is_empty())
+        .await,
+        "the re-registered peer did not end up on exactly one fresh endpoint"
+    );
+
+    // And it works: the instance id is unchanged, but the frame arrives at the
+    // restarted worker rather than the original one.
+    let errs = CountingErrors::new();
+    ping_message_to(
+        &eager,
+        first.instance_id,
+        &restarted,
+        &errs,
+        "re-registered",
+    )
+    .await;
+    assert_eq!(errs.count(), 0);
+
+    eager.transport.shutdown();
+    first.transport.shutdown();
+    restarted.transport.shutdown();
+    assert_rma_balanced(&eager);
+    assert_rma_balanced(&first);
+    assert_rma_balanced(&restarted);
+}
+
+/// Eager wireup and the idle reaper together, which is the combination the
+/// builder docs promise composes: an endpoint established at registration and
+/// never used is reclaimed one timeout later, and a use after that wires up a
+/// new one. Intended behaviour, asserted so it stays intended.
+#[tokio::test(flavor = "multi_thread")]
+async fn eager_wireup_and_the_reaper_compose() {
+    let a = start_node_with(|b| b.eager_endpoints(true).ep_idle_timeout(Some(IDLE))).await;
+    let b = start_node().await;
+    cross_register(&a, &b);
+
+    assert!(
+        wait_until(T, || eps_open(&a) == 1).await,
+        "eager wireup did not run"
+    );
+    assert!(
+        wait_until(T, || eps_closed_idle(&a) >= 1 && eps_open(&a) == 0).await,
+        "an eagerly established but unused endpoint was never reclaimed"
+    );
+
+    let errs = CountingErrors::new();
+    ping_message(&a, &b, &errs).await;
+    assert_eq!(errs.count(), 0, "the send after the reap failed");
+
+    a.transport.shutdown();
+    b.transport.shutdown();
+    assert_rma_balanced(&a);
+    assert_rma_balanced(&b);
+}
+
+/// Register / transfer / release, repeatedly, asserting the transport-side
+/// lifecycle counters return to where they started every cycle.
+///
+/// The soak the plan names, at the transport layer: what it can prove that a
+/// single round trip cannot is that nothing *accumulates* — not registrations,
+/// not unpacked keys, not endpoints. The registration-layer half of the same
+/// property (registered bytes returning to baseline) lives in
+/// `rendezvous::rdma`'s tests, over a mock backend where the cycle count can be
+/// much higher.
+#[tokio::test(flavor = "multi_thread")]
+async fn rma_lifecycle_soak() {
+    const CYCLES: usize = 24;
+    const LEN: usize = 256 * 1024;
+    let mut src = PageBuf::new(LEN);
+    let dst = PageBuf::new(LEN);
+    src.fill_pattern();
+
+    let pair = start_rma_pair().await;
+
+    for cycle in 0..CYCLES {
+        let remote = pair
+            .owner_rma
+            .map_region(src.addr(), LEN)
+            .await
+            .unwrap_or_else(|e| panic!("cycle {cycle}: map src: {e}"));
+        let local = pair
+            .puller_rma
+            .map_region(dst.addr(), LEN)
+            .await
+            .unwrap_or_else(|e| panic!("cycle {cycle}: map dst: {e}"));
+
+        tokio::time::timeout(
+            T,
+            pair.puller_rma
+                .get(get_request(&pair, &src, &remote, &local)),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("cycle {cycle}: get hung"))
+        .unwrap_or_else(|e| panic!("cycle {cycle}: get failed: {e}"));
+        assert_eq!(dst.as_slice(), src.as_slice(), "cycle {cycle}: bad data");
+
+        pair.puller_rma
+            .unmap_region(local.region_id)
+            .await
+            .unwrap_or_else(|e| panic!("cycle {cycle}: unmap dst: {e}"));
+        pair.owner_rma
+            .unmap_region(remote.region_id)
+            .await
+            .unwrap_or_else(|e| panic!("cycle {cycle}: unmap src: {e}"));
+
+        // The invariants, every cycle rather than only at the end: a leak that
+        // grows by one per cycle and a leak that appears once are different
+        // bugs, and only a per-cycle assertion tells them apart.
+        assert_eq!(
+            pair.puller
+                .transport
+                .shared
+                .live_regions
+                .load(Ordering::SeqCst),
+            0,
+            "cycle {cycle}: a destination region survived its unmap"
+        );
+        assert_eq!(
+            pair.owner
+                .transport
+                .shared
+                .live_regions
+                .load(Ordering::SeqCst),
+            0,
+            "cycle {cycle}: a source region survived its unmap"
+        );
+        assert_eq!(
+            pair.puller
+                .transport
+                .shared
+                .live_rkeys
+                .load(Ordering::SeqCst),
+            0,
+            "cycle {cycle}: an unpacked rkey survived its operation"
+        );
+        // One endpoint per direction, established on the first cycle and reused
+        // by every one after it — the reaper is off, so this must not move.
+        assert_eq!(
+            eps_open(&pair.puller),
+            1,
+            "cycle {cycle}: the puller's endpoint count drifted"
+        );
+    }
+
+    pair.owner.transport.shutdown();
+    pair.puller.transport.shutdown();
     assert_pair_balanced(&pair);
 }
 
