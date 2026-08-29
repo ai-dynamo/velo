@@ -120,6 +120,15 @@ pub(crate) enum RdmaPathReason {
     /// The owner's pinned staging was refused by the registered-bytes budget
     /// and the slot was staged in plain memory instead.
     Budget,
+    /// This instance has no RDMA registry at all — no UCX transport was
+    /// installed through `VeloBuilder::add_ucx_transport`.
+    ///
+    /// A deployment fact rather than a decision, and the one decline that used
+    /// to be silent: an instance configured without the RDMA path emitted
+    /// nothing, so `velo_rendezvous_rdma_path_total` was empty and
+    /// indistinguishable from an instance that was never asked. Naming it means
+    /// "why is nothing using RDMA" has an answer on every node.
+    NotConfigured,
 }
 
 #[cfg(all(target_os = "linux", feature = "ucx"))]
@@ -144,6 +153,7 @@ impl RdmaPathReason {
             Self::PoolExhausted => "pool_exhausted",
             Self::GetFailed => "get_failed",
             Self::Budget => "budget",
+            Self::NotConfigured => "not_configured",
         }
     }
 }

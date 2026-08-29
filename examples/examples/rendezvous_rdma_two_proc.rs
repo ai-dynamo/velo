@@ -189,8 +189,21 @@ async fn owner(args: Args) -> Result<()> {
     await_file(&args.dir.join("done")).await?;
 
     println!("owner: {}", path_summary(&registry));
+    // Read before shutting down, and asserted the same way the consumer does:
+    // the owner is the side that *decides* whether a descriptor goes out, so an
+    // owner that quietly answered chunked is exactly the failure this example
+    // exists to make visible.
+    let served_rdma = path_count(&registry, "ok") > 0;
+
     velo.graceful_shutdown(ShutdownPolicy::Timeout(Duration::from_secs(30)))
         .await;
+
+    if !served_rdma {
+        bail!(
+            "the owner answered chunked rather than with a descriptor; see the reason label \
+             above"
+        );
+    }
     Ok(())
 }
 

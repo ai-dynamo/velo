@@ -407,7 +407,10 @@ fn rdma_offer(_manager: &RendezvousManager, _target: WorkerId) -> Option<RdmaOff
 #[cfg(all(target_os = "linux", feature = "ucx"))]
 fn rdma_offer(manager: &RendezvousManager, target: WorkerId) -> Option<RdmaOffer> {
     let store = manager.data_store();
-    let ctx = store.rdma()?;
+    let Some(ctx) = store.rdma() else {
+        store.record_path(RdmaPathReason::NotConfigured);
+        return None;
+    };
     if !ctx.config.enabled {
         store.record_path(RdmaPathReason::KillSwitch);
         return None;

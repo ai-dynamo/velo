@@ -117,6 +117,38 @@ impl Node {
         Self { velo, registry }
     }
 
+    /// A node with a TCP transport registered *first* and UCX beside it.
+    ///
+    /// Transport priority follows registration order, so TCP becomes the
+    /// primary and UCX an alternative — which is the deployment the eligibility
+    /// rule was written for, and the only way to reach the
+    /// `alternative_transport_keys` branch of it.
+    async fn start_split() -> Self {
+        let tcp = Arc::new(
+            velo::transports::tcp::TcpTransportBuilder::new()
+                .from_listener(std::net::TcpListener::bind("127.0.0.1:0").expect("bind"))
+                .expect("listener")
+                .build()
+                .expect("build tcp transport"),
+        );
+        let ucx = Arc::new(
+            UcxTransportBuilder::new()
+                .tls("tcp")
+                .build()
+                .expect("build ucx transport"),
+        );
+        let registry = Registry::new();
+        let metrics = Arc::new(VeloMetrics::register(&registry).expect("register metrics"));
+        let velo = Velo::builder()
+            .metrics(metrics)
+            .add_transport(tcp)
+            .add_ucx_transport(ucx)
+            .build()
+            .await
+            .expect("build velo");
+        Self { velo, registry }
+    }
+
     /// Sum of `velo_rendezvous_rdma_path_total` for one reason label.
     fn path_count(&self, reason: &str) -> u64 {
         counter_with_label(
@@ -199,6 +231,14 @@ impl Pair {
     async fn with_incapable_consumer() -> Self {
         let owner = Node::start(None).await;
         let consumer = Node::start_without_rdma().await;
+        connect(&owner, &consumer).await;
+        Self { owner, consumer }
+    }
+
+    /// Both nodes with a TCP control plane and UCX registered beside it.
+    async fn with_split_transports() -> Self {
+        let owner = Node::start_split().await;
+        let consumer = Node::start_split().await;
         connect(&owner, &consumer).await;
         Self { owner, consumer }
     }
@@ -481,6 +521,50 @@ async fn register_data_in_region_checks_its_range() {
     node.velo
         .graceful_shutdown(ShutdownPolicy::Timeout(T))
         .await;
+}
+
+/// The RDMA path is taken when UCX is registered but **not** primary.
+///
+/// The eligibility rule accepts a peer reachable over UCX whether or not UCX is
+/// the transport the messenger chose — a control plane on TCP with UCX beside
+/// it is the expected deployment, and it is the two-process example's shape.
+/// Every other test here builds UCX-only nodes, which means the
+/// `alternative_transport_keys` half of that rule was never executed.
+///
+/// The primary is asserted, not assumed. Transport priority follows
+/// registration order today; if that changes, this test would quietly migrate
+/// back onto the primary branch and cover nothing new, so it fails loudly
+/// instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_rdma_path_is_taken_when_ucx_is_registered_but_not_primary() {
+    let pair = Pair::with_split_transports().await;
+
+    let primary = pair
+        .consumer
+        .velo
+        .primary_transport_key(pair.owner.velo.instance_id())
+        .expect("the owner is registered");
+    assert_ne!(
+        primary, "ucx",
+        "this test only covers the alternative-transport branch while UCX is not primary; \
+         transport priority changed underneath it"
+    );
+
+    let payload = pattern(512 * 1024);
+    let handle = pair.owner.velo.register_data_pinned(&payload).await;
+
+    let (data, lease) = pair.consumer.velo.get(handle).await.expect("get");
+    assert_pattern(&data, payload.len());
+    pair.consumer.velo.release(handle, lease).await.unwrap();
+
+    assert_eq!(
+        pair.consumer.path_count("ok"),
+        1,
+        "the consumer did not offer, or did not complete, an RDMA transfer over a \
+         non-primary UCX endpoint"
+    );
+    assert_eq!(pair.owner.path_count("ok"), 1);
+    shutdown(pair).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1026,6 +1110,17 @@ async fn the_reaper_force_releases_an_abandoned_lease() {
 /// The delay is injected: over `UCX_TLS=tcp` on loopback there is no honest way
 /// to make a GET slow, and the condition the ticker exists for is precisely a
 /// transfer that takes longer than half a deadline.
+///
+/// # The deliberate exception to the no-sleep rule
+///
+/// This test and the arena-shutdown one are the only two here that depend on
+/// real time, and it is unavoidable: what is under test *is* a cadence. The
+/// slack is sized so a missed tick cannot fail it. The deadline is 400 ms and
+/// renewals go out every 200 ms, so the 1.4 s transfer spans seven renewal
+/// intervals and would survive losing several of them; the failing behaviour —
+/// no ticker at all — reaps at 400 ms, three and a half deadlines before the
+/// transfer ends. A machine slow enough to close that gap would have to stall a
+/// tokio timer for an entire second.
 #[tokio::test(flavor = "multi_thread")]
 async fn lease_renewal_carries_a_slow_transfer_past_several_deadlines() {
     let pair = Pair::with_configs(

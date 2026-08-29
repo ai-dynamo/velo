@@ -1100,6 +1100,23 @@ impl Velo {
         self.rendezvous_manager.release(handle, lease_id).await
     }
 
+    /// Which transport this instance chose as `instance`'s primary, if it is
+    /// registered.
+    ///
+    /// Exposed for tests only. The RDMA path's eligibility rule deliberately
+    /// accepts a peer reachable over UCX *whether or not* UCX is the primary
+    /// transport — a TCP control plane with UCX beside it is the expected
+    /// deployment — and a test covering that branch has to be able to say which
+    /// branch it is on. Without it, a change to transport priority could move
+    /// the coverage back onto the primary path with nothing failing.
+    #[cfg(feature = "test-helpers")]
+    pub fn primary_transport_key(&self, instance: InstanceId) -> Option<String> {
+        self.messenger
+            .backend()
+            .primary_transport_key(instance)
+            .map(|key| key.as_str().to_string())
+    }
+
     /// Get the underlying rendezvous manager for direct access.
     pub fn rendezvous_manager(&self) -> &crate::rendezvous::RendezvousManager {
         &self.rendezvous_manager
