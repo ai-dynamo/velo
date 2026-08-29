@@ -166,6 +166,7 @@ pub(crate) struct TransferState {
 #[derive(Clone, Copy, Debug)]
 struct LeaseDeadline {
     /// The slot the lease holds a read lock on.
+    #[cfg_attr(not(all(target_os = "linux", feature = "ucx")), allow(dead_code))]
     local_id: u64,
     /// When the owner stops waiting.
     expires_at: Instant,
@@ -227,6 +228,9 @@ pub struct DataStore {
     lease_deadlines: DashMap<u64, LeaseDeadline>,
     /// Observability, for the decisions taken inside the handlers this store
     /// backs. `None` when the instance was built without metrics.
+    ///
+    /// Only the RDMA path reads it today, hence the conditional allow.
+    #[cfg_attr(not(all(target_os = "linux", feature = "ucx")), allow(dead_code))]
     metrics: Option<Arc<VeloMetrics>>,
     /// The RDMA registry and policy, once they exist.
     ///
@@ -272,6 +276,7 @@ impl DataStore {
     }
 
     /// The metrics handle, if this instance was built with one.
+    #[cfg_attr(not(all(target_os = "linux", feature = "ucx")), allow(dead_code))]
     pub(crate) fn metrics(&self) -> Option<&Arc<VeloMetrics>> {
         self.metrics.as_ref()
     }
@@ -395,6 +400,12 @@ impl DataStore {
     /// Give a lease a deadline, after which the reaper force-releases it.
     ///
     /// Only RDMA leases get one: see the module docs.
+    // Without the RDMA path nothing ever sets a deadline, so this is unused
+    // there. Kept unconditional rather than scattered with `#[cfg]`:
+    // `_rv_lease_renew` is registered in *every* build, so the store has to be
+    // able to answer it in every build, and a store whose shape depended on a
+    // feature flag is the readability cost this refactor exists to remove.
+    #[cfg_attr(not(all(target_os = "linux", feature = "ucx")), allow(dead_code))]
     pub(crate) fn set_lease_deadline(&self, lease_id: u64, local_id: u64, timeout: Duration) {
         self.lease_deadlines.insert(
             lease_id,
@@ -428,6 +439,7 @@ impl DataStore {
     /// forced release that follows removes from `lease_deadlines`,
     /// `active_leases`, `transfers` and `slots`, and doing any of that while a
     /// `DashMap` iterator holds a shard lock deadlocks rather than fails.
+    #[cfg_attr(not(all(target_os = "linux", feature = "ucx")), allow(dead_code))]
     pub(crate) fn expired_leases(&self, now: Instant) -> Vec<(u64, u64)> {
         self.lease_deadlines
             .iter()
@@ -437,6 +449,7 @@ impl DataStore {
     }
 
     /// Leases currently carrying a deadline.
+    #[cfg(test)]
     pub(crate) fn deadline_count(&self) -> usize {
         self.lease_deadlines.len()
     }
@@ -450,6 +463,7 @@ impl DataStore {
     ///
     /// Returns the slot the lease held, or `None` if the lease had already been
     /// ended by a detach or release that raced the reaper.
+    #[cfg_attr(not(all(target_os = "linux", feature = "ucx")), allow(dead_code))]
     pub(crate) fn force_release_lease(&self, lease_id: u64) -> Option<u64> {
         let local_id = self.consume_lease(lease_id)?;
         self.release_read_lock(local_id);

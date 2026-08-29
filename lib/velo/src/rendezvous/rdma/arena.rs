@@ -936,12 +936,15 @@ impl ArenaSet {
         }
     }
 
-    /// Arenas currently mapped. Test and diagnostics surface.
+    /// Arenas currently mapped. `cfg(test)` until Phase 4's reclamation has a
+    /// production reason to ask.
+    #[cfg(test)]
     pub(crate) fn arena_count(&self) -> usize {
         self.arenas.read().len()
     }
 
-    /// Live suballocations across every arena.
+    /// Live suballocations across every arena. `cfg(test)`, as above.
+    #[cfg(test)]
     pub(crate) fn live_allocations(&self) -> usize {
         self.arenas.read().iter().map(|a| a.live()).sum()
     }

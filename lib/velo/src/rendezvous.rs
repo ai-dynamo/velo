@@ -60,6 +60,15 @@
 pub mod consumer;
 /// The RDMA transfer descriptor. Runtime-internal: it is a wire format velo
 /// owns end to end, and nothing outside the crate constructs or reads one.
+///
+/// Deliberately *not* feature-gated even though only the RDMA path produces or
+/// consumes one. It is pure byte manipulation with no dependency on a backend,
+/// and keeping it unconditional keeps its round-trip and strict-decode tests
+/// running in every build — including the builds that cannot produce a
+/// descriptor, which are exactly the ones that would not notice the format
+/// drifting. The `allow` is the price of that, and it is one decision stated
+/// here rather than an attribute on each item.
+#[allow(dead_code)]
 pub(crate) mod descriptor;
 pub mod handle;
 pub mod handlers;
@@ -528,7 +537,7 @@ impl RendezvousManager {
                 .ok_or_else(|| anyhow::anyhow!("slot vanished after lock acquire"))?;
             Ok((data, lease_id))
         } else {
-            consumer::Consumer::get(self.messenger(), handle).await
+            consumer::Consumer::get(self, handle).await
         };
         if let Some(m) = &self.metrics {
             let outcome = if result.is_ok() {
@@ -544,10 +553,111 @@ impl RendezvousManager {
         result
     }
 
+    /// Pull data from a handle into registered memory, with no copy out.
+    ///
+    /// The zero-copy counterpart to [`get`](Self::get): where the owner answers
+    /// with an RDMA descriptor, the bytes land in the returned buffer written
+    /// by this instance's NIC and are never copied. Where it answers chunked —
+    /// a heap-staged slot, a payload under the threshold, a kill switch, an
+    /// owner without the RDMA path — the chunks are pulled and copied into a
+    /// pooled buffer, so the return type does not depend on what the owner
+    /// decided.
+    ///
+    /// # Holding the buffer
+    ///
+    /// Dropping the [`PinnedBuf`](rdma::PinnedBuf) returns its space to the
+    /// pool; nothing else is required and nothing is unregistered. Until then
+    /// the space is a live reservation against the registered-bytes budget, so
+    /// hold it for as long as the bytes are being used and no longer.
+    ///
+    /// The lease is a separate matter, and this does **not** hold it open for
+    /// you: the renewal ticker is scoped to the transfer, so a caller that
+    /// keeps the buffer past the lease deadline will find the owner has
+    /// force-released the lease. Release it as soon as the transfer is done —
+    /// the returned buffer stays valid, because it is this instance's memory.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`get`](Self::get) can fail with, plus
+    /// [`RdmaError::NotConfigured`](rdma::RdmaError::NotConfigured) when this
+    /// instance has no RDMA registry to allocate a destination from — including
+    /// for a purely local handle, which still needs somewhere pinned to copy
+    /// into.
+    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    pub async fn get_pinned(&self, handle: DataHandle) -> Result<(rdma::PinnedBuf, u64)> {
+        let started = Instant::now();
+        let (target_worker, local_id) = handle.unpack();
+        let result = if target_worker == self.worker_id {
+            // Local: there is no transfer to make zero-copy, so this is an
+            // acquire plus a copy into a pooled buffer. Offered anyway so a
+            // caller can use one code path for handles that may be either.
+            let lease_id = self
+                .store
+                .acquire_read_lock(local_id)
+                .ok_or_else(|| anyhow::anyhow!("rendezvous handle not found: {handle}"))?;
+            let data = self
+                .store
+                .get_data(local_id)
+                .ok_or_else(|| anyhow::anyhow!("slot vanished after lock acquire"))?;
+            let ctx = self.store.rdma().ok_or(rdma::RdmaError::NotConfigured)?;
+            let mut buf = ctx.registry.alloc_pinned(data.len()).await?;
+            buf.copy_from_slice(&data);
+            Ok((buf, lease_id))
+        } else {
+            consumer::Consumer::get_pinned(self, handle).await
+        };
+        if let Some(m) = &self.metrics {
+            let outcome = if result.is_ok() {
+                HandlerOutcome::Success
+            } else {
+                HandlerOutcome::Error
+            };
+            m.record_rendezvous_operation(RendezvousOp::Get, outcome, started.elapsed());
+            if let Ok((ref buf, _)) = result {
+                m.record_rendezvous_bytes(RendezvousOp::Get, buf.len());
+            }
+        }
+        result
+    }
+
+    /// Allocate a registered destination for [`get_into`](Self::get_into).
+    ///
+    /// The only [`RendezvousWrite`] a remote NIC can write into directly. Pass
+    /// it to `get_into` and, where the owner answers with a descriptor, the
+    /// transfer lands in it with no copy at all.
+    ///
+    /// # Errors
+    ///
+    /// [`NotConfigured`](rdma::RdmaError::NotConfigured) without a UCX
+    /// transport, [`BudgetExceeded`](rdma::RdmaError::BudgetExceeded) over the
+    /// registered-bytes ceiling, [`OutOfRange`](rdma::RdmaError::OutOfRange)
+    /// for a zero length.
+    ///
+    /// Unlike the staging APIs there is no fallback here, because there is
+    /// nothing to fall back *to*: the caller asked for registered memory
+    /// specifically, and an ordinary `Vec` would silently not be one. A caller
+    /// that can live with a copy should use a `Vec` directly, which works and
+    /// still rides the RDMA path.
+    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    pub async fn alloc_pinned_writer(
+        &self,
+        len: usize,
+    ) -> Result<write::PinnedWriter, rdma::RdmaError> {
+        let ctx = self.store.rdma().ok_or(rdma::RdmaError::NotConfigured)?;
+        Ok(write::PinnedWriter::new(
+            ctx.registry.alloc_pinned(len).await?,
+        ))
+    }
+
     /// Pull data from a handle into an explicit destination buffer.
     ///
     /// Returns `lease_id`. The caller must call [`detach()`](Self::detach) or
     /// [`release()`](Self::release) when done.
+    ///
+    /// A [`PinnedWriter`](write::PinnedWriter) destination is filled by the
+    /// NIC with no copy; every other destination gets one copy out of a pooled
+    /// buffer when the owner offers RDMA, and the chunk-by-chunk path when it
+    /// does not.
     pub async fn get_into(
         &self,
         handle: DataHandle,
@@ -568,7 +678,7 @@ impl RendezvousManager {
             dest.write_chunk(0, &data)?;
             Ok(lease_id)
         } else {
-            consumer::Consumer::get_into(self.messenger(), handle, dest).await
+            consumer::Consumer::get_into(self, handle, dest).await
         };
         if let Some(m) = &self.metrics {
             let outcome = if result.is_ok() {

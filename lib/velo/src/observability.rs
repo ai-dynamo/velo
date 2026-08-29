@@ -124,19 +124,6 @@ pub(crate) enum RdmaPathReason {
 
 #[cfg(all(target_os = "linux", feature = "ucx"))]
 impl RdmaPathReason {
-    /// Every reason, so a caller can pre-bind or a test can enumerate.
-    pub(crate) const ALL: [Self; 9] = [
-        Self::Ok,
-        Self::NoOffer,
-        Self::NotPinned,
-        Self::BelowMin,
-        Self::KillSwitch,
-        Self::DecodeError,
-        Self::PoolExhausted,
-        Self::GetFailed,
-        Self::Budget,
-    ];
-
     /// Which path this reason ended on.
     pub(crate) fn path(self) -> &'static str {
         match self {

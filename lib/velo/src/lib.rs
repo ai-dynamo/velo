@@ -68,9 +68,18 @@ pub use crate::rendezvous::{
 // public face of a subsystem that only exists when a UCX transport can back it.
 #[cfg(all(target_os = "linux", feature = "ucx"))]
 pub use crate::rendezvous::rdma::{
-    Deregistered, RdmaConfig, RdmaError, RdmaPoolConfig, RegionGuard, RegionWatch,
-    RegisterOwnedError,
+    Deregistered, PinnedBuf, RdmaConfig, RdmaError, RdmaPoolConfig, RdmaRendezvousConfig,
+    RegionGuard, RegionWatch, RegisterOwnedError,
 };
+
+#[cfg(all(target_os = "linux", feature = "ucx"))]
+pub use crate::rendezvous::write::PinnedWriter;
+/// The registered `get_into` destination, and the capability that describes it.
+///
+/// `RdmaDestination` is unconditional so the [`RendezvousWrite`] trait has one
+/// shape in every build; only velo can construct one, so a build without the
+/// RDMA path simply never does.
+pub use crate::rendezvous::write::RdmaDestination;
 
 // Observability
 pub use crate::observability::VeloMetrics;
@@ -983,6 +992,32 @@ impl Velo {
         self.rendezvous_manager.register_data_with(data, opts)
     }
 
+    /// Stage data in RDMA-registered memory, so a capable consumer reads it
+    /// with a single RDMA GET instead of a chunk-by-chunk pull.
+    ///
+    /// Never fails: pool pressure, a spent registered-bytes budget, a
+    /// switched-off kill switch and an instance with no UCX transport all stage
+    /// the data in plain memory instead. See
+    /// [`RendezvousManager::register_data_pinned`] for the full contract.
+    pub async fn register_data_pinned(&self, data: &[u8]) -> DataHandle {
+        self.rendezvous_manager.register_data_pinned(data).await
+    }
+
+    /// Stage a range of memory this instance already registered, zero-copy.
+    ///
+    /// See [`RendezvousManager::register_data_in_region`]: the slot holds an
+    /// in-flight guard on the region, so
+    /// [`RegionGuard::unregister`] waits for the anchors staged inside it.
+    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    pub fn register_data_in_region(
+        &self,
+        guard: &RegionGuard,
+        range: std::ops::Range<u64>,
+    ) -> Result<DataHandle, RdmaError> {
+        self.rendezvous_manager
+            .register_data_in_region(guard, range)
+    }
+
     /// Query metadata about the data behind a handle (no lock acquired).
     pub async fn metadata(&self, handle: DataHandle) -> Result<DataMetadata> {
         self.rendezvous_manager.metadata(handle).await
@@ -994,6 +1029,23 @@ impl Velo {
     /// [`detach()`](Self::detach) or [`release()`](Self::release) when done.
     pub async fn get(&self, handle: DataHandle) -> Result<(bytes::Bytes, u64)> {
         self.rendezvous_manager.get(handle).await
+    }
+
+    /// Pull data from a handle into registered memory, with no copy out.
+    ///
+    /// Returns `(buffer, lease_id)`. Dropping the buffer returns its space to
+    /// the pool. See [`RendezvousManager::get_pinned`] for what the lease does
+    /// and does not cover.
+    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    pub async fn get_pinned(&self, handle: DataHandle) -> Result<(PinnedBuf, u64)> {
+        self.rendezvous_manager.get_pinned(handle).await
+    }
+
+    /// Allocate a registered [`get_into`](Self::get_into) destination, so an
+    /// RDMA transfer into it costs no copy at all.
+    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    pub async fn alloc_pinned_writer(&self, len: usize) -> Result<PinnedWriter, RdmaError> {
+        self.rendezvous_manager.alloc_pinned_writer(len).await
     }
 
     /// Pull data from a handle into an explicit destination buffer.
