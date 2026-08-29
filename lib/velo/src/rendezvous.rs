@@ -585,28 +585,40 @@ impl RendezvousManager {
     /// tolerates a slot disappearing underneath it because that is exactly what
     /// it is trying to make happen.
     ///
-    /// **Pinned slots are dropped.** Each one holds a pool suballocation or an
-    /// in-flight guard on a caller's region, and the sweep's drains wait on
-    /// precisely those. One long-lived anchor would otherwise consume the whole
-    /// shutdown budget on a drain that cannot finish, starving every later
-    /// unmap and the messenger phase after it.
+    /// **Pinned slots are demoted to the heap.** Each one holds a pool
+    /// suballocation or an in-flight guard on a caller's region, and the
+    /// sweep's drains wait on precisely those. One long-lived anchor would
+    /// otherwise consume the whole shutdown budget on a drain that cannot
+    /// finish, starving every later unmap and the messenger phase after it.
+    ///
+    /// The bytes are *copied to the heap*, not discarded. The messenger has
+    /// only just gated new inbound requests, so a chunked pull admitted before
+    /// that gate is still entitled to finish; dropping its slot would turn a
+    /// completion into "chunk not found" mid-transfer. The copy costs one pass
+    /// over everything staged, transiently, and that is the price of not
+    /// breaking a transfer already in progress.
     ///
     /// # What that means for a peer mid-read
     ///
-    /// Dropping a pinned body releases memory a peer's GET may still be reading
-    /// as its *source*. That is the owner-side mirror of the risk D8 already
-    /// documents and accepts for a straggling transfer at shutdown, and it is
-    /// the same behaviour the reaper's own force-release already has: on RDMA
-    /// hardware the straggler fails at its own end, and over `UCX_TLS=tcp` it
-    /// is silently lost. The alternative — waiting indefinitely on peers that
-    /// may have crashed — is what the bounded sweep exists to avoid.
+    /// A peer's *RDMA* GET reads the staged memory directly, and demotion
+    /// releases it — the heap copy is a different address, and the descriptor
+    /// the peer holds names the old one. That is the owner-side mirror of the
+    /// risk D8 already documents and accepts for a straggling transfer at
+    /// shutdown, and the same behaviour the reaper's force-release already has:
+    /// on RDMA hardware the straggler fails at its own end, and over
+    /// `UCX_TLS=tcp` it is silently lost. Waiting indefinitely on peers that
+    /// may have crashed is what the bounded sweep exists to avoid.
+    ///
+    /// Chunked pulls, by contrast, keep working — which is the whole reason
+    /// demotion is not a drop.
     #[cfg(all(target_os = "linux", feature = "ucx"))]
     pub(crate) fn shutdown(&self) {
         self.reaper_shutdown.cancel();
-        let dropped = self.store.drop_pinned_slots();
-        if dropped != 0 {
+        let (demoted, dropped) = self.store.demote_pinned_slots();
+        if demoted != 0 || dropped != 0 {
             tracing::debug!(
-                slots = dropped,
+                demoted,
+                dropped,
                 "rendezvous: released pinned staging ahead of the registration sweep"
             );
         }
@@ -1100,16 +1112,30 @@ fn normalize_lease_timeout(configured: std::time::Duration) -> std::time::Durati
 /// # What `Drop` can and cannot do
 ///
 /// A *local* lease is released inline: it is a handful of map operations with
-/// nothing to await. A *remote* one needs `_rv_detach` on the wire, which is
-/// async, so `Drop` spawns it on the runtime captured at construction — the
-/// same shape `RegionGuard` uses, and for the same reason: `Drop` must not
-/// block inside a runtime worker.
+/// nothing to await, so it cannot fail to happen. A *remote* one needs
+/// `_rv_detach` on the wire, which is async, so `Drop` spawns it on the runtime
+/// captured at construction — the same shape `RegionGuard` uses, and for the
+/// same reason: `Drop` must not block inside a runtime worker.
 ///
-/// The spawn is caught rather than trusted. `Handle::spawn` panics on a runtime
-/// that has already shut down, and a panic inside `Drop` during an unwind
-/// aborts the process; a lease left behind because the runtime is gone is a
-/// process that is going away anyway, and it is the owner's reaper's problem
-/// for an RDMA lease. Losing the detach is the documented worst case here.
+/// The spawn is caught rather than trusted, because `Handle::spawn` panics on a
+/// runtime that has already shut down and a panic inside `Drop` during an
+/// unwind aborts the process.
+///
+/// # The residual, stated plainly
+///
+/// If that spawn does not land, a **remote** lease is not detached — and every
+/// lease this guard wraps on the remote path is a *chunked* lease, taken by the
+/// fallback or by a `Ready` response, which means it carries no deadline and
+/// the owner's reaper will never see it. It leaks owner-side for the life of
+/// that slot. There is no backstop for this case, and saying "the reaper covers
+/// it" would be false: the reaper covers RDMA leases, which are exactly the
+/// ones this guard is not holding by the time it fires.
+///
+/// The window is narrow — an error path taken while the runtime is being torn
+/// down — and it is strictly better than what preceded it, where *no* path
+/// released a lease it failed to return. It is a real gap nonetheless, and the
+/// honest fix is an owner-side TTL on chunked leases, which is named as future
+/// work in the milestone plan rather than smuggled into this phase.
 #[must_use = "the lease is released when this is dropped; call disarm() to keep it"]
 pub(crate) struct LeaseGuard {
     store: Arc<store::DataStore>,

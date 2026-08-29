@@ -427,6 +427,13 @@ defaults revisited with data. Not a PR; a report.
   owner PUTs + `ucp_ep_flush_nbx` + completion AM (`_rv_put_done`), the flush
   carrying an explicit timeout (tcp SW-RMA flush needs the peer progressing).
   Same descriptor struct, direction flag (D7).
+- Owner-side TTL for *chunked* leases. Phase 3 gave RDMA leases a deadline and
+  a reaper because an RDMA GET is invisible to the owner; chunked leases kept
+  their existing no-deadline behaviour deliberately, as scope discipline. The
+  gap that leaves: a consumer's `LeaseGuard` releases a chunked lease on every
+  error path except one — a spawn that cannot land because the runtime is being
+  torn down — and nothing on the owner reclaims it. Narrow, but the only lease
+  class with no backstop at all.
 - Only if the checkpoint numbers justify them: consumer-side unpacked-rkey
   cache (D3's deferral), register-in-place for large owned buffers
   (quick_cache design from D9).
