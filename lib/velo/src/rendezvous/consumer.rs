@@ -54,6 +54,7 @@ impl Consumer {
             .typed_unary_streaming::<AcquireResponse>("_rv_acquire")
             .payload(&RvAcquireRequest {
                 handle: RvHandleWire::from_handle(handle),
+                rdma: None,
             })?
             .worker(target_worker)
             .send()
@@ -112,6 +113,7 @@ impl Consumer {
             .typed_unary_streaming::<AcquireResponse>("_rv_acquire")
             .payload(&RvAcquireRequest {
                 handle: RvHandleWire::from_handle(handle),
+                rdma: None,
             })?
             .worker(target_worker)
             .send()

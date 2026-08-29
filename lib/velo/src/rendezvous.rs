@@ -92,15 +92,26 @@ impl RendezvousManager {
 
     /// Register the rendezvous control-plane handlers on the messenger.
     ///
-    /// Must be called exactly once. Registers six underscore-prefixed handlers:
-    /// `_rv_metadata`, `_rv_acquire`, `_rv_pull`, `_rv_ref`, `_rv_detach`, `_rv_release`.
+    /// Must be called exactly once. Registers seven underscore-prefixed
+    /// handlers: `_rv_metadata`, `_rv_acquire`, `_rv_pull`, `_rv_ref`,
+    /// `_rv_detach`, `_rv_release`, `_rv_lease_renew`.
+    ///
+    /// All seven are registered unconditionally, including on a build without
+    /// the RDMA path. `_rv_lease_renew` on such an owner is a no-op that logs
+    /// at `debug` — no lease it grants ever carries a deadline — and that is
+    /// the point: a consumer must not have to know whether the owner can grant
+    /// RDMA leases before it is allowed to send a keepalive, and a handler that
+    /// existed only in some builds would turn a benign fire-and-forget into an
+    /// "unknown handler" error in exactly the mixed deployment the
+    /// `#[serde(default)]` discipline exists to survive.
     pub fn register_handlers(
         self: &Arc<Self>,
         messenger: Arc<crate::messenger::Messenger>,
     ) -> Result<()> {
         use handlers::{
-            create_rv_acquire_handler, create_rv_detach_handler, create_rv_metadata_handler,
-            create_rv_pull_handler, create_rv_ref_handler, create_rv_release_handler,
+            create_rv_acquire_handler, create_rv_detach_handler, create_rv_lease_renew_handler,
+            create_rv_metadata_handler, create_rv_pull_handler, create_rv_ref_handler,
+            create_rv_release_handler,
         };
 
         messenger
@@ -110,6 +121,8 @@ impl RendezvousManager {
         messenger.register_streaming_handler(create_rv_ref_handler(Arc::clone(&self.store)))?;
         messenger.register_streaming_handler(create_rv_detach_handler(Arc::clone(&self.store)))?;
         messenger.register_streaming_handler(create_rv_release_handler(Arc::clone(&self.store)))?;
+        messenger
+            .register_streaming_handler(create_rv_lease_renew_handler(Arc::clone(&self.store)))?;
 
         self.messenger_lock
             .set(messenger)

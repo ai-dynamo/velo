@@ -3,19 +3,21 @@
 
 //! Control-plane handler constructors for the rendezvous protocol.
 //!
-//! Six handlers are registered on the owner side:
+//! Seven handlers are registered on the owner side:
 //! - [`create_rv_metadata_handler`]: lock-free metadata query
-//! - [`create_rv_acquire_handler`]: acquires read lock, returns inline or chunked
+//! - [`create_rv_acquire_handler`]: acquires read lock, returns an RDMA
+//!   descriptor or chunked transfer metadata
 //! - [`create_rv_pull_handler`]: returns a specific chunk
 //! - [`create_rv_ref_handler`]: increments refcount
 //! - [`create_rv_detach_handler`]: releases read lock only
 //! - [`create_rv_release_handler`]: releases read lock + decrements refcount
+//! - [`create_rv_lease_renew_handler`]: pushes an RDMA lease's deadline out
 
 use std::sync::Arc;
 
 use crate::rendezvous::protocol::{
-    AcquireResponse, RvAcquireRequest, RvDetachRequest, RvMetadataRequest, RvPullRequest,
-    RvRefRequest, RvReleaseRequest,
+    AcquireResponse, RvAcquireRequest, RvDetachRequest, RvLeaseRenewRequest, RvMetadataRequest,
+    RvPullRequest, RvRefRequest, RvReleaseRequest,
 };
 use crate::rendezvous::store::{DEFAULT_CHUNK_SIZE, DataStore};
 
@@ -105,6 +107,60 @@ pub fn create_rv_ref_handler(store: Arc<DataStore>) -> crate::messenger::Handler
                 anyhow::bail!("_rv_ref: handle not found: {handle}");
             }
             Ok(None)
+        },
+    )
+    .build()
+}
+
+/// Build the `_rv_lease_renew` handler: pushes an RDMA lease's deadline out by
+/// the timeout it was granted under (D8).
+///
+/// Fire-and-forget, and forgiving by design. A renewal that names a lease which
+/// has already been detached, released or reaped does nothing and says so at
+/// `debug`: the keepalive races the release that ends the transfer, and a
+/// consumer whose last renewal crossed its own release has done nothing wrong.
+/// Anything louder would make the normal end of every renewed transfer look
+/// like a fault.
+///
+/// The `handle` is checked against the lease the same way detach and release
+/// check theirs, so a renewal cannot extend a lease on a slot the caller does
+/// not name — a lease id is a small integer, and a confused or hostile peer
+/// guessing one must not be able to keep somebody else's slot alive.
+pub fn create_rv_lease_renew_handler(store: Arc<DataStore>) -> crate::messenger::Handler {
+    crate::messenger::Handler::am_handler(
+        "_rv_lease_renew",
+        move |ctx: crate::messenger::Context| {
+            let req: RvLeaseRenewRequest = serde_json::from_slice(&ctx.payload)?;
+            let handle = req.handle.to_handle();
+            let (_, local_id) = handle.unpack();
+
+            match store.lease_slot(req.lease_id) {
+                Some(expected_local_id) if expected_local_id == local_id => {
+                    if !store.renew_lease(req.lease_id) {
+                        tracing::debug!(
+                            lease = req.lease_id,
+                            %handle,
+                            "_rv_lease_renew: lease carries no deadline to renew"
+                        );
+                    }
+                }
+                Some(expected_local_id) => {
+                    tracing::warn!(
+                        "_rv_lease_renew: lease {} maps to slot {}, not {}",
+                        req.lease_id,
+                        expected_local_id,
+                        local_id,
+                    );
+                }
+                None => {
+                    tracing::debug!(
+                        lease = req.lease_id,
+                        %handle,
+                        "_rv_lease_renew: lease already ended"
+                    );
+                }
+            }
+            Ok(())
         },
     )
     .build()

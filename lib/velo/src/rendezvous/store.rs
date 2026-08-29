@@ -167,6 +167,15 @@ struct LeaseDeadline {
     local_id: u64,
     /// When the owner stops waiting.
     expires_at: Instant,
+    /// How far a renewal pushes the deadline out.
+    ///
+    /// Carried on the entry rather than read from config at renewal time, so
+    /// the `_rv_lease_renew` handler needs nothing but the store: the lease was
+    /// granted under a timeout the consumer was told about in the acquire
+    /// response, and renewing it under a *different* one — a config reloaded
+    /// between grant and renewal — would silently change the contract the
+    /// consumer is pacing its keepalives against.
+    timeout: Duration,
 }
 
 /// Options for registering data.
@@ -313,6 +322,17 @@ impl DataStore {
             .map(|(_, local_id)| local_id)
     }
 
+    /// Which slot a lease holds a read lock on, without consuming it.
+    ///
+    /// For the one caller that must check a lease's identity but must *not* end
+    /// it: `_rv_lease_renew`. Detach and release check identity as a side
+    /// effect of consuming, which is not an option for a keepalive.
+    pub(crate) fn lease_slot(&self, lease_id: u64) -> Option<u64> {
+        self.active_leases
+            .get(&lease_id)
+            .map(|entry| *entry.value())
+    }
+
     /// Give a lease a deadline, after which the reaper force-releases it.
     ///
     /// Only RDMA leases get one: see the module docs.
@@ -322,20 +342,21 @@ impl DataStore {
             LeaseDeadline {
                 local_id,
                 expires_at: Instant::now() + timeout,
+                timeout,
             },
         );
     }
 
-    /// Push a lease's deadline out by `timeout` from now.
+    /// Push a lease's deadline out by the timeout it was granted under.
     ///
     /// Returns whether the lease still had a deadline to push. A renewal for a
     /// lease that has already been released or reaped is not an error — the
     /// keepalive is fire-and-forget and races the release it is renewing past
     /// by construction — so the caller logs at most a debug line.
-    pub(crate) fn renew_lease(&self, lease_id: u64, timeout: Duration) -> bool {
+    pub(crate) fn renew_lease(&self, lease_id: u64) -> bool {
         match self.lease_deadlines.get_mut(&lease_id) {
             Some(mut entry) => {
-                entry.expires_at = Instant::now() + timeout;
+                entry.expires_at = Instant::now() + entry.timeout;
                 true
             }
             None => false,
@@ -658,7 +679,7 @@ mod tests {
                 .is_empty(),
             "a lease with no deadline must never be reported expired"
         );
-        assert!(!store.renew_lease(lease, Duration::from_secs(1)));
+        assert!(!store.renew_lease(lease));
     }
 
     #[test]
@@ -666,12 +687,22 @@ mod tests {
         let store = DataStore::new();
         let id = store.register(Bytes::from("data"), None);
         let lease = store.acquire_read_lock(id).unwrap();
+        store.set_lease_deadline(lease, id, Duration::from_secs(3600));
+        assert!(
+            store.expired_leases(Instant::now()).is_empty(),
+            "a fresh deadline is not expired"
+        );
+
+        // Expire it by re-granting under a zero timeout, which is what a
+        // deadline that has passed looks like from the reaper's side.
         store.set_lease_deadline(lease, id, Duration::from_millis(0));
+        assert_eq!(store.expired_leases(Instant::now()), vec![(lease, id)]);
 
-        let expired = store.expired_leases(Instant::now());
-        assert_eq!(expired, vec![(lease, id)]);
-
-        assert!(store.renew_lease(lease, Duration::from_secs(3600)));
+        // A renewal pushes the deadline out by the timeout the lease was
+        // granted under, which is now zero — so re-grant under a real one and
+        // check that renewal keeps it alive.
+        store.set_lease_deadline(lease, id, Duration::from_secs(3600));
+        assert!(store.renew_lease(lease));
         assert!(
             store.expired_leases(Instant::now()).is_empty(),
             "renewal must push the deadline past now"
@@ -690,7 +721,7 @@ mod tests {
 
         assert_eq!(store.consume_lease(lease), Some(id));
         assert_eq!(store.deadline_count(), 0);
-        assert!(!store.renew_lease(lease, Duration::from_secs(30)));
+        assert!(!store.renew_lease(lease));
     }
 
     /// A forced release is a release, not a detach: the refcount the vanished
