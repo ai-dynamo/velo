@@ -55,7 +55,11 @@ pub struct DataMetadata {
     pub total_len: u64,
     /// Current refcount.
     pub refcount: u32,
-    /// Whether the data is RDMA-pinned (Phase 2).
+    /// Whether the payload is staged in RDMA-registered memory.
+    ///
+    /// A hint about *how* it can be moved, never about whether it can be:
+    /// a pinned slot answers the chunked path exactly as a heap-staged one
+    /// does. `true` means an RDMA-capable consumer may get it in one GET.
     pub pinned: bool,
 }
 

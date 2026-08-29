@@ -118,6 +118,87 @@ pub struct RendezvousManager {
     /// while regions are being unmapped underneath them.
     #[cfg(all(target_os = "linux", feature = "ucx"))]
     reaper_shutdown: tokio_util::sync::CancellationToken,
+    /// One armed fault for the next RDMA transfer. See
+    /// [`arm_rdma_hook`](Self::arm_rdma_hook).
+    #[cfg(all(target_os = "linux", feature = "ucx", feature = "test-helpers"))]
+    test_hook: parking_lot::Mutex<Option<RdmaTestHook>>,
+}
+
+/// A condition to force on the next RDMA transfer, for tests.
+///
+/// Every variant is something that either cannot happen over `UCX_TLS=tcp` or
+/// cannot happen without a peer that misbehaves — and every one of them has a
+/// velo-side response this phase is responsible for. Arming it is how those
+/// responses stay covered.
+///
+/// Behind `test-helpers`, so it is not part of a release build's surface.
+#[cfg(all(target_os = "linux", feature = "ucx", feature = "test-helpers"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RdmaTestHook {
+    /// Overwrite the received descriptor's backend discriminator with one no
+    /// build knows.
+    UnknownBackend,
+    /// Drop the descriptor's last byte, so its key length overstates what
+    /// follows.
+    TruncateDescriptor,
+    /// Append a byte the framing cannot account for.
+    TrailingByte,
+    /// Overstate the descriptor's declared key length without changing its
+    /// bytes.
+    LyingKeyLength,
+    /// Fail the transfer after the descriptor has decoded, as an RDMA lane
+    /// would on a remote access error.
+    FailGet,
+    /// Delay the transfer.
+    ///
+    /// **Not a failure.** A transfer that takes longer than half a lease
+    /// deadline is the condition the renewal ticker exists for, and over
+    /// `UCX_TLS=tcp` on a loopback there is no honest way to produce one.
+    SlowGet(std::time::Duration),
+}
+
+#[cfg(all(target_os = "linux", feature = "ucx", feature = "test-helpers"))]
+impl RdmaTestHook {
+    /// Whether this fault applies to the descriptor rather than the transfer.
+    fn is_descriptor_fault(&self) -> bool {
+        matches!(
+            self,
+            Self::UnknownBackend
+                | Self::TruncateDescriptor
+                | Self::TrailingByte
+                | Self::LyingKeyLength
+        )
+    }
+
+    /// Apply a descriptor fault to the bytes the owner sent.
+    ///
+    /// Deliberately operates on the encoded form rather than on a decoded
+    /// struct: what is under test is the decoder's accounting of the bytes on
+    /// the wire, and re-encoding a mutated struct would only ever produce blobs
+    /// the encoder considers well-formed.
+    fn corrupt(&self, mut descriptor: Vec<u8>) -> Vec<u8> {
+        match self {
+            Self::UnknownBackend => {
+                if let Some(byte) = descriptor.first_mut() {
+                    *byte = 0xEE;
+                }
+            }
+            Self::TruncateDescriptor => {
+                descriptor.pop();
+            }
+            Self::TrailingByte => descriptor.push(0),
+            Self::LyingKeyLength => {
+                // The `rkey_len` field sits at the end of the fixed header.
+                let at = descriptor::HEADER_LEN - 2;
+                if descriptor.len() >= descriptor::HEADER_LEN {
+                    descriptor[at..at + 2].copy_from_slice(&u16::MAX.to_le_bytes());
+                }
+            }
+            Self::FailGet | Self::SlowGet(_) => {}
+        }
+        descriptor
+    }
 }
 
 /// The RDMA registry and the policy the rendezvous protocol applies to it.
@@ -157,6 +238,8 @@ impl RendezvousManager {
             metrics,
             #[cfg(all(target_os = "linux", feature = "ucx"))]
             reaper_shutdown: tokio_util::sync::CancellationToken::new(),
+            #[cfg(all(target_os = "linux", feature = "ucx", feature = "test-helpers"))]
+            test_hook: parking_lot::Mutex::new(None),
         }
     }
 
@@ -483,6 +566,47 @@ impl RendezvousManager {
     #[cfg(all(target_os = "linux", feature = "ucx"))]
     pub(crate) fn shutdown(&self) {
         self.reaper_shutdown.cancel();
+    }
+
+    /// Arm one fault on the next RDMA transfer this instance performs.
+    ///
+    /// The fallback paths are the ones that must not rot, and every condition
+    /// that reaches them is either impossible to provoke over `UCX_TLS=tcp` (a
+    /// GET that fails) or impossible to provoke at all without a peer that
+    /// lies (a malformed descriptor). Arming the condition here tests *velo's*
+    /// response to it, which is the part this phase owns.
+    ///
+    /// One-shot: the next transfer takes it and clears it. Sticky would pass
+    /// today only because the fallback re-acquire carries no offer and so never
+    /// sees a second descriptor — a property of the code under test, which is
+    /// not something a test should quietly rely on.
+    #[cfg(all(target_os = "linux", feature = "ucx", feature = "test-helpers"))]
+    pub fn arm_rdma_hook(&self, hook: RdmaTestHook) {
+        *self.test_hook.lock() = Some(hook);
+    }
+
+    /// Take an armed descriptor fault, if the armed one is a descriptor fault.
+    ///
+    /// Split from [`take_get_hook`](Self::take_get_hook) so one slot can hold
+    /// either kind without a descriptor test consuming a GET fault or the
+    /// reverse.
+    #[cfg(all(target_os = "linux", feature = "ucx", feature = "test-helpers"))]
+    fn take_descriptor_hook(&self) -> Option<RdmaTestHook> {
+        let mut slot = self.test_hook.lock();
+        match slot.as_ref() {
+            Some(hook) if hook.is_descriptor_fault() => slot.take(),
+            _ => None,
+        }
+    }
+
+    /// Take an armed transfer fault, if the armed one is a transfer fault.
+    #[cfg(all(target_os = "linux", feature = "ucx", feature = "test-helpers"))]
+    fn take_get_hook(&self) -> Option<RdmaTestHook> {
+        let mut slot = self.test_hook.lock();
+        match slot.as_ref() {
+            Some(hook) if !hook.is_descriptor_fault() => slot.take(),
+            _ => None,
+        }
     }
 
     // -----------------------------------------------------------------------

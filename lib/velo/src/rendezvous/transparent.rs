@@ -3,6 +3,12 @@
 
 //! Transparent large payload support: implements the messenger's
 //! [`LargePayloadStager`] and [`LargePayloadResolver`] traits.
+//!
+//! A payload over [`DEFAULT_THRESHOLD`] is staged by the sender, replaced in
+//! the frame by a handle, and resolved by the receiver before the handler is
+//! called — so handler code never sees the difference. Where both ends have the
+//! RDMA path and the sender's pool is warm, that resolution is a single GET;
+//! otherwise it is the chunked pull it has always been.
 
 use std::sync::Arc;
 

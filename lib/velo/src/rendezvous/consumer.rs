@@ -129,14 +129,17 @@ impl Consumer {
                 lease_id,
                 descriptor,
                 lease_timeout_ms,
-            } => match rdma_pull(manager, handle, lease_id, &descriptor, lease_timeout_ms).await {
-                // One copy out of registered memory, so the caller holds an
-                // ordinary `Bytes` with no relationship to the pool and the
-                // space goes back immediately. `get_pinned` is the version that
-                // skips this copy.
-                Ok(buf) => Ok((Bytes::copy_from_slice(&buf), lease_id)),
-                Err(reason) => fallback_chunked(manager, handle, lease_id, reason).await,
-            },
+            } => {
+                let descriptor = with_descriptor_hook(manager, descriptor);
+                match rdma_pull(manager, handle, lease_id, &descriptor, lease_timeout_ms).await {
+                    // One copy out of registered memory, so the caller holds an
+                    // ordinary `Bytes` with no relationship to the pool and the
+                    // space goes back immediately. `get_pinned` is the version
+                    // that skips this copy.
+                    Ok(buf) => Ok((Bytes::copy_from_slice(&buf), lease_id)),
+                    Err(reason) => fallback_chunked(manager, handle, lease_id, reason).await,
+                }
+            }
             #[cfg(not(all(target_os = "linux", feature = "ucx")))]
             AcquireResponse::Rdma { lease_id, .. } => {
                 unsolicited_rdma(manager, handle, lease_id).await
@@ -166,14 +169,17 @@ impl Consumer {
                 lease_id,
                 descriptor,
                 lease_timeout_ms,
-            } => match rdma_pull(manager, handle, lease_id, &descriptor, lease_timeout_ms).await {
-                Ok(buf) => Ok((buf, lease_id)),
-                Err(reason) => {
-                    let (data, lease_id) =
-                        fallback_chunked(manager, handle, lease_id, reason).await?;
-                    Ok((copy_into_pool(manager, &data).await?, lease_id))
+            } => {
+                let descriptor = with_descriptor_hook(manager, descriptor);
+                match rdma_pull(manager, handle, lease_id, &descriptor, lease_timeout_ms).await {
+                    Ok(buf) => Ok((buf, lease_id)),
+                    Err(reason) => {
+                        let (data, lease_id) =
+                            fallback_chunked(manager, handle, lease_id, reason).await?;
+                        Ok((copy_into_pool(manager, &data).await?, lease_id))
+                    }
                 }
-            },
+            }
             AcquireResponse::Ready {
                 lease_id,
                 transfer_id,
@@ -259,6 +265,7 @@ impl Consumer {
                 descriptor,
                 lease_timeout_ms,
             } => {
+                let descriptor = with_descriptor_hook(manager, descriptor);
                 match rdma_pull_into(
                     manager,
                     handle,
@@ -412,6 +419,47 @@ fn rdma_offer(manager: &RendezvousManager, target: WorkerId) -> Option<RdmaOffer
     Some(RdmaOffer {
         backends: vec![key.to_string()],
     })
+}
+
+/// Apply an armed descriptor fault, if there is one. Identity in a release
+/// build, where the hook does not exist.
+#[cfg(all(target_os = "linux", feature = "ucx"))]
+fn with_descriptor_hook(manager: &RendezvousManager, descriptor: Vec<u8>) -> Vec<u8> {
+    #[cfg(feature = "test-helpers")]
+    if let Some(hook) = manager.take_descriptor_hook() {
+        return hook.corrupt(descriptor);
+    }
+    let _ = manager;
+    descriptor
+}
+
+/// What an armed transfer fault asks of the GET. Always `None` in a build
+/// without `test-helpers`, where nothing can arm one.
+#[cfg(all(target_os = "linux", feature = "ucx"))]
+#[cfg_attr(not(feature = "test-helpers"), allow(dead_code))]
+enum TransferHook {
+    /// Report the transfer as failed without issuing it.
+    Fail,
+    /// Issue it, but not yet.
+    Delay(std::time::Duration),
+}
+
+#[cfg(all(target_os = "linux", feature = "ucx"))]
+fn take_transfer_hook(manager: &RendezvousManager) -> Option<TransferHook> {
+    #[cfg(feature = "test-helpers")]
+    {
+        use crate::rendezvous::RdmaTestHook;
+        match manager.take_get_hook() {
+            Some(RdmaTestHook::FailGet) => Some(TransferHook::Fail),
+            Some(RdmaTestHook::SlowGet(delay)) => Some(TransferHook::Delay(delay)),
+            _ => None,
+        }
+    }
+    #[cfg(not(feature = "test-helpers"))]
+    {
+        let _ = manager;
+        None
+    }
 }
 
 /// Why an RDMA transfer could not be completed.
@@ -600,14 +648,25 @@ async fn run_get(
         len: desc.len,
     };
 
+    let delay = match take_transfer_hook(manager) {
+        Some(TransferHook::Fail) => {
+            return Err(RdmaFallback::new(
+                RdmaPathReason::GetFailed,
+                "injected transfer failure",
+            ));
+        }
+        Some(TransferHook::Delay(delay)) => Some(delay),
+        None => None,
+    };
+
     let started = std::time::Instant::now();
-    let outcome = with_lease_renewal(
-        manager,
-        handle,
-        lease_id,
-        lease_timeout_ms,
-        ctx.registry.get(req),
-    )
+    let transfer = ctx.registry.get(req);
+    let outcome = with_lease_renewal(manager, handle, lease_id, lease_timeout_ms, async move {
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        transfer.await
+    })
     .await;
 
     match outcome {

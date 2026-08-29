@@ -541,12 +541,27 @@ impl Default for VeloBuilder {
 /// the metric.
 #[cfg(all(target_os = "linux", feature = "ucx"))]
 fn rdma_rendezvous_disabled_by_env() -> bool {
-    std::env::var("VELO_RDMA_RENDEZVOUS_DISABLE")
-        .map(|v| {
-            let v = v.trim().to_ascii_lowercase();
-            v == "1" || v == "true" || v == "yes" || v == "on"
-        })
-        .unwrap_or(false)
+    rdma_rendezvous_disabled(
+        std::env::var("VELO_RDMA_RENDEZVOUS_DISABLE")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// The parsing half of the kill switch, split out so it can be tested.
+///
+/// The environment is process-global and `cargo test` runs in parallel, so a
+/// test that *set* the variable would silently switch the path off for every
+/// other test building a `Velo` at that moment. Splitting the decision from the
+/// read means the rule can be checked exhaustively without touching the
+/// process; the end-to-end effect is covered through
+/// [`RdmaRendezvousConfig::enabled`], which is the same field this writes.
+#[cfg(all(target_os = "linux", feature = "ucx"))]
+fn rdma_rendezvous_disabled(value: Option<&str>) -> bool {
+    value.is_some_and(|v| {
+        let v = v.trim().to_ascii_lowercase();
+        v == "1" || v == "true" || v == "yes" || v == "on"
+    })
 }
 
 impl Velo {
@@ -1197,6 +1212,37 @@ impl Velo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The kill switch fires on an affirmative and on nothing else.
+    ///
+    /// The asymmetry is deliberate and worth pinning down: a switch that fired
+    /// on a typo would silently cost performance in production, while one that
+    /// misses a misspelling shows up the moment anybody reads
+    /// `velo_rendezvous_rdma_path_total`.
+    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    #[test]
+    fn the_rdma_kill_switch_reads_only_affirmatives() {
+        for on in [
+            "1", "true", "TRUE", "True", "yes", "YES", "on", "ON", " 1 ", "\ttrue\n",
+        ] {
+            assert!(
+                rdma_rendezvous_disabled(Some(on)),
+                "{on:?} should switch the rendezvous RDMA path off"
+            );
+        }
+        for off in [
+            "0", "false", "no", "off", "", "  ", "2", "disable", "ture", "1 1",
+        ] {
+            assert!(
+                !rdma_rendezvous_disabled(Some(off)),
+                "{off:?} must not switch the rendezvous RDMA path off"
+            );
+        }
+        assert!(
+            !rdma_rendezvous_disabled(None),
+            "an unset variable must leave the path enabled"
+        );
+    }
 
     /// Test: stream_config double-call returns Err (GRPC-07)
     ///
