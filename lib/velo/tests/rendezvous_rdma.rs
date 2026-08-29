@@ -742,6 +742,20 @@ async fn an_acquire_without_the_offer_field_is_answered_chunked() {
 /// Read off the wire rather than inferred, because the wire value is the whole
 /// claim: the owner's deadline and the milliseconds it reports must come from
 /// one number.
+///
+/// # Two handles, and nothing touched twice
+///
+/// A one-millisecond lease is reaped almost at once — the reaper's floor is ten
+/// milliseconds, so it force-releases on its very next tick, and a force-release
+/// is a *full* release that takes the slot's last reference with it. That is the
+/// configuration behaving as asked (see `RdmaRendezvousConfig::lease_timeout` on
+/// why a timeout this short is defined rather than sensible), but it means any
+/// slot this test acquires against may be gone moments later.
+///
+/// So the ordinary transfer runs first, against its own handle, and the
+/// wire-probing acquire runs second against a handle nothing reads again.
+/// Sharing one handle made the follow-up racy — it flaked roughly one run in
+/// fifteen — for a reason that had nothing to do with what is under test.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_sub_millisecond_lease_timeout_is_clamped_before_it_reaches_the_wire() {
     let pair = Pair::with_configs(
@@ -757,8 +771,18 @@ async fn a_sub_millisecond_lease_timeout_is_clamped_before_it_reaches_the_wire()
     .await;
 
     let payload = pattern(512 * 1024);
-    let handle = pair.owner.velo.register_data_pinned(&payload).await;
 
+    // First, against its own handle: the path still works under the clamped
+    // config, rather than the clamp having quietly disabled it.
+    let transferred = pair.owner.velo.register_data_pinned(&payload).await;
+    let (data, lease) = pair.consumer.velo.get(transferred).await.expect("get");
+    assert_pattern(&data, payload.len());
+    assert_eq!(pair.consumer.path_count("ok"), 1);
+    let _ = pair.consumer.velo.release(transferred, lease).await;
+
+    // Second, the wire probe, against a handle nothing reads again — the lease
+    // it takes out is reaped within a tick or two.
+    let handle = pair.owner.velo.register_data_pinned(&payload).await;
     let raw = handle.as_u128();
     let acquire = format!(
         r#"{{"handle":{{"hi":{},"lo":{}}},"rdma":{{"backends":["ucx"]}}}}"#,
@@ -792,11 +816,6 @@ async fn a_sub_millisecond_lease_timeout_is_clamped_before_it_reaches_the_wire()
         }
         AcquireResponse::Ready { .. } => panic!("expected the RDMA path for a pinned slot"),
     }
-
-    // And the transfer still works under the clamped config.
-    let (data, lease) = pair.consumer.velo.get(handle).await.expect("get");
-    assert_pattern(&data, payload.len());
-    let _ = pair.consumer.velo.release(handle, lease).await;
 
     shutdown(pair).await;
 }
