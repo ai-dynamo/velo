@@ -655,11 +655,12 @@ impl RendezvousManager {
                 .store
                 .acquire_read_lock(local_id)
                 .ok_or_else(|| anyhow::anyhow!("rendezvous handle not found: {handle}"))?;
+            let lease = self.lease_guard(handle, lease_id);
             let data = self
                 .store
                 .get_data(local_id)
                 .ok_or_else(|| anyhow::anyhow!("slot vanished after lock acquire"))?;
-            Ok((data, lease_id))
+            Ok((data, lease.disarm()))
         } else {
             consumer::Consumer::get(self, handle).await
         };
@@ -719,6 +720,11 @@ impl RendezvousManager {
                 .store
                 .acquire_read_lock(local_id)
                 .ok_or_else(|| anyhow::anyhow!("rendezvous handle not found: {handle}"))?;
+            // Guarded from here: `NotConfigured` is a *documented* outcome of
+            // this call on an instance with no UCX transport, so without the
+            // guard the ordinary configuration leaked a deadline-free lease on
+            // every single invocation.
+            let lease = self.lease_guard(handle, lease_id);
             let data = self
                 .store
                 .get_data(local_id)
@@ -726,7 +732,7 @@ impl RendezvousManager {
             let ctx = self.store.rdma().ok_or(rdma::RdmaError::NotConfigured)?;
             let mut buf = ctx.registry.alloc_pinned(data.len()).await?;
             buf.copy_from_slice(&data);
-            Ok((buf, lease_id))
+            Ok((buf, lease.disarm()))
         } else {
             consumer::Consumer::get_pinned(self, handle).await
         };
@@ -795,12 +801,13 @@ impl RendezvousManager {
                 .store
                 .acquire_read_lock(local_id)
                 .ok_or_else(|| anyhow::anyhow!("rendezvous handle not found: {handle}"))?;
+            let lease = self.lease_guard(handle, lease_id);
             let data = self
                 .store
                 .get_data(local_id)
                 .ok_or_else(|| anyhow::anyhow!("slot vanished after lock acquire"))?;
             dest.write_chunk(0, &data)?;
-            Ok(lease_id)
+            Ok(lease.disarm())
         } else {
             consumer::Consumer::get_into(self, handle, dest).await
         };
@@ -915,6 +922,133 @@ impl RendezvousManager {
     /// Get direct access to the data store (for transparent mode integration).
     pub fn data_store(&self) -> &Arc<store::DataStore> {
         &self.store
+    }
+
+    /// Take responsibility for a lease until it is handed back.
+    ///
+    /// Wrap every step between acquiring a lease and returning it; see
+    /// [`LeaseGuard`] for why the alternative did not survive contact with a
+    /// fourth error arm.
+    pub(crate) fn lease_guard(&self, handle: DataHandle, lease_id: u64) -> LeaseGuard {
+        let local = handle.worker_id() == self.worker_id;
+        LeaseGuard {
+            store: Arc::clone(&self.store),
+            messenger: if local {
+                None
+            } else {
+                self.messenger_lock.get().cloned()
+            },
+            runtime: self
+                .messenger_lock
+                .get()
+                .map(|m| m.runtime().clone())
+                .unwrap_or_else(tokio::runtime::Handle::current),
+            handle,
+            lease_id,
+            armed: true,
+        }
+    }
+}
+
+/// Releases a lease a `get` acquired but never handed back to its caller.
+///
+/// # Why a guard rather than cleanup on each error arm
+///
+/// Every `get` variant is *acquire a lease, then do some work, then return the
+/// lease*. Each step between can fail — the slot vanished under the lock, this
+/// instance has no registry to allocate a destination from, the pool refused,
+/// the caller's buffer was too small — and each failure that returns without
+/// the lease leaves the owner holding a read lock nobody will ever release.
+///
+/// That is worse than an ordinary leak. A leaked lease is by construction a
+/// *chunked or local* lease, and those carry no deadline (see
+/// `store::tests::chunked_leases_never_expire`, which pins that guarantee
+/// down), so the reaper cannot reclaim it and the slot is immortal. The failure
+/// modes that produce one are the unlucky paths, so it would be invisible.
+///
+/// Hand-written cleanup on each arm is what let four of them drift apart in the
+/// first place, and it cannot survive a fifth step being added later. The guard
+/// makes releasing the default and returning it the deliberate act.
+///
+/// # What `Drop` can and cannot do
+///
+/// A *local* lease is released inline: it is a handful of map operations with
+/// nothing to await. A *remote* one needs `_rv_detach` on the wire, which is
+/// async, so `Drop` spawns it on the runtime captured at construction — the
+/// same shape `RegionGuard` uses, and for the same reason: `Drop` must not
+/// block inside a runtime worker.
+///
+/// The spawn is caught rather than trusted. `Handle::spawn` panics on a runtime
+/// that has already shut down, and a panic inside `Drop` during an unwind
+/// aborts the process; a lease left behind because the runtime is gone is a
+/// process that is going away anyway, and it is the owner's reaper's problem
+/// for an RDMA lease. Losing the detach is the documented worst case here.
+#[must_use = "the lease is released when this is dropped; call disarm() to keep it"]
+pub(crate) struct LeaseGuard {
+    store: Arc<store::DataStore>,
+    /// `None` for a lease on this instance's own store, which is released
+    /// without touching the network.
+    messenger: Option<Arc<crate::messenger::Messenger>>,
+    runtime: tokio::runtime::Handle,
+    handle: DataHandle,
+    lease_id: u64,
+    armed: bool,
+}
+
+impl LeaseGuard {
+    /// Keep the lease and hand its id back. The success path.
+    pub(crate) fn disarm(mut self) -> u64 {
+        self.armed = false;
+        self.lease_id
+    }
+}
+
+impl Drop for LeaseGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let (_, local_id) = self.handle.unpack();
+        let lease_id = self.lease_id;
+        let handle = self.handle;
+
+        let Some(messenger) = self.messenger.clone() else {
+            // Local: the store is right here.
+            if self.store.consume_lease(lease_id, local_id) == store::LeaseOutcome::Consumed {
+                self.store.release_read_lock(local_id);
+                self.store.remove_transfers_by_lease(lease_id);
+            }
+            return;
+        };
+
+        tracing::debug!(
+            %handle,
+            lease = lease_id,
+            "rendezvous: releasing a lease whose get did not complete"
+        );
+        // `AssertUnwindSafe` because the only thing this closure touches is a
+        // runtime handle and two `Arc`s, and a panic from `spawn` leaves none of
+        // them observably half-updated.
+        let spawned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.runtime.spawn(async move {
+                if let Err(e) = consumer::Consumer::detach(&messenger, handle, lease_id).await {
+                    tracing::warn!(
+                        %handle,
+                        lease = lease_id,
+                        error = %e,
+                        "rendezvous: could not detach a lease after a failed get"
+                    );
+                }
+            })
+        }));
+        if spawned.is_err() {
+            tracing::warn!(
+                %handle,
+                lease = lease_id,
+                "rendezvous: the runtime is gone, so this lease was not detached; the owner's \
+                 reaper reclaims it if it was an RDMA lease"
+            );
+        }
     }
 }
 

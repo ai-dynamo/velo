@@ -856,6 +856,105 @@ async fn a_spent_budget_stages_in_plain_memory() {
         .await;
 }
 
+/// A `get` that fails after taking the lease still gives the lease back.
+///
+/// The failure here is the *documented* one: `get_pinned` needs a registry to
+/// allocate a destination from, and an instance without a UCX transport answers
+/// `NotConfigured`. Before the lease guard that meant every single call on such
+/// an instance stranded a read lock — and a local lease carries no deadline, so
+/// the reaper could never reclaim it and the slot was immortal.
+///
+/// The assertion is indirect on purpose: a leaked read lock is invisible in
+/// metadata, and shows up only as a slot that a full release cannot free. That
+/// is exactly the shape of the bug, so it is the shape of the test.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_get_that_fails_after_taking_the_lease_returns_it() {
+    let node = Node::start_without_rdma().await;
+
+    let payload = pattern(8 * 1024);
+    let handle = node.velo.register_data(Bytes::from(payload.clone()));
+
+    for _ in 0..3 {
+        let err = node
+            .velo
+            .get_pinned(handle)
+            .await
+            .expect_err("no registry, so there is nowhere to put the bytes");
+        assert!(
+            err.to_string().contains("no rdma backend configured"),
+            "expected NotConfigured; got: {err}"
+        );
+    }
+
+    // One full get + release takes the last reference and the last read lock.
+    // A lease stranded above would still be holding one, and the slot would
+    // survive.
+    let (data, lease) = node.velo.get(handle).await.expect("get");
+    assert_eq!(&data[..], &payload[..]);
+    node.velo.release(handle, lease).await.expect("release");
+    assert!(
+        node.velo.metadata(handle).await.is_err(),
+        "a failed get_pinned stranded its read lock, so the slot cannot be freed"
+    );
+
+    node.velo
+        .graceful_shutdown(ShutdownPolicy::Timeout(T))
+        .await;
+}
+
+/// The same, for the lease the *fallback* takes out.
+///
+/// A failed GET detaches its lease and re-acquires a fresh one; the copy into
+/// the caller's destination happens after that, and a destination too small to
+/// take the payload fails there. The fresh lease is the one at risk, and it is
+/// as deadline-free as any other chunked lease.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_write_after_the_fallback_returns_its_fresh_lease() {
+    let pair = Pair::new().await;
+
+    let payload = pattern(512 * 1024);
+    let handle = pair.owner.velo.register_data_pinned(&payload).await;
+    pair.consumer
+        .velo
+        .rendezvous_manager()
+        .arm_rdma_hook(RdmaTestHook::FailGet);
+
+    let mut too_small = [0u8; 64];
+    let mut dest: &mut [u8] = &mut too_small;
+    let err = pair
+        .consumer
+        .velo
+        .get_into(handle, &mut dest)
+        .await
+        .expect_err("a 64-byte destination cannot take 512 KiB");
+    assert!(
+        err.to_string().contains("out of bounds"),
+        "expected the destination to refuse; got: {err}"
+    );
+    assert_eq!(
+        pair.consumer.path_count("get_failed"),
+        1,
+        "the fallback should have run before the write failed"
+    );
+
+    // The owner must be holding nothing: one full get + release frees the slot.
+    let (data, lease) = pair.consumer.velo.get(handle).await.expect("get");
+    assert_pattern(&data, payload.len());
+    pair.consumer
+        .velo
+        .release(handle, lease)
+        .await
+        .expect("release");
+    wait_until(
+        "the slot is freed, so no lease was stranded by the failed write",
+        || slot_is_gone(&pair.owner, handle),
+        || "the slot is still staged, so a read lock outlived its get".to_string(),
+    )
+    .await;
+
+    shutdown(pair).await;
+}
+
 // ---------------------------------------------------------------------------
 // 5. Leases: the reaper and the keepalive
 // ---------------------------------------------------------------------------

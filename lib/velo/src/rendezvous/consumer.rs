@@ -174,9 +174,15 @@ impl Consumer {
                 match rdma_pull(manager, handle, lease_id, &descriptor, lease_timeout_ms).await {
                     Ok(buf) => Ok((buf, lease_id)),
                     Err(reason) => {
+                        // The fallback returns a *fresh* lease, and the copy
+                        // below can still fail — a pool under pressure, a
+                        // registry that has gone away. Guard it, or the failure
+                        // strands a chunked lease the reaper cannot reclaim.
                         let (data, lease_id) =
                             fallback_chunked(manager, handle, lease_id, reason).await?;
-                        Ok((copy_into_pool(manager, &data).await?, lease_id))
+                        let lease = manager.lease_guard(handle, lease_id);
+                        let buf = copy_into_pool(manager, &data).await?;
+                        Ok((buf, lease.disarm()))
                     }
                 }
             }
@@ -197,7 +203,11 @@ impl Consumer {
                 )
                 .await
                 {
-                    Ok(data) => Ok((copy_into_pool(manager, &data).await?, lease_id)),
+                    Ok(data) => {
+                        let lease = manager.lease_guard(handle, lease_id);
+                        let buf = copy_into_pool(manager, &data).await?;
+                        Ok((buf, lease.disarm()))
+                    }
                     Err(e) => {
                         if let Err(cleanup_err) =
                             Consumer::detach(messenger, handle, lease_id).await
@@ -280,16 +290,21 @@ impl Consumer {
                     Err(reason) => {
                         let (data, lease_id) =
                             fallback_chunked(manager, handle, lease_id, reason).await?;
+                        // `write_chunk` refuses a destination too small for the
+                        // payload, and that refusal must not take the fresh
+                        // lease with it.
+                        let lease = manager.lease_guard(handle, lease_id);
                         dest.write_chunk(0, &data)?;
-                        Ok(lease_id)
+                        Ok(lease.disarm())
                     }
                 }
             }
             #[cfg(not(all(target_os = "linux", feature = "ucx")))]
             AcquireResponse::Rdma { lease_id, .. } => {
                 let (data, lease_id) = unsolicited_rdma(manager, handle, lease_id).await?;
+                let lease = manager.lease_guard(handle, lease_id);
                 dest.write_chunk(0, &data)?;
-                Ok(lease_id)
+                Ok(lease.disarm())
             }
         }
     }
