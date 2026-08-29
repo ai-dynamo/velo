@@ -685,6 +685,31 @@ impl DataStore {
         self.transfers.remove(&transfer_id);
     }
 
+    /// Drop every slot staged in registered memory, releasing what it holds.
+    ///
+    /// Called once, from `RendezvousManager::shutdown`, before the registration
+    /// sweep. Dropping a pinned body releases its pool suballocation and, for
+    /// an anchor inside a caller's region, the in-flight guard that region's
+    /// deregistration is waiting on. Without this a single long-lived anchor
+    /// burns the *entire* shutdown budget on a drain that can never finish, and
+    /// every unmap behind it — and the messenger phase after that — is starved
+    /// of the time it needed.
+    ///
+    /// Heap-staged slots are deliberately left alone. They hold nothing the
+    /// sweep cares about, and the messenger has only just gated inbound
+    /// requests: a chunked pull admitted before the gate is still entitled to
+    /// finish, and clearing its slot would turn a completion into "chunk not
+    /// found".
+    ///
+    /// Returns how many slots were dropped.
+    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    pub(crate) fn drop_pinned_slots(&self) -> usize {
+        let before = self.slots.len();
+        self.slots
+            .retain(|_, slot| !matches!(slot.body, SlotBody::Pinned(_)));
+        before - self.slots.len()
+    }
+
     /// Remove all transfers associated with a given lease ID.
     pub fn remove_transfers_by_lease(&self, lease_id: u64) {
         self.transfers.retain(|_, state| state.lease_id != lease_id);

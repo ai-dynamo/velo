@@ -676,6 +676,16 @@ impl RegionWatch {
         self.inner.with_live(read)
     }
 
+    /// Build a watch over a region directly.
+    ///
+    /// Production watches come from `RegionGuard::watch`, which needs a
+    /// registry and a backend behind it; the ordering properties a watch
+    /// carries are velo's own and are better tested without either.
+    #[cfg(test)]
+    pub(crate) fn for_test(inner: Arc<RegionInner>) -> Self {
+        Self { inner }
+    }
+
     /// Close the latch directly, for the adversarial wakeup scan.
     ///
     /// The scan needs to fire the latch from a plain thread at a precise moment

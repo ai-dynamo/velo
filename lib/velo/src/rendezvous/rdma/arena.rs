@@ -249,9 +249,19 @@ pub(crate) struct Arena {
     /// Arena length in [`GRANULE`]s — the unit the suballocator works in.
     granules: u32,
     free: Mutex<Allocator<u32>>,
-    /// Live [`PinnedBuf`]s cut from this arena. Phase 4's reclamation reads it;
-    /// here it makes "the pool really did give the space back" assertable.
+    /// Live suballocations cut from this arena — held by a caller, by an
+    /// in-flight transfer, or both. Phase 4's reclamation reads it; here it
+    /// makes "the pool really did give the space back" assertable.
     live: AtomicUsize,
+    /// Suballocations an in-flight transfer is still writing into.
+    ///
+    /// Deliberately separate from `live`. Shutdown must wait for *these* before
+    /// unmapping — a NIC writing into a deregistered range is the hazard — but
+    /// it must not wait for a caller that is simply still holding a buffer,
+    /// which it may hold until long after shutdown and which nothing is
+    /// writing to. Conflating the two turns an application that keeps a
+    /// `PinnedBuf` around into a shutdown that burns its entire budget.
+    in_flight: AtomicUsize,
     /// Dedicated arenas back exactly one oversize request and are never offered
     /// to the general search, so the request that motivated them cannot be
     /// crowded out by later small ones.
@@ -268,9 +278,14 @@ impl Arena {
         self.memory.len
     }
 
-    /// Live suballocations.
+    /// Live suballocations, whoever is holding them.
     pub(crate) fn live(&self) -> usize {
         self.live.load(Ordering::Acquire)
+    }
+
+    /// Suballocations an in-flight transfer is still writing into.
+    pub(crate) fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Acquire)
     }
 
     /// Try to cut `len` bytes out of this arena.
@@ -352,7 +367,15 @@ impl Drop for Suballoc {
 /// buffer if the caller goes away. It has no accessors at all: it cannot read
 /// or write the range, which is what keeps [`PinnedBuf`]'s raw-pointer `Deref`
 /// pair sound while a hold is outstanding.
-pub(crate) struct TransferHold(#[allow(dead_code)] Arc<Suballoc>);
+pub(crate) struct TransferHold(Arc<Suballoc>);
+
+impl Drop for TransferHold {
+    /// The transfer is over: stop shutdown waiting on it, and drop this
+    /// holder's share of the suballocation.
+    fn drop(&mut self) {
+        self.0.arena.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// An owned, registered byte range cut from an [`Arena`].
 ///
@@ -415,6 +438,7 @@ impl PinnedBuf {
     /// The hold must live until the *backend* reports the transfer finished,
     /// not until the caller stops waiting for it. See [`TransferHold`].
     pub(crate) fn hold(&self) -> TransferHold {
+        self.inner.arena.in_flight.fetch_add(1, Ordering::AcqRel);
         TransferHold(Arc::clone(&self.inner))
     }
 
@@ -918,6 +942,7 @@ impl ArenaSet {
             // any arena above 512 MiB.
             free: Mutex::new(Allocator::with_max_allocs(granules, granules)),
             live: AtomicUsize::new(0),
+            in_flight: AtomicUsize::new(0),
             dedicated,
             memory,
         });
@@ -953,12 +978,37 @@ impl ArenaSet {
         let arenas: Vec<Arc<Arena>> = std::mem::take(&mut *self.arenas.write());
         let mut unconfirmed = Vec::new();
         for arena in arenas {
+            // Bounded wait for in-flight *transfers*, mirroring what an
+            // external region gets from its own drain. Warning and unmapping
+            // regardless was the asymmetry: a transfer still writing into this
+            // arena would be handed a deregistered range.
+            //
+            // It waits on `in_flight`, not on `live`. A caller may still be
+            // holding a `PinnedBuf` at shutdown and is entitled to — nothing is
+            // writing into it, and it may outlive the runtime — so waiting for
+            // `live` would let an ordinary application burn the whole budget.
+            //
+            // Polled rather than notified: this runs once per arena at
+            // shutdown, and a condvar on the release path would cost something
+            // on every free to save nothing measurable here.
+            while arena.in_flight() != 0 && Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            if arena.in_flight() != 0 {
+                tracing::warn!(
+                    in_flight = arena.in_flight(),
+                    bytes = arena.len(),
+                    "rdma: unmapping an arena with transfers still writing into it; they will \
+                     fail at their own end"
+                );
+            }
             let live = arena.live();
             if live != 0 {
-                tracing::warn!(
+                tracing::debug!(
                     live,
                     bytes = arena.len(),
-                    "rdma: unmapping an arena that still has live suballocations"
+                    "rdma: unmapping an arena a caller still holds buffers from; their memory \
+                     stays valid, it is simply no longer registered"
                 );
             }
             let remaining = deadline.saturating_duration_since(Instant::now());

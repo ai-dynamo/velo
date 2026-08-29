@@ -663,10 +663,19 @@ impl Velo {
             let started = std::time::Instant::now();
             if let Some(rdma) = &self.rdma {
                 self.begin_drain();
-                // Before the sweep, not after: the reaper force-releases leases
-                // and drops the pinned staging under them, and doing that while
-                // the sweep is walking regions and arenas would have two tasks
-                // taking the same memory apart from opposite ends.
+                // Before the sweep, and load-bearing for it. This stops the
+                // lease reaper — so it is not taking the same memory apart
+                // from the other end while the sweep walks it — and drops
+                // every pinned slot, which is what releases the pool
+                // suballocations and region in-flight guards the sweep's
+                // drains are about to wait on. A single long-lived anchor left
+                // in place would consume the entire budget below on a drain
+                // that cannot finish.
+                //
+                // Cancelling the reaper is not a join: a tick already running
+                // may still complete. That overlap is benign — both paths end
+                // a lease through the same atomic store operations, and the
+                // sweep is trying to make slots disappear anyway.
                 self.rendezvous_manager.shutdown();
                 let budget = match &policy {
                     ShutdownPolicy::Timeout(deadline) => *deadline,

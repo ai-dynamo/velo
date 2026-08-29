@@ -2069,3 +2069,60 @@ fn a_copy_never_overlaps_the_deregistration_latch() {
         drop(region);
     }
 }
+
+/// An anchor refuses to read a region that has been released.
+///
+/// The other half of the copy gate: the ordering test proves a copy and the
+/// latch cannot overlap, and this proves the anchor actually consults it. A
+/// `read_at` that skipped the check would return bytes out of memory the
+/// region's owner has already been told it may free.
+///
+/// Driven directly rather than through a shutdown, because after
+/// `RendezvousManager::shutdown` drops pinned slots ahead of the registration
+/// sweep there is no longer a *normal* path that leaves an anchor alive over a
+/// released region — which is the point of that change, and would make this an
+/// assertion about nothing.
+#[test]
+fn an_anchor_refuses_to_read_a_region_that_has_been_released() {
+    use super::region::RegionWatch;
+    use crate::rendezvous::descriptor::DescriptorBackend;
+    use crate::rendezvous::pinned::PinnedSlot;
+
+    const LEN: u64 = 4096;
+    let region = bare_region(vec![0x5Au8; LEN as usize].into_boxed_slice());
+    let slot = PinnedSlot::from_region(
+        region.in_flight.acquire(),
+        RegionWatch::for_test(Arc::clone(&region)),
+        DescriptorBackend::Ucx,
+        region.ptr as u64,
+        LEN,
+        1,
+        Bytes::from_static(b"packed-key"),
+    );
+
+    // While the region is live the anchor reads it, so the refusal below is a
+    // change of state rather than a slot that never worked.
+    let read = slot
+        .read_at(0, LEN as usize)
+        .expect("read while registered");
+    assert!(read.iter().all(|b| *b == 0x5A));
+    assert!(slot.descriptor().is_some());
+    assert!(slot.is_live());
+
+    // The latch is the moment the region's owner may free the memory.
+    region.latch_deregistered();
+
+    assert!(
+        slot.read_at(0, LEN as usize).is_none(),
+        "the anchor read a region whose owner has been told it may free it"
+    );
+    assert!(slot.to_bytes().is_none());
+    assert!(
+        slot.descriptor().is_none(),
+        "a descriptor for a released region would send a peer's NIC at freed memory"
+    );
+    assert!(!slot.is_live());
+
+    drop(slot);
+    drop(region);
+}

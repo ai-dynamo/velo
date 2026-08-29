@@ -571,14 +571,45 @@ impl RendezvousManager {
         Ok(())
     }
 
-    /// Stop the lease reaper.
+    /// Stop the lease reaper and release the staging the sweep is waiting for.
     ///
-    /// Called by `Velo::graceful_shutdown` before the registration sweep, so
-    /// the reaper is not force-releasing leases — and dropping the pinned
-    /// staging under them — while regions are being unmapped.
+    /// Called by `Velo::graceful_shutdown` immediately before the registration
+    /// sweep, and it does two things.
+    ///
+    /// **The reaper stops.** It force-releases leases and drops the pinned
+    /// staging under them, and doing that while the sweep walks regions and
+    /// arenas would have two tasks taking the same memory apart from opposite
+    /// ends. Cancelling is not a join — a tick already in progress may still
+    /// finish — and that overlap is benign: both paths end a lease through the
+    /// same store operations, which are individually atomic, and the sweep
+    /// tolerates a slot disappearing underneath it because that is exactly what
+    /// it is trying to make happen.
+    ///
+    /// **Pinned slots are dropped.** Each one holds a pool suballocation or an
+    /// in-flight guard on a caller's region, and the sweep's drains wait on
+    /// precisely those. One long-lived anchor would otherwise consume the whole
+    /// shutdown budget on a drain that cannot finish, starving every later
+    /// unmap and the messenger phase after it.
+    ///
+    /// # What that means for a peer mid-read
+    ///
+    /// Dropping a pinned body releases memory a peer's GET may still be reading
+    /// as its *source*. That is the owner-side mirror of the risk D8 already
+    /// documents and accepts for a straggling transfer at shutdown, and it is
+    /// the same behaviour the reaper's own force-release already has: on RDMA
+    /// hardware the straggler fails at its own end, and over `UCX_TLS=tcp` it
+    /// is silently lost. The alternative — waiting indefinitely on peers that
+    /// may have crashed — is what the bounded sweep exists to avoid.
     #[cfg(all(target_os = "linux", feature = "ucx"))]
     pub(crate) fn shutdown(&self) {
         self.reaper_shutdown.cancel();
+        let dropped = self.store.drop_pinned_slots();
+        if dropped != 0 {
+            tracing::debug!(
+                slots = dropped,
+                "rendezvous: released pinned staging ahead of the registration sweep"
+            );
+        }
     }
 
     /// Arm one fault on the next RDMA transfer this instance performs.

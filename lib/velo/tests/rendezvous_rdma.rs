@@ -41,6 +41,11 @@
 //!   pre-phase struct shapes in both directions. The end-to-end half — an
 //!   acquire with no `rdma` key at all — is
 //!   `an_acquire_without_the_offer_field_is_answered_chunked` below.
+//! * **An anchor over a released region.** `rdma::tests` drives the copy gate
+//!   and the refusal directly. There is deliberately no *normal* path that
+//!   leaves an anchor alive over a released region any more — shutdown drops
+//!   pinned slots before the sweep — so reaching that state end to end would
+//!   mean staging something the runtime is designed to prevent.
 
 #![cfg(all(target_os = "linux", feature = "ucx", feature = "test-helpers"))]
 
@@ -430,79 +435,6 @@ async fn an_external_region_anchor_serves_the_chunked_path() {
     );
 
     shutdown(pair).await;
-}
-
-/// Reading an anchor whose region has been unmapped refuses, instead of
-/// touching memory the caller has been told it may free.
-///
-/// The in-flight guard makes a deregistration *wait* for staged anchors; this is
-/// the other half. Shutdown's sweep is bounded, so a region with an anchor still
-/// staged is unmapped anyway and its `deregistered()` latch is closed at the end
-/// of `graceful_shutdown` regardless — D8's documented cost of bounding
-/// shutdown. From that moment the slot's `RegionWatch` has to turn every read
-/// into an error, or the chunked path would `copy_nonoverlapping` out of a
-/// deregistered range.
-///
-/// Driven through `graceful_shutdown` rather than through
-/// `RegionGuard::unregister`, which is not a deterministic way to reach this
-/// state: `unregister` gives its *whole* sequence one budget, so a drain that
-/// cannot finish consumes all of it and the unmap that follows gets none —
-/// leaving `Err(Timeout)`, an unconfirmed unmap, and no latch, except when the
-/// timer's granularity happens to let the unmap through. Shutdown's
-/// `latch_all_deregistered` closes the latch unconditionally once the backend
-/// reports nothing registered, which is the property this test needs.
-///
-/// The read is local, so it does not need the messenger that shutdown took
-/// down: the question is what the *store* does, and that is exactly what a
-/// remote `_rv_pull` would have reached.
-#[tokio::test(flavor = "multi_thread")]
-async fn reads_refuse_once_the_region_behind_them_is_gone() {
-    let node = Node::start(None).await;
-
-    let backing = pattern(512 * 1024);
-    let guard = node
-        .velo
-        .register_owned(backing.clone().into_boxed_slice())
-        .await
-        .map_err(|e| e.cause)
-        .expect("register");
-    let watch = guard.watch();
-    let handle = node
-        .velo
-        .register_data_in_region(&guard, 0..512 * 1024)
-        .expect("stage an anchor");
-
-    // While the region is live the anchor reads correctly, so the refusal below
-    // is a change of state rather than a slot that never worked.
-    let (data, lease) = node.velo.get(handle).await.expect("get while registered");
-    assert_eq!(&data[..], &backing[..]);
-    node.velo.detach(handle, lease).await.expect("detach");
-
-    // The anchor holds an in-flight guard, so the sweep cannot drain the region;
-    // it unmaps anyway and the latch is closed at the end of shutdown.
-    // The budget is what the sweep spends waiting on a drain that cannot
-    // finish, so it is also this test's runtime. Teardown itself is not bounded
-    // by it — which is why the latch still closes with nothing left over.
-    node.velo
-        .graceful_shutdown(ShutdownPolicy::Timeout(Duration::from_millis(500)))
-        .await;
-    assert!(
-        watch.is_deregistered(),
-        "shutdown returned without declaring the region released, so this test \
-         never reached the state it is about"
-    );
-
-    let err = node
-        .velo
-        .get(handle)
-        .await
-        .expect_err("reading an anchor whose region is gone must fail");
-    assert!(
-        err.to_string().contains("slot vanished"),
-        "expected the read to refuse; got: {err}"
-    );
-
-    drop(guard);
 }
 
 /// `register_data_in_region` refuses a range it cannot honour, and refuses it
@@ -1283,6 +1215,104 @@ async fn a_cancelled_transfer_does_not_release_its_destination() {
     .await;
 
     shutdown(pair).await;
+}
+
+/// Shutdown waits for a live transfer before unmapping the arena under it.
+///
+/// The arena counterpart of `reads_refuse_once_the_region_behind_them_is_gone`.
+/// An external region gets a bounded in-flight drain before its unmap; arenas
+/// used to warn and unmap regardless, which hands the NIC a deregistered range
+/// while it is still writing.
+///
+/// The wait is observed as elapsed time, and this is one of the two tests that
+/// looks at a clock. The injected delay is the only way to hold a transfer open
+/// across a shutdown over `UCX_TLS=tcp`, and the assertion is a *lower* bound
+/// against a deliberately long delay, so it cannot pass by being fast.
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_waits_for_a_live_transfer_before_unmapping_its_arena() {
+    let pair = Pair::new().await;
+
+    let payload = pattern(512 * 1024);
+    let handle = pair.owner.velo.register_data_pinned(&payload).await;
+    pair.consumer
+        .velo
+        .rendezvous_manager()
+        .arm_rdma_hook(RdmaTestHook::SlowGet(Duration::from_millis(900)));
+
+    // Abandoned while the transfer is running: the detached task still holds
+    // its destination inside the consumer's arena.
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(60),
+        pair.consumer.velo.get_pinned(handle),
+    )
+    .await;
+    assert!(
+        cancelled.is_err(),
+        "the transfer finished too fast to cancel"
+    );
+
+    let started = std::time::Instant::now();
+    pair.consumer
+        .velo
+        .graceful_shutdown(ShutdownPolicy::Timeout(Duration::from_secs(10)))
+        .await;
+    let waited = started.elapsed();
+
+    assert!(
+        waited >= Duration::from_millis(500),
+        "shutdown unmapped the arena after {waited:?}, without waiting for the transfer \
+         still writing into it"
+    );
+    assert_eq!(
+        pair.consumer.velo.rdma_registered_bytes(),
+        0,
+        "the arena should still have been unmapped once the transfer was done"
+    );
+
+    pair.owner
+        .velo
+        .graceful_shutdown(ShutdownPolicy::Timeout(T))
+        .await;
+}
+
+/// A staged anchor does not starve the shutdown sweep.
+///
+/// An anchor inside a caller's region holds an in-flight guard, and the
+/// region's drain waits on it — so a slot left staged would consume the whole
+/// budget on a drain that can never finish, and every unmap behind it would get
+/// nothing. Dropping pinned slots before the sweep is what makes the drains
+/// finish normally instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_staged_anchor_does_not_starve_the_shutdown_sweep() {
+    let node = Node::start(None).await;
+
+    let guard = node
+        .velo
+        .register_owned(pattern(512 * 1024).into_boxed_slice())
+        .await
+        .map_err(|e| e.cause)
+        .expect("register");
+    let watch = guard.watch();
+    let _anchor = node
+        .velo
+        .register_data_in_region(&guard, 0..512 * 1024)
+        .expect("stage an anchor");
+    // A second, pooled slot, so both kinds of pinned staging are in the way.
+    let _pooled = node.velo.register_data_pinned(&pattern(256 * 1024)).await;
+
+    let started = std::time::Instant::now();
+    node.velo
+        .graceful_shutdown(ShutdownPolicy::Timeout(Duration::from_secs(10)))
+        .await;
+    let took = started.elapsed();
+
+    assert!(
+        took < Duration::from_secs(5),
+        "the sweep spent {took:?} draining a region an abandoned anchor was holding open"
+    );
+    assert!(watch.is_deregistered());
+    assert_eq!(node.velo.rdma_registered_bytes(), 0);
+    drop(guard);
 }
 
 /// Dropping a pooled buffer really does return its space.
