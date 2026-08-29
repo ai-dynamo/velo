@@ -844,14 +844,16 @@ impl RendezvousManager {
         let started = Instant::now();
         let (target_worker, local_id) = handle.unpack();
         let result = if target_worker == self.worker_id {
-            match self.store.consume_lease(lease_id) {
-                Some(expected) if expected == local_id => {
+            match self.store.consume_lease(lease_id, local_id) {
+                store::LeaseOutcome::Consumed => {
                     self.store.release_read_lock(local_id);
                     self.store.remove_transfers_by_lease(lease_id);
                     Ok(())
                 }
-                Some(_) | None => {
-                    anyhow::bail!("invalid or already-consumed lease {lease_id} for {handle}")
+                outcome => {
+                    anyhow::bail!(
+                        "invalid or already-consumed lease {lease_id} for {handle}: {outcome:?}"
+                    )
                 }
             }
         } else {
@@ -874,8 +876,8 @@ impl RendezvousManager {
         let started = Instant::now();
         let (target_worker, local_id) = handle.unpack();
         let result = if target_worker == self.worker_id {
-            match self.store.consume_lease(lease_id) {
-                Some(expected) if expected == local_id => {
+            match self.store.consume_lease(lease_id, local_id) {
+                store::LeaseOutcome::Consumed => {
                     self.store.release_read_lock(local_id);
                     self.store.remove_transfers_by_lease(lease_id);
                     let should_free = self.store.ref_decrement(local_id);
@@ -884,8 +886,10 @@ impl RendezvousManager {
                     }
                     Ok(())
                 }
-                Some(_) | None => {
-                    anyhow::bail!("invalid or already-consumed lease {lease_id} for {handle}")
+                outcome => {
+                    anyhow::bail!(
+                        "invalid or already-consumed lease {lease_id} for {handle}: {outcome:?}"
+                    )
                 }
             }
         } else {
@@ -961,7 +965,7 @@ async fn reap_expired_leases(
             // `None` means a detach, release, or a previous sweep got there
             // first, which is the ordinary outcome of racing a consumer that
             // finished just in time. Only an actually-forced release counts.
-            if store.force_release_lease(lease_id).is_some() {
+            if store.force_release_lease(lease_id, local_id) {
                 reaped += 1;
                 tracing::warn!(
                     lease = lease_id,

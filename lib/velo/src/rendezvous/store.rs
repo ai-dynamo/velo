@@ -181,6 +181,27 @@ struct LeaseDeadline {
     timeout: Duration,
 }
 
+/// What [`DataStore::consume_lease`] found.
+///
+/// Distinguished so a caller can log the difference, and so the two failing
+/// cases cannot be collapsed into one by accident: a lease held by another slot
+/// is still live and still has a deadline, while an unknown one has neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaseOutcome {
+    /// The lease named the expected slot, and has been consumed. The caller
+    /// owns the release that follows.
+    Consumed,
+    /// The lease exists but holds a different slot. **Nothing was consumed**:
+    /// the lease and its deadline are untouched, so the reaper still backstops
+    /// it.
+    Mismatch {
+        /// The slot the lease actually holds.
+        actual: u64,
+    },
+    /// No such lease — never issued, or already ended.
+    Unknown,
+}
+
 /// Options for registering data.
 #[derive(Debug, Clone)]
 pub struct RegisterOptions {
@@ -371,19 +392,52 @@ impl DataStore {
         Some(lease_id)
     }
 
-    /// Validate and consume a lease, returning the associated local slot ID.
+    /// Consume a lease **only** if it holds the slot the caller named.
     ///
-    /// Returns `None` if the lease is invalid or has already been consumed.
-    /// Each lease can only be consumed once, preventing double-detach/release.
+    /// Each lease can be consumed once, which is what prevents a double detach
+    /// or release. The `expected_local_id` check is part of the same atomic
+    /// step rather than something the caller does afterwards, and that is the
+    /// point of the signature:
+    ///
+    /// A lease id is a small integer travelling on the wire beside a handle
+    /// that names a slot. A request pairing a real lease with the *wrong*
+    /// handle — a confused peer, a replayed frame, a guess — must change
+    /// nothing. Consuming first and checking afterwards left the slot's read
+    /// lock permanently elevated (the lock is only released on the matching
+    /// arm) and, worse, silently discarded the lease's reaper deadline, so the
+    /// backstop that exists precisely for leases nobody ends could no longer
+    /// see it. One mismatched frame turned a recoverable leak into an immortal
+    /// slot.
+    ///
+    /// So: nothing is consumed unless it matches, the deadline survives a
+    /// mismatch, and the reaper still reclaims the lease when it expires.
     ///
     /// This is also the single point where a lease's deadline is discarded, so
     /// every path that ends a lease — detach, release, and the reaper's own
     /// forced release — drops the deadline with it.
-    pub fn consume_lease(&self, lease_id: u64) -> Option<u64> {
-        self.lease_deadlines.remove(&lease_id);
-        self.active_leases
-            .remove(&lease_id)
-            .map(|(_, local_id)| local_id)
+    pub fn consume_lease(&self, lease_id: u64, expected_local_id: u64) -> LeaseOutcome {
+        // `remove_if` decides and removes under one shard lock: a concurrent
+        // detach for the same lease cannot slip between the comparison and the
+        // removal, so exactly one caller can be told `Consumed`.
+        if self
+            .active_leases
+            .remove_if(&lease_id, |_, held| *held == expected_local_id)
+            .is_some()
+        {
+            self.lease_deadlines.remove(&lease_id);
+            return LeaseOutcome::Consumed;
+        }
+        // Diagnosis only, and deliberately a second lookup: the lease was not
+        // consumed either way, and whether it is absent or merely held by
+        // another slot only changes the log line.
+        match self
+            .active_leases
+            .get(&lease_id)
+            .map(|entry| *entry.value())
+        {
+            Some(actual) => LeaseOutcome::Mismatch { actual },
+            None => LeaseOutcome::Unknown,
+        }
     }
 
     /// Which slot a lease holds a read lock on, without consuming it.
@@ -464,14 +518,16 @@ impl DataStore {
     /// Returns the slot the lease held, or `None` if the lease had already been
     /// ended by a detach or release that raced the reaper.
     #[cfg_attr(not(all(target_os = "linux", feature = "ucx")), allow(dead_code))]
-    pub(crate) fn force_release_lease(&self, lease_id: u64) -> Option<u64> {
-        let local_id = self.consume_lease(lease_id)?;
+    pub(crate) fn force_release_lease(&self, lease_id: u64, local_id: u64) -> bool {
+        if self.consume_lease(lease_id, local_id) != LeaseOutcome::Consumed {
+            return false;
+        }
         self.release_read_lock(local_id);
         self.remove_transfers_by_lease(lease_id);
         if self.ref_decrement(local_id) {
             self.try_free(local_id);
         }
-        Some(local_id)
+        true
     }
 
     /// Release a read lock on a slot. Returns true if the slot should be freed
@@ -792,9 +848,54 @@ mod tests {
         store.set_lease_deadline(lease, id, Duration::from_secs(30));
         assert_eq!(store.deadline_count(), 1);
 
-        assert_eq!(store.consume_lease(lease), Some(id));
+        assert_eq!(store.consume_lease(lease, id), LeaseOutcome::Consumed);
         assert_eq!(store.deadline_count(), 0);
         assert!(!store.renew_lease(lease));
+    }
+
+    /// A detach or release that names the right lease and the wrong slot must
+    /// change nothing at all.
+    ///
+    /// The dangerous half is the deadline. Consuming first and checking the
+    /// handle afterwards discarded it, which blinded the reaper to the one kind
+    /// of lease it exists for; the read lock was then elevated forever and the
+    /// slot became immortal. So the assertion is not only "the lease survived"
+    /// but "the reaper can still reclaim it".
+    #[test]
+    fn a_mismatched_lease_is_not_consumed_and_stays_reapable() {
+        let store = DataStore::new();
+        let mine = store.register(Bytes::from(vec![0u8; 4096]), None);
+        let theirs = store.register(Bytes::from(vec![1u8; 4096]), None);
+        let lease = store.acquire_read_lock(mine).unwrap();
+        store.set_lease_deadline(lease, mine, Duration::from_millis(0));
+
+        assert_eq!(
+            store.consume_lease(lease, theirs),
+            LeaseOutcome::Mismatch { actual: mine },
+            "a lease held by another slot must not be consumed"
+        );
+        assert_eq!(
+            store.deadline_count(),
+            1,
+            "the mismatch discarded the deadline, blinding the reaper"
+        );
+        assert_eq!(
+            store.lease_slot(lease),
+            Some(mine),
+            "the lease must survive"
+        );
+
+        // The backstop still works, which is the property the whole fix is for.
+        assert_eq!(store.expired_leases(Instant::now()), vec![(lease, mine)]);
+        assert!(store.force_release_lease(lease, mine));
+        assert!(
+            store.metadata(mine).is_none(),
+            "the reaper must free the slot"
+        );
+
+        // And an unknown lease is distinguishable from a mismatched one.
+        assert_eq!(store.consume_lease(lease, mine), LeaseOutcome::Unknown);
+        assert_eq!(store.consume_lease(9_999, mine), LeaseOutcome::Unknown);
     }
 
     /// A forced release is a release, not a detach: the refcount the vanished
@@ -807,13 +908,12 @@ mod tests {
         let (transfer_id, _, _) = store.create_transfer(id, lease, 1024).unwrap();
         store.set_lease_deadline(lease, id, Duration::from_millis(0));
 
-        assert_eq!(store.force_release_lease(lease), Some(id));
+        assert!(store.force_release_lease(lease, id));
         assert!(store.metadata(id).is_none(), "the slot must be freed");
         assert!(store.get_chunk(transfer_id, 0).is_none());
         assert_eq!(store.deadline_count(), 0);
-        assert_eq!(
-            store.force_release_lease(lease),
-            None,
+        assert!(
+            !store.force_release_lease(lease, id),
             "a lease is force-released at most once"
         );
     }
