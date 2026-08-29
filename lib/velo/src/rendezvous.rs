@@ -26,6 +26,11 @@ pub mod consumer;
 pub(crate) mod descriptor;
 pub mod handle;
 pub mod handlers;
+/// Slot bodies staged in RDMA-registered memory. Gated with the registration
+/// layer it depends on, and runtime-internal: a `PinnedSlot` is how the store
+/// holds staged memory, not something a caller names.
+#[cfg(all(target_os = "linux", feature = "ucx"))]
+pub(crate) mod pinned;
 pub mod protocol;
 // The RDMA registration layer, gated exactly as `transports::ucx` is.
 #[cfg(all(target_os = "linux", feature = "ucx"))]
