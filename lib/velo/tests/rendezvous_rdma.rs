@@ -435,54 +435,74 @@ async fn an_external_region_anchor_serves_the_chunked_path() {
 /// Reading an anchor whose region has been unmapped refuses, instead of
 /// touching memory the caller has been told it may free.
 ///
-/// The in-flight guard makes `unregister` *wait* for staged anchors; this is
-/// the other half. When that wait runs out of budget the unmap proceeds anyway
-/// — D8's documented cost of bounding shutdown — and from that moment the
-/// slot's `RegionWatch` has to turn every read into an error. Without the check
-/// the chunked path would `copy_nonoverlapping` out of a deregistered range.
+/// The in-flight guard makes a deregistration *wait* for staged anchors; this is
+/// the other half. Shutdown's sweep is bounded, so a region with an anchor still
+/// staged is unmapped anyway and its `deregistered()` latch is closed at the end
+/// of `graceful_shutdown` regardless — D8's documented cost of bounding
+/// shutdown. From that moment the slot's `RegionWatch` has to turn every read
+/// into an error, or the chunked path would `copy_nonoverlapping` out of a
+/// deregistered range.
+///
+/// Driven through `graceful_shutdown` rather than through
+/// `RegionGuard::unregister`, which is not a deterministic way to reach this
+/// state: `unregister` gives its *whole* sequence one budget, so a drain that
+/// cannot finish consumes all of it and the unmap that follows gets none —
+/// leaving `Err(Timeout)`, an unconfirmed unmap, and no latch, except when the
+/// timer's granularity happens to let the unmap through. Shutdown's
+/// `latch_all_deregistered` closes the latch unconditionally once the backend
+/// reports nothing registered, which is the property this test needs.
+///
+/// The read is local, so it does not need the messenger that shutdown took
+/// down: the question is what the *store* does, and that is exactly what a
+/// remote `_rv_pull` would have reached.
 #[tokio::test(flavor = "multi_thread")]
 async fn reads_refuse_once_the_region_behind_them_is_gone() {
-    let pair = Pair::with_incapable_consumer().await;
+    let node = Node::start(None).await;
 
     let backing = pattern(512 * 1024);
-    let guard = pair
-        .owner
+    let guard = node
         .velo
-        .register_owned(backing.into_boxed_slice())
+        .register_owned(backing.clone().into_boxed_slice())
         .await
         .map_err(|e| e.cause)
         .expect("register");
-    let handle = pair
-        .owner
+    let watch = guard.watch();
+    let handle = node
         .velo
         .register_data_in_region(&guard, 0..512 * 1024)
         .expect("stage an anchor");
 
-    // The anchor holds an in-flight guard, so the drain cannot finish. The
-    // unmap goes ahead once the budget runs out, which is the state this test
-    // exists to cover.
-    let outcome = guard
-        .unregister(Duration::from_millis(250))
-        .await
-        .expect("the unmap is confirmed even when the drain times out");
-    assert_eq!(
-        outcome,
-        Deregistered::DrainTimedOut,
-        "the staged anchor should have kept the drain from completing"
+    // While the region is live the anchor reads correctly, so the refusal below
+    // is a change of state rather than a slot that never worked.
+    let (data, lease) = node.velo.get(handle).await.expect("get while registered");
+    assert_eq!(&data[..], &backing[..]);
+    node.velo.detach(handle, lease).await.expect("detach");
+
+    // The anchor holds an in-flight guard, so the sweep cannot drain the region;
+    // it unmaps anyway and the latch is closed at the end of shutdown.
+    // The budget is what the sweep spends waiting on a drain that cannot
+    // finish, so it is also this test's runtime. Teardown itself is not bounded
+    // by it — which is why the latch still closes with nothing left over.
+    node.velo
+        .graceful_shutdown(ShutdownPolicy::Timeout(Duration::from_millis(500)))
+        .await;
+    assert!(
+        watch.is_deregistered(),
+        "shutdown returned without declaring the region released, so this test \
+         never reached the state it is about"
     );
 
-    let err = pair
-        .consumer
+    let err = node
         .velo
         .get(handle)
         .await
         .expect_err("reading an anchor whose region is gone must fail");
     assert!(
-        err.to_string().contains("chunk not found"),
-        "expected the chunk read to refuse; got: {err}"
+        err.to_string().contains("slot vanished"),
+        "expected the read to refuse; got: {err}"
     );
 
-    shutdown(pair).await;
+    drop(guard);
 }
 
 /// `register_data_in_region` refuses a range it cannot honour, and refuses it
