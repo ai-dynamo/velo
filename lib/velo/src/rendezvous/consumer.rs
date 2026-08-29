@@ -565,16 +565,18 @@ async fn rdma_pull_into(
     // trips the chunked path would have cost — and the destination's own
     // semantics are exactly what they were. A `Vec`, a `BytesMut` and a
     // `&mut [u8]` all take this branch.
-    if dest.capacity() < len {
-        return Err(RdmaFallback::new(
-            RdmaPathReason::DecodeError,
-            format!(
-                "destination holds {} bytes, descriptor names {len}",
-                dest.capacity()
-            ),
-        ));
-    }
+    //
+    // Deliberately *no* capacity check here: `write_chunk` is what decides
+    // whether a destination can take the bytes, and the growable destinations
+    // answer that by resizing. Pre-empting it with `capacity()` would send a
+    // `Vec::with_capacity(0)` down the fallback path over a number that says
+    // nothing about whether the write would have succeeded. The registered
+    // branch above does need its check, because the NIC writes without asking.
+    let _ = len;
     let buf = rdma_pull(manager, handle, lease_id, descriptor, lease_timeout_ms).await?;
+    // A destination that refuses the write refuses it on the chunked path too,
+    // so this reaches the caller as an error either way — one extra round trip
+    // for a destination that was never going to work.
     dest.write_chunk(0, &buf)
         .map_err(|e| RdmaFallback::new(RdmaPathReason::GetFailed, e.to_string()))
 }

@@ -1005,8 +1005,12 @@ async fn get_into_a_pinned_writer_takes_the_zero_copy_path() {
     assert_eq!(dest.as_slice(), &payload[..]);
     assert_eq!(pair.consumer.path_count("ok"), 1);
 
-    // And an ordinary destination still works, taking the copy-once branch.
-    let mut plain = vec![0u8; payload.len()];
+    // An ordinary destination still works, taking the copy-once branch. Sized
+    // at zero on purpose: `write_chunk` is what decides whether a destination
+    // can take the bytes, and a growable one answers by resizing — a
+    // `capacity()` check here would have sent this down the chunked fallback
+    // over a number that says nothing about whether the write would succeed.
+    let mut plain: Vec<u8> = Vec::new();
     let lease2 = pair
         .consumer
         .velo
@@ -1014,7 +1018,11 @@ async fn get_into_a_pinned_writer_takes_the_zero_copy_path() {
         .await
         .expect("get_into a Vec");
     assert_eq!(plain, payload);
-    assert_eq!(pair.consumer.path_count("ok"), 2);
+    assert_eq!(
+        pair.consumer.path_count("ok"),
+        2,
+        "an ordinary destination should still ride the RDMA path, with one copy"
+    );
 
     pair.consumer.velo.detach(handle, lease).await.unwrap();
     pair.consumer.velo.release(handle, lease2).await.unwrap();
