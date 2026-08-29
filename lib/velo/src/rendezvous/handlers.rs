@@ -38,8 +38,13 @@ pub fn create_rv_metadata_handler(store: Arc<DataStore>) -> crate::messenger::Ha
     .build()
 }
 
-/// Build the `_rv_acquire` handler: acquires a read lock and returns data
-/// inline (small) or chunked transfer metadata (large).
+/// Build the `_rv_acquire` handler: acquires a read lock and answers with
+/// either an RDMA descriptor or chunked transfer metadata.
+///
+/// The read lock is taken *first*, before either answer is composed, so the
+/// slot cannot be freed between the decision and the response. Which answer the
+/// consumer gets never changes what it must do afterwards: both carry a lease,
+/// and both end in a detach or a release.
 pub fn create_rv_acquire_handler(store: Arc<DataStore>) -> crate::messenger::Handler {
     crate::messenger::Handler::typed_unary(
         "_rv_acquire",
@@ -56,6 +61,17 @@ pub fn create_rv_acquire_handler(store: Arc<DataStore>) -> crate::messenger::Han
                 .get_total_len(local_id)
                 .ok_or_else(|| anyhow::anyhow!("slot vanished after lock acquire"))?;
 
+            #[cfg(all(target_os = "linux", feature = "ucx"))]
+            if let Some(response) = rdma_response(
+                &store,
+                local_id,
+                lease_id,
+                total_len,
+                ctx.input.rdma.as_ref(),
+            ) {
+                return Ok(response);
+            }
+
             // Always use chunked transfer (even for 1 chunk) to avoid
             // JSON-encoding binary data in the typed-unary response.
             let (transfer_id, chunk_size, chunk_count) = store
@@ -71,6 +87,87 @@ pub fn create_rv_acquire_handler(store: Arc<DataStore>) -> crate::messenger::Han
         },
     )
     .build()
+}
+
+/// Decide whether this acquire can be answered with an RDMA descriptor.
+///
+/// `None` means "serve it chunked", and every `None` has recorded *why* on
+/// `velo_rendezvous_rdma_path_total` before returning — the series that makes a
+/// path nobody can see answerable in production. The checks run cheapest-first,
+/// and each one is a plain fact about this acquire:
+///
+/// 1. The consumer offered nothing, so it could not decode a descriptor.
+/// 2. This instance has no registry, so it has no pinned slots either.
+/// 3. The kill switch is off (D6): rollback without a rebuild.
+/// 4. The slot is plain heap bytes.
+/// 5. The payload is below `rdma_min_bytes`, where one GET does not pay for
+///    itself against the single pull it would replace (D11).
+/// 6. The consumer's offer does not name the backend this owner serves (D12) —
+///    a NIXL-only consumer talking to a UCX owner is well-formed and simply
+///    unservable.
+/// 7. The staging is gone: an external region was deregistered under the slot,
+///    or the descriptor would not encode. Counted as `not_pinned`, because from
+///    the acquire's point of view that is what it now is.
+///
+/// A lease that *is* answered with a descriptor gets a deadline, and that is
+/// the only place one is set. Chunked leases stay deadline-free.
+#[cfg(all(target_os = "linux", feature = "ucx"))]
+fn rdma_response(
+    store: &Arc<DataStore>,
+    local_id: u64,
+    lease_id: u64,
+    total_len: u64,
+    offer: Option<&crate::rendezvous::protocol::RdmaOffer>,
+) -> Option<AcquireResponse> {
+    use crate::observability::RdmaPathReason;
+    use crate::rendezvous::store::StageMode;
+
+    let decline = |reason: RdmaPathReason| -> Option<AcquireResponse> {
+        store.record_path(reason);
+        None
+    };
+
+    let Some(offer) = offer else {
+        return decline(RdmaPathReason::NoOffer);
+    };
+    let Some(rdma) = store.rdma() else {
+        return decline(RdmaPathReason::NotPinned);
+    };
+    if !rdma.config.enabled {
+        return decline(RdmaPathReason::KillSwitch);
+    }
+    if store.stage_mode(local_id) != Some(StageMode::Pinned) {
+        return decline(RdmaPathReason::NotPinned);
+    }
+    if total_len < rdma.config.rdma_min_bytes {
+        return decline(RdmaPathReason::BelowMin);
+    }
+    let backend = rdma.backend;
+    if !offer.backends.iter().any(|name| name == backend.key()) {
+        return decline(RdmaPathReason::NoOffer);
+    }
+
+    // Built under the slot's map guard and encoded outside it. `None` here is a
+    // slot that vanished, a slot staged for a different backend, or an external
+    // region that has been deregistered underneath it — all of which mean the
+    // memory is not readable by a peer's NIC any more.
+    let descriptor = store
+        .with_pinned(local_id, |slot| {
+            (slot.backend() == backend).then(|| slot.descriptor())?
+        })
+        .flatten();
+    let Some(bytes) = descriptor.and_then(|d| d.encode()) else {
+        return decline(RdmaPathReason::NotPinned);
+    };
+
+    // The lease is now the owner's only handle on a transfer it cannot observe.
+    store.set_lease_deadline(lease_id, local_id, rdma.config.lease_timeout);
+    store.record_path(RdmaPathReason::Ok);
+    Some(AcquireResponse::Rdma {
+        lease_id,
+        descriptor: bytes,
+        lease_timeout_ms: u64::try_from(rdma.config.lease_timeout.as_millis()).unwrap_or(u64::MAX),
+    })
 }
 
 /// Build the `_rv_pull` handler: returns chunk bytes for a given transfer + index.

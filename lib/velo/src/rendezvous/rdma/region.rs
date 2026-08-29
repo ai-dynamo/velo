@@ -72,8 +72,7 @@ pub(crate) struct RegionInner {
     /// The length the caller asked to register.
     pub(super) len: usize,
     /// Packed key covering the region. Read by `RegionGuard::remote`, which
-    /// Phase 3 turns into the wire descriptor.
-    #[allow(dead_code)]
+    /// becomes the wire descriptor of an anchor staged inside it.
     pub(super) packed_key: Bytes,
     /// Start of the range the backend actually pinned. Reported, never used for
     /// offset arithmetic: the backend rounds outward to page boundaries, so it
@@ -81,8 +80,8 @@ pub(crate) struct RegionInner {
     pub(super) effective_addr: u64,
     /// Length of the pinned range.
     pub(super) effective_len: u64,
-    /// In-flight operations against this region. Phase 3 acquires a guard per
-    /// RDMA lease; here the counter exists and `unregister` drains it.
+    /// In-flight operations against this region: one guard per staged anchor,
+    /// which `unregister` drains before it unmaps.
     ///
     /// Reused verbatim from `velo_ext` rather than hand-rolled: the SeqCst plus
     /// register-notified-first discipline in there has been paid for twice
@@ -445,9 +444,8 @@ impl RegionGuard {
         }
     }
 
-    /// How a peer would address this region. Phase 3 builds the wire
-    /// descriptor from it.
-    #[allow(dead_code)]
+    /// How a peer would address this region. The wire descriptor for an
+    /// anchor staged inside it is cut from this.
     pub(crate) fn remote(&self) -> RemoteRef {
         RemoteRef {
             addr: self.inner.ptr as u64,
@@ -457,10 +455,11 @@ impl RegionGuard {
         }
     }
 
-    /// The region's in-flight accounting. Phase 3 acquires a guard from it per
-    /// RDMA lease, which is what makes `unregister` wait for outstanding
-    /// transfers rather than pulling the registration out from under them.
-    #[allow(dead_code)]
+    /// The region's in-flight accounting.
+    ///
+    /// `register_data_in_region` takes a guard from it for every staged anchor,
+    /// which is what makes `unregister` wait for those anchors rather than
+    /// pulling the registration out from under them.
     pub(crate) fn in_flight(&self) -> &ShutdownState {
         &self.inner.in_flight
     }

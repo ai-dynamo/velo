@@ -3,22 +3,59 @@
 
 //! Rendezvous data staging and large payload transfer for velo.
 //!
-//! The rendezvous primitive allows staging data at one location (the owner),
-//! passing a compact [`DataHandle`] to consumers, and pulling data via the handle
-//! using a receiver-driven protocol.
+//! Stage data at one worker (the *owner*), pass a compact [`DataHandle`] to
+//! consumers by any means, and let each consumer pull it. The consumer drives
+//! every transfer; the owner only ever answers.
 //!
-//! # Protocol
+//! ```text
+//! metadata(handle)  →  size and refcount, no lock
+//! get(handle)       →  acquire a read lock, move the bytes, return a lease
+//! detach(handle, lease)   release the lock, keep the handle usable
+//! release(handle, lease)  release the lock and one reference; freed at zero
+//! ```
 //!
-//! The consumer drives all data transfer:
-//! 1. `metadata(handle)` — query size/info without locking
-//! 2. `get(handle)` — acquire read lock + pull data (inline or chunked)
-//! 3. `detach(handle)` — release read lock, keep handle alive (can get again)
-//! 4. `release(handle)` — release read lock + decrement refcount (freed at 0)
+//! # Two ways the bytes move
 //!
-//! # Phases
+//! `_rv_acquire` takes the read lock and, in the same round trip, decides how
+//! the payload will travel. Both answers end in the same detach-or-release, so
+//! a caller writes the same code either way.
 //!
-//! - **Phase 1** (current): Multi-message chunked transfer over active messages
-//! - **Phase 2** (future): NIXL RDMA direct memory access via dynamo-memory arena
+//! * **Chunked** ([`AcquireResponse::Ready`](protocol::AcquireResponse::Ready))
+//!   — the owner opens a transfer and the consumer pulls `_rv_pull` chunks of
+//!   [`DEFAULT_CHUNK_SIZE`](store::DEFAULT_CHUNK_SIZE) until it has them all.
+//!   Always available, for every slot and every consumer.
+//!
+//! * **RDMA** ([`AcquireResponse::Rdma`](protocol::AcquireResponse::Rdma)) —
+//!   the owner answers with a [descriptor](descriptor::RdmaDescriptor) naming
+//!   an address, a length and a packed remote key, and the consumer's NIC reads
+//!   the bytes directly with a single `ucp_get_nbx`. No chunk round trips, no
+//!   copy through the owner's handler.
+//!
+//! The RDMA answer requires four things at once, and any one of them missing
+//! means chunked: the slot is staged in registered memory
+//! ([`register_data_pinned`](RendezvousManager::register_data_pinned) or
+//! [`register_data_in_region`](RendezvousManager::register_data_in_region)),
+//! the consumer advertised a backend the owner can serve, the payload is at
+//! least [`rdma_min_bytes`](rdma::RdmaRendezvousConfig::rdma_min_bytes), and
+//! neither side has the RDMA path switched off. GET-first and decided at
+//! acquire time, so the owner revalidates the registration on every transfer
+//! and there is no cross-node invalidation protocol to get wrong.
+//!
+//! **Pinned slots are never RDMA-only.** They answer the chunked path exactly
+//! as heap-staged slots do, which is what lets an old consumer, a consumer
+//! without a UCX endpoint, and a consumer whose GET failed all read the same
+//! slot without the owner knowing in advance which it is talking to.
+//!
+//! # Leases
+//!
+//! A `get` returns a lease the caller passes back to `detach` or `release`.
+//! Chunked leases live until one of those arrives. **RDMA leases carry a
+//! deadline**, because the transfer is issued by the consumer's NIC and the
+//! owner cannot see it finish, fail, or never start: an owner-side reaper
+//! force-releases a lease whose deadline passed, and a consumer with a slow
+//! transfer keeps its lease alive with `_rv_lease_renew` for as long as the
+//! transfer is running. Holding an RDMA lease idle past its deadline is not
+//! supported in v1 — hold it briefly, or take the data and release.
 
 pub mod consumer;
 /// The RDMA transfer descriptor. Runtime-internal: it is a wire format velo
@@ -67,26 +104,50 @@ pub struct RendezvousManager {
     messenger_lock: OnceLock<Arc<crate::messenger::Messenger>>,
     /// Optional Prometheus metrics.
     metrics: Option<Arc<VeloMetrics>>,
+    /// Stops the lease reaper. Cancelled by `Velo::graceful_shutdown` before
+    /// the registration sweep, so the reaper is not force-releasing leases
+    /// while regions are being unmapped underneath them.
+    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    reaper_shutdown: tokio_util::sync::CancellationToken,
+}
+
+/// The RDMA registry and the policy the rendezvous protocol applies to it.
+///
+/// Bound late — the registry wraps an RMA endpoint on a transport that must
+/// have started first — and held by the [`DataStore`](store::DataStore), which
+/// is the one thing the `_rv_acquire` handler closure already has an `Arc` to.
+/// See the field's own docs for why capturing the manager instead would be a
+/// reference cycle.
+#[cfg(all(target_os = "linux", feature = "ucx"))]
+pub(crate) struct RdmaContext {
+    /// The registration layer: the arena pool, the external regions, the GET.
+    pub(crate) registry: Arc<rdma::RdmaRegistry>,
+    /// Thresholds, the kill switch, and the lease deadline.
+    pub(crate) config: rdma::RdmaRendezvousConfig,
+    /// The wire discriminator for `registry`'s backend, resolved once at bind
+    /// time rather than re-parsed from a string on every acquire.
+    pub(crate) backend: descriptor::DescriptorBackend,
 }
 
 impl RendezvousManager {
     /// Create a new `RendezvousManager` for the given worker.
     pub fn new(worker_id: WorkerId) -> Self {
-        Self {
-            worker_id,
-            store: Arc::new(store::DataStore::new()),
-            messenger_lock: OnceLock::new(),
-            metrics: None,
-        }
+        Self::build(worker_id, None)
     }
 
     /// Create a new `RendezvousManager` with metrics.
     pub fn with_metrics(worker_id: WorkerId, metrics: Arc<VeloMetrics>) -> Self {
+        Self::build(worker_id, Some(metrics))
+    }
+
+    fn build(worker_id: WorkerId, metrics: Option<Arc<VeloMetrics>>) -> Self {
         Self {
             worker_id,
-            store: Arc::new(store::DataStore::new()),
+            store: Arc::new(store::DataStore::with_metrics(metrics.clone())),
             messenger_lock: OnceLock::new(),
-            metrics: Some(metrics),
+            metrics,
+            #[cfg(all(target_os = "linux", feature = "ucx"))]
+            reaper_shutdown: tokio_util::sync::CancellationToken::new(),
         }
     }
 
@@ -149,9 +210,19 @@ impl RendezvousManager {
     ///
     /// Default refcount is 1.
     pub fn register_data(&self, data: Bytes) -> DataHandle {
+        self.stage(store::SlotBody::InMemory(data), None)
+    }
+
+    /// Stage data with options (TTL, etc.) and return a [`DataHandle`].
+    pub fn register_data_with(&self, data: Bytes, opts: RegisterOptions) -> DataHandle {
+        self.stage(store::SlotBody::InMemory(data), Some(opts))
+    }
+
+    /// Insert a body and account for it. The one place a slot is created.
+    fn stage(&self, body: store::SlotBody, opts: Option<RegisterOptions>) -> DataHandle {
         let started = Instant::now();
-        let data_len = data.len();
-        let local_id = self.store.register(data, None);
+        let data_len = body.total_len() as usize;
+        let local_id = self.store.register_body(body, opts);
         if let Some(m) = &self.metrics {
             m.record_rendezvous_operation(
                 RendezvousOp::Register,
@@ -164,21 +235,245 @@ impl RendezvousManager {
         DataHandle::pack(self.worker_id, local_id)
     }
 
-    /// Stage data with options (TTL, etc.) and return a [`DataHandle`].
-    pub fn register_data_with(&self, data: Bytes, opts: RegisterOptions) -> DataHandle {
-        let started = Instant::now();
-        let data_len = data.len();
-        let local_id = self.store.register(data, Some(opts));
-        if let Some(m) = &self.metrics {
-            m.record_rendezvous_operation(
-                RendezvousOp::Register,
-                HandlerOutcome::Success,
-                started.elapsed(),
-            );
-            m.record_rendezvous_bytes(RendezvousOp::Register, data_len);
-            m.set_rendezvous_active_slots(self.store.slots.len());
+    /// Stage data in RDMA-registered pool memory, so consumers that can issue
+    /// an RDMA GET read it without a chunk round trip.
+    ///
+    /// # This never fails
+    ///
+    /// It returns a [`DataHandle`], not a `Result`, and that is the contract.
+    /// Pool exhaustion, a registered-bytes budget that is already spent, a
+    /// switched-off kill switch, an instance with no UCX transport at all —
+    /// every one of them stages the data in plain memory instead and records
+    /// the reason on `velo_rendezvous_rdma_path_total`. Pinning is a transfer
+    /// optimisation, and a *staging* call that failed because the pool was busy
+    /// would push a fallback onto every caller that most of them would get
+    /// wrong (D4).
+    ///
+    /// The slot is readable either way: a pinned slot still answers the chunked
+    /// path, so falling back changes how fast the data moves and never whether
+    /// it can be reached.
+    ///
+    /// # Cost
+    ///
+    /// One copy, always: the bytes are copied into registered memory here so a
+    /// peer's NIC can read them later, and the fallback copies them into a
+    /// `Bytes`. Zero-length data is staged in plain memory — there is nothing
+    /// for a GET to transfer.
+    ///
+    /// To stage without a copy, register the memory yourself and use
+    /// [`register_data_in_region`](Self::register_data_in_region).
+    pub async fn register_data_pinned(&self, data: &[u8]) -> DataHandle {
+        #[cfg(all(target_os = "linux", feature = "ucx"))]
+        if !data.is_empty()
+            && let Some(ctx) = self.store.rdma()
+        {
+            use crate::observability::RdmaPathReason;
+            if !ctx.config.enabled {
+                self.store.record_path(RdmaPathReason::KillSwitch);
+            } else {
+                match ctx.registry.alloc_pinned(data.len()).await {
+                    Ok(mut buf) => {
+                        // `alloc_pinned` hands back exactly the requested
+                        // length, so this cannot be a partial copy.
+                        buf.copy_from_slice(data);
+                        return self.stage(
+                            store::SlotBody::Pinned(pinned::PinnedSlot::from_pool(
+                                buf,
+                                ctx.backend,
+                            )),
+                            None,
+                        );
+                    }
+                    Err(e) => {
+                        let reason = match e {
+                            rdma::RdmaError::BudgetExceeded { .. } => RdmaPathReason::Budget,
+                            _ => RdmaPathReason::PoolExhausted,
+                        };
+                        self.store.record_path(reason);
+                        tracing::debug!(
+                            bytes = data.len(),
+                            error = %e,
+                            "rendezvous: pinned staging refused; staging in plain memory"
+                        );
+                    }
+                }
+            }
         }
-        DataHandle::pack(self.worker_id, local_id)
+        self.register_data(Bytes::copy_from_slice(data))
+    }
+
+    /// Stage data in pool memory *without blocking*, for the transparent
+    /// large-payload path.
+    ///
+    /// Uses only arenas the pool has already mapped
+    /// ([`try_alloc_pinned`](rdma::RdmaRegistry::try_alloc_pinned)) and stages
+    /// in plain memory otherwise. The caller is the messenger's synchronous
+    /// `send_message`, which has no `await` to give and must not grow the pool
+    /// on a send: mapping an arena is an `ibv_reg_mr` whose cost is linear in
+    /// its size.
+    ///
+    /// The consequence, stated plainly: a process whose only staging is
+    /// transparent never maps an arena and therefore never takes the RDMA path.
+    /// The pool is grown by [`register_data_pinned`](Self::register_data_pinned),
+    /// which can await. Warming it from a send in the background was considered
+    /// and rejected — a message send that side-effects a 64 MiB pin on a
+    /// detached task is not something a caller can reason about.
+    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    pub(crate) fn register_data_pinned_sync(&self, data: Bytes) -> DataHandle {
+        use crate::observability::RdmaPathReason;
+        if !data.is_empty()
+            && let Some(ctx) = self.store.rdma()
+        {
+            if !ctx.config.enabled {
+                self.store.record_path(RdmaPathReason::KillSwitch);
+            } else if let Some(mut buf) = ctx.registry.try_alloc_pinned(data.len()) {
+                buf.copy_from_slice(&data);
+                return self.stage(
+                    store::SlotBody::Pinned(pinned::PinnedSlot::from_pool(buf, ctx.backend)),
+                    None,
+                );
+            } else {
+                self.store.record_path(RdmaPathReason::PoolExhausted);
+            }
+        }
+        self.register_data(data)
+    }
+
+    /// Stage a range of memory the caller registered, without copying it.
+    ///
+    /// The zero-copy counterpart to
+    /// [`register_data_pinned`](Self::register_data_pinned): the bytes stay
+    /// where the caller put them and the slot merely describes them. `range` is
+    /// measured from the pointer that was registered, not from
+    /// [`RegionGuard::effective_range`](rdma::RegionGuard::effective_range), so
+    /// a caller can never name a byte inside the registration but outside its
+    /// own allocation.
+    ///
+    /// # The staged slot holds the region open
+    ///
+    /// The slot takes an in-flight guard on `guard`'s own accounting, so
+    /// [`RegionGuard::unregister`](rdma::RegionGuard::unregister) drains the
+    /// anchors staged inside the region before it unmaps. Freeing the slot —
+    /// the last `release` — is what lets the deregistration through. A caller
+    /// that stages anchors and then unregisters without releasing them sees
+    /// `unregister` wait and, if it runs out of budget, unmap anyway with a
+    /// warning; reads of that slot refuse from that moment rather than touching
+    /// freed pages.
+    ///
+    /// # Errors
+    ///
+    /// [`NotConfigured`](rdma::RdmaError::NotConfigured) without a UCX
+    /// transport, [`OutOfRange`](rdma::RdmaError::OutOfRange) for an empty,
+    /// inverted, or out-of-bounds range, and
+    /// [`ShuttingDown`](rdma::RdmaError::ShuttingDown) once the region or the
+    /// registry has begun to go away.
+    ///
+    /// Unlike `register_data_pinned` this *does* return a `Result`, because no
+    /// fallback could honour what was asked: staging in plain memory would
+    /// silently copy bytes the caller asked not to be copied.
+    ///
+    /// The kill switch does not affect it. The memory is registered either way,
+    /// so anchoring in it costs nothing extra; the switch decides whether
+    /// `_rv_acquire` answers with a descriptor, and a switched-off owner serves
+    /// the same slot chunked.
+    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    pub fn register_data_in_region(
+        &self,
+        guard: &rdma::RegionGuard,
+        range: std::ops::Range<u64>,
+    ) -> Result<DataHandle, rdma::RdmaError> {
+        let ctx = self.store.rdma().ok_or(rdma::RdmaError::NotConfigured)?;
+        let len = range
+            .end
+            .checked_sub(range.start)
+            .filter(|len| *len != 0)
+            .ok_or(rdma::RdmaError::OutOfRange)?;
+        if range.end > guard.len() {
+            return Err(rdma::RdmaError::OutOfRange);
+        }
+        let addr = guard
+            .addr()
+            .checked_add(range.start)
+            .ok_or(rdma::RdmaError::OutOfRange)?;
+
+        // Acquire *first*, then check. The guard is what a concurrent
+        // `unregister` waits on, so taking it after the check would leave a gap
+        // in which the whole gate-drain-unmap sequence could run. The read-time
+        // re-check inside the slot is the containment for what remains: a slot
+        // that lands after a drain has already timed out refuses its first read
+        // rather than touching freed memory.
+        let in_flight = guard.in_flight().acquire();
+        if guard.in_flight().is_draining() || guard.is_deregistered() || guard.is_shutting_down() {
+            drop(in_flight);
+            return Err(rdma::RdmaError::ShuttingDown);
+        }
+
+        let remote = guard.remote();
+        Ok(self.stage(
+            store::SlotBody::Pinned(pinned::PinnedSlot::from_region(
+                in_flight,
+                guard.watch(),
+                ctx.backend,
+                addr,
+                len,
+                remote.generation,
+                remote.packed_key,
+            )),
+            None,
+        ))
+    }
+
+    /// Bind the RDMA registry and start the lease reaper.
+    ///
+    /// Called once, by `VeloBuilder::build`, after the transports have started
+    /// and the registry exists. Mirrors `messenger_lock`: the manager is
+    /// constructed before the thing it needs, and the binding is a set-once.
+    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    pub(crate) fn set_rdma_context(
+        &self,
+        registry: Arc<rdma::RdmaRegistry>,
+        config: rdma::RdmaRendezvousConfig,
+        runtime: &tokio::runtime::Handle,
+    ) -> Result<()> {
+        let key = registry.backend_key().to_string();
+        let backend = descriptor::DescriptorBackend::from_key(&key).ok_or_else(|| {
+            anyhow::anyhow!("rdma backend {key:?} has no descriptor discriminator")
+        })?;
+        // Half the deadline, so a lease is force-released between one and one
+        // and a half timeouts after its last renewal. The floor keeps a config
+        // with a zero or tiny timeout from turning the reaper into a spin.
+        let period = (config.lease_timeout / 2).max(std::time::Duration::from_millis(10));
+
+        let ctx = RdmaContext {
+            registry: Arc::clone(&registry),
+            config,
+            backend,
+        };
+        if self.store.set_rdma(ctx).is_err() {
+            anyhow::bail!("set_rdma_context called twice");
+        }
+
+        // Weak on both sides: a `Velo` dropped without `graceful_shutdown` must
+        // not be kept alive by its own reaper. The token is the orderly exit,
+        // the upgrade failure is the backstop, so neither a forgotten shutdown
+        // nor an abandoned runtime leaves the task holding a store.
+        let store = Arc::downgrade(&self.store);
+        let registry = Arc::downgrade(&registry);
+        let token = self.reaper_shutdown.clone();
+        runtime.spawn(async move {
+            reap_expired_leases(store, registry, token, period).await;
+        });
+        Ok(())
+    }
+
+    /// Stop the lease reaper.
+    ///
+    /// Called by `Velo::graceful_shutdown` before the registration sweep, so
+    /// the reaper is not force-releasing leases — and dropping the pinned
+    /// staging under them — while regions are being unmapped.
+    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    pub(crate) fn shutdown(&self) {
+        self.reaper_shutdown.cancel();
     }
 
     // -----------------------------------------------------------------------
@@ -382,5 +677,79 @@ impl RendezvousManager {
     /// Get direct access to the data store (for transparent mode integration).
     pub fn data_store(&self) -> &Arc<store::DataStore> {
         &self.store
+    }
+}
+
+/// Force-release RDMA leases whose deadline has passed (D8).
+///
+/// # Why only RDMA leases have deadlines
+///
+/// A chunked transfer is *visible*: every chunk is an inbound request, and a
+/// consumer that died stops sending them, so the owner could in principle
+/// notice. An RDMA GET is issued by the consumer's NIC into the owner's memory
+/// without the owner's CPU being involved at all — there is no completion the
+/// owner sees, no error it is told about, and nothing to time out. Without this
+/// task, a consumer that crashes between `_rv_acquire` and `_rv_release` leaves
+/// the read lock and its reference held forever, and the slot becomes immortal.
+/// That compounding leak is the failure PR #40 shipped.
+///
+/// # Why the scan collects before it acts
+///
+/// Force-releasing removes from `lease_deadlines`, `active_leases`, `transfers`
+/// and `slots`, all `DashMap`s. Doing any of that while an iterator holds a
+/// shard lock deadlocks rather than fails, so
+/// [`expired_leases`](store::DataStore::expired_leases) returns an owned `Vec`
+/// and nothing here iterates while it mutates.
+///
+/// # Why the handles are weak
+///
+/// A `Velo` dropped without `graceful_shutdown` — a panic, a test that lets it
+/// fall out of scope — must not be kept alive by its own reaper. The token is
+/// the orderly exit; the upgrade failure is the backstop for every other way a
+/// runtime ends.
+#[cfg(all(target_os = "linux", feature = "ucx"))]
+async fn reap_expired_leases(
+    store: std::sync::Weak<store::DataStore>,
+    registry: std::sync::Weak<rdma::RdmaRegistry>,
+    token: tokio_util::sync::CancellationToken,
+    period: std::time::Duration,
+) {
+    loop {
+        tokio::select! {
+            _ = token.cancelled() => return,
+            _ = tokio::time::sleep(period) => {}
+        }
+        let Some(store) = store.upgrade() else { return };
+
+        let expired = store.expired_leases(Instant::now());
+        let mut reaped = 0usize;
+        for (lease_id, local_id) in expired {
+            // `None` means a detach, release, or a previous sweep got there
+            // first, which is the ordinary outcome of racing a consumer that
+            // finished just in time. Only an actually-forced release counts.
+            if store.force_release_lease(lease_id).is_some() {
+                reaped += 1;
+                tracing::warn!(
+                    lease = lease_id,
+                    slot = local_id,
+                    "rendezvous: force-releasing an RDMA lease past its deadline; the consumer \
+                     did not release it and stopped renewing it"
+                );
+            }
+        }
+        if let Some(m) = store.metrics() {
+            if reaped != 0 {
+                m.record_rendezvous_leases_reaped(reaped);
+                m.set_rendezvous_active_slots(store.slots.len());
+            }
+            // Sampled on the tick rather than pushed from the registration
+            // paths, so the gauge reads current at scrape time instead of
+            // freezing at whatever the last registration left behind.
+            if let Some(registry) = registry.upgrade()
+                && let Some(regions) = registry.live_regions()
+            {
+                m.set_rdma_live_regions(regions);
+            }
+        }
     }
 }

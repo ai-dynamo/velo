@@ -34,12 +34,14 @@
 //! their existing no-deadline behaviour deliberately: giving them one would
 //! change the semantics of a path this phase is not otherwise touching.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use dashmap::DashMap;
 
+use crate::observability::VeloMetrics;
 use crate::rendezvous::protocol::DataMetadata;
 
 /// Default chunk size for chunked transfers (512 KiB).
@@ -223,6 +225,26 @@ pub struct DataStore {
     /// removed by the same [`consume_lease`](Self::consume_lease) that ends the
     /// lease, so a deadline never outlives the thing it bounds.
     lease_deadlines: DashMap<u64, LeaseDeadline>,
+    /// Observability, for the decisions taken inside the handlers this store
+    /// backs. `None` when the instance was built without metrics.
+    metrics: Option<Arc<VeloMetrics>>,
+    /// The RDMA registry and policy, once they exist.
+    ///
+    /// # Why this lives on the store rather than beside it
+    ///
+    /// The `_rv_acquire` handler is a closure built at `register_handlers`
+    /// time, which is *before* `VeloBuilder::build` has constructed the
+    /// registry — the registry wraps an RMA endpoint on a transport that must
+    /// already have started. So the handler cannot capture the context by
+    /// value, and capturing the `RendezvousManager` instead would make a
+    /// reference cycle through the messenger that holds the handler, which
+    /// leaks the store for the life of the process.
+    ///
+    /// The store is the one thing the handler already holds an `Arc` to, and it
+    /// is per-instance, so it is where the late-bound context goes. Set once,
+    /// by `RendezvousManager::set_rdma_context`.
+    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    rdma: std::sync::OnceLock<super::RdmaContext>,
 }
 
 impl DataStore {
@@ -235,6 +257,43 @@ impl DataStore {
             next_lease_id: AtomicU64::new(1),
             active_leases: DashMap::new(),
             lease_deadlines: DashMap::new(),
+            metrics: None,
+            #[cfg(all(target_os = "linux", feature = "ucx"))]
+            rdma: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// A store that emits into `metrics`.
+    pub(crate) fn with_metrics(metrics: Option<Arc<VeloMetrics>>) -> Self {
+        Self {
+            metrics,
+            ..Self::new()
+        }
+    }
+
+    /// The metrics handle, if this instance was built with one.
+    pub(crate) fn metrics(&self) -> Option<&Arc<VeloMetrics>> {
+        self.metrics.as_ref()
+    }
+
+    /// Bind the RDMA registry and policy. Called once, from
+    /// `RendezvousManager::set_rdma_context`.
+    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    pub(crate) fn set_rdma(&self, ctx: super::RdmaContext) -> Result<(), super::RdmaContext> {
+        self.rdma.set(ctx)
+    }
+
+    /// The RDMA registry and policy, if this instance has them.
+    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    pub(crate) fn rdma(&self) -> Option<&super::RdmaContext> {
+        self.rdma.get()
+    }
+
+    /// Count one path decision. A no-op without metrics.
+    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    pub(crate) fn record_path(&self, reason: crate::observability::RdmaPathReason) {
+        if let Some(m) = &self.metrics {
+            m.record_rendezvous_rdma_path(reason);
         }
     }
 

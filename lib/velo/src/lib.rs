@@ -463,14 +463,41 @@ impl VeloBuilder {
         // the transport marks itself started — but it would let a registration
         // fail for a reason that reads like a bug.
         #[cfg(all(target_os = "linux", feature = "ucx"))]
-        let rdma = self.ucx_transport.as_ref().map(|transport| {
-            Arc::new(crate::rendezvous::rdma::RdmaRegistry::new(
-                crate::rendezvous::rdma::UcxBackend::new(transport.rdma_endpoint()),
-                self.rdma_config.clone().unwrap_or_default(),
-                messenger.runtime().clone(),
-                self.metrics.clone(),
-            ))
-        });
+        let rdma = match self.ucx_transport.as_ref() {
+            Some(transport) => {
+                let mut config = self.rdma_config.clone().unwrap_or_default();
+                // The kill switch (D6), read once at build. An environment
+                // variable rather than only a config field so a rollback is a
+                // restart rather than a rebuild, and applied here rather than
+                // at each decision point so one process cannot answer half its
+                // acquires one way and half the other.
+                if rdma_rendezvous_disabled_by_env() {
+                    tracing::info!(
+                        "VELO_RDMA_RENDEZVOUS_DISABLE is set: the rendezvous RDMA path is off. \
+                         Staged data is still readable — every slot answers the chunked path."
+                    );
+                    config.rendezvous.enabled = false;
+                }
+                let rendezvous_config = config.rendezvous.clone();
+                let registry = Arc::new(crate::rendezvous::rdma::RdmaRegistry::new(
+                    crate::rendezvous::rdma::UcxBackend::new(transport.rdma_endpoint()),
+                    config,
+                    messenger.runtime().clone(),
+                    self.metrics.clone(),
+                ));
+                // Hand the rendezvous manager the registry it was built too
+                // early to be given: the registry wraps an RMA endpoint on a
+                // transport that has to have started first. This also starts
+                // the lease reaper.
+                rendezvous_manager.set_rdma_context(
+                    Arc::clone(&registry),
+                    rendezvous_config,
+                    messenger.runtime(),
+                )?;
+                Some(registry)
+            }
+            None => None,
+        };
 
         // Step 10: Assemble Velo
         Ok(Arc::new(Velo {
@@ -492,6 +519,25 @@ impl Default for VeloBuilder {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Whether `VELO_RDMA_RENDEZVOUS_DISABLE` asks for the rendezvous RDMA path to
+/// be switched off (D6).
+///
+/// Only `1`, `true`, `yes` and `on` (any case) count. A variable set to
+/// anything else — `0`, `false`, an empty string, a typo — leaves the path
+/// enabled, because a kill switch that fires on a typo is worse than one that
+/// occasionally does not fire on a misspelling: the first silently costs
+/// performance in production, the second is visible the moment somebody checks
+/// the metric.
+#[cfg(all(target_os = "linux", feature = "ucx"))]
+fn rdma_rendezvous_disabled_by_env() -> bool {
+    std::env::var("VELO_RDMA_RENDEZVOUS_DISABLE")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes" || v == "on"
+        })
+        .unwrap_or(false)
 }
 
 impl Velo {
@@ -593,6 +639,11 @@ impl Velo {
             let started = std::time::Instant::now();
             if let Some(rdma) = &self.rdma {
                 self.begin_drain();
+                // Before the sweep, not after: the reaper force-releases leases
+                // and drops the pinned staging under them, and doing that while
+                // the sweep is walking regions and arenas would have two tasks
+                // taking the same memory apart from opposite ends.
+                self.rendezvous_manager.shutdown();
                 let budget = match &policy {
                     ShutdownPolicy::Timeout(deadline) => *deadline,
                     ShutdownPolicy::WaitForever => rdma.shutdown_timeout(),

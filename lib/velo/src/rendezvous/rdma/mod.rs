@@ -37,12 +37,6 @@
 //! `TransportAdapter::admit_message` does — the token is kept only as the
 //! observable a `RegionGuard` holder awaits.
 
-// The pool is fully exercised by this module's tests, but Phase 3 is its
-// production consumer: nothing in the runtime stages a pinned slot yet. The
-// allow is scoped to this module rather than sprinkled per item so it is one
-// decision to revisit when `StageMode::Pinned` becomes real, and it is stated
-// here rather than left as an unexplained attribute.
-#[allow(dead_code)]
 pub(crate) mod arena;
 pub(crate) mod backend;
 pub(crate) mod region;
@@ -58,11 +52,11 @@ use velo_ext::ShutdownState;
 
 use crate::observability::VeloMetrics;
 
-pub use arena::RdmaPoolConfig;
+pub use arena::{PinnedBuf, RdmaPoolConfig};
 pub use backend::RdmaError;
 pub use region::{Deregistered, RegionGuard, RegionWatch};
 
-pub(crate) use arena::{ArenaSet, Budget, PinnedBuf};
+pub(crate) use arena::{ArenaSet, Budget};
 pub(crate) use backend::{BackendGet, RdmaBackend, UcxBackend};
 use region::{RegionInner, RegionParts};
 
@@ -71,6 +65,8 @@ use region::{RegionInner, RegionParts};
 pub struct RdmaConfig {
     /// Arena pool sizing and the registered-bytes budget.
     pub pool: RdmaPoolConfig,
+    /// How `velo::rendezvous` uses the registration layer.
+    pub rendezvous: RdmaRendezvousConfig,
     /// Bound on the shutdown sweep when the runtime shutdown policy names no
     /// deadline of its own. Exceeding it warns and force-unmaps (D8).
     pub shutdown_timeout: Duration,
@@ -83,8 +79,68 @@ impl Default for RdmaConfig {
     fn default() -> Self {
         Self {
             pool: RdmaPoolConfig::default(),
+            rendezvous: RdmaRendezvousConfig::default(),
             shutdown_timeout: Duration::from_secs(30),
             drop_dereg_timeout: Duration::from_secs(30),
+        }
+    }
+}
+
+/// How the rendezvous protocol uses RDMA (D11's remaining knobs).
+#[derive(Debug, Clone)]
+pub struct RdmaRendezvousConfig {
+    /// Whether this instance uses the RDMA transfer path at all.
+    ///
+    /// The **kill switch**, and it acts on both roles: an owner with it off
+    /// never answers `AcquireResponse::Rdma` and stages new pooled slots in
+    /// plain memory instead; a consumer with it off never advertises an offer,
+    /// so any owner it talks to answers chunked. Either side alone is enough to
+    /// take the path out, which is what makes a rollout reversible one node at
+    /// a time.
+    ///
+    /// `VELO_RDMA_RENDEZVOUS_DISABLE=1` in the environment forces this off at
+    /// `VeloBuilder::build`, whatever the config says — production rollback
+    /// without a rebuild, which is the reason D6 asked for it.
+    ///
+    /// Switching it off changes *how* data moves and never *whether* it does:
+    /// pinned slots keep answering the chunked path, so nothing staged before
+    /// the switch becomes unreachable after it.
+    pub enabled: bool,
+    /// Below this many bytes, a pinned slot is still served chunked.
+    ///
+    /// The acquire round trip is the same either way, so the comparison is one
+    /// RDMA GET against `ceil(len / chunk_size)` pull round trips. At 64 KiB
+    /// that is one pull, and a GET does not pay for its extra machinery.
+    ///
+    /// D11's ordering invariant is `rdma_min_bytes <= transparent threshold <
+    /// chunk_size`, which keeps a transparently staged payload RDMA-eligible
+    /// from its first byte over the staging threshold. The defaults satisfy it
+    /// (64 KiB, 256 KiB, 512 KiB); raising this above the transparent threshold
+    /// would leave a band of payloads staged in pinned memory that never uses
+    /// it.
+    pub rdma_min_bytes: u64,
+    /// How long an RDMA lease survives without a `_rv_lease_renew`.
+    ///
+    /// The backstop for a consumer that crashed mid-transfer (D8). An RDMA GET
+    /// is issued by the consumer's NIC, so the owner cannot see the transfer
+    /// finish, cannot see it fail, and would otherwise hold the read lock and
+    /// the refcount forever. The reaper scans every half of this, so the worst
+    /// case a slot is held past its deadline is one and a half times this
+    /// value.
+    ///
+    /// It can stay tight because a live transfer renews: the consumer tickets
+    /// a keepalive every half-deadline for as long as its GET is running, so
+    /// only a *silent* consumer is reaped. Chunked leases have no deadline at
+    /// all and are unaffected.
+    pub lease_timeout: Duration,
+}
+
+impl Default for RdmaRendezvousConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            rdma_min_bytes: 64 << 10,
+            lease_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -390,9 +446,6 @@ impl RdmaRegistry {
         Ok(RegionGuard::new(inner, Arc::clone(&self.shared)))
     }
 
-    // Phase 3 stages pinned slots and issues GETs through these; the tests
-    // below are their only caller today.
-    #[allow(dead_code)]
     /// Cut `len` registered bytes out of the pool.
     ///
     /// Goes through the same admission gate as an external registration, so a
@@ -404,11 +457,42 @@ impl RdmaRegistry {
         self.pool.alloc(len).await
     }
 
-    /// Read remote memory into a locally registered destination. Phase 3 drives
-    /// this from an owner-authored descriptor.
-    #[allow(dead_code)]
+    /// Cut `len` registered bytes out of arenas that are **already** mapped,
+    /// without blocking and without growing the pool.
+    ///
+    /// For the one caller that has no `await` to give: the transparent
+    /// large-payload stager runs inside the messenger's synchronous
+    /// `send_message`, so it cannot map an arena — mapping is an `ibv_reg_mr`
+    /// whose cost is linear in the size registered, and doing one on a send
+    /// path would be a latency cliff nobody asked for.
+    ///
+    /// `None` means "not from the pool right now", never an error: the caller's
+    /// answer is to stage in plain memory, which always works. It is `None`
+    /// both when no mapped arena has room and when admission refuses, because
+    /// those are the same routing decision.
+    ///
+    /// Goes through the same [`admit`](Self::admit) gate as every other pool
+    /// entry, so this does not become the escape hatch
+    /// [`pool`](Self::pool) is `cfg(test)` to prevent.
+    pub(crate) fn try_alloc_pinned(&self, len: usize) -> Option<PinnedBuf> {
+        let _ticket = self.admit().ok()?;
+        self.pool.try_alloc_existing(len)
+    }
+
+    /// Read remote memory into a locally registered destination, from an
+    /// owner-authored descriptor.
     pub(crate) async fn get(&self, req: BackendGet) -> Result<(), RdmaError> {
         self.shared.backend.get(req).await
+    }
+
+    /// Regions the backend currently holds registered, if it can say.
+    ///
+    /// Sampled for the `velo_rdma_live_regions` gauge. The backend's own count
+    /// rather than this layer's bookkeeping, for the same reason the shutdown
+    /// latch uses it: asking the layer whether its own registrations are gone
+    /// is asking it to agree with itself.
+    pub(crate) fn live_regions(&self) -> Option<usize> {
+        self.shared.backend.live_registrations()
     }
 
     /// D8 steps 1 to 3: gate, drain, deregister.
@@ -593,9 +677,8 @@ impl RdmaRegistry {
         self.shared.cfg.shutdown_timeout
     }
 
-    /// Wire discriminator of the backend behind this registry. Phase 3 puts it
-    /// in the descriptor and matches it against the consumer offer.
-    #[allow(dead_code)]
+    /// Wire discriminator of the backend behind this registry: it goes in the
+    /// descriptor and is matched against the consumer's offer.
     pub(crate) fn backend_key(&self) -> &str {
         self.shared.backend.key()
     }

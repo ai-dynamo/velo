@@ -310,7 +310,25 @@ impl Arena {
 /// Derefs to its bytes, so it is usable as a plain buffer. Dropping it returns
 /// the space to the pool and nothing else: the arena stays registered, so the
 /// next allocation of that space costs no pin.
-pub(crate) struct PinnedBuf {
+///
+/// # This is registered memory, and that has consequences
+///
+/// Obtained from [`Velo::get_pinned`](crate::Velo::get_pinned) or
+/// [`Velo::alloc_pinned_writer`](crate::Velo::alloc_pinned_writer). It is a
+/// normal owned buffer in every respect the borrow checker can see, and one
+/// respect it cannot: the arena it was cut from is registered for RMA, so any
+/// peer holding that arena's key can *write* into these bytes at any moment.
+/// UCP carries no enforceable protection field, so the GET-only shape of the
+/// rendezvous protocol is a convention rather than an enforcement. The safety
+/// of reading through the `Deref` therefore rests on the trust domain — key
+/// material only ever reaches peers this instance already talks to — and not on
+/// exclusivity Rust could check.
+///
+/// Holding one keeps its space out of the pool. Drop it as soon as the bytes
+/// have been consumed, or copy them out; a long-lived `PinnedBuf` is a
+/// long-lived reservation against
+/// [`registered_bytes_budget`](RdmaPoolConfig::registered_bytes_budget).
+pub struct PinnedBuf {
     arena: Arc<Arena>,
     /// The free token. Private, and the only thing that can return the space.
     allocation: Allocation<u32>,
@@ -350,14 +368,26 @@ impl PinnedBuf {
     }
 
     /// Length in bytes, exactly as requested.
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.len
     }
 
     /// Whether the range is empty. Never true — the pool refuses zero-length
     /// requests — but clippy wants it beside `len`.
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+}
+
+impl std::fmt::Debug for PinnedBuf {
+    /// Never prints the bytes: a `PinnedBuf` is routinely megabytes, and its
+    /// identity is where it lives rather than what it holds.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PinnedBuf")
+            .field("addr", &self.addr())
+            .field("len", &self.len)
+            .field("generation", &self.arena.generation)
+            .finish()
     }
 }
 
@@ -704,6 +734,29 @@ impl ArenaSet {
             .ok_or_else(|| RdmaError::Backend("a fresh arena refused its own request".into()))?;
         self.arenas.write().push(arena);
         Ok(buf)
+    }
+
+    /// Cut `len` bytes out of an arena that is already mapped, or answer
+    /// `None`. Never maps, never blocks, never grows.
+    ///
+    /// The synchronous entry, for a caller with no `await` to give. An oversize
+    /// request is refused outright rather than searched for: by construction it
+    /// wants a dedicated arena, and one that does not exist yet cannot be
+    /// conjured without mapping.
+    ///
+    /// # What this costs on a hot path
+    ///
+    /// One `parking_lot` read lock on the arena vector, then one uncontended
+    /// `parking_lot` mutex per arena tried. The pool is *few* arenas by
+    /// construction — geometric growth from 64 MiB, capped at 1 GiB, under a
+    /// 1 GiB registered-bytes budget, so at most five at the defaults — and the
+    /// caller is about to `memcpy` at least the transparent-staging threshold
+    /// of 256 KiB. The search is not the expensive part of what follows it.
+    pub(crate) fn try_alloc_existing(&self, len: usize) -> Option<PinnedBuf> {
+        if len == 0 || len as u64 >= self.cfg.dedicated_arena_min {
+            return None;
+        }
+        self.try_existing(len)
     }
 
     /// Walk the existing pooled arenas, first fit. They are few and ordered by
