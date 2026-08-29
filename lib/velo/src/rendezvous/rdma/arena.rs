@@ -517,10 +517,17 @@ impl Drop for TransferHold {
 /// An owned, registered byte range cut from an [`Arena`].
 ///
 /// Derefs to its bytes, so it is usable as a plain buffer. Dropping it returns
-/// the space to the pool and nothing else: the arena stays registered, so the
-/// next allocation of that space costs no pin. If a transfer into the range is
-/// still outstanding the space is returned when *that* finishes instead — see
-/// [`TransferHold`].
+/// the space to the pool; if a transfer into the range is still outstanding the
+/// space is returned when *that* finishes instead — see [`TransferHold`].
+///
+/// What the drop costs depends on which kind of arena the space came from. Out
+/// of a **pooled** arena it costs nothing: the arena stays registered, so the
+/// next allocation of that space pays no pin. Out of a **dedicated** one — a
+/// request at or above [`RdmaPoolConfig::dedicated_arena_min`] gets an arena to
+/// itself — dropping the last buffer is exactly what makes the arena
+/// reclaimable, and the next sweep unmaps it. That is deliberate: a dedicated
+/// arena is never offered to another request, so holding it registered would
+/// charge the budget for capacity nothing can use.
 ///
 /// # This is registered memory, and that has consequences
 ///
@@ -891,15 +898,27 @@ pub(crate) fn pool_arena_target(initial: u64, max: u64, pooled: usize) -> u64 {
 // ArenaSet
 // ---------------------------------------------------------------------------
 
-/// The pool: an append-only set of arenas with geometric growth.
+/// The pool: a set of arenas that grows geometrically and is pruned by the
+/// reclamation sweep.
 pub(crate) struct ArenaSet {
     backend: Arc<dyn RdmaBackend>,
     cfg: RdmaPoolConfig,
     budget: Arc<Budget>,
     generations: Arc<AtomicU64>,
     metrics: Option<Arc<crate::observability::VeloMetrics>>,
-    /// Append-only until shutdown. Read on every allocation, written only by
-    /// the task holding `grow`.
+    /// Two writers with different protocols, and this `RwLock` is what orders
+    /// them against each other and against every allocation.
+    ///
+    /// [`ArenaSet::alloc`] *appends*, and serialises with itself through `grow`
+    /// so two concurrent misses map one arena rather than two.
+    /// [`ArenaSet::reclaim_idle`] *prunes*, and deliberately does not take
+    /// `grow`: it needs exclusion against allocations, which `grow` does not
+    /// provide, and it must not block behind a map it has no interest in.
+    ///
+    /// The lock is therefore load-bearing rather than incidental — see
+    /// [`ArenaSet::try_existing`] for the argument that a reclaimed arena can
+    /// never be handed out, which depends on the read guard spanning
+    /// `Arena::try_alloc`.
     arenas: RwLock<Vec<Arc<Arena>>>,
     /// Serialises growth so two concurrent misses map one arena, not two. An
     /// async mutex because what it guards is an await point.
@@ -1263,6 +1282,12 @@ impl ArenaSet {
     /// stay leaked *for now* — [`release_unconfirmed`](Self::release_unconfirmed)
     /// frees them once velo shutdown has completed and nothing can still be
     /// pinned.
+    ///
+    /// The `mem::take` below cannot collide with a concurrent
+    /// [`reclaim_idle`](Self::reclaim_idle): a reclaim removes its victims from
+    /// this vector *before* issuing their unmaps, so this sees either an arena
+    /// no reclaim has touched or nothing at all — never one that is mid-unmap.
+    /// No double unmap, no double budget release, in either interleaving.
     pub(crate) async fn unmap_all(&self, deadline: Instant) -> usize {
         let arenas: Vec<Arc<Arena>> = std::mem::take(&mut *self.arenas.write());
         let mut unconfirmed = Vec::new();

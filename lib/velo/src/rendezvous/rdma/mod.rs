@@ -528,7 +528,9 @@ impl RdmaRegistry {
     /// how many registrations remain, and get a non-zero answer from an unmap
     /// still in flight — refusing to resolve latches that were owed. The ticket
     /// is held across the whole sweep, so step 1 stops new reclaims and step 2's
-    /// drain waits for one already running.
+    /// drain waits for one already running — *within the shutdown budget*, which
+    /// is the same bounded promise a registration in progress gets and degrades
+    /// the same way (a warning, and the sweep proceeds anyway).
     ///
     /// Returns how many arenas were unmapped and confirmed; `0` when the gate is
     /// closed, which is the correct answer for "shutdown owns this now".
