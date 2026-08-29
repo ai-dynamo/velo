@@ -155,6 +155,15 @@ pub struct RdmaPoolConfig {
     /// The sweep runs on the rendezvous lease reaper's tick, so an arena is
     /// unmapped somewhere between one and two of these after it fell empty.
     ///
+    /// That tick has a ten-millisecond floor, so this knob has one in practice
+    /// too: a sub-millisecond setting does not produce sub-millisecond
+    /// reclamation, it produces a sweep at roughly 100 Hz. The churn that
+    /// invites is bounded by
+    /// [`retain_arena_bytes`](Self::retain_arena_bytes), which keeps the warm
+    /// floor mapped through it — which is why this field is left unclamped where
+    /// the transport's endpoint timeout is not: there, a too-small value breaks
+    /// sends; here, the worst case is a busy sweep finding nothing to do.
+    ///
     /// Dedicated arenas ignore this entirely: they are reclaimed as soon as a
     /// sweep finds them empty, whatever this says. See
     /// [`dedicated_arena_min`](Self::dedicated_arena_min).
@@ -1079,6 +1088,17 @@ impl ArenaSet {
             let mut keep = Vec::with_capacity(arenas.len());
             // Newest first. Growth is geometric, so this reclaims the largest
             // arenas first and leaves the small early one as the warm floor.
+            //
+            // The trade that makes, said out loud: what survives is the
+            // *smallest* arena, so a workload that cycles between busy and idle
+            // re-maps most of its working set every time it comes back — the
+            // retention floor is one arena's worth of warmth, not a working
+            // set's. Keeping the largest instead would serve that workload
+            // better and cost every other deployment the difference in pinned
+            // bytes, which is the wrong default for a knob whose entire purpose
+            // is to give registered memory back. Accepted, and the answer for a
+            // deployment that cycles is to raise `retain_arena_bytes` rather
+            // than to change the order.
             for arena in std::mem::take(&mut *arenas).into_iter().rev() {
                 if self.is_reclaimable(&arena, now_ms, pooled_bytes) {
                     if !arena.dedicated {

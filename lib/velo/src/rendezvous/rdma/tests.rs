@@ -2115,24 +2115,30 @@ async fn wait_deregistered_survives_a_latch_at_the_check() {
     registry.shutdown(T).await;
 }
 
-/// A dedicated arena is not reused after its buffer is dropped.
+/// Reclamation is **sweep-driven, never drop-driven**: dropping the last buffer
+/// makes an arena a candidate, and nothing more.
 ///
-/// The other direction of `pool_dedicates_an_arena_to_oversize_requests`: not
-/// only is a dedicated arena kept out of the general search, it is also not
-/// recycled for the next oversize request. That is Phase 4 work, and pinning it
-/// here means the behaviour change lands as a failing test rather than as a
-/// silent improvement nobody notices — and documents why
-/// `dedicated_arena_min` carries the warning it does.
+/// Worth pinning on its own because the difference is invisible from the outside
+/// and load-bearing on the inside. `Drop` cannot await, so an unmap issued from
+/// one would have to be spawned — a detached task racing the shutdown sweep for
+/// the same arena, with no admission ticket and no ordering against
+/// `latch_all_deregistered`. Doing the work on the periodic sweep instead is
+/// what lets a single gate cover it.
+///
+/// The complementary half — that a sweep *does* reclaim it — is
+/// `a_dedicated_arena_is_reclaimed_when_its_buffer_drops`. This one runs no
+/// sweep at all, which is exactly its point.
 #[tokio::test]
-async fn dedicated_arenas_are_not_reused() {
+async fn dropping_a_buffer_does_not_itself_unmap_its_arena() {
     let cfg = small_pool_config();
     let (backend, pool) = mock_pool(cfg.clone());
     let size = cfg.dedicated_arena_min as usize;
 
     let first = pool.alloc(size).await.expect("first oversize");
     assert_eq!(pool.arena_count(), 1);
-    let first_arena = backend.live();
+    let charged = pool.registered_bytes();
     drop(first);
+
     assert_eq!(
         pool.live_allocations(),
         0,
@@ -2140,16 +2146,24 @@ async fn dedicated_arenas_are_not_reused() {
     );
     assert_eq!(
         backend.live(),
-        first_arena,
-        "dropping a PinnedBuf must never unmap its arena"
+        1,
+        "dropping a PinnedBuf unmapped its arena; reclamation must happen on the sweep, \
+         where the shutdown gate can order it"
+    );
+    assert_eq!(
+        pool.registered_bytes(),
+        charged,
+        "the budget was released without an unmap having been confirmed"
     );
 
+    // And still not reused meanwhile: a dedicated arena stays out of the general
+    // search for as long as it exists, so the next oversize request maps its own
+    // rather than being handed one whose reclaim has not run yet.
     let second = pool.alloc(size).await.expect("second oversize");
     assert_eq!(
         pool.arena_count(),
         2,
-        "the freed dedicated arena was reused; Phase 4 reclamation has landed and \
-         `dedicated_arena_min` docs need updating"
+        "an unreclaimed dedicated arena was handed to another request"
     );
     assert_eq!(
         backend.live(),
@@ -2157,6 +2171,11 @@ async fn dedicated_arenas_are_not_reused() {
         "each oversize request maps its own arena"
     );
     drop(second);
+
+    // The sweep is what closes it out, which is the contrast this test exists to
+    // draw.
+    assert_eq!(pool.reclaim_idle().await, 2);
+    assert_eq!(pool.registered_bytes(), 0);
 }
 
 /// The latch refuses to open while the backend still holds registrations.
