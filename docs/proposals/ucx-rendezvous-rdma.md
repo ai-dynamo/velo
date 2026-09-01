@@ -194,6 +194,15 @@ backend: u8 | version: u8 | flags: u8 | generation: u64 | addr: u64
 
 (The leading `backend` discriminator comes from D12; `1 = ucx`.)
 
+Encoding is packed little-endian with no padding or alignment: a 29-byte
+header (`1+1+1+8+8+8+2`) followed by exactly `rkey_len` key bytes, so
+`len(descriptor) == 29 + rkey_len` and a decoder that finds any trailing byte
+rejects. Both the encoder and the parser apply the same bound — the descriptor
+refuses `rkey_len > MAX_KEY_LEN` (4096) — and the UCX backend bounds its keys
+more tightly still at `MAX_PACKED_RKEY` (1024), checked at map time and again
+before `ucp_ep_rkey_unpack`, so an oversized key fails registration and never
+reaches the wire.
+
 The consumer rejects any mismatch between `rkey_len`, the actual remaining
 bytes, and sanity bounds *before* the pointer reaches UCX. `generation` is the
 owner's region generation (bumped on arena/region reuse) — echoed back in
@@ -276,18 +285,21 @@ ring** (self-deadlock class — the ring's own docs warn about it).
 
 ### D11 — Size thresholds, one table (all tunable via config)
 
-| Knob | Default | Meaning |
-|---|---|---|
-| `transparent::DEFAULT_THRESHOLD` | 256 KiB | messenger payload → staged via rendezvous |
-| `DEFAULT_CHUNK_SIZE` | 512 KiB | chunked-pull chunk size |
-| UCX `eager_max` | 1 MiB | AM frame cap (unrelated to RDMA path) |
-| `rdma_min_bytes` (new) | 64 KiB | below this, pinned slots still answer chunked |
-| `dedicated_arena_min` (new) | 64 MiB | staging above this gets its own arena |
-| `registered_bytes_budget` (new) | 1 GiB | pool + external total; over → chunked fallback |
-| `lease_timeout` (new) | 30 s | RDMA lease deadline (reaper backstop) |
+| Knob | Set via | Default | Meaning |
+|---|---|---|---|
+| `transparent::DEFAULT_THRESHOLD` | compile-time constant | 256 KiB | messenger payload → staged via rendezvous |
+| `DEFAULT_CHUNK_SIZE` | compile-time constant | 512 KiB | chunked-pull chunk size |
+| `eager_max` | `UcxConfig` builder (velo's own cap, not an OpenUCX setting) | 1 MiB | AM frame cap (unrelated to the RDMA path) |
+| `rdma_min_bytes` (new) | `RdmaRendezvousConfig` | 64 KiB | below this, pinned slots still answer chunked |
+| `dedicated_arena_min` (new) | `RdmaPoolConfig` | 64 MiB | staging above this gets its own arena |
+| `registered_bytes_budget` (new) | `RdmaPoolConfig` | 1 GiB | pool + external total; over → chunked fallback |
+| `lease_timeout` (new) | `RdmaRendezvousConfig` | 30 s | RDMA lease deadline (reaper backstop) |
 
-Ordering invariant: `rdma_min ≤ transparent_threshold < chunk_size` keeps the
-transparent path RDMA-eligible from its first byte over threshold.
+Ordering invariant: `rdma_min ≤ transparent_threshold < chunk_size` makes a
+transparently-staged payload *size*-eligible for RDMA from its first byte over
+the threshold. Size eligibility is necessary, not sufficient — the budget
+(`BudgetExceeded`), the consumer/owner eligibility checks, and either kill
+switch can still answer chunked.
 
 ### D12 — Backend-pluggable by construction (sign-off amendment)
 
