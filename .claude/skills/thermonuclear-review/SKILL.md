@@ -13,6 +13,15 @@ races, FFI lifetime bugs) plus the ones RDMA work newly introduces.
 Run it on: the current branch's diff against `origin/main` (default), or an
 explicit PR number / commit range given in the arguments.
 
+**Resolve the target once, before Stage 0, and pass it to every agent.** Set
+`REVIEW_RANGE` from the invocation arguments — a commit range verbatim
+(`443d965..HEAD`), a PR number via `gh pr view <n> --json baseRefName,headRefName`
+(then `<base>...<head>`), or `origin/main...HEAD` when no argument was given. A
+working-tree review is the one case with no range: commit first (see Ground
+rules), then use the resulting range. Every finder prompt must carry the
+resolved range; a finder left to assume `origin/main...HEAD` reviews the wrong
+diff and reports a false pass.
+
 ## Ground rules (violations invalidate the review)
 
 - **Commit the code under review before starting.** A review of an
@@ -36,7 +45,7 @@ explicit PR number / commit range given in the arguments.
 Run these directly (not via agents). Any failure is a finding of severity
 `blocker` and the review continues so the report is complete:
 
-```
+```shell
 cargo fmt --check
 cargo clippy --all-features --no-deps --all-targets -- -D warnings
 cargo machete
@@ -49,10 +58,10 @@ Also verify the boundary invariant when `lib/velo-ext` is touched:
 
 ## Stage 1 — Fan-out (Workflow tool, sonnet finders)
 
-Launch a Workflow. One finder agent per dimension, each given the diff (have
-each agent run `git diff origin/main...HEAD` itself plus read full files it
-flags). Dimensions — drop any that cannot apply to the diff, add ad-hoc ones
-the diff suggests:
+Launch a Workflow. One finder agent per dimension, each given the resolved
+`REVIEW_RANGE` from above (have each agent run `git diff $REVIEW_RANGE` itself
+plus read full files it flags — never a hardcoded range). Dimensions — drop
+any that cannot apply to the diff, add ad-hoc ones the diff suggests:
 
 1. **correctness** — logic errors, off-by-one, error paths, races between
    check and use, lost wakeups, TOCTOU on DashMap entries.

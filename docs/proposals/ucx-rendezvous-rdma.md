@@ -187,10 +187,12 @@ truncated/corrupt blob is an OOB read inside UCX that no Rust wrapper can make
 safe. Therefore `AcquireResponse::Rdma.descriptor` gets an explicit layout,
 owned by velo:
 
+```text
+backend: u8 | version: u8 | flags: u8 | generation: u64 | addr: u64
+| len: u64 | rkey_len: u16 | rkey: [u8; rkey_len]
 ```
-version: u8 | flags: u8 | generation: u64 | addr: u64 | len: u64
-| rkey_len: u16 | rkey: [u8; rkey_len]
-```
+
+(The leading `backend` discriminator comes from D12; `1 = ucx`.)
 
 The consumer rejects any mismatch between `rkey_len`, the actual remaining
 bytes, and sanity bounds *before* the pointer reaches UCX. `generation` is the
@@ -272,6 +274,21 @@ ring via `send_async` (bounded = natural backpressure), completions resolve
 oneshots directly, and **no RMA completion callback ever enqueues onto the
 ring** (self-deadlock class — the ring's own docs warn about it).
 
+### D11 — Size thresholds, one table (all tunable via config)
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `transparent::DEFAULT_THRESHOLD` | 256 KiB | messenger payload → staged via rendezvous |
+| `DEFAULT_CHUNK_SIZE` | 512 KiB | chunked-pull chunk size |
+| UCX `eager_max` | 1 MiB | AM frame cap (unrelated to RDMA path) |
+| `rdma_min_bytes` (new) | 64 KiB | below this, pinned slots still answer chunked |
+| `dedicated_arena_min` (new) | 64 MiB | staging above this gets its own arena |
+| `registered_bytes_budget` (new) | 1 GiB | pool + external total; over → chunked fallback |
+| `lease_timeout` (new) | 30 s | RDMA lease deadline (reaper backstop) |
+
+Ordering invariant: `rdma_min ≤ transparent_threshold < chunk_size` keeps the
+transparent path RDMA-eligible from its first byte over threshold.
+
 ### D12 — Backend-pluggable by construction (sign-off amendment)
 
 A later NIXL, libfabric, or other RDMA implementation must slot in without
@@ -297,21 +314,6 @@ reshaping the registration layer or the wire protocol. Concretely:
   single progress thread vs NIXL's polling) live entirely behind the trait's
   async surface; if a future backend needs a different completion model, the
   oneshot-based contract already accommodates it.
-
-### D11 — Size thresholds, one table (all tunable via config)
-
-| Knob | Default | Meaning |
-|---|---|---|
-| `transparent::DEFAULT_THRESHOLD` | 256 KiB | messenger payload → staged via rendezvous |
-| `DEFAULT_CHUNK_SIZE` | 512 KiB | chunked-pull chunk size |
-| UCX `eager_max` | 1 MiB | AM frame cap (unrelated to RDMA path) |
-| `rdma_min_bytes` (new) | 64 KiB | below this, pinned slots still answer chunked |
-| `dedicated_arena_min` (new) | 64 MiB | staging above this gets its own arena |
-| `registered_bytes_budget` (new) | 1 GiB | pool + external total; over → chunked fallback |
-| `lease_timeout` (new) | 30 s | RDMA lease deadline (reaper backstop) |
-
-Ordering invariant: `rdma_min ≤ transparent_threshold < chunk_size` keeps the
-transparent path RDMA-eligible from its first byte over threshold.
 
 ---
 
