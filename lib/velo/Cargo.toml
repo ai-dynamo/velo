@@ -24,7 +24,7 @@ zmq = ["dep:zmq"]
 # UCX messenger transport (Linux only; RDMA via rdma-core when the ucx-rs `ib`
 # default feature is on — CI without RDMA packages exercises it over UCX_TLS=tcp,
 # but building still needs libibverbs-dev/librdmacm-dev headers).
-ucx = ["dep:ucx-rs", "dep:serde_bytes"]
+ucx = ["dep:ucx-rs", "dep:serde_bytes", "dep:offset-allocator"]
 
 # Discovery backends
 nats-discovery = ["dep:async-nats"]
@@ -96,6 +96,10 @@ nix = { version = "0.31.2", features = ["sched", "net"] }
 # what `cargo publish` resolves against once ucx-rs is on crates.io.
 ucx-rs = { path = "../../crates/ucx-rs", version = "0.1.0", optional = true }
 serde_bytes = { workspace = true, optional = true }
+# Suballocator for the RDMA arena pool. Declared here rather than in
+# `[dependencies]` so it tracks the `ucx` feature exactly: that feature is
+# Linux-only, and a non-Linux `--all-features` build must not pull it in.
+offset-allocator = { workspace = true, optional = true }
 
 [dev-dependencies]
 paste = "1"
