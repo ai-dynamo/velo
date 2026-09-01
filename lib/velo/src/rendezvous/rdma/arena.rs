@@ -608,6 +608,27 @@ impl Drop for Reservation {
     }
 }
 
+/// `initial` doubled once per pooled arena, saturated at `max`.
+///
+/// The doubling is a multiply, not a shift, because `checked_shl` refuses only
+/// an out-of-range *shift amount* — never a shifted-out *value*. Shifting
+/// `initial` by the arena count answers `Some(0)` as soon as the last
+/// significant bit leaves the word, and `0` read as a size collapses growth to
+/// one request-sized arena per allocation. `checked_mul` refuses that overflow,
+/// so the cap is reached instead.
+///
+/// Extracted from the growth path so the saturation can be tested directly:
+/// reaching the interesting arena counts through `alloc` would mean mapping
+/// tens of arenas.
+pub(crate) fn pool_arena_target(initial: u64, max: u64, pooled: usize) -> u64 {
+    u32::try_from(pooled)
+        .ok()
+        .and_then(|shift| 1u64.checked_shl(shift))
+        .and_then(|factor| initial.checked_mul(factor))
+        .unwrap_or(max)
+        .min(max)
+}
+
 // ---------------------------------------------------------------------------
 // ArenaSet
 // ---------------------------------------------------------------------------
@@ -701,11 +722,11 @@ impl ArenaSet {
     /// forced the growth.
     fn next_pool_arena_bytes(&self, len: usize) -> Result<u64, RdmaError> {
         let pooled = self.arenas.read().iter().filter(|a| !a.dedicated).count();
-        let grown = u32::try_from(pooled)
-            .ok()
-            .and_then(|shift| self.cfg.initial_arena_bytes.checked_shl(shift))
-            .unwrap_or(self.cfg.max_arena_bytes)
-            .min(self.cfg.max_arena_bytes);
+        let grown = pool_arena_target(
+            self.cfg.initial_arena_bytes,
+            self.cfg.max_arena_bytes,
+            pooled,
+        );
         let needed = (len as u64)
             .checked_next_multiple_of(GRANULE as u64)
             .ok_or(RdmaError::OutOfRange)?;

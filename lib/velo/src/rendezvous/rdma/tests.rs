@@ -27,7 +27,7 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 use velo_ext::Transport;
 
-use super::arena::{ArenaSet, Budget, GRANULE, RdmaPoolConfig};
+use super::arena::{ArenaSet, Budget, GRANULE, RdmaPoolConfig, pool_arena_target};
 use super::backend::{BackendGet, BackendRegion, RdmaBackend, RdmaError, UcxBackend};
 use super::region::Deregistered;
 use super::{RdmaConfig, RdmaRegistry};
@@ -281,6 +281,30 @@ async fn pool_grows_geometrically() {
         arenas,
         "every arena is one backend registration"
     );
+}
+
+/// Growth saturates at `max_arena_bytes` for every arena count, rather than
+/// wrapping to zero part-way up.
+///
+/// `checked_shl` refuses an out-of-range *shift*, never a shifted-out *value*:
+/// at the shipped defaults it answers `Some(0)` from 38 pooled arenas up to 63,
+/// then `None` again at 64. A size derived from it is therefore correct at both
+/// ends of the range and wrong only in the middle, which is exactly the shape
+/// that survives a spot check.
+#[test]
+fn pool_growth_saturates_instead_of_wrapping() {
+    const INITIAL: u64 = 64 << 20;
+    const MAX: u64 = 1 << 30;
+
+    for pooled in 0..=80usize {
+        // Oracle in wide arithmetic, where the doubling cannot overflow.
+        let want = ((INITIAL as u128) << pooled).min(MAX as u128) as u64;
+        assert_eq!(
+            pool_arena_target(INITIAL, MAX, pooled),
+            want,
+            "growth target is wrong at {pooled} pooled arenas"
+        );
+    }
 }
 
 /// A request at or above `dedicated_arena_min` gets an arena sized to it,
