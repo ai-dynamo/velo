@@ -36,6 +36,7 @@ use velo_ext::{
 };
 
 use super::address::{AM_ID_BASE, BLOB_VERSION, UcxEndpoint};
+use super::rma::{RdmaEndpoint, RmaState};
 use super::worker::{Cmd, Doorbell, SendTask, StartupSlot, WorkerArgs, WorkerShared, worker_main};
 
 /// Hard ceiling on `eager_max`, matching the TCP codec's frame cap.
@@ -109,6 +110,9 @@ pub struct UcxTransport {
     join: Mutex<Option<std::thread::JoinHandle<()>>>,
     ping_token: AtomicU64,
     metrics: OnceLock<Arc<dyn velo_ext::TransportObservability>>,
+    /// Submit-side RMA bookkeeping, shared with every [`RdmaEndpoint`] handed
+    /// out by [`UcxTransport::rdma_endpoint`].
+    rma: Arc<RmaState>,
 }
 
 impl UcxTransport {
@@ -123,6 +127,8 @@ impl UcxTransport {
             inflight_ops: Arc::new(Default::default()),
             shutdown_requested: Arc::new(Default::default()),
             reg_epoch: Arc::new(Default::default()),
+            live_regions: Arc::new(Default::default()),
+            live_rkeys: Arc::new(Default::default()),
         });
         Self {
             key,
@@ -139,7 +145,19 @@ impl UcxTransport {
             join: Mutex::new(None),
             ping_token: AtomicU64::new(1),
             metrics: OnceLock::new(),
+            rma: Arc::new(RmaState::new()),
         }
+    }
+
+    /// Handle for the RMA operations this transport's progress thread can
+    /// perform (`velo::rendezvous`'s GET fast path consumes it).
+    ///
+    /// Valid only after [`Transport::start`] has resolved; before that every
+    /// method on it answers `RmaError::NotStarted`.
+    // Phase 2 is the in-crate caller; today only the module's tests exercise it.
+    #[allow(dead_code)]
+    pub(crate) fn rdma_endpoint(&self) -> RdmaEndpoint {
+        RdmaEndpoint::new(Arc::clone(&self.shared), Arc::clone(&self.rma))
     }
 
     /// The effective `header + payload` cap for `peer`:
@@ -384,6 +402,11 @@ impl Transport for UcxTransport {
             );
             self.startup.set(out).ok();
             self.local_address.set(address).ok();
+            // Only now is the ring being consumed: before this, an RMA command
+            // would push successfully and never be answered. The runtime handle
+            // rides along so a cancelled `map_region` can retry its rollback push
+            // rather than drop it (see `MapRollback`).
+            self.rma.mark_started(self.runtime.get().cloned());
             Ok(())
         })
     }

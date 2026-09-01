@@ -29,6 +29,11 @@
 //! [`AdmissionGate`]: crate::transports::AdmissionGate
 
 mod address;
+// The RMA surface is Phase 1 of the rendezvous RDMA work: the mechanics land
+// first, the registration layer that calls them lands in Phase 2, so most of
+// this module has no in-crate caller yet outside its tests.
+#[allow(dead_code)]
+pub(crate) mod rma;
 mod transport;
 mod worker;
 
