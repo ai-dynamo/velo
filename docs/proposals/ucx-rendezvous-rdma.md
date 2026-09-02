@@ -584,7 +584,7 @@ conservative by accident.
 Status: written, open as PR #69 (`ai/rdma-phase4-lifecycle`), **not on main**.
 Nothing in this section can be checked against the tree yet, which is why the
 D11 rows for its four knobs carry a PR reference rather than a file anchor.
-Three things about it are worth recording here rather than in the PR:
+Five things about it are worth recording here rather than in the PR:
 
 - `eager_endpoints` is a Phase-4 addition this plan never anticipated, added
   because of the checkpoint's ~14 ms lazy-wireup finding (report §5).
@@ -595,14 +595,23 @@ Three things about it are worth recording here rather than in the PR:
   backend, and endpoint-count stability over UCX — with no single loop
   asserting both axes together. Both are open items, not closed ones.
 - `ep_idle_timeout`'s "decided with Ryan at checkpoint" (first deliverable
-  above) was **not** discharged. PR #69 ships the knob at this plan's own
-  default — `None`, off — with a 500 ms floor on any value a builder does set,
-  sized to dominate the measured ~14 ms wireup. That wireup finding pushed the
-  answer toward eager wireup rather than toward a number for the idle timeout,
-  which is why `eager_endpoints` exists and this knob still has no decided
-  value. D9's "connection-pool policy revisited later" is open on the same
-  grounds: the measurement it waited for now exists, and the decision it feeds
-  is still owed.
+  above) was not discharged at the checkpoint itself, but **it has since been
+  decided: 2026-09-01, ship as-is.** The reaper stays off by default (`None`),
+  documented as experimental, with its measured cost stated where an operator
+  will read it before enabling: reaping an endpoint whose peer still holds its
+  side costs that peer one silently-lost frame plus up to a UCX keepalive
+  interval (~20 s) before it self-heals. Two alternatives were offered and not
+  taken — gating the reaper behind `test-helpers`, or dropping it from PR #69.
+  The reasoning for shipping it: the cost is real but bounded, self-healing and
+  reachable only by opting in, and Phase 5's pre-close "goodbye" AM would
+  remove it entirely rather than being designed around.
+- The knob keeps a 500 ms floor on any value a builder does set, sized to
+  dominate the measured ~14 ms wireup. That wireup finding is also why the
+  answer went toward eager wireup rather than toward a number for the idle
+  timeout, and why `eager_endpoints` exists at all.
+- D9's "connection-pool policy revisited later" is narrower than the reaper
+  decision and remains open: the measurement it waited for now exists, but the
+  broader pooling question it feeds has not been answered.
 
 ### Phase 5 — Role reversal (PUT) + measured optimizations (PR 5, scope-gated)
 
