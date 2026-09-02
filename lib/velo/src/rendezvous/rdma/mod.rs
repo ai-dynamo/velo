@@ -684,6 +684,11 @@ impl RdmaRegistry {
         self.shared.budget.registered()
     }
 
+    /// Transfers still outstanding in the pool's arenas.
+    pub(crate) fn in_flight_transfers(&self) -> usize {
+        self.pool.in_flight_transfers()
+    }
+
     /// Live external registrations.
     #[allow(dead_code)]
     pub(crate) fn region_count(&self) -> usize {

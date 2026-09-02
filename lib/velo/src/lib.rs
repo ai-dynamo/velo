@@ -1232,6 +1232,20 @@ impl Velo {
             .unwrap_or(0)
     }
 
+    /// Transfers the NIC is still writing into this instance's arenas.
+    ///
+    /// Exposed for tests only. A test that wants to act *while* a transfer is
+    /// in flight has to be able to see that it started; timing the caller's
+    /// future instead races the acquire round trip, and a cancelled future
+    /// looks identical whether the transfer began or never did.
+    #[cfg(all(target_os = "linux", feature = "ucx", feature = "test-helpers"))]
+    pub fn rdma_in_flight_transfers(&self) -> usize {
+        self.rdma
+            .as_ref()
+            .map(|r| r.in_flight_transfers())
+            .unwrap_or(0)
+    }
+
     /// The registration layer, for tests that need to observe it directly.
     #[cfg(all(target_os = "linux", feature = "ucx", test))]
     pub(crate) fn rdma(&self) -> Option<&Arc<crate::rendezvous::rdma::RdmaRegistry>> {

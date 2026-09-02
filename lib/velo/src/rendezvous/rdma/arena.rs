@@ -1112,4 +1112,14 @@ impl ArenaSet {
     pub(crate) fn live_allocations(&self) -> usize {
         self.arenas.read().iter().map(|a| a.live()).sum()
     }
+
+    /// Transfers the NIC is still writing, across every arena.
+    ///
+    /// This is what shutdown drains on, so it is also the only honest way for a
+    /// test to know a transfer is genuinely in flight rather than merely
+    /// requested — the caller's future being slow proves nothing about whether
+    /// the backend was ever handed the op.
+    pub(crate) fn in_flight_transfers(&self) -> usize {
+        self.arenas.read().iter().map(|a| a.in_flight()).sum()
+    }
 }

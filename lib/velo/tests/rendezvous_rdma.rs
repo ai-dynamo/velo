@@ -1348,6 +1348,14 @@ async fn a_cancelled_transfer_does_not_release_its_destination() {
 /// looks at a clock. The injected delay is the only way to hold a transfer open
 /// across a shutdown over `UCX_TLS=tcp`, and the assertion is a *lower* bound
 /// against a deliberately long delay, so it cannot pass by being fast.
+///
+/// The *precondition* is not timed, though, and must not be: cancelling the
+/// caller after a fixed wait races the acquire round trip, and a cancelled
+/// future looks the same whether the transfer had started or had never been
+/// posted at all. A run that loses that race abandons nothing, leaves shutdown
+/// with nothing to drain, and fails here claiming shutdown did not wait. So the
+/// transfer is observed in flight — the same counter shutdown drains on —
+/// before the caller is dropped.
 #[tokio::test(flavor = "multi_thread")]
 async fn shutdown_waits_for_a_live_transfer_before_unmapping_its_arena() {
     let pair = Pair::new().await;
@@ -1361,15 +1369,20 @@ async fn shutdown_waits_for_a_live_transfer_before_unmapping_its_arena() {
 
     // Abandoned while the transfer is running: the detached task still holds
     // its destination inside the consumer's arena.
-    let cancelled = tokio::time::timeout(
-        Duration::from_millis(60),
-        pair.consumer.velo.get_pinned(handle),
+    let consumer = Arc::clone(&pair.consumer.velo);
+    let getter = tokio::spawn(async move { consumer.get_pinned(handle).await });
+    wait_until(
+        "the transfer reached the backend",
+        || async { pair.consumer.velo.rdma_in_flight_transfers() > 0 },
+        || {
+            format!(
+                "in_flight={}",
+                pair.consumer.velo.rdma_in_flight_transfers()
+            )
+        },
     )
     .await;
-    assert!(
-        cancelled.is_err(),
-        "the transfer finished too fast to cancel"
-    );
+    getter.abort();
 
     let started = std::time::Instant::now();
     pair.consumer
