@@ -2712,7 +2712,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "velo"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -2771,6 +2771,7 @@ dependencies = [
  "prometheus",
  "rmp-serde",
  "serde",
+ "serde_json",
  "socket2 0.6.5",
  "tokio",
  "tokio-util",
