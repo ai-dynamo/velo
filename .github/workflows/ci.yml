@@ -312,6 +312,8 @@ jobs:
       with:
         path: ~/.cargo/bin/cargo-semver-checks
         key: ${{ runner.os }}-cargo-semver-checks-${{ hashFiles('scripts/check-semver.sh', 'rust-toolchain.toml') }}
+    - name: Test the semver gate itself
+      run: bash scripts/check-semver.test.sh
     - name: Run semver check
       env:
         SEMVER_SKIP: ${{ needs.pr-metadata.outputs.semver-skip }}
