@@ -821,9 +821,16 @@ async fn get_unknown_peer() {
 /// The printed size settles the `md_map` question for CI: over `UCX_TLS=tcp`
 /// the measured packed rkey is exactly **9 bytes** — the header alone, with no
 /// per-memory-domain key material, because the tcp MD registers nothing. Real
-/// InfiniBand packs a key per MD on top of that, which only the hardware
-/// checkpoint can observe. The `>= 9` floor is therefore the tightest bound CI
-/// can assert.
+/// InfiniBand packs a key per MD on top of that: measured **20 B** on
+/// 2026-08-29 (`agent-docs/2026-08-29-rdma-phase3-hardware-checkpoint.md` §6),
+/// on a build whose mlx5 memory domain never opened. An independent probe on a
+/// DEVX memory domain measured 19 B on the same UCX
+/// (`docs/proposals/ibverbs-transport.md:919-920`).
+///
+/// So the size is memory-domain-dependent, and `>= 9` stays the tightest bound
+/// CI can assert. Tightening it to the 20 would pin a value that build produces
+/// only because of a link-order defect, and the assertion would go red when
+/// that defect is fixed.
 #[tokio::test(flavor = "multi_thread")]
 async fn rkey_pack_canary() {
     const LEN: usize = 64 * 1024;
@@ -1132,18 +1139,28 @@ async fn out_of_range_mem_type_is_refused_before_ucx() {
     assert_pair_balanced(&pair);
 }
 
-/// A blob that passes the pre-parse and is still refused by UCX.
+/// A blob that passes the pre-parse and is still refused by UCX over tcp.
 ///
 /// The complement of [`truncated_rkey_is_refused_before_ucx`]: this one is well
 /// formed — `md_map` names one memory domain, the entry is present, `sys_dev` is
 /// `UNKNOWN` — so the pre-parse lets it through and `ucp_ep_rkey_unpack` really
-/// runs, walking only bytes the blob owns. UCX rejects it because no local
-/// memory domain corresponds (it logs `failed to unpack remote key from remote
-/// md[0]`). What this pins down is the accounting on that branch: `live_rkeys`
-/// is incremented only after a successful unpack, so a failed one must leave it
-/// untouched rather than counting a key that was never created.
+/// runs, walking only bytes the blob owns. Over `UCX_TLS=tcp` UCX rejects it
+/// because no local memory domain corresponds (it logs `failed to unpack remote
+/// key from remote md[0]`). What this pins down is the accounting on that
+/// branch, which is lane-independent: `live_rkeys` is incremented only after a
+/// successful unpack, so a failed one must leave it untouched rather than
+/// counting a key that was never created.
+///
+/// The rejection is not. On InfiniBand a local mlx5 memory domain *does*
+/// correspond, `ucp_ep_rkey_unpack` succeeds, the GET posts with unusable key
+/// material, and `uct_rc_verbs` escalates the HCA completion error to
+/// `ucs_fatal` — **this same blob aborts the process** (measured 2026-08-29,
+/// `agent-docs/2026-08-29-rdma-phase3-hardware-checkpoint.md` §3). The name
+/// says `over_tcp` because reading it as a statement about the class would be
+/// reading it as "this failure mode is contained", which is the opposite of
+/// what the hardware run found.
 #[tokio::test(flavor = "multi_thread")]
-async fn unusable_rkey_fails_cleanly_inside_ucx() {
+async fn unusable_rkey_is_refused_by_ucx_over_tcp() {
     const LEN: usize = 64 * 1024;
     let src = PageBuf::new(LEN);
     let dst = PageBuf::new(LEN);
