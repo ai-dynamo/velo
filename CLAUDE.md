@@ -17,6 +17,8 @@ to crates.io before a `velo` release that enables the `ucx` feature can ship.
 
 Anything else under `lib/` or as a workspace member is a mistake — there used to be 9 sibling crates (`velo-messenger`, `velo-transports`, `velo-streaming`, …). They were collapsed into `lib/velo/src/` because independent versioning between them silently shipped broken releases. Do not reintroduce them.
 
+Two documentation directories, and they are not interchangeable: `docs/proposals/` holds living designs that are edited in place as the code moves, while `agent-docs/` holds dated evidence — measurement records, hardware checkpoints, deep-dive findings — which is superseded by a new dated file rather than rewritten.
+
 ## Build & Test
 
 ```bash
