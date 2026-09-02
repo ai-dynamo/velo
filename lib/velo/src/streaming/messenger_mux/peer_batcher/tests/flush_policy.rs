@@ -391,7 +391,16 @@ async fn an_auto_window_writes_without_a_kick() {
 /// coalesced state, so a thousand of them are one bit — nothing is queued and
 /// nothing is written early. What matters most is what comes out the far side
 /// when the gate opens: every record exactly once, in `frame_seq` order.
-#[tokio::test(flavor = "multi_thread")]
+///
+/// Driven on a single-threaded runtime on purpose. The property is about what
+/// the batcher does when the producer keeps kicking it, so the batcher must
+/// provably get a turn between kicks — and on a multi-threaded runtime it does
+/// not: the producer loop below runs in about 100 microseconds, less than it
+/// takes to unpark the worker the batcher sleeps on, so a batcher that *was*
+/// free to misbehave would still be caught doing nothing. One thread and a
+/// `yield_now` per pass makes "the batcher had its chance" a fact rather than a
+/// hope.
+#[tokio::test(flavor = "current_thread")]
 async fn kicks_during_an_admission_park_neither_double_send_nor_reorder() {
     use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
@@ -409,7 +418,7 @@ async fn kicks_during_an_admission_park_neither_double_send_nor_reorder() {
 
     let (transport, wire) = StallingTransport::new(tokio::runtime::Handle::current());
     let sender = Messenger::builder()
-        .add_transport(transport)
+        .add_transport(Arc::clone(&transport) as Arc<dyn velo_ext::Transport>)
         .build()
         .await
         .expect("sender messenger");
@@ -477,30 +486,53 @@ async fn kicks_during_an_admission_park_neither_double_send_nor_reorder() {
         crate::observability::test_helpers::MetricSnapshot::from_registry(registry)
             .counter("velo_streaming_mux_batches_total", &[("direction", "sent")])
     };
-    // The counter increments *after* a batch lands in the channel, so wait for
-    // the OpenSlot flush to be accounted before building on the number.
+    // The counter is incremented in `BatchWriter::flush` *before* the batch is
+    // offered to the messenger, so it counts batches offered, not batches
+    // landed. Wait for the OpenSlot flush to be accounted before building on
+    // the number.
     eventually(|| batches(&registry) == 1.0).await;
 
-    // Stage a record and flush it: that write fills the gate and parks there.
-    // Wait for BOTH facts — the gate being full and the batch being counted —
-    // or the baseline below races the increment (seen under llvm-cov, whose
-    // instrumentation widens the land-then-count window).
+    // The read above drained the OpenSlot batch off the wire, so this write
+    // takes the one free place rather than parking. It is the write *after* it
+    // that has nowhere to go.
     inlet.send(item(0)).expect("stage a record");
     handle.kick_flush();
     eventually(|| wire.is_full() && batches(&registry) == 2.0).await;
+
+    // Park the batcher, and wait for the fact rather than assuming it: the gate
+    // took this frame into its FIFO instead of admitting it, so the batcher is
+    // suspended on the `FireResult` and cannot reach another flush. Waiting on
+    // a batch *count* here would be waiting on the wrong thing — the count
+    // moves before the send, so it cannot distinguish offered from parked.
+    inlet.send(item(1)).expect("stage a record");
+    handle.kick_flush();
+    eventually(|| transport.stalled() == 1).await;
     let parked_at = batches(&registry);
+    let offered_at_park = transport.offered();
 
     // The producer keeps going: more of the stream, and a flush per pass, all
     // while the batcher is suspended.
-    for n in 1..QUEUED {
+    //
+    // The yield is what gives the assertion below its teeth. A serving loop
+    // awaits between passes, and so must this one: without a yield the whole
+    // loop can run inside a single scheduling slice, and then "nothing was
+    // offered" would only be saying that the batcher was never given a chance
+    // to offer anything. Yielding hands it that chance 118 times over.
+    for n in 2..QUEUED {
         inlet.send(item(n)).expect("stage a record");
         handle.kick_flush();
+        tokio::task::yield_now().await;
     }
+    assert_eq!(
+        transport.offered(),
+        offered_at_park,
+        "once the batcher is parked in an admission nothing more may be offered \
+         to the messenger, however many times the application asks"
+    );
     assert_eq!(
         batches(&registry),
         parked_at,
-        "nothing may reach the messenger while the peer's gate is full, \
-         however many times the application asks"
+        "and no further batch may even be built behind the parked one"
     );
 
     // Open the gate and collect everything, in the order it was written.

@@ -361,6 +361,10 @@ pub(super) struct StallingTransport {
     address: velo_ext::WorkerAddress,
     gate: velo_ext::AdmissionGate<(Bytes, Bytes)>,
     peers: std::sync::Mutex<std::collections::HashSet<velo_ext::InstanceId>>,
+    /// Frames handed to [`velo_ext::Transport::send_message`].
+    offered: std::sync::atomic::AtomicUsize,
+    /// Of those, the ones admission did not take synchronously.
+    stalled: std::sync::atomic::AtomicUsize,
 }
 
 impl StallingTransport {
@@ -376,8 +380,30 @@ impl StallingTransport {
             address,
             gate: velo_ext::AdmissionGate::new(tx, rt),
             peers: std::sync::Mutex::new(std::collections::HashSet::new()),
+            offered: std::sync::atomic::AtomicUsize::new(0),
+            stalled: std::sync::atomic::AtomicUsize::new(0),
         });
         (transport, rx)
+    }
+
+    /// How many frames the messenger has handed this transport.
+    ///
+    /// Read across tasks: the batcher calls `send_message`, the test thread
+    /// reads this.
+    pub(super) fn offered(&self) -> usize {
+        self.offered.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// How many of those admission refused to take synchronously.
+    ///
+    /// Strictly this counts every non-[`velo_ext::SendOutcome::Admitted`]
+    /// return, which includes an already-failed admission. In this harness
+    /// nothing fails the gate, so the only way to be counted is the one this
+    /// transport exists to produce: the `bounded(1)` channel is full, the frame
+    /// is queued behind it, and the caller's `FireResult` will not resolve
+    /// until something drains the wire.
+    pub(super) fn stalled(&self) -> usize {
+        self.stalled.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -406,7 +432,14 @@ impl velo_ext::Transport for StallingTransport {
         _message_type: velo_ext::MessageType,
         _on_error: Arc<dyn velo_ext::TransportErrorHandler>,
     ) -> velo_ext::SendOutcome {
-        self.gate.send((header, payload))
+        self.offered
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let outcome = self.gate.send((header, payload));
+        if !outcome.is_admitted() {
+            self.stalled
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        outcome
     }
 
     fn start(
