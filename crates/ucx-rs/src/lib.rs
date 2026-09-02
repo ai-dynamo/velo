@@ -93,6 +93,12 @@ pub const UCX_LICENSE: &str = include_str!("../LICENSE-UCX");
 /// references from a `#[used]` static are the mechanism that works and that
 /// survives `--gc-sections`. The symbol set mirrors the `Libs.private:`
 /// markers in UCX's own shipped pkg-config files, one per component.
+///
+/// The order of the array below is *not* the constructor order and changing it
+/// changes nothing: `.init_array` order comes from the order `build.rs` emits
+/// its `cargo:rustc-link-lib=static=...` lines. That order is load-bearing for
+/// `uct_ib` versus `uct_ib_mlx5` — see the comment at those two lines, and
+/// `tests/ctor_order.rs`, which fails if they are ever swapped back.
 /// Only meaningful for the vendored static build: with a shared system UCX
 /// (`UCX_DIR`), the transport modules are runtime-dlopen'd plugins whose init
 /// symbols are absent from the core libraries, and the core constructors run
