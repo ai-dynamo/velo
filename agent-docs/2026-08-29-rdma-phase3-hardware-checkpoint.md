@@ -373,7 +373,7 @@ tighten it.
 | Item | Outcome |
 |---|---|
 | (a) FORCE-close cancellation on IB — `get_cancelled_by_endpoint_replacement` | **PASSED on IB** (0.16 s). No `get_am`/`get_offload` divergence observed: the caller was answered, the region released, teardown balanced. |
-| (b) Stale/unusable rkey → remote access error | **Achieved by proxy.** The planned owner-unmap harness was not run. `unusable_rkey_fails_cleanly_inside_ucx` reached a comparable failure and produced a stronger result — process abort, not silent success. It is a *different* experiment: a hand-crafted unusable rkey, not a semantically stale rkey from an unmapped region. See Finding 2. |
+| (b) Stale/unusable rkey → remote access error | **Achieved by proxy.** The planned owner-unmap harness was not run. `unusable_rkey_fails_cleanly_inside_ucx` (renamed since this run to `unusable_rkey_is_refused_by_ucx_over_tcp`) reached a comparable failure and produced a stronger result — process abort, not silent success. It is a *different* experiment: a hand-crafted unusable rkey, not a semantically stale rkey from an unmapped region. See Finding 2. |
 | (c) `abandon_rma_ops` via a SIGSTOP'd owner | **NOT ATTEMPTED.** |
 
 Other in-crate UCX RMA tests re-run over IB, all **passing**:

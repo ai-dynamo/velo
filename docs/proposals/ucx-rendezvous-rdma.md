@@ -36,9 +36,10 @@ the judgment calls; everything after §1 is consequence.
 ### D1 — Native `ucp_get_nbx` on the existing UCX transport context. No NIXL.
 
 The `ucp_context` already requests `UCP_FEATURE_RMA`
-(`transports/ucx/worker.rs:569`) with a comment reserving it for exactly this.
-The two in-tree "Phase 2" comments disagree (`rendezvous.rs:18-21` says NIXL,
-`worker.rs:568-571` says native GET); this plan resolves them to native, and
+(`transports/ucx/worker.rs:879`) with a comment reserving it for exactly this.
+The two in-tree "Phase 2" comments disagree (`rendezvous.rs:18-21` says NIXL —
+pre-Phase-3 lines, deleted by the cleanup Phase 3 records below;
+`worker.rs:876-877` says native GET); this plan resolves them to native, and
 Phase 3 updates the stale doc comment.
 
 *Alternative considered — accept UCX's own rendezvous AMs* (drop the
@@ -46,7 +47,7 @@ Phase 3 updates the stale doc comment.
 machinery move large AM payloads): rejected. It accelerates *push* messaging,
 not the pull-by-handle model rendezvous is for, gives no external-memory
 registration story, and reopens the descriptor-ownership/shutdown problem the
-AM receive path deliberately closed (`worker.rs:295-324`).
+AM receive path deliberately closed (`worker.rs:553-561`).
 
 ### D2 — GET-first, receiver-driven, decided owner-side at `_rv_acquire`.
 
@@ -125,11 +126,15 @@ source):
   `parking_lot::Mutex`, allocating in **4 KiB granules** (u32 range → 16 TiB
   per arena; float-bin waste ≤12.5%). `with_max_allocs` explicitly sized — but
   **sized *up*, to the granule count, not down**
-  (`arena.rs:956`, rationale `arena.rs:80-84, 948-955`). The plan had the
-  trade-off backwards: shrinking the node pool below the granule count trades a
-  visible fixed cost (~28 B per granule, ~0.7% of the arena) for an invisible
-  one, where a fragmented arena reports "full" while it still has room and the
-  pool maps another arena it did not need.
+  (`arena.rs:956`, rationale `arena.rs:80-84, 948-955`). *The plan sized it
+  down because `Allocator::new`'s 128 Ki default eagerly allocates ~4 MB of
+  node metadata per arena* — the arithmetic holds (128 Ki × ~28 B ≈ 3.6 MB) and
+  the code names that same default as a trap (`arena.rs:954`), then pays the
+  cost regardless. What was backwards is the direction, not the number:
+  shrinking the node pool below the granule count trades a visible fixed cost
+  (~28 B per granule, ~0.7% of the arena) for an invisible one, where a
+  fragmented arena reports "full" while it still has room and the pool maps
+  another arena it did not need.
 - Oversize requests (≥ threshold, default 64 MiB) get a dedicated arena —
   avoids the 12.5% bin round-up costing 128 MiB on a 1 GiB object.
 - The free token is the private `Allocation` value held in an owner-side
@@ -366,7 +371,7 @@ ring** (self-deadlock class — the ring's own docs warn about it).
 | `lease_timeout` (new) | `RdmaRendezvousConfig` | 30 s | RDMA lease deadline (reaper backstop) |
 
 All seven defaults above still hold as built, verified one by one against
-`transparent.rs:32`, `store.rs:48`, `transports/ucx/transport.rs:74`,
+`transparent.rs:32`, `store.rs:48`, `transports/ucx/transport.rs:85`,
 `rdma/mod.rs:157`, `arena.rs:118`, `arena.rs:119` and `rdma/mod.rs:158`. What
 stopped holding is the claim that this is *one* table of the tunables — it is
 now incomplete, which makes it misleading rather than merely dated. The knobs
@@ -531,9 +536,9 @@ feature = "ucx"))]`, exactly matching the transport's gate).
   (`examples/Cargo.toml:56`); the stale-comment cleanup is done
   (`lib/velo/src/rendezvous.rs:17-28` now describes both paths,
   `lib/velo/src/rendezvous/write.rs:4-8` names `PinnedWriter`); the `md_map`
-  probe is `rkey_pack_canary` (`lib/velo/src/transports/ucx/tests.rs:792`); the
+  probe is `rkey_pack_canary` (`lib/velo/src/transports/ucx/tests.rs:799`); the
   micro-bench harness is `bench_rma`, `#[ignore]`d and printing tcp numbers
-  only (`tests.rs:1674-1676`).
+  only (`tests.rs:1691-1693`).
 
 **Checkpoint after Phase 3: hardware validation** on a real IB cluster
 (compute-session MCP; `UCX_TLS=rc_mlx5,ud_mlx5`): correctness matrix +
@@ -579,7 +584,7 @@ conservative by accident.
 Status: written, open as PR #69 (`ai/rdma-phase4-lifecycle`), **not on main**.
 Nothing in this section can be checked against the tree yet, which is why the
 D11 rows for its four knobs carry a PR reference rather than a file anchor.
-Two things about it are worth recording here rather than in the PR:
+Three things about it are worth recording here rather than in the PR:
 
 - `eager_endpoints` is a Phase-4 addition this plan never anticipated, added
   because of the checkpoint's ~14 ms lazy-wireup finding (report §5).
@@ -589,6 +594,15 @@ Two things about it are worth recording here rather than in the PR:
   carries is two partial soaks — registered-bytes stability against the mock
   backend, and endpoint-count stability over UCX — with no single loop
   asserting both axes together. Both are open items, not closed ones.
+- `ep_idle_timeout`'s "decided with Ryan at checkpoint" (first deliverable
+  above) was **not** discharged. PR #69 ships the knob at this plan's own
+  default — `None`, off — with a 500 ms floor on any value a builder does set,
+  sized to dominate the measured ~14 ms wireup. That wireup finding pushed the
+  answer toward eager wireup rather than toward a number for the idle timeout,
+  which is why `eager_endpoints` exists and this knob still has no decided
+  value. D9's "connection-pool policy revisited later" is open on the same
+  grounds: the measurement it waited for now exists, and the decision it feeds
+  is still owed.
 
 ### Phase 5 — Role reversal (PUT) + measured optimizations (PR 5, scope-gated)
 
@@ -642,8 +656,8 @@ tick — Phase-3 machinery, started by `set_rdma_context`
 (`rendezvous.rs:116-120, 574`). Reusing it was the right call: it is the one
 periodic task the subsystem already has, and a second timer would have to be
 ordered against the first anyway. But it means the stack is 1→2→3→4, which is
-what PR #69 stacking on PR #68 already reflects. Nobody parallelized, so
-nothing is lost by saying so plainly.
+what the #66→#67→#68→#69 stack reflected. Nobody parallelized, so nothing is
+lost by saying so plainly.
 
 **Phase 5 waited for the checkpoint; the checkpoint has run.** What gates it
 now is not the checkpoint but the mlx5 link-order fix (PR #70) — the two
@@ -672,7 +686,7 @@ same blob is refused inside `ucp_ep_rkey_unpack` and comes back as an ordinary
 error, so **a tcp-only CI can never see this class at all**. It stays out of
 reach today because of D3's two legs — single-use rkeys and acquire-time
 revalidation — and *not* because of the syntactic pre-parse
-(`lib/velo/src/transports/ucx/rma.rs:535`), which contains framing, not
+(`lib/velo/src/transports/ucx/rma.rs:551`), which contains framing, not
 staleness: a semantically stale but syntactically perfect rkey passes it
 identically. Two things on the table would hole that invariant. The Phase-5
 rkey cache (D3's deferral) makes an rkey outlive its op by construction, and
