@@ -1765,7 +1765,18 @@ async fn latched_regions_free_their_buffers_normally() {
 /// The old order deregistered successfully and then returned `NotOwned`,
 /// telling the caller the opposite of what happened: the region was gone, and
 /// the error said the call had found nothing to do.
-#[tokio::test(flavor = "multi_thread")]
+///
+/// Single-threaded on purpose. `unregister_owned` takes `self`, so the refused
+/// guard is dropped as the call returns, and `RegionGuard::drop` legitimately
+/// *spawns* a deregistration for the region nobody released. That spawn is not
+/// the bug this test is about, but on a multi-threaded runtime it can land on
+/// another worker before the assertions below read the counter — which is how
+/// this test failed under `llvm-cov`, reporting a deregistration that came from
+/// the drop rather than from `unregister_owned`. With one worker the spawned
+/// task cannot run until the test next awaits, and there is no await between
+/// the call and the assertions, so the counter is read at the only instant that
+/// means anything: after the refusal, before the drop's cleanup.
+#[tokio::test(flavor = "current_thread")]
 async fn unregister_owned_refuses_before_deregistering() {
     let (backend, registry) = mock_registry(RdmaConfig::default());
 
