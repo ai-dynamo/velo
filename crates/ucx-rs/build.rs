@@ -205,6 +205,12 @@ fn build_vendored(out: &Path, want_ib: bool, want_rdmacm: bool) -> PathBuf {
         require_header("infiniband/mlx5dv.h", "ib", "libmlx5 / rdma-core");
         args.push("--with-verbs".into());
         args.push("--with-mlx5".into());
+        // Upstream defaults `--with-devx` to `check`, which degrades to a
+        // DEVX-less mlx5 build with no error. Asking for it explicitly makes
+        // configure hard-fail (`src/uct/ib/configure.m4:213-214`, "devx
+        // requested but not found") rather than silently dropping the
+        // accelerated memory domain this crate exists to provide.
+        args.push("--with-devx".into());
     } else {
         args.push("--without-verbs".into());
     }
@@ -250,6 +256,24 @@ fn build_vendored(out: &Path, want_ib: bool, want_rdmacm: bool) -> PathBuf {
         cross_env.push(("CC", cc));
     }
     if let Ok(extra) = env::var("UCX_EXTRA_CONFIGURE") {
+        // Extras land after the arguments above, and configure takes the last
+        // occurrence of an option — so an extra that turns DEVX back off would
+        // silently undo the `--with-devx` this crate depends on and produce
+        // exactly the verbs-only build that guard exists to prevent. Refuse
+        // instead of quietly honouring one of two contradictory instructions.
+        // A path-bearing `--with-devx=/somewhere` still selects DEVX, so it is
+        // allowed through.
+        for arg in extra.split_whitespace() {
+            let disables_devx =
+                arg == "--without-devx" || arg == "--with-devx=no" || arg == "--with-devx=check";
+            assert!(
+                !disables_devx,
+                "UCX_EXTRA_CONFIGURE contains `{arg}`, which would disable or make optional \
+                 the DEVX support this crate requires for the mlx5 memory domain. Building \
+                 without it yields a UCX whose mlx5 transports report no devices. Drop that \
+                 option, or build against a system UCX with UCX_DIR."
+            );
+        }
         args.extend(extra.split_whitespace().map(str::to_owned));
     }
 
@@ -345,10 +369,29 @@ fn emit_link_flags(lib: &Path, modules: &Path, vendored: bool, ib: bool, rdmacm:
         return;
     }
 
-    // Modules before core: uct_ib references uct/ucs, not the other way round.
+    // ORDER IS LOAD-BEARING between these two, and not for symbol resolution.
+    //
+    // `static=` bundles each archive's members into this crate's rlib in
+    // emission order, so this order becomes `.init_array` order. `uct_ib_init`
+    // and `uct_mlx5_init` both register their memory domains with
+    // `ucs_list_add_head`, so whichever runs *later* owns the head of
+    // `uct_ib_ops`. `uct_ib_verbs_md_open` accepts any device it can open — it
+    // refuses only when DEVX is forced (`ib_md.c:1549`) — so a verbs head wins
+    // every open, and `rc_mlx5`/`dc_mlx5`/`ud_mlx5` then find zero devices.
+    // `uct_ib_component_md_open` (`ib_md.c:1090-1101`) continues only on
+    // `UCS_ERR_UNSUPPORTED`, so a verbs IO error aborts the device's MD open
+    // outright rather than falling through to mlx5.
+    //
+    // Emitting `uct_ib` first therefore puts mlx5 at the head, which is what we
+    // want. Repeating `uct_ib` defensively does NOT work: rustc collapses a
+    // repeated archive to its last position, reproducing the bug.
+    // `+whole-archive`/`+verbatim` change inclusion and name resolution, not
+    // member position, so they do not help either.
+    //
+    // `tests/ctor_order.rs` is the guard. Do not reorder these two lines.
     if ib {
-        println!("cargo:rustc-link-lib=static=uct_ib_mlx5");
         println!("cargo:rustc-link-lib=static=uct_ib");
+        println!("cargo:rustc-link-lib=static=uct_ib_mlx5");
     }
     if rdmacm {
         println!("cargo:rustc-link-lib=static=uct_rdmacm");
