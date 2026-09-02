@@ -333,7 +333,9 @@ pub struct MuxConfig {
     /// peer's credit moving then, so it is enough as a per-peer floor now, and
     /// it is a shipped number rather than a fresh guess. `Duration::ZERO` turns
     /// the floor off: every wake is walked, which is the behaviour this field
-    /// was added to bound.
+    /// was added to bound. At the other end it is clamped to an hour, past which
+    /// every value means the same thing — the doorbell is off and the periodic
+    /// sweep owns credit return — and the deadline arithmetic would overflow.
     pub drain_visit_floor: Duration,
     /// How long a batcher may sit idle with no slots before it is evicted.
     pub batcher_idle_ttl: Duration,
@@ -675,6 +677,26 @@ impl Drop for MuxCore {
     }
 }
 
+/// Ceiling on an operator's [`MuxConfig::drain_visit_floor`].
+///
+/// Not a tuning limit — a floor this long already means "the doorbell is off and
+/// the periodic sweep owns credit return", and every value past it means the
+/// same thing. It exists so `last + floor` is total arithmetic: a `Duration`
+/// near the maximum would overflow the `Instant` and panic the sweep task, which
+/// is a poor way to answer a misconfiguration.
+const MAX_DRAIN_VISIT_FLOOR: Duration = Duration::from_secs(3600);
+
+/// One peer's doorbell state.
+struct PeerVisits {
+    /// When the doorbell last walked this peer.
+    last: tokio::time::Instant,
+    /// Whether a deferred walk for it is already queued.
+    ///
+    /// Exactly one entry per peer is ever in the queue, and this is what says
+    /// so. See [`DrainVisits`] for what a second one costs.
+    queued: bool,
+}
+
 /// The per-peer floor on doorbell-driven visits, and the queue it defers into.
 ///
 /// Coalescing alone leaves the visit rate a property of the traffic: a visit
@@ -685,19 +707,30 @@ impl Drop for MuxCore {
 /// queue instead, and because the flag stays armed, every drain until then
 /// coalesces into that one scheduled visit rather than posting another wake. So
 /// deferral never loses a wake; it delays one by at most the floor.
+///
+/// **One queue entry per peer, and the reason is a ratchet.** A queued walk is
+/// the authoritative next one, so a wake arriving while one is queued is
+/// answered by it rather than queueing a second — and, past the floor or not, is
+/// never walked out of band. Letting either happen leaves the queued entry
+/// behind as residue, and the periodic tick supplies a steady source of them: it
+/// calls `sweep_peer` on every peer, clearing the wake of one that is
+/// *currently deferred*, whose consumer's next drain then re-arms and posts
+/// again inside the same floor. One entry per tick, permanently, with the sweep
+/// task's queue work growing to match. Measured before the bound: 64 rounds of
+/// that pattern left 64 entries for a single peer, monotone, and a live probe
+/// saw 59 floor-spaced walks continue after the traffic had provably stopped.
 struct DrainVisits {
     floor: Duration,
-    /// When the doorbell last walked each peer.
-    last: HashMap<WorkerId, tokio::time::Instant>,
-    /// Peers whose wake landed inside the floor, ordered by when they come due.
+    peers: HashMap<WorkerId, PeerVisits>,
+    /// Deferred walks, ordered by when they come due, at most one per peer.
     deferred: BinaryHeap<Reverse<(tokio::time::Instant, WorkerId)>>,
 }
 
 impl DrainVisits {
     fn new(floor: Duration) -> Self {
         Self {
-            floor,
-            last: HashMap::new(),
+            floor: floor.min(MAX_DRAIN_VISIT_FLOOR),
+            peers: HashMap::new(),
             deferred: BinaryHeap::new(),
         }
     }
@@ -707,53 +740,84 @@ impl DrainVisits {
         self.deferred.peek().map(|Reverse((due, _))| *due)
     }
 
-    /// Answer a wake: `Some(peer)` to walk it now, `None` when the floor
-    /// deferred it instead.
+    /// Walks currently queued.
+    ///
+    /// The bound this type owes its caller is one entry per peer, so the size
+    /// of the queue is the property worth asserting on and `next_due` alone
+    /// cannot see it — a queue holding residue reports the same next deadline
+    /// as one holding a single live entry.
+    #[cfg(test)]
+    fn queued(&self) -> usize {
+        self.deferred.len()
+    }
+
+    /// Answer a wake: `Some(peer)` to walk it now, `None` when the wake was
+    /// deferred into a queued walk instead.
     ///
     /// A peer handed back is stamped here rather than by the caller after the
     /// walk. The invariant is what makes the floor hold: *everything this
-    /// returns has already been counted as visited*, so two entries falling due
-    /// together cannot both be admitted, and the interval the floor measures is
+    /// returns has already been counted as visited*, so two wakes for one peer
+    /// cannot both be admitted, and the interval the floor measures is
     /// walk-start to walk-start — which is what the rate it bounds means.
     fn admit(&mut self, peer: WorkerId, now: tokio::time::Instant) -> Option<WorkerId> {
-        match self.last.get(&peer) {
-            Some(&last) if now.saturating_duration_since(last) < self.floor => {
-                self.deferred.push(Reverse((last + self.floor, peer)));
-                None
-            }
-            _ => {
-                self.last.insert(peer, now);
-                Some(peer)
-            }
+        let Some(state) = self.peers.get_mut(&peer) else {
+            self.peers.insert(
+                peer,
+                PeerVisits {
+                    last: now,
+                    queued: false,
+                },
+            );
+            return Some(peer);
+        };
+        // Checked before the floor, not after. A queued walk answers this wake
+        // whether or not the floor has since elapsed, and walking here instead
+        // would strand that entry in the queue as residue — which is the whole
+        // of the ratchet described on this type.
+        if state.queued {
+            return None;
         }
+        if now.saturating_duration_since(state.last) < self.floor {
+            state.queued = true;
+            self.deferred.push(Reverse((state.last + self.floor, peer)));
+            return None;
+        }
+        state.last = now;
+        Some(peer)
     }
 
-    /// Peers whose deferred visit has come due.
+    /// Peers whose deferred walk has come due.
     fn due(&mut self, now: tokio::time::Instant) -> Vec<WorkerId> {
         let mut ready = Vec::new();
         while self.next_due().is_some_and(|due| due <= now) {
             let Reverse((_, peer)) = self.deferred.pop().expect("peeked a moment ago");
-            // Back through `admit` rather than straight onto `ready`: that is
-            // the one place the floor is decided, so a peer already walked since
-            // it was deferred — by an earlier entry in this same batch, or by
-            // the tick clearing its wake mid-defer — is re-deferred instead of
-            // walked twice. The instant it is re-pushed at is strictly later
-            // than `now`, so this terminates.
+            if let Some(state) = self.peers.get_mut(&peer) {
+                state.queued = false;
+            }
+            // Back through `admit`, which is the one place the floor is decided.
+            // An entry exists only for a peer `admit` has refused to walk since
+            // it was queued, and its due instant is one floor past that peer's
+            // last walk, so this always comes back `Some` and never re-queues.
             ready.extend(self.admit(peer, now));
         }
         ready
     }
 
-    /// Drop last-visit stamps that can no longer defer anything.
+    /// Drop per-peer state that can no longer defer anything.
     ///
-    /// A stamp older than the floor admits the next wake immediately, so
+    /// A last walk older than the floor admits the next wake immediately, so
     /// forgetting it changes no decision. It only keeps this map to the peers
     /// currently draining rather than to every peer the node has ever received
     /// from.
+    ///
+    /// A peer with a walk still queued is kept regardless of its age. Its state
+    /// is what records that the walk is queued, and dropping it would let the
+    /// next wake walk immediately and queue a second entry behind the one still
+    /// sitting there — the residue this type exists to not accumulate.
     fn forget_stale(&mut self, now: tokio::time::Instant) {
         let floor = self.floor;
-        self.last
-            .retain(|_, last| now.saturating_duration_since(*last) < floor);
+        self.peers
+            .retain(|_, state| state.queued || now.saturating_duration_since(state.last) < floor);
     }
 }
 
@@ -788,6 +852,12 @@ async fn deferred_visit_due(due: Option<tokio::time::Instant>) {
 /// of not doing it is at most one extra doorbell walk per peer per tick period —
 /// against a default interval a hundred times the floor, that is noise, and it
 /// keeps the periodic path from having to report which peers it touched.
+///
+/// The tick does something subtler that is *not* noise, and [`DrainVisits`] is
+/// where it is answered: `sweep_peer` clears the wake of every peer, including
+/// one whose walk is already queued, so that peer's next drain re-arms and posts
+/// a second wake inside the same floor. Deferring that wake into a second queue
+/// entry is what used to leave one entry behind per tick, for good.
 fn spawn_sweep(core: &Arc<MuxCore>) {
     let weak = Arc::downgrade(core);
     let cancel = core.cancel.clone();

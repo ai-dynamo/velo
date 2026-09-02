@@ -84,7 +84,9 @@ them alone. There is also a pre-existing `cargo fmt` diff in
 
 `.research/` holds staged Dynamo sources, benchmark scripts, raw JSONL, and
 build logs. `target-drain/` and `examples/target-drain/` are isolated build dirs
-used because the shared `target/` was lock-contended.
+used because the shared `target/` was lock-contended. Note they are untracked but
+**not** gitignored, so a `git add -A` would sweep them into a commit; stage by
+path until someone adds them to `.gitignore`.
 
 ---
 
@@ -292,3 +294,41 @@ Gates after the fixes: fmt clean, clippy clean, `streaming_mux_credit` 5/5,
 
 The pre-existing teardown deadlock (work item 2) was re-confirmed live on
 this tree — the drain hook does not fix it, as expected.
+
+### Second-pass review, 2026-09-02
+
+A second adversarial pass over the fix itself returned one high finding and two
+low ones.
+
+1. **The deferral queue ratcheted.** A periodic tick calls `sweep_peer` on every
+   peer, including one whose walk was already queued, and that clears its wake;
+   the consumer's next drain re-arms and posts a second wake inside the same
+   floor. The old `admit` queued a second entry for it, and `due` then re-queued
+   whichever entry lost — permanent residue, one entry per tick, with the sweep
+   task's queue work growing to match. Confirmed twice before fixing: the
+   reviewer's live probe saw 59 floor-spaced walks continue after the traffic had
+   provably stopped, and a unit-level replay of the pattern grew the queue by
+   exactly one entry per round, monotone, 64 rounds to 64 entries. Fixed by
+   bounding the queue to one entry per peer: a queued walk is the authoritative
+   next one, so `admit` answers a wake with it rather than queueing a second and
+   never walks a queued peer out of band, `due` clears the membership on pop, and
+   `forget_stale` keeps a peer whose walk is queued regardless of its age.
+2. **`drain_visit_floor` could overflow the deferral deadline.** `last + floor`
+   panics for an absurd `Duration`. The floor is now clamped to an hour, which is
+   already "the doorbell is off".
+3. **`drain_pending` never shrinks across peer churn — known, not fixed.**
+   Recorded on the field. It mirrors the `peers` map beside it, and naive removal
+   is a footgun rather than a cleanup: a pump holds its peer's flag as an `Arc`
+   for the life of its stream, so removing the map entry while that pump lives
+   leaves it setting a flag nothing reads — permanently true, permanently
+   coalescing, and that peer's credit back on the periodic sweep for the rest of
+   the stream. It may only be removed under the same visibility that retires
+   slots and binds.
+
+Deviation from the review's fix ruling, deliberate: the ruling said a redundant
+pop should be *dropped* rather than re-queued. Under the bound as implemented a
+redundant pop is unreachable, because an entry exists only for a peer `admit` has
+refused to walk since it was queued. Taking the ruling literally would have left
+`admit` free to walk a queued peer once the floor elapsed, which strands that
+entry and reopens the residue by a second route — and opens a narrow lost-wake
+race along the way. Refusing that walk is what makes the bound structural.

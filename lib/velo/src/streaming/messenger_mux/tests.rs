@@ -711,58 +711,154 @@ mod drain_visit_floor {
         );
     }
 
-    /// A peer walked between being deferred and coming due is re-deferred, not
-    /// walked again on the spot — the floor is decided in one place, so nothing
-    /// reaches `due` that could beat it.
+    /// A wake landing while a walk is already queued coalesces into it.
+    ///
+    /// The queued walk is the authoritative next one, so `admit` refuses to
+    /// walk a scheduled peer even once the floor has elapsed. Racing it instead
+    /// is what leaves the queued entry behind as residue, and residue is what
+    /// the ratchet below is made of.
     #[test]
-    fn a_peer_walked_since_being_deferred_is_re_deferred() {
+    fn a_wake_while_a_walk_is_queued_coalesces_into_it() {
         let mut visits = DrainVisits::new(FLOOR);
         let start = Instant::now();
         assert_eq!(visits.admit(peer(1), start), Some(peer(1)));
         assert_eq!(visits.admit(peer(1), start + FLOOR / 2), None);
 
-        // A wake past the floor walked it again just before it fell due.
-        let walked = start + FLOOR;
-        assert_eq!(visits.admit(peer(1), walked), Some(peer(1)));
-
-        assert!(
-            visits.due(walked).is_empty(),
-            "its floor restarted at the later walk"
-        );
         assert_eq!(
-            visits.next_due(),
-            Some(walked + FLOOR),
-            "and it is queued again rather than dropped, so its wake is not lost"
+            visits.admit(peer(1), start + FLOOR),
+            None,
+            "the queued walk answers this wake; walking it here would strand that entry"
         );
+        assert_eq!(visits.queued(), 1, "and buys no second entry");
+        assert_eq!(
+            visits.due(start + FLOOR),
+            vec![peer(1)],
+            "the queued walk is what serves both wakes"
+        );
+        assert_eq!(visits.queued(), 0);
     }
 
-    /// Two deferrals of one peer still buy it one walk when they come due.
+    /// Two wakes inside one floor queue one walk, and leave nothing behind.
     ///
-    /// Reachable: the periodic tick calls `sweep_peer` on every peer, including
-    /// one already sitting in the deferred queue, and that clears its wake. The
-    /// next drain posts again, `admit` defers again, and the peer is queued
-    /// twice. Both entries fall due together, and if the floor were only
-    /// consulted against a stamp written after the whole batch was collected,
-    /// both would be handed back — one walk past what the floor allows, at the
-    /// same instant.
+    /// This is the ratchet in miniature. The periodic tick calls `sweep_peer` on
+    /// every peer, including one already sitting in the deferred queue, and that
+    /// clears its wake; the consumer's next drain re-arms and posts a second
+    /// wake inside the same floor. If that wake queues an entry of its own, the
+    /// pair falls due together, one walk is taken and the other entry is put
+    /// back — permanent residue, one entry per tick, with the sweep task's queue
+    /// work growing with it.
     #[test]
-    fn a_peer_deferred_twice_is_walked_once() {
+    fn a_peer_wakened_twice_inside_the_floor_is_queued_once() {
         let mut visits = DrainVisits::new(FLOOR);
         let start = Instant::now();
         assert_eq!(visits.admit(peer(1), start), Some(peer(1)));
         assert_eq!(visits.admit(peer(1), start + FLOOR / 4), None);
         assert_eq!(visits.admit(peer(1), start + FLOOR / 2), None);
+        assert_eq!(
+            visits.queued(),
+            1,
+            "one peer, one queued walk — the second wake has nothing to add to it"
+        );
 
         assert_eq!(
             visits.due(start + FLOOR),
             vec![peer(1)],
-            "the second entry must be re-deferred, not walked alongside the first"
+            "one walk serves both wakes"
         );
         assert_eq!(
-            visits.next_due(),
-            Some(start + 2 * FLOOR),
-            "and it waits a further floor from the walk it just missed"
+            visits.queued(),
+            0,
+            "and the queue is empty behind it: nothing was put back"
         );
+        assert_eq!(visits.next_due(), None);
+    }
+
+    /// The ratchet, run forward.
+    ///
+    /// Each round is one periodic tick clearing an armed-deferred peer's flag
+    /// and the drain that follows it, then the walk falling due. Before the
+    /// bound, every round left one more entry in the queue and it never came
+    /// back down — CPU in the sweep task before memory anywhere.
+    #[test]
+    fn rounds_of_tick_cleared_wakes_do_not_grow_the_queue() {
+        const ROUNDS: usize = 64;
+
+        let mut visits = DrainVisits::new(FLOOR);
+        let mut now = Instant::now();
+        assert_eq!(visits.admit(peer(1), now), Some(peer(1)));
+
+        for round in 0..ROUNDS {
+            // The drain that re-armed after the walk, and the one that re-armed
+            // after a tick cleared the flag underneath the queued walk.
+            assert_eq!(visits.admit(peer(1), now + FLOOR / 4), None);
+            assert_eq!(visits.admit(peer(1), now + FLOOR / 2), None);
+            assert!(
+                visits.queued() <= 1,
+                "round {round}: the queue holds {} entries for one peer",
+                visits.queued()
+            );
+
+            now += FLOOR;
+            assert_eq!(visits.due(now), vec![peer(1)], "round {round}");
+        }
+        assert_eq!(
+            visits.queued(),
+            0,
+            "after the last walk the queue is empty, not {ROUNDS} entries deep"
+        );
+    }
+
+    /// The prune must not orphan a queued walk.
+    ///
+    /// `forget_stale` drops per-peer state whose last walk is older than the
+    /// floor, which is exactly the state that says "this peer already has a walk
+    /// queued". Dropping it lets the next wake walk immediately and queue a
+    /// second entry behind the one still sitting there — the same residue by
+    /// another route.
+    #[test]
+    fn a_queued_walk_survives_the_periodic_prune() {
+        let mut visits = DrainVisits::new(FLOOR);
+        let start = Instant::now();
+        assert_eq!(visits.admit(peer(1), start), Some(peer(1)));
+        assert_eq!(visits.admit(peer(1), start + FLOOR / 2), None);
+
+        // The tick's prune runs while the deferred walk is still queued, at a
+        // point where the peer's last walk is already a floor old.
+        visits.forget_stale(start + FLOOR);
+
+        assert_eq!(
+            visits.admit(peer(1), start + FLOOR),
+            None,
+            "the queued walk is still the authoritative next one"
+        );
+        assert_eq!(
+            visits.queued(),
+            1,
+            "the prune must not have let a second entry in behind the queued one"
+        );
+        assert_eq!(visits.due(start + FLOOR), vec![peer(1)]);
+        assert_eq!(visits.queued(), 0);
+    }
+
+    /// An absurd floor is clamped rather than left to overflow the deadline.
+    ///
+    /// `drain_visit_floor` is an operator-set `Duration` and the deferral
+    /// deadline is `last + floor`, which panics the sweep task on overflow.
+    /// A floor of hours already means "the doorbell is off"; every larger value
+    /// means the same thing, so clamping loses nothing and keeps the arithmetic
+    /// total.
+    #[test]
+    fn an_absurd_floor_is_clamped_rather_than_overflowing_the_deadline() {
+        let mut visits = DrainVisits::new(Duration::MAX);
+        let start = Instant::now();
+        assert_eq!(visits.admit(peer(1), start), Some(peer(1)));
+        assert_eq!(
+            visits.admit(peer(1), start),
+            None,
+            "still inside the floor, so still deferred — and computing when to \
+             is what would have panicked"
+        );
+        assert_eq!(visits.queued(), 1);
     }
 
     #[test]

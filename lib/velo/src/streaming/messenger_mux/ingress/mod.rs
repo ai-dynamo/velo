@@ -76,6 +76,16 @@ pub(crate) struct IngressRegistry {
     peers: DashMap<WorkerId, Mutex<PeerIngress>>,
     /// Per-peer "a credit-return visit is already queued" flags, read and set by
     /// draining pumps without taking the peer mutex. See [`DrainSignal`].
+    ///
+    /// **Grows with distinct peers and is never pruned**, which mirrors `peers`
+    /// above and costs a pointer and a bool per peer this node has ever received
+    /// a slot from. Removing an entry is not a matter of picking a moment: a
+    /// pump holds its peer's flag as an `Arc` for the life of its stream, so a
+    /// removal while any such pump lives leaves that pump setting a flag nothing
+    /// reads — permanently true, permanently coalescing, and that peer's credit
+    /// falls back to the periodic sweep for the rest of the stream. So it may
+    /// only be removed under the same visibility that retires slots and binds,
+    /// and until that is worth building, unbounded-but-tiny is the honest trade.
     drain_pending: DashMap<WorkerId, Arc<AtomicBool>>,
 }
 
