@@ -179,7 +179,9 @@ rebuild.
 
 ## 3. Finding 2 — an unusable-but-well-formed rkey is fatal on IB, recoverable on tcp
 
-`unusable_rkey_fails_cleanly_inside_ucx`, run over IB, **aborts the process**:
+`unusable_rkey_fails_cleanly_inside_ucx` (renamed since this run to
+`unusable_rkey_is_refused_by_ucx_over_tcp`, for the reason below), run over IB,
+**aborts the process**:
 
 ```
 [lego-c2-qs-36:2150764:0:2150910] rc_verbs_impl.h:104  Fatal: receive completion[0] with error on

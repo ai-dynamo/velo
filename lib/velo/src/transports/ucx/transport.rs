@@ -58,10 +58,21 @@ pub struct UcxConfig {
     /// Capacity of the command ring between senders and the progress thread.
     /// The per-peer admission gates queue (and preserve order) beyond it.
     pub channel_capacity: usize,
-    /// Override for `UCX_TLS` (e.g. `"rc_mlx5,ud_mlx5"` or `"tcp"`), applied
-    /// only when the environment does not already set it. Note an RC-only
-    /// list cannot wire up — UCX needs a `ud`-class transport alongside RC
-    /// for wireup/keepalive.
+    /// Override for `UCX_TLS` (e.g. `"rc_verbs,ud_verbs,self"` or `"tcp"`),
+    /// applied only when the environment does not already set it. Note an
+    /// RC-only list cannot wire up — UCX needs a `ud`-class transport alongside
+    /// RC for wireup/keepalive.
+    ///
+    /// **Do not reach for `"rc_mlx5,ud_mlx5"` against the vendored UCX today.**
+    /// The mlx5 transports register but query zero devices, because
+    /// `crates/ucx-rs/build.rs` links `uct_ib_mlx5` ahead of `uct_ib` and the
+    /// verbs memory domain wins the open. UCX answers a setting naming only
+    /// unavailable transports by falling back — silently, as far as a caller
+    /// can tell — so the symptom is a deployment that believes it is on RDMA
+    /// and is not (measured 2026-08-29,
+    /// `agent-docs/2026-08-29-rdma-phase3-hardware-checkpoint.md` §2).
+    /// `UCX_IB_MLX5_DEVX=y` in the environment forces the DEVX domain open and
+    /// is a working workaround until the link order is fixed.
     pub tls: Option<String>,
     /// Override for `UCX_NET_DEVICES` (e.g. `"mlx5_0:1"`), applied only when
     /// the environment does not already set it.

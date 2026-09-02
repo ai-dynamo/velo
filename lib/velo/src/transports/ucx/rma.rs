@@ -532,6 +532,22 @@ pub(crate) fn validate_packed_rkey(packed: &[u8]) -> Result<(), RmaError> {
 /// `sys_dev == UNKNOWN`) are safe against trailing bytes only because UCX itself
 /// stops there. A UCX variant that passed a real length and kept reading would
 /// break that assumption — a version bump has to re-check it.
+///
+/// # This contains framing, not staleness
+///
+/// A *semantically* stale rkey — framing perfect, region long gone — passes
+/// here identically, and on InfiniBand the consequence is not a recoverable
+/// error: the unpack succeeds against a real local memory domain, the GET
+/// posts, and `uct_rc_verbs` escalates the HCA completion error to `ucs_fatal`,
+/// aborting the process. Over `UCX_TLS=tcp` the same blob comes back as an
+/// ordinary `Err`, so no tcp-only test can reach the class (measured
+/// 2026-08-29, `agent-docs/2026-08-29-rdma-phase3-hardware-checkpoint.md` §3).
+///
+/// What keeps that unreachable is D3 — single-use rkeys plus revalidation at
+/// every acquire — not this function. Anything that lets an rkey outlive its
+/// op, a consumer-side rkey cache or an arena reclaimed under a live
+/// descriptor, removes the only guard there is, and this pre-parse is what
+/// stands between a bad descriptor and `ucs_fatal` after that.
 pub(crate) fn preparse_packed_rkey(packed: &[u8]) -> Result<(), RmaError> {
     let bad = || RmaError::InvalidRkey;
 
