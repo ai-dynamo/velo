@@ -384,10 +384,10 @@ it does not list:
 | `shutdown_timeout` | `RdmaConfig` | 30 s | `rdma/mod.rs:72`, default `:83` |
 | `drop_dereg_timeout` | `RdmaConfig` | 30 s | `rdma/mod.rs:75`, default `:84`, used `region.rs:595` |
 | `MIN_LEASE_TIMEOUT` | constant clamp, not configurable | 1 ms | `rendezvous.rs:1049, 1078-1089` |
-| `arena_reclaim_after` | `RdmaPoolConfig` | `None` (off) | Phase 4, PR #69 — not on main |
-| `retain_arena_bytes` | `RdmaPoolConfig` | 64 MiB low-water | Phase 4, PR #69 — not on main |
-| `ep_idle_timeout` | `UcxConfig` / builder | `None`, floored | Phase 4, PR #69 — not on main |
-| `eager_endpoints` | `UcxConfig` / builder | `false` | Phase 4, PR #69 — not on main |
+| `arena_reclaim_after` | `RdmaPoolConfig` | `None` (off) | `rendezvous/rdma/arena.rs:170`, default `:197` |
+| `retain_arena_bytes` | `RdmaPoolConfig` | 64 MiB low-water | `rendezvous/rdma/arena.rs:187`, default `:198` |
+| `ep_idle_timeout` | `UcxConfig` / builder | `None`, floored | `transports/ucx/transport.rs:85`, default `:116`, floor `:106` |
+| `eager_endpoints` | `UcxConfig` / builder | `false` | `transports/ucx/transport.rs:89`, default `:117` |
 
 `MIN_LEASE_TIMEOUT` is a clamp rather than a knob because sub-millisecond
 encodes as `0` on the wire, which the protocol already spells *no deadline*: a
@@ -561,9 +561,10 @@ floor**. The root cause was proven off-hardware afterwards:
 `static=uct_ib`, so ELF constructor order runs `uct_mlx5_init` first, both
 constructors prepend to `uct_ib_ops`, and the verbs memory domain ends up at
 the head — where it opens unconditionally and every mlx5 NIC comes up
-unaccelerated. The fix is open as PR #70 (`ai/ucx-rs-mlx5-link-order`); until
-it lands, `UCX_IB_MLX5_DEVX=y` in the environment is a working runtime
-workaround.
+unaccelerated. **Fixed and merged as PR #70** — `crates/ucx-rs/build.rs:393-394`
+now emits `static=uct_ib` first, and `crates/ucx-rs/tests/ctor_order.rs` fails
+if the two are ever swapped back. For any build predating that merge,
+`UCX_IB_MLX5_DEVX=y` in the environment is a working runtime workaround.
 
 The consequence for this plan is specific, and it is not "re-run for tidiness":
 **`rdma_min_bytes = 64 KiB` must be re-derived on the accelerated lane before
@@ -581,10 +582,8 @@ conservative by accident.
 - Shutdown/teardown interaction tests; soak test (register/transfer/release
   loop asserting stable registered-bytes and EP counts).
 
-Status: written, open as PR #69 (`ai/rdma-phase4-lifecycle`), **not on main**.
-Nothing in this section can be checked against the tree yet, which is why the
-D11 rows for its four knobs carry a PR reference rather than a file anchor.
-Five things about it are worth recording here rather than in the PR:
+Status: **merged as PR #69**; velo is 0.12.0. Five things about it are worth
+recording here rather than leaving in the PR:
 
 - `eager_endpoints` is a Phase-4 addition this plan never anticipated, added
   because of the checkpoint's ~14 ms lazy-wireup finding (report §5).
@@ -668,11 +667,12 @@ ordered against the first anyway. But it means the stack is 1→2→3→4, which
 what the #66→#67→#68→#69 stack reflected. Nobody parallelized, so nothing is
 lost by saying so plainly.
 
-**Phase 5 waited for the checkpoint; the checkpoint has run.** What gates it
-now is not the checkpoint but the mlx5 link-order fix (PR #70) — the two
-optimizations at the end of Phase 5 are explicitly conditioned on measurements,
-and the accelerated lane those measurements have to come from does not exist
-yet. The gate moved; it did not disappear.
+**Phase 5 waited for the checkpoint; the checkpoint has run, and the mlx5
+link-order fix that gated it has merged.** What remains is that the two
+optimizations at the end of Phase 5 are conditioned on measurements nobody has
+taken yet: the accelerated lane now exists in the build, but no hardware run has
+used it. The gate moved from "the fix does not exist" to "the measurement does
+not exist" — a smaller thing, but not nothing.
 
 ---
 
@@ -707,9 +707,10 @@ cache as "just an optimization, gated on a profile" is mispricing it.**
 *verbs-MD* measurement, taken on the build where the mlx5 memory domain never
 opened. An independent probe on a DEVX MD measured 19 B on the same UCX 1.22
 (`docs/proposals/ibverbs-transport.md:919-920`). Raising `rkey_pack_canary`'s
-floor from `>= 9` to `== 20` would pin a number this build produces only
-*because of* the link-order defect. Leave it, re-measure after PR #70, and
-re-check `preparse_packed_rkey`'s assumptions against whatever comes back.
+floor from `>= 9` to `== 20` would pin a number that build produced only
+*because of* the link-order defect. Leave it, re-measure on the first hardware
+run after PR #70, and re-check `preparse_packed_rkey`'s assumptions against
+whatever comes back.
 
 **Note 3 — row 4: keep `rdma_min_bytes` at 64 KiB, but not for the reason we
 expected.** On a warm peer pair RDMA beat chunked at every size down to 4 KiB,
