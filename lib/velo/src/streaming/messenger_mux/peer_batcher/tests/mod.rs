@@ -14,6 +14,12 @@
 //! credit, which the batcher drains in a single wake — the opportunistic policy
 //! taking everything that is *already* queued, exactly as it does under a
 //! forward pass.
+//!
+//! "In a single wake" is a fact these tests establish, not one they assume.
+//! Back-to-back grants are separate writes to the control inbox, and a batcher
+//! scheduled between two of them takes the first on its own; a test that needs
+//! them coalesced holds the loop at [`super::test_hooks::TestHooks`] while it
+//! writes them.
 
 mod clamp;
 mod control;

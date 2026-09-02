@@ -18,50 +18,62 @@ use crate::transports::tcp::framing::COALESCE_THRESHOLD;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn one_batch_carries_records_from_several_slots() {
-    let harness = harness(MuxConfig::default()).await;
+    let hooks = std::sync::Arc::new(super::super::test_hooks::TestHooks::default());
+    let harness =
+        harness_with_hooks(MuxConfig::default(), Some(std::sync::Arc::clone(&hooks))).await;
 
     let mut slots = Vec::new();
     for session in 0..3u64 {
         slots.push(harness.open(1, session).await);
     }
 
-    // Queue on parked slots: with no credit the batcher pulls one record per
-    // slot, withholds it and stops draining. Everything else sits in the inlet.
+    // Queue on parked slots. The inlet is drained unconditionally, so all
+    // twelve records end up in the three withheld queues and the inlets are
+    // left empty — the state the grants below release in one go.
     for (inlet, _) in &slots {
         for n in 0..4u32 {
             inlet.send(item(n)).expect("queue record");
         }
     }
-    eventually(|| harness.try_next_batch().is_none()).await;
+    harness.await_withheld(12).await;
 
-    // One grant per slot, all queued before the batcher can flush the first:
-    // the opportunistic drain takes all three plus every queued record.
-    for (_, id) in &slots {
-        harness.grant(*id, 8);
-    }
+    // One grant per slot, all taken by a single `control.take()`.
+    //
+    // The barrier is what makes that a fact. Without it the three grants are
+    // three separate writes to the control inbox, and a batcher scheduled
+    // between two of them takes one grant, releases that slot's four records
+    // and flushes them on its own — three single-slot batches, and the
+    // bucketing this test is about never happens. Stopping the loop at the
+    // barrier puts every grant in the inbox before the drain that reads it.
+    hooks.pause();
+    harness.grant(slots[0].1, 8);
+    hooks.wait_until_parked().await;
+    harness.grant(slots[1].1, 8);
+    harness.grant(slots[2].1, 8);
+    hooks.release();
 
+    let batch = harness.next_batch().await;
     let mut seen = std::collections::BTreeMap::<u32, usize>::new();
-    let mut multi_slot_batches = 0;
-    while seen.values().sum::<usize>() < 12 {
-        let batch = harness.next_batch().await;
-        if batch.slots().len() > 1 {
-            multi_slot_batches += 1;
-        }
-        for record in &batch.records {
-            if record.kind == RecordType::Data {
-                *seen.entry(record.slot.index()).or_default() += 1;
-            }
+    for record in &batch.records {
+        if record.kind == RecordType::Data {
+            *seen.entry(record.slot.index()).or_default() += 1;
         }
     }
 
-    assert_eq!(seen.len(), 3, "every slot must have been drained");
+    assert_eq!(
+        seen.len(),
+        3,
+        "the point of bucketing by destination is that one batch carries \
+         several streams: {seen:?}"
+    );
+    assert_eq!(
+        seen.values().sum::<usize>(),
+        12,
+        "and that batch must carry every record the grants released: {seen:?}"
+    );
     assert!(
         seen.values().all(|count| *count == 4),
         "records lost or duplicated: {seen:?}"
-    );
-    assert!(
-        multi_slot_batches > 0,
-        "the point of bucketing by destination is that one batch carries several streams"
     );
 }
 
