@@ -854,6 +854,20 @@ impl AnchorManager {
             .map_err(|_| anyhow::anyhow!("a messenger mux is already installed on this manager"))
     }
 
+    /// Take the drain signal the mux parked for a bind, if the mux made it.
+    ///
+    /// `None` for the legacy per-stream transports, which is the honest answer:
+    /// they issue no credit over that seam, so there is nothing to return.
+    pub(crate) fn take_mux_drain_signal(
+        &self,
+        anchor_id: u64,
+        session_id: u64,
+    ) -> Option<Arc<crate::streaming::messenger_mux::ingress::DrainSignal>> {
+        self.mux
+            .get()
+            .and_then(|mux| mux.take_drain_signal(anchor_id, session_id))
+    }
+
     /// Write what the mux's batchers have staged, if a mux is installed.
     ///
     /// A no-op without one, which is the honest answer rather than an error:

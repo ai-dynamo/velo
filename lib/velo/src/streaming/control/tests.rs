@@ -95,8 +95,11 @@ async fn reader_pump_watchdog_firing_increments_counter() {
         frame_tx,
         cancel,
         ctx,
-        999,
-        deadline,
+        PumpContext {
+            local_id: 999,
+            heartbeat_deadline: deadline,
+            drain: None,
+        },
     ));
 
     // 4× deadline of slack so timer scheduling jitter doesn't flake on busy CI.
@@ -177,8 +180,11 @@ async fn reader_pump_watchdog_saturated_channel_drops_sentinel_silently() {
         frame_tx,
         cancel,
         ctx,
-        7777,
-        deadline,
+        PumpContext {
+            local_id: 7777,
+            heartbeat_deadline: deadline,
+            drain: None,
+        },
     ));
 
     let _ = tokio::time::timeout(std::time::Duration::from_millis(800), pump)
@@ -738,8 +744,11 @@ fn make_pump_test_infra() -> (
         frame_tx,
         pump_cancel,
         ctx,
-        local_id,
-        Duration::from_secs(5),
+        PumpContext {
+            local_id,
+            heartbeat_deadline: Duration::from_secs(5),
+            drain: None,
+        },
     ));
 
     (transport_tx, frame_rx, cancel_token, registry, local_id)
@@ -936,8 +945,11 @@ async fn test_child_token_reattach_pump_survives() {
         frame_tx.clone(),
         child1.clone(),
         ctx1,
-        local_id,
-        Duration::from_secs(5),
+        PumpContext {
+            local_id,
+            heartbeat_deadline: Duration::from_secs(5),
+            drain: None,
+        },
     ));
 
     // Send a frame -- pump should forward it
@@ -980,8 +992,11 @@ async fn test_child_token_reattach_pump_survives() {
         frame_tx.clone(),
         child2.clone(),
         ctx2,
-        local_id,
-        Duration::from_secs(5),
+        PumpContext {
+            local_id,
+            heartbeat_deadline: Duration::from_secs(5),
+            drain: None,
+        },
     ));
 
     // Send a frame through the new transport -- pump should forward it

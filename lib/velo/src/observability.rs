@@ -587,6 +587,7 @@ pub(crate) struct MuxMetricsHandle {
     control_refused_total: Counter,
     epoch_deaths_total: Counter,
     batch_seq_gaps_total: Counter,
+    drain_visits_total: Counter,
 }
 
 impl MuxMetricsHandle {
@@ -689,6 +690,13 @@ impl MuxMetricsHandle {
     pub(crate) fn batch_seq_gap(&self, batches: u32) {
         self.batch_seq_gaps_total.inc_by(f64::from(batches));
     }
+
+    /// The sweep task walked one peer's slots because that peer's consumer
+    /// drained. Counted per walk, not per wake: a wake held back by
+    /// `MuxConfig::drain_visit_floor` lands on the walk it coalesced into.
+    pub(crate) fn drain_visit(&self) {
+        self.drain_visits_total.inc();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -743,6 +751,7 @@ pub struct VeloMetrics {
     streaming_mux_control_refused_total: Counter,
     streaming_mux_epoch_deaths_total: Counter,
     streaming_mux_batch_seq_gaps_total: Counter,
+    streaming_mux_drain_visits_total: Counter,
     // Rendezvous metrics
     rendezvous_operations_total: CounterVec,
     rendezvous_operation_duration_seconds: HistogramVec,
@@ -1223,6 +1232,19 @@ impl VeloMetrics {
                  per-slot frame_seq machinery had to recover from.",
             ))?,
         )?;
+        let streaming_mux_drain_visits_total = register_collector(
+            registry,
+            Counter::with_opts(Opts::new(
+                "velo_streaming_mux_drain_visits_total",
+                "Per-peer credit reconciles the sweep task ran because a \
+                 consumer drained, counted once per walk actually performed. \
+                 Wakes deferred by MuxConfig::drain_visit_floor are not counted \
+                 until the walk they coalesced into runs, and the periodic \
+                 sweep's own walks are not counted at all, so this divided by \
+                 elapsed time is the doorbell's real per-peer visit rate and is \
+                 bounded above by 1/drain_visit_floor per peer.",
+            ))?,
+        )?;
 
         // -- Rendezvous metrics --
         let rendezvous_operations_total = register_collector(
@@ -1309,6 +1331,7 @@ impl VeloMetrics {
             streaming_mux_control_refused_total,
             streaming_mux_epoch_deaths_total,
             streaming_mux_batch_seq_gaps_total,
+            streaming_mux_drain_visits_total,
             rendezvous_operations_total,
             rendezvous_operation_duration_seconds,
             rendezvous_bytes_total,
@@ -1479,6 +1502,7 @@ impl VeloMetrics {
             control_refused_total: self.streaming_mux_control_refused_total.clone(),
             epoch_deaths_total: self.streaming_mux_epoch_deaths_total.clone(),
             batch_seq_gaps_total: self.streaming_mux_batch_seq_gaps_total.clone(),
+            drain_visits_total: self.streaming_mux_drain_visits_total.clone(),
         }
     }
 

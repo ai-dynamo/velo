@@ -28,7 +28,9 @@ mod slot;
 #[cfg(test)]
 mod tests;
 
+use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -58,6 +60,9 @@ const MAX_INGRESS_SLOTS_PER_PEER: usize = 1 << 16;
 struct BindEntry {
     /// The mux-owned `C + 1` buffer whose receiver went to the anchor.
     frame_tx: flume::Sender<Vec<u8>>,
+    /// Handed to `reader_pump` at attach; told which peer it belongs to here,
+    /// when an `OpenSlot` claims this bind.
+    drain: Arc<DrainSignal>,
 }
 
 /// Registry of binds and per-peer slot tables.
@@ -69,6 +74,9 @@ pub(crate) struct IngressRegistry {
     /// because the peer's ordering lane is its only writer; the credit sweep is
     /// the sole other visitor.
     peers: DashMap<WorkerId, Mutex<PeerIngress>>,
+    /// Per-peer "a credit-return visit is already queued" flags, read and set by
+    /// draining pumps without taking the peer mutex. See [`DrainSignal`].
+    drain_pending: DashMap<WorkerId, Arc<AtomicBool>>,
 }
 
 /// Receive-side state for one peer.
@@ -115,18 +123,129 @@ struct ApplyCtx<'a> {
     registry: &'a IngressRegistry,
     config: &'a MuxConfig,
     metrics: Option<&'a MuxMetricsHandle>,
+    /// Whose batch this is. Carried so `open_slot` can tell the bind's
+    /// [`DrainSignal`] which peer it turned out to belong to.
+    peer: WorkerId,
+}
+
+/// Told when the consumer takes a record out of the buffer credit is issued
+/// against, so credit can be returned by draining instead of by a timer.
+///
+/// `BATCHING.md` § P8 specifies this: `reader_pump` "gains an
+/// `Option<CreditReturn>` and calls `credit.release(1)` after each successful
+/// handoff to `frame_tx` — exact, O(1), and immediate", leaving the sweep to
+/// reclaim only for slots whose pump died. What shipped instead reconciled
+/// occupancy on a 500 Hz sweep that walks every slot of every ingress peer,
+/// so its cost grows as `O(peers x slots)` while the credit it finds does not.
+///
+/// The signal does not touch the credit ledger itself. Releasing credit needs
+/// the peer's mutex — the same one the inbound batch path takes — and taking it
+/// per record would trade a periodic cost for a worse per-record one. It posts
+/// the peer instead, and the sweep task does the reconcile it already knows how
+/// to do. That turns work proportional to *time × peers* into work a peer only
+/// pays when its consumer drains — bounded above by the drains and below by
+/// [`MuxConfig::drain_visit_floor`](super::MuxConfig::drain_visit_floor), which
+/// is what stops a consumer that keeps up from turning the doorbell into a spin
+/// over that peer's slot table.
+///
+/// The peer is not known when `bind` creates this: a bind belongs to whoever
+/// claims it, and the claim arrives later as an `OpenSlot`. Until then the
+/// signal is inert, which is correct — nothing has been delivered, so nothing
+/// has drained.
+pub(crate) struct DrainSignal {
+    /// Whose bind this turned out to be, and that peer's pending-wake flag.
+    /// Both arrive together when an `OpenSlot` claims the bind.
+    claim: std::sync::OnceLock<(WorkerId, Arc<AtomicBool>)>,
+    wake: flume::Sender<WorkerId>,
+}
+
+impl DrainSignal {
+    pub(crate) fn new(wake: flume::Sender<WorkerId>) -> Self {
+        Self {
+            claim: std::sync::OnceLock::new(),
+            wake,
+        }
+    }
+
+    /// Name the peer this bind turned out to belong to, and hand it that peer's
+    /// pending-wake flag. Called once, when an `OpenSlot` claims the bind.
+    pub(crate) fn claimed_by(&self, peer: WorkerId, pending: Arc<AtomicBool>) {
+        let _ = self.claim.set((peer, pending));
+    }
+
+    /// One record left the buffer.
+    ///
+    /// Coalesced per *peer*, which is the granularity the work happens at: one
+    /// `sweep_peer` reconciles every slot of that peer, so a second wake while
+    /// one is outstanding would buy nothing. The flag makes that exact — the
+    /// first drain posts, the rest are free until the sweep task takes it down.
+    /// The sweep task keeps the flag up while it holds a visit back under
+    /// [`MuxConfig::drain_visit_floor`](super::MuxConfig::drain_visit_floor), so
+    /// the drains arriving during that hold coalesce into the visit it has
+    /// already scheduled.
+    ///
+    /// A per-slot record threshold was the alternative and is worse on both
+    /// counts: it withholds credit for the first `T` records of every slot,
+    /// which is latency on the path this change exists to speed up, and with a
+    /// thousand slots on one peer it still posts a thousand times.
+    ///
+    /// `try_send` rather than an await: this runs on the pump's task, in the
+    /// path of every frame, and must never park it. **A full lane puts the flag
+    /// back down.** Leaving it up would be a claim that a visit is queued when
+    /// none is, and every later drain would coalesce into a wake that was
+    /// dropped — the peer would be stuck on the periodic sweep for the rest of
+    /// the stream. Clearing it costs this one drain its wake and lets the next
+    /// one try again; the periodic sweep is what bounds the gap if no next one
+    /// comes.
+    pub(crate) fn drained(&self) {
+        let Some((peer, pending)) = self.claim.get() else {
+            // Nothing has been delivered on this bind yet, so nothing drained.
+            return;
+        };
+        if pending.swap(true, Ordering::AcqRel) {
+            return; // a wake for this peer is already outstanding
+        }
+        if self.wake.try_send(*peer).is_err() {
+            // Nobody will take the flag down, so let the next drain try again
+            // rather than leaving this peer permanently marked as pending.
+            pending.store(false, Ordering::Release);
+        }
+    }
 }
 
 impl IngressRegistry {
+    /// This peer's pending-wake flag, created on first use.
+    ///
+    /// Lives on the registry rather than in `PeerIngress` so a draining pump
+    /// can reach it without taking the peer mutex — taking that mutex per
+    /// record is the cost this whole change exists to avoid.
+    pub(crate) fn pending_wake(&self, peer: WorkerId) -> Arc<AtomicBool> {
+        Arc::clone(
+            self.drain_pending
+                .entry(peer)
+                .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+                .value(),
+        )
+    }
+
+    /// Take this peer's wake down, so drains landing during the visit post a
+    /// fresh one rather than being swallowed by it.
+    pub(crate) fn clear_pending_wake(&self, peer: WorkerId) {
+        if let Some(flag) = self.drain_pending.get(&peer) {
+            flag.store(false, Ordering::Release);
+        }
+    }
+
     /// Register the buffer a `bind()` created, keyed by `(anchor, session)`.
     pub(crate) fn register_bind(
         &self,
         anchor_id: u64,
         session_id: u64,
         frame_tx: flume::Sender<Vec<u8>>,
+        drain: Arc<DrainSignal>,
     ) {
         self.binds
-            .insert((anchor_id, session_id), BindEntry { frame_tx });
+            .insert((anchor_id, session_id), BindEntry { frame_tx, drain });
     }
 
     /// Drop an unclaimed bind, reporting whether one was there.
@@ -241,6 +360,7 @@ pub(crate) fn handle_batch(
         registry,
         config,
         metrics,
+        peer,
     };
     for decoded in decoder {
         match decoded {
@@ -408,6 +528,12 @@ fn open_slot(
     // again here would hand the sender `2C` against a `C + 1` buffer — the
     // reader stall the credit invariant exists to make impossible. Credit
     // returns from here on are the ordinary reconciliation ones.
+    // The bind now has an owner, so its drain signal can start posting wakes.
+    // Before this point it is inert: nothing has been delivered on this slot,
+    // so nothing can have drained.
+    bind.drain
+        .claimed_by(ctx.peer, ctx.registry.pending_wake(ctx.peer));
+
     let slot = IngressSlot::new(
         id,
         bind.frame_tx,

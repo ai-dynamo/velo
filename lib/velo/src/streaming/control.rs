@@ -287,6 +287,22 @@ pub struct AnchorCancelRequest {
 // Reader pump
 // ---------------------------------------------------------------------------
 
+/// What a reader pump needs beyond its channels.
+///
+/// A struct rather than three more parameters: `mpsc_reader_pump` already
+/// carries a sender id and a registry, and adding the drain hook positionally
+/// would take it past the argument limit — which `CLAUDE.md` says to answer
+/// with a config struct rather than an `allow`.
+pub(crate) struct PumpContext {
+    /// The anchor's local id, for registry removal on heartbeat loss.
+    pub(crate) local_id: u64,
+    /// Negotiated at attach; `DETECTION_MULTIPLIER` misses is a dead stream.
+    pub(crate) heartbeat_deadline: Duration,
+    /// Told when a record leaves the buffer credit is issued against. `None`
+    /// for every transport that does not do flow control over this seam.
+    pub(crate) drain: Option<std::sync::Arc<crate::streaming::messenger_mux::ingress::DrainSignal>>,
+}
+
 /// Reader pump: bridges transport frames to the anchor's delivery channel.
 ///
 /// Spawned as a tokio task after successful attach. Reads from the transport
@@ -300,9 +316,13 @@ pub(crate) async fn reader_pump(
     frame_tx: flume::Sender<Vec<u8>>,
     cancel_token: tokio_util::sync::CancellationToken,
     ctx: crate::streaming::anchor::AnchorContext,
-    local_id: u64,
-    heartbeat_deadline: Duration,
+    pump: PumpContext,
 ) {
+    let PumpContext {
+        local_id,
+        heartbeat_deadline,
+        drain,
+    } = pump;
     let crate::streaming::anchor::AnchorContext {
         registry,
         mpsc_registry,
@@ -336,6 +356,16 @@ pub(crate) async fn reader_pump(
                                 }
                             }
                             Err(flume::TrySendError::Disconnected(_)) => break,
+                        }
+                        // The record is out of the buffer the mux issues credit
+                        // against, so that credit is free. Telling the mux here
+                        // is what lets its sweep interval be a backstop rather
+                        // than the only way credit comes back — see
+                        // `messenger_mux::ingress::DrainSignal`. `None` for
+                        // every transport that does not do flow control over
+                        // this seam, which pays one `Option` check per frame.
+                        if let Some(drain) = drain.as_deref() {
+                            drain.drained();
                         }
                     }
                     Ok(Err(_)) => break, // transport channel closed
@@ -549,13 +579,21 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::messe
 
                             // Spawn reader pump as background task
                             let (_, local_id) = req.handle.unpack();
+                            // Only the mux parks a drain signal, and only for
+                            // the pair it just bound. Every other transport
+                            // returns `None` and the pump's per-frame cost is
+                            // one `Option` check.
+                            let drain = manager.take_mux_drain_signal(local_id, routing_session_id);
                             tokio::spawn(reader_pump(
                                 receiver,      // transport receiver from bind
                                 pump_frame_tx, // cloned from entry
                                 pump_cancel,   // cloned from entry
                                 manager.anchor_context(),
-                                local_id, // anchor's local_id
-                                heartbeat_interval,
+                                PumpContext {
+                                    local_id,
+                                    heartbeat_deadline: heartbeat_interval,
+                                    drain,
+                                },
                             ));
 
                             manager.record_streaming_operation(

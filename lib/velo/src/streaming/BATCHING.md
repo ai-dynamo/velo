@@ -785,6 +785,7 @@ New series, alongside the existing `velo_streaming_*` collectors:
 | `velo_streaming_mux_reader_stall_total` | **Should always be zero.** Non-zero means the credit invariant is broken |
 | `velo_streaming_mux_generation_mismatch_total` | Stale records dropped by the generation check |
 | `velo_streaming_slot_credit_exhausted_total` | Per-slot credit starvation events |
+| `velo_streaming_mux_drain_visits_total` | Per-peer credit reconciles the sweep task ran because a consumer drained, counted per walk. Divided by elapsed time it is the doorbell's visit rate, which `MuxConfig::drain_visit_floor` caps at `1 / floor` per peer; the periodic sweep's own walks are not counted |
 
 > **`frames_written / egress_flushes` is the batching ratio** and the single
 > number that says whether this is working. It is meaningful at any scale, which
@@ -1034,3 +1035,96 @@ The cost of deferring the rest is bounded: out-of-tree `FrameTransport`s get no
 multiplexing for a release or two, and nothing else breaks. Because a receiver
 never offers `messenger-mux-v1` unless the mux is installed and enabled, a
 mux-less deployment degrades correctly by construction.
+
+---
+
+## Addendum, 2026-09-01: credit is returned by draining after all
+
+Superseding, by addition rather than rewrite, the two claims recorded above: that
+"credit is returned by reconciling buffer occupancy, not by `reader_pump`", and
+that doing so has "the same effect" because "the sweep bounds the latency".
+
+The effect was not the same, and the reason is structural. The sweep ran at
+`credit_sweep_interval` — 2 ms — and each tick walked every slot of every ingress
+peer, taking the same per-peer mutex the inbound batch path takes, to find the
+few slots with anything to return. That is work proportional to *peers x slots x
+time*, against credit returns proportional to *drains*. At the shape a
+512-worker deployment presents to each of two frontends — 256 ingress peers —
+the two diverge badly.
+
+**What that costs in CPU is not currently a measured number.** The figures first
+written here came from a rig run on a shared login node, and a paired
+re-measurement showed the machine noise to be as large as the effect. They are
+retracted rather than revised; see the banner in
+`examples/examples/response_plane_bench.evidence.md`. A clean measurement under
+an exclusive allocation is what should replace them.
+
+What does not depend on that measurement: the sweep was the *only* path
+returning credit to a slot whose peer had gone quiet, which is why 2 ms was
+load-bearing rather than a tuning choice, and why the interval could not be
+relaxed before this change. `lib/velo/tests/streaming/mux_credit.rs` pins that
+directly — with the sweep unreachable, a draining consumer's stream died at
+frame 4 of a 4-credit window before the hook and completes after it.
+
+So P8's original instinct — return credit where the record actually leaves the
+buffer — was right, and the deviation was a false economy at scale. What landed
+now differs from the P8 text in two ways, both deliberate:
+
+**The pump rings a doorbell; it does not release credit.** P8 asks
+`reader_pump` for `credit.release(1)` per handoff. It instead posts the *peer* on
+a bounded lane, and the sweep task runs the reconcile it already knew how to run.
+The reason is the surviving sweep: two paths each releasing an amount for the same
+drained record double-count, and `release` clamping per call does not save the
+pair. Reconciliation recomputes residency from scratch and is therefore
+idempotent, so a redundant visit is free and a lost one is only late. The
+invariant this protects is that the account's residency belief must never
+*under*-estimate: understate it and `admit` stops bounding the physical buffer,
+`deliver` overflows a `C + 1` channel, and the slot dies as a protocol error.
+
+**Wakes coalesce per peer, not per record.** A per-peer `AtomicBool` is set by
+the first drain and taken down by the sweep task before it reconciles, so a drain
+landing mid-visit posts a fresh wake rather than being swallowed. Per-record
+posting would have replaced a periodic cost with a worse per-record one; a
+per-slot record threshold — the other candidate — withholds credit for the first
+`T` records of every slot and still posts once per slot per threshold, so it is
+worse on both latency and volume.
+
+**Coalescing bounds the visits above; a floor bounds them below.** Taking the
+wake down before the walk is what stops a mid-walk drain being swallowed, and it
+is also what lets a consumer that keeps up re-arm the flag immediately: the task
+then runs wake → clear → walk every slot → re-armed, back to back, at a rate set
+by the traffic rather than by need. Since each walk holds the same per-peer mutex
+the inbound batch path takes, that is contention on the hot path of the shape
+this mux is for. So `MuxConfig::drain_visit_floor` — **2 ms**, the interval the
+sweep itself used to run at — is a ceiling on how often the doorbell may
+reconcile one peer. A wake arriving inside the floor is neither cleared nor
+walked: it is scheduled for when that peer next comes due, and because the flag
+stays up, the drains until then coalesce into that scheduled visit. No wake is
+lost; one is delayed by at most the floor. `velo_streaming_mux_drain_visits_total`
+counts the walks, so the rate is observable in production, and
+`lib/velo/tests/streaming/mux_credit.rs` pins it: before the floor, a stream
+drained through an 8-record window rang the doorbell 1000 times in ~270 ms —
+roughly seven times what the floor allows — and after it, the same 1000 walks are
+spread across ~3 s.
+
+The floor's own cost is credit latency, and only for a producer already parked
+with nothing arriving to reconcile it on the arrival path: it waits up to one
+floor per window, so `floor / initial_credit` per record. At the default
+256-record window that is under 8 µs a record; the ~3 s above is what the same
+floor costs at a window of 8, which is why the credit tests configure small
+windows on purpose.
+
+Consequently `credit_sweep_interval` now defaults to **200 ms**. `idle_ticks()`
+derives from it, so batcher eviction is unaffected in wall-clock terms: the TTL is
+`ticks × interval` either way.
+
+Both anchor kinds are hooked. MPSC negotiates the mux in the same version as
+SPSC, so `mpsc_reader_pump` carries the same signal; leaving it out would have
+made the relaxed interval a silent hundred-fold regression for MPSC streams.
+
+One claim in P8 above is **still not true of the implementation**, and is left
+standing here rather than quietly corrected because the fix is not part of this
+change: "a background sweep reclaims credit for slots whose pump died". It does
+not, on any interval. `IngressSlot::reconcile` measures against `frame_tx.len()`,
+which stays pinned once the receiver is dropped, so a dead pump's slot is closed
+by the next arrival finding it unknown rather than reclaimed by the sweep.

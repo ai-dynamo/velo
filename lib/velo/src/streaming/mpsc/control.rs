@@ -16,7 +16,6 @@
 //! senders unchanged (they register in the same [`SenderRegistry`]).
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
@@ -111,9 +110,13 @@ pub(crate) async fn mpsc_reader_pump(
     frame_tx: flume::Sender<(u64, Vec<u8>)>,
     cancel_token: CancellationToken,
     mpsc_registry: Arc<DashMap<u64, MpscAnchorEntry>>,
-    local_id: u64,
-    heartbeat_deadline: Duration,
+    pump: crate::streaming::control::PumpContext,
 ) {
+    let crate::streaming::control::PumpContext {
+        local_id,
+        heartbeat_deadline,
+        drain,
+    } = pump;
     let mut missed_heartbeats: u8 = 0;
 
     loop {
@@ -128,6 +131,13 @@ pub(crate) async fn mpsc_reader_pump(
                             || bytes == *crate::streaming::sender::cached_finalized();
                         if frame_tx.send_async((sender_id, bytes)).await.is_err() {
                             break;
+                        }
+                        // MPSC negotiates the mux in the same version as SPSC
+                        // (see `MpscAnchorAttachRequest::supported_transport_keys`),
+                        // so an MPSC stream over the mux needs its credit
+                        // returned by draining for exactly the same reason.
+                        if let Some(drain) = drain.as_deref() {
+                            drain.drained();
                         }
                         if explicit_terminal {
                             if let Some(slot) =
@@ -293,14 +303,18 @@ pub fn create_mpsc_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::
 
                 // Spawn the per-sender pump outside the shard lock.
                 let pump_registry = manager.mpsc_registry.clone();
+                let drain = manager.take_mux_drain_signal(local_id, routing_session_id);
                 tokio::spawn(mpsc_reader_pump(
                     sender_id,
                     transport_rx,
                     frame_tx,
                     pump_cancel,
                     pump_registry,
-                    local_id,
-                    heartbeat_interval,
+                    crate::streaming::control::PumpContext {
+                        local_id,
+                        heartbeat_deadline: heartbeat_interval,
+                        drain,
+                    },
                 ));
 
                 Ok(MpscAnchorAttachResponse::Ok {

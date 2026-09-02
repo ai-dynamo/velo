@@ -70,12 +70,26 @@
 //! credit starvation, which nothing but the consumer can end, that the withheld
 //! queue exists for.
 //!
-//! One deviation from `BATCHING.md` survives: `reader_pump` returns credit by
-//! *reconciliation* — the mux compares the buffer's occupancy against what it
-//! admitted — rather than through the exact `credit.release(1)` hook the
-//! document describes. The effect is the same and the sweep bounds the latency;
-//! what it costs is that a return is one sweep tick late when no further batch
-//! arrives to drive reconciliation on the arrival path.
+//! Credit comes back from three places, and which one gets there first decides
+//! what the sweep interval costs. The arrival path reconciles on every inbound
+//! batch. A draining consumer posts its peer through
+//! [`ingress::DrainSignal`], and the sweep task reconciles that peer alone — no
+//! more often than once per [`MuxConfig::drain_visit_floor`], because clearing
+//! the wake before the walk means a consumer that keeps up re-arms it
+//! immediately and would otherwise have the task spin over its slot table.
+//! The periodic tick is the backstop for what neither reaches — a slot parked
+//! with nothing arriving *and* nothing being taken out — and it carries batcher
+//! eviction.
+//!
+//! The drain path is a doorbell, not a ledger: it carries no quantity, and
+//! `IngressSlot::reconcile` remains the only thing that decides how much credit
+//! was freed. That is what lets it run concurrently with the sweep — a
+//! redundant visit recomputes the same answer, where a delta would double-count.
+//!
+//! It still differs from `BATCHING.md` § P8, which specifies an exact
+//! `credit.release(1)` per handoff. Releasing an amount from the pump is the
+//! part that was not adopted, for the reason above. See the dated addendum at
+//! the end of that document.
 
 pub(crate) mod flow_control;
 pub(crate) mod ingress;
@@ -84,6 +98,8 @@ pub(crate) mod protocol;
 #[cfg(test)]
 mod tests;
 
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
@@ -267,11 +283,58 @@ pub struct MuxConfig {
     pub peer_byte_budget: u64,
     /// How often the credit sweep runs.
     ///
-    /// The arrival path returns credit on every inbound batch, so this only
-    /// matters for a slot that has parked with nothing further arriving to
-    /// trigger reconciliation — where it is the difference between resuming and
-    /// deadlocking, at one interval of added latency.
+    /// A backstop, not the primary mechanism. Credit comes back from the
+    /// arrival path on every inbound batch and from the consumer draining
+    /// (`ingress::DrainSignal`); this covers only what neither reaches — a slot
+    /// parked with nothing further arriving *and* nothing being taken out — and
+    /// carries batcher eviction, whose granularity it also sets.
+    ///
+    /// It was 2 ms when the sweep was the only way credit came back, which is
+    /// what made that interval load-bearing rather than a tuning choice. Every
+    /// tick walks every slot of every ingress peer to find the few with
+    /// anything to do, so the cost grows as `O(peers x slots)` while the useful
+    /// work does not. Now that draining returns credit, the interval only has
+    /// to bound the cases draining cannot reach.
+    ///
+    /// The magnitude of what the old interval cost is not currently a
+    /// measured number: the figures first quoted here were taken on a shared
+    /// login node and are retracted. See the banner in
+    /// `examples/examples/response_plane_bench.evidence.md`.
     pub credit_sweep_interval: Duration,
+    /// Shortest gap between two doorbell-driven reconciles of the *same* peer —
+    /// so a ceiling of `1 / drain_visit_floor` visits per second per peer.
+    ///
+    /// Coalescing alone does not bound this. A visit takes the peer's wake down
+    /// before it walks, because a drain landing mid-walk must be able to post a
+    /// fresh one; on a peer whose consumer is keeping up, the first record
+    /// drained during the walk does exactly that, and the sweep task turns
+    /// wake -> clear -> walk as fast as it can. Each of those walks iterates
+    /// every slot of the peer and holds the mutex the inbound batch path takes,
+    /// so on the shape this mux exists for — one peer, hundreds to thousands of
+    /// slots, a consumer that keeps up — the doorbell becomes hot-path
+    /// contention.
+    ///
+    /// Under the floor a wake arriving too soon is *not* cleared and *not*
+    /// walked: it is scheduled for when the peer next comes due. The flag stays
+    /// armed meanwhile, so every further drain coalesces into that one visit
+    /// rather than queueing another, and no wake is lost — only delayed, by at
+    /// most this long.
+    ///
+    /// The price is latency, and it is worth being exact about who pays it: a
+    /// producer parked out of credit, with no further batch arriving to
+    /// reconcile it on the arrival path, waits up to this long for the return
+    /// its consumer's drain has already earned. That is one wait per window, so
+    /// what it costs per record is `floor / initial_credit` — negligible at the
+    /// default 256-record window, and visible at the small windows the credit
+    /// tests use deliberately.
+    ///
+    /// Defaults to 2 ms, which is the interval the sweep itself ran at while it
+    /// was the only way credit came back. That cadence was enough to keep every
+    /// peer's credit moving then, so it is enough as a per-peer floor now, and
+    /// it is a shipped number rather than a fresh guess. `Duration::ZERO` turns
+    /// the floor off: every wake is walked, which is the behaviour this field
+    /// was added to bound.
+    pub drain_visit_floor: Duration,
     /// How long a batcher may sit idle with no slots before it is evicted.
     pub batcher_idle_ttl: Duration,
     /// When a batcher writes what it has staged.
@@ -289,7 +352,8 @@ impl Default for MuxConfig {
             initial_credit: 256,
             slot_byte_budget: DEFAULT_SLOT_BYTE_BUDGET,
             peer_byte_budget: DEFAULT_PEER_BYTE_BUDGET,
-            credit_sweep_interval: Duration::from_millis(2),
+            credit_sweep_interval: Duration::from_millis(200),
+            drain_visit_floor: Duration::from_millis(2),
             batcher_idle_ttl: Duration::from_secs(60),
             flush_policy: FlushPolicy::Auto(AutoFlush::default()),
         }
@@ -304,6 +368,13 @@ impl MuxConfig {
         u32::try_from(ttl / interval).unwrap_or(u32::MAX).max(1)
     }
 }
+
+/// Peer wakes the drain lane holds before it starts dropping them.
+///
+/// Wakes coalesce naturally — many slots of one peer post the same `WorkerId`,
+/// and one reconcile of that peer serves all of them — so this does not need to
+/// scale with slot count. It needs to absorb a burst across distinct peers.
+const DRAIN_WAKE_CAPACITY: usize = 1024;
 
 /// The `messenger-mux-v1` [`FrameTransport`].
 ///
@@ -336,9 +407,40 @@ struct MuxCore {
     /// batch of the new one as stale and discard it wholesale.
     epochs: Arc<AtomicU64>,
     cancel: CancellationToken,
+    /// Peers with credit to return, posted by draining consumers. See
+    /// [`ingress::DrainSignal`].
+    drain_tx: flume::Sender<WorkerId>,
+    drain_rx: flume::Receiver<WorkerId>,
+    /// Drain signals waiting to be collected by the attach that will spawn the
+    /// pump holding them.
+    ///
+    /// `bind` cannot hand this back directly — `FrameTransport::bind` returns a
+    /// receiver and nothing else, and widening that trait would be a breaking
+    /// change to `velo-ext` for every out-of-tree implementor. So the signal is
+    /// parked here for the attach path to take, which it does a few lines after
+    /// `bind` returns. Take-once: whoever collects it owns it, and the bind
+    /// expiry that already exists drops any that was never collected.
+    drains: DashMap<(u64, u64), Arc<ingress::DrainSignal>>,
 }
 
 impl MessengerMuxTransport {
+    /// Take the [`ingress::DrainSignal`] `bind` parked for this pair.
+    ///
+    /// Called once by the attach path, between `bind` returning and the pump
+    /// being spawned. Returns `None` for a pair this transport did not bind,
+    /// which is the honest answer for the legacy per-stream transports — they
+    /// have no mux credit to return.
+    pub(crate) fn take_drain_signal(
+        &self,
+        anchor_id: u64,
+        session_id: u64,
+    ) -> Option<Arc<ingress::DrainSignal>> {
+        self.core
+            .drains
+            .remove(&(anchor_id, session_id))
+            .map(|(_, signal)| signal)
+    }
+
     /// Build a mux over `messenger` and register its `_stream_batch` handler.
     ///
     /// Registration is for the messenger's lifetime: there is no
@@ -363,6 +465,11 @@ impl MessengerMuxTransport {
             slot_byte_budget: limits.slot_byte_budget(),
             ..config
         };
+        // Bounded, and deliberately lossy on overflow: a wake is a hint that a
+        // peer has credit to return, and a dropped hint costs latency the
+        // periodic sweep still bounds. Sized so a burst across many peers does
+        // not discard wakes it could have kept.
+        let (drain_tx, drain_rx) = flume::bounded::<WorkerId>(DRAIN_WAKE_CAPACITY);
         let core = Arc::new(MuxCore {
             messenger: Arc::clone(&messenger),
             config,
@@ -374,6 +481,9 @@ impl MessengerMuxTransport {
             // zeroed header from reading as a legitimate one.
             epochs: Arc::new(AtomicU64::new(1)),
             cancel: CancellationToken::new(),
+            drain_tx,
+            drain_rx,
+            drains: DashMap::new(),
         });
 
         let handler_core = Arc::downgrade(&core);
@@ -494,14 +604,39 @@ impl MuxCore {
         self.batcher(peer).reply(replies);
     }
 
+    /// Return whatever credit one peer has to return.
+    ///
+    /// The drain-driven path: a consumer took records out of a slot's buffer,
+    /// so that peer — and only that peer — has credit worth reconciling. The
+    /// periodic sweep runs the same body across every peer.
+    fn sweep_peer(&self, peer: WorkerId) {
+        // Taken down before the reconcile, not after: a record drained while
+        // this visit is in progress must be able to post a fresh wake, or its
+        // credit waits for the periodic backstop.
+        self.ingress.clear_pending_wake(peer);
+        let replies = self.ingress.sweep_credit(peer);
+        if !replies.is_empty() {
+            let batcher = self.batcher(peer);
+            self.send_replies(&batcher, peer, &replies);
+        }
+    }
+
+    /// One doorbell-driven visit: reconcile the peer that rang, and count it.
+    ///
+    /// Counted here rather than where the wake is received, so the series
+    /// measures walks and not wakes — a wake the floor deferred is counted once,
+    /// on the visit it coalesced into.
+    fn visit_drained_peer(&self, peer: WorkerId) {
+        if let Some(metrics) = &self.metrics {
+            metrics.drain_visit();
+        }
+        self.sweep_peer(peer);
+    }
+
     /// One sweep tick: return credit, then age out idle batchers.
     fn sweep(&self) {
         for peer in self.ingress.peers() {
-            let replies = self.ingress.sweep_credit(peer);
-            if !replies.is_empty() {
-                let batcher = self.batcher(peer);
-                self.send_replies(&batcher, peer, &replies);
-            }
+            self.sweep_peer(peer);
         }
 
         let threshold = self.config.idle_ticks();
@@ -540,24 +675,182 @@ impl Drop for MuxCore {
     }
 }
 
-/// Spawn the periodic credit-return and eviction sweep.
+/// The per-peer floor on doorbell-driven visits, and the queue it defers into.
+///
+/// Coalescing alone leaves the visit rate a property of the traffic: a visit
+/// takes the peer's wake down before it walks, so the next record drained arms
+/// it again and the sweep task turns wake -> clear -> walk back to back. What
+/// bounds it is this — a peer visited less than [`MuxConfig::drain_visit_floor`]
+/// ago is *not* walked and its wake is *not* cleared. It goes into the deferred
+/// queue instead, and because the flag stays armed, every drain until then
+/// coalesces into that one scheduled visit rather than posting another wake. So
+/// deferral never loses a wake; it delays one by at most the floor.
+struct DrainVisits {
+    floor: Duration,
+    /// When the doorbell last walked each peer.
+    last: HashMap<WorkerId, tokio::time::Instant>,
+    /// Peers whose wake landed inside the floor, ordered by when they come due.
+    deferred: BinaryHeap<Reverse<(tokio::time::Instant, WorkerId)>>,
+}
+
+impl DrainVisits {
+    fn new(floor: Duration) -> Self {
+        Self {
+            floor,
+            last: HashMap::new(),
+            deferred: BinaryHeap::new(),
+        }
+    }
+
+    /// When the next deferred peer comes due, if any is waiting.
+    fn next_due(&self) -> Option<tokio::time::Instant> {
+        self.deferred.peek().map(|Reverse((due, _))| *due)
+    }
+
+    /// Answer a wake: `Some(peer)` to walk it now, `None` when the floor
+    /// deferred it instead.
+    ///
+    /// A peer handed back is stamped here rather than by the caller after the
+    /// walk. The invariant is what makes the floor hold: *everything this
+    /// returns has already been counted as visited*, so two entries falling due
+    /// together cannot both be admitted, and the interval the floor measures is
+    /// walk-start to walk-start — which is what the rate it bounds means.
+    fn admit(&mut self, peer: WorkerId, now: tokio::time::Instant) -> Option<WorkerId> {
+        match self.last.get(&peer) {
+            Some(&last) if now.saturating_duration_since(last) < self.floor => {
+                self.deferred.push(Reverse((last + self.floor, peer)));
+                None
+            }
+            _ => {
+                self.last.insert(peer, now);
+                Some(peer)
+            }
+        }
+    }
+
+    /// Peers whose deferred visit has come due.
+    fn due(&mut self, now: tokio::time::Instant) -> Vec<WorkerId> {
+        let mut ready = Vec::new();
+        while self.next_due().is_some_and(|due| due <= now) {
+            let Reverse((_, peer)) = self.deferred.pop().expect("peeked a moment ago");
+            // Back through `admit` rather than straight onto `ready`: that is
+            // the one place the floor is decided, so a peer already walked since
+            // it was deferred — by an earlier entry in this same batch, or by
+            // the tick clearing its wake mid-defer — is re-deferred instead of
+            // walked twice. The instant it is re-pushed at is strictly later
+            // than `now`, so this terminates.
+            ready.extend(self.admit(peer, now));
+        }
+        ready
+    }
+
+    /// Drop last-visit stamps that can no longer defer anything.
+    ///
+    /// A stamp older than the floor admits the next wake immediately, so
+    /// forgetting it changes no decision. It only keeps this map to the peers
+    /// currently draining rather than to every peer the node has ever received
+    /// from.
+    fn forget_stale(&mut self, now: tokio::time::Instant) {
+        let floor = self.floor;
+        self.last
+            .retain(|_, last| now.saturating_duration_since(*last) < floor);
+    }
+}
+
+/// Park until `due`, or forever when nothing is deferred.
+///
+/// `pending` rather than a zero-length sleep: an empty queue must leave the
+/// timer arm silent, or the loop spins on a deadline that is always in the past
+/// and becomes a worse version of the rate this floor exists to bound.
+async fn deferred_visit_due(due: Option<tokio::time::Instant>) {
+    match due {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Spawn the credit-return and eviction sweep.
+///
+/// Two sources, and which one does the work matters for cost. A draining
+/// consumer posts its peer on the drain lane, and this reconciles **that peer
+/// only** — bounded above by the drains, and bounded below by
+/// [`MuxConfig::drain_visit_floor`], which is what keeps a consumer that keeps
+/// up from turning the doorbell into a spin over the peer's slot table. The
+/// ticker is the backstop for what draining cannot reach: a slot parked with
+/// nothing further arriving and no consumer taking anything out, and batcher
+/// eviction, which free-rides on the same tick.
+///
+/// Before this, the ticker was the only source and ran at 500 Hz, walking every
+/// slot of every peer to find the few with credit to return — work that scales
+/// with peers and slots while the credit actually returned does not.
+///
+/// A tick does not stamp the peers it swept as visited. It could, and the cost
+/// of not doing it is at most one extra doorbell walk per peer per tick period —
+/// against a default interval a hundred times the floor, that is noise, and it
+/// keeps the periodic path from having to report which peers it touched.
 fn spawn_sweep(core: &Arc<MuxCore>) {
     let weak = Arc::downgrade(core);
     let cancel = core.cancel.clone();
     let interval = core.config.credit_sweep_interval;
+    let floor = core.config.drain_visit_floor;
+    let drain_rx = core.drain_rx.clone();
     tokio::spawn(async move {
+        enum Wake {
+            Tick,
+            Peer(WorkerId),
+            Due,
+        }
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut visits = DrainVisits::new(floor);
         loop {
-            tokio::select! {
+            // `biased` puts cancellation first, so teardown is never starved
+            // by a busy lane. The remaining arms are deliberately *not* biased
+            // against each other: an earlier version polled the ticker first,
+            // which at a short interval left it almost always ready and starved
+            // the drain arm — the event-driven path barely ran, and the periodic
+            // walk did the work it was meant to replace. The deferred-visit
+            // timer joins them on the same footing for the same reason.
+            let deferred_until = visits.next_due();
+            let wake = tokio::select! {
                 biased;
                 () = cancel.cancelled() => return,
-                _ = ticker.tick() => {}
-            }
+                wake = async {
+                    tokio::select! {
+                        _ = ticker.tick() => Wake::Tick,
+                        () = deferred_visit_due(deferred_until) => Wake::Due,
+                        drained = drain_rx.recv_async() => match drained {
+                            Ok(peer) => Wake::Peer(peer),
+                            // Every sender is gone with the transport. Fall back
+                            // to ticking so eviction still runs.
+                            Err(_) => {
+                                ticker.tick().await;
+                                Wake::Tick
+                            }
+                        },
+                    }
+                } => wake,
+            };
             let Some(core) = weak.upgrade() else {
                 return;
             };
-            core.sweep();
+            let now = tokio::time::Instant::now();
+            match wake {
+                Wake::Tick => {
+                    core.sweep();
+                    visits.forget_stale(now);
+                }
+                Wake::Peer(peer) => {
+                    if let Some(peer) = visits.admit(peer, now) {
+                        core.visit_drained_peer(peer);
+                    }
+                }
+                Wake::Due => {
+                    for peer in visits.due(now) {
+                        core.visit_drained_peer(peer);
+                    }
+                }
+            }
         }
     });
 }
@@ -585,7 +878,11 @@ impl FrameTransport for MessengerMuxTransport {
             // Credit is issued against *this* buffer and never against the
             // anchor's `frame_tx`, which has writers other than the mux.
             let (frame_tx, frame_rx) = flume::bounded::<Vec<u8>>(core.limits.slot_buffer_depth());
-            core.ingress.register_bind(anchor_id, session_id, frame_tx);
+            let drain = Arc::new(ingress::DrainSignal::new(core.drain_tx.clone()));
+            core.drains
+                .insert((anchor_id, session_id), Arc::clone(&drain));
+            core.ingress
+                .register_bind(anchor_id, session_id, frame_tx, drain);
 
             // `Weak`, and cancellable. A strong handle here would pin the whole
             // transport alive for the full accept window after the last owner
@@ -602,6 +899,11 @@ impl FrameTransport for MessengerMuxTransport {
                 let Some(core) = expiry.upgrade() else {
                     return;
                 };
+                // Whether or not the bind was still there, drop any drain
+                // signal no attach collected. Without this an attach that
+                // failed between `bind` and `take_drain_signal` would leak one
+                // entry per attempt for the process's life.
+                core.drains.remove(&(anchor_id, session_id));
                 if core.ingress.expire_bind(anchor_id, session_id) {
                     tracing::warn!(
                         anchor_id,

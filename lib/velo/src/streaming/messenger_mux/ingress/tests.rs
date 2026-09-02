@@ -14,6 +14,14 @@ use super::*;
 use crate::streaming::messenger_mux::protocol::{BatchEncoder, RecordType, SlotId};
 use crate::streaming::sender::{cached_dropped, cached_finalized};
 
+/// A drain signal whose wakes go nowhere, for tests that drive the registry
+/// directly. The claim path still runs, so `open_slot` naming the peer is
+/// covered; nothing consumes the lane because these tests have no sweep task.
+fn test_drain() -> Arc<DrainSignal> {
+    let (tx, _rx) = flume::bounded(16);
+    Arc::new(DrainSignal::new(tx))
+}
+
 const PEER: u64 = 0xABCD;
 const ANCHOR: u64 = 7;
 const SESSION: u64 = 11;
@@ -53,7 +61,7 @@ fn bound() -> (IngressRegistry, flume::Receiver<Vec<u8>>, MuxConfig) {
     let (tx, rx) = flume::bounded(
         crate::streaming::messenger_mux::flow_control::slot_buffer_depth(config.initial_credit),
     );
-    registry.register_bind(ANCHOR, SESSION, tx);
+    registry.register_bind(ANCHOR, SESSION, tx, test_drain());
     (registry, rx, config)
 }
 
@@ -134,10 +142,10 @@ fn a_colliding_open_slot_is_rejected_and_the_incumbent_survives() {
     let depth =
         crate::streaming::messenger_mux::flow_control::slot_buffer_depth(config.initial_credit);
     let (incumbent_tx, incumbent_rx) = flume::bounded(depth);
-    registry.register_bind(ANCHOR, SESSION, incumbent_tx);
+    registry.register_bind(ANCHOR, SESSION, incumbent_tx, test_drain());
     // A second bind, for the collider to try to claim.
     let (rival_tx, rival_rx) = flume::bounded(depth);
-    registry.register_bind(ANCHOR, SESSION + 1, rival_tx);
+    registry.register_bind(ANCHOR, SESSION + 1, rival_tx, test_drain());
 
     let incumbent = slot(0, 0);
     open(&registry, &config, incumbent, 1);
@@ -225,8 +233,8 @@ fn a_duplicate_open_retires_the_incumbent_through_the_ordinary_close() {
         crate::streaming::messenger_mux::flow_control::slot_buffer_depth(config.initial_credit);
     let (first_tx, first_rx) = flume::bounded(depth);
     let (second_tx, second_rx) = flume::bounded(depth);
-    registry.register_bind(ANCHOR, SESSION, first_tx);
-    registry.register_bind(ANCHOR, SESSION + 1, second_tx);
+    registry.register_bind(ANCHOR, SESSION, first_tx, test_drain());
+    registry.register_bind(ANCHOR, SESSION + 1, second_tx, test_drain());
 
     let id = slot(0, 0);
     open(&registry, &config, id, 1);
@@ -360,8 +368,8 @@ fn hold_overflow_closes_that_slot_and_leaves_the_others_alone() {
         crate::streaming::messenger_mux::flow_control::slot_buffer_depth(config.initial_credit);
     let (tx_a, rx_a) = flume::bounded(depth);
     let (tx_b, rx_b) = flume::bounded(depth);
-    registry.register_bind(ANCHOR, SESSION, tx_a);
-    registry.register_bind(ANCHOR, SESSION + 1, tx_b);
+    registry.register_bind(ANCHOR, SESSION, tx_a, test_drain());
+    registry.register_bind(ANCHOR, SESSION + 1, tx_b, test_drain());
 
     let a = slot(0, 0);
     let b = slot(1, 0);
@@ -536,7 +544,7 @@ fn a_terminal_gets_through_after_the_data_credit_is_spent() {
     let (tx, rx) = flume::bounded(
         crate::streaming::messenger_mux::flow_control::slot_buffer_depth(config.initial_credit),
     );
-    registry.register_bind(ANCHOR, SESSION, tx);
+    registry.register_bind(ANCHOR, SESSION, tx, test_drain());
     let id = slot(0, 0);
     open(&registry, &config, id, 1);
 
@@ -657,7 +665,7 @@ fn credit_is_withheld_while_the_slot_is_over_its_byte_watermark() {
     let (tx, rx) = flume::bounded(
         crate::streaming::messenger_mux::flow_control::slot_buffer_depth(config.initial_credit),
     );
-    registry.register_bind(ANCHOR, SESSION, tx);
+    registry.register_bind(ANCHOR, SESSION, tx, test_drain());
     let id = slot(0, 0);
     open(&registry, &config, id, 1);
 

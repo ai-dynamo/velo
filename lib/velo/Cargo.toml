@@ -170,6 +170,11 @@ path = "tests/streaming/mux_negotiation/mod.rs"
 required-features = ["test-helpers"]
 
 [[test]]
+name = "streaming_mux_credit"
+path = "tests/streaming/mux_credit.rs"
+required-features = ["test-helpers"]
+
+[[test]]
 name = "streaming_mux_flush"
 path = "tests/streaming/mux_flush.rs"
 required-features = ["test-helpers"]

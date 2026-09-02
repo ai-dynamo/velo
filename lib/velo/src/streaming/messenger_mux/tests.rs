@@ -619,3 +619,182 @@ async fn one_flush_reaches_every_peer_batcher() {
         "one flush, one batch per peer — not one per slot and not only the first peer"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The doorbell's per-peer floor
+// ---------------------------------------------------------------------------
+
+/// The scheduling half of the floor, taken away from the runtime.
+///
+/// `mux_credit.rs` observes the rate over a real pair of nodes, which is the
+/// claim that matters and also the slower, noisier way to find out that a
+/// boundary case is wrong. These pin the boundary itself: what `admit` does on
+/// each side of the floor, that a deferred peer is handed back exactly once,
+/// and that the re-check inside `due` cannot spin.
+mod drain_visit_floor {
+    use super::super::DrainVisits;
+    use std::time::Duration;
+    use tokio::time::Instant;
+    use velo_ext::WorkerId;
+
+    const FLOOR: Duration = Duration::from_millis(2);
+
+    fn peer(id: u64) -> WorkerId {
+        WorkerId::from_u64(id)
+    }
+
+    #[test]
+    fn a_first_wake_is_walked_immediately() {
+        let mut visits = DrainVisits::new(FLOOR);
+        let now = Instant::now();
+        assert_eq!(
+            visits.admit(peer(1), now),
+            Some(peer(1)),
+            "a peer with no visit behind it has nothing to wait for"
+        );
+        assert!(
+            visits.next_due().is_none(),
+            "an admitted wake is walked, not queued"
+        );
+    }
+
+    #[test]
+    fn a_wake_inside_the_floor_is_deferred_to_the_floor() {
+        let mut visits = DrainVisits::new(FLOOR);
+        let start = Instant::now();
+        assert_eq!(visits.admit(peer(1), start), Some(peer(1)));
+
+        assert_eq!(
+            visits.admit(peer(1), start + FLOOR / 2),
+            None,
+            "the floor has not elapsed, so this wake must not walk"
+        );
+        assert_eq!(
+            visits.next_due(),
+            Some(start + FLOOR),
+            "the deferred visit is due one floor after the last walk, not one floor from now — \
+             the second form would let a stream of wakes push it out indefinitely"
+        );
+    }
+
+    #[test]
+    fn a_wake_past_the_floor_is_walked_immediately() {
+        let mut visits = DrainVisits::new(FLOOR);
+        let start = Instant::now();
+        assert_eq!(visits.admit(peer(1), start), Some(peer(1)));
+        assert_eq!(
+            visits.admit(peer(1), start + FLOOR),
+            Some(peer(1)),
+            "exactly one floor later is late enough: the ceiling is one visit per floor"
+        );
+    }
+
+    #[test]
+    fn a_deferred_peer_comes_back_once_when_due() {
+        let mut visits = DrainVisits::new(FLOOR);
+        let start = Instant::now();
+        assert_eq!(visits.admit(peer(1), start), Some(peer(1)));
+        assert_eq!(visits.admit(peer(1), start + FLOOR / 2), None);
+
+        assert!(
+            visits.due(start + FLOOR / 2).is_empty(),
+            "nothing is due before the floor elapses"
+        );
+        assert_eq!(
+            visits.due(start + FLOOR),
+            vec![peer(1)],
+            "the deferred visit comes back exactly once"
+        );
+        assert!(
+            visits.next_due().is_none(),
+            "and is not left in the queue behind it"
+        );
+    }
+
+    /// A peer walked between being deferred and coming due is re-deferred, not
+    /// walked again on the spot — the floor is decided in one place, so nothing
+    /// reaches `due` that could beat it.
+    #[test]
+    fn a_peer_walked_since_being_deferred_is_re_deferred() {
+        let mut visits = DrainVisits::new(FLOOR);
+        let start = Instant::now();
+        assert_eq!(visits.admit(peer(1), start), Some(peer(1)));
+        assert_eq!(visits.admit(peer(1), start + FLOOR / 2), None);
+
+        // A wake past the floor walked it again just before it fell due.
+        let walked = start + FLOOR;
+        assert_eq!(visits.admit(peer(1), walked), Some(peer(1)));
+
+        assert!(
+            visits.due(walked).is_empty(),
+            "its floor restarted at the later walk"
+        );
+        assert_eq!(
+            visits.next_due(),
+            Some(walked + FLOOR),
+            "and it is queued again rather than dropped, so its wake is not lost"
+        );
+    }
+
+    /// Two deferrals of one peer still buy it one walk when they come due.
+    ///
+    /// Reachable: the periodic tick calls `sweep_peer` on every peer, including
+    /// one already sitting in the deferred queue, and that clears its wake. The
+    /// next drain posts again, `admit` defers again, and the peer is queued
+    /// twice. Both entries fall due together, and if the floor were only
+    /// consulted against a stamp written after the whole batch was collected,
+    /// both would be handed back — one walk past what the floor allows, at the
+    /// same instant.
+    #[test]
+    fn a_peer_deferred_twice_is_walked_once() {
+        let mut visits = DrainVisits::new(FLOOR);
+        let start = Instant::now();
+        assert_eq!(visits.admit(peer(1), start), Some(peer(1)));
+        assert_eq!(visits.admit(peer(1), start + FLOOR / 4), None);
+        assert_eq!(visits.admit(peer(1), start + FLOOR / 2), None);
+
+        assert_eq!(
+            visits.due(start + FLOOR),
+            vec![peer(1)],
+            "the second entry must be re-deferred, not walked alongside the first"
+        );
+        assert_eq!(
+            visits.next_due(),
+            Some(start + 2 * FLOOR),
+            "and it waits a further floor from the walk it just missed"
+        );
+    }
+
+    #[test]
+    fn peers_are_independent() {
+        let mut visits = DrainVisits::new(FLOOR);
+        let start = Instant::now();
+        assert_eq!(visits.admit(peer(1), start), Some(peer(1)));
+        assert_eq!(
+            visits.admit(peer(2), start),
+            Some(peer(2)),
+            "one peer's floor must not hold back another's — the walk is per peer"
+        );
+    }
+
+    /// The map holds the peers currently draining, not every peer ever seen.
+    #[test]
+    fn stale_stamps_are_forgotten_and_change_no_decision() {
+        let mut visits = DrainVisits::new(FLOOR);
+        let start = Instant::now();
+        assert_eq!(visits.admit(peer(1), start), Some(peer(1)));
+        assert_eq!(visits.admit(peer(2), start + FLOOR), Some(peer(2)));
+
+        visits.forget_stale(start + FLOOR);
+        assert_eq!(
+            visits.admit(peer(1), start + FLOOR),
+            Some(peer(1)),
+            "the forgotten stamp was already past the floor, so the answer is unchanged"
+        );
+        assert_eq!(
+            visits.admit(peer(2), start + FLOOR),
+            None,
+            "a stamp still inside the floor is kept"
+        );
+    }
+}
