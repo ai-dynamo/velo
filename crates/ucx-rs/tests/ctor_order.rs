@@ -28,6 +28,10 @@
 use std::ffi::{CStr, c_char, c_void};
 
 /// `ucs_list_link_t` — `src/ucs/datastruct/list.h:32`.
+///
+/// A verbatim mirror of the C type, so the field names match the ones upstream
+/// uses and a reader can compare the two side by side. Only `next` is read;
+/// the rest are here to place it at the right offset.
 #[repr(C)]
 struct UcsListLink {
     prev: *mut UcsListLink,
@@ -36,6 +40,8 @@ struct UcsListLink {
 
 /// `uct_ib_md_ops_entry_t` — `src/uct/ib/base/ib_md.h:250`. The list link
 /// leads the struct, so a node pointer is also an entry pointer.
+///
+/// Same as above: names mirror the C struct, and only `name` is read.
 #[repr(C)]
 struct IbMdOpsEntry {
     list: UcsListLink,
