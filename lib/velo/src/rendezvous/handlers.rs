@@ -131,7 +131,13 @@ fn rdma_response(
         return decline(RdmaPathReason::NoOffer);
     };
     let Some(rdma) = store.rdma() else {
-        return decline(RdmaPathReason::NotPinned);
+        // No registry at all: a `ucx` build whose instance never got
+        // `add_ucx_transport`. That is a transport-configuration fact, not a
+        // staging one, and `NotPinned` below means something else entirely —
+        // the slot exists and is heap-staged. The consumer records
+        // `NotConfigured` for this same condition, so labelling it anything
+        // else makes the two sides disagree about one fact.
+        return decline(RdmaPathReason::NotConfigured);
     };
     if !rdma.config.enabled {
         return decline(RdmaPathReason::KillSwitch);

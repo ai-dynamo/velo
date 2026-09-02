@@ -685,6 +685,7 @@ impl RdmaRegistry {
     }
 
     /// Transfers still outstanding in the pool's arenas.
+    #[cfg(feature = "test-helpers")]
     pub(crate) fn in_flight_transfers(&self) -> usize {
         self.pool.in_flight_transfers()
     }

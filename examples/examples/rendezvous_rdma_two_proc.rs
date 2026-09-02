@@ -361,9 +361,16 @@ fn fresh_dir(base: &Path) -> Result<PathBuf> {
 
 /// Every byte depends on its offset, so a transfer that lands shifted, short or
 /// duplicated fails the check rather than passing on a lucky pattern.
+///
+/// Two coprime periods, neither of them a factor of any chunk size in play.
+/// The arithmetic form this replaced — `i * 31 + i / 256` — looks
+/// position-dependent but repeats exactly every 512 KiB, which is the default
+/// chunk size: a payload landing one chunk out was byte-identical, and the
+/// check below passed on the coincidence. The test suites already carry the
+/// coprime form for this reason; the example did not.
 fn pattern(len: usize) -> Vec<u8> {
     (0..len)
-        .map(|i| (i.wrapping_mul(31).wrapping_add(i >> 8)) as u8)
+        .map(|i| ((i % 251) ^ ((i / 251) % 257)) as u8)
         .collect()
 }
 

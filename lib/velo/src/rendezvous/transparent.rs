@@ -22,9 +22,13 @@ use crate::RendezvousManager;
 /// Default threshold for auto-staging large payloads (256 KiB).
 ///
 /// Sits inside D11's ordering invariant, `rdma_min_bytes <= this <
-/// DEFAULT_CHUNK_SIZE` (64 KiB, 256 KiB, 512 KiB): everything staged here is
-/// already large enough for the RDMA path, and small enough that the chunked
-/// fallback is one or two pulls.
+/// DEFAULT_CHUNK_SIZE` (64 KiB, 256 KiB, 512 KiB at their defaults), so a
+/// payload that crosses this threshold is already large enough for the RDMA
+/// path. At the default chunk size a payload at the threshold is one pull;
+/// both the threshold and the chunk size are configurable, so that is a
+/// property of the defaults and not a guarantee — a smaller configured chunk
+/// size costs proportionally more pulls, and payloads far above the threshold
+/// take as many as their size requires.
 pub const DEFAULT_THRESHOLD: usize = 256 * 1024;
 
 /// Sender-side: stages large payloads locally via the [`RendezvousManager`].

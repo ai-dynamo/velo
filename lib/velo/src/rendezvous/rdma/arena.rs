@@ -1118,7 +1118,9 @@ impl ArenaSet {
     /// This is what shutdown drains on, so it is also the only honest way for a
     /// test to know a transfer is genuinely in flight rather than merely
     /// requested — the caller's future being slow proves nothing about whether
-    /// the backend was ever handed the op.
+    /// the backend was ever handed the op. Shutdown reads each arena's counter
+    /// directly, so this rollup exists only for the observer.
+    #[cfg(feature = "test-helpers")]
     pub(crate) fn in_flight_transfers(&self) -> usize {
         self.arenas.read().iter().map(|a| a.in_flight()).sum()
     }
