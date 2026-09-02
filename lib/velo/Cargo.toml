@@ -136,13 +136,27 @@ path = "tests/discovery/nats_discovery.rs"
 required-features = ["nats-discovery"]
 
 [[test]]
+name = "queue_memory_manual_ack"
+path = "tests/queue/memory_manual_ack.rs"
+
+[[test]]
 name = "queue_messenger"
 path = "tests/queue/messenger_integration.rs"
 required-features = ["queue-messenger"]
 
 [[test]]
+name = "queue_messenger_manual_ack"
+path = "tests/queue/messenger_manual_ack.rs"
+required-features = ["queue-messenger"]
+
+[[test]]
 name = "queue_nats"
 path = "tests/queue/nats_integration.rs"
+required-features = ["nats-queue"]
+
+[[test]]
+name = "queue_nats_manual_ack"
+path = "tests/queue/nats_manual_ack.rs"
 required-features = ["nats-queue"]
 
 [[test]]
