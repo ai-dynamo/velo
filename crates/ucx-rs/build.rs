@@ -256,6 +256,24 @@ fn build_vendored(out: &Path, want_ib: bool, want_rdmacm: bool) -> PathBuf {
         cross_env.push(("CC", cc));
     }
     if let Ok(extra) = env::var("UCX_EXTRA_CONFIGURE") {
+        // Extras land after the arguments above, and configure takes the last
+        // occurrence of an option — so an extra that turns DEVX back off would
+        // silently undo the `--with-devx` this crate depends on and produce
+        // exactly the verbs-only build that guard exists to prevent. Refuse
+        // instead of quietly honouring one of two contradictory instructions.
+        // A path-bearing `--with-devx=/somewhere` still selects DEVX, so it is
+        // allowed through.
+        for arg in extra.split_whitespace() {
+            let disables_devx =
+                arg == "--without-devx" || arg == "--with-devx=no" || arg == "--with-devx=check";
+            assert!(
+                !disables_devx,
+                "UCX_EXTRA_CONFIGURE contains `{arg}`, which would disable or make optional \
+                 the DEVX support this crate requires for the mlx5 memory domain. Building \
+                 without it yields a UCX whose mlx5 transports report no devices. Drop that \
+                 option, or build against a system UCX with UCX_DIR."
+            );
+        }
         args.extend(extra.split_whitespace().map(str::to_owned));
     }
 

@@ -108,4 +108,19 @@ fn verbs_md_is_not_at_the_head_of_uct_ib_ops() {
          uct_ib_ops and wins every open — mlx5 NICs will expose no rc_mlx5/dc_mlx5/ud_mlx5. \
          Emit uct_ib before uct_ib_mlx5 in build.rs. list = {names:?}"
     );
+    // The DEVX domain specifically, not merely "something that is not verbs".
+    // `uct_mlx5_init` registers `dv` and then `devx`, both onto the head, so on
+    // a DEVX build the accelerated domain is what a correct order leaves in
+    // front. Accepting the plain `uct_ib_mlx5_md_ops` here would let a build
+    // that quietly lost DEVX pass while still answering "not verbs" — which is
+    // the same silent degradation in a different place. Comparing the name as a
+    // string keeps this free at link time: nothing here references a symbol
+    // that only exists under `HAVE_DEVX`.
+    assert_eq!(
+        names[0].as_str(),
+        "uct_ib_mlx5_devx_md_ops",
+        "the head of uct_ib_ops is not the DEVX memory domain, so this build lost DEVX \
+         even though build.rs asks for it. Check that nothing in UCX_EXTRA_CONFIGURE \
+         disabled it. list = {names:?}"
+    );
 }
