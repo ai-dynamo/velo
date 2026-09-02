@@ -52,16 +52,59 @@ if ! cargo-semver-checks --version 2>/dev/null | grep -qF "$SEMVER_CHECKS_VERSIO
 fi
 
 # ── Check each changed crate individually ────────────────────────────────────
+
+# A crate's own Cargo.toml pins its version either literally
+# (`version = "X.Y.Z"`) or by inheriting the workspace root's
+# (`version.workspace = true` — velo's form since the workspace collapse
+# folded per-crate versioning into [workspace.package]). Resolve the
+# inherited form here so every caller below only ever sees an X.Y.Z string.
+extract_workspace_version() {
+    local manifest_text="$1"
+    # Scope to the [workspace.package] section by name rather than grepping
+    # the first `^version` line in the whole file: a root manifest is free to
+    # carry other `[section]` stanzas with their own `version = ...` line
+    # above it, and nothing enforces section order.
+    printf '%s\n' "$manifest_text" | awk '
+        /^\[/ { in_section = ($0 == "[workspace.package]") }
+        in_section && /^version[[:space:]]*=/ { print; exit }
+    '
+}
+
 extract_crate_version() {
     local crate_name="$1"
     local source="$2"
     local crate_dir="${crate_dirs[$crate_name]}"
+    local crate_manifest raw
+
     if [[ "$source" == "HEAD" ]]; then
-        grep '^version' "${crate_dir}/Cargo.toml" | head -1 | sed 's/.*"\(.*\)".*/\1/'
+        crate_manifest=$(cat "${crate_dir}/Cargo.toml" 2>/dev/null) || crate_manifest=""
     else
-        git show "${source}:${crate_dir}/Cargo.toml" 2>/dev/null \
-            | grep '^version' | head -1 | sed 's/.*"\(.*\)".*/\1/'
+        crate_manifest=$(git show "${source}:${crate_dir}/Cargo.toml" 2>/dev/null) || crate_manifest=""
     fi
+
+    raw=$(printf '%s\n' "$crate_manifest" | grep -m1 '^version') || raw=""
+
+    if printf '%s' "$raw" | grep -q 'workspace[[:space:]]*=[[:space:]]*true'; then
+        # Inherited version: the real value lives in [workspace.package] in
+        # the ROOT manifest. Read that root manifest from the SAME source
+        # (HEAD vs BASE_REF) as the crate manifest above — reading the
+        # baseline crate's inherited version out of the worktree's root
+        # Cargo.toml would compare the PR's own baseline version against
+        # itself instead of against what BASE_REF actually pinned.
+        local root_manifest
+        if [[ "$source" == "HEAD" ]]; then
+            root_manifest=$(cat Cargo.toml 2>/dev/null) || root_manifest=""
+        else
+            root_manifest=$(git show "${source}:Cargo.toml" 2>/dev/null) || root_manifest=""
+        fi
+        raw=$(extract_workspace_version "$root_manifest") || raw=""
+    fi
+
+    # -n ... p: print ONLY on a successful substitution. A plain `sed 's/.../'`
+    # prints the input unchanged when the pattern does not match, which is
+    # what let `version.workspace = true` pass straight through as if it were
+    # a version string in the first place — the actual root cause here.
+    printf '%s\n' "$raw" | sed -n 's/.*"\(.*\)".*/\1/p'
 }
 
 parse_version() {
@@ -137,8 +180,20 @@ for crate_name in "${changed_crates[@]}"; do
     base_version=$(extract_crate_version "$crate_name" "${BASE_REF}")
     pr_version=$(extract_crate_version "$crate_name" "HEAD")
 
-    if [[ -z "$base_version" || -z "$pr_version" ]]; then
-        echo "::error::Could not parse version for ${crate_name}"
+    # crates/ucx-rs pins "0.1.0+ucx.1.22.0". Build metadata records which UCX
+    # release is vendored and takes no part in precedence (semver 2.0 s10), so
+    # strip it before comparing. Rejecting it outright would make every future
+    # ucx-rs breaking change unsatisfiable — there is no version that both
+    # names the vendored UCX and passes the gate.
+    base_version="${base_version%%+*}"
+    pr_version="${pr_version%%+*}"
+
+    # What survives must be a plain X.Y.Z: that is the only shape
+    # check_bump_sufficient's arithmetic can compare. An empty string (the old
+    # crash trigger) and a pre-release suffix both fail here, loudly and
+    # closed, rather than reaching `-gt` and aborting the shell mid-run.
+    if [[ ! "$base_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || [[ ! "$pr_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "::error::Could not parse version for ${crate_name} (base='${base_version}' pr='${pr_version}')"
         exit 1
     fi
 
