@@ -72,8 +72,7 @@ pub(crate) struct RegionInner {
     /// The length the caller asked to register.
     pub(super) len: usize,
     /// Packed key covering the region. Read by `RegionGuard::remote`, which
-    /// Phase 3 turns into the wire descriptor.
-    #[allow(dead_code)]
+    /// becomes the wire descriptor of an anchor staged inside it.
     pub(super) packed_key: Bytes,
     /// Start of the range the backend actually pinned. Reported, never used for
     /// offset arithmetic: the backend rounds outward to page boundaries, so it
@@ -81,8 +80,8 @@ pub(crate) struct RegionInner {
     pub(super) effective_addr: u64,
     /// Length of the pinned range.
     pub(super) effective_len: u64,
-    /// In-flight operations against this region. Phase 3 acquires a guard per
-    /// RDMA lease; here the counter exists and `unregister` drains it.
+    /// In-flight operations against this region: one guard per staged anchor,
+    /// which `unregister` drains before it unmaps.
     ///
     /// Reused verbatim from `velo_ext` rather than hand-rolled: the SeqCst plus
     /// register-notified-first discipline in there has been paid for twice
@@ -90,6 +89,37 @@ pub(crate) struct RegionInner {
     pub(super) in_flight: ShutdownState,
     /// Latched once the backend confirms the unmap. Monotonic.
     deregistered: AtomicBool,
+    /// Serialises the latch against readers copying out of this region.
+    ///
+    /// # What it orders, and what it deliberately does not
+    ///
+    /// A rendezvous anchor staged inside this region serves the chunked path by
+    /// copying bytes out through a raw pointer. It checks
+    /// [`is_deregistered`](Self::is_deregistered) first, but a check followed by
+    /// a copy is a check-then-act: without this gate nothing stops the latch
+    /// closing between them, and the latch is precisely the moment the caller
+    /// is told it may free the memory.
+    ///
+    /// So readers take this for read, check the flag, and copy while holding
+    /// it; [`latch_deregistered`](Self::latch_deregistered) takes it for write.
+    /// A copy in progress therefore delays the latch, and a copy that starts
+    /// after the latch sees the flag. Both orderings are what the caller's
+    /// free-after-`deregistered()` contract needs.
+    ///
+    /// It is deliberately **not** held across the backend unmap. Unmapping
+    /// deregisters; it does not free. A copy overlapping the unmap reads memory
+    /// that is still allocated — by the caller, who may not free until the
+    /// latch resolves, or by `owned` here, which the reader's own `RegionWatch`
+    /// keeps alive. Holding a lock across that `await` would also make every
+    /// deregistration future non-`Send` for no gain.
+    ///
+    /// Hold times are bounded by one chunk copy, and that is enforced rather
+    /// than assumed: readers take the gate per `DEFAULT_CHUNK_SIZE` and
+    /// re-check the latch between chunks, so a request for a multi-gigabyte
+    /// anchor is many short acquisitions rather than one long one. A
+    /// deregistration waiting behind live readers therefore waits for a memcpy
+    /// of at most that size — not for a whole anchor, and not for a transfer.
+    copy_gate: parking_lot::RwLock<()>,
     dereg_notify: Notify,
     /// Serialises deregistration attempts so exactly one of them does the work
     /// and the rest observe the outcome.
@@ -133,6 +163,7 @@ impl RegionInner {
             effective_len: parts.effective_len,
             in_flight: ShutdownState::new(),
             deregistered: AtomicBool::new(false),
+            copy_gate: parking_lot::RwLock::new(()),
             dereg_notify: Notify::new(),
             dereg_lock: tokio::sync::Mutex::new(()),
             owned: parking_lot::Mutex::new(parts.owned),
@@ -148,12 +179,32 @@ impl RegionInner {
 
     /// Latch the region as deregistered and wake every waiter.
     ///
-    /// Only ever called after a backend unmap answered `Ok`. An error — a
+    /// Only ever called after a backend unmap answered `Ok`, or at the end of
+    /// velo shutdown once the backend reports it holds nothing. An error — a
     /// timeout, a shutting-down backend — means *unknown*, and latching on
     /// unknown would tell a caller it may free memory that is still pinned.
+    ///
+    /// Taken under the [`copy_gate`](Self::copy_gate) write lock, which is what
+    /// makes the flag safe to act on: no reader can be mid-copy when it flips,
+    /// and no reader that starts afterwards can miss it. The guard covers a
+    /// store and a notify and crosses no `await`.
     pub(super) fn latch_deregistered(&self) {
+        let _closing = self.copy_gate.write();
         self.deregistered.store(true, Ordering::SeqCst);
         self.dereg_notify.notify_waiters();
+    }
+
+    /// Run `read` against this region's memory, or answer `None` if it is gone.
+    ///
+    /// The whole check-then-copy sequence, held together by the gate so it
+    /// cannot be taken apart at the call site. `read` runs only when the region
+    /// is still registered, and the latch cannot close underneath it.
+    pub(super) fn with_live<R>(&self, read: impl FnOnce() -> R) -> Option<R> {
+        let _open = self.copy_gate.read();
+        if self.is_deregistered() {
+            return None;
+        }
+        Some(read())
     }
 
     /// Bytes charged against the registered-bytes budget for this region.
@@ -445,9 +496,8 @@ impl RegionGuard {
         }
     }
 
-    /// How a peer would address this region. Phase 3 builds the wire
-    /// descriptor from it.
-    #[allow(dead_code)]
+    /// How a peer would address this region. The wire descriptor for an
+    /// anchor staged inside it is cut from this.
     pub(crate) fn remote(&self) -> RemoteRef {
         RemoteRef {
             addr: self.inner.ptr as u64,
@@ -457,10 +507,11 @@ impl RegionGuard {
         }
     }
 
-    /// The region's in-flight accounting. Phase 3 acquires a guard from it per
-    /// RDMA lease, which is what makes `unregister` wait for outstanding
-    /// transfers rather than pulling the registration out from under them.
-    #[allow(dead_code)]
+    /// The region's in-flight accounting.
+    ///
+    /// `register_data_in_region` takes a guard from it for every staged anchor,
+    /// which is what makes `unregister` wait for those anchors rather than
+    /// pulling the registration out from under them.
     pub(crate) fn in_flight(&self) -> &ShutdownState {
         &self.inner.in_flight
     }
@@ -610,6 +661,32 @@ impl RegionWatch {
     /// is leaked deliberately rather than declared safe on no evidence.
     pub async fn deregistered(&self) {
         self.inner.wait_deregistered().await;
+    }
+
+    /// Run `read` against the region's memory while holding it open, or answer
+    /// `None` once it has been released.
+    ///
+    /// The only sound way to read a range this watch describes: it takes the
+    /// region's copy gate, checks the latch under it, and runs `read` before
+    /// releasing — so a caller cannot accidentally split the check from the
+    /// access it licenses. See
+    /// [`RegionInner::copy_gate`](super::region::RegionInner::copy_gate) for
+    /// what that ordering buys.
+    ///
+    /// `read` should be short: it delays any deregistration of this region for
+    /// as long as it runs.
+    pub(crate) fn with_live<R>(&self, read: impl FnOnce() -> R) -> Option<R> {
+        self.inner.with_live(read)
+    }
+
+    /// Build a watch over a region directly.
+    ///
+    /// Production watches come from `RegionGuard::watch`, which needs a
+    /// registry and a backend behind it; the ordering properties a watch
+    /// carries are velo's own and are better tested without either.
+    #[cfg(test)]
+    pub(crate) fn for_test(inner: Arc<RegionInner>) -> Self {
+        Self { inner }
     }
 
     /// Close the latch directly, for the adversarial wakeup scan.

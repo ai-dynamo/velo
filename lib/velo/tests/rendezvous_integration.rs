@@ -1,10 +1,15 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Integration tests for the velo-rendezvous crate.
+//! Integration tests for `velo::rendezvous` over TCP loopback.
 //!
-//! Tests two Velo instances over TCP loopback exercising the full rendezvous
-//! protocol: register_data on owner, get/metadata/detach/release on consumer.
+//! Two Velo instances exercising the chunked protocol end to end:
+//! `register_data` on the owner, `get`/`metadata`/`detach`/`release` on the
+//! consumer, and the transparent large-payload path over the top.
+//!
+//! The RDMA fast path has its own suite in `rendezvous_rdma.rs`, which needs
+//! the `ucx` feature. Everything here is the path that is always available, and
+//! it stays correct whether or not that feature is on.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -56,14 +61,16 @@ impl VeloPair {
 }
 
 // ---------------------------------------------------------------------------
-// Test: small payload (inline path)
+// Test: small payload (single chunk)
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_rendezvous_small_payload_inline() {
     let pair = VeloPair::new().await;
 
-    // Owner registers small data (well under 256 KiB inline threshold)
+    // There is no inline path: every payload is pulled chunk by chunk, and a
+    // 1 KiB one is a single chunk. The size is here to exercise that boundary,
+    // not to select a different code path.
     let payload = Bytes::from(vec![0xAB; 1024]); // 1 KiB
     let handle = pair.owner.register_data(payload.clone());
 
@@ -77,14 +84,14 @@ async fn test_rendezvous_small_payload_inline() {
 }
 
 // ---------------------------------------------------------------------------
-// Test: large payload (chunked pull path)
+// Test: large payload (several chunks)
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_rendezvous_large_payload_chunked() {
     let pair = VeloPair::new().await;
 
-    // Owner registers large data (exceeds 256 KiB inline threshold)
+    // Several chunks at the 512 KiB default, so the reassembly offsets matter.
     let size = 1024 * 1024; // 1 MiB
     let mut payload_vec = vec![0u8; size];
     // Write a pattern so we can verify integrity
@@ -267,7 +274,8 @@ async fn test_rendezvous_local_fast_path() {
 async fn test_rendezvous_large_get_into() {
     let pair = VeloPair::new().await;
 
-    // 512 KiB — exceeds inline threshold, will use chunked path
+    // Exactly one chunk at the 512 KiB default: the boundary where chunk_count
+    // is 1 rather than 2.
     let size = 512 * 1024;
     let mut payload_vec = vec![0u8; size];
     for (i, byte) in payload_vec.iter_mut().enumerate() {

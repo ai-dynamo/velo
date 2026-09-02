@@ -272,6 +272,18 @@ jobs:
       run: |
         cargo run --manifest-path examples/Cargo.toml --release --all-features --example batched_streaming -- --engines 2 --requests 24 --max-batch 8 --tokens 40
         cargo run --manifest-path examples/Cargo.toml --release --all-features --example batched_streaming -- --engines 2 --requests 24 --max-batch 8 --tokens 40 --flush-policy auto
+    - name: Run rendezvous_rdma_two_proc
+      timeout-minutes: 3
+      # Two real processes moving 8 MiB by RDMA GET with a TCP control plane.
+      # `UCX_TLS=tcp` because CI runners have no RDMA hardware — the same lane
+      # the ucx test suites use, and the same code path an RDMA lane takes.
+      #
+      # The example exits non-zero if either side answered chunked, so this is
+      # the only place the split-transport deployment is exercised as two
+      # processes rather than two instances in one.
+      env:
+        UCX_TLS: tcp
+      run: cargo run --manifest-path examples/Cargo.toml --release --all-features --example rendezvous_rdma_two_proc
     - name: sccache stats
       if: always()
       run: /tmp/use-sccache.sh show-stats "examples" || true

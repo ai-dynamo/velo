@@ -3,6 +3,12 @@
 
 //! Transparent large payload support: implements the messenger's
 //! [`LargePayloadStager`] and [`LargePayloadResolver`] traits.
+//!
+//! A payload over [`DEFAULT_THRESHOLD`] is staged by the sender, replaced in
+//! the frame by a handle, and resolved by the receiver before the handler is
+//! called — so handler code never sees the difference. Where both ends have the
+//! RDMA path and the sender's pool is warm, that resolution is a single GET;
+//! otherwise it is the chunked pull it has always been.
 
 use std::sync::Arc;
 
@@ -15,8 +21,14 @@ use crate::RendezvousManager;
 
 /// Default threshold for auto-staging large payloads (256 KiB).
 ///
-/// Matches the inline threshold in the `_rv_acquire` handler so that
-/// payloads staged transparently always take the chunked path.
+/// Sits inside D11's ordering invariant, `rdma_min_bytes <= this <
+/// DEFAULT_CHUNK_SIZE` (64 KiB, 256 KiB, 512 KiB at their defaults), so a
+/// payload that crosses this threshold is already large enough for the RDMA
+/// path. At the default chunk size a payload at the threshold is one pull;
+/// both the threshold and the chunk size are configurable, so that is a
+/// property of the defaults and not a guarantee — a smaller configured chunk
+/// size costs proportionally more pulls, and payloads far above the threshold
+/// take as many as their size requires.
 pub const DEFAULT_THRESHOLD: usize = 256 * 1024;
 
 /// Sender-side: stages large payloads locally via the [`RendezvousManager`].
@@ -40,7 +52,33 @@ impl RendezvousStager {
 }
 
 impl LargePayloadStager for RendezvousStager {
+    /// Stage the payload and return its handle.
+    ///
+    /// # Synchronous, and therefore never grows the pool
+    ///
+    /// This runs inside the messenger's `send_message`, which is not `async`.
+    /// Where an RDMA registry exists, the payload is staged in pool memory that
+    /// is *already mapped*, so a consumer can read it with one GET; where no
+    /// mapped arena has room it is staged in plain memory instead, and the
+    /// consumer pulls chunks exactly as before.
+    ///
+    /// Mapping a fresh arena is an `ibv_reg_mr` whose cost is linear in its
+    /// size, so doing one here would put a multi-millisecond stall in the
+    /// middle of a send. A process whose *only* staging is transparent
+    /// therefore never maps an arena and never rides the RDMA path; the pool is
+    /// grown by [`RendezvousManager::register_data_pinned`], which can await.
+    ///
+    /// # Ordering caveat (unchanged)
+    ///
+    /// Staging is still synchronous with respect to the send, so the handle is
+    /// in the headers before the frame leaves. The receiver resolves it with a
+    /// `get` + `release` before the handler sees the payload, which is what
+    /// keeps transparent mode invisible to handler code — and it is why a
+    /// transparently staged slot has refcount 1 and a single reader.
     fn stage(&self, payload: Bytes) -> String {
+        #[cfg(all(target_os = "linux", feature = "ucx"))]
+        let handle = self.manager.register_data_pinned_sync(payload);
+        #[cfg(not(all(target_os = "linux", feature = "ucx")))]
         let handle = self.manager.register_data(payload);
         // Encode handle as u128 decimal string for header transport
         handle.as_u128().to_string()

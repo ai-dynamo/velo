@@ -68,9 +68,18 @@ pub use crate::rendezvous::{
 // public face of a subsystem that only exists when a UCX transport can back it.
 #[cfg(all(target_os = "linux", feature = "ucx"))]
 pub use crate::rendezvous::rdma::{
-    Deregistered, RdmaConfig, RdmaError, RdmaPoolConfig, RegionGuard, RegionWatch,
-    RegisterOwnedError,
+    Deregistered, PinnedBuf, RdmaConfig, RdmaError, RdmaPoolConfig, RdmaRendezvousConfig,
+    RegionGuard, RegionWatch, RegisterOwnedError,
 };
+
+#[cfg(all(target_os = "linux", feature = "ucx"))]
+pub use crate::rendezvous::write::PinnedWriter;
+/// The registered `get_into` destination, and the capability that describes it.
+///
+/// `RdmaDestination` is unconditional so the [`RendezvousWrite`] trait has one
+/// shape in every build; only velo can construct one, so a build without the
+/// RDMA path simply never does.
+pub use crate::rendezvous::write::RdmaDestination;
 
 // Observability
 pub use crate::observability::VeloMetrics;
@@ -463,14 +472,41 @@ impl VeloBuilder {
         // the transport marks itself started — but it would let a registration
         // fail for a reason that reads like a bug.
         #[cfg(all(target_os = "linux", feature = "ucx"))]
-        let rdma = self.ucx_transport.as_ref().map(|transport| {
-            Arc::new(crate::rendezvous::rdma::RdmaRegistry::new(
-                crate::rendezvous::rdma::UcxBackend::new(transport.rdma_endpoint()),
-                self.rdma_config.clone().unwrap_or_default(),
-                messenger.runtime().clone(),
-                self.metrics.clone(),
-            ))
-        });
+        let rdma = match self.ucx_transport.as_ref() {
+            Some(transport) => {
+                let mut config = self.rdma_config.clone().unwrap_or_default();
+                // The kill switch (D6), read once at build. An environment
+                // variable rather than only a config field so a rollback is a
+                // restart rather than a rebuild, and applied here rather than
+                // at each decision point so one process cannot answer half its
+                // acquires one way and half the other.
+                if rdma_rendezvous_disabled_by_env() {
+                    tracing::info!(
+                        "VELO_RDMA_RENDEZVOUS_DISABLE is set: the rendezvous RDMA path is off. \
+                         Staged data is still readable — every slot answers the chunked path."
+                    );
+                    config.rendezvous.enabled = false;
+                }
+                let rendezvous_config = config.rendezvous.clone();
+                let registry = Arc::new(crate::rendezvous::rdma::RdmaRegistry::new(
+                    crate::rendezvous::rdma::UcxBackend::new(transport.rdma_endpoint()),
+                    config,
+                    messenger.runtime().clone(),
+                    self.metrics.clone(),
+                ));
+                // Hand the rendezvous manager the registry it was built too
+                // early to be given: the registry wraps an RMA endpoint on a
+                // transport that has to have started first. This also starts
+                // the lease reaper.
+                rendezvous_manager.set_rdma_context(
+                    Arc::clone(&registry),
+                    rendezvous_config,
+                    messenger.runtime(),
+                )?;
+                Some(registry)
+            }
+            None => None,
+        };
 
         // Step 10: Assemble Velo
         Ok(Arc::new(Velo {
@@ -492,6 +528,40 @@ impl Default for VeloBuilder {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Whether `VELO_RDMA_RENDEZVOUS_DISABLE` asks for the rendezvous RDMA path to
+/// be switched off (D6).
+///
+/// Only `1`, `true`, `yes` and `on` (any case) count. A variable set to
+/// anything else — `0`, `false`, an empty string, a typo — leaves the path
+/// enabled, because a kill switch that fires on a typo is worse than one that
+/// occasionally does not fire on a misspelling: the first silently costs
+/// performance in production, the second is visible the moment somebody checks
+/// the metric.
+#[cfg(all(target_os = "linux", feature = "ucx"))]
+fn rdma_rendezvous_disabled_by_env() -> bool {
+    rdma_rendezvous_disabled(
+        std::env::var("VELO_RDMA_RENDEZVOUS_DISABLE")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// The parsing half of the kill switch, split out so it can be tested.
+///
+/// The environment is process-global and `cargo test` runs in parallel, so a
+/// test that *set* the variable would silently switch the path off for every
+/// other test building a `Velo` at that moment. Splitting the decision from the
+/// read means the rule can be checked exhaustively without touching the
+/// process; the end-to-end effect is covered through
+/// [`RdmaRendezvousConfig::enabled`], which is the same field this writes.
+#[cfg(all(target_os = "linux", feature = "ucx"))]
+fn rdma_rendezvous_disabled(value: Option<&str>) -> bool {
+    value.is_some_and(|v| {
+        let v = v.trim().to_ascii_lowercase();
+        v == "1" || v == "true" || v == "yes" || v == "on"
+    })
 }
 
 impl Velo {
@@ -546,6 +616,12 @@ impl Velo {
     /// those latches would stay pending forever and a caller waiting on one
     /// would hold its memory for the life of the process.
     ///
+    /// Step 2 begins by moving anything staged in registered memory onto the
+    /// heap. That releases what the sweep's own drains wait on, and it costs
+    /// one transient copy of everything staged — the price of letting a
+    /// chunked transfer that was already admitted finish rather than fail
+    /// halfway through.
+    ///
     /// Step 4 is itself conditional: it checks with the backend that nothing is
     /// still registered, and declines to declare anything released if the
     /// answer is not "none". After an abnormal teardown — a panicking progress
@@ -593,6 +669,26 @@ impl Velo {
             let started = std::time::Instant::now();
             if let Some(rdma) = &self.rdma {
                 self.begin_drain();
+                // Before the sweep, and load-bearing for it. This stops the
+                // lease reaper — so it is not taking the same memory apart
+                // from the other end while the sweep walks it — and moves
+                // every pinned slot to the heap, which is what releases the
+                // pool suballocations and region in-flight guards the sweep's
+                // drains are about to wait on. A single long-lived anchor left
+                // in place would consume the entire budget below on a drain
+                // that cannot finish.
+                //
+                // The demotion copies everything currently staged in
+                // registered memory onto the heap, once. That is the cost of
+                // letting a chunked pull admitted before the gate finish
+                // rather than fail mid-transfer, and it is bounded by what was
+                // staged.
+                //
+                // Cancelling the reaper is not a join: a tick already running
+                // may still complete. That overlap is benign — both paths end
+                // a lease through the same atomic store operations, and the
+                // sweep is trying to make slots disappear anyway.
+                self.rendezvous_manager.shutdown();
                 let budget = match &policy {
                     ShutdownPolicy::Timeout(deadline) => *deadline,
                     ShutdownPolicy::WaitForever => rdma.shutdown_timeout(),
@@ -932,6 +1028,32 @@ impl Velo {
         self.rendezvous_manager.register_data_with(data, opts)
     }
 
+    /// Stage data in RDMA-registered memory, so a capable consumer reads it
+    /// with a single RDMA GET instead of a chunk-by-chunk pull.
+    ///
+    /// Never fails: pool pressure, a spent registered-bytes budget, a
+    /// switched-off kill switch and an instance with no UCX transport all stage
+    /// the data in plain memory instead. See
+    /// [`RendezvousManager::register_data_pinned`] for the full contract.
+    pub async fn register_data_pinned(&self, data: &[u8]) -> DataHandle {
+        self.rendezvous_manager.register_data_pinned(data).await
+    }
+
+    /// Stage a range of memory this instance already registered, zero-copy.
+    ///
+    /// See [`RendezvousManager::register_data_in_region`]: the slot holds an
+    /// in-flight guard on the region, so
+    /// [`RegionGuard::unregister`] waits for the anchors staged inside it.
+    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    pub fn register_data_in_region(
+        &self,
+        guard: &RegionGuard,
+        range: std::ops::Range<u64>,
+    ) -> Result<DataHandle, RdmaError> {
+        self.rendezvous_manager
+            .register_data_in_region(guard, range)
+    }
+
     /// Query metadata about the data behind a handle (no lock acquired).
     pub async fn metadata(&self, handle: DataHandle) -> Result<DataMetadata> {
         self.rendezvous_manager.metadata(handle).await
@@ -943,6 +1065,23 @@ impl Velo {
     /// [`detach()`](Self::detach) or [`release()`](Self::release) when done.
     pub async fn get(&self, handle: DataHandle) -> Result<(bytes::Bytes, u64)> {
         self.rendezvous_manager.get(handle).await
+    }
+
+    /// Pull data from a handle into registered memory, with no copy out.
+    ///
+    /// Returns `(buffer, lease_id)`. Dropping the buffer returns its space to
+    /// the pool. See [`RendezvousManager::get_pinned`] for what the lease does
+    /// and does not cover.
+    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    pub async fn get_pinned(&self, handle: DataHandle) -> Result<(PinnedBuf, u64)> {
+        self.rendezvous_manager.get_pinned(handle).await
+    }
+
+    /// Allocate a registered [`get_into`](Self::get_into) destination, so an
+    /// RDMA transfer into it costs no copy at all.
+    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    pub async fn alloc_pinned_writer(&self, len: usize) -> Result<PinnedWriter, RdmaError> {
+        self.rendezvous_manager.alloc_pinned_writer(len).await
     }
 
     /// Pull data from a handle into an explicit destination buffer.
@@ -971,6 +1110,23 @@ impl Velo {
     /// Data is freed when both refcount and read_lock_count reach zero.
     pub async fn release(&self, handle: DataHandle, lease_id: u64) -> Result<()> {
         self.rendezvous_manager.release(handle, lease_id).await
+    }
+
+    /// Which transport this instance chose as `instance`'s primary, if it is
+    /// registered.
+    ///
+    /// Exposed for tests only. The RDMA path's eligibility rule deliberately
+    /// accepts a peer reachable over UCX *whether or not* UCX is the primary
+    /// transport — a TCP control plane with UCX beside it is the expected
+    /// deployment — and a test covering that branch has to be able to say which
+    /// branch it is on. Without it, a change to transport priority could move
+    /// the coverage back onto the primary path with nothing failing.
+    #[cfg(feature = "test-helpers")]
+    pub fn primary_transport_key(&self, instance: InstanceId) -> Option<String> {
+        self.messenger
+            .backend()
+            .primary_transport_key(instance)
+            .map(|key| key.as_str().to_string())
     }
 
     /// Get the underlying rendezvous manager for direct access.
@@ -1076,6 +1232,20 @@ impl Velo {
             .unwrap_or(0)
     }
 
+    /// Transfers the NIC is still writing into this instance's arenas.
+    ///
+    /// Exposed for tests only. A test that wants to act *while* a transfer is
+    /// in flight has to be able to see that it started; timing the caller's
+    /// future instead races the acquire round trip, and a cancelled future
+    /// looks identical whether the transfer began or never did.
+    #[cfg(all(target_os = "linux", feature = "ucx", feature = "test-helpers"))]
+    pub fn rdma_in_flight_transfers(&self) -> usize {
+        self.rdma
+            .as_ref()
+            .map(|r| r.in_flight_transfers())
+            .unwrap_or(0)
+    }
+
     /// The registration layer, for tests that need to observe it directly.
     #[cfg(all(target_os = "linux", feature = "ucx", test))]
     pub(crate) fn rdma(&self) -> Option<&Arc<crate::rendezvous::rdma::RdmaRegistry>> {
@@ -1094,6 +1264,37 @@ impl Velo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The kill switch fires on an affirmative and on nothing else.
+    ///
+    /// The asymmetry is deliberate and worth pinning down: a switch that fired
+    /// on a typo would silently cost performance in production, while one that
+    /// misses a misspelling shows up the moment anybody reads
+    /// `velo_rendezvous_rdma_path_total`.
+    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    #[test]
+    fn the_rdma_kill_switch_reads_only_affirmatives() {
+        for on in [
+            "1", "true", "TRUE", "True", "yes", "YES", "on", "ON", " 1 ", "\ttrue\n",
+        ] {
+            assert!(
+                rdma_rendezvous_disabled(Some(on)),
+                "{on:?} should switch the rendezvous RDMA path off"
+            );
+        }
+        for off in [
+            "0", "false", "no", "off", "", "  ", "2", "disable", "ture", "1 1",
+        ] {
+            assert!(
+                !rdma_rendezvous_disabled(Some(off)),
+                "{off:?} must not switch the rendezvous RDMA path off"
+            );
+        }
+        assert!(
+            !rdma_rendezvous_disabled(None),
+            "an unset variable must leave the path enabled"
+        );
+    }
 
     /// Test: stream_config double-call returns Err (GRPC-07)
     ///

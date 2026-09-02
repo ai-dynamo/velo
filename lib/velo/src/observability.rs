@@ -77,6 +77,87 @@ impl RdmaRegistrationKind {
     }
 }
 
+/// Which path a rendezvous `get` took, and what decided it.
+///
+/// This is the series that proves the RDMA path is actually being chosen, which
+/// is the one operational question a fast path nobody can see cannot answer.
+/// Every fallback is deliberate and every one of them has a *name*, so
+/// "rendezvous is slow" resolves to a reason rather than to a guess: whether the
+/// consumer never offered, whether the owner had nothing pinned, whether the
+/// payload was under the threshold, whether the kill switch is on, or whether
+/// something actually went wrong.
+///
+/// Both sides emit into it, and they see different reasons. Only the owner can
+/// say [`NotPinned`](Self::NotPinned) or [`BelowMin`](Self::BelowMin); only the
+/// consumer can say [`DecodeError`](Self::DecodeError),
+/// [`PoolExhausted`](Self::PoolExhausted) or [`GetFailed`](Self::GetFailed).
+/// Reading one instance's series therefore tells you what *that* instance
+/// decided, which is what a rollout wants to know.
+///
+/// Gated with the RDMA path itself: on a build without it there is no decision
+/// to record, and a series that is always zero is worse than absent.
+#[cfg(all(target_os = "linux", feature = "ucx"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RdmaPathReason {
+    /// The RDMA path was taken. The only reason with `path="rdma"`.
+    Ok,
+    /// The consumer advertised no backend it could pull with — it has no RDMA
+    /// context, no UCX endpoint to this owner, or its kill switch is on.
+    NoOffer,
+    /// The owner's slot is plain heap bytes.
+    NotPinned,
+    /// The payload is below `rdma_min_bytes`, where a round trip plus a GET
+    /// costs more than the chunks it saves.
+    BelowMin,
+    /// The owner's rendezvous RDMA path is switched off.
+    KillSwitch,
+    /// The consumer could not decode the owner's descriptor.
+    DecodeError,
+    /// The consumer could not get a registered destination to GET into.
+    PoolExhausted,
+    /// The GET itself failed and the consumer re-acquired chunked.
+    GetFailed,
+    /// The owner's pinned staging was refused by the registered-bytes budget
+    /// and the slot was staged in plain memory instead.
+    Budget,
+    /// This instance has no RDMA registry at all — no UCX transport was
+    /// installed through `VeloBuilder::add_ucx_transport`.
+    ///
+    /// A deployment fact rather than a decision, and the one decline that used
+    /// to be silent: an instance configured without the RDMA path emitted
+    /// nothing, so `velo_rendezvous_rdma_path_total` was empty and
+    /// indistinguishable from an instance that was never asked. Naming it means
+    /// "why is nothing using RDMA" has an answer on every node.
+    NotConfigured,
+}
+
+#[cfg(all(target_os = "linux", feature = "ucx"))]
+impl RdmaPathReason {
+    /// Which path this reason ended on.
+    pub(crate) fn path(self) -> &'static str {
+        match self {
+            Self::Ok => "rdma",
+            _ => "chunked",
+        }
+    }
+
+    /// Prometheus label value.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::NoOffer => "no_offer",
+            Self::NotPinned => "not_pinned",
+            Self::BelowMin => "below_min",
+            Self::KillSwitch => "kill_switch",
+            Self::DecodeError => "decode_error",
+            Self::PoolExhausted => "pool_exhausted",
+            Self::GetFailed => "get_failed",
+            Self::Budget => "budget",
+            Self::NotConfigured => "not_configured",
+        }
+    }
+}
+
 /// Messenger handler outcome.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HandlerOutcome {
@@ -779,6 +860,14 @@ pub struct VeloMetrics {
     rdma_registered_bytes: Gauge,
     #[cfg(all(target_os = "linux", feature = "ucx"))]
     rdma_registrations_total: CounterVec,
+    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    rdma_live_regions: Gauge,
+    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    rendezvous_rdma_path_total: CounterVec,
+    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    rendezvous_rdma_get_duration_seconds: Histogram,
+    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    rendezvous_rdma_leases_reaped_total: Counter,
 }
 
 impl VeloMetrics {
@@ -1314,6 +1403,45 @@ impl VeloMetrics {
                 &["kind"],
             )?,
         )?;
+        #[cfg(all(target_os = "linux", feature = "ucx"))]
+        let rdma_live_regions = register_collector(
+            registry,
+            Gauge::new(
+                "velo_rdma_live_regions",
+                "Memory regions the RDMA backend currently holds registered.",
+            )?,
+        )?;
+        #[cfg(all(target_os = "linux", feature = "ucx"))]
+        let rendezvous_rdma_path_total = register_collector(
+            registry,
+            CounterVec::new(
+                Opts::new(
+                    "velo_rendezvous_rdma_path_total",
+                    "Rendezvous transfers by the path taken and what decided it.",
+                ),
+                &["path", "reason"],
+            )?,
+        )?;
+        #[cfg(all(target_os = "linux", feature = "ucx"))]
+        let rendezvous_rdma_get_duration_seconds = register_collector(
+            registry,
+            Histogram::with_opts(
+                HistogramOpts::new(
+                    "velo_rendezvous_rdma_get_duration_seconds",
+                    "Duration of the RDMA GET inside a rendezvous get, excluding the acquire \
+                     round trip.",
+                )
+                .buckets(exponential_buckets(0.00005, 2.0, 20)?),
+            )?,
+        )?;
+        #[cfg(all(target_os = "linux", feature = "ucx"))]
+        let rendezvous_rdma_leases_reaped_total = register_collector(
+            registry,
+            Counter::new(
+                "velo_rendezvous_rdma_leases_reaped_total",
+                "RDMA leases force-released by the owner-side reaper after their deadline passed.",
+            )?,
+        )?;
 
         Ok(Self {
             transport_frames_total,
@@ -1368,6 +1496,14 @@ impl VeloMetrics {
             rdma_registered_bytes,
             #[cfg(all(target_os = "linux", feature = "ucx"))]
             rdma_registrations_total,
+            #[cfg(all(target_os = "linux", feature = "ucx"))]
+            rdma_live_regions,
+            #[cfg(all(target_os = "linux", feature = "ucx"))]
+            rendezvous_rdma_path_total,
+            #[cfg(all(target_os = "linux", feature = "ucx"))]
+            rendezvous_rdma_get_duration_seconds,
+            #[cfg(all(target_os = "linux", feature = "ucx"))]
+            rendezvous_rdma_leases_reaped_total,
         })
     }
 
@@ -1680,6 +1816,55 @@ impl VeloMetrics {
 
     pub(crate) fn set_rendezvous_active_slots(&self, count: usize) {
         self.rendezvous_active_slots.set(count as f64);
+    }
+
+    /// Publish how many regions the backend currently holds registered.
+    ///
+    /// The backend's own count, not this side's bookkeeping — the same number
+    /// the shutdown latch treats as evidence. Sampled by the lease reaper's
+    /// tick rather than pushed from the registration paths, because what an
+    /// operator wants from a gauge is the current value at scrape time and not
+    /// a value that stopped moving when registrations did.
+    ///
+    /// Note what is *not* published beside it: the count of unpacked remote
+    /// keys. That is a UCX-level concept living behind the backend seam (D12),
+    /// and widening the trait to reach it would put a backend-specific idea
+    /// into the interface a NIXL or libfabric provider has to implement.
+    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    pub(crate) fn set_rdma_live_regions(&self, regions: usize) {
+        self.rdma_live_regions.set(regions as f64);
+    }
+
+    /// Count one rendezvous transfer by the path it took and what decided it.
+    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    pub(crate) fn record_rendezvous_rdma_path(&self, reason: RdmaPathReason) {
+        self.rendezvous_rdma_path_total
+            .with_label_values(&[reason.path(), reason.as_str()])
+            .inc();
+    }
+
+    /// Record how long an RDMA GET took, excluding the acquire round trip.
+    ///
+    /// Deliberately narrower than `velo_rendezvous_operation_duration_seconds`:
+    /// that one covers the whole `get`, and the question this phase has to be
+    /// able to answer is what the *transfer* costs once the control plane is
+    /// out of the way.
+    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    pub(crate) fn record_rendezvous_rdma_get(&self, duration: std::time::Duration) {
+        self.rendezvous_rdma_get_duration_seconds
+            .observe(duration.as_secs_f64());
+    }
+
+    /// Count leases the reaper had to force-release.
+    ///
+    /// Non-zero means consumers are holding RDMA leases past their deadline —
+    /// crashed mid-transfer, or too slow and not renewing. Either way the owner
+    /// is reclaiming slots somebody else believes they still hold, which is a
+    /// fact worth alerting on rather than one to find in a log.
+    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    pub(crate) fn record_rendezvous_leases_reaped(&self, leases: usize) {
+        self.rendezvous_rdma_leases_reaped_total
+            .inc_by(leases as f64);
     }
 }
 

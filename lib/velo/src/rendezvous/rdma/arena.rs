@@ -249,9 +249,19 @@ pub(crate) struct Arena {
     /// Arena length in [`GRANULE`]s — the unit the suballocator works in.
     granules: u32,
     free: Mutex<Allocator<u32>>,
-    /// Live [`PinnedBuf`]s cut from this arena. Phase 4's reclamation reads it;
-    /// here it makes "the pool really did give the space back" assertable.
+    /// Live suballocations cut from this arena — held by a caller, by an
+    /// in-flight transfer, or both. Phase 4's reclamation reads it; here it
+    /// makes "the pool really did give the space back" assertable.
     live: AtomicUsize,
+    /// Suballocations an in-flight transfer is still writing into.
+    ///
+    /// Deliberately separate from `live`. Shutdown must wait for *these* before
+    /// unmapping — a NIC writing into a deregistered range is the hazard — but
+    /// it must not wait for a caller that is simply still holding a buffer,
+    /// which it may hold until long after shutdown and which nothing is
+    /// writing to. Conflating the two turns an application that keeps a
+    /// `PinnedBuf` around into a shutdown that burns its entire budget.
+    in_flight: AtomicUsize,
     /// Dedicated arenas back exactly one oversize request and are never offered
     /// to the general search, so the request that motivated them cannot be
     /// crowded out by later small ones.
@@ -268,9 +278,14 @@ impl Arena {
         self.memory.len
     }
 
-    /// Live suballocations.
+    /// Live suballocations, whoever is holding them.
     pub(crate) fn live(&self) -> usize {
         self.live.load(Ordering::Acquire)
+    }
+
+    /// Suballocations an in-flight transfer is still writing into.
+    pub(crate) fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Acquire)
     }
 
     /// Try to cut `len` bytes out of this arena.
@@ -286,10 +301,12 @@ impl Arena {
         let allocation = self.free.lock().allocate(granules)?;
         self.live.fetch_add(1, Ordering::AcqRel);
         Some(PinnedBuf {
-            offset: allocation.offset as usize * GRANULE,
-            len,
-            allocation,
-            arena: Arc::clone(self),
+            inner: Arc::new(Suballoc {
+                offset: allocation.offset as usize * GRANULE,
+                len,
+                allocation,
+                arena: Arc::clone(self),
+            }),
         })
     }
 
@@ -305,12 +322,13 @@ impl Arena {
 // PinnedBuf
 // ---------------------------------------------------------------------------
 
-/// An owned, registered byte range cut from an [`Arena`].
+/// A reserved range inside an [`Arena`], and the free token that returns it.
 ///
-/// Derefs to its bytes, so it is usable as a plain buffer. Dropping it returns
-/// the space to the pool and nothing else: the arena stays registered, so the
-/// next allocation of that space costs no pin.
-pub(crate) struct PinnedBuf {
+/// Shared behind an `Arc` so that an in-flight transfer into the range can hold
+/// it alive independently of whoever asked for the allocation. It exposes no
+/// way to read or write the bytes — that belongs to [`PinnedBuf`] — so holding
+/// one is a *reservation* and nothing more.
+pub(crate) struct Suballoc {
     arena: Arc<Arena>,
     /// The free token. Private, and the only thing that can return the space.
     allocation: Allocation<u32>,
@@ -322,42 +340,142 @@ pub(crate) struct PinnedBuf {
     len: usize,
 }
 
+impl Drop for Suballoc {
+    /// Return the space to the pool. Runs when the last holder lets go — the
+    /// caller's [`PinnedBuf`] *and* any [`TransferHold`] an outstanding
+    /// transfer took.
+    fn drop(&mut self) {
+        self.arena.release(self.allocation);
+    }
+}
+
+/// Keeps a suballocation out of the free list while a transfer into it may
+/// still be running.
+///
+/// # Why this exists
+///
+/// `RdmaEndpoint::get`'s cancel-safety is *arena*-granular: dropping the future
+/// abandons the notification, the transfer runs to completion, and the arena
+/// stays mapped underneath it. What that does not cover is the suballocation.
+/// A cancelled `get_pinned` would drop its `PinnedBuf`, return the granules to
+/// the free list, and let the next allocation hand them to somebody else — with
+/// a NIC still writing into them. The next tenant's data would be silently
+/// overwritten by a transfer that was cancelled, which is about as hard to
+/// diagnose as a bug gets.
+///
+/// So the in-flight transfer owns a hold, and the hold outlives the caller's
+/// buffer if the caller goes away. It has no accessors at all: it cannot read
+/// or write the range, which is what keeps [`PinnedBuf`]'s raw-pointer `Deref`
+/// pair sound while a hold is outstanding.
+///
+/// # What it survives, and what it does not
+///
+/// It survives the *caller* cancelling: the transfer is a detached task, and
+/// dropping a `JoinHandle` detaches rather than cancels. It does **not** survive
+/// the runtime going away — a task dropped mid-await drops its hold, releasing
+/// the space while the NIC may still be writing.
+///
+/// That is not a hole velo leaves open on its own account. `graceful_shutdown`
+/// orders the registration sweep so transfers are waited for before their arena
+/// is unmapped, and the arena's pages are not freed until after that. The case
+/// this cannot reach is a caller dropping the runtime out from under live
+/// transfers, which is a decision only the application can make.
+pub(crate) struct TransferHold(Arc<Suballoc>);
+
+impl Drop for TransferHold {
+    /// The transfer is over: stop shutdown waiting on it, and drop this
+    /// holder's share of the suballocation.
+    fn drop(&mut self) {
+        self.0.arena.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// An owned, registered byte range cut from an [`Arena`].
+///
+/// Derefs to its bytes, so it is usable as a plain buffer. Dropping it returns
+/// the space to the pool and nothing else: the arena stays registered, so the
+/// next allocation of that space costs no pin. If a transfer into the range is
+/// still outstanding the space is returned when *that* finishes instead — see
+/// [`TransferHold`].
+///
+/// # This is registered memory, and that has consequences
+///
+/// Obtained from [`Velo::get_pinned`](crate::Velo::get_pinned) or
+/// [`Velo::alloc_pinned_writer`](crate::Velo::alloc_pinned_writer). It is a
+/// normal owned buffer in every respect the borrow checker can see, and one
+/// respect it cannot: the arena it was cut from is registered for RMA, so any
+/// peer holding that arena's key can *write* into these bytes at any moment.
+/// UCP carries no enforceable protection field, so the GET-only shape of the
+/// rendezvous protocol is a convention rather than an enforcement. The safety
+/// of reading through the `Deref` therefore rests on the trust domain — key
+/// material only ever reaches peers this instance already talks to — and not on
+/// exclusivity Rust could check.
+///
+/// Holding one keeps its space out of the pool. Drop it as soon as the bytes
+/// have been consumed, or copy them out; a long-lived `PinnedBuf` is a
+/// long-lived reservation against
+/// [`registered_bytes_budget`](RdmaPoolConfig::registered_bytes_budget).
+pub struct PinnedBuf {
+    inner: Arc<Suballoc>,
+}
+
 impl PinnedBuf {
     /// How a peer would address these bytes.
     pub(crate) fn remote(&self) -> RemoteRef {
         RemoteRef {
             addr: self.addr(),
-            len: self.len as u64,
-            packed_key: self.arena.packed_key.clone(),
-            generation: self.arena.generation,
+            len: self.inner.len as u64,
+            packed_key: self.inner.arena.packed_key.clone(),
+            generation: self.inner.arena.generation,
         }
     }
 
     /// Absolute address of the first byte.
     pub(crate) fn addr(&self) -> u64 {
-        self.arena.base() as u64 + self.offset as u64
+        self.inner.arena.base() as u64 + self.inner.offset as u64
     }
 
     /// Offset of this range inside its arena — what a backend GET wants when
     /// the arena is the destination.
     pub(crate) fn arena_offset(&self) -> u64 {
-        self.offset as u64
+        self.inner.offset as u64
     }
 
     /// Backend region id of the arena backing these bytes.
     pub(crate) fn backend_region_id(&self) -> u64 {
-        self.arena.backend_region_id
+        self.inner.arena.backend_region_id
+    }
+
+    /// Reserve this range for a transfer that may outlive the buffer.
+    ///
+    /// The hold must live until the *backend* reports the transfer finished,
+    /// not until the caller stops waiting for it. See [`TransferHold`].
+    pub(crate) fn hold(&self) -> TransferHold {
+        self.inner.arena.in_flight.fetch_add(1, Ordering::AcqRel);
+        TransferHold(Arc::clone(&self.inner))
     }
 
     /// Length in bytes, exactly as requested.
-    pub(crate) fn len(&self) -> usize {
-        self.len
+    pub fn len(&self) -> usize {
+        self.inner.len
     }
 
     /// Whether the range is empty. Never true — the pool refuses zero-length
     /// requests — but clippy wants it beside `len`.
-    pub(crate) fn is_empty(&self) -> bool {
-        self.len == 0
+    pub fn is_empty(&self) -> bool {
+        self.inner.len == 0
+    }
+}
+
+impl std::fmt::Debug for PinnedBuf {
+    /// Never prints the bytes: a `PinnedBuf` is routinely megabytes, and its
+    /// identity is where it lives rather than what it holds.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PinnedBuf")
+            .field("addr", &self.addr())
+            .field("len", &self.inner.len)
+            .field("generation", &self.inner.arena.generation)
+            .finish()
     }
 }
 
@@ -371,6 +489,10 @@ impl Deref for PinnedBuf {
         // the suballocator hands out non-overlapping ranges, so no other
         // `PinnedBuf` aliases these bytes *from this process*.
         //
+        // A `TransferHold` on the same `Suballoc` may exist, but it is a
+        // reservation with no accessors: it cannot produce a reference or a
+        // pointer to these bytes, so it introduces no Rust aliasing.
+        //
         // What this cannot establish is that nothing else is writing. The arena
         // is registered for RMA, so any peer holding its key can write into
         // this range at any moment, and `prot` is dead code in UCP — the
@@ -378,26 +500,38 @@ impl Deref for PinnedBuf {
         // enforcement. A concurrent remote write is a data race the Rust
         // abstract machine has no vocabulary for. It is admitted as the
         // module's trust-domain assumption, not proved away here.
-        unsafe { std::slice::from_raw_parts(self.arena.base().add(self.offset), self.len) }
+        unsafe {
+            std::slice::from_raw_parts(
+                self.inner.arena.base().add(self.inner.offset),
+                self.inner.len,
+            )
+        }
     }
 }
 
 impl DerefMut for PinnedBuf {
     fn deref_mut(&mut self) -> &mut [u8] {
-        // SAFETY: as for `Deref`. `&mut self` proves this is the only *Rust*
-        // handle to the range — it proves nothing about the NIC, which is a
-        // writer the borrow checker cannot see and which needs no handle from
-        // us to write here. Exclusivity against remote writers is a property of
-        // the protocol and the trust domain, and the trust domain alone is what
-        // makes this sound; claiming `&mut self` settles it would be a lie
-        // about which writers exist.
-        unsafe { std::slice::from_raw_parts_mut(self.arena.base().add(self.offset), self.len) }
-    }
-}
-
-impl Drop for PinnedBuf {
-    fn drop(&mut self) {
-        self.arena.release(self.allocation);
+        // SAFETY: as for `Deref`, and note what `&mut self` does and does not
+        // establish here.
+        //
+        // It proves this is the only *`PinnedBuf`* handle to the range. It does
+        // not prove there is no `TransferHold` on the same `Suballoc` — but a
+        // hold exposes no accessor of any kind, so it can never produce an
+        // aliasing reference. The hold's job is to keep the space out of the
+        // free list, not to read it.
+        //
+        // It proves nothing about the NIC either, which is a writer the borrow
+        // checker cannot see and which needs no handle from us to write here.
+        // Exclusivity against remote writers is a property of the protocol and
+        // the trust domain, and the trust domain alone is what makes this
+        // sound; claiming `&mut self` settles it would be a lie about which
+        // writers exist.
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self.inner.arena.base().add(self.inner.offset),
+                self.inner.len,
+            )
+        }
     }
 }
 
@@ -706,6 +840,29 @@ impl ArenaSet {
         Ok(buf)
     }
 
+    /// Cut `len` bytes out of an arena that is already mapped, or answer
+    /// `None`. Never maps, never blocks, never grows.
+    ///
+    /// The synchronous entry, for a caller with no `await` to give. An oversize
+    /// request is refused outright rather than searched for: by construction it
+    /// wants a dedicated arena, and one that does not exist yet cannot be
+    /// conjured without mapping.
+    ///
+    /// # What this costs on a hot path
+    ///
+    /// One `parking_lot` read lock on the arena vector, then one uncontended
+    /// `parking_lot` mutex per arena tried. The pool is *few* arenas by
+    /// construction — geometric growth from 64 MiB, capped at 1 GiB, under a
+    /// 1 GiB registered-bytes budget, so at most five at the defaults — and the
+    /// caller is about to `memcpy` at least the transparent-staging threshold
+    /// of 256 KiB. The search is not the expensive part of what follows it.
+    pub(crate) fn try_alloc_existing(&self, len: usize) -> Option<PinnedBuf> {
+        if len == 0 || len as u64 >= self.cfg.dedicated_arena_min {
+            return None;
+        }
+        self.try_existing(len)
+    }
+
     /// Walk the existing pooled arenas, first fit. They are few and ordered by
     /// creation, so the earlier (smaller) ones are tried first and the big tail
     /// stays available for big requests.
@@ -798,6 +955,7 @@ impl ArenaSet {
             // any arena above 512 MiB.
             free: Mutex::new(Allocator::with_max_allocs(granules, granules)),
             live: AtomicUsize::new(0),
+            in_flight: AtomicUsize::new(0),
             dedicated,
             memory,
         });
@@ -825,6 +983,13 @@ impl ArenaSet {
     /// unconfirmed list and the sweep moves on; the transport's own force-unmap
     /// at teardown is the backstop.
     ///
+    /// It bounds the in-flight wait below too, which means a deadline already
+    /// reached — the regions are swept from the same one, serially — skips that
+    /// wait entirely. `ShutdownPolicy::Timeout` is a promise about the whole
+    /// call, so there is deliberately no per-arena floor that could overrun it;
+    /// what the degraded path gets instead is a warning that says which of the
+    /// two happened.
+    ///
     /// Returns the number of arenas whose unmap was not confirmed. Their pages
     /// stay leaked *for now* — [`release_unconfirmed`](Self::release_unconfirmed)
     /// frees them once velo shutdown has completed and nothing can still be
@@ -833,12 +998,64 @@ impl ArenaSet {
         let arenas: Vec<Arc<Arena>> = std::mem::take(&mut *self.arenas.write());
         let mut unconfirmed = Vec::new();
         for arena in arenas {
+            // Bounded wait for in-flight *transfers*, mirroring what an
+            // external region gets from its own drain. Warning and unmapping
+            // regardless was the asymmetry: a transfer still writing into this
+            // arena would be handed a deregistered range.
+            //
+            // It waits on `in_flight`, not on `live`. A caller may still be
+            // holding a `PinnedBuf` at shutdown and is entitled to — nothing is
+            // writing into it, and it may outlive the runtime — so waiting for
+            // `live` would let an ordinary application burn the whole budget.
+            //
+            // The wait converges because `RdmaRegistry::get` is admission
+            // gated: with the gate closed no new transfer can raise this count,
+            // so it only falls.
+            //
+            // **What the wait is worth is bounded by the budget, and past it
+            // there is no wait at all.** The regions above are swept serially
+            // from the same deadline, so a slow region can leave nothing for
+            // the arenas — and this loop's guard, evaluated once with the
+            // deadline already behind it, would then skip silently. That is the
+            // accepted D8 degradation, not an oversight: past the budget the
+            // sweep force-unmaps and the transport's own teardown is the
+            // backstop. It is said out loud below rather than left to look like
+            // a wait that happened.
+            //
+            // Polled rather than notified: this runs once per arena at
+            // shutdown, and a condvar on the release path would cost something
+            // on every free to save nothing measurable here.
+            let budget_spent = Instant::now() >= deadline;
+            if budget_spent {
+                if arena.in_flight() != 0 {
+                    tracing::warn!(
+                        in_flight = arena.in_flight(),
+                        bytes = arena.len(),
+                        "rdma: the shutdown budget was already spent before this arena, so its \
+                         transfers were not waited for at all; force-unmapping. Transport \
+                         teardown is the backstop and a straggling transfer fails at its own end."
+                    );
+                }
+            } else {
+                while arena.in_flight() != 0 && Instant::now() < deadline {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                if arena.in_flight() != 0 {
+                    tracing::warn!(
+                        in_flight = arena.in_flight(),
+                        bytes = arena.len(),
+                        "rdma: transfers into this arena outlasted the shutdown budget; \
+                         unmapping anyway, and they will fail at their own end"
+                    );
+                }
+            }
             let live = arena.live();
             if live != 0 {
-                tracing::warn!(
+                tracing::debug!(
                     live,
                     bytes = arena.len(),
-                    "rdma: unmapping an arena that still has live suballocations"
+                    "rdma: unmapping an arena a caller still holds buffers from; their memory \
+                     stays valid, it is simply no longer registered"
                 );
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -883,13 +1100,28 @@ impl ArenaSet {
         }
     }
 
-    /// Arenas currently mapped. Test and diagnostics surface.
+    /// Arenas currently mapped. `cfg(test)` until Phase 4's reclamation has a
+    /// production reason to ask.
+    #[cfg(test)]
     pub(crate) fn arena_count(&self) -> usize {
         self.arenas.read().len()
     }
 
-    /// Live suballocations across every arena.
+    /// Live suballocations across every arena. `cfg(test)`, as above.
+    #[cfg(test)]
     pub(crate) fn live_allocations(&self) -> usize {
         self.arenas.read().iter().map(|a| a.live()).sum()
+    }
+
+    /// Transfers the NIC is still writing, across every arena.
+    ///
+    /// This is what shutdown drains on, so it is also the only honest way for a
+    /// test to know a transfer is genuinely in flight rather than merely
+    /// requested — the caller's future being slow proves nothing about whether
+    /// the backend was ever handed the op. Shutdown reads each arena's counter
+    /// directly, so this rollup exists only for the observer.
+    #[cfg(feature = "test-helpers")]
+    pub(crate) fn in_flight_transfers(&self) -> usize {
+        self.arenas.read().iter().map(|a| a.in_flight()).sum()
     }
 }

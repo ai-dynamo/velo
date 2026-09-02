@@ -214,6 +214,14 @@ path = "tests/transports/ucx_integration.rs"
 required-features = ["ucx"]
 
 [[test]]
+name = "rendezvous_rdma"
+path = "tests/rendezvous_rdma.rs"
+# `test-helpers` carries the fault-injection hook: a malformed descriptor and a
+# failing GET cannot be produced over `UCX_TLS=tcp`, and the fallbacks they
+# drive are exactly the code that must not rot.
+required-features = ["ucx", "test-helpers"]
+
+[[test]]
 name = "observability_scenarios"
 path = "tests/observability_scenarios.rs"
 required-features = ["test-helpers"]
