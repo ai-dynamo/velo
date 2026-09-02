@@ -11,6 +11,8 @@ Sign-off amendments:
   backend-discriminated; only the backend mechanics are UCX-specific.
 - Hardware checkpoint: pause at the Phase-3 validation target with restart
   instructions if no cluster is reachable from this session (§2, checkpoint).
+  **Discharged 2026-08-29** —
+  `agent-docs/2026-08-29-rdma-phase3-hardware-checkpoint.md`.
 
 Scope: native UCX RDMA GET path for `velo::rendezvous`, first-class memory
 registration (internal pool + external RAII), registration/EP lifecycle
@@ -59,11 +61,19 @@ UCX 1.22 facts make GET strictly simpler than PUT:
 
 Flow (mirrors PR #40's one good structural idea): consumer sends `_rv_acquire`
 (existing handler) advertising RDMA capability; owner replies
-`AcquireResponse::Rdma { lease_id, descriptor }` iff the slot is pinned AND the
-request advertised capability, else `Ready{...}` (chunked). Consumer issues
-`ucp_get_nbx`, then `_rv_detach`/`_rv_release` as today. The acquire round-trip
-is the linchpin: the owner revalidates the registration on every transfer, so
-**no cross-node invalidation protocol is needed for slot memory**.
+`AcquireResponse::Rdma { lease_id, descriptor, lease_timeout_ms }` iff the slot
+is pinned AND the request advertised capability, else `Ready{...}` (chunked).
+Consumer issues `ucp_get_nbx`, then `_rv_detach`/`_rv_release` as today. The
+acquire round-trip is the linchpin: the owner revalidates the registration on
+every transfer, so **no cross-node invalidation protocol is needed for slot
+memory**.
+
+`lease_timeout_ms` is a correction to this plan's original two-field
+description, not an addition made later: as built the response carries it as a
+`#[serde(default)] u64` where `0` means *no deadline*, which is the encoding an
+owner from before the reaper produces by omitting the field
+(`lib/velo/src/rendezvous/protocol.rs:134-144`). It is skew-load-bearing, so it
+belongs in any description of the response.
 
 ### D3 — Single-use unpacked rkeys in v1. No consumer-side rkey cache yet.
 
@@ -105,11 +115,21 @@ Pool design (from the Rust research, verified against `offset-allocator` 0.2
 source):
 
 - `ArenaSet`: append-only `Vec<Arc<Arena>>`, geometric growth (64 MiB → cap),
-  each arena = one `mmap` + one `ucp_mem_map` + one packed rkey (`Bytes`).
+  each arena = one page-aligned allocation + one `ucp_mem_map` + one packed
+  rkey (`Bytes`). *As built the allocation is `std::alloc::alloc_zeroed` under
+  a granule-aligned `Layout`, not `mmap`*
+  (`lib/velo/src/rendezvous/rdma/arena.rs:171-190`) — the plan named the
+  syscall it expected the allocator to reach for, which is not a property
+  anything depends on.
 - Suballocation: `offset-allocator` (MIT, zero unsafe, O(1) alloc+free) behind
   `parking_lot::Mutex`, allocating in **4 KiB granules** (u32 range → 16 TiB
-  per arena; float-bin waste ≤12.5%). `with_max_allocs` explicitly sized (the
-  default eagerly allocates ~4 MB of node metadata per arena).
+  per arena; float-bin waste ≤12.5%). `with_max_allocs` explicitly sized — but
+  **sized *up*, to the granule count, not down**
+  (`arena.rs:956`, rationale `arena.rs:80-84, 948-955`). The plan had the
+  trade-off backwards: shrinking the node pool below the granule count trades a
+  visible fixed cost (~28 B per granule, ~0.7% of the arena) for an invisible
+  one, where a fragmented arena reports "full" while it still has room and the
+  pool maps another arena it did not need.
 - Oversize requests (≥ threshold, default 64 MiB) get a dedicated arena —
   avoids the 12.5% bin round-up costing 128 MiB on a 1 GiB object.
 - The free token is the private `Allocation` value held in an owner-side
@@ -131,18 +151,35 @@ large owned buffers is Phase 5, behind an explicit API.
 - `deregistered().await` — resolves only when velo has fully quiesced and
   `ucp_mem_unmap` returned; then and only then may the caller free the memory.
 - `unregister(timeout).await` — caller-initiated: gate new leases → drain
-  in-flight ops/leases → flush → unmap.
+  in-flight ops/leases → flush → unmap. *As built it returns
+  `Result<Deregistered, RdmaError>` where **both** `Ok` variants mean released:
+  `Deregistered::DrainTimedOut` says "released without waiting for in-flight
+  work" (`lib/velo/src/rendezvous/rdma/region.rs:245-254, 526`). The plan's
+  plain success/failure shape is the bug that distinction was added to close —
+  an `Err(Timeout)` conflates "still mapped" with "unmapped early", and only
+  the first means the caller must not free.*
 - `Drop` without awaiting = **background deregistration + `tracing::warn!`**.
   Never block in Drop (panics in a runtime), never abort. Memory stays mapped
   until the async dereg completes, so dropping early is a liveness bug for the
   caller, not UB for anyone.
+- *Not planned, and shipped: `RegionGuard::watch() -> RegionWatch`
+  (`region.rs:493, 628`), a clonable observational handle carrying the same
+  observers. It exists because `unregister` consumes the guard, so without it a
+  task that only wants to know when the memory was released would have to own
+  the release.*
 
 Ownership: the guard does **not** borrow. Constructors:
 `register_external_memory(ptr: NonNull<u8>, len)` is `unsafe` with a
 documented contract (caller keeps the allocation alive and un-freed until
 `deregistered()` resolves — which is exactly the contract Ryan described), plus
-a safe `register_owned(impl Into<BoxedBytes>)` variant where velo takes
-ownership and hands the buffer back on deregistration. A `&mut [u8]`-shaped
+a safe `register_owned` variant where velo takes ownership and hands the buffer
+back on deregistration. *As built that variant is
+`Velo::register_owned(Box<[u8]>) -> Result<RegionGuard, RegisterOwnedError>`
+(`lib/velo/src/lib.rs:1213-1216`) — a distinct error type carrying the buffer
+back on failure, not `RdmaError`, so a rejected registration does not eat the
+allocation. Recovery on the success path is
+`RegionGuard::unregister_owned(timeout) -> Result<(Box<[u8]>, Deregistered),
+RdmaError>` (`region.rs:549-552`).* A `&mut [u8]`-shaped
 API would be an aliasing lie: UCP's `prot` field is dead code, so every
 RMA-registered region is remotely *writable* by any rkey holder regardless of
 our GET-only protocol. Documented as a trust-domain assumption.
@@ -161,7 +198,12 @@ outstanding leases on anchors inside the region.
 ### D6 — Eligibility is consumer-advertised, owner-decided; fully skew-safe.
 
 New `#[serde(default)]` field on `RvAcquireRequest`:
-`rdma: Option<RdmaOffer>` (transport key + protocol version). serde_json
+`rdma: Option<RdmaOffer>`. "Transport key + protocol version" is this
+paragraph's own text failing to track D12, which replaced it: as built
+`RdmaOffer { backends: Vec<String> }` is a preference-ordered list of backend
+names and nothing else (`lib/velo/src/rendezvous/protocol.rs:90-95`). **There
+is no protocol-version field on the offer**, so a future descriptor-format
+change has no negotiation channel — see the Phase-5 addendum in §2. serde_json
 ignores unknown fields and defaults missing ones, so: old consumer → no field
 → owner never sends `Rdma` (old consumers keep working); old owner → ignores
 the field → replies `Ready` (new consumers fall back transparently). No hello
@@ -205,12 +247,19 @@ reaches the wire.
 
 The consumer rejects any mismatch between `rkey_len`, the actual remaining
 bytes, and sanity bounds *before* the pointer reaches UCX. `generation` is the
-owner's region generation (bumped on arena/region reuse) — echoed back in
-`_rv_detach`/`_rv_release` for diagnostics, and future-proofs a Phase-5 rkey
-cache. No foreign types (no `MemType` enums from FFI crates) on the wire.
+owner's region generation (bumped on arena/region reuse), carried in the
+descriptor for diagnostics there
+(`lib/velo/src/rendezvous/descriptor.rs:139-141`), and future-proofs a Phase-5
+rkey cache. **It is not echoed back**: `RvDetachRequest` and `RvReleaseRequest`
+carry `handle` + `lease_id` only
+(`lib/velo/src/rendezvous/protocol.rs:171-183`). The echo was never built and
+nothing decided against it — this plan simply described a field that does not
+exist. No foreign types (no `MemType` enums from FFI crates) on the wire.
 The same struct serves the Phase-5 PUT reversal with a direction flag —
 one descriptor primitive, two directions (the MPICH `prepare_rdma_info`
-shape; every surveyed system converged on it).
+shape; every surveyed system converged on it). **This forward-compatibility
+promise did not survive contact with the decoder Phase 3 built** — see the
+addendum on Phase 5's first bullet in §2.
 
 ### D8 — Shutdown: rendezvous pinned-state drains *before* transport teardown.
 
@@ -277,6 +326,27 @@ bump, no external-implementor impact. Revisit only if an out-of-tree transport
 ever needs RDMA (then the `set_observability`-shaped default-impl accessor is
 the pattern, priced at a coordinated minor bump).
 
+The `velo-ext` half held exactly as written — no trait change, no bump. What
+this decision does **not** say, and a reader takes from it wrongly, is that
+`velo`'s own public surface stayed as small. It did not. Publicly exported
+today (`lib/velo/src/lib.rs:69-76`, all under the same
+`cfg(all(target_os = "linux", feature = "ucx"))` gate as the transport):
+`Deregistered`, `PinnedBuf`, `RdmaConfig`, `RdmaError`, `RdmaPoolConfig`,
+`RdmaRendezvousConfig`, `RegionGuard`, `RegionWatch`, `RegisterOwnedError`,
+`PinnedWriter` — of which this plan names only `RegionGuard` and `PinnedBuf`.
+Also public and unplanned: `RendezvousManager::alloc_pinned_writer`
+(`lib/velo/src/rendezvous.rs:853`); `RendezvousWrite::rdma_destination` with
+the `RdmaDestination<'a>` type it returns
+(`lib/velo/src/rendezvous/write.rs:49, 64`), which *is* Phase 3's "new
+`RendezvousWrite` capability method, defaulted" but whose borrow-plus-
+`TransferHold` shape — the thing that keeps a cancelled `get_into` from
+returning granules the NIC is still writing into — this plan gives no hint of;
+`StageMode` (`lib/velo/src/rendezvous/store.rs:55`), derived from `SlotBody`
+rather than stored; and `RdmaTestHook` / `arm_rdma_hook`
+(`rendezvous.rs:138, 640`), correctly gated behind `test-helpers`. `RdmaError`
+is `#[non_exhaustive]`, which is what keeps Phase 5's lease, descriptor and
+direction failures from being a breaking change.
+
 RMA submission bypasses `send_message`/`AdmissionGate` (those are AM-frame
 semantics — eager caps, drain rejection, `SendOutcome`): commands go to the
 ring via `send_async` (bounded = natural backpressure), completions resolve
@@ -294,6 +364,40 @@ ring** (self-deadlock class — the ring's own docs warn about it).
 | `dedicated_arena_min` (new) | `RdmaPoolConfig` | 64 MiB | staging above this gets its own arena |
 | `registered_bytes_budget` (new) | `RdmaPoolConfig` | 1 GiB | pool + external total; over → chunked fallback |
 | `lease_timeout` (new) | `RdmaRendezvousConfig` | 30 s | RDMA lease deadline (reaper backstop) |
+
+All seven defaults above still hold as built, verified one by one against
+`transparent.rs:32`, `store.rs:48`, `transports/ucx/transport.rs:74`,
+`rdma/mod.rs:157`, `arena.rs:118`, `arena.rs:119` and `rdma/mod.rs:158`. What
+stopped holding is the claim that this is *one* table of the tunables — it is
+now incomplete, which makes it misleading rather than merely dated. The knobs
+it does not list:
+
+| Knob | Set via | Default | Anchor |
+|---|---|---|---|
+| `initial_arena_bytes` | `RdmaPoolConfig` | 64 MiB | `arena.rs:85`, default `:116` |
+| `max_arena_bytes` | `RdmaPoolConfig` | 1 GiB | `arena.rs:87`, default `:117` |
+| `shutdown_timeout` | `RdmaConfig` | 30 s | `rdma/mod.rs:72`, default `:83` |
+| `drop_dereg_timeout` | `RdmaConfig` | 30 s | `rdma/mod.rs:75`, default `:84`, used `region.rs:595` |
+| `MIN_LEASE_TIMEOUT` | constant clamp, not configurable | 1 ms | `rendezvous.rs:1049, 1078-1089` |
+| `arena_reclaim_after` | `RdmaPoolConfig` | `None` (off) | Phase 4, PR #69 — not on main |
+| `retain_arena_bytes` | `RdmaPoolConfig` | 64 MiB low-water | Phase 4, PR #69 — not on main |
+| `ep_idle_timeout` | `UcxConfig` / builder | `None`, floored | Phase 4, PR #69 — not on main |
+| `eager_endpoints` | `UcxConfig` / builder | `false` | Phase 4, PR #69 — not on main |
+
+`MIN_LEASE_TIMEOUT` is a clamp rather than a knob because sub-millisecond
+encodes as `0` on the wire, which the protocol already spells *no deadline*: a
+lease configured at 100 µs would otherwise become immortal.
+
+`eager_endpoints` is worth calling out as unplanned. It exists because the
+hardware checkpoint measured a ~14 ms one-time lazy-wireup cost against a
+~108 µs warm GET — a lever this plan did not know about and did not price.
+
+**Kill switch, which D6 promises and never names:** the environment variable is
+`VELO_RDMA_RENDEZVOUS_DISABLE`, read once at `VeloBuilder::build` with
+affirmative-only parsing (`lib/velo/src/lib.rs:478-489`), forcing
+`RdmaRendezvousConfig::enabled` off whatever the config says
+(`rdma/mod.rs:101-103`). Read once and centrally so one process cannot answer
+half its acquires one way and half the other.
 
 Ordering invariant: `rdma_min ≤ transparent_threshold < chunk_size` makes a
 transparently-staged payload *size*-eligible for RDMA from its first byte over
@@ -379,7 +483,13 @@ feature = "ucx"))]`, exactly matching the transport's gate).
   (warn + background dereg), `deregistered()` latching, shutdown-ordering
   (region unmap strictly before EP close — assert via instrumented ordering),
   budget exhaustion behavior, concurrent register/unregister/shutdown races
-  under `loom`-style stress where practical.
+  under `loom`-style stress where practical. *"Where practical" resolved to
+  "not": no permutation-checking harness covers these races, which are pinned
+  by ordinary concurrency tests instead. (The `loom-rs` in the dependency tree
+  is a different thing — a simulation runtime behind the `simulation` feature,
+  used by `velo::simulation` and not by the registration layer.) A
+  substitution, not a gap, but this bullet should not be read as a promise of
+  `loom`.*
 
 ### Phase 3 — Protocol: the GET fast path end-to-end (PR 3)
 
@@ -401,16 +511,61 @@ feature = "ucx"))]`, exactly matching the transport's gate).
   the one that proves RDMA is actually chosen — GET latency histogram,
   arena-utilization gauge), stale-comment cleanup (`rendezvous.rs:18-21`,
   `write.rs:17-18`, test comments).
+
+  Metrics as shipped, six registered at `lib/velo/src/observability.rs:1391,
+  1400, 1410, 1419, 1430, 1441`: `velo_rdma_registered_bytes`,
+  `velo_rdma_registrations_total`, `velo_rdma_live_regions` (unplanned),
+  `velo_rendezvous_rdma_path_total` (ten labelled fallback reasons, more than
+  this bullet asked for), `velo_rendezvous_rdma_get_duration_seconds` and
+  `velo_rendezvous_rdma_leases_reaped_total` (unplanned). **The
+  arena-utilization gauge is the one item of this bullet that is not built** —
+  there is no such series anywhere in `observability.rs`. It is a Phase-3
+  deliverable and it is still owed.
 - Tests: full matrix over tcp — pinned↔chunked consumer/owner cross-product,
   old-wire simulation (requests without the offer field), GET-failure
   fallback, lease-reaper, kill switch, two-process example
   (`rendezvous_rdma_two_proc.rs`, porting PR #40's launcher harness — its one
   unambiguously good artifact).
+- Deliverables as shipped: the two-process example is
+  `examples/examples/rendezvous_rdma_two_proc.rs`
+  (`examples/Cargo.toml:56`); the stale-comment cleanup is done
+  (`lib/velo/src/rendezvous.rs:17-28` now describes both paths,
+  `lib/velo/src/rendezvous/write.rs:4-8` names `PinnedWriter`); the `md_map`
+  probe is `rkey_pack_canary` (`lib/velo/src/transports/ucx/tests.rs:792`); the
+  micro-bench harness is `bench_rma`, `#[ignore]`d and printing tcp numbers
+  only (`tests.rs:1674-1676`).
 
 **Checkpoint after Phase 3: hardware validation** on a real IB cluster
 (compute-session MCP; `UCX_TLS=rc_mlx5,ud_mlx5`): correctness matrix +
 latency/bandwidth vs chunked baseline + registration-cost numbers. Threshold
 defaults revisited with data. Not a PR; a report.
+
+**Addendum (2026-08-29): the checkpoint ran, and passed. Report:
+`agent-docs/2026-08-29-rdma-phase3-hardware-checkpoint.md`.** computelab
+lego-c2, ConnectX-7 NDR, two `--exclusive` nodes on one InfiniBand fabric. The
+correctness matrix is byte-verified 50/50 and all 23 `rendezvous_rdma`
+integration tests pass over real InfiniBand.
+
+It could **not** run on the lane this paragraph prescribes. Velo's vendored UCX
+exposed no mlx5-accelerated transports, and `UCX_TLS=rc_mlx5,ud_mlx5` degrades
+to chunked *silently* — the setting this plan named is the setting that hides
+the problem. The run therefore used `rc_verbs,ud_verbs,self`, and **every
+latency, bandwidth and rkey-size number in the report is an unaccelerated
+floor**. The root cause was proven off-hardware afterwards:
+`crates/ucx-rs/build.rs:350-351` emits `static=uct_ib_mlx5` before
+`static=uct_ib`, so ELF constructor order runs `uct_mlx5_init` first, both
+constructors prepend to `uct_ib_ops`, and the verbs memory domain ends up at
+the head — where it opens unconditionally and every mlx5 NIC comes up
+unaccelerated. The fix is open as PR #70 (`ai/ucx-rs-mlx5-link-order`); until
+it lands, `UCX_IB_MLX5_DEVX=y` in the environment is a working runtime
+workaround.
+
+The consequence for this plan is specific, and it is not "re-run for tidiness":
+**`rdma_min_bytes = 64 KiB` must be re-derived on the accelerated lane before
+it is trusted**, along with the ~14 ms wireup finding and the two findings in
+§3's ledger below. An unaccelerated floor is a lower bound on what the hardware
+does, not a measurement of it, and a threshold derived from a floor can only be
+conservative by accident.
 
 ### Phase 4 — Lifecycle pressure: EP reaper + pool reclamation (PR 4)
 
@@ -421,12 +576,50 @@ defaults revisited with data. Not a PR; a report.
 - Shutdown/teardown interaction tests; soak test (register/transfer/release
   loop asserting stable registered-bytes and EP counts).
 
+Status: written, open as PR #69 (`ai/rdma-phase4-lifecycle`), **not on main**.
+Nothing in this section can be checked against the tree yet, which is why the
+D11 rows for its four knobs carry a PR reference rather than a file anchor.
+Two things about it are worth recording here rather than in the PR:
+
+- `eager_endpoints` is a Phase-4 addition this plan never anticipated, added
+  because of the checkpoint's ~14 ms lazy-wireup finding (report §5).
+- The metric this bullet names, `eps_closed_idle_total`, is **not** shipped as
+  a Prometheus series. The count exists as an internal atomic reachable from
+  tests. The soak deliverable is likewise not met as written: what PR #69
+  carries is two partial soaks — registered-bytes stability against the mock
+  backend, and endpoint-count stability over UCX — with no single loop
+  asserting both axes together. Both are open items, not closed ones.
+
 ### Phase 5 — Role reversal (PUT) + measured optimizations (PR 5, scope-gated)
 
 - Consumer-supplied descriptor in the acquire request ("PUT into this"):
   owner PUTs + `ucp_ep_flush_nbx` + completion AM (`_rv_put_done`), the flush
   carrying an explicit timeout (tcp SW-RMA flush needs the peer progressing).
   Same descriptor struct, direction flag (D7).
+
+  **Addendum (2026-09-01): the direction flag is not additively deployable, as
+  D7 assumed it would be.** D7 promised "one descriptor primitive, two
+  directions". The decoder Phase 3 built refuses *any* non-zero `flags` byte
+  outright (`lib/velo/src/rendezvous/descriptor.rs:225-227`,
+  `DescriptorError::UnknownFlags`). That refusal is correct and should stay — a
+  flag exists to change how the rest of the blob is read, so a decoder that
+  ignores one it does not know reads the wrong thing. The consequence is that
+  every Phase-3 and Phase-4 peer rejects a flagged descriptor and falls back to
+  chunked: benign, and total, for the whole mixed-version window. Bumping
+  `DESCRIPTOR_VERSION` (`descriptor.rs:68`) instead does not help, because
+  there is nowhere to negotiate it — `RdmaOffer` carries backend names and no
+  version (`lib/velo/src/rendezvous/protocol.rs:90-95`), so a version field
+  would itself have to be added to the offer first, under the
+  `#[serde(default)]` discipline, and shipped a release ahead. **Phase 5 must
+  either budget for that negotiation step or accept universal chunked fallback
+  in the mixed window — deliberately, and stated in its plan.**
+
+  Additive surface Phase 5 needs and does not have today: a consumer-descriptor
+  field on `RvAcquireRequest` (`protocol.rs:98-110`, `#[serde(default)]`); a
+  `_rv_put_done` handler (the registered set is `_rv_metadata`, `_rv_acquire`,
+  `_rv_pull`, `_rv_ref`, `_rv_detach`, `_rv_release`, `_rv_lease_renew`); and
+  `put`/`flush` on the internal `RdmaBackend` trait, whose transfer surface is
+  `get` alone (`lib/velo/src/rendezvous/rdma/backend.rs:177-223`).
 - Owner-side TTL for *chunked* leases. Phase 3 gave RDMA leases a deadline and
   a reaper because an RDMA GET is invisible to the owner; chunked leases kept
   their existing no-deadline behaviour deliberately, as scope discipline. The
@@ -439,8 +632,24 @@ defaults revisited with data. Not a PR; a report.
   (quick_cache design from D9).
 
 Phases 1→2→3 are strictly sequential (each builds on the previous PR landing
-on main). Phase 4 is independent of 3 (can parallelize after 2). Phase 5 waits
-for the checkpoint.
+on main).
+
+**Phase 4 was predicted to be independent of 3 and parallelizable after 2. As
+built it is not.** Its arena reclamation runs on the rendezvous lease reaper's
+tick — Phase-3 machinery, started by `set_rdma_context`
+(`lib/velo/src/rendezvous.rs:525`) with a period derived from `lease_timeout /
+2` (`rendezvous.rs:550`) and stopped ahead of the registration sweep
+(`rendezvous.rs:116-120, 574`). Reusing it was the right call: it is the one
+periodic task the subsystem already has, and a second timer would have to be
+ordered against the first anyway. But it means the stack is 1→2→3→4, which is
+what PR #69 stacking on PR #68 already reflects. Nobody parallelized, so
+nothing is lost by saying so plainly.
+
+**Phase 5 waited for the checkpoint; the checkpoint has run.** What gates it
+now is not the checkpoint but the mlx5 link-order fix (PR #70) — the two
+optimizations at the end of Phase 5 are explicitly conditioned on measurements,
+and the accelerated lane those measurements have to come from does not exist
+yet. The gate moved; it did not disappear.
 
 ---
 
@@ -450,10 +659,51 @@ Honest accounting, per the critique:
 
 | Not testable over `UCX_TLS=tcp` | Mitigation |
 |---|---|
-| Stale-rkey → remote access error → QP death | Design excludes stale rkeys (single-use + acquire-time revalidation); hardware checkpoint exercises the error path deliberately once |
+| Stale-rkey → remote access error → **process abort** | Design excludes stale rkeys (single-use + acquire-time revalidation). Exercised on IB 2026-08-29 — resolved worse than priced; see note 1 |
 | SW RMA validates nothing (bad addr = silent corruption) | Owner-authored addresses only (descriptor comes from the owner's own table); consumer never computes remote addresses; debug asserts on ranges |
-| Multi-MD rkey serialization | `md_map` probe test documents what CI covers; hardware checkpoint covers the real format |
-| Registration cost realism | Bench harness both places; thresholds re-derived at checkpoint |
+| Multi-MD rkey serialization | **Settled.** `md_map` probe documents what CI covers (9 B over tcp: header only, the tcp MD registers nothing); measured 20 B on IB. The probe's `>= 9` floor stays — see note 2 |
+| Registration cost realism | Bench harness both places; **thresholds re-derived 2026-08-29, verdict: no change** — see note 3 |
+
+**Note 1 — row 1 resolved worse than D3 priced it.** D3 predicted that a stale
+rkey on RC means `IBV_WC_REM_ACCESS_ERR` and "the whole QP dies". On
+rc_verbs/CX-7 the observed outcome is `ucs_fatal` → `SIGABRT`: **the process
+dies, not the QP**, with no Rust-level error to fall back from. Over tcp the
+same blob is refused inside `ucp_ep_rkey_unpack` and comes back as an ordinary
+error, so **a tcp-only CI can never see this class at all**. It stays out of
+reach today because of D3's two legs — single-use rkeys and acquire-time
+revalidation — and *not* because of the syntactic pre-parse
+(`lib/velo/src/transports/ucx/rma.rs:535`), which contains framing, not
+staleness: a semantically stale but syntactically perfect rkey passes it
+identically. Two things on the table would hole that invariant. The Phase-5
+rkey cache (D3's deferral) makes an rkey outlive its op by construction, and
+Phase 4's arena reclamation rests on the argument that an empty arena is
+referenced by nothing — an argument a cached rkey breaks. **Scoping the rkey
+cache as "just an optimization, gated on a profile" is mispricing it.**
+
+**Note 2 — row 3, and why the canary bound is not tightened.** The 20 B is a
+*verbs-MD* measurement, taken on the build where the mlx5 memory domain never
+opened. An independent probe on a DEVX MD measured 19 B on the same UCX 1.22
+(`docs/proposals/ibverbs-transport.md:919-920`). Raising `rkey_pack_canary`'s
+floor from `>= 9` to `== 20` would pin a number this build produces only
+*because of* the link-order defect. Leave it, re-measure after PR #70, and
+re-check `preparse_packed_rkey`'s assumptions against whatever comes back.
+
+**Note 3 — row 4: keep `rdma_min_bytes` at 64 KiB, but not for the reason we
+expected.** On a warm peer pair RDMA beat chunked at every size down to 4 KiB,
+so there is no crossover above 4 KiB on this fabric and 64 KiB is conservative
+— at a cost of roughly 40–70 µs per transfer in the 4–64 KiB band, which is not
+worth the pinned-memory and lease pressure. Registration itself is cheap
+(43–266 µs across 4 KiB–64 MiB) and is not the bottleneck; the ~105 µs acquire
+round-trip dominates. **The threshold turned out not to be the lever.** The
+lever is a ~14 ms one-time lazy-endpoint wireup on a fresh peer pair against a
+108–229 µs warm GET, which is why Phase 4 added `eager_endpoints`. Two caveats
+the numbers carry: the chunked arm ran under
+`VELO_RDMA_RENDEZVOUS_DISABLE=1`, so staging mode co-varies with path — this
+answers "enable RDMA at all", not a clean per-slot sweep; and the cold
+crossover is bracketed only between 16 MiB and 256 MiB, cells 16× apart, so do
+not interpolate a point estimate from it. D11's ordering invariant is
+untouched. **All of it is an rc_verbs floor and owes a re-derivation on the
+accelerated lane** — see the checkpoint addendum in §2.
 
 ## 4. Explicitly out of scope (this milestone)
 
@@ -476,5 +726,8 @@ Honest accounting, per the critique:
 4. Hardware checkpoint: implementation **pauses at the Phase-3 validation
    target** and hands Ryan restart instructions (cluster session spin-up on
    a compute cluster) unless a session-reachable IB allocation exists at that
-   point.
+   point. **Done 2026-08-29** —
+   `agent-docs/2026-08-29-rdma-phase3-hardware-checkpoint.md`. One item on the
+   checkpoint's own list, `abandon_rma_ops` under a SIGSTOP'd owner, was not
+   attempted and is still owed to a second cluster session.
 5. Backend pluggability (NIXL / libfabric later) added as **D12**.
