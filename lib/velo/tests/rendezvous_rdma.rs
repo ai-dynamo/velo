@@ -1294,6 +1294,7 @@ async fn a_cancelled_transfer_does_not_release_its_destination() {
             max_arena_bytes: ARENA,
             dedicated_arena_min: 64 << 20,
             registered_bytes_budget: ARENA + (ARENA / 2),
+            ..RdmaPoolConfig::default()
         },
         ..RdmaConfig::default()
     };
@@ -1468,6 +1469,7 @@ async fn dropping_a_pinned_buffer_returns_its_pool_space() {
             // Room for one arena and not two, with slack for the page rounding
             // the backend may add to the first.
             registered_bytes_budget: ARENA + (ARENA / 2),
+            ..RdmaPoolConfig::default()
         },
         ..RdmaConfig::default()
     }))

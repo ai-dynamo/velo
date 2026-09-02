@@ -187,8 +187,13 @@ impl PinnedSlot {
 
     /// Whether the memory behind this slot is still registered.
     ///
-    /// Always true for pool staging: an arena outlives every suballocation cut
-    /// from it, and the registry sweep is the only thing that unmaps one.
+    /// Always true for pool staging, and the reason is the same one arena
+    /// reclamation rests on rather than an accident of who unmaps what. An arena
+    /// is unmapped — by the shutdown sweep or by the periodic reclaim — only
+    /// when `live() == 0`, meaning no suballocation exists. A `Pool` slot holds
+    /// a [`PinnedBuf`], which *is* a suballocation, for its whole life. So while
+    /// this slot exists its arena cannot be reclaimed, and the descriptor it
+    /// hands out cannot outlive the registration behind it.
     pub(crate) fn is_live(&self) -> bool {
         match &self.staging {
             PinnedStaging::Pool(_) => true,

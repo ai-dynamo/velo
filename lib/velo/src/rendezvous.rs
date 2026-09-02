@@ -547,7 +547,20 @@ impl RendezvousManager {
         // Half the deadline, so a lease is force-released between one and one
         // and a half timeouts after its last renewal. The floor keeps a tiny
         // timeout from turning the reaper into a spin.
-        let period = (config.lease_timeout / 2).max(std::time::Duration::from_millis(10));
+        let lease_period = (config.lease_timeout / 2).max(std::time::Duration::from_millis(10));
+        // The same task also sweeps the arena pool (Phase 4), so it ticks at
+        // whichever of the two duties needs it sooner. One task rather than two
+        // because they have identical lifetimes — both exist exactly when an
+        // RDMA backend does — and identical exits, and because a second timer
+        // would be a second thing to cancel correctly at shutdown.
+        //
+        // Reclamation still runs on the lease cadence when
+        // `arena_reclaim_after` is unset: empty *dedicated* arenas are reclaimed
+        // unconditionally, so the sweep is never a no-op by configuration.
+        let period = match registry.arena_reclaim_after() {
+            Some(after) => lease_period.min((after / 2).max(std::time::Duration::from_millis(10))),
+            None => lease_period,
+        };
 
         let ctx = RdmaContext {
             registry: Arc::clone(&registry),
@@ -584,6 +597,12 @@ impl RendezvousManager {
     /// same store operations, which are individually atomic, and the sweep
     /// tolerates a slot disappearing underneath it because that is exactly what
     /// it is trying to make happen.
+    ///
+    /// The same task also sweeps the arena pool, and *that* overlap is closed
+    /// rather than tolerated: `RdmaRegistry::reclaim_idle_arenas` holds an
+    /// admission ticket for its whole run, so the registry's own gate refuses a
+    /// reclaim that starts after the sweep and its drain waits out one already
+    /// running.
     ///
     /// **Pinned slots are demoted to the heap.** Each one holds a pool
     /// suballocation or an in-flight guard on a caller's region, and the
@@ -1205,7 +1224,13 @@ impl Drop for LeaseGuard {
     }
 }
 
-/// Force-release RDMA leases whose deadline has passed (D8).
+/// The RDMA subsystem's periodic tick: force-release expired leases (D8), and
+/// sweep the arena pool for arenas nothing is using (Phase 4).
+///
+/// Two duties in one task because they have the same lifetime — both exist
+/// exactly when an RDMA backend does — the same orderly exit, and the same
+/// backstop. The tick period is the faster of what the two ask for; see
+/// `set_rdma_context`.
 ///
 /// # Why only RDMA leases have deadlines
 ///
@@ -1246,6 +1271,19 @@ async fn reap_expired_leases(
         }
         let Some(store) = store.upgrade() else { return };
 
+        let registry = registry.upgrade();
+
+        // Pool reclamation (Phase 4) before the lease sweep, so a slot released
+        // by *this* tick's force-releases is reclaimed by the next one rather
+        // than being looked at in the same pass it was freed in. Awaiting it
+        // here is what serialises the two duties: an arena unmap and a lease
+        // force-release both take pool state apart, and running them
+        // concurrently would be two tasks doing that from opposite ends for no
+        // benefit at all.
+        if let Some(registry) = &registry {
+            registry.reclaim_idle_arenas().await;
+        }
+
         let expired = store.expired_leases(Instant::now());
         let mut reaped = 0usize;
         for (lease_id, local_id) in expired {
@@ -1269,8 +1307,10 @@ async fn reap_expired_leases(
             }
             // Sampled on the tick rather than pushed from the registration
             // paths, so the gauge reads current at scrape time instead of
-            // freezing at whatever the last registration left behind.
-            if let Some(registry) = registry.upgrade()
+            // freezing at whatever the last registration left behind. Read
+            // after the reclaim above, so an arena unmapped by this tick is
+            // already out of the number.
+            if let Some(registry) = &registry
                 && let Some(regions) = registry.live_regions()
             {
                 m.set_rdma_live_regions(regions);

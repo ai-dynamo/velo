@@ -513,6 +513,40 @@ impl RdmaRegistry {
         self.shared.backend.get(req).await
     }
 
+    /// Unmap arenas nothing is using any more (Phase 4's pool reclamation).
+    ///
+    /// Driven by the rendezvous lease reaper's tick, which is the one periodic
+    /// task this subsystem already has and which exists exactly when a pool
+    /// does. Policy lives on [`ArenaSet::reclaim_idle`] and the two config
+    /// fields it reads; what belongs *here* is the gate.
+    ///
+    /// Admission-gated for the same reason [`get`](Self::get) is, and it is not
+    /// an optimisation. The shutdown sweep takes the arena vector and unmaps
+    /// what it finds; a reclaim running concurrently has already removed its
+    /// victims from that vector and is awaiting their unmaps, so without a gate
+    /// the sweep could return, `latch_all_deregistered` could ask the backend
+    /// how many registrations remain, and get a non-zero answer from an unmap
+    /// still in flight — refusing to resolve latches that were owed. The ticket
+    /// is held across the whole sweep, so step 1 stops new reclaims and step 2's
+    /// drain waits for one already running — *within the shutdown budget*, which
+    /// is the same bounded promise a registration in progress gets and degrades
+    /// the same way (a warning, and the sweep proceeds anyway).
+    ///
+    /// Returns how many arenas were unmapped and confirmed; `0` when the gate is
+    /// closed, which is the correct answer for "shutdown owns this now".
+    pub(crate) async fn reclaim_idle_arenas(&self) -> usize {
+        let Ok(_ticket) = self.admit() else {
+            return 0;
+        };
+        self.pool.reclaim_idle().await
+    }
+
+    /// How long a pooled arena must sit empty before the sweep unmaps it, if
+    /// ever. Read by the reaper task to pick its tick period.
+    pub(crate) fn arena_reclaim_after(&self) -> Option<Duration> {
+        self.shared.cfg.pool.arena_reclaim_after
+    }
+
     /// The runtime this registry was built on.
     ///
     /// An in-flight transfer must be able to outlive the caller that started

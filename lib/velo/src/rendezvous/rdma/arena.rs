@@ -49,17 +49,44 @@
 //! about who holds the buffer. Handing a shared reference to a range the NIC is
 //! actively filling would be a race Rust would otherwise let through silently.
 //!
-//! # Reclamation is Phase 4
+//! # Reclamation (Phase 4)
 //!
-//! Arenas are append-only and live until registry shutdown. Empty-arena
-//! reclamation under a low-water mark — the only kind that is safe, since
-//! nothing references an empty arena — is deliberately not in this phase.
+//! Arenas are append-only until something gives them back. Two things do, and
+//! they are deliberately different because the risk is different.
+//!
+//! **Empty pooled arenas, on a timer, off by default.** D9 is emphatic that
+//! memory registrations are evicted by *byte budget* and never by inactivity,
+//! because timer-evicting a registration a peer still holds a descriptor for is
+//! the stale-key hazard that kills a whole queue pair. An **empty** arena is the
+//! one exception it names, and the exception is sound for a checkable reason
+//! rather than a hopeful one: `live() == 0` means no [`Suballoc`] exists, and a
+//! staged slot a peer could hold a descriptor for owns a [`PinnedBuf`] — hence a
+//! `Suballoc` — for its whole life (`rendezvous::pinned::PinnedSlot`, whose
+//! `is_live` returns `true` unconditionally for pool staging on exactly this
+//! reasoning). No suballocation therefore means no live descriptor into the
+//! arena, which is what makes unmapping it safe rather than merely tidy.
+//! [`RdmaPoolConfig::arena_reclaim_after`] arms it;
+//! [`RdmaPoolConfig::retain_arena_bytes`] keeps a warm floor so an idle-then-busy
+//! workload does not pay a fresh `ibv_reg_mr` for its first allocation.
+//!
+//! **Empty dedicated arenas, unconditionally.** A dedicated arena backs exactly
+//! one oversize request and is never offered to the general search, so once its
+//! single suballocation is gone it can never be used again — it is pure charge
+//! against the budget. Phase 2 shipped with no way to give one back, and said so
+//! on [`RdmaPoolConfig::dedicated_arena_min`]: a workload staging repeatedly at
+//! that size walked into the registered-bytes budget within a session and fell
+//! back to chunked from then on. Reclaiming these needs no timer and no
+//! retention, and closing that gap is not optional enough to hide behind a knob.
+//!
+//! Both run from the same periodic sweep ([`ArenaSet::reclaim_idle`]), which
+//! routes through the ordinary [`RdmaBackend::unmap`] and reuses the
+//! unconfirmed-retention machinery for an unmap the backend would not confirm.
 
 use std::alloc::Layout;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use offset_allocator::{Allocation, Allocator};
@@ -89,14 +116,19 @@ pub struct RdmaPoolConfig {
     /// request. Without it the float-bin round-up would cost up to 12.5% — 128
     /// MiB on a 1 GiB object.
     ///
-    /// A dedicated arena is never offered to the general search, and this phase
-    /// reclaims no arenas, so *every* oversize request maps a new one and holds
-    /// it until shutdown — dropping the `PinnedBuf` does not give the arena
-    /// back. A workload that repeatedly stages at or above this size therefore
-    /// walks into [`registered_bytes_budget`](Self::registered_bytes_budget)
-    /// within a single session (16 allocations at the defaults) and falls back
-    /// to chunked from then on. Empty-arena reclamation is Phase 4; until then,
-    /// raise this threshold above the sizes a hot path actually stages.
+    /// A dedicated arena is never offered to the general search, so once its one
+    /// suballocation is dropped nothing can ever use it again. Phase 2 shipped
+    /// with no way to give one back, and the consequence was written down here:
+    /// a workload repeatedly staging at or above this size walked into
+    /// [`registered_bytes_budget`](Self::registered_bytes_budget) within a
+    /// single session (16 allocations at the defaults) and fell back to chunked
+    /// from then on, with the only mitigation being to raise this threshold
+    /// above the sizes a hot path actually stages.
+    ///
+    /// That gap is closed: an empty dedicated arena is reclaimed by the periodic
+    /// sweep, unconditionally and with no retention floor — see the module docs
+    /// for why it needs neither. The threshold is now a pure sizing decision
+    /// again, which is what it was always meant to be.
     pub dedicated_arena_min: u64,
     /// Ceiling on *mapped* bytes across the pool and external regions together.
     ///
@@ -108,6 +140,51 @@ pub struct RdmaPoolConfig {
     /// and Phase 3's callers stage chunked instead — pool exhaustion is never a
     /// hard failure of the staging operation (D4).
     pub registered_bytes_budget: u64,
+    /// Unmap a pooled arena that has been **empty** for this long. `None` (the
+    /// default) never unmaps one.
+    ///
+    /// D9's position is that memory registrations are evicted by byte budget and
+    /// never by inactivity, with empty arenas the single documented exception —
+    /// nothing references one, so no peer can hold a descriptor into it (the
+    /// module docs give the checkable version of that argument). This is that
+    /// exception, and it is off by default because the conservative reading of
+    /// D9 is the one that ships first: an arena kept mapped costs registered
+    /// bytes, an arena unmapped too eagerly costs an `ibv_reg_mr` linear in its
+    /// size on the next allocation.
+    ///
+    /// The sweep runs on the rendezvous lease reaper's tick, so an arena is
+    /// unmapped somewhere between one and two of these after it fell empty.
+    ///
+    /// That tick has a ten-millisecond floor, so this knob has one in practice
+    /// too: a sub-millisecond setting does not produce sub-millisecond
+    /// reclamation, it produces a sweep at roughly 100 Hz. The churn that
+    /// invites is bounded by
+    /// [`retain_arena_bytes`](Self::retain_arena_bytes), which keeps the warm
+    /// floor mapped through it — which is why this field is left unclamped where
+    /// the transport's endpoint timeout is not: there, a too-small value breaks
+    /// sends; here, the worst case is a busy sweep finding nothing to do.
+    ///
+    /// Dedicated arenas ignore this entirely: they are reclaimed as soon as a
+    /// sweep finds them empty, whatever this says. See
+    /// [`dedicated_arena_min`](Self::dedicated_arena_min).
+    pub arena_reclaim_after: Option<Duration>,
+    /// Pooled arena bytes to keep mapped even when they are empty and eligible.
+    ///
+    /// The low-water mark for
+    /// [`arena_reclaim_after`](Self::arena_reclaim_after). A workload that goes
+    /// quiet and then busy again should not pay a fresh registration for its
+    /// first allocation, so the sweep stops once unmapping the next candidate
+    /// would take the pool's mapped total below this.
+    ///
+    /// Defaults to one initial arena's worth (64 MiB), and is measured against
+    /// *pooled* arenas only — dedicated ones are never offered to the general
+    /// search, so keeping one warm would buy nothing. Candidates are considered
+    /// newest-first, which under geometric growth means the largest go first and
+    /// the small early arena is what survives as the warm floor.
+    ///
+    /// Zero means "reclaim every empty arena", which is well-defined and
+    /// occasionally what a memory-tight deployment wants.
+    pub retain_arena_bytes: u64,
 }
 
 impl Default for RdmaPoolConfig {
@@ -117,9 +194,26 @@ impl Default for RdmaPoolConfig {
             max_arena_bytes: 1 << 30,
             dedicated_arena_min: 64 << 20,
             registered_bytes_budget: 1 << 30,
+            arena_reclaim_after: None,
+            retain_arena_bytes: 64 << 20,
         }
     }
 }
+
+/// Milliseconds since the first call, from a monotonic clock.
+///
+/// The arena emptiness stamp has to live in an atomic — it is written from
+/// whichever thread drops the last suballocation and read by the sweep — and
+/// `Instant` is not one. Millisecond resolution against a lazily-captured
+/// baseline is four orders of magnitude finer than any reclaim delay worth
+/// configuring, and a `u64` of milliseconds does not wrap for 584 million years.
+fn coarse_now_ms() -> u64 {
+    static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    BASE.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// [`Arena::empty_since_ms`] when the arena has suballocations outstanding.
+const NOT_EMPTY: u64 = u64::MAX;
 
 /// Where some registered bytes currently live, as a peer would address them.
 ///
@@ -250,9 +344,17 @@ pub(crate) struct Arena {
     granules: u32,
     free: Mutex<Allocator<u32>>,
     /// Live suballocations cut from this arena — held by a caller, by an
-    /// in-flight transfer, or both. Phase 4's reclamation reads it; here it
-    /// makes "the pool really did give the space back" assertable.
+    /// in-flight transfer, or both. Reclamation's precondition and the thing
+    /// that makes "the pool really did give the space back" assertable.
     live: AtomicUsize,
+    /// [`coarse_now_ms`] at which `live` last fell to zero, or [`NOT_EMPTY`].
+    ///
+    /// Written under no lock, by whichever thread drops the last suballocation,
+    /// and read by the sweep under the arena vector's write lock. It does not
+    /// need to be exact — it gates a delay measured in seconds — but it does need
+    /// to be *reset* when the arena is used again, which [`Arena::try_alloc`]
+    /// does before the caller can possibly drop what it just handed out.
+    empty_since_ms: AtomicU64,
     /// Suballocations an in-flight transfer is still writing into.
     ///
     /// Deliberately separate from `live`. Shutdown must wait for *these* before
@@ -288,6 +390,24 @@ impl Arena {
         self.in_flight.load(Ordering::Acquire)
     }
 
+    /// Bytes charged against the budget for this arena.
+    fn charged(&self) -> u64 {
+        self.charged
+    }
+
+    /// How long this arena has been empty, or `None` if it is not.
+    ///
+    /// Reports `None` for an arena that has never been empty *and* for one that
+    /// has never been allocated from, which cannot happen — [`ArenaSet::alloc`]
+    /// cuts the request that motivated an arena out of it before publishing it —
+    /// but is the safe answer either way.
+    fn empty_for_ms(&self, now_ms: u64) -> Option<u64> {
+        match self.empty_since_ms.load(Ordering::Acquire) {
+            NOT_EMPTY => None,
+            since => Some(now_ms.saturating_sub(since)),
+        }
+    }
+
     /// Try to cut `len` bytes out of this arena.
     ///
     /// `None` means "not from here" — no space, or the request does not fit at
@@ -300,6 +420,12 @@ impl Arena {
         }
         let allocation = self.free.lock().allocate(granules)?;
         self.live.fetch_add(1, Ordering::AcqRel);
+        // Not empty any more. Ordered after the `live` bump, so a sweep that
+        // sees a stale `empty_since` has already seen `live != 0` and skipped
+        // the arena on that alone — and in any case the sweep does this check
+        // under the arena vector's write lock, which this runs inside the read
+        // lock of. See `ArenaSet::try_existing`.
+        self.empty_since_ms.store(NOT_EMPTY, Ordering::Release);
         Some(PinnedBuf {
             inner: Arc::new(Suballoc {
                 offset: allocation.offset as usize * GRANULE,
@@ -312,9 +438,16 @@ impl Arena {
 
     /// Return a suballocation's space to the pool. Never touches the backend —
     /// the arena stays registered, which is the point of pooling.
+    ///
+    /// Falling to zero starts the reclamation clock. Only the transition is
+    /// stamped, not every release: a *later* release cannot happen without an
+    /// intervening allocation, which resets the stamp itself.
     fn release(&self, allocation: Allocation<u32>) {
         self.free.lock().free(allocation);
-        self.live.fetch_sub(1, Ordering::AcqRel);
+        if self.live.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.empty_since_ms
+                .store(coarse_now_ms(), Ordering::Release);
+        }
     }
 }
 
@@ -393,10 +526,17 @@ impl Drop for TransferHold {
 /// An owned, registered byte range cut from an [`Arena`].
 ///
 /// Derefs to its bytes, so it is usable as a plain buffer. Dropping it returns
-/// the space to the pool and nothing else: the arena stays registered, so the
-/// next allocation of that space costs no pin. If a transfer into the range is
-/// still outstanding the space is returned when *that* finishes instead — see
-/// [`TransferHold`].
+/// the space to the pool; if a transfer into the range is still outstanding the
+/// space is returned when *that* finishes instead — see [`TransferHold`].
+///
+/// What the drop costs depends on which kind of arena the space came from. Out
+/// of a **pooled** arena it costs nothing: the arena stays registered, so the
+/// next allocation of that space pays no pin. Out of a **dedicated** one — a
+/// request at or above [`RdmaPoolConfig::dedicated_arena_min`] gets an arena to
+/// itself — dropping the last buffer is exactly what makes the arena
+/// reclaimable, and the next sweep unmaps it. That is deliberate: a dedicated
+/// arena is never offered to another request, so holding it registered would
+/// charge the budget for capacity nothing can use.
 ///
 /// # This is registered memory, and that has consequences
 ///
@@ -767,15 +907,27 @@ pub(crate) fn pool_arena_target(initial: u64, max: u64, pooled: usize) -> u64 {
 // ArenaSet
 // ---------------------------------------------------------------------------
 
-/// The pool: an append-only set of arenas with geometric growth.
+/// The pool: a set of arenas that grows geometrically and is pruned by the
+/// reclamation sweep.
 pub(crate) struct ArenaSet {
     backend: Arc<dyn RdmaBackend>,
     cfg: RdmaPoolConfig,
     budget: Arc<Budget>,
     generations: Arc<AtomicU64>,
     metrics: Option<Arc<crate::observability::VeloMetrics>>,
-    /// Append-only until shutdown. Read on every allocation, written only by
-    /// the task holding `grow`.
+    /// Two writers with different protocols, and this `RwLock` is what orders
+    /// them against each other and against every allocation.
+    ///
+    /// [`ArenaSet::alloc`] *appends*, and serialises with itself through `grow`
+    /// so two concurrent misses map one arena rather than two.
+    /// [`ArenaSet::reclaim_idle`] *prunes*, and deliberately does not take
+    /// `grow`: it needs exclusion against allocations, which `grow` does not
+    /// provide, and it must not block behind a map it has no interest in.
+    ///
+    /// The lock is therefore load-bearing rather than incidental — see
+    /// [`ArenaSet::try_existing`] for the argument that a reclaimed arena can
+    /// never be handed out, which depends on the read guard spanning
+    /// `Arena::try_alloc`.
     arenas: RwLock<Vec<Arc<Arena>>>,
     /// Serialises growth so two concurrent misses map one arena, not two. An
     /// async mutex because what it guards is an await point.
@@ -866,12 +1018,162 @@ impl ArenaSet {
     /// Walk the existing pooled arenas, first fit. They are few and ordered by
     /// creation, so the earlier (smaller) ones are tried first and the big tail
     /// stays available for big requests.
+    ///
+    /// # This read guard is reclamation's exclusion, not just a lock
+    ///
+    /// The guard is held **across** `try_alloc`, and [`reclaim_idle`] does its
+    /// emptiness check and its removal from the vector inside one write-lock
+    /// critical section. Those two facts together are the whole of "an arena
+    /// being reclaimed is never handed out": either this call wins and the
+    /// sweep's re-check sees `live() != 0`, or the sweep wins and the arena is
+    /// out of the vector before this can reach it.
+    ///
+    /// A refactor that snapshotted the vector and dropped the guard before
+    /// allocating would compile, run, and silently reopen a use-after-unmap
+    /// window. Keep the guard spanning `try_alloc`.
+    ///
+    /// [`reclaim_idle`]: Self::reclaim_idle
     fn try_existing(&self, len: usize) -> Option<PinnedBuf> {
         let arenas = self.arenas.read();
         arenas
             .iter()
             .filter(|a| !a.dedicated)
             .find_map(|arena| arena.try_alloc(len))
+    }
+
+    /// Unmap arenas nothing is using any more, and give their bytes back.
+    ///
+    /// Two policies, described in full on the module docs and the config fields:
+    /// an empty **dedicated** arena goes unconditionally (it can never serve
+    /// another request, so keeping it is pure charge against the budget), and an
+    /// empty **pooled** arena goes once it has been empty for
+    /// [`RdmaPoolConfig::arena_reclaim_after`] — off by default — and only while
+    /// [`RdmaPoolConfig::retain_arena_bytes`] of pooled arena would still be
+    /// mapped afterwards.
+    ///
+    /// Returns how many arenas were unmapped and confirmed.
+    ///
+    /// # Composing with the shutdown sweep
+    ///
+    /// A victim leaves `self.arenas` before its unmap is issued, so
+    /// [`unmap_all`](Self::unmap_all)'s `mem::take` cannot also see it: no
+    /// double unmap and no double budget release, in either interleaving. The
+    /// other half of that is at the caller — `RdmaRegistry::reclaim_idle_arenas`
+    /// holds an admission ticket across this, so the shutdown gate stops new
+    /// sweeps and the drain waits for one already running.
+    ///
+    /// An unmap the backend will not confirm joins the same `unconfirmed` list
+    /// [`unmap_all`](Self::unmap_all) uses, and its budget is released by
+    /// [`release_unconfirmed`](Self::release_unconfirmed) at the end of velo
+    /// shutdown rather than here — `Err` from an unmap means *unknown*, not
+    /// *unmapped*, and crediting the budget for pages that may still be pinned
+    /// would let the next registration overcommit `RLIMIT_MEMLOCK`.
+    pub(crate) async fn reclaim_idle(&self) -> usize {
+        let now_ms = coarse_now_ms();
+
+        // Selection and removal in one critical section: see `try_existing` for
+        // why that is what makes this safe against a concurrent allocation.
+        // Nothing awaits inside it.
+        let victims: Vec<Arc<Arena>> = {
+            let mut arenas = self.arenas.write();
+            // The pooled total retention is measured against. Dedicated arenas
+            // are excluded because they are never offered to the general
+            // search, so keeping one mapped buys no warm capacity.
+            let mut pooled_bytes: u64 = arenas
+                .iter()
+                .filter(|a| !a.dedicated)
+                .map(|a| a.charged())
+                .sum();
+            let mut victims = Vec::new();
+            let mut keep = Vec::with_capacity(arenas.len());
+            // Newest first. Growth is geometric, so this reclaims the largest
+            // arenas first and leaves the small early one as the warm floor.
+            //
+            // The trade that makes, said out loud: what survives is the
+            // *smallest* arena, so a workload that cycles between busy and idle
+            // re-maps most of its working set every time it comes back — the
+            // retention floor is one arena's worth of warmth, not a working
+            // set's. Keeping the largest instead would serve that workload
+            // better and cost every other deployment the difference in pinned
+            // bytes, which is the wrong default for a knob whose entire purpose
+            // is to give registered memory back. Accepted, and the answer for a
+            // deployment that cycles is to raise `retain_arena_bytes` rather
+            // than to change the order.
+            for arena in std::mem::take(&mut *arenas).into_iter().rev() {
+                if self.is_reclaimable(&arena, now_ms, pooled_bytes) {
+                    if !arena.dedicated {
+                        pooled_bytes -= arena.charged();
+                    }
+                    victims.push(arena);
+                } else {
+                    keep.push(arena);
+                }
+            }
+            keep.reverse();
+            *arenas = keep;
+            victims
+        };
+        if victims.is_empty() {
+            return 0;
+        }
+
+        let mut reclaimed = 0usize;
+        let mut unconfirmed = Vec::new();
+        for arena in victims {
+            match self.backend.unmap(arena.backend_region_id).await {
+                Ok(()) => {
+                    arena.memory.mark_unmapped();
+                    self.budget.release(arena.charged());
+                    reclaimed += 1;
+                    tracing::debug!(
+                        bytes = arena.len(),
+                        dedicated = arena.dedicated,
+                        generation = arena.generation,
+                        "rdma: reclaimed an empty arena"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        %e,
+                        bytes = arena.len(),
+                        "rdma: reclaim unmap unconfirmed; the arena's pages and its budget stay \
+                         held until velo shutdown completes"
+                    );
+                    unconfirmed.push(arena);
+                }
+            }
+        }
+        if !unconfirmed.is_empty() {
+            self.unconfirmed.lock().extend(unconfirmed);
+        }
+        reclaimed
+    }
+
+    /// The reclamation predicate, split out so the policy reads in one place.
+    ///
+    /// `pooled_bytes` is what the pool would still have mapped *including* this
+    /// arena, so the retention test subtracts before comparing.
+    fn is_reclaimable(&self, arena: &Arena, now_ms: u64, pooled_bytes: u64) -> bool {
+        // The safety precondition, and the only one that is not policy. `live`
+        // covers every holder of a suballocation, `in_flight` every transfer
+        // still writing into one; the second is implied by the first (a
+        // `TransferHold` keeps its `Suballoc` alive) and checked anyway, because
+        // an unmap under a NIC write is the hazard this module exists to
+        // contain and one redundant load is not a price worth negotiating.
+        if arena.live() != 0 || arena.in_flight() != 0 {
+            return false;
+        }
+        if arena.dedicated {
+            return true;
+        }
+        let Some(after) = self.cfg.arena_reclaim_after else {
+            return false;
+        };
+        let Some(empty_for) = arena.empty_for_ms(now_ms) else {
+            return false;
+        };
+        u128::from(empty_for) >= after.as_millis()
+            && pooled_bytes.saturating_sub(arena.charged()) >= self.cfg.retain_arena_bytes
     }
 
     /// Geometric growth from `initial_arena_bytes`, doubling per pooled arena,
@@ -955,6 +1257,12 @@ impl ArenaSet {
             // any arena above 512 MiB.
             free: Mutex::new(Allocator::with_max_allocs(granules, granules)),
             live: AtomicUsize::new(0),
+            // Not `coarse_now_ms()`: an arena that has never held anything is
+            // not "empty since now", and treating it as such would let a sweep
+            // reclaim the arena a caller is at this moment cutting its request
+            // out of. `try_alloc` runs before the arena is published, and it is
+            // `release` that starts this clock.
+            empty_since_ms: AtomicU64::new(NOT_EMPTY),
             in_flight: AtomicUsize::new(0),
             dedicated,
             memory,
@@ -994,6 +1302,12 @@ impl ArenaSet {
     /// stay leaked *for now* — [`release_unconfirmed`](Self::release_unconfirmed)
     /// frees them once velo shutdown has completed and nothing can still be
     /// pinned.
+    ///
+    /// The `mem::take` below cannot collide with a concurrent
+    /// [`reclaim_idle`](Self::reclaim_idle): a reclaim removes its victims from
+    /// this vector *before* issuing their unmaps, so this sees either an arena
+    /// no reclaim has touched or nothing at all — never one that is mid-unmap.
+    /// No double unmap, no double budget release, in either interleaving.
     pub(crate) async fn unmap_all(&self, deadline: Instant) -> usize {
         let arenas: Vec<Arc<Arena>> = std::mem::take(&mut *self.arenas.write());
         let mut unconfirmed = Vec::new();
@@ -1100,8 +1414,8 @@ impl ArenaSet {
         }
     }
 
-    /// Arenas currently mapped. `cfg(test)` until Phase 4's reclamation has a
-    /// production reason to ask.
+    /// Arenas currently mapped. `cfg(test)`: reclamation walks the vector
+    /// itself, so nothing on a production path needs to ask.
     #[cfg(test)]
     pub(crate) fn arena_count(&self) -> usize {
         self.arenas.read().len()
@@ -1123,5 +1437,15 @@ impl ArenaSet {
     #[cfg(feature = "test-helpers")]
     pub(crate) fn in_flight_transfers(&self) -> usize {
         self.arenas.read().iter().map(|a| a.in_flight()).sum()
+    }
+
+    /// The shared registered-bytes total this pool charges against.
+    ///
+    /// `cfg(test)`: production reads it through `RdmaRegistry::registered_bytes`
+    /// on the registry that owns the budget. It is the *shared* number — pool
+    /// and external regions together — which in a pool-only test is the pool's.
+    #[cfg(test)]
+    pub(crate) fn registered_bytes(&self) -> u64 {
+        self.budget.registered()
     }
 }
