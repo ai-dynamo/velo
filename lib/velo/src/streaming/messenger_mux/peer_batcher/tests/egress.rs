@@ -37,14 +37,16 @@ async fn one_batch_carries_records_from_several_slots() {
     }
     harness.await_withheld(12).await;
 
-    // One grant per slot, all taken by a single `control.take()`.
+    // One grant per slot, all applied before anything is written.
     //
-    // The barrier is what makes that a fact. Without it the three grants are
-    // three separate writes to the control inbox, and a batcher scheduled
-    // between two of them takes one grant, releases that slot's four records
-    // and flushes them on its own — three single-slot batches, and the
-    // bucketing this test is about never happens. Stopping the loop at the
-    // barrier puts every grant in the inbox before the drain that reads it.
+    // The barrier is what makes that a fact, and not by coalescing the takes:
+    // it sits after `dispatch`, so the first grant is taken and applied by the
+    // select arm on its own. What the barrier stops is the *flush* — the loop
+    // cannot reach one while parked, so the remaining grants land in the inbox
+    // and are applied by the drain that follows the release. Without it a
+    // batcher scheduled between two grants takes one, releases that slot's
+    // four records and flushes them alone — three single-slot batches, and the
+    // bucketing this test is about never happens.
     hooks.pause();
     harness.grant(slots[0].1, 8);
     hooks.wait_until_parked().await;

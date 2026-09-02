@@ -17,9 +17,11 @@
 //!
 //! "In a single wake" is a fact these tests establish, not one they assume.
 //! Back-to-back grants are separate writes to the control inbox, and a batcher
-//! scheduled between two of them takes the first on its own; a test that needs
-//! them coalesced holds the loop at [`super::test_hooks::TestHooks`] while it
-//! writes them.
+//! scheduled between two of them takes the first on its own and flushes it
+//! alone. A test that needs every grant applied before anything is written
+//! holds the loop at [`super::test_hooks::TestHooks`], whose barrier sits
+//! after the dispatch — so it does not merge the takes, it withholds the
+//! flush until the drain has seen them all.
 
 mod clamp;
 mod control;
