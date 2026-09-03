@@ -66,4 +66,22 @@ New module `lib/runtime/src/pipeline/network/velo_response.rs` (+`velo_response/
 - Prereqs staged by job 2704276: `.research/bin/{etcd,nats-server}` (arm64), `.research/aiperf-venv` (aiperf 0.10.0 + maturin), Qwen3-0.6B tokenizer in `/work/hf_cache`. The `ai-dynamo` wheel needs `maturin` against `lib/bindings/python` in the container — first build is its own job.
 - Slurm discipline: every step `--cpus-per-task=144` (without it, `--exclusive` still cgroups the step to 1 CPU — verified); short jobs (≤30 min) schedule in ~1 min even under load; `RUSTUP_HOME=/work/.rustup-aarch64 CARGO_HOME=/work/.cargo-aarch64`.
 - Reproducibility gate: **commit the velo streaming work before the first measured run** — dyn-pin pins this working tree by path, and today's tree differs from HEAD (200 ms sweep default).
+## Addendum 2026-09-02 — as implemented
+
+The adapter landed in `.research/dyn-pin` (uncommitted there): `velo_response.rs` (~1,700 lines with tests) + glue in the five files above + 4 Python files. Gates: fmt, check, clippy `-D warnings`, 637/637 `dynamo-runtime` lib tests (15 velo_response, seam tests widened to all six plane pairs). Two adversarial reviewers (fable, opus) produced 18 findings; 7 fixed in code, 6 recorded as known deltas in the module docs, 2 rejected with cited reasons.
+
+Accepted deviations from this brief:
+- A `dyn_velo_response_hello` unary handler gives the frontend the worker's `WorkerAddress` — credit return needs the reverse route, and velo hard-fails sends to unregistered peers. One extra round-trip per (worker, frontend) pair, once.
+- `Data(Bytes)` with a private serde module (no `serde_bytes` dep in `lib/runtime`); hex not base64 for the address blob (no base64 dep; QUIC hand-rolls hex too).
+- Flush cadence is the mux `AutoFlush` linger (`DYN_VELO_RESPONSE_FLUSH_INTERVAL_US`, 0 = write-on-admission), no flusher task.
+- One process-wide `Velo` node shared by server and pool (the mocker packs many DRTs per process), lifecycle by holder refcount + a per-DRT `VeloResponseHold` on the runtime child token; last release drains live publishers, dumps mux metrics, then `graceful_shutdown(Timeout)`.
+- Co-located frontend+worker in one process streams in-process (no transport to negotiate); the mux assertion accepts that case with a warning so it cannot be read as mux evidence.
+- Frontend-initiated cancel: `reset_on_stop() = true` (QUIC parity), abort path live and counted.
+
+Benchmark rules that came out of review:
+1. Run arm D at `DYN_VELO_RESPONSE_FLUSH_INTERVAL_US=1000` **and** `0`. The linger delays the prologue (~1–2 ms TTFT floor); `=0` is the configuration comparable to QUIC's immediate prologue flush. PR 11918's batch interval never delays its prologue, so the default is NOT parity.
+2. Set `DYN_VELO_RESPONSE_STREAM_HOST` to an explicit IP on multi-NIC nodes — velo's default advertise-all policy differs from the other planes' address selection, and the arm must transit the same NIC.
+3. Velo's `max_batch_bytes` (60 KiB) has no frame-count cap; PR 11918 caps at 64 frames/65,536 bytes. State this when comparing tokens-per-wire-write.
+4. Known deltas to state in the writeup: 15 s heartbeat-only worker-death detection; unauthenticated hello (same trust model as TCP call-home, weaker than QUIC's cert pinning); one `spawn_blocking` per stream retirement on the worker.
+
 - Cluster confound, checked and resolved: velo requests 2 MiB socket buffers (`lib/velo/src/transports/tcp/listener.rs:513`, `transport.rs:645`); this cluster's unraisable `net.core.{r,w}mem_max = 212992` clamps that to ~208 KiB and the explicit setsockopt locks out autotune. At 0.5 ms RTT that caps one connection near 400 MB/s. Worst-case mux traffic at the published rig's rate is ~200 MB/s *total*, so the clamp does not bite provided workers are packed into **≥4 mocker processes** (≥4 mux connections). Rule: use ≥4 worker processes per node in every velo-arm config, and state the clamp in the writeup.

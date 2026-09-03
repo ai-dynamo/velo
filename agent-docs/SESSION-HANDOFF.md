@@ -313,6 +313,37 @@ Gates after the fixes: fmt clean, clippy clean, `streaming_mux_credit` 5/5,
 The pre-existing teardown deadlock (work item 2) was re-confirmed live on
 this tree — the drain hook does not fix it, as expected.
 
+---
+
+## Addendum 2026-09-03 — measured head-to-head complete
+
+The Tier-2 adapter was implemented, adversarially reviewed, and benchmarked
+at both scales. **Results: `agent-docs/response-plane-benchmark-results.md`.**
+Headline: velo beats upstream main's per-request plane by 13–14% req/s with
+24–31% lower TTFT p99 and zero errors at the 512-worker/8192-concurrency
+shape; PR 11996 QUIC cannot complete a clean full-scale run on this cluster;
+PR 11918's build is faster end-to-end but cross-base (ai-dynamo 1.3.0 vs
+1.5.0) with no control arm, so its response-plane share is unresolved.
+
+Adapter code lives uncommitted in `.research/dyn-pin` (velo_response.rs +
+glue + Python choices); the rig is `.research/rig/` (t3-submit.sh /
+t3-submit-m18.sh). Design rulings and known deltas:
+`tier2-adapter-brief.md` addendum.
+
+Open items needing a ruling or follow-up:
+1. **Port PR 11918 onto the current Dynamo base** — the one measurement that
+   would isolate its mux against velo's fairly.
+2. **May `MpscSender::Drop` block a runtime worker?** Its own test asserts
+   the blocking (`tests/streaming/mpsc_integration.rs:288`); same defect
+   class as the fixed teardown deadlock. Needs a design ruling.
+3. Velo adapter CPU headroom (~2.4 ms/req vs bare TCP; velo0 closes most).
+4. Upstream Dynamo issue-worthy finds: silent discovery `Conflict`
+   (`controller.rs:391-404`, no logging, permanently non-serving fleet) and
+   aiperf 0.10.0's unbounded record wait on mmap decode failures.
+5. UCX arm: needs a container image with rdma-core; fabric verified healthy.
+6. Branch `drain-credit-return` (5 commits) is PR-ready; `gh` is not
+   authenticated here, so nothing was pushed.
+
 ### Second-pass review, 2026-09-02
 
 A second adversarial pass over the fix itself returned one high finding and two
