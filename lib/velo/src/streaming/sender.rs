@@ -15,10 +15,13 @@
 //!
 //! 1. **[`finalize(self)`](StreamSender::finalize)** — clean close, sends `Finalized` sentinel.
 //! 2. **[`detach(self)`](StreamSender::detach)** — clean detach, sends `Detached` sentinel, returns handle for re-attach.
-//! 3. **Drop** — abnormal exit, sends `Dropped` sentinel synchronously.
+//! 3. **Drop** — abnormal exit, sends `Dropped` sentinel.
 //!
 //! The heartbeat background task is cancelled in all three paths before the
 //! terminal sentinel is sent.
+//!
+//! None of the three blocks the calling thread on a full channel. `send_terminal`
+//! is where that is arranged, and why it has to be.
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -119,8 +122,8 @@ pub(crate) fn is_terminal_sentinel(bytes: &[u8]) -> bool {
 /// Holds a [`flume::Sender<Vec<u8>>`] for serialized frame bytes, a
 /// [`StreamAnchorHandle`] identifying the anchor, a [`CancellationToken`]
 /// to stop the background heartbeat task, and a reference to the anchor
-/// registry so that [`detach`](StreamSender::detach) can atomically clear
-/// the attachment flag before returning the handle.
+/// registry so that [`detach`](StreamSender::detach) can clear the attachment
+/// flag once its sentinel is in the channel.
 ///
 /// `T` is the user-defined item payload type. The `Serialize` bound is required
 /// for [`send`](StreamSender::send) to serialize `StreamFrame::Item(T)`.
@@ -331,9 +334,13 @@ impl<T: Serialize> StreamSender<T> {
 
     /// Permanently close the stream by sending a `Finalized` sentinel.
     ///
-    /// Cancels the heartbeat task, sends `StreamFrame::Finalized` synchronously,
-    /// and consumes `self`. The subsequent `Drop` will see `sent_terminal = true`
-    /// and skip the `Dropped` sentinel.
+    /// Cancels the heartbeat task, hands `StreamFrame::Finalized` to the channel
+    /// through `send_terminal`, and consumes `self`. The subsequent `Drop` will
+    /// see `sent_terminal = true` and skip the `Dropped` sentinel.
+    ///
+    /// Ordering holds even when the channel is full and the sentinel is queued by
+    /// a task: every record this sender produced is already in the channel ahead
+    /// of it, and this sender can produce no more.
     ///
     /// # Errors
     ///
@@ -344,15 +351,23 @@ impl<T: Serialize> StreamSender<T> {
         self.sent_terminal = true;
         // Clean up sender registry entry before returning
         self.sender_registry.senders.remove(&self.sender_stream_id);
-        self.tx.send(bytes).map_err(|_| SendError::ChannelClosed)
+        send_terminal(&self.tx, bytes, || {})
     }
 
     /// Detach the sender from the anchor by sending a `Detached` sentinel.
     ///
-    /// Cancels the heartbeat task, sends `StreamFrame::Detached` synchronously,
-    /// clears the attachment flag in the registry (so a new sender can attach
-    /// immediately), and returns the [`StreamAnchorHandle`] for re-attachment.
-    /// The subsequent `Drop` will see `sent_terminal = true` and skip `Dropped`.
+    /// Cancels the heartbeat task, hands `StreamFrame::Detached` to the channel
+    /// through `send_terminal`, clears the attachment flag in the registry (so a
+    /// new sender can attach), and returns the [`StreamAnchorHandle`] for
+    /// re-attachment. The subsequent `Drop` will see `sent_terminal = true` and
+    /// skip `Dropped`.
+    ///
+    /// The attachment flag is cleared **after** the sentinel reaches the channel,
+    /// which on a full channel means after the queuing task drains into it. A
+    /// sender that attached earlier would put its records ahead of the `Detached`
+    /// that ends the previous attachment, and the stream's frame order is the one
+    /// thing a re-attach may not disturb. Until then a re-attach sees the anchor
+    /// as still attached and can retry.
     ///
     /// # Errors
     ///
@@ -361,20 +376,79 @@ impl<T: Serialize> StreamSender<T> {
         self.heartbeat_cancel.cancel();
         let bytes = cached_detached().clone();
         self.sent_terminal = true;
-        self.tx.send(bytes).map_err(|_| SendError::ChannelClosed)?;
-        // Atomically clear the attachment flag so a new sender can attach
-        // without waiting for StreamAnchor to consume the Detached sentinel.
+        let registry = Arc::clone(&self.registry);
         let (_, local_id) = self.handle.unpack();
-        if let Some(mut entry) = self.registry.get_mut(&local_id) {
-            entry.attachment = false;
-        }
+        send_terminal(&self.tx, bytes, move || {
+            if let Some(mut entry) = registry.get_mut(&local_id) {
+                entry.attachment = false;
+            }
+        })?;
         // Clean up sender registry entry
         self.sender_registry.senders.remove(&self.sender_stream_id);
         Ok(self.handle)
     }
 }
 
-/// Drop safety: sends `StreamFrame::Dropped` synchronously if no terminal was sent.
+/// Hand a terminal sentinel to the frame channel without blocking a runtime worker.
+///
+/// [`flume::Sender::send`] blocks the calling **thread** while the channel is
+/// full. Under the messenger mux that channel is a per-slot inlet drained by one
+/// tokio task, so blocking a worker here starves the very task that would make
+/// room: a runtime with `W` workers wedges on `W` concurrent terminal sends, and a
+/// one-worker runtime on the first. Credit starvation is what fills the inlet, so
+/// this is reachable whenever a producer finalizes a stream whose consumer is
+/// behind — not an exotic state.
+///
+/// Dropping the record instead is not open to us: it is what tells the consumer
+/// `Finalized` from `Dropped`, and losing it strands a reader on the heartbeat
+/// watchdog. So a full channel escalates to a task that **awaits** the space
+/// rather than a thread that waits for it. The task takes a clone of the sender,
+/// which is what keeps the channel open until the sentinel is in it — otherwise
+/// the receiver would see the inlet's EOF before the record that explains it.
+///
+/// `on_delivered` runs once the record is queued: inline on the fast path, on the
+/// task otherwise. It carries work that must not become visible to anyone before
+/// the sentinel is in the channel.
+///
+/// The one case where the record is still lost is a runtime shutting down before
+/// the task runs. Nothing is owed then — the receiver is being torn down by the
+/// same shutdown, so no consumer is left to tell `Finalized` from `Dropped` — and
+/// the sender clone dies with the task, so the inlet reaches EOF rather than
+/// hanging. [`tokio::task::block_in_place`] would avoid even that, at the price of
+/// panicking on a `current_thread` runtime, which is a worse failure than the one
+/// it fixes.
+fn send_terminal(
+    tx: &flume::Sender<Vec<u8>>,
+    bytes: Vec<u8>,
+    on_delivered: impl FnOnce() + Send + 'static,
+) -> Result<(), SendError> {
+    let bytes = match tx.try_send(bytes) {
+        Ok(()) => {
+            on_delivered();
+            return Ok(());
+        }
+        Err(flume::TrySendError::Disconnected(_)) => return Err(SendError::ChannelClosed),
+        Err(flume::TrySendError::Full(bytes)) => bytes,
+    };
+
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        // No runtime under this thread, so there is no worker for the send to
+        // starve and blocking is exactly what the caller asked for.
+        tx.send(bytes).map_err(|_| SendError::ChannelClosed)?;
+        on_delivered();
+        return Ok(());
+    };
+
+    let tx = tx.clone();
+    runtime.spawn(async move {
+        if tx.send_async(bytes).await.is_ok() {
+            on_delivered();
+        }
+    });
+    Ok(())
+}
+
+/// Drop safety: hands `StreamFrame::Dropped` to the channel if no terminal was sent.
 ///
 /// This `impl` block has no `T: Serialize` bound because sentinel serialization
 /// uses `StreamFrame::<()>` — Rust forbids trait bounds on `Drop` impls.
@@ -386,9 +460,10 @@ impl<T> Drop for StreamSender<T> {
         if !self.sent_terminal {
             self.heartbeat_cancel.cancel();
             let bytes = cached_dropped().clone();
-            // Synchronous send — no spawn, no block_on. Ignore errors (channel
-            // may already be closed if the receiver was dropped first).
-            let _ = self.tx.send(bytes);
+            // Never blocks — see `send_terminal`. A `Drop` that parks a runtime
+            // worker is the one thing this path may not do. Errors ignored: the
+            // channel may already be closed if the receiver was dropped first.
+            let _ = send_terminal(&self.tx, bytes, || {});
         }
     }
 }

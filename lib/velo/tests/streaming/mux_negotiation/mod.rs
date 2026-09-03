@@ -47,9 +47,15 @@ const PATIENCE: Duration = Duration::from_secs(30);
 /// load-bearing. At the default 256 the window never empties and none of that is
 /// exercised; at 8 it empties constantly and only the return path can refill it.
 fn mux_config() -> MuxConfig {
+    mux_config_at(8)
+}
+
+/// The same shape at an explicit window, for the tests where the window is the
+/// variable rather than the backdrop.
+fn mux_config_at(initial_credit: u32) -> MuxConfig {
     MuxConfig {
         enabled: true,
-        initial_credit: 8,
+        initial_credit,
         credit_sweep_interval: Duration::from_millis(1),
         ..MuxConfig::default()
     }
@@ -423,6 +429,84 @@ async fn concurrent_streams_to_one_peer_share_the_batch_flow() {
         records > batches,
         "{records} records arrived in {batches} batches — nothing was multiplexed"
     );
+    consumer.assert_no_reader_stall();
+    eventually(|| consumer.mux_live_slots() == 0.0).await;
+}
+
+/// (i) Every `finalize` lands even when its slot's inlet is full.
+///
+/// `initial_credit: 1` makes each inlet two records deep, so eight producers
+/// running 40 frames apiece are past it almost at once and every `finalize` is
+/// offered to a full channel. That used to block the calling thread; on a runtime
+/// with `W` workers, `W` of those blocked the executor that drains the inlets, and
+/// the process deadlocked rather than failing — `agent-docs/mux-negotiation-hang.md`
+/// has the evidence.
+///
+/// The window is deliberately the smallest a peer may advertise (zero is
+/// `NegotiationError::LegacyPeer`), so nothing here passes by having *more* room:
+/// a fix that widened a buffer rather than removing the blocking send fails this.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_terminal_lands_even_when_its_inlet_is_full() {
+    const STREAMS: u32 = 8;
+    const FRAMES: u32 = 40;
+    let (consumer, producer) = pair(Some(mux_config_at(1)), Some(mux_config_at(1))).await;
+
+    let mut anchors = Vec::new();
+    let mut senders = Vec::new();
+    for _ in 0..STREAMS {
+        let anchor = consumer.velo.create_anchor::<u32>();
+        let handle = transfer(anchor.handle());
+        senders.push(
+            producer
+                .velo
+                .attach_anchor::<u32>(handle)
+                .await
+                .expect("remote attach"),
+        );
+        anchors.push(anchor);
+    }
+
+    let send = tokio::spawn(async move {
+        for n in 0..FRAMES {
+            for sender in &senders {
+                sender.send(n).await.expect("send item");
+            }
+        }
+        // The claim under test: none of these may block the thread they run on,
+        // whatever the state of the channel behind them.
+        for sender in senders {
+            sender.finalize().expect("finalize");
+        }
+    });
+
+    let collectors = anchors.into_iter().map(|mut anchor| async move {
+        let mut items = Vec::with_capacity(FRAMES as usize);
+        let mut finalized = false;
+        while let Some(frame) = anchor.next().await {
+            match frame.expect("no stream error") {
+                StreamFrame::Item(value) => items.push(value),
+                StreamFrame::Finalized => {
+                    finalized = true;
+                    break;
+                }
+                other => panic!("unexpected frame: {other:?}"),
+            }
+        }
+        (items, finalized)
+    });
+    let collected = tokio::time::timeout(PATIENCE, futures::future::join_all(collectors))
+        .await
+        .expect("timed out collecting items");
+    send.await.expect("send task");
+
+    for (items, finalized) in &collected {
+        assert!(
+            finalized,
+            "a starved stream ended without its terminal: the consumer cannot tell \
+             a finished producer from a stranded one"
+        );
+        assert_eq!(items, &(0..FRAMES).collect::<Vec<_>>());
+    }
     consumer.assert_no_reader_stall();
     eventually(|| consumer.mux_live_slots() == 0.0).await;
 }

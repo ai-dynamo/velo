@@ -21,15 +21,18 @@
 //! > of credit, or fencing a rendezvous singleton — still has its records
 //! > pulled, into [`EgressSlot`]'s withheld queue.
 //!
-//! That is not an optimisation. `finalize`, `detach` and `Drop` reach the inlet
-//! through a **synchronous** `flume::Sender::send`, which blocks when the
-//! channel is full — and under mux a starved slot's channel would never drain,
-//! so the block would be permanent, on a runtime worker thread, from inside a
-//! `Drop` in async context. TCP never had this failure mode: its egress pump
-//! drains at socket speed, so a full channel is transient. Credit can park a
-//! slot indefinitely, so it is not. The withheld queue is where the backpressure
-//! goes instead, bounded by the slot's byte cap rather than by a channel that
-//! control traffic has to get through.
+//! That is not an optimisation. A slot parked on credit whose inlet nobody
+//! pulled would leave every terminal sent through it — `finalize`, `detach`,
+//! `Drop` — waiting on a channel that never makes room. TCP never had this
+//! problem: its egress pump drains at socket speed, so a full channel is
+//! transient. Credit can park a slot indefinitely, so it is not. The withheld
+//! queue is where the backpressure goes instead, bounded by the slot's byte cap
+//! rather than by a channel that control traffic has to get through.
+//!
+//! Draining unconditionally keeps the inlet *moving*; it does not keep it from
+//! being momentarily full, so it was never the whole guarantee. The other half is
+//! [`send_terminal`](crate::streaming::sender), which is why a terminal on a full
+//! inlet now waits as a task rather than as a blocked runtime worker.
 
 use std::collections::VecDeque;
 use std::pin::Pin;

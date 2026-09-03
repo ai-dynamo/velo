@@ -43,12 +43,11 @@
 //! ## Draining X channels from one task
 //!
 //! [`slot_stream`] explains the `SelectAll` arrangement and why every inlet is
-//! drained unconditionally, credit or no credit: `finalize`, `detach` and `Drop`
-//! reach the inlet through a *synchronous* send, and a slot parked on credit
-//! would otherwise block one of them on a full channel forever. The batcher's
-//! half of that contract is the per-slot withheld queue — where a record waits
-//! when the slot cannot send it — and the byte cap on that queue, which is what
-//! bounds the memory the arrangement costs.
+//! drained unconditionally, credit or no credit: a slot parked on credit would
+//! otherwise leave its producer's terminal waiting on a channel that never makes
+//! room. The batcher's half of that contract is the per-slot withheld queue —
+//! where a record waits when the slot cannot send it — and the byte cap on that
+//! queue, which is what bounds the memory the arrangement costs.
 
 mod control;
 mod flush_gate;

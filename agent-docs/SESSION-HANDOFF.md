@@ -135,7 +135,24 @@ performance number.**
 
 ---
 
-## Work item 2: a deadlock on `main` — DIAGNOSED, NOT FIXED
+## Work item 2: a deadlock on `main` — FIXED 2026-09-02
+
+> Fixed on branch `drain-credit-return-teardown-fix` (on top of `3eab5c9`). The
+> cause was **not** the missing terminal reserve this section guesses at below:
+> the batcher drains fine and never parks on admission, and the inlet was full of
+> data records. The synchronous terminal send blocked the runtime's only worker,
+> which starved the batcher that would have released it. `finalize`, `detach` and
+> `Drop` now escalate a full channel to a task that awaits the space instead of a
+> thread that blocks on it, so the invariant no longer depends on a buffer size.
+> Full mechanism, stack evidence and gate results are in the "FIXED" section of
+> `agent-docs/mux-negotiation-hang.md`. The original diagnosis below is kept as
+> written.
+>
+> One more hang of the same class turned up and was **left alone**:
+> `test_mpsc_local_drop_preserved_under_backpressure` blocks on `MpscSender`'s
+> `Drop` (`mpsc/sender.rs:259`). It hangs with the fix stashed too, so it predates
+> this work, and its own assertion demands the blocking behaviour — so it needs a
+> ruling rather than a repeat of the patch.
 
 See `agent-docs/mux-negotiation-hang.md`. This is arguably the most valuable
 output of the session and it is **not caused by any of the work above** — it
@@ -250,8 +267,9 @@ Treat them as arithmetic, not findings.
 1. **Review the drain-driven credit change** and decide whether it ships. It is
    complete, tested and gate-clean; the case is correctness, with ~4.5% as a
    secondary benefit.
-2. **Fix the deadlock.** It is on `main`, in the workload shape the mux targets,
-   and the bisect makes it cheap to pick up.
+2. ~~**Fix the deadlock.**~~ Done — see work item 2. Review it: it changes when
+   `detach` clears the attachment flag, which is the only behaviour change a
+   caller can observe.
 3. **Decide whether the mux becomes the default.** Currently opt-in, which means
    stock velo ships the architecture Dynamo already beat.
 4. **Build the Tier-2 adapter** and get a real head-to-head.
