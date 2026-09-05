@@ -492,3 +492,26 @@ The next session executes `agent-docs/velo-response-plane-win-plan.md`. This sec
 ### Parked (carried forward)
 
 Draft PR for the `drain-credit-return` branch; mux default-on decision; velo-ext mux surface (BATCHING.md P11); W6 UCX fixes (and the possible velo issue lifted from `ucx-arm-instability-diagnosis.md`); velo issue #75 follow-up; W5 bounded ingest only if a residual TTFT gap survives W1+W2+W4.
+
+## Addendum 2026-09-04 (evening): Step 0 and Step 1 done, the seat moved, W0b in flight
+
+### State on disk
+
+- Branches and PRs: `response-plane-docs` off `main` is draft PR #76 (docs only: the five campaign docs, `ingest-cost-ledger.md`, and the dated addenda; every commit signed off, the DCO check requires `git commit -s`). `drain-credit-return` is pushed to origin with no PR of its own (still parked for the user). `w0-ingest-metrics` is draft PR #77 with base `drain-credit-return` (one commit, cd8c076, the W0 instruments; W0b becomes its second commit). Code PRs stack on `drain-credit-return` because `main` lacks af58539 (the terminal-sentinel deadlock fix) and the measured velo0 baseline. CI (`ci.yml`) runs only on `main` and mirrored `pull-request/N` branches, so the compute-node gates are the check for stacked PRs. The working tree at `/lustre/fsw/core_dlfw_ci/ryan/velo` is on `w0-ingest-metrics`; `/lustre/fsw/core_dlfw_ci/ryan/velo-docs` is a worktree on `response-plane-docs`. Docs edited in the worktree are mirrored as untracked copies in the main tree so a reader there sees the current text.
+- Gates: `.research/rig/check-w0-velo.sh` (velo: fmt, clippy all-features, the touched test targets, and in `full` mode etcd plus a JetStream nats-server and the whole suite with `--skip test_mpsc_local_drop_preserved_under_backpressure`), `.research/rig/check-w0-adapter.sh` (dyn-pin), `.research/rig/dbg/w0-precheck.sh` (single node at 8x64: worker ports, velo and TTFR series on every page, readiness), `.research/rig/failbefore-w0-velo.sh` (fail-before evidence by reverting one decision at a time). All green on 2026-09-04.
+- Wheel: built from velo cd8c076 plus the dyn-pin rig-local mods (`VeloResponseHold::attach_metrics` puts velo's registry on every DistributedRuntime's `/metrics`; `work_handler_perf` registers per registry; `log_velo_metrics` widened to the `velo_` prefix). Rebuild after W0b lands.
+- Rig: `t3-workers.sh` has `RIG_WORKER_METRICS` (default 1: `DYN_SYSTEM_PORT=9090+p` on the same line as `DYN_SELF_HOST_METADATA=0`, and a 2 s harvester into `prometheus/workers/proc<p>.txt`); `t3-frontend.sh` scrapes `/metrics` about once a second into `prometheus/timeseries.txt` (about 27 MB per rep); all four `rig_run_meta.json` writers carry `velo_sha`, `velo_dirty`, `dynpin_describe`. If the W0b agent flipped the harvest default to 0, flip it back to 1: three instrumented reps and one control showed no systematic perturbation.
+- Analysis: `.research/analysis/w0/` (`w1_queue.py` to `w5_report.py`, `lib_w0.py`, 50 unit tests) and the parameterized join (`T3_RESULTS_ROOT`, `T3_OUT`; `extract.py <rep>` then `w5_report.py <rep_dir>`). The frontend log is ANSI-coloured; prefilters must not span the colon after `metrics`.
+- Results: `t3-w0-probe` (rep1, the outlier: p99 4.6 s, hot process 1,887 slots), `t3-w0-probe2` (two clean instrumented reps), `t3-w0-ctrl-nowm` (worker harvest off), `t3-w0-probe-c2048` (concurrency 2048 discriminator). Join outputs under `.research/analysis/ttft-join/out-<tag>/`.
+- Memory notes for future sessions: GitHub over https through `gh` (no SSH agent on the login node), the branch-base decision, the DCO sign-off, and the Slurm queue facts.
+
+### Findings that changed the plan
+
+See the evening addenda in `ttft-gap-diagnosis.md` and `velo-response-plane-win-plan.md`: the frontend FIFOs hold about 146 ms; the attach round trip is 524 ms mean and scales with the mocker process's live slots; worker egress backpressure is present at 8192 and absent at 2048. W3 and a transport-level W4 come first; W1 drops to last. `ingest-cost-ledger.md` records the W1 and W2 design research (W2 reduced to items (a) and (d)).
+
+### Next, in order
+
+1. Land W0b (workflow `wf_eee734d1-73e`): review its diff, commit with sign-off as the second commit on `w0-ingest-metrics`, rebuild the wheel, run one instrumented velo0 rep, run `w6_egress.py`, and record the egress split as a further addendum. Then `wills-mega-review` on PR #77.
+2. W3 design and implementation (velo protocol plus the dyn-pin adapter), tests first, behind `DYN_VELO_RESPONSE_*` gates parsed with hard errors, arm `velo3`; then W4 at the transport writer, arm `velo4`, and `velo34`. Rig arm edits exactly as `mux18p` was added, with every existing arm explicitly unsetting the new gates.
+3. W2 (a) and (d) as its own PR, arm `velo2`.
+4. Matrix `win1`: `ARMS="tcp velo0 velo2 velo3 velo34 veloF mux18p" REPS=3`, then the verdict against the success bar, the benchmark doc, the results page (pass the artifact URL as `url`), and this handoff.

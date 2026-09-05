@@ -87,3 +87,16 @@ Decision points: after W0, the measured `message_rx`-vs-lane split sizes W1 (if 
 - No tuning of flush/linger knobs: ruled out by the t3e control and by code (no timer exists on velo0's path).
 - No ucx rerun before W6(a)+(c): ruled by the UCX diagnosis.
 - No mux18p-style unbounded streaming concurrency: velo keeps admission discipline; W4 exists precisely so TTFT does not require giving up the E2E tail.
+
+## Addendum 2026-09-04 (evening): W0 moved the seat of the backlog, so the order changes
+
+W0's measurement (`ttft-gap-diagnosis.md`, addendum of the same date) found the frontend's two ingest FIFOs hold about 146 ms of the ~1,070 ms C segment (message_rx 36 ms by Little's law, ordered lanes 110 ms mean), while the worker-observed attach round trip averages 524 ms and every mocker process shows egress backpressure at concurrency 8192 and none at 2048. The standing backlog is in front of the per-connection writer on the worker's egress, above the wire. The workstreams keep their letters; their targets and order change:
+
+1. **W0b (instrumentation, in flight)**: egress queue-wait histogram, frames-written counter and write-duration histogram on the connection writer, plus socket queue and node CPU sampling on both nodes, and `w6_egress.py`. Exit: the attach round trip is split between the worker egress queue, the socket, and the frontend egress queue.
+2. **W3 (zero-RTT setup)** moves first among the fixes: it removes the largest single measured term (the attach round trip, 524 ms mean, 253 to 1,723 ms per process) and the worker-side pre-generate wait entirely.
+3. **W4 (urgent class)** moves to the transport writer on the sending side: OpenSlot, prologue and attach frames bypass the per-connection data FIFO the way mux18p's writer drains its urgent lane before ordered data. Same concept as W6(b)'s heartbeat lane; design them as one mechanism in the `AdmissionGate` and the TCP writer.
+4. **W2 (per-record cost)** unchanged in content, reduced in scope per `ingest-cost-ledger.md` to items (a) and (d); it is the frontend CPU category.
+5. **W5 (bounded queue with backpressure)** now means bounding the per-connection admission queue in bytes, mux18p-style, so the backlog moves into per-stream slot inlets. It stays behind W3 and W4.
+6. **W1 (frontend ingest)** drops to last: at most 110 ms of lane wait is available there, and the touched-slot reconcile in `ingest-cost-ledger.md` is the candidate only if a residual TTFT gap survives W3 and W4.
+
+Arms for the next isolation matrix: `velo3` (W3), `velo4` (W4), `velo34`, `velo2` (W2), and `veloF` (W2+W3+W4), against `velo0`, `tcp`, `mux18p`, 3 reps, worker-side harvest on for every arm (three instrumented reps and one control showed no systematic perturbation; one outlier rep was router imbalance). Decision point after `velo34`: TTFT p50 at or under 200 ms with throughput at or above 3,000 req/s and E2E p99 at or under 8 s makes W5 and W1 optional. The success bar is unchanged.
