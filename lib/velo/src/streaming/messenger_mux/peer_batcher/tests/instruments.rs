@@ -69,6 +69,15 @@ async fn sent_records_are_counted_by_type() {
     let (inlet, slot) = harness.open_credited(1, 1, CREDIT).await;
     assert_eq!(sent(&harness, "open_slot"), 1.0, "the open went out alone");
 
+    // Wire-decoded tally, independent of `records_sent_total`: every record
+    // counted here comes from `OwnedBatch::decode`'s `record.kind`, which
+    // reads the wire byte `RecordType::as_u8` writes; `records_sent_total`
+    // is read out of `BatchEncoder::record_type_counts`, an array
+    // `RecordType::count_index` indexes, in the same `push` call. Seeded at
+    // 1 for the `OpenSlot` batch `open_credited` already decoded and pinned
+    // above.
+    let mut wire_total: u64 = 1;
+
     inlet.send(item(0)).expect("queue record");
     inlet.send(item(1)).expect("queue record");
     inlet
@@ -78,6 +87,7 @@ async fn sent_records_are_counted_by_type() {
     let mut closed = false;
     while !closed {
         for record in harness.next_batch().await.records {
+            wire_total += 1;
             match record.kind {
                 RecordType::Data => data += 1,
                 RecordType::CloseSlot => closed = true,
@@ -94,12 +104,33 @@ async fn sent_records_are_counted_by_type() {
         .handle
         .reply(&[ReplyRecord::CreditUpdate { slot, delta: 5 }]);
     let batch = harness.next_batch().await;
+    wire_total += batch.records.len() as u64;
     assert_eq!(batch.records[0].kind, RecordType::CreditUpdate);
     assert_eq!(sent(&harness, "credit_update"), 1.0);
     assert_eq!(
         sent(&harness, "open_slot"),
         1.0,
         "nothing else is filed as an open"
+    );
+
+    // The per-type assertions above already pair a wire-decoded kind with
+    // its registry counter, which is what catches a `count_index` bug: a
+    // wrong or colliding index mislabels the registry series while leaving
+    // the wire byte -- written from the same `record_type` argument, by
+    // `RecordType::as_u8`, in the same `push` call -- correct. This closes
+    // the total: comparing the registry's summed count to `wire_total`,
+    // decoded independently of `record_type_counts`, catches a `push` call
+    // site that reaches the wire without incrementing `record_type_counts`
+    // at all (or the reverse). Comparing this counter's sum to
+    // `records_per_batch` instead, as an earlier version of this assertion
+    // did, cannot fail: both are derived from the same `counts` array inside
+    // `batch_sent`.
+    let total_sent = harness
+        .snapshot()
+        .counter_sum("velo_streaming_mux_records_sent_total", &[]);
+    assert_eq!(
+        total_sent, wire_total as f64,
+        "every record decoded off the wire is counted, in total, by type"
     );
 }
 
@@ -116,6 +147,9 @@ async fn singleton_records_are_counted_by_type() {
     .await;
     let (inlet, _slot) = harness.open_credited(1, 1, CREDIT).await;
     let before = sent(&harness, "data");
+    let singletons_before = harness
+        .snapshot()
+        .counter("velo_streaming_mux_rendezvous_singletons_total", &[]);
 
     let oversized = rmp_serde::to_vec(&crate::streaming::frame::StreamFrame::Item(vec![
         7u8;
@@ -135,6 +169,16 @@ async fn singleton_records_are_counted_by_type() {
         sent(&harness, "data") - before,
         1.0,
         "the singleton path packs a record too, and must count it"
+    );
+    assert_eq!(
+        harness
+            .snapshot()
+            .counter("velo_streaming_mux_rendezvous_singletons_total", &[])
+            - singletons_before,
+        1.0,
+        "pins that this record actually rode dispatch_singleton, the only \
+         caller of MuxMetricsHandle::rendezvous_singleton, rather than a \
+         one-record BatchWriter::flush that happened to look the same"
     );
 }
 
@@ -168,8 +212,8 @@ async fn sent_records_exclude_batches_discarded_before_flush() {
 /// dies underneath it. `Batcher::epoch_death` calls `BatchWriter::reset_epoch`
 /// (`writer.rs`), which drops the encoder along with everything staged —
 /// the same mechanism `sent_records_exclude_batches_discarded_before_flush`
-/// pins for teardown, triggered here by a failed rendezvous admission instead
-/// of cancellation.
+/// pins for teardown, triggered here by the resolution a failed rendezvous
+/// admission delivers, instead of by cancellation.
 #[tokio::test(flavor = "multi_thread")]
 async fn sent_records_exclude_batches_discarded_by_epoch_death() {
     let harness = harness(manual()).await;

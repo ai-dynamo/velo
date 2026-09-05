@@ -646,11 +646,13 @@ const MUX_WAKE_SOURCES: [&str; 5] = ["open", "control", "frame", "inlet_closed",
 pub(crate) enum BatcherWake {
     /// An `OpenSlot` request from a producer.
     Open,
-    /// Coalesced control: grants, closes, replies, kicks, or a retirement.
+    /// Coalesced control: grants, closes, replies, kicks, a retirement, or a
+    /// singleton admission result.
     Control,
     /// A producer queued a record on one of this batcher's slots.
     Frame,
-    /// A producer went away without a terminal.
+    /// Every producer handle for this slot dropped, and no terminal went out
+    /// ahead of it.
     InletClosed,
     /// The linger window on a staged batch ran out.
     Linger,
@@ -661,6 +663,11 @@ impl BatcherWake {
     /// pre-bound `batcher_wakes` array — one select-loop wake fires this on
     /// every trip, including a bare `Frame` wake for a single queued record,
     /// so this stays a plain array index rather than a label lookup.
+    ///
+    /// A variant added here without a matching [`MUX_WAKE_SOURCES`] entry
+    /// panics on its first [`MuxMetricsHandle::batcher_wake`] call — an
+    /// out-of-bounds read of `batcher_wakes`. Grow both in the same change,
+    /// same hazard as [`RecordType::count_index`](crate::streaming::messenger_mux::protocol::RecordType::count_index).
     const fn index(self) -> usize {
         match self {
             Self::Open => 0,
@@ -669,14 +676,6 @@ impl BatcherWake {
             Self::InletClosed => 3,
             Self::Linger => 4,
         }
-    }
-
-    /// Test-only: `batcher_wake` indexes `MUX_WAKE_SOURCES` directly via
-    /// [`Self::index`] now, so the drift guard
-    /// (`mux_enum_label_values_match_docs`) is this method's sole caller.
-    #[cfg(test)]
-    fn as_str(self) -> &'static str {
-        MUX_WAKE_SOURCES[self.index()]
     }
 }
 
@@ -708,23 +707,34 @@ pub(crate) struct MuxMetricsHandle {
 }
 
 impl MuxMetricsHandle {
-    /// A batch just handed to the messenger packed `counts` records, indexed
-    /// by [`RecordType::count_index`](crate::streaming::messenger_mux::protocol::RecordType::count_index).
+    /// An outbound batch of `counts.iter().sum()` records — as
+    /// [`RecordType::count_index`](crate::streaming::messenger_mux::protocol::RecordType::count_index)
+    /// breaks them down — went to the peer.
     ///
-    /// Called once per batch, from the same point that already counts the
-    /// batch itself, so a batch discarded before it gets there (an epoch
-    /// death, or the task tearing down) is never read out and never counted.
+    /// Deriving the total from `counts` here, rather than a separate
+    /// `BatchEncoder::record_count` read, keeps
+    /// `velo_streaming_mux_records_sent_total` and
+    /// `velo_streaming_mux_records_per_batch{direction="sent"}` in sync by
+    /// construction. A batch discarded before it gets here (an epoch death,
+    /// or the task tearing down) is never counted; a batch the messenger goes
+    /// on to refuse — a failed `dispatch` or `am_send_streaming` call — is
+    /// counted here all the same. [`Self::batch`] stays free-standing for the
+    /// `Received` side (`ingress::mod`'s inbound-batch count), which has no
+    /// per-type breakdown to derive a total from.
+    ///
     /// `counts[index]`'s label is already resolved — pre-bound in
     /// [`VeloMetrics::bind_mux`] the same way [`Self::batcher_wake`]'s array
-    /// is — so this is a plain array index and an atomic add, no label lookup
-    /// at any count.
-    pub(crate) fn records_sent(
+    /// is — so the per-type loop below is a plain array index and an atomic
+    /// add, no label lookup at any count.
+    pub(crate) fn batch_sent(
         &self,
         counts: [u16; crate::streaming::messenger_mux::protocol::RECORD_TYPE_COUNT],
     ) {
-        for (index, count) in counts.into_iter().enumerate() {
+        let total: usize = counts.iter().map(|&count| usize::from(count)).sum();
+        self.batch(MuxDirection::Sent, total);
+        for (count, counter) in counts.into_iter().zip(&self.records_sent) {
             if count > 0 {
-                self.records_sent[index].inc_by(f64::from(count));
+                counter.inc_by(f64::from(count));
             }
         }
     }
@@ -1808,13 +1818,11 @@ impl VeloMetrics {
     /// batchers and the `_stream_batch` ingress lane, so the hot paths hold
     /// concrete collectors instead of resolving label values per record.
     pub(crate) fn bind_mux(&self) -> MuxMetricsHandle {
-        use crate::streaming::messenger_mux::protocol::RecordType;
+        use crate::streaming::messenger_mux::protocol::RECORD_TYPE_LABELS;
 
         let records_sent = std::array::from_fn(|index| {
-            let kind = RecordType::from_u8(index as u8)
-                .expect("0..RECORD_TYPE_COUNT are all valid RecordType discriminants");
             self.streaming_mux_records_sent_total
-                .with_label_values(&[kind.as_str()])
+                .with_label_values(&[RECORD_TYPE_LABELS[index]])
         });
         let batcher_wakes = std::array::from_fn(|index| {
             self.streaming_mux_batcher_wakes_total
@@ -2504,30 +2512,5 @@ mod tests {
 
         assert_eq!(HandlerOutcome::Success.as_str(), HANDLER_OUTCOMES[0]);
         assert_eq!(HandlerOutcome::Error.as_str(), HANDLER_OUTCOMES[1]);
-    }
-
-    /// Pins each enum's `as_str`/`index` mapping against the
-    /// [`RECORD_TYPE_LABELS`](crate::streaming::messenger_mux::protocol::RECORD_TYPE_LABELS)
-    /// / [`MUX_WAKE_SOURCES`] arrays [`VeloMetrics::bind_mux`] pre-binds from,
-    /// rather than a second hand-typed copy of the same strings, so a
-    /// reordered variant fails here instead of silently filing a count under
-    /// the wrong label. `BATCHING.md`'s mux rows still want a human's eyes
-    /// against these two arrays whenever either changes — nothing here reads
-    /// the doc.
-    #[test]
-    fn mux_enum_label_values_match_docs() {
-        use crate::streaming::messenger_mux::protocol::{RECORD_TYPE_LABELS, RecordType};
-
-        assert_eq!(RecordType::Data.as_str(), RECORD_TYPE_LABELS[0]);
-        assert_eq!(RecordType::OpenSlot.as_str(), RECORD_TYPE_LABELS[1]);
-        assert_eq!(RecordType::CloseSlot.as_str(), RECORD_TYPE_LABELS[2]);
-        assert_eq!(RecordType::CreditUpdate.as_str(), RECORD_TYPE_LABELS[3]);
-        assert_eq!(RecordType::SlotHeartbeat.as_str(), RECORD_TYPE_LABELS[4]);
-
-        assert_eq!(BatcherWake::Open.as_str(), MUX_WAKE_SOURCES[0]);
-        assert_eq!(BatcherWake::Control.as_str(), MUX_WAKE_SOURCES[1]);
-        assert_eq!(BatcherWake::Frame.as_str(), MUX_WAKE_SOURCES[2]);
-        assert_eq!(BatcherWake::InletClosed.as_str(), MUX_WAKE_SOURCES[3]);
-        assert_eq!(BatcherWake::Linger.as_str(), MUX_WAKE_SOURCES[4]);
     }
 }

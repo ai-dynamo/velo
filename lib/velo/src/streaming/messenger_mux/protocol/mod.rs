@@ -274,16 +274,20 @@ impl RecordType {
     /// Dense index into [`RECORD_TYPE_LABELS`] and `BatchEncoder`'s per-type
     /// count array.
     ///
-    /// Deliberately its own exhaustive match rather than a reuse of
-    /// [`Self::as_u8`]'s wire discriminant: a `match` with no catch-all forces
-    /// a new variant to get an arm here, which is what makes the next author
-    /// visit this site instead of the compiler silently accepting an
-    /// unindexed type. It does not by itself prove the index fits
-    /// [`RECORD_TYPE_LABELS`] — that still needs a matching entry appended
-    /// there, which is what actually sizes the array `BatchEncoder::push`
-    /// writes into via [`RECORD_TYPE_COUNT`]. Nothing calls [`Self::as_str`]
-    /// in a const context, so a variant added here without a matching label
-    /// panics on its first `as_str()` call, not at compile time.
+    /// A variant added here without a matching [`RECORD_TYPE_LABELS`] entry
+    /// panics on its first `push()` — an out-of-bounds write into
+    /// `record_type_counts`, sized by [`RECORD_TYPE_COUNT`].
+    /// `protocol::tests::decodable_record_type_has_in_range_unique_count_index`
+    /// catches an in-range collision too, for every variant [`Self::from_u8`]
+    /// decodes. It cannot reach a variant constructed directly without a
+    /// [`Self::from_u8`] arm — `#[cfg(test)]` `push_heartbeat` builds
+    /// `SlotHeartbeat` that way. An out-of-range arm there still panics
+    /// `push`; an in-range arm colliding with another variant's does not — it
+    /// silently files that variant's records under the colliding variant's
+    /// label in `velo_streaming_mux_records_sent_total`, and no test in the
+    /// tree catches it. Grow this match, [`RECORD_TYPE_LABELS`] and the
+    /// [`Self::from_u8`] arm together (see `agent-docs/w7-batcher-instrument-cost.md`
+    /// for the named-field alternative considered and rejected for this).
     pub(crate) const fn count_index(self) -> usize {
         match self {
             Self::Data => 0,
@@ -292,12 +296,6 @@ impl RecordType {
             Self::CreditUpdate => 3,
             Self::SlotHeartbeat => 4,
         }
-    }
-
-    /// The label value `velo_streaming_mux_records_sent_total` files this
-    /// type under.
-    pub(crate) const fn as_str(self) -> &'static str {
-        RECORD_TYPE_LABELS[self.count_index()]
     }
 
     /// Decodes a discriminant, or `None` for a type this build does not know.
