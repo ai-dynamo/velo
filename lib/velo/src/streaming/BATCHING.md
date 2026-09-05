@@ -808,15 +808,18 @@ New series, alongside the existing `velo_streaming_*` collectors:
 > gate's pending queue as well as the bounded channel — and
 > `velo_transport_frames_written_total` is what the outbound frame counter is
 > subtracted from to get that queue's depth. They are the transport-level twins
-> of the two rows above, and they are where a batch that the mux already packed
-> goes on waiting. TCP and UDS only.
+> of `velo_streaming_egress_flushes_total` and `velo_streaming_frames_written_total`
+> above, and they are where a batch that the mux already packed goes on
+> waiting. TCP and UDS only — see the README's Observability section for the
+> identity's full set of limits.
 
-> **`frames_written / egress_flushes` is the batching ratio** and the single
-> number that says whether this is working. It is meaningful at any scale, which
-> is why it ships before the protocol does. It counts flushes rather than
-> syscalls -- `write_all` may loop internally, an oversized frame is written
-> segmented as a single batch, and TCP segmentation is the kernel's call -- so
-> read it as "how much the pump batched", not "how many syscalls were saved".
+> **`velo_streaming_frames_written_total` / `velo_streaming_egress_flushes_total`
+> is the batching ratio** and the single number that says whether this is
+> working. It is meaningful at any scale, which is why it ships before the
+> protocol does. It counts flushes rather than syscalls -- `write_all` may loop
+> internally, an oversized frame is written segmented as a single batch, and
+> TCP segmentation is the kernel's call -- so read it as "how much the pump
+> batched", not "how many syscalls were saved".
 
 ### A meaning change operators must know about
 
@@ -824,6 +827,18 @@ New series, alongside the existing `velo_streaming_*` collectors:
 4096-deep connect-side channel was full."* Under mux it means *"this slot ran
 out of credit."* Arguably a more useful signal, but dashboards built on the old
 meaning will shift under them. `SATURATION.md` is updated in the same change.
+
+`velo_transport_frames_total{transport="nats"|"zmq",direction="outbound",outcome="accepted"}`
+and the matching `velo_transport_frame_bytes_total` used to be recorded twice
+per frame on NATS and ZMQ — once by `finalize_send_outcome` on admission and
+again by each transport's own sender task after the wire send succeeded.
+Fixing that double count halves both series' outbound values on these two
+transports. The trigger also moves: the count now fires on admission, the
+same as every other transport, rather than after the publish/send call
+returns — so a frame that is admitted but whose wire send later fails is now
+counted outbound-accepted and separately as a `send_error` rejection, instead
+of not being counted outbound at all. The per-frame byte value itself is
+unchanged; only the number of observations halves.
 
 ---
 

@@ -28,10 +28,9 @@ use crate::transports::tcp::framing::DEFAULT_MAX_FRAME_SIZE;
 
 use super::listener::{UdsListener, default_shrink_threshold};
 use crate::transports::coalesce::{
-    Coalescable, FrameTally, WriterFailure, WriterObserver, run_coalescing_writer,
+    Coalescable, EgressMetrics, FrameTally, WriterFailure, WriterObserver, run_coalescing_writer,
 };
 use crate::transports::ingress::{DialedReaderContext, run_dialed_reader};
-use crate::transports::message_type_label;
 
 /// UDS transport with lock-free concurrent access
 ///
@@ -683,7 +682,7 @@ async fn connection_writer_inner(
         &UdsWriterObserver {
             instance_id,
             path,
-            metrics,
+            egress: EgressMetrics::new(metrics),
         },
     )
     .await;
@@ -744,13 +743,15 @@ impl Coalescable for SendTask {
 
 /// Attaches the connection's identity to the writer loop's log lines, and
 /// carries the transport's pre-bound metrics handle so the per-frame egress
-/// path does no label lookup. Identical to the TCP observer because it drives
-/// the same loop — the only difference is the `transport` label already bound
-/// into the handle.
+/// path does no label lookup.
+///
+/// The egress-metrics methods delegate to [`EgressMetrics`], which TCP
+/// shares byte-for-byte — the only thing that differs per transport is the
+/// failure log text below.
 struct UdsWriterObserver<'a> {
     instance_id: crate::InstanceId,
     path: &'a Path,
-    metrics: Option<Arc<dyn velo_ext::TransportObservability>>,
+    egress: EgressMetrics,
 }
 
 impl WriterObserver for UdsWriterObserver<'_> {
@@ -768,22 +769,15 @@ impl WriterObserver for UdsWriterObserver<'_> {
     }
 
     fn records_egress(&self) -> bool {
-        self.metrics.is_some()
+        self.egress.records_egress()
     }
 
     fn on_dequeue(&self, waited: Duration) {
-        if let Some(metrics) = &self.metrics {
-            metrics.record_egress_queue_wait(waited);
-        }
+        self.egress.on_dequeue(waited);
     }
 
     fn on_write(&self, tally: &FrameTally, elapsed: Duration) {
-        if let Some(metrics) = &self.metrics {
-            for (msg_type, count) in tally.counts() {
-                metrics.record_frames_written(message_type_label(msg_type), count);
-            }
-            metrics.record_egress_write_duration(elapsed);
-        }
+        self.egress.on_write(tally, elapsed);
     }
 }
 

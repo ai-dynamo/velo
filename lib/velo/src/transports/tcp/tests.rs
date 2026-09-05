@@ -145,7 +145,7 @@ async fn writer_observer_publishes_egress_into_the_bound_handle() {
         &TcpWriterObserver {
             instance_id: crate::InstanceId::new_v4(),
             addr: "127.0.0.1:1".parse().unwrap(),
-            metrics: Some(handle),
+            egress: EgressMetrics::new(Some(handle)),
         },
     )
     .await;
@@ -192,8 +192,7 @@ async fn writer_observer_publishes_egress_into_the_bound_handle() {
 /// Capacity 1 pins the split — one frame in the bounded channel, one blocked in
 /// the gate's driver, one in the gate's pending queue — and the writer starts
 /// only after the hold, so all three waited it out. A stamp taken behind the
-/// gate would report one observation of one hold instead of three, which is
-/// what `.research/rig/failbefore-w0-velo.sh` phase d7 reverts to.
+/// gate would report one observation of one hold instead of three.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_egress_queue_wait_spans_the_admission_gate() {
     use crate::observability::VeloMetrics;
@@ -251,7 +250,7 @@ async fn the_egress_queue_wait_spans_the_admission_gate() {
                 &TcpWriterObserver {
                     instance_id,
                     addr: "127.0.0.1:1".parse().unwrap(),
-                    metrics: Some(handle),
+                    egress: EgressMetrics::new(Some(handle)),
                 },
             )
             .await;

@@ -214,7 +214,8 @@ name = "transports_ucx"
 path = "tests/transports/ucx_integration.rs"
 # `test-helpers` for `MetricSnapshot`: the suite asserts that UCX records the
 # inbound frames it admits, which is the numerator of the messenger's derived
-# inbound-queue depth.
+# inbound-queue depth. Both features are required to run this suite directly:
+# `cargo test --features ucx,test-helpers --test transports_ucx`.
 required-features = ["ucx", "test-helpers"]
 
 [[test]]

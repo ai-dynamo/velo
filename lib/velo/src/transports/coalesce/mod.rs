@@ -62,13 +62,16 @@
 //! allocation, no copy.
 
 use std::io;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
-use velo_ext::MessageType;
+use velo_ext::{MessageType, TransportObservability};
+
+use crate::transports::message_type_label;
 
 use super::tcp::framing::{
     COALESCE_THRESHOLD, DIRECT_PREFIX_CAP, MIN_HEADER_SIZE, TcpFrameCodec, stage_direct_prefix,
@@ -320,6 +323,67 @@ pub(crate) trait WriterObserver {
     /// Not called for a failed write: those frames are reported through
     /// [`Coalescable::fail`] and must not be counted as written.
     fn on_write(&self, _tally: &FrameTally, _elapsed: Duration) {}
+}
+
+/// The egress-metrics half of a [`WriterObserver`], shared by every writer
+/// that drives [`run_coalescing_writer`].
+///
+/// TCP and UDS answer `records_egress`, `on_dequeue`, and `on_write`
+/// identically — both hold the connection's pre-bound metrics handle and read
+/// it the same way, and the only thing that actually varies per transport is
+/// `on_failure`'s log text, which stays on each transport's own
+/// `WriterObserver` impl. Delegating here instead of duplicating the body
+/// keeps that one real difference visible instead of buried in twenty
+/// identical lines.
+///
+/// The handle is a snapshot taken once, when the connection's writer task is
+/// spawned — not a per-frame `OnceLock` read like the UCX AM callback's,
+/// which has to re-read per frame because `set_observability` can arrive
+/// after `start()` on a worker thread the transport does not otherwise
+/// synchronize with. TCP and UDS don't have that ordering hazard: the runtime
+/// always calls `set_observability` before `start()`, and the writer task
+/// (and its snapshot) does not exist until a connection is created after
+/// `start()` returns. A `TcpTransport`/`UdsTransport` used standalone, before
+/// `set_observability`, records neither side of the accepted/written
+/// identity, so it stays 0-0 rather than going stale.
+pub(crate) struct EgressMetrics {
+    metrics: Option<Arc<dyn TransportObservability>>,
+}
+
+impl EgressMetrics {
+    pub(crate) fn new(metrics: Option<Arc<dyn TransportObservability>>) -> Self {
+        Self { metrics }
+    }
+
+    /// See [`WriterObserver::records_egress`].
+    ///
+    /// The only question this side of the trait boundary can ask is whether a
+    /// handle exists at all — the runtime's own handle builds its egress
+    /// Prometheus children lazily, on first use, so there is no separate
+    /// "is this transport eligible" flag to fall out of step with it. A
+    /// transport with no metrics handle takes no clock reads or tally
+    /// increments; a transport with one that never calls the three egress
+    /// recorders (gRPC, NATS, ZMQ, UCX) simply never fills them in.
+    pub(crate) fn records_egress(&self) -> bool {
+        self.metrics.is_some()
+    }
+
+    /// See [`WriterObserver::on_dequeue`].
+    pub(crate) fn on_dequeue(&self, waited: Duration) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_egress_queue_wait(waited);
+        }
+    }
+
+    /// See [`WriterObserver::on_write`].
+    pub(crate) fn on_write(&self, tally: &FrameTally, elapsed: Duration) {
+        if let Some(metrics) = &self.metrics {
+            for (msg_type, count) in tally.counts() {
+                metrics.record_frames_written(message_type_label(msg_type), count);
+            }
+            metrics.record_egress_write_duration(elapsed);
+        }
+    }
 }
 
 /// What to do with the next item, decided before it is touched.

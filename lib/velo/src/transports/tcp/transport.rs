@@ -28,11 +28,9 @@ use velo_ext::{MessageType, PeerInfo, Transport, TransportAdapter, TransportKey,
 
 use super::framing::DEFAULT_MAX_FRAME_SIZE;
 use super::listener::TcpListener;
-use crate::transports::coalesce::{
-    Coalescable, FrameTally, WriterFailure, WriterObserver, run_coalescing_writer,
-};
+use super::writer::TcpWriterObserver;
+use crate::transports::coalesce::{EgressMetrics, run_coalescing_writer};
 use crate::transports::ingress::{DialedReaderContext, run_dialed_reader};
-use crate::transports::message_type_label;
 
 /// High-performance TCP transport with lock-free concurrent access
 ///
@@ -107,11 +105,15 @@ impl ConnectionHandle {
 }
 
 /// Task sent to writer task containing pre-encoded frame
-struct SendTask {
-    msg_type: MessageType,
-    header: Bytes,
-    payload: Bytes,
-    on_error: Arc<dyn TransportErrorHandler>,
+///
+/// Fields are `pub(super)`: `writer.rs`'s `impl Coalescable for SendTask`
+/// reads them directly, and constructs nothing here, so `tcp` is the visibility
+/// this type needs rather than a public one.
+pub(super) struct SendTask {
+    pub(super) msg_type: MessageType,
+    pub(super) header: Bytes,
+    pub(super) payload: Bytes,
+    pub(super) on_error: Arc<dyn TransportErrorHandler>,
     /// When the transport accepted this frame, or `None` when nothing is
     /// watching.
     ///
@@ -121,11 +123,11 @@ struct SendTask {
     /// gate is where the frames actually are. The clock read is skipped
     /// entirely when the transport has no observability handle, because the
     /// writer would have nowhere to report it.
-    queued_at: Option<Instant>,
+    pub(super) queued_at: Option<Instant>,
 }
 
 impl SendTask {
-    fn on_error(self, error: impl Into<String>) {
+    pub(super) fn on_error(self, error: impl Into<String>) {
         self.on_error
             .on_error(self.header, self.payload, error.into());
     }
@@ -698,7 +700,7 @@ async fn connection_writer_inner(
         &TcpWriterObserver {
             instance_id,
             addr,
-            metrics,
+            egress: EgressMetrics::new(metrics),
         },
     )
     .await;
@@ -720,83 +722,6 @@ struct DialedReaderErrorHandler;
 impl TransportErrorHandler for DialedReaderErrorHandler {
     fn on_error(&self, _header: Bytes, _payload: Bytes, error: String) {
         warn!("Transport error: {}", error);
-    }
-}
-
-impl Coalescable for SendTask {
-    /// A staged task *is* its own failure token: what
-    /// [`TransportErrorHandler::on_error`] needs — the header, the payload,
-    /// and the handler — is every field but a one-byte `Copy` enum, and all
-    /// three are refcounted handles. Splitting them into a second struct would
-    /// have the same footprint, so the writer just keeps the task. Retaining
-    /// it holds no payload bytes beyond the ones the sender already owns.
-    type FailureToken = Self;
-
-    fn msg_type(&self) -> MessageType {
-        self.msg_type
-    }
-
-    fn header(&self) -> &[u8] {
-        &self.header
-    }
-
-    fn payload(&self) -> &[u8] {
-        &self.payload
-    }
-
-    fn queued_at(&self) -> Option<Instant> {
-        self.queued_at
-    }
-
-    fn into_failure_token(self) -> Self {
-        self
-    }
-
-    fn fail(token: Self, reason: &str) {
-        token.on_error(format!("Failed to write to stream: {}", reason));
-    }
-}
-
-/// Attaches the connection's identity to the writer loop's log lines, and
-/// carries the transport's pre-bound metrics handle so the per-frame egress
-/// path does no label lookup.
-struct TcpWriterObserver {
-    instance_id: crate::InstanceId,
-    addr: SocketAddr,
-    metrics: Option<std::sync::Arc<dyn velo_ext::TransportObservability>>,
-}
-
-impl WriterObserver for TcpWriterObserver {
-    fn on_failure(&self, kind: WriterFailure, err: &std::io::Error, frames: usize) {
-        match kind {
-            WriterFailure::Write => error!(
-                "Write error to {} ({}): {} ({} message(s) in batch)",
-                self.instance_id, self.addr, err, frames
-            ),
-            WriterFailure::Encode => error!(
-                "Encode error to {} ({}): {}",
-                self.instance_id, self.addr, err
-            ),
-        }
-    }
-
-    fn records_egress(&self) -> bool {
-        self.metrics.is_some()
-    }
-
-    fn on_dequeue(&self, waited: Duration) {
-        if let Some(metrics) = &self.metrics {
-            metrics.record_egress_queue_wait(waited);
-        }
-    }
-
-    fn on_write(&self, tally: &FrameTally, elapsed: Duration) {
-        if let Some(metrics) = &self.metrics {
-            for (msg_type, count) in tally.counts() {
-                metrics.record_frames_written(message_type_label(msg_type), count);
-            }
-            metrics.record_egress_write_duration(elapsed);
-        }
     }
 }
 

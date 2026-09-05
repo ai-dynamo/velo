@@ -47,6 +47,16 @@ fn new_uds_transport(dir: &tempfile::TempDir) -> Arc<velo::transports::uds::UdsT
     )
 }
 
+#[cfg(feature = "zmq")]
+fn new_zmq_transport() -> Arc<velo::transports::zmq::ZmqTransport> {
+    Arc::new(
+        velo::transports::zmq::ZmqTransportBuilder::new()
+            .bind_endpoint("tcp://127.0.0.1:0")
+            .build()
+            .unwrap(),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Two-instance helper
 // ---------------------------------------------------------------------------
@@ -502,16 +512,14 @@ async fn scenario_inbound_queue_conservation(pair: &VeloPair) {
 /// real work, so the assertion has to wait the queue out rather than guess how
 /// long it is.
 ///
-/// The `transport` label is deliberately absent from the frame lookup:
-/// `VeloPair` gives each side exactly one transport, so the subset match
-/// resolves to that transport's series. A pair carrying two transports per side
-/// would have to pin the label, because the snapshot returns the first match
-/// rather than a sum.
+/// The `transport` label is deliberately absent from the frame lookup: this
+/// sums every series that matches the remaining labels, so it stays correct
+/// whether `VeloPair` gives each side one transport or several.
 async fn await_inbound_queue_quiesced(label: &str, snapshot: impl Fn() -> MetricSnapshot) {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         let snap = snapshot();
-        let accepted = snap.counter(
+        let accepted = snap.counter_sum(
             "velo_transport_frames_total",
             &[
                 ("direction", "inbound"),
@@ -773,6 +781,80 @@ mod uds {
     async fn egress_conservation() {
         let (p, _dir) = pair().await;
         scenario_egress_conservation(&p).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ZMQ: outbound accepted must not be double-counted
+// ---------------------------------------------------------------------------
+//
+// Not run through `transport_metrics_tests!`: that macro's full suite assumes
+// every scenario already holds for every transport, which is a broader claim
+// than this fix makes. This one scenario is what the fix actually changes.
+
+#[cfg(feature = "zmq")]
+mod zmq {
+    use super::*;
+
+    /// NATS and ZMQ each used to record the outbound-accepted frame twice:
+    /// once via `finalize_send_outcome` (transports.rs) when `send_message`
+    /// returns `Admitted` — true the instant the frame reaches the sender's
+    /// internal channel — and again from their own sender task/thread once
+    /// the frame actually reached the wire. This test pins ZMQ; NATS shares
+    /// the same `finalize_send_outcome` call site and the same shape of fix
+    /// (a redundant `record_frame(Direction::Outbound, ...)` deleted from its
+    /// sender task) but needs a running NATS server to exercise here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn outbound_accepted_is_counted_once_per_send() {
+        let pair = VeloPair::new(new_zmq_transport(), new_zmq_transport()).await;
+
+        let handler = Handler::am_handler("sink", |_ctx| Ok(())).build();
+        pair.server.register_handler(handler).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Warm-up send: a client's first contact with a peer lazily triggers
+        // one `_hello` handshake frame ahead of the message itself
+        // (messenger/client/mod.rs), so counting from before ANY send would
+        // conflate the handshake with the send this test is actually about.
+        // Settle that here, outside the measurement window.
+        pair.client
+            .am_send("sink")
+            .unwrap()
+            .raw_payload(Bytes::from_static(b"warmup"))
+            .instance(pair.server.instance_id())
+            .send()
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let outbound_accepted = &[
+            ("transport", "zmq"),
+            ("direction", "outbound"),
+            ("outcome", "accepted"),
+        ];
+        let before = pair
+            .client_snap()
+            .counter_sum("velo_transport_frames_total", outbound_accepted);
+
+        pair.client
+            .am_send("sink")
+            .unwrap()
+            .raw_payload(Bytes::from_static(b"fire"))
+            .instance(pair.server.instance_id())
+            .send()
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let after = pair
+            .client_snap()
+            .counter_sum("velo_transport_frames_total", outbound_accepted);
+        assert_eq!(
+            after - before,
+            1.0,
+            "one am_send must add exactly one outbound-accepted frame, not two; before={before} after={after}"
+        );
     }
 }
 

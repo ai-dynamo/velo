@@ -232,7 +232,7 @@ async fn attach_rtt_covers_the_round_trip_and_only_the_remote_one() {
         .await
         .expect("a local attach must succeed");
     assert_eq!(
-        sent().histogram_count(RTT, &[("outcome", "success")]),
+        sent().histogram_count_sum(RTT, &[("outcome", "success")]),
         0,
         "a co-located attach is not a round trip and must not enter the RTT histogram"
     );
@@ -246,14 +246,14 @@ async fn attach_rtt_covers_the_round_trip_and_only_the_remote_one() {
         .expect("attach must succeed when both peers are registered");
 
     assert_eq!(
-        sent().histogram_count(RTT, &[("outcome", "success")]),
+        sent().histogram_count_sum(RTT, &[("outcome", "success")]),
         1,
         "one remote attach is one observation"
     );
-    let rtt = sent().histogram_sum(RTT, &[("outcome", "success")]);
+    let rtt = sent().histogram_sum_sum(RTT, &[("outcome", "success")]);
     assert!(rtt > 0.0, "the round trip must have taken measurable time");
 
-    let handler = MetricSnapshot::from_registry(&consumer_reg).histogram_sum(
+    let handler = MetricSnapshot::from_registry(&consumer_reg).histogram_sum_sum(
         "velo_streaming_anchor_operation_duration_seconds",
         &[("operation", "attach"), ("outcome", "success")],
     );
@@ -277,12 +277,12 @@ async fn attach_rtt_covers_the_round_trip_and_only_the_remote_one() {
         "attaching to an anchor that was never created must fail"
     );
     assert_eq!(
-        sent().histogram_count(RTT, &[("outcome", "error")]),
+        sent().histogram_count_sum(RTT, &[("outcome", "error")]),
         1,
         "a refused attach is still a round trip the caller waited on"
     );
     assert_eq!(
-        sent().histogram_count(RTT, &[("outcome", "success")]),
+        sent().histogram_count_sum(RTT, &[("outcome", "success")]),
         1,
         "the refusal must not be counted as a success"
     );
@@ -291,4 +291,51 @@ async fn attach_rtt_covers_the_round_trip_and_only_the_remote_one() {
     // purpose: dropping either mid-assertion tears its sender down and races
     // the counters above.
     let _ = (local_anchor, anchor);
+}
+
+/// The MPSC remote attach shares `record_attach_rtt` with the SPSC path
+/// (both go through the sender's shared helper), so the RTT histogram gets a
+/// sample from a remote MPSC attach the same way it does from an SPSC one.
+/// The RTT series' own help text names its denominator —
+/// `velo_streaming_anchor_operation_duration_seconds{operation="attach"}` —
+/// and `_mpsc_anchor_attach` (`streaming/mpsc/control.rs`) records into that
+/// series on every arm, success included, the same way `_anchor_attach`
+/// (`streaming/control.rs`) does: the two attach kinds share one RTT series
+/// and one duration series. This test pins both halves of that population.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mpsc_remote_attach_rtt_has_a_matching_operation_duration_sample() {
+    const RTT: &str = "velo_streaming_anchor_attach_rtt_seconds";
+    const OP_DURATION: &str = "velo_streaming_anchor_operation_duration_seconds";
+
+    let (producer, producer_reg, consumer, consumer_reg) = make_pair().await;
+
+    let anchor = consumer.create_mpsc_anchor::<u64>();
+    let handle = anchor.handle();
+    let sender = producer
+        .attach_mpsc_anchor::<u64>(handle)
+        .await
+        .expect("mpsc attach must succeed when both peers are registered");
+
+    let rtt_count = MetricSnapshot::from_registry(&producer_reg)
+        .histogram_count_sum(RTT, &[("outcome", "success")]);
+    assert_eq!(
+        rtt_count, 1,
+        "the mpsc remote attach must record one RTT observation, same as spsc"
+    );
+
+    let op_duration_count = MetricSnapshot::from_registry(&consumer_reg).histogram_count_sum(
+        OP_DURATION,
+        &[("operation", "attach"), ("outcome", "success")],
+    );
+    assert_eq!(
+        op_duration_count, 1,
+        "the mpsc anchor_attach handler must record its own operation duration, \
+         same as the spsc _anchor_attach handler does — otherwise the RTT \
+         histogram's documented subtraction has no denominator for this half \
+         of its population"
+    );
+
+    // `anchor` and `sender` stay bound to the end of the function so neither
+    // tears down mid-assertion.
+    let _ = (anchor, sender);
 }

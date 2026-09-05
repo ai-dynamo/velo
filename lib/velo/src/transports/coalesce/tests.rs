@@ -1280,3 +1280,77 @@ async fn successful_writes_report_nothing() {
     assert!(factory.errors().is_empty());
     assert!(observer.failures().is_empty());
 }
+
+// -----------------------------------------------------------------------
+// Egress eligibility
+// -----------------------------------------------------------------------
+
+/// `EgressMetrics::records_egress` answers from whether a metrics handle
+/// exists at all — the only question this side of the trait boundary can
+/// ask. Eligibility used to be keyed on the handle's own transport label
+/// (`EGRESS_INSTRUMENTED_TRANSPORTS`), so a TCP/UDS transport built with a
+/// key outside that list (`.key(TransportKey::from("custom-uds"))`,
+/// exercised in-tree at `uds/tests.rs`) got a handle for which
+/// `records_egress()` answered `false` even though the handle itself would
+/// happily record into it — the writer paid nothing and the handle recorded
+/// nothing, which was consistent but blind to any out-of-tree transport
+/// whose `key()` happened to collide with `"tcp"`/`"uds"` while never
+/// running a coalescing writer, and vice versa. `records_egress` and the
+/// handle's own Prometheus children now agree by construction: this test
+/// proves both sides of that.
+#[test]
+fn records_egress_answers_from_handle_existence_not_transport_label() {
+    use crate::observability::VeloMetrics;
+
+    let registry = prometheus::Registry::new();
+    let metrics = VeloMetrics::register(&registry).expect("register metrics");
+
+    // A key outside the old allowlist is still eligible: the writer no
+    // longer has a second, label-keyed question to disagree with this one.
+    let custom = metrics.bind_transport("custom-uds");
+    let custom_dyn: Arc<dyn velo_ext::TransportObservability> = Arc::new(custom.clone());
+    assert!(
+        EgressMetrics::new(Some(custom_dyn)).records_egress(),
+        "eligibility must not depend on the transport's own label"
+    );
+
+    assert!(
+        !EgressMetrics::new(None).records_egress(),
+        "no handle at all must still mean no instruments"
+    );
+
+    // The deeper claim: a handle bound to a non-default key that actually
+    // records must produce real series under that key, not a dropped
+    // observation. Nothing exists yet — the children are built lazily.
+    let has_series_for = |name: &str, transport: &str| {
+        registry.gather().iter().any(|family| {
+            family.name() == name
+                && family.get_metric().iter().any(|metric| {
+                    metric
+                        .get_label()
+                        .iter()
+                        .any(|l| l.name() == "transport" && l.value() == transport)
+                })
+        })
+    };
+    assert!(
+        !has_series_for("velo_transport_frames_written_total", "custom-uds"),
+        "nothing has been recorded yet, so nothing should exist"
+    );
+
+    custom.record_frames_written("message", 1);
+    custom.record_egress_queue_wait(Duration::from_millis(1));
+    custom.record_egress_write_duration(Duration::from_millis(1));
+
+    for name in [
+        "velo_transport_frames_written_total",
+        "velo_transport_egress_queue_wait_seconds",
+        "velo_transport_write_duration_seconds",
+    ] {
+        assert!(
+            has_series_for(name, "custom-uds"),
+            "{name} must exist under the transport's own key once it actually \
+             records — the old allowlist would have silently dropped this"
+        );
+    }
+}

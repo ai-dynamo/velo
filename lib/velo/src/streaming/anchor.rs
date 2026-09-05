@@ -1085,10 +1085,12 @@ impl AnchorManager {
     /// The single place both the SPSC (`attach_remote`) and MPSC
     /// (`attach_mpsc_remote`) paths stamp the RTT, so the two cannot drift into
     /// bracketing different spans of work. `started` must be taken immediately
-    /// before the `_anchor_attach` send and observed immediately after it — the
-    /// transport connect that follows a successful attach is the sender's own
-    /// work, not the round trip, and folding it in would make the excess over
-    /// the receiver's handler timing stop meaning "ingest queueing".
+    /// before the attach request's send — to `_anchor_attach` or
+    /// `_mpsc_anchor_attach`, whichever this call is for — and observed
+    /// immediately after it: the transport connect that follows a successful
+    /// attach is the sender's own work, not the round trip, and folding it in
+    /// would make the excess over the receiver's handler timing stop meaning
+    /// "ingest queueing".
     ///
     /// The co-located attach path observes nothing: it never leaves the
     /// process, so it has no round trip to report.
