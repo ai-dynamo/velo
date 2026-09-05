@@ -531,3 +531,7 @@ The first-token second was load-generator interference; see the late-night adden
 ### Update 2026-09-05: pinned baseline is the scoreboard; W3 is PR #78
 
 `t3-base-pin` (3 reps, pinned 72/72) is recorded in `response-plane-benchmark-results.md`; the plan carries the reset success bar. W3 velo side is committed as a2e7365 on `w3-zero-rtt-attach`, draft PR #78 against `drain-credit-return`. W4a is implemented on `w4-async-open-ack` (worktree `velo-w4a`) with a follow-up in flight (fence-aware close lane, velo 0.12.0 bump for the new public `MuxConfig` field, semver run). Next: commit W4a and open its PR; the adapter and rig-arm stage for both against an integration branch; `t3-rt32` tests a 32-worker frontend runtime as the precursor to any loom-rs (per-thread pinning) integration.
+
+### Update 2026-09-05: runtime-sizing experiment (t3-rt32)
+
+Frontend tokio runtime forced to 32 workers under the default 72/72 pinning, one rep each: velo0 3,055 req/s, TTFT p50 89 ms, p99 769 ms, CPU 5.48 ms/req (default runtime: 3,060 to 3,327 req/s, 57 to 85 ms, 3.4 to 4.0 ms/req); mux18p 2,824 req/s, 49 ms, 782 ms. A smaller runtime costs velo0 CPU and first-token time, so per-thread pinning with fewer threads (the loom-rs shape) is not a lever now; the frontend wants the parallelism. loom-rs stays a candidate only if a later profile shows migration or cache effects, and it would enter dynamo through `Runtime::from_handle` in the Python binding entry.
