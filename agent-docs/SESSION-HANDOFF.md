@@ -551,3 +551,7 @@ The W3 adapter half is in `.research/dyn-pin` (gate `DYN_VELO_RESPONSE_ZERO_RTT_
 ### Update 2026-09-05: W4a merged into the wheel branch
 
 `integration/response-plane-wheel` = W0 + W3 + W4a (379240a; full gate green on the merged tree, 18 targeted binaries plus the whole suite). The W4a adapter gate and arms `velo4a`, `velo34` are in flight (workflow `wf_c9c6f3fb-bf3`: adapter, rig arms, wheel rebuild, four-arm smoke, review, fix). Next after it: `RIG_IMG=... ARMS="velo0 velo3 velo4a velo34 mux18p" REPS=3 bash .research/rig/t3-submit.sh iso1` (pinning is the default), then `w5_report.py` on the velo reps and the verdict against the reset bar.
+
+### Update 2026-09-05: isolation matrix submitted
+
+W4a adapter gate and arms landed (rig-local): `DYN_VELO_RESPONSE_ASYNC_OPEN_ACK`, arms `velo4a` and `velo34`, `assert-async-open-ack.sh` (configuration assertion on both roles, with a 9-case fixture harness), parity check extended. Wheel rebuilt from 379240a (job 2729211); four-arm smoke green with assertions. Matrix `t3-iso1`: `ARMS="velo0 velo3 velo4a velo34 mux18p" REPS=3`, pinned by default. Next: per-arm means against the bar in the plan addendum of 2026-09-05, `w5_report.py` on the velo reps, docs and page update, then `wills-mega-review` on PRs #77, #78, #79 (each from its own worktree, gates through `in-ctr.sh`).
