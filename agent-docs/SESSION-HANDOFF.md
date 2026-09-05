@@ -575,3 +575,7 @@ The join (`out-iso1`; `w1_queue.py` and `w3_worker.py` now read a missing attach
 ### Update 2026-09-05 (evening): segment medians for every iso1 rep; join handles failed requests
 
 The join now runs on all fifteen iso1 reps (`out-iso1`); `a2_join.py` skips and counts requests with no first token (`skipped_failed`, unit test `test_a2_join_failed_rows.py`), so the errored velo34 reps join too. Three-rep segment means are in the diagnosis (section 3): zero-RTT adds about 9 ms to A and 8 ms to B in every rep while C falls to mux18p's level or below. `t3-iso2` is job 2730444 (queued on priority at submission).
+
+### Update 2026-09-05 (evening): W7 counters folded into the iso2 wheel
+
+`t3-iso2` (job 2730444) will not start before about 09:54, so the W7 counters go into the wheel it runs on: `integration/response-plane-wheel` is now f58de76 = b68d94b + `w7-batcher-instruments` (conflicts: `records.rs` keeps the rendezvous meter beside the sent-record counts; `tests/mod.rs` lists both modules; the detached open counts its `OpenSlot` after `dispatch_singleton`, a line W7's base lacks and PR #80 must gain when it rebases onto W4a). Sequence in flight: quick gate on the merged tree (label `int-w7-gate`), then `build-wheel.sh`, then `smoke-all.sh` for velo3 and velo34, all before the matrix starts. iso2 then carries `velo_streaming_mux_records_sent_total{record_type}` and `velo_streaming_mux_batcher_wakes_total{source}` on every rep, so the multiplying reply can be read from the velo3 reps without a separate run.
