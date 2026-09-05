@@ -178,3 +178,35 @@ What changes in the reading: the frontend spends 25 to 30 cores on every plane a
 | velo34 | 3 | 2,784 | 62 | 150 | 909 | 1.4 | 54.6 | 9.56 | 0.41 | 10.94 | 14.38 | 0 |
 
 What it settles: zero errors in nine reps, zero heartbeat watchdog firings, and on three reps a worker refused control entries at the cap (24,865 on velo34 rep 1) with no slot left fenced and nothing withheld at the end, which is the control-cap fix doing exactly what its tests say. What it does not settle: these nodes ran every arm slower and hotter than `t3-iso1`'s (throughput 2,600 to 2,900 against 3,300; CPU 8.5 to 10 against 7.7 to 8.7), the mocker backlog fell across four to six processes in several reps (velo3 rep 1 has ITL p50 10 ms and E2E p50 2.8 s, which is the mocker, not the plane), and velo3 rep 2 is aiperf's second pass after its first hit a dataset decode error inside aiperf itself, so its capture missed the measured window. The per-request join on the clean reps (`out-iso2`) puts velo3 and velo34 at A 5 to 6 ms, B 5 to 6 ms, C 50 ms, against velo4a at A 1.8, B 1.5, C 64: the request-path cost of zero-RTT is half what `t3-iso1` measured on its nodes and the response leg is the same, which says the request-path cost is contention, not a fixed price. The first-token comparison against the bar waits for `t3-iso3` with the reply linger (PR #81) and a same-matrix mux18p.
+
+## Addendum 2026-09-06: matrix `t3-iso3`, the reply linger measured
+
+Matrix `t3-iso3` (job 2731049; nodes ptyche0196 and ptyche0197; velo `4afb407`, the integration branch with the control-cap fix, PR #80's counters and PR #81's reply linger; three reps each of velo3 (reply linger 1 ms, the new default), velo3n (velo3 with `DYN_VELO_RESPONSE_REPLY_LINGER_US=0`, the pre-linger behaviour), velo3f (velo3 with `DYN_VELO_RESPONSE_FLUSH_INTERVAL_US=500`, a data linger on the workers), velo34 and mux18p; pinned 72/72; 250,000 requests per rep; CPU per request from the corrected summary).
+
+| arm | rep | req/s | TTFT p50 ms | TTFT p95 ms | TTFT p99 ms | ITL p50 ms | ITL p99 ms | frontend CPU ms/req | E2E p50 s | E2E p90 s | E2E p99 s | errors |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| velo3 | 1 | 3,017 | 83 | 142 | 803 | 10.8 | 23.5 | 9.87 | 3.04 | 5.28 | 6.24 | 0 |
+| velo3 | 2 | 2,254 | 54 | 231 | 871 | 1.8 | 106.7 | 9.91 | 0.51 | 19.37 | 28.03 | 0 |
+| velo3 | 3 | 2,825 | 62 | 149 | 896 | 1.4 | 55.8 | 9.52 | 0.42 | 10.88 | 14.70 | 0 |
+| velo3n | 1 | 2,353 | 55 | 225 | 864 | 1.7 | 101.5 | 10.15 | 0.48 | 18.78 | 26.63 | 0 |
+| velo3n | 2 | 2,326 | 55 | 222 | 835 | 1.7 | 101.7 | 10.01 | 0.50 | 18.74 | 26.65 | 0 |
+| velo3n | 3 | 2,314 | 55 | 231 | 868 | 1.7 | 102.3 | 10.29 | 0.51 | 18.99 | 26.86 | 0 |
+| velo3f | 1 | 2,790 | 62 | 136 | 834 | 1.5 | 46.1 | 9.05 | 0.44 | 10.37 | 12.15 | 0 |
+| velo3f | 2 | 3,077 | 75 | 132 | 805 | 1.4 | 27.0 | 9.15 | 0.43 | 6.57 | 7.13 | 0 |
+| velo3f | 3 | 3,106 | 76 | 139 | 854 | 1.4 | 27.5 | 9.10 | 0.43 | 6.50 | 7.30 | 0 |
+| velo34 | 1 | 2,815 | 61 | 138 | 842 | 1.5 | 44.9 | 9.72 | 0.43 | 10.34 | 11.83 | 0 |
+| velo34 | 2 | 3,000 | 73 | 138 | 837 | 1.4 | 29.2 | 9.79 | 0.42 | 6.85 | 7.72 | 0 |
+| velo34 | 3 | 2,352 | 54 | 229 | 847 | 1.6 | 101.6 | 9.88 | 0.46 | 18.71 | 26.70 | 0 |
+| mux18p | 1 | 2,379 | 49 | 203 | 786 | 1.7 | 99.3 | 7.33 | 0.48 | 18.70 | 26.07 | 0 |
+| mux18p | 2 | 2,928 | 48 | 115 | 788 | 1.4 | 51.2 | 7.62 | 0.41 | 10.18 | 13.46 | 0 |
+| mux18p | 3 | 2,952 | 49 | 108 | 793 | 1.4 | 42.5 | 7.50 | 0.40 | 9.76 | 11.16 | 0 |
+
+Three-rep means: velo3 2,699 req/s (spread 763), TTFT p50 66, p99 857, CPU 9.76; velo3n 2,331 (39), 55, 855, 10.15; velo3f 2,991 (316), 71, 831, 9.10; velo34 2,722 (648), 63, 842, 9.80; mux18p 2,753 (573), 49, 789, 7.48. Zero errors on all fifteen reps; zero heartbeat watchdog firings.
+
+**Two load modes, set by the mocker.** Every rep of this matrix fell into one of two states that have nothing to do with the arm: a "bad" draw in which one mocker process holds about 7,300 of the 8,192 in-flight requests (velo3n's three reps, velo3 rep 2, velo34 rep 3, mux18p rep 1: about 2,330 req/s, ITL p99 about 100 ms, E2E p99 about 27 s) and a "good" draw in which the backlog is split over two or three processes (about 2,800 to 3,100 req/s, E2E p99 7 to 15 s). Throughput, ITL and E2E columns are the draw. TTFT p50 rises with the draw's throughput on the velo arms (54 to 55 ms at 2,300 req/s, 61 to 62 at 2,800, 73 to 76 at 3,000 to 3,100) and does not on mux18p (48 to 49 at both). Only same-mode pairs compare. The nodes also run every arm below `t3-iso1`'s (mux18p 2,753 against 3,305 there; CPU 7.48 against 7.43 is the one column that agrees).
+
+**What the reply linger did.** From PR #80's counters on the frontend: with the linger off (velo3n) the frontend sent 1.58 to 1.69 million batches per rep, one per control wake, all credit replies; with it on (velo3, velo34) it sent 275,000 to 372,000, a five-fold cut, with 62,000 to 89,000 linger wakes carrying them. The per-request join (`out-iso3`) on the same-mode pair velo3 rep 2 against velo3n reps 1 and 2 shows no change in any segment: A 3.7 against 3.9 to 4.0 ms, B 3.3 against 3.3 to 3.5, C 47.7 against 47.8 to 47.9. CPU per request fell 0.4 ms (9.76 against 10.15). The linger removes the batch inflation and nothing else; the inflation was a symptom, not the cost.
+
+**What the data linger did.** velo3f cuts the frontend's inbound batches from 7.5 to 8.6 million per rep to 1.0 million (the workers' data batches carry seven times more records) and CPU to 9.10 ms per request, the lowest velo figure, but its request path pays for it: A 8.4 to 9.1 ms and B 12 to 13 ms against velo3's 5.6 and 5.5 in the same mode, and its TTFT p50 is 72 to 76 ms. Bigger inbound batches hold the peer's ingress lock and the ordered lane longer per batch, and the requests waiting behind them pay. Not a ship setting at 500 us.
+
+**Where velo stands against mux18p on these nodes, same mode.** Segment medians: mux18p A 1.4 to 1.6, B 0.5 to 0.7, C 45.6 to 45.9 ms, frontend-internal first-token time 12.3; velo3 A 3.7 to 5.6, B 3.3 to 5.5, C 47.7 to 50.4, frontend-internal 18 to 24. The response leg is within 2 to 4 ms of mux18p; the request leg costs 5 to 9 ms more; the frontend's own first-token time is 6 to 11 ms longer; frontend CPU is 2.3 ms per request (31 percent) higher, against 6 percent for velo0 on the pinned baseline. The residual is per-request frontend work under load, not batch counts.
