@@ -32,11 +32,13 @@ transport_integration_tests!(UcxFactory);
 /// as "responses are uninstrumented", it reads as "no responses arrived". That
 /// is a worse failure than a family that is dark throughout.
 ///
-/// Observability is set after `start()` deliberately, because a hand-driven
-/// transport such as this one can — the `Transport` trait fixes no order
-/// between the two, so the AM receive callback has to read the handle at call
-/// time rather than capture it at construction. (The `Velo` builder happens to
-/// set it *before* `start()`; the callback must not depend on either.)
+/// Observability is set after `start()` here, deliberately, even though the
+/// runtime itself always sets it before `start()` (see
+/// `Transport::set_observability`'s rustdoc in `velo-ext`). This test drives
+/// the transport by hand to prove the callback does not lean on that guarantee:
+/// UCX's AM receive callback runs on the progress thread, a thread the
+/// runtime does not otherwise synchronize with, so it has to read the handle
+/// at call time rather than capture it once at `start()` the way TCP/UDS do.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn inbound_frames_are_recorded_on_every_message_type() {
     use std::sync::Arc;

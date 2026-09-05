@@ -107,8 +107,9 @@ the part that actually matters — **one write instead of 32**.
 ## Measured results
 
 The validation methodology below calls the batching ratio
-(`frames_written / egress_flushes`) *"the cheapest and most decisive
-experiment."* It has been run. Both numbers come from
+(`velo_streaming_frames_written_total / velo_streaming_egress_flushes_total`)
+*"the cheapest and most decisive experiment."* It has been run. Both numbers
+come from
 `lib/velo/tests/streaming/tcp_batching.rs` on TCP loopback, and both are
 reproducible with `cargo test --all-features --test streaming_tcp_batching --
 --nocapture`.
@@ -810,8 +811,11 @@ New series, alongside the existing `velo_streaming_*` collectors:
 > subtracted from to get that queue's depth. They are the transport-level twins
 > of `velo_streaming_egress_flushes_total` and `velo_streaming_frames_written_total`
 > above, and they are where a batch that the mux already packed goes on
-> waiting. TCP and UDS only — see the README's Observability section for the
-> identity's full set of limits.
+> waiting. Published only by the coalescing writer the TCP and UDS transports
+> run — the `transport` label is whatever `TransportKey` the transport was
+> built with, not a fixed "tcp"/"uds" string, so select on the series'
+> presence rather than on a transport-name pattern — see the README's
+> Observability section for the identity's full set of limits.
 
 > **`velo_streaming_frames_written_total` / `velo_streaming_egress_flushes_total`
 > is the batching ratio** and the single number that says whether this is
@@ -839,6 +843,18 @@ returns — so a frame that is admitted but whose wire send later fails is now
 counted outbound-accepted and separately as a `send_error` rejection, instead
 of not being counted outbound at all. The per-frame byte value itself is
 unchanged; only the number of observations halves.
+
+`velo_transport_frames_total{transport="ucx",direction="inbound",*}` and the
+matching `velo_transport_frame_bytes_total` used to be permanently zero — the
+UCX admit path never called `record_frame` on the inbound side, unlike every
+other transport. It now does, so a dashboard or alert that treated UCX as
+uninstrumented on inbound will start showing real traffic.
+
+`velo_streaming_anchor_operations_total{operation="attach"}` and
+`velo_streaming_anchor_operation_duration_seconds{operation="attach"}` used to
+be populated by SPSC attaches only. MPSC attaches now record into the same two
+series, so the attach population and its duration mean both shift under an
+operator who was reading `{operation="attach"}` as an SPSC-only signal.
 
 ---
 

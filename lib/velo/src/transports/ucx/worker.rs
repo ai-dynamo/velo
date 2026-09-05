@@ -190,8 +190,11 @@ pub(crate) struct WorkerShared {
     /// callback runs on the progress thread and reaches only this struct — and
     /// because a `OnceLock` read is a plain atomic load, which is what makes it
     /// usable there at all. A `Mutex` would put a lock on the AM callback path.
-    /// `set_observability` may be called after `start()`, so the callback has
-    /// to read the slot per frame rather than capture the handle once.
+    /// The runtime always calls `set_observability` before `start()` (see
+    /// `Transport::set_observability`'s rustdoc in `velo-ext`), but that
+    /// guarantee does not reach this callback: the progress thread is not one
+    /// the runtime otherwise synchronizes with, so the callback reads the
+    /// slot per frame rather than capture the handle once at `start()`.
     pub metrics: OnceLock<Arc<dyn velo_ext::TransportObservability>>,
 }
 

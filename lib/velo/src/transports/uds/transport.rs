@@ -28,7 +28,7 @@ use crate::transports::tcp::framing::DEFAULT_MAX_FRAME_SIZE;
 
 use super::listener::{UdsListener, default_shrink_threshold};
 use crate::transports::coalesce::{
-    Coalescable, EgressMetrics, FrameTally, WriterFailure, WriterObserver, run_coalescing_writer,
+    Coalescable, EgressMetrics, WriterFailure, WriterObserver, run_coalescing_writer,
 };
 use crate::transports::ingress::{DialedReaderContext, run_dialed_reader};
 
@@ -682,7 +682,7 @@ async fn connection_writer_inner(
         &UdsWriterObserver {
             instance_id,
             path,
-            egress: EgressMetrics::new(metrics),
+            egress: metrics.map(EgressMetrics::new),
         },
     )
     .await;
@@ -745,13 +745,13 @@ impl Coalescable for SendTask {
 /// carries the transport's pre-bound metrics handle so the per-frame egress
 /// path does no label lookup.
 ///
-/// The egress-metrics methods delegate to [`EgressMetrics`], which TCP
-/// shares byte-for-byte — the only thing that differs per transport is the
-/// failure log text below.
+/// Answers [`WriterObserver::egress`] with that handle, which TCP shares
+/// byte-for-byte — the only thing that differs per transport is the failure
+/// log text below.
 struct UdsWriterObserver<'a> {
     instance_id: crate::InstanceId,
     path: &'a Path,
-    egress: EgressMetrics,
+    egress: Option<EgressMetrics>,
 }
 
 impl WriterObserver for UdsWriterObserver<'_> {
@@ -768,16 +768,8 @@ impl WriterObserver for UdsWriterObserver<'_> {
         }
     }
 
-    fn records_egress(&self) -> bool {
-        self.egress.records_egress()
-    }
-
-    fn on_dequeue(&self, waited: Duration) {
-        self.egress.on_dequeue(waited);
-    }
-
-    fn on_write(&self, tally: &FrameTally, elapsed: Duration) {
-        self.egress.on_write(tally, elapsed);
+    fn egress(&self) -> Option<&EgressMetrics> {
+        self.egress.as_ref()
     }
 }
 

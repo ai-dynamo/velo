@@ -700,7 +700,7 @@ async fn connection_writer_inner(
         &TcpWriterObserver {
             instance_id,
             addr,
-            egress: EgressMetrics::new(metrics),
+            egress: metrics.map(EgressMetrics::new),
         },
     )
     .await;

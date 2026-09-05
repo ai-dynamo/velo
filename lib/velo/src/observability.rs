@@ -18,6 +18,7 @@ use prometheus::{
     Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramOpts, HistogramVec, Opts, Registry,
     exponential_buckets,
 };
+use velo_ext::MessageType;
 
 #[cfg(feature = "distributed-tracing")]
 use opentelemetry::propagation::{Extractor, Injector};
@@ -300,7 +301,12 @@ pub mod labels {
     pub const MSG_SHUTTING_DOWN: &str = "shutting_down";
 }
 
-// Keep for the record_frame fallback when message_type is an unknown &str.
+// `record_frame`'s only caller of this: its `message_type` stays `&str`
+// because it is a required trait method and every out-of-tree implementation
+// already calls it with the well-known label strings, so changing its
+// signature is a breaking change (see CONTRIBUTING.md, *velo-ext API
+// stability*). `record_frames_written` used to share this lookup but now
+// takes `MessageType` directly and indexes without a fallback.
 fn transport_message_type_index(message_type: &str) -> Option<usize> {
     match message_type {
         "message" => Some(0),
@@ -433,19 +439,15 @@ impl TransportMetricsHandle {
         })
     }
 
-    /// Record `count` frames of one message type reaching the wire, using a
-    /// pre-bound counter whenever the label is known.
-    pub fn record_frames_written(&self, message_type: &str, count: u64) {
-        let egress = self.egress_children();
-        match transport_message_type_index(message_type) {
-            Some(message_type_idx) => egress.frames_written[message_type_idx].inc_by(count as f64),
-            None => {
-                debug_assert!(false, "unknown message_type label: {message_type:?}");
-                self.transport_frames_written_total
-                    .with_label_values(&[self.transport.as_str(), message_type])
-                    .inc_by(count as f64);
-            }
-        }
+    /// Record `count` frames of one message type reaching the wire.
+    ///
+    /// [`MessageType`] is a closed, `#[repr(u8)]` enum, so every discriminant
+    /// names a real slot in `egress_children().frames_written` — there is no
+    /// unknown-label case left to fall back on the way [`Self::record_frame`]
+    /// does for its `&str` parameter. `frames_written_total_covers_every_message_type`
+    /// is what keeps that true if the enum ever grows.
+    pub fn record_frames_written(&self, message_type: MessageType, count: u64) {
+        self.egress_children().frames_written[message_type as usize].inc_by(count as f64);
     }
 
     /// Record how long one frame waited in front of its connection's writer.
@@ -521,7 +523,7 @@ impl velo_ext::TransportObservability for TransportMetricsHandle {
         TransportMetricsHandle::record_egress_queue_wait(self, wait);
     }
 
-    fn record_frames_written(&self, message_type: &str, count: u64) {
+    fn record_frames_written(&self, message_type: MessageType, count: u64) {
         TransportMetricsHandle::record_frames_written(self, message_type, count);
     }
 
@@ -921,8 +923,12 @@ impl VeloMetrics {
                     "Frames a transport's per-connection writer handed to the kernel's socket \
                      send buffer, counted once the write returned. Subtract this from \
                      velo_transport_frames_total{direction=\"outbound\",outcome=\"accepted\"} on \
-                     the same transport to get that transport's egress queue depth — TCP and UDS \
-                     only; see the README's Observability section for the identity's limits.",
+                     the same transport to get that transport's egress queue depth. Published \
+                     only by the coalescing writer the TCP and UDS transports run — the \
+                     `transport` label is whatever TransportKey the transport was built with, \
+                     not a fixed name, so select on this series' presence rather than on a \
+                     transport-name pattern; see the README's Observability section for the \
+                     identity's limits.",
                 ),
                 &["transport", "message_type"],
             )?,
@@ -940,7 +946,10 @@ impl VeloMetrics {
                      by the writer, at the dequeue — including a frame whose \
                      write then failed, so this count is at least \
                      velo_transport_frames_written_total and equals it only on \
-                     a connection that never faulted. TCP and UDS only.",
+                     a connection that never faulted. Published only by the \
+                     coalescing writer the TCP and UDS transports run — select \
+                     on this series' presence, not on the `transport` label's \
+                     value.",
                 )
                 .buckets(EGRESS_BUCKETS.to_vec()),
                 &["transport"],
@@ -959,7 +968,10 @@ impl VeloMetrics {
                      socket's send buffer is full and the wire or the receiver \
                      is the constraint; small values beside a large \
                      velo_transport_egress_queue_wait_seconds mean the writer \
-                     is starved or the queue is simply long. TCP and UDS only.",
+                     is starved or the queue is simply long. Published only by \
+                     the coalescing writer the TCP and UDS transports run — \
+                     select on this series' presence, not on the `transport` \
+                     label's value.",
                 )
                 .buckets(EGRESS_BUCKETS.to_vec()),
                 &["transport"],
@@ -2138,7 +2150,7 @@ mod tests {
         // Same reason as the line above: a `CounterVec` or `HistogramVec` with
         // no children collects no family, so the egress names below only mean
         // something once something has been observed on them.
-        handle.record_frames_written("message", 2);
+        handle.record_frames_written(MessageType::Message, 2);
         handle.record_egress_queue_wait(Duration::from_millis(2));
         handle.record_egress_write_duration(Duration::from_micros(50));
 
@@ -2175,8 +2187,8 @@ mod tests {
         let metrics = VeloMetrics::register(&registry).expect("register metrics");
         let handle = metrics.bind_transport("tcp");
 
-        handle.record_frames_written("message", 3);
-        handle.record_frames_written("response", 1);
+        handle.record_frames_written(MessageType::Message, 3);
+        handle.record_frames_written(MessageType::Response, 1);
         handle.record_egress_queue_wait(Duration::from_millis(4));
         handle.record_egress_write_duration(Duration::from_micros(120));
 
@@ -2226,6 +2238,45 @@ mod tests {
             ),
             1
         );
+    }
+
+    /// `TransportMetricsHandle::record_frames_written` indexes
+    /// `egress_children().frames_written` by `message_type as usize` with no
+    /// bounds check — the old `&str` signature had an `Option` fallback for
+    /// an unrecognized label, but `MessageType` is closed, so the enum itself
+    /// is supposed to make that case unrepresentable. This is what keeps that
+    /// true if a future discriminant is ever added above `ShuttingDown`
+    /// without widening `TRANSPORT_MESSAGE_TYPES` to match — the mirror of
+    /// `tally_has_one_slot_per_message_type` in `transports::coalesce::tests`.
+    ///
+    /// The bounds check alone would still pass if `TRANSPORT_MESSAGE_TYPES`
+    /// were merely reordered (no discriminant added or removed) — the slot
+    /// would exist, just under the wrong Prometheus label, and nothing here
+    /// or in `record_frames_written` itself would notice. The second
+    /// assertion below closes that: it ties each slot's string back to
+    /// `transports::message_type_label`, the function that already gives
+    /// every discriminant its canonical label, so the two can no longer
+    /// silently drift apart.
+    #[test]
+    fn frames_written_total_covers_every_message_type() {
+        for byte in 0..=u8::MAX {
+            if let Some(msg_type) = MessageType::from_u8(byte) {
+                assert!(
+                    (msg_type as usize) < TRANSPORT_MESSAGE_TYPES.len(),
+                    "{msg_type:?} (discriminant {byte}) has no frames_written slot — \
+                     widen TRANSPORT_MESSAGE_TYPES"
+                );
+                assert_eq!(
+                    TRANSPORT_MESSAGE_TYPES[msg_type as usize],
+                    crate::transports::message_type_label(msg_type),
+                    "{msg_type:?}'s frames_written slot is labelled \
+                     {:?}, but its canonical label is {:?} — \
+                     TRANSPORT_MESSAGE_TYPES has drifted out of discriminant order",
+                    TRANSPORT_MESSAGE_TYPES[msg_type as usize],
+                    crate::transports::message_type_label(msg_type)
+                );
+            }
+        }
     }
 
     /// The two egress histograms must share one bucket ladder. Neither answers
@@ -2302,7 +2353,7 @@ mod tests {
         // TCP does publish these, and calling the recorders must still
         // produce them — the lazy build must not narrow this to nothing.
         let tcp_handle = metrics.bind_transport("tcp");
-        tcp_handle.record_frames_written("message", 1);
+        tcp_handle.record_frames_written(MessageType::Message, 1);
         tcp_handle.record_egress_queue_wait(Duration::from_millis(1));
         tcp_handle.record_egress_write_duration(Duration::from_millis(1));
 

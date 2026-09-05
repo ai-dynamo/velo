@@ -145,7 +145,7 @@ async fn writer_observer_publishes_egress_into_the_bound_handle() {
         &TcpWriterObserver {
             instance_id: crate::InstanceId::new_v4(),
             addr: "127.0.0.1:1".parse().unwrap(),
-            egress: EgressMetrics::new(Some(handle)),
+            egress: Some(EgressMetrics::new(handle)),
         },
     )
     .await;
@@ -250,7 +250,7 @@ async fn the_egress_queue_wait_spans_the_admission_gate() {
                 &TcpWriterObserver {
                     instance_id,
                     addr: "127.0.0.1:1".parse().unwrap(),
-                    egress: EgressMetrics::new(Some(handle)),
+                    egress: Some(EgressMetrics::new(handle)),
                 },
             )
             .await;

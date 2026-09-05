@@ -10,8 +10,8 @@ Written 2026-09-05, PR #77 (`w0-ingest-metrics`), pass 3 review response.
 ## The finding
 
 `EgressLog::dequeued` / `staged` / `started` / `written`
-(`lib/velo/src/transports/coalesce/mod.rs:177-197`) add contended atomic
-traffic to the exact outbound path W0 exists to measure. Per outbound frame on
+(`lib/velo/src/transports/coalesce/mod.rs`, type `EgressLog`) add contended
+atomic traffic to the exact outbound path W0 exists to measure. Per outbound frame on
 TCP/UDS this PR adds: one `Instant::now()` at send
 (`tcp/transport.rs:385`), one `Instant::elapsed()` plus one histogram observe
 (4 atomic RMWs in `prometheus` 0.14's `HistogramCore::observe`) at dequeue, and
@@ -59,6 +59,28 @@ frame instead of once per frame in the batch. That drops the per-frame
 `Instant::elapsed()` and histogram observe on every frame coalesced into a
 batch, keeping one observation per `write_all` instead of one per frame.
 
-This note closes the loop so a fourth pass does not re-raise the same
-un-measured claim as new information; it does not claim the cost is
-acceptable, only that it is accepted, unmeasured, for this PR.
+This note closes the loop on the *egress* instruments so a fourth pass does
+not re-raise the same un-measured claim as new information; it does not claim
+the cost is acceptable, only that it is accepted, unmeasured, for this PR.
+
+## The other unmeasured addition: the ordered-lane dispatch handle
+
+This doc's scope above is the egress writer's three instruments. It omits the
+second hot-path addition this PR turns on: `bind_ordered_dispatcher`
+(`lib/velo/src/observability.rs:1721-1722`) now admits
+`STREAM_BATCH_HANDLER` past `should_track_handler`'s `_`-prefix filter, so
+`_stream_batch` — the messenger mux's only ingress lane — goes from `None` to
+`Some(OrderedMetricsHandle)`. Per dispatched batch this now costs: an
+`OrderedMetricsHandle` clone in `dispatcher.rs:247` (four `Arc` increments,
+one decrement each when the clones drop — two `Gauge`, one `Histogram`, one
+`Counter`, per `observability.rs:593-598`), an `Instant::elapsed()` plus
+`Histogram::observe` at `dispatcher.rs:251`, and a `lane_depth` gauge
+increment/decrement pair at `dispatcher.rs:402`/`:295`.
+
+Unlike the egress instruments, this one is not deferred pending a measurement
+— it is accepted outright, because it is intrinsic to ruling 6: W0 cannot
+measure `W_lane` (the per-sender ordered-lane wait that ruling 13's primary
+exit criterion, `|2*W_rx + W_lane - C_mean| <= 0.10 * C_mean`, is read from)
+without paying to observe it on the one path that carries it. There is no
+A/B to defer to, because turning the instrument off is turning off the
+measurement W0 exists to take.

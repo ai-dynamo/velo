@@ -12,15 +12,13 @@
 //! it is queued for one.
 
 use std::net::SocketAddr;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use tracing::error;
 
 use velo_ext::MessageType;
 
-use crate::transports::coalesce::{
-    Coalescable, EgressMetrics, FrameTally, WriterFailure, WriterObserver,
-};
+use crate::transports::coalesce::{Coalescable, EgressMetrics, WriterFailure, WriterObserver};
 
 use super::transport::SendTask;
 
@@ -62,9 +60,9 @@ impl Coalescable for SendTask {
 /// carries the transport's pre-bound metrics handle so the per-frame egress
 /// path does no label lookup.
 ///
-/// The egress-metrics methods delegate to [`EgressMetrics`], which UDS
-/// shares byte-for-byte — the only thing that differs per transport is the
-/// failure log text below.
+/// Answers [`WriterObserver::egress`] with that handle, which UDS shares
+/// byte-for-byte — the only thing that differs per transport is the failure
+/// log text below.
 ///
 /// `pub(super)`, along with its fields: `transport.rs` constructs this by
 /// struct literal at the connection writer's spawn site, so `tcp` is the
@@ -72,7 +70,7 @@ impl Coalescable for SendTask {
 pub(super) struct TcpWriterObserver {
     pub(super) instance_id: crate::InstanceId,
     pub(super) addr: SocketAddr,
-    pub(super) egress: EgressMetrics,
+    pub(super) egress: Option<EgressMetrics>,
 }
 
 impl WriterObserver for TcpWriterObserver {
@@ -89,15 +87,7 @@ impl WriterObserver for TcpWriterObserver {
         }
     }
 
-    fn records_egress(&self) -> bool {
-        self.egress.records_egress()
-    }
-
-    fn on_dequeue(&self, waited: Duration) {
-        self.egress.on_dequeue(waited);
-    }
-
-    fn on_write(&self, tally: &FrameTally, elapsed: Duration) {
-        self.egress.on_write(tally, elapsed);
+    fn egress(&self) -> Option<&EgressMetrics> {
+        self.egress.as_ref()
     }
 }

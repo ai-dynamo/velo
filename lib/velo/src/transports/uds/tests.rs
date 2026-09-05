@@ -673,7 +673,7 @@ async fn the_egress_queue_wait_spans_the_admission_gate() {
                 &UdsWriterObserver {
                     instance_id,
                     path: &socket_path,
-                    egress: EgressMetrics::new(Some(handle)),
+                    egress: Some(EgressMetrics::new(handle)),
                 },
             )
             .await;

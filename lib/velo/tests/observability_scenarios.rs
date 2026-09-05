@@ -604,8 +604,8 @@ async fn await_egress_quiesced(label: &str, snapshot: impl Fn() -> MetricSnapsho
         );
         let written = snap.counter_sum("velo_transport_frames_written_total", &[]);
         if accepted > 0.0 && (accepted - written).abs() < f64::EPSILON {
-            let waits = snap.histogram_count("velo_transport_egress_queue_wait_seconds", &[]);
-            let writes = snap.histogram_count("velo_transport_write_duration_seconds", &[]);
+            let waits = snap.histogram_count_sum("velo_transport_egress_queue_wait_seconds", &[]);
+            let writes = snap.histogram_count_sum("velo_transport_write_duration_seconds", &[]);
             assert_eq!(
                 waits as f64, written,
                 "{label}: one queue-wait observation per written frame — waits={waits} written={written}"
