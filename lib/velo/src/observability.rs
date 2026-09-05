@@ -637,6 +637,33 @@ impl MuxDirection {
     }
 }
 
+/// What woke a peer batcher's task, for `velo_streaming_mux_batcher_wakes_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BatcherWake {
+    /// An `OpenSlot` request from a producer.
+    Open,
+    /// Coalesced control: grants, closes, replies, kicks, or a retirement.
+    Control,
+    /// A producer queued a record on one of this batcher's slots.
+    Frame,
+    /// A producer went away without a terminal.
+    InletClosed,
+    /// The linger window on a staged batch ran out.
+    Linger,
+}
+
+impl BatcherWake {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Control => "control",
+            Self::Frame => "frame",
+            Self::InletClosed => "inlet_closed",
+            Self::Linger => "linger",
+        }
+    }
+}
+
 /// Collectors for the `messenger-mux-v1` streaming transport.
 ///
 /// Bound once per mux transport via [`VeloMetrics::bind_mux`] so the hot paths
@@ -660,9 +687,26 @@ pub(crate) struct MuxMetricsHandle {
     epoch_deaths_total: Counter,
     batch_seq_gaps_total: Counter,
     drain_visits_total: Counter,
+    records_sent_total: CounterVec,
+    batcher_wakes_total: CounterVec,
 }
 
 impl MuxMetricsHandle {
+    /// A batcher packed one record of `kind` into a batch bound for its peer.
+    pub(crate) fn record_sent(&self, kind: crate::streaming::messenger_mux::protocol::RecordType) {
+        self.records_sent_total
+            .with_label_values(&[kind.as_str()])
+            .inc();
+    }
+
+    /// A batcher's task woke for `source`, whether from its select or from the
+    /// drain loop that follows it.
+    pub(crate) fn batcher_wake(&self, source: BatcherWake) {
+        self.batcher_wakes_total
+            .with_label_values(&[source.as_str()])
+            .inc();
+    }
+
     /// A slot came into existence on either side of the mux.
     pub(crate) fn slot_opened(&self) {
         self.live_slots.inc();
@@ -829,6 +873,8 @@ pub struct VeloMetrics {
     streaming_mux_epoch_deaths_total: Counter,
     streaming_mux_batch_seq_gaps_total: Counter,
     streaming_mux_drain_visits_total: Counter,
+    streaming_mux_records_sent_total: CounterVec,
+    streaming_mux_batcher_wakes_total: CounterVec,
     // Rendezvous metrics
     rendezvous_operations_total: CounterVec,
     rendezvous_operation_duration_seconds: HistogramVec,
@@ -1428,6 +1474,35 @@ impl VeloMetrics {
                  bounded above by 1/drain_visit_floor per peer.",
             ))?,
         )?;
+        let streaming_mux_records_sent_total = register_collector(
+            registry,
+            CounterVec::new(
+                Opts::new(
+                    "velo_streaming_mux_records_sent_total",
+                    "Mux records a batcher packed for its peer, by record type. \
+                     Divided by velo_streaming_mux_batches_total{direction=\"sent\"} \
+                     it says what a node's outbound batches are made of, which \
+                     is the question a batch count alone cannot answer: a rise \
+                     in small batches is either data that arrives one record at \
+                     a time or control that is flushed as it comes.",
+                ),
+                &["record_type"],
+            )?,
+        )?;
+        let streaming_mux_batcher_wakes_total = register_collector(
+            registry,
+            CounterVec::new(
+                Opts::new(
+                    "velo_streaming_mux_batcher_wakes_total",
+                    "Wakes of the per-peer batcher tasks, by what woke them: a \
+                     producer's open, coalesced control, a queued record, a \
+                     departed producer, or the linger timer. Under the default \
+                     flush policy every wake that staged anything writes a \
+                     batch, so this is the denominator behind the batch count.",
+                ),
+                &["source"],
+            )?,
+        )?;
 
         // -- Rendezvous metrics --
         let rendezvous_operations_total = register_collector(
@@ -1520,6 +1595,8 @@ impl VeloMetrics {
             streaming_mux_epoch_deaths_total,
             streaming_mux_batch_seq_gaps_total,
             streaming_mux_drain_visits_total,
+            streaming_mux_records_sent_total,
+            streaming_mux_batcher_wakes_total,
             rendezvous_operations_total,
             rendezvous_operation_duration_seconds,
             rendezvous_bytes_total,
@@ -1713,6 +1790,8 @@ impl VeloMetrics {
             epoch_deaths_total: self.streaming_mux_epoch_deaths_total.clone(),
             batch_seq_gaps_total: self.streaming_mux_batch_seq_gaps_total.clone(),
             drain_visits_total: self.streaming_mux_drain_visits_total.clone(),
+            records_sent_total: self.streaming_mux_records_sent_total.clone(),
+            batcher_wakes_total: self.streaming_mux_batcher_wakes_total.clone(),
         }
     }
 

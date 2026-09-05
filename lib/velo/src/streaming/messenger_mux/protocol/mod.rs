@@ -258,6 +258,18 @@ pub(crate) enum RecordType {
 }
 
 impl RecordType {
+    /// The label value `velo_streaming_mux_records_sent_total` files this
+    /// type under.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Data => "data",
+            Self::OpenSlot => "open_slot",
+            Self::CloseSlot => "close_slot",
+            Self::CreditUpdate => "credit_update",
+            Self::SlotHeartbeat => "slot_heartbeat",
+        }
+    }
+
     /// Decodes a discriminant, or `None` for a type this build does not know.
     pub(crate) const fn from_u8(value: u8) -> Option<Self> {
         match value {
