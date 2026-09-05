@@ -1080,6 +1080,57 @@ impl AnchorManager {
         }
     }
 
+    /// Observe one remote attach round trip, from the sender's side.
+    ///
+    /// The single place both the SPSC (`attach_remote`) and MPSC
+    /// (`attach_mpsc_remote`) paths stamp the RTT, so the two cannot drift into
+    /// bracketing different spans of work. `started` must be taken immediately
+    /// before the attach request's send — to `_anchor_attach` or
+    /// `_mpsc_anchor_attach`, whichever this call is for — and observed
+    /// immediately after it: the transport connect that follows a successful
+    /// attach is the sender's own work, not the round trip, and folding it in
+    /// would make the excess over the receiver's handler timing stop meaning
+    /// "ingest queueing".
+    ///
+    /// The co-located attach path observes nothing: it never leaves the
+    /// process, so it has no round trip to report.
+    pub(crate) fn record_attach_rtt(
+        &self,
+        started: Instant,
+        outcome: HandlerOutcome,
+        transport_scheme: &str,
+    ) {
+        if let Some(metrics) = self.metrics.as_ref() {
+            metrics.record_attach_rtt(outcome, transport_scheme, started.elapsed());
+        }
+    }
+
+    /// Fold the transport key a peer answered an attach with into the closed
+    /// set this node advertised, or `"unknown"`.
+    ///
+    /// `streaming_transport_key` on an attach response is a string the *remote*
+    /// worker put on the wire, and `transport_scheme` is a metric label:
+    /// recorded raw, a version-skewed or hostile peer mints one histogram child
+    /// per distinct string, each alive for the life of the process. That is the
+    /// unbounded cardinality a fixed label set is supposed to make impossible.
+    ///
+    /// The advertisement is the closed set to fold onto, and it is the right
+    /// one: `resolve_transport` succeeds only on a key in this node's registry,
+    /// and the mux key takes `Connect::Mux`, so every key that can lead to a
+    /// working attach is in here. A key outside it fails `connect_streaming` a
+    /// few lines later, and `"unknown"` is the honest label for it — nothing was
+    /// negotiated. Normalising here rather than after the connect is what keeps
+    /// the RTT bracket over the send alone.
+    fn attach_scheme_label<'a>(
+        advertised: &'a [velo_ext::TransportKey],
+        answered: &velo_ext::TransportKey,
+    ) -> &'a str {
+        advertised
+            .iter()
+            .find(|key| key.as_str() == answered.as_str())
+            .map_or("unknown", |key| key.as_str())
+    }
+
     /// Register all five control-plane AM handlers on a live Messenger.
     ///
     /// Registers: `_anchor_attach`, `_anchor_detach`, `_anchor_finalize`,
@@ -1177,17 +1228,27 @@ impl AnchorManager {
             supported_transport_keys: self.supported_transport_keys(),
         };
 
-        // Send _anchor_attach AM to the remote worker (typed request-response)
-        let response: crate::streaming::control::AnchorAttachResponse = messenger
+        // Send _anchor_attach AM to the remote worker (typed request-response).
+        //
+        // The RTT timer brackets the send and nothing else: the request is
+        // built before it starts and `connect_streaming` below runs after it
+        // stops, so what the histogram reports is exactly the wire round trip
+        // the caller was blocked on.
+        let request = messenger
             .typed_unary_streaming::<crate::streaming::control::AnchorAttachResponse>(
                 "_anchor_attach",
             )
             .payload(&req)
             .map_err(AttachError::TransportError)?
-            .worker(handle_worker_id)
-            .send()
-            .await
-            .map_err(AttachError::TransportError)?;
+            .worker(handle_worker_id);
+        let started = Instant::now();
+        let response: crate::streaming::control::AnchorAttachResponse = match request.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                self.record_attach_rtt(started, HandlerOutcome::Error, "unknown");
+                return Err(AttachError::TransportError(error));
+            }
+        };
 
         match response {
             crate::streaming::control::AnchorAttachResponse::Ok {
@@ -1197,6 +1258,14 @@ impl AnchorManager {
                 initial_credit,
                 slot_byte_budget,
             } => {
+                self.record_attach_rtt(
+                    started,
+                    HandlerOutcome::Success,
+                    Self::attach_scheme_label(
+                        &req.supported_transport_keys,
+                        &streaming_transport_key,
+                    ),
+                );
                 let (_, local_id) = handle.unpack();
 
                 // Resolve the local FrameTransport that matches the remote
@@ -1249,6 +1318,9 @@ impl AnchorManager {
                 ))
             }
             crate::streaming::control::AnchorAttachResponse::Err { reason } => {
+                // A refusal is still a round trip the caller waited on, so it
+                // is observed. No scheme was ever negotiated, hence "unknown".
+                self.record_attach_rtt(started, HandlerOutcome::Error, "unknown");
                 Err(AttachError::TransportError(anyhow::anyhow!("{}", reason)))
             }
         }
@@ -1581,16 +1653,24 @@ impl AnchorManager {
             supported_transport_keys: self.supported_transport_keys(),
         };
 
-        let response: crate::streaming::mpsc::control::MpscAnchorAttachResponse = messenger
+        // Same bracket as the SPSC path above, through the same helper: the
+        // timer covers the send and nothing on either side of it.
+        let request = messenger
             .typed_unary_streaming::<crate::streaming::mpsc::control::MpscAnchorAttachResponse>(
                 "_mpsc_anchor_attach",
             )
             .payload(&req)
             .map_err(AttachError::TransportError)?
-            .worker(handle_worker_id)
-            .send()
-            .await
-            .map_err(AttachError::TransportError)?;
+            .worker(handle_worker_id);
+        let started = Instant::now();
+        let response: crate::streaming::mpsc::control::MpscAnchorAttachResponse =
+            match request.send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    self.record_attach_rtt(started, HandlerOutcome::Error, "unknown");
+                    return Err(AttachError::TransportError(error));
+                }
+            };
 
         match response {
             crate::streaming::mpsc::control::MpscAnchorAttachResponse::Ok {
@@ -1601,6 +1681,14 @@ impl AnchorManager {
                 initial_credit,
                 slot_byte_budget,
             } => {
+                self.record_attach_rtt(
+                    started,
+                    HandlerOutcome::Success,
+                    Self::attach_scheme_label(
+                        &req.supported_transport_keys,
+                        &streaming_transport_key,
+                    ),
+                );
                 let (_, local_id) = handle.unpack();
                 // See the SPSC remote attach above for routing_session_id
                 // rationale and the legacy-zero fallback.
@@ -1644,6 +1732,7 @@ impl AnchorManager {
                 ))
             }
             crate::streaming::mpsc::control::MpscAnchorAttachResponse::Err { reason } => {
+                self.record_attach_rtt(started, HandlerOutcome::Error, "unknown");
                 Err(AttachError::TransportError(anyhow::anyhow!("{}", reason)))
             }
         }
@@ -2983,5 +3072,151 @@ mod tests {
         );
 
         drop(sender);
+    }
+
+    // -----------------------------------------------------------------------
+    // Attach-RTT label cardinality
+    // -----------------------------------------------------------------------
+
+    /// A `FrameTransport` whose key the test chooses, so the two sides of an
+    /// attach can disagree about it.
+    struct KeyedMockTransport(&'static str);
+
+    impl crate::streaming::transport::FrameTransport for KeyedMockTransport {
+        fn key(&self) -> velo_ext::TransportKey {
+            velo_ext::TransportKey::new(self.0)
+        }
+
+        fn address(&self) -> velo_ext::WorkerAddress {
+            velo_ext::WorkerAddress::empty()
+        }
+
+        fn bind(
+            &self,
+            _anchor_id: u64,
+            _session_id: u64,
+        ) -> BoxFuture<'_, AnyhowResult<flume::Receiver<Vec<u8>>>> {
+            Box::pin(async { Ok(flume::bounded::<Vec<u8>>(256).1) })
+        }
+
+        fn connect(
+            &self,
+            _peer: velo_ext::WorkerId,
+            _anchor_id: u64,
+            _session_id: u64,
+        ) -> BoxFuture<'_, AnyhowResult<flume::Sender<Vec<u8>>>> {
+            Box::pin(async { Ok(flume::bounded::<Vec<u8>>(256).0) })
+        }
+    }
+
+    fn tcp_messenger_transport() -> Arc<crate::transports::tcp::TcpTransport> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        Arc::new(
+            crate::transports::tcp::TcpTransportBuilder::new()
+                .from_listener(listener)
+                .expect("from_listener")
+                .build()
+                .expect("build transport"),
+        )
+    }
+
+    /// The `transport_scheme` label never carries a string the peer chose.
+    ///
+    /// The key in an attach response comes off the wire, and the sender records
+    /// it as a label before anything has resolved it — `connect_streaming` runs
+    /// afterwards, and moving the observation there would fold the transport
+    /// dial into the round trip the histogram is supposed to bracket. A label
+    /// value a peer can pick is unbounded cardinality: one histogram child per
+    /// distinct string, each alive for the life of the process.
+    ///
+    /// The disagreement is the ordinary mixed-deployment one, not a contrived
+    /// hostile peer: `negotiation::select` falls through to the *receiver's*
+    /// own default transport key whenever the sender did not advertise the mux,
+    /// so a receiver configured with a different streaming transport answers
+    /// with a key this sender never named. Here the sender's registry is empty,
+    /// which is the documented convenience path where `resolve_transport` falls
+    /// back to the default transport — so the attach also succeeds, and the
+    /// label is recorded on the success arm rather than an error one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_peer_chosen_transport_key_never_becomes_a_label_value() {
+        use crate::observability::test_helpers::MetricSnapshot;
+
+        const RTT: &str = "velo_streaming_anchor_attach_rtt_seconds";
+        const PEER_CHOSEN: &str = "a-key-this-sender-never-advertised";
+
+        let m_consumer = crate::messenger::Messenger::builder()
+            .add_transport(tcp_messenger_transport())
+            .build()
+            .await
+            .expect("consumer messenger");
+        let m_producer = crate::messenger::Messenger::builder()
+            .add_transport(tcp_messenger_transport())
+            .build()
+            .await
+            .expect("producer messenger");
+        m_consumer
+            .register_peer(m_producer.peer_info())
+            .expect("register producer on consumer");
+        m_producer
+            .register_peer(m_consumer.peer_info())
+            .expect("register consumer on producer");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let producer_reg = prometheus::Registry::new();
+        let producer_metrics =
+            Arc::new(VeloMetrics::register(&producer_reg).expect("register metrics"));
+
+        let am_consumer = Arc::new(
+            AnchorManagerBuilder::default()
+                .worker_id(m_consumer.instance_id().worker_id())
+                .transport(Arc::new(KeyedMockTransport(PEER_CHOSEN))
+                    as Arc<dyn crate::streaming::transport::FrameTransport>)
+                .messenger(Some(Arc::clone(&m_consumer)))
+                .build()
+                .expect("consumer anchor manager"),
+        );
+        let am_producer = Arc::new(
+            AnchorManagerBuilder::default()
+                .worker_id(m_producer.instance_id().worker_id())
+                .transport(Arc::new(KeyedMockTransport("this-senders-own-stream"))
+                    as Arc<dyn crate::streaming::transport::FrameTransport>)
+                .messenger(Some(Arc::clone(&m_producer)))
+                .metrics(Some(Arc::clone(&producer_metrics)))
+                .build()
+                .expect("producer anchor manager"),
+        );
+        am_consumer
+            .register_handlers(Arc::clone(&m_consumer))
+            .expect("consumer handlers");
+        am_producer
+            .register_handlers(Arc::clone(&m_producer))
+            .expect("producer handlers");
+
+        let anchor = am_consumer.create_anchor::<u32>();
+        let handle = anchor.handle();
+        let _sender = am_producer
+            .attach_stream_anchor::<u32>(handle)
+            .await
+            .expect("the attach must succeed: an empty registry resolves any key");
+
+        let snap = MetricSnapshot::from_registry(&producer_reg);
+        assert_eq!(
+            snap.histogram_count(RTT, &[("transport_scheme", PEER_CHOSEN)]),
+            0,
+            "the peer named the label child; every distinct string a peer sends \
+             would mint one that lives as long as the process"
+        );
+        assert_eq!(
+            snap.histogram_count(
+                RTT,
+                &[("outcome", "success"), ("transport_scheme", "unknown")]
+            ),
+            1,
+            "a key outside this node's advertisement is not a negotiated scheme"
+        );
+
+        // Held to the end: dropping the anchor tears the consumer side down and
+        // races the handler that produced the observation above.
+        drop(anchor);
     }
 }

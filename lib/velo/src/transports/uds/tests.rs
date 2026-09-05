@@ -90,6 +90,7 @@ fn task(on_error: Arc<dyn TransportErrorHandler>) -> SendTask {
         header: Bytes::from_static(b"hdr"),
         payload: Bytes::from_static(b"pay"),
         on_error,
+        queued_at: None,
     }
 }
 
@@ -254,6 +255,7 @@ async fn test_writer_task_cleans_up_on_write_error() {
         header: Bytes::from_static(b"hdr"),
         payload: Bytes::from_static(b"pay"),
         on_error: Arc::new(NullErrorHandler),
+        queued_at: None,
     })
     .unwrap();
 
@@ -440,6 +442,7 @@ async fn test_writer_task_drains_on_connect_failure() {
         header: Bytes::from_static(b"hdr"),
         payload: Bytes::from_static(b"pay"),
         on_error: error_handler.clone(),
+        queued_at: None,
     })
     .unwrap();
 
@@ -611,5 +614,106 @@ async fn max_message_size_is_exactly_what_the_codec_will_encode() {
     assert!(
         TcpFrameCodec::build_preamble(MessageType::Message, header_len, payload_len + 1).is_err(),
         "one byte past the reported capacity must not",
+    );
+}
+
+/// The UDS twin of `the_egress_queue_wait_spans_the_admission_gate`. The stamp
+/// site is duplicated — `uds/transport.rs`'s `send_message` builds its own
+/// `SendTask` — so it can regress on its own, and the writer it feeds is
+/// literally the TCP one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_egress_queue_wait_spans_the_admission_gate() {
+    use crate::observability::VeloMetrics;
+    use crate::observability::test_helpers::MetricSnapshot;
+
+    let registry = prometheus::Registry::new();
+    let metrics = VeloMetrics::register(&registry).expect("register metrics");
+    let handle: Arc<dyn velo_ext::TransportObservability> = Arc::new(metrics.bind_transport("uds"));
+    let (transport, socket_path) = make_transport();
+    transport.set_observability(Arc::clone(&handle));
+
+    let instance_id = crate::InstanceId::new_v4();
+    let (conn, rx) = make_handle(1);
+    transport.connections.insert(instance_id, conn);
+
+    let outcomes: Vec<SendOutcome> = (0..3)
+        .map(|_| {
+            transport.send_message(
+                instance_id,
+                Bytes::from_static(b"hdr"),
+                Bytes::from_static(b"pay"),
+                MessageType::Message,
+                Arc::new(NullErrorHandler),
+            )
+        })
+        .collect();
+    assert!(
+        outcomes[0].is_admitted(),
+        "the bounded channel takes the first frame"
+    );
+    assert!(
+        !outcomes[1].is_admitted() && !outcomes[2].is_admitted(),
+        "the other two are the gate's, which is the whole point of the test"
+    );
+
+    let hold = Duration::from_millis(200);
+    tokio::time::sleep(hold).await;
+
+    let cancel = CancellationToken::new();
+    let writer = {
+        let cancel = cancel.clone();
+        let handle = Arc::clone(&handle);
+        tokio::spawn(async move {
+            let mut sink: Vec<u8> = Vec::new();
+            run_coalescing_writer(
+                &mut sink,
+                &rx,
+                std::convert::identity,
+                Some(&cancel),
+                &UdsWriterObserver {
+                    instance_id,
+                    path: &socket_path,
+                    egress: EgressMetrics::new(Some(handle)),
+                },
+            )
+            .await;
+        })
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let observed = MetricSnapshot::from_registry(&registry).histogram_count(
+            "velo_transport_egress_queue_wait_seconds",
+            &[("transport", "uds")],
+        );
+        if observed == 3 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "only {observed} of three frames were observed waiting — a frame stamped \
+                 behind the gate is never observed at all"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(5), writer)
+        .await
+        .expect("the writer stopped on cancellation")
+        .expect("writer task");
+
+    let snap = MetricSnapshot::from_registry(&registry);
+    let waited = snap.histogram_sum(
+        "velo_transport_egress_queue_wait_seconds",
+        &[("transport", "uds")],
+    );
+    assert!(
+        waited >= 2.0 * hold.as_secs_f64(),
+        "the two gate-held frames carry the hold too: waited={waited}s over a {hold:?} hold"
+    );
+    assert_eq!(
+        snap.counter_sum("velo_transport_frames_written_total", &[]),
+        3.0,
+        "and all three reached the writer"
     );
 }

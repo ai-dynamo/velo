@@ -13,7 +13,7 @@ use dashmap::DashMap;
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::UnixStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -28,7 +28,7 @@ use crate::transports::tcp::framing::DEFAULT_MAX_FRAME_SIZE;
 
 use super::listener::{UdsListener, default_shrink_threshold};
 use crate::transports::coalesce::{
-    Coalescable, WriterFailure, WriterObserver, run_coalescing_writer,
+    Coalescable, EgressMetrics, FrameTally, WriterFailure, WriterObserver, run_coalescing_writer,
 };
 use crate::transports::ingress::{DialedReaderContext, run_dialed_reader};
 
@@ -96,6 +96,16 @@ struct SendTask {
     header: Bytes,
     payload: Bytes,
     on_error: Arc<dyn TransportErrorHandler>,
+    /// When the transport accepted this frame, or `None` when nothing is
+    /// watching.
+    ///
+    /// Stamped in `send_message`, before the frame is offered to the gate, so
+    /// the writer's `velo_transport_egress_queue_wait_seconds` covers the
+    /// gate's pending queue as well as the bounded channel — under load the
+    /// gate is where the frames actually are. The clock read is skipped
+    /// entirely when the transport has no observability handle, because the
+    /// writer would have nowhere to report it.
+    queued_at: Option<Instant>,
 }
 
 impl SendTask {
@@ -358,6 +368,8 @@ impl Transport for UdsTransport {
             header,
             payload,
             on_error,
+            // One clock read per send, and only when a writer will report it.
+            queued_at: self.metrics.get().map(|_| Instant::now()),
         };
 
         // Fast path: an established connection. The liveness probe comes first
@@ -652,7 +664,7 @@ async fn connection_writer_inner(
         tokio::spawn(run_dialed_reader(
             read_half,
             ctx,
-            metrics,
+            metrics.clone(),
             conn_cancel.clone(),
             format!("{} ({:?})", instance_id, path),
         ))
@@ -667,7 +679,11 @@ async fn connection_writer_inner(
         // The channel already carries the writer's item type.
         std::convert::identity,
         Some(&conn_cancel),
-        &UdsWriterObserver { instance_id, path },
+        &UdsWriterObserver {
+            instance_id,
+            path,
+            egress: EgressMetrics::new(metrics),
+        },
     )
     .await;
 
@@ -712,6 +728,10 @@ impl Coalescable for SendTask {
         &self.payload
     }
 
+    fn queued_at(&self) -> Option<Instant> {
+        self.queued_at
+    }
+
     fn into_failure_token(self) -> Self {
         self
     }
@@ -721,10 +741,17 @@ impl Coalescable for SendTask {
     }
 }
 
-/// Attaches the connection's identity to the writer loop's log lines.
+/// Attaches the connection's identity to the writer loop's log lines, and
+/// carries the transport's pre-bound metrics handle so the per-frame egress
+/// path does no label lookup.
+///
+/// The egress-metrics methods delegate to [`EgressMetrics`], which TCP
+/// shares byte-for-byte — the only thing that differs per transport is the
+/// failure log text below.
 struct UdsWriterObserver<'a> {
     instance_id: crate::InstanceId,
     path: &'a Path,
+    egress: EgressMetrics,
 }
 
 impl WriterObserver for UdsWriterObserver<'_> {
@@ -739,6 +766,18 @@ impl WriterObserver for UdsWriterObserver<'_> {
                 self.instance_id, self.path, err
             ),
         }
+    }
+
+    fn records_egress(&self) -> bool {
+        self.egress.records_egress()
+    }
+
+    fn on_dequeue(&self, waited: Duration) {
+        self.egress.on_dequeue(waited);
+    }
+
+    fn on_write(&self, tally: &FrameTally, elapsed: Duration) {
+        self.egress.on_write(tally, elapsed);
     }
 }
 

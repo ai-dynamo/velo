@@ -183,6 +183,16 @@ pub(crate) struct WorkerShared {
     /// re-registered peer (new incarnation) gets a fresh endpoint instead of
     /// AMs on the stale one.
     pub reg_epoch: Arc<AtomicU64>,
+    /// Written once by `Transport::set_observability`, read by both the
+    /// transport (any thread) and the AM receive callback.
+    ///
+    /// It lives here rather than on `UcxTransport` because the receive
+    /// callback runs on the progress thread and reaches only this struct — and
+    /// because a `OnceLock` read is a plain atomic load, which is what makes it
+    /// usable there at all. A `Mutex` would put a lock on the AM callback path.
+    /// `set_observability` may be called after `start()`, so the callback has
+    /// to read the slot per frame rather than capture the handle once.
+    pub metrics: OnceLock<Arc<dyn velo_ext::TransportObservability>>,
 }
 
 /// What the progress thread reports back once UCX is initialised.
@@ -284,6 +294,10 @@ struct RecvShared {
     adapter: TransportAdapter,
     ring_tx: flume::Sender<Cmd>,
     pending_pings: Arc<DashMap<u64, tokio::sync::oneshot::Sender<()>>>,
+    /// The state the transport side shares with the progress thread, held here
+    /// so the AM callback can read `metrics` without a second slot to keep in
+    /// step with it.
+    worker: Arc<WorkerShared>,
 }
 
 /// Per-handler argument: the shared context plus which AM kind this id is.
@@ -358,6 +372,26 @@ unsafe extern "C" fn recv_trampoline(
             }
             kind => {
                 let adapter = &ra.shared.adapter;
+                // Taken before any arm below moves the two buffers into a
+                // stream.
+                let frame_bytes = header.len() + payload.len();
+                // Every inbound type is recorded, not just `Message`, and that
+                // is the whole point: `bind_transport` pre-creates a child for
+                // every direction x message_type at zero, so a family where
+                // only `message` ever moves does not read as "responses are not
+                // instrumented" — it reads as "no responses arrived". The
+                // shared exit path in `transports::ingress` records all four
+                // for TCP and UDS; this is the same contract on the AM
+                // callback.
+                let record = |message_type: MessageType| {
+                    if let Some(metrics) = ra.shared.worker.metrics.get() {
+                        metrics.record_frame(
+                            crate::observability::Direction::Inbound,
+                            crate::transports::message_type_label(message_type),
+                            frame_bytes,
+                        );
+                    }
+                };
                 match MessageType::from_u8(kind) {
                     Some(MessageType::Message) => {
                         // The drain gate: `admit_message` acquires the
@@ -366,7 +400,17 @@ unsafe extern "C" fn recv_trampoline(
                         // message is work `wait_for_drain` can see. Sync, so
                         // it is callable from this AM callback.
                         match adapter.admit_message(header, payload) {
-                            AdmitOutcome::Admitted => {}
+                            AdmitOutcome::Admitted => {
+                                // Every other transport records this, and the
+                                // messenger's inbound-queue depth is derived as
+                                // accepted minus dequeued — so a transport that
+                                // admits silently makes that difference read
+                                // negative, which surfaces as a healthy zero.
+                                // Recorded only on `Admitted`, matching
+                                // `ingress::route_frame`: a drain-rejected
+                                // message is a rejection, not inbound traffic.
+                                record(MessageType::Message);
+                            }
                             AdmitOutcome::Draining { header, .. } => {
                                 // Echo the header back as ShuttingDown, like the
                                 // TCP listener's per-frame drain gate.
@@ -391,12 +435,15 @@ unsafe extern "C" fn recv_trampoline(
                         }
                     }
                     Some(MessageType::Response) => {
+                        record(MessageType::Response);
                         let _ = adapter.response_stream.send((header, payload));
                     }
                     Some(MessageType::ShuttingDown) => {
+                        record(MessageType::ShuttingDown);
                         let _ = adapter.shutdown_stream.send((header, payload));
                     }
-                    Some(MessageType::Ack) | Some(MessageType::Event) => {
+                    Some(event @ (MessageType::Ack | MessageType::Event)) => {
+                        record(event);
                         let _ = adapter.event_stream.send((header, payload));
                     }
                     None => {
@@ -604,6 +651,7 @@ unsafe fn init_ucx(
             adapter: adapter.clone(),
             ring_tx: shared.ring_tx.clone(),
             pending_pings: Arc::clone(&shared.pending_pings),
+            worker: Arc::clone(shared),
         });
         let mut recv_args = Vec::with_capacity(AM_KIND_COUNT as usize);
         for kind in 0..AM_KIND_COUNT {

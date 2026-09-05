@@ -93,15 +93,87 @@ impl AsyncWrite for RecordingSink {
     }
 }
 
+/// An `AsyncWrite` that parks every write until [`release`] is called, then
+/// accepts everything.
+///
+/// A blocked socket is the state the egress instruments exist to describe, and
+/// it is the one state a `RecordingSink` cannot reach: it always accepts.
+struct ParkingSink {
+    state: Arc<Mutex<ParkState>>,
+}
+
+#[derive(Default)]
+struct ParkState {
+    released: bool,
+    waker: Option<std::task::Waker>,
+}
+
+/// Let a parked sink through, waking the writer that is sitting on it.
+fn release(state: &Arc<Mutex<ParkState>>) {
+    let waker = {
+        let mut state = state.lock();
+        state.released = true;
+        state.waker.take()
+    };
+    if let Some(waker) = waker {
+        waker.wake();
+    }
+}
+
+impl AsyncWrite for ParkingSink {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let mut state = self.state.lock();
+        if !state.released {
+            state.waker = Some(cx.waker().clone());
+            return Poll::Pending;
+        }
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// The frames one write carried, as `(message type, frames)` pairs — the
+/// [`FrameTally`] flattened for assertions.
+type WrittenFrames = Vec<(MessageType, u64)>;
+
+/// One `on_write` report: what the write carried, and how long it took.
+type WriteReport = (WrittenFrames, Duration);
+
 /// Records how the loop reported its progress.
 #[derive(Default)]
 struct TestObserver {
     /// Frame count of each successful flush, in order.
     flushes: Mutex<Vec<usize>>,
     failures: Mutex<Vec<(WriterFailure, usize)>>,
+    /// Answer to `records_egress`. Off by default, so every scenario written
+    /// before the egress instruments existed still exercises the
+    /// uninstrumented path — the one the streaming egress pump takes.
+    egress: bool,
+    /// One entry per `on_dequeue`, in order.
+    dequeues: Mutex<Vec<Duration>>,
+    /// One entry per `on_write`: what the write carried, and how long it took.
+    writes: Mutex<Vec<WriteReport>>,
 }
 
 impl TestObserver {
+    /// An observer whose egress instruments are live.
+    fn instrumented() -> Self {
+        Self {
+            egress: true,
+            ..Default::default()
+        }
+    }
     fn flushes(&self) -> Vec<usize> {
         self.flushes.lock().clone()
     }
@@ -110,6 +182,30 @@ impl TestObserver {
     }
     fn failures(&self) -> Vec<(WriterFailure, usize)> {
         self.failures.lock().clone()
+    }
+    fn dequeues(&self) -> Vec<Duration> {
+        self.dequeues.lock().clone()
+    }
+    fn writes(&self) -> Vec<WriteReport> {
+        self.writes.lock().clone()
+    }
+    /// Frames counted written across every write.
+    fn written_total(&self) -> u64 {
+        self.writes
+            .lock()
+            .iter()
+            .flat_map(|(tally, _)| tally.iter().map(|(_, count)| *count))
+            .sum()
+    }
+    /// Frames counted written under one message type.
+    fn written_of(&self, msg_type: MessageType) -> u64 {
+        self.writes
+            .lock()
+            .iter()
+            .flat_map(|(tally, _)| tally.iter())
+            .filter(|(seen, _)| *seen == msg_type)
+            .map(|(_, count)| *count)
+            .sum()
     }
 }
 
@@ -120,15 +216,28 @@ impl WriterObserver for TestObserver {
     fn on_failure(&self, kind: WriterFailure, _err: &io::Error, frames: usize) {
         self.failures.lock().push((kind, frames));
     }
+    fn records_egress(&self) -> bool {
+        self.egress
+    }
+    fn on_dequeue(&self, waited: Duration) {
+        self.dequeues.lock().push(waited);
+    }
+    fn on_write(&self, tally: &FrameTally, elapsed: Duration) {
+        self.writes.lock().push((tally.counts().collect(), elapsed));
+    }
 }
 
 /// A `Coalescable` that logs its own failure notifications into a shared
 /// list, so tests can assert each item is reported exactly once.
 struct TestItem {
     tag: String,
+    msg_type: MessageType,
     header: Vec<u8>,
     payload: Vec<u8>,
     terminal: bool,
+    /// Set by [`ItemFactory::stamped`], as the messenger transports stamp
+    /// theirs; `None` reproduces the streaming egress pump's item.
+    queued_at: Option<Instant>,
     errors: Arc<Mutex<Vec<String>>>,
 }
 
@@ -144,13 +253,16 @@ impl Coalescable for TestItem {
     type FailureToken = TestToken;
 
     fn msg_type(&self) -> MessageType {
-        MessageType::Message
+        self.msg_type
     }
     fn header(&self) -> &[u8] {
         &self.header
     }
     fn payload(&self) -> &[u8] {
         &self.payload
+    }
+    fn queued_at(&self) -> Option<Instant> {
+        self.queued_at
     }
     fn is_terminal(&self) -> bool {
         self.terminal
@@ -181,10 +293,29 @@ impl ItemFactory {
     fn item(&self, tag: &str, payload: Vec<u8>) -> TestItem {
         TestItem {
             tag: tag.to_string(),
+            msg_type: MessageType::Message,
             header: Vec::new(),
             payload,
             terminal: false,
+            queued_at: None,
             errors: Arc::clone(&self.errors),
+        }
+    }
+
+    /// An item carrying an admission stamp, as a messenger transport's
+    /// `SendTask` does.
+    fn stamped(&self, tag: &str, payload: Vec<u8>) -> TestItem {
+        TestItem {
+            queued_at: Some(Instant::now()),
+            ..self.item(tag, payload)
+        }
+    }
+
+    /// A stamped item of a given frame type.
+    fn stamped_typed(&self, tag: &str, msg_type: MessageType, payload: Vec<u8>) -> TestItem {
+        TestItem {
+            msg_type,
+            ..self.stamped(tag, payload)
         }
     }
 
@@ -225,6 +356,209 @@ async fn run_with(items: Vec<TestItem>, sink: &mut RecordingSink, observer: &Tes
     }
     drop(tx);
     run_coalescing_writer(sink, &rx, std::convert::identity, None, observer).await;
+}
+
+// -----------------------------------------------------------------------
+// Egress instruments
+// -----------------------------------------------------------------------
+
+/// The tally is indexed by the `MessageType` discriminant, so a variant whose
+/// discriminant lands outside the array would index out of bounds on the
+/// writer's hot path — in a task whose death silently drops the connection.
+///
+/// The second loop is the load-bearing one, and it scans the whole byte range
+/// rather than stopping at `MESSAGE_TYPE_SLOTS`. Walking forward from zero
+/// only catches a variant appended to the contiguous run: `Heartbeat = 9`
+/// leaves `MESSAGE_TYPE_SLOTS` at 5 and `from_u8(5)` at `None`, so a forward
+/// walk stays green while `FrameTally::add` indexes slot 9 of a five-slot
+/// array. `from_u8` is the right enumeration to key off because it *is* the
+/// wire protocol's set of admissible discriminants — a variant missing from it
+/// cannot be decoded by a peer.
+#[test]
+fn tally_has_one_slot_per_message_type() {
+    for idx in 0..MESSAGE_TYPE_SLOTS {
+        assert!(
+            MessageType::from_u8(idx as u8).is_some(),
+            "tally slot {idx} names no MessageType"
+        );
+    }
+    for byte in 0..=u8::MAX {
+        if let Some(msg_type) = MessageType::from_u8(byte) {
+            assert!(
+                (msg_type as usize) < MESSAGE_TYPE_SLOTS,
+                "{msg_type:?} (discriminant {byte}) has no tally slot — widen MESSAGE_TYPE_SLOTS"
+            );
+        }
+    }
+}
+
+/// The queue wait is observed per frame and the write duration per write, and
+/// coalescing is exactly what makes those two different numbers. Their ratio is
+/// the batching ratio; conflating them would report it as 1.
+#[tokio::test]
+async fn coalesced_frames_are_dequeued_once_each_and_written_in_one_write() {
+    let factory = ItemFactory::new();
+    let items: Vec<TestItem> = (0..8)
+        .map(|i| factory.stamped(&format!("i{i}"), vec![b'x'; 16]))
+        .collect();
+    let mut sink = RecordingSink::default();
+    let observer = TestObserver::instrumented();
+    run_with(items, &mut sink, &observer).await;
+
+    assert_eq!(
+        observer.dequeues().len(),
+        8,
+        "one queue-wait observation per frame"
+    );
+    // Everything was queued before the writer started, so the loop blocks for
+    // the first item and drains the other seven with `try_recv` into one batch.
+    assert_eq!(observer.flushes(), vec![8]);
+    assert_eq!(observer.writes().len(), 1, "one write bracket per flush");
+    assert_eq!(observer.written_total(), 8, "every frame counted written");
+}
+
+/// Frames are counted under their own message type: that label is what makes
+/// `velo_transport_frames_written_total` subtractable from the outbound frame
+/// counter, which is per message type too.
+#[tokio::test]
+async fn frames_are_counted_written_under_their_own_message_type() {
+    let factory = ItemFactory::new();
+    let items = vec![
+        factory.stamped_typed("a", MessageType::Message, vec![b'a'; 8]),
+        factory.stamped_typed("b", MessageType::Response, vec![b'b'; 8]),
+        factory.stamped_typed("c", MessageType::Message, vec![b'c'; 8]),
+        factory.stamped_typed("d", MessageType::Event, vec![b'd'; 8]),
+    ];
+    let mut sink = RecordingSink::default();
+    let observer = TestObserver::instrumented();
+    run_with(items, &mut sink, &observer).await;
+
+    assert_eq!(observer.written_of(MessageType::Message), 2);
+    assert_eq!(observer.written_of(MessageType::Response), 1);
+    assert_eq!(observer.written_of(MessageType::Event), 1);
+    assert_eq!(observer.written_of(MessageType::Ack), 0);
+    assert_eq!(observer.written_total(), 4);
+}
+
+/// A failed write counts no frames written. The derived egress depth is
+/// `accepted - written`, so counting a frame that never reached the wire would
+/// make a broken connection look like a drained queue.
+#[tokio::test]
+async fn a_failed_write_counts_no_frames_written() {
+    let factory = ItemFactory::new();
+    let items = vec![
+        factory.stamped("a", vec![b'a'; 8]),
+        factory.stamped("b", vec![b'b'; 8]),
+    ];
+    let mut sink = RecordingSink::failing_at(0);
+    let observer = TestObserver::instrumented();
+    run_with(items, &mut sink, &observer).await;
+
+    assert!(
+        observer.writes().is_empty(),
+        "a failed write is not a write"
+    );
+    assert_eq!(observer.written_total(), 0);
+    assert_eq!(
+        observer.dequeues().len(),
+        2,
+        "both frames still left the queue"
+    );
+    assert_eq!(
+        factory.errors().len(),
+        2,
+        "and both were reported undelivered"
+    );
+}
+
+/// The default observer — the streaming egress pump's — reports no egress at
+/// all, even for items that happen to carry a stamp. That is what keeps this
+/// instrumentation off the streaming data plane's writer.
+#[tokio::test]
+async fn an_uninstrumented_writer_reports_no_egress() {
+    let factory = ItemFactory::new();
+    let items: Vec<TestItem> = (0..3)
+        .map(|i| factory.stamped(&format!("i{i}"), vec![b'x'; 8]))
+        .collect();
+    let mut sink = RecordingSink::default();
+    let observer = TestObserver::default();
+    run_with(items, &mut sink, &observer).await;
+
+    assert!(observer.dequeues().is_empty());
+    assert!(observer.writes().is_empty());
+    assert_eq!(
+        observer.frames_written(),
+        3,
+        "the pre-existing flush accounting is untouched"
+    );
+}
+
+/// Park the socket and the two instruments separate, which is the reading the
+/// pair exists to give: the frames are already off the queue and counted as
+/// having waited, and nothing is counted written until the write returns. A
+/// long queue wait beside a long write is a slow wire; beside a short write it
+/// is a starved writer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_parked_socket_defers_the_write_but_not_the_dequeue() {
+    let state = Arc::new(Mutex::new(ParkState::default()));
+    let factory = ItemFactory::new();
+    let (tx, rx) = flume::unbounded::<TestItem>();
+    for i in 0..4 {
+        tx.send(factory.stamped(&format!("i{i}"), vec![b'x'; 32]))
+            .expect("queue item");
+    }
+    drop(tx);
+
+    let observer = Arc::new(TestObserver::instrumented());
+    let writer = {
+        let observer = Arc::clone(&observer);
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut sink = ParkingSink { state };
+            run_coalescing_writer(
+                &mut sink,
+                &rx,
+                std::convert::identity,
+                None,
+                observer.as_ref(),
+            )
+            .await;
+        })
+    };
+
+    // The loop drains the channel into one batch before it touches the socket,
+    // so every dequeue lands while the write is still parked.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while observer.dequeues().len() < 4 {
+        assert!(
+            Instant::now() < deadline,
+            "the writer never drained the queue: {} dequeues",
+            observer.dequeues().len()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        observer.writes().is_empty(),
+        "nothing reaches the wire while the socket is parked"
+    );
+
+    let parked_for = Duration::from_millis(50);
+    tokio::time::sleep(parked_for).await;
+    release(&state);
+
+    tokio::time::timeout(Duration::from_secs(5), writer)
+        .await
+        .expect("the writer finished once the socket was released")
+        .expect("writer task");
+
+    let writes = observer.writes();
+    assert_eq!(writes.len(), 1);
+    assert_eq!(observer.written_total(), 4);
+    assert!(
+        writes[0].1 >= parked_for,
+        "the write bracket spans the park, got {:?}",
+        writes[0].1
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -945,4 +1279,78 @@ async fn successful_writes_report_nothing() {
     assert_eq!(sink.decode_frames().len(), 12);
     assert!(factory.errors().is_empty());
     assert!(observer.failures().is_empty());
+}
+
+// -----------------------------------------------------------------------
+// Egress eligibility
+// -----------------------------------------------------------------------
+
+/// `EgressMetrics::records_egress` answers from whether a metrics handle
+/// exists at all — the only question this side of the trait boundary can
+/// ask. Eligibility used to be keyed on the handle's own transport label
+/// (`EGRESS_INSTRUMENTED_TRANSPORTS`), so a TCP/UDS transport built with a
+/// key outside that list (`.key(TransportKey::from("custom-uds"))`,
+/// exercised in-tree at `uds/tests.rs`) got a handle for which
+/// `records_egress()` answered `false` even though the handle itself would
+/// happily record into it — the writer paid nothing and the handle recorded
+/// nothing, which was consistent but blind to any out-of-tree transport
+/// whose `key()` happened to collide with `"tcp"`/`"uds"` while never
+/// running a coalescing writer, and vice versa. `records_egress` and the
+/// handle's own Prometheus children now agree by construction: this test
+/// proves both sides of that.
+#[test]
+fn records_egress_answers_from_handle_existence_not_transport_label() {
+    use crate::observability::VeloMetrics;
+
+    let registry = prometheus::Registry::new();
+    let metrics = VeloMetrics::register(&registry).expect("register metrics");
+
+    // A key outside the old allowlist is still eligible: the writer no
+    // longer has a second, label-keyed question to disagree with this one.
+    let custom = metrics.bind_transport("custom-uds");
+    let custom_dyn: Arc<dyn velo_ext::TransportObservability> = Arc::new(custom.clone());
+    assert!(
+        EgressMetrics::new(Some(custom_dyn)).records_egress(),
+        "eligibility must not depend on the transport's own label"
+    );
+
+    assert!(
+        !EgressMetrics::new(None).records_egress(),
+        "no handle at all must still mean no instruments"
+    );
+
+    // The deeper claim: a handle bound to a non-default key that actually
+    // records must produce real series under that key, not a dropped
+    // observation. Nothing exists yet — the children are built lazily.
+    let has_series_for = |name: &str, transport: &str| {
+        registry.gather().iter().any(|family| {
+            family.name() == name
+                && family.get_metric().iter().any(|metric| {
+                    metric
+                        .get_label()
+                        .iter()
+                        .any(|l| l.name() == "transport" && l.value() == transport)
+                })
+        })
+    };
+    assert!(
+        !has_series_for("velo_transport_frames_written_total", "custom-uds"),
+        "nothing has been recorded yet, so nothing should exist"
+    );
+
+    custom.record_frames_written("message", 1);
+    custom.record_egress_queue_wait(Duration::from_millis(1));
+    custom.record_egress_write_duration(Duration::from_millis(1));
+
+    for name in [
+        "velo_transport_frames_written_total",
+        "velo_transport_egress_queue_wait_seconds",
+        "velo_transport_write_duration_seconds",
+    ] {
+        assert!(
+            has_series_for(name, "custom-uds"),
+            "{name} must exist under the transport's own key once it actually \
+             records — the old allowlist would have silently dropped this"
+        );
+    }
 }

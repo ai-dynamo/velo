@@ -108,7 +108,6 @@ pub struct UcxTransport {
     shutdown_state: OnceLock<ShutdownState>,
     join: Mutex<Option<std::thread::JoinHandle<()>>>,
     ping_token: AtomicU64,
-    metrics: OnceLock<Arc<dyn velo_ext::TransportObservability>>,
 }
 
 impl UcxTransport {
@@ -123,6 +122,7 @@ impl UcxTransport {
             inflight_ops: Arc::new(Default::default()),
             shutdown_requested: Arc::new(Default::default()),
             reg_epoch: Arc::new(Default::default()),
+            metrics: OnceLock::new(),
         });
         Self {
             key,
@@ -138,7 +138,6 @@ impl UcxTransport {
             shutdown_state: OnceLock::new(),
             join: Mutex::new(None),
             ping_token: AtomicU64::new(1),
-            metrics: OnceLock::new(),
         }
     }
 
@@ -166,7 +165,7 @@ impl UcxTransport {
                 gate: AdmissionGate::new(self.ring_tx.clone(), rt.clone()),
             })
             .clone();
-        if let Some(m) = self.metrics.get() {
+        if let Some(m) = self.shared.metrics.get() {
             m.set_active_connections(self.connections.len());
         }
         Ok(handle)
@@ -180,7 +179,7 @@ impl UcxTransport {
                 SendOutcome::Admitted
             }
             SendOutcome::Pending(admission) => {
-                if let Some(m) = self.metrics.get() {
+                if let Some(m) = self.shared.metrics.get() {
                     m.record_send_backpressure();
                 }
                 // The ring push happens later, from the gate's driver task —
@@ -209,7 +208,7 @@ impl UcxTransport {
             && let Some((_, stale)) = self.connections.remove(&peer)
         {
             stale.gate.fail_all(AdmissionError::ConnectionReplaced);
-            if let Some(m) = self.metrics.get() {
+            if let Some(m) = self.shared.metrics.get() {
                 m.set_active_connections(self.connections.len());
             }
         }
@@ -250,7 +249,7 @@ impl Transport for UcxTransport {
         // re-registration may carry a new incarnation of the same instance.
         self.shared.reg_epoch.fetch_add(1, Ordering::AcqRel);
         self.shared.doorbell.ring();
-        if let Some(m) = self.metrics.get() {
+        if let Some(m) = self.shared.metrics.get() {
             m.set_registered_peers(self.shared.peers.len());
         }
         debug!("ucx: registered peer {peer}");
@@ -416,14 +415,14 @@ impl Transport for UcxTransport {
             entry.value().gate.fail_all(AdmissionError::ChannelClosed);
         }
         self.connections.clear();
-        if let Some(m) = self.metrics.get() {
+        if let Some(m) = self.shared.metrics.get() {
             m.set_active_connections(0);
         }
     }
 
     fn set_observability(&self, observability: Arc<dyn velo_ext::TransportObservability>) {
-        let _ = self.metrics.set(observability);
-        if let Some(m) = self.metrics.get() {
+        let _ = self.shared.metrics.set(observability);
+        if let Some(m) = self.shared.metrics.get() {
             m.set_registered_peers(self.shared.peers.len());
             m.set_active_connections(self.connections.len());
         }

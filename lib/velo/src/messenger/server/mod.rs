@@ -170,6 +170,14 @@ async fn create_message_handler(
     // for the teardown log below.
     let mut abandoned = 0usize;
 
+    // Resolved once, outside the loop. This task is the node's single consumer
+    // of `message_rx`, so every inbound message pays whatever is in here; a
+    // per-message label lookup would be a real cost on the hot path, and there
+    // is nothing to look up.
+    let inbound_dequeued = observability
+        .as_ref()
+        .map(|metrics| metrics.bind_inbound_dequeued());
+
     loop {
         let inbound = tokio::select! {
             biased;
@@ -187,6 +195,30 @@ async fn create_message_handler(
             drop(inbound);
             abandoned += 1;
             break;
+        }
+
+        // Counted between the abandonment check above and the decode below,
+        // which is the only placement that keeps
+        // `frames_total{inbound,message,accepted} - this` equal to the queue's
+        // depth for as long as this instance is live: a message dropped at
+        // teardown never became work, and a message that fails to decode has
+        // still left the queue.
+        //
+        // Teardown ends the identity rather than preserving it, and that is
+        // deliberate. The message abandoned on the cancelled token above, and
+        // everything the post-loop sweep drops, are admitted frames that never
+        // count as departures — so once the loop exits the derived depth reads
+        // high by the abandoned count and stays there. The alternative,
+        // counting them, would make a live queue's depth read low by however
+        // much a *previous* teardown discarded, which is the reading that
+        // matters.
+        //
+        // One writer today — this task is spawned once per instance. Sharding
+        // the decode loop would make it many; the counter itself is atomic so
+        // that stays correct, but it is worth knowing the assumption is being
+        // broken.
+        if let Some(dequeued) = &inbound_dequeued {
+            dequeued.inc();
         }
 
         // The guard was acquired by the transport at admission

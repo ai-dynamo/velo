@@ -47,6 +47,16 @@ fn new_uds_transport(dir: &tempfile::TempDir) -> Arc<velo::transports::uds::UdsT
     )
 }
 
+#[cfg(feature = "zmq")]
+fn new_zmq_transport() -> Arc<velo::transports::zmq::ZmqTransport> {
+    Arc::new(
+        velo::transports::zmq::ZmqTransportBuilder::new()
+            .bind_endpoint("tcp://127.0.0.1:0")
+            .build()
+            .unwrap(),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Two-instance helper
 // ---------------------------------------------------------------------------
@@ -451,6 +461,169 @@ async fn scenario_client_direct_resolution(pair: &VeloPair) {
     );
 }
 
+/// T9: Inbound-queue conservation — every admitted `Message` is one the
+/// dispatch loop eventually takes off `message_rx`.
+///
+/// There is no depth gauge for that queue, on purpose: sampling
+/// `flume::Receiver::len()` reads the wrong number under exactly the load that
+/// makes the depth interesting. The depth is instead *derived*, as
+/// `velo_transport_frames_total{direction="inbound",message_type="message",
+/// outcome="accepted"} - velo_messenger_inbound_dequeued_total`, and that
+/// subtraction is only meaningful while the two counters agree at rest. This
+/// scenario is what keeps them agreeing: a counter wired to the wrong side of
+/// the loop, or a transport that admits without recording, shows up here as a
+/// gap that never closes.
+///
+/// Traffic runs both ways because the identity has to hold on both: a request
+/// is an inbound `Message` on the side that serves it, while the reply comes
+/// back as a `Response` frame and never touches the inbound queue. One
+/// direction would leave the other side's counters at a vacuous zero.
+async fn scenario_inbound_queue_conservation(pair: &VeloPair) {
+    for velo in [&pair.server, &pair.client] {
+        let handler = Handler::unary_handler("echo", |ctx| Ok(Some(ctx.payload))).build();
+        velo.register_handler(handler).unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    for (from, to) in [(&pair.client, &pair.server), (&pair.server, &pair.client)] {
+        for _ in 0..4 {
+            let payload = Bytes::from_static(b"conserve");
+            let response: Bytes = from
+                .unary("echo")
+                .unwrap()
+                .raw_payload(payload.clone())
+                .instance(to.instance_id())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response, payload);
+        }
+    }
+
+    await_inbound_queue_quiesced("server", || pair.server_snap()).await;
+    await_inbound_queue_quiesced("client", || pair.client_snap()).await;
+}
+
+/// Poll one side's snapshot until admitted and dequeued inbound messages agree
+/// on a non-zero count, or fail with both numbers.
+///
+/// Equality is a property of quiescence, not of any fixed sleep: admission and
+/// dequeue are the two ends of a real queue and the window between them is
+/// real work, so the assertion has to wait the queue out rather than guess how
+/// long it is.
+///
+/// The `transport` label is deliberately absent from the frame lookup: this
+/// sums every series that matches the remaining labels, so it stays correct
+/// whether `VeloPair` gives each side one transport or several.
+async fn await_inbound_queue_quiesced(label: &str, snapshot: impl Fn() -> MetricSnapshot) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let snap = snapshot();
+        let accepted = snap.counter_sum(
+            "velo_transport_frames_total",
+            &[
+                ("direction", "inbound"),
+                ("message_type", "message"),
+                ("outcome", "accepted"),
+            ],
+        );
+        let dequeued = snap.counter("velo_messenger_inbound_dequeued_total", &[]);
+        // Non-zero on both counts: every peer receives at least the other's
+        // `_hello`, so a pair of zeroes is a dark counter, not a quiet queue.
+        if accepted > 0.0 && (accepted - dequeued).abs() < f64::EPSILON {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{label}: inbound queue never quiesced — accepted={accepted} dequeued={dequeued}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// T10: Egress conservation — every outbound frame the transport admitted is
+/// one its per-connection writer eventually handed to the socket.
+///
+/// The mirror of T9, one layer further out. `finalize_send_outcome` counts a
+/// frame as `velo_transport_frames_total{direction="outbound",
+/// outcome="accepted"}` the moment it reaches the connection's bounded send
+/// channel; `velo_transport_frames_written_total` counts it again once the
+/// writer's `write_all` has returned for it. The difference is the egress
+/// queue — the depth this instrumentation exists to measure — so the two
+/// counters have to converge at rest or the derived depth is a fiction.
+///
+/// Traffic runs both ways for the same reason T9 does: each side's egress is
+/// its own queue with its own writer task.
+async fn scenario_egress_conservation(pair: &VeloPair) {
+    for velo in [&pair.server, &pair.client] {
+        let handler = Handler::unary_handler("echo", |ctx| Ok(Some(ctx.payload))).build();
+        velo.register_handler(handler).unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    for (from, to) in [(&pair.client, &pair.server), (&pair.server, &pair.client)] {
+        for _ in 0..4 {
+            let payload = Bytes::from_static(b"egress");
+            let response: Bytes = from
+                .unary("echo")
+                .unwrap()
+                .raw_payload(payload.clone())
+                .instance(to.instance_id())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response, payload);
+        }
+    }
+
+    await_egress_quiesced("server", || pair.server_snap()).await;
+    await_egress_quiesced("client", || pair.client_snap()).await;
+}
+
+/// Poll one side's snapshot until admitted and written outbound frames agree on
+/// a non-zero count, then assert the two egress histograms are consistent with
+/// that count.
+///
+/// Equality is a property of quiescence, exactly as in
+/// [`await_inbound_queue_quiesced`]: admission and the wire are the two ends of
+/// a real queue.
+///
+/// The two histograms are counted differently on purpose. The queue wait is
+/// observed once per frame, as the writer takes it off the channel, so its
+/// count tracks the frame count. The write duration brackets one `write_all`
+/// sequence, and the writer coalesces whatever is already queued into a single
+/// write — so its count is at most the frame count, and equals it only when
+/// every write happened to carry one frame.
+async fn await_egress_quiesced(label: &str, snapshot: impl Fn() -> MetricSnapshot) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let snap = snapshot();
+        let accepted = snap.counter_sum(
+            "velo_transport_frames_total",
+            &[("direction", "outbound"), ("outcome", "accepted")],
+        );
+        let written = snap.counter_sum("velo_transport_frames_written_total", &[]);
+        if accepted > 0.0 && (accepted - written).abs() < f64::EPSILON {
+            let waits = snap.histogram_count("velo_transport_egress_queue_wait_seconds", &[]);
+            let writes = snap.histogram_count("velo_transport_write_duration_seconds", &[]);
+            assert_eq!(
+                waits as f64, written,
+                "{label}: one queue-wait observation per written frame — waits={waits} written={written}"
+            );
+            assert!(
+                writes >= 1 && (writes as f64) <= written,
+                "{label}: writes must be between one and one-per-frame — writes={writes} written={written}"
+            );
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{label}: egress never quiesced — accepted={accepted} written={written}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Parameterisation macro
 // ---------------------------------------------------------------------------
@@ -510,6 +683,18 @@ macro_rules! transport_metrics_tests {
             async fn client_direct_resolution() {
                 let p = pair().await;
                 scenario_client_direct_resolution(&p).await;
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn inbound_queue_conservation() {
+                let p = pair().await;
+                scenario_inbound_queue_conservation(&p).await;
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn egress_conservation() {
+                let p = pair().await;
+                scenario_egress_conservation(&p).await;
             }
         }
     };
@@ -584,6 +769,92 @@ mod uds {
     async fn client_direct_resolution() {
         let (p, _dir) = pair().await;
         scenario_client_direct_resolution(&p).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn inbound_queue_conservation() {
+        let (p, _dir) = pair().await;
+        scenario_inbound_queue_conservation(&p).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn egress_conservation() {
+        let (p, _dir) = pair().await;
+        scenario_egress_conservation(&p).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ZMQ: outbound accepted must not be double-counted
+// ---------------------------------------------------------------------------
+//
+// Not run through `transport_metrics_tests!`: that macro's full suite assumes
+// every scenario already holds for every transport, which is a broader claim
+// than this fix makes. This one scenario is what the fix actually changes.
+
+#[cfg(feature = "zmq")]
+mod zmq {
+    use super::*;
+
+    /// NATS and ZMQ each used to record the outbound-accepted frame twice:
+    /// once via `finalize_send_outcome` (transports.rs) when `send_message`
+    /// returns `Admitted` — true the instant the frame reaches the sender's
+    /// internal channel — and again from their own sender task/thread once
+    /// the frame actually reached the wire. This test pins ZMQ; NATS shares
+    /// the same `finalize_send_outcome` call site and the same shape of fix
+    /// (a redundant `record_frame(Direction::Outbound, ...)` deleted from its
+    /// sender task) but needs a running NATS server to exercise here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn outbound_accepted_is_counted_once_per_send() {
+        let pair = VeloPair::new(new_zmq_transport(), new_zmq_transport()).await;
+
+        let handler = Handler::am_handler("sink", |_ctx| Ok(())).build();
+        pair.server.register_handler(handler).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Warm-up send: a client's first contact with a peer lazily triggers
+        // one `_hello` handshake frame ahead of the message itself
+        // (messenger/client/mod.rs), so counting from before ANY send would
+        // conflate the handshake with the send this test is actually about.
+        // Settle that here, outside the measurement window.
+        pair.client
+            .am_send("sink")
+            .unwrap()
+            .raw_payload(Bytes::from_static(b"warmup"))
+            .instance(pair.server.instance_id())
+            .send()
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let outbound_accepted = &[
+            ("transport", "zmq"),
+            ("direction", "outbound"),
+            ("outcome", "accepted"),
+        ];
+        let before = pair
+            .client_snap()
+            .counter_sum("velo_transport_frames_total", outbound_accepted);
+
+        pair.client
+            .am_send("sink")
+            .unwrap()
+            .raw_payload(Bytes::from_static(b"fire"))
+            .instance(pair.server.instance_id())
+            .send()
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let after = pair
+            .client_snap()
+            .counter_sum("velo_transport_frames_total", outbound_accepted);
+        assert_eq!(
+            after - before,
+            1.0,
+            "one am_send must add exactly one outbound-accepted frame, not two; before={before} after={after}"
+        );
     }
 }
 

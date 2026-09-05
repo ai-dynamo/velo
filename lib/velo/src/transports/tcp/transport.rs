@@ -11,7 +11,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -28,9 +28,8 @@ use velo_ext::{MessageType, PeerInfo, Transport, TransportAdapter, TransportKey,
 
 use super::framing::DEFAULT_MAX_FRAME_SIZE;
 use super::listener::TcpListener;
-use crate::transports::coalesce::{
-    Coalescable, WriterFailure, WriterObserver, run_coalescing_writer,
-};
+use super::writer::TcpWriterObserver;
+use crate::transports::coalesce::{EgressMetrics, run_coalescing_writer};
 use crate::transports::ingress::{DialedReaderContext, run_dialed_reader};
 
 /// High-performance TCP transport with lock-free concurrent access
@@ -106,15 +105,29 @@ impl ConnectionHandle {
 }
 
 /// Task sent to writer task containing pre-encoded frame
-struct SendTask {
-    msg_type: MessageType,
-    header: Bytes,
-    payload: Bytes,
-    on_error: Arc<dyn TransportErrorHandler>,
+///
+/// Fields are `pub(super)`: `writer.rs`'s `impl Coalescable for SendTask`
+/// reads them directly, and constructs nothing here, so `tcp` is the visibility
+/// this type needs rather than a public one.
+pub(super) struct SendTask {
+    pub(super) msg_type: MessageType,
+    pub(super) header: Bytes,
+    pub(super) payload: Bytes,
+    pub(super) on_error: Arc<dyn TransportErrorHandler>,
+    /// When the transport accepted this frame, or `None` when nothing is
+    /// watching.
+    ///
+    /// Stamped in `send_message`, before the frame is offered to the gate, so
+    /// the writer's `velo_transport_egress_queue_wait_seconds` covers the
+    /// gate's pending queue as well as the bounded channel — under load the
+    /// gate is where the frames actually are. The clock read is skipped
+    /// entirely when the transport has no observability handle, because the
+    /// writer would have nowhere to report it.
+    pub(super) queued_at: Option<Instant>,
 }
 
 impl SendTask {
-    fn on_error(self, error: impl Into<String>) {
+    pub(super) fn on_error(self, error: impl Into<String>) {
         self.on_error
             .on_error(self.header, self.payload, error.into());
     }
@@ -368,6 +381,8 @@ impl Transport for TcpTransport {
             header,
             payload,
             on_error,
+            // One clock read per send, and only when a writer will report it.
+            queued_at: self.metrics.get().map(|_| Instant::now()),
         };
 
         // Fast path: an established connection. The liveness probe comes first
@@ -665,7 +680,7 @@ async fn connection_writer_inner(
         tokio::spawn(run_dialed_reader(
             read_half,
             ctx,
-            metrics,
+            metrics.clone(),
             conn_cancel.clone(),
             format!("{} ({})", instance_id, addr),
         ))
@@ -682,7 +697,11 @@ async fn connection_writer_inner(
         // The channel already carries the writer's item type.
         std::convert::identity,
         Some(&conn_cancel),
-        &TcpWriterObserver { instance_id, addr },
+        &TcpWriterObserver {
+            instance_id,
+            addr,
+            egress: EgressMetrics::new(metrics),
+        },
     )
     .await;
 
@@ -703,57 +722,6 @@ struct DialedReaderErrorHandler;
 impl TransportErrorHandler for DialedReaderErrorHandler {
     fn on_error(&self, _header: Bytes, _payload: Bytes, error: String) {
         warn!("Transport error: {}", error);
-    }
-}
-
-impl Coalescable for SendTask {
-    /// A staged task *is* its own failure token: what
-    /// [`TransportErrorHandler::on_error`] needs — the header, the payload,
-    /// and the handler — is every field but a one-byte `Copy` enum, and all
-    /// three are refcounted handles. Splitting them into a second struct would
-    /// have the same footprint, so the writer just keeps the task. Retaining
-    /// it holds no payload bytes beyond the ones the sender already owns.
-    type FailureToken = Self;
-
-    fn msg_type(&self) -> MessageType {
-        self.msg_type
-    }
-
-    fn header(&self) -> &[u8] {
-        &self.header
-    }
-
-    fn payload(&self) -> &[u8] {
-        &self.payload
-    }
-
-    fn into_failure_token(self) -> Self {
-        self
-    }
-
-    fn fail(token: Self, reason: &str) {
-        token.on_error(format!("Failed to write to stream: {}", reason));
-    }
-}
-
-/// Attaches the connection's identity to the writer loop's log lines.
-struct TcpWriterObserver {
-    instance_id: crate::InstanceId,
-    addr: SocketAddr,
-}
-
-impl WriterObserver for TcpWriterObserver {
-    fn on_failure(&self, kind: WriterFailure, err: &std::io::Error, frames: usize) {
-        match kind {
-            WriterFailure::Write => error!(
-                "Write error to {} ({}): {} ({} message(s) in batch)",
-                self.instance_id, self.addr, err, frames
-            ),
-            WriterFailure::Encode => error!(
-                "Encode error to {} ({}): {}",
-                self.instance_id, self.addr, err
-            ),
-        }
     }
 }
 

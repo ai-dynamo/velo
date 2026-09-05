@@ -251,7 +251,7 @@ impl Transport for ZmqTransport {
                 adapter: channels,
                 rcvhwm,
                 linger_ms,
-                metrics: metrics.clone(),
+                metrics,
                 router_socket,
                 ready_tx,
             };
@@ -283,7 +283,6 @@ impl Transport for ZmqTransport {
                 identity: instance_id_bytes,
                 sndhwm,
                 linger_ms,
-                metrics,
                 ready_tx: sender_ready_tx,
             };
             let sender_handle = std::thread::Builder::new()
@@ -442,7 +441,6 @@ struct SenderConfig {
     identity: Vec<u8>,
     sndhwm: i32,
     linger_ms: i32,
-    metrics: Option<std::sync::Arc<dyn velo_ext::TransportObservability>>,
     ready_tx: std::sync::mpsc::SyncSender<Result<(), String>>,
 }
 
@@ -509,15 +507,12 @@ fn run_sender(cfg: SenderConfig) {
             .and_then(|_| sock.send(task.payload.as_ref(), 0));
 
         match send_result {
-            Ok(()) => {
-                if let Some(ref m) = cfg.metrics {
-                    m.record_frame(
-                        crate::observability::Direction::Outbound,
-                        crate::transports::message_type_label(task.msg_type),
-                        task.header.len() + task.payload.len(),
-                    );
-                }
-            }
+            // The outbound-accepted frame is already recorded by
+            // `finalize_send_outcome` (transports.rs) the moment
+            // `send_message` returns `Admitted` (or a `Pending` admission
+            // resolves `Ok`) — before this thread ever sees the task.
+            // Recording it again here double-counted every ZMQ send.
+            Ok(()) => {}
             Err(e) => {
                 error!("ZMQ send error to {}: {}", target, e);
                 // Remove dead socket so it gets recreated on next attempt

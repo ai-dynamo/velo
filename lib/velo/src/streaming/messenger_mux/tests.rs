@@ -621,6 +621,126 @@ async fn one_flush_reaches_every_peer_batcher() {
 }
 
 // ---------------------------------------------------------------------------
+// Ordered-lane observability
+// ---------------------------------------------------------------------------
+
+/// The ordered lane is observed once per *batch*, never once per record.
+///
+/// This is what makes `velo_messenger_ordered_lane_wait_seconds` readable as a
+/// queue measurement rather than a throughput one: a `_stream_batch` carrying N
+/// records costs exactly one lane observation, so the wait it reports is the
+/// wait of the batch, and the records that batch carried are counted separately
+/// by `velo_streaming_mux_records_per_batch`. Were the dispatcher ever to
+/// observe per record the two series would move together and the wait would
+/// read N times too heavy — the same series, silently measuring nothing.
+///
+/// The consumer messenger gets a registry of its own on purpose: credit rides
+/// home to the producer on `_stream_batch` too, so one registry shared by both
+/// messengers would count that return traffic as ingress here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_ordered_lane_is_observed_once_per_batch_not_once_per_record() {
+    const RECORDS: u32 = 8;
+
+    let consumer_reg = prometheus::Registry::new();
+    let consumer_metrics =
+        Arc::new(VeloMetrics::register(&consumer_reg).expect("register metrics"));
+
+    let producer_messenger = Messenger::builder()
+        .add_transport(tcp_transport())
+        .build()
+        .await
+        .expect("producer messenger");
+    let consumer_messenger = Messenger::builder()
+        .add_transport(tcp_transport())
+        .metrics(Arc::clone(&consumer_metrics))
+        .build()
+        .await
+        .expect("consumer messenger");
+    producer_messenger
+        .register_peer(consumer_messenger.peer_info())
+        .expect("register consumer");
+    consumer_messenger
+        .register_peer(producer_messenger.peer_info())
+        .expect("register producer");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Manual flush so "one batch" is something the test states rather than
+    // something it hopes the flush timer happened to produce.
+    let config = MuxConfig {
+        flush_policy: crate::streaming::FlushPolicy::Manual,
+        ..test_config()
+    };
+    let consumer = MessengerMuxTransport::new(
+        Arc::clone(&consumer_messenger),
+        config.clone(),
+        Some(Arc::clone(&consumer_metrics)),
+    )
+    .expect("consumer mux");
+    let producer = MessengerMuxTransport::new(Arc::clone(&producer_messenger), config, None)
+        .expect("producer mux");
+
+    let rx = consumer.bind(1, 1).await.expect("bind");
+    let tx = producer
+        .connect(consumer_messenger.instance_id().worker_id(), 1, 1)
+        .await
+        .expect("connect");
+
+    let snapshot = || MetricSnapshot::from_registry(&consumer_reg);
+    let waits = || {
+        snapshot().histogram_count(
+            "velo_messenger_ordered_lane_wait_seconds",
+            &[("handler", STREAM_BATCH_HANDLER)],
+        )
+    };
+    let records = || {
+        snapshot().histogram_sum(
+            "velo_streaming_mux_records_per_batch",
+            &[("direction", "received")],
+        )
+    };
+
+    // `connect` flushes its OpenSlot eagerly, so one batch has already crossed.
+    // Wait on that batch's *record* count rather than its lane observation: the
+    // receive path stamps the records inside the handler, after the lane wait
+    // for the same batch, so `records() >= 1` is the only one of the two that
+    // proves no batch is still in flight when the baseline is taken.
+    eventually(|| records() >= 1.0).await;
+    let waits_before = waits();
+    let records_before = records();
+    assert_eq!(
+        waits_before, 1,
+        "the OpenSlot batch must have been observed on the ordered lane — it is \
+         not, while the `_` prefix of `_stream_batch` keeps it off the allowlist"
+    );
+
+    for n in 0..RECORDS {
+        tx.send_async(item(n)).await.expect("send item");
+    }
+    producer.flush_batches();
+    for n in 0..RECORDS {
+        assert_eq!(recv(&rx).await, item(n), "record {n} out of order");
+    }
+
+    assert_eq!(
+        waits() - waits_before,
+        1,
+        "one flush is one batch is one lane observation"
+    );
+    assert_eq!(
+        records() - records_before,
+        f64::from(RECORDS),
+        "the batch that cost one lane observation carried every record"
+    );
+    assert!(
+        snapshot().gauge(
+            "velo_messenger_ordered_lanes",
+            &[("handler", STREAM_BATCH_HANDLER)]
+        ) >= 1.0,
+        "the sending peer's lane must be live while its stream is"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // The doorbell's per-peer floor
 // ---------------------------------------------------------------------------
 
