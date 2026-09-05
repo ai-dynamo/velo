@@ -257,7 +257,49 @@ pub(crate) enum RecordType {
     SlotHeartbeat = 4,
 }
 
+/// The label value `velo_streaming_mux_records_sent_total` files each
+/// [`RecordType`] under, indexed by [`RecordType::count_index`].
+pub(crate) const RECORD_TYPE_LABELS: [&str; 5] = [
+    "data",
+    "open_slot",
+    "close_slot",
+    "credit_update",
+    "slot_heartbeat",
+];
+
+/// Number of [`RecordType`] variants — the width of a per-type count array.
+pub(crate) const RECORD_TYPE_COUNT: usize = RECORD_TYPE_LABELS.len();
+
 impl RecordType {
+    /// Dense index into [`RECORD_TYPE_LABELS`] and `BatchEncoder`'s per-type
+    /// count array.
+    ///
+    /// Deliberately its own exhaustive match rather than a reuse of
+    /// [`Self::as_u8`]'s wire discriminant: a `match` with no catch-all forces
+    /// a new variant to get an arm here, which is what makes the next author
+    /// visit this site instead of the compiler silently accepting an
+    /// unindexed type. It does not by itself prove the index fits
+    /// [`RECORD_TYPE_LABELS`] — that still needs a matching entry appended
+    /// there, which is what actually sizes the array `BatchEncoder::push`
+    /// writes into via [`RECORD_TYPE_COUNT`]. Nothing calls [`Self::as_str`]
+    /// in a const context, so a variant added here without a matching label
+    /// panics on its first `as_str()` call, not at compile time.
+    pub(crate) const fn count_index(self) -> usize {
+        match self {
+            Self::Data => 0,
+            Self::OpenSlot => 1,
+            Self::CloseSlot => 2,
+            Self::CreditUpdate => 3,
+            Self::SlotHeartbeat => 4,
+        }
+    }
+
+    /// The label value `velo_streaming_mux_records_sent_total` files this
+    /// type under.
+    pub(crate) const fn as_str(self) -> &'static str {
+        RECORD_TYPE_LABELS[self.count_index()]
+    }
+
     /// Decodes a discriminant, or `None` for a type this build does not know.
     pub(crate) const fn from_u8(value: u8) -> Option<Self> {
         match value {
@@ -459,6 +501,13 @@ pub(crate) const fn record_encoded_len(body_len: usize) -> Option<usize> {
 pub(crate) struct BatchEncoder {
     buf: BytesMut,
     record_count: u16,
+    /// Records appended so far, by [`RecordType::count_index`] index.
+    ///
+    /// Tracked here rather than by the batcher's caller counting `push`
+    /// invocations, because this is the one funnel every record already goes
+    /// through — a discarded batch (an epoch death, or the task tearing down)
+    /// simply never reads this out, so nothing staged can be counted as sent.
+    record_type_counts: [u16; RECORD_TYPE_COUNT],
 }
 
 impl BatchEncoder {
@@ -477,12 +526,19 @@ impl BatchEncoder {
         Self {
             buf,
             record_count: 0,
+            record_type_counts: [0; RECORD_TYPE_COUNT],
         }
     }
 
     /// Records appended so far.
     pub(crate) const fn record_count(&self) -> u16 {
         self.record_count
+    }
+
+    /// Records appended so far, by type — read once when the batch is handed
+    /// to the messenger, alongside [`Self::record_count`], never per record.
+    pub(crate) const fn record_type_counts(&self) -> [u16; RECORD_TYPE_COUNT] {
+        self.record_type_counts
     }
 
     /// Whether the batch is worth sending.
@@ -588,6 +644,7 @@ impl BatchEncoder {
         self.buf.put_u32(len);
         write_body(&mut self.buf);
         self.record_count += 1;
+        self.record_type_counts[record_type.count_index()] += 1;
         Ok(())
     }
 }

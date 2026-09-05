@@ -81,7 +81,7 @@ use super::protocol::{
     BATCH_HEADER_LEN, BatchEncoder, CloseReason, EncodeError, SlotId, record_encoded_len,
 };
 use crate::messenger::Messenger;
-use crate::observability::{MuxDropReason, MuxMetricsHandle};
+use crate::observability::{BatcherWake, MuxDropReason, MuxMetricsHandle};
 use crate::streaming::messenger_mux::flow_control::{CreditClass, SlotCredit};
 use crate::streaming::sender::is_terminal_sentinel;
 
@@ -355,6 +355,15 @@ impl Batcher {
                 () = linger_until(deadline) => Work::Linger,
             };
             self.handle.mark_active();
+            if let Some(metrics) = &self.metrics {
+                metrics.batcher_wake(match &work {
+                    Work::Slot(_, SlotItem::Frame(_)) => BatcherWake::Frame,
+                    Work::Slot(_, SlotItem::InletClosed) => BatcherWake::InletClosed,
+                    Work::Open(_) => BatcherWake::Open,
+                    Work::Control(_) => BatcherWake::Control,
+                    Work::Linger => BatcherWake::Linger,
+                });
+            }
             self.dispatch(work).await;
 
             // The one point a test can stop the loop at, so a record can be
