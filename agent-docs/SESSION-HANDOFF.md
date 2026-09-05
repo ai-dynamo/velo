@@ -571,3 +571,7 @@ The join (`out-iso1`; `w1_queue.py` and `w3_worker.py` now read a missing attach
 ### Update 2026-09-05 (evening): W7 instruments are PR #80; wheel with the cap fix built; smoke running
 
 `w7-batcher-instruments` (5713955, signed off; gate green: fmt, clippy, peer batcher 51, mux 23, observability 11, credit 5) is draft PR #80 against `w0-ingest-metrics`. The wheel from integration b68d94b (control-cap fix) built with provenance verified (job 2730185); `smoke-all.sh cap` with `ARMS='velo4a velo34'` is running (job 2730431). Next in order: `RIG_IMG=... REPS=3 ARMS="velo3 velo4a velo34" bash .research/rig/t3-submit.sh iso2`; when the review workflow returns, commit its fixes and the cap fix on the PR branches with `-s`, push, run the review loop again on PR #80, and re-create the integration branch from the PR heads (note the version split it will hit: #77 now bumps velo to 0.12.1 against main's 0.12.0, #79 sits at 0.12.0); then merge W7 into the wheel branch and run one velo3 rep to name the multiplying reply.
+
+### Update 2026-09-05 (evening): segment medians for every iso1 rep; join handles failed requests
+
+The join now runs on all fifteen iso1 reps (`out-iso1`); `a2_join.py` skips and counts requests with no first token (`skipped_failed`, unit test `test_a2_join_failed_rows.py`), so the errored velo34 reps join too. Three-rep segment means are in the diagnosis (section 3): zero-RTT adds about 9 ms to A and 8 ms to B in every rep while C falls to mux18p's level or below. `t3-iso2` is job 2730444 (queued on priority at submission).

@@ -166,17 +166,17 @@ This is also what puts velo34's live slots over the control cap in section 1: th
 
 ### 3. Where velo3's first-token time went, and where it came back: the request path pays for the response path
 
-The per-request join (`.research/analysis/ttft-join`, `out-iso1`) splits client TTFT into A (client send to the frontend's `request received` line), B (that line to the worker's `request received` line, skew-corrected) and C (worker ingress to the first token at the client). Medians, milliseconds:
+The per-request join (`.research/analysis/ttft-join`, `out-iso1`) splits client TTFT into A (client send to the frontend's `request received` line), B (that line to the worker's `request received` line, skew-corrected per mocker process) and C (worker ingress to the first token at the client); the three sum to the client's TTFT per request. Medians per rep, then the three-rep mean, milliseconds:
 
-| rep | A | B | C | frontend's own TTFT | client TTFT |
-|---|---|---|---|---|---|
-| velo0 rep 2 | 2.7 | 1.3 | 87 | 80 | 95 |
-| velo0 rep 3 | 2.4 | 1.2 | 67 | 58 | 74 |
-| velo3 rep 2 | 13.1 | 11.1 | 47 | 38 | 72 |
-| velo34 rep 1 | 10.6 | 8.6 | 49 | 32 | 68 |
-| mux18p rep 2 | 4.3 | 0.5 | 42 | 12 | 47 |
+| arm | A per rep | B per rep | C per rep | A mean | B mean | C mean | client TTFT p50 mean |
+|---|---|---|---|---|---|---|---|
+| velo0 | 2.0, 2.7, 2.4 | 1.9, 1.3, 1.2 | 79, 87, 67 | 2.4 | 1.5 | 78 | 85 |
+| velo3 | 10.2, 13.1, 10.1 | 8.2, 11.1, 10.1 | 47, 47, 49 | 11.1 | 9.8 | 48 | 69 |
+| velo4a | 3.1, 5.2, 4.4 | 1.3, 1.4, 1.4 | 72, 87, 86 | 4.2 | 1.4 | 82 | 91 |
+| velo34 | 10.6, 10.6, 9.6 | 8.6, 8.1, 5.2 | 49, 43, 25 | 10.3 | 7.3 | 39 | 59 |
+| mux18p | 5.3, 4.3, 3.6 | 0.7, 0.5, 0.5 | 45, 42, 43 | 4.4 | 0.6 | 43 | 48 |
 
-Zero-RTT setup takes C from 67 to 87 ms down to 47 to 49 ms, which is mux18p's 42. The client sees only 16 to 20 ms of that, because A and B each grow by about 10 ms: the request path from the client to the worker goes from 4 ms to 20 to 24 ms. That growth is the whole remaining gap to mux18p (velo34 68 = 10.6 + 8.6 + 49; mux18p 47 = 4.3 + 0.5 + 42).
+Zero-RTT setup takes C from 78 ms to 48 (velo3) and, with the detached ack, to 39 (velo34; 25 in its best rep), at or under mux18p's 43. The client sees 16 to 26 ms of that, because A and B grow in every zero-RTT rep, by about 9 ms and 8 ms: the request path from the client to the worker goes from 4 ms to 18 to 21 ms. That growth is the remaining gap to mux18p (velo34 59 = 10.3 + 7.3 + 39 against mux18p 48 = 4.4 + 0.6 + 43). The detached ack on its own (velo4a) leaves C where velo0 has it (82 against 78), so what it buys shows only once the attach round trip is gone (velo34 against velo3, 9 ms on C).
 
 What changed on the frontend under the gate, from the scrapes: it sends ten times more mux batches to the workers (velo3 rep 2: 1,027,872 outbound `_stream_batch` messages against 97,042 for velo0 rep 2; velo34 rep 1: 1,049,277) carrying 29 percent more records (22.4 M against 17.4 M); the sent-batch size distribution moves from a median near 100 records to 240,000 one-record batches and 740,000 of eight or fewer; the frontend's event-loop delay mean doubles (1.46 to 2.9 ms); node A stays at 47 to 49 percent busy in both. Drain visits are similar (127,000 to 142,000 against 178,000 to 181,000), so the credit sweep's cadence is not the multiplier, and the frontend records no drops, stalls, holds or refusals in the clean zero-RTT reps. Per stream the frontend goes from 0.4 to 4 control batches; every one is an inbound message on the worker and a wake on the frontend's batcher. The worker's TTFR (handler start to first response) is 3 ms under W3 against 20 ms, so the worker side of the request path is not where B grew; B and A grow together on the frontend, consistent with a runtime that is servicing far more small sends.
 
