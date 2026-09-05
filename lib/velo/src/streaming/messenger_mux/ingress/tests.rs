@@ -719,3 +719,28 @@ fn a_heartbeat_record_reaches_the_consumer_as_a_heartbeat_frame() {
     );
     assert_eq!(RecordType::SlotHeartbeat.as_u8(), 4);
 }
+
+/// The claim is write-once, and the first `OpenSlot` is the one that counts.
+///
+/// Both readers of this cell depend on that. `drained` posts wakes to the peer
+/// it names, and a pre-bind's owner closes the slot it names; a second claim
+/// overwriting either would send credit to the wrong peer's lane, or close a
+/// slot belonging to a stream that is still running.
+#[test]
+fn drain_signal_claim_stays_write_once() {
+    let drain = test_drain();
+    assert_eq!(drain.claimed(), None, "an unclaimed bind names no slot");
+
+    let first = SlotId::new(3, 0).expect("slot id");
+    let second = SlotId::new(9, 1).expect("slot id");
+    let other_peer = WorkerId::from_u64(PEER + 1);
+
+    drain.claimed_by(peer(), first, Arc::new(AtomicBool::new(false)));
+    drain.claimed_by(other_peer, second, Arc::new(AtomicBool::new(false)));
+
+    assert_eq!(
+        drain.claimed(),
+        Some((peer(), first)),
+        "the second claim must be dropped, not applied"
+    );
+}

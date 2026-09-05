@@ -163,9 +163,17 @@ struct ApplyCtx<'a> {
 /// signal is inert, which is correct — nothing has been delivered, so nothing
 /// has drained.
 pub(crate) struct DrainSignal {
-    /// Whose bind this turned out to be, and that peer's pending-wake flag.
-    /// Both arrive together when an `OpenSlot` claims the bind.
-    claim: std::sync::OnceLock<(WorkerId, Arc<AtomicBool>)>,
+    /// Whose bind this turned out to be, which slot it became, and that peer's
+    /// pending-wake flag. All three arrive together when an `OpenSlot` claims
+    /// the bind.
+    ///
+    /// The slot id is not for [`DrainSignal::drained`], which never looks at
+    /// it. It is here because this write-once cell is *the* record of whether a
+    /// bind was claimed, and the owner that has to close a claimed slot needs
+    /// to name it — see [`DrainSignal::claimed`]. Keeping the answer in one
+    /// cell is what makes claimed-or-not and which-slot a single, consistent
+    /// observation rather than two that can disagree.
+    claim: std::sync::OnceLock<(WorkerId, SlotId, Arc<AtomicBool>)>,
     wake: flume::Sender<WorkerId>,
 }
 
@@ -177,10 +185,19 @@ impl DrainSignal {
         }
     }
 
-    /// Name the peer this bind turned out to belong to, and hand it that peer's
-    /// pending-wake flag. Called once, when an `OpenSlot` claims the bind.
-    pub(crate) fn claimed_by(&self, peer: WorkerId, pending: Arc<AtomicBool>) {
-        let _ = self.claim.set((peer, pending));
+    /// Name the peer this bind turned out to belong to and the slot it became,
+    /// and hand it that peer's pending-wake flag. Called once, when an
+    /// `OpenSlot` claims the bind.
+    pub(crate) fn claimed_by(&self, peer: WorkerId, slot: SlotId, pending: Arc<AtomicBool>) {
+        let _ = self.claim.set((peer, slot, pending));
+    }
+
+    /// The peer and slot that claimed this bind, once one has.
+    ///
+    /// `None` is "no `OpenSlot` has arrived", which is what tells a pre-bind's
+    /// owner that giving up means releasing a bind rather than closing a slot.
+    pub(crate) fn claimed(&self) -> Option<(WorkerId, SlotId)> {
+        self.claim.get().map(|(peer, slot, _)| (*peer, *slot))
     }
 
     /// One record left the buffer.
@@ -208,7 +225,7 @@ impl DrainSignal {
     /// one try again; the periodic sweep is what bounds the gap if no next one
     /// comes.
     pub(crate) fn drained(&self) {
-        let Some((peer, pending)) = self.claim.get() else {
+        let Some((peer, _slot, pending)) = self.claim.get() else {
             // Nothing has been delivered on this bind yet, so nothing drained.
             return;
         };
@@ -261,6 +278,82 @@ impl IngressRegistry {
     /// Drop an unclaimed bind, reporting whether one was there.
     pub(crate) fn expire_bind(&self, anchor_id: u64, session_id: u64) -> bool {
         self.binds.remove(&(anchor_id, session_id)).is_some()
+    }
+
+    /// Retire a live slot whose consumer has gone, reporting the close its
+    /// owner is owed.
+    ///
+    /// The same verdict the arrival path reaches for a slot whose consumer
+    /// dropped the receiver — `CloseReason::UnknownSlot`, "this side has
+    /// nowhere to put your records", the answer `fault_reason` gives for
+    /// `ConsumerGone` — on a trigger that does not need a record to arrive.
+    ///
+    /// `None` when no such slot is there, which is what makes it idempotent:
+    /// a second call finds the table entry gone and asks for nothing.
+    pub(crate) fn close_consumer_gone(
+        &self,
+        peer: WorkerId,
+        id: SlotId,
+        metrics: Option<&MuxMetricsHandle>,
+    ) -> Option<ReplyRecord> {
+        let entry = self.peers.get(&peer)?;
+        let mut state = lock(entry.value());
+        // Generation-checked, because `finish_close` is not: it takes the slot
+        // by dense index alone, and the peer may have recycled this one under a
+        // new generation since the caller learned the id. Retiring by index
+        // would then kill whichever healthy stream holds it now.
+        if state
+            .slots
+            .get(id.index() as usize)
+            .and_then(Option::as_ref)
+            .map(|slot| slot.id)
+            != Some(id)
+        {
+            return None;
+        }
+        let mut outcome = BatchOutcome::default();
+        finish_close(
+            &mut state,
+            id,
+            CloseReason::UnknownSlot,
+            metrics,
+            &mut outcome,
+        );
+        (outcome.closed > 0).then_some(ReplyRecord::CloseSlot {
+            slot: id,
+            reason: CloseReason::UnknownSlot,
+        })
+    }
+
+    /// Binds registered and neither claimed nor released.
+    #[cfg(test)]
+    pub(crate) fn bind_count(&self) -> usize {
+        self.binds.len()
+    }
+
+    /// The window one of `peer`'s live slots opened holding.
+    #[cfg(test)]
+    pub(crate) fn slot_open_terms(&self, peer: WorkerId, id: SlotId) -> Option<(u32, u64)> {
+        let entry = self.peers.get(&peer)?;
+        let state = lock(entry.value());
+        state
+            .slots
+            .get(id.index() as usize)
+            .and_then(Option::as_ref)
+            .filter(|slot| slot.id == id)
+            .map(|slot| slot.open_terms())
+    }
+
+    /// The ids of `peer`'s live slots.
+    #[cfg(test)]
+    pub(crate) fn live_slot_ids(&self, peer: WorkerId) -> Vec<SlotId> {
+        self.peers.get(&peer).map_or_else(Vec::new, |entry| {
+            lock(entry.value())
+                .slots
+                .iter()
+                .filter_map(|slot| slot.as_ref().map(|slot| slot.id))
+                .collect()
+        })
     }
 
     /// Bytes `peer`'s ahead-of-sequence holds have reserved between them.
@@ -542,7 +635,7 @@ fn open_slot(
     // Before this point it is inert: nothing has been delivered on this slot,
     // so nothing can have drained.
     bind.drain
-        .claimed_by(ctx.peer, ctx.registry.pending_wake(ctx.peer));
+        .claimed_by(ctx.peer, id, ctx.registry.pending_wake(ctx.peer));
 
     let slot = IngressSlot::new(
         id,

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::BoxFuture;
-use velo::streaming::{AnchorManager, AnchorManagerBuilder, AttachError};
+use velo::streaming::{AnchorConfig, AnchorManager, AnchorManagerBuilder, AttachError};
 use velo_ext::{TransportKey, WorkerAddress, WorkerId};
 
 // ---------------------------------------------------------------------------
@@ -290,5 +290,197 @@ async fn test_cancel_03_remote_cancel() {
     assert!(
         cancel_token.is_cancelled(),
         "sender cancel_token must fire after _stream_cancel AM received"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Cancel over the mux: the two ways a dead consumer reaches its producer
+// ---------------------------------------------------------------------------
+//
+// A producer learns its consumer is gone through one of two paths, and which
+// one is available depends on how the stream was opened:
+//
+// - **Attach.** `_anchor_attach` carries a `StreamCancelHandle`, so the anchor
+//   can name the producer's `SenderEntry` and poison it directly. This works
+//   whether or not the producer is sending.
+// - **Ingress.** The next record to arrive for a slot whose consumer dropped
+//   its receiver faults with `CloseReason::UnknownSlot`
+//   (`messenger_mux/ingress/slot.rs:292`), which closes the producer's egress
+//   slot. This works only while records keep arriving.
+//
+// Zero-RTT setup never sends an attach, so it never learns the cancel handle
+// and the first path is unavailable to it. The pair of tests below is that
+// contrast: the control fixes the second path in place, and the behavioural
+// test asks for an idle producer, which only the second path cannot serve.
+
+use futures::StreamExt;
+use velo::Velo;
+use velo::streaming::control::StreamOpenTicket;
+use velo::streaming::{MuxConfig, StreamAnchorHandle, StreamFrame};
+
+/// Long enough to absorb a loaded machine, short enough that a hang fails the
+/// test rather than the runner.
+const CANCEL_BOUND: Duration = Duration::from_secs(15);
+
+/// How long a producer stays silent before the send that must fail.
+///
+/// The close travels batcher flush, then TCP, then the peer's `_stream_batch`
+/// handler. Loopback needs milliseconds; the margin is for a node running the
+/// whole 41-binary suite at once, where no retry is available — retrying the
+/// send would feed the reactive ingress-fault path and make the test
+/// tautological.
+const SETTLE: Duration = Duration::from_secs(5);
+
+/// A window small enough that credit has to move, and a sweep fast enough that
+/// a parked producer resumes inside `CANCEL_BOUND`.
+fn cancel_mux_config() -> MuxConfig {
+    MuxConfig {
+        enabled: true,
+        initial_credit: 8,
+        credit_sweep_interval: Duration::from_millis(1),
+        ..MuxConfig::default()
+    }
+}
+
+async fn velo_node() -> Arc<Velo> {
+    Velo::builder()
+        .add_transport(new_tcp_transport())
+        .stream_bind_addr(std::net::Ipv4Addr::LOCALHOST.into())
+        .messenger_mux(cancel_mux_config())
+        .expect("install mux")
+        .build()
+        .await
+        .expect("build velo")
+}
+
+/// Two cross-registered nodes: `consumer` owns the anchors, `producer` sends.
+async fn velo_pair() -> (Arc<Velo>, Arc<Velo>) {
+    let consumer = velo_node().await;
+    let producer = velo_node().await;
+    consumer
+        .register_peer(producer.peer_info())
+        .expect("register producer on consumer");
+    producer
+        .register_peer(consumer.peer_info())
+        .expect("register consumer on producer");
+    for (node, peer) in [
+        (&producer, consumer.instance_id()),
+        (&consumer, producer.instance_id()),
+    ] {
+        tokio::time::timeout(CANCEL_BOUND, node.wait_for_handler(peer, "_anchor_attach"))
+            .await
+            .expect("timed out waiting for the peer's control plane")
+            .expect("peer never advertised the handler");
+    }
+    (consumer, producer)
+}
+
+fn transfer(handle: StreamAnchorHandle) -> StreamAnchorHandle {
+    StreamAnchorHandle::from_u128(handle.as_u128())
+}
+
+/// Control. A producer that keeps sending already learns its consumer is gone,
+/// on every setup path, because the ingress slot faults on the next record.
+///
+/// This is what makes the idle-producer test next door non-tautological: the
+/// fixture, the bound and the mux config are identical, so a failure there is
+/// about the producer being idle and not about any of those.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancel_with_a_record_in_flight_already_errors() {
+    let (consumer, producer) = velo_pair().await;
+
+    let mut anchor = consumer.create_anchor::<u32>();
+    let sender = producer
+        .attach_anchor::<u32>(transfer(anchor.handle()))
+        .await
+        .expect("remote attach");
+
+    let send = tokio::spawn(async move {
+        for n in 0..u32::MAX {
+            if sender.send(n).await.is_err() {
+                return n;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        unreachable!("the send loop must end on an error");
+    });
+
+    // One item proves the stream is live before the anchor dies.
+    let first = tokio::time::timeout(CANCEL_BOUND, anchor.next())
+        .await
+        .expect("timed out waiting for the first item")
+        .expect("stream ended early")
+        .expect("no stream error");
+    assert!(matches!(first, StreamFrame::Item(0)));
+
+    drop(anchor);
+
+    let sent = tokio::time::timeout(CANCEL_BOUND, send)
+        .await
+        .expect("the producer never learned its consumer was gone")
+        .expect("send task");
+    assert!(sent > 0, "the failure must come after a delivered record");
+}
+
+/// Behavioural. Under zero-RTT setup there is no attach, so the anchor never
+/// learns a [`velo::streaming::control::StreamCancelHandle`] and cannot poison
+/// its producer directly. The producer is idle, so the ingress fault that rides
+/// on the next arriving record cannot reach it either. The close the dying
+/// pre-bind posts is the only thing left, and this is the test of it.
+///
+/// One send, after a settle the producer spends silent: a send that succeeds
+/// here is the slot still open and the producer still blind.
+///
+/// The anchor's heartbeat interval is raised well past `SETTLE`: the ticket
+/// carries it straight to the producer's own heartbeat cadence
+/// (`StreamOpenTicket::from_limits`), so with the manager default (5 s, equal
+/// to `SETTLE`) the producer's first fallback heartbeat and this test's send
+/// land within ~100 ms of each other and race down the *other* path this test
+/// exists to exclude — see the doc comment above. Nothing here should ever be
+/// able to fire during the silent window; if it can, the assertion below is
+/// no longer testing the pre-bind's own close.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancel_reaches_an_idle_worker_within_a_bound() {
+    let (consumer, producer) = velo_pair().await;
+
+    let mut anchor = consumer
+        .anchor_manager()
+        .create_anchor_with_config::<u32>(AnchorConfig {
+            heartbeat_interval: Some(SETTLE * 6),
+            ..AnchorConfig::default()
+        });
+    let handle = transfer(anchor.handle());
+    let ticket = consumer
+        .prebind_anchor(handle)
+        .expect("both nodes run the mux, so a ticket is minted");
+    // Through serde, because that is how a ticket reaches a worker: in the
+    // request envelope the application already sends, never by reference.
+    let ticket: StreamOpenTicket =
+        serde_json::from_slice(&serde_json::to_vec(&ticket).expect("encode ticket"))
+            .expect("decode ticket");
+
+    let sender = producer
+        .open_anchor_stream::<u32>(handle, ticket)
+        .await
+        .expect("zero-RTT open");
+    sender.send(0).await.expect("first item");
+
+    let first = tokio::time::timeout(CANCEL_BOUND, anchor.next())
+        .await
+        .expect("timed out waiting for the first item")
+        .expect("stream ended early")
+        .expect("no stream error");
+    assert!(matches!(first, StreamFrame::Item(0)));
+    assert!(
+        !sender.cancellation_token().is_cancelled(),
+        "no attach happened, so nothing can have routed a cancel AM to this sender"
+    );
+
+    drop(anchor);
+
+    tokio::time::sleep(SETTLE).await;
+    assert!(
+        sender.send(1).await.is_err(),
+        "the first send after the consumer died must already fail"
     );
 }

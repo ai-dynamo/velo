@@ -112,6 +112,17 @@ impl IngressSlot {
         self.hold.len()
     }
 
+    /// The window this slot opened holding: data credit, then byte watermark.
+    ///
+    /// The one read that says what `IngressSlot::new` was actually handed. A
+    /// ticket quotes those two numbers to a sender long before this slot
+    /// exists, and the only thing keeping the two reads equal is the config
+    /// normalisation between them.
+    #[cfg(test)]
+    pub(super) fn open_terms(&self) -> (u32, u64) {
+        (self.account.limit(), self.byte_watermark)
+    }
+
     /// Apply a `Data` or `SlotHeartbeat` record.
     ///
     /// `frame_seq` is compared with plain ordering rather than modulo: it is

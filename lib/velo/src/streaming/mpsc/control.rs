@@ -116,6 +116,10 @@ pub(crate) async fn mpsc_reader_pump(
         local_id,
         heartbeat_deadline,
         drain,
+        // MPSC has no zero-RTT pre-bind path (`AnchorManager::prebind_anchor`
+        // refuses `is_mpsc_stream()`), so every spawn here is an ordinary
+        // attach and there is nothing to gate on.
+        prebound: _,
     } = pump;
     let mut missed_heartbeats: u8 = 0;
 
@@ -314,6 +318,9 @@ pub fn create_mpsc_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::
                         local_id,
                         heartbeat_deadline: heartbeat_interval,
                         drain,
+                        // Always an ordinary attach; see the destructure in
+                        // `mpsc_reader_pump`.
+                        prebound: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     },
                 ));
 
