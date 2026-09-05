@@ -117,3 +117,29 @@ What this changes. The shipping tcp plane is not broken at p50 once the frontend
 Where velo0's remaining first-token time is, from the W0 and W0b instruments on `t3-base-pin` rep 2 (means over the steady window): C 74 ms, worker handler start to first response 20 ms of which the attach round trip is 13 ms, ordered lanes 6 ms, inbound queue and egress queues under 2 ms each; the remainder is the delivery path from the anchor to the SSE writer and the client. W3 (PR #78, zero-RTT setup) and W4a (detached OpenSlot ack) remove the pre-generation waits; W2 targets the CPU gap.
 
 The results page and the plan's scoreboard are updated to this table. `t3-m18p1`, `t3-ucx1`, and every earlier matrix remain on disk as pre-pinning history.
+
+## Addendum 2026-09-05: isolation matrix `t3-iso1` (W3 and W4a against velo0 and mux18p)
+
+Matrix `t3-iso1` (job 2729436; three reps per arm; 512 workers, concurrency 8192, 250,000 requests per rep; pinned 72/72; velo `379240a`, which is `drain-credit-return` plus W0, W3 and W4a, with rig-local modifications; dyn-pin `3a67ae2e6e` with rig-local mods; gate `DYN_VELO_RESPONSE_ZERO_RTT_ATTACH` on for velo3 and velo34, `DYN_VELO_RESPONSE_ASYNC_OPEN_ACK` on for velo4a and velo34, both asserted per rep from the resolved-config lines and the attach counters).
+
+| arm | rep | req/s | TTFT p50 ms | TTFT p95 ms | TTFT p99 ms | ITL p50 ms | ITL p99 ms | frontend CPU ms/req | E2E p50 s | E2E p90 s | E2E p99 s | errors |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| velo0 | 1 | 3,055 | 86 | 179 | 707 | 1.8 | 49.4 | 4.86 | 0.56 | 7.30 | 13.04 | 0 |
+| velo0 | 2 | 3,302 | 95 | 199 | 823 | 1.6 | 34.6 | 3.09 | 0.50 | 8.28 | 9.15 | 0 |
+| velo0 | 3 | 3,115 | 74 | 185 | 842 | 1.5 | 51.5 | 3.84 | 0.46 | 9.89 | 13.60 | 0 |
+| velo3 | 1 | 3,263 | 65 | 177 | 869 | 1.6 | 43.9 | 3.34 | 0.48 | 8.76 | 11.59 | 0 |
+| velo3 | 2 | 3,517 | 72 | 206 | 850 | 1.7 | 33.7 | 2.42 | 0.51 | 7.64 | 8.91 | 0 |
+| velo3 | 3 | 3,128 | 69 | 177 | 832 | 1.6 | 56.0 | 3.69 | 0.47 | 7.94 | 14.77 | 0 |
+| velo4a | 1 | 3,275 | 80 | 217 | 819 | 1.7 | 56.1 | 2.93 | 0.51 | 8.98 | 14.79 | 16 |
+| velo4a | 2 | 3,502 | 98 | 235 | 828 | 1.7 | 31.6 | 2.22 | 0.55 | 7.50 | 8.37 | 0 |
+| velo4a | 3 | 3,447 | 95 | 227 | 813 | 1.7 | 32.9 | 2.45 | 0.53 | 7.62 | 8.72 | 0 |
+| velo34 | 1 | 3,386 | 68 | 189 | 868 | 1.6 | 34.7 | 2.79 | 0.48 | 7.98 | 9.16 | 0 |
+| velo34 | 2 | 3,271 | 63 | 198 | 817 | 1.7 | 63.4 | 3.16 | 0.50 | 9.13 | 16.73 | 95 |
+| velo34 | 3 | 3,281 | 46 | 202 | 822 | 1.7 | 81.6 | 3.09 | 0.50 | 9.17 | 21.46 | 186 |
+| mux18p | 1 | 3,373 | 51 | 197 | 772 | 1.8 | 43.3 | 2.67 | 0.52 | 6.34 | 11.41 | 0 |
+| mux18p | 2 | 3,320 | 47 | 178 | 756 | 1.7 | 49.5 | 2.75 | 0.49 | 8.87 | 13.04 | 0 |
+| mux18p | 3 | 3,222 | 47 | 165 | 764 | 1.7 | 42.9 | 3.10 | 0.48 | 8.89 | 11.31 | 0 |
+
+Three-rep means: velo0 3,157 req/s (spread 247), TTFT p50 85, p99 791, CPU 3.93, E2E p99 11.9 s; velo3 3,303 (389), 69, 851, 3.15, 11.8; velo4a 3,408 (227), 91, 820, 2.53, 10.6, 16 errors; velo34 3,313 (114), 59, 835, 3.01, 15.8, 281 errors; mux18p 3,305 (152), 48, 764, 2.84, 11.9.
+
+Reading. W3 (zero-RTT setup) is worth about 16 ms at p50 with zero errors. W4a on its own is within noise; with W3 it reaches 59 ms mean and 46 ms in its best rep, but those reps carry a defect: every error is a stream whose `OpenSlot` admission answer was refused at the control inbox's cap, which left the slot fenced until the frontend's heartbeat watchdog gave up 15 s later (`ttft-gap-diagnosis.md`, afternoon addendum, section 1; fixed on PR #79; velo4a and velo34 rerun). The E2E and ITL p99 columns measure one mocker process's backlog in every arm, tcp and mux18p included (section 2 of the same addendum), and are no longer a criterion. The results page carries this table beside the pinned baseline.
