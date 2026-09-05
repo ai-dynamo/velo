@@ -210,16 +210,25 @@ async fn a_flush_with_nothing_staged_writes_nothing() {
 // What no policy may hold back
 // ---------------------------------------------------------------------------
 
-/// A `CreditUpdate` owed to a peer goes without waiting to be flushed.
+/// A `CreditUpdate` owed to a peer goes within the reply window, without
+/// waiting for a flush.
 ///
 /// The sharpest case of the rule, and the reason it is correctness rather than
 /// polish: the peer's sender is parked waiting for this window, and no
-/// application on *this* side knows it owes that peer anything. If credit could
-/// wait for `flush_batch`, a node with a quiet producer would starve a busy
-/// one.
+/// application on *this* side knows it owes that peer anything. If credit
+/// could wait for `flush_batch`, a node with a quiet producer would starve a
+/// busy one. Bounded by an explicit short `reply_linger` rather than
+/// `RECV_TIMEOUT`, so this discriminates a held reply from one that moved —
+/// the assertion held at any `reply_linger` under five seconds before
+/// `flush_gate` bounded a reply's window to records joining it either way.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_credit_reply_moves_under_manual() {
-    let harness = harness(manual()).await;
+    let window = Duration::from_millis(50);
+    let harness = harness(MuxConfig {
+        reply_linger: window,
+        ..manual()
+    })
+    .await;
     let peer_slot = SlotId::new(7, 0).expect("index fits u24");
 
     harness
@@ -229,11 +238,55 @@ async fn a_credit_reply_moves_under_manual() {
             delta: 32,
         }]);
 
-    let batch = harness.next_batch().await;
+    let batch = tokio::time::timeout(window * 4, harness.next_batch())
+        .await
+        .expect("a credit reply must not wait past its own window");
     assert_eq!(batch.records.len(), 1);
     assert_eq!(batch.records[0].kind, RecordType::CreditUpdate);
     assert_eq!(batch.records[0].slot, peer_slot);
     assert_eq!(batch.records[0].credit, 32);
+}
+
+/// A reply joining a batch that already holds a staged data record keeps its
+/// own window, under `Manual`, end to end through the running batcher.
+///
+/// The regression this file previously could not see: staging a data record
+/// first left the gate's `staged == 0` guard on `stage_reply` never firing, so
+/// the reply's window never started and nothing under `Manual` — no policy, no
+/// timer — ever rescued it. `await_staged(1)` is the positive fact that the
+/// data record reached the gate before the reply is sent, which is what makes
+/// this Family A rather than a reply-alone case.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_credit_reply_moves_under_manual_behind_a_staged_record() {
+    let window = Duration::from_millis(50);
+    let harness = harness(MuxConfig {
+        reply_linger: window,
+        ..manual()
+    })
+    .await;
+    let (inlet, _) = harness.open_credited(1, 1, CREDIT).await;
+
+    inlet.send(item(0)).expect("stage a record");
+    harness.await_staged(1).await;
+
+    let peer_slot = SlotId::new(7, 0).expect("index fits u24");
+    harness
+        .handle
+        .reply(&[super::super::ReplyRecord::CreditUpdate {
+            slot: peer_slot,
+            delta: 32,
+        }]);
+
+    let batch = tokio::time::timeout(window * 4, harness.next_batch())
+        .await
+        .expect("a reply joining an already-staged batch keeps its own window under Manual");
+    assert!(
+        batch
+            .records
+            .iter()
+            .any(|r| r.kind == RecordType::CreditUpdate),
+        "the reply must still reach the wire, not sit staged forever"
+    );
 }
 
 /// So does a close the peer is waiting on.

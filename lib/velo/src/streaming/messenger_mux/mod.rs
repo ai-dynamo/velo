@@ -168,7 +168,11 @@ pub struct AutoFlush {
     /// never waits for work that has not arrived, it only notices that more is
     /// *already* there and takes all of it. The name is the mechanism — a flush
     /// parks until the transport admits it, so "at the end of every wake" is in
-    /// practice "as soon as the peer admitted the last batch".
+    /// practice "as soon as the peer admitted the last batch". The one
+    /// exception is a batch holding nothing but pending credit replies, which
+    /// waits for [`MuxConfig::reply_linger`] under every policy — see that
+    /// field for why, and for what changes the moment anything else joins the
+    /// batch.
     pub on_admission: bool,
     /// Also write once this long has passed since the oldest staged record.
     ///
@@ -201,7 +205,8 @@ impl AutoFlush {
 ///
 /// See `BATCHING.md` § "Flush policy". Both policies obey the same two
 /// overrides — a batch at its size clamp goes, and the records that carry
-/// liveness go — and under both,
+/// liveness go (a close or a terminal at once, a credit reply within
+/// [`MuxConfig::reply_linger`]) — and under both,
 /// [`Velo::flush_batch`](crate::Velo::flush_batch) writes immediately. What
 /// they differ on is whether anything *else* does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,9 +222,14 @@ pub enum FlushPolicy {
     ///
     /// The policy a serving loop wants: one write per forward pass carrying
     /// that pass's whole fan-out to each peer, and nothing lingering into the
-    /// next pass. **There is no timer.** A producer that stops calling
-    /// `flush_batch` leaves its last records staged until something else moves
-    /// them; `velo_streaming_mux_staged_records` is where that shows.
+    /// next pass. **There is no timer for the application's own records.** A
+    /// producer that stops calling `flush_batch` leaves its last records
+    /// staged until something else moves them;
+    /// `velo_streaming_mux_staged_records` is where that shows. The one record
+    /// this does not apply to is a pending credit reply, which carries
+    /// whatever it is staged with out after [`MuxConfig::reply_linger`] —
+    /// nothing on this side of the reply knows it is owed, so `Manual` cannot
+    /// leave it to the application the way it leaves everything else.
     Manual,
 }
 
@@ -326,7 +336,10 @@ pub struct MuxConfig {
     /// its consumer's drain has already earned. That is one wait per window, so
     /// what it costs per record is `floor / initial_credit` — negligible at the
     /// default 256-record window, and visible at the small windows the credit
-    /// tests use deliberately.
+    /// tests use deliberately. It stacks with
+    /// [`reply_linger`](Self::reply_linger) rather than replacing it: the
+    /// return still has to cross the receiver's egress batcher once it is
+    /// reconciled here.
     ///
     /// Defaults to 2 ms, which is the interval the sweep itself ran at while it
     /// was the only way credit came back. That cadence was enough to keep every
@@ -344,7 +357,7 @@ pub struct MuxConfig {
     /// Defaults to [`FlushPolicy::Auto`] on [`AutoFlush::default`], which is
     /// the behaviour every mux had before this knob existed.
     pub flush_policy: FlushPolicy,
-    /// How long a batch holding only credit replies may form before it goes.
+    /// How long a pending credit reply may wait for a batch to form around it.
     ///
     /// A `CreditUpdate` used to mark its batch urgent, so a batcher whose peer
     /// admits at once wrote one batch per wake — and a receiver's batcher wakes
@@ -355,13 +368,37 @@ pub struct MuxConfig {
     /// for every one as a wake on this side and an inbound message on the
     /// other.
     ///
-    /// Under this window a batch that holds nothing but credit replies waits
-    /// for the window, or for the next record that does not wait — a close, a
-    /// terminal, data, an application flush — whichever comes first. The
-    /// return a sender is owed is delayed by at most this long, once per
+    /// What ends the wait early depends on the policy, because `on_admission`
+    /// already has its own reason to write and this window does not override
+    /// it:
+    ///
+    /// - Under [`AutoFlush::on_admission`], any record that is not a credit
+    ///   reply ends the wait at once — data included — because the batch is no
+    ///   longer replies-only and `on_admission` writes any non-empty batch
+    ///   that isn't. A batch holding nothing but replies still waits out the
+    ///   window (or a close, a terminal or an application flush, whichever is
+    ///   sooner).
+    /// - Under [`FlushPolicy::Manual`] and `Auto { on_admission: false }`,
+    ///   nothing about admission or ordinary staging cuts the wait short: data
+    ///   joins the batch without disturbing it, because the window is a
+    ///   property of the pending reply and not of the batch staying
+    ///   replies-only. The reply keeps its bound and the data rides out with
+    ///   it when the window (or a close, a terminal, or `flush_batch`) ends
+    ///   it.
+    ///
+    /// A shorter `max_linger` on the same batcher can still cut either case
+    /// short, since the two windows run independently and the earlier due time
+    /// wins.
+    ///
+    /// The return a sender is owed is delayed by at most this long, once per
     /// window, which per record is `reply_linger / initial_credit`: nothing at
-    /// the default 256-record window. `Duration::ZERO` restores the urgent
-    /// flush.
+    /// the default 256-record window. On the drain-driven return path this
+    /// stacks with [`drain_visit_floor`](Self::drain_visit_floor) rather than
+    /// replacing it — a producer parked out of credit can wait for both, in
+    /// series.
+    /// `Duration::ZERO` makes the window already due, so a reply goes out at
+    /// the end of the wake that staged it — the same urgent flush the
+    /// batcher had before this knob existed.
     pub reply_linger: Duration,
 }
 

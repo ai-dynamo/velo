@@ -34,11 +34,14 @@
 //!
 //! [`flush_gate`] owns that decision and nothing else does. The loop below
 //! stages work, drains everything already queued behind it, and then asks the
-//! gate once. Under the default policy the answer is always yes, which is why
-//! this is a refactor of the old unconditional flush rather than a new path
-//! through it; under [`FlushPolicy::Manual`](super::FlushPolicy::Manual) the
-//! answer is no until the application says otherwise, and the kick it says it
-//! with arrives as coalesced control for the reason everything else does.
+//! gate once. Under the default policy the answer is yes unless the batch
+//! holds nothing but pending credit replies, in which case `flush_gate` holds
+//! it for [`MuxConfig::reply_linger`](super::MuxConfig::reply_linger)
+//! instead. Under [`FlushPolicy::Manual`](super::FlushPolicy::Manual) the
+//! answer is no until the application says otherwise, except that a pending
+//! reply still ages out after `reply_linger` and takes whatever else is
+//! staged with it. The kick the application says otherwise with arrives as
+//! coalesced control for the reason everything else does.
 //!
 //! ## Draining X channels from one task
 //!

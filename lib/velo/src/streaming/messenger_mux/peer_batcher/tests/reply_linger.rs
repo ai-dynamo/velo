@@ -4,11 +4,12 @@
 //! Credit replies form a batch for [`MuxConfig::reply_linger`] instead of each
 //! writing one.
 //!
-//! What is pinned: replies alone wait for the window and go out together; a
-//! close reply does not wait and carries the replies staged before it; a zero
-//! window is the urgent flush the batcher had before. The windows here are
-//! long (a second) and the waits short (tens of milliseconds), so the assertions
-//! hold on a loaded runner without depending on how fast the peer admits.
+//! What is pinned: replies alone wait for the window and go out together
+//! through the `linger` timer, not some incidental wake; a close reply does
+//! not wait and carries the replies staged before it; a zero window is the
+//! urgent flush the batcher had before. The windows here are long (a second)
+//! and the waits short (tens of milliseconds), so the assertions hold on a
+//! loaded runner without depending on how fast the peer admits.
 
 use std::time::Duration;
 
@@ -27,16 +28,28 @@ fn with_reply_linger(window: Duration) -> MuxConfig {
     }
 }
 
+fn wakes(harness: &Harness, source: &str) -> f64 {
+    harness.snapshot().counter(
+        "velo_streaming_mux_batcher_wakes_total",
+        &[("source", source)],
+    )
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn credit_replies_alone_form_one_batch_for_the_window() {
     let harness = harness(with_reply_linger(WINDOW)).await;
     let (_inlet, slot) = harness.open_credited(1, 1, CREDIT).await;
 
-    for delta in 1..=3 {
+    // `await_staged` after each reply is the positive fact: it proves this
+    // reply was already staged as its own record before the next one is sent,
+    // so two replies to the same slot cannot coalesce in the control inbox
+    // into one record with a merged delta before the batcher ever sees them
+    // separately.
+    for (staged, delta) in (1..=3u32).enumerate() {
         harness
             .handle
             .reply(&[ReplyRecord::CreditUpdate { slot, delta }]);
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        harness.await_staged(staged + 1).await;
     }
     assert!(
         harness.try_next_batch().is_none(),
@@ -56,6 +69,11 @@ async fn credit_replies_alone_form_one_batch_for_the_window() {
         "the window's replies go out together, in order"
     );
     assert_eq!(batch.records.len(), 3, "and nothing else rode along");
+    assert!(
+        wakes(&harness, "linger") >= 1.0,
+        "the batch must have arrived through the reply window's own timer, \
+         not some incidental wake"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

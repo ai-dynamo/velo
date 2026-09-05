@@ -557,9 +557,9 @@ separates them is only *who* decides.
 
 | Policy | Trigger | Added latency | Default |
 |---|---|---|---|
-| **`Auto { on_admission }`** | end of every wake, having first drained what is already queued | **none** | **on** |
+| **`Auto { on_admission }`** | end of every wake, having first drained what is already queued | **none** (≤ `reply_linger` for a replies-only batch) | **on** |
 | **`Auto { max_linger }`** | up to `max_linger` after the batch's first record | ≤ window | off |
-| **`Manual`** | `flush_batch()` | the caller's | off |
+| **`Manual`** | `flush_batch()` | the caller's (≤ `reply_linger` for a batch holding a pending reply, data included) | off |
 
 The two `Auto` conditions are a struct rather than two variants because they
 compose — a batcher may hold both, and holding neither is a legitimate if
@@ -573,7 +573,9 @@ Opportunistic is the default precisely because it cannot make anything worse:
 the egress task never waits for work that has not arrived. It simply notices
 that more work is *already* queued and takes all of it. Under load, batches
 form; under no load, behaviour is identical to today minus one syscall's worth
-of bookkeeping.
+of bookkeeping. The one exception is a batch holding nothing but pending
+credit replies, which waits for `MuxConfig::reply_linger` under every
+policy — see the `CreditUpdate` bullet below.
 
 **Two reasons to write override every policy**, and they are why a burst is a
 hint rather than a frame boundary:
@@ -583,16 +585,23 @@ hint rather than a frame boundary:
   there is no room left to batch into.
 - **Records that carry liveness go.** `OpenSlot` keeps its own eager flush, and
   a `CloseSlot` or a terminal moves the batch it was staged into. A
-  `CreditUpdate` moves too, but on its own clock: a batch holding nothing but
-  credit replies forms for `MuxConfig::reply_linger` (1 ms by default) and then
-  goes, or goes sooner with the next record that does not wait. Held for good,
-  a reply is a peer's sender starved with nothing left to rescue it, and no
-  application on this side knows it owes that peer anything — so no policy may
-  hold one, and the window is the batcher's own. Held for a millisecond it costs
-  that sender `reply_linger / initial_credit` per record and turns one batch
-  per reply into one per sweep visit, which on a receiver whose egress is
-  otherwise idle is the difference between one and ten outbound batches per
-  stream.
+  `CreditUpdate` moves too, but on its own clock: `MuxConfig::reply_linger`
+  (1 ms by default) starts the moment a reply with no window already running
+  joins the batch, and the window is a property of *that reply*, not of the
+  batch staying replies-only — a data record joining afterward does not cancel
+  it. Whether data cuts the wait short depends on the policy: under
+  `on_admission`, any record that is not a credit reply ends the wait at once,
+  because the batch is no longer replies-only and `on_admission` has its own
+  reason to write it; a batch holding nothing but replies waits out the window.
+  Under `Manual` and `Auto { on_admission: false }`, nothing about ordinary
+  staging cuts it short, so the reply keeps its bound and any data staged with
+  it rides out in the same write. Held for good, a reply is a peer's sender
+  starved with nothing left to rescue it, and no application on this side knows
+  it owes that peer anything — so no policy may hold one past its window.
+  Held for a millisecond it costs that sender `reply_linger / initial_credit`
+  per record and turns one batch per reply into one per sweep visit, which on a
+  receiver whose egress is otherwise idle is the difference between one and ten
+  outbound batches per stream.
 
 Credit starvation also cuts a batch, from the other direction: a slot with no
 credit contributes nothing to the batch at all, and its records wait in the
@@ -647,14 +656,17 @@ one it makes itself, at the end of the pass it is already writing.
 #### The one failure mode
 
 Under `Manual`, records that end up staged after the last `flush_batch` wait for
-the next one, and **nothing rescues them** — there is no timer behind the policy,
-which is what makes "one write per pass, carrying that pass" a property of the
-code rather than of the scheduler. Usually that means a producer that stopped
-calling it. It also covers a subtler case: a slot starved of credit has its
-records in the withheld queue rather than the batch, so a grant arriving after
-the flush releases them into the *next* pass's batch. That one is bounded by the
-stream's own end, since a terminal and an inlet close are both records that move
-on their own.
+the next one, and **nothing rescues them for the application's own records** —
+there is no timer behind the policy for those, which is what makes "one write
+per pass, carrying that pass" a property of the code rather than of the
+scheduler. Usually that means a producer that stopped calling it. It also
+covers a subtler case: a slot starved of credit has its records in the withheld
+queue rather than the batch, so a grant arriving after the flush releases them
+into the *next* pass's batch. That one is bounded by the stream's own end,
+since a terminal and an inlet close are both records that move on their own.
+The one record this section does not describe is a pending credit reply:
+`MuxConfig::reply_linger` carries it, and whatever else is staged with it, out
+after that window regardless of policy — see the `CreditUpdate` bullet above.
 
 The cost is latency rather than memory either way, since staged records are
 bounded by the same clamps as any batch, and `velo_streaming_mux_staged_records`
@@ -801,14 +813,14 @@ New series, alongside the existing `velo_streaming_*` collectors:
 | `velo_streaming_batch_flush_total{reason}` | Mux-era flush reasons: `opportunistic\|window\|hint\|cap\|starved\|watchdog\|terminal`. Distinct from `egress_flushes_total`, which counts per-stream pump flushes and ships today |
 | `velo_streaming_mux_batches_total{direction}` | `_stream_batch` active messages packed (`sent`) or decoded (`received`) |
 | `velo_streaming_mux_records_per_batch{direction}` | Histogram of records carried by one of them. Labelled like its sibling and for the same reason: every mux node is both ends at once — credit rides back on `_stream_batch` — so an unlabelled sum would mix a node's own packing with its peers' and be attributable to neither |
-| `velo_streaming_mux_staged_records` | Gauge of records packed into batches the batchers have open but have not written. Transient under `Auto`; under `Manual` a plateau is a producer that stopped calling `flush_batch()`, which is that policy's one failure mode |
+| `velo_streaming_mux_staged_records` | Gauge of records packed into batches the batchers have open but have not written. Transient under `Auto` with `on_admission` set, where every wake that stages anything besides credit replies ends in a write and a batch holding only credit replies is held for up to `MuxConfig::reply_linger`. Under `Manual`, or `Auto` with `on_admission` unset, a pending credit reply holds the whole batch it is in for that same bound — data included — so a plateau beyond it is a producer that stopped calling `flush_batch()` |
 | `velo_streaming_mux_live_slots` | Gauge; must return to zero at teardown |
 | `velo_streaming_mux_reader_stall_total` | **Should always be zero.** Non-zero means the credit invariant is broken |
 | `velo_streaming_mux_generation_mismatch_total` | Stale records dropped by the generation check |
 | `velo_streaming_slot_credit_exhausted_total` | Per-slot credit starvation events |
 | `velo_streaming_mux_drain_visits_total` | Per-peer credit reconciles the sweep task ran because a consumer drained, counted per walk. Divided by elapsed time it is the doorbell's visit rate, which `MuxConfig::drain_visit_floor` caps at `1 / floor` per peer; the periodic sweep's own walks are not counted |
 | `velo_streaming_mux_records_sent_total{record_type}` | Records a batcher packed for its peer, by type (`data`, `open_slot`, `close_slot`, `credit_update`, `slot_heartbeat`). Against `velo_streaming_mux_batches_total{direction="sent"}` it says what a node's outbound batches are made of; a batch count that multiplies is either data arriving one record at a time or control flushed as it comes, and only this series tells those apart |
-| `velo_streaming_mux_batcher_wakes_total{source}` | Wakes of the per-peer batcher tasks, by what woke them (`open`, `control`, `frame`, `inlet_closed`, `linger`). Under `Auto` every wake that staged anything writes a batch, so this is the denominator behind the batch count |
+| `velo_streaming_mux_batcher_wakes_total{source}` | Wakes of the per-peer batcher tasks, by what woke them (`open`, `control`, `frame`, `inlet_closed`, `linger`). Under the default flush policy every wake that stages anything other than credit replies writes a batch; a wake that stages only credit replies arms `MuxConfig::reply_linger` and writes on a later `linger` wake instead. Wakes therefore outnumber batches: a wake that stages only credit replies defers its write, and a wake that stages nothing writes nothing |
 
 > **Below the mux, on the messenger connection.** A `_stream_batch` active
 > message is an ordinary messenger frame, so it queues behind the *transport's*
@@ -1020,13 +1032,21 @@ above where they belong; what they cost is worth stating in one place.
   a set of conditions that compose, so "opportunistic" and "windowed" stopped
   being alternatives and became `on_admission` and `max_linger`. Nothing about
   either behaviour changed; there is simply no longer a reason to pick one.
-- **`Manual` has no watchdog.** The specification's F2 — a gate watchdog that
-  force-opens after 5 ms — is gone with the gate. Under `Manual` a forgotten
-  flush is not degraded into the windowed policy; it stalls the records it
-  staged, and the deployment that wants the old behaviour configures the window
-  explicitly. Making the manual policy quietly stop being manual is the worse
-  failure: it would mean the determinism the policy exists for holds only until
-  something is slow.
+- **`Manual` has no watchdog, for the application's own records.** The
+  specification's F2 — a gate watchdog that force-opens after 5 ms — is gone
+  with the gate. Under `Manual` a forgotten flush is not degraded into the
+  windowed policy; the application's own records stall until it flushes, and
+  the deployment that wants the old behaviour configures the window explicitly.
+  Making the manual policy quietly stop being manual is the worse failure: it
+  would mean the determinism the policy exists for holds only until something
+  is slow. **Amendment, `reply_linger`:** a pending credit reply is the one
+  thing this ruling carves out — nothing on this side of the reply knows a peer
+  is owed one, so `Manual` cannot leave it stalled indefinitely the way it
+  leaves the application's own records. `MuxConfig::reply_linger` carries a
+  pending reply, and whatever else is staged alongside it, out after a bounded
+  wait regardless of policy. That is a narrower failure than the one this
+  ruling forecloses: only the reply is ever moved on a clock the application
+  did not ask for, not the batch policy itself.
 
 ### Why the mux surface is not in `velo-ext` yet
 
@@ -1142,10 +1162,13 @@ spread across ~3 s.
 
 The floor's own cost is credit latency, and only for a producer already parked
 with nothing arriving to reconcile it on the arrival path: it waits up to one
-floor per window, so `floor / initial_credit` per record. At the default
-256-record window that is under 8 µs a record; the ~3 s above is what the same
-floor costs at a window of 8, which is why the credit tests configure small
-windows on purpose.
+floor per window, so `floor / initial_credit` per record — and on the
+drain-driven return path this stacks with `MuxConfig::reply_linger` rather than
+replacing it, since the reply still has to cross the receiver's egress batcher
+once the floor has let the walk run, giving `(floor + reply_linger) /
+initial_credit` per record. At the default 256-record window that is under
+12 µs a record; the ~3 s above is what the same floor costs at a window of 8,
+which is why the credit tests configure small windows on purpose.
 
 Consequently `credit_sweep_interval` now defaults to **200 ms**. `idle_ticks()`
 derives from it, so batcher eviction is unaffected in wall-clock terms: the TTL is
