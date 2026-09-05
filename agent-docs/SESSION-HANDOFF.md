@@ -527,3 +527,7 @@ See the evening addenda in `ttft-gap-diagnosis.md` and `velo-response-plane-win-
 ### Update 2026-09-04 (late night): pinning experiment
 
 The first-token second was load-generator interference; see the late-night addenda in `ttft-gap-diagnosis.md` and the plan. `RIG_PIN_CORES` now defaults to 1 in `t3-frontend.sh` (frontend cpus 0-71, aiperf 72-143; `pin_cores` is written into `rig_run_meta.json`). `t3-base-pin` (tcp, velo0, mux18p, 3 reps) is running as the new scoreboard; `t3-pin2` checks a 48/96 split. Every number in `response-plane-benchmark-results.md`, the results page, and the plan scoreboard predates pinning and is superseded.
+
+### Update 2026-09-05: pinned baseline is the scoreboard; W3 is PR #78
+
+`t3-base-pin` (3 reps, pinned 72/72) is recorded in `response-plane-benchmark-results.md`; the plan carries the reset success bar. W3 velo side is committed as a2e7365 on `w3-zero-rtt-attach`, draft PR #78 against `drain-credit-return`. W4a is implemented on `w4-async-open-ack` (worktree `velo-w4a`) with a follow-up in flight (fence-aware close lane, velo 0.12.0 bump for the new public `MuxConfig` field, semver run). Next: commit W4a and open its PR; the adapter and rig-arm stage for both against an integration branch; `t3-rt32` tests a 32-worker frontend runtime as the precursor to any loom-rs (per-thread pinning) integration.

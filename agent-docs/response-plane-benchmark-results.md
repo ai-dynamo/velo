@@ -93,3 +93,27 @@ Readings:
 - **mux18p wins first-token latency and frontend CPU decisively at this shape.** TTFT p50 86–168 ms vs velo0's ~1,100 ms, p95 548 vs 2,050 ms, p99 1,746 vs 2,742 ms, and 6.51 vs 9.19 CPU ms/req. Its ITL p99 is wider (26–99 vs velo0's 18–28), so the trade is first-token latency against stream smoothness and throughput. *(Diagnosed 2026-09-04: the TTFT gap is a standing backlog in velo's fixed-parallelism frontend ingest plus a per-request attach round trip — not flush policy. See `ttft-gap-diagnosis.md`; the fix plan is `velo-response-plane-win-plan.md`.)*
 - **Both planes are clean.** Zero errors, all reps, both mux planes. The competitive picture is now two viable mux designs with different trade-offs, not one winner on every axis: velo0 for throughput, throughput stability, ITL tails, and the qualitative surface (negotiated fallback, drain, credit flow control, observability); mux18p's numbers say the first-token path and per-request frontend cost deserve a targeted look in the velo adapter (`tier2-adapter-brief.md` already enumerates the known deltas).
 - The tcp arm reproduced its structural 3.4–3.5 s p99 tail in every rep, at every throughput draw.
+
+## Addendum 2026-09-05: the pinned baseline replaces every table above
+
+Every number above was measured with aiperf sharing the frontend node and starving it (`ttft-gap-diagnosis.md`, late-night addendum of 2026-09-04). The rig now pins the frontend to cpus 0-71 and aiperf to 72-143 by default (`RIG_PIN_CORES`, recorded as `pin_cores` in `rig_run_meta.json`). Matrix `t3-base-pin` (job 2725241, three reps per arm, 512 workers, concurrency 8192, 250,000 requests per rep, velo `0160fa1`, dyn-pin `3a67ae2e6e` with rig-local mods) is the scoreboard from here on.
+
+| arm | rep | req/s | TTFT p50 ms | TTFT p95 ms | TTFT p99 ms | ITL p50 ms | ITL p99 ms | frontend CPU ms/req | E2E p50 s | E2E p90 s | E2E p99 s | errors |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| tcp | 1 | 3,339 | 65 | 183 | 1,664 | 6.8 | 38.8 | 4.92 | 1.86 | 4.42 | 10.26 | 0 |
+| tcp | 2 | 3,296 | 54 | 139 | 1,706 | 1.7 | 51.4 | 3.83 | 0.47 | 8.87 | 13.54 | 0 |
+| tcp | 3 | 3,282 | 54 | 123 | 1,758 | 1.6 | 47.6 | 3.79 | 0.47 | 9.26 | 12.53 | 0 |
+| velo0 | 1 | 3,060 | 57 | 192 | 850 | 1.7 | 71.5 | 4.04 | 0.49 | 13.71 | 18.78 | 0 |
+| velo0 | 2 | 3,244 | 71 | 179 | 814 | 1.6 | 56.3 | 3.43 | 0.48 | 10.02 | 14.84 | 0 |
+| velo0 | 3 | 3,327 | 85 | 180 | 834 | 1.6 | 36.0 | 3.78 | 0.48 | 8.44 | 9.51 | 0 |
+| mux18p | 1 | 3,260 | 47 | 143 | 743 | 1.7 | 64.3 | 3.05 | 0.48 | 12.94 | 16.89 | 0 |
+| mux18p | 2 | 3,318 | 47 | 109 | 765 | 1.5 | 43.6 | 3.00 | 0.42 | 8.98 | 11.47 | 0 |
+| mux18p | 3 | 3,538 | 47 | 155 | 751 | 1.8 | 35.9 | 2.23 | 0.50 | 7.61 | 9.46 | 0 |
+
+Three-rep means: tcp 3,306 req/s (spread 57), TTFT p50 58, p99 1,709, CPU 4.18; velo0 3,210 (266), 71, 833, 3.75; mux18p 3,372 (278), 47, 753, 2.76.
+
+What this changes. The shipping tcp plane is not broken at p50 once the frontend is fed; its accept loop still costs a 1.7 s p99. velo0 and mux18p are within rep spread on throughput; mux18p leads first token by 24 ms at p50 and 80 ms at p99 and uses 26 percent less frontend CPU per request. The end-to-end tail is noisy and a tie at this split (both planes 9.5 to 18.8 s p99 across reps); at a 48/96 split velo0 holds 8.1 s while mux18p returns to 25 s (`t3-pin2`), so velo's tail discipline shows only when the frontend is CPU-constrained.
+
+Where velo0's remaining first-token time is, from the W0 and W0b instruments on `t3-base-pin` rep 2 (means over the steady window): C 74 ms, worker handler start to first response 20 ms of which the attach round trip is 13 ms, ordered lanes 6 ms, inbound queue and egress queues under 2 ms each; the remainder is the delivery path from the anchor to the SSE writer and the client. W3 (PR #78, zero-RTT setup) and W4a (detached OpenSlot ack) remove the pre-generation waits; W2 targets the CPU gap.
+
+The results page and the plan's scoreboard are updated to this table. `t3-m18p1`, `t3-ucx1`, and every earlier matrix remain on disk as pre-pinning history.
