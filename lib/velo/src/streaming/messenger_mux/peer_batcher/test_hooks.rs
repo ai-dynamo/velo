@@ -15,7 +15,7 @@
 //! this is: a barrier the loop offers only when a test installed one, and a
 //! no-op — one `Option` check per wake, in `cfg(test)` builds only — otherwise.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::sync::Notify;
@@ -31,6 +31,16 @@ pub(crate) struct TestHooks {
     /// The loop is sitting at the barrier right now.
     parked: AtomicBool,
     resume: Notify,
+    /// Times `fire_singleton` has raised the fence.
+    ///
+    /// Whether a singleton's admission resolves before a test can observe the
+    /// slot's withheld queue is a genuine race against the watcher task
+    /// `fire_singleton` spawns — on an uncongested peer that race can go
+    /// either way, which makes the withheld gauge alone unfit for pinning "no
+    /// fence was raised at all". The fence itself, in contrast, is decided
+    /// synchronously on the batcher's own task before that task ever yields,
+    /// so counting it is race-free.
+    fenced: AtomicU64,
 }
 
 impl TestHooks {
@@ -59,6 +69,16 @@ impl TestHooks {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         panic!("the batcher never reached the barrier within {PATIENCE:?}");
+    }
+
+    /// Record that `fire_singleton` raised the fence.
+    pub(super) fn note_fenced(&self) {
+        self.fenced.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Times the fence has been raised so far.
+    pub(super) fn fenced_count(&self) -> u64 {
+        self.fenced.load(Ordering::Relaxed)
     }
 
     /// Called by the run loop on each wake, before its drain loop runs.

@@ -27,8 +27,6 @@
 //! clamps — stays in [`super`], because those are decisions about the peer
 //! rather than about a record.
 
-use std::sync::Arc;
-
 use super::*;
 
 impl Batcher {
@@ -83,8 +81,9 @@ impl Batcher {
     /// The producer ran past the byte cap on a slot that cannot send.
     ///
     /// This is the per-slot slow-consumer kill, and it is deliberately *not* the
-    /// heartbeat watchdog: the slot dies, its consumer sees `Dropped` through the
-    /// `CloseSlot{PeerGone}` sent here, and the peer's other slots never notice.
+    /// heartbeat watchdog: the slot dies and its consumer sees `Dropped` through
+    /// a `CloseSlot{PeerGone}` — written here, or by `release_withheld` if the
+    /// slot is fenced (see below) — and the peer's other slots never notice.
     /// Anything withheld goes with it — including a queued terminal, so a
     /// consumer that would have seen `Finalized` sees `Dropped` instead. That is
     /// the cost of not blocking the producer's synchronous terminal send, and it
@@ -93,7 +92,9 @@ impl Batcher {
     /// The kill runs here; the record it owes may go later. Cutting the producer
     /// off is what the kill *is*, so it happens on the spot whatever the slot is
     /// waiting for; only the `CloseSlot` can wait, because a fenced slot has a
-    /// record of its own outstanding and the close is the record after it.
+    /// record of its own outstanding and the close is the record after it. The
+    /// slot itself outlives the kill in that case — its entry stays in the
+    /// table, disconnected but not retired, until the fence lifts.
     async fn overflow_kill(&mut self, index: u32, error: slot_stream::WithheldOverflow) {
         let Some(slot) = self.slots.get_mut(index) else {
             return;
@@ -168,7 +169,7 @@ impl Batcher {
             // [`MuxConfig::async_open_ack`], or the over-budget record that
             // fenced it. Either way the close is the slot's *next* record and
             // may not overtake them: a `CloseSlot` the receiver meets before the
-            // `OpenSlot` that binds the slot is dropped as `unknown_slot`, and
+            // `OpenSlot` that binds the slot is dropped as `closed_slot`, and
             // the stream it should have ended is left for the consumer's
             // heartbeat watchdog to find. `release_withheld` writes it once the
             // queue empties and the fence lifts.
@@ -264,7 +265,8 @@ impl Batcher {
     }
 
     /// Send one record alone, over the eager budget and therefore through
-    /// rendezvous, and fence its slot until the admission resolves.
+    /// rendezvous, fencing its slot until the admission resolves unless the
+    /// admission is already behind it (see `fire_singleton`'s doc).
     async fn send_singleton(&mut self, index: u32, bytes: Vec<u8>, terminal: bool) {
         let class = if terminal {
             CreditClass::Terminal
@@ -281,7 +283,7 @@ impl Batcher {
         let seq = slot.take_seq();
         let close_seq = terminal.then(|| slot.take_seq());
 
-        let fire = self.writer.dispatch_singleton(|encoder| {
+        if !self.fire_singleton(id, |encoder| {
             encoder.push_data(id, seq, &bytes)?;
             match close_seq {
                 Some(close_seq) => {
@@ -289,30 +291,23 @@ impl Batcher {
                 }
                 None => Ok(()),
             }
-        });
-        let Some(fire) = fire else {
-            self.epoch_death();
+        }) {
             return;
-        };
-        // Metered here rather than in the writer: the writer dispatches an
-        // `OpenSlot` the same way, and that one is not a rendezvous transfer.
+        }
+        // Metered here rather than in `fire_singleton`: that seam also serves
+        // `open_detached`, and an `OpenSlot` is not a rendezvous transfer.
         if let Some(metrics) = &self.metrics {
             metrics.rendezvous_singleton();
         }
 
+        // A terminal closes the slot outright rather than leaving it fenced —
+        // there is no next record to hold behind the admission — which is why
+        // this, unlike the fence `open_detached` raises through
+        // `fire_singleton`, has to stay a choice made here rather than inside
+        // `fire_singleton` itself.
         if terminal {
             self.close_local(index);
-        } else if let Some(slot) = self.slots.get_mut(index) {
-            slot.fence();
         }
-
-        // Deliberately not awaited here: fencing is per slot, so every other
-        // slot on this peer keeps flowing while the staged transfer is in
-        // flight. The resolution comes back as coalesced control.
-        let control = Arc::clone(&self.control);
-        tokio::spawn(async move {
-            control.singleton_resolved(id, fire.await.is_ok());
-        });
     }
 
     /// Drain a slot's withheld queue as far as credit and the fence allow.

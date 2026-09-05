@@ -319,10 +319,12 @@ One narrow exception survives, and it is self-inflicted. Rendezvous payloads
 resolve in a detached task *before* dispatch, so an oversized record routed that
 way is not ordered against the eager batches around it — the ordered dispatcher
 says so itself, and warns once per handler. Two mechanisms bound it. Egress
-fences the slot: at most one rendezvous record per slot is outstanding, and the
-batcher withholds that slot's later records until the staged send is admitted —
-its `CloseSlot` included, since a close the receiver meets before the record it
-is ordered behind is a close for a slot it cannot name. Only the record waits.
+fences the slot: at most one such singleton per slot is outstanding — a
+rendezvous record, or (`MuxConfig::async_open_ack`) the slot's own `OpenSlot`
+— and the batcher withholds that slot's later records until the staged send is
+admitted — its `CloseSlot` included, since a close the receiver meets before
+the record it is ordered behind is a close for a slot it cannot name. Only the
+record waits.
 The kill's other half, ending the producer's inlet, happens the moment the cap
 is exceeded: it is the near side of the same event, and a producer left running
 ahead into a slot whose records are already being discarded is the thing the
@@ -349,10 +351,12 @@ handed to the transport before `connect` returns, so the accept window keeps
 measuring the same thing, but the ack no longer waits for the transport to admit
 it. On a congested peer that wait is a place in a send queue that is already
 full, and a worker cannot start producing until it comes free. The open then
-behaves exactly like an over-budget singleton: the slot is fenced until the
-admission resolves, so its first record cannot overtake the `OpenSlot` that
-claims it, and a failed admission is epoch death. The default is off — the
-awaited ack is what shipped.
+behaves exactly like an over-budget singleton: unless the admission is already
+behind it — synchronously `Admitted`, as it is on an uncongested peer, where
+per-target FIFO already orders it ahead of anything sent after it — the slot
+is fenced until the admission resolves, so its first record cannot overtake
+the `OpenSlot` that claims it, and a failed admission is epoch death either
+way. The default is off — the awaited ack is what shipped.
 
 The ack it skips is the open's own. The `OpenSlot` still goes in a batch of its
 own, so whatever was already staged for the peer is written first and *that*
@@ -491,7 +495,7 @@ per-target admission gate as `SendOutcome::{Admitted, Pending(SendAdmission)}`,
 reserving the ticket synchronously so an unpolled slow-path send cannot be
 overtaken. A batcher therefore learns at the send site, in order, that its peer is
 congested, and parks itself rather than a runtime worker. It is also what the
-rendezvous fence in [Slots](#slots) is made of.
+singleton fence in [Slots](#slots) is made of.
 
 > **Invariant.** A slot never has more than `C` frames outstanding against a
 > `C + 1`-deep buffer, so the applier only `try_send`s into space credit already
@@ -590,10 +594,13 @@ hint rather than a frame boundary:
 - **A batch at a clamp goes.** The byte cap, the record cap and the eager budget
   each cut a batch where they bind, because holding a full batch buys nothing —
   there is no room left to batch into.
-- **Records that carry liveness go.** `OpenSlot` keeps its own eager flush, and
-  a `CloseSlot`, a `CreditUpdate` or a terminal moves the batch it was staged
-  into. A `CreditUpdate` held back is a peer's sender starved with nothing left
-  to rescue it, and no application on this side knows it owes that peer
+- **Records that carry liveness go.** The awaited open path's `OpenSlot` keeps
+  its own eager flush, and a `CloseSlot`, a `CreditUpdate` or a terminal moves
+  the batch it was staged into. (`MuxConfig::async_open_ack`'s detached open
+  bypasses this policy entirely, dispatching straight to the transport — see
+  § "Configuration".) A `CreditUpdate` held back is a peer's sender starved
+  with nothing left to rescue it, and no application on this side knows it
+  owes that peer
   anything — so this is correctness, not courtesy.
 
 Credit starvation also cuts a batch, from the other direction: a slot with no
@@ -765,6 +772,7 @@ let node = Velo::builder()
         max_batch_bytes: 60 * 1024,   // further clamped by the eager budget
         initial_credit: 256,          // advertised verbatim; zero is refused
         flush_policy: FlushPolicy::Manual,   // default: Auto, opportunistic
+        async_open_ack: true,         // default: false; see the warning below
         ..Default::default()
     })?
     .build()
@@ -779,6 +787,25 @@ let node = Velo::builder()
 > half a configuration: the other half is the producer calling `flush_batch()`,
 > and a node configured this way whose producer does not is a node whose streams
 > stop. Set it where you own the send loop.
+>
+> **`async_open_ack` trades the awaited `OpenSlot` for a second way to lose a
+> stream, and the only measurement of it so far did not show the open it is
+> meant to speed up.** It removes the wait a congested peer's send queue puts
+> on opening one, but it is not free either: one `tokio::spawn`, a
+> control-inbox map insert and, once the fence lifts, a `release_withheld`
+> pass, per open — real costs paid whether or not that wait was on the
+> critical path. The fence it installs instead withholds from the slot's first
+> record regardless of credit — so a producer that starts generating into
+> that same congestion can overrun the per-slot byte cap and be killed before its `OpenSlot` ever
+> reaches the wire, unbounded across however many slots are opened this way
+> at once (`SATURATION.md` § "Under the messenger mux"). Measured on
+> `t3-iso1` (`agent-docs/w4a-async-open-ack-status.md`), the flag alone did
+> not move TTFT p50 and made p95 worse in every rep; a control-inbox defect
+> and an unconditional fence that withheld an uncongested peer's first record
+> for no ordering reason, both from that same run, are fixed on this branch
+> but not yet rerun. Set it where a stalled peer's queue depth is bounded and
+> you have measured the open it is meant to speed up at your own concurrency
+> — not on the expectation that it will.
 
 Activation is opt-in and stays that way for this work; the mux is not the default
 transport. Defaults are otherwise chosen so `enabled` is the only decision an

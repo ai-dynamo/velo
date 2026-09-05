@@ -84,6 +84,7 @@ use crate::messenger::Messenger;
 use crate::observability::{MuxDropReason, MuxMetricsHandle};
 use crate::streaming::messenger_mux::flow_control::{CreditClass, SlotCredit};
 use crate::streaming::sender::is_terminal_sentinel;
+use crate::transports::AdmissionState;
 
 /// The per-peer batcher registry, keyed by the batching key from `BATCHING.md`
 /// § "Why bucketing by destination is free".
@@ -596,35 +597,105 @@ impl Batcher {
             let _ = ack.send(Ok(()));
             return;
         }
-        let seq = self.open_seq(id);
-        let fire = self
-            .writer
-            .dispatch_singleton(|encoder| encoder.push_open_slot(id, seq, anchor_id, session_id));
-        let Some(fire) = fire else {
-            // Nothing reached the transport, so the slot has a `frame_seq` gap
-            // that will never close. The awaited path reaches the same place
-            // through a failed flush, and answers the caller the same way: the
-            // ack is `Ok`, and the producer learns from the inlet the epoch
-            // death just closed under it.
-            self.epoch_death();
-            let _ = ack.send(Ok(()));
-            return;
-        };
         // Fenced before the ack, because the ack is what hands the producer its
         // inlet: the slot's first record must wait for the `OpenSlot` that
-        // claims its buffer at the receiver, and per-target FIFO alone does not
-        // hold it there. A send to a peer the messenger has not resolved yet is
-        // issued from a detached task (`spawn_slow_path`), which keeps no order
-        // against the send that follows it — and an unresolved peer is exactly
-        // where a first `OpenSlot` lands.
-        if let Some(slot) = self.slots.get_mut(id.index()) {
+        // claims its buffer at the receiver. The receiver binds a slot from its
+        // own `OpenSlot`'s frame_seq, so a data record that arrives first names
+        // a slot it has never bound and is dropped outright — there is no
+        // reordering buffer on the other side that would let it wait, the way
+        // `apply_data`'s own does for records that merely arrive out of order
+        // once the slot exists. Per-target FIFO cannot substitute for the fence
+        // on its own: nothing about this send path guarantees the `OpenSlot`
+        // itself is what the peer's transport admits first — its fire can take
+        // the direct send while a later data batch for the same slot takes
+        // `spawn_slow_path`, or the reverse, and only the fence orders the two
+        // regardless of which one the transport admits first.
+        //
+        // `fire_singleton` (below) fails the epoch on a dispatch that never
+        // reached the transport and acks `Ok` either way: the awaited path
+        // reaches the same place through a failed flush and answers the caller
+        // the same way, and the producer learns from the inlet that the epoch
+        // death just closed under it.
+        //
+        // The fence above does not extend to *two* opens issued on one wake:
+        // it orders a slot against its own later records, not one detached
+        // open against another. Two back-to-back opens through a peer whose
+        // sends are still taking `spawn_slow_path` (not yet registered) are
+        // each an independently scheduled detached task, so they are not
+        // guaranteed to admit in the order they were issued in and their
+        // `batch_seq` can invert on the wire. Nothing reads that as data loss
+        // — per-slot order is the fence's job, and `note_batch_seq` only
+        // meters — but the receiver's gap counter reads an inverted pair as
+        // one batch that went missing: `velo_streaming_mux_batch_seq_gaps_total`
+        // jumps by `u32::MAX` from the wraparound. Latent, not observed —
+        // every peer in the rig is registered long before its first stream
+        // opens — and belongs to a per-class `batch_seq`, a W4b-scoped follow-up
+        // rather than a fix owed here.
+        let seq = self.open_seq(id);
+        self.fire_singleton(id, |encoder| {
+            encoder.push_open_slot(id, seq, anchor_id, session_id)
+        });
+        let _ = ack.send(Ok(()));
+    }
+
+    /// Dispatch one record outside the packed batch, fence its slot behind the
+    /// admission unless the admission is already behind it, and watch the
+    /// result from a detached task.
+    ///
+    /// The shared tail of `send_singleton` and `open_detached` — extracted
+    /// because it used to be copied between them, which is how
+    /// `metrics.rendezvous_singleton()` ended up needing to move to the caller
+    /// (it counts a rendezvous transfer, not an open, and this seam is the one
+    /// place both call from). Returns `false` after failing the epoch when
+    /// nothing reached the transport; the caller still owes its own record
+    /// whatever answer it owes on that arm (an ack, a close), which is why this
+    /// does not do it itself.
+    ///
+    /// The fence is conditional on [`FireResult::admission_state`] — cheap,
+    /// synchronous, and already resolved by the time it is read here, since
+    /// `dispatch_singleton` builds `fire` on this same call stack. On the fast
+    /// path `_stream_batch` always takes for a registered peer,
+    /// [`AdmissionState::Admitted`] means the frame is already on the
+    /// transport's send channel: every record this batcher dispatches after
+    /// this call enters that same FIFO channel behind it, because the batcher
+    /// dispatches one record at a time on its own task. There is nothing left
+    /// for a fence to order in that case.
+    ///
+    /// The `tokio::spawn` below, the control-inbox insert
+    /// `singleton_resolved` makes, its `Notify` wake, and the `unfence` plus
+    /// `release_withheld` pass that answers it are unconditional either way —
+    /// this only decides whether the slot's own records have to *wait* for
+    /// that round trip before `on_frame` will stage them. Raising the fence
+    /// when nothing needs ordering buys no order and only makes the first
+    /// record of every stream wait out hops that were never on the critical
+    /// path — on an uncongested peer, exactly the wait
+    /// `MuxConfig::async_open_ack` exists to remove. Everywhere admission is
+    /// *not* already `Admitted` — a congested peer's gate, or a peer not yet
+    /// registered taking `spawn_slow_path` — dispatch order no longer
+    /// guarantees entry order (`open_detached`'s doc above spells out why),
+    /// and the fence still applies.
+    fn fire_singleton(
+        &mut self,
+        id: SlotId,
+        write: impl FnOnce(&mut BatchEncoder) -> Result<(), EncodeError>,
+    ) -> bool {
+        let Some(fire) = self.writer.dispatch_singleton(write) else {
+            self.epoch_death();
+            return false;
+        };
+        let needs_fence = fire.admission_state() != AdmissionState::Admitted;
+        if needs_fence && let Some(slot) = self.slots.get_mut(id.index()) {
             slot.fence();
+        }
+        #[cfg(test)]
+        if needs_fence && let Some(hooks) = &self.hooks {
+            hooks.note_fenced();
         }
         let control = Arc::clone(&self.control);
         tokio::spawn(async move {
             control.singleton_resolved(id, fire.await.is_ok());
         });
-        let _ = ack.send(Ok(()));
+        true
     }
 
     fn on_peer_closed(&mut self, slot: SlotId, reason: CloseReason) {

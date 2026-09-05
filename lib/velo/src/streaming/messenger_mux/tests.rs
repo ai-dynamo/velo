@@ -16,7 +16,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use velo_ext::WorkerId;
 
-use super::test_support::{StallingTransport, stalling_address};
+use super::test_support::stalled_producer;
 use super::*;
 use crate::observability::test_helpers::MetricSnapshot;
 use crate::streaming::sender::{cached_dropped, cached_finalized};
@@ -631,57 +631,6 @@ async fn one_flush_reaches_every_peer_batcher() {
 /// the peer here ever un-parks — which is never. Nothing in between is a
 /// judgement call this test has to make.
 const ACK_PATIENCE: Duration = Duration::from_secs(2);
-
-/// A producer mux whose peer takes one frame and never another.
-///
-/// [`StallingTransport`]'s admission gate holds exactly one frame, so the first
-/// write lands and every write after it parks. That is the congested peer the
-/// response-plane measurement found on every mocker process, made deterministic
-/// instead of waited for.
-struct Stalled {
-    producer: Arc<MessengerMuxTransport>,
-    peer: WorkerId,
-    wire: flume::Receiver<(bytes::Bytes, bytes::Bytes)>,
-    // Held so the messenger outlives the batchers it spawned.
-    _messenger: Arc<Messenger>,
-}
-
-async fn stalled_producer(config: MuxConfig) -> Stalled {
-    let (transport, wire) = StallingTransport::new(tokio::runtime::Handle::current());
-    let messenger = Messenger::builder()
-        .add_transport(transport)
-        .build()
-        .await
-        .expect("producer messenger");
-    // A peer this transport accepts and nothing ever answers for: the gate is
-    // the whole of the far side.
-    let peer_instance = velo_ext::InstanceId::new_v4();
-    messenger
-        .register_peer(velo_ext::PeerInfo::new(peer_instance, stalling_address()))
-        .expect("register peer");
-    let producer =
-        MessengerMuxTransport::new(Arc::clone(&messenger), config, None).expect("producer mux");
-    Stalled {
-        producer,
-        peer: peer_instance.worker_id(),
-        wire,
-        _messenger: messenger,
-    }
-}
-
-impl Stalled {
-    /// Open a slot, bounded by `patience`. `None` means no ack arrived.
-    async fn connect(&self, id: u64, patience: Duration) -> Option<flume::Sender<Vec<u8>>> {
-        let limits = self.producer.advertised_limits();
-        tokio::time::timeout(
-            patience,
-            self.producer.connect_negotiated(self.peer, id, id, limits),
-        )
-        .await
-        .ok()
-        .map(|opened| opened.expect("slot allocated"))
-    }
-}
 
 /// A stream may open while the peer's send channel is full.
 ///

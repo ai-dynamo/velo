@@ -222,24 +222,55 @@ impl BatchWriter {
     /// detached task.
     ///
     /// Both ways out without a send give the reserved sequence back, so this
-    /// type's numbering stays contiguous whatever a caller does with the answer.
-    /// That is an invariant of the writer rather than a live defect: every
-    /// batcher path that meets a `None` here fails the peer epoch next, and
-    /// [`Self::reset_epoch`] restarts the numbering at zero, so no gap a
-    /// receiver could meter is reachable through the batcher today.
+    /// call's own reservation never leaks — whatever a caller does with the
+    /// `Option<FireResult>` it gets back. That does not, by itself, keep the
+    /// wire contiguous against a *separate* reservation a caller holds open
+    /// across this call: `emit_data`'s clamp-retry path calls `ensure_batch`
+    /// (reserving a sequence for a fresh, still-empty encoder) and can in
+    /// principle fall through to this method without flushing it first, which
+    /// would leave that encoder's sequence to be refunded later out of order
+    /// and read at the receiver as a hole followed by a duplicate. It cannot
+    /// today: that fallthrough needs [`Self::compute_cap`] to shrink between
+    /// the two `ensure_batch` calls in one `emit_data` invocation, and
+    /// [`batch_cap`]'s own doc records that the eager term never binds
+    /// end-to-end for any transport in this workspace. So this is a caller
+    /// discipline the writer cannot enforce by itself — held today by that
+    /// arithmetic fact about `emit_data`, not by construction here.
+    ///
+    /// Every caller flushes immediately before reaching here, so `self.buffer`
+    /// is free capacity the last flush handed back — take it the way
+    /// `ensure_batch` does, rather than allocating a fresh `BytesMut`, so the
+    /// path this flag adds costs no more per open than the awaited one did.
+    /// The one caller that does not arrive with `self.buffer` free is
+    /// `emit_data`'s clamp-retry arm, which re-opens an encoder (and so
+    /// re-takes the buffer into it) before learning the record still does not
+    /// fit; a staged `self.encoder` is how that case is told apart, and it
+    /// falls back to a fresh allocation because the buffer is already spoken
+    /// for.
     pub(super) fn dispatch_singleton(
         &mut self,
         write: impl FnOnce(&mut BatchEncoder) -> Result<(), EncodeError>,
     ) -> Option<FireResult> {
         let batch_seq = self.take_batch_seq();
-        let mut encoder = BatchEncoder::new(self.epoch, batch_seq);
+        let mut encoder = if self.encoder.is_none() {
+            BatchEncoder::with_buffer(std::mem::take(&mut self.buffer), self.epoch, batch_seq)
+        } else {
+            BatchEncoder::new(self.epoch, batch_seq)
+        };
         if let Err(error) = write(&mut encoder) {
             tracing::error!(%error, "messenger mux: dropping unencodable singleton");
             self.refund_batch_seq();
+            self.buffer = encoder.finish();
             return None;
         }
         let records = usize::from(encoder.record_count());
-        let payload = encoder.finish().freeze();
+        // Split rather than freeze whole, so the tail capacity comes back to
+        // `self.buffer` exactly as `flush` returns its own — the reuse this
+        // method exists to give the next call is worthless if this one never
+        // gives the buffer back.
+        let mut finished = encoder.finish();
+        let payload = finished.split().freeze();
+        self.buffer = finished;
 
         match self.messenger.am_send_streaming(STREAM_BATCH_HANDLER) {
             Ok(builder) => {

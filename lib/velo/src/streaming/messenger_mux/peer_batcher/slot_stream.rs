@@ -18,8 +18,9 @@
 //! contract, reached by dropping a receiver exactly as the TCP egress pump does.
 //!
 //! > **The inlet is drained unconditionally.** A slot that cannot *send* — out
-//! > of credit, or fencing a rendezvous singleton — still has its records
-//! > pulled, into [`EgressSlot`]'s withheld queue.
+//! > of credit, or fenced behind a singleton whose admission has not answered
+//! > (a rendezvous transfer, or an `OpenSlot` under `MuxConfig::async_open_ack`)
+//! > — still has its records pulled, into [`EgressSlot`]'s withheld queue.
 //!
 //! That is not an optimisation. A slot parked on credit whose inlet nobody
 //! pulled would leave every terminal sent through it — `finalize`, `detach`,
@@ -49,8 +50,10 @@ use crate::streaming::messenger_mux::flow_control::{CreditClass, SlotCredit};
 /// Close signalling for one slot's inlet, shared between the batcher task and
 /// the stream it polls.
 ///
-/// One flag, because there is only one thing to say: draining never stops for
-/// any reason short of the slot ending.
+/// One flag, because there is only one thing to say: draining stops when the
+/// gate closes, whether that is the slot ending or `EgressSlot::disconnect`
+/// cutting the producer off ahead of a deferred close — the two are the same
+/// signal to a stream that only ever sees its gate close once.
 pub(super) struct SlotGate {
     closed: AtomicBool,
     waker: AtomicWaker,
@@ -250,8 +253,10 @@ pub(super) struct EgressSlot {
     /// the deferred close is always the slot's last record.
     pub(super) close_owed: bool,
     gate: Arc<SlotGate>,
-    /// A rendezvous singleton is outstanding. `BATCHING.md` § "Slots": at most
-    /// one per slot, and the slot's later records wait for its admission so
+    /// A singleton sent outside the batch is outstanding for this slot — a
+    /// rendezvous transfer, or the `OpenSlot` under
+    /// `MuxConfig::async_open_ack`. `BATCHING.md` § "Slots": at most one per
+    /// slot, and the slot's later records wait for its admission so
     /// `frame_seq` order survives the unordered resolve.
     fenced: bool,
     /// Whether the slot is currently withholding for want of credit, so the
@@ -260,7 +265,8 @@ pub(super) struct EgressSlot {
 }
 
 impl EgressSlot {
-    /// Whether a rendezvous singleton is outstanding for this slot.
+    /// Whether an outstanding singleton (rendezvous, or an `OpenSlot` under
+    /// `MuxConfig::async_open_ack`) fences this slot.
     pub(super) const fn is_fenced(&self) -> bool {
         self.fenced
     }
@@ -284,12 +290,13 @@ impl EgressSlot {
         self.starved = false;
     }
 
-    /// Fence the slot behind an outstanding rendezvous singleton.
+    /// Fence the slot behind an outstanding singleton (rendezvous, or an
+    /// `OpenSlot` under `MuxConfig::async_open_ack`).
     pub(super) fn fence(&mut self) {
         self.fenced = true;
     }
 
-    /// Release the rendezvous fence.
+    /// Release the fence once the singleton's admission has resolved.
     pub(super) fn unfence(&mut self) {
         self.fenced = false;
     }

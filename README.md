@@ -503,7 +503,7 @@ Metric families covered:
 
 ```toml
 [dependencies]
-velo = { version = "0.10", features = ["distributed-tracing"] }
+velo = { version = "0.12", features = ["distributed-tracing"] }
 ```
 
 ---
