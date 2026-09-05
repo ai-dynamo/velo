@@ -163,7 +163,11 @@ receives `Dropped`, `velo_streaming_mux_records_dropped_total{reason="withheld_o
 ticks, and the peer's other slots carry on. One ordering caveat: if the slot is
 still fenced behind an unresolved `OpenSlot` or rendezvous admission, the
 consumer's `Dropped` waits for that admission to resolve while the producer is
-already disconnected (see the fence paragraph in `BATCHING.md`). Two
+already disconnected (see the fence paragraph in `BATCHING.md`) — and if that
+admission instead resolves *failed*, the wait never ends: a failed admission
+is epoch death for the whole peer, which retires the slot without ever
+writing the deferred `Dropped`, and that consumer instead falls back on the
+heartbeat watchdog like every other epoch-death casualty. Two
 consequences worth knowing before you meet them:
 
 - **A queued terminal goes with it.** A consumer that would have seen
@@ -207,10 +211,15 @@ takes knowing from the deployment which arm is in play, chiefly whether
 `async_open_ack` is enabled. A related trap in `velo_streaming_mux_live_slots`:
 a slot killed while fenced stays counted there — the deferred `CloseSlot` it
 still owes its consumer must not overtake the `OpenSlot` its fence is waiting
-on, so the
-registry entry survives the kill — and it holds its batcher past
-`batcher_idle_ttl` until the admission resolves. `live_slots` is therefore not
-a count of slots a producer can still write to while any are fenced.
+on, so the registry entry survives the kill, holding its batcher past
+`batcher_idle_ttl`
+(which only evicts a batcher with zero live slots) until the admission
+resolves. If it never does — the congested peer this kill exists for is
+exactly the peer whose admission may never answer — the registry entry, the
+dense index, the withheld bytes and the `live_slots` count are held for the
+rest of the peer's epoch, not for a bounded extra wait. `live_slots` is
+therefore not a count of slots a producer can still write to while any are
+fenced, and is not bounded in time by `batcher_idle_ttl` either.
 
 ## What this is NOT
 

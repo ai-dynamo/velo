@@ -3,7 +3,7 @@ SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All 
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# `MuxConfig::async_open_ack` (PR #79) — measured, not yet a win
+# `MuxConfig::async_open_ack` (PR #79) — measured, still not a win
 
 This branch (`w4-async-open-ack`) ships the flag; the only A/B measurement of it
 was taken on the `integration/response-plane-wheel` branch, after this PR's
@@ -47,7 +47,7 @@ answer coming, so every record it ever queues sits withheld until the
 consumer's heartbeat watchdog gives up 15 s later — the "500 Failed to
 generate completions" the frontend logged.
 
-This worktree carries the fix, uncommitted: `entry_mine_owed`
+This branch carries the fix as `8a8b001`: `entry_mine_owed`
 (`peer_batcher/control.rs`) exempts a singleton resolution from the cap by
 keeping it in its own map (`ControlState::resolutions`), merged into `mine`
 only at drain time. A first pass exempted it by inserting straight into `mine`
@@ -85,17 +85,84 @@ batcher dispatches one record at a time so every later record for the same
 slot necessarily enters behind it. Test: `an_admitted_open_slot_is_never_fenced`
 (`peer_batcher/tests/open_ack.rs`).
 
+## The rerun: `t3-iso2`, three reps, velo3 vs velo4a vs velo34
+
+`t3-iso1`'s velo4a and velo34 reps predated both fixes above, and their tails,
+live-slot counts and CPU were not clean because of the control-cap leak — their
+TTFT numbers are reported above with that caveat. `t3-iso2` reran the same
+shape (three reps, 512 workers, 8,192-way concurrency) with both fixes applied,
+against `velo3` as the unflagged baseline (`velo0`'s peer from that matrix).
+Results: `.research/results/t3-iso2/summary.jsonl`.
+
+| | TTFT p50 (mean of 3 reps) | TTFT p95 (mean of 3 reps) | errors (per rep) |
+|---|---|---|---|
+| velo3 (baseline) | 69 ms | 132 ms | 0 / 0 / 0 |
+| velo4a (flag on) | 79 ms | 212 ms | 0 / 0 / 0 |
+| velo34 (flag on, stacked with W3) | 59 ms | 172 ms | 0 / 0 / 0 |
+
+**The control-cap defect is fixed: zero errors across every arm and every
+rep**, where `t3-iso1` had 16 on velo4a and errors on both velo34 reps.
+
+**The latency verdict is unchanged.** p95 is worse than baseline in every rep
+for both flagged arms — velo4a: 209/176/252 ms against velo3's 142/119/136 ms;
+velo34: 225/140/150 ms against the same baseline — the same shape `t3-iso1`
+measured, not narrowed by the unconditional-fence fix. p50 is mixed: velo34
+(which stacks W3) comes in under baseline, velo4a alone does not. `t3-iso1`'s
+own p50 delta (85→91 ms) does not repeat in the same direction here, which
+given the per-rep spread on both sides (e.g. velo3's own p50 ranges 60–87 ms
+across its three reps) reads as noise at this concurrency rather than a
+reversal.
+
 ## Merge precondition
 
-The exemption has not been re-measured. `t3-iso1`'s velo4a and velo34 reps
-predate it and their tails, live-slot counts and CPU are not clean because of
-the leak this fixes — their TTFT p50 is reported above with that caveat, but
-the error columns and everything downstream of them are not a clean read on
-the flag. **A `t3-iso2` rerun of velo4a and velo34 against the same velo0 and
-velo3 baseline is a precondition for calling this flag a win**, not merely
-correct. Until that rerun lands, `MuxConfig::async_open_ack`'s doc and
-`BATCHING.md` describe the mechanism and its known-negative p95 result rather
-than asserting a benefit.
+**Met.** The rerun landed and the fix is correct: it removes the error mode it
+targeted without changing the flag's latency shape. `MuxConfig::async_open_ack`'s
+doc and `BATCHING.md` describe that shape — a mechanism with a known-negative
+p95 result at this concurrency — rather than asserting a benefit.
+
+## Addendum, 2026-09-05 (pass-3 fixer)
+
+The "second defect" fix above was applied inside the caller-shared
+`fire_singleton` helper, so the `admission_state() != Admitted` skip covered
+both `open_detached`'s `OpenSlot` dispatch and `send_singleton`'s unrelated,
+always-on rendezvous-record path — silently changing the shipped default's
+existing rendezvous behavior (an over-budget record no longer fenced its slot
+when synchronously admitted), with no test on that arm and a rationale
+("per-target FIFO already orders anything dispatched after it") that does not
+hold for it: a rendezvous record's bytes are resolved by the receiver's
+ordered dispatcher in a detached task before dispatch, so the sender's
+admission order says nothing about the order the receiver applies it in.
+Narrowed to `open_detached` alone (`fire_singleton` now takes a `FenceSkip`
+argument); `send_singleton` is back to fencing unconditionally for its
+non-terminal case, matching pre-PR behavior there. On a terminal it now
+fences too, which the pre-PR code did not (base `send_singleton` fenced only
+in the non-terminal `else` arm); that is inert here because the immediately
+following `close_local` removes the slot's table entry before anything can
+observe the fence. Test:
+`a_synchronously_admitted_rendezvous_record_still_fences_its_slot`
+(`peer_batcher/tests/egress.rs`). This does not revise the numbers above:
+oversized records are rare in the measured workload and the `OpenSlot` fence
+is what they are attributed to.
+
+## Addendum, 2026-09-05 (pass-6 fixer): known-scoped follow-up, `batch_seq` inversion
+
+`open_detached` and any later flush to the same peer are independently
+scheduled tasks for as long as that peer's sends still take
+`spawn_slow_path` (i.e. before `can_send_directly` registers it), so their
+two `batch_seq` values can admit to the wire out of the order they were
+issued in. Nothing about per-slot delivery order depends on `batch_seq` — the
+fence is what orders a slot's own records — so this is not a correctness
+defect; it inverts a *counter*. The receiver's gap meter
+(`ingress/mod.rs`'s `note_batch_seq`, which only calls
+`metrics.batch_seq_gap(gap)` and updates `state.last_batch_seq`) reads an
+inverted pair as one batch that went missing and
+`velo_streaming_mux_batch_seq_gaps_total` jumps by `u32::MAX` on the
+wraparound. Latent, not observed: every peer in the response-plane rig is
+registered well before its first stream opens, so the two tasks never race in
+practice there. The fix is a per-class `batch_seq` — one counter per
+registration state rather than one per peer — which is out of scope for this
+PR and not yet filed as its own issue; this addendum is that follow-up's
+record until it is.
 
 ## Addendum 2026-09-05: the size cap is gone
 

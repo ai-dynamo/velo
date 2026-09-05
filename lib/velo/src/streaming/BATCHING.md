@@ -318,21 +318,30 @@ the consumer.
 One narrow exception survives, and it is self-inflicted. Rendezvous payloads
 resolve in a detached task *before* dispatch, so an oversized record routed that
 way is not ordered against the eager batches around it — the ordered dispatcher
-says so itself, and warns once per handler. Two mechanisms bound it. Egress
-fences the slot: at most one such singleton per slot is outstanding — a
-rendezvous record, or (`MuxConfig::async_open_ack`) the slot's own `OpenSlot`
-— and the batcher withholds that slot's later records until the staged send is
-admitted — its `CloseSlot` included, since a close the receiver meets before
-the record it is ordered behind is a close for a slot it cannot name. Only the
-record waits.
-The kill's other half, ending the producer's inlet, happens the moment the cap
-is exceeded: it is the near side of the same event, and a producer left running
-ahead into a slot whose records are already being discarded is the thing the
-byte cap exists to stop.
-Ingress holds records arriving ahead of `frame_seq` in that slot's own buffer,
-bounded by credit already granted, applying them when the gap closes. Overflow
-closes **that slot** with `Dropped` and meters it; other slots are untouched and
-the lane never blocks.
+says so itself, and warns once per handler. Two mechanisms bound it:
+
+1. Egress fences the slot: at most one *fenced* singleton per slot is
+   outstanding — a rendezvous record, which always fences, or
+   (`MuxConfig::async_open_ack`) the slot's own `OpenSlot`, which skips the
+   fence only when the transport already admitted it synchronously, since
+   per-target FIFO then already orders anything dispatched after it and there
+   is nothing left for a fence to buy — and only that singleton's own
+   resolution lifts a fence it did raise. While the fence is up, the batcher
+   withholds that slot's later records until the staged send is admitted —
+   its `CloseSlot` included, since a close is the slot's next record too and
+   may not overtake the one still awaiting admission. The `OpenSlot` case is
+   the sharper of the two: there the receiver has not bound the slot at all,
+   so a `CloseSlot` that arrived first would name a slot it cannot resolve
+   and is dropped as `closed_slot`, leaving the stream for the consumer's
+   heartbeat watchdog to find. Only the record waits; the slow-consumer
+   kill's other half, ending the producer's inlet, happens the moment the
+   byte cap is exceeded regardless of the fence (`SATURATION.md`) — a
+   producer left running ahead into a slot whose records are already being
+   discarded is the thing the byte cap exists to stop.
+2. Ingress holds records arriving ahead of `frame_seq` in that slot's own
+   buffer, bounded by credit already granted, applying them when the gap
+   closes. Overflow closes **that slot** with `Dropped` and meters it; other
+   slots are untouched and the lane never blocks.
 
 #### `OpenSlot` is eager
 
@@ -810,23 +819,13 @@ let node = Velo::builder()
 > stop. Set it where you own the send loop.
 >
 > **`async_open_ack` trades the awaited `OpenSlot` for a second way to lose a
-> stream, and the only measurement of it so far did not show the open it is
-> meant to speed up.** It removes the wait a congested peer's send queue puts
-> on opening one, but it is not free either: one `tokio::spawn`, a
-> control-inbox map insert and, once the fence lifts, a `release_withheld`
-> pass, per open — real costs paid whether or not that wait was on the
-> critical path. The fence it installs instead withholds from the slot's first
-> record regardless of credit — so a producer that starts generating into
-> that same congestion can overrun the per-slot byte cap and be killed before its `OpenSlot` ever
-> reaches the wire, unbounded across however many slots are opened this way
-> at once (`SATURATION.md` § "Under the messenger mux"). Measured on
-> `t3-iso1` (`agent-docs/w4a-async-open-ack-status.md`), the flag alone did
-> not move TTFT p50 and made p95 worse in every rep; a control-inbox defect
-> and an unconditional fence that withheld an uncongested peer's first record
-> for no ordering reason, both from that same run, are fixed on this branch
-> but not yet rerun. Set it where a stalled peer's queue depth is bounded and
-> you have measured the open it is meant to speed up at your own concurrency
-> — not on the expectation that it will.
+> stream, and measurement so far has not shown the open it is meant to speed
+> up.** The mechanism and its per-open cost are on the field's own rustdoc
+> (`MuxConfig::async_open_ack`); the kill it opens on a congested peer is in
+> `SATURATION.md` § "Under the messenger mux"; the numbers are in
+> `agent-docs/w4a-async-open-ack-status.md`. Set it where a stalled peer's
+> queue depth is bounded and you have measured the open it is meant to speed
+> up at your own concurrency — not on the expectation that it will.
 
 Activation is opt-in and stays that way for this work; the mux is not the default
 transport. Defaults are otherwise chosen so `enabled` is the only decision an

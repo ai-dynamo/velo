@@ -351,11 +351,13 @@ pub struct MuxConfig {
     /// Whether opening a slot acks before the peer has admitted its `OpenSlot`.
     ///
     /// **Defaults to `false`**, the awaited ack every mux shipped with: the
-    /// `OpenSlot` is written in its own batch and `connect` returns once the
-    /// transport has taken it. That couples opening a stream to the depth of
-    /// the per-connection send queue, and on a congested peer that queue is
-    /// full — so a worker cannot start producing until a place in it comes
-    /// free, behind every batch already there.
+    /// `OpenSlot` is written into this peer's batch — joining whatever is
+    /// already staged, or opening a fresh one if nothing is — and `connect`
+    /// returns once the transport has taken it. That couples opening a
+    /// stream to the depth of the per-connection send queue, and on a
+    /// congested peer that queue is full — so a worker cannot start
+    /// producing until a place in it comes free, behind every batch already
+    /// there.
     ///
     /// Set to `true` and the `OpenSlot` is still cut into a batch of its own
     /// and still handed to the transport before the ack, so `bind()`'s accept
@@ -375,29 +377,36 @@ pub struct MuxConfig {
     /// principle is the open of an idle peer, which is the open a queued
     /// request waits on.
     ///
-    /// **Measured, that benefit did not show at load.** `t3-iso1`
-    /// (`agent-docs/w4a-async-open-ack-status.md`), three reps at 512 workers
-    /// and 8,192-way concurrency: this flag alone moved TTFT p50 from 85 to
-    /// 91 ms — no improvement — and made p95 worse in every rep (188 → 227 ms
-    /// mean, against a same-arm p95 spread of about 20 ms). Whether the wait
-    /// this removes dominates first-token latency is a question of
-    /// concurrency and peer congestion, not something this flag answers by
-    /// existing; a rerun past the control-inbox fixes in
-    /// `peer_batcher::control` (the owed resolution's own lane, then the size
-    /// cap replaced by the batcher's allocation bound) is a precondition for
-    /// calling it a win at any shape.
+    /// **Measured, that benefit did not show at load.** Two reruns at 512
+    /// workers and 8,192-way concurrency, the second past a control-cap fix
+    /// this branch also carries: TTFT p95 is worse than baseline in every rep
+    /// for every flagged arm, both times; p50 does not improve. See
+    /// `agent-docs/w4a-async-open-ack-status.md` for the numbers.
     ///
     /// **The per-open cost is not amortized the way a packed flush is, and is
     /// paid whether or not the wait it removes was on the critical path.**
     /// Every call spends one `tokio::spawn` and an `Arc` clone to watch the
-    /// admission, one `ControlInbox` mutex-guarded map insert plus a `Notify`
-    /// wake to report it back, and — once the fence lifts — an unfence and a
-    /// full `release_withheld` pass. Every record queued during the fence
-    /// window pays a withheld-queue push and pop plus a second
-    /// `is_terminal_sentinel` decode that the unfenced fast path never runs.
+    /// admission. On a peer whose admission is not already behind it — the
+    /// congested case, where the fence below actually goes up — that watcher
+    /// also costs a `ControlInbox` mutex-guarded map insert plus a `Notify`
+    /// wake to report the answer back, and — once the fence lifts — an
+    /// unfence and a full `release_withheld` pass; a synchronously `Admitted`
+    /// admission reports nothing, since there is no fence for it to lift.
+    /// Every record queued during the fence window pays a withheld-queue push
+    /// and pop plus a second `is_terminal_sentinel` decode that the unfenced
+    /// fast path never runs.
     ///
-    /// **The fence this trades in is a second way to lose a stream.** It goes
-    /// up before the ack, unconditionally of credit, so the slot's first
+    /// **The lift itself can queue behind other opens to the same peer.** The
+    /// run loop's `select!` and its `drain_once` fast-forward both poll the
+    /// opens channel ahead of coalesced control, so while that channel has
+    /// anything queued for this peer, the resolution that lifts a fence —
+    /// carried on the control lane — does not get drained. Before this flag a
+    /// slot's first record never depended on the control lane at all; with it,
+    /// every congested-peer open now does.
+    ///
+    /// **The fence this trades in is a second way to lose a stream.** On a
+    /// peer whose admission is not already behind it, the fence goes up
+    /// before the ack, unconditionally of credit, so the slot's first
     /// record — and every one behind it — withholds from record #1 whether or
     /// not the slot has room to spend. On a peer whose send queue is the
     /// congested one this flag exists to route around, a producer that starts

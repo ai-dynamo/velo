@@ -526,7 +526,9 @@ pub(crate) enum MuxDropReason {
     /// A producer ran past the byte cap on a slot that could not send, and the
     /// slot was closed with everything it was holding.
     WithheldOverflow,
-    /// A rendezvous singleton resolved for a slot that had already closed.
+    /// A singleton — a rendezvous transfer, or an `OpenSlot` under
+    /// `MuxConfig::async_open_ack` — failed to resolve for a slot that had
+    /// already closed.
     StaleSingleton,
     /// The record's `frame_seq` was behind the slot's next expected sequence.
     Duplicate,
@@ -1153,9 +1155,9 @@ impl VeloMetrics {
                 "velo_streaming_mux_rendezvous_singletons_total",
                 "Records larger than the effective eager budget, sent alone in \
                  their batch so the messenger stages them through rendezvous. \
-                 Each one fences its own slot until admission resolves and pays \
-                 a round trip; a rising rate means frames are outgrowing the \
-                 target's eager budget.",
+                 Each one pays a round trip and fences its own slot until the \
+                 admission resolves; a rising rate means frames are outgrowing \
+                 the target's eager budget.",
             ))?,
         )?;
         let streaming_mux_held_records = register_collector(
@@ -1174,7 +1176,9 @@ impl VeloMetrics {
                 "velo_streaming_mux_withheld_records",
                 "Records the egress batcher has pulled from producer inlets but \
                  may not send yet — a slot out of credit, or fencing a \
-                 rendezvous singleton. The inlet is drained regardless of \
+                 singleton (a rendezvous transfer, or an OpenSlot under \
+                 MuxConfig::async_open_ack) whose admission has not resolved. \
+                 The inlet is drained regardless of \
                  whether the slot can send, because `finalize`, `detach` and \
                  `Drop` reach it through a synchronous send that a full channel \
                  would block forever; this gauge is where that backpressure \

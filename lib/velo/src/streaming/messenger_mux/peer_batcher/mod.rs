@@ -328,6 +328,18 @@ enum Work {
     Linger,
 }
 
+/// Whether [`Batcher::fire_singleton`] may skip the fence on a synchronously
+/// admitted dispatch.
+///
+/// Only `open_detached`'s `OpenSlot` qualifies — see `fire_singleton`'s doc
+/// for why `send_singleton`'s rendezvous records never do.
+enum FenceSkip {
+    /// Skip the fence when [`AdmissionState::Admitted`] already applies.
+    IfAdmitted,
+    /// Always fence, regardless of how the admission resolved.
+    Never,
+}
+
 struct Batcher {
     peer: WorkerId,
     metrics: Option<MuxMetricsHandle>,
@@ -635,73 +647,94 @@ impl Batcher {
         // the same way, and the producer learns from the inlet that the epoch
         // death just closed under it.
         //
-        // The fence above does not extend to *two* opens issued on one wake:
-        // it orders a slot against its own later records, not one detached
-        // open against another. Two back-to-back opens through a peer whose
-        // sends are still taking `spawn_slow_path` (not yet registered) are
-        // each an independently scheduled detached task, so they are not
-        // guaranteed to admit in the order they were issued in and their
-        // `batch_seq` can invert on the wire. Nothing reads that as data loss
-        // — per-slot order is the fence's job, and `note_batch_seq` only
-        // meters — but the receiver's gap counter reads an inverted pair as
-        // one batch that went missing: `velo_streaming_mux_batch_seq_gaps_total`
-        // jumps by `u32::MAX` from the wraparound. Latent, not observed —
-        // every peer in the rig is registered long before its first stream
-        // opens — and belongs to a per-class `batch_seq`, a W4b-scoped follow-up
-        // rather than a fix owed here.
+        // The fence above orders a slot against its own later records, not one
+        // detached dispatch on this peer against another. A detached open and
+        // *any* later batch to the same peer — another open, or an ordinary
+        // flush — are each an independently scheduled task the moment that
+        // peer's sends still take `spawn_slow_path` (not yet registered):
+        // `can_send_directly` gates inline-vs-detached identically for both,
+        // so it takes only one detached open racing one later flush, not two
+        // opens, for their `spawn_slow_path` tasks to admit out of the order
+        // they were issued in and their `batch_seq` to invert on the wire.
+        // Nothing reads that as data loss — per-slot order is the fence's
+        // job, and `note_batch_seq` only meters — but the receiver's gap
+        // counter reads an inverted pair as one batch that went missing:
+        // `velo_streaming_mux_batch_seq_gaps_total` jumps by `u32::MAX` from
+        // the wraparound. Latent, not observed — every peer in the rig is
+        // registered long before its first stream opens — and belongs to a
+        // per-class `batch_seq`, a follow-up scoped and tracked in
+        // `agent-docs/w4a-async-open-ack-status.md` rather than a fix owed
+        // here.
         let seq = self.open_seq(id);
-        self.fire_singleton(id, |encoder| {
+        self.fire_singleton(id, FenceSkip::IfAdmitted, |encoder| {
             encoder.push_open_slot(id, seq, anchor_id, session_id)
         });
         let _ = ack.send(Ok(()));
     }
 
-    /// Dispatch one record outside the packed batch, fence its slot behind the
-    /// admission unless the admission is already behind it, and watch the
-    /// result from a detached task.
+    /// Dispatch one record outside the packed batch, fence its slot unless
+    /// `skip` says the caller's admission already made the fence pointless,
+    /// and watch the result from a detached task.
     ///
-    /// The shared tail of `send_singleton` and `open_detached` — extracted
-    /// because it used to be copied between them, which is how
-    /// `metrics.rendezvous_singleton()` ended up needing to move to the caller
-    /// (it counts a rendezvous transfer, not an open, and this seam is the one
-    /// place both call from). Returns `false` after failing the epoch when
-    /// nothing reached the transport; the caller still owes its own record
-    /// whatever answer it owes on that arm (an ack, a close), which is why this
-    /// does not do it itself.
+    /// The shared tail of `send_singleton` and `open_detached`: both need to
+    /// fence the slot, dispatch outside the packed batch, and watch the same
+    /// admission, so it lives once here rather than in each caller.
+    /// `metrics.rendezvous_singleton()` is counted by the caller rather than
+    /// here because it counts a rendezvous transfer, not an open, and this
+    /// seam is the one place both call from. Returns `false` after failing the
+    /// epoch when nothing reached the transport; the caller still owes its own
+    /// record whatever answer it owes on that arm (an ack, a close), which is
+    /// why this does not do it itself.
     ///
-    /// The fence is conditional on [`FireResult::admission_state`] — cheap,
-    /// synchronous, and already resolved by the time it is read here, since
-    /// `dispatch_singleton` builds `fire` on this same call stack. On the fast
-    /// path `_stream_batch` always takes for a registered peer,
-    /// [`AdmissionState::Admitted`] means the frame is already on the
-    /// transport's send channel: every record this batcher dispatches after
-    /// this call enters that same FIFO channel behind it, because the batcher
-    /// dispatches one record at a time on its own task. There is nothing left
-    /// for a fence to order in that case.
+    /// Only [`FenceSkip::IfAdmitted`] ever skips the fence, and only
+    /// `open_detached` passes it: an `OpenSlot` [`AdmissionState::Admitted`]
+    /// synchronously has already entered the transport's send channel, so
+    /// every record this batcher dispatches after this call enters that same
+    /// FIFO channel behind it — there is nothing left for a fence to order.
+    /// `send_singleton` passes [`FenceSkip::Never`] and always fences,
+    /// including on a terminal. That is inert on this call path: `close_local`
+    /// removes the slot's table entry (`EgressSlots::close`'s `Option::take`)
+    /// with no `.await` between the fence and the close, so nothing observes
+    /// the fence before it goes with the entry — except the `cfg(test)` hook
+    /// just below, which does record it. The always-fences behavior itself is
+    /// unconditional because a rendezvous record's bytes are resolved by the
+    /// receiver's ordered dispatcher in a detached task before dispatch
+    /// (`BATCHING.md` § "Slots"), so nothing about the *sender's* admission
+    /// order says anything about the order the receiver applies it in.
     ///
-    /// The `tokio::spawn` below, the control-inbox insert
-    /// `singleton_resolved` makes, its `Notify` wake, and the `unfence` plus
-    /// `release_withheld` pass that answers it are unconditional either way —
-    /// this only decides whether the slot's own records have to *wait* for
-    /// that round trip before `on_frame` will stage them. Raising the fence
+    /// The `tokio::spawn` below always watches the admission — even an
+    /// unfenced dispatch has to learn of a *failure*, which is epoch death
+    /// whether or not the fence was ever raised. But it reports *success* to
+    /// `singleton_resolved` only when this call actually fenced: an unfenced
+    /// admission's own resolution has no fence of its own to lift, and
+    /// [`ControlState::resolutions`] is keyed by [`SlotId`] alone, with no way
+    /// to tell *which* dispatch a `true` is answering. Reporting one anyway
+    /// would let it coalesce with a later, genuinely outstanding fenced
+    /// singleton's entry and release a fence that has not actually resolved —
+    /// the exact race
+    /// `an_admitted_singletons_resolution_does_not_lift_a_different_fence`
+    /// pins shut. The fence itself, raised synchronously above, is what makes
+    /// the slot's own records *wait* before `on_frame` will stage them; the
+    /// report only decides whether anything will ever lift that wait back
+    /// off. Raising the fence
     /// when nothing needs ordering buys no order and only makes the first
     /// record of every stream wait out hops that were never on the critical
     /// path — on an uncongested peer, exactly the wait
-    /// `MuxConfig::async_open_ack` exists to remove. Everywhere admission is
-    /// *not* already `Admitted` — a congested peer's gate, or a peer not yet
-    /// registered taking `spawn_slow_path` — dispatch order no longer
-    /// guarantees entry order (`open_detached`'s doc above spells out why),
-    /// and the fence still applies.
+    /// `MuxConfig::async_open_ack` exists to remove.
     fn fire_singleton(
         &mut self,
         id: SlotId,
+        skip: FenceSkip,
         write: impl FnOnce(&mut BatchEncoder) -> Result<(), EncodeError>,
     ) -> bool {
         let Some(fire) = self.writer.dispatch_singleton(write) else {
             self.epoch_death();
             return false;
         };
-        let needs_fence = fire.admission_state() != AdmissionState::Admitted;
+        let needs_fence = match skip {
+            FenceSkip::IfAdmitted => fire.admission_state() != AdmissionState::Admitted,
+            FenceSkip::Never => true,
+        };
         if needs_fence && let Some(slot) = self.slots.get_mut(id.index()) {
             slot.fence();
         }
@@ -710,8 +743,25 @@ impl Batcher {
             hooks.note_fenced();
         }
         let control = Arc::clone(&self.control);
+        #[cfg(test)]
+        let hooks = self.hooks.clone();
         tokio::spawn(async move {
-            control.singleton_resolved(id, fire.await.is_ok());
+            let admitted = fire.await.is_ok();
+            #[cfg(test)]
+            if let Some(hooks) = &hooks {
+                hooks.await_resolutions_release().await;
+            }
+            // A failure is epoch death regardless of whether this dispatch
+            // fenced, so it is always reported. A success is reported only
+            // when it fenced: an unfenced dispatch's own resolution has no
+            // fence of its own to lift, and reporting one anyway would let it
+            // coalesce with a *different*, still-outstanding fenced
+            // singleton's entry under the same `SlotId` key and release a
+            // fence that has not actually resolved (see `fire_singleton`'s
+            // doc above).
+            if needs_fence || !admitted {
+                control.singleton_resolved(id, admitted);
+            }
         });
         true
     }

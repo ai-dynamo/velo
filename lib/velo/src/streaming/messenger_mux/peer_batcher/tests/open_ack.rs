@@ -67,12 +67,15 @@ fn async_open_ack() -> MuxConfig {
 /// the same FIFO admission gate behind the frame that was just admitted, since
 /// the batcher dispatches one record at a time on its own task.
 ///
-/// The spawned watcher, its control-inbox insert, the `Notify` wake and the
-/// eventual `unfence` are unconditional — they run either way, off the
-/// critical path. What fencing anyway used to cost is the *wait*: the slot's
-/// first record could not be staged until that whole round trip had been
-/// drained, which on exactly the uncongested peer `MuxConfig::async_open_ack`
-/// exists to speed up bought no order at all.
+/// The spawned watcher still runs, off the critical path either way — it has
+/// to, in case the admission fails after all — but on this path it reports
+/// nothing: an admission that never fenced has no fence of its own to lift,
+/// and `singleton_resolved`'s `SlotId` key has no way to tell its `Ok` apart
+/// from a *different* singleton's still-outstanding one on the same slot (see
+/// `fire_singleton`'s doc). What fencing anyway used to cost is the *wait*:
+/// the slot's first record could not be staged until that whole round trip
+/// had been drained, which on exactly the uncongested peer
+/// `MuxConfig::async_open_ack` exists to speed up bought no order at all.
 ///
 /// The fence decision itself is made synchronously, before `fire_singleton`
 /// ever yields, so `TestHooks::fenced_count` pins it without racing the
@@ -92,6 +95,69 @@ async fn an_admitted_open_slot_is_never_fenced() {
         "an OpenSlot admitted synchronously has already reached the transport's \
          send channel; fencing it would only make the record wait for a round \
          trip that orders nothing"
+    );
+}
+
+/// An admitted singleton's resolution must not lift a fence a *different*,
+/// still-outstanding singleton on the same slot raised.
+///
+/// `fire_singleton` spawns a watcher unconditionally, whether or not it fenced
+/// — `an_admitted_open_slot_is_never_fenced` pins that the `OpenSlot` here
+/// does not. `on_owned_control` keys a singleton's resolution by `SlotId`
+/// alone, with no way to tell which dispatch a `true` answers, so if that
+/// unfenced watcher's report is still in flight when a *second* singleton for
+/// the same slot fences — the slot's first data record, oversized enough to
+/// need `send_singleton` while the gate's one place is still held by the
+/// un-drained `OpenSlot` — the two can be answered out of order. `TestHooks`'s
+/// resolution gate makes that ordering a decision instead of a coin flip: the
+/// `OpenSlot` watcher's already-`Ok` report is held here until after the
+/// second singleton has fenced, which is the one interleaving neither
+/// existing test drives.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_admitted_singletons_resolution_does_not_lift_a_different_fence() {
+    let hooks = Arc::new(TestHooks::default());
+    hooks.hold_resolutions();
+    let harness = stalled_harness_with_hooks(async_open_ack(), Some(Arc::clone(&hooks))).await;
+
+    // Takes the gate's one free place and is admitted there and then — never
+    // fenced, per `an_admitted_open_slot_is_never_fenced` — but the watcher it
+    // still spawns is parked at the resolution gate with `Ok` in hand.
+    let (inlet, ack_rx) = harness.open(1, 1, CREDIT).await;
+    tokio::time::timeout(RECV_TIMEOUT, ack_rx)
+        .await
+        .expect("ack")
+        .expect("ack delivered")
+        .expect("slot allocated");
+    assert_eq!(hooks.fenced_count(), 0, "the OpenSlot must not have fenced");
+
+    // The slot's first data record, too large for any eager batch, goes out
+    // alone through `send_singleton` — and the gate's one place is still held
+    // by the `OpenSlot` above, nobody having drained the wire, so this one is
+    // genuinely `Pending` and does fence.
+    inlet
+        .send(vec![0u8; 100_000])
+        .expect("queue the oversized record");
+    eventually(|| hooks.fenced_count() == 1).await;
+
+    // A record queued behind that fence must be withheld, not sent — the
+    // property the fence exists to hold until the *right* admission answers.
+    inlet.send(item(0)).expect("queue record");
+    harness.await_withheld(1).await;
+
+    // Let both watchers report. The `OpenSlot`'s admission resolved before
+    // either record was ever sent; the oversized record's has not — the gate's
+    // one place is still held and nothing has taken it back.
+    hooks.release_resolutions();
+
+    // The withheld record must still be sitting there: only the oversized
+    // singleton's own resolution may release it, and that has not happened.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        harness
+            .snapshot()
+            .gauge("velo_streaming_mux_withheld_records", &[]),
+        1.0,
+        "the OpenSlot's stale success must not lift a fence it never raised"
     );
 }
 
