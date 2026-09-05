@@ -185,3 +185,31 @@ Settled by the counters PR #80 added, read from `t3-iso2` rep 1 of velo3 (`w7_ba
 ### 4. The reply linger measured (`t3-iso3`): the batch inflation was a symptom
 
 With PR #81's reply linger the frontend sends five times fewer outbound batches (275,000 to 372,000 per 250,000 requests against 1.6 million with it off) and the per-request join shows no change in A, B or C at equal load (velo3 rep 2 against velo3n reps 1 and 2 of `t3-iso3`: A 3.7 against 3.9 to 4.0 ms, B 3.3 against 3.3 to 3.5, C 47.7 against 47.8 to 47.9). The request-path growth under zero-RTT setup is therefore not caused by the batch count; the batches and the growth were two symptoms of the frontend's response path being busier per request. On the same nodes and mode mux18p's frontend-internal first-token time is 12 ms against velo3's 18 to 24, its event-loop delay 1.1 ms against 2.3 to 3.5, its CPU 7.5 ms per request against 9.8. The next step is a profile of both frontends on one node pair (plan addendum of 2026-09-06).
+
+### 5. The frontend profiled (`t3-prof2`): the per-request cost has names
+
+`perf record` on the frontend's pinned cores (0 to 71, system-wide, 199 Hz for 30 s inside aiperf's profiling phase, plus a 49 Hz DWARF call-graph pass; the host's perf 6.14 bind-mounted with five shared libraries), one rep each of velo3 and mux18p on one node pair (ptyche 0290/0291 class, job 2734467; wheel 4afb407). Shares are of all cycles on those 72 cores over the window.
+
+| | velo3 | mux18p |
+|---|---|---|
+| frontend user code (`_core.abi3.so`) | 31.1% | 24.8% |
+| frontend in the kernel (tokio workers) | 19.7% | 17.5% |
+| frontend in libc (malloc, free, memcpy) | 10.7% | 8.3% |
+| idle | 24.2% | 7.9% |
+| nats-server (user plus kernel) | 11.9% | 38.1% |
+
+nats-server carries only the mockers' KV events on both arms; it is unpinned, so how much of it lands on the frontend's half of the node is the scheduler's choice and varies by rep (the rig now pins it and etcd to aiperf's half). The frontend process's own cost is what the rest of this section is about.
+
+The symbols that appear in velo3's profile and not in mux18p's, with what the DWARF callers say they are:
+
+| symbol | share of the 72 cores | where it is called from |
+|---|---|---|
+| `flume::Shared<T>::len` | 2.09% | the inbound batch lane: `handle_batch` runs `collect_grants` once per batch, which walks every slot of the peer and calls `reconcile`, which asks the slot's frame channel its length, a lock per slot per batch |
+| `parking_lot::RawMutex::lock_slow` + `WordLock::lock_slow` | 1.58% | tokio's time driver: `reader_pump` registers a `timeout` per received frame, so every record contends on the timer wheel's lock |
+| `flume::Sender<T>::try_send` | 0.93% | delivery of each record into its anchor's channel, from the batch lane |
+| `velo::streaming::anchor::set_active_anchor_gauge` | 0.49% | once per anchor create and once per retire, from the router and from `StreamAnchor::retire` |
+| `tokio_util::sync::cancellation_token::is_cancelled` | 0.43% | per-record checks on the delivery path |
+
+Together about 5.5 percent of the 72 cores, four cores, 1.3 ms per request at this rep's 3,028 req/s: roughly half of the same-node CPU gap to mux18p (velo3 9.4 to 10.0 against 7.1 to 7.5 ms per request); malloc and free account for another 0.5 percent over mux18p (1.48 against 0.99). The costs the two frontends share (tracing span lookups, the model-manager DashMap walk per request, msgpack decode of each record, the async-stream adaptor) are dynamo's, not the plane's, and are the same size in both.
+
+The first item is the per-batch slot walk `ingest-cost-ledger.md` named W1-B: reconcile only the slots a batch delivered into (the drain doorbell and the periodic sweep already cover the rest), which turns O(live slots) per batch into O(records in the batch). The second is the ledger's per-record reader-pump timer: keep a last-frame instant and check it from one interval tick instead of registering a timeout per frame. The third is a gauge computed by counting registry entries twice per request instead of from an atomic. All three are bounded changes with a failing test each.
