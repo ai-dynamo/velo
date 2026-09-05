@@ -344,6 +344,25 @@ pub struct MuxConfig {
     /// Defaults to [`FlushPolicy::Auto`] on [`AutoFlush::default`], which is
     /// the behaviour every mux had before this knob existed.
     pub flush_policy: FlushPolicy,
+    /// How long a batch holding only credit replies may form before it goes.
+    ///
+    /// A `CreditUpdate` used to mark its batch urgent, so a batcher whose peer
+    /// admits at once wrote one batch per wake — and a receiver's batcher wakes
+    /// once per reply the sweep hands it. Measured on the tier-3 rig with the
+    /// attach round trip gone (nothing else left in the receiver's egress to
+    /// wait behind), that was ten times the outbound batches of the same load
+    /// with it, most of them one to eight records, and the request path paid
+    /// for every one as a wake on this side and an inbound message on the
+    /// other.
+    ///
+    /// Under this window a batch that holds nothing but credit replies waits
+    /// for the window, or for the next record that does not wait — a close, a
+    /// terminal, data, an application flush — whichever comes first. The
+    /// return a sender is owed is delayed by at most this long, once per
+    /// window, which per record is `reply_linger / initial_credit`: nothing at
+    /// the default 256-record window. `Duration::ZERO` restores the urgent
+    /// flush.
+    pub reply_linger: Duration,
 }
 
 impl Default for MuxConfig {
@@ -358,6 +377,7 @@ impl Default for MuxConfig {
             drain_visit_floor: Duration::from_millis(2),
             batcher_idle_ttl: Duration::from_secs(60),
             flush_policy: FlushPolicy::Auto(AutoFlush::default()),
+            reply_linger: Duration::from_millis(1),
         }
     }
 }

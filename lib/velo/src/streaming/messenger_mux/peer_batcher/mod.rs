@@ -276,7 +276,11 @@ pub(crate) fn spawn(peer: WorkerId, ctx: BatcherContext) -> Arc<BatcherHandle> {
         alive: AtomicBool::new(true),
     });
     let epoch = ctx.epochs.fetch_add(1, Ordering::Relaxed);
-    let gate = FlushGate::new(ctx.config.flush_policy, ctx.metrics.clone());
+    let gate = FlushGate::new(
+        ctx.config.flush_policy,
+        ctx.config.reply_linger,
+        ctx.metrics.clone(),
+    );
     let writer = BatchWriter::new(
         Arc::clone(&ctx.messenger),
         peer,
@@ -600,10 +604,16 @@ impl Batcher {
             if let Some(metrics) = &self.metrics {
                 metrics.record_sent(kind);
             }
-            // Likewise, and more sharply: a `CreditUpdate` held back is a peer's
-            // sender starved with nothing left to rescue it, and no application
-            // on this side knows it owes that peer a flush.
-            self.gate.stage_urgent(1);
+            // A close is liveness and goes now. A credit reply is liveness too,
+            // but held for at most the reply window rather than at once: no
+            // application on this side knows it owes the peer a flush, so the
+            // window is the batcher's own and never the policy's — see
+            // `flush_gate`'s module docs for what the urgent flush cost.
+            if kind == RecordType::CreditUpdate {
+                self.gate.stage_reply(1);
+            } else {
+                self.gate.stage_urgent(1);
+            }
         }
     }
 

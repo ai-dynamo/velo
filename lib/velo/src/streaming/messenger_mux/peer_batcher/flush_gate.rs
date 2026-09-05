@@ -19,10 +19,20 @@
 //!   flush inline when a record will not fit, because holding a full batch buys
 //!   nothing — there is no room left to batch into.
 //! - **Records that carry liveness go.** `OpenSlot` has its own eager flush, and
-//!   a `CloseSlot`, a `CreditUpdate` or a terminal staged into the batch marks it
-//!   [`urgent`](FlushGate::stage_urgent). A `CreditUpdate` that lingers is a
-//!   peer's sender starved with nothing left to rescue it, which is not
-//!   something an application should be able to cause by forgetting a call.
+//!   a `CloseSlot` or a terminal staged into the batch marks it
+//!   [`urgent`](FlushGate::stage_urgent).
+//!
+//! A `CreditUpdate` is the third liveness record, and it gets its own, bounded,
+//! treatment: [`stage_reply`](FlushGate::stage_reply) lets a batch that holds
+//! nothing but credit replies form for [`MuxConfig::reply_linger`] before it
+//! goes, whatever the policy says otherwise. Holding a reply for good would
+//! starve a peer's sender with nothing left to rescue it, which is why no
+//! policy may hold one; holding it for a millisecond costs that sender
+//! `reply_linger / initial_credit` per record and buys the receiver one batch
+//! per sweep visit instead of one per reply. `Duration::ZERO` makes a reply
+//! urgent again.
+//!
+//! [`MuxConfig::reply_linger`]: super::super::MuxConfig::reply_linger
 //!
 //! ## The kick, and why it outlives a clamp
 //!
@@ -67,10 +77,20 @@ pub(super) struct FlushGate {
     /// Only tracked under a linger window: taking a timestamp per record would
     /// otherwise be a clock read on the hot path for a number nothing reads.
     since: Option<Instant>,
+    /// How long a batch of nothing but credit replies may form.
+    reply_linger: Duration,
+    /// When the open batch's first credit reply was staged, while every record
+    /// in it is one. `None` once anything else joins, and whenever the batch
+    /// is empty.
+    replies_since: Option<Instant>,
 }
 
 impl FlushGate {
-    pub(super) fn new(policy: FlushPolicy, metrics: Option<MuxMetricsHandle>) -> Self {
+    pub(super) fn new(
+        policy: FlushPolicy,
+        reply_linger: Duration,
+        metrics: Option<MuxMetricsHandle>,
+    ) -> Self {
         Self {
             policy,
             metrics,
@@ -78,6 +98,8 @@ impl FlushGate {
             urgent: false,
             kicked: false,
             since: None,
+            reply_linger,
+            replies_since: None,
         }
     }
 
@@ -86,6 +108,38 @@ impl FlushGate {
         if count == 0 {
             return;
         }
+        // Anything that is not a credit reply ends the replies-only hold: the
+        // batch now carries a record the policy has its own answer for.
+        self.replies_since = None;
+        self.stage_records(count);
+    }
+
+    /// As [`Self::stage`], for records that must move whatever the policy says:
+    /// a close, a terminal.
+    pub(super) fn stage_urgent(&mut self, count: usize) {
+        self.stage(count);
+        self.urgent = true;
+    }
+
+    /// Note `count` credit replies appended to the open batch.
+    ///
+    /// A batch that holds nothing else may form for the reply window (module
+    /// docs); with the window at zero this is [`Self::stage_urgent`].
+    pub(super) fn stage_reply(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        if self.reply_linger.is_zero() {
+            self.stage_urgent(count);
+            return;
+        }
+        if self.staged == 0 {
+            self.replies_since = Some(Instant::now());
+        }
+        self.stage_records(count);
+    }
+
+    fn stage_records(&mut self, count: usize) {
         if self.staged == 0 && self.linger_window().is_some() {
             self.since = Some(Instant::now());
         }
@@ -93,13 +147,6 @@ impl FlushGate {
         if let Some(metrics) = &self.metrics {
             metrics.staged_records_delta(count as i64);
         }
-    }
-
-    /// As [`Self::stage`], for records that must move whatever the policy says:
-    /// a close, a credit update, a terminal.
-    pub(super) fn stage_urgent(&mut self, count: usize) {
-        self.stage(count);
-        self.urgent = true;
     }
 
     /// An application called `flush_batch`.
@@ -123,7 +170,13 @@ impl FlushGate {
     /// without the timer arm ever being selected, and a batch that is late is
     /// late however the batcher happened to wake up.
     pub(super) fn should_flush(&self) -> bool {
-        if self.urgent || self.policy.on_admission() {
+        if self.urgent {
+            return true;
+        }
+        if let Some(since) = self.replies_since {
+            return since.elapsed() >= self.reply_linger;
+        }
+        if self.policy.on_admission() {
             return true;
         }
         match (self.since, self.linger_window()) {
@@ -137,6 +190,9 @@ impl FlushGate {
     /// `None` means nothing is running: either no window is configured or
     /// nothing is staged to run one against.
     pub(super) fn deadline(&self) -> Option<Instant> {
+        if let Some(since) = self.replies_since {
+            return Some(since + self.reply_linger);
+        }
         match (self.since, self.linger_window()) {
             (Some(since), Some(window)) => Some(since + window),
             _ => None,
@@ -167,6 +223,7 @@ impl FlushGate {
         self.staged = 0;
         self.urgent = false;
         self.since = None;
+        self.replies_since = None;
     }
 
     const fn linger_window(&self) -> Option<Duration> {
@@ -191,7 +248,11 @@ mod tests {
     use super::*;
 
     fn gate(policy: FlushPolicy) -> FlushGate {
-        FlushGate::new(policy, None)
+        FlushGate::new(policy, Duration::ZERO, None)
+    }
+
+    fn gate_with_reply_linger(policy: FlushPolicy, window: Duration) -> FlushGate {
+        FlushGate::new(policy, window, None)
     }
 
     fn auto(on_admission: bool, max_linger: Option<Duration>) -> FlushPolicy {
@@ -225,8 +286,66 @@ mod tests {
         gate.stage_urgent(1);
         assert!(
             gate.should_flush(),
-            "a close, a credit update or a terminal moves whatever the policy says"
+            "a close or a terminal moves whatever the policy says"
         );
+    }
+
+    #[test]
+    fn credit_replies_alone_wait_for_the_reply_window() {
+        let window = Duration::from_millis(50);
+        let mut gate = gate_with_reply_linger(FlushPolicy::default(), window);
+        gate.stage_reply(1);
+        assert!(
+            !gate.should_flush(),
+            "on_admission does not write a batch that holds only credit replies"
+        );
+        let due = gate.deadline().expect("the reply window is running");
+        gate.stage_reply(3);
+        assert_eq!(
+            gate.deadline(),
+            Some(due),
+            "later replies join the window the first started"
+        );
+    }
+
+    #[test]
+    fn anything_else_ends_the_reply_hold() {
+        let mut gate = gate_with_reply_linger(FlushPolicy::default(), Duration::from_millis(50));
+        gate.stage_reply(2);
+        gate.stage(1);
+        assert!(
+            gate.should_flush(),
+            "a data record puts the batch back under the policy"
+        );
+        assert_eq!(gate.deadline(), None, "and the reply timer is gone with it");
+
+        let mut gate = gate_with_reply_linger(FlushPolicy::Manual, Duration::from_millis(50));
+        gate.stage_reply(2);
+        gate.stage_urgent(1);
+        assert!(
+            gate.should_flush(),
+            "a close moves the replies staged before it"
+        );
+    }
+
+    #[test]
+    fn a_zero_reply_window_makes_a_reply_urgent() {
+        let mut gate = gate(FlushPolicy::Manual);
+        gate.stage_reply(1);
+        assert!(
+            gate.should_flush(),
+            "the pre-window behaviour: a reply moves at once"
+        );
+        assert_eq!(gate.deadline(), None);
+    }
+
+    #[test]
+    fn a_written_batch_ends_the_reply_window() {
+        let mut gate = gate_with_reply_linger(FlushPolicy::Manual, Duration::from_millis(50));
+        gate.stage_reply(1);
+        gate.cleared();
+        assert_eq!(gate.deadline(), None);
+        assert!(!gate.should_flush());
     }
 
     #[test]
