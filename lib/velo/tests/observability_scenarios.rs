@@ -451,6 +451,88 @@ async fn scenario_client_direct_resolution(pair: &VeloPair) {
     );
 }
 
+/// T9: Inbound-queue conservation — every admitted `Message` is one the
+/// dispatch loop eventually takes off `message_rx`.
+///
+/// There is no depth gauge for that queue, on purpose: sampling
+/// `flume::Receiver::len()` reads the wrong number under exactly the load that
+/// makes the depth interesting. The depth is instead *derived*, as
+/// `velo_transport_frames_total{direction="inbound",message_type="message",
+/// outcome="accepted"} - velo_messenger_inbound_dequeued_total`, and that
+/// subtraction is only meaningful while the two counters agree at rest. This
+/// scenario is what keeps them agreeing: a counter wired to the wrong side of
+/// the loop, or a transport that admits without recording, shows up here as a
+/// gap that never closes.
+///
+/// Traffic runs both ways because the identity has to hold on both: a request
+/// is an inbound `Message` on the side that serves it, while the reply comes
+/// back as a `Response` frame and never touches the inbound queue. One
+/// direction would leave the other side's counters at a vacuous zero.
+async fn scenario_inbound_queue_conservation(pair: &VeloPair) {
+    for velo in [&pair.server, &pair.client] {
+        let handler = Handler::unary_handler("echo", |ctx| Ok(Some(ctx.payload))).build();
+        velo.register_handler(handler).unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    for (from, to) in [(&pair.client, &pair.server), (&pair.server, &pair.client)] {
+        for _ in 0..4 {
+            let payload = Bytes::from_static(b"conserve");
+            let response: Bytes = from
+                .unary("echo")
+                .unwrap()
+                .raw_payload(payload.clone())
+                .instance(to.instance_id())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response, payload);
+        }
+    }
+
+    await_inbound_queue_quiesced("server", || pair.server_snap()).await;
+    await_inbound_queue_quiesced("client", || pair.client_snap()).await;
+}
+
+/// Poll one side's snapshot until admitted and dequeued inbound messages agree
+/// on a non-zero count, or fail with both numbers.
+///
+/// Equality is a property of quiescence, not of any fixed sleep: admission and
+/// dequeue are the two ends of a real queue and the window between them is
+/// real work, so the assertion has to wait the queue out rather than guess how
+/// long it is.
+///
+/// The `transport` label is deliberately absent from the frame lookup:
+/// `VeloPair` gives each side exactly one transport, so the subset match
+/// resolves to that transport's series. A pair carrying two transports per side
+/// would have to pin the label, because the snapshot returns the first match
+/// rather than a sum.
+async fn await_inbound_queue_quiesced(label: &str, snapshot: impl Fn() -> MetricSnapshot) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let snap = snapshot();
+        let accepted = snap.counter(
+            "velo_transport_frames_total",
+            &[
+                ("direction", "inbound"),
+                ("message_type", "message"),
+                ("outcome", "accepted"),
+            ],
+        );
+        let dequeued = snap.counter("velo_messenger_inbound_dequeued_total", &[]);
+        // Non-zero on both counts: every peer receives at least the other's
+        // `_hello`, so a pair of zeroes is a dark counter, not a quiet queue.
+        if accepted > 0.0 && (accepted - dequeued).abs() < f64::EPSILON {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{label}: inbound queue never quiesced — accepted={accepted} dequeued={dequeued}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Parameterisation macro
 // ---------------------------------------------------------------------------
@@ -510,6 +592,12 @@ macro_rules! transport_metrics_tests {
             async fn client_direct_resolution() {
                 let p = pair().await;
                 scenario_client_direct_resolution(&p).await;
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn inbound_queue_conservation() {
+                let p = pair().await;
+                scenario_inbound_queue_conservation(&p).await;
             }
         }
     };
@@ -584,6 +672,12 @@ mod uds {
     async fn client_direct_resolution() {
         let (p, _dir) = pair().await;
         scenario_client_direct_resolution(&p).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn inbound_queue_conservation() {
+        let (p, _dir) = pair().await;
+        scenario_inbound_queue_conservation(&p).await;
     }
 }
 

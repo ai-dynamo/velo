@@ -212,7 +212,10 @@ required-features = ["test-helpers"]
 [[test]]
 name = "transports_ucx"
 path = "tests/transports/ucx_integration.rs"
-required-features = ["ucx"]
+# `test-helpers` for `MetricSnapshot`: the suite asserts that UCX records the
+# inbound frames it admits, which is the numerator of the messenger's derived
+# inbound-queue depth.
+required-features = ["ucx", "test-helpers"]
 
 [[test]]
 name = "observability_scenarios"

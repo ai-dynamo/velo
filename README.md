@@ -276,7 +276,7 @@ Things worth knowing:
 
 - **Ordering is preserved, not created.** Ordered mode hands messages to the handler in the order they reached the messenger. If a peer is reachable over several transports, or a connection drops and reconnects mid-stream, arrival order was already lost upstream.
 - **Large payloads are exempt.** Rendezvous-staged messages resolve out-of-band before dispatch, so they are not ordered relative to each other even on an ordered handler. The dispatcher warns once when it sees one.
-- **Lane queues are unbounded.** `max_queue_depth` is a soft admission cap driving `OverflowPolicy`, not a bound on the channel. It applies **per lane**, so one backed-up peer cannot shed traffic from peers whose lanes are empty. Watch `velo_messenger_ordered_lane_depth` and `velo_messenger_ordered_lane_wait_seconds` to spot a lane falling behind; under `Reject`, `velo_messenger_dispatch_failures_total{reason="ordered_lane_shed"}` carries the shed rate (the log line fires once per handler).
+- **Lane queues are unbounded.** `max_queue_depth` is a soft admission cap driving `OverflowPolicy`, not a bound on the channel. It applies **per lane**, so one backed-up peer cannot shed traffic from peers whose lanes are empty. Watch `velo_messenger_ordered_lane_depth` and `velo_messenger_ordered_lane_wait_seconds` to spot a lane falling behind — they cover the streaming mux's own `_stream_batch` ingress lane as well as your handlers, the one system handler exempted from the `_`-prefix filter; under `Reject`, `velo_messenger_dispatch_failures_total{reason="ordered_lane_shed"}` carries the shed rate (the log line fires once per handler).
 - **On a unary handler this serialises request/response per sender** — a client issuing 100 concurrent calls will have them served one at a time.
 - Idle lanes reap themselves after `idle_lane_ttl` (30s by default) so churning short-lived peers don't leak tasks.
 
@@ -490,13 +490,18 @@ let node = Velo::builder()
 // Expose `registry` via your HTTP server, e.g. with axum or prometheus's text encoder
 ```
 
+Two of these are meant to be read as a subtraction rather than on their own. Aggregate both sides onto the same label set before subtracting — the frame counter is per transport and the other two are per instance, so a bare `a - b` matches on the full label set and returns nothing.
+
+- **Inbound queue depth** = `sum by (job, instance) (velo_transport_frames_total{direction="inbound",message_type="message",outcome="accepted"}) - sum by (job, instance) (velo_messenger_inbound_dequeued_total)`. There is no gauge, because a sampled channel length reads the wrong number under exactly the load that makes the depth worth knowing. Two limits on the identity. It holds while the instance is live: messages abandoned when a `Timeout` shutdown tears the dispatch loop down never count as departures, so from teardown onward the difference reads high by the abandoned count and stays there. And it holds only over transports that record what they admit — every in-tree messenger transport does, but the `simulation` transport's `set_observability` is a no-op, and an out-of-tree transport that admits without recording drives the difference negative.
+- **Receiver-side attach queueing** = `velo_streaming_anchor_attach_rtt_seconds` (stamped by the sender, around the round trip) − `velo_streaming_anchor_operation_duration_seconds{operation="attach"}` (stamped by the receiver, inside its handler). The difference bounds that queueing from above rather than equalling it: the sender's own send path, both wire legs, the receiver's handler-spawn delay and the sender task's wake latency all sit inside the bracket too.
+
 Metric families covered:
 
 | Category     | Metrics                                                              |
 |--------------|----------------------------------------------------------------------|
 | Transport    | Frame counts, byte counts, rejections, registered peers, active connections |
-| Messenger    | Handler requests, durations, payload bytes, in-flight count, dispatch failures |
-| Streaming    | Anchor operations, durations, active anchors, backpressure           |
+| Messenger    | Handler requests, durations, payload bytes, in-flight count, dispatch failures, inbound-queue departures |
+| Streaming    | Anchor operations, durations, attach round-trip time, active anchors, backpressure |
 | Rendezvous   | Stage/get/release operations, durations, transferred bytes, active slots |
 
 **Distributed tracing**: enable the `distributed-tracing` feature to propagate OpenTelemetry trace context through message headers automatically:

@@ -476,6 +476,20 @@ rendezvous fence in [Slots](#slots) is made of.
 > each handler to completion before pulling the next batch.
 > `velo_streaming_mux_reader_stall_total > 0` is a bug, not a tuning signal.
 
+> **Watching the lane.** `velo_messenger_ordered_lane_depth{handler="_stream_batch"}`
+> and `velo_messenger_ordered_lane_wait_seconds{handler="_stream_batch"}` report
+> the ingress lane directly. `_stream_batch` is the one `_`-prefixed handler
+> exempted from the ordered-dispatch metric filter, precisely because it is the
+> lane this section is about. Both are observed once per *batch*, so a wait read
+> there is the wait of a batch, not of a record — `velo_streaming_mux_records_per_batch`
+> is what says how many records that one wait covered.
+>
+> The lane carries the credit-return direction too: grants and peer-closes ride
+> home to the producer as `ReplyRecord`s in ordinary `_stream_batch` batches. On
+> a node that both sends and receives streams the wait distribution therefore
+> mixes record-carrying data batches with credit-only ones, which are not the
+> same size of work.
+
 ### Terminal sentinels
 
 Today the egress pump writes a terminal, breaks out of its loop, discards

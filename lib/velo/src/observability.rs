@@ -36,6 +36,20 @@ const TRANSPORT_MESSAGE_TYPES: [&str; 5] = ["message", "response", "ack", "event
 const HANDLER_RESPONSE_TYPES: [&str; 3] = ["fire_and_forget", "ack_nack", "unary"];
 const HANDLER_OUTCOMES: [&str; 2] = ["success", "error"];
 
+/// Bucket edges for `velo_streaming_anchor_attach_rtt_seconds`.
+///
+/// Placed by hand rather than taken from the house recipe
+/// `exponential_buckets(0.0005, 2.0, 16)`, whose top edges fall at 0.256,
+/// 0.512, 1.024 and 2.048 s. The effect this histogram exists to size — an
+/// attach round trip queued behind a busy receiver's ingest backlog — lands
+/// between those edges, so a percentile read off them is accurate only to a
+/// factor of two, which is the same factor as the effect. These resolve the
+/// 0.1-2 s band instead, while keeping enough short edges to show that a
+/// healthy attach is sub-millisecond.
+const ATTACH_RTT_BUCKETS: &[f64] = &[
+    0.001, 0.005, 0.02, 0.05, 0.1, 0.2, 0.35, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0,
+];
+
 // ---------------------------------------------------------------------------
 // Type-safe label enums
 // ---------------------------------------------------------------------------
@@ -725,8 +739,10 @@ pub struct VeloMetrics {
     messenger_client_resolution_total: CounterVec,
     messenger_pending_responses: Gauge,
     messenger_response_slot_exhausted_total: Counter,
+    messenger_inbound_dequeued_total: Counter,
     streaming_anchor_operations_total: CounterVec,
     streaming_anchor_operation_duration_seconds: HistogramVec,
+    streaming_anchor_attach_rtt_seconds: HistogramVec,
     streaming_active_anchors: Gauge,
     streaming_backpressure_total: CounterVec,
     streaming_reader_pump_backpressure_total: Counter,
@@ -956,6 +972,24 @@ impl VeloMetrics {
                 "Response slot acquisitions that hit the per-worker capacity ceiling.",
             ))?,
         )?;
+        let messenger_inbound_dequeued_total = register_collector(
+            registry,
+            Counter::with_opts(Opts::new(
+                "velo_messenger_inbound_dequeued_total",
+                "Messages the dispatch loop took off the messenger's inbound \
+                 queue. Subtract this from velo_transport_frames_total{direction=\"inbound\",\
+                 message_type=\"message\",outcome=\"accepted\"} to get that queue's \
+                 depth — there is deliberately no gauge for it, because a \
+                 sampled channel length reads the wrong number under exactly \
+                 the load that makes the depth interesting. Sum the frame \
+                 counter across transports before subtracting: it is per \
+                 transport and this one is per instance. The identity holds \
+                 while the instance is live — messages abandoned when a \
+                 Timeout shutdown tears the dispatch loop down are never \
+                 counted here, so from teardown onward the derived depth reads \
+                 high by the abandoned count.",
+            ))?,
+        )?;
         let streaming_anchor_operations_total = register_collector(
             registry,
             CounterVec::new(
@@ -977,6 +1011,24 @@ impl VeloMetrics {
                     prometheus::Error::Msg(format!("invalid streaming histogram buckets: {e}"))
                 })?),
                 &["operation", "outcome", "transport_scheme"],
+            )?,
+        )?;
+        let streaming_anchor_attach_rtt_seconds = register_collector(
+            registry,
+            HistogramVec::new(
+                HistogramOpts::new(
+                    "velo_streaming_anchor_attach_rtt_seconds",
+                    "Wall time a remote anchor attach spent in flight, measured \
+                     by the sender across the _anchor_attach round trip. Its \
+                     excess over velo_streaming_anchor_operation_duration_seconds\
+                     {operation=\"attach\"} on the receiver bounds that \
+                     receiver's ingest queueing from above; the sender's own \
+                     send path, both wire legs, the receiver's handler-spawn \
+                     delay and the sender task's wake latency are inside the \
+                     bracket too.",
+                )
+                .buckets(ATTACH_RTT_BUCKETS.to_vec()),
+                &["outcome", "transport_scheme"],
             )?,
         )?;
         let streaming_active_anchors = register_collector(
@@ -1305,9 +1357,11 @@ impl VeloMetrics {
             messenger_dispatch_failures_total,
             messenger_client_resolution_total,
             messenger_pending_responses,
+            messenger_inbound_dequeued_total,
             messenger_response_slot_exhausted_total,
             streaming_anchor_operations_total,
             streaming_anchor_operation_duration_seconds,
+            streaming_anchor_attach_rtt_seconds,
             streaming_active_anchors,
             streaming_backpressure_total,
             streaming_reader_pump_backpressure_total,
@@ -1459,10 +1513,19 @@ impl VeloMetrics {
 
     /// Bind ordered-dispatch collectors for a specific handler label.
     ///
-    /// Applies the same `_`-prefix filter as [`Self::bind_handler`], so system
-    /// handlers stay out of the per-handler series.
+    /// Applies the same `_`-prefix filter as [`Self::bind_handler`], with one
+    /// exception: `_stream_batch`. That handler is the messenger mux's only
+    /// ingress lane, so filtering it out leaves the lane depth and wait series
+    /// dark on the single path carrying every streamed record — the one place
+    /// they are worth having, and the reason the series exist at all.
+    ///
+    /// The exception is scoped to ordered dispatch. Per-handler request,
+    /// duration and byte series stay off for every `_` handler, because those
+    /// are per-handler cardinality that system traffic should not add to.
     pub(crate) fn bind_ordered_dispatcher(&self, handler: &str) -> Option<OrderedMetricsHandle> {
-        if !Self::should_track_handler(handler) {
+        if !Self::should_track_handler(handler)
+            && handler != crate::streaming::messenger_mux::STREAM_BATCH_HANDLER
+        {
             return None;
         }
 
@@ -1533,6 +1596,36 @@ impl VeloMetrics {
     /// backpressure path.
     pub(crate) fn inc_response_slot_exhausted(&self) {
         self.messenger_response_slot_exhausted_total.inc();
+    }
+
+    /// The inbound-dequeue counter itself, for the messenger's dispatch loop.
+    ///
+    /// Handed out rather than wrapped in a `record_*` method so the loop
+    /// resolves the collector once, outside itself: it is the single consumer
+    /// of `message_rx` and every message on the node passes through it.
+    pub(crate) fn bind_inbound_dequeued(&self) -> Counter {
+        self.messenger_inbound_dequeued_total.clone()
+    }
+
+    /// Record the wall time one remote anchor attach spent in flight.
+    ///
+    /// Deliberately separate from [`Self::record_streaming_operation`]: that
+    /// one is stamped inside the *receiving* handler and answers "how long did
+    /// the handler take", while this is stamped by the *sender* around the
+    /// round trip and answers "how long did the caller wait". The gap between
+    /// them is an upper bound on the receiver's ingest queueing — it also
+    /// carries both wire legs, the handler-spawn delay and the sender task's
+    /// own wake latency — and bounding that queueing is the only reason to
+    /// carry both.
+    pub(crate) fn record_attach_rtt(
+        &self,
+        outcome: HandlerOutcome,
+        transport_scheme: &str,
+        elapsed: Duration,
+    ) {
+        self.streaming_anchor_attach_rtt_seconds
+            .with_label_values(&[outcome.as_str(), transport_scheme])
+            .observe(elapsed.as_secs_f64());
     }
 
     /// Record a streaming control-plane operation.
@@ -1796,6 +1889,9 @@ mod tests {
             Duration::from_millis(1),
         );
         metrics.set_streaming_active_anchors(2);
+        // A `HistogramVec` with no children collects no family at all, so the
+        // name assertion below only means anything once one has been observed.
+        metrics.record_attach_rtt(HandlerOutcome::Success, "tcp", Duration::from_millis(1));
 
         let names: Vec<_> = registry
             .gather()
@@ -1811,6 +1907,8 @@ mod tests {
         assert!(names.contains(&"velo_streaming_active_anchors".to_string()));
         assert!(names.contains(&"velo_streaming_anchor_operations_total".to_string()));
         assert!(names.contains(&"velo_streaming_anchor_operation_duration_seconds".to_string()));
+        assert!(names.contains(&"velo_messenger_inbound_dequeued_total".to_string()));
+        assert!(names.contains(&"velo_streaming_anchor_attach_rtt_seconds".to_string()));
     }
 
     #[test]
@@ -1839,6 +1937,81 @@ mod tests {
         let metrics = VeloMetrics::register(&registry).expect("register metrics");
         assert!(metrics.bind_ordered_dispatcher("_internal").is_none());
         assert!(metrics.bind_ordered_dispatcher("user_handler").is_some());
+        // `_stream_batch` is the one exception to the `_` filter. It is the
+        // mux's only ingress lane, so with it excluded the lane depth and wait
+        // histograms are dark on the single path that carries every streamed
+        // record — the one place an operator needs them.
+        assert!(
+            metrics
+                .bind_ordered_dispatcher(crate::streaming::messenger_mux::STREAM_BATCH_HANDLER)
+                .is_some(),
+            "the mux ingress lane must reach the ordered-dispatch collectors"
+        );
+        // The exception is scoped to ordered dispatch. Per-handler request,
+        // duration and byte series stay off for every `_` handler, so the
+        // allowlist must not widen that surface on its way past.
+        assert!(
+            metrics
+                .bind_handler(crate::streaming::messenger_mux::STREAM_BATCH_HANDLER)
+                .is_none(),
+            "the ordered-lane allowlist must not leak into the per-handler series"
+        );
+    }
+
+    #[test]
+    fn inbound_dequeue_counter_counts_every_departure() {
+        use super::test_helpers::MetricSnapshot;
+
+        let registry = Registry::new();
+        let metrics = VeloMetrics::register(&registry).expect("register metrics");
+        let dequeued = metrics.bind_inbound_dequeued();
+
+        dequeued.inc();
+        dequeued.inc();
+        dequeued.inc();
+
+        assert_eq!(
+            MetricSnapshot::from_registry(&registry)
+                .counter("velo_messenger_inbound_dequeued_total", &[]),
+            3.0,
+            "the handed-out collector must write into the registered family"
+        );
+    }
+
+    /// The attach RTT histogram does not use the house bucket recipe, and the
+    /// edges it uses instead are the point of the metric.
+    ///
+    /// `exponential_buckets(0.0005, 2.0, 16)` — what every other Velo histogram
+    /// takes — has its top edges at 0.256, 0.512, 1.024 and 2.048 s. An attach
+    /// queued behind a busy receiver's ingest backlog lands between them, so a
+    /// percentile read there is good only to a factor of two: the same factor
+    /// as the effect. These edges resolve that band instead, and this test is
+    /// what stops a later tidy-up from folding them back into the recipe.
+    #[test]
+    fn attach_rtt_buckets_resolve_the_second_scale() {
+        let registry = Registry::new();
+        let metrics = VeloMetrics::register(&registry).expect("register metrics");
+        metrics.record_attach_rtt(HandlerOutcome::Success, "tcp", Duration::from_millis(1));
+
+        let families = registry.gather();
+        let family = families
+            .iter()
+            .find(|f| f.name() == "velo_streaming_anchor_attach_rtt_seconds")
+            .expect("attach rtt family");
+        let edges: Vec<f64> = family.get_metric()[0]
+            .get_histogram()
+            .get_bucket()
+            .iter()
+            .map(|b| b.upper_bound())
+            .collect();
+
+        for edge in [0.1, 0.2, 0.35, 0.5, 0.75, 1.0, 1.5, 2.0] {
+            assert!(
+                edges.contains(&edge),
+                "missing the {edge}s edge; the second scale is where the answer lives. \
+                 got {edges:?}"
+            );
+        }
     }
 
     #[test]
