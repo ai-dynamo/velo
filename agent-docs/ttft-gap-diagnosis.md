@@ -163,3 +163,21 @@ Arrivals are equal: per 8 s bucket each of the eight mocker processes logs the s
 By Little's law the residence time on the hot process is 6,500 / 436 req/s, about 15 s, against 0.43 s on the others. The hot process is one eighth of all requests, so E2E p99 (9 to 21 s across reps) and ITL p99 (32 to 82 ms) are inside that population and measure which process got the backlog and how large it is. They do not measure the plane. TTFT p50 is the healthy seven eighths. TTFT p95 and p99 (165 to 235 ms and 707 to 869 ms in every arm, mux18p included) are probably the hot process's first tokens as well; the per-worker join (`extract.py`, `out-iso1`) can settle that and is queued.
 
 This is also what puts velo34's live slots over the control cap in section 1: the hot process's 6,000 live slots are the backlog, not a velo effect. The E2E p99 criterion in the plan is withdrawn for this rig until the backlog is addressed on the rig side (fewer workers per mocker process, or a per-process admission limit), and the ITL caveat of the original diagnosis is withdrawn for the same reason.
+
+### 3. Where velo3's first-token time went, and where it came back: the request path pays for the response path
+
+The per-request join (`.research/analysis/ttft-join`, `out-iso1`) splits client TTFT into A (client send to the frontend's `request received` line), B (that line to the worker's `request received` line, skew-corrected) and C (worker ingress to the first token at the client). Medians, milliseconds:
+
+| rep | A | B | C | frontend's own TTFT | client TTFT |
+|---|---|---|---|---|---|
+| velo0 rep 2 | 2.7 | 1.3 | 87 | 80 | 95 |
+| velo0 rep 3 | 2.4 | 1.2 | 67 | 58 | 74 |
+| velo3 rep 2 | 13.1 | 11.1 | 47 | 38 | 72 |
+| velo34 rep 1 | 10.6 | 8.6 | 49 | 32 | 68 |
+| mux18p rep 2 | 4.3 | 0.5 | 42 | 12 | 47 |
+
+Zero-RTT setup takes C from 67 to 87 ms down to 47 to 49 ms, which is mux18p's 42. The client sees only 16 to 20 ms of that, because A and B each grow by about 10 ms: the request path from the client to the worker goes from 4 ms to 20 to 24 ms. That growth is the whole remaining gap to mux18p (velo34 68 = 10.6 + 8.6 + 49; mux18p 47 = 4.3 + 0.5 + 42).
+
+What changed on the frontend under the gate, from the scrapes: it sends ten times more mux batches to the workers (velo3 rep 2: 1,027,872 outbound `_stream_batch` messages against 97,042 for velo0 rep 2; velo34 rep 1: 1,049,277) carrying 29 percent more records (22.4 M against 17.4 M); the sent-batch size distribution moves from a median near 100 records to 240,000 one-record batches and 740,000 of eight or fewer; the frontend's event-loop delay mean doubles (1.46 to 2.9 ms); node A stays at 47 to 49 percent busy in both. Drain visits are similar (127,000 to 142,000 against 178,000 to 181,000), so the credit sweep's cadence is not the multiplier, and the frontend records no drops, stalls, holds or refusals in the clean zero-RTT reps. Per stream the frontend goes from 0.4 to 4 control batches; every one is an inbound message on the worker and a wake on the frontend's batcher. The worker's TTFR (handler start to first response) is 3 ms under W3 against 20 ms, so the worker side of the request path is not where B grew; B and A grow together on the frontend, consistent with a runtime that is servicing far more small sends.
+
+Which reply multiplies is not settled by the counters that exist: the batcher counts batches and records per direction, not records by type. The candidates, from the code, are the `CloseSlot` a pre-bound anchor's drop sends when its slot is still claimed (`PreBind::drop`, `close_claimed_slot`) and fragmentation of the credit replies across batcher wakes. The next instrument is a `velo_streaming_mux_records_sent_total{record_type}` counter and a batcher wake counter by source, one rep of velo3, and then the fix. This is the largest first-token lever left: recovering the request path returns velo34 to about 48 ms at p50, which is the bar.
