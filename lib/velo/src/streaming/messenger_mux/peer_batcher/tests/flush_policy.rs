@@ -393,69 +393,12 @@ async fn an_auto_window_writes_without_a_kick() {
 /// when the gate opens: every record exactly once, in `frame_seq` order.
 #[tokio::test(flavor = "multi_thread")]
 async fn kicks_during_an_admission_park_neither_double_send_nor_reorder() {
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicU64;
-
-    use dashmap::DashMap;
-    use tokio_util::sync::CancellationToken;
-
-    use super::super::{BatcherContext, OpenSlotRequest, spawn};
-    use super::support::{OwnedBatch, StallingTransport, eventually};
-    use crate::messenger::Messenger;
-    use crate::observability::VeloMetrics;
-    use crate::streaming::messenger_mux::flow_control::SlotCredit;
+    use super::support::{eventually, stalled_harness};
 
     const QUEUED: u32 = 120;
 
-    let (transport, wire) = StallingTransport::new(tokio::runtime::Handle::current());
-    let sender = Messenger::builder()
-        .add_transport(transport)
-        .build()
-        .await
-        .expect("sender messenger");
-    let peer_instance = velo_ext::InstanceId::new_v4();
-    sender
-        .register_peer(velo_ext::PeerInfo::new(
-            peer_instance,
-            velo_ext::WorkerAddress::from_encoded(
-                rmp_serde::to_vec(&std::collections::HashMap::from([(
-                    "stalling".to_string(),
-                    b"stalling".to_vec(),
-                )]))
-                .expect("encode"),
-            ),
-        ))
-        .expect("register peer");
-
-    let registry = prometheus::Registry::new();
-    let metrics = Arc::new(VeloMetrics::register(&registry).expect("register metrics"));
-    let cancel = CancellationToken::new();
-    let handle = spawn(
-        peer_instance.worker_id(),
-        BatcherContext {
-            messenger: Arc::clone(&sender),
-            config: manual(),
-            metrics: Some(metrics.bind_mux()),
-            epochs: Arc::new(AtomicU64::new(1)),
-            batchers: Arc::new(DashMap::new()),
-            cancel: cancel.clone(),
-            hooks: None,
-        },
-    );
-
-    let (inlet, inlet_rx) = flume::bounded::<Vec<u8>>(512);
-    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-    handle
-        .open_slot(OpenSlotRequest {
-            anchor_id: 1,
-            session_id: 1,
-            inlet: inlet_rx,
-            credit: SlotCredit::new(CREDIT),
-            slot_byte_budget: MuxConfig::default().slot_byte_budget,
-            ack: ack_tx,
-        })
-        .await
-        .expect("queue OpenSlot");
+    let harness = stalled_harness(manual()).await;
+    let (inlet, ack_rx) = harness.open(1, 1, CREDIT).await;
     tokio::time::timeout(RECV_TIMEOUT, ack_rx)
         .await
         .expect("ack")
@@ -464,13 +407,7 @@ async fn kicks_during_an_admission_park_neither_double_send_nor_reorder() {
 
     // The eager `OpenSlot` flush is the first write; it takes the gate's one
     // free place, so every flush after it parks.
-    let open = OwnedBatch::decode(&{
-        let (_, payload) = tokio::time::timeout(RECV_TIMEOUT, wire.recv_async())
-            .await
-            .expect("the OpenSlot flush must reach the wire")
-            .expect("wire open");
-        payload
-    });
+    let open = harness.next_wire_batch().await;
     assert_eq!(open.records[0].kind, RecordType::OpenSlot);
 
     let batches = |registry: &prometheus::Registry| {
@@ -479,25 +416,25 @@ async fn kicks_during_an_admission_park_neither_double_send_nor_reorder() {
     };
     // The counter increments *after* a batch lands in the channel, so wait for
     // the OpenSlot flush to be accounted before building on the number.
-    eventually(|| batches(&registry) == 1.0).await;
+    eventually(|| batches(&harness.registry) == 1.0).await;
 
     // Stage a record and flush it: that write fills the gate and parks there.
     // Wait for BOTH facts — the gate being full and the batch being counted —
     // or the baseline below races the increment (seen under llvm-cov, whose
     // instrumentation widens the land-then-count window).
     inlet.send(item(0)).expect("stage a record");
-    handle.kick_flush();
-    eventually(|| wire.is_full() && batches(&registry) == 2.0).await;
-    let parked_at = batches(&registry);
+    harness.handle.kick_flush();
+    eventually(|| harness.wire.is_full() && batches(&harness.registry) == 2.0).await;
+    let parked_at = batches(&harness.registry);
 
     // The producer keeps going: more of the stream, and a flush per pass, all
     // while the batcher is suspended.
     for n in 1..QUEUED {
         inlet.send(item(n)).expect("stage a record");
-        handle.kick_flush();
+        harness.handle.kick_flush();
     }
     assert_eq!(
-        batches(&registry),
+        batches(&harness.registry),
         parked_at,
         "nothing may reach the messenger while the peer's gate is full, \
          however many times the application asks"
@@ -506,16 +443,11 @@ async fn kicks_during_an_admission_park_neither_double_send_nor_reorder() {
     // Open the gate and collect everything, in the order it was written.
     let mut seen: Vec<u32> = Vec::new();
     while (seen.len() as u32) < QUEUED {
-        let (_, payload) = tokio::time::timeout(RECV_TIMEOUT, wire.recv_async())
-            .await
-            .expect("the batcher must resume once the gate drains")
-            .expect("wire open");
-        for record in OwnedBatch::decode(&payload).records {
+        for record in harness.next_wire_batch().await.records {
             assert_eq!(record.kind, RecordType::Data);
             seen.push(record.frame_seq);
         }
     }
-    cancel.cancel();
 
     // `OpenSlot` took frame_seq 0, so the data records are 1..=QUEUED.
     let expected: Vec<u32> = (1..=QUEUED).collect();

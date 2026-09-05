@@ -158,10 +158,13 @@ keeps draining the channel into a per-slot withheld queue bounded by the slot's
 byte cap (1 MiB by default).
 
 When a producer runs past that cap on a slot nobody is draining, **the mux closes
-that slot**: the consumer receives `Dropped`, the producer's channel starts
-erroring, `velo_streaming_mux_records_dropped_total{reason="withheld_overflow"}`
-ticks, and the peer's other slots carry on. Two consequences worth knowing
-before you meet them:
+that slot**: the producer's channel starts erroring at once, the consumer
+receives `Dropped`, `velo_streaming_mux_records_dropped_total{reason="withheld_overflow"}`
+ticks, and the peer's other slots carry on. One ordering caveat: if the slot is
+still fenced behind an unresolved `OpenSlot` or rendezvous admission, the
+consumer's `Dropped` waits for that admission to resolve while the producer is
+already disconnected (see the fence paragraph in `BATCHING.md`). Two
+consequences worth knowing before you meet them:
 
 - **A queued terminal goes with it.** A consumer that would have seen
   `Finalized` sees `Dropped` instead. The stream was already a megabyte behind;
@@ -175,6 +178,32 @@ before you meet them:
 
 The knob is the mux's per-slot byte cap. Raising it buys a slower producer more
 run-ahead before the kill; lowering it fails a wedged stream sooner.
+
+**Under `MuxConfig::async_open_ack`, a healthy consumer is no longer required
+to reach this kill.** The `OpenSlot`-admission fence withholds a slot's records
+from the first one, credit or no credit, so a producer that starts generating
+into a peer whose *send queue* — not whose consumer — is congested can run
+past the byte cap before its own `OpenSlot` is admitted. The slot dies the same
+way and reads the same in the metrics, but the cause is sender-side congestion
+rather than a stalled reader. It also does not compose the way the classic kill
+does: `peer_byte_budget` bounds ingress only, so nothing caps how many slots
+may be open this way against one congested peer at once, and each can withhold
+up to the per-slot cap. N concurrent opens into a stalled peer can therefore
+hold N times the byte cap in egress memory, where the awaited ack (the
+default) serialised new opens behind the same admission and bounded this to
+one wait at a time.
+
+This new kill has no counter of its own: both arms report the same
+`MuxDropReason::WithheldOverflow`, so telling a sender-side-congestion kill
+from the classic stalled-reader one takes a join across
+`velo_streaming_mux_control_refused_total`, `velo_streaming_mux_withheld_records`
+and `velo_streaming_mux_live_slots`, not a single series. A related trap in
+that last gauge: a slot killed while fenced stays counted in
+`velo_streaming_mux_live_slots` — the deferred `CloseSlot` it still owes its
+consumer must not overtake the `OpenSlot` its fence is waiting on, so the
+registry entry survives the kill — and it holds its batcher past
+`batcher_idle_ttl` until the admission resolves. `live_slots` is therefore not
+a count of slots a producer can still write to while any are fenced.
 
 ## What this is NOT
 

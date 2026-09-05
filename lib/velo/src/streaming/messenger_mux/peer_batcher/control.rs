@@ -47,11 +47,46 @@ use crate::observability::MuxMetricsHandle;
 
 /// Entries either map may hold before it starts refusing new keys.
 ///
-/// Legitimate entries are bounded by live slots on one peer — a decode engine's
-/// 1024 concurrent streams to one router sit an order of magnitude under this.
-/// The cap exists for the other case: a peer naming slot ids that were never
-/// alive, which would otherwise grow the maps by one entry per bogus record.
-const MAX_PENDING_CONTROL: usize = 4096;
+/// The cap exists for one case: a peer naming slot ids that were never alive,
+/// which would otherwise grow the maps by one entry per bogus record. It was
+/// sized against a decode engine's 1024 concurrent streams to one router — an
+/// order of magnitude of headroom against *that* shape. That headroom is not
+/// universal: `t3-iso1` measured one peer holding 4,000 to 6,700 live slots at
+/// once (`agent-docs/w4a-async-open-ack-status.md`), an order of magnitude
+/// above the sizing assumption, and at that shape it is legitimate entries —
+/// not bogus ones — the cap refuses.
+///
+/// It applies to what the *peer* names. A singleton resolution is exempt: it
+/// is this side's own answer to a fence it raised, there is at most one
+/// outstanding per fenced slot, and nothing sends it twice. Refusing one leaves
+/// the slot fenced with no second answer coming, so every record it ever
+/// queues is withheld until the consumer's heartbeat watchdog gives up on it.
+/// That is what happened on a peer with more live slots than this cap under
+/// [`MuxConfig::async_open_ack`], where `t3-iso1` measured every open landing
+/// on a peer congested enough to fence it (`fire_singleton` fenced
+/// unconditionally at the time; it now fences only when the admission is not
+/// already behind it, but a peer that congested still fences most opens).
+///
+/// The exemption lives in its own map (see [`ControlState::resolutions`])
+/// rather than as an uncapped key into `mine`, precisely so it cannot make
+/// `entry_mine`'s own problem worse. `entry_mine`'s credit grants and
+/// peer-initiated closes still go through the capped path and still refuse
+/// once *`mine`'s own* entries — grants and closes alone, with nothing from
+/// the exemption in them — reach this cap, which at a peer's live-slot count
+/// above it is the same legitimate-entries case described above, not the
+/// bogus-id case the cap was sized for. That refusal is still real and still
+/// unrecoverable: the receiver has already zeroed the credit it sent by the
+/// time its `CreditUpdate` reached us. A singleton resolution sharing `mine`
+/// with grants and closes would only add to that pressure — a peer with more
+/// live slots than this cap generates that many resolutions too, and every
+/// one of them would have pushed `mine` closer to refusing the grant behind
+/// it. The separate map removes that particular contributor; it does not
+/// close the underlying gap. A cap keyed to live slots, or one that refuses
+/// only keys naming no live slot, is the follow-up this leaves open
+/// (`agent-docs/w4a-async-open-ack-status.md`).
+///
+/// [`MuxConfig::async_open_ack`]: super::super::MuxConfig::async_open_ack
+pub(super) const MAX_PENDING_CONTROL: usize = 4096;
 
 /// Coalesced control for one slot **this** batcher owns.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -60,7 +95,8 @@ pub(super) struct OwnedControl {
     pub(super) credit: u32,
     /// The receiver asked us to abandon the slot.
     pub(super) close: Option<CloseReason>,
-    /// A rendezvous singleton resolved; `false` is a failed admission.
+    /// A singleton (rendezvous, or an `OpenSlot` under
+    /// `MuxConfig::async_open_ack`) resolved; `false` is a failed admission.
     pub(super) singleton: Option<bool>,
 }
 
@@ -82,6 +118,15 @@ struct ControlState {
     pub(super) flush: bool,
     mine: HashMap<u32, OwnedControl>,
     peers: HashMap<u32, PeerControl>,
+    /// Singleton resolutions owed to this side's own fenced slots — see
+    /// [`MAX_PENDING_CONTROL`]'s doc for why this is a separate, uncapped map
+    /// rather than one more key into `mine`. Merged into `mine` at [`drain`]
+    /// time, once the cap has nothing left to protect: draining takes both
+    /// maps out of the state a writer could still be growing, so nothing
+    /// about the merge can trip a refusal.
+    ///
+    /// [`drain`]: Self::drain
+    resolutions: HashMap<u32, bool>,
     /// Entries refused because a map was at [`MAX_PENDING_CONTROL`].
     refused: u64,
 }
@@ -89,7 +134,11 @@ struct ControlState {
 impl ControlState {
     /// Whether the batcher has anything to do.
     fn is_idle(&self) -> bool {
-        !self.retire && !self.flush && self.mine.is_empty() && self.peers.is_empty()
+        !self.retire
+            && !self.flush
+            && self.mine.is_empty()
+            && self.peers.is_empty()
+            && self.resolutions.is_empty()
     }
 
     /// The sweep evicted this batcher from the registry.
@@ -102,27 +151,50 @@ impl ControlState {
         self.flush = true;
     }
 
-    /// Pending entries across both maps, for the bound to be asserted on.
+    /// Pending entries across every map, for the bound to be asserted on.
     ///
     /// The two flags are deliberately not counted: they are `bool`s, so they
     /// bound themselves and cannot be what a flood grows.
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.mine.len() + self.peers.len()
+        self.mine.len() + self.peers.len() + self.resolutions.len()
     }
 
     /// Take everything pending, leaving the state empty.
+    ///
+    /// `resolutions` merges into `mine` here rather than living there all
+    /// along, so a slot with both a grant and a resolution pending still
+    /// reaches `on_owned_control` as the one `OwnedControl` it has always
+    /// been — coalescing a failed admission over a successful one exactly as
+    /// [`ControlInbox::singleton_resolved`] does, since this is the same rule
+    /// applied at the boundary instead of at write time.
     fn drain(&mut self) -> DrainedControl {
+        let mut mine = std::mem::take(&mut self.mine);
+        for (raw, admitted) in std::mem::take(&mut self.resolutions) {
+            let entry = mine.entry(raw).or_default();
+            entry.singleton = Some(entry.singleton.unwrap_or(true) && admitted);
+        }
         DrainedControl {
             retire: std::mem::take(&mut self.retire),
             flush: std::mem::take(&mut self.flush),
-            mine: std::mem::take(&mut self.mine),
+            mine,
             peers: std::mem::take(&mut self.peers),
         }
     }
 
     fn entry_mine(&mut self, slot: SlotId) -> Option<&mut OwnedControl> {
         Self::slot_entry(&mut self.mine, &mut self.refused, slot)
+    }
+
+    /// The entry for an answer this batcher owes one of its own fenced slots.
+    ///
+    /// Not subject to [`MAX_PENDING_CONTROL`] — it does not touch `mine` at
+    /// all until [`Self::drain`] — for why see the cap's own doc: a refused
+    /// resolution is a leak rather than a dropped message, and the whole point
+    /// of a separate map is that this lane's growth can never be what refuses
+    /// somebody else's grant.
+    fn entry_mine_owed(&mut self, slot: SlotId) -> &mut bool {
+        self.resolutions.entry(slot.raw()).or_insert(true)
     }
 
     fn entry_peer(&mut self, slot: SlotId) -> Option<&mut PeerControl> {
@@ -234,14 +306,14 @@ impl ControlInbox {
         });
     }
 
-    /// A rendezvous singleton finished resolving its admission.
+    /// A singleton (rendezvous, or an `OpenSlot` under
+    /// `MuxConfig::async_open_ack`) finished resolving its admission.
     pub(super) fn singleton_resolved(&self, slot: SlotId, admitted: bool) {
         self.mutate(|state| {
-            if let Some(entry) = state.entry_mine(slot) {
-                // A failed admission is epoch death and must survive any number
-                // of successful resolutions coalescing over it.
-                entry.singleton = Some(entry.singleton.unwrap_or(true) && admitted);
-            }
+            let entry = state.entry_mine_owed(slot);
+            // A failed admission is epoch death and must survive any number
+            // of successful resolutions coalescing over it.
+            *entry = *entry && admitted;
         });
     }
 
@@ -390,6 +462,82 @@ mod tests {
         inbox.grant(slot(0, 0), 41);
         let drained = inbox.take().expect("something pending");
         assert_eq!(drained.mine[&slot(0, 0).raw()].credit, 42);
+    }
+
+    /// The answer a fenced slot is waiting for is never refused at the cap.
+    ///
+    /// A peer flooding bogus ids can fill the map, and under `async_open_ack`
+    /// a peer with more live slots than the cap fills it legitimately. Either
+    /// way the resolution of a slot's own `OpenSlot` or over-budget record has
+    /// to land, because nothing else lifts that slot's fence.
+    #[test]
+    fn a_singleton_resolution_is_never_refused_at_the_cap() {
+        let inbox = ControlInbox::default();
+        for index in 0..(MAX_PENDING_CONTROL as u32) {
+            inbox.grant(slot(index, 0), 1);
+        }
+        assert_eq!(inbox.pending_len(), MAX_PENDING_CONTROL);
+
+        let fenced = slot(MAX_PENDING_CONTROL as u32 + 1, 0);
+        inbox.singleton_resolved(fenced, true);
+        assert_eq!(
+            inbox.refused(),
+            0,
+            "a resolution is owed to a fence this side raised; refusing it leaks the slot"
+        );
+
+        let drained = inbox.take().expect("something pending");
+        assert_eq!(
+            drained
+                .mine
+                .get(&fenced.raw())
+                .and_then(|entry| entry.singleton),
+            Some(true),
+            "the resolution reaches the batcher past a full map"
+        );
+    }
+
+    /// The exemption must not spend the capped lane's own budget.
+    ///
+    /// Every open under `MuxConfig::async_open_ack` resolves through
+    /// `entry_mine_owed`, so a peer holding more live slots than
+    /// `MAX_PENDING_CONTROL` — `t3-iso1` measured 4,000-6,700 against 4,096 —
+    /// generates that many resolutions with no grant or peer-close among them
+    /// at all. If those resolutions shared `mine` with `entry_mine`, that
+    /// alone would push `mine` past the cap and start refusing every grant
+    /// behind it. A refused grant is unrecoverable: the receiver has already
+    /// zeroed `ungranted` for the delta the moment it sent the
+    /// `CreditUpdate`, so nothing about the flood a peer's resolutions cause
+    /// may be allowed to starve credit for the peer's other slots.
+    #[test]
+    fn resolutions_alone_must_not_exhaust_the_grant_lane() {
+        let inbox = ControlInbox::default();
+        for index in 0..(MAX_PENDING_CONTROL as u32 + 500) {
+            inbox.singleton_resolved(slot(index, 0), true);
+        }
+        assert_eq!(
+            inbox.refused(),
+            0,
+            "the exempt lane must never itself trip the refusal counter"
+        );
+
+        // An ordinary credit grant, for a slot the resolution flood above
+        // never touched, must still land.
+        let untouched = slot(MAX_PENDING_CONTROL as u32 + 999, 0);
+        inbox.grant(untouched, 7);
+        assert_eq!(
+            inbox.refused(),
+            0,
+            "a grant for an untouched slot must not be refused merely because \
+             open-ack resolutions filled the shared map"
+        );
+
+        let drained = inbox.take().expect("something pending");
+        assert_eq!(
+            drained.mine.get(&untouched.raw()).map(|entry| entry.credit),
+            Some(7),
+            "the grant must reach the batcher, not be silently dropped at the cap"
+        );
     }
 
     #[test]

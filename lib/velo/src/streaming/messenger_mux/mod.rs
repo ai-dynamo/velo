@@ -60,9 +60,11 @@
 //! - **The bound is bytes, and overrunning it ends the stream.** That queue is
 //!   capped at the per-slot byte budget (1 MiB by default). A producer that runs
 //!   further ahead than that on a slot nobody is draining has its slot closed:
-//!   the consumer receives `Dropped`, the producer's channel starts erroring,
-//!   and the peer's other slots are untouched. `SATURATION.md` describes it from
-//!   the operator's side.
+//!   the producer's channel starts erroring at once, the consumer receives
+//!   `Dropped` (deferred behind an outstanding singleton's admission if the
+//!   slot is fenced — see the fence paragraph in `BATCHING.md`), and the
+//!   peer's other slots are untouched. `SATURATION.md` describes it from the
+//!   operator's side.
 //!
 //! The exception is a batcher parked on *admission* rather than on credit. That
 //! suspends the task, inlet drain included — but it is bounded by the
@@ -95,6 +97,8 @@ pub(crate) mod flow_control;
 pub(crate) mod ingress;
 pub(crate) mod peer_batcher;
 pub(crate) mod protocol;
+#[cfg(test)]
+mod test_support;
 #[cfg(test)]
 mod tests;
 
@@ -344,6 +348,67 @@ pub struct MuxConfig {
     /// Defaults to [`FlushPolicy::Auto`] on [`AutoFlush::default`], which is
     /// the behaviour every mux had before this knob existed.
     pub flush_policy: FlushPolicy,
+    /// Whether opening a slot acks before the peer has admitted its `OpenSlot`.
+    ///
+    /// **Defaults to `false`**, the awaited ack every mux shipped with: the
+    /// `OpenSlot` is written in its own batch and `connect` returns once the
+    /// transport has taken it. That couples opening a stream to the depth of
+    /// the per-connection send queue, and on a congested peer that queue is
+    /// full — so a worker cannot start producing until a place in it comes
+    /// free, behind every batch already there.
+    ///
+    /// Set to `true` and the `OpenSlot` is still cut into a batch of its own
+    /// and still handed to the transport before the ack, so `bind()`'s accept
+    /// window keeps measuring "time until a batch bearing this `OpenSlot`
+    /// arrives". What stops is *waiting* for the transport to take it. The
+    /// slot is fenced until that admission resolves, so its first data record
+    /// cannot overtake the `OpenSlot` that claims the buffer it lands in, and a
+    /// failed admission is epoch death exactly as an awaited one is.
+    ///
+    /// The wait it removes is the open's own, and only that one. Cutting the
+    /// `OpenSlot` into a batch of its own means first writing whatever this
+    /// peer already had staged, and *that* write still parks on admission — so
+    /// the ack is wait-free only when nothing is staged. With a batch staged
+    /// the two paths wait the same once and this one costs a frame more,
+    /// because the awaited path packs the `OpenSlot` into that staged batch
+    /// rather than sending a second. Read as a rate, what this buys in
+    /// principle is the open of an idle peer, which is the open a queued
+    /// request waits on.
+    ///
+    /// **Measured, that benefit did not show at load.** `t3-iso1`
+    /// (`agent-docs/w4a-async-open-ack-status.md`), three reps at 512 workers
+    /// and 8,192-way concurrency: this flag alone moved TTFT p50 from 85 to
+    /// 91 ms — no improvement — and made p95 worse in every rep (188 → 227 ms
+    /// mean, against a same-arm p95 spread of about 20 ms). Whether the wait
+    /// this removes dominates first-token latency is a question of
+    /// concurrency and peer congestion, not something this flag answers by
+    /// existing; a rerun past the control-cap fix in `peer_batcher::control`'s
+    /// `MAX_PENDING_CONTROL` doc is a precondition for calling it a win at any
+    /// shape.
+    ///
+    /// **The per-open cost is not amortized the way a packed flush is, and is
+    /// paid whether or not the wait it removes was on the critical path.**
+    /// Every call spends one `tokio::spawn` and an `Arc` clone to watch the
+    /// admission, one `ControlInbox` mutex-guarded map insert plus a `Notify`
+    /// wake to report it back, and — once the fence lifts — an unfence and a
+    /// full `release_withheld` pass. Every record queued during the fence
+    /// window pays a withheld-queue push and pop plus a second
+    /// `is_terminal_sentinel` decode that the unfenced fast path never runs.
+    ///
+    /// **The fence this trades in is a second way to lose a stream.** It goes
+    /// up before the ack, unconditionally of credit, so the slot's first
+    /// record — and every one behind it — withholds from record #1 whether or
+    /// not the slot has room to spend. On a peer whose send queue is the
+    /// congested one this flag exists to route around, a producer that starts
+    /// generating right away can fill the slot's byte cap before its own
+    /// `OpenSlot` is admitted, and the slow-consumer kill (`SATURATION.md`)
+    /// destroys the stream on that basis — a healthy consumer never entered
+    /// into it. Because `peer_byte_budget` bounds ingress only, nothing caps
+    /// how many slots may be open this way against one congested peer at once:
+    /// each can withhold up to `slot_byte_budget`, so the aggregate egress
+    /// buffer a stalled peer can hold grows with concurrent opens where the
+    /// awaited ack bounded it to one wait at a time.
+    pub async_open_ack: bool,
 }
 
 impl Default for MuxConfig {
@@ -358,6 +423,7 @@ impl Default for MuxConfig {
             drain_visit_floor: Duration::from_millis(2),
             batcher_idle_ttl: Duration::from_secs(60),
             flush_policy: FlushPolicy::Auto(AutoFlush::default()),
+            async_open_ack: false,
         }
     }
 }

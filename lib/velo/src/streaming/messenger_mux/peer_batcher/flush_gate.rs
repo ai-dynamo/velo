@@ -18,11 +18,14 @@
 //! - **A batch at a clamp goes.** `emit_data`, `push_close` and `push_reply`
 //!   flush inline when a record will not fit, because holding a full batch buys
 //!   nothing — there is no room left to batch into.
-//! - **Records that carry liveness go.** `OpenSlot` has its own eager flush, and
-//!   a `CloseSlot`, a `CreditUpdate` or a terminal staged into the batch marks it
-//!   [`urgent`](FlushGate::stage_urgent). A `CreditUpdate` that lingers is a
-//!   peer's sender starved with nothing left to rescue it, which is not
-//!   something an application should be able to cause by forgetting a call.
+//! - **Records that carry liveness go.** The awaited open path's `OpenSlot` has
+//!   its own eager flush, and a `CloseSlot`, a `CreditUpdate` or a terminal
+//!   staged into the batch marks it [`urgent`](FlushGate::stage_urgent). A
+//!   `CreditUpdate` that lingers is a peer's sender starved with nothing left
+//!   to rescue it, which is not something an application should be able to
+//!   cause by forgetting a call. `MuxConfig::async_open_ack`'s detached open
+//!   bypasses this gate entirely — it dispatches straight to the transport, so
+//!   nothing here decides when it goes.
 //!
 //! ## The kick, and why it outlives a clamp
 //!

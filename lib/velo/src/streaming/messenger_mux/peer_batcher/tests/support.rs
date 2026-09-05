@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use dashmap::DashMap;
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use super::super::*;
@@ -20,6 +21,7 @@ use crate::streaming::messenger_mux::flow_control::SlotCredit;
 use crate::streaming::messenger_mux::protocol::{
     BatchDecoder, BatchHeader, RecordBody, RecordType,
 };
+use crate::streaming::messenger_mux::test_support::{StallingTransport, stalling_address};
 use crate::transports::tcp::TcpTransportBuilder;
 
 pub(super) const RECV_TIMEOUT: Duration = Duration::from_secs(5);
@@ -112,11 +114,12 @@ pub(super) async fn harness(config: MuxConfig) -> Harness {
     harness_with_hooks(config, None).await
 }
 
-/// As [`harness`], with a barrier installed in the batcher's run loop.
-pub(super) async fn harness_with_hooks(
-    config: MuxConfig,
-    hooks: Option<Arc<super::super::test_hooks::TestHooks>>,
-) -> Harness {
+/// A sender messenger and a peer capturing every `_stream_batch` payload it is
+/// sent.
+///
+/// The far end of every egress test: a real messenger pair over loopback TCP,
+/// so the assertions read wire bytes rather than an accounting mirror.
+pub(super) async fn capture_pair() -> (Arc<Messenger>, Arc<Messenger>, flume::Receiver<Bytes>) {
     let sender = Messenger::builder()
         .add_transport(tcp_transport())
         .build()
@@ -151,6 +154,15 @@ pub(super) async fn harness_with_hooks(
 
     // Let the TCP connections settle so the first send takes the direct path.
     tokio::time::sleep(Duration::from_millis(200)).await;
+    (sender, capture, batches)
+}
+
+/// As [`harness`], with a barrier installed in the batcher's run loop.
+pub(super) async fn harness_with_hooks(
+    config: MuxConfig,
+    hooks: Option<Arc<super::super::test_hooks::TestHooks>>,
+) -> Harness {
+    let (sender, capture, batches) = capture_pair().await;
 
     let registry = prometheus::Registry::new();
     let metrics = Arc::new(VeloMetrics::register(&registry).expect("register metrics"));
@@ -351,82 +363,168 @@ pub(super) async fn eventually(mut predicate: impl FnMut() -> bool) {
     panic!("condition never held within {RECV_TIMEOUT:?}");
 }
 
-/// A transport whose per-target send channel this test owns.
+// ---------------------------------------------------------------------------
+// A batcher whose peer never takes a second frame
+// ---------------------------------------------------------------------------
+
+/// A batcher over a [`StallingTransport`], plus the wire nobody drains.
 ///
-/// One admission gate over a `bounded(1)` channel nobody drains: the first send
-/// takes the fast path, every send after it parks in the gate. That is the shape
-/// of a congested peer, produced deterministically instead of waited for.
-pub(super) struct StallingTransport {
-    key: velo_ext::TransportKey,
-    address: velo_ext::WorkerAddress,
-    gate: velo_ext::AdmissionGate<(Bytes, Bytes)>,
-    peers: std::sync::Mutex<std::collections::HashSet<velo_ext::InstanceId>>,
+/// The congested peer, made deterministic: the gate holds exactly one frame, so
+/// the first send lands and every send after it parks until a test takes that
+/// one out. Separate from [`Harness`] because there is no capture messenger and
+/// no far end at all — the admission gate is the whole of the peer.
+pub(super) struct StalledHarness {
+    pub(super) handle: Arc<BatcherHandle>,
+    /// The batcher's own configuration, so [`StalledHarness::open`] hands a slot
+    /// the byte budget the batcher was built with.
+    config: MuxConfig,
+    /// Frames the gate has admitted. Draining one place lets the next in.
+    pub(super) wire: flume::Receiver<(Bytes, Bytes)>,
+    pub(super) registry: prometheus::Registry,
+    pub(super) cancel: CancellationToken,
+    // Held so the messenger outlives the batcher.
+    _sender: Arc<Messenger>,
 }
 
-impl StallingTransport {
-    pub(super) fn new(rt: tokio::runtime::Handle) -> (Arc<Self>, flume::Receiver<(Bytes, Bytes)>) {
-        let (tx, rx) = flume::bounded::<(Bytes, Bytes)>(1);
-        let key = velo_ext::TransportKey::new("stalling");
-        let mut entries = std::collections::HashMap::<String, Vec<u8>>::new();
-        entries.insert(key.as_str().to_string(), b"stalling".to_vec());
-        let address =
-            velo_ext::WorkerAddress::from_encoded(rmp_serde::to_vec(&entries).expect("encode"));
-        let transport = Arc::new(Self {
-            key,
-            address,
-            gate: velo_ext::AdmissionGate::new(tx, rt),
-            peers: std::sync::Mutex::new(std::collections::HashSet::new()),
-        });
-        (transport, rx)
+pub(super) async fn stalled_harness(config: MuxConfig) -> StalledHarness {
+    stalled_harness_with_hooks(config, None).await
+}
+
+pub(super) async fn stalled_harness_with_hooks(
+    config: MuxConfig,
+    hooks: Option<Arc<super::super::test_hooks::TestHooks>>,
+) -> StalledHarness {
+    let (transport, wire) = StallingTransport::new(tokio::runtime::Handle::current());
+    let sender = Messenger::builder()
+        .add_transport(transport)
+        .build()
+        .await
+        .expect("sender messenger");
+    // A peer id the transport accepts. Nothing ever reads the far end; the
+    // gate is the only thing under test.
+    let peer_instance = velo_ext::InstanceId::new_v4();
+    sender
+        .register_peer(velo_ext::PeerInfo::new(peer_instance, stalling_address()))
+        .expect("register peer");
+
+    let registry = prometheus::Registry::new();
+    let metrics = Arc::new(VeloMetrics::register(&registry).expect("register metrics"));
+    let cancel = CancellationToken::new();
+    let handle = spawn(
+        peer_instance.worker_id(),
+        BatcherContext {
+            messenger: Arc::clone(&sender),
+            config: config.clone(),
+            metrics: Some(metrics.bind_mux()),
+            epochs: Arc::new(AtomicU64::new(1)),
+            batchers: Arc::new(DashMap::new()),
+            cancel: cancel.clone(),
+            hooks,
+        },
+    );
+
+    StalledHarness {
+        handle,
+        config,
+        wire,
+        registry,
+        cancel,
+        _sender: sender,
     }
 }
 
-impl velo_ext::Transport for StallingTransport {
-    fn key(&self) -> velo_ext::TransportKey {
-        self.key.clone()
-    }
-
-    fn address(&self) -> velo_ext::WorkerAddress {
-        self.address.clone()
-    }
-
-    fn register(&self, peer_info: velo_ext::PeerInfo) -> Result<(), velo_ext::TransportError> {
-        self.peers
-            .lock()
-            .expect("peer set poisoned")
-            .insert(peer_info.instance_id());
-        Ok(())
-    }
-
-    fn send_message(
+impl StalledHarness {
+    /// Queue an `OpenSlot` and hand back the producer inlet and the ack channel.
+    ///
+    /// The ack is deliberately **not** awaited here: whether it arrives before
+    /// the `OpenSlot` is admitted is the property these tests are about, so a
+    /// helper that waited for it would decide the question it is used to ask.
+    pub(super) async fn open(
         &self,
-        _instance_id: velo_ext::InstanceId,
-        header: Bytes,
-        payload: Bytes,
-        _message_type: velo_ext::MessageType,
-        _on_error: Arc<dyn velo_ext::TransportErrorHandler>,
-    ) -> velo_ext::SendOutcome {
-        self.gate.send((header, payload))
+        anchor_id: u64,
+        session_id: u64,
+        credit: u32,
+    ) -> (
+        flume::Sender<Vec<u8>>,
+        oneshot::Receiver<Result<(), OpenRejected>>,
+    ) {
+        // Deep enough that a producer never meets a full channel while the
+        // batcher is parked on admission and therefore not draining it.
+        let (inlet_tx, inlet_rx) = flume::bounded::<Vec<u8>>(512);
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.handle
+            .open_slot(OpenSlotRequest {
+                anchor_id,
+                session_id,
+                inlet: inlet_rx,
+                credit: SlotCredit::new(credit),
+                slot_byte_budget: self.config.slot_byte_budget,
+                ack: ack_tx,
+            })
+            .await
+            .expect("queue OpenSlot");
+        (inlet_tx, ack_rx)
     }
 
-    fn start(
-        &self,
-        _instance_id: velo_ext::InstanceId,
-        _channels: velo_ext::TransportAdapter,
-        _rt: tokio::runtime::Handle,
-    ) -> futures::future::BoxFuture<'_, anyhow::Result<()>> {
-        Box::pin(async { Ok(()) })
+    /// Take one admitted frame off the gate, freeing its place.
+    pub(super) async fn next_wire_batch(&self) -> OwnedBatch {
+        let (_, payload) = tokio::time::timeout(RECV_TIMEOUT, self.wire.recv_async())
+            .await
+            .expect("timed out waiting for an admitted frame")
+            .expect("wire closed");
+        OwnedBatch::decode(&payload)
     }
 
-    fn shutdown(&self) {}
+    /// Drop the receiver behind the gate, so a frame parked in it fails to
+    /// admit instead of merely waiting.
+    ///
+    /// `StallingTransport`'s gate is a bounded(1) `flume` channel over `wire`;
+    /// dropping this end disconnects it, and the gate's driver task resolves
+    /// every queued ticket `Err(AdmissionError::ChannelClosed)` rather than
+    /// leaving it parked. That is the one way this fixture can produce a real
+    /// failed admission rather than an admission a test injects by calling
+    /// `singleton_resolved` directly.
+    pub(super) fn disconnect_wire(&mut self) {
+        let (_tx, unused) = flume::bounded(0);
+        drop(std::mem::replace(&mut self.wire, unused));
+    }
 
-    fn check_health(
-        &self,
-        _instance_id: velo_ext::InstanceId,
-        _timeout: Duration,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(), velo_ext::HealthCheckError>> + Send + '_>,
-    > {
-        Box::pin(async { Ok(()) })
+    pub(super) fn snapshot(&self) -> crate::observability::test_helpers::MetricSnapshot {
+        crate::observability::test_helpers::MetricSnapshot::from_registry(&self.registry)
+    }
+
+    /// Records packed into a batch the writer has open but has not written.
+    pub(super) fn staged(&self) -> f64 {
+        self.snapshot()
+            .gauge("velo_streaming_mux_staged_records", &[])
+    }
+
+    /// Records the producer ran past a starved slot's byte cap and lost.
+    pub(super) fn overflow_dropped(&self) -> f64 {
+        self.snapshot().counter(
+            "velo_streaming_mux_records_dropped_total",
+            &[("reason", "withheld_overflow")],
+        )
+    }
+
+    /// Wait until exactly `count` records are parked — for want of credit, or
+    /// behind a fence.
+    ///
+    /// A positive fact, unlike "nothing has reached the wire yet", which is
+    /// true before the batcher has run at all and so proves nothing.
+    pub(super) async fn await_withheld(&self, count: usize) {
+        eventually(|| {
+            let withheld = self
+                .snapshot()
+                .gauge("velo_streaming_mux_withheld_records", &[]);
+            (withheld - count as f64).abs() < f64::EPSILON
+        })
+        .await;
+    }
+}
+
+impl Drop for StalledHarness {
+    fn drop(&mut self) {
+        self.cancel.cancel();
     }
 }

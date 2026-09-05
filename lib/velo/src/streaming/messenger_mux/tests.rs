@@ -16,6 +16,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use velo_ext::WorkerId;
 
+use super::test_support::stalled_producer;
 use super::*;
 use crate::observability::test_helpers::MetricSnapshot;
 use crate::streaming::sender::{cached_dropped, cached_finalized};
@@ -617,6 +618,81 @@ async fn one_flush_reaches_every_peer_batcher() {
         sent_batches(),
         after_opens + PEERS as f64,
         "one flush, one batch per peer — not one per slot and not only the first peer"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Opening a slot into a congested peer
+// ---------------------------------------------------------------------------
+
+/// How long a `connect` may take before it counts as having waited.
+///
+/// Far longer than an open costs when it does not wait, and far shorter than
+/// the peer here ever un-parks — which is never. Nothing in between is a
+/// judgement call this test has to make.
+const ACK_PATIENCE: Duration = Duration::from_secs(2);
+
+/// A stream may open while the peer's send channel is full.
+///
+/// The measured shape: at the published concurrency every mocker process sits
+/// with its per-connection channel full, and a worker cannot start generating
+/// until its stream is open. Today the ack waits for the `OpenSlot`'s own
+/// admission, so opening a stream costs a place in exactly the queue that is
+/// full — the wait is not the network, it is the batch already in front of it.
+/// The `OpenSlot` still goes to the transport before the ack; what stops is
+/// waiting for the transport to take it.
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_returns_while_the_data_channel_is_full() {
+    let stalled = stalled_producer(MuxConfig {
+        async_open_ack: true,
+        ..test_config()
+    })
+    .await;
+
+    // The first open takes the gate's one free place, so it is admitted and
+    // says nothing about the property. It is how the channel gets full.
+    //
+    // Its inlet is held for the rest of the test on purpose: dropping it is the
+    // producer going away, which queues a `CloseSlot{PeerGone}` and parks the
+    // batcher on *that* write instead — a stall that has nothing to do with the
+    // open being measured.
+    let _first_inlet = stalled
+        .connect(1, RECV_TIMEOUT)
+        .await
+        .expect("the first open is admitted immediately");
+    eventually(|| stalled.wire.is_full()).await;
+
+    // The second one's `OpenSlot` parks behind it.
+    assert!(
+        stalled.connect(2, ACK_PATIENCE).await.is_some(),
+        "connect must return while the peer's send channel is full"
+    );
+}
+
+/// With the gate off, `connect` waits for the admission exactly as it always
+/// did.
+///
+/// This is what makes the bound above mean something. A fixture whose channel
+/// never actually filled would let the fast return pass for the wrong reason;
+/// here the same fixture, the same peer and the same full channel do not answer
+/// at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn gate_off_reproduces_the_awaited_ack() {
+    let stalled = stalled_producer(test_config()).await;
+    assert!(
+        !MuxConfig::default().async_open_ack,
+        "the awaited ack is the default"
+    );
+
+    let _first_inlet = stalled
+        .connect(1, RECV_TIMEOUT)
+        .await
+        .expect("the first open is admitted immediately");
+    eventually(|| stalled.wire.is_full()).await;
+
+    assert!(
+        stalled.connect(2, ACK_PATIENCE).await.is_none(),
+        "the default must keep waiting for the OpenSlot's own admission"
     );
 }
 

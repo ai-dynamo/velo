@@ -197,8 +197,7 @@ impl BatchWriter {
             return Ok(());
         };
         if encoder.is_empty() {
-            // Nothing went out, so the sequence it reserved is not a gap.
-            self.next_batch_seq = self.next_batch_seq.wrapping_sub(1);
+            self.refund_batch_seq();
             self.buffer = encoder.finish();
             return Ok(());
         }
@@ -213,37 +212,92 @@ impl BatchWriter {
         self.dispatch(payload).await.map_err(FlushFailed)
     }
 
-    /// Build and hand off a one- or two-record batch of its own.
+    /// Build and hand off a batch of its own, without parking on admission.
     ///
-    /// Returns the [`FireResult`] rather than awaiting it: an over-budget record
-    /// rides rendezvous, and charging every other slot on the peer for that
-    /// round trip is exactly what the singleton path exists to avoid. The
+    /// Returns the [`FireResult`] rather than awaiting it, for the two records
+    /// that must not charge a whole peer for their own round trip: an
+    /// over-budget record, which rides rendezvous, and an `OpenSlot`, whose ack
+    /// is what a producer waits on before it may send anything at all. The
     /// caller fences the one slot involved and watches the admission from a
     /// detached task.
+    ///
+    /// Both ways out without a send give the reserved sequence back, so this
+    /// call's own reservation never leaks — whatever a caller does with the
+    /// `Option<FireResult>` it gets back. That does not, by itself, keep the
+    /// wire contiguous against a *separate* reservation a caller holds open
+    /// across this call: `emit_data`'s clamp-retry path calls `ensure_batch`
+    /// (reserving a sequence for a fresh, still-empty encoder) and can in
+    /// principle fall through to this method without flushing it first, which
+    /// would leave that encoder's sequence to be refunded later out of order
+    /// and read at the receiver as a hole followed by a duplicate. It cannot
+    /// today: that fallthrough needs [`Self::compute_cap`] to shrink between
+    /// the two `ensure_batch` calls in one `emit_data` invocation, and
+    /// [`batch_cap`]'s own doc records that the eager term never binds
+    /// end-to-end for any transport in this workspace. So this is a caller
+    /// discipline the writer cannot enforce by itself — held today by that
+    /// arithmetic fact about `emit_data`, not by construction here.
+    ///
+    /// Every caller flushes immediately before reaching here, so `self.buffer`
+    /// is free capacity the last flush handed back — take it the way
+    /// `ensure_batch` does, rather than allocating a fresh `BytesMut`, so the
+    /// path this flag adds costs no more per open than the awaited one did.
+    /// The one caller that does not arrive with `self.buffer` free is
+    /// `emit_data`'s clamp-retry arm, which re-opens an encoder (and so
+    /// re-takes the buffer into it) before learning the record still does not
+    /// fit; a staged `self.encoder` is how that case is told apart, and it
+    /// falls back to a fresh allocation because the buffer is already spoken
+    /// for.
     pub(super) fn dispatch_singleton(
         &mut self,
         write: impl FnOnce(&mut BatchEncoder) -> Result<(), EncodeError>,
     ) -> Option<FireResult> {
         let batch_seq = self.take_batch_seq();
-        let mut encoder = BatchEncoder::new(self.epoch, batch_seq);
+        let mut encoder = if self.encoder.is_none() {
+            BatchEncoder::with_buffer(std::mem::take(&mut self.buffer), self.epoch, batch_seq)
+        } else {
+            BatchEncoder::new(self.epoch, batch_seq)
+        };
         if let Err(error) = write(&mut encoder) {
             tracing::error!(%error, "messenger mux: dropping unencodable singleton");
+            self.refund_batch_seq();
+            self.buffer = encoder.finish();
             return None;
         }
         let records = usize::from(encoder.record_count());
-        let payload = encoder.finish().freeze();
+        // Split rather than freeze whole, so the tail capacity comes back to
+        // `self.buffer` exactly as `flush` returns its own — the reuse this
+        // method exists to give the next call is worthless if this one never
+        // gives the buffer back.
+        let mut finished = encoder.finish();
+        let payload = finished.split().freeze();
+        self.buffer = finished;
 
-        if let Some(metrics) = &self.metrics {
-            metrics.rendezvous_singleton();
-            metrics.batch(MuxDirection::Sent, records);
-        }
         match self.messenger.am_send_streaming(STREAM_BATCH_HANDLER) {
-            Ok(builder) => Some(builder.raw_payload(payload).worker(self.peer).send()),
+            Ok(builder) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics.batch(MuxDirection::Sent, records);
+                }
+                Some(builder.raw_payload(payload).worker(self.peer).send())
+            }
             Err(error) => {
                 tracing::error!(%error, "messenger mux: could not build a singleton send");
+                self.refund_batch_seq();
                 None
             }
         }
+    }
+
+    /// Give back a sequence a dispatch reserved and then did not send under.
+    ///
+    /// Nothing went out, so the sequence is not a gap — but a receiver reading
+    /// the next batch would meter one: `note_batch_seq` measures the distance
+    /// between the `batch_seq` it expected and the one that arrived, and cannot
+    /// tell a batch that was lost from one that was never built. Contiguity is
+    /// therefore the writer's own invariant, held at the writer's own seam. It
+    /// is not covering for a reachable defect: the batcher fails the epoch on
+    /// every arm that returns without sending, and that resets the counter.
+    fn refund_batch_seq(&mut self) {
+        self.next_batch_seq = self.next_batch_seq.wrapping_sub(1);
     }
 
     async fn dispatch(&self, payload: Bytes) -> anyhow::Result<()> {
