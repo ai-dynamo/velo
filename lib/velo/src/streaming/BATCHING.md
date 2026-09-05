@@ -1128,3 +1128,61 @@ change: "a background sweep reclaims credit for slots whose pump died". It does
 not, on any interval. `IngressSlot::reconcile` measures against `frame_tx.len()`,
 which stays pinned once the receiver is dropped, so a dead pump's slot is closed
 by the next arrival finding it unknown rather than reclaimed by the sweep.
+
+---
+
+## Addendum, 2026-09-04: a slot can be bound before anyone asks for it
+
+Superseding, by addition, two claims above: that setup costs "1 active-message
+round trip" in the resource table, and that "there is no `bind_muxed`" because
+"the window it would have taken is not known at bind time — the *receiver*
+chooses it".
+
+The second sentence is the answer to the first. The receiver chooses every field
+of `AnchorAttachResponse::Ok` without needing anything from the sender, so
+nothing obliges it to wait to be asked. `MessengerMuxTransport::prebind` is the
+synchronous twin of `bind` — the same body, called while a request is being
+registered rather than while an attach is being served — and
+`AnchorManager::prebind_anchor` wraps it with everything else the attach handler
+does on the round trip: allocate the routing session, take the drain signal,
+spawn `reader_pump`. What comes back is a `StreamOpenTicket`, the same five
+values the response carries, for the application to put in the request envelope
+it already sends the worker. The worker opens on it with
+`AnchorManager::open_anchor_stream`, its first batch's `OpenSlot` claims the
+pre-bound slot exactly as an attached sender's would, and no `_anchor_attach`
+crosses the wire.
+
+Nothing on the wire changed. The attach request and response gain and lose no
+field; `StreamOpenTicket` is a separate type carried in the application's own
+envelope, and a worker that receives no ticket attaches exactly as before. With
+no mux installed no ticket is minted at all, so `MuxConfig::enabled` remains the
+complete rollback for this path too.
+
+Three seams follow from a slot existing before its sender does:
+
+- **A sender that attaches anyway must be given the slot that is waiting, not a
+  second one.** The attach handler adopts an unclaimed pre-bind and answers with
+  its ticket's own session id. A pre-bind whose `OpenSlot` has already arrived is
+  refused instead — that stream is running, and a second opener may not have it.
+  A sender that cannot speak the pre-bound key is refused and the bind is
+  released, so its retry meets a clean anchor — and the release re-arms the
+  anchor's unattached timer, which the pre-bind had paused. The co-located
+  branch of `attach_stream_anchor` follows the same rule from the other side: a
+  same-worker sender writes straight into the anchor's channel, so an unclaimed
+  pre-bind will never have a sender and is released, while a claimed one is
+  refused as an already-attached anchor.
+- **A request that dies before its first token must give the bind back.**
+  `PreBind`'s `Drop` does it, which needs no new call site: every path that kills
+  an anchor already removes its registry entry. The 60 s accept window stays as
+  the backstop rather than as the mechanism.
+- **Cancellation loses its direct route and gets another.** Zero-RTT never sends
+  an attach, so the anchor never learns a `StreamCancelHandle` and cannot poison
+  its producer. The receive side already closes a slot whose consumer has gone —
+  `CloseReason::UnknownSlot`, on the next record to arrive — and an idle producer
+  sends no next record. So a claimed `PreBind`'s `Drop` posts that same close
+  itself, on a trigger that does not wait for traffic.
+
+Credit is exact by construction and not by agreement: `prebind` sizes its buffer
+at `slot_buffer_depth()` from the same `NegotiatedLimits` the ticket quotes, and
+`open_slot` still emits no `CreditUpdate` on the claim, so the `2C`-against-a-
+`C + 1`-buffer hazard P8 closed stays closed.

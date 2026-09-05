@@ -729,6 +729,7 @@ fn make_pump_test_infra() -> (
             unattached_timeout: None,
             heartbeat_interval: Duration::from_secs(5),
             stream_cancel_handle: None,
+            prebind: None,
         },
     );
 
@@ -929,6 +930,7 @@ async fn test_child_token_reattach_pump_survives() {
             unattached_timeout: None,
             heartbeat_interval: Duration::from_secs(5),
             stream_cancel_handle: None,
+            prebind: None,
         },
     );
 
@@ -1086,5 +1088,80 @@ async fn test_pump_exits_when_consumer_drops() {
     assert!(
         cancel_token.is_cancelled(),
         "cancel_token must be cancelled after pump exits due to consumer drop"
+    );
+}
+
+/// Zero-RTT setup added a type, not a field: the attach request and response
+/// encode exactly what they encoded before, and a peer that sends neither a
+/// ticket nor anything about one still round-trips.
+///
+/// The negative is the point. `StreamOpenTicket` carries the same five values
+/// as `AnchorAttachResponse::Ok`, and the cheap way to build it would have been
+/// to hang it off the attach types — which would have put a new field on the
+/// wire for every peer, ticket or no ticket. This is what says that did not
+/// happen.
+#[test]
+fn attach_response_golden_encoding_unchanged() {
+    // The request as a sender that knows nothing of tickets writes it: the
+    // three fields that predate negotiation, plus the key list negotiation
+    // added. Nothing else may be required to decode it.
+    let ticketless_request = r#"{
+        "handle": {"hi": 1, "lo": 2},
+        "session_id": 3,
+        "stream_cancel_handle": {"hi": 4, "lo": 5},
+        "supported_transport_keys": ["messenger-mux-v1"]
+    }"#;
+    let decoded: AnchorAttachRequest =
+        serde_json::from_str(ticketless_request).expect("a ticketless request must deserialize");
+    assert_eq!(decoded.session_id, 3);
+    assert_eq!(
+        decoded
+            .supported_transport_keys
+            .iter()
+            .map(velo_ext::TransportKey::as_str)
+            .collect::<Vec<_>>(),
+        ["messenger-mux-v1"]
+    );
+
+    // The response keeps its five fields and gains none. Compared as a value
+    // rather than as bytes because the field *set* is the invariant; rmp-serde
+    // writes named fields, so an added one would show up here as an extra key.
+    let response = AnchorAttachResponse::Ok {
+        streaming_transport_key: velo_ext::TransportKey::new("messenger-mux-v1"),
+        heartbeat_interval_ms: 1234,
+        routing_session_id: 42,
+        initial_credit: 64,
+        slot_byte_budget: 4096,
+    };
+    let json: serde_json::Value =
+        serde_json::from_str(&serde_json::to_string(&response).expect("serialize"))
+            .expect("reparse");
+    let fields = json
+        .get("Ok")
+        .and_then(serde_json::Value::as_object)
+        .expect("externally tagged Ok");
+    let mut names: Vec<&str> = fields.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        [
+            "heartbeat_interval_ms",
+            "initial_credit",
+            "routing_session_id",
+            "slot_byte_budget",
+            "streaming_transport_key",
+        ],
+        "the attach response gained or lost a field; zero-RTT must add neither"
+    );
+
+    // And the ticket is its own type, decodable on its own terms.
+    let ticket: StreamOpenTicket = serde_json::from_str(
+        r#"{"streaming_transport_key":"messenger-mux-v1","routing_session_id":7,"initial_credit":8,"slot_byte_budget":0}"#,
+    )
+    .expect("a ticket must deserialize");
+    assert_eq!(ticket.routing_session_id, 7);
+    assert_eq!(
+        ticket.heartbeat_interval_ms, 5000,
+        "an absent cadence defaults exactly as the attach response's does"
     );
 }

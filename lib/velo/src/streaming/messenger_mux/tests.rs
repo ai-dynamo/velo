@@ -19,7 +19,7 @@ use velo_ext::WorkerId;
 use super::*;
 use crate::observability::test_helpers::MetricSnapshot;
 use crate::streaming::sender::{cached_dropped, cached_finalized};
-use crate::streaming::{AnchorManagerBuilder, StreamAnchorHandle, StreamFrame};
+use crate::streaming::{AnchorManager, AnchorManagerBuilder, StreamAnchorHandle, StreamFrame};
 use crate::transports::tcp::TcpTransportBuilder;
 
 const RECV_TIMEOUT: Duration = Duration::from_secs(10);
@@ -66,6 +66,7 @@ struct Pair {
     consumer: Arc<MessengerMuxTransport>,
     producer: Arc<MessengerMuxTransport>,
     consumer_worker: WorkerId,
+    producer_worker: WorkerId,
     registry: prometheus::Registry,
     _messengers: (Arc<Messenger>, Arc<Messenger>),
 }
@@ -84,10 +85,12 @@ async fn mux_pair(config: MuxConfig) -> Pair {
         MessengerMuxTransport::new(Arc::clone(&m_producer), config, Some(Arc::clone(&metrics)))
             .expect("producer mux");
     let consumer_worker = m_consumer.instance_id().worker_id();
+    let producer_worker = m_producer.instance_id().worker_id();
     Pair {
         consumer,
         producer,
         consumer_worker,
+        producer_worker,
         registry,
         _messengers: (m_consumer, m_producer),
     }
@@ -893,4 +896,291 @@ mod drain_visit_floor {
             "a stamp still inside the floor is kept"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Zero-RTT pre-binds
+// ---------------------------------------------------------------------------
+
+/// One node that can pre-bind: a messenger, the mux installed on it, and an
+/// anchor manager that knows about both.
+///
+/// `prebind_anchor` needs all three at once — the mux for the bind, the manager
+/// for the registry entry the `PreBind` lives in — so every test below would
+/// otherwise open with the same twelve lines.
+struct PrebindingNode {
+    messenger: Arc<Messenger>,
+    mux: Arc<MessengerMuxTransport>,
+    manager: AnchorManager,
+}
+
+async fn prebinding_node(
+    config: MuxConfig,
+    unattached_timeout: Option<Duration>,
+) -> PrebindingNode {
+    let messenger = Messenger::builder()
+        .add_transport(tcp_transport())
+        .build()
+        .await
+        .expect("messenger");
+    let mux = MessengerMuxTransport::new(Arc::clone(&messenger), config, None).expect("mux");
+    let mut builder = AnchorManagerBuilder::default()
+        .worker_id(messenger.instance_id().worker_id())
+        .transport(Arc::clone(&mux) as Arc<dyn crate::streaming::transport::FrameTransport>);
+    if let Some(timeout) = unattached_timeout {
+        builder = builder.default_unattached_timeout(timeout);
+    }
+    let manager = builder.build().expect("anchor manager");
+    manager.install_mux(Arc::clone(&mux)).expect("install mux");
+    PrebindingNode {
+        messenger,
+        mux,
+        manager,
+    }
+}
+
+/// A bind nobody claimed goes back when its anchor dies, not when the accept
+/// window closes.
+///
+/// Zero-RTT setup binds a slot at request registration, so a request that dies
+/// before its first token — a client that hangs up, a prompt that is refused —
+/// leaves one behind. [`ACCEPT_TIMEOUT`] would collect it eventually and stays
+/// as the backstop, but at the rate a frontend registers requests, a minute of
+/// leaked bind, drain signal and reader pump per abandoned one is not a
+/// reclamation policy.
+///
+/// The assertion runs with no `.await` between it and the drop, which is what
+/// pins the claim: nothing asynchronous — no timer, no sweep, no spawned task —
+/// can have run in between, so the reclamation is the drop and nothing else.
+/// That is stronger than pausing the clock and advancing it a little, and it
+/// avoids the trap in the weaker version: under `start_paused` an idle runtime
+/// auto-advances to the next deadline, which is exactly the 60 s accept window
+/// this test exists to prove is not involved.
+#[tokio::test(flavor = "multi_thread")]
+async fn unclaimed_bind_is_reclaimed_on_anchor_death_without_the_timer() {
+    let node = prebinding_node(test_config(), None).await;
+    let (messenger, mux, manager) = (&node.messenger, &node.mux, &node.manager);
+
+    let anchor = manager.create_anchor::<u32>();
+    let ticket = manager
+        .prebind_anchor(anchor.handle())
+        .expect("a mux is installed, so a ticket is minted");
+    assert!(ticket.routing_session_id > 0);
+    assert_eq!(mux.pending_binds(), 1, "the pre-bind registered a bind");
+    assert_eq!(
+        mux.parked_drains(),
+        0,
+        "`prebind_anchor` collected the drain signal inline, before spawning the pump, so no \
+         later attach can find one parked here"
+    );
+
+    drop(anchor);
+
+    assert_eq!(
+        mux.pending_binds(),
+        0,
+        "the anchor died unclaimed, so its bind must be gone with it"
+    );
+    assert_eq!(mux.parked_drains(), 0);
+    assert_eq!(
+        mux.live_ingress_slots(messenger.instance_id().worker_id()),
+        0
+    );
+}
+
+/// Closing a claimed slot twice closes it once, and telling nobody is the
+/// answer for a slot that is not there.
+///
+/// A pre-bind's drop is not the only thing that retires a slot whose consumer
+/// has gone — the arrival path reaches the same verdict whenever a record
+/// follows the consumer's death — so the two run in whichever order the traffic
+/// decides. The second one must find nothing to do rather than close whatever
+/// now holds that dense index.
+#[tokio::test(flavor = "multi_thread")]
+async fn close_claimed_slot_is_idempotent() {
+    let pair = mux_pair(test_config()).await;
+
+    // A slot this side never opened: nothing to close, and nothing to say.
+    pair.consumer
+        .close_claimed_slot(pair.producer_worker, protocol::SlotId::from_raw(0));
+
+    let rx = pair.consumer.bind(1, 1).await.expect("bind");
+    let tx = pair
+        .producer
+        .connect(pair.consumer_worker, 1, 1)
+        .await
+        .expect("connect");
+    tx.send_async(item(0)).await.expect("send item");
+    assert_eq!(recv(&rx).await, item(0));
+
+    let ids = pair.consumer.live_slot_ids(pair.producer_worker);
+    assert_eq!(ids.len(), 1, "one stream, one receive-side slot");
+    let slot = ids[0];
+
+    pair.consumer.close_claimed_slot(pair.producer_worker, slot);
+    assert_eq!(
+        pair.consumer.live_ingress_slots(pair.producer_worker),
+        0,
+        "the close must retire the slot here, not only tell the peer"
+    );
+    // The peer is told, so its producer stops rather than waiting for a record
+    // it will never be asked for.
+    eventually(|| tx.is_disconnected()).await;
+
+    // Second close: same slot, already gone.
+    pair.consumer.close_claimed_slot(pair.producer_worker, slot);
+    assert_eq!(pair.consumer.live_ingress_slots(pair.producer_worker), 0);
+}
+
+/// A pre-bind refused for a key mismatch gives the anchor its unattached timer
+/// back.
+///
+/// `prebind_anchor` cancels that timer on purpose: the timer measures "no
+/// sender attached", and a pre-bound anchor has a slot bound and pumped with a
+/// sender on its way to it. A key mismatch takes the pre-bind away again — the
+/// sender has been told the attach failed, so the `OpenSlot` that would have
+/// claimed it never comes — and the anchor is plainly unattached once more.
+/// Without a re-arm it is unattached with nothing left to reap it, and the
+/// entry, its frame channel and its place in `velo_streaming_active_anchors`
+/// outlive the request for the life of the process.
+///
+/// The mismatch is not a contrived shape: a worker running with
+/// `MuxConfig::enabled = false` — the per-node rollback — advertises exactly
+/// this, so the refusal is the rollback's own path.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_prebind_gives_the_unattached_timer_back() {
+    /// Long enough that no plausible scheduling delay lets it fire between
+    /// `create_anchor` and `prebind_anchor`, short enough to wait out twice.
+    const UNATTACHED: Duration = Duration::from_secs(2);
+
+    let node = prebinding_node(test_config(), Some(UNATTACHED)).await;
+    let anchor = node.manager.create_anchor::<u32>();
+    let handle = anchor.handle();
+    let (_, local_id) = handle.unpack();
+    node.manager.prebind_anchor(handle).expect("ticket");
+
+    let request = crate::streaming::control::AnchorAttachRequest {
+        handle,
+        session_id: 1,
+        stream_cancel_handle: crate::streaming::control::StreamCancelHandle::pack(
+            WorkerId::from_u64(7),
+            1,
+        ),
+        supported_transport_keys: vec![velo_ext::TransportKey::new(
+            crate::streaming::tcp_transport::TCP_STREAM_KEY,
+        )],
+    };
+    assert!(
+        matches!(
+            node.manager.adopt_prebind(local_id, &request),
+            crate::streaming::anchor::PrebindAdoption::Refused(_)
+        ),
+        "a sender that cannot open the pre-bound key must be refused"
+    );
+
+    eventually(|| !node.manager.registry.contains_key(&local_id)).await;
+    assert_eq!(
+        node.mux.pending_binds(),
+        0,
+        "the refusal released the bind, and the reaped anchor left nothing behind"
+    );
+}
+
+/// Arming an unattached timeout on a pre-bound anchor stores it without
+/// starting it.
+///
+/// Same reason `prebind_anchor` cancels the one already running: the anchor is
+/// spoken for. Starting a reaper here would remove a stream that is about to
+/// run, and under zero-RTT nothing would ever cancel it — there is no attach.
+/// The duration is still stored, which is what lets a later release re-arm it.
+#[tokio::test(flavor = "multi_thread")]
+async fn set_timeout_on_a_pre_bound_anchor_arms_nothing() {
+    const UNATTACHED: Duration = Duration::from_millis(50);
+
+    let node = prebinding_node(test_config(), None).await;
+    let anchor = node.manager.create_anchor::<u32>();
+    let handle = anchor.handle();
+    let (_, local_id) = handle.unpack();
+    node.manager.prebind_anchor(handle).expect("ticket");
+
+    anchor.set_timeout(Some(UNATTACHED));
+    tokio::time::sleep(UNATTACHED * 6).await;
+
+    assert!(
+        node.manager.registry.contains_key(&local_id),
+        "a pre-bound anchor has a slot waiting for a sender; nothing may reap it"
+    );
+    assert_eq!(
+        node.manager
+            .registry
+            .get(&local_id)
+            .expect("entry")
+            .unattached_timeout,
+        Some(UNATTACHED),
+        "the duration is stored even while it is not running, so a released \
+         pre-bind has something to re-arm"
+    );
+}
+
+/// A pre-bound slot opens holding exactly what its ticket quoted.
+///
+/// The two numbers are read from different places — the ticket from
+/// `NegotiatedLimits`, the slot from `MuxConfig` — and agree only because
+/// `MessengerMuxTransport::new` normalises the config from the same limits. The
+/// run in `mux_credit.rs` proves the sender and the buffer agree; nothing there
+/// compares the ticket with what `IngressSlot::new` was actually handed, so a
+/// change that gave `open_slot` its own budget source would split them
+/// silently.
+///
+/// `slot_byte_budget: 0` is the field where they can differ: zero on the wire
+/// means *use the default*, so a ticket built by copying the config field would
+/// quote a zero the slot never opens at.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_prebound_slot_opens_on_the_terms_its_ticket_quotes() {
+    let config = MuxConfig {
+        // Distinctive, so the assertion cannot pass on a shared default.
+        initial_credit: 5,
+        slot_byte_budget: 0,
+        ..test_config()
+    };
+    let pair = mux_pair(config).await;
+    let manager = AnchorManagerBuilder::default()
+        .worker_id(pair.consumer_worker)
+        .transport(
+            Arc::clone(&pair.consumer) as Arc<dyn crate::streaming::transport::FrameTransport>
+        )
+        .build()
+        .expect("anchor manager");
+    manager
+        .install_mux(Arc::clone(&pair.consumer))
+        .expect("install mux");
+
+    let anchor = manager.create_anchor::<u32>();
+    let (_, local_id) = anchor.handle().unpack();
+    let ticket = manager.prebind_anchor(anchor.handle()).expect("ticket");
+
+    let tx = pair
+        .producer
+        .connect(pair.consumer_worker, local_id, ticket.routing_session_id)
+        .await
+        .expect("connect");
+    tx.send_async(item(0)).await.expect("send item");
+    eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 1).await;
+
+    let id = pair.consumer.live_slot_ids(pair.producer_worker)[0];
+    let (credit, byte_budget) = pair
+        .consumer
+        .slot_open_terms(pair.producer_worker, id)
+        .expect("the claimed slot is live");
+    assert_eq!(
+        ticket.initial_credit, credit,
+        "the sender opens holding what the ticket quoted; the slot must have reserved the same"
+    );
+    assert_eq!(
+        u64::from(ticket.slot_byte_budget),
+        byte_budget,
+        "a configured zero resolves to the default in both reads, or neither"
+    );
+
+    drop(anchor);
 }

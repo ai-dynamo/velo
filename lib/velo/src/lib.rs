@@ -678,6 +678,37 @@ impl Velo {
         self.anchor_manager.attach_stream_anchor::<T>(handle).await
     }
 
+    /// Bind and pump a stream for an anchor now, so its sender never has to ask.
+    ///
+    /// Delegates to [`AnchorManager::prebind_anchor`](crate::streaming::AnchorManager::prebind_anchor).
+    /// Carry the returned [`streaming::control::StreamOpenTicket`] to the worker
+    /// in whatever request envelope you already send it, and have the worker
+    /// open its sender with [`open_anchor_stream`](Velo::open_anchor_stream).
+    /// `None` means no ticket was minted and the worker should
+    /// [`attach_anchor`](Velo::attach_anchor) the ordinary way.
+    pub fn prebind_anchor(
+        &self,
+        handle: StreamAnchorHandle,
+    ) -> Option<streaming::control::StreamOpenTicket> {
+        self.anchor_manager.prebind_anchor(handle)
+    }
+
+    /// Open a sender for an anchor whose slot the consumer already bound.
+    ///
+    /// Delegates to [`AnchorManager::open_anchor_stream`](crate::streaming::AnchorManager::open_anchor_stream).
+    /// The zero-RTT counterpart of [`attach_anchor`](Velo::attach_anchor): no
+    /// `_anchor_attach` round trip, because `ticket` already carries what one
+    /// would have returned.
+    pub async fn open_anchor_stream<T: serde::Serialize>(
+        &self,
+        handle: StreamAnchorHandle,
+        ticket: streaming::control::StreamOpenTicket,
+    ) -> Result<StreamSender<T>, AttachError> {
+        self.anchor_manager
+            .open_anchor_stream::<T>(handle, ticket)
+            .await
+    }
+
     /// Get the underlying anchor manager for direct registry access.
     pub fn anchor_manager(&self) -> &crate::streaming::AnchorManager {
         &self.anchor_manager

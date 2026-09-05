@@ -258,6 +258,76 @@ pub enum AnchorAttachResponse {
     Err { reason: String },
 }
 
+// ---------------------------------------------------------------------------
+// StreamOpenTicket
+// ---------------------------------------------------------------------------
+
+/// The terms a stream opens on, carried to the sender instead of asked for.
+///
+/// Exactly the five fields of [`AnchorAttachResponse::Ok`], because it is the
+/// same answer arriving by a different road: the receiver decides them all
+/// without needing anything from the sender, so nothing obliges it to wait to
+/// be asked. An application that already sends the worker a request envelope
+/// puts a ticket in it, the worker opens its sender locally through
+/// [`AnchorManager::open_anchor_stream`](crate::streaming::AnchorManager::open_anchor_stream),
+/// and the `_anchor_attach` round trip that used to precede the first token
+/// does not happen.
+///
+/// A separate type rather than the response variant reused. The two shapes are
+/// identical today and are free to diverge: the response is a reply whose
+/// compatibility is owed to every peer that sends an attach, while a ticket is
+/// only ever read by a peer new enough to have been sent one. Tying them
+/// together would buy nothing and cost that freedom — and, decisively,
+/// [`AnchorAttachRequest`] and [`AnchorAttachResponse`] gain and lose no field
+/// for any of this.
+///
+/// The receiver mints one through [`StreamOpenTicket::from_limits`], which takes
+/// the window as a `NegotiatedLimits` rather than as two integers. That keeps
+/// the two asymmetric zeros — `initial_credit = 0` means *not offering the mux*,
+/// `slot_byte_budget = 0` means *use the default* — decided in the single place
+/// that already decides them, so a minted ticket can never quote a window the
+/// receiver did not size a buffer for.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamOpenTicket {
+    /// The transport the sender must open on, as
+    /// [`AnchorAttachResponse::Ok::streaming_transport_key`].
+    pub streaming_transport_key: velo_ext::TransportKey,
+    /// The cadence the sender must beat at, as
+    /// [`AnchorAttachResponse::Ok::heartbeat_interval_ms`].
+    #[serde(default = "default_heartbeat_interval_ms")]
+    pub heartbeat_interval_ms: u64,
+    /// The receiver-allocated routing slot this stream owns, as
+    /// [`AnchorAttachResponse::Ok::routing_session_id`].
+    #[serde(default)]
+    pub routing_session_id: u64,
+    /// Data credit the slot opens holding. Never zero on a minted ticket: zero
+    /// is the wire encoding of *not offering the mux*, and a receiver with no
+    /// mux mints no ticket at all.
+    #[serde(default)]
+    pub initial_credit: u32,
+    /// Bytes one slot may hold in flight; zero means the default.
+    #[serde(default)]
+    pub slot_byte_budget: u32,
+}
+
+impl StreamOpenTicket {
+    /// Mint a ticket for a slot this node has already pre-bound.
+    pub(crate) fn from_limits(
+        streaming_transport_key: velo_ext::TransportKey,
+        heartbeat_interval: Duration,
+        routing_session_id: u64,
+        limits: crate::streaming::messenger_mux::flow_control::NegotiatedLimits,
+    ) -> Self {
+        Self {
+            streaming_transport_key,
+            heartbeat_interval_ms: heartbeat_interval.as_millis() as u64,
+            routing_session_id,
+            initial_credit: limits.initial_credit(),
+            slot_byte_budget: limits.slot_byte_budget(),
+        }
+    }
+}
+
 /// Request to detach the current sender from an anchor without closing it.
 ///
 /// After detach the anchor remains in the registry so a new sender may attach.
@@ -471,6 +541,48 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::messe
 
                 let (_, local_id) = req.handle.unpack();
 
+                // Step 0: adopt a pre-bound slot, if this anchor is holding one.
+                //
+                // Zero-RTT setup does at request registration what the rest of
+                // this handler does on the round trip: negotiate, bind, and
+                // spawn the pump. A sender that speaks the attach protocol
+                // anyway — an older worker, or one whose envelope carried no
+                // ticket — must be given *that* slot rather than a second one:
+                // binding again would leave the first bind unclaimed with a
+                // pump nobody feeds, and the sender would open against a
+                // routing session the pre-bind never expects an OpenSlot for.
+                //
+                // Ahead of the already-attached check because a pre-bound
+                // anchor is not attached; nothing has claimed it yet, which is
+                // exactly what makes it adoptable.
+                match manager.adopt_prebind(local_id, &req) {
+                    crate::streaming::anchor::PrebindAdoption::None => {}
+                    crate::streaming::anchor::PrebindAdoption::Adopted(ticket) => {
+                        manager.record_streaming_operation(
+                            StreamingOp::Attach,
+                            HandlerOutcome::Success,
+                            ticket.streaming_transport_key.as_str(),
+                            started,
+                        );
+                        return Ok(AnchorAttachResponse::Ok {
+                            streaming_transport_key: ticket.streaming_transport_key,
+                            heartbeat_interval_ms: ticket.heartbeat_interval_ms,
+                            routing_session_id: ticket.routing_session_id,
+                            initial_credit: ticket.initial_credit,
+                            slot_byte_budget: ticket.slot_byte_budget,
+                        });
+                    }
+                    crate::streaming::anchor::PrebindAdoption::Refused(reason) => {
+                        manager.record_streaming_operation(
+                            StreamingOp::Attach,
+                            HandlerOutcome::Error,
+                            "unknown",
+                            started,
+                        );
+                        return Ok(AnchorAttachResponse::Err { reason });
+                    }
+                }
+
                 // Step 1: Quick check -- anchor exists and is unattached (drop lock)
                 {
                     let entry = manager.registry.get(&local_id);
@@ -560,6 +672,30 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::messe
                             );
                             Ok(AnchorAttachResponse::Err {
                                 reason: format!("anchor {} already attached", req.handle),
+                            })
+                        } else if entry.prebind.is_some() {
+                            // A pre-bind that landed while this handler was
+                            // awaiting its bind. Step 0 looked before the await
+                            // and found none, and `attachment` never says so —
+                            // which is why this asks the same pair
+                            // `prebind_anchor` asks (`anchor.rs`). Binding over
+                            // it would leave two pumps feeding one `frame_tx`
+                            // and two live routing sessions, with
+                            // `active_pump_token` naming only the newer, so
+                            // nothing could ever cancel the older. The bind just
+                            // made is left to the accept window, as it is on the
+                            // two arms above.
+                            manager.record_streaming_operation(
+                                StreamingOp::Attach,
+                                HandlerOutcome::Error,
+                                "unknown",
+                                started,
+                            );
+                            Ok(AnchorAttachResponse::Err {
+                                reason: format!(
+                                    "anchor {} was pre-bound while this attach was binding",
+                                    req.handle
+                                ),
                             })
                         } else {
                             // Derive a child token for this pump so detach can cancel it

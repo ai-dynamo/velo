@@ -566,3 +566,80 @@ async fn a_draining_mpsc_consumer_returns_credit_without_the_sweep() {
 
     consumer.assert_no_reader_stall();
 }
+
+/// A pre-bound slot opens on exactly the terms its ticket quotes: `C` data
+/// credits against the `C + 1` buffer the receiver sized from the same numbers.
+///
+/// Pre-binding is where the two could drift. The attach path quotes the window
+/// on the response and sizes the buffer in the same call, so a mismatch is hard
+/// to write; a ticket is minted early, travels, and is honoured later, and
+/// nothing between those points re-reads the config. So the identity is pinned
+/// twice — the ticket against the configuration, and the run against the
+/// reader-stall counter, which is the only outside evidence that the applier
+/// never met a buffer credit said had room.
+///
+/// The byte budget is configured as `0` on purpose. Zero on the wire means
+/// *use the default*, and a ticket built by copying the config field would
+/// quote that zero verbatim; one built through `NegotiatedLimits::from_wire`
+/// quotes the resolved default. The assertion below is that difference.
+#[tokio::test(flavor = "multi_thread")]
+async fn prebound_slot_holds_c_credits_against_a_c_plus_one_buffer() {
+    const FRAMES: u32 = 200;
+    /// The value `slot_byte_budget: 0` resolves to — the per-slot cap that
+    /// stands in for the ~1 MiB the kernel socket used to enforce per stream.
+    const DEFAULT_SLOT_BYTE_BUDGET: u32 = 1024 * 1024;
+
+    let config = MuxConfig {
+        slot_byte_budget: 0,
+        ..sweepless_mux(SMALL_CREDIT)
+    };
+    let consumer = node(config.clone()).await;
+    let producer = node(config).await;
+    introduce(&producer, &consumer).await;
+
+    let mut anchor = consumer.velo.create_anchor::<u32>();
+    let handle = transfer(anchor.handle());
+    let ticket = consumer
+        .velo
+        .prebind_anchor(handle)
+        .expect("the mux is installed, so a ticket is minted");
+
+    assert_eq!(
+        ticket.initial_credit, SMALL_CREDIT,
+        "the ticket must quote the window the receiver sized its buffer to"
+    );
+    assert_eq!(
+        ticket.slot_byte_budget, DEFAULT_SLOT_BYTE_BUDGET,
+        "a configured zero means the default, and the ticket must quote the resolved value \
+         rather than the zero — a sender reading it would otherwise cap itself at nothing"
+    );
+
+    let sender = producer
+        .velo
+        .open_anchor_stream::<u32>(handle, ticket)
+        .await
+        .expect("zero-RTT open");
+
+    // Many times the window, with the sweep unreachable: the run can only
+    // finish if the pre-bind's own reader pump returned credit by draining.
+    let send = tokio::spawn(async move {
+        for n in 0..FRAMES {
+            sender.send(n).await.expect("send item");
+        }
+        sender.finalize().expect("finalize");
+    });
+    for expected in 0..FRAMES {
+        expect_item(
+            next_item(&mut anchor, PATIENCE).await,
+            expected,
+            "a pre-bound slot returns credit through the pump the pre-bind spawned",
+        );
+    }
+    send.await.expect("send task");
+
+    consumer.assert_no_reader_stall();
+    assert!(
+        consumer.mux_drain_visits() > 0.0,
+        "credit came back some other way than the consumer draining"
+    );
+}

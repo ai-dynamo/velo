@@ -635,6 +635,41 @@ impl MuxCore {
         self.sweep_peer(peer);
     }
 
+    /// Retire a slot whose consumer has gone and tell its owner.
+    ///
+    /// Two halves, and both are needed. The local retire is what returns
+    /// `live_slots` to zero — nothing else does, because the credit sweep's
+    /// `reconcile` reads the buffer's length and a `flume` channel whose
+    /// receiver was dropped still reports one. The reply is what an idle
+    /// producer needs, since the fault that carries the same news to it
+    /// otherwise rides on the next record it sends.
+    fn close_claimed_slot(&self, peer: WorkerId, slot: protocol::SlotId) {
+        let Some(reply) = self
+            .ingress
+            .close_consumer_gone(peer, slot, self.metrics.as_ref())
+        else {
+            return;
+        };
+        if let Some(metrics) = &self.metrics {
+            metrics.slot_closed();
+        }
+        // Resolving a batcher may spawn its task, and this runs from a `Drop`
+        // that can land on a thread with no runtime under it.
+        // `StreamController::cancel` guards its own spawn the same way and for
+        // the same reason (`streaming/anchor.rs`). Without the reply the peer
+        // is exactly where it was before this path existed: it learns on its
+        // next record.
+        if tokio::runtime::Handle::try_current().is_err() {
+            tracing::debug!(
+                peer = %peer,
+                "messenger mux: no runtime to post a slot close on; the peer learns on its next record"
+            );
+            return;
+        }
+        let batcher = self.batcher(peer);
+        self.send_replies(&batcher, peer, &[reply]);
+    }
+
     /// One sweep tick: return credit, then age out idle batchers.
     fn sweep(&self) {
         for peer in self.ingress.peers() {
@@ -925,6 +960,58 @@ fn spawn_sweep(core: &Arc<MuxCore>) {
     });
 }
 
+/// Register the receive buffer for one `(anchor_id, session_id)` and open the
+/// accept window on it.
+///
+/// The body [`FrameTransport::bind`] and
+/// [`MessengerMuxTransport::prebind`] share. `bind` is async because the trait
+/// is; **nothing in here awaits**, and that is what lets the zero-RTT path call
+/// it synchronously while registering a request. Anything a future accept-window
+/// change touches — the reaper this window is a candidate to become — is here,
+/// once, rather than in two places that would drift.
+fn open_bind(core: &Arc<MuxCore>, anchor_id: u64, session_id: u64) -> flume::Receiver<Vec<u8>> {
+    // `C + 1`: `C` data credits plus the one reserved terminal credit.
+    // Credit is issued against *this* buffer and never against the
+    // anchor's `frame_tx`, which has writers other than the mux.
+    let (frame_tx, frame_rx) = flume::bounded::<Vec<u8>>(core.limits.slot_buffer_depth());
+    let drain = Arc::new(ingress::DrainSignal::new(core.drain_tx.clone()));
+    core.drains
+        .insert((anchor_id, session_id), Arc::clone(&drain));
+    core.ingress
+        .register_bind(anchor_id, session_id, frame_tx, drain);
+
+    // `Weak`, and cancellable. A strong handle here would pin the whole
+    // transport alive for the full accept window after the last owner
+    // dropped it — a minute of leaked slots, batcher tasks and ingress
+    // state per outstanding bind, and a `live_slots` gauge that only
+    // comes back to zero when the timers do.
+    let expiry = Arc::downgrade(core);
+    let cancel = core.cancel.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            () = cancel.cancelled() => return,
+            () = tokio::time::sleep(ACCEPT_TIMEOUT) => {}
+        }
+        let Some(core) = expiry.upgrade() else {
+            return;
+        };
+        // Whether or not the bind was still there, drop any drain
+        // signal no attach collected. Without this an attach that
+        // failed between `bind` and `take_drain_signal` would leak one
+        // entry per attempt for the process's life.
+        core.drains.remove(&(anchor_id, session_id));
+        if core.ingress.expire_bind(anchor_id, session_id) {
+            tracing::warn!(
+                anchor_id,
+                session_id,
+                "messenger mux: no OpenSlot arrived before the accept window closed"
+            );
+        }
+    });
+
+    frame_rx
+}
+
 impl FrameTransport for MessengerMuxTransport {
     fn key(&self) -> TransportKey {
         self.key.clone()
@@ -943,48 +1030,7 @@ impl FrameTransport for MessengerMuxTransport {
         session_id: u64,
     ) -> BoxFuture<'_, Result<flume::Receiver<Vec<u8>>>> {
         let core = Arc::clone(&self.core);
-        Box::pin(async move {
-            // `C + 1`: `C` data credits plus the one reserved terminal credit.
-            // Credit is issued against *this* buffer and never against the
-            // anchor's `frame_tx`, which has writers other than the mux.
-            let (frame_tx, frame_rx) = flume::bounded::<Vec<u8>>(core.limits.slot_buffer_depth());
-            let drain = Arc::new(ingress::DrainSignal::new(core.drain_tx.clone()));
-            core.drains
-                .insert((anchor_id, session_id), Arc::clone(&drain));
-            core.ingress
-                .register_bind(anchor_id, session_id, frame_tx, drain);
-
-            // `Weak`, and cancellable. A strong handle here would pin the whole
-            // transport alive for the full accept window after the last owner
-            // dropped it — a minute of leaked slots, batcher tasks and ingress
-            // state per outstanding bind, and a `live_slots` gauge that only
-            // comes back to zero when the timers do.
-            let expiry = Arc::downgrade(&core);
-            let cancel = core.cancel.clone();
-            tokio::spawn(async move {
-                tokio::select! {
-                    () = cancel.cancelled() => return,
-                    () = tokio::time::sleep(ACCEPT_TIMEOUT) => {}
-                }
-                let Some(core) = expiry.upgrade() else {
-                    return;
-                };
-                // Whether or not the bind was still there, drop any drain
-                // signal no attach collected. Without this an attach that
-                // failed between `bind` and `take_drain_signal` would leak one
-                // entry per attempt for the process's life.
-                core.drains.remove(&(anchor_id, session_id));
-                if core.ingress.expire_bind(anchor_id, session_id) {
-                    tracing::warn!(
-                        anchor_id,
-                        session_id,
-                        "messenger mux: no OpenSlot arrived before the accept window closed"
-                    );
-                }
-            });
-
-            Ok(frame_rx)
-        })
+        Box::pin(async move { Ok(open_bind(&core, anchor_id, session_id)) })
     }
 
     /// Opens a slot at *this node's* limits.
@@ -1011,6 +1057,91 @@ impl MessengerMuxTransport {
     /// The window this node advertises to a peer negotiating an attach.
     pub(crate) fn advertised_limits(&self) -> NegotiatedLimits {
         self.core.limits
+    }
+
+    /// Bind a slot before any sender has asked for one.
+    ///
+    /// The synchronous twin of [`FrameTransport::bind`], and identical to it:
+    /// the trait's `bind` is async only because the trait is, and its body has
+    /// no await in it. Zero-RTT setup needs the receiver *now*, while
+    /// registering a request, so it takes this door instead of paying a future
+    /// for nothing.
+    ///
+    /// Nothing about the resulting bind is special. A peer's `OpenSlot` claims
+    /// it by the same `(anchor_id, session_id)` lookup, the accept window runs
+    /// the same 60 s, and [`release_bind`](Self::release_bind) is what an owner
+    /// that gives up before then calls.
+    pub(crate) fn prebind(&self, anchor_id: u64, session_id: u64) -> flume::Receiver<Vec<u8>> {
+        open_bind(&self.core, anchor_id, session_id)
+    }
+
+    /// Give back a bind nobody claimed, along with the drain signal parked with
+    /// it.
+    ///
+    /// The accept window does the same thing when it expires, and stays as the
+    /// backstop. This is for the owner that already knows: a pre-bound anchor
+    /// whose request died before its first token knows a minute earlier than
+    /// the timer does, and at the rate a frontend registers requests that
+    /// minute is thousands of leaked binds.
+    ///
+    /// Idempotent: a bind already claimed or already released is not there to
+    /// remove, and removing nothing is the right answer for both.
+    pub(crate) fn release_bind(&self, anchor_id: u64, session_id: u64) {
+        self.core.drains.remove(&(anchor_id, session_id));
+        self.core.ingress.expire_bind(anchor_id, session_id);
+    }
+
+    /// Retire a live slot whose consumer has gone, and tell the peer that owns
+    /// it to abandon its end.
+    ///
+    /// The receive side already reaches this verdict on its own — a record
+    /// arriving for a slot whose consumer dropped the receiver faults with
+    /// `CloseReason::UnknownSlot` — but only on the *next* record, and an idle
+    /// producer sends none. This is the same close on a different trigger.
+    ///
+    /// Idempotent, and silent where there is nothing to close: a stream that
+    /// ended on its own terminal retired the slot then, so the ordinary end of
+    /// a stream costs no extra record on the wire.
+    pub(crate) fn close_claimed_slot(&self, peer: WorkerId, slot: protocol::SlotId) {
+        self.core.close_claimed_slot(peer, slot);
+    }
+
+    /// Binds registered and neither claimed nor released.
+    #[cfg(test)]
+    pub(crate) fn pending_binds(&self) -> usize {
+        self.core.ingress.bind_count()
+    }
+
+    /// Drain signals a bind parked and no attach has collected.
+    #[cfg(test)]
+    pub(crate) fn parked_drains(&self) -> usize {
+        self.core.drains.len()
+    }
+
+    /// Live receive-side slots for `peer`.
+    #[cfg(test)]
+    pub(crate) fn live_ingress_slots(&self, peer: WorkerId) -> usize {
+        self.core.ingress.live_slots(peer)
+    }
+
+    /// The ids of `peer`'s live receive-side slots.
+    ///
+    /// A test that has to name a slot would otherwise have to re-derive the
+    /// sender's allocation order, which is the allocator's business and not the
+    /// test's.
+    #[cfg(test)]
+    pub(crate) fn live_slot_ids(&self, peer: WorkerId) -> Vec<protocol::SlotId> {
+        self.core.ingress.live_slot_ids(peer)
+    }
+
+    /// The window one of `peer`'s live receive-side slots opened holding.
+    #[cfg(test)]
+    pub(crate) fn slot_open_terms(
+        &self,
+        peer: WorkerId,
+        id: protocol::SlotId,
+    ) -> Option<(u32, u64)> {
+        self.core.ingress.slot_open_terms(peer, id)
     }
 
     /// Write what every batcher has staged, to every peer.
