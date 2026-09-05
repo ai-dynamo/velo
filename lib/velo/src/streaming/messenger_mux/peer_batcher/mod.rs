@@ -274,6 +274,7 @@ pub(crate) fn spawn(peer: WorkerId, ctx: BatcherContext) -> Arc<BatcherHandle> {
     });
     let epoch = ctx.epochs.fetch_add(1, Ordering::Relaxed);
     let gate = FlushGate::new(ctx.config.flush_policy, ctx.metrics.clone());
+    let async_open_ack = ctx.config.async_open_ack;
     let writer = BatchWriter::new(
         Arc::clone(&ctx.messenger),
         peer,
@@ -294,6 +295,7 @@ pub(crate) fn spawn(peer: WorkerId, ctx: BatcherContext) -> Arc<BatcherHandle> {
         slots: EgressSlots::default(),
         streams: SelectAll::new(),
         stopping: false,
+        async_open_ack,
         #[cfg(test)]
         hooks: ctx.hooks,
     };
@@ -329,6 +331,9 @@ struct Batcher {
     /// Set once the task has decided to exit, so the drain loop stops pulling
     /// work it will never flush.
     stopping: bool,
+    /// Whether an open acks before its `OpenSlot` is admitted. See
+    /// [`MuxConfig::async_open_ack`].
+    async_open_ack: bool,
     #[cfg(test)]
     hooks: Option<Arc<TestHooks>>,
 }
@@ -524,21 +529,101 @@ impl Batcher {
             metrics.slot_opened();
         }
 
-        let seq = self
-            .slots
+        // Eager, and written before the ack either way: `bind()`'s accept
+        // timeout measures "time until a batch bearing this OpenSlot arrives",
+        // and piggybacking it on the first data record would quietly redefine
+        // that as "time until the producer produces its first token" — expiring
+        // a queued request with a long prefill.
+        if self.async_open_ack {
+            self.open_detached(id, anchor_id, session_id, ack).await;
+        } else {
+            self.open_awaited(id, anchor_id, session_id, ack).await;
+        }
+    }
+
+    /// The `frame_seq` the slot's `OpenSlot` is stamped with — its first.
+    fn open_seq(&mut self, id: SlotId) -> u32 {
+        self.slots
             .get_mut(id.index())
-            .map_or(0, |entry| entry.take_seq());
+            .map_or(0, |entry| entry.take_seq())
+    }
+
+    /// Write the `OpenSlot` and ack once the transport has taken it.
+    async fn open_awaited(
+        &mut self,
+        id: SlotId,
+        anchor_id: u64,
+        session_id: u64,
+        ack: oneshot::Sender<Result<(), OpenRejected>>,
+    ) {
+        let seq = self.open_seq(id);
         self.ensure_batch();
         if let Some(encoder) = self.writer.encoder() {
             let _ = encoder.push_open_slot(id, seq, anchor_id, session_id);
             self.gate.stage_urgent(1);
         }
-        // Eager, in its own flush: `bind()`'s accept timeout measures "time
-        // until a batch bearing this OpenSlot arrives", and piggybacking it on
-        // the first data record would quietly redefine that as "time until the
-        // producer produces its first token" — expiring a queued request with a
-        // long prefill.
         self.flush().await;
+        let _ = ack.send(Ok(()));
+    }
+
+    /// Hand the `OpenSlot` to the transport and ack without waiting for it.
+    ///
+    /// The `send_singleton` shape, applied to an open: the batch is dispatched,
+    /// the slot is fenced behind its admission, and the answer comes back as
+    /// coalesced control rather than by parking this task. What it buys is the
+    /// wait it does not take — on a congested peer the awaited ack costs a place
+    /// in the send queue that is already full, which is the queue a worker's
+    /// first token sits behind.
+    async fn open_detached(
+        &mut self,
+        id: SlotId,
+        anchor_id: u64,
+        session_id: u64,
+        ack: oneshot::Sender<Result<(), OpenRejected>>,
+    ) {
+        // Cut whatever is staged first, so the open's own batch cannot overtake
+        // records already packed for this peer: `batch_seq` is the receiver's
+        // gap meter and it reads a reordered pair as a batch that went missing.
+        // It costs no wait that was not already owed — that batch was going out
+        // at the end of this wake anyway — and it keeps "a batch that was never
+        // admitted is epoch death" a decision made in the one place that makes
+        // it.
+        self.flush().await;
+        // That cut can be the failure that kills the epoch, and the slot
+        // allocated a moment ago goes with it. Opening it on the wire now would
+        // bind a receiver to a stream nothing can ever send on.
+        if self.slots.get_mut_checked(id).is_none() {
+            let _ = ack.send(Ok(()));
+            return;
+        }
+        let seq = self.open_seq(id);
+        let fire = self
+            .writer
+            .dispatch_singleton(|encoder| encoder.push_open_slot(id, seq, anchor_id, session_id));
+        let Some(fire) = fire else {
+            // Nothing reached the transport, so the slot has a `frame_seq` gap
+            // that will never close. The awaited path reaches the same place
+            // through a failed flush, and answers the caller the same way: the
+            // ack is `Ok`, and the producer learns from the inlet the epoch
+            // death just closed under it.
+            self.epoch_death();
+            let _ = ack.send(Ok(()));
+            return;
+        };
+        // Fenced before the ack, because the ack is what hands the producer its
+        // inlet: the slot's first record must wait for the `OpenSlot` that
+        // claims its buffer at the receiver, and per-target FIFO alone does not
+        // hold it there. A send to a peer the messenger has not resolved yet is
+        // issued from a detached task (`spawn_slow_path`), which keeps no order
+        // against the send that follows it — and an unresolved peer is exactly
+        // where a first `OpenSlot` lands.
+        if let Some(slot) = self.slots.get_mut(id.index()) {
+            slot.fence();
+        }
+        let control = Arc::clone(&self.control);
+        tokio::spawn(async move {
+            control.singleton_resolved(id, fire.await.is_ok());
+        });
         let _ = ack.send(Ok(()));
     }
 

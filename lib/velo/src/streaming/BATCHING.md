@@ -320,7 +320,13 @@ resolve in a detached task *before* dispatch, so an oversized record routed that
 way is not ordered against the eager batches around it — the ordered dispatcher
 says so itself, and warns once per handler. Two mechanisms bound it. Egress
 fences the slot: at most one rendezvous record per slot is outstanding, and the
-batcher withholds that slot's later records until the staged send is admitted.
+batcher withholds that slot's later records until the staged send is admitted —
+its `CloseSlot` included, since a close the receiver meets before the record it
+is ordered behind is a close for a slot it cannot name. Only the record waits.
+The kill's other half, ending the producer's inlet, happens the moment the cap
+is exceeded: it is the near side of the same event, and a producer left running
+ahead into a slot whose records are already being discarded is the thing the
+byte cap exists to stop.
 Ingress holds records arriving ahead of `frame_seq` in that slot's own buffer,
 bounded by credit already granted, applying them when the gap closes. Overflow
 closes **that slot** with `Dropped` and meters it; other slots are untouched and
@@ -336,6 +342,23 @@ producer produces its first token"* and would expire a queued request with a lon
 prefill. It costs a record, not a send. The reverse race — an `OpenSlot` for an
 `(anchor_id, session_id)` that was never registered — must **not** fail the peer:
 the receiver replies `CloseSlot{unknown}` and discards that slot's records.
+
+Eager is about the *write*, not about the ack. `MuxConfig::async_open_ack`
+separates the two: the `OpenSlot` is still cut into a batch of its own and still
+handed to the transport before `connect` returns, so the accept window keeps
+measuring the same thing, but the ack no longer waits for the transport to admit
+it. On a congested peer that wait is a place in a send queue that is already
+full, and a worker cannot start producing until it comes free. The open then
+behaves exactly like an over-budget singleton: the slot is fenced until the
+admission resolves, so its first record cannot overtake the `OpenSlot` that
+claims it, and a failed admission is epoch death. The default is off — the
+awaited ack is what shipped.
+
+The ack it skips is the open's own. The `OpenSlot` still goes in a batch of its
+own, so whatever was already staged for the peer is written first and *that*
+write still parks on admission: an open is wait-free only when nothing is
+staged, and when something is it costs one frame more than the awaited path,
+which packs the `OpenSlot` into the staged batch instead.
 
 #### Peer loss
 

@@ -241,9 +241,14 @@ pub(super) struct EgressSlot {
     pub(super) next_seq: u32,
     /// Records pulled from the inlet that the slot may not send yet.
     pub(super) withheld: WithheldQueue,
-    /// Set once the producer has gone, so the `CloseSlot{PeerGone}` that tells
-    /// the consumer can wait behind whatever is still withheld.
-    pub(super) inlet_closed: bool,
+    /// Set once the slot is dying without a terminal — its producer went, or it
+    /// ran past its byte cap — so the `CloseSlot{PeerGone}` that tells the
+    /// consumer can wait behind whatever is still withheld and behind the fence.
+    ///
+    /// Nothing more arrives for the slot once it is set: the producer left of
+    /// its own accord in the first case and was disconnected in the second, so
+    /// the deferred close is always the slot's last record.
+    pub(super) close_owed: bool,
     gate: Arc<SlotGate>,
     /// A rendezvous singleton is outstanding. `BATCHING.md` § "Slots": at most
     /// one per slot, and the slot's later records wait for its admission so
@@ -287,6 +292,22 @@ impl EgressSlot {
     /// Release the rendezvous fence.
     pub(super) fn unfence(&mut self) {
         self.fenced = false;
+    }
+
+    /// End the producer's inlet without retiring the slot.
+    ///
+    /// The slow-consumer kill has two halves, and behind a fence they no longer
+    /// travel together: the producer must be cut off at once — that is what the
+    /// kill is *for* — while the `CloseSlot` its consumer is owed is the slot's
+    /// next record and may not overtake the one still awaiting admission.
+    ///
+    /// Hence a gate close with the entry left in the table. Retiring the slot
+    /// here instead would bump the generation and free the index, and the
+    /// outstanding singleton's resolution — which names the `SlotId` it was sent
+    /// under — would then be rejected as stale: the deferred close would never
+    /// be written and the slot would sit in `live_slots` for good.
+    pub(super) fn disconnect(&self) {
+        self.gate.close();
     }
 
     /// Take the next `frame_seq` for a record this side is emitting.
@@ -376,7 +397,7 @@ impl EgressSlots {
             credit,
             next_seq: 0,
             withheld: WithheldQueue::new(slot_byte_budget),
-            inlet_closed: false,
+            close_owed: false,
             gate,
             fenced: false,
             starved: false,

@@ -158,10 +158,13 @@ keeps draining the channel into a per-slot withheld queue bounded by the slot's
 byte cap (1 MiB by default).
 
 When a producer runs past that cap on a slot nobody is draining, **the mux closes
-that slot**: the consumer receives `Dropped`, the producer's channel starts
-erroring, `velo_streaming_mux_records_dropped_total{reason="withheld_overflow"}`
-ticks, and the peer's other slots carry on. Two consequences worth knowing
-before you meet them:
+that slot**: the producer's channel starts erroring at once, the consumer
+receives `Dropped`, `velo_streaming_mux_records_dropped_total{reason="withheld_overflow"}`
+ticks, and the peer's other slots carry on. One ordering caveat: if the slot is
+still fenced behind an unresolved `OpenSlot` or rendezvous admission, the
+consumer's `Dropped` waits for that admission to resolve while the producer is
+already disconnected (see the fence paragraph in `BATCHING.md`). Two
+consequences worth knowing before you meet them:
 
 - **A queued terminal goes with it.** A consumer that would have seen
   `Finalized` sees `Dropped` instead. The stream was already a megabyte behind;

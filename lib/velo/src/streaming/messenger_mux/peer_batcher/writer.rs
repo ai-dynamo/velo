@@ -197,8 +197,7 @@ impl BatchWriter {
             return Ok(());
         };
         if encoder.is_empty() {
-            // Nothing went out, so the sequence it reserved is not a gap.
-            self.next_batch_seq = self.next_batch_seq.wrapping_sub(1);
+            self.refund_batch_seq();
             self.buffer = encoder.finish();
             return Ok(());
         }
@@ -213,13 +212,21 @@ impl BatchWriter {
         self.dispatch(payload).await.map_err(FlushFailed)
     }
 
-    /// Build and hand off a one- or two-record batch of its own.
+    /// Build and hand off a batch of its own, without parking on admission.
     ///
-    /// Returns the [`FireResult`] rather than awaiting it: an over-budget record
-    /// rides rendezvous, and charging every other slot on the peer for that
-    /// round trip is exactly what the singleton path exists to avoid. The
+    /// Returns the [`FireResult`] rather than awaiting it, for the two records
+    /// that must not charge a whole peer for their own round trip: an
+    /// over-budget record, which rides rendezvous, and an `OpenSlot`, whose ack
+    /// is what a producer waits on before it may send anything at all. The
     /// caller fences the one slot involved and watches the admission from a
     /// detached task.
+    ///
+    /// Both ways out without a send give the reserved sequence back, so this
+    /// type's numbering stays contiguous whatever a caller does with the answer.
+    /// That is an invariant of the writer rather than a live defect: every
+    /// batcher path that meets a `None` here fails the peer epoch next, and
+    /// [`Self::reset_epoch`] restarts the numbering at zero, so no gap a
+    /// receiver could meter is reachable through the batcher today.
     pub(super) fn dispatch_singleton(
         &mut self,
         write: impl FnOnce(&mut BatchEncoder) -> Result<(), EncodeError>,
@@ -228,22 +235,38 @@ impl BatchWriter {
         let mut encoder = BatchEncoder::new(self.epoch, batch_seq);
         if let Err(error) = write(&mut encoder) {
             tracing::error!(%error, "messenger mux: dropping unencodable singleton");
+            self.refund_batch_seq();
             return None;
         }
         let records = usize::from(encoder.record_count());
         let payload = encoder.finish().freeze();
 
-        if let Some(metrics) = &self.metrics {
-            metrics.rendezvous_singleton();
-            metrics.batch(MuxDirection::Sent, records);
-        }
         match self.messenger.am_send_streaming(STREAM_BATCH_HANDLER) {
-            Ok(builder) => Some(builder.raw_payload(payload).worker(self.peer).send()),
+            Ok(builder) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics.batch(MuxDirection::Sent, records);
+                }
+                Some(builder.raw_payload(payload).worker(self.peer).send())
+            }
             Err(error) => {
                 tracing::error!(%error, "messenger mux: could not build a singleton send");
+                self.refund_batch_seq();
                 None
             }
         }
+    }
+
+    /// Give back a sequence a dispatch reserved and then did not send under.
+    ///
+    /// Nothing went out, so the sequence is not a gap — but a receiver reading
+    /// the next batch would meter one: `note_batch_seq` measures the distance
+    /// between the `batch_seq` it expected and the one that arrived, and cannot
+    /// tell a batch that was lost from one that was never built. Contiguity is
+    /// therefore the writer's own invariant, held at the writer's own seam. It
+    /// is not covering for a reachable defect: the batcher fails the epoch on
+    /// every arm that returns without sending, and that resets the counter.
+    fn refund_batch_seq(&mut self) {
+        self.next_batch_seq = self.next_batch_seq.wrapping_sub(1);
     }
 
     async fn dispatch(&self, payload: Bytes) -> anyhow::Result<()> {

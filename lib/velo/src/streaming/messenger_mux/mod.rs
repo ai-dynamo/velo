@@ -96,6 +96,8 @@ pub(crate) mod ingress;
 pub(crate) mod peer_batcher;
 pub(crate) mod protocol;
 #[cfg(test)]
+mod test_support;
+#[cfg(test)]
 mod tests;
 
 use std::cmp::Reverse;
@@ -344,6 +346,34 @@ pub struct MuxConfig {
     /// Defaults to [`FlushPolicy::Auto`] on [`AutoFlush::default`], which is
     /// the behaviour every mux had before this knob existed.
     pub flush_policy: FlushPolicy,
+    /// Whether opening a slot acks before the peer has admitted its `OpenSlot`.
+    ///
+    /// **Defaults to `false`**, the awaited ack every mux shipped with: the
+    /// `OpenSlot` is written in its own batch and `connect` returns once the
+    /// transport has taken it. That couples opening a stream to the depth of
+    /// the per-connection send queue, and on a congested peer that queue is
+    /// full — so a worker cannot start producing until a place in it comes
+    /// free, behind every batch already there.
+    ///
+    /// Set to `true` and the `OpenSlot` is still cut into a batch of its own
+    /// and still handed to the transport before the ack, so `bind()`'s accept
+    /// window keeps measuring "time until a batch bearing this `OpenSlot`
+    /// arrives". What stops is *waiting* for the transport to take it. The
+    /// slot is fenced until that admission resolves, so its first data record
+    /// cannot overtake the `OpenSlot` that claims the buffer it lands in, and a
+    /// failed admission is epoch death exactly as an awaited one is.
+    ///
+    /// The wait it removes is the open's own, and only that one. Cutting the
+    /// `OpenSlot` into a batch of its own means first writing whatever this
+    /// peer already had staged, and *that* write still parks on admission — so
+    /// the ack is wait-free only when nothing is staged, which under
+    /// [`FlushPolicy::Auto`] on a peer that is producing is not the common
+    /// case. With a batch staged the two paths wait the same once and this one
+    /// costs a frame more, because the awaited path packs the `OpenSlot` into
+    /// that staged batch rather than sending a second. Read as a rate: what
+    /// this buys is the open of an idle peer, which is the open a queued
+    /// request waits on.
+    pub async_open_ack: bool,
 }
 
 impl Default for MuxConfig {
@@ -358,6 +388,7 @@ impl Default for MuxConfig {
             drain_visit_floor: Duration::from_millis(2),
             batcher_idle_ttl: Duration::from_secs(60),
             flush_policy: FlushPolicy::Auto(AutoFlush::default()),
+            async_open_ack: false,
         }
     }
 }
