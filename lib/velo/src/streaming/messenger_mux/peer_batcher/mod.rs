@@ -81,7 +81,7 @@ use self::test_hooks::TestHooks;
 use self::writer::BatchWriter;
 use super::MuxConfig;
 use super::protocol::{
-    BATCH_HEADER_LEN, BatchEncoder, CloseReason, EncodeError, SlotId, record_encoded_len,
+    BATCH_HEADER_LEN, BatchEncoder, CloseReason, EncodeError, RecordType, SlotId, record_encoded_len,
 };
 use crate::messenger::Messenger;
 use crate::observability::{BatcherWake, MuxDropReason, MuxMetricsHandle};
@@ -572,17 +572,24 @@ impl Batcher {
     /// batch position.
     async fn on_reply(&mut self, slot: SlotId, entry: PeerControl) {
         if entry.credit > 0 {
-            self.push_reply(|encoder| encoder.push_credit_update(slot, 0, entry.credit))
-                .await;
+            self.push_reply(RecordType::CreditUpdate, |encoder| {
+                encoder.push_credit_update(slot, 0, entry.credit)
+            })
+            .await;
         }
         if let Some(reason) = entry.close {
-            self.push_reply(|encoder| encoder.push_close_slot(slot, 0, reason))
-                .await;
+            self.push_reply(RecordType::CloseSlot, |encoder| {
+                encoder.push_close_slot(slot, 0, reason)
+            })
+            .await;
         }
     }
 
+    /// `kind` is what the reply is, and decides how long the batch may hold
+    /// it: a credit reply rides the reply window, a close goes now.
     async fn push_reply(
         &mut self,
+        kind: RecordType,
         write: impl FnOnce(&mut BatchEncoder) -> Result<(), EncodeError>,
     ) {
         let needed = record_encoded_len(4).unwrap_or(usize::MAX);
