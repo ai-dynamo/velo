@@ -582,10 +582,17 @@ hint rather than a frame boundary:
   each cut a batch where they bind, because holding a full batch buys nothing —
   there is no room left to batch into.
 - **Records that carry liveness go.** `OpenSlot` keeps its own eager flush, and
-  a `CloseSlot`, a `CreditUpdate` or a terminal moves the batch it was staged
-  into. A `CreditUpdate` held back is a peer's sender starved with nothing left
-  to rescue it, and no application on this side knows it owes that peer
-  anything — so this is correctness, not courtesy.
+  a `CloseSlot` or a terminal moves the batch it was staged into. A
+  `CreditUpdate` moves too, but on its own clock: a batch holding nothing but
+  credit replies forms for `MuxConfig::reply_linger` (1 ms by default) and then
+  goes, or goes sooner with the next record that does not wait. Held for good,
+  a reply is a peer's sender starved with nothing left to rescue it, and no
+  application on this side knows it owes that peer anything — so no policy may
+  hold one, and the window is the batcher's own. Held for a millisecond it costs
+  that sender `reply_linger / initial_credit` per record and turns one batch
+  per reply into one per sweep visit, which on a receiver whose egress is
+  otherwise idle is the difference between one and ten outbound batches per
+  stream.
 
 Credit starvation also cuts a batch, from the other direction: a slot with no
 credit contributes nothing to the batch at all, and its records wait in the

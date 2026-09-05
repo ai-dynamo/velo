@@ -20,4 +20,5 @@ mod control;
 mod egress;
 mod flush_policy;
 mod instruments;
+mod reply_linger;
 mod support;
