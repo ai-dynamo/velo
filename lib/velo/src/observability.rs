@@ -205,6 +205,15 @@ pub(crate) enum StreamingOp {
     Finalize,
     /// Cancel an anchor (terminal).
     Cancel,
+    /// Mint a zero-RTT ticket ahead of any sender asking
+    /// (`AnchorManager::prebind_anchor`). The zero-RTT counterpart to
+    /// `Attach`'s handler run, on the node that mints rather than answers.
+    Prebind,
+    /// Open a sender on terms already known -- a minted ticket or an
+    /// attach response -- and connect its transport
+    /// (`AnchorManager::open_stream_sender`, the tail both remote open paths
+    /// share). Recorded on the node that opens, whichever door it came in.
+    Open,
 }
 
 impl StreamingOp {
@@ -215,6 +224,8 @@ impl StreamingOp {
             Self::Detach => "detach",
             Self::Finalize => "finalize",
             Self::Cancel => "cancel",
+            Self::Prebind => "prebind",
+            Self::Open => "open",
         }
     }
 }
@@ -733,6 +744,7 @@ pub struct VeloMetrics {
     streaming_server_pump_backpressure_total: Counter,
     streaming_producer_send_backpressure_total: Counter,
     streaming_heartbeat_watchdog_firings_total: Counter,
+    streaming_unclaimed_bind_reaped_total: Counter,
     streaming_egress_flushes_total: Counter,
     streaming_frames_written_total: Counter,
     // Messenger-mux metrics
@@ -1037,6 +1049,21 @@ impl VeloMetrics {
                  surfaced by the *_backpressure_total counters above.",
             ))?,
         )?;
+        let streaming_unclaimed_bind_reaped_total = register_collector(
+            registry,
+            Counter::with_opts(Opts::new(
+                "velo_streaming_unclaimed_bind_reaped_total",
+                "Reader-pump reap of a mux bind (a zero-RTT pre-bind, an ordinary \
+                 attach whose peer never sent its OpenSlot, or an attach that \
+                 adopted a pre-bind) whose accept window closed with no sender \
+                 having claimed it. Distinct from the heartbeat-watchdog firing \
+                 above: this is the accept window catching what the watchdog \
+                 either cannot see yet (no sender exists) or would catch too \
+                 late (the watchdog's threshold exceeds the accept window's \
+                 remaining span, at heartbeat_interval >= 20s -- see \
+                 streaming/BATCHING.md).",
+            ))?,
+        )?;
         let streaming_egress_flushes_total = register_collector(
             registry,
             Counter::with_opts(Opts::new(
@@ -1314,6 +1341,7 @@ impl VeloMetrics {
             streaming_server_pump_backpressure_total,
             streaming_producer_send_backpressure_total,
             streaming_heartbeat_watchdog_firings_total,
+            streaming_unclaimed_bind_reaped_total,
             streaming_egress_flushes_total,
             streaming_frames_written_total,
             streaming_mux_live_slots,
@@ -1587,6 +1615,17 @@ impl VeloMetrics {
     /// Record a heartbeat-watchdog firing in the reader pump.
     pub(crate) fn record_heartbeat_watchdog_firing(&self) {
         self.streaming_heartbeat_watchdog_firings_total.inc();
+    }
+
+    /// Record the reader pump reaping a mux bind whose accept window closed
+    /// with no sender having claimed it. See
+    /// [`record_heartbeat_watchdog_firing`](Self::record_heartbeat_watchdog_firing)
+    /// for the sibling reaper this one is not: that one fires once a sender's
+    /// silence outlasts its tolerance, this one fires when no sender ever
+    /// showed up (or adopted a pre-bind and then never sent its `OpenSlot`)
+    /// before the mux gave the slot back.
+    pub(crate) fn record_unclaimed_bind_reaped(&self) {
+        self.streaming_unclaimed_bind_reaped_total.inc();
     }
 
     /// Record one batch reaching the wire on the streaming egress path,

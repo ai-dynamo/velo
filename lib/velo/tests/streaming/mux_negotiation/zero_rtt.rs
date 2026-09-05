@@ -266,6 +266,81 @@ async fn zero_rtt_run_reports_no_batch_seq_gaps() {
     consumer.assert_no_reader_stall();
 }
 
+/// Finding: zero-RTT setup went through `attach_handler_runs` dropping to
+/// zero and nothing else -- neither `prebind_anchor` nor the ticket-opening
+/// tail recorded an operation of their own, so a deployment that switched to
+/// zero-RTT read identically to one where streaming had stopped working.
+///
+/// `record_streaming_operation` already exists and is cheap (one label
+/// lookup, one histogram observation); this pins that both new call sites use
+/// it, on the consumer that mints and the producer that opens.
+#[tokio::test(flavor = "multi_thread")]
+async fn zero_rtt_setup_is_observable_via_streaming_anchor_operations() {
+    let (consumer, producer) = pair(Some(mux_config()), Some(mux_config())).await;
+
+    let anchor = consumer.velo.create_anchor::<u32>();
+    let handle = transfer(anchor.handle());
+    let ticket = ship(
+        consumer
+            .velo
+            .prebind_anchor(handle)
+            .expect("both sides run the mux, so a ticket is minted"),
+    );
+    assert_eq!(
+        prebind_operations(&consumer, "success"),
+        1.0,
+        "prebind_anchor minting a ticket must be counted on the consumer"
+    );
+
+    let sender = producer
+        .velo
+        .open_anchor_stream::<u32>(handle, ticket)
+        .await
+        .expect("zero-RTT open");
+    assert_eq!(
+        open_operations(&producer, "success"),
+        1.0,
+        "opening on the ticket must be counted on the producer"
+    );
+
+    drain_stream(anchor, sender, 8).await;
+
+    // A second `prebind_anchor` on the same handle finds the anchor gone
+    // (drained and dropped by `drain_stream`'s consumer): the refusal path,
+    // which must be counted too rather than only logged.
+    let second = consumer.velo.create_anchor::<u32>();
+    let second_handle = transfer(second.handle());
+    consumer
+        .velo
+        .prebind_anchor(second_handle)
+        .expect("ticket for the still-attached check below");
+    assert!(
+        consumer.velo.prebind_anchor(second_handle).is_none(),
+        "an anchor already pre-bound must refuse a second mint"
+    );
+    assert_eq!(
+        prebind_operations(&consumer, "error"),
+        1.0,
+        "the refusal must be counted, not only logged at debug"
+    );
+}
+
+/// Prebind operations this node ran, by outcome.
+fn prebind_operations(node: &Node, outcome: &str) -> f64 {
+    node.snapshot().counter(
+        "velo_streaming_anchor_operations_total",
+        &[("operation", "prebind"), ("outcome", outcome)],
+    )
+}
+
+/// Ticket-open operations this node ran, by outcome.
+fn open_operations(node: &Node, outcome: &str) -> f64 {
+    node.snapshot().counter(
+        "velo_streaming_anchor_operations_total",
+        &[("operation", "open"), ("outcome", outcome)],
+    )
+}
+
 // ---------------------------------------------------------------------------
 // A sender that attaches anyway
 // ---------------------------------------------------------------------------

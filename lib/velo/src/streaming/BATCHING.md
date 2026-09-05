@@ -1155,8 +1155,18 @@ crosses the wire.
 Nothing on the wire changed. The attach request and response gain and lose no
 field; `StreamOpenTicket` is a separate type carried in the application's own
 envelope, and a worker that receives no ticket attaches exactly as before. With
-no mux installed no ticket is minted at all, so `MuxConfig::enabled` remains the
-complete rollback for this path too.
+no mux installed no ticket is minted at all, so `MuxConfig::enabled` is a
+complete rollback on the node that mints -- the minting side alone.
+
+It is not symmetric. A producer rolled back to `MuxConfig::enabled = false`
+still advertises a non-empty key set (`advertised_keys` always returns at
+least the default transport's key), just not `messenger-mux-v1`. Attaching
+against a consumer that still pre-binds does not fall through to that
+default: `adopt_prebind`'s key-mismatch check refuses the attach outright
+(documented on `AnchorAttachRequest::supported_transport_keys` in
+`control.rs`), where the base branch served it. Roll the minting side back
+first, or roll both back together -- never the producer alone while a
+consumer still pre-binds.
 
 A ticket may sit in a request envelope for up to the 60 s accept window before
 its worker opens it — that bound, not a fraction of it, because heartbeat
@@ -1177,8 +1187,20 @@ handed a slot whose `OpenSlot` has not yet arrived either, but it is no longer
 waiting on its ticket — `PreBind::adopt` clears `PumpContext::prebound` the
 instant the attach handler adopts it, and the pump falls straight back to the
 ordinary `DETECTION_MULTIPLIER * heartbeat_interval` window every other attach
-gets. An adopting sender that dies before its first record is caught in
-seconds, not left to the 60 s accept window.
+gets, restarting from wherever the pump's current window happened to be, not
+from adoption. `PreBind::adopt` does not restart the bind's own 60 s accept
+window either — see `ACCEPT_TIMEOUT`'s doc — so an adopting sender that dies
+before its first record is caught by whichever deadline comes first: the
+watchdog, at `DETECTION_MULTIPLIER * heartbeat_interval` measured loosely from
+adoption, or the pre-bind's already-running accept window, at whatever is left
+of the 60 s. At the manager default (5 s heartbeat) the watchdog usually wins
+and the catch is in seconds; at `heartbeat_interval >= 20 s` — the 30 s this
+crate's own `cancel.rs` example configures, say — the watchdog's threshold
+exceeds 60 s and the accept window always wins instead, so the catch is up to
+60 s, not seconds. Either way `control::reader_pump`'s `Ok(Err(_))` arm reaps
+the registry entry once the accept window closes on an unclaimed bind,
+regardless of which door (`prebind_anchor` or an adopted attach) was expecting
+the sender — so the adopting sender is always caught, just not always quickly.
 
 The gate that gives a pre-bind this exemption is `PumpContext::prebound`, not
 `drain.claimed()` by itself: the mux parks a `DrainSignal` for *every* bind,

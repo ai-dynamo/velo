@@ -23,13 +23,17 @@ use std::time::Duration;
 /// and the `_anchor_attach` round trip that used to precede the first token
 /// does not happen.
 ///
-/// A separate type rather than the response variant reused. The two shapes are
-/// identical today and are free to diverge: the response is a reply whose
-/// compatibility is owed to every peer that sends an attach, while a ticket is
-/// only ever read by a peer new enough to have been sent one. Tying them
-/// together would buy nothing and cost that freedom — and, decisively,
-/// [`super::AnchorAttachRequest`] and [`super::AnchorAttachResponse`] gain and
-/// lose no field for any of this.
+/// A separate type rather than the response variant reused. The two shapes
+/// are identical today: the response is a reply whose compatibility is owed
+/// to every peer that sends an attach, while a ticket is only ever read by a
+/// peer new enough to have been sent one, so tying them together would buy
+/// nothing. [`super::AnchorAttachRequest`] and [`super::AnchorAttachResponse`]
+/// gain and lose no field for any of this. That divergence is not yet free in
+/// practice, though: every field here is `pub` with no `#[non_exhaustive]`,
+/// so once this type ships, adding a sixth field is a breaking change for any
+/// out-of-tree constructor exactly as it would be on the response — the
+/// separation buys room to diverge only if the attribute is added before
+/// release.
 ///
 /// The receiver mints one through [`StreamOpenTicket::from_limits`], which takes
 /// the window as a `NegotiatedLimits` rather than as two integers. That keeps
@@ -44,7 +48,11 @@ pub struct StreamOpenTicket {
     pub streaming_transport_key: velo_ext::TransportKey,
     /// The cadence the sender must beat at, as
     /// [`super::AnchorAttachResponse::Ok::heartbeat_interval_ms`].
-    #[serde(default = "super::default_heartbeat_interval_ms")]
+    ///
+    /// No `#[serde(default)]`, for the same reason as `routing_session_id`: a
+    /// missing value is corruption, not a legacy peer, and defaulting it to
+    /// 5 s would silently cross a short-heartbeat anchor's watchdog instead
+    /// of failing to decode.
     pub heartbeat_interval_ms: u64,
     /// The receiver-allocated routing slot this stream owns, as
     /// [`super::AnchorAttachResponse::Ok::routing_session_id`].
@@ -62,7 +70,15 @@ pub struct StreamOpenTicket {
     /// missing value is corruption, and defaulting it to zero would silently
     /// read as "not offering the mux" instead of failing to decode.
     pub initial_credit: u32,
-    /// Bytes one slot may hold in flight; zero means the default.
+    /// Bytes one slot may hold in flight. Never zero on a minted ticket, for
+    /// the same reason as `initial_credit`: `from_limits` quotes
+    /// [`NegotiatedLimits::slot_byte_budget`](crate::streaming::messenger_mux::flow_control::NegotiatedLimits::slot_byte_budget),
+    /// the already-resolved value, never the configured `0` that means "use
+    /// the default". That zero-means-default reading belongs to the wire
+    /// encoding this field mirrors — [`super::AnchorAttachResponse::Ok`],
+    /// which [`NegotiatedLimits::from_wire`](crate::streaming::messenger_mux::flow_control::NegotiatedLimits::from_wire)
+    /// still interprets on the open path — not to a ticket, which carries
+    /// only the resolved value.
     ///
     /// No `#[serde(default)]`, for the same reason as `routing_session_id`.
     pub slot_byte_budget: u32,

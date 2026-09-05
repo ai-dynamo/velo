@@ -134,13 +134,25 @@ pub const MESSENGER_MUX_KEY: &str = "messenger-mux-v1";
 /// The active-message handler every batch travels through.
 pub(crate) const STREAM_BATCH_HANDLER: &str = "_stream_batch";
 
-/// How long a `bind()` waits for the `OpenSlot` that claims it.
+/// How long a bind waits for the `OpenSlot` that claims it.
 ///
 /// Deliberately the same 60 s the TCP transport gives a pending session, and
 /// deliberately measuring the same thing: "time until a batch bearing this
-/// `OpenSlot` arrives". `OpenSlot` is eager precisely so this cannot quietly
-/// become "time until the producer produces its first token" and expire a queued
-/// request with a long prefill.
+/// `OpenSlot` arrives". That sentence holds without qualification for
+/// `FrameTransport::bind`'s attach-path caller: a sender has already asked by
+/// the time the bind exists, so the window is one response leg plus one batch
+/// leg, and `OpenSlot` is eager precisely so it cannot quietly become "time
+/// until the producer produces its first token" there.
+///
+/// It does not hold for `MessengerMuxTransport::prebind`'s zero-RTT caller,
+/// where the same clock starts before any sender has asked at all: the window
+/// there is envelope transit plus however long the ticket sits in a request
+/// envelope before its worker calls `open_anchor_stream`, which can be exactly
+/// the producer-side wait the paragraph above rules out for `bind`. See
+/// `AnchorManager::prebind_anchor`'s doc for that bound. An attach that adopts
+/// an existing pre-bind does not restart this timer either way — adoption
+/// takes over the bind `prebind` already registered rather than calling
+/// `bind` again, so it inherits whatever is left of the 60 s, not a fresh one.
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Attempts `connect` makes before giving up on a batcher that keeps retiring

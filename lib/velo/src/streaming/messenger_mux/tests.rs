@@ -1185,6 +1185,74 @@ async fn an_adopted_prebind_is_reaped_on_heartbeat_silence_before_its_open_slot(
     drop(anchor);
 }
 
+/// End-to-end version of the `control::reader_pump` reap-on-reclaim fix,
+/// driven through the real `AnchorManager` / mux stack rather than the
+/// synthetic pump fixture: at a heartbeat interval the watchdog alone cannot
+/// beat the fixed 60 s accept window with (`>= 20 s` -- `DETECTION_MULTIPLIER`
+/// is 3, so the watchdog's earliest fire from a fresh window is `3 *
+/// heartbeat`), an adopted pre-bind whose sender never delivers its
+/// `OpenSlot` must still be reaped once the accept window closes, and the
+/// consumer must see `SenderDropped` rather than wedge on `Poll::Pending`
+/// forever.
+///
+/// The sibling above uses a 50 ms heartbeat, so its watchdog always wins the
+/// race against the 60 s window and this path never runs there -- this test
+/// is the one that actually exercises the accept window as the reaper.
+#[tokio::test]
+async fn an_adopted_prebind_with_a_slow_heartbeat_is_reaped_by_the_accept_window() {
+    tokio::time::pause();
+    let heartbeat = Duration::from_secs(25);
+    let node = prebinding_node(test_config(), None).await;
+    let mut anchor = node.manager.create_anchor_with_config::<u32>(AnchorConfig {
+        heartbeat_interval: Some(heartbeat),
+        ..Default::default()
+    });
+    let handle = anchor.handle();
+    let (_, local_id) = handle.unpack();
+    node.manager
+        .prebind_anchor(handle)
+        .expect("a mux is installed, so a ticket is minted");
+
+    let request = crate::streaming::control::AnchorAttachRequest {
+        handle,
+        session_id: 1,
+        stream_cancel_handle: crate::streaming::control::StreamCancelHandle::pack(
+            WorkerId::from_u64(7),
+            1,
+        ),
+        supported_transport_keys: vec![velo_ext::TransportKey::new(MESSENGER_MUX_KEY)],
+    };
+    assert!(
+        matches!(
+            node.manager.adopt_prebind(local_id, &request),
+            crate::streaming::anchor::PrebindAdoption::Adopted(_)
+        ),
+        "the pre-bind's own key is offered, so this attach adopts it"
+    );
+
+    // The watchdog alone would not fire until 25 s * (0 + DETECTION_MULTIPLIER)
+    // = 75 s from adoption -- after the fixed 60 s accept window, not before.
+    // Advance well past both so whichever fires first has already run.
+    tokio::time::sleep(Duration::from_secs(65)).await;
+
+    assert!(
+        !node.manager.registry.contains_key(&local_id),
+        "the accept window closing an unclaimed bind must reap the entry \
+         even though the watchdog has not yet reached its own threshold"
+    );
+
+    let next = tokio::time::timeout(Duration::from_millis(50), anchor.next())
+        .await
+        .expect("the pump already exited on the accept window; the consumer must not block");
+    assert!(
+        matches!(
+            next,
+            Some(Err(crate::streaming::StreamError::SenderDropped))
+        ),
+        "expected SenderDropped, got {next:?}"
+    );
+}
+
 /// Arming an unattached timeout on a pre-bound anchor stores it without
 /// starting it.
 ///
@@ -1279,6 +1347,53 @@ async fn a_prebound_slot_opens_on_the_terms_its_ticket_quotes() {
         u64::from(ticket.slot_byte_budget),
         byte_budget,
         "a configured zero resolves to the default in both reads, or neither"
+    );
+
+    drop(anchor);
+}
+
+/// Finding: `open_anchor_stream` has no same-worker guard, unlike its twin
+/// `attach_stream_anchor`. `prebind_anchor` only mints for a handle this node
+/// owns, but says nothing about which worker ends up opening it -- so a
+/// ticket that is opened on the node that minted it (a single-process
+/// application, or a test) took the network path instead of failing fast or
+/// taking the co-located one.
+///
+/// Confirmed by running it before this guard existed: `open_anchor_stream`
+/// returned `Ok(sender)`, and the very first `send` on that sender failed
+/// with `ChannelClosed` -- a caller cannot tell the two apart from the
+/// `Ok(sender)` alone, and has already lost the item it tried to send. The
+/// fix is not "take the co-located path": zero-RTT deliberately never sets
+/// `attachment` for a claimed slot (see `BATCHING.md`), so there is no
+/// existing claim representation a co-located write could reuse without
+/// making `attachment` mean two different things depending on where the
+/// producer happened to land. Nothing in this PR claims same-worker ticket
+/// open is supported -- every zero-RTT test pairs two nodes, and the README
+/// example mints on one and opens on the other -- so the fix is to fail
+/// immediately with a clear error instead of a confusing deferred one.
+#[tokio::test(flavor = "multi_thread")]
+async fn open_anchor_stream_on_the_minting_worker_fails_fast() {
+    let node = prebinding_node(test_config(), None).await;
+    let anchor = node.manager.create_anchor::<u32>();
+    let handle = anchor.handle();
+    let ticket = node.manager.prebind_anchor(handle).expect("ticket");
+
+    let err = tokio::time::timeout(
+        Duration::from_secs(3),
+        node.manager.open_anchor_stream::<u32>(handle, ticket),
+    )
+    .await
+    .expect("must fail immediately, not hang")
+    .expect_err("a ticket opened on the worker that minted it must be refused");
+
+    assert!(
+        matches!(err, crate::streaming::AttachError::TransportError(_)),
+        "expected TransportError naming the misuse, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("attach_stream_anchor"),
+        "the error must point at the co-located path a same-worker sender \
+         should use instead, got: {err}"
     );
 
     drop(anchor);

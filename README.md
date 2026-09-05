@@ -425,7 +425,9 @@ sender.send("hello".into()).await?;
 sender.finalize()?;
 ```
 
-`prebind_anchor` returns `None` whenever there is nothing to mint — no `messenger-mux` installed, an MPSC anchor, or a handle this node cannot pre-bind — and `None` is never an error: the application keeps the ticket beside the handle it already carries, and a worker that gets no ticket calls `attach_anchor` exactly as before.
+`prebind_anchor` returns `None` whenever there is nothing to mint — no `messenger-mux` installed, an MPSC anchor, or a handle this node cannot pre-bind — and `None` is never an error: the application keeps the ticket beside the handle it already carries, and a worker that gets no ticket calls `attach_anchor` exactly as before. `prebind_anchor` must be called from a runtime context — it spawns the reader pump and the bind's accept-window task, exactly as an ordinary attach does.
+
+A sender opened this way never sent an `_anchor_attach`, so it never learned a `StreamCancelHandle` and `sender.cancellation_token()` never fires — check the result of `send`/`finalize` rather than selecting on the token; a dropped consumer surfaces there as a send error instead.
 
 ---
 

@@ -12,11 +12,17 @@
 //! - [`create_anchor_finalize_handler`]: injects [`crate::streaming::frame::StreamFrame::Finalized`]
 //!   sentinel, then removes anchor from registry.
 //! - [`create_anchor_cancel_handler`]: removes anchor from registry with no sentinel injection.
+//!
+//! It also re-exports [`StreamOpenTicket`] (minted by
+//! [`crate::streaming::anchor::AnchorManager::prebind_anchor`] for zero-RTT
+//! stream setup) and the reader pump ([`pump`], `pub(crate)` only — every
+//! caller is in-crate) that all four handlers and the zero-RTT open path
+//! spawn onto.
 
 use crate::observability::{HandlerOutcome, StreamingOp};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::streaming::anchor::AnchorManager;
 use crate::streaming::handle::StreamAnchorHandle;
@@ -194,8 +200,11 @@ pub struct AnchorAttachRequest {
     /// `messenger-mux-v1` when it appears in both. `#[serde(default)]` means a
     /// sender that predates negotiation deserializes as one advertising
     /// nothing, which is exactly right: an empty list can never intersect, so
-    /// such a sender is always answered with the receiver's default transport
-    /// key — the behaviour it already expects.
+    /// absent a pre-bound slot on the anchor, such a sender is always answered
+    /// with the receiver's default transport key — the behaviour it already
+    /// expects. When the anchor holds an unclaimed pre-bind whose key this
+    /// sender does not advertise, `adopt_prebind` refuses the attach instead
+    /// of falling through to that default.
     #[serde(default)]
     pub supported_transport_keys: Vec<velo_ext::TransportKey>,
 }
@@ -258,7 +267,9 @@ pub enum AnchorAttachResponse {
     Err { reason: String },
 }
 
+mod pump;
 mod ticket;
+pub(crate) use pump::{PumpContext, reader_pump};
 pub use ticket::StreamOpenTicket;
 
 /// Request to detach the current sender from an anchor without closing it.
@@ -284,254 +295,6 @@ pub struct AnchorFinalizeRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AnchorCancelRequest {
     pub handle: StreamAnchorHandle,
-}
-
-// ---------------------------------------------------------------------------
-// Reader pump
-// ---------------------------------------------------------------------------
-
-/// What a reader pump needs beyond its channels.
-///
-/// A struct rather than three more parameters: `mpsc_reader_pump` already
-/// carries a sender id and a registry, and adding the drain hook positionally
-/// would take it past the argument limit — which `CLAUDE.md` says to answer
-/// with a config struct rather than an `allow`.
-pub(crate) struct PumpContext {
-    /// The anchor's local id, for registry removal on heartbeat loss.
-    pub(crate) local_id: u64,
-    /// Negotiated at attach; `DETECTION_MULTIPLIER` misses is a dead stream.
-    pub(crate) heartbeat_deadline: Duration,
-    /// Told when a record leaves the buffer credit is issued against. `None`
-    /// for every transport that does not do flow control over this seam.
-    pub(crate) drain: Option<std::sync::Arc<crate::streaming::messenger_mux::ingress::DrainSignal>>,
-    /// Whether this pump's slot still has no sender, other than through its
-    /// own `OpenSlot`.
-    ///
-    /// `true` only at the one genuine pre-bind spawn site
-    /// (`AnchorManager::prebind_anchor`); every ordinary attach spawn passes
-    /// a fresh `Arc::new(AtomicBool::new(false))`. Shared with the
-    /// `PreBind` the pump was spawned for, and cleared by
-    /// [`PreBind::adopt`](crate::streaming::anchor::PreBind::adopt) the
-    /// moment a sender attaches the long way round instead of opening on its
-    /// ticket -- the one other door through which a sender can show up, and
-    /// the one transition an `Arc<AtomicBool>` exists to carry immediately
-    /// rather than the pump learning it only once that sender's own
-    /// `OpenSlot` lands.
-    ///
-    /// `drain.claimed().is_none()` is not a proxy for this on its own: the
-    /// mux parks a `DrainSignal` for *every* bind, including an ordinary
-    /// attach's, and that signal stays unclaimed until the peer's `OpenSlot`
-    /// arrives -- which is necessarily after the attach response already
-    /// returned. See [`awaiting_sender`] for the combined read both
-    /// heartbeat-suppression branches below need.
-    pub(crate) prebound: std::sync::Arc<std::sync::atomic::AtomicBool>,
-}
-
-/// Whether a pump's slot still has no sender -- the state that must not count
-/// against the heartbeat watchdog nor trigger registry removal on a closed
-/// transport.
-///
-/// Two different doors let a sender show up, and this has to watch both:
-/// `prebound` answers for the one that opens on its ticket directly (an
-/// `OpenSlot` claims `drain`, no attach in between) by being cleared the
-/// instant [`PreBind::adopt`](crate::streaming::anchor::PreBind::adopt)
-/// reassigns the slot to a sender that attached the ordinary way instead --
-/// `drain` alone cannot see that sender, since its own `OpenSlot` may still
-/// be seconds or minutes away. `prebound` alone is not enough either: an
-/// ordinary attach's pump starts with an unclaimed `drain` too, for as long
-/// as the peer's own `OpenSlot` is still in flight, and that pump is spawned
-/// with `prebound` already `false` for exactly that reason.
-fn awaiting_sender(
-    prebound: &std::sync::atomic::AtomicBool,
-    drain: Option<&crate::streaming::messenger_mux::ingress::DrainSignal>,
-) -> bool {
-    prebound.load(std::sync::atomic::Ordering::Relaxed)
-        && drain.is_some_and(|d| d.claimed().is_none())
-}
-
-/// Reader pump: bridges transport frames to the anchor's delivery channel.
-///
-/// Spawned as a tokio task after successful attach. Reads from the transport
-/// receiver, forwards to the anchor's frame_tx. Monitors for heartbeat
-/// timeouts: `DETECTION_MULTIPLIER` consecutive `heartbeat_deadline` windows
-/// with no frames trigger Dropped sentinel injection, registry removal
-/// (LIVE-02), and cleanup. The deadline is negotiated at attach time via
-/// `AnchorAttachResponse::heartbeat_interval_ms`.
-pub(crate) async fn reader_pump(
-    transport_rx: flume::Receiver<Vec<u8>>,
-    frame_tx: flume::Sender<Vec<u8>>,
-    cancel_token: tokio_util::sync::CancellationToken,
-    ctx: crate::streaming::anchor::AnchorContext,
-    pump: PumpContext,
-) {
-    let PumpContext {
-        local_id,
-        heartbeat_deadline,
-        drain,
-        prebound,
-    } = pump;
-    let crate::streaming::anchor::AnchorContext {
-        registry,
-        mpsc_registry,
-        metrics,
-    } = ctx;
-    let mut missed_heartbeats: u8 = 0;
-
-    loop {
-        tokio::select! {
-            _ = cancel_token.cancelled() => break,
-            result = tokio::time::timeout(heartbeat_deadline, transport_rx.recv_async()) => {
-                match result {
-                    Ok(Ok(bytes)) => {
-                        // Any frame (data or heartbeat) proves liveness
-                        missed_heartbeats = 0;
-                        // Forward to anchor's frame channel.
-                        //
-                        // The per-anchor frame_tx is bounded(256) — the smallest
-                        // channel in the saturation cascade and the first to fill
-                        // when the consumer can't keep up. We try_send first so we
-                        // can record a leading-indicator counter on the slow path
-                        // before falling through to the awaited send.
-                        match frame_tx.try_send(bytes) {
-                            Ok(()) => {}
-                            Err(flume::TrySendError::Full(b)) => {
-                                if let Some(m) = metrics.as_ref() {
-                                    m.record_reader_pump_backpressure();
-                                }
-                                if frame_tx.send_async(b).await.is_err() {
-                                    break; // consumer dropped
-                                }
-                            }
-                            Err(flume::TrySendError::Disconnected(_)) => break,
-                        }
-                        // The record is out of the buffer the mux issues credit
-                        // against, so that credit is free. Telling the mux here
-                        // is what lets its sweep interval be a backstop rather
-                        // than the only way credit comes back — see
-                        // `messenger_mux::ingress::DrainSignal`. `None` for
-                        // every transport that does not do flow control over
-                        // this seam, which pays one `Option` check per frame.
-                        if let Some(drain) = drain.as_deref() {
-                            drain.drained();
-                        }
-                    }
-                    Ok(Err(_)) => {
-                        // Transport channel closed. Once a sender exists --
-                        // whichever door it came through, see
-                        // `awaiting_sender` -- this is unchanged from before:
-                        // something else already owns telling the registry,
-                        // so just stop pumping.
-                        //
-                        // While the slot is still `awaiting_sender`, this is
-                        // the 60 s accept window reclaiming it --
-                        // `release_bind`/`expire_bind` drop the bind's
-                        // `frame_tx`, which is the other end of this
-                        // `transport_rx`. Heartbeat detection is gated on the
-                        // same read below precisely so it cannot reap this
-                        // case, which makes the accept window the *only*
-                        // reaper an abandoned pre-bind has left. Remove the
-                        // registry entry here or nothing ever will: unlike the
-                        // watchdog-fired branch, this exit was silent before.
-                        //
-                        // `!cancel_token.is_cancelled()` excludes the pump
-                        // being *retired* rather than abandoned: releasing an
-                        // unclaimed pre-bind (a mismatched-transport refusal,
-                        // say) cancels this same token before dropping the
-                        // bind, precisely so the entry it would otherwise
-                        // remove -- reused by whatever attach wins next -- is
-                        // never touched by a pump that no longer speaks for
-                        // it. `tokio::select!` does not guarantee the cancel
-                        // branch wins a tie, so the check has to be a state
-                        // read here, not an ordering assumption.
-                        if awaiting_sender(&prebound, drain.as_deref())
-                            && !cancel_token.is_cancelled()
-                            && let Some((_, entry)) = registry.remove(&local_id)
-                        {
-                            entry.cancel_token.cancel();
-                            crate::streaming::anchor::set_active_anchor_gauge(
-                                metrics.as_ref(),
-                                &registry,
-                                &mpsc_registry,
-                            );
-                        }
-                        break;
-                    }
-                    Err(_timeout) => {
-                        // A slot still `awaiting_sender` times out on every
-                        // window by construction -- there is no producer to
-                        // be silent yet. Counting that as a miss is the bug:
-                        // it arms this watchdog against a sender that has not
-                        // shown up, capping how long a zero-RTT request may
-                        // wait in a queue, or an adopted attach may wait for
-                        // its own `OpenSlot`, at a bound nothing documents.
-                        // Once a sender exists -- an `OpenSlot` claims the
-                        // bind, or an attach adopts it -- every miss counts
-                        // exactly as it always has, with the same
-                        // `DETECTION_MULTIPLIER` margin the ordinary attach
-                        // path has always given it.
-                        if awaiting_sender(&prebound, drain.as_deref()) {
-                            continue;
-                        }
-                        missed_heartbeats += 1;
-                        if missed_heartbeats >= DETECTION_MULTIPLIER {
-                            if let Some(m) = metrics.as_ref() {
-                                m.record_heartbeat_watchdog_firing();
-                            }
-                            // Inject Dropped sentinel -- sender is dead.
-                            // The diagnostic context here is what the saturation
-                            // runbook tells operators to grep for: anchor channel
-                            // depth at the moment of firing tells you whether the
-                            // session was sitting at the bound (cascade) or empty
-                            // (real producer crash).
-                            tracing::warn!(
-                                local_id,
-                                anchor_frame_tx_len = frame_tx.len(),
-                                anchor_frame_tx_cap = frame_tx.capacity().unwrap_or_default(),
-                                transport_rx_len = transport_rx.len(),
-                                transport_rx_cap = transport_rx.capacity().unwrap_or_default(),
-                                heartbeat_deadline_ms = heartbeat_deadline.as_millis() as u64,
-                                detection_multiplier = DETECTION_MULTIPLIER,
-                                "reader_pump: heartbeat watchdog fired, injecting Dropped \
-                                 (saturation indicator: see velo_streaming_*_backpressure_total)"
-                            );
-                            let dropped_bytes = crate::streaming::sender::cached_dropped().clone();
-                            // Non-blocking: an anchor channel that is already
-                            // full when the watchdog fires would deadlock a
-                            // blocking await here -- registry cleanup and the
-                            // cancel_token would never run, leaking a dead
-                            // anchor. We accept that the consumer may see a
-                            // plain channel-close (EOF) instead of an explicit
-                            // SenderDropped in the saturated edge case; the
-                            // watchdog firing metric + the warn! above are the
-                            // authoritative signal for operators.
-                            if frame_tx.try_send(dropped_bytes).is_err() {
-                                tracing::warn!(
-                                    local_id,
-                                    "reader_pump: anchor channel saturated at watchdog-fire; \
-                                     Dropped sentinel could not be injected, consumer will see \
-                                     channel close (EOF) -- watchdog firing counter is the \
-                                     authoritative signal here"
-                                );
-                            }
-                            // LIVE-02: Full anchor cleanup -- remove from registry
-                            // so no stale entry remains (ANCR-04)
-                            if let Some((_, entry)) = registry.remove(&local_id) {
-                                entry.cancel_token.cancel();
-                                crate::streaming::anchor::set_active_anchor_gauge(
-                                    metrics.as_ref(),
-                                    &registry,
-                                    &mpsc_registry,
-                                );
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    // Cleanup: cancel token so other paths know the pump exited
-    cancel_token.cancel();
 }
 
 // ---------------------------------------------------------------------------
@@ -838,6 +601,11 @@ pub fn create_anchor_detach_handler(manager: Arc<AnchorManager>) -> crate::messe
                         // the same reason Mismatch does: the anchor is
                         // genuinely unattached again.
                         let released = entry.prebind.take();
+                        // Called under the `Entry::Occupied` guard held
+                        // above: safe now that `spawn_timeout_task` guards
+                        // its own `tokio::spawn` — the call never runs
+                        // synchronously and never touches this registry, so
+                        // there is nothing here for it to deadlock against.
                         if released.is_some()
                             && let Some(duration) = entry.unattached_timeout
                         {

@@ -267,11 +267,22 @@ impl<T: Serialize> StreamSender<T> {
     /// loop {
     ///     tokio::select! {
     ///         _ = sender.cancellation_token().cancelled() => break,
-    ///         val = produce() => { let _ = sender.send(val).await; }
+    ///         val = produce() => { if sender.send(val).await.is_err() { break; } }
     ///     }
     /// }
     /// # }
     /// ```
+    ///
+    /// This fires only for a stream opened by attach. A sender built by
+    /// [`AnchorManager::open_anchor_stream`](crate::streaming::AnchorManager::open_anchor_stream)
+    /// (or [`Velo::open_anchor_stream`](crate::Velo::open_anchor_stream)) never
+    /// sent an attach, so the consumer never learned a `StreamCancelHandle` to
+    /// reach it by, and this token never cancels for it -- a dropped consumer
+    /// surfaces there as `SendError::ChannelClosed` on the next `send`
+    /// instead, posted promptly once the pre-bind's reclamation runs. The
+    /// `tokio::select!` above is still correct for that case: the token side
+    /// just never fires, so the loop exits through the `send` error the way
+    /// the corrected example above does.
     pub fn cancellation_token(&self) -> CancellationToken {
         self.cancel_token.clone()
     }

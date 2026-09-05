@@ -687,6 +687,9 @@ impl Velo {
     /// open its sender with [`open_anchor_stream`](Velo::open_anchor_stream).
     /// `None` means no ticket was minted and the worker should
     /// [`attach_anchor`](Velo::attach_anchor) the ordinary way.
+    ///
+    /// Must be called from a runtime context: it spawns the reader pump and
+    /// the bind's accept-window task, exactly as the attach handler does.
     pub fn prebind_anchor(
         &self,
         handle: StreamAnchorHandle,
@@ -700,6 +703,10 @@ impl Velo {
     /// The zero-RTT counterpart of [`attach_anchor`](Velo::attach_anchor): no
     /// `_anchor_attach` round trip, because `ticket` already carries what one
     /// would have returned.
+    ///
+    /// No attach means no `StreamCancelHandle`, so the returned sender's
+    /// `cancellation_token` never fires; a dropped consumer surfaces as a
+    /// send error instead.
     pub async fn open_anchor_stream<T: serde::Serialize>(
         &self,
         handle: StreamAnchorHandle,

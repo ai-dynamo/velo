@@ -304,9 +304,9 @@ async fn test_cancel_03_remote_cancel() {
 //   can name the producer's `SenderEntry` and poison it directly. This works
 //   whether or not the producer is sending.
 // - **Ingress.** The next record to arrive for a slot whose consumer dropped
-//   its receiver faults with `CloseReason::UnknownSlot`
-//   (`messenger_mux/ingress/slot.rs:292`), which closes the producer's egress
-//   slot. This works only while records keep arriving.
+//   its receiver faults with `CloseReason::UnknownSlot` (`fault_reason`'s
+//   `ConsumerGone` arm, `messenger_mux/ingress/slot.rs`), which closes the
+//   producer's egress slot. This works only while records keep arriving.
 //
 // Zero-RTT setup never sends an attach, so it never learns the cancel handle
 // and the first path is unavailable to it. The pair of tests below is that

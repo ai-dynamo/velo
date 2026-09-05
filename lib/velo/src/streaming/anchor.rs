@@ -223,14 +223,19 @@ pub(crate) struct AnchorEntry {
 ///   learns a `StreamCancelHandle` either, and this is the only prompt path
 ///   left.
 ///
-/// Two races follow from `is_claimed` being an unlocked `OnceLock` read
-/// rather than something the registry's shard lock also covers, and both
-/// degrade to the pre-zero-RTT reactive path rather than leak: an `OpenSlot`
-/// claiming between [`PreBind::drop`]'s read and its `release_bind` leaves a
-/// live slot with no close posted, discovered on the producer's next record
-/// or heartbeat; and one claiming right after [`AnchorManager::adopt_prebind`]
-/// reads `is_claimed` for its verdict hands the attaching sender terms
-/// already in use, whose `OpenSlot` is then refused `UnknownSlot`.
+/// Three races follow from `is_claimed` being an unlocked `OnceLock` read
+/// rather than something the registry's shard lock also covers, and none of
+/// them leak: an `OpenSlot` claiming between [`PreBind::drop`]'s read and its
+/// `release_bind` leaves a live slot with no close posted, discovered on the
+/// producer's next record or heartbeat; one claiming right after
+/// [`AnchorManager::adopt_prebind`] reads `is_claimed` for its verdict hands
+/// the attaching sender terms already in use, whose `OpenSlot` is then
+/// refused `UnknownSlot`; and one claiming between the co-located branch of
+/// [`AnchorManager::attach_stream_anchor`]'s guard read and its release below
+/// is evicted correctly rather than left as a second writer — that branch
+/// cancels this bind's pump before the release runs, so the claim has
+/// already lost its only route to the anchor's channel by the time
+/// [`PreBind::drop`] posts the close.
 pub(crate) struct PreBind {
     /// The anchor this slot was bound for. Half of the bind's key; the other
     /// half is `ticket.routing_session_id`.
@@ -579,8 +584,8 @@ impl<T> StreamAnchor<T> {
     /// `TransportError` and a frame that fails to deserialize — not only
     /// `Dropped` and `Finalized` — which cancels `entry.cancel_token` and so
     /// kills the pump feeding this anchor. That reach is not zero-RTT-specific:
-    /// every anchor's pump used to keep running past those two arms, with the
-    /// registry entry gone but nothing telling it to stop.
+    /// on every anchor, those two arms used to leave both the registry entry
+    /// and its pump running, with nothing telling either to stop.
     fn retire(&self) {
         if let Some((_, entry)) = self.registry.remove(&self.local_id) {
             entry.cancel_token.cancel();
@@ -730,6 +735,13 @@ impl<T: DeserializeOwned> Stream for StreamAnchor<T> {
                             // running -- unlike `adopt_prebind`'s Mismatch
                             // arm, which does cancel a pump because its
                             // pre-bind is genuinely still unclaimed.
+                            // Calling `spawn_timeout_task` under this shard
+                            // guard (rather than hoisting it out the way
+                            // `AnchorManager::detach`'s two-phase shape does)
+                            // is fine now that the guard lives inside that
+                            // function: it never runs synchronously and never
+                            // touches the registry itself, so there is
+                            // nothing here for it to deadlock against.
                             let released_prebind =
                                 this.registry.get_mut(&this.local_id).and_then(|mut entry| {
                                     entry.attachment = false;
@@ -997,7 +1009,19 @@ impl AnchorManager {
     /// Spawn a background task that removes the anchor after `timeout` elapses.
     ///
     /// Returns a [`CancellationToken`] that cancels the task when triggered
-    /// (e.g. on attach, or when `set_timeout(None)` is called).
+    /// (e.g. on attach, or when `set_timeout(None)` is called). The returned
+    /// token is safe to store and cancel unconditionally even when no task
+    /// was actually spawned (see the guard below) — every reader of
+    /// `AnchorEntry::timeout_cancel` only ever calls `.cancel()` on it, which
+    /// is a no-op with nothing listening.
+    ///
+    /// Guarded by `Handle::try_current()` for the same reason
+    /// `close_claimed_slot` (`messenger_mux/mod.rs`) and `StreamController::cancel`
+    /// (below) are: this is reachable from `StreamAnchor::poll_next`'s `Detached`
+    /// arm, which runs under whatever executor the *consumer* chose, not
+    /// necessarily tokio. Degrading to "the timer never fires" is the same
+    /// trade those two make — the alternative is a bare `tokio::spawn` panic
+    /// in the middle of a consumer's poll.
     pub(crate) fn spawn_timeout_task(
         registry: Arc<DashMap<u64, AnchorEntry>>,
         mpsc_registry: Arc<DashMap<u64, crate::streaming::mpsc::anchor::MpscAnchorEntry>>,
@@ -1007,8 +1031,15 @@ impl AnchorManager {
         parent_cancel: &CancellationToken,
     ) -> CancellationToken {
         let tc = parent_cancel.child_token();
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            tracing::debug!(
+                local_id,
+                "anchor: no runtime to arm the unattached timeout on; it will not fire"
+            );
+            return tc;
+        };
         let tc_clone = tc.clone();
-        tokio::spawn(async move {
+        rt.spawn(async move {
             tokio::select! {
                 _ = tc_clone.cancelled() => {
                     // Attach or explicit cancel -- do nothing
@@ -1111,14 +1142,22 @@ impl AnchorManager {
         &self,
         handle: StreamAnchorHandle,
     ) -> Option<crate::streaming::control::StreamOpenTicket> {
-        // The rollback, and the only `None` that is not a mistake.
+        // The rollback, and the only `None` that is not a mistake -- zero-RTT
+        // is simply off, so there is no operation to record.
         let mux = self.mux.get()?;
+        let started = Instant::now();
 
         let (handle_worker_id, local_id) = handle.unpack();
         if handle.is_mpsc_stream() || handle_worker_id != self.worker_id {
             tracing::debug!(
                 %handle,
                 "prebind_anchor: not a local SPSC anchor; no ticket minted"
+            );
+            self.record_streaming_operation(
+                StreamingOp::Prebind,
+                HandlerOutcome::Error,
+                "unknown",
+                started,
             );
             return None;
         }
@@ -1133,12 +1172,24 @@ impl AnchorManager {
         match self.registry.get(&local_id) {
             None => {
                 tracing::debug!(%handle, "prebind_anchor: anchor is missing; no ticket minted");
+                self.record_streaming_operation(
+                    StreamingOp::Prebind,
+                    HandlerOutcome::Error,
+                    "unknown",
+                    started,
+                );
                 return None;
             }
             Some(entry) if entry.attachment || entry.prebind.is_some() => {
                 tracing::debug!(
                     %handle,
                     "prebind_anchor: anchor is attached or already pre-bound; no ticket minted"
+                );
+                self.record_streaming_operation(
+                    StreamingOp::Prebind,
+                    HandlerOutcome::Error,
+                    "unknown",
+                    started,
                 );
                 return None;
             }
@@ -1218,6 +1269,12 @@ impl AnchorManager {
                 %handle,
                 "prebind_anchor: anchor is missing, attached or already pre-bound; no ticket minted"
             );
+            self.record_streaming_operation(
+                StreamingOp::Prebind,
+                HandlerOutcome::Error,
+                "unknown",
+                started,
+            );
             return None;
         };
 
@@ -1238,6 +1295,12 @@ impl AnchorManager {
             },
         ));
 
+        self.record_streaming_operation(
+            StreamingOp::Prebind,
+            HandlerOutcome::Success,
+            ticket.streaming_transport_key.as_str(),
+            started,
+        );
         Some(ticket)
     }
 
@@ -1323,9 +1386,17 @@ impl AnchorManager {
                     // measures exactly that has to come back. `prebind_anchor`
                     // cancelled it because a pre-bind is a sender on its way;
                     // this is that sender turning back. Without the re-arm the
-                    // anchor has no reaper at all — the timer was the only one,
-                    // and a consumer that never polls its `StreamAnchor` to a
-                    // terminal drops it into a `Drop` that does nothing.
+                    // anchor has no reaper left for the consumer that holds its
+                    // `StreamAnchor` open and never gets a replacement sender —
+                    // `Drop` only reaps a `StreamAnchor` that is actually
+                    // dropped un-terminated (see `retire`'s doc above), and one
+                    // the application is still holding is never dropped.
+                    //
+                    // Called under the `Entry::Occupied` guard held above:
+                    // safe now that `spawn_timeout_task` guards its own
+                    // `tokio::spawn` — the call never runs synchronously and
+                    // never touches this registry, so there is nothing here
+                    // for it to deadlock against.
                     if let Some(duration) = entry.unattached_timeout {
                         let tc = Self::spawn_timeout_task(
                             Arc::clone(&self.registry),
@@ -1747,9 +1818,26 @@ impl AnchorManager {
     /// routing session id, which is the claim — bind-on-`OpenSlot` is how a mux
     /// bind has always been taken up, and nothing about that changes.
     ///
+    /// `Ok` means the local egress slot is staged, not that the receiver has
+    /// accepted the ticket: the `OpenSlot` this call stages is eager and
+    /// unacked, the same as an ordinary attach's, so a ticket whose bind was
+    /// already released or has expired still returns `Ok` here and only
+    /// surfaces later, as a send failure on the returned `StreamSender`.
+    ///
+    /// No `_anchor_attach` means no `StreamCancelHandle` either, so the
+    /// returned sender's
+    /// [`cancellation_token`](crate::streaming::sender::StreamSender::cancellation_token)
+    /// never fires; a dropped consumer surfaces as a send error instead.
+    ///
     /// # Errors
-    /// - [`AttachError::TransportError`] if the ticket names a transport this
-    ///   node cannot open, or if opening the slot fails.
+    /// - [`AttachError::TransportError`] if `handle` names this node's own
+    ///   worker id (a ticket is for a *different* worker to open; a
+    ///   same-worker sender should use
+    ///   [`attach_stream_anchor`](Self::attach_stream_anchor) instead), if
+    ///   the ticket names `messenger-mux-v1` but this node has no mux
+    ///   installed, if the ticket names a transport key this node cannot
+    ///   resolve, or if staging the local slot fails after retrying a
+    ///   batcher that keeps retiring underneath it.
     pub async fn open_anchor_stream<T: serde::Serialize>(
         &self,
         handle: StreamAnchorHandle,
@@ -1763,6 +1851,33 @@ impl AnchorManager {
                 handle,
                 expected: crate::streaming::handle::AnchorKind::Spsc,
             });
+        }
+        // `prebind_anchor` only checks that `handle` names an anchor this
+        // node owns -- it says nothing about which worker ends up opening
+        // the ticket, so nothing upstream of here rules out this node
+        // opening its own ticket. Unlike `attach_stream_anchor`'s same-worker
+        // case, there is no co-located path to take instead: zero-RTT
+        // deliberately never sets `attachment` for a claimed slot (see
+        // `streaming/BATCHING.md`), so a co-located write here would have to
+        // either invent a second claim representation or reuse `attachment`
+        // with a meaning that depends on where the producer landed -- the
+        // "two spellings of one rule" this crate's `CLAUDE.md` singles out.
+        // Refusing outright also matches every real caller: a ticket exists
+        // to travel to a *different* worker in the application's own request
+        // envelope, which is what `prebind_anchor` and the README's example
+        // both assume. Without this guard the call silently took the network
+        // path instead: `open_anchor_stream` returned `Ok(sender)`, and the
+        // very first `send` on it failed with `ChannelClosed` -- confirmed by
+        // running it before this guard existed.
+        let (handle_worker_id, _) = handle.unpack();
+        if handle_worker_id == self.worker_id {
+            return Err(AttachError::TransportError(anyhow::anyhow!(
+                "open_anchor_stream: handle {handle} names this node's own worker id, so \
+                 the ticket it carries was minted here too -- a ticket is for a *different* \
+                 worker to open, the one the application's request envelope is addressed \
+                 to. A same-worker sender should use attach_stream_anchor instead, whose \
+                 co-located path writes directly into the anchor's channel"
+            )));
         }
         self.open_stream_sender::<T>(handle, &ticket, self.new_sender_identity())
             .await
@@ -1792,11 +1907,12 @@ impl AnchorManager {
         ticket: &crate::streaming::control::StreamOpenTicket,
         identity: SenderIdentity,
     ) -> Result<crate::streaming::sender::StreamSender<T>, AttachError> {
+        let started = Instant::now();
         let (handle_worker_id, local_id) = handle.unpack();
 
         // Resolve the local FrameTransport that matches the remote worker's
         // bound streaming transport, then connect by WorkerId.
-        let frame_tx = self
+        let frame_tx = match self
             .connect_streaming(
                 &ticket.streaming_transport_key,
                 handle_worker_id,
@@ -1805,7 +1921,19 @@ impl AnchorManager {
                 ticket.initial_credit,
                 ticket.slot_byte_budget,
             )
-            .await?;
+            .await
+        {
+            Ok(frame_tx) => frame_tx,
+            Err(err) => {
+                self.record_streaming_operation(
+                    StreamingOp::Open,
+                    HandlerOutcome::Error,
+                    ticket.streaming_transport_key.as_str(),
+                    started,
+                );
+                return Err(err);
+            }
+        };
 
         let SenderIdentity {
             sender_stream_id,
@@ -1825,7 +1953,7 @@ impl AnchorManager {
 
         // Build StreamSender: frame_tx from the transport (not a local registry
         // frame_tx). No local AnchorEntry is created for the remote anchor.
-        Ok(crate::streaming::sender::StreamSender::new(
+        let sender = crate::streaming::sender::StreamSender::new(
             frame_tx,
             handle,
             self.registry.clone(), // this worker's registry (no entry for this handle — correct)
@@ -1838,7 +1966,14 @@ impl AnchorManager {
             Duration::from_millis(ticket.heartbeat_interval_ms),
             self.metrics.clone(),
             Some(ticket.streaming_transport_key.clone()),
-        ))
+        );
+        self.record_streaming_operation(
+            StreamingOp::Open,
+            HandlerOutcome::Success,
+            ticket.streaming_transport_key.as_str(),
+            started,
+        );
+        Ok(sender)
     }
 
     /// Attach a sender to an existing anchor, establishing the transport connection.
@@ -1895,13 +2030,21 @@ impl AnchorManager {
 
         // Step 2: Atomically set attachment under shard lock.
         // Re-check under the entry guard to prevent TOCTOU.
+        //
+        // The whole match evaluates to `(result, released_prebind)` rather
+        // than returning `result` directly, so the block below can hoist a
+        // released `PreBind` out before dropping it -- `PreBind::drop`
+        // reaches into mux state (ingress registry, a batcher), and the two
+        // other call sites that take one out from under this same shard lock
+        // (`_anchor_detach`, `adopt_prebind`'s `Mismatch` arm) both drop it
+        // only after the guard is gone, never while it is held.
         use dashmap::mapref::entry::Entry;
-        match self.registry.entry(local_id) {
-            Entry::Vacant(_) => Err(AttachError::AnchorNotFound { handle }),
+        let (result, released_prebind) = match self.registry.entry(local_id) {
+            Entry::Vacant(_) => (Err(AttachError::AnchorNotFound { handle }), None),
             Entry::Occupied(mut occ) => {
                 let entry = occ.get_mut();
                 if entry.attachment || entry.prebind_is_claimed() {
-                    Err(AttachError::AlreadyAttached { handle })
+                    (Err(AttachError::AlreadyAttached { handle }), None)
                 } else {
                     // Clone the frame_tx so the StreamSender can write items
                     // directly to the StreamAnchor consumer.
@@ -1918,33 +2061,45 @@ impl AnchorManager {
                         tc.cancel();
                     }
 
-                    // An *unclaimed* pre-bound slot on this anchor was minted
-                    // for a sender on another worker. This one is on ours and
-                    // writes straight into the anchor's channel, so that slot
-                    // has no sender and never will: releasing it here is what
-                    // keeps the accept window from holding a bind for a minute
-                    // that nothing can claim. A claimed one never reaches this
-                    // line — the guard above refuses it as an attached anchor,
-                    // because a claim *is* a sender: admitting a second one
-                    // would interleave two writers on this `frame_tx`, and the
-                    // release below would post `CloseSlot{UnknownSlot}` to the
-                    // producer of a healthy stream. It is dropped inside the
-                    // shard guard, which is safe because `PreBind`'s drop
-                    // reaches only mux state — the ingress registry and a
-                    // batcher — and never back into this one.
+                    // A pre-bound slot on this anchor was minted for a sender
+                    // on another worker. This one is on ours and writes
+                    // straight into the anchor's channel, so that slot has no
+                    // sender and never will: releasing it here is what keeps
+                    // the accept window from holding a bind for a minute that
+                    // nothing can claim.
+                    //
+                    // The guard above is a best-effort read: `prebind_is_claimed`
+                    // resolves through an unlocked `OnceLock` the mux ingress
+                    // writes from `open_slot`, under that peer's own mutex, not
+                    // this registry's shard lock -- so a remote `OpenSlot` can
+                    // still claim the bind in the gap between that read and the
+                    // release below. That is not a leak: the pump feeding this
+                    // slot is cancelled a few lines down, before the prebind is
+                    // taken, so a claim landing in the gap has already lost its
+                    // only route to `frame_tx` -- there is no second writer to
+                    // guard against. `PreBind::drop` sees the claim and posts
+                    // `CloseSlot{UnknownSlot}` to that producer, which is the
+                    // true state of a stream whose pump just died, delivered
+                    // promptly rather than on the producer's next record. It is
+                    // returned out of this block and dropped once the shard
+                    // guard is gone -- `PreBind`'s drop reaches into mux state
+                    // (the ingress registry, a batcher), which is exactly what
+                    // the two other call sites that release one from under this
+                    // same lock (`_anchor_detach`, `adopt_prebind`'s `Mismatch`
+                    // arm) exist to avoid doing while holding it.
                     //
                     // Its pump has to stop with it, and this branch spawns no
                     // replacement — the co-located sender writes straight into
                     // `frame_tx` below, no transport in between. Left running,
                     // the orphaned pump would see its `transport_rx` close once
-                    // `_released_prebind` drops and exit through the reader
+                    // the released prebind drops and exit through the reader
                     // pump's "transport channel closed" arm, which for an
                     // *unclaimed* drain now removes the registry entry this
                     // co-located sender is about to become (see `reader_pump`).
                     if let Some(pump_cancel) = entry.active_pump_token.take() {
                         pump_cancel.cancel();
                     }
-                    let _released_prebind = entry.prebind.take();
+                    let released_prebind = entry.prebind.take();
 
                     // Allocate sender_stream_id and build SenderEntry
                     let sender_stream_id =
@@ -1968,7 +2123,7 @@ impl AnchorManager {
                         ));
 
                     // Return sender with all new fields
-                    Ok(crate::streaming::sender::StreamSender::new(
+                    let sender = crate::streaming::sender::StreamSender::new(
                         frame_tx,
                         handle,
                         self.registry.clone(),
@@ -1983,10 +2138,13 @@ impl AnchorManager {
                         // Same worker: the frames go straight into the anchor's
                         // channel, so there was no transport to negotiate.
                         None,
-                    ))
+                    );
+                    (Ok(sender), released_prebind)
                 }
             }
-        }
+        };
+        drop(released_prebind);
+        result
     }
 
     // -----------------------------------------------------------------------
@@ -2649,6 +2807,88 @@ mod tests {
             result3.is_none(),
             "expected None after SenderDropped, got {:?}",
             result3
+        );
+    }
+
+    #[test]
+    fn test_detached_arm_off_runtime_does_not_panic() {
+        // The `Detached` arm's `released.is_some()` branch spawns a timeout
+        // task, but `poll_next` runs under whatever executor the *consumer*
+        // chose -- `StreamAnchor`'s inner stream is a plain
+        // `flume::r#async::RecvStream`, executor-agnostic, with no tokio
+        // requirement documented anywhere on the consumer side. A bare
+        // `tokio::spawn` reachable from here therefore panics mid-poll on a
+        // thread with no runtime under it, exactly the hazard
+        // `close_claimed_slot` and `StreamController::cancel` already guard
+        // against for the same reason.
+        //
+        // Setup needs a runtime of its own (`create_anchor_with_config`'s
+        // `spawn_timeout_task` call does too), so build one, use it, and
+        // drop it before polling on a bare `std::thread`.
+        let setup_rt = tokio::runtime::Runtime::new().expect("build setup runtime");
+        let (frame_tx, mut anchor) = setup_rt.block_on(async {
+            let mgr = make_manager();
+            let anchor = mgr.create_anchor_with_config::<u32>(AnchorConfig {
+                unattached_timeout: Some(Duration::from_secs(30)),
+                heartbeat_interval: None,
+            });
+            let (_, local_id) = anchor.handle().unpack();
+            let frame_tx = mgr
+                .registry
+                .get(&local_id)
+                .map(|e| e.frame_tx.clone())
+                .expect("entry must exist");
+
+            // Give the anchor a *claimed* pre-bind -- the only shape that
+            // reaches `released.is_some()` in the Detached arm: a zero-RTT
+            // producer that called `StreamSender::detach()` after its
+            // `OpenSlot` claimed the pre-bind.
+            let (wake_tx, _wake_rx) = flume::bounded(1);
+            let drain = Arc::new(crate::streaming::messenger_mux::ingress::DrainSignal::new(
+                wake_tx,
+            ));
+            drain.claimed_by(
+                velo_ext::WorkerId::from_u64(7),
+                crate::streaming::messenger_mux::protocol::SlotId::from_raw(0),
+                Arc::new(AtomicBool::new(false)),
+            );
+            let ticket = crate::streaming::control::StreamOpenTicket {
+                streaming_transport_key: velo_ext::TransportKey::new("mock-stream"),
+                heartbeat_interval_ms: 5000,
+                routing_session_id: 1,
+                initial_credit: 1,
+                slot_byte_budget: 1,
+            };
+            let prebind = PreBind {
+                anchor_id: local_id,
+                ticket,
+                drain,
+                // Dangling on purpose: `PreBind::drop`'s `mux.upgrade()`
+                // then returns `None` and does nothing, which is exactly
+                // right with no real mux transport under this unit test.
+                mux: std::sync::Weak::new(),
+                prebound: Arc::new(AtomicBool::new(false)),
+            };
+            if let Some(mut entry) = mgr.registry.get_mut(&local_id) {
+                entry.prebind = Some(prebind);
+            }
+
+            (frame_tx, anchor)
+        });
+        drop(setup_rt);
+
+        let bytes = rmp_serde::to_vec(&StreamFrame::<u32>::Detached).unwrap();
+        frame_tx.send(bytes).expect("send Detached frame");
+
+        // The hazard itself: poll from a thread with no tokio runtime.
+        let result = std::thread::spawn(move || futures::executor::block_on(anchor.next()))
+            .join()
+            .expect("poll_next must not panic off-runtime");
+
+        assert!(
+            matches!(result, Some(Ok(StreamFrame::Detached))),
+            "expected Detached, got {:?}",
+            result
         );
     }
 
