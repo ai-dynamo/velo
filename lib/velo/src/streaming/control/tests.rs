@@ -99,6 +99,7 @@ async fn reader_pump_watchdog_firing_increments_counter() {
             local_id: 999,
             heartbeat_deadline: deadline,
             drain: None,
+            prebound: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
     ));
 
@@ -184,6 +185,7 @@ async fn reader_pump_watchdog_saturated_channel_drops_sentinel_silently() {
             local_id: 7777,
             heartbeat_deadline: deadline,
             drain: None,
+            prebound: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
     ));
 
@@ -749,10 +751,258 @@ fn make_pump_test_infra() -> (
             local_id,
             heartbeat_deadline: Duration::from_secs(5),
             drain: None,
+            prebound: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
     ));
 
     (transport_tx, frame_rx, cancel_token, registry, local_id)
+}
+
+/// Helper: reader_pump infra for a pump spawned over the mux, where a bare
+/// [`crate::streaming::messenger_mux::ingress::DrainSignal`] stands in for the
+/// mux's own -- `claimed()` is `None` until the test calls `claimed_by`,
+/// exactly like a bind no `OpenSlot` has opened yet.
+///
+/// `prebound` selects which of the two real spawn sites this stands in for:
+/// `true` is the zero-RTT pre-bind shape (`AnchorManager::prebind_anchor`);
+/// `false` is an ordinary mux attach whose peer just hasn't sent its
+/// `OpenSlot` yet. Both start with `drain: Some(unclaimed)` -- the mux parks
+/// a `DrainSignal` for every bind, not only a pre-bound one -- which is
+/// exactly the distinction `PumpContext::prebound` exists to carry explicitly
+/// rather than infer from `drain.claimed()`.
+///
+/// `attachment` is independent of `prebound`, not `!prebound`: a pre-bind an
+/// attach has adopted is both `prebound` (until its `OpenSlot` lands or an
+/// attach clears the flag) and `attachment: true` at once, and a fixture that
+/// tied the two together could never construct that pair to test it.
+///
+/// Returns `(transport_tx, drain, frame_rx, cancel_token, registry, local_id)`.
+/// `frame_rx` must be kept alive (even if unused) for as long as the pump
+/// should run: dropping it disconnects `frame_tx` and the pump exits, same as
+/// [`make_pump_test_infra`].
+#[allow(clippy::type_complexity)]
+fn make_prebind_pump_test_infra(
+    heartbeat_deadline: Duration,
+    prebound: bool,
+    attachment: bool,
+) -> (
+    flume::Sender<Vec<u8>>,
+    Arc<crate::streaming::messenger_mux::ingress::DrainSignal>,
+    flume::Receiver<Vec<u8>>,
+    tokio_util::sync::CancellationToken,
+    std::sync::Arc<dashmap::DashMap<u64, crate::streaming::anchor::AnchorEntry>>,
+    u64,
+) {
+    let (transport_tx, transport_rx) = flume::bounded::<Vec<u8>>(256);
+    let (frame_tx, frame_rx) = flume::bounded::<Vec<u8>>(256);
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+    let registry = std::sync::Arc::new(dashmap::DashMap::new());
+    let local_id = 1u64;
+    let (wake_tx, _wake_rx) = flume::bounded::<velo_ext::WorkerId>(16);
+    let drain = Arc::new(crate::streaming::messenger_mux::ingress::DrainSignal::new(
+        wake_tx,
+    ));
+
+    registry.insert(
+        local_id,
+        crate::streaming::anchor::AnchorEntry {
+            frame_tx: frame_tx.clone(),
+            cancel_token: cancel_token.clone(),
+            active_pump_token: None,
+            attachment,
+            timeout_cancel: None,
+            unattached_timeout: None,
+            heartbeat_interval: heartbeat_deadline,
+            stream_cancel_handle: None,
+            prebind: None,
+        },
+    );
+
+    // A child of the entry's token, as every real spawn site derives one
+    // (`anchor.rs`'s `prebind_anchor`, `control.rs`'s attach handler): a
+    // fixture that instead cloned the parent would make `cancel_token`'s own
+    // unconditional cancel-on-exit (`reader_pump`'s last line) indistinguishable
+    // from the entry's token being cancelled by a removal this test is trying
+    // to observe.
+    let pump_cancel = cancel_token.child_token();
+    let ctx = crate::streaming::anchor::AnchorContext {
+        registry: registry.clone(),
+        mpsc_registry: std::sync::Arc::new(dashmap::DashMap::new()),
+        metrics: None,
+    };
+    tokio::spawn(reader_pump(
+        transport_rx,
+        frame_tx,
+        pump_cancel,
+        ctx,
+        PumpContext {
+            local_id,
+            heartbeat_deadline,
+            drain: Some(Arc::clone(&drain)),
+            prebound: Arc::new(std::sync::atomic::AtomicBool::new(prebound)),
+        },
+    ));
+
+    (
+        transport_tx,
+        drain,
+        frame_rx,
+        cancel_token,
+        registry,
+        local_id,
+    )
+}
+
+/// Finding: the reader pump's heartbeat watchdog was armed at pre-bind time,
+/// so a zero-RTT request that waited longer than `DETECTION_MULTIPLIER *
+/// heartbeat_interval` for its worker to be scheduled was torn down before
+/// its sender ever opened -- an undocumented cap on how long such a request
+/// may sit in a queue.
+///
+/// A timeout with no claim is silence from a producer that does not exist,
+/// not proof one died, so it must not count toward the watchdog at all.
+#[tokio::test]
+async fn test_pump_does_not_reap_an_unclaimed_prebind_on_heartbeat_silence() {
+    tokio::time::pause();
+    let heartbeat = Duration::from_millis(50);
+    let (transport_tx, _drain, _frame_rx, _cancel, registry, local_id) =
+        make_prebind_pump_test_infra(heartbeat, true, false);
+
+    // Twice the window that reaps an already-claimed slot (see the sibling
+    // test below) with nothing having claimed this one.
+    tokio::time::sleep(heartbeat * (2 * DETECTION_MULTIPLIER as u32)).await;
+
+    assert!(
+        registry.contains_key(&local_id),
+        "an unclaimed pre-bind must survive heartbeat silence -- nothing has \
+         opened it yet, so a timeout proves nothing about a sender"
+    );
+
+    drop(transport_tx);
+}
+
+/// The other half of the same fix: once an `OpenSlot` claims the bind, a
+/// sender genuinely exists and the watchdog must reap it exactly as it always
+/// has if that sender goes silent. Gating on the claim must delay detection,
+/// never defeat it.
+#[tokio::test]
+async fn test_pump_reaps_a_claimed_prebind_after_missed_heartbeats() {
+    tokio::time::pause();
+    let heartbeat = Duration::from_millis(50);
+    let (transport_tx, drain, _frame_rx, _cancel, registry, local_id) =
+        make_prebind_pump_test_infra(heartbeat, true, false);
+
+    // What `open_slot` does to a bind's drain signal when an `OpenSlot`
+    // claims it, without a mux in the loop.
+    let peer = velo_ext::WorkerId::from_u64(0xABCD);
+    let slot = crate::streaming::messenger_mux::protocol::SlotId::new(0, 0).expect("slot id");
+    drain.claimed_by(
+        peer,
+        slot,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
+
+    // Same generous margin as the sibling test above and as
+    // `test_pump_removes_registry_entry_after_3_missed_heartbeats` (3.2x
+    // there): a tight `+1` window depends on this pump getting polled between
+    // each paused-clock advance in exactly the order the assertion assumes.
+    tokio::time::sleep(heartbeat * (2 * DETECTION_MULTIPLIER as u32)).await;
+
+    assert!(
+        !registry.contains_key(&local_id),
+        "a claimed pre-bind whose sender goes silent must still be reaped"
+    );
+
+    drop(transport_tx);
+}
+
+/// Finding: an unclaimed pre-bind reclaimed by the mux's accept window (the
+/// bind's `frame_tx` -- the other end of this `transport_rx` -- being
+/// dropped) left the registry entry behind forever, because the pump's
+/// `Ok(Err(_))` exit did nothing but break the loop. Once heartbeat detection
+/// is gated on a claim (the fix above), the accept window is the *only*
+/// reaper an abandoned pre-bind has, so this exit must do the cleanup the
+/// watchdog-fired branch already does.
+#[tokio::test]
+async fn test_pump_reaps_an_unclaimed_prebind_when_its_bind_is_reclaimed() {
+    let (transport_tx, _drain, _frame_rx, cancel_token, registry, local_id) =
+        make_prebind_pump_test_infra(Duration::from_secs(5), true, false);
+
+    // Simulate the accept window's `release_bind`/`expire_bind`: it drops the
+    // `BindEntry`, and with it the `frame_tx` that feeds this `transport_rx`.
+    drop(transport_tx);
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    assert!(
+        !registry.contains_key(&local_id),
+        "an unclaimed pre-bind must be reaped once its bind is reclaimed -- \
+         nothing else will, once heartbeat silence no longer can"
+    );
+    assert!(
+        cancel_token.is_cancelled(),
+        "reaping the entry must cancel its token, same as the watchdog branch"
+    );
+}
+
+/// Finding: `drain.claimed().is_none()` is true of an ordinary mux attach's
+/// pump too, for as long as the peer's `OpenSlot` is still in flight -- which
+/// is always at least until after the attach response this pump was spawned
+/// from already returned (see `PumpContext::prebound`). Before gating on
+/// `prebound` instead, this pump silently stopped counting heartbeat misses
+/// for the same window, so a sender that attached and then died before its
+/// first frame went undetected until the mux's 60 s accept-window timer
+/// reclaimed the bind, instead of the configured
+/// `DETECTION_MULTIPLIER * heartbeat_interval`.
+#[tokio::test]
+async fn test_pump_reaps_an_ordinary_attach_with_unclaimed_mux_drain_after_missed_heartbeats() {
+    tokio::time::pause();
+    let heartbeat = Duration::from_millis(50);
+    let (transport_tx, _drain, _frame_rx, _cancel, registry, local_id) =
+        make_prebind_pump_test_infra(heartbeat, false, true);
+
+    // Same generous margin the claimed-prebind sibling test uses.
+    tokio::time::sleep(heartbeat * (2 * DETECTION_MULTIPLIER as u32)).await;
+
+    assert!(
+        !registry.contains_key(&local_id),
+        "an ordinary attach's pump must still be reaped on heartbeat silence \
+         even while the mux's drain signal for its bind reads unclaimed -- \
+         a sender already exists here, unlike a real pre-bind"
+    );
+
+    drop(transport_tx);
+}
+
+/// The `Ok(Err(_))` half of the same finding: an ordinary attach's bind
+/// closing (its own accept window expiring because the peer never sent an
+/// `OpenSlot`, say) must not remove the registry entry -- the entry is
+/// attached and live, and something else already owns telling the registry
+/// about an attached anchor going away (finalize, cancel, or the watchdog
+/// branch above). Only a real pre-bind (`prebound: true`) may be reaped here,
+/// since it is otherwise unreachable once heartbeat detection stops covering
+/// it.
+#[tokio::test]
+async fn test_pump_does_not_reap_an_attached_entry_when_its_mux_bind_is_reclaimed() {
+    let (transport_tx, _drain, _frame_rx, cancel_token, registry, local_id) =
+        make_prebind_pump_test_infra(Duration::from_secs(5), false, true);
+
+    // Simulate the peer never opening its slot: the bind's `frame_tx` --
+    // the other end of this `transport_rx` -- goes away.
+    drop(transport_tx);
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    assert!(
+        registry.contains_key(&local_id),
+        "an attached anchor's registry entry must survive its mux bind being \
+         reclaimed -- it is not a pre-bind, so nothing here owns removing it"
+    );
+    assert!(
+        !cancel_token.is_cancelled(),
+        "the entry's own token must be untouched -- only a removed entry's \
+         token is cancelled by this branch"
+    );
 }
 
 #[tokio::test]
@@ -951,6 +1201,7 @@ async fn test_child_token_reattach_pump_survives() {
             local_id,
             heartbeat_deadline: Duration::from_secs(5),
             drain: None,
+            prebound: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
     ));
 
@@ -998,6 +1249,7 @@ async fn test_child_token_reattach_pump_survives() {
             local_id,
             heartbeat_deadline: Duration::from_secs(5),
             drain: None,
+            prebound: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
     ));
 
@@ -1164,4 +1416,45 @@ fn attach_response_golden_encoding_unchanged() {
         ticket.heartbeat_interval_ms, 5000,
         "an absent cadence defaults exactly as the attach response's does"
     );
+}
+
+/// A ticket missing a field `from_limits` always sets is a corrupt envelope,
+/// not an old sender, and must fail to decode rather than silently mint a
+/// wrong one.
+///
+/// `AnchorAttachResponse::Ok`'s `#[serde(default)]` on these same three
+/// fields exists for a sender old enough to predate them; a `StreamOpenTicket`
+/// has no such sender; it is "only ever read by a peer new enough to have
+/// been sent one" ([`StreamOpenTicket`]'s own doc). Inheriting the response's
+/// defaults anyway turned a truncated or corrupted ticket into a stream that
+/// silently opens against session id 0, or a credit window that silently
+/// reads "not offering the mux" -- both wrong answers reached without error,
+/// on a field the doc comment above says is "never zero on a minted ticket".
+#[test]
+fn a_ticket_missing_a_minted_field_fails_rather_than_silently_defaulting() {
+    let missing_routing_session_id = r#"{"streaming_transport_key":"messenger-mux-v1","initial_credit":8,"slot_byte_budget":4096}"#;
+    assert!(
+        serde_json::from_str::<StreamOpenTicket>(missing_routing_session_id).is_err(),
+        "a ticket missing routing_session_id must not silently decode as session 0"
+    );
+
+    let missing_initial_credit = r#"{"streaming_transport_key":"messenger-mux-v1","routing_session_id":7,"slot_byte_budget":4096}"#;
+    assert!(
+        serde_json::from_str::<StreamOpenTicket>(missing_initial_credit).is_err(),
+        "a ticket missing initial_credit must not silently decode as 'not offering the mux'"
+    );
+
+    let missing_slot_byte_budget = r#"{"streaming_transport_key":"messenger-mux-v1","routing_session_id":7,"initial_credit":8}"#;
+    assert!(
+        serde_json::from_str::<StreamOpenTicket>(missing_slot_byte_budget).is_err(),
+        "a ticket missing slot_byte_budget must not silently decode as 'use the default'"
+    );
+
+    // Unlike the other three, an absent cadence is not corrupt, only silent,
+    // and `attach_response_golden_encoding_unchanged` above already pins that
+    // this one keeps its default.
+    let missing_heartbeat = r#"{"streaming_transport_key":"messenger-mux-v1","routing_session_id":7,"initial_credit":8,"slot_byte_budget":4096}"#;
+    let ticket: StreamOpenTicket =
+        serde_json::from_str(missing_heartbeat).expect("an absent cadence still decodes");
+    assert_eq!(ticket.heartbeat_interval_ms, 5000);
 }

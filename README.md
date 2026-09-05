@@ -402,6 +402,31 @@ let node = Velo::builder()
     .await?;
 ```
 
+**Zero-RTT setup**: `attach_anchor` costs an `_anchor_attach` round trip before the first item can move. When the consumer already knows which worker will produce — a request it is about to dispatch, say — it can mint the terms up front and hand them to the worker in its own request envelope instead:
+
+```rust
+// Consumer: mint a ticket instead of waiting to be attached
+let mut anchor = node_b.create_anchor::<String>();
+let handle = anchor.handle();
+let Some(ticket) = node_b.prebind_anchor(handle) else {
+    // Nothing to mint (no mux installed, an MPSC anchor, or a handle this
+    // node cannot pre-bind) — attach the ordinary way instead.
+    let sender = node_a.attach_anchor::<String>(handle).await?;
+    sender.send("hello".into()).await?;
+    sender.finalize()?;
+    return Ok(());
+};
+
+// ... `ticket` travels inside the application's own request to the worker ...
+
+// Worker: open on the ticket, no _anchor_attach involved
+let sender = node_a.open_anchor_stream::<String>(handle, ticket).await?;
+sender.send("hello".into()).await?;
+sender.finalize()?;
+```
+
+`prebind_anchor` returns `None` whenever there is nothing to mint — no `messenger-mux` installed, an MPSC anchor, or a handle this node cannot pre-bind — and `None` is never an error: the application keeps the ticket beside the handle it already carries, and a worker that gets no ticket calls `attach_anchor` exactly as before.
+
 ---
 
 ## Transports

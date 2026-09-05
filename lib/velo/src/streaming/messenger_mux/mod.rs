@@ -644,6 +644,24 @@ impl MuxCore {
     /// producer needs, since the fault that carries the same news to it
     /// otherwise rides on the next record it sends.
     fn close_claimed_slot(&self, peer: WorkerId, slot: protocol::SlotId) {
+        // Checked before touching the ingress table, not after: this runs
+        // from a `Drop` that can land on a thread with no runtime under it
+        // (`StreamController::cancel` guards its own spawn the same way and
+        // for the same reason, `streaming/anchor.rs`), and resolving a
+        // batcher may need to spawn its task. Retiring the slot first and
+        // discovering only afterward that there is nowhere to post the reply
+        // would leave the peer worse off than doing nothing at all: the
+        // reactive `ConsumerGone` fault a live slot would otherwise raise on
+        // its next record can no longer find a slot to raise it on. With no
+        // runtime, do nothing -- the peer learns on its next record, exactly
+        // as if this path did not exist.
+        if tokio::runtime::Handle::try_current().is_err() {
+            tracing::debug!(
+                peer = %peer,
+                "messenger mux: no runtime to post a slot close on; the peer learns on its next record"
+            );
+            return;
+        }
         let Some(reply) = self
             .ingress
             .close_consumer_gone(peer, slot, self.metrics.as_ref())
@@ -652,19 +670,6 @@ impl MuxCore {
         };
         if let Some(metrics) = &self.metrics {
             metrics.slot_closed();
-        }
-        // Resolving a batcher may spawn its task, and this runs from a `Drop`
-        // that can land on a thread with no runtime under it.
-        // `StreamController::cancel` guards its own spawn the same way and for
-        // the same reason (`streaming/anchor.rs`). Without the reply the peer
-        // is exactly where it was before this path existed: it learns on its
-        // next record.
-        if tokio::runtime::Handle::try_current().is_err() {
-            tracing::debug!(
-                peer = %peer,
-                "messenger mux: no runtime to post a slot close on; the peer learns on its next record"
-            );
-            return;
         }
         let batcher = self.batcher(peer);
         self.send_replies(&batcher, peer, &[reply]);

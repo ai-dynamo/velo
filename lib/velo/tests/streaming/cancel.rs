@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::BoxFuture;
-use velo::streaming::{AnchorManager, AnchorManagerBuilder, AttachError};
+use velo::streaming::{AnchorConfig, AnchorManager, AnchorManagerBuilder, AttachError};
 use velo_ext::{TransportKey, WorkerAddress, WorkerId};
 
 // ---------------------------------------------------------------------------
@@ -430,11 +430,25 @@ async fn cancel_with_a_record_in_flight_already_errors() {
 ///
 /// One send, after a settle the producer spends silent: a send that succeeds
 /// here is the slot still open and the producer still blind.
+///
+/// The anchor's heartbeat interval is raised well past `SETTLE`: the ticket
+/// carries it straight to the producer's own heartbeat cadence
+/// (`StreamOpenTicket::from_limits`), so with the manager default (5 s, equal
+/// to `SETTLE`) the producer's first fallback heartbeat and this test's send
+/// land within ~100 ms of each other and race down the *other* path this test
+/// exists to exclude — see the doc comment above. Nothing here should ever be
+/// able to fire during the silent window; if it can, the assertion below is
+/// no longer testing the pre-bind's own close.
 #[tokio::test(flavor = "multi_thread")]
 async fn cancel_reaches_an_idle_worker_within_a_bound() {
     let (consumer, producer) = velo_pair().await;
 
-    let mut anchor = consumer.create_anchor::<u32>();
+    let mut anchor = consumer
+        .anchor_manager()
+        .create_anchor_with_config::<u32>(AnchorConfig {
+            heartbeat_interval: Some(SETTLE * 6),
+            ..AnchorConfig::default()
+        });
     let handle = transfer(anchor.handle());
     let ticket = consumer
         .prebind_anchor(handle)

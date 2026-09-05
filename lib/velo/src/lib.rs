@@ -54,6 +54,7 @@ pub use crate::events::{
 };
 
 // Streaming (flat at root for convenience; full surface still under [`streaming`])
+pub use crate::streaming::control::StreamOpenTicket;
 pub use crate::streaming::{
     AnchorManager, AttachError, SendError, StreamAnchor, StreamAnchorHandle, StreamController,
     StreamError, StreamFrame, StreamSender,

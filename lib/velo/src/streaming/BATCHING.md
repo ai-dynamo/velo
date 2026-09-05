@@ -1158,7 +1158,41 @@ envelope, and a worker that receives no ticket attaches exactly as before. With
 no mux installed no ticket is minted at all, so `MuxConfig::enabled` remains the
 complete rollback for this path too.
 
-Three seams follow from a slot existing before its sender does:
+A ticket may sit in a request envelope for up to the 60 s accept window before
+its worker opens it — that bound, not a fraction of it, because heartbeat
+detection does not start until the `OpenSlot` that claims the bind arrives.
+Counting silence before a sender exists as a miss would cap the wait at
+`DETECTION_MULTIPLIER * heartbeat_interval` (15 s at the manager default: a
+`DETECTION_MULTIPLIER` of 3 times a 5 s heartbeat) regardless of what the
+application configured; gating the miss count on the claim is what makes the
+accept window the true backstop rather than a claim the watchdog beat to it.
+The one thing this does *not* do is honour a configured `unattached_timeout`
+during the wait — `prebind_anchor` still pauses that timer, same as attach —
+so a pre-bind's own bound is the fixed 60 s regardless of what an ordinary
+unattached anchor was configured for.
+
+That fixed bound is a pre-bind's bound, not an adopted attach's. A sender that
+attaches the ordinary way onto a pre-bound slot (the first seam below) is
+handed a slot whose `OpenSlot` has not yet arrived either, but it is no longer
+waiting on its ticket — `PreBind::adopt` clears `PumpContext::prebound` the
+instant the attach handler adopts it, and the pump falls straight back to the
+ordinary `DETECTION_MULTIPLIER * heartbeat_interval` window every other attach
+gets. An adopting sender that dies before its first record is caught in
+seconds, not left to the 60 s accept window.
+
+The gate that gives a pre-bind this exemption is `PumpContext::prebound`, not
+`drain.claimed()` by itself: the mux parks a `DrainSignal` for *every* bind,
+including an ordinary attach's, and that signal reads unclaimed for as long as
+the peer's `OpenSlot` is still in flight — always at least until after the
+attach response has already returned. `prebound` is what tells a real pre-bind
+(no sender has shown up yet) from an ordinary attach whose peer just hasn't
+opened its slot yet (a sender exists, and heartbeat detection must run for it
+exactly as it always has). It is an `Arc<AtomicBool>` rather than a value fixed
+at spawn for exactly the adoption case above: the one cell is shared between
+the pump and the `PreBind` it was spawned for, so a write either side makes is
+visible to the other immediately, with no second `OpenSlot` required.
+
+Four seams follow from a slot existing before its sender does:
 
 - **A sender that attaches anyway must be given the slot that is waiting, not a
   second one.** The attach handler adopts an unclaimed pre-bind and answers with
@@ -1181,6 +1215,22 @@ Three seams follow from a slot existing before its sender does:
   `CloseReason::UnknownSlot`, on the next record to arrive — and an idle producer
   sends no next record. So a claimed `PreBind`'s `Drop` posts that same close
   itself, on a trigger that does not wait for traffic.
+- **Detach must give back what it took.** `Detached` is not terminal — the
+  registry entry survives it so a new sender may reattach — but zero-RTT never
+  sets `attachment`, so a claimed pre-bind is the only thing that would
+  otherwise say a sender is here. Both places `Detached` is handled (the
+  `StreamAnchor` poll arm and the `_anchor_detach` handler) take the pre-bind
+  and resume the unattached timer, so the anchor is genuinely unattached again
+  rather than permanently unattachable — but they differ on the pump the
+  pre-bind was feeding, and deliberately so. `_anchor_detach` cancels it: an
+  administrative detach severs the connection outright. The poll arm does not,
+  because a `Detached` frame can only reach it in-band, through that same
+  pump, which means the pre-bind it sees is always still claimed — but
+  `Detached` is terminal at the ingress, retired in the same batch apply that
+  puts the frame into the bind's buffer, so by the time the poll arm runs
+  there is no live slot left for a close to reach. Cancelling here would race
+  an already-finished teardown for nothing, not reclaim a stream still
+  running.
 
 Credit is exact by construction and not by agreement: `prebind` sizes its buffer
 at `slot_buffer_depth()` from the same `NegotiatedLimits` the ticket quotes, and

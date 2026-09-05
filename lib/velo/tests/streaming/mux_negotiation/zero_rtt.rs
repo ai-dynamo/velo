@@ -473,6 +473,69 @@ async fn open_slot_then_late_attach_does_not_rebind() {
     );
 }
 
+/// E-06's shape on the zero-RTT path: a claimed pre-bind that detaches must
+/// leave the anchor genuinely unattached again, not permanently unattachable.
+///
+/// Under the ordinary attach path, `Detached` clearing `attachment` is enough
+/// to let a fresh attach through. Under zero-RTT `attachment` is never set —
+/// there was no attach to set it — so `entry.prebind` is the only thing that
+/// says a sender is here, and until `Detached` also releases it, a claimed
+/// pre-bind reads exactly like a stream still running: every later attach or
+/// `open_anchor_stream` is refused forever, and nothing reaps the entry.
+#[tokio::test(flavor = "multi_thread")]
+async fn detach_releases_a_claimed_prebind_for_reattach() {
+    let (consumer, producer) = pair(Some(mux_config()), Some(mux_config())).await;
+
+    let mut anchor = consumer.velo.create_anchor::<u32>();
+    let handle = transfer(anchor.handle());
+    let ticket = ship(consumer.velo.prebind_anchor(handle).expect("ticket"));
+    let sender = producer
+        .velo
+        .open_anchor_stream::<u32>(handle, ticket)
+        .await
+        .expect("zero-RTT open");
+
+    // One delivered record proves the OpenSlot has claimed the bind.
+    sender.send(0).await.expect("first item");
+    let first = tokio::time::timeout(PATIENCE, anchor.next())
+        .await
+        .expect("timed out")
+        .expect("stream ended early")
+        .expect("no stream error");
+    assert!(matches!(first, StreamFrame::Item(0)));
+
+    sender.detach().expect("detach");
+    let detached = tokio::time::timeout(PATIENCE, anchor.next())
+        .await
+        .expect("timed out waiting for Detached")
+        .expect("stream ended early")
+        .expect("no stream error");
+    assert!(matches!(detached, StreamFrame::Detached));
+
+    // The anchor must be genuinely unattached again: an ordinary attach on
+    // the same handle succeeds.
+    let second = producer
+        .velo
+        .attach_anchor::<u32>(handle)
+        .await
+        .expect("a detached, previously-claimed pre-bind must accept a fresh attach");
+    second.send(1).await.expect("send after reattach");
+    let item = tokio::time::timeout(PATIENCE, anchor.next())
+        .await
+        .expect("timed out")
+        .expect("stream ended early")
+        .expect("no stream error");
+    assert!(matches!(item, StreamFrame::Item(1)));
+
+    second.finalize().expect("finalize");
+    let finalized = tokio::time::timeout(PATIENCE, anchor.next())
+        .await
+        .expect("timed out")
+        .expect("stream ended early")
+        .expect("no stream error");
+    assert!(matches!(finalized, StreamFrame::Finalized));
+}
+
 /// A sender that cannot speak the pre-bound transport is refused, and the slot
 /// it could not take is given straight back.
 ///

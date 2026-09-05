@@ -19,7 +19,9 @@ use velo_ext::WorkerId;
 use super::*;
 use crate::observability::test_helpers::MetricSnapshot;
 use crate::streaming::sender::{cached_dropped, cached_finalized};
-use crate::streaming::{AnchorManager, AnchorManagerBuilder, StreamAnchorHandle, StreamFrame};
+use crate::streaming::{
+    AnchorConfig, AnchorManager, AnchorManagerBuilder, StreamAnchorHandle, StreamFrame,
+};
 use crate::transports::tcp::TcpTransportBuilder;
 
 const RECV_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1032,6 +1034,51 @@ async fn close_claimed_slot_is_idempotent() {
     assert_eq!(pair.consumer.live_ingress_slots(pair.producer_worker), 0);
 }
 
+/// A `close_claimed_slot` with no runtime under it must retire nothing.
+///
+/// `PreBind::drop` is the only caller with no guarantee of a runtime -- it can
+/// run wherever a `StreamAnchor` happens to be dropped, the same reason
+/// `StreamController::cancel`'s own `_stream_cancel` spawn guards itself with
+/// `Handle::try_current()` a few lines above it (`streaming/anchor.rs`).
+/// Retiring the slot before checking for a runtime to post the reply on
+/// leaves the producer strictly worse off than doing nothing: the reactive
+/// `ConsumerGone` fault a live slot would otherwise raise on its next record
+/// can no longer find a slot to raise it on.
+#[tokio::test(flavor = "multi_thread")]
+async fn close_claimed_slot_without_a_runtime_leaves_the_slot_in_place() {
+    let pair = mux_pair(test_config()).await;
+
+    let rx = pair.consumer.bind(1, 1).await.expect("bind");
+    let tx = pair
+        .producer
+        .connect(pair.consumer_worker, 1, 1)
+        .await
+        .expect("connect");
+    tx.send_async(item(0)).await.expect("send item");
+    assert_eq!(recv(&rx).await, item(0));
+
+    let ids = pair.consumer.live_slot_ids(pair.producer_worker);
+    assert_eq!(ids.len(), 1, "one stream, one receive-side slot");
+    let slot = ids[0];
+
+    let consumer = Arc::clone(&pair.consumer);
+    let peer = pair.producer_worker;
+    // A bare OS thread carries no tokio context -- exactly the condition
+    // `PreBind::drop` can hit and `close_claimed_slot`'s own runtime check
+    // exists for.
+    std::thread::spawn(move || consumer.close_claimed_slot(peer, slot))
+        .join()
+        .expect("close_claimed_slot must not panic off a runtime");
+
+    assert_eq!(
+        pair.consumer.live_ingress_slots(pair.producer_worker),
+        1,
+        "with no runtime to post the close, the slot must stay in the table for \
+         the reactive ConsumerGone path to find -- retiring it here strands the \
+         producer with neither a proactive close nor a reactive one"
+    );
+}
+
 /// A pre-bind refused for a key mismatch gives the anchor its unattached timer
 /// back.
 ///
@@ -1084,6 +1131,58 @@ async fn a_refused_prebind_gives_the_unattached_timer_back() {
         0,
         "the refusal released the bind, and the reaped anchor left nothing behind"
     );
+}
+
+/// Adoption is the one transition from "no sender yet" to "a sender exists",
+/// and the pre-bind's pump has to learn it immediately -- not only once the
+/// adopting sender's own `OpenSlot` lands.
+///
+/// An older worker (or one whose envelope carried no ticket) can still attach
+/// the ordinary way onto a slot this node already pre-bound. `adopt_prebind`
+/// answers it `Ok` on the pre-bind's own terms, but the adopting sender has
+/// not yet opened that slot -- nothing has claimed the pre-bind's drain --
+/// which is exactly the window a sender that dies right after attaching (a
+/// worker crash before its first record) sits in. If the pump still believes
+/// no sender exists, that death is invisible to the heartbeat watchdog and
+/// waits for the mux's 60 s accept window instead of the usual
+/// `DETECTION_MULTIPLIER * heartbeat_interval`.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_adopted_prebind_is_reaped_on_heartbeat_silence_before_its_open_slot() {
+    let heartbeat = Duration::from_millis(50);
+    let node = prebinding_node(test_config(), None).await;
+    let anchor = node.manager.create_anchor_with_config::<u32>(AnchorConfig {
+        heartbeat_interval: Some(heartbeat),
+        ..Default::default()
+    });
+    let handle = anchor.handle();
+    let (_, local_id) = handle.unpack();
+    node.manager
+        .prebind_anchor(handle)
+        .expect("a mux is installed, so a ticket is minted");
+
+    let request = crate::streaming::control::AnchorAttachRequest {
+        handle,
+        session_id: 1,
+        stream_cancel_handle: crate::streaming::control::StreamCancelHandle::pack(
+            WorkerId::from_u64(7),
+            1,
+        ),
+        supported_transport_keys: vec![velo_ext::TransportKey::new(MESSENGER_MUX_KEY)],
+    };
+    assert!(
+        matches!(
+            node.manager.adopt_prebind(local_id, &request),
+            crate::streaming::anchor::PrebindAdoption::Adopted(_)
+        ),
+        "the pre-bind's own key is offered, so this attach adopts it"
+    );
+
+    // The adopting sender has not opened its slot yet -- nothing has claimed
+    // the pre-bind's drain -- so the pump is still deciding purely on
+    // `PumpContext::prebound`, which adoption must have cleared.
+    eventually(|| !node.manager.registry.contains_key(&local_id)).await;
+
+    drop(anchor);
 }
 
 /// Arming an unattached timeout on a pre-bound anchor stores it without
