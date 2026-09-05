@@ -91,3 +91,26 @@ W0 landed the missing instruments (velo PR #77 on top of `drain-credit-return`: 
 **Instrument perturbation.** The first instrumented rep read TTFT p99 4,597 ms and 2,748 req/s, outside the historical velo0 band (2,107 to 2,853 ms, 2,684 to 3,084 req/s). Two further instrumented reps read p99 2,491 and 2,639 ms at 2,918 and 2,988 req/s, and a control rep with the worker-side harvest off read 2,349 ms at 2,930 req/s. The outlier was the hot process (1,887 live slots on one of eight), the same router-imbalance mechanism the UCX diagnosis describes, not the instrument. The worker-side harvest stays on by default so every arm carries the same series.
 
 **Corrections to the text above.** The "What this run cannot measure" section said zero `velo_streaming_*` series existed in the matrix; the frontend teardown dump in `t3-m18p1` did carry them (the dump's prefix filter dropped only the `velo_messenger_*` lane series). And `velo_streaming_anchor_operation_duration_seconds{operation="attach"}` was never the round trip: it is the frontend handler body (mean 30 us in that matrix), which is why W0 added the sender-side histogram.
+
+## Addendum 2026-09-04 (night): W0b measured the egress side, and the wait is spread, not seated in one queue
+
+W0b (second commit on PR #77) added `velo_transport_egress_queue_wait_seconds`, `velo_transport_frames_written_total`, and `velo_transport_write_duration_seconds` on the TCP and UDS connection writers, and the rig now samples socket queues and node CPU on both nodes. One instrumented rep at the published shape (`t3-w0b-probe`, velo `0160fa1`, 3,076 req/s, TTFT p50 992 ms, p99 2,363 ms, frontend CPU 7.69 ms/req) gives, as means over the steady middle half:
+
+| stage | mean | note |
+|---|---|---|
+| worker egress queue (admit to writer dequeue) | 79 ms pooled, 41 to 130 per process | p50 0.4 to 35 ms: the mean is carried by a tail |
+| worker write duration | 0.8 ms | the socket send buffer is not full for long |
+| socket queues, worker side | 2.9 MB sent-unacked across all connections, max 484 KB on one | about 25 ms of records at the per-connection rate |
+| socket queues, frontend side | 2.0 MB unread across all connections, max 318 KB on one | the frontend's readers lag the wire |
+| frontend `message_rx` | 26 ms | Little's law, depth 530 messages |
+| frontend ordered lanes | 112 ms (p50 66 ms) | unchanged from the earlier probes |
+| frontend egress queue (replies, credit returns) | 42 ms (p50 0.4 ms) | the attach reply's return leg |
+| worker attach round trip | 390 ms (p50 342 ms) | measured by the sender |
+| worker handler start to first response | 485 ms | attach plus the OpenSlot flush wait plus first-token generation |
+| C, worker ingress to first token at the client | 982 ms | from the per-request join |
+
+Summed, the measured queues on the attach's path (worker egress, sockets, `message_rx`, frontend egress) come to about 170 ms of the 390 ms round trip, and the queues on the first token's path (worker egress, sockets, `message_rx`, lanes) to about 240 ms of the roughly 500 ms between the worker's first response and the client's first token. The remainder in both legs is not in any queue velo owns: it is time between a wake and a run. The node CPU sampler explains where it goes: node A (frontend, etcd, nats, and aiperf) ran at 95% utilization with a load average of 159 on 144 cores, while the frontend process itself used 24 cores; node B (workers) ran at 57%. The load generator is starving the system under test. Every arm shares this rig, so the arm-versus-arm comparison stands, but the arm with the most frontend CPU per request (velo0 at 7.7 to 11.4 ms/req against mux18p's 6.5) pays the most scheduler latency, which makes W2's CPU cuts a first-token lever as well as a CPU-category one.
+
+Two consequences. First, the plan's order holds: W3 removes the attach round trip outright, which is still the largest single measured term, and W4a removes the OpenSlot flush wait that sits between the attach and generation; both are correct regardless of where the remaining latency comes from. Second, the rig needs one experiment before the next matrix: pin aiperf and the frontend to disjoint core sets (`taskset` exists in the image) and rerun `velo0` and `mux18p` once each. If pinning moves velo0's first token materially, the published scoreboard has been measuring load-generator interference and the matrix shape changes for every arm; if it does not, the interference is not the lever and the order above stands unchanged. Either way the change is gated and default-off until the result is in.
+
+The `EGRESS_SEAT` verdict from `w6_egress.py` is `undecided` by its own rule (no single term explains 60% of the attach round trip), which is the correct reading.
