@@ -13,6 +13,8 @@
 //! transports — without depending on the runtime crate or its concrete
 //! metrics implementation.
 
+use std::time::Duration;
+
 /// Direction of a transport frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {
@@ -84,9 +86,16 @@ impl TransportRejection {
 /// concerns.
 ///
 /// All methods take `&self` and have implementations that are typically lock-free
-/// — they are safe to call from any hot path. Default impls are intentionally
-/// not provided: every method represents an observable signal a real
-/// implementation would care about.
+/// — they are safe to call from any hot path.
+///
+/// The frame, rejection, gauge and backpressure methods carry no default: each
+/// names a signal any real implementation would care about, and a transport
+/// that reported none of them would be invisible. The three egress methods do
+/// carry defaults, for two reasons. A transport whose `send_message` hands the
+/// frame straight to the wire has no queue in front of a writer and nothing to
+/// report; and adding a bare method to this trait would break every
+/// out-of-tree implementation, which is a major bump and a coordinated `velo`
+/// release (see `CONTRIBUTING.md`, *velo-ext API stability*).
 pub trait TransportObservability: Send + Sync {
     /// Record an accepted frame.
     ///
@@ -108,4 +117,37 @@ pub trait TransportObservability: Send + Sync {
     /// queued in the target's [`AdmissionGate`](crate::admission::AdmissionGate)
     /// instead of admitted on the spot.
     fn record_send_backpressure(&self);
+
+    /// Record how long one outbound frame waited between this transport
+    /// accepting it and the per-connection writer taking it off the send
+    /// queue.
+    ///
+    /// Observed once per frame, by the writer, at the moment of dequeue. A
+    /// transport that stamps the frame before offering it to its
+    /// [`AdmissionGate`](crate::admission::AdmissionGate) reports a wait that
+    /// spans the gate's pending queue as well as the bounded channel behind
+    /// it, which is the reading that matters: the gate is where a saturated
+    /// connection actually backs up.
+    fn record_egress_queue_wait(&self, _wait: Duration) {}
+
+    /// Record `count` frames of one `message_type` reaching the wire.
+    ///
+    /// Called once per message type per write, after the write returns — a
+    /// writer that coalesces several frames into one write reports them
+    /// together, so this counts frames and not writes. `message_type` takes
+    /// the same well-known label strings as [`record_frame`](Self::record_frame).
+    ///
+    /// Paired with [`record_frame`](Self::record_frame)'s outbound count, this
+    /// is what makes the egress queue's depth derivable without sampling a
+    /// channel length.
+    fn record_frames_written(&self, _message_type: &str, _count: u64) {}
+
+    /// Record the wall time of one write, which may carry several coalesced
+    /// frames.
+    ///
+    /// A long write means the socket's send buffer is full and the wire or the
+    /// receiver is the constraint. A short write beside a long
+    /// [`record_egress_queue_wait`](Self::record_egress_queue_wait) means the
+    /// writer is starved of runtime time, or the queue is simply long.
+    fn record_egress_write_duration(&self, _duration: Duration) {}
 }

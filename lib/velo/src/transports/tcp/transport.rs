@@ -11,7 +11,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -29,9 +29,10 @@ use velo_ext::{MessageType, PeerInfo, Transport, TransportAdapter, TransportKey,
 use super::framing::DEFAULT_MAX_FRAME_SIZE;
 use super::listener::TcpListener;
 use crate::transports::coalesce::{
-    Coalescable, WriterFailure, WriterObserver, run_coalescing_writer,
+    Coalescable, FrameTally, WriterFailure, WriterObserver, run_coalescing_writer,
 };
 use crate::transports::ingress::{DialedReaderContext, run_dialed_reader};
+use crate::transports::message_type_label;
 
 /// High-performance TCP transport with lock-free concurrent access
 ///
@@ -111,6 +112,16 @@ struct SendTask {
     header: Bytes,
     payload: Bytes,
     on_error: Arc<dyn TransportErrorHandler>,
+    /// When the transport accepted this frame, or `None` when nothing is
+    /// watching.
+    ///
+    /// Stamped in `send_message`, before the frame is offered to the gate, so
+    /// the writer's `velo_transport_egress_queue_wait_seconds` covers the
+    /// gate's pending queue as well as the bounded channel — under load the
+    /// gate is where the frames actually are. The clock read is skipped
+    /// entirely when the transport has no observability handle, because the
+    /// writer would have nowhere to report it.
+    queued_at: Option<Instant>,
 }
 
 impl SendTask {
@@ -368,6 +379,8 @@ impl Transport for TcpTransport {
             header,
             payload,
             on_error,
+            // One clock read per send, and only when a writer will report it.
+            queued_at: self.metrics.get().map(|_| Instant::now()),
         };
 
         // Fast path: an established connection. The liveness probe comes first
@@ -665,7 +678,7 @@ async fn connection_writer_inner(
         tokio::spawn(run_dialed_reader(
             read_half,
             ctx,
-            metrics,
+            metrics.clone(),
             conn_cancel.clone(),
             format!("{} ({})", instance_id, addr),
         ))
@@ -682,7 +695,11 @@ async fn connection_writer_inner(
         // The channel already carries the writer's item type.
         std::convert::identity,
         Some(&conn_cancel),
-        &TcpWriterObserver { instance_id, addr },
+        &TcpWriterObserver {
+            instance_id,
+            addr,
+            metrics,
+        },
     )
     .await;
 
@@ -727,6 +744,10 @@ impl Coalescable for SendTask {
         &self.payload
     }
 
+    fn queued_at(&self) -> Option<Instant> {
+        self.queued_at
+    }
+
     fn into_failure_token(self) -> Self {
         self
     }
@@ -736,10 +757,13 @@ impl Coalescable for SendTask {
     }
 }
 
-/// Attaches the connection's identity to the writer loop's log lines.
+/// Attaches the connection's identity to the writer loop's log lines, and
+/// carries the transport's pre-bound metrics handle so the per-frame egress
+/// path does no label lookup.
 struct TcpWriterObserver {
     instance_id: crate::InstanceId,
     addr: SocketAddr,
+    metrics: Option<std::sync::Arc<dyn velo_ext::TransportObservability>>,
 }
 
 impl WriterObserver for TcpWriterObserver {
@@ -753,6 +777,25 @@ impl WriterObserver for TcpWriterObserver {
                 "Encode error to {} ({}): {}",
                 self.instance_id, self.addr, err
             ),
+        }
+    }
+
+    fn records_egress(&self) -> bool {
+        self.metrics.is_some()
+    }
+
+    fn on_dequeue(&self, waited: Duration) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_egress_queue_wait(waited);
+        }
+    }
+
+    fn on_write(&self, tally: &FrameTally, elapsed: Duration) {
+        if let Some(metrics) = &self.metrics {
+            for (msg_type, count) in tally.counts() {
+                metrics.record_frames_written(message_type_label(msg_type), count);
+            }
+            metrics.record_egress_write_duration(elapsed);
         }
     }
 }

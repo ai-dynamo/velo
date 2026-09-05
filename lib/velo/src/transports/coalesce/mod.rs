@@ -62,6 +62,7 @@
 //! allocation, no copy.
 
 use std::io;
+use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -92,6 +93,122 @@ const DEFAULT_MAX_BATCH_FRAMES: usize = 1024;
 /// Reason handed to [`Coalescable::fail`] when an item was dropped because the
 /// flush that had to precede it failed.
 const FLUSH_FAILED: &str = "batch flush failed";
+
+/// How many frames of each [`MessageType`] one write carried.
+///
+/// A fixed array rather than a `Vec<MessageType>` kept beside the failure
+/// tokens: this is written once per staged frame on the writer's hot path and
+/// read once per write, and the streaming egress pump — whose failure token is
+/// `()` precisely so that retention costs it nothing — must not start paying
+/// for a per-frame push it never reads.
+pub(crate) struct FrameTally([u64; MESSAGE_TYPE_SLOTS]);
+
+/// One tally slot per [`MessageType`] discriminant.
+///
+/// Derived from `ShuttingDown` because that variant holds the largest
+/// discriminant today, which is an assumption and not a guarantee: a variant
+/// given an explicit discriminant above the contiguous run would leave this
+/// constant behind and make [`FrameTally::add`]'s index panic the connection
+/// writer. `tally_has_one_slot_per_message_type` is what fails first — it
+/// walks every byte [`MessageType::from_u8`] accepts, not just the ones below
+/// this bound.
+pub(crate) const MESSAGE_TYPE_SLOTS: usize = MessageType::ShuttingDown as usize + 1;
+
+impl Default for FrameTally {
+    fn default() -> Self {
+        Self([0; MESSAGE_TYPE_SLOTS])
+    }
+}
+
+impl FrameTally {
+    /// Count one frame.
+    #[inline]
+    fn add(&mut self, msg_type: MessageType) {
+        self.0[msg_type as usize] += 1;
+    }
+
+    /// Forget the frames counted so far. Called after every write, successful
+    /// or not: a failed write's frames never reached the wire and are reported
+    /// through [`Coalescable::fail`] instead.
+    #[inline]
+    fn clear(&mut self) {
+        self.0 = [0; MESSAGE_TYPE_SLOTS];
+    }
+
+    /// The non-zero counts, as `(message type, frames)`.
+    pub(crate) fn counts(&self) -> impl Iterator<Item = (MessageType, u64)> + '_ {
+        self.0
+            .iter()
+            .enumerate()
+            .filter(|&(_, &count)| count > 0)
+            .map(|(idx, &count)| {
+                let msg_type =
+                    MessageType::from_u8(idx as u8).expect("every tally slot names a MessageType");
+                (msg_type, count)
+            })
+    }
+}
+
+/// The writer's egress bookkeeping: the tally for the write in flight, and the
+/// one-time answer to [`WriterObserver::records_egress`].
+///
+/// Asking the observer once, at writer start, is what keeps the instruments
+/// free for a writer that has no metrics handle — the streaming egress pump
+/// runs this same loop on the data plane's hot path, and it takes no
+/// timestamps at all.
+struct EgressLog {
+    tally: FrameTally,
+    enabled: bool,
+}
+
+impl EgressLog {
+    fn new<O: WriterObserver>(observer: &O) -> Self {
+        Self {
+            tally: FrameTally::default(),
+            enabled: observer.records_egress(),
+        }
+    }
+
+    /// Report one item leaving the send queue.
+    #[inline]
+    fn dequeued<T: Coalescable, O: WriterObserver>(&self, observer: &O, item: &T) {
+        if self.enabled
+            && let Some(queued_at) = item.queued_at()
+        {
+            observer.on_dequeue(queued_at.elapsed());
+        }
+    }
+
+    /// Count one frame into the write being assembled.
+    #[inline]
+    fn staged(&mut self, msg_type: MessageType) {
+        if self.enabled {
+            self.tally.add(msg_type);
+        }
+    }
+
+    /// Open a write bracket.
+    #[inline]
+    fn started(&self) -> Option<Instant> {
+        self.enabled.then(Instant::now)
+    }
+
+    /// Close a bracket whose write reached the wire.
+    #[inline]
+    fn written<O: WriterObserver>(&mut self, observer: &O, started: Option<Instant>) {
+        if let Some(started) = started {
+            observer.on_write(&self.tally, started.elapsed());
+        }
+        self.tally.clear();
+    }
+
+    /// Close a bracket whose write failed. Nothing reached the wire, so
+    /// nothing is counted written.
+    #[inline]
+    fn failed(&mut self) {
+        self.tally.clear();
+    }
+}
 
 /// An item a coalescing writer can put on the wire.
 ///
@@ -135,6 +252,17 @@ pub(crate) trait Coalescable: Sized {
     /// for an item that was written.
     fn fail(token: Self::FailureToken, reason: &str);
 
+    /// When the transport accepted this item, if it stamps one.
+    ///
+    /// `None` by default, and `None` for a transport running without an
+    /// observability handle: the stamp costs a clock read per send, so it is
+    /// taken only when something will read it. The streaming egress pump never
+    /// stamps — its queueing is already covered by the streaming credit
+    /// metrics.
+    fn queued_at(&self) -> Option<Instant> {
+        None
+    }
+
     /// Whether the writer should stop after this item reaches the wire.
     ///
     /// Used by the streaming egress pump: after a terminal sentinel
@@ -172,6 +300,26 @@ pub(crate) trait WriterObserver {
     /// implicates — the batch size for a failed flush, `1` for a single frame
     /// on the direct path.
     fn on_failure(&self, _kind: WriterFailure, _err: &io::Error, _frames: usize) {}
+
+    /// Whether this writer's egress instruments are live.
+    ///
+    /// Read exactly once, when the writer starts. `false` buys the loop out of
+    /// every timestamp and every tally increment, which is what lets the
+    /// streaming egress pump share this code without paying for instruments it
+    /// does not publish.
+    fn records_egress(&self) -> bool {
+        false
+    }
+
+    /// One item came off the send queue, `waited` after the transport accepted
+    /// it. Called only for items that carry a [`Coalescable::queued_at`] stamp.
+    fn on_dequeue(&self, _waited: Duration) {}
+
+    /// One write reached the wire in `elapsed`, carrying the frames in `tally`.
+    ///
+    /// Not called for a failed write: those frames are reported through
+    /// [`Coalescable::fail`] and must not be counted as written.
+    fn on_write(&self, _tally: &FrameTally, _elapsed: Duration) {}
 }
 
 /// What to do with the next item, decided before it is touched.
@@ -313,6 +461,7 @@ pub(crate) async fn run_coalescing_writer<W, I, T, O>(
     // write can report every frame it was carrying rather than just the last.
     // Zero-sized, and never allocating, when `FailureToken = ()`.
     let mut staged: Vec<T::FailureToken> = Vec::new();
+    let mut egress = EgressLog::new(observer);
 
     'writer: loop {
         // Block for the first item. Cancellation is polled first so a hot send
@@ -327,6 +476,7 @@ pub(crate) async fn run_coalescing_writer<W, I, T, O>(
                 Err(_) => break 'writer,
             },
         };
+        egress.dequeued(observer, &first);
 
         let mut pending = Some(first);
         let mut terminal = false;
@@ -335,7 +485,7 @@ pub(crate) async fn run_coalescing_writer<W, I, T, O>(
             let staging = batch.classify(item.header().len(), item.payload().len());
 
             if staging.needs_flush_first()
-                && !flush::<_, T, _>(&mut batch, &mut staged, writer, observer).await
+                && !flush::<_, T, _>(&mut batch, &mut staged, writer, observer, &mut egress).await
             {
                 // `item` never entered the batch, so `flush` did not report it.
                 T::fail(item.into_failure_token(), FLUSH_FAILED);
@@ -343,12 +493,18 @@ pub(crate) async fn run_coalescing_writer<W, I, T, O>(
             }
 
             if staging == Staging::WriteDirect {
+                // The preceding flush emptied the tally, so this write carries
+                // exactly this one frame.
+                egress.staged(item.msg_type());
+                let started = egress.started();
                 if let Err((kind, e)) = write_frame_direct(writer, &item).await {
+                    egress.failed();
                     observer.on_failure(kind, &e, 1);
                     T::fail(item.into_failure_token(), &e.to_string());
                     break 'writer;
                 }
                 observer.on_flush(1);
+                egress.written(observer, started);
                 if item.is_terminal() {
                     terminal = true;
                     break;
@@ -363,12 +519,13 @@ pub(crate) async fn run_coalescing_writer<W, I, T, O>(
                     observer.on_failure(WriterFailure::Encode, &e, 1);
                     T::fail(item.into_failure_token(), &e.to_string());
                     // Frames already staged are still valid — get them out.
-                    flush::<_, T, _>(&mut batch, &mut staged, writer, observer).await;
+                    flush::<_, T, _>(&mut batch, &mut staged, writer, observer, &mut egress).await;
                     break 'writer;
                 }
                 // Read before the move. `is_terminal` is consulted *after*
                 // staging so the terminal frame itself still reaches the wire.
                 let is_terminal = item.is_terminal();
+                egress.staged(item.msg_type());
                 // The bytes are in the batch now; all the item still owes is
                 // its failure notification, so only that is kept.
                 staged.push(item.into_failure_token());
@@ -387,9 +544,14 @@ pub(crate) async fn run_coalescing_writer<W, I, T, O>(
             } else {
                 rx.try_recv().ok().map(&wrap)
             };
+            if let Some(item) = pending.as_ref() {
+                egress.dequeued(observer, item);
+            }
         }
 
-        if !flush::<_, T, _>(&mut batch, &mut staged, writer, observer).await || terminal {
+        if !flush::<_, T, _>(&mut batch, &mut staged, writer, observer, &mut egress).await
+            || terminal
+        {
             break 'writer;
         }
     }
@@ -412,6 +574,7 @@ async fn flush<W, T, O>(
     staged: &mut Vec<T::FailureToken>,
     writer: &mut W,
     observer: &O,
+    egress: &mut EgressLog,
 ) -> bool
 where
     W: AsyncWrite + Unpin,
@@ -429,14 +592,17 @@ where
     if frames == 0 {
         return true;
     }
+    let started = egress.started();
     match batch.flush_to(writer).await {
         Ok(()) => {
             staged.clear();
             observer.on_flush(frames);
+            egress.written(observer, started);
             true
         }
         Err(e) => {
             observer.on_failure(WriterFailure::Write, &e, frames);
+            egress.failed();
             let reason = e.to_string();
             for token in staged.drain(..) {
                 T::fail(token, &reason);

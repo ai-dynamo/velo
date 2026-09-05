@@ -533,6 +533,89 @@ async fn await_inbound_queue_quiesced(label: &str, snapshot: impl Fn() -> Metric
     }
 }
 
+/// T10: Egress conservation — every outbound frame the transport admitted is
+/// one its per-connection writer eventually handed to the socket.
+///
+/// The mirror of T9, one layer further out. `finalize_send_outcome` counts a
+/// frame as `velo_transport_frames_total{direction="outbound",
+/// outcome="accepted"}` the moment it reaches the connection's bounded send
+/// channel; `velo_transport_frames_written_total` counts it again once the
+/// writer's `write_all` has returned for it. The difference is the egress
+/// queue — the depth this instrumentation exists to measure — so the two
+/// counters have to converge at rest or the derived depth is a fiction.
+///
+/// Traffic runs both ways for the same reason T9 does: each side's egress is
+/// its own queue with its own writer task.
+async fn scenario_egress_conservation(pair: &VeloPair) {
+    for velo in [&pair.server, &pair.client] {
+        let handler = Handler::unary_handler("echo", |ctx| Ok(Some(ctx.payload))).build();
+        velo.register_handler(handler).unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    for (from, to) in [(&pair.client, &pair.server), (&pair.server, &pair.client)] {
+        for _ in 0..4 {
+            let payload = Bytes::from_static(b"egress");
+            let response: Bytes = from
+                .unary("echo")
+                .unwrap()
+                .raw_payload(payload.clone())
+                .instance(to.instance_id())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response, payload);
+        }
+    }
+
+    await_egress_quiesced("server", || pair.server_snap()).await;
+    await_egress_quiesced("client", || pair.client_snap()).await;
+}
+
+/// Poll one side's snapshot until admitted and written outbound frames agree on
+/// a non-zero count, then assert the two egress histograms are consistent with
+/// that count.
+///
+/// Equality is a property of quiescence, exactly as in
+/// [`await_inbound_queue_quiesced`]: admission and the wire are the two ends of
+/// a real queue.
+///
+/// The two histograms are counted differently on purpose. The queue wait is
+/// observed once per frame, as the writer takes it off the channel, so its
+/// count tracks the frame count. The write duration brackets one `write_all`
+/// sequence, and the writer coalesces whatever is already queued into a single
+/// write — so its count is at most the frame count, and equals it only when
+/// every write happened to carry one frame.
+async fn await_egress_quiesced(label: &str, snapshot: impl Fn() -> MetricSnapshot) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let snap = snapshot();
+        let accepted = snap.counter_sum(
+            "velo_transport_frames_total",
+            &[("direction", "outbound"), ("outcome", "accepted")],
+        );
+        let written = snap.counter_sum("velo_transport_frames_written_total", &[]);
+        if accepted > 0.0 && (accepted - written).abs() < f64::EPSILON {
+            let waits = snap.histogram_count("velo_transport_egress_queue_wait_seconds", &[]);
+            let writes = snap.histogram_count("velo_transport_write_duration_seconds", &[]);
+            assert_eq!(
+                waits as f64, written,
+                "{label}: one queue-wait observation per written frame — waits={waits} written={written}"
+            );
+            assert!(
+                writes >= 1 && (writes as f64) <= written,
+                "{label}: writes must be between one and one-per-frame — writes={writes} written={written}"
+            );
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{label}: egress never quiesced — accepted={accepted} written={written}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Parameterisation macro
 // ---------------------------------------------------------------------------
@@ -598,6 +681,12 @@ macro_rules! transport_metrics_tests {
             async fn inbound_queue_conservation() {
                 let p = pair().await;
                 scenario_inbound_queue_conservation(&p).await;
+            }
+
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            async fn egress_conservation() {
+                let p = pair().await;
+                scenario_egress_conservation(&p).await;
             }
         }
     };
@@ -678,6 +767,12 @@ mod uds {
     async fn inbound_queue_conservation() {
         let (p, _dir) = pair().await;
         scenario_inbound_queue_conservation(&p).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn egress_conservation() {
+        let (p, _dir) = pair().await;
+        scenario_egress_conservation(&p).await;
     }
 }
 

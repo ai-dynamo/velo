@@ -801,6 +801,16 @@ New series, alongside the existing `velo_streaming_*` collectors:
 | `velo_streaming_slot_credit_exhausted_total` | Per-slot credit starvation events |
 | `velo_streaming_mux_drain_visits_total` | Per-peer credit reconciles the sweep task ran because a consumer drained, counted per walk. Divided by elapsed time it is the doorbell's visit rate, which `MuxConfig::drain_visit_floor` caps at `1 / floor` per peer; the periodic sweep's own walks are not counted |
 
+> **Below the mux, on the messenger connection.** A `_stream_batch` active
+> message is an ordinary messenger frame, so it queues behind the *transport's*
+> per-connection writer as well. `velo_transport_egress_queue_wait_seconds`
+> reports that wait — stamped before admission, so it covers the admission
+> gate's pending queue as well as the bounded channel — and
+> `velo_transport_frames_written_total` is what the outbound frame counter is
+> subtracted from to get that queue's depth. They are the transport-level twins
+> of the two rows above, and they are where a batch that the mux already packed
+> goes on waiting. TCP and UDS only.
+
 > **`frames_written / egress_flushes` is the batching ratio** and the single
 > number that says whether this is working. It is meaningful at any scale, which
 > is why it ships before the protocol does. It counts flushes rather than
