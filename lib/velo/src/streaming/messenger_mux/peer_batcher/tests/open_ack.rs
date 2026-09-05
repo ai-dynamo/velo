@@ -20,9 +20,13 @@
 //!   the shipped default reaches the same deferral through a different door,
 //!   which is why the arms at the bottom of this file run
 //!   [`MuxConfig::default`];
-//! - the admission's answer reaches the batcher however full the control map
-//!   is. It is the only thing that lifts the fence, so it cannot be one of the
-//!   entries the map's cap refuses;
+//! - the admission's answer reaches the batcher whatever else is pending or
+//!   refused. It is the only thing that lifts the fence, so it lives in its
+//!   own `resolutions` lane rather than sharing `mine` with ordinary grants,
+//!   and that lane is never refused: it is this side's own answer to every
+//!   singleton this batcher dispatched (see `ControlState::resolutions` for
+//!   the exact bound — the dispatch, not the fence, is what admits an
+//!   entry);
 //! - and the other direction of the same property: an admission that needed no
 //!   fence must not be given one anyway. `fire_singleton` only raises the fence
 //!   when [`AdmissionState::Admitted`] is not already the answer, so on an
@@ -218,15 +222,18 @@ async fn a_real_admission_failure_reaches_the_detached_watcher() {
 
 /// Bogus grants are refused and the admission's answer still lifts the fence.
 ///
-/// A peer naming slot indices this batcher never allocated is the one thing
-/// the control inbox refuses (`velo_streaming_mux_control_refused_total`).
-/// Under the size cap this file's inbox once had, a peer holding more live
-/// slots than the cap filled the map with legitimate grants and the `OpenSlot`
-/// resolution behind them was refused, leaving the slot fenced until the
-/// consumer's heartbeat watchdog gave up (HTTP 500s on the tier-3 rig's
-/// `velo4a` and `velo34` arms). Now the map is bounded by what the batcher
-/// allocated: a flood of bogus ids is counted and dropped, and the resolution
-/// of a slot this batcher owns lands whatever else is pending.
+/// A peer naming a slot index this batcher never allocated is one of two
+/// things the control inbox refuses (`velo_streaming_mux_control_refused_total`;
+/// the other is a flood of `OpenSlot`s this side's ingress rejects outright,
+/// covered in `control.rs`'s own tests). Under the size cap this file's inbox
+/// once had, a peer holding more live slots than the cap filled the map with
+/// legitimate grants and the `OpenSlot` resolution behind them was refused,
+/// leaving the slot fenced until the consumer's heartbeat watchdog gave up
+/// (HTTP 500s on the tier-3 rig's `velo4a` and `velo34` arms). Now `mine` is
+/// bounded by which index the batcher has actually allocated: a flood of
+/// bogus ids is counted and dropped, and the resolution of a slot this
+/// batcher owns — kept in its own lane, `resolutions` — lands whatever else
+/// is pending.
 #[tokio::test(flavor = "multi_thread")]
 async fn bogus_grants_are_refused_and_the_admission_answer_still_lifts_the_fence() {
     const BOGUS: u32 = 4_096;
@@ -245,7 +252,6 @@ async fn bogus_grants_are_refused_and_the_admission_answer_still_lifts_the_fence
     // A peer naming slots this batcher never allocated: every one is refused
     // and counted, none of them is kept.
     let refused_before = harness.handle.control.refused();
-    let pending_before = harness.handle.control.pending_len();
     for index in 0..BOGUS {
         let bogus = SlotId::new(1_000 + index, 0).expect("index fits u24");
         harness.handle.grant(bogus, 1);
@@ -255,11 +261,13 @@ async fn bogus_grants_are_refused_and_the_admission_answer_still_lifts_the_fence
         u64::from(BOGUS),
         "every grant for a slot this batcher never allocated is refused"
     );
-    assert_eq!(
-        harness.handle.control.pending_len(),
-        pending_before,
-        "and none of them is kept"
-    );
+
+    // Sampled after the flood rather than before it: this baseline is for the
+    // admission's own resolution below, not for the flood just asserted on
+    // `refused()` above, so it must not race the filler's own unconditional
+    // resolution watcher (`fire_singleton` spawns it whether or not a fence
+    // was raised).
+    let pending_before = harness.handle.control.pending_len();
 
     // Free the gate. The parked `OpenSlot` is admitted, and its resolution
     // arrives while the batcher is still parked.

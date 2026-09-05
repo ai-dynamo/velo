@@ -117,13 +117,40 @@ fn open_slot_for_an_unregistered_anchor_rejects_that_slot_only() {
     assert_eq!(outcome.opened, 0);
     assert_eq!(
         outcome.replies,
-        vec![ReplyRecord::CloseSlot {
+        vec![ReplyRecord::RejectSlot {
             slot: id,
             reason: CloseReason::UnknownSlot
         }],
-        "the reverse race must not fail the peer"
+        "the reverse race must not fail the peer, and names no slot this side \
+         ever held — the reject lane, not the held-slot close lane"
     );
     // The bind that *was* registered is untouched and still claimable.
+    let outcome = open(&registry, &config, slot(0, 0), 1);
+    assert_eq!(outcome.opened, 1);
+}
+
+/// An `OpenSlot` past the table's index ceiling is rejected before any table
+/// lookup — it names no entry this table ever had or ever will.
+#[test]
+fn an_out_of_range_open_slot_is_rejected_without_touching_the_table() {
+    let (registry, _rx, config) = bound();
+    let id = slot(MAX_INGRESS_SLOTS_PER_PEER as u32, 0);
+
+    let payload = batch(1, 0, |encoder| {
+        encoder.push_open_slot(id, 0, ANCHOR, SESSION).unwrap();
+    });
+    let outcome = handle_batch(&registry, &config, None, peer(), &payload);
+
+    assert_eq!(outcome.opened, 0);
+    assert_eq!(
+        outcome.replies,
+        vec![ReplyRecord::RejectSlot {
+            slot: id,
+            reason: CloseReason::ProtocolError
+        }],
+        "out of range names no table entry, so it is a rejection, not a close"
+    );
+    // The bind is untouched: an out-of-range `OpenSlot` must not consume it.
     let outcome = open(&registry, &config, slot(0, 0), 1);
     assert_eq!(outcome.opened, 1);
 }
@@ -175,11 +202,13 @@ fn a_colliding_open_slot_is_rejected_and_the_incumbent_survives() {
     assert_eq!(outcome.closed, 0, "the incumbent must not be retired");
     assert_eq!(
         outcome.replies,
-        vec![ReplyRecord::CloseSlot {
+        vec![ReplyRecord::RejectSlot {
             slot: collider,
             reason: CloseReason::ProtocolError
         }],
-        "the newcomer is what fails, and it is told which slot id failed"
+        "the newcomer is what fails, and it is told which slot id failed; the \
+         newcomer's id names no entry in the table, so it is a rejection, not \
+         a close"
     );
     assert_eq!(registry.live_slots(peer()), 1);
     assert!(
@@ -276,6 +305,61 @@ fn a_duplicate_open_retires_the_incumbent_through_the_ordinary_close() {
     handle_batch(&registry, &config, None, peer(), &payload);
     assert_eq!(drain(&second_rx), vec![item(9)]);
     assert_eq!(registry.live_slots(peer()), 1);
+}
+
+/// A same-id duplicate `OpenSlot` with no bind registered for its pair is
+/// rejected without disturbing the live incumbent it names — locally, and
+/// only up to this function's own return. The collision guard only fires
+/// when the incoming id differs from the incumbent's
+/// (`a_colliding_open_slot_is_rejected_and_the_incumbent_survives`); a
+/// matching id passes it as an ordinary duplicate and falls straight to the
+/// bind lookup below. When that lookup misses, the rejection this produces
+/// names an id that is still live in the table right now — the reject lane is
+/// not "the id was never entered", it is "this `OpenSlot` was never admitted".
+///
+/// Once that `RejectSlot` reply is delivered, though, the sender's
+/// `on_peer_closed` closes its own live egress slot for this id with no
+/// reply of its own (`close_local`, unlike `finish_close`, emits no
+/// `CloseSlot`) — so the incumbent this test pins as surviving is left
+/// running with no producer behind it. Pre-existing, byte-identical before
+/// this lane split; not chased here.
+#[test]
+fn a_same_id_duplicate_with_no_bind_is_rejected_without_disturbing_the_incumbent() {
+    let (registry, rx, config) = bound();
+    let id = slot(0, 0);
+    open(&registry, &config, id, 1);
+    assert_eq!(registry.live_slots(peer()), 1);
+
+    // The exact same id, but naming a pair nobody bound.
+    let payload = batch(1, 1, |encoder| {
+        encoder.push_open_slot(id, 0, 999, 999).unwrap();
+    });
+    let outcome = handle_batch(&registry, &config, None, peer(), &payload);
+
+    assert_eq!(outcome.opened, 0);
+    assert_eq!(outcome.closed, 0, "the incumbent must not be retired");
+    assert_eq!(
+        outcome.replies,
+        vec![ReplyRecord::RejectSlot {
+            slot: id,
+            reason: CloseReason::UnknownSlot
+        }],
+        "the rejection names the incumbent's own id, which is still live in \
+         the table — the collision guard let it through because the ids \
+         match, not because the slot is absent"
+    );
+    assert_eq!(
+        registry.live_slots(peer()),
+        1,
+        "the incumbent survives untouched"
+    );
+
+    // The incumbent still works.
+    let payload = batch(1, 2, |encoder| {
+        encoder.push_data(id, 1, &item(1)).unwrap();
+    });
+    handle_batch(&registry, &config, None, peer(), &payload);
+    assert_eq!(drain(&rx), vec![item(1)]);
 }
 
 #[test]

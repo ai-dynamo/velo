@@ -20,5 +20,6 @@ mod control;
 mod egress;
 mod flush_policy;
 mod open_ack;
+mod reject_lane;
 mod support;
 mod writer;

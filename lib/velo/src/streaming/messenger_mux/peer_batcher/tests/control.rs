@@ -19,8 +19,9 @@ use crate::streaming::sender::cached_finalized;
 /// The stall is not exotic: a flush parks whenever the peer is congested, and a
 /// congested peer is exactly when its ingress lane is busiest returning credit.
 /// An unbounded control queue in that window is unbounded memory. Coalesced
-/// state is O(live slots) whatever the arrival rate, and the deltas it merged
-/// still deliver once the peer un-parks.
+/// state does not grow with arrival rate — see `ControlState`'s struct doc for
+/// the bound each map actually carries — and the deltas it merged still
+/// deliver once the peer un-parks.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stalled_batcher_coalesces_control_instead_of_queueing_it() {
     let harness = stalled_harness(MuxConfig::default()).await;

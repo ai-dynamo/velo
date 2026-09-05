@@ -33,9 +33,24 @@
 //!   producer loop keeps flushing every pass whether or not the last batch has
 //!   been admitted.
 //!
-//! The result is O(live slots) whatever the arrival rate, and the batcher is
-//! woken rather than fed: one [`tokio::sync::Notify`] permit stands in for any
-//! number of pending changes.
+//! A fixed constant bound belongs only to `rejects`, the small capped lane
+//! for a peer's bogus `OpenSlot`s — `OpenSlot`s the ingress never admitted,
+//! so no live-slot count applies to them either (the id itself can still
+//! name a slot admitted under a different, already-live `OpenSlot`; see
+//! `ControlState::reject`). `mine`, `peers` and `resolutions` carry no size
+//! cap: each is keyed by slot id, and `ControlState`'s field docs give the
+//! exact (index, generation) bound each one carries. `drain` (below) caps
+//! the accumulation window in practice, taking every map under one lock
+//! hold. What answers the "unbounded and unread" hazard above, for
+//! `entry_peer`'s own writers (`collect_grants` and `fail_slot`), is that a
+//! new key never comes free there: it costs the peer a full
+//! open/record/close cycle and consumes a locally registered bind, so
+//! growth tracks stream lifecycles rather than arrival rate. The up to
+//! [`MAX_PENDING_REJECTS`] reject-derived keys `drain` merges into `peers`
+//! are bounded by that cap instead — see its doc for why capping them,
+//! unlike `entry_peer`'s own keys, costs nothing. The batcher is woken
+//! rather than fed either way: one [`tokio::sync::Notify`] permit stands in
+//! for any number of pending changes.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -44,32 +59,6 @@ use tokio::sync::Notify;
 
 use super::super::protocol::{CloseReason, SlotId};
 use crate::observability::MuxMetricsHandle;
-
-// What bounds the two slot maps, now that nothing caps them by size.
-//
-// A fixed cap (4,096 entries, until 2026-09-06) was sized for a peer with
-// about a thousand live slots and refused the 4,097th key. Legitimate keys
-// are bounded by live slots on one peer, and a router in front of a worker
-// that is carrying thousands of streams is an ordinary deployment: `t3-iso1`
-// measured one peer at 4,000 to 6,700 and the cap refused its credit grants,
-// its closes and, under `MuxConfig::async_open_ack`, the admission answers
-// that lift a fenced slot. A refused grant is credit lost for good — the
-// receiver zeroed its `ungranted` the moment it sent the `CreditUpdate` — so
-// a size cap is the wrong shape for what it guards against, which is a peer
-// naming slot ids that were never alive.
-//
-// The bound is now the one thing that distinguishes a legitimate key from a
-// bogus one. `mine` holds control the *peer* sends about slots this batcher
-// owns, and this batcher knows exactly which indices it has handed out:
-// `ControlState::allocated`, published by the batcher on every allocation.
-// A key at or past it names a slot that never existed and is refused, which
-// is what `velo_streaming_mux_control_refused_total` now counts. Below it the
-// map is bounded by the indices in use. `peers` holds control this side's own
-// ingress writes about the peer's slots, which it only does for slots it
-// holds in a table bounded by its own slot limit, so nothing a peer sends can
-// grow it and it refuses nothing. Resolutions keep their own map (see
-// `ControlState::resolutions`) for the ordering reason given there.
-//
 
 /// Coalesced control for one slot **this** batcher owns.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -92,7 +81,93 @@ pub(super) struct PeerControl {
     pub(super) close: Option<CloseReason>,
 }
 
+/// Ceiling on `ControlState::rejects`, the lane for `OpenSlot`s the ingress
+/// rejected outright.
+///
+/// Capped rather than bounded by any table, because the ingress's own
+/// `MAX_INGRESS_SLOTS_PER_PEER` (65,536 indices) caps none of what lands
+/// here: every index at or above it is out of range by definition, and the
+/// `SlotId` index space (`u24`) holds roughly 16.7 million of them for a
+/// peer to name — plus any in-range index whose bind lookup misses or whose
+/// id collides with a live incumbent. Repeats are free regardless: `reject`
+/// early-returns on a key already pending and never counts it, so what
+/// actually grows this lane is distinct bogus ids, not repetition of one. A
+/// rejection is safe to drop because it carries no credit: the sender's
+/// slot just keeps streaming into one the receiver already discarded
+/// (`MuxDropReason::ClosedSlot`) until its own producer finishes, and no
+/// state leaks on either side. A dropped `CreditUpdate` is not recoverable
+/// the same way — the receiver zeroed `ungranted` for that delta the moment
+/// it sent the grant — which is why this cap belongs only here and never to
+/// `entry_peer`.
+pub(super) const MAX_PENDING_REJECTS: usize = 8_192;
+
 /// Everything pending for a batcher that is not a data record or an open.
+///
+/// `mine` and `peers` used to share one fixed-size cap (4,096 entries) that
+/// refused whichever key arrived once the map was full — including the
+/// 4,097th live slot's credit grant, which is unrecoverable: the receiver
+/// zeroed its `ungranted` the moment it sent the `CreditUpdate`, so a refused
+/// grant is credit lost for good. `t3-iso1` measured one peer at 4,000 to
+/// 6,700 live slots and hit exactly that. A size cap is the wrong shape for
+/// what it was guarding against, which is a peer naming slot ids that were
+/// never alive — so each map now has a bound built from what actually
+/// distinguishes a legitimate key from a bogus one, and neither bound is a
+/// cap on live traffic:
+///
+/// - **`mine`** holds control the *peer* sends about slots this batcher
+///   owns, keyed by the whole [`SlotId`] — generation included, because
+///   keying by index alone would let a grant meant for a retired generation
+///   land in the live one's entry and hand it credit it was never given.
+///   [`ControlInbox::note_allocated`] publishes each index's live generation
+///   the moment this batcher opens it, before the peer can possibly have
+///   learned the id, so [`ControlState::entry_mine`] can tell a legitimate
+///   key from a bogus one without a separate size limit: an index this
+///   batcher never allocated is refused and counted (`refused`, the operator
+///   view is `velo_streaming_mux_control_refused_total`); an index it did
+///   allocate but at a generation other than the live one names a generation
+///   that is not current — either it retired because the index was since
+///   reopened, or the peer simply guessed a generation that index never had
+///   — and either way the key is stale and is dropped silently, uncounted
+///   (without the check a hostile peer could pin one entry per generation it
+///   cares to name, up to 256 per index, rather than none). The check only
+///   gates *future* writes, though — it does not reach back and remove
+///   whatever a reopen's predecessor generation already left in `mine` — so
+///   the map's real bound between two drains is one entry per index at its
+///   live generation, plus one stale leftover per reopen that index went
+///   through since the last drain, up to the same 256-per-index ceiling the
+///   check exists to keep a bogus peer from reaching on its own. A slot that
+///   is closed but **not yet reopened** still matches its live generation,
+///   so it is accepted here the same as any other grant and dies one hop
+///   later instead, at apply time, when the batcher's own generation check
+///   against the live `EgressSlots` table finds no slot there to credit.
+/// - **`peers`** holds control this side's own ingress writes about the
+///   peer's slots, keyed by the whole [`SlotId`] for the same reason `mine`
+///   is: a credit or close reply names the generation the ingress table held
+///   at the time it was admitted, and `fail_slot` pushes its `CloseSlot`
+///   reply after `finish_close` has already removed that row, so the key can
+///   outlive the table entry that produced it. Most of it — the credit and
+///   close replies `collect_grants` and `fail_slot` produce — names a slot
+///   the ingress table actually admitted, and the table never holds more
+///   than one live generation per index at a time, so none of it is ever
+///   refused. But the table's own slot limit does not cap `peers`: a peer
+///   that closes and reopens the same index repeatedly leaves one entry
+///   behind per generation the ingress admitted for it since the last
+///   drain — up to 256, the width of the generation — because nothing here
+///   is removed except by [`drain`]. Separately, `open_slot` rejecting an
+///   `OpenSlot` outright — out of range, a collision, or a bind that never
+///   existed — was never admitted (one of those rejections can still name an
+///   id a *different*, admitted `OpenSlot` holds live right now; what bounds
+///   it is that nothing here is waiting on it, not that the id is absent
+///   from the table). Those go through `ControlState::reject` into `rejects`
+///   instead, a lane capped at [`MAX_PENDING_REJECTS`] for the reason given
+///   there: dropping one costs no credit, unlike the credit and closes the
+///   rest of `peers` carries. `rejects` merges into `peers` at [`drain`]
+///   time, same as `resolutions` merges into `mine`.
+///
+/// Resolutions keep their own map (see `ControlState::resolutions`) for the
+/// ordering reason given there.
+///
+/// [`drain`]: Self::drain
 #[derive(Debug, Default)]
 struct ControlState {
     /// The sweep evicted this batcher from the registry.
@@ -104,16 +179,42 @@ struct ControlState {
     /// Singleton resolutions owed to this side's own fenced slots, kept apart
     /// from `mine` so that this lane's growth can never be what refuses
     /// somebody else's grant, and so a resolution is never refused at all: it
-    /// is this side's own answer to a fence it raised, at most one per fenced
-    /// slot. Merged into `mine` at [`drain`] time, which takes both maps out
-    /// of the state a writer could still be growing.
+    /// is this side's own answer to every singleton this batcher dispatched.
+    /// `fire_singleton`'s spawn that inserts here runs unconditionally
+    /// whether or not the fence was actually raised, so the bound is one
+    /// entry per slot id that dispatched a singleton since the last drain,
+    /// not one per *fenced* slot. Merged into `mine` at [`drain`] time,
+    /// which takes both maps out of the state a writer could still be
+    /// growing.
     ///
     /// [`drain`]: Self::drain
     resolutions: HashMap<u32, bool>,
-    /// One past the highest slot index this batcher has ever allocated. A
-    /// key into `mine` at or past it names a slot that never existed.
-    allocated: u32,
-    /// Entries refused because their index was never allocated.
+    /// `OpenSlot`s the ingress rejected without admitting, capped at
+    /// [`MAX_PENDING_REJECTS`] for the reason given there — unlike
+    /// everything else in `peers`, dropping one costs no credit. Merged
+    /// into `peers` at [`drain`] time.
+    ///
+    /// [`drain`]: Self::drain
+    rejects: HashMap<u32, CloseReason>,
+    /// Live generation of each index this batcher has ever allocated,
+    /// published by [`ControlInbox::note_allocated`] on every open —
+    /// including a reopen, which is what keeps this current across a
+    /// close-then-reopen rather than only at first allocation. A `Vec`
+    /// rather than a map: `EgressSlots::allocate` only ever reuses a freed
+    /// index or pushes at its own length, so the allocated index set is
+    /// always exactly `0..len` with no gaps, and position already encodes
+    /// "never allocated" as `index >= len`. An index absent (past the end,
+    /// or `None` within it — `note_allocated` never leaves a hole, but
+    /// `resize` fills forward with `None` rather than assume it never will)
+    /// was never allocated; present and matching the incoming key's
+    /// generation means the slot is either still open or closed and not yet
+    /// reopened, and either way the key is accepted; present but not
+    /// matching means the key names a stale generation — one this index has
+    /// since moved past via a reopen, or one it never had at all.
+    live_generations: Vec<Option<u8>>,
+    /// Entries refused: an index `mine` never allocated, or a `rejects` key
+    /// past its cap. An ordinary stale-generation race is not counted here —
+    /// see `entry_mine`.
     refused: u64,
 }
 
@@ -125,6 +226,7 @@ impl ControlState {
             && self.mine.is_empty()
             && self.peers.is_empty()
             && self.resolutions.is_empty()
+            && self.rejects.is_empty()
     }
 
     /// The sweep evicted this batcher from the registry.
@@ -140,10 +242,13 @@ impl ControlState {
     /// Pending entries across every map, for the bound to be asserted on.
     ///
     /// The two flags are deliberately not counted: they are `bool`s, so they
-    /// bound themselves and cannot be what a flood grows.
+    /// bound themselves and cannot be what a flood grows. `live_generations`
+    /// is excluded for a different reason: it is not pending state — nothing
+    /// drains it, and it never shrinks, so it is bounded by this batcher's
+    /// own allocation history rather than by anything a peer can grow.
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.mine.len() + self.peers.len() + self.resolutions.len()
+        self.mine.len() + self.peers.len() + self.resolutions.len() + self.rejects.len()
     }
 
     /// Take everything pending, leaving the state empty.
@@ -160,29 +265,43 @@ impl ControlState {
             let entry = mine.entry(raw).or_default();
             entry.singleton = Some(entry.singleton.unwrap_or(true) && admitted);
         }
+        let mut peers = std::mem::take(&mut self.peers);
+        for (raw, reason) in std::mem::take(&mut self.rejects) {
+            peers.entry(raw).or_default().close.get_or_insert(reason);
+        }
         DrainedControl {
             retire: std::mem::take(&mut self.retire),
             flush: std::mem::take(&mut self.flush),
             mine,
-            peers: std::mem::take(&mut self.peers),
+            peers,
         }
     }
 
     /// The entry for control the peer sent about a slot this side owns.
     ///
-    /// `None`, counted as a refusal, when the index was never allocated here:
-    /// the one case a size cap was guarding against, answered exactly. Both
-    /// maps key by the whole [`SlotId`], generation included: keying by index
-    /// alone would let a grant meant for a retired generation land in the
-    /// live one's entry and hand it credit it was never given. A stale entry
-    /// is harmless; the batcher's generation check rejects it on the next
-    /// wake and the entry goes with the drain.
+    /// `None` for an index this side never allocated — counted as a refusal
+    /// — or for a generation that is not the one currently live at an index
+    /// it did allocate, whether that generation retired via a reopen or the
+    /// peer simply named one that index never had; either way it is an
+    /// ordinary stale key and is dropped without counting. A slot that is
+    /// closed but not yet reopened still matches its live generation and is
+    /// accepted here, not dropped — it dies one hop later, at apply time,
+    /// against the live `EgressSlots` table. See `ControlState`'s struct doc
+    /// for what the stale-key drop costs `mine`'s bound between drains.
     fn entry_mine(&mut self, slot: SlotId) -> Option<&mut OwnedControl> {
-        if slot.index() >= self.allocated {
-            self.refused = self.refused.saturating_add(1);
-            return None;
+        match self
+            .live_generations
+            .get(slot.index() as usize)
+            .copied()
+            .flatten()
+        {
+            None => {
+                self.refused = self.refused.saturating_add(1);
+                None
+            }
+            Some(live) if live != slot.generation() => None,
+            Some(_) => Some(self.mine.entry(slot.raw()).or_default()),
         }
-        Some(self.mine.entry(slot.raw()).or_default())
     }
 
     /// The entry for an answer this batcher owes one of its own fenced slots.
@@ -196,11 +315,40 @@ impl ControlState {
 
     /// The entry for control this side sends back about a slot the peer owns.
     ///
-    /// Never refused: the ingress writes these only for slots it holds, and
-    /// its table is bounded by its own slot limit, so the map is bounded by
-    /// construction and nothing the peer sends can grow it.
+    /// Never refused: `collect_grants` and `fail_slot`, the only writers,
+    /// name a slot the ingress table actually admitted. See `ControlState`'s
+    /// struct doc for `peers`'s real bound between drains and why leaving it
+    /// unrefused is still safe. An `OpenSlot` the ingress rejects outright
+    /// never comes through here, whether or not its id happens to match a
+    /// slot admitted under a different `OpenSlot` — see `ControlState::reject`.
     fn entry_peer(&mut self, slot: SlotId) -> &mut PeerControl {
         self.peers.entry(slot.raw()).or_default()
+    }
+
+    /// Record an `OpenSlot` the ingress rejected without admitting it: out of
+    /// range, a collision, or a bind that never existed.
+    ///
+    /// The rejected id can still coincide with a slot this side holds live
+    /// under a different, admitted `OpenSlot` — a duplicate whose bind lookup
+    /// missed is one way that happens. What makes dropping it safe is that
+    /// this particular `OpenSlot` was never admitted, so nothing is waiting
+    /// on its answer, not that the id is absent from the table.
+    ///
+    /// A repeat of a key already pending changes nothing — first reason wins,
+    /// same as `entry_peer` — so it never counts against the cap. A genuinely
+    /// new key past [`MAX_PENDING_REJECTS`] is refused and counted: dropping
+    /// it is safe because it carries no credit, which is not true of
+    /// anything `entry_peer` carries — see [`MAX_PENDING_REJECTS`] for why.
+    fn reject(&mut self, slot: SlotId, reason: CloseReason) {
+        let raw = slot.raw();
+        if self.rejects.contains_key(&raw) {
+            return;
+        }
+        if self.rejects.len() >= MAX_PENDING_REJECTS {
+            self.refused = self.refused.saturating_add(1);
+            return;
+        }
+        self.rejects.insert(raw, reason);
     }
 }
 
@@ -262,23 +410,30 @@ impl ControlInbox {
         self.lock().len()
     }
 
-    /// Entries refused because their index was never allocated. The series
-    /// `velo_streaming_mux_control_refused_total` is the operator-facing view of
-    /// the same number; this one exists so a test can read it without a
-    /// registry.
+    /// Entries refused: an index `mine` never allocated, or a `rejects` key
+    /// past its cap. The series `velo_streaming_mux_control_refused_total` is
+    /// the operator-facing view of the same number; this one exists so a
+    /// test can read it without a registry.
     #[cfg(test)]
     pub(super) fn refused(&self) -> u64 {
         self.lock().refused
     }
 
-    /// The batcher handed out slot `index`; keys up to it are now legitimate.
+    /// The batcher opened `slot`; its generation is now the live one for its
+    /// index, whether this is a first allocation or a reopen.
     ///
     /// Not a wake: nothing became pending. Taken under the lock so a grant
-    /// that races the open it answers is judged against the bound the open
-    /// just raised, never against the one before it.
-    pub(super) fn note_allocated(&self, index: u32) {
+    /// that races the open it answers is judged against the generation the
+    /// open just published, never against the one before it. Called before
+    /// the peer can possibly have learned `slot`'s id, so by the time a
+    /// legitimate grant for it can arrive, this has always already run.
+    pub(super) fn note_allocated(&self, slot: SlotId) {
         let mut state = self.lock();
-        state.allocated = state.allocated.max(index.saturating_add(1));
+        let index = slot.index() as usize;
+        if index >= state.live_generations.len() {
+            state.live_generations.resize(index + 1, None);
+        }
+        state.live_generations[index] = Some(slot.generation());
     }
 
     /// An inbound `CreditUpdate` for a slot we own.
@@ -323,6 +478,11 @@ impl ControlInbox {
         self.mutate(|state| {
             state.entry_peer(slot).close.get_or_insert(reason);
         });
+    }
+
+    /// An `OpenSlot` the ingress rejected without ever holding `slot`.
+    pub(super) fn reject_slot(&self, slot: SlotId, reason: CloseReason) {
+        self.mutate(|state| state.reject(slot, reason));
     }
 
     /// The sweep evicted this batcher.
@@ -373,6 +533,7 @@ impl ControlInbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::streaming::messenger_mux::ingress::MAX_INGRESS_SLOTS_PER_PEER;
 
     fn slot(index: u32, generation: u8) -> SlotId {
         SlotId::new(index, generation).expect("index fits u24")
@@ -382,10 +543,14 @@ mod tests {
     /// below prove no longer applies.
     const OLD_CAP: u32 = 4096;
 
-    /// An inbox whose batcher has allocated `allocated` slot indices.
+    /// An inbox whose batcher has allocated indices `0..allocated`, each at
+    /// generation 0 — one `note_allocated` call per index, exactly as a real
+    /// batcher's `on_open_slot` makes one per open.
     fn inbox_with(allocated: u32) -> ControlInbox {
         let inbox = ControlInbox::default();
-        inbox.note_allocated(allocated - 1);
+        for index in 0..allocated {
+            inbox.note_allocated(slot(index, 0));
+        }
         inbox
     }
 
@@ -437,15 +602,60 @@ mod tests {
         );
     }
 
+    /// A grant for a retired generation must not credit the live one.
+    ///
+    /// Before the generation check moved to write time, both entries were
+    /// kept — the raw key already kept them apart — and the stale one was
+    /// only dropped later, at apply time. Dropping it here instead is a
+    /// tighter bound (`mine` no longer holds one entry per generation a peer
+    /// cares to name, up to 256 per index), not a different outcome for the
+    /// live entry, which is what this test still pins.
     #[test]
-    fn generations_do_not_share_an_entry() {
+    fn a_stale_generation_is_dropped_and_never_credits_the_live_entry() {
         let inbox = inbox_with(8);
         inbox.grant(slot(4, 0), 1);
         inbox.grant(slot(4, 1), 2);
         assert_eq!(
             inbox.pending_len(),
-            2,
-            "a grant for a retired generation must not credit the live one"
+            1,
+            "the stale generation names no live slot and is dropped, not kept"
+        );
+
+        let drained = inbox.take().expect("something pending");
+        assert_eq!(
+            drained.mine[&slot(4, 0).raw()].credit,
+            1,
+            "the live entry is untouched by the stale grant"
+        );
+    }
+
+    /// A slot closed but not yet reopened is accepted here, not dropped.
+    ///
+    /// `note_allocated` is the only writer of `live_generations`, and it only
+    /// runs on open — `EgressSlots::close` never touches it. So from this
+    /// inbox's own state, a slot this batcher has since closed is
+    /// indistinguishable from one still open: both leave the index's live
+    /// generation exactly where the last open set it. A grant naming that
+    /// generation is accepted here either way; the real answer comes one hop
+    /// later, when the batcher applies it against the live `EgressSlots`
+    /// table and finds no slot to credit.
+    #[test]
+    fn a_grant_for_a_closed_but_not_reopened_slot_is_accepted_here() {
+        let inbox = inbox_with(8);
+        // No reopen happens — this inbox has no way to represent one without
+        // `note_allocated`, and that is exactly the point: closing a slot
+        // alone changes nothing this map can see.
+        inbox.grant(slot(4, 0), 1);
+
+        let drained = inbox.take().expect("something pending");
+        assert_eq!(
+            drained
+                .mine
+                .get(&slot(4, 0).raw())
+                .map(|entry| entry.credit),
+            Some(1),
+            "a grant at the still-live generation is accepted, whether or \
+             not the batcher has already closed that slot locally"
         );
     }
 
@@ -490,10 +700,13 @@ mod tests {
         assert_eq!(drained.mine[&slot(OLD_CAP + 903, 0).raw()].credit, 1);
     }
 
-    /// Replies are this side's own writes about the peer's slots, bounded by
-    /// the ingress table that produces them; nothing refuses one.
+    /// Credit and close replies for slots the ingress currently holds are
+    /// this side's own writes, and nothing here checks a size limit for
+    /// them — see `ControlState`'s field doc for what actually bounds
+    /// `peers` across drains. (An `OpenSlot` the ingress rejects outright is
+    /// a different lane — see `a_flood_of_bogus_open_rejections_is_capped`.)
     #[test]
-    fn replies_are_never_refused() {
+    fn replies_for_held_slots_are_never_refused() {
         let inbox = ControlInbox::default();
         for index in 0..(OLD_CAP + 5_904) {
             inbox.reply_credit(slot(index, 0), 1);
@@ -505,6 +718,126 @@ mod tests {
         assert_eq!(
             drained.peers[&slot(OLD_CAP + 5_903, 0).raw()].close,
             Some(CloseReason::UnknownSlot)
+        );
+    }
+
+    /// `peers` is not bounded by the ingress table's own slot limit: one
+    /// index can hold at most one live ingress slot at a time, but a peer
+    /// that closes and reopens that index keeps minting a new key here, one
+    /// per generation the ingress admitted for it, because nothing removes
+    /// an entry except [`ControlState::drain`]. The ceiling is the width of
+    /// the generation, not the ingress table's index cap — this pins the
+    /// 256-per-index half of that claim directly, without needing 65,536
+    /// indices' worth of churn to demonstrate it.
+    #[test]
+    fn one_index_reopened_through_every_generation_leaves_256_entries_in_peers() {
+        let inbox = ControlInbox::default();
+        let index = 0;
+        for generation in 0..=u8::MAX {
+            inbox.reply_credit(slot(index, generation), 1);
+        }
+        assert_eq!(
+            inbox.refused(),
+            0,
+            "every reply names a generation the ingress table could plausibly \
+             have admitted; entry_peer never checks live_generations at all"
+        );
+        assert_eq!(
+            inbox.pending_len(),
+            256,
+            "one index, 256 generations, 256 keys — not the one entry an \
+             \"O(live slots)\" bound would predict"
+        );
+
+        let drained = inbox.take().expect("something pending");
+        assert_eq!(
+            drained.peers.len(),
+            256,
+            "the 256 keys are in `peers` specifically, not spread across the \
+             other maps `pending_len` also sums"
+        );
+    }
+
+    /// A flood of `OpenSlot` rejections is capped; credit and close replies
+    /// for slots the ingress actually holds are not.
+    ///
+    /// `replies_for_held_slots_are_never_refused` pins the half of the old
+    /// "refuses nothing" claim that is still true. This pins the half that
+    /// was not: a peer can name an unbounded number of slots it will never
+    /// hold — an out-of-range index, a collision, a bind that expired — and
+    /// each one produces a rejection here on the ingress task, not on the
+    /// peer's own accounting. Dropping one past the cap costs no credit
+    /// (see [`MAX_PENDING_REJECTS`]), which is why this lane is capped
+    /// instead of grown, and the two lanes are independent: filling this
+    /// one must not touch the other.
+    #[test]
+    fn a_flood_of_bogus_open_rejections_is_capped() {
+        let inbox = ControlInbox::default();
+        let flood = MAX_PENDING_REJECTS as u32 + 10_000;
+        for index in 0..flood {
+            inbox.reject_slot(
+                slot(MAX_INGRESS_SLOTS_PER_PEER as u32 + index, 0),
+                CloseReason::ProtocolError,
+            );
+        }
+        assert_eq!(
+            inbox.pending_len(),
+            MAX_PENDING_REJECTS,
+            "the reject lane stops growing at its cap, unlike the credit lane it merges into"
+        );
+        assert_eq!(
+            inbox.refused(),
+            u64::from(flood) - MAX_PENDING_REJECTS as u64,
+            "entries past the cap are refused and counted, not silently dropped uncounted"
+        );
+
+        // A repeat of a key already pending changes neither count: first
+        // reason wins, and it was never new.
+        let refused_before = inbox.refused();
+        inbox.reject_slot(
+            slot(MAX_INGRESS_SLOTS_PER_PEER as u32, 0),
+            CloseReason::UnknownSlot,
+        );
+        assert_eq!(inbox.pending_len(), MAX_PENDING_REJECTS);
+        assert_eq!(inbox.refused(), refused_before);
+
+        // The credit lane for a slot the ingress actually holds is a
+        // different map on the same inbox and does not feel the flood.
+        inbox.note_allocated(slot(0, 0));
+        inbox.grant(slot(0, 0), 1);
+        assert_eq!(
+            inbox.refused(),
+            refused_before,
+            "a full reject lane must not refuse an ordinary grant"
+        );
+        let drained = inbox.take().expect("something pending");
+        assert_eq!(
+            drained
+                .mine
+                .get(&slot(0, 0).raw())
+                .map(|entry| entry.credit),
+            Some(1),
+            "the grant reaches the batcher past a full reject lane"
+        );
+
+        // The defining property of the split: a `RejectSlot` must come out
+        // the wire the same way a `CloseSlot` does, which only happens if
+        // `drain` actually merges `rejects` into `peers` rather than
+        // dropping them once the cap has done its counting.
+        assert_eq!(
+            drained.peers.len(),
+            MAX_PENDING_REJECTS,
+            "every capped rejection must reach the batcher's peers map, not \
+             just be counted and discarded"
+        );
+        assert_eq!(
+            drained
+                .peers
+                .get(&slot(MAX_INGRESS_SLOTS_PER_PEER as u32, 0).raw())
+                .and_then(|entry| entry.close),
+            Some(CloseReason::ProtocolError),
+            "the merged entry carries the close reason through, so the peer \
+             actually gets told to abandon the slot it opened"
         );
     }
 

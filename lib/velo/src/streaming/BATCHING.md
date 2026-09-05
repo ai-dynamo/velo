@@ -477,13 +477,34 @@ worker thread from inside a `Drop` in async context.
 > document prefers to the watchdog kill, made deterministic; `SATURATION.md`
 > describes it from the operator's side.
 
-The batcher's own control inlet is bounded the same way, and for the same
-reason. Credit returns, closes and singleton resolutions arrive as **coalesced
-per-slot state** rather than as messages: credit accumulates into a `u32`, a
-close dominates the credit for its slot, and a failed singleton dominates a
-successful one. A queue would have been unbounded exactly when it matters — a
-flush parks on admission precisely when the peer is congested, which is when its
-ingress lane is busiest returning credit — so the batcher is *woken*, never fed.
+The batcher's own control inlet is bounded for the same reason, but not by a
+byte cap — a slot's credit and close are state a peer can only ever hold one
+of, not a queue a byte budget can drain. Credit returns, closes and singleton
+resolutions arrive as **coalesced per-slot state** rather than as messages:
+credit accumulates into a `u32`, a close dominates the credit for its slot,
+and a failed singleton dominates a successful one. A queue would have been
+unbounded exactly when it matters — a flush parks on admission precisely when
+the peer is congested, which is when its ingress lane is busiest returning
+credit — so the batcher is *woken*, never fed. Each of these maps is keyed by
+slot id — index plus an 8-bit generation the writer chose, not by index
+alone — so a fixed size cap was the wrong shape for what it was guarding
+against, which is a peer naming ids that were never alive. What actually
+bounds each map is distinct (index, generation) pairs written since the last
+drain, not one entry per live slot: the map of what a peer owes this side's
+own slots is bounded by which indices this batcher has ever allocated, and
+the map of what this side owes the peer's slots is bounded by which indices
+the ingress table has ever admitted — both up to 256 keys per index, the
+width of the generation, if that index is closed and reopened repeatedly
+between two drains — plus the one sub-lane that answers an `OpenSlot` this
+side never admitted. The id that lane rejects can still be one this side
+holds live under a different, admitted `OpenSlot`, so no table's size limit
+bounds it either; that sub-lane is capped by count instead, which is safe
+because dropping one of those costs no credit — the sender's slot just keeps
+streaming into one the receiver already discarded until its own producer
+finishes, unlike a dropped `CreditUpdate`, which is unrecoverable. `drain`
+is what actually caps the accumulation window in practice — it takes every
+map under one lock hold — and `peer_batcher::control::ControlState`'s field
+docs give the bound each map carries.
 Attach requests keep a queue, bounded, because each carries its own channel and
 its own waiting caller and there is nothing to merge.
 

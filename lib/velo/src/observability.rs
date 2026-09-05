@@ -670,7 +670,8 @@ impl MuxMetricsHandle {
         self.staged_records.add(delta as f64);
     }
 
-    /// A batcher's coalesced control state refused a new slot key at its cap.
+    /// A batcher's coalesced control state refused a slot key: an index it
+    /// never allocated, or a rejection past the reject lane's cap.
     pub(crate) fn control_refused(&self) {
         self.control_refused_total.inc();
     }
@@ -1197,10 +1198,17 @@ impl VeloMetrics {
             registry,
             Counter::with_opts(Opts::new(
                 "velo_streaming_mux_control_refused_total",
-                "Coalesced control entries a peer batcher refused because they \
-                 named a slot index it never allocated. Anything here means a \
-                 peer is naming slot ids that were never alive; a peer with any \
-                 number of live slots produces none.",
+                "Coalesced control entries a peer batcher refused, for either of \
+                 two reasons: a grant or close named a slot index this side \
+                 never allocated, or a burst of `OpenSlot`s this side never \
+                 admitted filled the bounded lane that carries their \
+                 rejections. Either way the peer's own accounting is not at \
+                 risk: a real held-slot credit or close reply is never refused. \
+                 Not counted here: an ordinary stale-generation race, where a \
+                 grant or close names an index this side allocated but at a \
+                 generation that is not the one currently live there — that \
+                 is dropped silently rather than signalled, since it is \
+                 expected traffic rather than a hostile peer.",
             ))?,
         )?;
         let streaming_mux_hold_overflow_total = register_collector(

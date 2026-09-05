@@ -54,7 +54,7 @@ use crate::observability::{MuxDirection, MuxDropReason, MuxMetricsHandle};
 /// 1024 concurrent streams to one peer use indices 0..1024 — and keeps the
 /// worst case one `OpenSlot` can force to a few megabytes rather than a few
 /// hundred, which is the same amplification the batch decoder refuses.
-const MAX_INGRESS_SLOTS_PER_PEER: usize = 1 << 16;
+pub(crate) const MAX_INGRESS_SLOTS_PER_PEER: usize = 1 << 16;
 
 /// A `bind()` waiting for the `OpenSlot` that will claim it.
 struct BindEntry {
@@ -475,7 +475,9 @@ fn open_slot(
     let id = record.slot;
     let index = id.index() as usize;
     if index >= MAX_INGRESS_SLOTS_PER_PEER {
-        outcome.replies.push(ReplyRecord::CloseSlot {
+        // Never held and never will be: this index is out of the table's
+        // range entirely, so the reject lane carries it, not `peers`.
+        outcome.replies.push(ReplyRecord::RejectSlot {
             slot: id,
             reason: CloseReason::ProtocolError,
         });
@@ -497,7 +499,9 @@ fn open_slot(
         .and_then(Option::as_ref)
         .is_some_and(|incumbent| incumbent.id != id)
     {
-        outcome.replies.push(ReplyRecord::CloseSlot {
+        // The incumbent, not `id`, occupies this index — `id` itself names no
+        // entry in the table, so it goes to the reject lane.
+        outcome.replies.push(ReplyRecord::RejectSlot {
             slot: id,
             reason: CloseReason::ProtocolError,
         });
@@ -510,8 +514,16 @@ fn open_slot(
     let Some((_, bind)) = ctx.registry.binds.remove(&(anchor_id, session_id)) else {
         // The reverse race: an `OpenSlot` for a pair that was never registered,
         // or whose accept window expired. It must **not** fail the peer — reply
-        // and discard that slot's records.
-        outcome.replies.push(ReplyRecord::CloseSlot {
+        // and discard that slot's records. This `OpenSlot` was never admitted
+        // — that is what puts it in the reject lane, not that `id` is absent
+        // from the table: a same-id duplicate passes the collision guard
+        // above and can reach here with `id` still the live incumbent. That
+        // incumbent survives only up to this reply's delivery: once the
+        // sender's `on_peer_closed` acts on it, it closes its own live slot
+        // for `id` with no reply of its own, leaving this incumbent running
+        // with no producer behind it. Pre-existing, unchanged by this lane's
+        // split from `CloseSlot`.
+        outcome.replies.push(ReplyRecord::RejectSlot {
             slot: id,
             reason: CloseReason::UnknownSlot,
         });

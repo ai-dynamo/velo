@@ -124,12 +124,24 @@ const OPEN_QUEUE_DEPTH: usize = 64;
 /// owner. That partition is what lets a node tell "close the slot I opened" from
 /// "close the slot you opened" when both sides may hold a slot at the same dense
 /// index.
+///
+/// `RejectSlot` writes the identical wire frame as `CloseSlot` — the peer
+/// cannot tell them apart and does not need to. The split is internal: a
+/// `CloseSlot` answers an `OpenSlot` this side admitted, for a slot still in
+/// its table (bounded by that table, so keeping it is safe); a `RejectSlot`
+/// answers one this side never admitted (out of range, a collision, or a bind
+/// that never existed), so keeping every one a hostile peer can name is not —
+/// even the rare rejection whose id happens to match a slot admitted under a
+/// different `OpenSlot`. See `ControlState` for where that distinction is
+/// enforced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReplyRecord {
     /// Additional data credit for the peer's slot.
     CreditUpdate { slot: SlotId, delta: u32 },
-    /// Tell the peer to abandon its slot.
+    /// Tell the peer to abandon a slot the ingress holds and is closing.
     CloseSlot { slot: SlotId, reason: CloseReason },
+    /// Tell the peer to abandon an `OpenSlot` the ingress never admitted.
+    RejectSlot { slot: SlotId, reason: CloseReason },
 }
 
 /// Why an `OpenSlot` command was refused.
@@ -195,6 +207,7 @@ impl BatcherHandle {
             match *record {
                 ReplyRecord::CreditUpdate { slot, delta } => self.control.reply_credit(slot, delta),
                 ReplyRecord::CloseSlot { slot, reason } => self.control.reply_close(slot, reason),
+                ReplyRecord::RejectSlot { slot, reason } => self.control.reject_slot(slot, reason),
             }
         }
     }
@@ -524,7 +537,11 @@ impl Batcher {
                 return;
             }
         };
-        self.control.note_allocated(id.index());
+        // Not a redundant copy of `self.slots`: `id.generation()` is
+        // information the control inbox has no other way to see, published
+        // here because `entry_mine`'s bound needs it and nothing shorter than
+        // this call site can hand it over.
+        self.control.note_allocated(id);
         self.streams.push(stream);
         self.publish_live_slots();
         if let Some(metrics) = &self.metrics {

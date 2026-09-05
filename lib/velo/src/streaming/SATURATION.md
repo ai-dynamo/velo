@@ -194,13 +194,20 @@ default) serialised new opens behind the same admission and bounded this to
 one wait at a time.
 
 This new kill has no counter of its own: both arms report the same
-`MuxDropReason::WithheldOverflow`, so telling a sender-side-congestion kill
-from the classic stalled-reader one takes a join across
-`velo_streaming_mux_control_refused_total`, `velo_streaming_mux_withheld_records`
-and `velo_streaming_mux_live_slots`, not a single series. A related trap in
-that last gauge: a slot killed while fenced stays counted in
-`velo_streaming_mux_live_slots` — the deferred `CloseSlot` it still owes its
-consumer must not overtake the `OpenSlot` its fence is waiting on, so the
+`MuxDropReason::WithheldOverflow`, `velo_streaming_mux_withheld_records` is an
+unlabelled gauge that cannot tell them apart either, and neither does the
+`tracing::warn!` `overflow_kill` logs on the way out — it carries the slot id,
+the error and the discarded count, not whether the slot was fenced at the
+time. Nor does `velo_streaming_mux_control_refused_total` help: it counts a
+peer batcher naming a slot index it never allocated or a burst of bogus
+`OpenSlot`s, neither of which correlates with ordinary sender-side congestion.
+There is currently no signal — metric or log — that separates a
+sender-side-congestion kill from the classic stalled-reader one; today that
+takes knowing from the deployment which arm is in play, chiefly whether
+`async_open_ack` is enabled. A related trap in `velo_streaming_mux_live_slots`:
+a slot killed while fenced stays counted there — the deferred `CloseSlot` it
+still owes its consumer must not overtake the `OpenSlot` its fence is waiting
+on, so the
 registry entry survives the kill — and it holds its batcher past
 `batcher_idle_ttl` until the admission resolves. `live_slots` is therefore not
 a count of slots a producer can still write to while any are fenced.
