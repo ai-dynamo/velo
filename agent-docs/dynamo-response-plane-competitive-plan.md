@@ -284,3 +284,9 @@ Reproduce with `.research/runtime-gate.sh`. **Tier 2 is unblocked at the depende
 - A Dynamo worktree at the PR 11996 head with the velo pin edited: `.research/dyn-pin/`
 - Fetched refs in the Dynamo checkout: `refs/dyn-pr/11918`, `refs/dyn-pr/11996`
 - Fetched refs here: `refs/velo-pr/24`, `refs/velo-pr/66` through `69`
+
+## Addendum 2026-09-05 — the physical-write half of Gap 4 is closed
+
+Velo PR #77 (`w0-ingest-metrics`) adds `velo_transport_frames_written_total`, published from the TCP/UDS coalescing writer (`lib/velo/src/transports/coalesce/mod.rs`, registered in `lib/velo/src/observability.rs`). That is the "real physical-write counter" §4/Gap 4 and the step-A work item at line 240 call for — `velo_transport_frames_total{direction="outbound"}` continues to count admissions, exactly as both passages describe, but subtracting the new counter from it now gives the egress-queue-depth reading this document says did not exist.
+
+Not closed by #77, so the rest of both passages stands: no stream-setup latency histogram, and the mux's `_stream_batch` path still has no counter of its own under this name (`velo_streaming_egress_flushes_total` predates this PR, on `drain-credit-return`, and was already live before this gap analysis was written — it covers flush counts, not a write-return counter comparable to the new transport-level one).

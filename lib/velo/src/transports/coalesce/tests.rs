@@ -417,6 +417,48 @@ async fn coalesced_frames_are_dequeued_once_each_and_written_in_one_write() {
     assert_eq!(observer.written_total(), 8, "every frame counted written");
 }
 
+/// A frame above `COALESCE_THRESHOLD` takes the direct-write path instead of
+/// the batched one — a `_stream_batch` active message carrying a large
+/// payload hits exactly this in production. The direct branch's tally starts
+/// from whatever the mandatory flush ahead of it left behind, so this is the
+/// one test that proves that flush actually empties it rather than trusting
+/// the comment that says so.
+#[tokio::test]
+async fn a_large_frame_is_written_direct_and_counted_once() {
+    let factory = ItemFactory::new();
+    let items = vec![
+        factory.stamped("small", vec![b'x'; 8]),
+        factory.stamped("big", vec![0xAB; COALESCE_THRESHOLD + 1]),
+    ];
+    let mut sink = RecordingSink::default();
+    let observer = TestObserver::instrumented();
+    run_with(items, &mut sink, &observer).await;
+
+    assert_eq!(
+        observer.dequeues().len(),
+        2,
+        "both frames still counted off the queue"
+    );
+    assert_eq!(
+        observer.flushes(),
+        vec![1, 1],
+        "the small frame's batch flushes on its own before the large frame is written direct"
+    );
+    assert_eq!(
+        observer.writes().len(),
+        2,
+        "one write bracket for the batched frame, one for the direct frame"
+    );
+    for (tally, _) in observer.writes() {
+        assert_eq!(
+            tally,
+            vec![(MessageType::Message, 1)],
+            "neither write is allowed to carry the other write's frame"
+        );
+    }
+    assert_eq!(observer.written_total(), 2);
+}
+
 /// Frames are counted under their own message type: that label is what makes
 /// `velo_transport_frames_written_total` subtractable from the outbound frame
 /// counter, which is per message type too.
@@ -1279,4 +1321,66 @@ async fn successful_writes_report_nothing() {
     assert_eq!(sink.decode_frames().len(), 12);
     assert!(factory.errors().is_empty());
     assert!(observer.failures().is_empty());
+}
+
+// -----------------------------------------------------------------------
+// Egress eligibility
+// -----------------------------------------------------------------------
+
+/// Egress eligibility used to be keyed on the handle's own transport label
+/// (`EGRESS_INSTRUMENTED_TRANSPORTS`), so a TCP/UDS transport built with a
+/// key outside that list (`.key(TransportKey::from("custom-uds"))`,
+/// exercised in-tree at `uds/tests.rs`) recorded nothing even though the
+/// handle itself would happily record into it. `EgressMetrics` now wraps a
+/// handle unconditionally, with no label of its own to consult — whether a
+/// connection has one at all is `WriterObserver::egress`'s `Option` to hold,
+/// not a question the handle answers — so there is no label-keyed check left
+/// to fall out of step with the handle's own Prometheus children. This test
+/// proves the handle side: a bound handle under a non-default key produces
+/// real series under that key.
+#[test]
+fn a_bound_handle_records_under_its_own_key_regardless_of_transport_label() {
+    use crate::observability::VeloMetrics;
+
+    let registry = prometheus::Registry::new();
+    let metrics = VeloMetrics::register(&registry).expect("register metrics");
+
+    // A key outside the old allowlist is still eligible: the writer no
+    // longer has a second, label-keyed question to disagree with this one.
+    let custom = metrics.bind_transport("custom-uds");
+
+    // The claim: a handle bound to a non-default key that actually
+    // records must produce real series under that key, not a dropped
+    // observation. Nothing exists yet — the children are built lazily.
+    let has_series_for = |name: &str, transport: &str| {
+        registry.gather().iter().any(|family| {
+            family.name() == name
+                && family.get_metric().iter().any(|metric| {
+                    metric
+                        .get_label()
+                        .iter()
+                        .any(|l| l.name() == "transport" && l.value() == transport)
+                })
+        })
+    };
+    assert!(
+        !has_series_for("velo_transport_frames_written_total", "custom-uds"),
+        "nothing has been recorded yet, so nothing should exist"
+    );
+
+    custom.record_frames_written(MessageType::Message, 1);
+    custom.record_egress_queue_wait(Duration::from_millis(1));
+    custom.record_egress_write_duration(Duration::from_millis(1));
+
+    for name in [
+        "velo_transport_frames_written_total",
+        "velo_transport_egress_queue_wait_seconds",
+        "velo_transport_write_duration_seconds",
+    ] {
+        assert!(
+            has_series_for(name, "custom-uds"),
+            "{name} must exist under the transport's own key once it actually \
+             records — the old allowlist would have silently dropped this"
+        );
+    }
 }

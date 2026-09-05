@@ -60,15 +60,31 @@
 //! a crate-wide `impl Coalescable for Vec<u8>` that any future caller would
 //! silently inherit. Wrapping is a move into a transparent newtype — no
 //! allocation, no copy.
+//!
+//! # What the writer reports
+//!
+//! [`WriterObserver::records_egress`] is asked exactly once, at writer start,
+//! and cached in [`EgressLog`] — never re-asked per item or per write. A
+//! stamped item is observed once, at dequeue
+//! ([`WriterObserver::on_dequeue`]); a write that reaches the wire is
+//! observed once, with the [`FrameTally`] it carried
+//! ([`WriterObserver::on_write`]); a write that fails reports through
+//! [`Coalescable::fail`] instead and the tally is cleared uncounted
+//! ([`EgressLog::failed`]) — a fifth exit path from
+//! [`run_coalescing_writer`] must preserve that split, or a frame ends up
+//! reported both written and failed, double-counting
+//! `velo_transport_frames_written_total` and driving the derived egress depth
+//! negative.
 
 use std::io;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
-use velo_ext::MessageType;
+use velo_ext::{MessageType, TransportObservability};
 
 use super::tcp::framing::{
     COALESCE_THRESHOLD, DIRECT_PREFIX_CAP, MIN_HEADER_SIZE, TcpFrameCodec, stage_direct_prefix,
@@ -133,6 +149,15 @@ impl FrameTally {
     #[inline]
     fn clear(&mut self) {
         self.0 = [0; MESSAGE_TYPE_SLOTS];
+    }
+
+    /// Frames counted across every message type. Used only by `debug_assert`s
+    /// that check the tally stays in lockstep with what actually got staged;
+    /// `debug_assert!`'s condition still has to typecheck in release builds,
+    /// so this cannot be `#[cfg(debug_assertions)]`-only, but it is a
+    /// same-size array sum, not a hot-path cost.
+    fn total(&self) -> u64 {
+        self.0.iter().sum()
     }
 
     /// The non-zero counts, as `(message type, frames)`.
@@ -301,25 +326,98 @@ pub(crate) trait WriterObserver {
     /// on the direct path.
     fn on_failure(&self, _kind: WriterFailure, _err: &io::Error, _frames: usize) {}
 
+    /// This writer's pre-bound egress-metrics handle, if it has one.
+    ///
+    /// `records_egress`, `on_dequeue`, and `on_write` all default to asking
+    /// this rather than each carrying its own copy of "do I have metrics" —
+    /// TCP and UDS answer all three identically (they hold the connection's
+    /// [`EgressMetrics`] and read it the same way), so overriding this one
+    /// accessor is all either transport needs. `None` is what buys an
+    /// uninstrumented writer — a connection built with no observability
+    /// handle, or the streaming egress pump, which has no `EgressMetrics` at
+    /// all — out of every timestamp and every tally increment on the
+    /// per-message path. An observer whose egress bookkeeping is not an
+    /// `EgressMetrics` at all — a test double, say — overrides the three
+    /// methods below directly instead and never calls this one.
+    fn egress(&self) -> Option<&EgressMetrics> {
+        None
+    }
+
     /// Whether this writer's egress instruments are live.
     ///
-    /// Read exactly once, when the writer starts. `false` buys the loop out of
-    /// every timestamp and every tally increment, which is what lets the
-    /// streaming egress pump share this code without paying for instruments it
-    /// does not publish.
+    /// Read exactly once, when the writer starts. `EgressMetrics` only exists
+    /// when the transport was handed an observability handle, so `egress()`
+    /// returning `Some` already means live.
     fn records_egress(&self) -> bool {
-        false
+        self.egress().is_some()
     }
 
     /// One item came off the send queue, `waited` after the transport accepted
     /// it. Called only for items that carry a [`Coalescable::queued_at`] stamp.
-    fn on_dequeue(&self, _waited: Duration) {}
+    fn on_dequeue(&self, waited: Duration) {
+        if let Some(egress) = self.egress() {
+            egress.on_dequeue(waited);
+        }
+    }
 
     /// One write reached the wire in `elapsed`, carrying the frames in `tally`.
     ///
     /// Not called for a failed write: those frames are reported through
     /// [`Coalescable::fail`] and must not be counted as written.
-    fn on_write(&self, _tally: &FrameTally, _elapsed: Duration) {}
+    fn on_write(&self, tally: &FrameTally, elapsed: Duration) {
+        if let Some(egress) = self.egress() {
+            egress.on_write(tally, elapsed);
+        }
+    }
+}
+
+/// The egress-metrics half of a [`WriterObserver`], shared by every writer
+/// that drives [`run_coalescing_writer`].
+///
+/// TCP and UDS answer `records_egress`, `on_dequeue`, and `on_write`
+/// identically — both hold the connection's pre-bound metrics handle and read
+/// it the same way, and the only thing that actually varies per transport is
+/// `on_failure`'s log text, which stays on each transport's own
+/// `WriterObserver` impl. Both implement that shared answer by overriding
+/// [`WriterObserver::egress`] to return their handle, rather than each
+/// re-stating the three delegating method bodies, which keeps that one real
+/// difference visible instead of buried beside identical boilerplate.
+///
+/// The handle is a snapshot taken once, when the connection's writer task is
+/// spawned — not a per-frame `OnceLock` read like the UCX AM callback's,
+/// which has to re-read per frame because `set_observability` can arrive
+/// after `start()` on a worker thread the transport does not otherwise
+/// synchronize with. TCP and UDS don't have that ordering hazard: the runtime
+/// always calls `set_observability` before `start()`, and the writer task
+/// (and its snapshot) does not exist until a connection is created after
+/// `start()` returns. A `TcpTransport`/`UdsTransport` used standalone, before
+/// `set_observability`, records neither side of the accepted/written
+/// identity, so it stays 0-0 rather than going stale.
+pub(crate) struct EgressMetrics {
+    metrics: Arc<dyn TransportObservability>,
+}
+
+impl EgressMetrics {
+    /// Wraps a bound handle. Whether a connection has one at all is the
+    /// owning [`WriterObserver::egress`]'s `Option` to hold — once an
+    /// `EgressMetrics` exists, it is live by construction, with no second
+    /// "but is it really on" question left to answer or get out of step.
+    pub(crate) fn new(metrics: Arc<dyn TransportObservability>) -> Self {
+        Self { metrics }
+    }
+
+    /// See [`WriterObserver::on_dequeue`].
+    pub(crate) fn on_dequeue(&self, waited: Duration) {
+        self.metrics.record_egress_queue_wait(waited);
+    }
+
+    /// See [`WriterObserver::on_write`].
+    pub(crate) fn on_write(&self, tally: &FrameTally, elapsed: Duration) {
+        for (msg_type, count) in tally.counts() {
+            self.metrics.record_frames_written(msg_type, count);
+        }
+        self.metrics.record_egress_write_duration(elapsed);
+    }
 }
 
 /// What to do with the next item, decided before it is touched.
@@ -494,8 +592,14 @@ pub(crate) async fn run_coalescing_writer<W, I, T, O>(
 
             if staging == Staging::WriteDirect {
                 // The preceding flush emptied the tally, so this write carries
-                // exactly this one frame.
+                // exactly this one frame — asserted, not just commented, so a
+                // future call that stages without flushing first fails a test
+                // instead of silently over-reporting frames written.
                 egress.staged(item.msg_type());
+                debug_assert!(
+                    !egress.enabled || egress.tally.total() == 1,
+                    "a direct write must carry exactly the one frame staged for it"
+                );
                 let started = egress.started();
                 if let Err((kind, e)) = write_frame_direct(writer, &item).await {
                     egress.failed();
@@ -587,6 +691,12 @@ where
         staged.len(),
         batch.frame_count(),
         "the writer must hold one failure token per staged frame"
+    );
+    // Only when the tally is live: an uninstrumented writer never calls
+    // `egress.staged`, so its tally stays at zero while `batch` still fills up.
+    debug_assert!(
+        !egress.enabled || egress.tally.total() as usize == batch.frame_count(),
+        "the egress tally must count exactly the frames staged in the batch"
     );
     let frames = batch.frame_count();
     if frames == 0 {

@@ -329,13 +329,7 @@ impl Transport for NatsTransport {
 
             let sender_cancel = self.cancel_token.clone();
             let sender_client = self.client.clone();
-            let sender_metrics = self.metrics.get().cloned();
-            rt.spawn(run_sender_task(
-                sender_rx,
-                sender_client,
-                sender_cancel,
-                sender_metrics,
-            ));
+            rt.spawn(run_sender_task(sender_rx, sender_client, sender_cancel));
 
             // Spawn receive loop (LIFECYCLE-03)
             let cancel = self.cancel_token.clone();
@@ -459,7 +453,6 @@ async fn run_sender_task(
     rx: flume::Receiver<NatsSendTask>,
     client: Arc<async_nats::Client>,
     cancel: CancellationToken,
-    metrics: Option<std::sync::Arc<dyn velo_ext::TransportObservability>>,
 ) {
     loop {
         tokio::select! {
@@ -477,14 +470,12 @@ async fn run_sender_task(
                             &task.payload,
                         );
 
-                        if let Some(metrics) = metrics.as_ref() {
-                            metrics.record_frame(
-                                Direction::Outbound,
-                                crate::transports::message_type_label(task.message_type),
-                                nats_payload.len(),
-                            );
-                        }
-
+                        // The outbound-accepted frame is already recorded by
+                        // `finalize_send_outcome` (transports.rs) the moment
+                        // `send_message` returns `Admitted`, which happens as
+                        // soon as this task is queued — before this loop ever
+                        // sees it. Recording it again here double-counted
+                        // every NATS send.
                         if let Err(e) = client
                             .publish_with_headers(task.subject, nats_headers, nats_payload)
                             .await
