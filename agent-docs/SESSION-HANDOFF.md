@@ -523,3 +523,7 @@ See the evening addenda in `ttft-gap-diagnosis.md` and `velo-response-plane-win-
 - Findings: see the night addendum in `ttft-gap-diagnosis.md`. Node A runs at 95% CPU with aiperf sharing it; the remaining latency is scheduler time, not a velo queue.
 - In flight: W3 (`velo-w3` worktree, branch `w3-zero-rtt-attach`, workflow `wf_70982ebd-fb2`) and W4a (`velo-w4a`, branch `w4-async-open-ack`, workflow `wf_4119ef8a-1a1`), velo side only; their adapter halves and the rig arms follow in one stage against an integration branch. `.research/rig/check-tree-velo.sh` is the per-worktree gate (`VELO_TREE`, `VELO_TEST_TARGETS` semicolon-separated).
 - Next: (1) core-pinning experiment (`RIG_PIN_CORES`, default off) with `velo0` and `mux18p`, one rep each; (2) commit W3 and W4a, open their draft PRs against `drain-credit-return`; (3) adapter and arm stage; (4) integration branch, wheel, smoke of each new arm, then the matrix.
+
+### Update 2026-09-04 (late night): pinning experiment
+
+The first-token second was load-generator interference; see the late-night addenda in `ttft-gap-diagnosis.md` and the plan. `RIG_PIN_CORES` now defaults to 1 in `t3-frontend.sh` (frontend cpus 0-71, aiperf 72-143; `pin_cores` is written into `rig_run_meta.json`). `t3-base-pin` (tcp, velo0, mux18p, 3 reps) is running as the new scoreboard; `t3-pin2` checks a 48/96 split. Every number in `response-plane-benchmark-results.md`, the results page, and the plan scoreboard predates pinning and is superseded.

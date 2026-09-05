@@ -114,3 +114,22 @@ Summed, the measured queues on the attach's path (worker egress, sockets, `messa
 Two consequences. First, the plan's order holds: W3 removes the attach round trip outright, which is still the largest single measured term, and W4a removes the OpenSlot flush wait that sits between the attach and generation; both are correct regardless of where the remaining latency comes from. Second, the rig needs one experiment before the next matrix: pin aiperf and the frontend to disjoint core sets (`taskset` exists in the image) and rerun `velo0` and `mux18p` once each. If pinning moves velo0's first token materially, the published scoreboard has been measuring load-generator interference and the matrix shape changes for every arm; if it does not, the interference is not the lever and the order above stands unchanged. Either way the change is gated and default-off until the result is in.
 
 The `EGRESS_SEAT` verdict from `w6_egress.py` is `undecided` by its own rule (no single term explains 60% of the attach round trip), which is the correct reading.
+
+## Addendum 2026-09-04 (late night): the seat of the TTFT gap was the rig, and the scoreboard is withdrawn
+
+The core-pinning experiment (`t3-pin1`, one rep each, frontend on cpus 0-71 and aiperf on 72-143 via `taskset`, everything else unchanged) settles it:
+
+| arm | pinning | req/s | TTFT p50 | TTFT p99 | E2E p50 | E2E p90 | E2E p99 | ITL p99 | frontend CPU ms/req |
+|---|---|---|---|---|---|---|---|---|---|
+| velo0 | off (t3-w0b-probe) | 3,076 | 992 | 2,363 | 2.36 s | 4.14 s | 5.45 s | 16.6 | 7.69 |
+| velo0 | on | 2,933 | 98 | 813 | 1.69 s | 6.84 s | 11.61 s | 43.9 | 5.85 |
+| mux18p | off (t3-m18p1 rep1) | 2,360 | 86 | 1,697 | 0.54 s | 18.2 s | 26.1 s | 99.3 | 6.51 (3-rep) |
+| mux18p | on | 2,762 | 49 | 768 | 0.44 s | 10.5 s | 11.25 s | 42.8 | 5.27 |
+
+Every velo0 first-token number published before this date was load-generator interference: aiperf, with 64 worker processes and 64 record processors on the same node as the frontend, took the node to 95% utilization and starved the frontend's runtime of CPU. With disjoint cores velo0's first token is 98 ms at the same throughput, and its frontend CPU per request falls from 7.7 to 5.9 ms because the process stops paying for preemption. The mechanism sections above that place the second in velo's ingest FIFOs, and the evening addendum that moved it to the worker egress, both describe real queues whose measured occupancy was small; the wait between the queues was scheduler time on a saturated node.
+
+The end-to-end tail moves the other way. velo0's E2E p99 rises from 5.5 to 6.8 s to 11.6 s under pinning, and mux18p's falls from 26 s to 11.3 s, and both ITL p99 values land near 43 ms. The "admission discipline" this document credited to velo0 was the starved frontend throttling how many streams ran at once. With the frontend fed, both planes stream about the same population and pay the same tail. That advantage is withdrawn along with the scoreboard.
+
+What remains true and measured: at the published shape with pinning, velo0 leads throughput (2,933 against 2,762) and trails mux18p on first token (98 against 49 ms p50, 813 against 768 ms p99) and frontend CPU (5.85 against 5.27 ms/req). The remaining first-token gap has the shape the instruments now resolve: the attach round trip is 22 ms mean under pinning, the OpenSlot flush wait sits on top of it, and the ordered lanes and the anchor path carry the rest. W3 (no attach round trip) and W4a (no flush wait before the ack) target exactly those terms; W2 targets the CPU gap. The three-rep pinned baseline (`t3-base-pin`, tcp, velo0, mux18p) replaces `t3-m18p1` as the scoreboard, and `RIG_PIN_CORES` defaults to 1 in `t3-frontend.sh` from now on, with the 72/72 split recorded in `rig_run_meta.json`; a 48/96 split runs as a sensitivity check.
+
+Corrections to the record: `response-plane-benchmark-results.md`'s t3-m18p1 table and the results page are superseded by `t3-base-pin`; the first-token and E2E rows of the plan's scoreboard are withdrawn; the isolation matrices for W2, W3 and W4 run under pinning, and their success bar is set against mux18p's pinned numbers once the three-rep baseline is in.
