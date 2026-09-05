@@ -24,7 +24,6 @@
 
 use std::sync::Arc;
 
-use super::super::protocol::RecordType;
 use super::*;
 
 impl Batcher {
@@ -119,9 +118,6 @@ impl Batcher {
         }
         if let Some(encoder) = self.writer.encoder() {
             let _ = encoder.push_close_slot(id, seq, reason);
-            if let Some(metrics) = &self.metrics {
-                metrics.record_sent(RecordType::CloseSlot);
-            }
             // A close is a liveness record: the consumer behind it is waiting
             // for a terminal or a `Dropped` that only this tells it about, so it
             // does not wait on an application's flush.
@@ -214,15 +210,9 @@ impl Batcher {
                 tracing::error!(slot = ?id, %error, "messenger mux: dropping unencodable record");
                 return;
             }
-            if let Some(metrics) = &self.metrics {
-                metrics.record_sent(RecordType::Data);
-            }
             match close_seq {
                 Some(close_seq) => {
                     let _ = encoder.push_close_slot(id, close_seq, CloseReason::TerminalSent);
-                    if let Some(metrics) = &self.metrics {
-                        metrics.record_sent(RecordType::CloseSlot);
-                    }
                     // The terminal ends a stream, so it and its close travel
                     // like the other liveness records rather than waiting for a
                     // flush the finalizing producer may never make.
@@ -268,12 +258,6 @@ impl Batcher {
             self.epoch_death();
             return;
         };
-        if let Some(metrics) = &self.metrics {
-            metrics.record_sent(RecordType::Data);
-            if terminal {
-                metrics.record_sent(RecordType::CloseSlot);
-            }
-        }
 
         if terminal {
             self.close_local(index);

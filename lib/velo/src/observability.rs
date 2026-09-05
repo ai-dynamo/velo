@@ -637,6 +637,10 @@ impl MuxDirection {
     }
 }
 
+/// The label value `velo_streaming_mux_batcher_wakes_total` files each
+/// [`BatcherWake`] source under, indexed by [`BatcherWake::index`].
+const MUX_WAKE_SOURCES: [&str; 5] = ["open", "control", "frame", "inlet_closed", "linger"];
+
 /// What woke a peer batcher's task, for `velo_streaming_mux_batcher_wakes_total`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BatcherWake {
@@ -653,14 +657,26 @@ pub(crate) enum BatcherWake {
 }
 
 impl BatcherWake {
-    fn as_str(self) -> &'static str {
+    /// Dense index into [`MUX_WAKE_SOURCES`] and `MuxMetricsHandle`'s
+    /// pre-bound `batcher_wakes` array — one select-loop wake fires this on
+    /// every trip, including a bare `Frame` wake for a single queued record,
+    /// so this stays a plain array index rather than a label lookup.
+    const fn index(self) -> usize {
         match self {
-            Self::Open => "open",
-            Self::Control => "control",
-            Self::Frame => "frame",
-            Self::InletClosed => "inlet_closed",
-            Self::Linger => "linger",
+            Self::Open => 0,
+            Self::Control => 1,
+            Self::Frame => 2,
+            Self::InletClosed => 3,
+            Self::Linger => 4,
         }
+    }
+
+    /// Test-only: `batcher_wake` indexes `MUX_WAKE_SOURCES` directly via
+    /// [`Self::index`] now, so the drift guard
+    /// (`mux_enum_label_values_match_docs`) is this method's sole caller.
+    #[cfg(test)]
+    fn as_str(self) -> &'static str {
+        MUX_WAKE_SOURCES[self.index()]
     }
 }
 
@@ -687,24 +703,41 @@ pub(crate) struct MuxMetricsHandle {
     epoch_deaths_total: Counter,
     batch_seq_gaps_total: Counter,
     drain_visits_total: Counter,
-    records_sent_total: CounterVec,
-    batcher_wakes_total: CounterVec,
+    records_sent: [Counter; crate::streaming::messenger_mux::protocol::RECORD_TYPE_COUNT],
+    batcher_wakes: [Counter; MUX_WAKE_SOURCES.len()],
 }
 
 impl MuxMetricsHandle {
-    /// A batcher packed one record of `kind` into a batch bound for its peer.
-    pub(crate) fn record_sent(&self, kind: crate::streaming::messenger_mux::protocol::RecordType) {
-        self.records_sent_total
-            .with_label_values(&[kind.as_str()])
-            .inc();
+    /// A batch just handed to the messenger packed `counts` records, indexed
+    /// by [`RecordType::count_index`](crate::streaming::messenger_mux::protocol::RecordType::count_index).
+    ///
+    /// Called once per batch, from the same point that already counts the
+    /// batch itself, so a batch discarded before it gets there (an epoch
+    /// death, or the task tearing down) is never read out and never counted.
+    /// `counts[index]`'s label is already resolved — pre-bound in
+    /// [`VeloMetrics::bind_mux`] the same way [`Self::batcher_wake`]'s array
+    /// is — so this is a plain array index and an atomic add, no label lookup
+    /// at any count.
+    pub(crate) fn records_sent(
+        &self,
+        counts: [u16; crate::streaming::messenger_mux::protocol::RECORD_TYPE_COUNT],
+    ) {
+        for (index, count) in counts.into_iter().enumerate() {
+            if count > 0 {
+                self.records_sent[index].inc_by(f64::from(count));
+            }
+        }
     }
 
-    /// A batcher's task woke for `source`, whether from its select or from the
-    /// drain loop that follows it.
+    /// A batcher's task woke for `source`.
+    ///
+    /// Pre-bound array index, not a label lookup: this fires once per
+    /// select-loop trip, and a `Frame` wake is one record by construction
+    /// (`SlotStream::poll_next` yields exactly one queued item per poll), so
+    /// this is on the per-record path regardless of how many records a wake's
+    /// batch ends up carrying.
     pub(crate) fn batcher_wake(&self, source: BatcherWake) {
-        self.batcher_wakes_total
-            .with_label_values(&[source.as_str()])
-            .inc();
+        self.batcher_wakes[source.index()].inc();
     }
 
     /// A slot came into existence on either side of the mux.
@@ -1479,12 +1512,14 @@ impl VeloMetrics {
             CounterVec::new(
                 Opts::new(
                     "velo_streaming_mux_records_sent_total",
-                    "Mux records a batcher packed for its peer, by record type. \
-                     Divided by velo_streaming_mux_batches_total{direction=\"sent\"} \
-                     it says what a node's outbound batches are made of, which \
-                     is the question a batch count alone cannot answer: a rise \
-                     in small batches is either data that arrives one record at \
-                     a time or control that is flushed as it comes.",
+                    "Mux records a batcher packed for its peer, by record type \
+                     — this series only ever describes what a node sends, so \
+                     it carries no direction label of its own. Compared with \
+                     velo_streaming_mux_batches_total{direction=\"sent\"} it \
+                     says what those outbound batches are made of, which is \
+                     the question a batch count alone cannot answer: a rise in \
+                     small batches is either data arriving one record at a \
+                     time or control flushed as it comes.",
                 ),
                 &["record_type"],
             )?,
@@ -1496,9 +1531,9 @@ impl VeloMetrics {
                     "velo_streaming_mux_batcher_wakes_total",
                     "Wakes of the per-peer batcher tasks, by what woke them: a \
                      producer's open, coalesced control, a queued record, a \
-                     departed producer, or the linger timer. Under the default \
-                     flush policy every wake that staged anything writes a \
-                     batch, so this is the denominator behind the batch count.",
+                     departed producer, or the linger timer. One wake can still \
+                     write more than one batch, so this attributes what woke \
+                     the task rather than counting batches.",
                 ),
                 &["source"],
             )?,
@@ -1773,6 +1808,19 @@ impl VeloMetrics {
     /// batchers and the `_stream_batch` ingress lane, so the hot paths hold
     /// concrete collectors instead of resolving label values per record.
     pub(crate) fn bind_mux(&self) -> MuxMetricsHandle {
+        use crate::streaming::messenger_mux::protocol::RecordType;
+
+        let records_sent = std::array::from_fn(|index| {
+            let kind = RecordType::from_u8(index as u8)
+                .expect("0..RECORD_TYPE_COUNT are all valid RecordType discriminants");
+            self.streaming_mux_records_sent_total
+                .with_label_values(&[kind.as_str()])
+        });
+        let batcher_wakes = std::array::from_fn(|index| {
+            self.streaming_mux_batcher_wakes_total
+                .with_label_values(&[MUX_WAKE_SOURCES[index]])
+        });
+
         MuxMetricsHandle {
             live_slots: self.streaming_mux_live_slots.clone(),
             reader_stall_total: self.streaming_mux_reader_stall_total.clone(),
@@ -1790,8 +1838,8 @@ impl VeloMetrics {
             epoch_deaths_total: self.streaming_mux_epoch_deaths_total.clone(),
             batch_seq_gaps_total: self.streaming_mux_batch_seq_gaps_total.clone(),
             drain_visits_total: self.streaming_mux_drain_visits_total.clone(),
-            records_sent_total: self.streaming_mux_records_sent_total.clone(),
-            batcher_wakes_total: self.streaming_mux_batcher_wakes_total.clone(),
+            records_sent,
+            batcher_wakes,
         }
     }
 
@@ -2456,5 +2504,30 @@ mod tests {
 
         assert_eq!(HandlerOutcome::Success.as_str(), HANDLER_OUTCOMES[0]);
         assert_eq!(HandlerOutcome::Error.as_str(), HANDLER_OUTCOMES[1]);
+    }
+
+    /// Pins each enum's `as_str`/`index` mapping against the
+    /// [`RECORD_TYPE_LABELS`](crate::streaming::messenger_mux::protocol::RECORD_TYPE_LABELS)
+    /// / [`MUX_WAKE_SOURCES`] arrays [`VeloMetrics::bind_mux`] pre-binds from,
+    /// rather than a second hand-typed copy of the same strings, so a
+    /// reordered variant fails here instead of silently filing a count under
+    /// the wrong label. `BATCHING.md`'s mux rows still want a human's eyes
+    /// against these two arrays whenever either changes — nothing here reads
+    /// the doc.
+    #[test]
+    fn mux_enum_label_values_match_docs() {
+        use crate::streaming::messenger_mux::protocol::{RECORD_TYPE_LABELS, RecordType};
+
+        assert_eq!(RecordType::Data.as_str(), RECORD_TYPE_LABELS[0]);
+        assert_eq!(RecordType::OpenSlot.as_str(), RECORD_TYPE_LABELS[1]);
+        assert_eq!(RecordType::CloseSlot.as_str(), RECORD_TYPE_LABELS[2]);
+        assert_eq!(RecordType::CreditUpdate.as_str(), RECORD_TYPE_LABELS[3]);
+        assert_eq!(RecordType::SlotHeartbeat.as_str(), RECORD_TYPE_LABELS[4]);
+
+        assert_eq!(BatcherWake::Open.as_str(), MUX_WAKE_SOURCES[0]);
+        assert_eq!(BatcherWake::Control.as_str(), MUX_WAKE_SOURCES[1]);
+        assert_eq!(BatcherWake::Frame.as_str(), MUX_WAKE_SOURCES[2]);
+        assert_eq!(BatcherWake::InletClosed.as_str(), MUX_WAKE_SOURCES[3]);
+        assert_eq!(BatcherWake::Linger.as_str(), MUX_WAKE_SOURCES[4]);
     }
 }

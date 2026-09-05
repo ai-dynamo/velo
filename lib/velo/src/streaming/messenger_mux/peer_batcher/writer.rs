@@ -203,12 +203,14 @@ impl BatchWriter {
             return Ok(());
         }
         let records = usize::from(encoder.record_count());
+        let by_type = encoder.record_type_counts();
         let mut finished = encoder.finish();
         let payload = finished.split().freeze();
         self.buffer = finished;
 
         if let Some(metrics) = &self.metrics {
             metrics.batch(MuxDirection::Sent, records);
+            metrics.records_sent(by_type);
         }
         self.dispatch(payload).await.map_err(FlushFailed)
     }
@@ -231,11 +233,13 @@ impl BatchWriter {
             return None;
         }
         let records = usize::from(encoder.record_count());
+        let by_type = encoder.record_type_counts();
         let payload = encoder.finish().freeze();
 
         if let Some(metrics) = &self.metrics {
             metrics.rendezvous_singleton();
             metrics.batch(MuxDirection::Sent, records);
+            metrics.records_sent(by_type);
         }
         match self.messenger.am_send_streaming(STREAM_BATCH_HANDLER) {
             Ok(builder) => Some(builder.raw_payload(payload).worker(self.peer).send()),
