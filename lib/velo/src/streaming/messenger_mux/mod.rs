@@ -164,7 +164,7 @@ pub struct AutoFlush {
     /// Write whatever is staged at the end of every wake, having first taken
     /// everything already queued.
     ///
-    /// The historical default, and it cannot make anything worse: the batcher
+    /// The historical default, and on its own it cannot make anything worse: the batcher
     /// never waits for work that has not arrived, it only notices that more is
     /// *already* there and takes all of it. The name is the mechanism — a flush
     /// parks until the transport admits it, so "at the end of every wake" is in
@@ -214,8 +214,11 @@ impl AutoFlush {
 pub enum FlushPolicy {
     /// The batcher decides, on the conditions in [`AutoFlush`].
     ///
-    /// The default is `AutoFlush::default()`, which is byte-for-byte the
-    /// behaviour every mux had before this knob existed.
+    /// The default is `AutoFlush::default()`, which reproduces the *policy*
+    /// every mux had before this knob existed. Reproducing the pre-knob
+    /// *behaviour* also needs [`MuxConfig::reply_linger`] at `Duration::ZERO`
+    /// — the default is 1 ms, so a credit reply now waits up to that long for
+    /// company before this policy would have written it at once.
     Auto(AutoFlush),
     /// The application decides, through
     /// [`Velo::flush_batch`](crate::Velo::flush_batch).
@@ -354,19 +357,31 @@ pub struct MuxConfig {
     pub batcher_idle_ttl: Duration,
     /// When a batcher writes what it has staged.
     ///
-    /// Defaults to [`FlushPolicy::Auto`] on [`AutoFlush::default`], which is
-    /// the behaviour every mux had before this knob existed.
+    /// Defaults to [`FlushPolicy::Auto`] on [`AutoFlush::default`], which
+    /// reproduces the pre-knob flush *policy* — reproducing the pre-knob
+    /// *behaviour* also needs [`Self::reply_linger`] at `Duration::ZERO`; see
+    /// that field's doc for what the 1 ms default costs instead.
     pub flush_policy: FlushPolicy,
     /// How long a pending credit reply may wait for a batch to form around it.
     ///
     /// A `CreditUpdate` used to mark its batch urgent, so a batcher whose peer
     /// admits at once wrote one batch per wake — and a receiver's batcher wakes
-    /// once per reply the sweep hands it. Measured on the tier-3 rig with the
-    /// attach round trip gone (nothing else left in the receiver's egress to
-    /// wait behind), that was ten times the outbound batches of the same load
-    /// with it, most of them one to eight records, and the request path paid
-    /// for every one as a wake on this side and an inbound message on the
-    /// other.
+    /// once per reply the sweep hands it. Measured on the tier-3 rig, arms that
+    /// differ only in this window with zero-RTT attach on both (so nothing
+    /// else in the path is waiting behind a round trip), turning that
+    /// per-reply batch into one per sweep visit cut outbound batches by
+    /// 4.3x-5.9x across 3 reps. Records per batch moved too (roughly 20-22 to
+    /// roughly 96-105), but not by the same ratio, because the two arms did
+    /// not carry equal total `CreditUpdate` volume — see
+    /// `agent-docs/w7-reply-linger-measurement.md` for the numbers, why the
+    /// two ratios do not have to match, and why that document's request-level
+    /// numbers (throughput, TTFT, ITL) do not establish a benefit from this
+    /// window on their own. What the receiver's own instrumentation does
+    /// show, band-independent across the same reps: with the window on,
+    /// `velo_transport_write_duration_seconds_sum` ran 2.82-3.88 s against
+    /// 13.52-14.30 s with it off, and
+    /// `velo_transport_egress_queue_wait_seconds_sum` ran 3.53-6.56 s against
+    /// 25.82-27.44 s — disjoint in both series.
     ///
     /// What ends the wait early depends on the policy, because `on_admission`
     /// already has its own reason to write and this window does not override
@@ -399,6 +414,8 @@ pub struct MuxConfig {
     /// `Duration::ZERO` makes the window already due, so a reply goes out at
     /// the end of the wake that staged it — the same urgent flush the
     /// batcher had before this knob existed.
+    ///
+    /// Defaults to 1 ms.
     pub reply_linger: Duration,
 }
 

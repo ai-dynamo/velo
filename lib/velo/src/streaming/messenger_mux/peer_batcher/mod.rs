@@ -710,7 +710,10 @@ impl Batcher {
         self.publish_live_slots();
         // The staged batch goes with the epoch, so the gate must forget it too.
         // Otherwise the staged gauge — the one signal a forgotten flush shows up
-        // in — drifts up by a batch per epoch death and cries wolf.
+        // in — drifts up by a batch per epoch death and cries wolf. A staged
+        // credit reply discarded here is credit lost for good — see
+        // agent-docs/w7-reply-linger-credit-loss.md for which of this
+        // function's three call sites can reach it without a flush first.
         self.gate.discarded();
         self.writer
             .reset_epoch(self.epochs.fetch_add(1, Ordering::Relaxed));

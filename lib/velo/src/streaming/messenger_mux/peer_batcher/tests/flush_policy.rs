@@ -6,8 +6,9 @@
 //! Read against `egress.rs`, which pins the same batcher under the default
 //! policy: everything there is the regression that `Auto` did not change. What
 //! is asserted here is the difference — that `Manual` holds ordinary records
-//! and only ordinary records, that a kick moves them, and that neither policy
-//! can hold back the records something else is waiting on.
+//! until a kick moves them, that a close or a terminal moves the batch it was
+//! staged into regardless, and that a `CreditUpdate` moves within
+//! `MuxConfig::reply_linger` even when a data record is staged beside it.
 //!
 //! Every test drives the real batcher against a real messenger, so the
 //! assertions are the decoded wire bytes rather than an accounting mirror.
@@ -280,12 +281,12 @@ async fn a_credit_reply_moves_under_manual_behind_a_staged_record() {
     let batch = tokio::time::timeout(window * 4, harness.next_batch())
         .await
         .expect("a reply joining an already-staged batch keeps its own window under Manual");
-    assert!(
-        batch
-            .records
-            .iter()
-            .any(|r| r.kind == RecordType::CreditUpdate),
-        "the reply must still reach the wire, not sit staged forever"
+    let kinds: Vec<RecordType> = batch.records.iter().map(|r| r.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![RecordType::Data, RecordType::CreditUpdate],
+        "the data record staged first must ride out in the same write as the \
+         reply that carries it — not just the reply reaching the wire on its own"
     );
 }
 

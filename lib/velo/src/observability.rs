@@ -1421,11 +1421,15 @@ impl VeloMetrics {
                  `on_admission` set, where every wake that stages anything \
                  besides credit replies ends in a write and a batch holding \
                  only credit replies is held for up to `MuxConfig::reply_linger`. \
-                 Under `FlushPolicy::Manual`, or `Auto` with `on_admission` \
-                 unset, a pending credit reply holds the whole batch it is in \
-                 for that same bound — data included — so a plateau beyond it \
-                 is a producer that stopped calling `flush_batch`. Bounded by \
-                 the batch clamps, so it costs latency rather than memory.",
+                 Under `FlushPolicy::Manual`, or `Auto { on_admission: false, \
+                 max_linger: None }` — the two policies with no timer of \
+                 their own — a pending credit reply still holds the whole \
+                 batch it is in for that same bound, data included, so a \
+                 plateau beyond it is a producer that stopped calling \
+                 `flush_batch` (under `Auto { max_linger: Some(_) }` instead, \
+                 the same plateau means that window's own timer stalled). \
+                 Bounded by the batch clamps, so it costs latency rather than \
+                 memory.",
             )?,
         )?;
         let streaming_mux_control_refused_total = register_collector(
@@ -1502,14 +1506,15 @@ impl VeloMetrics {
                     "velo_streaming_mux_batcher_wakes_total",
                     "Wakes of the per-peer batcher tasks, by what woke them: a \
                      producer's open, coalesced control, a queued record, a \
-                     departed producer, or the linger timer. Under the default \
-                     flush policy every wake that stages anything other than \
-                     credit replies writes a batch; a wake that stages only \
-                     credit replies arms `MuxConfig::reply_linger` and writes \
-                     on a later `linger` wake instead. Wakes therefore \
-                     outnumber batches: a wake that stages only credit \
-                     replies defers its write, and a wake that stages nothing \
-                     writes nothing.",
+                     departed producer, or the linger timer. This attributes \
+                     what woke the task, not what it wrote: one wake can \
+                     still write more than one batch (a size clamp or an \
+                     oversized record flushes inline), and a batch held open \
+                     only by `MuxConfig::reply_linger` writes on the first \
+                     end-of-wake check after the window elapses — a `linger` \
+                     wake only when the batcher was otherwise idle at the \
+                     deadline, a `control` or `frame` wake when one arrives \
+                     first (measured 21-30% linger on the tier-3 frontend).",
                 ),
                 &["source"],
             )?,

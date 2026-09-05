@@ -410,6 +410,10 @@ impl SlotCreditAccount {
 
     /// Takes the pending grant for a `CreditUpdate` record, or `None` when
     /// there is nothing to advertise.
+    ///
+    /// This zeroes `ungranted` at mint time, before the record it becomes is
+    /// even staged — see `agent-docs/w7-reply-linger-credit-loss.md` for why
+    /// that makes the batch carrying it the credit's only remaining copy.
     pub(crate) fn take_pending_grant(&mut self) -> Option<u32> {
         let delta = self.ungranted;
         if delta == 0 {

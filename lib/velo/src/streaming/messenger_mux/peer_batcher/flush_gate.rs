@@ -5,10 +5,11 @@
 //!
 //! The batcher stages records; this decides whether the batch it has is written
 //! at the end of the current wake. It is a separate component for the same
-//! reason [`super::writer`] is: it knows nothing about slots, credit or epochs,
-//! only about what has been staged and what the policy says about that, so the
-//! policy cannot quietly acquire a second implementation in a branch somewhere
-//! on the data path.
+//! reason [`super::writer`] is: it knows nothing about slots or epochs, only
+//! about what has been staged, one record class it tracks by name — a pending
+//! `CreditUpdate` reply, because it alone gets its own bounded wait — and what
+//! the policy says about the rest, so the policy cannot quietly acquire a
+//! second implementation in a branch somewhere on the data path.
 //!
 //! ## The two things that are not policy
 //!
@@ -203,26 +204,17 @@ impl FlushGate {
     /// Whether the open batch is due, by policy or by a pending reply's
     /// window.
     ///
-    /// The linger arm compares *state* rather than reacting to a timer firing:
-    /// a wake from a slot record can easily arrive after the deadline passed
-    /// without the timer arm ever being selected, and a batch that is late is
-    /// late however the batcher happened to wake up.
+    /// The deadline arm compares *state* against [`Self::deadline`] rather
+    /// than reacting to a timer firing: a wake from a slot record can easily
+    /// arrive after the deadline passed without the timer arm ever being
+    /// selected, and a batch that is late goes out on whichever wake notices,
+    /// not only a `linger` one. Written as `deadline().is_some_and(..)`
+    /// rather than re-deriving the two clocks by hand, so the two functions
+    /// cannot drift out of agreement about which one binds.
     pub(super) fn should_flush(&self) -> bool {
-        if self.urgent {
-            return true;
-        }
-        if let Some(since) = self.replies_since
-            && since.elapsed() >= self.reply_linger
-        {
-            return true;
-        }
-        if self.policy.on_admission() && !self.replies_only() {
-            return true;
-        }
-        match (self.since, self.linger_window()) {
-            (Some(since), Some(window)) => since.elapsed() >= window,
-            _ => false,
-        }
+        self.urgent
+            || (self.policy.on_admission() && !self.replies_only())
+            || self.deadline().is_some_and(|due| due <= Instant::now())
     }
 
     /// When the open batch is due, for the batcher's select to park on.
@@ -247,11 +239,13 @@ impl FlushGate {
 
     /// Whether every record currently staged is a credit reply.
     ///
-    /// `false` on an empty batch: `on_admission` still has to write an empty
-    /// wake (module docs), and that decision must not depend on whether the
-    /// batch happens to have last held only replies. `replies_since` being
-    /// set is what makes an empty batch not count — it is `None` whenever
-    /// nothing is staged — so this needs no separate emptiness check.
+    /// `false` on an empty batch, and for free: `replies_since` is `None`
+    /// whenever nothing is staged, so an empty batch never reads as
+    /// replies-only without a separate emptiness check. Not that it would
+    /// matter if it did — an empty batch writes nothing either way
+    /// ([`writer::flush`](super::writer::BatchWriter::flush) no-ops on an
+    /// absent or empty encoder) — but a decision this close to the reply
+    /// window should not depend on an accident of what the batch last held.
     fn replies_only(&self) -> bool {
         self.replies_since.is_some() && !self.non_reply_staged
     }
@@ -268,20 +262,14 @@ impl FlushGate {
     /// signal, so a discarded batch that kept its count would read as an
     /// application that stopped flushing.
     ///
-    /// A pending credit reply discarded here is credit lost for good: the
-    /// ingress account already zeroed its ungranted delta the moment the
-    /// reply record was minted (`take_pending_grant`), and a later reconcile
-    /// at the same occupancy has nothing left to re-derive it from. That hole
-    /// predates this file and is out of scope here.
-    ///
-    /// A reply's window is what makes that reachable: a staged reply can sit
-    /// unwritten across wakes for up to `reply_linger`, so a discard in that
-    /// interval loses it. Every exit but one flushes first — the `stopping`
-    /// branch forces a write before it tears down, and `epoch_death` only
-    /// runs from a flush that already lost its batch. The exception is
-    /// `cancel.cancelled()`, which breaks the run loop straight to
-    /// [`Self::discarded`] when the transport goes away; the credit is moot
-    /// there, since nothing is left to send it to.
+    /// A pending credit reply discarded here is credit lost for good, and
+    /// `reply_linger` widens the window in which that can happen — this file
+    /// knows nothing about slots, credit or epochs, so the mechanism (which
+    /// call sites can reach here without a flush first, and why) lives in
+    /// `agent-docs/w7-reply-linger-credit-loss.md`, cross-referenced from
+    /// [`epoch_death`](super::Batcher::epoch_death) and from
+    /// `FlowControl::take_pending_grant`. Pinned today by
+    /// `super::tests::reply_linger::epoch_death_discards_a_staged_reply_and_the_credit_is_lost`.
     pub(super) fn discarded(&mut self) {
         self.forget_staged();
     }

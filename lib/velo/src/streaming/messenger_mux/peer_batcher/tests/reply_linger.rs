@@ -114,3 +114,60 @@ async fn a_zero_window_writes_a_reply_at_once() {
         .expect("with the window off a reply is urgent, as before");
     assert_eq!(batch.records[0].kind, RecordType::CreditUpdate);
 }
+
+/// Characterizes a known gap, not desired behaviour: a reply staged inside the
+/// window this test exercises can be discarded before it ever reaches the
+/// wire, and the credit it carried does not come back.
+///
+/// `on_control` applies `drained.peers` (which can stage a `CreditUpdate`
+/// through `FlushGate::stage_reply`) before `drained.mine` (whose
+/// failed-singleton arm calls `epoch_death`), and `epoch_death` discards
+/// whatever is staged with no flush in between — see `FlushGate::discarded`'s
+/// doc comment for the full enumeration of why this is the one reachable
+/// hole. `reply_linger` is what makes the hole span more than one drain: the
+/// reply can sit staged, unwritten, for up to the window configured here.
+///
+/// The credit is not recoverable elsewhere either: `take_pending_grant`
+/// already zeroed the ingress account's `ungranted` delta the moment this
+/// reply was minted, and nothing later re-derives it at the same occupancy.
+/// Fixing that is a larger, separate change (re-post the pending grant on
+/// discard, or don't zero `ungranted` until the batch is admitted) — this
+/// test only pins what happens today, so a change to it is deliberate rather
+/// than a silent regression.
+#[tokio::test(flavor = "multi_thread")]
+async fn epoch_death_discards_a_staged_reply_and_the_credit_is_lost() {
+    // Long enough that nothing here can flush the reply on its own clock
+    // before `singleton_resolved` reaches it.
+    let harness = harness(with_reply_linger(Duration::from_secs(5))).await;
+    let (_inlet, slot) = harness.open(1, 1).await;
+
+    harness
+        .handle
+        .reply(&[ReplyRecord::CreditUpdate { slot, delta: 7 }]);
+    harness.await_staged(1).await;
+
+    harness.handle.control.singleton_resolved(slot, false);
+    harness.await_staged(0).await;
+
+    assert_eq!(
+        harness
+            .snapshot()
+            .counter("velo_streaming_mux_epoch_deaths_total", &[]),
+        1.0,
+        "the failed singleton must have failed the epoch, which is what \
+         discards the batch the reply was staged into"
+    );
+
+    let mut sent_a_credit_update = false;
+    while let Some(batch) = harness.try_next_batch() {
+        sent_a_credit_update |= batch
+            .records
+            .iter()
+            .any(|r| r.kind == RecordType::CreditUpdate);
+    }
+    assert!(
+        !sent_a_credit_update,
+        "the staged reply must never have reached the wire — this is the \
+         loss the doc comment describes, not proof it was avoided"
+    );
+}
