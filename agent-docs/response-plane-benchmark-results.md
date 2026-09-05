@@ -143,3 +143,38 @@ Matrix `t3-iso1` (job 2729436; three reps per arm; 512 workers, concurrency 8192
 Three-rep means: velo0 3,157 req/s (spread 247), TTFT p50 85, p99 791, CPU 3.93, E2E p99 11.9 s; velo3 3,303 (389), 69, 851, 3.15, 11.8; velo4a 3,408 (227), 91, 820, 2.53, 10.6, 16 errors; velo34 3,313 (114), 59, 835, 3.01, 15.8, 281 errors; mux18p 3,305 (152), 48, 764, 2.84, 11.9.
 
 Reading. W3 (zero-RTT setup) is worth about 16 ms at p50 with zero errors. W4a on its own is within noise; with W3 it reaches 59 ms mean and 46 ms in its best rep, but those reps carry a defect: every error is a stream whose `OpenSlot` admission answer was refused at the control inbox's cap, which left the slot fenced until the frontend's heartbeat watchdog gave up 15 s later (`ttft-gap-diagnosis.md`, afternoon addendum, section 1; fixed on PR #79; velo4a and velo34 rerun). The E2E and ITL p99 columns measure one mocker process's backlog in every arm, tcp and mux18p included (section 2 of the same addendum), and are no longer a criterion. The results page carries this table beside the pinned baseline.
+
+## Addendum 2026-09-05 (night): every frontend CPU number above is corrected, and matrix `t3-iso2`
+
+**The correction.** `summarize.py` computed frontend CPU per request inside aiperf's own measurement window, read from aiperf's `start_time` and `end_time`. Those strings carry no offset and are the machine's local clock (aiperf 0.10.0); the script read them as UTC. The window therefore landed seven hours past the capture, no sample fell inside it, and the script fell through to its second strategy, "the last `benchmark_duration` seconds of the capture", which on this rig is mostly the idle tail after aiperf has finished. Every frontend CPU per request number in this document, the plan, the results page and the diagnosis before this addendum came from that tail and understates the true figure about three-fold. The script now reads aiperf's naive timestamps in the capture's own offset (unit tests `dbg/test_summarize_cpu_window.py`), and the numbers below are recomputed from the same samples inside the real window. Throughput, first-token, ITL and end-to-end numbers were never affected; they come from aiperf.
+
+Corrected frontend CPU per request, milliseconds, per rep and three-rep mean:
+
+| matrix | arm | rep 1 | rep 2 | rep 3 | mean | recorded before |
+|---|---|---|---|---|---|---|
+| t3-base-pin | tcp | 11.12 | 10.30 | 10.01 | 10.48 | 4.18 |
+| t3-base-pin | velo0 | 7.93 | 8.11 | 8.22 | 8.09 | 3.75 |
+| t3-base-pin | mux18p | 7.69 | 7.63 | 7.52 | 7.61 | 2.76 |
+| t3-iso1 | velo0 | 8.45 | 8.00 | 8.01 | 8.15 | 3.93 |
+| t3-iso1 | velo3 | 8.70 | 8.64 | 8.87 | 8.74 | 3.15 |
+| t3-iso1 | velo4a | 7.46 | 7.74 | 7.78 | 7.66 | 2.53 |
+| t3-iso1 | velo34 | 8.73 | 8.54 | 8.09 | 8.45 | 3.01 |
+| t3-iso1 | mux18p | 7.79 | 7.24 | 7.25 | 7.43 | 2.84 |
+
+What changes in the reading: the frontend spends 25 to 30 cores on every plane at this load, not 10; mux18p's advantage over velo0 is 0.5 ms per request (6 percent), not 1.0 (26 percent); tcp costs 2.9 ms more than velo0, not 0.4; zero-RTT setup costs 0.6 ms per request over velo0 on the frontend (velo3 8.74 against 8.15), which is the request-path cost section 3 of the diagnosis addendum measures in time, and the detached ack alone saves 0.5 (velo4a 7.66). The CPU term of the success bar is restated in the plan as "at or below mux18p's on the same matrix". Earlier matrices (`t3-m18p1`, `t3-ucx1`, `t3-pin1`, `t3-pin2`, `t3-rt32`) are not recomputed; their CPU columns are wrong in the same way and their other columns stand.
+
+**Matrix `t3-iso2`** (job 2730444; nodes ptyche0092 and ptyche0093; velo `f58de76`, the integration branch with the control-cap fix and PR #80's counters; three reps of velo3, velo4a, velo34; pinned 72/72; 250,000 requests per rep).
+
+| arm | rep | req/s | TTFT p50 ms | TTFT p95 ms | TTFT p99 ms | ITL p50 ms | ITL p99 ms | frontend CPU ms/req | E2E p50 s | E2E p90 s | E2E p99 s | errors |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| velo3 | 1 | 2,918 | 87 | 142 | 831 | 10.2 | 33.3 | 9.93 | 2.79 | 4.55 | 8.83 | 0 |
+| velo3 | 2 | 2,824 | 60 | 119 | 161 | 1.4 | 46.3 | not captured | 0.42 | 10.26 | 12.18 | 0 |
+| velo3 | 3 | 2,852 | 61 | 136 | 855 | 1.4 | 41.4 | 9.80 | 0.41 | 10.23 | 10.88 | 0 |
+| velo4a | 1 | 3,029 | 111 | 209 | 841 | 1.5 | 29.8 | 8.46 | 0.49 | 6.54 | 7.91 | 0 |
+| velo4a | 2 | 2,816 | 69 | 176 | 816 | 1.5 | 50.9 | 8.30 | 0.45 | 10.70 | 13.42 | 0 |
+| velo4a | 3 | 2,271 | 56 | 252 | 820 | 1.7 | 105.1 | 8.90 | 0.49 | 19.61 | 27.62 | 0 |
+| velo34 | 1 | 2,367 | 55 | 225 | 837 | 1.7 | 101.4 | 10.29 | 0.49 | 17.89 | 26.64 | 0 |
+| velo34 | 2 | 2,763 | 61 | 140 | 836 | 1.4 | 46.8 | 9.91 | 0.41 | 10.58 | 12.36 | 0 |
+| velo34 | 3 | 2,784 | 62 | 150 | 909 | 1.4 | 54.6 | 9.56 | 0.41 | 10.94 | 14.38 | 0 |
+
+What it settles: zero errors in nine reps, zero heartbeat watchdog firings, and on three reps a worker refused control entries at the cap (24,865 on velo34 rep 1) with no slot left fenced and nothing withheld at the end, which is the control-cap fix doing exactly what its tests say. What it does not settle: these nodes ran every arm slower and hotter than `t3-iso1`'s (throughput 2,600 to 2,900 against 3,300; CPU 8.5 to 10 against 7.7 to 8.7), the mocker backlog fell across four to six processes in several reps (velo3 rep 1 has ITL p50 10 ms and E2E p50 2.8 s, which is the mocker, not the plane), and velo3 rep 2 is aiperf's second pass after its first hit a dataset decode error inside aiperf itself, so its capture missed the measured window. The per-request join on the clean reps (`out-iso2`) puts velo3 and velo34 at A 5 to 6 ms, B 5 to 6 ms, C 50 ms, against velo4a at A 1.8, B 1.5, C 64: the request-path cost of zero-RTT is half what `t3-iso1` measured on its nodes and the response leg is the same, which says the request-path cost is contention, not a fixed price. The first-token comparison against the bar waits for `t3-iso3` with the reply linger (PR #81) and a same-matrix mux18p.
