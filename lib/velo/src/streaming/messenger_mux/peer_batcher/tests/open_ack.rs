@@ -5,7 +5,7 @@
 //! the fence-aware close lane that comes with it.
 //!
 //! Under [`MuxConfig::async_open_ack`] the open's batch is handed to the
-//! transport and the caller is answered immediately. Three things have to
+//! transport and the caller is answered immediately. Several things have to
 //! survive that, and they are what is pinned here:
 //!
 //! - the slot's first record must not overtake the `OpenSlot` that claims its
@@ -15,18 +15,31 @@
 //!   it the stream can never make progress;
 //! - a `CloseSlot` owed while the fence is up waits for it, and the slow-consumer
 //!   kill that writes one still disconnects its producer on the spot. Deferring
-//!   the *record* must not defer the *kill*.
-//!
-//! The last of those is not a property of the new gate. `send_singleton` fences
-//! any over-budget non-terminal record, so the shipped default reaches the same
-//! deferral through a different door — which is why the arms at the bottom of
-//! this file run [`MuxConfig::default`].
+//!   the *record* must not defer the *kill* — this one is not a property of the
+//!   new gate: `send_singleton` fences any over-budget non-terminal record, so
+//!   the shipped default reaches the same deferral through a different door,
+//!   which is why the arms at the bottom of this file run
+//!   [`MuxConfig::default`];
+//! - the admission's answer reaches the batcher however full the control map
+//!   is. It is the only thing that lifts the fence, so it cannot be one of the
+//!   entries the map's cap refuses;
+//! - and the other direction of the same property: an admission that needed no
+//!   fence must not be given one anyway. `fire_singleton` only raises the fence
+//!   when [`AdmissionState::Admitted`] is not already the answer, so on an
+//!   uncongested peer the slot's first record is never withheld waiting for a
+//!   round trip nothing ordered it against — the round trip itself (the
+//!   spawned watcher, the control-inbox insert, the eventual `unfence`) still
+//!   happens, off the critical path, exactly as it does when the fence is
+//!   raised.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use super::super::control::MAX_PENDING_CONTROL;
+use super::super::test_hooks::TestHooks;
 use super::super::*;
 use super::support::*;
-use crate::streaming::messenger_mux::protocol::RecordType;
+use crate::streaming::messenger_mux::protocol::{RecordType, SlotId};
 
 /// Credit generous enough that nothing here parks for want of it: the fence is
 /// the only thing that may hold a record back.
@@ -39,14 +52,57 @@ fn async_open_ack() -> MuxConfig {
     }
 }
 
+/// An admitted `OpenSlot` leaves nothing for the fence to wait for.
+///
+/// `_stream_batch` is a system handler, so `can_send_directly` takes the direct
+/// send the moment the peer is registered — the harness's real messenger pair
+/// registers each other before this test ever opens a slot. With the gate's one
+/// place free, `AdmissionGate::send` returns `SendOutcome::Admitted`
+/// synchronously, and `FireResult::admission_state()` reads that answer without
+/// awaiting anything. On that path a fence buys no ordering: every record this
+/// batcher dispatches after `open_detached`'s call to `fire_singleton` enters
+/// the same FIFO admission gate behind the frame that was just admitted, since
+/// the batcher dispatches one record at a time on its own task.
+///
+/// The spawned watcher, its control-inbox insert, the `Notify` wake and the
+/// eventual `unfence` are unconditional — they run either way, off the
+/// critical path. What fencing anyway used to cost is the *wait*: the slot's
+/// first record could not be staged until that whole round trip had been
+/// drained, which on exactly the uncongested peer `MuxConfig::async_open_ack`
+/// exists to speed up bought no order at all.
+///
+/// The fence decision itself is made synchronously, before `fire_singleton`
+/// ever yields, so `TestHooks::fenced_count` pins it without racing the
+/// spawned admission watcher the way asserting on the withheld gauge would:
+/// that watcher can resolve before or after a test gets to look, but nothing
+/// races the fence itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_admitted_open_slot_is_never_fenced() {
+    let hooks = Arc::new(TestHooks::default());
+    let harness = harness_with_hooks(async_open_ack(), Some(Arc::clone(&hooks))).await;
+
+    let (_inlet, _slot) = harness.open_credited(1, 1, CREDIT).await;
+
+    assert_eq!(
+        hooks.fenced_count(),
+        0,
+        "an OpenSlot admitted synchronously has already reached the transport's \
+         send channel; fencing it would only make the record wait for a round \
+         trip that orders nothing"
+    );
+}
+
 /// A slot's first record waits for the `OpenSlot`'s admission, not for the wire.
 ///
 /// The receiver binds a slot on the `OpenSlot` that names it, so a `Data` record
 /// arriving first has nowhere to land. Per-target FIFO is not enough to prevent
-/// that: a send to a peer the messenger has not resolved yet is issued from a
-/// detached task, which keeps no order against the send that follows it — and an
-/// unresolved peer is exactly where a first `OpenSlot` goes. So the slot is
-/// fenced, and the record waits in the withheld queue rather than in a batch.
+/// that when the admission does not resolve synchronously: a send to a peer the
+/// messenger has not resolved yet is issued from a detached task, which keeps no
+/// order against the send that follows it. So the slot is fenced whenever
+/// `fire_singleton` does not read `AdmissionState::Admitted` back, and the
+/// record waits in the withheld queue rather than in a batch. This arm forces
+/// that by stalling the wire (see [`stalled_harness`]) so the first open's
+/// `OpenSlot` is left `Pending`, not `Admitted`, when the second one is fired.
 #[tokio::test(flavor = "multi_thread")]
 async fn fence_holds_first_data_until_the_open_slot_admission_resolves() {
     let harness = stalled_harness(async_open_ack()).await;
@@ -109,6 +165,12 @@ async fn fence_holds_first_data_until_the_open_slot_admission_resolves() {
 /// control naming the slot it was sent under — and mean the same thing there. A
 /// batch that never reached the wire leaves a `frame_seq` gap the mux cannot
 /// close, whichever path dispatched it.
+///
+/// This drives `on_owned_control`'s reaction to that control directly — the
+/// same reaction the rendezvous path already exercised. It does not reach the
+/// `tokio::spawn` watcher `open_detached` adds; the test below,
+/// `a_real_admission_failure_reaches_the_detached_watcher`, is what drives a
+/// genuine failure through that.
 #[tokio::test(flavor = "multi_thread")]
 async fn failed_open_slot_admission_is_still_epoch_death() {
     let harness = harness(async_open_ack()).await;
@@ -125,6 +187,102 @@ async fn failed_open_slot_admission_is_still_epoch_death() {
     })
     .await;
     eventually(|| inlet.is_disconnected()).await;
+}
+
+/// A real failed admission, arriving through the detached watcher itself.
+///
+/// `open_detached` answers the caller before `fire.await` resolves, and
+/// watches it from `tokio::spawn(async move { control.singleton_resolved(id,
+/// fire.await.is_ok()) })`. Nothing before this test drove that spawn to a
+/// genuine `Err`; the arm above injects the answer the watcher would have
+/// produced instead of producing it. Here the gate's one place is taken by a
+/// filler, the target's `OpenSlot` parks behind it, and dropping the receiver
+/// behind the gate fails the parked ticket for real — `AdmissionGate`'s driver
+/// task resolves it `Err(AdmissionError::ChannelClosed)`, which is exactly what
+/// a peer going away mid-send looks like from here.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_real_admission_failure_reaches_the_detached_watcher() {
+    let mut harness = stalled_harness(async_open_ack()).await;
+    let (_filler_inlet, inlet) = open_behind_a_full_gate(&harness).await;
+
+    harness.disconnect_wire();
+
+    eventually(|| {
+        harness
+            .snapshot()
+            .counter("velo_streaming_mux_epoch_deaths_total", &[])
+            > 0.0
+    })
+    .await;
+    eventually(|| inlet.is_disconnected()).await;
+}
+
+/// The fence lifts even when the admission answers into a full control map.
+///
+/// A peer holding more live slots than [`MAX_PENDING_CONTROL`] — a router in
+/// front of a worker that is carrying thousands of streams — fills the
+/// owned-control map with legitimate grants between two drains. The `OpenSlot`
+/// resolution that lands then is not one more grant: it is the only thing that
+/// lifts this slot's fence, and refusing it leaves every record the slot ever
+/// queues withheld until the consumer's heartbeat watchdog gives up. Measured
+/// as HTTP 500s on the tier-3 rig's `velo4a` and `velo34` arms.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_fence_lifts_when_the_admission_answers_into_a_full_control_map() {
+    let hooks = Arc::new(TestHooks::default());
+    let harness = stalled_harness_with_hooks(async_open_ack(), Some(Arc::clone(&hooks))).await;
+    let (_filler_inlet, inlet) = open_behind_a_full_gate(&harness).await;
+    inlet.send(item(0)).expect("queue record");
+    harness.await_withheld(1).await;
+
+    // Park the batcher mid-wake, so what lands in its inbox from here on stays
+    // there until it is released.
+    hooks.pause();
+    harness.handle.kick_flush();
+    hooks.wait_until_parked().await;
+
+    // What a peer with that many streams sends between two drains: one grant
+    // per slot, none of them this one.
+    for index in 0..MAX_PENDING_CONTROL {
+        let bogus = SlotId::new(1_000 + index as u32, 0).expect("index fits u24");
+        harness.handle.grant(bogus, 1);
+    }
+    let filled = harness.handle.control.pending_len();
+    assert!(filled >= MAX_PENDING_CONTROL, "the map is at its cap");
+    // A delta from here, not an assertion that this is zero: the filler's own
+    // `OpenSlot` resolves too (its admission was synchronous, so `fire_singleton`
+    // never fenced it, but the watcher it still spawns calls
+    // `singleton_resolved` regardless), and that resolution can land before or
+    // after this line runs. It costs nothing either way — resolutions live in
+    // their own map now (see `MAX_PENDING_CONTROL`'s doc) and can never be
+    // refused — but a delta is what makes the property under test (the fenced
+    // slot's own resolution is never refused) independent of that timing.
+    let refused_before = harness.handle.control.refused();
+
+    // Free the gate. The parked `OpenSlot` is admitted, and its resolution
+    // arrives while the map is full.
+    let first = harness.next_wire_batch().await;
+    assert_eq!(first.records[0].kind, RecordType::OpenSlot);
+    let opened = harness.next_wire_batch().await;
+    assert_eq!(opened.records[0].kind, RecordType::OpenSlot);
+    eventually(|| {
+        harness.handle.control.pending_len() > filled || harness.handle.control.refused() > 0
+    })
+    .await;
+
+    hooks.release();
+
+    let data = harness.next_wire_batch().await;
+    assert_eq!(data.records[0].kind, RecordType::Data);
+    assert_eq!(data.records[0].slot, opened.records[0].slot);
+    assert_eq!(
+        data.records[0].frame_seq, 1,
+        "the record follows the `OpenSlot` whose admission it waited for"
+    );
+    assert_eq!(
+        harness.handle.control.refused(),
+        refused_before,
+        "the resolution was owed to the fence, not refused at the cap"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -219,7 +377,7 @@ async fn assert_the_close_follows_its_open(harness: &StalledHarness) {
 /// The close is the slot's second record, and it may no more overtake the
 /// `OpenSlot` that claims the buffer it names than the first data record may.
 /// A `CloseSlot` the receiver meets first names a slot it has never bound, so it
-/// is dropped as `unknown_slot` — and the `OpenSlot` landing behind it then
+/// is dropped as `closed_slot` — and the `OpenSlot` landing behind it then
 /// binds a stream nothing will ever close, which the consumer pays for by
 /// waiting out its heartbeat watchdog. The fence is what holds it, and an empty
 /// withheld queue is exactly the case the queue itself cannot cover.

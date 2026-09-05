@@ -387,6 +387,13 @@ pub(super) struct StalledHarness {
 }
 
 pub(super) async fn stalled_harness(config: MuxConfig) -> StalledHarness {
+    stalled_harness_with_hooks(config, None).await
+}
+
+pub(super) async fn stalled_harness_with_hooks(
+    config: MuxConfig,
+    hooks: Option<Arc<super::super::test_hooks::TestHooks>>,
+) -> StalledHarness {
     let (transport, wire) = StallingTransport::new(tokio::runtime::Handle::current());
     let sender = Messenger::builder()
         .add_transport(transport)
@@ -412,7 +419,7 @@ pub(super) async fn stalled_harness(config: MuxConfig) -> StalledHarness {
             epochs: Arc::new(AtomicU64::new(1)),
             batchers: Arc::new(DashMap::new()),
             cancel: cancel.clone(),
-            hooks: None,
+            hooks,
         },
     );
 
@@ -466,6 +473,20 @@ impl StalledHarness {
             .expect("timed out waiting for an admitted frame")
             .expect("wire closed");
         OwnedBatch::decode(&payload)
+    }
+
+    /// Drop the receiver behind the gate, so a frame parked in it fails to
+    /// admit instead of merely waiting.
+    ///
+    /// `StallingTransport`'s gate is a bounded(1) `flume` channel over `wire`;
+    /// dropping this end disconnects it, and the gate's driver task resolves
+    /// every queued ticket `Err(AdmissionError::ChannelClosed)` rather than
+    /// leaving it parked. That is the one way this fixture can produce a real
+    /// failed admission rather than an admission a test injects by calling
+    /// `singleton_resolved` directly.
+    pub(super) fn disconnect_wire(&mut self) {
+        let (_tx, unused) = flume::bounded(0);
+        drop(std::mem::replace(&mut self.wire, unused));
     }
 
     pub(super) fn snapshot(&self) -> crate::observability::test_helpers::MetricSnapshot {
