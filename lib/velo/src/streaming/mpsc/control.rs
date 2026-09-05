@@ -16,11 +16,13 @@
 //! senders unchanged (they register in the same [`SenderRegistry`]).
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
+use crate::observability::{HandlerOutcome, StreamingOp};
 use crate::streaming::anchor::AnchorManager;
 use crate::streaming::control::{DETECTION_MULTIPLIER, StreamCancelHandle};
 use crate::streaming::handle::StreamAnchorHandle;
@@ -195,12 +197,19 @@ pub fn create_mpsc_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::
         move |ctx: crate::messenger::TypedContext<MpscAnchorAttachRequest>| {
             let manager = manager.clone();
             async move {
+                let started = Instant::now();
                 let req = ctx.input;
 
                 // Defence-in-depth: reject SPSC handles at the MPSC attach
                 // endpoint. Mirrors the symmetric check in
                 // `create_anchor_attach_handler`.
                 if req.handle.is_spsc_stream() {
+                    manager.record_streaming_operation(
+                        StreamingOp::Attach,
+                        HandlerOutcome::Error,
+                        "unknown",
+                        started,
+                    );
                     return Ok(MpscAnchorAttachResponse::Err {
                         reason: format!("anchor {} is spsc; use _anchor_attach", req.handle),
                     });
@@ -213,6 +222,12 @@ pub fn create_mpsc_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::
                     let entry = manager.mpsc_registry.get(&local_id);
                     match entry {
                         None => {
+                            manager.record_streaming_operation(
+                                StreamingOp::Attach,
+                                HandlerOutcome::Error,
+                                "unknown",
+                                started,
+                            );
                             return Ok(MpscAnchorAttachResponse::Err {
                                 reason: format!("mpsc anchor {} not found", req.handle),
                             });
@@ -221,6 +236,12 @@ pub fn create_mpsc_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::
                             if let Some(limit) = e.max_senders
                                 && e.senders.len() >= limit
                             {
+                                manager.record_streaming_operation(
+                                    StreamingOp::Attach,
+                                    HandlerOutcome::Error,
+                                    "unknown",
+                                    started,
+                                );
                                 return Ok(MpscAnchorAttachResponse::Err {
                                     reason: format!(
                                         "mpsc anchor {} reached max_senders limit {}",
@@ -252,6 +273,12 @@ pub fn create_mpsc_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::
                     match selection.transport.bind(local_id, routing_session_id).await {
                         Ok(rx) => rx,
                         Err(e) => {
+                            manager.record_streaming_operation(
+                                StreamingOp::Attach,
+                                HandlerOutcome::Error,
+                                "unknown",
+                                started,
+                            );
                             return Ok(MpscAnchorAttachResponse::Err {
                                 reason: format!("transport error: {}", e),
                             });
@@ -264,6 +291,12 @@ pub fn create_mpsc_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::
                 let (frame_tx, pump_cancel, sender_id) = match manager.mpsc_registry.entry(local_id)
                 {
                     Entry::Vacant(_) => {
+                        manager.record_streaming_operation(
+                            StreamingOp::Attach,
+                            HandlerOutcome::Error,
+                            "unknown",
+                            started,
+                        );
                         return Ok(MpscAnchorAttachResponse::Err {
                             reason: format!("mpsc anchor {} removed during bind", req.handle),
                         });
@@ -273,6 +306,12 @@ pub fn create_mpsc_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::
                         if let Some(limit) = entry.max_senders
                             && entry.senders.len() >= limit
                         {
+                            manager.record_streaming_operation(
+                                StreamingOp::Attach,
+                                HandlerOutcome::Error,
+                                "unknown",
+                                started,
+                            );
                             return Ok(MpscAnchorAttachResponse::Err {
                                 reason: format!(
                                     "mpsc anchor {} reached max_senders limit {}",
@@ -316,6 +355,13 @@ pub fn create_mpsc_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::
                         drain,
                     },
                 ));
+
+                manager.record_streaming_operation(
+                    StreamingOp::Attach,
+                    HandlerOutcome::Success,
+                    streaming_transport_key.as_str(),
+                    started,
+                );
 
                 Ok(MpscAnchorAttachResponse::Ok {
                     streaming_transport_key,

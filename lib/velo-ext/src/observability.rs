@@ -15,6 +15,8 @@
 
 use std::time::Duration;
 
+use crate::transport::MessageType;
+
 /// Direction of a transport frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {
@@ -102,6 +104,14 @@ pub trait TransportObservability: Send + Sync {
     /// `message_type` is one of the well-known
     /// [`MessageType`](crate::transport::MessageType) label strings:
     /// `"message"`, `"response"`, `"ack"`, `"event"`, or `"shutting_down"`.
+    ///
+    /// For `direction: Inbound, message_type: "message"`, the runtime derives
+    /// its inbound-queue-depth reading as this counter minus the dequeue
+    /// counter, so every call site that admits an inbound `Message` frame
+    /// **must** call this — a transport that admits without recording drives
+    /// the derived depth negative. Call this on the `Admitted` arm only, once
+    /// [`TransportAdapter::admit_message`](crate::transport::TransportAdapter::admit_message)
+    /// has returned.
     fn record_frame(&self, direction: Direction, message_type: &str, bytes: usize);
 
     /// Record a rejected or dropped frame.
@@ -134,13 +144,21 @@ pub trait TransportObservability: Send + Sync {
     ///
     /// Called once per message type per write, after the write returns — a
     /// writer that coalesces several frames into one write reports them
-    /// together, so this counts frames and not writes. `message_type` takes
-    /// the same well-known label strings as [`record_frame`](Self::record_frame).
+    /// together, so this counts frames and not writes.
+    ///
+    /// This takes [`MessageType`] directly rather than the label string
+    /// [`record_frame`](Self::record_frame) takes: `record_frame` is a
+    /// required method, so changing its signature would break every
+    /// out-of-tree implementation, but this method is new and carries a
+    /// default, so nothing outside this crate can yet depend on a particular
+    /// parameter type. Taking the enum turns an unknown-label case a
+    /// `&str` parameter would force implementations to handle into something
+    /// unrepresentable.
     ///
     /// Paired with [`record_frame`](Self::record_frame)'s outbound count, this
     /// is what makes the egress queue's depth derivable without sampling a
     /// channel length.
-    fn record_frames_written(&self, _message_type: &str, _count: u64) {}
+    fn record_frames_written(&self, _message_type: MessageType, _count: u64) {}
 
     /// Record the wall time of one write, which may carry several coalesced
     /// frames.

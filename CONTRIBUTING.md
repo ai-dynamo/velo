@@ -84,7 +84,7 @@ pre-commit run --all-files
 
 ## velo-ext API stability
 
-`velo-ext` is the published trait surface that out-of-tree implementors of `Transport`, `FrameTransport`, `PeerDiscovery`, and `ServiceDiscovery` compile against. Every change to it propagates to every downstream impl, so the bar is higher than for the runtime crate.
+`velo-ext` is the published trait surface that out-of-tree implementors of `Transport`, `FrameTransport`, `PeerDiscovery`, `ServiceDiscovery`, and `TransportObservability` compile against. Every change to it propagates to every downstream impl, so the bar is higher than for the runtime crate.
 
 When changing `lib/velo-ext/`:
 
@@ -94,7 +94,7 @@ When changing `lib/velo-ext/`:
 4. **`velo`'s dep on `velo-ext` is an exact `=` pin in `[workspace.dependencies]`.** Bumping `velo-ext` without bumping the pin will break the workspace lockfile.
 5. **The CI `semver:` job is the enforcement gate** — it runs `cargo semver-checks` per changed crate against `origin/main` and fails the build if a breaking change is not paired with a sufficient version bump. Use the `semver:skip` PR label only with explicit reviewer agreement.
 
-Any other workspace crate (`velo-messenger`, `velo-transports`, `velo-streaming`, etc.) is marked `publish = false` and is internal to this repository. External consumers can only depend on `velo` and `velo-ext`, so internal API changes do not require version coordination.
+Any other workspace crate is marked `publish = false` and is internal to this repository — `crates/ucx-rs` is the one documented exception, versioned independently as a leaf FFI crate (see `CLAUDE.md`, *Workspace layout*). External consumers can only depend on `velo` and `velo-ext`, so internal API changes do not require version coordination.
 
 ## DCO & Licensing
 
