@@ -165,14 +165,16 @@ impl ControlState {
     /// `resolutions` merges into `mine` here rather than living there all
     /// along, so a slot with both a grant and a resolution pending still
     /// reaches `on_owned_control` as the one `OwnedControl` it has always
-    /// been — coalescing a failed admission over a successful one exactly as
-    /// [`ControlInbox::singleton_resolved`] does, since this is the same rule
-    /// applied at the boundary instead of at write time.
+    /// been. No coalescing happens at this boundary: `mine`'s own writers
+    /// (`entry_mine`, reached from `grant` and `peer_closed`) never touch
+    /// `singleton`, so an entry taken from `mine` here is always fresh, and
+    /// the failed-admission-wins rule lives entirely in
+    /// [`ControlInbox::singleton_resolved`], the one place that writes
+    /// `resolutions`.
     fn drain(&mut self) -> DrainedControl {
         let mut mine = std::mem::take(&mut self.mine);
         for (raw, admitted) in std::mem::take(&mut self.resolutions) {
-            let entry = mine.entry(raw).or_default();
-            entry.singleton = Some(entry.singleton.unwrap_or(true) && admitted);
+            mine.entry(raw).or_default().singleton = Some(admitted);
         }
         DrainedControl {
             retire: std::mem::take(&mut self.retire),

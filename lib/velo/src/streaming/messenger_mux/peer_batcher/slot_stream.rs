@@ -254,10 +254,17 @@ pub(super) struct EgressSlot {
     pub(super) close_owed: bool,
     gate: Arc<SlotGate>,
     /// A singleton sent outside the batch is outstanding for this slot — a
-    /// rendezvous transfer, or the `OpenSlot` under
-    /// `MuxConfig::async_open_ack`. `BATCHING.md` § "Slots": at most one per
-    /// slot, and the slot's later records wait for its admission so
-    /// `frame_seq` order survives the unordered resolve.
+    /// rendezvous transfer, or the `OpenSlot` under `MuxConfig::async_open_ack`
+    /// whose admission did not resolve synchronously. `BATCHING.md` §
+    /// "Slots": at most one *fenced* singleton per slot, and the slot's later
+    /// records wait for its admission so `frame_seq` order survives the
+    /// unordered resolve. Only an `OpenSlot` the transport admitted
+    /// synchronously ever skips this — per-target FIFO already orders anything
+    /// dispatched after it, so there is nothing left for a fence to buy. A
+    /// rendezvous record always sets this: its bytes are resolved by the
+    /// receiver's ordered dispatcher in a detached task before dispatch, so
+    /// the sender's admission order says nothing about the order the receiver
+    /// applies it in.
     fenced: bool,
     /// Whether the slot is currently withholding for want of credit, so the
     /// starvation meter ticks once per episode rather than once per record.

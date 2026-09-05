@@ -21,6 +21,8 @@ use std::sync::Arc;
 
 use super::super::writer::BatchWriter;
 use super::support::{OwnedBatch, RECV_TIMEOUT, capture_pair};
+use crate::observability::VeloMetrics;
+use crate::observability::test_helpers::MetricSnapshot;
 use crate::streaming::messenger_mux::MuxConfig;
 use crate::streaming::messenger_mux::protocol::{EncodeError, RecordType, SlotId};
 
@@ -31,20 +33,33 @@ const EPOCH: u64 = 7;
 /// Opens, at the order of magnitude the response plane runs at (~3k/s).
 const OPENS: u32 = 1000;
 
-/// A refused encode must give its `batch_seq` back.
+/// A refused encode must give its `batch_seq` back, and neither refusal arm
+/// may meter a batch that was never sent.
 ///
 /// [`BatchWriter::dispatch_singleton`] reserves the sequence before it knows
 /// whether the record will encode, exactly as [`BatchWriter::flush`] does — and
 /// `flush` gives the sequence back when the batch turns out to be empty. The
-/// singleton path has the same duty and two ways to leave without sending: an
-/// encode that fails and a send builder that cannot be made. Neither may leave
-/// a hole in the writer's numbering — see the module doc for why that is an
-/// invariant asserted here rather than a gap production can currently reach.
+/// singleton path has the same duty on its encode-failure arm, asserted below
+/// — see the module doc for why that is an invariant asserted here rather than
+/// a gap production can currently reach. `dispatch_singleton` refunds on a
+/// second arm too — `am_send_streaming` returning `Err` — but nothing here
+/// drives it: `am_send_streaming`'s only implementation
+/// (`AmSendBuilder::new_unchecked`) is infallible today, so that arm cannot be
+/// reached without fabricating a failure production cannot produce. The
+/// refund there is defensive, for whenever that stops being true.
 #[tokio::test(flavor = "multi_thread")]
 async fn open_slot_batch_seq_stays_contiguous_across_failures() {
     let (sender, capture, batches) = capture_pair().await;
     let peer = capture.instance_id().worker_id();
-    let mut writer = BatchWriter::new(Arc::clone(&sender), peer, MuxConfig::default(), None, EPOCH);
+    let registry = prometheus::Registry::new();
+    let metrics = VeloMetrics::register(&registry).expect("register metrics");
+    let mut writer = BatchWriter::new(
+        Arc::clone(&sender),
+        peer,
+        MuxConfig::default(),
+        Some(metrics.bind_mux()),
+        EPOCH,
+    );
 
     for n in 0..OPENS {
         // Every third open meets an encoder that refuses the record. Nothing
@@ -81,5 +96,19 @@ async fn open_slot_batch_seq_stays_contiguous_across_failures() {
         seen, expected,
         "a sequence reserved by a dispatch that sent nothing must be given back, \
          or every failure reads at the peer as a batch that went missing"
+    );
+
+    let snapshot = MetricSnapshot::from_registry(&registry);
+    assert_eq!(
+        snapshot.counter("velo_streaming_mux_batches_total", &[("direction", "sent")]),
+        f64::from(OPENS),
+        "a refused encode dispatches nothing and must not meter a batch"
+    );
+    assert_eq!(
+        snapshot.counter("velo_streaming_mux_rendezvous_singletons_total", &[]),
+        0.0,
+        "dispatch_singleton does not meter a rendezvous transfer itself; that \
+         is `send_singleton`'s own call, one layer up, which this test never \
+         reaches"
     );
 }

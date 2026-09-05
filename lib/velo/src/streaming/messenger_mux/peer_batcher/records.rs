@@ -171,8 +171,23 @@ impl Batcher {
             // may not overtake them: a `CloseSlot` the receiver meets before the
             // `OpenSlot` that binds the slot is dropped as `closed_slot`, and
             // the stream it should have ended is left for the consumer's
-            // heartbeat watchdog to find. `release_withheld` writes it once the
-            // queue empties and the fence lifts.
+            // heartbeat watchdog to find. `release_withheld` writes the
+            // deferred close once the queue empties and the fence lifts — but
+            // only when it lifts by resolving successfully. A resolution that
+            // fails or never arrives leaves it unwritten, and the two do not
+            // fail alike. A failed resolution is epoch death
+            // (`on_owned_control`'s `singleton == Some(false)` arm), which
+            // retires the slot through `close_all` without ever reaching
+            // `finish_close`: the deferred `CloseSlot` here is silently never
+            // written, and the consumer learns through the heartbeat watchdog
+            // like every other epoch-death casualty. A resolution that never
+            // arrives — the congested peer `MuxConfig::async_open_ack` exists
+            // for — has no timer of its own: `release_withheld`'s only caller
+            // (`on_owned_control`, gated on a grant or an unfence) has
+            // nothing to call it for, so this slot's `close_owed`, its dense
+            // index, its withheld bytes and its share of `live_slots` are
+            // held for as long as the peer's epoch runs, bounded only by
+            // whatever eventually ends that epoch — not by this deferral.
             return;
         }
         self.finish_close(index).await;
@@ -265,8 +280,7 @@ impl Batcher {
     }
 
     /// Send one record alone, over the eager budget and therefore through
-    /// rendezvous, fencing its slot until the admission resolves unless the
-    /// admission is already behind it (see `fire_singleton`'s doc).
+    /// rendezvous, and fence its slot until the admission resolves.
     async fn send_singleton(&mut self, index: u32, bytes: Vec<u8>, terminal: bool) {
         let class = if terminal {
             CreditClass::Terminal
@@ -283,7 +297,7 @@ impl Batcher {
         let seq = slot.take_seq();
         let close_seq = terminal.then(|| slot.take_seq());
 
-        if !self.fire_singleton(id, |encoder| {
+        if !self.fire_singleton(id, FenceSkip::Never, |encoder| {
             encoder.push_data(id, seq, &bytes)?;
             match close_seq {
                 Some(close_seq) => {

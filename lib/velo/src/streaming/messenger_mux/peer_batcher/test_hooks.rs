@@ -41,6 +41,18 @@ pub(crate) struct TestHooks {
     /// synchronously on the batcher's own task before that task ever yields,
     /// so counting it is race-free.
     fenced: AtomicU64,
+    /// The next singleton watcher to finish holds its report at the gate
+    /// below instead of calling `singleton_resolved` right away.
+    ///
+    /// Exists to pin the one property racing the real watcher cannot show:
+    /// that an admission which never fenced writes nothing for a test to
+    /// later mistake for a *different*, still-outstanding singleton's answer.
+    /// Without this, "wait for the unfenced watcher's write, then fence a
+    /// second singleton on the same slot, then see which lands first" is a
+    /// coin flip against the scheduler — this makes the interleaving a
+    /// decision the test makes instead of one it hopes for.
+    resolutions_held: AtomicBool,
+    resolutions_gate: Notify,
 }
 
 impl TestHooks {
@@ -79,6 +91,32 @@ impl TestHooks {
     /// Times the fence has been raised so far.
     pub(super) fn fenced_count(&self) -> u64 {
         self.fenced.load(Ordering::Relaxed)
+    }
+
+    /// Hold every singleton watcher's report from here on, until released.
+    pub(super) fn hold_resolutions(&self) {
+        self.resolutions_held.store(true, Ordering::Release);
+    }
+
+    /// Let every held report through.
+    pub(super) fn release_resolutions(&self) {
+        self.resolutions_held.store(false, Ordering::Release);
+        self.resolutions_gate.notify_waiters();
+    }
+
+    /// Called by a singleton's watcher task once its admission has answered,
+    /// before it reports that answer onward. A no-op when nothing is holding.
+    pub(super) async fn await_resolutions_release(&self) {
+        loop {
+            // Registered before the check, for the same reason `barrier`
+            // registers its own wait first: a release landing between the two
+            // is held as a permit rather than missed.
+            let released = self.resolutions_gate.notified();
+            if !self.resolutions_held.load(Ordering::Acquire) {
+                return;
+            }
+            released.await;
+        }
     }
 
     /// Called by the run loop on each wake, before its drain loop runs.
