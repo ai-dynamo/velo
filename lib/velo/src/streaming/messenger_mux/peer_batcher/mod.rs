@@ -81,7 +81,8 @@ use self::test_hooks::TestHooks;
 use self::writer::BatchWriter;
 use super::MuxConfig;
 use super::protocol::{
-    BATCH_HEADER_LEN, BatchEncoder, CloseReason, EncodeError, RecordType, SlotId, record_encoded_len,
+    BATCH_HEADER_LEN, BatchEncoder, CloseReason, EncodeError, RecordType, SlotId,
+    record_encoded_len,
 };
 use crate::messenger::Messenger;
 use crate::observability::{BatcherWake, MuxDropReason, MuxMetricsHandle};
