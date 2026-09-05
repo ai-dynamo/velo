@@ -1197,10 +1197,10 @@ impl VeloMetrics {
             registry,
             Counter::with_opts(Opts::new(
                 "velo_streaming_mux_control_refused_total",
-                "Coalesced control entries a peer batcher refused because its \
-                 pending-control map was at capacity. Legitimate entries are \
-                 bounded by live slots, so anything here means a peer is naming \
-                 slot ids that were never alive.",
+                "Coalesced control entries a peer batcher refused because they \
+                 named a slot index it never allocated. Anything here means a \
+                 peer is naming slot ids that were never alive; a peer with any \
+                 number of live slots produces none.",
             ))?,
         )?;
         let streaming_mux_hold_overflow_total = register_collector(

@@ -35,7 +35,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::super::control::MAX_PENDING_CONTROL;
 use super::super::test_hooks::TestHooks;
 use super::super::*;
 use super::support::*;
@@ -217,17 +216,20 @@ async fn a_real_admission_failure_reaches_the_detached_watcher() {
     eventually(|| inlet.is_disconnected()).await;
 }
 
-/// The fence lifts even when the admission answers into a full control map.
+/// Bogus grants are refused and the admission's answer still lifts the fence.
 ///
-/// A peer holding more live slots than [`MAX_PENDING_CONTROL`] — a router in
-/// front of a worker that is carrying thousands of streams — fills the
-/// owned-control map with legitimate grants between two drains. The `OpenSlot`
-/// resolution that lands then is not one more grant: it is the only thing that
-/// lifts this slot's fence, and refusing it leaves every record the slot ever
-/// queues withheld until the consumer's heartbeat watchdog gives up. Measured
-/// as HTTP 500s on the tier-3 rig's `velo4a` and `velo34` arms.
+/// A peer naming slot indices this batcher never allocated is the one thing
+/// the control inbox refuses (`velo_streaming_mux_control_refused_total`).
+/// Under the size cap this file's inbox once had, a peer holding more live
+/// slots than the cap filled the map with legitimate grants and the `OpenSlot`
+/// resolution behind them was refused, leaving the slot fenced until the
+/// consumer's heartbeat watchdog gave up (HTTP 500s on the tier-3 rig's
+/// `velo4a` and `velo34` arms). Now the map is bounded by what the batcher
+/// allocated: a flood of bogus ids is counted and dropped, and the resolution
+/// of a slot this batcher owns lands whatever else is pending.
 #[tokio::test(flavor = "multi_thread")]
-async fn the_fence_lifts_when_the_admission_answers_into_a_full_control_map() {
+async fn bogus_grants_are_refused_and_the_admission_answer_still_lifts_the_fence() {
+    const BOGUS: u32 = 4_096;
     let hooks = Arc::new(TestHooks::default());
     let harness = stalled_harness_with_hooks(async_open_ack(), Some(Arc::clone(&hooks))).await;
     let (_filler_inlet, inlet) = open_behind_a_full_gate(&harness).await;
@@ -240,34 +242,32 @@ async fn the_fence_lifts_when_the_admission_answers_into_a_full_control_map() {
     harness.handle.kick_flush();
     hooks.wait_until_parked().await;
 
-    // What a peer with that many streams sends between two drains: one grant
-    // per slot, none of them this one.
-    for index in 0..MAX_PENDING_CONTROL {
-        let bogus = SlotId::new(1_000 + index as u32, 0).expect("index fits u24");
+    // A peer naming slots this batcher never allocated: every one is refused
+    // and counted, none of them is kept.
+    let refused_before = harness.handle.control.refused();
+    let pending_before = harness.handle.control.pending_len();
+    for index in 0..BOGUS {
+        let bogus = SlotId::new(1_000 + index, 0).expect("index fits u24");
         harness.handle.grant(bogus, 1);
     }
-    let filled = harness.handle.control.pending_len();
-    assert!(filled >= MAX_PENDING_CONTROL, "the map is at its cap");
-    // A delta from here, not an assertion that this is zero: the filler's own
-    // `OpenSlot` resolves too (its admission was synchronous, so `fire_singleton`
-    // never fenced it, but the watcher it still spawns calls
-    // `singleton_resolved` regardless), and that resolution can land before or
-    // after this line runs. It costs nothing either way — resolutions live in
-    // their own map now (see `MAX_PENDING_CONTROL`'s doc) and can never be
-    // refused — but a delta is what makes the property under test (the fenced
-    // slot's own resolution is never refused) independent of that timing.
-    let refused_before = harness.handle.control.refused();
+    assert_eq!(
+        harness.handle.control.refused() - refused_before,
+        u64::from(BOGUS),
+        "every grant for a slot this batcher never allocated is refused"
+    );
+    assert_eq!(
+        harness.handle.control.pending_len(),
+        pending_before,
+        "and none of them is kept"
+    );
 
     // Free the gate. The parked `OpenSlot` is admitted, and its resolution
-    // arrives while the map is full.
+    // arrives while the batcher is still parked.
     let first = harness.next_wire_batch().await;
     assert_eq!(first.records[0].kind, RecordType::OpenSlot);
     let opened = harness.next_wire_batch().await;
     assert_eq!(opened.records[0].kind, RecordType::OpenSlot);
-    eventually(|| {
-        harness.handle.control.pending_len() > filled || harness.handle.control.refused() > 0
-    })
-    .await;
+    eventually(|| harness.handle.control.pending_len() > pending_before).await;
 
     hooks.release();
 
@@ -277,11 +277,6 @@ async fn the_fence_lifts_when_the_admission_answers_into_a_full_control_map() {
     assert_eq!(
         data.records[0].frame_seq, 1,
         "the record follows the `OpenSlot` whose admission it waited for"
-    );
-    assert_eq!(
-        harness.handle.control.refused(),
-        refused_before,
-        "the resolution was owed to the fence, not refused at the cap"
     );
 }
 

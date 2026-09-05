@@ -45,48 +45,31 @@ use tokio::sync::Notify;
 use super::super::protocol::{CloseReason, SlotId};
 use crate::observability::MuxMetricsHandle;
 
-/// Entries either map may hold before it starts refusing new keys.
-///
-/// The cap exists for one case: a peer naming slot ids that were never alive,
-/// which would otherwise grow the maps by one entry per bogus record. It was
-/// sized against a decode engine's 1024 concurrent streams to one router — an
-/// order of magnitude of headroom against *that* shape. That headroom is not
-/// universal: `t3-iso1` measured one peer holding 4,000 to 6,700 live slots at
-/// once (`agent-docs/w4a-async-open-ack-status.md`), an order of magnitude
-/// above the sizing assumption, and at that shape it is legitimate entries —
-/// not bogus ones — the cap refuses.
-///
-/// It applies to what the *peer* names. A singleton resolution is exempt: it
-/// is this side's own answer to a fence it raised, there is at most one
-/// outstanding per fenced slot, and nothing sends it twice. Refusing one leaves
-/// the slot fenced with no second answer coming, so every record it ever
-/// queues is withheld until the consumer's heartbeat watchdog gives up on it.
-/// That is what happened on a peer with more live slots than this cap under
-/// [`MuxConfig::async_open_ack`], where `t3-iso1` measured every open landing
-/// on a peer congested enough to fence it (`fire_singleton` fenced
-/// unconditionally at the time; it now fences only when the admission is not
-/// already behind it, but a peer that congested still fences most opens).
-///
-/// The exemption lives in its own map (see [`ControlState::resolutions`])
-/// rather than as an uncapped key into `mine`, precisely so it cannot make
-/// `entry_mine`'s own problem worse. `entry_mine`'s credit grants and
-/// peer-initiated closes still go through the capped path and still refuse
-/// once *`mine`'s own* entries — grants and closes alone, with nothing from
-/// the exemption in them — reach this cap, which at a peer's live-slot count
-/// above it is the same legitimate-entries case described above, not the
-/// bogus-id case the cap was sized for. That refusal is still real and still
-/// unrecoverable: the receiver has already zeroed the credit it sent by the
-/// time its `CreditUpdate` reached us. A singleton resolution sharing `mine`
-/// with grants and closes would only add to that pressure — a peer with more
-/// live slots than this cap generates that many resolutions too, and every
-/// one of them would have pushed `mine` closer to refusing the grant behind
-/// it. The separate map removes that particular contributor; it does not
-/// close the underlying gap. A cap keyed to live slots, or one that refuses
-/// only keys naming no live slot, is the follow-up this leaves open
-/// (`agent-docs/w4a-async-open-ack-status.md`).
-///
-/// [`MuxConfig::async_open_ack`]: super::super::MuxConfig::async_open_ack
-pub(super) const MAX_PENDING_CONTROL: usize = 4096;
+// What bounds the two slot maps, now that nothing caps them by size.
+//
+// A fixed cap (4,096 entries, until 2026-09-06) was sized for a peer with
+// about a thousand live slots and refused the 4,097th key. Legitimate keys
+// are bounded by live slots on one peer, and a router in front of a worker
+// that is carrying thousands of streams is an ordinary deployment: `t3-iso1`
+// measured one peer at 4,000 to 6,700 and the cap refused its credit grants,
+// its closes and, under `MuxConfig::async_open_ack`, the admission answers
+// that lift a fenced slot. A refused grant is credit lost for good — the
+// receiver zeroed its `ungranted` the moment it sent the `CreditUpdate` — so
+// a size cap is the wrong shape for what it guards against, which is a peer
+// naming slot ids that were never alive.
+//
+// The bound is now the one thing that distinguishes a legitimate key from a
+// bogus one. `mine` holds control the *peer* sends about slots this batcher
+// owns, and this batcher knows exactly which indices it has handed out:
+// `ControlState::allocated`, published by the batcher on every allocation.
+// A key at or past it names a slot that never existed and is refused, which
+// is what `velo_streaming_mux_control_refused_total` now counts. Below it the
+// map is bounded by the indices in use. `peers` holds control this side's own
+// ingress writes about the peer's slots, which it only does for slots it
+// holds in a table bounded by its own slot limit, so nothing a peer sends can
+// grow it and it refuses nothing. Resolutions keep their own map (see
+// `ControlState::resolutions`) for the ordering reason given there.
+//
 
 /// Coalesced control for one slot **this** batcher owns.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -118,16 +101,19 @@ struct ControlState {
     pub(super) flush: bool,
     mine: HashMap<u32, OwnedControl>,
     peers: HashMap<u32, PeerControl>,
-    /// Singleton resolutions owed to this side's own fenced slots — see
-    /// [`MAX_PENDING_CONTROL`]'s doc for why this is a separate, uncapped map
-    /// rather than one more key into `mine`. Merged into `mine` at [`drain`]
-    /// time, once the cap has nothing left to protect: draining takes both
-    /// maps out of the state a writer could still be growing, so nothing
-    /// about the merge can trip a refusal.
+    /// Singleton resolutions owed to this side's own fenced slots, kept apart
+    /// from `mine` so that this lane's growth can never be what refuses
+    /// somebody else's grant, and so a resolution is never refused at all: it
+    /// is this side's own answer to a fence it raised, at most one per fenced
+    /// slot. Merged into `mine` at [`drain`] time, which takes both maps out
+    /// of the state a writer could still be growing.
     ///
     /// [`drain`]: Self::drain
     resolutions: HashMap<u32, bool>,
-    /// Entries refused because a map was at [`MAX_PENDING_CONTROL`].
+    /// One past the highest slot index this batcher has ever allocated. A
+    /// key into `mine` at or past it names a slot that never existed.
+    allocated: u32,
+    /// Entries refused because their index was never allocated.
     refused: u64,
 }
 
@@ -182,42 +168,39 @@ impl ControlState {
         }
     }
 
+    /// The entry for control the peer sent about a slot this side owns.
+    ///
+    /// `None`, counted as a refusal, when the index was never allocated here:
+    /// the one case a size cap was guarding against, answered exactly. Both
+    /// maps key by the whole [`SlotId`], generation included: keying by index
+    /// alone would let a grant meant for a retired generation land in the
+    /// live one's entry and hand it credit it was never given. A stale entry
+    /// is harmless; the batcher's generation check rejects it on the next
+    /// wake and the entry goes with the drain.
     fn entry_mine(&mut self, slot: SlotId) -> Option<&mut OwnedControl> {
-        Self::slot_entry(&mut self.mine, &mut self.refused, slot)
+        if slot.index() >= self.allocated {
+            self.refused = self.refused.saturating_add(1);
+            return None;
+        }
+        Some(self.mine.entry(slot.raw()).or_default())
     }
 
     /// The entry for an answer this batcher owes one of its own fenced slots.
     ///
-    /// Not subject to [`MAX_PENDING_CONTROL`] — it does not touch `mine` at
-    /// all until [`Self::drain`] — for why see the cap's own doc: a refused
-    /// resolution is a leak rather than a dropped message, and the whole point
-    /// of a separate map is that this lane's growth can never be what refuses
-    /// somebody else's grant.
+    /// Its own map rather than one more key into `mine`: a refused
+    /// resolution is a leak rather than a dropped message, and keeping the
+    /// lane apart is what makes that statement hold whatever else is pending.
     fn entry_mine_owed(&mut self, slot: SlotId) -> &mut bool {
         self.resolutions.entry(slot.raw()).or_insert(true)
     }
 
-    fn entry_peer(&mut self, slot: SlotId) -> Option<&mut PeerControl> {
-        Self::slot_entry(&mut self.peers, &mut self.refused, slot)
-    }
-
-    /// Key by the whole [`SlotId`], generation included.
+    /// The entry for control this side sends back about a slot the peer owns.
     ///
-    /// Keying by index alone would let a grant meant for a retired generation
-    /// land in the live one's entry and hand it credit it was never given. A
-    /// stale entry is harmless: the batcher's generation check rejects it on the
-    /// next wake and the entry goes with the drain.
-    fn slot_entry<'a, T: Default>(
-        map: &'a mut HashMap<u32, T>,
-        refused: &mut u64,
-        slot: SlotId,
-    ) -> Option<&'a mut T> {
-        let key = slot.raw();
-        if !map.contains_key(&key) && map.len() >= MAX_PENDING_CONTROL {
-            *refused = refused.saturating_add(1);
-            return None;
-        }
-        Some(map.entry(key).or_default())
+    /// Never refused: the ingress writes these only for slots it holds, and
+    /// its table is bounded by its own slot limit, so the map is bounded by
+    /// construction and nothing the peer sends can grow it.
+    fn entry_peer(&mut self, slot: SlotId) -> &mut PeerControl {
+        self.peers.entry(slot.raw()).or_default()
     }
 }
 
@@ -279,13 +262,23 @@ impl ControlInbox {
         self.lock().len()
     }
 
-    /// Entries refused at the cap. The series
+    /// Entries refused because their index was never allocated. The series
     /// `velo_streaming_mux_control_refused_total` is the operator-facing view of
     /// the same number; this one exists so a test can read it without a
     /// registry.
     #[cfg(test)]
     pub(super) fn refused(&self) -> u64 {
         self.lock().refused
+    }
+
+    /// The batcher handed out slot `index`; keys up to it are now legitimate.
+    ///
+    /// Not a wake: nothing became pending. Taken under the lock so a grant
+    /// that races the open it answers is judged against the bound the open
+    /// just raised, never against the one before it.
+    pub(super) fn note_allocated(&self, index: u32) {
+        let mut state = self.lock();
+        state.allocated = state.allocated.max(index.saturating_add(1));
     }
 
     /// An inbound `CreditUpdate` for a slot we own.
@@ -320,18 +313,15 @@ impl ControlInbox {
     /// Credit to advertise back for a slot the peer owns.
     pub(super) fn reply_credit(&self, slot: SlotId, delta: u32) {
         self.mutate(|state| {
-            if let Some(entry) = state.entry_peer(slot) {
-                entry.credit = entry.credit.saturating_add(delta);
-            }
+            let entry = state.entry_peer(slot);
+            entry.credit = entry.credit.saturating_add(delta);
         });
     }
 
     /// A close to send back for a slot the peer owns.
     pub(super) fn reply_close(&self, slot: SlotId, reason: CloseReason) {
         self.mutate(|state| {
-            if let Some(entry) = state.entry_peer(slot) {
-                entry.close.get_or_insert(reason);
-            }
+            state.entry_peer(slot).close.get_or_insert(reason);
         });
     }
 
@@ -388,9 +378,20 @@ mod tests {
         SlotId::new(index, generation).expect("index fits u24")
     }
 
+    /// The size cap the bound replaced, kept only to name what the tests
+    /// below prove no longer applies.
+    const OLD_CAP: u32 = 4096;
+
+    /// An inbox whose batcher has allocated `allocated` slot indices.
+    fn inbox_with(allocated: u32) -> ControlInbox {
+        let inbox = ControlInbox::default();
+        inbox.note_allocated(allocated - 1);
+        inbox
+    }
+
     #[test]
     fn credit_accumulates_into_one_entry() {
-        let inbox = ControlInbox::default();
+        let inbox = inbox_with(8);
         let id = slot(3, 0);
         for _ in 0..10_000 {
             inbox.grant(id, 1);
@@ -404,7 +405,7 @@ mod tests {
 
     #[test]
     fn a_close_dominates_and_the_first_reason_wins() {
-        let inbox = ControlInbox::default();
+        let inbox = inbox_with(8);
         let id = slot(1, 0);
         inbox.grant(id, 5);
         inbox.peer_closed(id, CloseReason::UnknownSlot);
@@ -438,7 +439,7 @@ mod tests {
 
     #[test]
     fn generations_do_not_share_an_entry() {
-        let inbox = ControlInbox::default();
+        let inbox = inbox_with(8);
         inbox.grant(slot(4, 0), 1);
         inbox.grant(slot(4, 1), 2);
         assert_eq!(
@@ -448,20 +449,63 @@ mod tests {
         );
     }
 
+    /// A key naming a slot this batcher never allocated is refused; every
+    /// key below the bound is kept, however many there are.
     #[test]
-    fn the_cap_refuses_new_keys_rather_than_growing() {
-        let inbox = ControlInbox::default();
-        for index in 0..(MAX_PENDING_CONTROL as u32 + 500) {
+    fn a_grant_for_an_index_never_allocated_is_refused() {
+        let inbox = inbox_with(10);
+        for index in 0..10 {
             inbox.grant(slot(index, 0), 1);
         }
-        assert_eq!(inbox.pending_len(), MAX_PENDING_CONTROL);
-        assert_eq!(inbox.refused(), 500);
+        inbox.grant(slot(10, 0), 1);
+        inbox.grant(slot(4_999, 0), 1);
+        assert_eq!(
+            inbox.pending_len(),
+            10,
+            "ten allocated indices, ten entries"
+        );
+        assert_eq!(inbox.refused(), 2, "and two keys that name no slot of ours");
 
-        // Keys already present still merge — a live slot's credit is never lost
-        // to a flood of bogus ids that arrived first.
+        // Keys already present still merge.
         inbox.grant(slot(0, 0), 41);
         let drained = inbox.take().expect("something pending");
         assert_eq!(drained.mine[&slot(0, 0).raw()].credit, 42);
+    }
+
+    /// A peer with more live slots than the old size cap loses no grant.
+    ///
+    /// This is the case `t3-iso1` hit: one router-side batcher owning 4,000
+    /// to 6,700 slots on a worker, every one of them owed credit. The bound
+    /// is the batcher's own allocation, so the count of live slots is not
+    /// something the map can be too small for.
+    #[test]
+    fn a_peer_with_more_live_slots_than_the_old_cap_loses_no_grant() {
+        let inbox = inbox_with(6_000);
+        for index in 0..(OLD_CAP + 904) {
+            inbox.grant(slot(index, 0), 1);
+        }
+        assert_eq!(inbox.refused(), 0, "every grant names a slot we allocated");
+        assert_eq!(inbox.pending_len(), (OLD_CAP + 904) as usize);
+        let drained = inbox.take().expect("something pending");
+        assert_eq!(drained.mine[&slot(OLD_CAP + 903, 0).raw()].credit, 1);
+    }
+
+    /// Replies are this side's own writes about the peer's slots, bounded by
+    /// the ingress table that produces them; nothing refuses one.
+    #[test]
+    fn replies_are_never_refused() {
+        let inbox = ControlInbox::default();
+        for index in 0..(OLD_CAP + 5_904) {
+            inbox.reply_credit(slot(index, 0), 1);
+        }
+        assert_eq!(inbox.refused(), 0);
+        assert_eq!(inbox.pending_len(), (OLD_CAP + 5_904) as usize);
+        inbox.reply_close(slot(OLD_CAP + 5_903, 0), CloseReason::UnknownSlot);
+        let drained = inbox.take().expect("something pending");
+        assert_eq!(
+            drained.peers[&slot(OLD_CAP + 5_903, 0).raw()].close,
+            Some(CloseReason::UnknownSlot)
+        );
     }
 
     /// The answer a fenced slot is waiting for is never refused at the cap.
@@ -472,13 +516,13 @@ mod tests {
     /// to land, because nothing else lifts that slot's fence.
     #[test]
     fn a_singleton_resolution_is_never_refused_at_the_cap() {
-        let inbox = ControlInbox::default();
-        for index in 0..(MAX_PENDING_CONTROL as u32) {
+        let inbox = inbox_with(OLD_CAP + 2);
+        for index in 0..OLD_CAP {
             inbox.grant(slot(index, 0), 1);
         }
-        assert_eq!(inbox.pending_len(), MAX_PENDING_CONTROL);
+        assert_eq!(inbox.pending_len(), OLD_CAP as usize);
 
-        let fenced = slot(MAX_PENDING_CONTROL as u32 + 1, 0);
+        let fenced = slot(OLD_CAP + 1, 0);
         inbox.singleton_resolved(fenced, true);
         assert_eq!(
             inbox.refused(),
@@ -497,22 +541,22 @@ mod tests {
         );
     }
 
-    /// The exemption must not spend the capped lane's own budget.
+    /// Resolutions never crowd out grants.
     ///
     /// Every open under `MuxConfig::async_open_ack` resolves through
-    /// `entry_mine_owed`, so a peer holding more live slots than
-    /// `MAX_PENDING_CONTROL` — `t3-iso1` measured 4,000-6,700 against 4,096 —
-    /// generates that many resolutions with no grant or peer-close among them
-    /// at all. If those resolutions shared `mine` with `entry_mine`, that
-    /// alone would push `mine` past the cap and start refusing every grant
+    /// `entry_mine_owed`, so a peer holding thousands of live slots —
+    /// `t3-iso1` measured 4,000 to 6,700 on one peer — generates that many
+    /// resolutions with no grant or peer-close among them at all. Under the
+    /// size cap this file had then, resolutions sharing `mine` with
+    /// `entry_mine` would have pushed it past the cap and refused every grant
     /// behind it. A refused grant is unrecoverable: the receiver has already
     /// zeroed `ungranted` for the delta the moment it sent the
     /// `CreditUpdate`, so nothing about the flood a peer's resolutions cause
     /// may be allowed to starve credit for the peer's other slots.
     #[test]
     fn resolutions_alone_must_not_exhaust_the_grant_lane() {
-        let inbox = ControlInbox::default();
-        for index in 0..(MAX_PENDING_CONTROL as u32 + 500) {
+        let inbox = inbox_with(OLD_CAP + 1_000);
+        for index in 0..(OLD_CAP + 500) {
             inbox.singleton_resolved(slot(index, 0), true);
         }
         assert_eq!(
@@ -523,7 +567,7 @@ mod tests {
 
         // An ordinary credit grant, for a slot the resolution flood above
         // never touched, must still land.
-        let untouched = slot(MAX_PENDING_CONTROL as u32 + 999, 0);
+        let untouched = slot(OLD_CAP + 999, 0);
         inbox.grant(untouched, 7);
         assert_eq!(
             inbox.refused(),

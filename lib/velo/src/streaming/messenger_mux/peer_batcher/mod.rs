@@ -524,6 +524,7 @@ impl Batcher {
                 return;
             }
         };
+        self.control.note_allocated(id.index());
         self.streams.push(stream);
         self.publish_live_slots();
         if let Some(metrics) = &self.metrics {

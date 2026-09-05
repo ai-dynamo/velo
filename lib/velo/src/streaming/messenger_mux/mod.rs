@@ -382,9 +382,10 @@ pub struct MuxConfig {
     /// mean, against a same-arm p95 spread of about 20 ms). Whether the wait
     /// this removes dominates first-token latency is a question of
     /// concurrency and peer congestion, not something this flag answers by
-    /// existing; a rerun past the control-cap fix in `peer_batcher::control`'s
-    /// `MAX_PENDING_CONTROL` doc is a precondition for calling it a win at any
-    /// shape.
+    /// existing; a rerun past the control-inbox fixes in
+    /// `peer_batcher::control` (the owed resolution's own lane, then the size
+    /// cap replaced by the batcher's allocation bound) is a precondition for
+    /// calling it a win at any shape.
     ///
     /// **The per-open cost is not amortized the way a packed flush is, and is
     /// paid whether or not the wait it removes was on the critical path.**

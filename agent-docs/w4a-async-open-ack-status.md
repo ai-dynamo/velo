@@ -96,3 +96,7 @@ velo3 baseline is a precondition for calling this flag a win**, not merely
 correct. Until that rerun lands, `MuxConfig::async_open_ack`'s doc and
 `BATCHING.md` describe the mechanism and its known-negative p95 result rather
 than asserting a benefit.
+
+## Addendum 2026-09-06: the size cap is gone
+
+The follow-up above is done on `w8-control-map-bound`: `MAX_PENDING_CONTROL` is removed. `mine` refuses only a key whose index the batcher never allocated (the batcher publishes its allocation high-water mark to the inbox on every open); `peers` refuses nothing, being this side's own writes about slots its ingress holds. A peer with any number of live slots loses no grant, no close and no resolution; `velo_streaming_mux_control_refused_total` now means exactly "a peer named a slot that never existed here". Tests: a grant past the allocation bound is refused; 5,000 live slots lose no grant; 10,000 replies are never refused; a flood of bogus grants is refused while the admission answer still lifts the fence.
