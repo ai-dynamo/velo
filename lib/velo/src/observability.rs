@@ -637,16 +637,22 @@ impl MuxDirection {
     }
 }
 
+/// The label value `velo_streaming_mux_batcher_wakes_total` files each
+/// [`BatcherWake`] source under, indexed by [`BatcherWake::index`].
+const MUX_WAKE_SOURCES: [&str; 5] = ["open", "control", "frame", "inlet_closed", "linger"];
+
 /// What woke a peer batcher's task, for `velo_streaming_mux_batcher_wakes_total`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BatcherWake {
     /// An `OpenSlot` request from a producer.
     Open,
-    /// Coalesced control: grants, closes, replies, kicks, or a retirement.
+    /// Coalesced control: grants, closes, replies, kicks, a retirement, or a
+    /// singleton admission result.
     Control,
     /// A producer queued a record on one of this batcher's slots.
     Frame,
-    /// A producer went away without a terminal.
+    /// Every producer handle for this slot dropped, and no terminal went out
+    /// ahead of it.
     InletClosed,
     /// A staged batch's window ran out — the policy's `max_linger`, or a
     /// pending credit reply's `MuxConfig::reply_linger`; the two share this
@@ -656,13 +662,22 @@ pub(crate) enum BatcherWake {
 }
 
 impl BatcherWake {
-    fn as_str(self) -> &'static str {
+    /// Dense index into [`MUX_WAKE_SOURCES`] and `MuxMetricsHandle`'s
+    /// pre-bound `batcher_wakes` array — one select-loop wake fires this on
+    /// every trip, including a bare `Frame` wake for a single queued record,
+    /// so this stays a plain array index rather than a label lookup.
+    ///
+    /// A variant added here without a matching [`MUX_WAKE_SOURCES`] entry
+    /// panics on its first [`MuxMetricsHandle::batcher_wake`] call — an
+    /// out-of-bounds read of `batcher_wakes`. Grow both in the same change,
+    /// same hazard as [`RecordType::count_index`](crate::streaming::messenger_mux::protocol::RecordType::count_index).
+    const fn index(self) -> usize {
         match self {
-            Self::Open => "open",
-            Self::Control => "control",
-            Self::Frame => "frame",
-            Self::InletClosed => "inlet_closed",
-            Self::Linger => "linger",
+            Self::Open => 0,
+            Self::Control => 1,
+            Self::Frame => 2,
+            Self::InletClosed => 3,
+            Self::Linger => 4,
         }
     }
 }
@@ -690,24 +705,52 @@ pub(crate) struct MuxMetricsHandle {
     epoch_deaths_total: Counter,
     batch_seq_gaps_total: Counter,
     drain_visits_total: Counter,
-    records_sent_total: CounterVec,
-    batcher_wakes_total: CounterVec,
+    records_sent: [Counter; crate::streaming::messenger_mux::protocol::RECORD_TYPE_COUNT],
+    batcher_wakes: [Counter; MUX_WAKE_SOURCES.len()],
 }
 
 impl MuxMetricsHandle {
-    /// A batcher packed one record of `kind` into a batch bound for its peer.
-    pub(crate) fn record_sent(&self, kind: crate::streaming::messenger_mux::protocol::RecordType) {
-        self.records_sent_total
-            .with_label_values(&[kind.as_str()])
-            .inc();
+    /// An outbound batch of `counts.iter().sum()` records — as
+    /// [`RecordType::count_index`](crate::streaming::messenger_mux::protocol::RecordType::count_index)
+    /// breaks them down — went to the peer.
+    ///
+    /// Deriving the total from `counts` here, rather than a separate
+    /// `BatchEncoder::record_count` read, keeps
+    /// `velo_streaming_mux_records_sent_total` and
+    /// `velo_streaming_mux_records_per_batch{direction="sent"}` in sync by
+    /// construction. A batch discarded before it gets here (an epoch death,
+    /// or the task tearing down) is never counted; a batch the messenger goes
+    /// on to refuse — a failed `dispatch` or `am_send_streaming` call — is
+    /// counted here all the same. [`Self::batch`] stays free-standing for the
+    /// `Received` side (`ingress::mod`'s inbound-batch count), which has no
+    /// per-type breakdown to derive a total from.
+    ///
+    /// `counts[index]`'s label is already resolved — pre-bound in
+    /// [`VeloMetrics::bind_mux`] the same way [`Self::batcher_wake`]'s array
+    /// is — so the per-type loop below is a plain array index and an atomic
+    /// add, no label lookup at any count.
+    pub(crate) fn batch_sent(
+        &self,
+        counts: [u16; crate::streaming::messenger_mux::protocol::RECORD_TYPE_COUNT],
+    ) {
+        let total: usize = counts.iter().map(|&count| usize::from(count)).sum();
+        self.batch(MuxDirection::Sent, total);
+        for (count, counter) in counts.into_iter().zip(&self.records_sent) {
+            if count > 0 {
+                counter.inc_by(f64::from(count));
+            }
+        }
     }
 
-    /// A batcher's task woke for `source`, whether from its select or from the
-    /// drain loop that follows it.
+    /// A batcher's task woke for `source`.
+    ///
+    /// Pre-bound array index, not a label lookup: this fires once per
+    /// select-loop trip, and a `Frame` wake is one record by construction
+    /// (`SlotStream::poll_next` yields exactly one queued item per poll), so
+    /// this is on the per-record path regardless of how many records a wake's
+    /// batch ends up carrying.
     pub(crate) fn batcher_wake(&self, source: BatcherWake) {
-        self.batcher_wakes_total
-            .with_label_values(&[source.as_str()])
-            .inc();
+        self.batcher_wakes[source.index()].inc();
     }
 
     /// A slot came into existence on either side of the mux.
@@ -1489,12 +1532,14 @@ impl VeloMetrics {
             CounterVec::new(
                 Opts::new(
                     "velo_streaming_mux_records_sent_total",
-                    "Mux records a batcher packed for its peer, by record type. \
-                     Divided by velo_streaming_mux_batches_total{direction=\"sent\"} \
-                     it says what a node's outbound batches are made of, which \
-                     is the question a batch count alone cannot answer: a rise \
-                     in small batches is either data that arrives one record at \
-                     a time or control that is flushed as it comes.",
+                    "Mux records a batcher packed for its peer, by record type \
+                     — this series only ever describes what a node sends, so \
+                     it carries no direction label of its own. Compared with \
+                     velo_streaming_mux_batches_total{direction=\"sent\"} it \
+                     says what those outbound batches are made of, which is \
+                     the question a batch count alone cannot answer: a rise in \
+                     small batches is either data arriving one record at a \
+                     time or control flushed as it comes.",
                 ),
                 &["record_type"],
             )?,
@@ -1789,6 +1834,17 @@ impl VeloMetrics {
     /// batchers and the `_stream_batch` ingress lane, so the hot paths hold
     /// concrete collectors instead of resolving label values per record.
     pub(crate) fn bind_mux(&self) -> MuxMetricsHandle {
+        use crate::streaming::messenger_mux::protocol::RECORD_TYPE_LABELS;
+
+        let records_sent = std::array::from_fn(|index| {
+            self.streaming_mux_records_sent_total
+                .with_label_values(&[RECORD_TYPE_LABELS[index]])
+        });
+        let batcher_wakes = std::array::from_fn(|index| {
+            self.streaming_mux_batcher_wakes_total
+                .with_label_values(&[MUX_WAKE_SOURCES[index]])
+        });
+
         MuxMetricsHandle {
             live_slots: self.streaming_mux_live_slots.clone(),
             reader_stall_total: self.streaming_mux_reader_stall_total.clone(),
@@ -1806,8 +1862,8 @@ impl VeloMetrics {
             epoch_deaths_total: self.streaming_mux_epoch_deaths_total.clone(),
             batch_seq_gaps_total: self.streaming_mux_batch_seq_gaps_total.clone(),
             drain_visits_total: self.streaming_mux_drain_visits_total.clone(),
-            records_sent_total: self.streaming_mux_records_sent_total.clone(),
-            batcher_wakes_total: self.streaming_mux_batcher_wakes_total.clone(),
+            records_sent,
+            batcher_wakes,
         }
     }
 

@@ -21,7 +21,7 @@ use velo_ext::{InstanceId, WorkerId};
 use super::super::MuxConfig;
 use super::super::protocol::{BATCH_HEADER_LEN, BatchEncoder, EncodeError, MAX_RECORDS_PER_BATCH};
 use crate::messenger::{FireResult, Messenger};
-use crate::observability::{MuxDirection, MuxMetricsHandle};
+use crate::observability::MuxMetricsHandle;
 use crate::streaming::messenger_mux::STREAM_BATCH_HANDLER;
 use crate::transports::tcp::framing::COALESCE_THRESHOLD;
 
@@ -202,13 +202,13 @@ impl BatchWriter {
             self.buffer = encoder.finish();
             return Ok(());
         }
-        let records = usize::from(encoder.record_count());
+        let by_type = encoder.record_type_counts();
         let mut finished = encoder.finish();
         let payload = finished.split().freeze();
         self.buffer = finished;
 
         if let Some(metrics) = &self.metrics {
-            metrics.batch(MuxDirection::Sent, records);
+            metrics.batch_sent(by_type);
         }
         self.dispatch(payload).await.map_err(FlushFailed)
     }
@@ -230,12 +230,12 @@ impl BatchWriter {
             tracing::error!(%error, "messenger mux: dropping unencodable singleton");
             return None;
         }
-        let records = usize::from(encoder.record_count());
+        let by_type = encoder.record_type_counts();
         let payload = encoder.finish().freeze();
 
         if let Some(metrics) = &self.metrics {
             metrics.rendezvous_singleton();
-            metrics.batch(MuxDirection::Sent, records);
+            metrics.batch_sent(by_type);
         }
         match self.messenger.am_send_streaming(STREAM_BATCH_HANDLER) {
             Ok(builder) => Some(builder.raw_payload(payload).worker(self.peer).send()),

@@ -63,8 +63,6 @@ mod tests;
 mod writer;
 
 use std::sync::Arc;
-
-use crate::observability::BatcherWake;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use dashmap::DashMap;
@@ -83,11 +81,10 @@ use self::test_hooks::TestHooks;
 use self::writer::BatchWriter;
 use super::MuxConfig;
 use super::protocol::{
-    BATCH_HEADER_LEN, BatchEncoder, CloseReason, EncodeError, RecordType, SlotId,
-    record_encoded_len,
+    BATCH_HEADER_LEN, BatchEncoder, CloseReason, EncodeError, SlotId, record_encoded_len,
 };
 use crate::messenger::Messenger;
-use crate::observability::{MuxDropReason, MuxMetricsHandle};
+use crate::observability::{BatcherWake, MuxDropReason, MuxMetricsHandle};
 use crate::streaming::messenger_mux::flow_control::{CreditClass, SlotCredit};
 use crate::streaming::sender::is_terminal_sentinel;
 
@@ -365,6 +362,15 @@ impl Batcher {
                 () = linger_until(deadline) => Work::Linger,
             };
             self.handle.mark_active();
+            if let Some(metrics) = &self.metrics {
+                metrics.batcher_wake(match &work {
+                    Work::Slot(_, SlotItem::Frame(_)) => BatcherWake::Frame,
+                    Work::Slot(_, SlotItem::InletClosed) => BatcherWake::InletClosed,
+                    Work::Open(_) => BatcherWake::Open,
+                    Work::Control(_) => BatcherWake::Control,
+                    Work::Linger => BatcherWake::Linger,
+                });
+            }
             self.dispatch(work).await;
 
             // The one point a test can stop the loop at, so a record can be
@@ -424,15 +430,6 @@ impl Batcher {
     }
 
     async fn dispatch(&mut self, work: Work) {
-        if let Some(metrics) = &self.metrics {
-            metrics.batcher_wake(match &work {
-                Work::Slot(_, SlotItem::Frame(_)) => BatcherWake::Frame,
-                Work::Slot(_, SlotItem::InletClosed) => BatcherWake::InletClosed,
-                Work::Open(_) => BatcherWake::Open,
-                Work::Control(_) => BatcherWake::Control,
-                Work::Linger => BatcherWake::Linger,
-            });
-        }
         match work {
             Work::Slot(index, SlotItem::Frame(bytes)) => self.on_frame(index, bytes).await,
             Work::Slot(index, SlotItem::InletClosed) => self.on_inlet_closed(index).await,
@@ -550,9 +547,6 @@ impl Batcher {
         self.ensure_batch();
         if let Some(encoder) = self.writer.encoder() {
             let _ = encoder.push_open_slot(id, seq, anchor_id, session_id);
-            if let Some(metrics) = &self.metrics {
-                metrics.record_sent(RecordType::OpenSlot);
-            }
             self.gate.stage_urgent(1);
         }
         // Eager, in its own flush: `bind()`'s accept timeout measures "time
@@ -578,22 +572,17 @@ impl Batcher {
     /// batch position.
     async fn on_reply(&mut self, slot: SlotId, entry: PeerControl) {
         if entry.credit > 0 {
-            self.push_reply(RecordType::CreditUpdate, |encoder| {
-                encoder.push_credit_update(slot, 0, entry.credit)
-            })
-            .await;
+            self.push_reply(|encoder| encoder.push_credit_update(slot, 0, entry.credit))
+                .await;
         }
         if let Some(reason) = entry.close {
-            self.push_reply(RecordType::CloseSlot, |encoder| {
-                encoder.push_close_slot(slot, 0, reason)
-            })
-            .await;
+            self.push_reply(|encoder| encoder.push_close_slot(slot, 0, reason))
+                .await;
         }
     }
 
     async fn push_reply(
         &mut self,
-        kind: RecordType,
         write: impl FnOnce(&mut BatchEncoder) -> Result<(), EncodeError>,
     ) {
         let needed = record_encoded_len(4).unwrap_or(usize::MAX);
@@ -604,9 +593,6 @@ impl Batcher {
         }
         if let Some(encoder) = self.writer.encoder() {
             let _ = write(encoder);
-            if let Some(metrics) = &self.metrics {
-                metrics.record_sent(kind);
-            }
             // A close is liveness and goes now. A credit reply is liveness too,
             // but held for at most the reply window rather than at once: no
             // application on this side knows it owes the peer a flush, so the
