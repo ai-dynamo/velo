@@ -72,8 +72,9 @@
 //! credit starvation, which nothing but the consumer can end, that the withheld
 //! queue exists for.
 //!
-//! Credit comes back from three places, and each visits only slots that
-//! something named. A draining consumer's pump counts the record on that
+//! Credit comes back from three places. Two of them visit only slots that
+//! something named; the third is the whole-table backstop. A draining
+//! consumer's pump counts the record on that
 //! slot's [`ingress::DrainSignal`], puts the slot's index on its peer's dirty
 //! lane, and posts the peer. The **arrival path** then reconciles, on every
 //! inbound batch, the slots that batch delivered into together with the slots

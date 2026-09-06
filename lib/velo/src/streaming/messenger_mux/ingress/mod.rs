@@ -24,18 +24,20 @@
 //! an early record waits — bounded by the credit already granted and by the byte
 //! budget behind it. Overflow closes **that** slot and nothing else.
 
+mod drain;
 mod slot;
 #[cfg(test)]
 mod tests;
 
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
 use dashmap::DashMap;
 use velo_ext::WorkerId;
 
+pub(crate) use self::drain::DrainSignal;
 use self::slot::{Applied, IngressSlot, heartbeat_frame};
 use super::MuxConfig;
 use super::flow_control::ByteBudget;
@@ -114,13 +116,26 @@ struct PeerIngress {
     /// Both ends live here rather than beside `drain_pending` on the registry
     /// because everything that touches either end already holds this mutex —
     /// [`open_slot`] hands the sender to the claiming slot's [`DrainSignal`],
-    /// and [`list_drained_slots`] is the only reader. A pump reaches its clone
-    /// of the sender through the signal it already owns, so nothing needs the
-    /// lane without the lock and nothing needs the lock to list.
+    /// and [`list_drained_slots`] and [`collect_grants`] are the readers, one
+    /// per pass. A pump reaches its clone of the sender through the signal it
+    /// already owns, so nothing needs the lane without the lock and nothing
+    /// needs the lock to list.
     ///
-    /// Capacity is [`MAX_INGRESS_SLOTS_PER_PEER`], the ceiling on the slots
-    /// that could ever be listed at once; `flume` allocates the queue as it
-    /// fills, so an idle peer pays nothing for it.
+    /// Capacity is [`MAX_INGRESS_SLOTS_PER_PEER`] — a bound on live slots,
+    /// not a promise that a slot never has more than one entry outstanding.
+    /// The arrival path and the doorbell both drain this lane in
+    /// [`list_drained_slots`] *before* [`collect_touched_grants`] clears any
+    /// slot's `listed` flag, and `collect_grants` drains it itself before its
+    /// own walk clears every flag it visits — in every case, a drain racing
+    /// between that lane drain and the flag clear relists a slot the walk is
+    /// about to (or just did) clear, leaving a stale entry for the next pass.
+    /// That entry costs its slot one visit that reads whatever that slot's
+    /// own [`DrainSignal`] has accumulated since — it cannot misplace or lose
+    /// credit, because the quantity lives there and not in the lane — and it
+    /// cannot survive whichever pass visits this peer next, since every pass
+    /// drains the lane before it reconciles.
+    /// `flume` allocates the queue as it fills, so an idle peer pays nothing
+    /// for it.
     drained_tx: flume::Sender<u32>,
     drained_rx: flume::Receiver<u32>,
     /// Reconcile visits this peer's slots have taken. Counts exactly what the
@@ -175,146 +190,6 @@ struct ApplyCtx<'a> {
     /// Whose batch this is. Carried so `open_slot` can tell the bind's
     /// [`DrainSignal`] which peer it turned out to belong to.
     peer: WorkerId,
-}
-
-/// Told when the consumer takes a record out of the buffer credit is issued
-/// against, so credit comes back by draining instead of by a timer.
-///
-/// `BATCHING.md` § P8 specifies this: `reader_pump` "gains an
-/// `Option<CreditReturn>` and calls `credit.release(1)` after each successful
-/// handoff to `frame_tx` — exact, O(1), and immediate", leaving the sweep to
-/// reclaim only for slots whose pump died. Two halves of that landed and one
-/// did not, deliberately.
-///
-/// **The pump counts, and it names its slot.** `drained` is the exact number
-/// of records this slot's pump has taken out of the buffer since the last
-/// reconcile, and `listed` says whether the slot is already on its peer's
-/// dirty lane waiting for one. That is what lets a reconcile be exact without
-/// reading the slot channel's length — a read that takes that channel's lock,
-/// which is what made the arrival path's whole-table walk expensive enough to
-/// narrow in the first place.
-///
-/// **The pump does not release credit.** Releasing needs the peer's mutex —
-/// the same one the inbound batch path takes — and taking it per record would
-/// trade a periodic cost for a worse per-record one. Two paths each releasing
-/// an amount for one drained record would also double-count, and the periodic
-/// sweep is still there. So the pump posts and the reconcile decides, which
-/// keeps every visit idempotent: a redundant one recomputes zero.
-///
-/// The peer is not known when `bind` creates this: a bind belongs to whoever
-/// claims it, and the claim arrives later as an `OpenSlot`. Until then the
-/// signal is inert, which is correct — nothing has been delivered, so nothing
-/// has drained.
-pub(crate) struct DrainSignal {
-    /// Whose bind this turned out to be, and where its drains are posted. All
-    /// of it arrives together when an `OpenSlot` claims the bind.
-    claim: std::sync::OnceLock<SlotClaim>,
-    /// Records this slot's pump has taken out of the buffer since the last
-    /// [`IngressSlot::reconcile`] swapped it to zero.
-    drained: AtomicU32,
-    /// Whether this slot's index is already sitting on the peer's dirty lane.
-    listed: AtomicBool,
-    wake: flume::Sender<WorkerId>,
-}
-
-/// What an `OpenSlot` tells a bind's [`DrainSignal`] when it claims it.
-struct SlotClaim {
-    peer: WorkerId,
-    /// The peer's "a credit-return visit is already queued" flag.
-    pending: Arc<AtomicBool>,
-    /// The peer's dirty-slot lane, for naming this slot as having drained.
-    lane: flume::Sender<u32>,
-    /// This slot's index in the peer's table.
-    index: u32,
-}
-
-impl DrainSignal {
-    pub(crate) fn new(wake: flume::Sender<WorkerId>) -> Self {
-        Self {
-            claim: std::sync::OnceLock::new(),
-            drained: AtomicU32::new(0),
-            listed: AtomicBool::new(false),
-            wake,
-        }
-    }
-
-    /// Name the peer this bind turned out to belong to, its slot index, that
-    /// peer's dirty lane and its pending-wake flag. Called once, when an
-    /// `OpenSlot` claims the bind.
-    pub(crate) fn claimed_by(
-        &self,
-        peer: WorkerId,
-        pending: Arc<AtomicBool>,
-        lane: flume::Sender<u32>,
-        index: u32,
-    ) {
-        let _ = self.claim.set(SlotClaim {
-            peer,
-            pending,
-            lane,
-            index,
-        });
-    }
-
-    /// One record left the buffer: count it, name the slot, ring the doorbell.
-    ///
-    /// The count comes first and is unconditional, because it is the only
-    /// record of the drain that survives — the listing and the wake are both
-    /// best-effort hints about *when* to look, and a reconcile that arrives by
-    /// any route reads the same number.
-    ///
-    /// The listing is per *slot* and the wake is per *peer*, which is the
-    /// granularity each does its work at: one lane entry is all a reconcile
-    /// needs to find this slot, and one wake is all the sweep task needs to
-    /// come and drain the lane. `listed` and the peer's `pending` flag are the
-    /// two coalescers, and each is taken down by the visit it summoned.
-    ///
-    /// `try_send` rather than an await on both: this runs on the pump's task,
-    /// in the path of every frame, and must never park it. **A full lane puts
-    /// `listed` back down**, and a full wake lane puts `pending` back down, for
-    /// the same reason: leaving either up claims a visit is coming when none
-    /// is, and every later drain would coalesce into something that was
-    /// dropped. Clearing costs this one drain its hint and lets the next one
-    /// try again; the periodic sweep's whole-table walk is what bounds the gap
-    /// if no next one comes, and the count is still there when it arrives.
-    ///
-    /// A per-slot record threshold was the alternative to the wake and is
-    /// worse on both counts: it withholds credit for the first `T` records of
-    /// every slot, which is latency on the path this change exists to speed up,
-    /// and with a thousand slots on one peer it still posts a thousand times.
-    pub(crate) fn drained(&self) {
-        let Some(claim) = self.claim.get() else {
-            // Nothing has been delivered on this bind yet, so nothing drained.
-            return;
-        };
-        self.drained.fetch_add(1, Ordering::Relaxed);
-        if !self.listed.swap(true, Ordering::AcqRel) && claim.lane.try_send(claim.index).is_err() {
-            self.listed.store(false, Ordering::Release);
-        }
-        if claim.pending.swap(true, Ordering::AcqRel) {
-            return; // a wake for this peer is already outstanding
-        }
-        if self.wake.try_send(claim.peer).is_err() {
-            // Nobody will take the flag down, so let the next drain try again
-            // rather than leaving this peer permanently marked as pending.
-            claim.pending.store(false, Ordering::Release);
-        }
-    }
-
-    /// Clear the listing, then take the drain count.
-    ///
-    /// The order is what makes a concurrent drain safe, and it is the reverse
-    /// of [`drained`](Self::drained)'s. A drain landing between the two steps
-    /// finds `listed` down and lists the slot again, so the next pass sees
-    /// either a count of zero (this pass had already taken its record) or the
-    /// new drain — never a count with nothing to come and fetch it. Swapping
-    /// first and clearing after loses exactly that case: the drain would find
-    /// `listed` still up, decline to list, and its credit would wait for the
-    /// periodic walk.
-    fn take_drained(&self) -> u32 {
-        self.listed.store(false, Ordering::Release);
-        self.drained.swap(0, Ordering::AcqRel)
-    }
 }
 
 impl IngressRegistry {
@@ -919,6 +794,18 @@ fn retire_epoch(state: &mut PeerIngress, metrics: Option<&MuxMetricsHandle>) -> 
     // a left-behind entry would send the next pass to whatever slot takes that
     // index back — a reconcile of a slot neither the batch nor a pump named.
     // Clearing keeps every entry meaning what the pass assumes it means.
+    //
+    // The dirty lane gets no matching clear. A retired index's own pump can
+    // still post to it — draining what was already in the C + 1 buffer at
+    // close — and that entry outlives this function with nothing here to name
+    // it. Left alone, it costs whatever visits the index next one empty visit
+    // (nothing, if the index stays closed) or one spurious visit of a
+    // replacement (harmless per `collect_touched_grants`'s doc: the visit
+    // reads the replacement's own count, whatever its own pump has drained
+    // since, and that count is always its own — `bind` makes one
+    // `DrainSignal` per bind and `open_slot` claims it, so it can never be the
+    // retired slot's). `collect_grants`'s periodic walk also drains the lane
+    // outright, so such an entry cannot outlive one tick.
     state.touched.clear();
     state.peer_bytes = ByteBudget::new(state.peer_bytes.limit());
     closed
@@ -927,7 +814,27 @@ fn retire_epoch(state: &mut PeerIngress, metrics: Option<&MuxMetricsHandle>) -> 
 /// Reconcile every slot of this peer. The periodic tick's walk, and the
 /// backstop for a slot whose drain could not reach [`collect_touched_grants`]
 /// because the dirty lane was full when its pump tried to list it.
+///
+/// Unlike the other two visitors, this one does not route through
+/// [`list_drained_slots`], so it is the one that must drain the lane itself:
+/// every live slot below is reconciled and cleared unconditionally. Draining
+/// the lane first narrows this function's own race window rather than
+/// closing it — a drain landing after the drain loop below but before the
+/// walk reaches that slot still relists it, leaving one entry behind for the
+/// *next* call to discard. That entry is redundant, not harmful: its slot
+/// cannot be granted credit for it twice, because the quantity a reconcile
+/// reads lives in the slot's own [`DrainSignal`], not in the lane, and the
+/// entry itself does not survive this function's next call, which drains the
+/// lane unconditionally before it reconciles again. Discarded rather than run
+/// through `mark_touched`: nothing downstream of this walk needs a
+/// touched-list entry, since every live slot is about to be visited
+/// regardless of what named it.
 fn collect_grants(state: &mut PeerIngress, replies: &mut Vec<ReplyRecord>) {
+    for _ in 0..MAX_INGRESS_SLOTS_PER_PEER {
+        let Ok(_index) = state.drained_rx.try_recv() else {
+            break;
+        };
+    }
     #[cfg(test)]
     let visits = &mut state.reconcile_visits;
     for entry in &mut state.slots {
@@ -938,6 +845,11 @@ fn collect_grants(state: &mut PeerIngress, replies: &mut Vec<ReplyRecord>) {
         {
             *visits += 1;
         }
+        // This walk visits every live slot unconditionally, so clearing here
+        // is what keeps `touched`'s meaning scoped to a pass
+        // (`IngressSlot::touched`'s doc) without depending on a list entry to
+        // find the slot.
+        slot.clear_touched();
         reconcile_slot(slot, replies);
     }
 }
@@ -955,9 +867,9 @@ fn collect_grants(state: &mut PeerIngress, replies: &mut Vec<ReplyRecord>) {
 ///
 /// An entry naming an index whose slot is gone lists nothing, and one naming an
 /// index a *different* slot has since taken costs that slot one visit that
-/// finds a count of zero. Neither can misplace credit: the lane carries an
-/// index and no quantity, and the quantity lives in the [`DrainSignal`] the
-/// slot itself holds.
+/// reads that slot's own count, whatever it is. Neither can misplace credit:
+/// the lane carries an index and no quantity, and the quantity lives in the
+/// [`DrainSignal`] the slot itself holds.
 fn list_drained_slots(state: &mut PeerIngress) {
     for _ in 0..MAX_INGRESS_SLOTS_PER_PEER {
         let Ok(index) = state.drained_rx.try_recv() else {
@@ -982,11 +894,12 @@ fn list_drained_slots(state: &mut PeerIngress) {
 /// An index whose slot was *replaced* — closed and reopened at the same dense
 /// index in one pass — is not skipped: the lookup finds the new occupant and
 /// reconciles it, even though the entry that listed the index belonged to the
-/// slot that is now gone. That visit is spurious and cannot mint credit the
+/// slot that is now gone. That visit is spurious but cannot mint credit the
 /// replacement did not earn, because the count a reconcile reads belongs to
 /// the slot rather than to the index: `bind` makes one [`DrainSignal`] per
-/// bind and `open_slot` claims it, so the replacement reads a signal no pump
-/// has drained from and takes a count of zero. If the replacement is listed
+/// bind and `open_slot` claims it, so the replacement reads its own count —
+/// zero unless its own pump has already drained something, and either way
+/// its own credit, never the retired slot's. If the replacement is listed
 /// again later in the same pass, it is visited twice — the first visit takes
 /// the whole count and the pending grant with it, so the second finds zero of
 /// each and stages nothing.

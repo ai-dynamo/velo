@@ -845,8 +845,14 @@ fn open_many(registry: &IngressRegistry, config: &MuxConfig, count: u32) -> Vec<
 
 /// The cost this scope exists to remove: a visit per live slot per batch, on a
 /// peer holding a thousand of them, under the mutex the batch path needs.
+///
+/// Named for the surviving rule, not the first cut's: a batch reconciles the
+/// slots it delivered into *and* the slots on the dirty lane, and this case
+/// has none of the latter, so the assertion below only exercises the first
+/// half. [`a_batch_returns_the_credit_of_every_slot_that_drained`] is the
+/// counterpart that exercises the dirty-lane half.
 #[test]
-fn a_batch_reconciles_only_the_slots_it_delivered_into() {
+fn a_batch_reconciles_the_slots_it_delivered_into_and_no_others_when_nothing_drained() {
     let config = config();
     let registry = IngressRegistry::default();
     let _consumers = open_many(&registry, &config, MANY_SLOTS);
@@ -985,7 +991,12 @@ fn a_doorbell_visit_reconciles_only_the_slots_that_drained() {
     );
 }
 
-/// The grant is what the pump counted, not what the slot buffer holds.
+/// The grant is what the pump counted, not what the slot buffer holds — and
+/// staying exact holds even once the pump's count outruns `sizes`, the one
+/// case R6 asked to pin: `inject_dropped` is the only producer of a channel
+/// entry with no `sizes` entry, and no live slot reaches it, but a record
+/// pushed straight into the buffer behind the mux's back (below) is the same
+/// shape without needing that path.
 ///
 /// Occupancy was only ever a proxy for the drain, and only right while the mux
 /// was the buffer's sole writer — which the ledger had no way to check. Here a
@@ -1023,13 +1034,36 @@ fn the_grant_is_what_the_pump_counted_not_what_the_channel_holds() {
         "two records were counted out of the buffer, so two credits come back \
          however many records the buffer happens to hold"
     );
+
+    // Take the rest out: the real seq-3 record, whose `sizes` entry the first
+    // reconcile above left behind, plus the injected one that never had one.
+    // The pump counts both, so the next reconcile's drain count (2) outruns
+    // `sizes` (1 entry) — the `drained > sizes.len()` case R6 asked to decide
+    // and test. `reconcile`'s pop loop stops at the one entry `sizes` has, and
+    // `SlotCreditAccount::release` clamps the unbounded count against what the
+    // account itself still shows buffered (1, not 2), so the grant is 1: the
+    // account's clamp is what keeps this exact, not the `sizes` bound, which
+    // exists only to stop an underflow that no live slot can actually reach.
+    assert_eq!(consumer.pump().len(), 2);
+    assert_eq!(
+        registry.sweep_credit(peer()),
+        vec![ReplyRecord::CreditUpdate { slot: id, delta: 1 }],
+        "the pump counted 2 drains but `sizes` and the account both show only \
+         1 record still outstanding, so the grant is 1, clamped by the \
+         account rather than inflated by the count"
+    );
 }
 
-/// A full dirty lane costs a listing, not the credit.
+/// A full dirty lane costs a listing, not the credit — and the periodic walk
+/// that answers it also empties the lane, not just the slots.
 ///
 /// The lane is the fast path and the periodic walk is what stands behind it.
-/// Filling and emptying a lane of `MAX_INGRESS_SLOTS_PER_PEER` entries is why
-/// this test runs in tens of milliseconds rather than microseconds.
+/// The walk reconciles every live slot regardless of what is on the lane, so
+/// it drains the lane too: leaving an entry behind would let the next real
+/// listing for the same index queue a second one, and "one entry per slot
+/// with something outstanding" would stop being true. Filling and emptying a
+/// lane of `MAX_INGRESS_SLOTS_PER_PEER` entries is why this test runs in tens
+/// of milliseconds rather than microseconds.
 #[test]
 fn a_drain_that_cannot_list_still_gets_its_credit_from_the_periodic_walk() {
     let (registry, consumer, config) = bound();
@@ -1058,12 +1092,12 @@ fn a_drain_that_cannot_list_still_gets_its_credit_from_the_periodic_walk() {
          the count the pump left on the slot"
     );
 
-    let mut spilled = 0;
-    while let Ok(index) = lane_rx.try_recv() {
-        assert_eq!(index, u32::MAX, "a listing landed on a full lane");
-        spilled += 1;
-    }
-    assert_eq!(spilled, MAX_INGRESS_SLOTS_PER_PEER);
+    assert!(
+        lane_rx.try_recv().is_err(),
+        "the walk that just reconciled this slot must also have drained the \
+         fill entries it invalidated; one left behind here is what lets a \
+         later drain of the same slot queue a second entry for it"
+    );
 
     // With room again, the next drain lists: a failed listing puts the flag
     // back down rather than claiming a visit that is not coming.

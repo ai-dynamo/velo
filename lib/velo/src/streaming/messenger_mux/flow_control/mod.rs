@@ -28,8 +28,9 @@
 //! > `C + 1`-deep buffer, so the applier only `try_send`s into space credit
 //! > already reserved and never blocks its lane.
 //!
-//! [`slot_buffer_depth`] is that arithmetic, and
-//! [`SlotCreditAccount::buffered`] is the occupancy it bounds.
+//! [`slot_buffer_depth`] is that arithmetic, and `SlotCreditAccount`'s private
+//! `buffered` field is the occupancy it bounds — a `#[cfg(test)]` accessor
+//! reads it back for the tests that pin the bound, so it is not a link here.
 
 use super::protocol::RecordType;
 

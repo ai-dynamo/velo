@@ -1289,8 +1289,10 @@ answers both lists.
 - The doorbell walks that lane too, and covers a peer with no further batches
   arriving.
 - The periodic tick keeps the whole-table walk, as the backstop for a slot whose
-  listing found the lane full. A visit is now an atomic swap rather than a
-  slot-channel length read, so the walk costs what the tick can afford.
+  listing found the lane full. It drains the lane outright before it
+  reconciles, so an entry that walk empties does not survive to relist a slot
+  on its own account. A visit is now an atomic swap rather than a slot-channel
+  length read, so the walk costs what the tick can afford.
 
 **The count replaces the occupancy estimate.** `IngressSlot::reconcile` no
 longer reads `frame_tx.len()`. It clears the listing, swaps the count to zero,
@@ -1311,6 +1313,7 @@ arrival finding it unknown rather than reclaimed by any sweep.
 flag back down, so the drain keeps its count and the next drain lists again; the
 periodic walk is what returns that credit meanwhile. An entry naming a slot that
 has since closed costs the next pass one visit that finds nothing, and an entry
-naming an index a different slot has taken costs that slot one visit that finds a
-count of zero. Neither can misplace credit, because the lane carries an index and
-no quantity and the quantity lives in the `DrainSignal` the slot itself holds.
+naming an index a different slot has taken costs that slot one visit that reads
+that slot's own count, whatever it is. Neither can misplace credit, because the
+lane carries an index and no quantity and the quantity lives in the
+`DrainSignal` the slot itself holds.
