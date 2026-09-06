@@ -299,3 +299,26 @@ Matrix `t3-t3-now2e72` (job 2742370), the same node pair as `t3-w2e72`, tree 94d
 Without #85, worker credit exhaustion is back at 276 to 377 per rep (`t3-final72`: 246 to 368), and velo3's ITL p99 sits inside mux18p's range on the same nodes (33, 37 and 66 against 31, 61 and 61). With #85 on the same nodes it was 44 to 76 against 35 to 42, and exhaustion reached 1,431. The ITL p50 of 4 to 6 ms in the five- and six-holder reps belongs to the draw and hits both arms. CPU per request is unchanged either way (13.0 to 13.4 here).
 
 **Verdict.** PR #85 owns the tail cost and bought no CPU. It closes with this measurement in its body. The inline receiver is cleared: the tails and the exhaustion without #85 are at their `t3-final72` levels, and it removed about 0.2 ms/req of adapter work. The integration branch reverts the #85 merge (its content is 94dc8eb again, which is the wheel now installed). The first-token picture is unchanged: velo3 3 to 4 ms ahead of mux18p at a matched three-holder draw (45.4 and 44.5 against 48.3), and level at the heaviest draws (55.5 against 55.1).
+
+## Addendum 2026-09-06 night: long inter-token gaps, per token, velo3 against mux18p
+
+Source: aiperf's per-request `inter_chunk_latency` lists in `aiperf/profile_export.jsonl`, every request of every rep of `t3-final72` and `t3-now2e72` (both on the tree without PR #85), read by `.research/analysis/itl/analyze_itl.py`. Each rep holds about 63.5 million gaps. Exhaustion is the workers' `slot_credit_exhausted_total` summed over eight processes.
+
+| matrix | rep | arm | draw | gaps > 50 ms | > 100 ms | > 500 ms | p99 of per-request max gap, ms | exhaustion |
+|---|---|---|---|---|---|---|---|---|
+| final72 | 1 | mux18p | 2 holders | 2,442,444 | 58,268 | 308 | 301 | |
+| final72 | 1 | velo3 | 2 holders | 3,019,508 | 90,001 | 670 | 383 | 368 |
+| final72 | 3 | velo3 | 2 holders | 2,534,571 | 90,882 | 501 | 370 | 246 |
+| final72 | 2 | mux18p | 1 holder | 6,831,367 | 3,607,199 | 4,395 | 529 | |
+| final72 | 3 | mux18p | 1 holder | 6,893,298 | 3,263,465 | 3,873 | 519 | |
+| final72 | 2 | velo3 | 1 holder | 6,583,421 | 2,769,552 | 4,951 | 547 | 310 |
+| now2e72 | 1 | mux18p | 1 holder | 4,553,338 | 580,146 | 3,358 | 512 | |
+| now2e72 | 2 | mux18p | 3 holders | 3,208,316 | 320,499 | 233 | 354 | |
+| now2e72 | 2 | velo3 | 3 holders | 1,530,797 | 272,824 | 802 | 391 | 377 |
+| now2e72 | 3 | velo3 | 3 holders | 3,843,136 | 195,889 | 257 | 238 | 334 |
+| now2e72 | 3 | mux18p | 5 holders | 1,232,712 | 276,366 | 89 | 320 | |
+| now2e72 | 1 | velo3 | 6 holders | 1,401,111 | 179,204 | 227 | 248 | 276 |
+
+At a matched draw the sign flips between reps above 50 and 100 ms: velo3 is lower at one holder, higher at two, and both at three. Above 500 ms velo3 is equal or higher in all six matched comparisons, at 227 to 4,951 gaps of 63.5 million per rep. Along the stream, long gaps are spread evenly over the ten deciles for both arms (10.1 to 11.0 percent above 50 ms in every decile of the one-holder pair). In the last four token positions velo3 shows a small uptick against the rest of its stream (1.08x above 100 ms, 1.37x above 500 ms; mux18p 1.01x and 1.10x), at 76 to 106 gaps per rep. That uptick is the credit tail: the sender needs one grant for its last few records.
+
+**What it settles.** Velo's ITL tail is the backlog draw, as mux18p's is. A sender runs out of credit about 300 times per rep and waits under 2 ms (the reply window plus the lane wait and two hops), and only 21 to 30 percent of credit batches wait out the window at all. The starved-slot urgent grant left open on PR #83 has under 1 ms to win on about 300 of 250,000 streams. It is not built (plan addendum of this night; design facts in the session brief).

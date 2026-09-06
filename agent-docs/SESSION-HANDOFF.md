@@ -735,3 +735,7 @@ The author ruled that CPU per request is a bonus, not a bar: cut it only when la
 - **Next**: the starved-slot urgent grant on #83, then TTFT p99 at 72 workers. Every CPU change gets a same-matrix tail check (plan addendum of this night).
 - **Worktree `velo-w2e`** holds the review loop's uncommitted pass-1 and pass-2 edits (`BATCHING.md`, `ingress/slot.rs`, `ingress/tests.rs`, `messenger_mux/mod.rs`, `peer_batcher/flush_gate.rs`). The loop was stopped in pass 3 when #85 closed. The reviewer's pass-1 finding matched the measurement: the no-stall argument missed the in-flight records and the anchor channel's 256 cap, so a sender can wait on the threshold. Nothing there is needed; the worktree and the branch can go once the user agrees.
 - **Results page** republished with the headline, the W2(e) section and the re-ordered plan.
+
+### Update 2026-09-06 night: the urgent grant sized from the per-token data and not built
+
+Three read-only readers (receiver grant path, sender stall path, aiperf per-token gaps) fed `scratchpad/w2/BRIEF-w9-urgent-grant.md`. Ruling: not built (plan and results addenda of this night). The analysis script is `.research/analysis/itl/analyze_itl.py <matrix dir>`. The `velo-ug` worktree and `w9-urgent-grant` branch were created and removed. Next: decompose first-token p99 per request at a matched draw on `t3-now2e72` before proposing a mechanism.
