@@ -188,17 +188,22 @@ pub(crate) async fn reader_pump(
 
     loop {
         tokio::select! {
+            // `tokio::time::timeout`, which this replaced, always polled the
+            // receive first and only checked its own deadline if that was
+            // Pending -- a ready receive could never lose. An unbiased
+            // `select!` instead starts each poll from a pseudo-random branch,
+            // so a heartbeat landing right at the deadline boundary (it is
+            // sent on the same cadence as this pump's own deadline) can find
+            // both the receive and the fired sleep ready at once and let the
+            // sleep win the coin flip, discarding a frame that just proved
+            // liveness -- an explicit terminal, worst case, reported to the
+            // consumer as a watchdog-driven `Dropped` instead of the real
+            // sentinel. `biased` restores `timeout`'s exact priority.
+            biased;
             _ = &mut cancelled => break,
             received = transport_rx.recv_async() => {
                 match received {
                     Ok(bytes) => {
-                        // Any frame (data or heartbeat) proves liveness. The
-                        // timer is deliberately left alone here: the next
-                        // fire compares against `last_frame` instead, which
-                        // is what keeps the per-record cost a clock read
-                        // rather than a deregister/register pair.
-                        missed_heartbeats = 0;
-                        last_frame = tokio::time::Instant::now();
                         // Forward to anchor's frame channel.
                         //
                         // The per-anchor frame_tx is bounded(256) — the smallest
@@ -218,6 +223,24 @@ pub(crate) async fn reader_pump(
                             }
                             Err(flume::TrySendError::Disconnected(_)) => break,
                         }
+                        // Any frame (data or heartbeat) proves liveness -- but
+                        // only once it is actually forwarded. A `frame_tx` that
+                        // is full makes the `send_async` above block for as
+                        // long as the consumer takes to free a slot; that is
+                        // the pump doing real work, not the sender going
+                        // silent, and stamping on arrival instead of here would
+                        // charge the block against the sender's heartbeat
+                        // budget, so a watchdog window that should need
+                        // `DETECTION_MULTIPLIER * heartbeat_deadline` of actual
+                        // silence would instead fire one window early --
+                        // `messenger::server::lanes` takes the same stance on
+                        // its own `last_item` for the same reason. The timer
+                        // itself is deliberately left alone here: the next
+                        // fire compares against `last_frame` instead, which
+                        // is what keeps the per-record cost a clock read
+                        // rather than a deregister/register pair.
+                        missed_heartbeats = 0;
+                        last_frame = tokio::time::Instant::now();
                         // The record is out of the buffer the mux issues credit
                         // against, so that credit is free. Telling the mux here
                         // is what lets its sweep interval be a backstop rather
@@ -263,9 +286,12 @@ pub(crate) async fn reader_pump(
                         // bind, precisely so the entry it would otherwise
                         // remove -- reused by whatever attach wins next -- is
                         // never touched by a pump that no longer speaks for
-                        // it. `tokio::select!` does not guarantee the cancel
-                        // branch wins a tie, so the check has to be a state
-                        // read here, not an ordering assumption.
+                        // it. The `biased` cancel branch above always wins a
+                        // poll where both it and this receive are ready, but
+                        // cancellation can still land in the gap after this
+                        // poll already committed to this arm's body, so the
+                        // check stays a state read rather than an ordering
+                        // assumption.
                         if bind_unclaimed(drain.as_deref())
                             && !cancel_token.is_cancelled()
                             && let Some((_, entry)) = registry.remove(&local_id)

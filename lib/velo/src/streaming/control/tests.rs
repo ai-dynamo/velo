@@ -145,7 +145,7 @@ async fn reader_pump_watchdog_firing_increments_counter() {
     );
 }
 
-/// The sibling reap the `Ok(Err(_))` branch does must also (1) increment
+/// The sibling reap the transport-closed arm does must also (1) increment
 /// `streaming_unclaimed_bind_reaped_total` and (2) inject a `Dropped`
 /// sentinel, the same two obligations the watchdog branch above proves --
 /// otherwise an operator watching the watchdog counter alone would see
@@ -1015,7 +1015,7 @@ async fn test_pump_reaps_a_claimed_prebind_after_missed_heartbeats() {
 /// Finding: an unclaimed pre-bind reclaimed by the mux's accept window (the
 /// bind's `frame_tx` -- the other end of this `transport_rx` -- being
 /// dropped) left the registry entry behind forever, because the pump's
-/// `Ok(Err(_))` exit did nothing but break the loop. Once heartbeat detection
+/// transport-closed arm did nothing but break the loop. Once heartbeat detection
 /// is gated on a claim (the fix above), the accept window is the *only*
 /// reaper an abandoned pre-bind has, so this exit must do the cleanup the
 /// watchdog-fired branch already does.
@@ -1070,7 +1070,7 @@ async fn test_pump_reaps_an_ordinary_attach_with_unclaimed_mux_drain_after_misse
     drop(transport_tx);
 }
 
-/// The `Ok(Err(_))` half of the same finding, corrected: an ordinary or
+/// The transport-closed-arm half of the same finding, corrected: an ordinary or
 /// adopted attach's bind closing (its own accept window expiring because the
 /// peer never sent an `OpenSlot`) must remove the registry entry exactly as
 /// an unclaimed pre-bind's does. "Something else already owns telling the
@@ -1181,6 +1181,15 @@ async fn a_thousand_records_arm_the_heartbeat_timer_a_handful_of_times() {
     }
 
     let armed = arms.load(std::sync::atomic::Ordering::Relaxed);
+    // Without this, deleting every `note_timer_arm()` call site leaves
+    // `armed` at 0 and the bound below still passes -- an upper bound alone
+    // does not prove the seam is wired to anything. The pre-loop arm is
+    // unconditional and this point is reached only after a record has been
+    // forwarded, so `>= 1` is exact and cannot flake.
+    assert!(
+        armed >= 1,
+        "the pre-loop arm must have counted at least once"
+    );
     assert!(
         armed <= MAX_ARMS,
         "reader_pump must arm its heartbeat timer a bounded number of times, not \
@@ -1206,6 +1215,99 @@ async fn test_pump_forwards_data_frames() {
             .expect("frame_rx closed");
 
     assert_eq!(received, data_bytes, "pump must forward bytes unchanged");
+}
+
+/// A forward blocked on a saturated `frame_tx` is the pump doing real work,
+/// not the sender going silent, so it must not count against the heartbeat
+/// budget. `last_frame` has to be stamped once the forward lands, not when
+/// the frame arrives -- `messenger::server::lanes` already takes this stance
+/// for its own consumer call (see its comment on `last_item`); this pins
+/// `reader_pump` to the same rule.
+///
+/// Scenario: a capacity-1 `frame_tx` is pre-filled so `try_send` always
+/// finds it full and the pump must block on `send_async`. One frame is sent;
+/// the pump receives it and parks on the full channel. The clock advances
+/// past one heartbeat deadline while it is parked -- time spent moving that
+/// frame, not silence -- then the slot is drained so the send lands. From
+/// that instant a correct pump still needs a full
+/// `DETECTION_MULTIPLIER * heartbeat_deadline` of real silence before it
+/// gives up; a pump that stamped `last_frame` on arrival instead already
+/// believes one whole window of that silence has passed and gives up one
+/// window early.
+#[tokio::test]
+async fn reader_pump_does_not_count_a_blocked_forward_as_heartbeat_silence() {
+    tokio::time::pause();
+
+    let deadline = Duration::from_millis(50);
+    let (transport_tx, transport_rx) = flume::bounded::<Vec<u8>>(4);
+    let (frame_tx, frame_rx) = flume::bounded::<Vec<u8>>(1);
+    // Fill the one slot so `try_send` always finds it full.
+    frame_tx.try_send(b"placeholder".to_vec()).unwrap();
+
+    let registry = std::sync::Arc::new(dashmap::DashMap::new());
+    let local_id = 1u64;
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+    registry.insert(
+        local_id,
+        crate::streaming::anchor::AnchorEntry {
+            frame_tx: frame_tx.clone(),
+            cancel_token: cancel_token.clone(),
+            active_pump_token: None,
+            attachment: true,
+            timeout_cancel: None,
+            unattached_timeout: None,
+            heartbeat_interval: deadline,
+            stream_cancel_handle: None,
+            prebind: None,
+        },
+    );
+    let ctx = crate::streaming::anchor::AnchorContext {
+        registry: registry.clone(),
+        mpsc_registry: std::sync::Arc::new(dashmap::DashMap::new()),
+        metrics: None,
+    };
+    tokio::spawn(reader_pump(
+        transport_rx,
+        frame_tx,
+        cancel_token,
+        ctx,
+        PumpContext {
+            local_id,
+            heartbeat_deadline: deadline,
+            drain: None,
+            prebound: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        },
+    ));
+
+    let record = rmp_serde::to_vec(&crate::streaming::frame::StreamFrame::Item(1u32)).unwrap();
+    transport_tx.send_async(record.clone()).await.unwrap();
+
+    // Let the forward stay blocked for slightly over one deadline before
+    // anything drains it: this is the "the pump was busy, not silent"
+    // interval the bug misattributes to the sender.
+    tokio::time::sleep(deadline + Duration::from_millis(10)).await;
+
+    // Free the slot the forward was waiting on.
+    let placeholder = frame_rx.recv_async().await.unwrap();
+    assert_eq!(placeholder, b"placeholder".to_vec());
+    let forwarded = frame_rx.recv_async().await.unwrap();
+    assert_eq!(forwarded, record, "the blocked record must still land");
+
+    // No further frames arrive. Two more full windows of genuine silence --
+    // three in total from the moment the forward actually finished -- must
+    // still be needed before the entry is reaped. A half-window margin
+    // (rather than a fixed few milliseconds) keeps this proportional to
+    // `deadline`: the buggy stamp kills the entry at 2 windows past `S` (the
+    // moment the forward landed), the correct one at 3, and this sleep lands
+    // squarely between them either way.
+    tokio::time::sleep(deadline * 2 + deadline / 2).await;
+
+    assert!(
+        registry.contains_key(&local_id),
+        "reader_pump killed the stream one window early: a forward blocked by \
+         backpressure was counted as heartbeat silence because `last_frame` was \
+         stamped when the frame arrived instead of when the forward finished"
+    );
 }
 
 #[tokio::test]

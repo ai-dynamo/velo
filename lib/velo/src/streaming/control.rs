@@ -629,7 +629,7 @@ pub fn create_anchor_detach_handler(manager: Arc<AnchorManager>) -> crate::messe
                         // `released_prebind` below is dropped. Cancelling first is load-bearing for
                         // a released pre-bind: `PreBind::drop` closes the bind's `frame_tx` (the
                         // other end of this pump's `transport_rx`) when unclaimed, and the pump's
-                        // own `Ok(Err(_))` arm treats an unclaimed, *uncancelled* transport close as
+                        // own transport-closed arm treats an unclaimed, *uncancelled* transport close as
                         // "the accept window reclaimed an abandoned pre-bind" and removes the
                         // registry entry -- which this handler has just re-armed for reattachment,
                         // not abandoned. Cancelling first is what tells that arm this pump is being

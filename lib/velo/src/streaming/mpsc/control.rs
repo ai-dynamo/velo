@@ -142,18 +142,35 @@ pub(crate) async fn mpsc_reader_pump(
 
     loop {
         tokio::select! {
+            // `tokio::time::timeout`, which this replaced, always polled the
+            // receive first and only checked its own deadline if that was
+            // Pending -- a ready receive could never lose. `biased` restores
+            // that exact priority; see `crate::streaming::control::reader_pump`
+            // for why an unbiased select over a deadline that lands on the
+            // sender's own cadence is a real, not theoretical, race.
+            biased;
             _ = &mut cancelled => break,
             received = transport_rx.recv_async() => {
                 match received {
                     Ok(bytes) => {
-                        missed_heartbeats = 0;
-                        last_frame = tokio::time::Instant::now();
                         let explicit_terminal = bytes == *crate::streaming::sender::cached_detached()
                             || bytes == *crate::streaming::sender::cached_dropped()
                             || bytes == *crate::streaming::sender::cached_finalized();
                         if frame_tx.send_async((sender_id, bytes)).await.is_err() {
                             break;
                         }
+                        // Any frame proves liveness -- but only once it is
+                        // actually forwarded. `mpsc_reader_pump` has no
+                        // `try_send` fast path, so every frame blocks here
+                        // for as long as the consumer takes to free a slot;
+                        // that is the pump doing real work, not the sender
+                        // going silent. Stamping on arrival instead of here
+                        // would charge that block against the sender's
+                        // heartbeat budget -- see the SPSC counterpart of
+                        // this stamp in `crate::streaming::control::reader_pump`
+                        // for the full argument.
+                        missed_heartbeats = 0;
+                        last_frame = tokio::time::Instant::now();
                         // MPSC negotiates the mux in the same version as SPSC
                         // (see `MpscAnchorAttachRequest::supported_transport_keys`),
                         // so an MPSC stream over the mux needs its credit
@@ -493,6 +510,15 @@ mod tests {
         }
 
         let armed = arms.load(Ordering::Relaxed);
+        // Without this, deleting every `note_timer_arm()` call site leaves
+        // `armed` at 0 and the bound below still passes -- an upper bound
+        // alone does not prove the seam is wired to anything. The pre-loop
+        // arm is unconditional and this point is reached only after a record
+        // has been forwarded, so `>= 1` is exact and cannot flake.
+        assert!(
+            armed >= 1,
+            "the pre-loop arm must have counted at least once"
+        );
         assert!(
             armed <= MAX_ARMS,
             "mpsc_reader_pump must arm its heartbeat timer a bounded number of times, \
@@ -514,6 +540,7 @@ mod tests {
         // watchdog's doing, not the closed-channel arm's.
         let (_transport_tx, transport_rx) = flume::bounded::<Vec<u8>>(16);
         let (frame_tx, frame_rx) = flume::bounded::<(u64, Vec<u8>)>(16);
+        let heartbeat = Duration::from_millis(50);
 
         let pump = tokio::spawn(mpsc_reader_pump(
             7,
@@ -523,16 +550,24 @@ mod tests {
             Arc::new(DashMap::new()),
             PumpContext {
                 local_id: 1,
-                heartbeat_deadline: Duration::from_millis(50),
+                heartbeat_deadline: heartbeat,
                 drain: None,
                 prebound: Arc::new(AtomicBool::new(false)),
             },
         ));
 
-        // The paused clock advances itself once every task is parked, so this
-        // resolves as fast as the runtime can poll it.
-        pump.await
-            .expect("the pump must exit once the detection window passes");
+        // Bounded even under a paused clock: if the hoisted timer were ever
+        // silently disarmed (the seam this PR is built around), the pump
+        // would park forever on a channel with no other pending timer, and a
+        // paused clock has nothing left to auto-advance to -- the test would
+        // hang the runner instead of failing red. This timeout is that
+        // remaining timer: it gives the paused clock something to advance to
+        // regardless of the pump's own state, so a dead watchdog fails on a
+        // named assertion here instead.
+        tokio::time::timeout(heartbeat * (DETECTION_MULTIPLIER as u32 + 2), pump)
+            .await
+            .expect("the pump must exit once the detection window passes")
+            .expect("the pump task must not panic");
 
         let (sender_id, bytes) = frame_rx
             .try_recv()
@@ -595,6 +630,67 @@ mod tests {
             "a sender streaming inside its heartbeat deadline must never be dropped"
         );
         drop(transport_tx);
+    }
+
+    /// A forward blocked on a saturated `frame_tx` is the pump doing real
+    /// work, not the sender going silent, so it must not count against the
+    /// heartbeat budget -- see the SPSC counterpart of this test on
+    /// `crate::streaming::control::reader_pump` for the full argument.
+    /// `mpsc_reader_pump` has no `try_send` fast path at all, so this is the
+    /// ordinary saturated case for it, not an edge one.
+    #[tokio::test]
+    async fn mpsc_reader_pump_does_not_count_a_blocked_forward_as_heartbeat_silence() {
+        tokio::time::pause();
+
+        let heartbeat = Duration::from_millis(50);
+        let (transport_tx, transport_rx) = flume::bounded::<Vec<u8>>(4);
+        let (frame_tx, frame_rx) = flume::bounded::<(u64, Vec<u8>)>(1);
+        // Fill the one slot so the send always blocks.
+        frame_tx.try_send((0, b"placeholder".to_vec())).unwrap();
+
+        let pump = tokio::spawn(mpsc_reader_pump(
+            7,
+            transport_rx,
+            frame_tx,
+            CancellationToken::new(),
+            Arc::new(DashMap::new()),
+            PumpContext {
+                local_id: 1,
+                heartbeat_deadline: heartbeat,
+                drain: None,
+                prebound: Arc::new(AtomicBool::new(false)),
+            },
+        ));
+
+        let record = rmp_serde::to_vec(&crate::streaming::frame::StreamFrame::Item(1u32)).unwrap();
+        transport_tx.send_async(record.clone()).await.unwrap();
+
+        // Let the forward stay blocked for slightly over one deadline before
+        // anything drains it -- time spent moving the frame, not silence.
+        tokio::time::sleep(heartbeat + Duration::from_millis(10)).await;
+
+        let (placeholder_id, placeholder) = frame_rx.recv_async().await.unwrap();
+        assert_eq!(placeholder_id, 0);
+        assert_eq!(placeholder, b"placeholder".to_vec());
+        let (sender_id, forwarded) = frame_rx.recv_async().await.unwrap();
+        assert_eq!(sender_id, 7);
+        assert_eq!(forwarded, record, "the blocked record must still land");
+
+        // No further frames. Two more full windows of genuine silence --
+        // three in total from the moment the forward actually finished --
+        // must still be needed before the sender is dropped. A half-window
+        // margin keeps this proportional to `heartbeat`: the buggy stamp
+        // drops the sender at 2 windows past the moment the forward landed,
+        // the correct one at 3, and this sleep lands squarely between them.
+        tokio::time::sleep(heartbeat * 2 + heartbeat / 2).await;
+
+        assert!(
+            !pump.is_finished(),
+            "mpsc_reader_pump dropped the sender one window early: a forward \
+             blocked by backpressure was counted as heartbeat silence because \
+             `last_frame` was stamped when the frame arrived instead of when \
+             the forward finished"
+        );
     }
 
     /// MPSC negotiates in the same version as SPSC, so its request carries the

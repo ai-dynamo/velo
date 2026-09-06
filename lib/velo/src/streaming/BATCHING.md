@@ -1197,8 +1197,8 @@ of the 60 s. At the manager default (5 s heartbeat) the watchdog usually wins
 and the catch is in seconds; at `heartbeat_interval >= 20 s` — the 30 s this
 crate's own `cancel.rs` example configures, say — the watchdog's threshold
 exceeds 60 s and the accept window always wins instead, so the catch is up to
-60 s, not seconds. Either way `control::reader_pump`'s `Ok(Err(_))` arm reaps
-the registry entry once the accept window closes on an unclaimed bind,
+60 s, not seconds. Either way `control::reader_pump`'s transport-closed arm
+reaps the registry entry once the accept window closes on an unclaimed bind,
 regardless of which door (`prebind_anchor` or an adopted attach) was expecting
 the sender — so the adopting sender is always caught, just not always quickly.
 
