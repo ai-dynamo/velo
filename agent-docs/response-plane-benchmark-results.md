@@ -246,3 +246,39 @@ Matrices `t3-t3-final72` (job 2741447) and `t3-t3-final32` (job 2741448, `RIG_FR
 | 32 | 4 holders | velo3 | 3,001 | 57.6 | 177 | 966 | 34.5 | 10.01 | 0 |
 
 At 72 workers velo3's p50 is 2 to 7 ms ahead of mux18p at a matched draw, its p99 40 to 70 ms behind, and its CPU per request 1.9 to 2.9 ms above. At 32 workers the CPU gap shrinks to 1.4 to 1.8 ms, but velo3's p95 grows from about 206 to 317 to 366 ms at a one-holder draw and its p50 lead disappears; mux18p is unchanged. Velo's larger task count needs the workers. The rig stays at 72, and the CPU clause is judged there. Worker credit exhaustion 0 to 102 per process; every rep zero errors.
+
+## Addendum 2026-09-06 night: W2(e) and the inline receiver (`t3-w2e72`, `t3-prof6`)
+
+Matrix `t3-t3-w2e72` (job 2742328) and the profiled rep `t3-t3-prof6` (job 2742329). Tree f4dccc6: the final tree plus PR #85 (one credit grant per half window). The adapter carries its inline receiver (the connection task polls the anchor; the consumer task and its 64-deep mailbox are gone) and one runtime. 72 workers, three reps per arm, grouped by draw. Credit updates are the frontend's `records_sent_total{record_type="credit_update"}` per rep for 67.7 million data records. Exhaustion is the workers' `slot_credit_exhausted_total` summed over the eight processes, with the largest single process in parentheses.
+
+| draw | arm | req/s | TTFT p50 ms | p95 | p99 | ITL p50 ms | ITL p99 ms | CPU ms/req | credit updates | frontend batches | exhaustion | errors |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 holder | velo3 | 2,985 | 41.8 | 182 | 862 | 1.57 | 75.6 | 12.40 | 3.10 M | 7,848 | 1,431 (382) | 0 |
+| 2 holders | mux18p | 3,343 | 47.1 | 159 | 739 | 1.65 | 40.3 | 10.29 | | | | 0 |
+| 2 holders | mux18p | 3,359 | 48.0 | 160 | 805 | 1.59 | 42.2 | 10.63 | | | | 0 |
+| 2 holders | mux18p | 3,369 | 47.8 | 153 | 807 | 1.67 | 35.2 | 10.50 | | | | 0 |
+| 2 holders | velo3 | 3,052 | 50.4 | 190 | 815 | 3.52 | 68.3 | 12.38 | 3.15 M | 9,962 | 133 (37) | 0 |
+| 2 holders | velo3 | 3,337 | 47.2 | 209 | 877 | 1.72 | 44.3 | 13.17 | 2.76 M | 10,222 | 835 (294) | 0 |
+
+**What moved.** Credit updates fell from 54 to 59 million per rep on `t3-final72` (one per 1.2 records) to 2.8 to 3.1 million (one per 21 to 25 records). Frontend batches sent fell from 307,000 to 484,000 per rep to 7,800 to 10,200. The target of one per 128 was not reached. The 200 ms sweep grants every sub-threshold remainder, and a stream lives about 2.7 s under the 8,192-way backlog at 3,000 req/s, so the sweep visits each slot about 13 times.
+
+**What did not move.** Frontend CPU per request: 12.4 to 13.2 against mux18p 10.3 to 10.6 (on `t3-final72`: 11.9 to 13.2 against 10.0 to 10.3). Grants were not a CPU lever of any size: the batcher bucket was already 0.12 ms/req before W2(e) (`t3-prof5`).
+
+**What moved the wrong way.** ITL p99 is 68 and 76 ms in two reps against mux18p's 40 and 42 on the same nodes, and 44 against 35 in the third. On `t3-final72` velo3's ITL p99 matched mux18p's at the same draw (50 against 44, 100 against 105, 46 against 102). ITL p50 is 3.5 ms in the heaviest-draw rep. Exhaustion summed over the eight worker processes is 133, 1,431 and 835, against 368, 310 and 246 on `t3-final72`. Correction to the two addenda above: their exhaustion figures (0 to 102, 25 to 74) are the first worker process alone. The sums over eight processes for `t3-final72` were 368, 310 and 246, with a largest process of 130, 147 and 102.
+
+A likely mechanism: with a half-window threshold the receiver holds drained-but-ungranted credit until the threshold or the next sweep, so the sender's usable window is between 128 and 256 records, not 256. A slow HTTP reader then exhausts the sender sooner. The inline receiver pushes the same way: without the mailbox the anchor channel fills 64 records sooner, the pump stops sooner, and the held count grows sooner. Matrix `t3-now2e72` isolates the two: the tree without #85 (94dc8eb) with the same adapter.
+
+**Profile `t3-t3-prof6`** (velo3 3,034 req/s at a three-holder draw, 13.55 ms/req; mux18p 2,336 req/s at a one-holder draw, 9.43). The velo-only buckets against `t3-prof5`:
+
+| bucket | `t3-prof5` ms/req | `t3-prof6` ms/req |
+|---|---|---|
+| reader pump | 1.11 | 1.01 |
+| anchor | 0.79 | 0.85 |
+| ingress | 0.65 | 0.51 |
+| adapter (receiver) | 0.66 | 0.49 |
+| tcp | 0.23 | 0.18 |
+| dispatch | 0.15 | 0.14 |
+| batcher | 0.12 | 0.01 |
+| sum | 3.71 | 3.20 |
+
+The velo-only work fell by 0.5 ms/req. The aggregate fell by 0.15 (13.70 to 13.55) because the axum shutdown-watch bucket swung the other way: 1.89 ms/req on velo3 against 0.43 on mux18p in this rep, 1.36 against 2.21 on `t3-prof5`. That bucket tracks the draw, not the response plane. The reader pump and the anchor channel, 1.86 ms/req together, are now the whole of velo's addressable surplus.
