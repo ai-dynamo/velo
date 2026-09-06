@@ -73,14 +73,19 @@ pub(super) struct IngressSlot {
     next_seq: u32,
     hold: BTreeMap<u32, Vec<u8>>,
     hold_bytes: ByteBudget,
-    /// Whether this slot is already on the peer's touched list for the batch
-    /// being applied.
+    /// Whether this slot is already on the peer's reconcile list for the pass
+    /// being run.
     ///
-    /// A flag rather than a batch stamp because its meaning is scoped to one
+    /// A flag rather than a pass stamp because its meaning is scoped to one
     /// critical section: the list is drained before the peer's mutex is
-    /// released, so "set" can only mean "already listed for the batch in
-    /// flight". A stamp would buy robustness against a missed clear that the
-    /// scoping makes unreachable, and cost four more bytes per slot.
+    /// released, so "set" can only mean "already listed for the pass in
+    /// flight". A missed clear (the lock's own poison-is-ignored policy means a
+    /// panic mid-critical-section can leave one behind) is not a correctness
+    /// problem either way: the stale list entry it leaves is exactly what
+    /// visits and clears the flag on the next pass, so it self-heals in one
+    /// pass, and `retire_epoch` clears the whole list on the epoch-change
+    /// path. That is why a stamp is not worth four more bytes per slot — not
+    /// that the miss is unreachable.
     touched: bool,
     /// A `CloseSlot` that arrived ahead of records still in the hold.
     ///

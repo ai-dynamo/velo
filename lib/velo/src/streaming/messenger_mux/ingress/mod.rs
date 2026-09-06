@@ -102,9 +102,11 @@ struct PeerIngress {
     /// batch pushes the few indexes it delivered into, [`list_drained_slots`]
     /// adds the ones the pump named on the dirty lane, and
     /// [`collect_touched_grants`] drains the list, keeping the capacity. It is
-    /// empty whenever the peer's mutex is free, which is what makes
-    /// [`IngressSlot::mark_touched`]'s flag mean "already listed for the pass
-    /// in flight" and nothing wider.
+    /// meant to be empty whenever the peer's mutex is free, which is what
+    /// makes [`IngressSlot::mark_touched`]'s flag mean "already listed for the
+    /// pass in flight" and nothing wider — a panic between a push and the
+    /// drain can leave a stale entry here instead, and it self-heals on the
+    /// next pass that visits it (see the flag's own doc on [`IngressSlot`]).
     touched: Vec<u32>,
     /// The peer's dirty-slot lane: indexes a draining pump named, waiting for
     /// the next pass to reconcile them.
@@ -805,10 +807,12 @@ fn deliver(
     let Some(slot) = state.slots[index].as_mut() else {
         return;
     };
-    // Marked before the record is applied rather than after, so a record that
-    // parks in the reorder hold counts: it has spent credit that only a
-    // reconcile gives back, and it may release the whole hold later in this
-    // same batch.
+    // Marked before the record is applied rather than after, so any record
+    // that reaches the slot counts, not only the ones that spend credit: one
+    // that parks in the reorder hold has spent credit that only a reconcile
+    // gives back and may release the whole hold later in this same batch,
+    // while a duplicate spends none — marking it anyway costs at worst one
+    // visit that takes a drain count of zero and returns.
     if slot.mark_touched() {
         touched.push(id.index());
     }
@@ -906,11 +910,15 @@ fn retire_epoch(state: &mut PeerIngress, metrics: Option<&MuxMetricsHandle>) -> 
         }
     }
     state.slots.clear();
-    // The entries here name slots of the epoch being retired. The table is
-    // cleared and regrows from index zero, so one left behind would send the
-    // next batch's pass to whatever slot takes that index back — a reconcile of
-    // a slot the batch never delivered into. Clearing keeps every entry meaning
-    // what the pass assumes it means.
+    // The entries here name slots of the epoch being retired. On the ordinary
+    // path the list is already empty at this point — the epoch check runs
+    // before any record is applied, and `shutdown` runs with no batch in
+    // flight — so this clears the poison path `touched`'s own doc names (a
+    // panic between a push and the drain), plus any future caller that
+    // retires mid-batch. The table is cleared and regrows from index zero, so
+    // a left-behind entry would send the next pass to whatever slot takes that
+    // index back — a reconcile of a slot neither the batch nor a pump named.
+    // Clearing keeps every entry meaning what the pass assumes it means.
     state.touched.clear();
     state.peer_bytes = ByteBudget::new(state.peer_bytes.limit());
     closed
@@ -970,6 +978,18 @@ fn list_drained_slots(state: &mut PeerIngress) {
 /// closed it, and a retired slot has nobody left to grant credit to — which is
 /// what the whole-table walk did with it too, since it ran after every record
 /// of the batch had been applied.
+///
+/// An index whose slot was *replaced* — closed and reopened at the same dense
+/// index in one pass — is not skipped: the lookup finds the new occupant and
+/// reconciles it, even though the entry that listed the index belonged to the
+/// slot that is now gone. That visit is spurious and cannot mint credit the
+/// replacement did not earn, because the count a reconcile reads belongs to
+/// the slot rather than to the index: `bind` makes one [`DrainSignal`] per
+/// bind and `open_slot` claims it, so the replacement reads a signal no pump
+/// has drained from and takes a count of zero. If the replacement is listed
+/// again later in the same pass, it is visited twice — the first visit takes
+/// the whole count and the pending grant with it, so the second finds zero of
+/// each and stages nothing.
 fn collect_touched_grants(state: &mut PeerIngress, replies: &mut Vec<ReplyRecord>) {
     #[cfg(test)]
     let visits = &mut state.reconcile_visits;

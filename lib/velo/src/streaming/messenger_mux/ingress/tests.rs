@@ -1224,6 +1224,71 @@ fn a_held_record_marks_its_slot_and_its_release_is_reconciled_in_the_same_batch(
     );
 }
 
+/// A dense index closed and reopened, with a drain of the retired slot still
+/// on the lane: the entry names the index, so the pass finds the
+/// *replacement* there instead. That visit is spurious but grants the
+/// replacement nothing, because the count a reconcile reads belongs to the
+/// slot and not to the index — the replacement claimed its own bind's
+/// `DrainSignal`, and no pump has taken anything out of that one.
+#[test]
+fn a_reused_index_reconciles_its_replacement_and_grants_it_nothing() {
+    let (registry, consumer, config) = bound();
+    let id = slot(0, 0);
+    open(&registry, &config, id, 1);
+
+    // A drain of the slot that is about to be retired. It lists index 0, so
+    // the pass below has an entry for an index whose occupant has changed —
+    // and a credit the replacement must not be handed.
+    let payload = batch(1, 1, |encoder| {
+        encoder.push_data(id, 1, &item(1)).unwrap();
+    });
+    handle_batch(&registry, &config, None, peer(), &payload);
+    assert_eq!(
+        consumer.pump(),
+        vec![item(1)],
+        "the retired slot drained one"
+    );
+
+    let replacement = register(&registry, &config, SESSION + 1);
+    let new_id = slot(0, 1);
+
+    // Close before open: with the open first, `open_slot`'s collision guard
+    // would reject the newcomer, since the old occupant is still live.
+    let before = registry.reconcile_visits(peer());
+    let payload = batch(1, 2, |encoder| {
+        encoder
+            .push_close_slot(id, 2, CloseReason::TerminalSent)
+            .unwrap();
+        encoder
+            .push_open_slot(new_id, 0, ANCHOR, SESSION + 1)
+            .unwrap();
+    });
+    let outcome = handle_batch(&registry, &config, None, peer(), &payload);
+    let visits = registry.reconcile_visits(peer()) - before;
+
+    assert_eq!(outcome.closed, 1);
+    assert_eq!(
+        registry.live_slots(peer()),
+        1,
+        "index 0 is live again, under the new generation"
+    );
+    assert!(
+        outcome.replies.is_empty(),
+        "the drain belonged to the slot that is gone, and the replacement's \
+         own signal has counted nothing: {:?}",
+        outcome.replies
+    );
+    assert_eq!(
+        visits, 1,
+        "the pass visits whatever now occupies the listed index, not the \
+         slot that listed it: {visits} visits"
+    );
+    assert!(
+        replacement.pump().is_empty(),
+        "the replacement never received a record in this batch"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Teardown
 // ---------------------------------------------------------------------------

@@ -333,12 +333,16 @@ pub struct MuxConfig {
     /// most this long.
     ///
     /// The price is latency, and it is worth being exact about who pays it: a
-    /// producer parked out of credit, with no further batch arriving to
-    /// reconcile it on the arrival path, waits up to this long for the return
-    /// its consumer's drain has already earned. That is one wait per window, so
-    /// what it costs per record is `floor / initial_credit` — negligible at the
-    /// default 256-record window, and visible at the small windows the credit
-    /// tests use deliberately.
+    /// producer parked out of credit on a peer sending this side no further
+    /// batch waits up to this long for the return its consumer's drain has
+    /// already earned. Only that producer — any inbound batch from the peer
+    /// reconciles the slots its pumps named on the dirty lane, so a peer that
+    /// keeps sending never reaches this floor at all. A drain whose listing
+    /// found the lane full is not on the lane and so not on this path either;
+    /// `credit_sweep_interval` is what covers it. That is one wait per window,
+    /// so what it costs per record is `floor / initial_credit` — negligible at
+    /// the default 256-record window, and visible at the small windows the
+    /// credit tests use deliberately.
     ///
     /// Defaults to 2 ms, which is the interval the sweep itself ran at while it
     /// was the only way credit came back. That cadence was enough to keep every
