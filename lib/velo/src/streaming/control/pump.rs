@@ -42,6 +42,30 @@ pub(crate) fn note_timer_arm() {
 #[inline(always)]
 pub(crate) fn note_timer_arm() {}
 
+#[cfg(test)]
+tokio::task_local! {
+    /// Counts how many times a pump's heartbeat timer has actually elapsed.
+    ///
+    /// A second counter rather than a flag on [`TIMER_ARMS`] because the two
+    /// answer different questions and the receive-arm re-arm below moves them
+    /// in opposite directions: a stream under traffic pushes its deadline
+    /// forward roughly twice per deadline, so its arm count *rises*, while its
+    /// fire count goes to zero. An arm count alone cannot tell a timer that
+    /// never fires from one that fires every window.
+    pub(crate) static TIMER_FIRES: std::sync::Arc<std::sync::atomic::AtomicU64>;
+}
+
+/// Record one timer fire. Nothing observes it outside a test scope.
+#[cfg(test)]
+pub(crate) fn note_timer_fire() {
+    let _ = TIMER_FIRES.try_with(|fires| fires.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+}
+
+/// Compiles away entirely: the seam must cost the shipped pump nothing.
+#[cfg(not(test))]
+#[inline(always)]
+pub(crate) fn note_timer_fire() {}
+
 /// What a reader pump needs beyond its channels.
 ///
 /// A struct rather than three more parameters: `mpsc_reader_pump` already
@@ -122,21 +146,31 @@ fn awaiting_sender(
 /// [`AnchorManager::prebind_anchor`](crate::streaming::anchor::AnchorManager::prebind_anchor),
 /// before any sender has. Reads from the transport receiver, forwards to the
 /// anchor's frame_tx. Monitors for heartbeat loss with one timer for the
-/// whole stream, armed once before the loop and re-armed only when it fires:
-/// `DETECTION_MULTIPLIER * heartbeat_deadline` of silence triggers Dropped
-/// sentinel injection, registry removal (LIVE-02), and cleanup -- but only
-/// once a sender exists.
+/// whole stream: `DETECTION_MULTIPLIER * heartbeat_deadline` of silence
+/// triggers Dropped sentinel injection, registry removal (LIVE-02), and
+/// cleanup -- but only once a sender exists.
 ///
-/// Detection lands where a timer rebuilt per record would have put it. Write
-/// `L` for the instant of the last frame and `d` for `heartbeat_deadline`.
-/// The timer was armed no later than `L`, so the first fire after it finds
-/// `L.elapsed() < d`, counts nothing, and re-arms to `L + d`; the fire at
-/// `L + d` sees exactly `d` of silence, counts the first miss and re-arms to
-/// `L + 2d`; the third miss lands at `L + DETECTION_MULTIPLIER * d`. The only
-/// fire that finds `L.elapsed() >= d` immediately is one whose `L` predates
-/// the arm -- the arm at spawn, or the re-arm an [`awaiting_sender`] window
-/// takes -- and a per-record timeout restarted its window at exactly those
-/// points too.
+/// That timer is armed once before the loop and moved by two rules. A
+/// received frame pushes it forward only when its deadline is already inside
+/// half a window, setting it a full `heartbeat_deadline` past the frame;
+/// otherwise the frame leaves it alone. A fire compares against `last_frame`
+/// and re-arms from there. Under steady traffic the first rule keeps the
+/// deadline at least half a window ahead of the clock, so the timer never
+/// fires and is moved at most twice per deadline.
+///
+/// Detection still lands where a timer rebuilt per record would have put it.
+/// Write `L` for the instant of the last frame and `d` for
+/// `heartbeat_deadline`. When frames stop, the deadline sits somewhere in
+/// `[L + d/2, L + d]` -- the receive rule only ever sets it a full `d` past a
+/// frame, and only from inside `d/2`. A deadline at `L + d` fires there, sees
+/// exactly `d` of silence and counts the first miss; a deadline short of it
+/// fires early, finds `L.elapsed() < d`, counts no miss and re-arms to
+/// `L + d`, where that first miss is counted instead. Either way the misses
+/// land at `L + d`, `L + 2d`, `L + 3d`, and the `DETECTION_MULTIPLIER`th at
+/// `L + DETECTION_MULTIPLIER * d`. The only fire that finds `L.elapsed() >= d`
+/// on its first look is one whose `L` predates the arm -- the arm at spawn,
+/// or the re-arm an [`awaiting_sender`] window takes -- and a per-record
+/// timeout restarted its window at exactly those points too.
 ///
 /// While [`awaiting_sender`] holds, a pre-bind pump times out every window by
 /// construction (there is no producer yet to be silent), so the timer branch
@@ -179,8 +213,23 @@ pub(crate) async fn reader_pump(
     // `registered` branch), which leaves one clock read per record in its
     // place. The cancellation future is hoisted for the same reason: rebuilt
     // per trip it adds and removes a waiter on the token each time.
+    //
+    // The timer is moved by two rules, and neither runs per record. The
+    // receive arm below pushes the deadline forward only once it is inside
+    // half a window; the fired arm re-arms from `last_frame`. Under steady
+    // traffic the first keeps the deadline at least half a window ahead of
+    // the clock, so this timer never fires and moves at most twice per
+    // deadline -- where resetting it on every frame would put the
+    // deregister/register pair back, and re-arming it only from its own fire
+    // (the shape this replaced) left every live stream firing once per
+    // window, thousands of them in phase.
     let mut last_frame = tokio::time::Instant::now();
-    let sleep = tokio::time::sleep(heartbeat_deadline);
+    // Hoisted out of the per-record path: the check below is then one
+    // comparison against an `Instant` already stamped, no division and no
+    // second clock read.
+    let rearm_threshold = heartbeat_deadline / 2;
+    let mut armed_until = last_frame + heartbeat_deadline;
+    let sleep = tokio::time::sleep_until(armed_until);
     tokio::pin!(sleep);
     note_timer_arm();
     let cancelled = cancel_token.cancelled();
@@ -234,13 +283,24 @@ pub(crate) async fn reader_pump(
                         // `DETECTION_MULTIPLIER * heartbeat_deadline` of actual
                         // silence would instead fire one window early --
                         // `messenger::server::lanes` takes the same stance on
-                        // its own `last_item` for the same reason. The timer
-                        // itself is deliberately left alone here: the next
-                        // fire compares against `last_frame` instead, which
-                        // is what keeps the per-record cost a clock read
-                        // rather than a deregister/register pair.
+                        // its own `last_item` for the same reason.
                         missed_heartbeats = 0;
                         last_frame = tokio::time::Instant::now();
+                        // Push the deadline out only once it is inside half a
+                        // window. That bounds this to twice per deadline
+                        // under any record rate, so the timer never fires on
+                        // a live stream, and it costs a comparison against
+                        // the instant just stamped. Resetting on every record
+                        // instead would be a deregister/register pair on the
+                        // time driver's lock per record -- the cost the one
+                        // timer per stream was hoisted to avoid.
+                        if armed_until.saturating_duration_since(last_frame)
+                            < rearm_threshold
+                        {
+                            armed_until = last_frame + heartbeat_deadline;
+                            sleep.as_mut().reset(armed_until);
+                            note_timer_arm();
+                        }
                         // The record is out of the buffer the mux issues credit
                         // against, so that credit is free. Telling the mux here
                         // is what lets its sweep interval be a backstop rather
@@ -328,6 +388,7 @@ pub(crate) async fn reader_pump(
                 }
             }
             _ = &mut sleep => {
+                note_timer_fire();
                 // Every path out of this arm re-arms the sleep first. A fired
                 // `Sleep` stays ready until it is reset, so a `continue` past
                 // one turns the pump into a hot loop instead of a wait --
@@ -336,14 +397,18 @@ pub(crate) async fn reader_pump(
                 let idle = last_frame.elapsed();
                 if idle < heartbeat_deadline {
                     // A frame landed inside this window, so the deadline that
-                    // frame implies has not arrived yet. Re-arming here
-                    // rather than on the frame is the whole point: one arm
-                    // per window instead of one per record.
-                    sleep.as_mut().reset(last_frame + heartbeat_deadline);
+                    // frame implies has not arrived yet. Reached only when
+                    // the last frame fell in the first half of a window, or
+                    // when there is no sender yet -- the receive arm's push
+                    // keeps a stream carrying records out of this arm
+                    // entirely.
+                    armed_until = last_frame + heartbeat_deadline;
+                    sleep.as_mut().reset(armed_until);
                     note_timer_arm();
                     continue;
                 }
-                sleep.as_mut().reset(tokio::time::Instant::now() + heartbeat_deadline);
+                armed_until = tokio::time::Instant::now() + heartbeat_deadline;
+                sleep.as_mut().reset(armed_until);
                 note_timer_arm();
                 // A slot still `awaiting_sender` times out on every
                 // window by construction -- there is no producer to

@@ -70,6 +70,29 @@ pub(crate) fn note_timer_arm() {
 #[inline(always)]
 pub(crate) fn note_timer_arm() {}
 
+#[cfg(test)]
+tokio::task_local! {
+    /// Counts how many times a lane task's idle timer has actually elapsed.
+    ///
+    /// Lane-local for the same reason as [`TIMER_ARMS`], and a second counter
+    /// rather than a flag on it because the two move in opposite directions
+    /// under the receive-arm re-arm below: a lane under traffic pushes its
+    /// deadline forward roughly twice per TTL, so its arm count rises, while
+    /// its fire count goes to zero.
+    pub(crate) static TIMER_FIRES: std::sync::Arc<std::sync::atomic::AtomicU64>;
+}
+
+/// Record one timer fire. Nothing observes it outside a test scope.
+#[cfg(test)]
+pub(crate) fn note_timer_fire() {
+    let _ = TIMER_FIRES.try_with(|fires| fires.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+}
+
+/// Compiles away entirely: the seam must cost the shipped lane task nothing.
+#[cfg(not(test))]
+#[inline(always)]
+pub(crate) fn note_timer_fire() {}
+
 /// Hooks fired as lanes are created, reaped, and drained.
 ///
 /// Kept as a trait so this module carries no `prometheus` dependency and tests
@@ -279,7 +302,15 @@ where
         // for a deadline that almost never fires. A pinned `Sleep` that is
         // already registered polls without it, and comparing each fire
         // against `last_item` leaves the reap where it was: after `idle_ttl`
-        // of real silence. Same shape as the two streaming reader pumps
+        // of real silence.
+        //
+        // An item pushes that deadline forward only once it is inside half a
+        // TTL, so a lane that keeps receiving moves its timer at most twice
+        // per TTL and never lets it fire, while a lane that stops still reaps
+        // one TTL after its last item: the deadline then sits in
+        // `[last_item + ttl/2, last_item + ttl]`, and a fire short of
+        // `last_item + ttl` re-arms to exactly that instant rather than
+        // reaping. Same shape as the two streaming reader pumps
         // (`streaming::control::reader_pump` carries the timing argument) --
         // but not `biased`, unlike those two: `biased` there fixes a real
         // race, a heartbeat frame and a fired sleep landing on the same poll
@@ -295,9 +326,7 @@ where
         // item still queued, which the un-`biased` select made reachable by
         // a coin flip instead of only by the narrower race the pre-hoist
         // `timeout` left (see `try_reap`).
-        let sleep = tokio::time::sleep(deadline);
-        tokio::pin!(sleep);
-        note_timer_arm();
+
         // The idle window starts when the handler returns, not when the item
         // was dequeued: the timeout this replaces wrapped `recv_async` alone,
         // so a handler slower than `idle_ttl` never put its own lane a window
@@ -305,20 +334,30 @@ where
         // hand back a lane that is already past its deadline with an empty
         // queue -- reaped the moment it finished work.
         let mut last_item = tokio::time::Instant::now();
+        // Hoisted out of the per-item path; see the two reader pumps for the
+        // rule.
+        let rearm_threshold = deadline / 2;
+        let mut armed_until = last_item + deadline;
+        let sleep = tokio::time::sleep_until(armed_until);
+        tokio::pin!(sleep);
+        note_timer_arm();
 
         loop {
             let received = tokio::select! {
                 _ = &mut sleep => {
+                    note_timer_fire();
                     // Every path out of this arm re-arms the sleep first: a
                     // fired `Sleep` stays ready until it is reset, so a
                     // `continue` past one would spin the lane task.
                     let idle = last_item.elapsed();
                     if idle < deadline {
-                        sleep.as_mut().reset(last_item + deadline);
+                        armed_until = last_item + deadline;
+                        sleep.as_mut().reset(armed_until);
                         note_timer_arm();
                         continue;
                     }
-                    sleep.as_mut().reset(tokio::time::Instant::now() + deadline);
+                    armed_until = tokio::time::Instant::now() + deadline;
+                    sleep.as_mut().reset(armed_until);
                     note_timer_arm();
                     if self.try_reap() {
                         trace!(
@@ -345,6 +384,15 @@ where
             // empty queue is never mistaken for idle.
             self.state.pending.fetch_sub(1, Ordering::AcqRel);
             last_item = tokio::time::Instant::now();
+            // Push the deadline out only once it is inside half a TTL, so a
+            // busy lane moves its timer at most twice per TTL instead of once
+            // per item. Resetting on every item would put back the driver
+            // lock pair this loop was rewritten to avoid.
+            if armed_until.saturating_duration_since(last_item) < rearm_threshold {
+                armed_until = last_item + deadline;
+                sleep.as_mut().reset(armed_until);
+                note_timer_arm();
+            }
         }
     }
 
@@ -592,8 +640,10 @@ mod tests {
         // not reap the lane and flip the assertions below (a real-clock test
         // with no invariant to fall back on, unlike `no_reap_while_pending`'s
         // `pending > 0` or `no_reap_while_handler_in_flight`'s handler still
-        // running). ~200 ms total still lets the lane's timer fire twice
-        // mid-stream.
+        // running). At that rate the receive-arm re-arm keeps the deadline
+        // half a TTL ahead and the timer never fires, so what this asserts is
+        // the outcome -- a lane fed inside its TTL stays live -- for whichever
+        // of the two arms ends up moving the timer on a loaded runner.
         const ITEMS: usize = 40;
         for handled_so_far in 1..=ITEMS {
             let _ = router.route(9, (), None);
@@ -625,7 +675,10 @@ mod tests {
     /// lane and one per item -- the same items come out either way -- so
     /// this counts the arms directly, the same way
     /// `a_thousand_records_arm_the_heartbeat_timer_a_handful_of_times` pins
-    /// it for `streaming::control::reader_pump`. Built from a bare
+    /// it for `streaming::control::reader_pump`. The hour-long TTL keeps the
+    /// timer from ever firing here;
+    /// `a_lane_under_traffic_never_fires_its_idle_timer_and_reaps_once_it_stops`
+    /// is what pins the firing case. Built from a bare
     /// [`LaneTask`] rather than through [`LaneRouter`]: the task-local scope
     /// below has to wrap the exact future that gets spawned, and
     /// `LaneRouter::route` spawns that future itself, several calls removed
@@ -698,6 +751,135 @@ mod tests {
             "the lane task must arm its idle timer a bounded number of times, \
              not once per item: {ITEMS} items armed it {armed} times (bound {MAX_ARMS})"
         );
+    }
+
+    /// The lane half of `streaming::control`'s
+    /// `a_stream_under_traffic_never_fires_its_heartbeat_timer`, which carries
+    /// the derivation of both bounds: a lane that keeps receiving items must
+    /// not let its idle timer fire, and a lane that stops must still reap one
+    /// TTL after its last item.
+    ///
+    /// Built from a bare [`LaneTask`] rather than through [`LaneRouter`] for
+    /// the reason `lane_arms_its_idle_timer_a_handful_of_times_not_once_per_item`
+    /// gives: the task-local scopes have to wrap the exact future that gets
+    /// spawned, and `LaneRouter::route` spawns that future itself. The map it
+    /// holds is real rather than a dangling `Weak`, so the reap below goes
+    /// through `try_reap`'s actual predicate -- this lane's own entry, with
+    /// `pending == 0` -- and not through its router-is-gone shortcut.
+    ///
+    /// The consumer signals each item on a channel instead of the `wait_for`
+    /// poll the router tests use: a poll loop sleeps, and under
+    /// `tokio::time::pause` a sleeping test task with a parked lane task lets
+    /// the runtime auto-advance to the lane's own timer -- firing the very
+    /// timer this test says must not fire.
+    #[tokio::test]
+    async fn a_lane_under_traffic_never_fires_its_idle_timer_and_reaps_once_it_stops() {
+        tokio::time::pause();
+
+        const TTL_MS: u64 = 100;
+        const STEP_MS: u64 = 5;
+        const TRAFFIC_MS: u64 = 500;
+        const ITEMS: usize = (TRAFFIC_MS / STEP_MS) as usize + 1;
+        const MAX_ARMS: u64 = 1 + TRAFFIC_MS / (TTL_MS / 2) + 1;
+
+        let ttl = Duration::from_millis(TTL_MS);
+        let step = Duration::from_millis(STEP_MS);
+
+        let (tx, rx) = flume::unbounded::<()>();
+        let (done_tx, done_rx) = flume::unbounded::<()>();
+        let state = Arc::new(LaneState {
+            pending: AtomicUsize::new(0),
+        });
+        let lanes: Arc<DashMap<u64, Lane<()>>> = Arc::new(DashMap::new());
+        lanes.insert(
+            1,
+            Lane {
+                tx: tx.clone(),
+                state: Arc::clone(&state),
+            },
+        );
+        let arms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let fires = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        let task: LaneTask<u64, ()> = LaneTask {
+            key: 1,
+            rx,
+            state: Arc::clone(&state),
+            lanes: Arc::downgrade(&lanes),
+            consumer: Arc::new(move |()| {
+                let done = done_tx.clone();
+                Box::pin(async move {
+                    let _ = done.send(());
+                })
+            }),
+            idle_ttl: Some(ttl),
+            observer: None,
+        };
+
+        let lane = tokio::spawn(TIMER_FIRES.scope(
+            Arc::clone(&fires),
+            TIMER_ARMS.scope(Arc::clone(&arms), task.run()),
+        ));
+
+        for i in 0..ITEMS {
+            // Advance between items, never after the last one, so the clock
+            // still reads the last item's instant when the loop ends.
+            if i > 0 {
+                tokio::time::advance(step).await;
+            }
+            // Mirrors what `LaneRouter::route` does under its entry guard.
+            state.pending.fetch_add(1, Ordering::AcqRel);
+            tx.send(()).expect("the lane task must still be receiving");
+            done_rx
+                .recv_async()
+                .await
+                .unwrap_or_else(|_| panic!("the lane task must handle item {i}"));
+        }
+
+        let fired = fires.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            fired, 0,
+            "a lane task must not fire its timer under traffic: {ITEMS} items \
+             {STEP_MS} ms apart under a {TTL_MS} ms TTL fired it {fired} times"
+        );
+
+        let armed = arms.load(std::sync::atomic::Ordering::Relaxed);
+        // Without this, deleting every `note_timer_arm()` call site leaves
+        // `armed` at 0 and the bound below still passes.
+        assert!(
+            armed >= 1,
+            "the pre-loop arm must have counted at least once"
+        );
+        assert!(
+            armed <= MAX_ARMS,
+            "the lane task must re-arm its idle timer at a bounded rate, not once \
+             per item: {ITEMS} items armed it {armed} times (bound {MAX_ARMS})"
+        );
+
+        // The lane stamps `last_item` right after the handler this loop just
+        // drained, and no advance separates the two, so the paused clock reads
+        // that same instant here.
+        let last_item = tokio::time::Instant::now();
+
+        // Bounded rather than a bare await: a lane whose timer never fired
+        // would park this test on a paused clock with nothing left to advance
+        // to, hanging the runner instead of going red.
+        tokio::time::timeout(ttl * 10, lane)
+            .await
+            .expect("a lane left idle must reap itself")
+            .expect("the lane task must not panic");
+
+        let reaped_after = last_item.elapsed();
+        assert!(
+            reaped_after >= ttl && reaped_after < ttl * 2,
+            "a lane that stops must reap one TTL after its last item, no sooner: \
+             reaped after {reaped_after:?} under a {ttl:?} TTL"
+        );
+        assert!(
+            fires.load(std::sync::atomic::Ordering::Relaxed) > fired,
+            "the reap must have come from a timer fire, not from anything else"
+        );
+        assert_eq!(lanes.len(), 0, "a reaped lane must leave no map entry");
     }
 
     /// `idle_ttl: None` disables reaping, and the pre-hoist code never called

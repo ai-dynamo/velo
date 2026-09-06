@@ -1125,7 +1125,10 @@ async fn test_pump_reaps_an_attached_entry_with_unclaimed_mux_drain_when_its_bin
 /// On the tier-3 rig those turns were 7.3 percent of the frontend's 72 cores.
 /// A behavioural test cannot see the difference -- the same bytes come out
 /// either way -- so this counts the arms directly and pins the shape of the
-/// count: bounded, rather than one per record.
+/// count: bounded, rather than one per record. The clock never gets near the
+/// hour-long deadline below, so this says nothing about a timer that could
+/// fire; `a_stream_under_traffic_never_fires_its_heartbeat_timer` is what
+/// pins that.
 #[tokio::test]
 async fn a_thousand_records_arm_the_heartbeat_timer_a_handful_of_times() {
     tokio::time::pause();
@@ -1197,6 +1200,236 @@ async fn a_thousand_records_arm_the_heartbeat_timer_a_handful_of_times() {
     );
 
     drop(transport_tx);
+}
+
+/// The discriminator for the bounded re-arm: a stream that keeps carrying
+/// records must not let its heartbeat timer fire at all.
+///
+/// The first cut of this pump armed one `Sleep` per stream and re-armed it
+/// only from its own fired arm. Under traffic that timer fired once every
+/// `heartbeat_deadline`, found `idle < deadline`, re-armed and continued --
+/// harmless at the 5 s deadline the manager defaults to, but not what the
+/// pump's doc comment promises, and with thousands of pumps spawned in the
+/// same second those fires arrive as a herd. Pushing the deadline forward
+/// from the receive arm, but only once it is within half a deadline of
+/// firing, is what removes them.
+///
+/// `fired == 0` is the whole discriminator here. The arm bound cannot be: the
+/// receive-arm re-arm *raises* the arm count, because it moves the deadline up
+/// to twice per deadline where the fired arm moved it once. What the arm bound
+/// still pins is the property the timer hoist bought -- that the count does not
+/// scale with the number of records.
+///
+/// The bound's derivation: one arm before the loop, plus at most one
+/// receive-arm re-arm per `heartbeat_deadline / 2` of traffic. A re-arm sets
+/// the deadline a full `heartbeat_deadline` out, and the next one cannot
+/// happen until that deadline is back inside half of itself, which is
+/// `heartbeat_deadline / 2` later at the earliest. Over `TRAFFIC_MS` that is
+/// `TRAFFIC_MS / (DEADLINE_MS / 2)` re-arms; the remaining `+ 1` covers a
+/// record landing exactly on a half-window edge.
+///
+/// `tokio::time::advance` moves the paused clock by an exact amount and gives
+/// the runtime one scheduling turn, so every count here is derived rather than
+/// measured. Each record is drained in step with its send: letting a backlog
+/// build would park this task and the pump at the same time, and an idle
+/// runtime under `tokio::time::pause` auto-advances to the pump's own sleep --
+/// firing the very timer this test says must not fire.
+#[tokio::test]
+async fn a_stream_under_traffic_never_fires_its_heartbeat_timer() {
+    tokio::time::pause();
+
+    const DEADLINE_MS: u64 = 50;
+    const STEP_MS: u64 = 5;
+    const TRAFFIC_MS: u64 = 500;
+    const RECORDS: usize = (TRAFFIC_MS / STEP_MS) as usize + 1;
+    const MAX_ARMS: u64 = 1 + TRAFFIC_MS / (DEADLINE_MS / 2) + 1;
+
+    let deadline = Duration::from_millis(DEADLINE_MS);
+    let step = Duration::from_millis(STEP_MS);
+
+    let (transport_tx, transport_rx) = flume::bounded::<Vec<u8>>(4);
+    let (frame_tx, frame_rx) = flume::bounded::<Vec<u8>>(4);
+    let arms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let fires = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let ctx = crate::streaming::anchor::AnchorContext {
+        registry: std::sync::Arc::new(dashmap::DashMap::new()),
+        mpsc_registry: std::sync::Arc::new(dashmap::DashMap::new()),
+        metrics: None,
+    };
+
+    tokio::spawn(TIMER_FIRES.scope(
+        Arc::clone(&fires),
+        TIMER_ARMS.scope(
+            Arc::clone(&arms),
+            reader_pump(
+                transport_rx,
+                frame_tx,
+                tokio_util::sync::CancellationToken::new(),
+                ctx,
+                PumpContext {
+                    local_id: 1,
+                    heartbeat_deadline: deadline,
+                    drain: None,
+                    prebound: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                },
+            ),
+        ),
+    ));
+
+    let record = rmp_serde::to_vec(&crate::streaming::frame::StreamFrame::Item(7u32)).unwrap();
+    for i in 0..RECORDS {
+        // Advance between records, never after the last one, so the clock
+        // still reads the last frame's instant when the loop ends.
+        if i > 0 {
+            tokio::time::advance(step).await;
+        }
+        transport_tx
+            .send_async(record.clone())
+            .await
+            .unwrap_or_else(|_| panic!("the pump must still be reading at record {i}"));
+        let forwarded = frame_rx
+            .recv_async()
+            .await
+            .unwrap_or_else(|_| panic!("the pump must forward record {i}"));
+        assert_eq!(forwarded, record, "record {i} must be forwarded unchanged");
+    }
+
+    let fired = fires.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        fired, 0,
+        "reader_pump must not fire its timer under traffic: {RECORDS} records \
+         {STEP_MS} ms apart under a {DEADLINE_MS} ms deadline fired it {fired} times"
+    );
+
+    let armed = arms.load(std::sync::atomic::Ordering::Relaxed);
+    // Without this, deleting every `note_timer_arm()` call site leaves `armed`
+    // at 0 and the bound below still passes.
+    assert!(
+        armed >= 1,
+        "the pre-loop arm must have counted at least once"
+    );
+    assert!(
+        armed <= MAX_ARMS,
+        "reader_pump must re-arm its heartbeat timer at a bounded rate, not once \
+         per record: {RECORDS} records armed it {armed} times (bound {MAX_ARMS})"
+    );
+
+    drop(transport_tx);
+}
+
+/// The other half of the same rule: a stream that stops is still caught
+/// `DETECTION_MULTIPLIER` deadlines after its last record, and the fires the
+/// test above forbids under traffic do happen once the traffic stops.
+///
+/// This is also the anti-tautology control for the fire seam. With
+/// `note_timer_fire()` deleted, every `fired == 0` assertion passes vacuously;
+/// the fire count asserted here is what says the seam is wired to the arm it
+/// names.
+///
+/// The fire count is read as a delta across the traffic/silence boundary
+/// rather than as a total, deliberately: the total depends on what the timer
+/// did during the traffic phase, and this test has to stay green under the
+/// fail-before revert that puts the first cut's shape back -- that is what
+/// makes it evidence that detection timing did not move.
+///
+/// Writing `L` for the last record's instant and `d` for `heartbeat_deadline`,
+/// the timer's deadline sits somewhere in `[L + d/2, L + d]` when the traffic
+/// stops: the receive arm only ever pushes it to a full `d` out and only when
+/// it was inside `d/2`. If it sits short of `L + d` the first fire finds
+/// `idle < d`, counts no miss and re-arms to `L + d`; from there the misses
+/// land at `L + d`, `L + 2d` and `L + 3d`, which is where a timer rebuilt per
+/// record would have put them. So the pump exits at `L + 3d` exactly, having
+/// fired `DETECTION_MULTIPLIER` times, or `DETECTION_MULTIPLIER + 1` when the
+/// first fire was that no-miss re-arm.
+#[tokio::test]
+async fn a_stream_that_stops_is_caught_a_detection_window_after_its_last_record() {
+    tokio::time::pause();
+
+    const DEADLINE_MS: u64 = 50;
+    const STEP_MS: u64 = 5;
+    const TRAFFIC_MS: u64 = 500;
+    const RECORDS: usize = (TRAFFIC_MS / STEP_MS) as usize + 1;
+
+    let deadline = Duration::from_millis(DEADLINE_MS);
+    let step = Duration::from_millis(STEP_MS);
+
+    let (transport_tx, transport_rx) = flume::bounded::<Vec<u8>>(4);
+    let (frame_tx, frame_rx) = flume::bounded::<Vec<u8>>(4);
+    let fires = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let ctx = crate::streaming::anchor::AnchorContext {
+        registry: std::sync::Arc::new(dashmap::DashMap::new()),
+        mpsc_registry: std::sync::Arc::new(dashmap::DashMap::new()),
+        metrics: None,
+    };
+
+    let pump = tokio::spawn(TIMER_FIRES.scope(
+        Arc::clone(&fires),
+        reader_pump(
+            transport_rx,
+            frame_tx,
+            tokio_util::sync::CancellationToken::new(),
+            ctx,
+            PumpContext {
+                local_id: 1,
+                heartbeat_deadline: deadline,
+                drain: None,
+                prebound: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+        ),
+    ));
+
+    let record = rmp_serde::to_vec(&crate::streaming::frame::StreamFrame::Item(7u32)).unwrap();
+    for i in 0..RECORDS {
+        if i > 0 {
+            tokio::time::advance(step).await;
+        }
+        transport_tx
+            .send_async(record.clone())
+            .await
+            .unwrap_or_else(|_| panic!("the pump must still be reading at record {i}"));
+        let forwarded = frame_rx
+            .recv_async()
+            .await
+            .unwrap_or_else(|_| panic!("the pump must forward record {i}"));
+        assert_eq!(forwarded, record, "record {i} must be forwarded unchanged");
+    }
+
+    // The pump stamps `last_frame` right after the forward this loop just
+    // drained, and no advance separates the two, so the paused clock reads
+    // that same instant here.
+    let last_frame = tokio::time::Instant::now();
+    let fires_under_traffic = fires.load(std::sync::atomic::Ordering::Relaxed);
+
+    // Bounded rather than a bare await: a watchdog that never fired would
+    // otherwise park this test on a channel nothing will ever feed, and a
+    // paused clock with no other pending timer has nothing to auto-advance to
+    // -- the runner would hang instead of going red.
+    tokio::time::timeout(deadline * 20, pump)
+        .await
+        .expect("the watchdog must give up on a stream that stopped")
+        .expect("the pump task must not panic");
+
+    let caught_after = last_frame.elapsed();
+    let window = deadline * u32::from(DETECTION_MULTIPLIER);
+    assert!(
+        caught_after >= window && caught_after < window + deadline,
+        "a stream that stops must be caught {DETECTION_MULTIPLIER} deadlines after \
+         its last record: caught after {caught_after:?}, want {window:?} within one \
+         {deadline:?} deadline"
+    );
+
+    let fired = fires.load(std::sync::atomic::Ordering::Relaxed) - fires_under_traffic;
+    let misses = u64::from(DETECTION_MULTIPLIER);
+    assert!(
+        fired == misses || fired == misses + 1,
+        "a stream that stops must fire its timer once per window of silence \
+         (plus at most one no-miss re-arm): fired {fired} times, want {misses} or \
+         {}",
+        misses + 1
+    );
+
+    drop(transport_tx);
+    drop(frame_rx);
 }
 
 #[tokio::test]
