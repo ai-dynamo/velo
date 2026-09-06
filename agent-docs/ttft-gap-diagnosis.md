@@ -213,3 +213,22 @@ The symbols that appear in velo3's profile and not in mux18p's, with what the DW
 Together about 5.5 percent of the 72 cores, four cores, 1.3 ms per request at this rep's 3,028 req/s: roughly half of the same-node CPU gap to mux18p (velo3 9.4 to 10.0 against 7.1 to 7.5 ms per request); malloc and free account for another 0.5 percent over mux18p (1.48 against 0.99). The costs the two frontends share (tracing span lookups, the model-manager DashMap walk per request, msgpack decode of each record, the async-stream adaptor) are dynamo's, not the plane's, and are the same size in both.
 
 The first item is the per-batch slot walk `ingest-cost-ledger.md` named W1-B: reconcile only the slots a batch delivered into (the drain doorbell and the periodic sweep already cover the rest), which turns O(live slots) per batch into O(records in the batch). The second is the ledger's per-record reader-pump timer: keep a last-frame instant and check it from one interval tick instead of registering a timeout per frame. The third is a gauge computed by counting registry entries twice per request instead of from an atomic. All three are bounded changes with a failing test each.
+
+### 6. The backlog draw, and the one hop that is instrumented
+
+Two things came out of a read of every metric the iso3 reps already carry, not from a new run.
+
+**TTFT p50 on this rig is set by the backlog draw, not by the plane's knobs.** All twelve velo runs of `t3-iso3` did the same work (258,192 requests, 67.1 to 67.3 million data records, each of the eight mocker processes emitting exactly one eighth). Their TTFT p50 ran from 54 to 83 ms. The predictor is how many mocker processes share the 8,192-way backlog, read from `velo_streaming_mux_live_slots` per process (`prometheus/workers/proc*.txt`):
+
+| mocker processes holding the backlog | velo TTFT p50, ms | reps |
+|---|---|---|
+| 1 | 54.2 to 55.3 | 5 |
+| 2 | 60.7 to 61.7 | 3 |
+| 3 | 73.4 to 76.5 | 3 |
+| 5 | 83.4 | 1 |
+
+Within a draw group the four arms (velo3, linger off, data linger, detached ack) agree to within 1 to 3 ms. mux18p's p50 stays at 48.3 to 48.8 ms across the same spread; its per-process first-response times vary just as much (19 to 43 ms), so it sees the same draw and does not pay for it. Frontend CPU per request does not move with the draw (velo3: 9.5 to 9.9 across draws of one, two and five processes). So the gap is not "6 to 13 ms": it is about 6 ms at a concentrated draw and 26 to 35 ms at a spread one, and CPU per request is the only number that currently decides anything between arms. Pairing reps by req/s measures the draw, because rate is itself a symptom of it: every concentrated-draw rep sits at 2,250 to 2,350 req/s, every spread-draw rep at 2,790 to 3,100.
+
+**The one instrumented hop.** velo's frontend response path is six tasks and five handoffs per token: the socket reader, the messenger receive loop, the ordered lane, the reader pump (one per stream), the adapter's consumer task (one per request), and the decoder in the request's own task. mux18p is two tasks and one handoff. Only the ordered lane is instrumented: `velo_messenger_ordered_lane_wait_seconds{handler="_stream_batch"}` averages 0.36 to 0.46 ms per batch on velo3 (p99 in the 4 to 8 ms bucket), against about 23 µs a work-conserving server would show at the lane's 36 percent duty cycle. Most of it is scheduling delay. Under the data linger the same wait halves (0.17 to 0.21 ms, p99 under 4 ms) while CPU per request falls; the data linger was rejected for holding the lane longer, and this series says it does the opposite. Its A and B growth is better explained by all three of its reps landing on two- and three-process draws.
+
+**What this changes.** The plan's W2 items are a CPU program. The one measurement that could reorder them is velo3 against the data-linger arm at a matched draw, with segment C read together with the lane wait: if the halved lane wait shows in C, per-hop scheduling delay is real, and collapsing hops outranks every CPU item.

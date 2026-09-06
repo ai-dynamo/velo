@@ -156,3 +156,14 @@ Rulings.
 2. W1 (lane sharding) is not on the list: the lane's own cost is the slot walk, which (d) removes, and the profile shows no core-bound lane stage.
 3. Rig: `nats-server` and `etcd` are pinned to aiperf's half of the node from here on; they were unpinned and took 12 to 38 percent of the frontend's cores across the two profiled reps. Every CPU number before this pinning includes whatever share the scheduler gave them.
 4. The mocker backlog and the capture-window fixes stand as prerequisites for the first-token comparison; the profile does not need them, because it compares composition, not throughput.
+
+## Addendum 2026-09-06 evening: the batching review, and W2 in build order
+
+A read-only review of both planes' batching paths (four readers, three proposers, two refuters per proposal, one critic; the run's full output is in the session's task record) confirmed the profile's order and corrected two of its numbers. The per-frame timeout in the reader pump is four to five times larger than section 5 booked: the whole `Sleep` subtree under the pump is 7.3 percent of the frontend's cores plus 0.8 for the cancellation future, against 1.8 for the pump's own work. The two "credit return" ideas (a touched-slot visit list, and an exact drain counter fed by the pump) are one change at one call site. And the data linger was rejected for a mechanism the lane-wait series contradicts (diagnosis section 6).
+
+Rulings.
+
+1. Build, in this order, each its own PR with a failing test and a fail-before run: (d) touched-slot reconcile in `handle_batch`, keeping the doorbell and the sweep as the full-walk backstops, no cursor stride (0.50 ms/req expected); (a) one pinned timer per stream in the reader pump, at three sites (the mux pump, the mpsc pump, the messenger lane loop), 0.8 to 1.2 ms/req booked against a 1.9 ceiling; then a Data-class-only record cap on the batch writer that must not touch credit-reply batches; then the data linger retried after (d) and (a) at a matched draw; then a terminal-class bit in the record header. Cumulative: 1.4 to 1.9 ms/req against a 2.3 ms/req gap, discounted by about a third for sampling over-attribution.
+2. No first-token claim is booked for any of them. TTFT is compared only at a matched backlog draw (diagnosis section 6); until such a comparison exists, arms are ordered by CPU per request.
+3. Not built: a credit-grant threshold (refuted; `BATCHING.md` already rejects it), a connection pool per peer, lane sharding, a bigger initial credit, header reshaping. Each was measured or traced as not on the path.
+4. Started 2026-09-06: (d) on `w2d-touched-slot-reconcile` off `w8-control-map-bound`, (a) on `w2a-pump-timer-hoist` off `w3-zero-rtt-attach` (the pump file is W3's).
