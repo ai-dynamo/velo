@@ -194,3 +194,11 @@ Diagnosis section 8 partitions the one-runtime profile. Rulings.
 ## Addendum 2026-09-06 night: worker count settled; the CPU work is the hop chain
 
 The three-rep matrices at 72 and 32 workers (results addendum of this evening) settle ruling 1 of the evening addendum: 32 workers cuts velo's CPU per request by about 2 ms but costs its p95 about 130 ms and its p50 lead; the rig stays at 72. The CPU program is therefore the hop chain itself, in the evening addendum's order: one wake per burst into the consumer, then the reader pump hop, then the surviving channel and the cancellation-token walks. The first-token clause of the bar is met at a matched draw on the final tree (39 to 44 against 46); the p99 clause is 40 to 70 ms short; the CPU clause is 1.9 to 2.9 ms short.
+
+## Addendum 2026-09-06, later: the order after the per-record trace
+
+Diagnosis section 9 replaces the evening addendum's item (i): there is no SSE-flush lever. Rulings.
+
+1. Build now, in parallel: W2(e), one credit grant per half window instead of one per drained record (velo, branch `w2e-grant-threshold` off `w2d-touched-slot-reconcile`; the threshold is derived from the negotiated window, the periodic sweep grants any remainder, and a dated `BATCHING.md` addendum supersedes the earlier ruling against a record threshold); and the adapter's inline receiver (rig-local `dyn-pin`, belongs upstream with the one-runtime fix).
+2. Then carry `Bytes` end to end so the frontend stops allocating a `Vec` per record.
+3. Not to build: merging the reader pump into the anchor channel (the sole-writer credit invariant forbids it); a linger anywhere on the response path.
