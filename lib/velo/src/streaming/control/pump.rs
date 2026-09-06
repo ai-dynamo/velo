@@ -16,6 +16,32 @@ use std::time::Duration;
 
 use super::DETECTION_MULTIPLIER;
 
+#[cfg(test)]
+tokio::task_local! {
+    /// Counts how many times a pump has armed or re-armed its heartbeat
+    /// timer.
+    ///
+    /// A task-local rather than a field on [`PumpContext`]: the property it
+    /// exists to pin -- that a pump arms one timer for its stream instead of
+    /// one per record -- belongs to the pump's own loop, not to anything a
+    /// caller hands it, so a field would have had to be threaded through all
+    /// three production spawn sites to observe something none of them decide.
+    /// Scoping it per task also keeps each test's count its own while the
+    /// suite runs them in parallel, which a process-wide counter could not.
+    pub(crate) static TIMER_ARMS: std::sync::Arc<std::sync::atomic::AtomicU64>;
+}
+
+/// Record one timer arm. Nothing observes it outside a test scope.
+#[cfg(test)]
+pub(crate) fn note_timer_arm() {
+    let _ = TIMER_ARMS.try_with(|arms| arms.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+}
+
+/// Compiles away entirely: the seam must cost the shipped pump nothing.
+#[cfg(not(test))]
+#[inline(always)]
+pub(crate) fn note_timer_arm() {}
+
 /// What a reader pump needs beyond its channels.
 ///
 /// A struct rather than three more parameters: `mpsc_reader_pump` already
@@ -95,13 +121,27 @@ fn awaiting_sender(
 /// already asked for the stream, or
 /// [`AnchorManager::prebind_anchor`](crate::streaming::anchor::AnchorManager::prebind_anchor),
 /// before any sender has. Reads from the transport receiver, forwards to the
-/// anchor's frame_tx. Monitors for heartbeat timeouts: `DETECTION_MULTIPLIER`
-/// consecutive `heartbeat_deadline` windows with no frames trigger Dropped
+/// anchor's frame_tx. Monitors for heartbeat loss with one timer for the
+/// whole stream, armed once before the loop and re-armed only when it fires:
+/// `DETECTION_MULTIPLIER * heartbeat_deadline` of silence triggers Dropped
 /// sentinel injection, registry removal (LIVE-02), and cleanup -- but only
-/// once a sender exists. While [`awaiting_sender`] holds, a pre-bind pump
-/// times out every window by construction (there is no producer yet to be
-/// silent), so the timeout branch gates on it instead of counting those
-/// windows as misses. The transport-closed branch gates on the narrower
+/// once a sender exists.
+///
+/// Detection lands where a timer rebuilt per record would have put it. Write
+/// `L` for the instant of the last frame and `d` for `heartbeat_deadline`.
+/// The timer was armed no later than `L`, so the first fire after it finds
+/// `L.elapsed() < d`, counts nothing, and re-arms to `L + d`; the fire at
+/// `L + d` sees exactly `d` of silence, counts the first miss and re-arms to
+/// `L + 2d`; the third miss lands at `L + DETECTION_MULTIPLIER * d`. The only
+/// fire that finds `L.elapsed() >= d` immediately is one whose `L` predates
+/// the arm -- the arm at spawn, or the re-arm an [`awaiting_sender`] window
+/// takes -- and a per-record timeout restarted its window at exactly those
+/// points too.
+///
+/// While [`awaiting_sender`] holds, a pre-bind pump times out every window by
+/// construction (there is no producer yet to be silent), so the timer branch
+/// gates on it instead of counting those windows as misses. The
+/// transport-closed branch gates on the narrower
 /// [`bind_unclaimed`] instead: a bind nobody has claimed has no sender to
 /// speak of regardless of which door it was expecting one through, and the
 /// mux's accept window closing it is the only reaper such a bind has left,
@@ -129,15 +169,36 @@ pub(crate) async fn reader_pump(
         metrics,
     } = ctx;
     let mut missed_heartbeats: u8 = 0;
+    // One timer for the stream, not one per record. `tokio::time::timeout`
+    // builds a fresh `Sleep` every trip: its first poll registers a timer
+    // entry with the driver and its drop deregisters it, both under the
+    // driver's lock, so a stream carrying N records took 2N turns of that
+    // lock -- 7.3 percent of the frontend's cores on the tier-3 profile, for
+    // a deadline that almost never fires. A pinned `Sleep` that is already
+    // registered polls without the lock (tokio's `poll_elapsed` takes its
+    // `registered` branch), which leaves one clock read per record in its
+    // place. The cancellation future is hoisted for the same reason: rebuilt
+    // per trip it adds and removes a waiter on the token each time.
+    let mut last_frame = tokio::time::Instant::now();
+    let sleep = tokio::time::sleep(heartbeat_deadline);
+    tokio::pin!(sleep);
+    note_timer_arm();
+    let cancelled = cancel_token.cancelled();
+    tokio::pin!(cancelled);
 
     loop {
         tokio::select! {
-            _ = cancel_token.cancelled() => break,
-            result = tokio::time::timeout(heartbeat_deadline, transport_rx.recv_async()) => {
-                match result {
-                    Ok(Ok(bytes)) => {
-                        // Any frame (data or heartbeat) proves liveness
+            _ = &mut cancelled => break,
+            received = transport_rx.recv_async() => {
+                match received {
+                    Ok(bytes) => {
+                        // Any frame (data or heartbeat) proves liveness. The
+                        // timer is deliberately left alone here: the next
+                        // fire compares against `last_frame` instead, which
+                        // is what keeps the per-record cost a clock read
+                        // rather than a deregister/register pair.
                         missed_heartbeats = 0;
+                        last_frame = tokio::time::Instant::now();
                         // Forward to anchor's frame channel.
                         //
                         // The per-anchor frame_tx is bounded(256) — the smallest
@@ -168,7 +229,7 @@ pub(crate) async fn reader_pump(
                             drain.drained();
                         }
                     }
-                    Ok(Err(_)) => {
+                    Err(_) => {
                         // Transport channel closed -- the mux's accept window
                         // reclaiming an unclaimed bind (`release_bind` /
                         // `expire_bind` drop the bind's `frame_tx`, the other
@@ -238,76 +299,93 @@ pub(crate) async fn reader_pump(
                         }
                         break;
                     }
-                    Err(_timeout) => {
-                        // A slot still `awaiting_sender` times out on every
-                        // window by construction -- there is no producer to
-                        // be silent yet. Counting that as a miss is the bug:
-                        // it arms this watchdog against a sender that has not
-                        // shown up, capping how long a zero-RTT request may
-                        // wait in a queue, or an adopted attach may wait for
-                        // its own `OpenSlot`, at a bound nothing documents.
-                        // Once a sender exists -- an `OpenSlot` claims the
-                        // bind, or an attach adopts it -- every miss counts
-                        // exactly as it always has, with the same
-                        // `DETECTION_MULTIPLIER` margin the ordinary attach
-                        // path has always given it.
-                        if awaiting_sender(&prebound, drain.as_deref()) {
-                            continue;
-                        }
-                        missed_heartbeats += 1;
-                        if missed_heartbeats >= DETECTION_MULTIPLIER {
-                            if let Some(m) = metrics.as_ref() {
-                                m.record_heartbeat_watchdog_firing();
-                            }
-                            // Inject Dropped sentinel -- sender is dead.
-                            // The diagnostic context here is what the saturation
-                            // runbook tells operators to grep for: anchor channel
-                            // depth at the moment of firing tells you whether the
-                            // session was sitting at the bound (cascade) or empty
-                            // (real producer crash).
-                            tracing::warn!(
-                                local_id,
-                                anchor_frame_tx_len = frame_tx.len(),
-                                anchor_frame_tx_cap = frame_tx.capacity().unwrap_or_default(),
-                                transport_rx_len = transport_rx.len(),
-                                transport_rx_cap = transport_rx.capacity().unwrap_or_default(),
-                                heartbeat_deadline_ms = heartbeat_deadline.as_millis() as u64,
-                                detection_multiplier = DETECTION_MULTIPLIER,
-                                "reader_pump: heartbeat watchdog fired, injecting Dropped \
-                                 (saturation indicator: see velo_streaming_*_backpressure_total)"
-                            );
-                            let dropped_bytes = crate::streaming::sender::cached_dropped().clone();
-                            // Non-blocking: an anchor channel that is already
-                            // full when the watchdog fires would deadlock a
-                            // blocking await here -- registry cleanup and the
-                            // cancel_token would never run, leaking a dead
-                            // anchor. We accept that the consumer may see a
-                            // plain channel-close (EOF) instead of an explicit
-                            // SenderDropped in the saturated edge case; the
-                            // watchdog firing metric + the warn! above are the
-                            // authoritative signal for operators.
-                            if frame_tx.try_send(dropped_bytes).is_err() {
-                                tracing::warn!(
-                                    local_id,
-                                    "reader_pump: anchor channel saturated at watchdog-fire; \
-                                     Dropped sentinel could not be injected, consumer will see \
-                                     channel close (EOF) -- watchdog firing counter is the \
-                                     authoritative signal here"
-                                );
-                            }
-                            // LIVE-02: Full anchor cleanup -- remove from registry
-                            // so no stale entry remains (ANCR-04)
-                            if let Some((_, entry)) = registry.remove(&local_id) {
-                                entry.cancel_token.cancel();
-                                crate::streaming::anchor::set_active_anchor_gauge(
-                                    metrics.as_ref(),
-                                    &registry,
-                                    &mpsc_registry,
-                                );
-                            }
-                            break;
-                        }
+                }
+            }
+            _ = &mut sleep => {
+                // Every path out of this arm re-arms the sleep first. A fired
+                // `Sleep` stays ready until it is reset, so a `continue` past
+                // one turns the pump into a hot loop instead of a wait --
+                // which is exactly what a pre-bind pump, exempt from the
+                // miss count below, would otherwise do on every window.
+                let idle = last_frame.elapsed();
+                if idle < heartbeat_deadline {
+                    // A frame landed inside this window, so the deadline that
+                    // frame implies has not arrived yet. Re-arming here
+                    // rather than on the frame is the whole point: one arm
+                    // per window instead of one per record.
+                    sleep.as_mut().reset(last_frame + heartbeat_deadline);
+                    note_timer_arm();
+                    continue;
+                }
+                sleep.as_mut().reset(tokio::time::Instant::now() + heartbeat_deadline);
+                note_timer_arm();
+                // A slot still `awaiting_sender` times out on every
+                // window by construction -- there is no producer to
+                // be silent yet. Counting that as a miss is the bug:
+                // it arms this watchdog against a sender that has not
+                // shown up, capping how long a zero-RTT request may
+                // wait in a queue, or an adopted attach may wait for
+                // its own `OpenSlot`, at a bound nothing documents.
+                // Once a sender exists -- an `OpenSlot` claims the
+                // bind, or an attach adopts it -- every miss counts
+                // exactly as it always has, with the same
+                // `DETECTION_MULTIPLIER` margin the ordinary attach
+                // path has always given it.
+                if awaiting_sender(&prebound, drain.as_deref()) {
+                    continue;
+                }
+                missed_heartbeats += 1;
+                if missed_heartbeats >= DETECTION_MULTIPLIER {
+                    if let Some(m) = metrics.as_ref() {
+                        m.record_heartbeat_watchdog_firing();
                     }
+                    // Inject Dropped sentinel -- sender is dead.
+                    // The diagnostic context here is what the saturation
+                    // runbook tells operators to grep for: anchor channel
+                    // depth at the moment of firing tells you whether the
+                    // session was sitting at the bound (cascade) or empty
+                    // (real producer crash).
+                    tracing::warn!(
+                        local_id,
+                        anchor_frame_tx_len = frame_tx.len(),
+                        anchor_frame_tx_cap = frame_tx.capacity().unwrap_or_default(),
+                        transport_rx_len = transport_rx.len(),
+                        transport_rx_cap = transport_rx.capacity().unwrap_or_default(),
+                        heartbeat_deadline_ms = heartbeat_deadline.as_millis() as u64,
+                        detection_multiplier = DETECTION_MULTIPLIER,
+                        "reader_pump: heartbeat watchdog fired, injecting Dropped \
+                         (saturation indicator: see velo_streaming_*_backpressure_total)"
+                    );
+                    let dropped_bytes = crate::streaming::sender::cached_dropped().clone();
+                    // Non-blocking: an anchor channel that is already
+                    // full when the watchdog fires would deadlock a
+                    // blocking await here -- registry cleanup and the
+                    // cancel_token would never run, leaking a dead
+                    // anchor. We accept that the consumer may see a
+                    // plain channel-close (EOF) instead of an explicit
+                    // SenderDropped in the saturated edge case; the
+                    // watchdog firing metric + the warn! above are the
+                    // authoritative signal for operators.
+                    if frame_tx.try_send(dropped_bytes).is_err() {
+                        tracing::warn!(
+                            local_id,
+                            "reader_pump: anchor channel saturated at watchdog-fire; \
+                             Dropped sentinel could not be injected, consumer will see \
+                             channel close (EOF) -- watchdog firing counter is the \
+                             authoritative signal here"
+                        );
+                    }
+                    // LIVE-02: Full anchor cleanup -- remove from registry
+                    // so no stale entry remains (ANCR-04)
+                    if let Some((_, entry)) = registry.remove(&local_id) {
+                        entry.cancel_token.cancel();
+                        crate::streaming::anchor::set_active_anchor_gauge(
+                            metrics.as_ref(),
+                            &registry,
+                            &mpsc_registry,
+                        );
+                    }
+                    break;
                 }
             }
         }

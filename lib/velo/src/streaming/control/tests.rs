@@ -1116,6 +1116,80 @@ async fn test_pump_reaps_an_attached_entry_with_unclaimed_mux_drain_when_its_bin
     );
 }
 
+/// One timer per stream, not one per record.
+///
+/// The reader pump used to wrap every `recv_async` in a fresh
+/// `tokio::time::timeout`. That registers a timer entry with tokio's driver
+/// on the future's first poll and deregisters it on drop, both under the
+/// driver's lock, so a stream carrying N records took 2N turns of that lock.
+/// On the tier-3 rig those turns were 7.3 percent of the frontend's 72 cores.
+/// A behavioural test cannot see the difference -- the same bytes come out
+/// either way -- so this counts the arms directly and pins the shape of the
+/// count: bounded, rather than one per record.
+#[tokio::test]
+async fn a_thousand_records_arm_the_heartbeat_timer_a_handful_of_times() {
+    tokio::time::pause();
+
+    const RECORDS: usize = 1_000;
+    // The arm before the loop is the whole steady state here: the deadline is
+    // an hour and the test never advances the clock, so the timer has no
+    // reason to fire. The headroom covers the paused clock auto-advancing if
+    // the runtime does go idle between records, which costs one re-arm each
+    // time. What the bound asserts is that it does not scale with `RECORDS`.
+    const MAX_ARMS: u64 = 4;
+
+    let (transport_tx, transport_rx) = flume::bounded::<Vec<u8>>(256);
+    let (frame_tx, frame_rx) = flume::bounded::<Vec<u8>>(256);
+    let arms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let ctx = crate::streaming::anchor::AnchorContext {
+        registry: std::sync::Arc::new(dashmap::DashMap::new()),
+        mpsc_registry: std::sync::Arc::new(dashmap::DashMap::new()),
+        metrics: None,
+    };
+
+    tokio::spawn(TIMER_ARMS.scope(
+        Arc::clone(&arms),
+        reader_pump(
+            transport_rx,
+            frame_tx,
+            tokio_util::sync::CancellationToken::new(),
+            ctx,
+            PumpContext {
+                local_id: 1,
+                heartbeat_deadline: Duration::from_secs(3600),
+                drain: None,
+                prebound: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+        ),
+    ));
+
+    let record = rmp_serde::to_vec(&crate::streaming::frame::StreamFrame::Item(7u32)).unwrap();
+    for i in 0..RECORDS {
+        transport_tx
+            .send_async(record.clone())
+            .await
+            .expect("the pump must still be reading");
+        // Drained in step with the send. Letting a thousand records pile up
+        // would park this task and the pump at the same time, and an idle
+        // runtime under `tokio::time::pause` auto-advances to the sleep's
+        // deadline -- firing the very timer this test is counting.
+        let forwarded = frame_rx
+            .recv_async()
+            .await
+            .unwrap_or_else(|_| panic!("the pump must forward record {i}"));
+        assert_eq!(forwarded, record, "record {i} must be forwarded unchanged");
+    }
+
+    let armed = arms.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        armed <= MAX_ARMS,
+        "reader_pump must arm its heartbeat timer a bounded number of times, not \
+         once per record: {RECORDS} records armed it {armed} times (bound {MAX_ARMS})"
+    );
+
+    drop(transport_tx);
+}
+
 #[tokio::test]
 async fn test_pump_forwards_data_frames() {
     let (transport_tx, frame_rx, _cancel, _registry, _id) = make_pump_test_infra();

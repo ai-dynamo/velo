@@ -223,23 +223,55 @@ where
             observer: self.observer.clone(),
         };
 
+        // One timer for the lane, not one per item. A fresh
+        // `tokio::time::timeout` registers a timer entry with the driver on
+        // its first poll and deregisters it on drop, both under the driver's
+        // lock, so every item on every live lane took two turns of that lock
+        // for a deadline that almost never fires. A pinned `Sleep` that is
+        // already registered polls without it, and comparing each fire
+        // against `last_item` leaves the reap where it was: after `idle_ttl`
+        // of real silence. Same shape as the two streaming reader pumps
+        // (`streaming::control::reader_pump` carries the timing argument).
+        let idle_ttl = self.idle_ttl;
+        // A lane with no TTL never polls the timer branch below, so its
+        // `Sleep` is never registered and this deadline never read; it exists
+        // only because `tokio::pin!` needs a value to pin. An hour rather
+        // than `Duration::MAX` because the re-arm arithmetic would overflow
+        // on the latter.
+        let ttl = idle_ttl.unwrap_or(Duration::from_secs(3600));
+        let sleep = tokio::time::sleep(ttl);
+        tokio::pin!(sleep);
+        // The idle window starts when the handler returns, not when the item
+        // was dequeued: the timeout this replaces wrapped `recv_async` alone,
+        // so a handler slower than `idle_ttl` never put its own lane a window
+        // behind. Stamping this at dequeue instead would let such a handler
+        // hand back a lane that is already past its deadline with an empty
+        // queue -- reaped the moment it finished work.
+        let mut last_item = tokio::time::Instant::now();
+
         loop {
-            let received = match self.idle_ttl {
-                Some(ttl) => match tokio::time::timeout(ttl, self.rx.recv_async()).await {
-                    Ok(received) => received,
-                    Err(_elapsed) => {
-                        if self.try_reap() {
-                            trace!(
-                                target: "crate::messenger::lanes",
-                                key = ?self.key,
-                                "Reaping idle ordering lane"
-                            );
-                            break;
-                        }
+            let received = tokio::select! {
+                _ = &mut sleep, if idle_ttl.is_some() => {
+                    // Every path out of this arm re-arms the sleep first: a
+                    // fired `Sleep` stays ready until it is reset, so a
+                    // `continue` past one would spin the lane task.
+                    let idle = last_item.elapsed();
+                    if idle < ttl {
+                        sleep.as_mut().reset(last_item + ttl);
                         continue;
                     }
-                },
-                None => self.rx.recv_async().await,
+                    sleep.as_mut().reset(tokio::time::Instant::now() + ttl);
+                    if self.try_reap() {
+                        trace!(
+                            target: "crate::messenger::lanes",
+                            key = ?self.key,
+                            "Reaping idle ordering lane"
+                        );
+                        break;
+                    }
+                    continue;
+                }
+                received = self.rx.recv_async() => received,
             };
 
             let Ok(item) = received else {
@@ -253,6 +285,7 @@ where
             // Decrement only now, so a lane running a long handler over an
             // empty queue is never mistaken for idle.
             self.state.pending.fetch_sub(1, Ordering::AcqRel);
+            last_item = tokio::time::Instant::now();
         }
     }
 
@@ -458,6 +491,58 @@ mod tests {
 
         assert_eq!(observer.created.load(Ordering::Acquire), 1);
         assert_eq!(observer.closed.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lane_is_not_reaped_while_items_keep_arriving() {
+        // The sharp edge of the hoisted idle timer: it is armed once and
+        // re-armed only when it fires, so a fire that lands mid-stream must
+        // compare against the last item rather than reap on the spot. Unlike
+        // `no_reap_while_pending` this lane is genuinely empty and idle each
+        // time the timer could fire -- what keeps it alive is that it was fed
+        // inside its TTL, not that it had a backlog.
+        let observer = Arc::new(CountingObserver::default());
+        let handled = Arc::new(AtomicUsize::new(0));
+
+        let consumer_handled = Arc::clone(&handled);
+        let router: LaneRouter<u64, ()> = LaneRouter::new(
+            Arc::new(move |()| {
+                let handled = Arc::clone(&consumer_handled);
+                Box::pin(async move {
+                    handled.fetch_add(1, Ordering::AcqRel);
+                })
+            }),
+            config(Some(Duration::from_millis(100)), Arc::clone(&observer)),
+        );
+
+        // Fifteen items 20 ms apart is three 100 ms windows of streaming, so
+        // the lane's timer fires several times over a lane that is never idle
+        // for more than a fifth of its TTL.
+        const ITEMS: usize = 15;
+        for handled_so_far in 1..=ITEMS {
+            let _ = router.route(9, (), None);
+            wait_for("item handled", || {
+                handled.load(Ordering::Acquire) == handled_so_far
+            })
+            .await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert_eq!(
+            router.lane_count(),
+            1,
+            "a lane fed every 20 ms must still be live under a 100 ms TTL"
+        );
+        assert_eq!(
+            observer.created.load(Ordering::Acquire),
+            1,
+            "the lane must never have been reaped and recreated"
+        );
+        assert_eq!(
+            observer.closed.load(Ordering::Acquire),
+            0,
+            "no lane may have closed while items kept arriving"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -104,6 +104,13 @@ pub struct MpscAnchorCancelRequest {
 /// slot from the MPSC entry. Explicit in-band terminal sentinels
 /// (`Detached`, `Dropped`, `Finalized`) are treated as authoritative and are
 /// forwarded exactly once.
+///
+/// Heartbeat loss is watched with one timer per sender, armed once before the
+/// loop and re-armed only when it fires, the same shape and for the same
+/// reason as [`crate::streaming::control::reader_pump`] — whose doc carries
+/// the argument that detection still lands
+/// `DETECTION_MULTIPLIER * heartbeat_deadline` after the last frame. MPSC has
+/// no pre-bind, so there is no `awaiting_sender` exemption here.
 pub(crate) async fn mpsc_reader_pump(
     sender_id: u64,
     transport_rx: flume::Receiver<Vec<u8>>,
@@ -122,14 +129,25 @@ pub(crate) async fn mpsc_reader_pump(
         prebound: _,
     } = pump;
     let mut missed_heartbeats: u8 = 0;
+    // One timer per sender, not one per record: see
+    // `crate::streaming::control::reader_pump` for what rebuilding it per
+    // record cost on the driver's lock. Kept in the same shape as that pump
+    // and as `messenger::server::lanes` so a reader recognises all three.
+    let mut last_frame = tokio::time::Instant::now();
+    let sleep = tokio::time::sleep(heartbeat_deadline);
+    tokio::pin!(sleep);
+    crate::streaming::control::note_timer_arm();
+    let cancelled = cancel_token.cancelled();
+    tokio::pin!(cancelled);
 
     loop {
         tokio::select! {
-            _ = cancel_token.cancelled() => break,
-            result = tokio::time::timeout(heartbeat_deadline, transport_rx.recv_async()) => {
-                match result {
-                    Ok(Ok(bytes)) => {
+            _ = &mut cancelled => break,
+            received = transport_rx.recv_async() => {
+                match received {
+                    Ok(bytes) => {
                         missed_heartbeats = 0;
+                        last_frame = tokio::time::Instant::now();
                         let explicit_terminal = bytes == *crate::streaming::sender::cached_detached()
                             || bytes == *crate::streaming::sender::cached_dropped()
                             || bytes == *crate::streaming::sender::cached_finalized();
@@ -153,7 +171,7 @@ pub(crate) async fn mpsc_reader_pump(
                             break;
                         }
                     }
-                    Ok(Err(_)) => {
+                    Err(_) => {
                         let dropped = crate::streaming::sender::cached_dropped().clone();
                         let _ = frame_tx.send_async((sender_id, dropped)).await;
                         super::anchor::remove_sender_slot(
@@ -163,19 +181,26 @@ pub(crate) async fn mpsc_reader_pump(
                         );
                         break;
                     }
-                    Err(_timeout) => {
-                        missed_heartbeats += 1;
-                        if missed_heartbeats >= DETECTION_MULTIPLIER {
-                            let dropped = crate::streaming::sender::cached_dropped().clone();
-                            let _ = frame_tx.send_async((sender_id, dropped)).await;
-                            super::anchor::remove_sender_slot(
-                                &mpsc_registry,
-                                local_id,
-                                sender_id,
-                            );
-                            break;
-                        }
-                    }
+                }
+            }
+            _ = &mut sleep => {
+                // Every path out of this arm re-arms the sleep first: a fired
+                // `Sleep` stays ready until it is reset, so a `continue` past
+                // one would spin this task instead of waiting.
+                let idle = last_frame.elapsed();
+                if idle < heartbeat_deadline {
+                    sleep.as_mut().reset(last_frame + heartbeat_deadline);
+                    crate::streaming::control::note_timer_arm();
+                    continue;
+                }
+                sleep.as_mut().reset(tokio::time::Instant::now() + heartbeat_deadline);
+                crate::streaming::control::note_timer_arm();
+                missed_heartbeats += 1;
+                if missed_heartbeats >= DETECTION_MULTIPLIER {
+                    let dropped = crate::streaming::sender::cached_dropped().clone();
+                    let _ = frame_tx.send_async((sender_id, dropped)).await;
+                    super::anchor::remove_sender_slot(&mpsc_registry, local_id, sender_id);
+                    break;
                 }
             }
         }
@@ -410,7 +435,167 @@ pub fn create_mpsc_anchor_cancel_handler(manager: Arc<AnchorManager>) -> crate::
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::streaming::control::{PumpContext, TIMER_ARMS};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::time::Duration;
     use velo_ext::{TransportKey, WorkerId};
+
+    /// The MPSC half of the property `streaming::control`'s
+    /// `a_thousand_records_arm_the_heartbeat_timer_a_handful_of_times` pins:
+    /// this pump watches one sender, and it must arm one timer for that
+    /// sender rather than one per record it carries.
+    #[tokio::test]
+    async fn a_thousand_records_arm_the_mpsc_heartbeat_timer_a_handful_of_times() {
+        tokio::time::pause();
+
+        const RECORDS: usize = 1_000;
+        // One arm before the loop, plus headroom for a paused-clock
+        // auto-advance if the runtime goes idle between records. The bound
+        // does not scale with `RECORDS`; that is the whole assertion.
+        const MAX_ARMS: u64 = 4;
+
+        let (transport_tx, transport_rx) = flume::bounded::<Vec<u8>>(256);
+        let (frame_tx, frame_rx) = flume::bounded::<(u64, Vec<u8>)>(256);
+        let arms = Arc::new(AtomicU64::new(0));
+
+        tokio::spawn(TIMER_ARMS.scope(
+            Arc::clone(&arms),
+            mpsc_reader_pump(
+                7,
+                transport_rx,
+                frame_tx,
+                CancellationToken::new(),
+                Arc::new(DashMap::new()),
+                PumpContext {
+                    local_id: 1,
+                    heartbeat_deadline: Duration::from_secs(3600),
+                    drain: None,
+                    prebound: Arc::new(AtomicBool::new(false)),
+                },
+            ),
+        ));
+
+        let record = rmp_serde::to_vec(&crate::streaming::frame::StreamFrame::Item(7u32)).unwrap();
+        for i in 0..RECORDS {
+            transport_tx
+                .send_async(record.clone())
+                .await
+                .expect("the pump must still be reading");
+            // Drained in step with the send: a backlog would park both this
+            // task and the pump, and an idle runtime under
+            // `tokio::time::pause` auto-advances to the sleep's deadline.
+            let (sender_id, forwarded) = frame_rx
+                .recv_async()
+                .await
+                .unwrap_or_else(|_| panic!("the pump must forward record {i}"));
+            assert_eq!(sender_id, 7, "record {i} must carry its sender's id");
+            assert_eq!(forwarded, record, "record {i} must be forwarded unchanged");
+        }
+
+        let armed = arms.load(Ordering::Relaxed);
+        assert!(
+            armed <= MAX_ARMS,
+            "mpsc_reader_pump must arm its heartbeat timer a bounded number of times, \
+             not once per record: {RECORDS} records armed it {armed} times (bound {MAX_ARMS})"
+        );
+
+        drop(transport_tx);
+    }
+
+    /// Hoisting the timer must not cost the watchdog: a sender that goes
+    /// silent is still dropped after `DETECTION_MULTIPLIER` windows, and the
+    /// sentinel still carries that sender's id so the anchor drops one sender
+    /// rather than the whole stream.
+    #[tokio::test]
+    async fn a_silent_mpsc_sender_is_dropped_after_the_detection_window() {
+        tokio::time::pause();
+
+        // Held so the transport channel stays open: this must be the
+        // watchdog's doing, not the closed-channel arm's.
+        let (_transport_tx, transport_rx) = flume::bounded::<Vec<u8>>(16);
+        let (frame_tx, frame_rx) = flume::bounded::<(u64, Vec<u8>)>(16);
+
+        let pump = tokio::spawn(mpsc_reader_pump(
+            7,
+            transport_rx,
+            frame_tx,
+            CancellationToken::new(),
+            Arc::new(DashMap::new()),
+            PumpContext {
+                local_id: 1,
+                heartbeat_deadline: Duration::from_millis(50),
+                drain: None,
+                prebound: Arc::new(AtomicBool::new(false)),
+            },
+        ));
+
+        // The paused clock advances itself once every task is parked, so this
+        // resolves as fast as the runtime can poll it.
+        pump.await
+            .expect("the pump must exit once the detection window passes");
+
+        let (sender_id, bytes) = frame_rx
+            .try_recv()
+            .expect("a silent sender must be dropped");
+        assert_eq!(
+            sender_id, 7,
+            "the Dropped sentinel must name the sender that went silent"
+        );
+        assert_eq!(
+            bytes,
+            *crate::streaming::sender::cached_dropped(),
+            "the sentinel must be Dropped"
+        );
+    }
+
+    /// The other half: a sender that keeps sending is never dropped, however
+    /// many times its timer fires in between. This is what the compare
+    /// against the last frame's instant buys -- the timer is no longer pushed
+    /// forward by each record, so a fire that lands mid-stream must count
+    /// nothing rather than a miss.
+    #[tokio::test]
+    async fn an_mpsc_sender_that_keeps_sending_is_never_dropped() {
+        tokio::time::pause();
+
+        let heartbeat = Duration::from_millis(50);
+        let (transport_tx, transport_rx) = flume::bounded::<Vec<u8>>(16);
+        let (frame_tx, frame_rx) = flume::bounded::<(u64, Vec<u8>)>(16);
+
+        let pump = tokio::spawn(mpsc_reader_pump(
+            7,
+            transport_rx,
+            frame_tx,
+            CancellationToken::new(),
+            Arc::new(DashMap::new()),
+            PumpContext {
+                local_id: 1,
+                heartbeat_deadline: heartbeat,
+                drain: None,
+                prebound: Arc::new(AtomicBool::new(false)),
+            },
+        ));
+
+        let record = rmp_serde::to_vec(&crate::streaming::frame::StreamFrame::Item(1u32)).unwrap();
+        // Ten detection windows of streaming, one record every half window.
+        for i in 0..(10 * DETECTION_MULTIPLIER as u32) {
+            transport_tx
+                .send_async(record.clone())
+                .await
+                .expect("the pump must still be reading");
+            let (_, forwarded) = frame_rx
+                .recv_async()
+                .await
+                .unwrap_or_else(|_| panic!("the pump must forward record {i}"));
+            assert_eq!(forwarded, record, "record {i} must be forwarded unchanged");
+            tokio::time::sleep(heartbeat / 2).await;
+        }
+
+        assert!(
+            !pump.is_finished(),
+            "a sender streaming inside its heartbeat deadline must never be dropped"
+        );
+        drop(transport_tx);
+    }
 
     /// MPSC negotiates in the same version as SPSC, so its request carries the
     /// same key list and its response the same credit fields. What this pins is

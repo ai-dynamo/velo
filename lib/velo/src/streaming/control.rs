@@ -30,7 +30,10 @@ use crate::streaming::handle::StreamAnchorHandle;
 /// Number of consecutive missed heartbeat windows that trigger `Dropped` injection.
 ///
 /// The reader pump tolerates `DETECTION_MULTIPLIER * heartbeat_interval` of total silence
-/// (each window of length `heartbeat_interval`) before declaring the sender dead.
+/// before declaring the sender dead. It measures that with a single timer per stream that
+/// re-arms only when it fires, comparing each fire against the last frame's instant, so the
+/// misses it counts are consecutive windows of silence rather than consecutive trips round
+/// its loop -- see [`reader_pump`] for why detection still lands at the same instant.
 /// Both the producer (`StreamSender`) heartbeat cadence and the consumer (`reader_pump`)
 /// per-window deadline are negotiated via `AnchorAttachResponse::heartbeat_interval_ms`,
 /// but the multiplier itself is a protocol constant agreed by both sides.
@@ -269,7 +272,9 @@ pub enum AnchorAttachResponse {
 
 mod pump;
 mod ticket;
-pub(crate) use pump::{PumpContext, reader_pump};
+#[cfg(test)]
+pub(crate) use pump::TIMER_ARMS;
+pub(crate) use pump::{PumpContext, note_timer_arm, reader_pump};
 pub use ticket::StreamOpenTicket;
 
 /// Request to detach the current sender from an anchor without closing it.
