@@ -7,6 +7,8 @@
 //! receive-side property is testable without a messenger, a runtime, or a
 //! socket — the batch bytes go in and the replies come out.
 
+use std::collections::BTreeMap;
+
 use bytes::Bytes;
 use velo_ext::WorkerId;
 
@@ -766,6 +768,234 @@ fn credit_is_withheld_while_the_slot_is_over_its_byte_watermark() {
     assert_eq!(
         registry.sweep_credit(peer()),
         vec![ReplyRecord::CreditUpdate { slot: id, delta: 2 }]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Reconcile scope
+// ---------------------------------------------------------------------------
+
+/// Live slots one peer holds in these tests. The shape measured on the tier-3
+/// rig is about a thousand slots per peer against the eleven a batch delivers
+/// into.
+const MANY_SLOTS: u32 = 1_000;
+
+/// Open `count` slots on one peer in a single batch, at indexes `0..count`.
+///
+/// The receivers come back so the caller can keep them alive: dropping one
+/// turns the next record for that slot into a `ConsumerGone` fault and retires
+/// the slot these tests are counting.
+fn open_many(
+    registry: &IngressRegistry,
+    config: &MuxConfig,
+    count: u32,
+) -> Vec<flume::Receiver<Vec<u8>>> {
+    let depth =
+        crate::streaming::messenger_mux::flow_control::slot_buffer_depth(config.initial_credit);
+    let mut receivers = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let (tx, rx) = flume::bounded(depth);
+        registry.register_bind(ANCHOR, SESSION + u64::from(index), tx, test_drain());
+        receivers.push(rx);
+    }
+
+    let payload = batch(1, 0, |encoder| {
+        for index in 0..count {
+            encoder
+                .push_open_slot(slot(index, 0), 0, ANCHOR, SESSION + u64::from(index))
+                .unwrap();
+        }
+    });
+    handle_batch(registry, config, None, peer(), &payload);
+    assert_eq!(registry.live_slots(peer()), count as usize);
+    receivers
+}
+
+/// The cost this scope exists to remove: one slot-buffer length read, under
+/// that channel's lock, for every slot the pass visits.
+#[test]
+fn a_batch_reconciles_only_the_slots_it_delivered_into() {
+    let config = config();
+    let registry = IngressRegistry::default();
+    let _receivers = open_many(&registry, &config, MANY_SLOTS);
+
+    let before = registry.reconcile_visits(peer());
+    let payload = batch(1, 1, |encoder| {
+        encoder.push_data(slot(7, 0), 1, &item(1)).unwrap();
+    });
+    handle_batch(&registry, &config, None, peer(), &payload);
+    let visits = registry.reconcile_visits(peer()) - before;
+
+    assert_eq!(
+        visits, 1,
+        "a batch delivering into 1 of the peer's {MANY_SLOTS} slots reconciled \
+         {visits} of them, and every visit reads a slot buffer's length under \
+         that channel's lock"
+    );
+}
+
+/// Control: the sweep keeps the whole-table walk, because it is the backstop
+/// for every slot no batch delivered into.
+#[test]
+fn the_sweep_reconciles_every_slot() {
+    let config = config();
+    let registry = IngressRegistry::default();
+    let _receivers = open_many(&registry, &config, MANY_SLOTS);
+
+    let before = registry.reconcile_visits(peer());
+    assert!(
+        registry.sweep_credit(peer()).is_empty(),
+        "nothing has drained, so there is nothing to grant back"
+    );
+    let visits = registry.reconcile_visits(peer()) - before;
+
+    assert_eq!(
+        visits,
+        u64::from(MANY_SLOTS),
+        "the sweep visited {visits} of the peer's {MANY_SLOTS} slots"
+    );
+}
+
+/// The batch carries the touched slot's grant; the sweep carries the rest.
+#[test]
+fn a_batch_returns_the_credit_of_the_slot_it_touched_and_the_sweep_the_rest() {
+    let config = config();
+    let registry = IngressRegistry::default();
+    let receivers = open_many(&registry, &config, 2);
+    let a = slot(0, 0);
+    let b = slot(1, 0);
+
+    let payload = batch(1, 1, |encoder| {
+        for seq in 1..=2u32 {
+            encoder.push_data(a, seq, &item(seq as u8)).unwrap();
+            encoder.push_data(b, seq, &item(seq as u8)).unwrap();
+        }
+    });
+    let outcome = handle_batch(&registry, &config, None, peer(), &payload);
+    assert!(outcome.replies.is_empty(), "nothing has drained yet");
+    assert_eq!(drain(&receivers[0]).len(), 2);
+    assert_eq!(drain(&receivers[1]).len(), 2);
+
+    // A second batch that delivers into A alone.
+    let payload = batch(1, 2, |encoder| {
+        encoder.push_data(a, 3, &item(3)).unwrap();
+    });
+    let outcome = handle_batch(&registry, &config, None, peer(), &payload);
+    assert_eq!(
+        outcome.replies,
+        vec![ReplyRecord::CreditUpdate { slot: a, delta: 2 }],
+        "the batch answers for the slot it delivered into and says nothing \
+         about the one it did not"
+    );
+
+    assert_eq!(
+        registry.sweep_credit(peer()),
+        vec![ReplyRecord::CreditUpdate { slot: b, delta: 2 }],
+        "B's credit is not lost: the sweep carries it, with the delta its \
+         consumer actually drained"
+    );
+    assert!(
+        registry.sweep_credit(peer()).is_empty(),
+        "and carries it once — A's third record is still in its buffer, and \
+         B has nothing further to return"
+    );
+}
+
+/// The ledger is unchanged by the scope: every credit a consumer drained comes
+/// back exactly once, whichever pass mints it.
+///
+/// Passes whether the batch pass walks the whole table or only what it touched,
+/// which is what makes it a control on the arithmetic rather than on the scope.
+#[test]
+fn no_grant_is_lost_or_double_counted_when_a_batch_touches_one_of_two_slots() {
+    let config = config();
+    let registry = IngressRegistry::default();
+    let receivers = open_many(&registry, &config, 2);
+    let a = slot(0, 0);
+    let b = slot(1, 0);
+
+    let payload = batch(1, 1, |encoder| {
+        for seq in 1..=2u32 {
+            encoder.push_data(a, seq, &item(seq as u8)).unwrap();
+            encoder.push_data(b, seq, &item(seq as u8)).unwrap();
+        }
+    });
+    handle_batch(&registry, &config, None, peer(), &payload);
+    assert_eq!(drain(&receivers[0]).len(), 2);
+    assert_eq!(drain(&receivers[1]).len(), 2);
+
+    let payload = batch(1, 2, |encoder| {
+        encoder.push_data(a, 3, &item(3)).unwrap();
+    });
+    let mut granted: BTreeMap<SlotId, u32> = BTreeMap::new();
+    let mut tally = |replies: Vec<ReplyRecord>| {
+        for reply in replies {
+            match reply {
+                ReplyRecord::CreditUpdate { slot, delta } => {
+                    *granted.entry(slot).or_insert(0) += delta;
+                }
+                other => panic!("unexpected reply: {other:?}"),
+            }
+        }
+    };
+    tally(handle_batch(&registry, &config, None, peer(), &payload).replies);
+    tally(registry.sweep_credit(peer()));
+    tally(registry.sweep_credit(peer()));
+
+    let expected: BTreeMap<SlotId, u32> = [(a, 2), (b, 2)].into_iter().collect();
+    assert_eq!(
+        granted, expected,
+        "two records drained on each slot, so each gets two credits back, once"
+    );
+}
+
+/// A record that parks in the hold marks its slot, and the release the next
+/// record triggers is reconciled inside that same batch.
+///
+/// One slot open on purpose: with the hold marking nothing, the batch would
+/// reconcile no slot at all, which is the regression this pins.
+#[test]
+fn a_held_record_marks_its_slot_and_its_release_is_reconciled_in_the_same_batch() {
+    let (registry, rx, config) = bound();
+    let id = slot(0, 0);
+    open(&registry, &config, id, 1);
+
+    // Ahead of sequence: parked in the hold, delivered to nobody.
+    let before = registry.reconcile_visits(peer());
+    let payload = batch(1, 1, |encoder| {
+        encoder.push_data(id, 2, &item(2)).unwrap();
+    });
+    handle_batch(&registry, &config, None, peer(), &payload);
+    let visits = registry.reconcile_visits(peer()) - before;
+    assert_eq!(
+        visits, 1,
+        "a held record has spent credit only a reconcile gives back, so its \
+         slot is visited: {visits} visits"
+    );
+    assert!(drain(&rx).is_empty(), "seq 2 waits for seq 1");
+
+    // The gap closes, and the hold releases behind it, in one batch.
+    let before = registry.reconcile_visits(peer());
+    let payload = batch(1, 2, |encoder| {
+        encoder.push_data(id, 1, &item(1)).unwrap();
+    });
+    handle_batch(&registry, &config, None, peer(), &payload);
+    let visits = registry.reconcile_visits(peer()) - before;
+    assert_eq!(visits, 1, "the releasing batch visits its slot: {visits}");
+    assert_eq!(
+        drain(&rx),
+        vec![item(1), item(2)],
+        "the release hands the consumer both records, in sequence"
+    );
+
+    let payload = batch(1, 3, |encoder| {
+        encoder.push_data(id, 3, &item(3)).unwrap();
+    });
+    let outcome = handle_batch(&registry, &config, None, peer(), &payload);
+    assert_eq!(
+        outcome.replies,
+        vec![ReplyRecord::CreditUpdate { slot: id, delta: 2 }],
+        "the held record is accounted exactly once, when it drains"
     );
 }
 

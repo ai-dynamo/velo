@@ -74,7 +74,9 @@
 //!
 //! Credit comes back from three places, and which one gets there first decides
 //! what the sweep interval costs. The arrival path reconciles on every inbound
-//! batch. A draining consumer posts its peer through
+//! batch, over the slots that batch delivered into and no others — a peer's
+//! other slots cost nothing to a batch that said nothing about them.
+//! A draining consumer posts its peer through
 //! [`ingress::DrainSignal`], and the sweep task reconciles that peer alone — no
 //! more often than once per [`MuxConfig::drain_visit_floor`], because clearing
 //! the wake before the walk means a consumer that keeps up re-arms it

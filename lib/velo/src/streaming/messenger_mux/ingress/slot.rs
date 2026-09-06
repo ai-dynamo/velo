@@ -64,6 +64,15 @@ pub(super) struct IngressSlot {
     next_seq: u32,
     hold: BTreeMap<u32, Vec<u8>>,
     hold_bytes: ByteBudget,
+    /// Whether this slot is already on the peer's touched list for the batch
+    /// being applied.
+    ///
+    /// A flag rather than a batch stamp because its meaning is scoped to one
+    /// critical section: the list is drained before the peer's mutex is
+    /// released, so "set" can only mean "already listed for the batch in
+    /// flight". A stamp would buy robustness against a missed clear that the
+    /// scoping makes unreachable, and cost four more bytes per slot.
+    touched: bool,
     /// A `CloseSlot` that arrived ahead of records still in the hold.
     ///
     /// `CloseSlot{TerminalSent}` is position-ordered behind its terminal, and
@@ -103,6 +112,7 @@ impl IngressSlot {
             next_seq: first_seq,
             hold: BTreeMap::new(),
             hold_bytes: ByteBudget::new(u64::from(slot_byte_budget)),
+            touched: false,
             pending_close: None,
         }
     }
@@ -110,6 +120,17 @@ impl IngressSlot {
     /// Records currently parked ahead of sequence.
     pub(super) fn held(&self) -> usize {
         self.hold.len()
+    }
+
+    /// Put this slot on the batch's reconcile list, reporting whether the
+    /// caller now owes the list an entry.
+    pub(super) fn mark_touched(&mut self) -> bool {
+        !std::mem::replace(&mut self.touched, true)
+    }
+
+    /// Called by the pass that has consumed this slot's list entry.
+    pub(super) fn clear_touched(&mut self) {
+        self.touched = false;
     }
 
     /// Apply a `Data` or `SlotHeartbeat` record.
@@ -173,6 +194,12 @@ impl IngressSlot {
     /// count is exact at every sample — only its timing is sampled — and the
     /// sweep in [`super`] is what guarantees a slot with no further arrivals
     /// still gets its credit back.
+    ///
+    /// Sampled per slot rather than per table: a batch reconciles only the
+    /// slots it delivered into, so a slot whose consumer drained while no
+    /// record arrived for it is sampled by the drain doorbell or the periodic
+    /// sweep instead. `frame_tx.len()` takes that channel's lock, which is the
+    /// cost the narrower scope removes.
     pub(super) fn reconcile(&mut self) {
         let in_channel = self.frame_tx.len() as u32;
         let resident = in_channel.saturating_add(self.hold.len() as u32);

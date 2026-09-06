@@ -1198,3 +1198,39 @@ change: "a background sweep reclaims credit for slots whose pump died". It does
 not, on any interval. `IngressSlot::reconcile` measures against `frame_tx.len()`,
 which stays pinned once the receiver is dropped, so a dead pump's slot is closed
 by the next arrival finding it unknown rather than reclaimed by the sweep.
+
+---
+
+## Addendum, 2026-09-05: the arrival path reconciles the slots a batch touched
+
+Narrowing, by addition, the claim recorded above that the mux "compares what it
+admitted against what is still queued, on every inbound batch and on a periodic
+sweep". The comparison per batch is now over the slots that batch delivered
+into, not over the peer's whole table.
+
+The two quantities were never related. A batch's reconcile pass walked every
+live slot of the sending peer and read each slot buffer's length, which takes
+that channel's lock; the number of slots is set by how many streams the peer
+holds open, and the number a batch has anything to say about is set by how many
+of them produced a record in that window. On the tier-3 rig a frontend peer
+holds about a thousand slots, a batch delivers into about eleven of them, and
+the frontend receives about six million batches per rep — so `flume::Shared::len`
+was 2.1 percent of that node's 72 cores, the largest velo-only cost on it, and
+it did not fall when the traffic did.
+
+So `handle_batch` records the indexes it delivers into, in a scratch list on the
+peer's ingress state, and reconciles those. A record that parks in the reorder
+hold marks its slot too: it has spent credit, and it may release the whole hold
+later in the same batch. Opening a slot and closing one mark nothing — a slot
+opens with an empty buffer and nothing to give back, and a closed slot is out of
+the table before the pass runs, which is what the whole-table walk did with it
+as well.
+
+Nothing about the ledger changed, only which slots are sampled and when. A slot
+whose consumer drained while no record arrived for it is reconciled by the drain
+doorbell, within `MuxConfig::drain_visit_floor` (2 ms) of that drain, and by the
+periodic sweep behind it; both still walk the whole table, and both recompute
+residency from scratch, so a grant is never lost and a redundant visit still
+costs nothing. Striding through a few untouched slots on each batch would buy a
+latency bound the doorbell already gives, at the price of the lock reads this
+change exists to remove.
