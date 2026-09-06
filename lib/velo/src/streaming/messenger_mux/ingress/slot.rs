@@ -70,8 +70,13 @@ pub(super) struct IngressSlot {
     /// A flag rather than a batch stamp because its meaning is scoped to one
     /// critical section: the list is drained before the peer's mutex is
     /// released, so "set" can only mean "already listed for the batch in
-    /// flight". A stamp would buy robustness against a missed clear that the
-    /// scoping makes unreachable, and cost four more bytes per slot.
+    /// flight". A missed clear (the lock's own poison-is-ignored policy means a
+    /// panic mid-critical-section can leave one behind) is not a correctness
+    /// problem either way: the stale list entry it leaves is exactly what
+    /// visits and clears the flag on the next batch, so it self-heals in one
+    /// batch, and `retire_epoch` clears the whole list on the epoch-change
+    /// path. That is why a stamp is not worth four more bytes per slot — not
+    /// that the miss is unreachable.
     touched: bool,
     /// A `CloseSlot` that arrived ahead of records still in the hold.
     ///

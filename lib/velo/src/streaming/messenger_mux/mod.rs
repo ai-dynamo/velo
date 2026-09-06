@@ -290,7 +290,8 @@ pub struct MuxConfig {
     /// How often the credit sweep runs.
     ///
     /// A backstop, not the primary mechanism. Credit comes back from the
-    /// arrival path on every inbound batch and from the consumer draining
+    /// arrival path on every inbound batch, over the slots that batch
+    /// delivered into and no others, and from the consumer draining
     /// (`ingress::DrainSignal`); this covers only what neither reaches — a slot
     /// parked with nothing further arriving *and* nothing being taken out — and
     /// carries batcher eviction, whose granularity it also sets.
@@ -327,12 +328,13 @@ pub struct MuxConfig {
     /// most this long.
     ///
     /// The price is latency, and it is worth being exact about who pays it: a
-    /// producer parked out of credit, with no further batch arriving to
-    /// reconcile it on the arrival path, waits up to this long for the return
-    /// its consumer's drain has already earned. That is one wait per window, so
-    /// what it costs per record is `floor / initial_credit` — negligible at the
-    /// default 256-record window, and visible at the small windows the credit
-    /// tests use deliberately.
+    /// producer parked out of credit on a slot the arrival path did not
+    /// reconcile — because no batch delivered into that slot, whether or not
+    /// the peer's other slots keep receiving batches — waits up to this long
+    /// for the return its consumer's drain has already earned. That is one
+    /// wait per window, so what it costs per record is `floor / initial_credit`
+    /// — negligible at the default 256-record window, and visible at the small
+    /// windows the credit tests use deliberately.
     ///
     /// Defaults to 2 ms, which is the interval the sweep itself ran at while it
     /// was the only way credit came back. That cadence was enough to keep every

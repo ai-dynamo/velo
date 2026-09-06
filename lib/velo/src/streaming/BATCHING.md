@@ -1214,23 +1214,44 @@ that channel's lock; the number of slots is set by how many streams the peer
 holds open, and the number a batch has anything to say about is set by how many
 of them produced a record in that window. On the tier-3 rig a frontend peer
 holds about a thousand slots, a batch delivers into about eleven of them, and
-the frontend receives about six million batches per rep — so `flume::Shared::len`
-was 2.1 percent of that node's 72 cores, the largest velo-only cost on it, and
-it did not fall when the traffic did.
+the frontend receives about six million batches per rep — so, in a `perf` flat
+profile from the tier-3 rig's exclusive two-node allocation (run `t3-prof2`;
+rig artifacts live outside the repo, not under a tracked path),
+`flume::Shared::len` was 2.1 percent of that node's 72 cores, the largest
+velo-only cost on it, and it did not fall when the traffic did. This is a
+different measurement from the one retracted above: that one was the periodic
+sweep's cost; this one is the arrival-path walk's, on a clean exclusive
+allocation rather than a shared login node.
 
 So `handle_batch` records the indexes it delivers into, in a scratch list on the
 peer's ingress state, and reconciles those. A record that parks in the reorder
 hold marks its slot too: it has spent credit, and it may release the whole hold
-later in the same batch. Opening a slot and closing one mark nothing — a slot
-opens with an empty buffer and nothing to give back, and a closed slot is out of
-the table before the pass runs, which is what the whole-table walk did with it
-as well.
+later in the same batch. Opening a slot marks nothing — it opens with an empty
+buffer and nothing to give back. Closing one takes it out of the table before
+the pass runs, which is what the whole-table walk did with it as well — but
+only when the close takes effect at once. A close deferred behind the hold (the
+owner's `CloseSlot` outrunning a rendezvous singleton still resolving outside
+the ordered lane) leaves the slot live, and whether the pass visits it follows
+the ordinary marking rule: the held record ahead of the close already marked
+it, in the common shape where a held terminal and its close arrive together, so
+the deferred close does not change what the pass does. The narrower case — the
+close is the only record this batch has for that slot, its predecessor having
+arrived in an earlier one — leaves the slot unmarked and untouched, the
+ordinary case for a slot with nothing delivered into it this batch, and it is
+reached the same way: the drain doorbell or the sweep behind it.
 
 Nothing about the ledger changed, only which slots are sampled and when. A slot
 whose consumer drained while no record arrived for it is reconciled by the drain
 doorbell, within `MuxConfig::drain_visit_floor` (2 ms) of that drain, and by the
 periodic sweep behind it; both still walk the whole table, and both recompute
-residency from scratch, so a grant is never lost and a redundant visit still
-costs nothing. Striding through a few untouched slots on each batch would buy a
+residency from scratch, so a grant is never lost and a redundant visit mints
+nothing. Striding through a few untouched slots on each batch would buy a
 latency bound the doorbell already gives, at the price of the lock reads this
 change exists to remove.
+
+This also widens who pays `drain_visit_floor` (2026-09-01 addendum, above): that
+paragraph scoped the floor's cost to a producer already parked with nothing
+arriving to reconcile it on the arrival path, which under the whole-table walk
+meant a peer that had gone quiet entirely. It is now paid by any producer parked
+on a slot no batch delivered into, whether or not the peer's other slots keep
+receiving batches — the normal case at the tier-3 shape above, not the rare one.

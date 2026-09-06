@@ -8,8 +8,9 @@
 //! each successful handoff to `frame_tx` — exact, O(1), and immediate", with a
 //! background sweep only reclaiming credit for slots whose pump died.
 //!
-//! What shipped instead reconciles buffer occupancy on every inbound batch and
-//! on a periodic sweep. The same document records that deviation and argues
+//! What shipped instead reconciles buffer occupancy on every inbound batch,
+//! over the slots that batch delivered into and no others, and on a periodic
+//! sweep. The same document records that deviation and argues
 //! "the effect is the same and the sweep bounds the latency".
 //!
 //! The effect is not the same, and this file is what shows it. The sweep runs

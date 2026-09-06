@@ -42,8 +42,8 @@
 //! exact (index, generation) bound each one carries. `drain` (below) caps
 //! the accumulation window in practice, taking every map under one lock
 //! hold. What answers the "unbounded and unread" hazard above, for
-//! `entry_peer`'s own writers (`collect_grants` and `fail_slot`), is that a
-//! new key never comes free there: it costs the peer a full
+//! `entry_peer`'s own writers (the ingress reconcile passes and `fail_slot`),
+//! is that a new key never comes free there: it costs the peer a full
 //! open/record/close cycle and consumes a locally registered bind, so
 //! growth tracks stream lifecycles rather than arrival rate. The up to
 //! [`MAX_PENDING_REJECTS`] reject-derived keys `drain` merges into `peers`
@@ -146,11 +146,11 @@ pub(super) const MAX_PENDING_REJECTS: usize = 8_192;
 ///   at the time it was admitted, and `fail_slot` pushes its `CloseSlot`
 ///   reply after `finish_close` has already removed that row, so the key can
 ///   outlive the table entry that produced it. Most of it — the credit and
-///   close replies `collect_grants` and `fail_slot` produce — names a slot
-///   the ingress table actually admitted, and the table never holds more
-///   than one live generation per index at a time, so none of it is ever
-///   refused. But the table's own slot limit does not cap `peers`: a peer
-///   that closes and reopens the same index repeatedly leaves one entry
+///   close replies the ingress reconcile passes and `fail_slot` produce —
+///   names a slot the ingress table actually admitted, and the table never
+///   holds more than one live generation per index at a time, so none of it
+///   is ever refused. But the table's own slot limit does not cap `peers`: a
+///   peer that closes and reopens the same index repeatedly leaves one entry
 ///   behind per generation the ingress admitted for it since the last
 ///   drain — up to 256, the width of the generation — because nothing here
 ///   is removed except by [`drain`]. Separately, `open_slot` rejecting an
@@ -317,12 +317,13 @@ impl ControlState {
 
     /// The entry for control this side sends back about a slot the peer owns.
     ///
-    /// Never refused: `collect_grants` and `fail_slot`, the only writers,
-    /// name a slot the ingress table actually admitted. See `ControlState`'s
-    /// struct doc for `peers`'s real bound between drains and why leaving it
-    /// unrefused is still safe. An `OpenSlot` the ingress rejects outright
-    /// never comes through here, whether or not its id happens to match a
-    /// slot admitted under a different `OpenSlot` — see `ControlState::reject`.
+    /// Never refused: the ingress reconcile passes and `fail_slot`, the only
+    /// writers, name a slot the ingress table actually admitted. See
+    /// `ControlState`'s struct doc for `peers`'s real bound between drains
+    /// and why leaving it unrefused is still safe. An `OpenSlot` the ingress
+    /// rejects outright never comes through here, whether or not its id
+    /// happens to match a slot admitted under a different `OpenSlot` — see
+    /// `ControlState::reject`.
     fn entry_peer(&mut self, slot: SlotId) -> &mut PeerControl {
         self.peers.entry(slot.raw()).or_default()
     }

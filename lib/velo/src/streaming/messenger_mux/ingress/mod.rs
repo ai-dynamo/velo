@@ -101,9 +101,12 @@ struct PeerIngress {
     /// Scratch, reused across batches so the steady state allocates nothing:
     /// a batch pushes the few indexes it touched and
     /// [`collect_touched_grants`] drains them, keeping the capacity. It is
-    /// empty whenever the peer's mutex is free, which is what makes
-    /// [`IngressSlot::mark_touched`]'s flag mean "already listed for the batch
-    /// in flight" and nothing wider.
+    /// meant to be empty whenever the peer's mutex is free, which is what
+    /// makes [`IngressSlot::mark_touched`]'s flag mean "already listed for the
+    /// batch in flight" and nothing wider — a panic between a push and the
+    /// drain can leave a stale entry here instead, and it self-heals on the
+    /// next batch that visits it (see the flag's own doc on
+    /// [`IngressSlot`]).
     touched: Vec<u32>,
     /// Reconcile visits this peer's slots have taken. Counts exactly what the
     /// per-batch scope removes — one slot-buffer `len` under this mutex — which
@@ -424,9 +427,9 @@ pub(crate) fn handle_batch(
     // measured serving shape, whatever the load.
     //
     // A slot that drained without receiving a record still gets its credit
-    // back, and neither late nor lost: the consumer's drain rings the doorbell,
-    // which reconciles that whole peer within
-    // `MuxConfig::drain_visit_floor` (2 ms), and the periodic sweep is the
+    // back, never lost, at the price of up to one `MuxConfig::drain_visit_floor`
+    // (2 ms) of latency: the consumer's drain rings the doorbell, which
+    // reconciles that whole peer within the floor, and the periodic sweep is the
     // backstop behind that. Striding through a few untouched slots per batch
     // as well would buy a bound the doorbell already gives, at the price of the
     // lock reads this removes. Credit returns stay off the per-record path for
@@ -690,10 +693,12 @@ fn deliver(
     let Some(slot) = state.slots[index].as_mut() else {
         return;
     };
-    // Marked before the record is applied rather than after, so a record that
-    // parks in the reorder hold counts: it has spent credit that only a
-    // reconcile gives back, and it may release the whole hold later in this
-    // same batch.
+    // Marked before the record is applied rather than after, so any record
+    // that reaches the slot counts, not only the ones that spend credit: one
+    // that parks in the reorder hold has spent credit that only a reconcile
+    // gives back and may release the whole hold later in this same batch,
+    // while a duplicate spends none — marking it anyway costs nothing a
+    // reconcile pass doesn't already recompute from scratch.
     if slot.mark_touched() {
         touched.push(id.index());
     }
@@ -791,11 +796,16 @@ fn retire_epoch(state: &mut PeerIngress, metrics: Option<&MuxMetricsHandle>) -> 
         }
     }
     state.slots.clear();
-    // The entries here name slots of the epoch being retired. The table is
-    // cleared and regrows from index zero, so one left behind would send the
-    // next batch's pass to whatever slot takes that index back — a reconcile of
-    // a slot the batch never delivered into. Clearing keeps every entry meaning
-    // what the pass assumes it means.
+    // The entries here name slots of the epoch being retired. On the ordinary
+    // path the list is already empty at this point — the epoch check runs
+    // before any record is applied, and `shutdown` runs with no batch in
+    // flight — so this clears the poison path `touched`'s own doc names (a
+    // panic between a push and the drain), plus any future caller that
+    // retires mid-batch. The table is cleared and regrows from index
+    // zero, so a left-behind entry would send the next batch's pass to
+    // whatever slot takes that index back — a reconcile of a slot the batch
+    // never delivered into. Clearing keeps every entry meaning what the pass
+    // assumes it means.
     state.touched.clear();
     state.peer_bytes = ByteBudget::new(state.peer_bytes.limit());
     closed
@@ -825,6 +835,22 @@ fn collect_grants(state: &mut PeerIngress, replies: &mut Vec<ReplyRecord>) {
 /// closed it, and a retired slot has nobody left to grant credit to — which is
 /// what the whole-table walk did with it too, since it ran after every record
 /// of the batch had been applied.
+///
+/// An index whose slot was *replaced* — closed and reopened at the same dense
+/// index in one batch — is not skipped: the lookup finds the new occupant and
+/// reconciles it, even though the touch that queued the index belonged to the
+/// slot that is now gone. That visit is spurious but harmless, and does not
+/// mint credit the replacement did not earn: a fresh slot starts with nothing
+/// resident and `reconcile` recomputes occupancy from scratch rather than
+/// applying a delta, so it finds nothing drained and grants nothing. If the
+/// replacement also takes a record later in the same batch, the index is
+/// pushed a second time and visited twice. Each visit still recomputes
+/// `drained` from the account's own `buffered()` count, so two visits split
+/// whatever drained between them into two deltas rather than granting it
+/// twice; the peer's control state merges them by addition
+/// (`peer_batcher::control::ControlState::reply_credit`), so reconciling the
+/// same slot from scratch a second time is as harmless as reconciling it
+/// once.
 fn collect_touched_grants(state: &mut PeerIngress, replies: &mut Vec<ReplyRecord>) {
     #[cfg(test)]
     let visits = &mut state.reconcile_visits;

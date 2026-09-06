@@ -999,6 +999,61 @@ fn a_held_record_marks_its_slot_and_its_release_is_reconciled_in_the_same_batch(
     );
 }
 
+/// A dense index closed and reopened within the same batch: the touch that
+/// queued the index belongs to the slot the close retired, so the pass finds
+/// the *replacement* there instead. That extra visit is spurious but grants
+/// the replacement nothing, because a fresh slot starts with nothing resident
+/// and `reconcile` recomputes occupancy from scratch rather than applying a
+/// delta.
+#[test]
+fn a_reused_index_reconciles_its_replacement_and_grants_it_nothing() {
+    let (registry, _rx, config) = bound();
+    let id = slot(0, 0);
+    open(&registry, &config, id, 1);
+
+    let new_id = slot(0, 1);
+    let (tx2, rx2) = flume::bounded(
+        crate::streaming::messenger_mux::flow_control::slot_buffer_depth(config.initial_credit),
+    );
+    registry.register_bind(ANCHOR, SESSION + 1, tx2, test_drain());
+
+    // Close before open: with the open first, `open_slot`'s collision guard
+    // would reject the newcomer, since the old occupant is still live.
+    let before = registry.reconcile_visits(peer());
+    let payload = batch(1, 1, |encoder| {
+        encoder.push_data(id, 1, &item(1)).unwrap();
+        encoder
+            .push_close_slot(id, 2, CloseReason::TerminalSent)
+            .unwrap();
+        encoder
+            .push_open_slot(new_id, 0, ANCHOR, SESSION + 1)
+            .unwrap();
+    });
+    let outcome = handle_batch(&registry, &config, None, peer(), &payload);
+    let visits = registry.reconcile_visits(peer()) - before;
+
+    assert_eq!(outcome.closed, 1);
+    assert_eq!(
+        registry.live_slots(peer()),
+        1,
+        "index 0 is live again, under the new generation"
+    );
+    assert!(
+        outcome.replies.is_empty(),
+        "the replacement is fresh and has nothing resident to grant back: {:?}",
+        outcome.replies
+    );
+    assert_eq!(
+        visits, 1,
+        "the pass visits whatever now occupies the touched index, not the \
+         slot that queued it: {visits} visits"
+    );
+    assert!(
+        drain(&rx2).is_empty(),
+        "the replacement never received a record in this batch"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Teardown
 // ---------------------------------------------------------------------------
