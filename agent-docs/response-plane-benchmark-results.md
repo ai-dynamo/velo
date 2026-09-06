@@ -210,3 +210,18 @@ Three-rep means: velo3 2,699 req/s (spread 763), TTFT p50 66, p99 857, CPU 9.76;
 **What the data linger did.** velo3f cuts the frontend's inbound batches from 7.5 to 8.6 million per rep to 1.0 million (the workers' data batches carry seven times more records) and CPU to 9.10 ms per request, the lowest velo figure, but its request path pays for it: A 8.4 to 9.1 ms and B 12 to 13 ms against velo3's 5.6 and 5.5 in the same mode, and its TTFT p50 is 72 to 76 ms. Bigger inbound batches hold the peer's ingress lock and the ordered lane longer per batch, and the requests waiting behind them pay. Not a ship setting at 500 us.
 
 **Where velo stands against mux18p on these nodes, same mode.** Segment medians: mux18p A 1.4 to 1.6, B 0.5 to 0.7, C 45.6 to 45.9 ms, frontend-internal first-token time 12.3; velo3 A 3.7 to 5.6, B 3.3 to 5.5, C 47.7 to 50.4, frontend-internal 18 to 24. The response leg is within 2 to 4 ms of mux18p; the request leg costs 5 to 9 ms more; the frontend's own first-token time is 6 to 11 ms longer; frontend CPU is 2.3 ms per request (31 percent) higher, against 6 percent for velo0 on the pinned baseline. The residual is per-request frontend work under load, not batch counts.
+
+## Addendum 2026-09-06: one runtime, and velo3 ahead at a matched draw
+
+Matrix `t3-t3-w2-onert3` (job 2741140), three reps per arm, the W2 integration tree 065c545 (touched-plus-listed reconcile, one pinned timer per stream) with the frontend on one tokio runtime (diagnosis section 7), core pinning on, etcd and nats-server on aiperf's cores, 250,000 requests per rep. Reps are grouped by the backlog draw (holders: mocker processes with a share of the backlog; `analysis/draw/draw.py`).
+
+| draw | arm | req/s | TTFT p50 ms | p95 | p99 | ITL p99 ms | CPU ms/req | errors |
+|---|---|---|---|---|---|---|---|---|
+| 1 holder | mux18p | 2,298 | 45.6 | 208 | 768 | 105.6 | 9.54 | 0 |
+| 1 holder | mux18p | 2,308 | 46.1 | 205 | 820 | 103.1 | 9.89 | 0 |
+| 1 holder | velo3 | 2,355 | 41.5 | 207 | 863 | 101.2 | 12.26 | 0 |
+| 2 holders | mux18p | 2,784 | 45.8 | 105 | 771 | 45.7 | 9.97 | 0 |
+| 2 holders | velo3 | 2,725 | 39.1 | 122 | 805 | 55.9 | 13.16 | 0 |
+| 6 holders | velo3 | 3,036 | 57.4 | 182 | 822 | 26.9 | 14.03 | 0 |
+
+At a matched draw velo3's first token is 4 to 7 ms ahead of mux18p at p50 and within the rep-to-rep spread at p99. Worker credit exhaustion is 25 to 74 per process (13 before W2, about 21,000 under the collapse), the frontend's lane wait is 0.2 to 0.4 ms per batch, and the thread count is 154 (242 with two runtimes). Frontend CPU per request is the open item: velo3 12.3 to 14.0 against mux18p 9.5 to 10.0. Both arms sit above their iso3 values (7.5 for mux18p then), so part of the shift is the environment: with nats-server off the frontend's cores and one runtime, more of the 72 workers idle-spin. A 32-worker run of both arms (`t3-w2-wt32`) and a per-subtree attribution of the one-runtime profile (`t3-prof5`) are in progress.

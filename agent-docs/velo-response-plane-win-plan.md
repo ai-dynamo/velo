@@ -171,3 +171,13 @@ Rulings.
 ## Addendum 2026-09-06 night: (d)'s first cut starved the credit tail
 
 Ruling 1 above said the doorbell and the sweep are enough backstops for a slot a batch did not touch. Measured, they are not: every stream on this workload needs one grant for its last four records, and that grant must ride the peer's next inbound batch, not a rate-limited per-peer walk (see the handoff for the numbers: credit exhaustion 13 to 20,500 per worker process, throughput halved, lane wait 0.36 ms to 1.4 s). The corrected rule for (d): the pump names the slot it drained (an exact atomic count plus a per-peer lane of slot indexes, no lock), and the batch handler reconciles touched plus listed slots. The full walk survives only on the periodic tick, where it is now lock-free. (a) stands as built.
+
+## Addendum 2026-09-06 afternoon: verdict with one runtime
+
+With the frontend on one tokio runtime and both W2 changes, velo3 is ahead of mux18p on first-token p50 at every matched backlog draw (39 to 42 ms against 46, three reps; results addendum of this date). Zero errors. The bar's first-token clause is met at a matched draw; the p99 clause is within spread; the throughput clause is draw-bound for both arms; the CPU clause is not met (12.3 to 14.0 against 9.5 to 10.0 ms/req).
+
+Rulings.
+
+1. The one-runtime fix is the largest single lever found in this campaign and it is not velo's: it belongs in dynamo's Python bindings (`DistributedRuntime` initialising the pyo3 bridge with its own runtime). Until it lands upstream it lives in the rig-local adapter. Every velo measurement from here on is taken with it.
+2. W2 (a) and (d) stand as built, second cuts. (d) must never leave credit to the doorbell; (a) must never fire under traffic. Both are pinned by tests.
+3. Next on CPU: the per-subtree attribution of `t3-prof5` decides the order. The frontend worker-thread count is measured first because it moves both arms and may be most of the environment shift.
