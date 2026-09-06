@@ -242,3 +242,26 @@ The dynamo frontend process has two 72-worker tokio runtimes on its 72 pinned co
 Every record's hop from the lane to its pump is therefore a cross-runtime wake: `AsyncSignal::fire` in `IngressSlot::deliver` takes tokio's `push_remote_task`, which locks runtime B's single injection-queue mutex, the same mutex B's 72 workers take to find work. It was there before W2 (0.28 percent of the cores in `t3-prof2`); the two W2 changes removed the per-record locks that had paced the lane, the wake rate rose, and the convoy on that one mutex became 2.4 percent plus 6.8 percent of parking_lot lock time. A worker parked in a futex inside that lock is not parked in tokio's sense, so runtime A's time driver goes unserviced: the batchers' 1 ms linger timers stop firing for seconds, credit stops, the 8,192-stream cohort synchronises, and the 6 to 8 s limit cycle of section 6 follows. Moving the pumps onto runtime A alone only relocates the remote wake to the pump's forward into the adapter's consumer on B.
 
 The fix is one runtime: initialise the pyo3 bridge with dynamo's runtime when no runtime exists yet, the way `dynamo.common.backend.Worker` already does. It is an adapter change (rig-local `dyn-pin`, `lib/bindings/python/rust/lib.rs`), it removes the oversubscription for both planes, and it turns the per-record hop into a local push. It is being measured with the W2 wheel as `t3-w2-onert`.
+
+### 8. With one runtime: where velo's extra CPU per request is, and what the worker count does to it
+
+`t3-prof5` (job 2741141) profiled both frontends with one runtime (section 7). A per-subtree partition of the folded stacks, every line to exactly one bucket, both arms summing to 100 percent, converted at 72 cores divided by the rep's request rate (velo3 3,021 req/s, mux18p 3,721), and checked by an independent recomputation:
+
+| bucket, ms per request | velo3 | mux18p | velo3 minus mux18p |
+|---|---|---|---|
+| HTTP and SSE connection task, socket writes | 7.51 | 5.03 | +2.48 |
+| reader pump (per-anchor relay task) | 1.11 | 0 | +1.11 |
+| anchor (frame decode, gauge) | 0.79 | 0 | +0.79 |
+| adapter consumer task | 0.66 | 0 | +0.66 |
+| ingress lane, `handle_batch` | 0.65 | 0 | +0.65 |
+| tokio scheduler residual | 0.78 | 0.33 | +0.46 |
+| unattributed (unwind stops) | 2.37 | 2.00 | +0.37 |
+| tcp transport, messenger dispatch, batcher and credit | 0.50 | 0 | +0.50 |
+| shared request path (SSE convert and serialize, router, preprocessor, other) | 3.77 | 3.62 | +0.15 |
+| mux18p's reader and per-request receiver | 0 | 1.24 | −1.24 |
+| axum's graceful-shutdown watch, a process-wide Notify re-polled on every connection wake | 1.36 | 2.21 | −0.84 |
+| idle | 4.04 | 4.66 | −0.62 |
+
+The gap is not "velo's plane is expensive". Velo's anchor plus adapter consumer (1.46) costs about what mux18p's reader plus receiver costs (1.24). The excess is task-hop machinery, about 2.2 ms: the reader pump is a pure channel-to-channel relay with no counterpart, and the lane, the dispatch and the transport are three more stages where mux18p has one task. The second piece is inside the shared HTTP path: the same number of SSE body frames, but about 1.8 times the flushes and 2.3 times the TCP segments per request, because every record reaches the connection task as its own wake. The largest single site in either profile is axum's shutdown watch, a global mutex taken on every connection wake, and mux18p pays more of it than velo does. MessagePack decode is a wash. Both are one rep.
+
+**The worker count.** `t3-t3-w2-wt32` (job 2741276) ran both arms with the frontend runtime at 32 workers instead of 72. velo3's CPU per request fell from 13.6 to 9.8 ms and mux18p's from 9.5 to 9.2, at 3,079 and 2,372 req/s. Most of velo's apparent CPU excess on 72 workers is idle workers searching for work, which velo's larger task count provokes more of. First-token p50 in that one rep was 76.7 ms at a five-holder draw for velo3, so the worker count is not free of first-token cost; a three-rep matrix at each count is queued (`t3-final72`, `t3-final32`, both on the tree with both second cuts).

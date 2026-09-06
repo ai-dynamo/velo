@@ -181,3 +181,12 @@ Rulings.
 1. The one-runtime fix is the largest single lever found in this campaign and it is not velo's: it belongs in dynamo's Python bindings (`DistributedRuntime` initialising the pyo3 bridge with its own runtime). Until it lands upstream it lives in the rig-local adapter. Every velo measurement from here on is taken with it.
 2. W2 (a) and (d) stand as built, second cuts. (d) must never leave credit to the doorbell; (a) must never fire under traffic. Both are pinned by tests.
 3. Next on CPU: the per-subtree attribution of `t3-prof5` decides the order. The frontend worker-thread count is measured first because it moves both arms and may be most of the environment shift.
+
+## Addendum 2026-09-06 evening: the CPU order after the profile with one runtime
+
+Diagnosis section 8 partitions the one-runtime profile. Rulings.
+
+1. Before any velo change, measure the frontend worker count with three reps at 72 and 32 (queued). If 32 holds first-token latency at a matched draw, the rig runs at 32 from then on and the CPU clause is judged there.
+2. Then, in order: (i) deliver a batch's records to a slot's consumer with one wake instead of one per record, so hyper flushes once per burst (bounded 1.0 to 1.45 ms/req in velo3's HTTP path; the site is `IngressSlot::apply_data` through the reader pump into the adapter consumer); (ii) delete the reader pump hop for mux slots and deliver straight into the anchor's channel (0.5 to 0.9 ms/req plus a share of the scheduler residual; the credit count then moves to wherever the record leaves the mux buffer); (iii) the per-record channel cost on the surviving hop (0.2 to 0.4); (iv) the cancellation-token walks (0.1 to 0.17). Each its own PR with a failing test and a rig measurement.
+3. Not velo's, worth raising with dynamo: axum's graceful-shutdown watch is re-polled on every connection wake and costs 1.4 (velo3) to 2.2 (mux18p) ms/req; and the two-runtime frontend (section 7), which the rig-local adapter now avoids.
+4. Not to pursue: flattening the MessagePack envelope, the anchor, the adapter consumer, or the scheduler as a target of its own.
