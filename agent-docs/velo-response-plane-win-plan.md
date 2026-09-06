@@ -202,3 +202,14 @@ Diagnosis section 9 replaces the evening addendum's item (i): there is no SSE-fl
 1. Build now, in parallel: W2(e), one credit grant per half window instead of one per drained record (velo, branch `w2e-grant-threshold` off `w2d-touched-slot-reconcile`; the threshold is derived from the negotiated window, the periodic sweep grants any remainder, and a dated `BATCHING.md` addendum supersedes the earlier ruling against a record threshold); and the adapter's inline receiver (rig-local `dyn-pin`, belongs upstream with the one-runtime fix).
 2. Then carry `Bytes` end to end so the frontend stops allocating a `Vec` per record.
 3. Not to build: merging the reader pump into the anchor channel (the sole-writer credit invariant forbids it); a linger anywhere on the response path.
+
+## Addendum 2026-09-06, late: the CPU clause is no longer a gate; W2(e) is judged on the tail
+
+The author's ruling of this evening: a smaller frontend CPU per request is welcome when it costs nothing, but it is not worth any latency or tail. The bar therefore keeps TTFT p50 and p99 at or below mux18p's at a matched draw, throughput at or above mux18p's on the same matrix, and zero errors. Frontend CPU at or below mux18p's is recorded, not required.
+
+Consequences for the work in flight (results addendum of this night, `t3-w2e72` and `t3-prof6`):
+
+1. W2(e), PR #85 (one grant per half window), cut credit updates 19-fold and frontend batches 30-fold and moved CPU per request by nothing measurable. On the same nodes it raised ITL p99 from mux18p's level to 68 and 76 ms and worker credit exhaustion to as much as 1,431 per rep. A change with no upside on the bar and a cost on the tail does not merge. Matrix `t3-now2e72` (the same wheel without #85) decides whether the tail belongs to #85 or to the adapter's inline receiver. If #85 owns it, the PR closes with the measurement in its body. A quarter-window threshold is worth a run only if it keeps ITL p99 at mux18p's, and then only as a batch-count tidy-up.
+2. The adapter's inline receiver (rig-local `dyn-pin`) removed about 0.2 ms/req of adapter work. It stays only if `t3-now2e72` shows the tails at their `t3-final72` levels without #85. Otherwise the consumer task and its mailbox come back from the backup under `.research/logs/adapter-inline/baseline/`.
+3. The CPU levers left in the hop chain (folding the reader pump into the anchor, the surviving channel costs, the cancellation-token walks) drop to optional. They are taken only with a same-matrix tail check.
+4. The latency items move up: TTFT p99 is 40 to 70 ms behind mux18p at 72 workers on every matrix since the one-runtime fix, and the credit tail (a stream's last records wait for a grant) is the mechanism that turns a slow reader into an ITL spike. The starved-slot urgent grant on #83 is the next change with a claim on the tail.
