@@ -38,7 +38,7 @@ use dashmap::DashMap;
 use velo_ext::WorkerId;
 
 pub(crate) use self::drain::DrainSignal;
-use self::slot::{Applied, IngressSlot, heartbeat_frame};
+use self::slot::{Applied, GrantPolicy, IngressSlot, heartbeat_frame};
 use super::MuxConfig;
 use super::flow_control::ByteBudget;
 use super::peer_batcher::ReplyRecord;
@@ -144,6 +144,18 @@ struct PeerIngress {
     /// indistinguishable from a visit that never happened.
     #[cfg(test)]
     reconcile_visits: u64,
+    /// `CreditUpdate` replies this peer's passes have staged. The record count
+    /// the grant threshold exists to cut, which the credit a run returns does
+    /// not reveal: the same credit comes back either way, in more records or
+    /// in fewer.
+    ///
+    /// Counted as the growth of the reply vector across a pass's reconcile
+    /// loop, which is exact only while [`reconcile_slot`] is the one thing that
+    /// pushes inside those loops. A pass that grew to stage anything else there
+    /// would have to count grants directly instead, or this would quietly
+    /// measure something wider.
+    #[cfg(test)]
+    grants_minted: u64,
 }
 
 impl PeerIngress {
@@ -159,6 +171,8 @@ impl PeerIngress {
             drained_rx,
             #[cfg(test)]
             reconcile_visits: 0,
+            #[cfg(test)]
+            grants_minted: 0,
         }
     }
 
@@ -248,6 +262,14 @@ impl IngressRegistry {
             .map_or(0, |entry| lock(entry.value()).reconcile_visits)
     }
 
+    /// `CreditUpdate` replies minted for `peer` since its table opened.
+    #[cfg(test)]
+    pub(crate) fn grants_minted(&self, peer: WorkerId) -> u64 {
+        self.peers
+            .get(&peer)
+            .map_or(0, |entry| lock(entry.value()).grants_minted)
+    }
+
     /// Live receive-side slots for `peer`.
     pub(crate) fn live_slots(&self, peer: WorkerId) -> usize {
         self.peers
@@ -270,6 +292,13 @@ impl IngressRegistry {
     /// parked. It is the backstop for one more: a drain whose listing found the
     /// dirty lane full, which neither [`handle_batch`] nor [`sweep_drained`]
     /// can see.
+    ///
+    /// It is also the only pass that advertises a pending grant below the
+    /// half-window threshold the other two hold to, which is what bounds how
+    /// long such a remainder waits to one
+    /// [`MuxConfig::credit_sweep_interval`](super::MuxConfig::credit_sweep_interval).
+    /// Nothing waits on that remainder — [`IngressSlot::take_grant`] has the
+    /// argument — but the ledger must not carry it indefinitely either.
     ///
     /// A visit is now an atomic swap per slot rather than a slot-channel length
     /// read, so what this walk costs is bounded by the tick's own interval.
@@ -294,6 +323,9 @@ impl IngressRegistry {
     /// visit per
     /// [`MuxConfig::drain_visit_floor`](super::MuxConfig::drain_visit_floor)
     /// per peer.
+    ///
+    /// Like the arrival path, it advertises a slot's credit only once half that
+    /// slot's window has drained; the periodic tick is what carries the rest.
     pub(crate) fn sweep_drained(&self, peer: WorkerId) -> Vec<ReplyRecord> {
         let Some(entry) = self.peers.get(&peer) else {
             return Vec::new();
@@ -815,6 +847,10 @@ fn retire_epoch(state: &mut PeerIngress, metrics: Option<&MuxMetricsHandle>) -> 
 /// backstop for a slot whose drain could not reach [`collect_touched_grants`]
 /// because the dirty lane was full when its pump tried to list it.
 ///
+/// It advertises under [`GrantPolicy::Everything`], which makes it the backstop
+/// for one more thing: a slot whose pending credit sits below the half-window
+/// threshold the other two passes hold to.
+///
 /// Unlike the other two visitors, this one does not route through
 /// [`list_drained_slots`], so it is the one that must drain the lane itself:
 /// every live slot below is reconciled and cleared unconditionally. Draining
@@ -836,6 +872,8 @@ fn collect_grants(state: &mut PeerIngress, replies: &mut Vec<ReplyRecord>) {
         };
     }
     #[cfg(test)]
+    let staged = replies.len();
+    #[cfg(test)]
     let visits = &mut state.reconcile_visits;
     for entry in &mut state.slots {
         let Some(slot) = entry.as_mut() else {
@@ -850,7 +888,11 @@ fn collect_grants(state: &mut PeerIngress, replies: &mut Vec<ReplyRecord>) {
         // (`IngressSlot::touched`'s doc) without depending on a list entry to
         // find the slot.
         slot.clear_touched();
-        reconcile_slot(slot, replies);
+        reconcile_slot(slot, replies, GrantPolicy::Everything);
+    }
+    #[cfg(test)]
+    {
+        state.grants_minted += (replies.len() - staged) as u64;
     }
 }
 
@@ -886,6 +928,11 @@ fn list_drained_slots(state: &mut PeerIngress) {
 
 /// Reconcile the slots this pass listed, and clear the list it built.
 ///
+/// It advertises under [`GrantPolicy::HalfWindow`]. This pass runs on every
+/// inbound batch and on every doorbell visit, so it sees a slot about once per
+/// record that slot moved, and advertising whatever each visit found freed is
+/// what turned almost every drained record into a `CreditUpdate` of its own.
+///
 /// An index whose slot is gone is skipped: a later record of the same batch
 /// closed it, and a retired slot has nobody left to grant credit to — which is
 /// what the whole-table walk did with it too, since it ran after every record
@@ -905,6 +952,8 @@ fn list_drained_slots(state: &mut PeerIngress) {
 /// each and stages nothing.
 fn collect_touched_grants(state: &mut PeerIngress, replies: &mut Vec<ReplyRecord>) {
     #[cfg(test)]
+    let staged = replies.len();
+    #[cfg(test)]
     let visits = &mut state.reconcile_visits;
     for index in &state.touched {
         let Some(slot) = state
@@ -919,15 +968,23 @@ fn collect_touched_grants(state: &mut PeerIngress, replies: &mut Vec<ReplyRecord
             *visits += 1;
         }
         slot.clear_touched();
-        reconcile_slot(slot, replies);
+        reconcile_slot(slot, replies, GrantPolicy::HalfWindow);
     }
     state.touched.clear();
+    #[cfg(test)]
+    {
+        state.grants_minted += (replies.len() - staged) as u64;
+    }
 }
 
-/// Reconcile one slot and stage the `CreditUpdate` it earned, if any.
-fn reconcile_slot(slot: &mut IngressSlot, replies: &mut Vec<ReplyRecord>) {
+/// Reconcile one slot and stage the `CreditUpdate` `policy` lets it advertise.
+///
+/// The reconcile itself is unconditional: the drain count is taken and released
+/// on the account whatever the policy says, so a withheld grant is credit
+/// waiting on this side's ledger rather than a drain that went uncounted.
+fn reconcile_slot(slot: &mut IngressSlot, replies: &mut Vec<ReplyRecord>, policy: GrantPolicy) {
     slot.reconcile();
-    if let Some(delta) = slot.take_grant() {
+    if let Some(delta) = slot.take_grant(policy) {
         replies.push(ReplyRecord::CreditUpdate {
             slot: slot.id,
             delta,

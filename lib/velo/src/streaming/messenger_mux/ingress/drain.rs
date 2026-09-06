@@ -112,10 +112,17 @@ impl DrainSignal {
     /// try again; the periodic sweep's whole-table walk is what bounds the gap
     /// if no next one comes, and the count is still there when it arrives.
     ///
-    /// A per-slot record threshold was the alternative to the wake and is
-    /// worse on both counts: it withholds credit for the first `T` records of
-    /// every slot, which is latency on the path this change exists to speed up,
-    /// and with a thousand slots on one peer it still posts a thousand times.
+    /// A per-slot record threshold on *this* post was the alternative to the
+    /// wake and is still not taken: with a thousand slots on one peer it posts
+    /// a thousand times whatever the threshold, so it buys nothing the
+    /// coalescing above does not, and it strands the count of a slot that
+    /// drained fewer than `T` records and then went quiet. That is a different
+    /// rule from the threshold that decides whether a *visit* advertises,
+    /// which the tree does have — see
+    /// [`IngressSlot::take_grant`](super::slot::IngressSlot::take_grant).
+    /// Nothing here is withheld: the count is always taken, and a visit that
+    /// declines to advertise leaves the credit on this side's ledger for the
+    /// next one.
     ///
     /// Both flag updates below are RMWs (`swap`), never a load followed by a
     /// conditional swap: a plain `listed.load` could return a stale `true`

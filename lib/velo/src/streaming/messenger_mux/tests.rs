@@ -67,6 +67,9 @@ struct Pair {
     consumer: Arc<MessengerMuxTransport>,
     producer: Arc<MessengerMuxTransport>,
     consumer_worker: WorkerId,
+    /// Whose slots the consumer's ingress table holds, for the tests that read
+    /// that table directly.
+    producer_worker: WorkerId,
     registry: prometheus::Registry,
     _messengers: (Arc<Messenger>, Arc<Messenger>),
 }
@@ -85,10 +88,12 @@ async fn mux_pair(config: MuxConfig) -> Pair {
         MessengerMuxTransport::new(Arc::clone(&m_producer), config, Some(Arc::clone(&metrics)))
             .expect("producer mux");
     let consumer_worker = m_consumer.instance_id().worker_id();
+    let producer_worker = m_producer.instance_id().worker_id();
     Pair {
         consumer,
         producer,
         consumer_worker,
+        producer_worker,
         registry,
         _messengers: (m_consumer, m_producer),
     }
@@ -107,6 +112,19 @@ impl Pair {
 
     fn live_slots(&self) -> f64 {
         self.snapshot().gauge("velo_streaming_mux_live_slots", &[])
+    }
+
+    /// `CreditUpdate` replies the consumer's ingress passes have staged for the
+    /// producer.
+    ///
+    /// Read off the ingress table rather than off a metric because no metric
+    /// counts reply records by type, and the quantity under test is the record
+    /// count and not the credit: the same credit comes back either way.
+    fn grants_minted(&self) -> u64 {
+        self.consumer
+            .core
+            .ingress
+            .grants_minted(self.producer_worker)
     }
 
     /// The applier's `try_send` never failed on space credit had reserved.
@@ -291,6 +309,82 @@ async fn credit_returns_let_a_producer_outrun_its_window() {
     assert_eq!(rx.recv().await, *cached_finalized());
     producer.await.expect("producer task");
     pair.assert_no_reader_stall();
+}
+
+/// The half-window threshold cuts the credit records and cannot stall the
+/// producer.
+///
+/// The consumer takes one record every `DRAIN_GAP`, which is longer than the
+/// default `MuxConfig::drain_visit_floor`, so every drain gets a reconcile pass
+/// of its own — the shape in which a mux that advertised whatever was pending
+/// emits one `CreditUpdate` per record, which is what the tier-3 rig measured
+/// at 0.93 grants per data record. The sweep is set far past the run, so every
+/// grant counted here came from a threshold path and none from the periodic
+/// backstop.
+///
+/// The stream completing is the other half, and the one that matters more: the
+/// producer sends `FRAMES` records through a window of `WINDOW`, so it spends
+/// its window over and over and only a returned grant lets it go on.
+#[tokio::test(flavor = "multi_thread")]
+async fn credit_records_are_bounded_by_the_half_window_threshold() {
+    const FRAMES: u32 = 120;
+    const WINDOW: u32 = 4;
+    const THRESHOLD: u32 = WINDOW / 2;
+    const DRAIN_GAP: Duration = Duration::from_millis(5);
+
+    let pair = mux_pair(MuxConfig {
+        initial_credit: WINDOW,
+        // Far longer than this run: the periodic tick grants whatever is
+        // pending, so a tick inside the run would put sub-threshold grants in
+        // the count and measure something else.
+        credit_sweep_interval: Duration::from_secs(600),
+        ..MuxConfig::default()
+    })
+    .await;
+
+    let rx = pair.bind(3, 3).await;
+    let tx = pair
+        .producer
+        .connect(pair.consumer_worker, 3, 3)
+        .await
+        .expect("connect");
+
+    let producer = tokio::spawn(async move {
+        for n in 0..FRAMES {
+            tx.send_async(item(n)).await.expect("send item");
+        }
+        tx.send_async(cached_finalized().clone())
+            .await
+            .expect("send terminal");
+    });
+
+    for n in 0..FRAMES {
+        tokio::time::sleep(DRAIN_GAP).await;
+        assert_eq!(rx.recv().await, item(n), "frame {n} out of order");
+    }
+    assert_eq!(rx.recv().await, *cached_finalized());
+    producer.await.expect("producer task");
+    pair.assert_no_reader_stall();
+
+    let grants = pair.grants_minted();
+    let ceiling = u64::from(FRAMES / THRESHOLD + 2);
+    // One window short of `FRAMES / WINDOW`: the credit of the records drained
+    // behind the terminal is owed to nobody, because the slot closes with the
+    // terminal and its sender is gone.
+    let floor = u64::from(FRAMES / WINDOW - 1);
+    assert!(
+        grants >= floor,
+        "{FRAMES} records went through a {WINDOW}-record window, so the \
+         producer needed at least {floor} grants to finish and the run \
+         counted {grants}"
+    );
+    assert!(
+        grants <= ceiling,
+        "{grants} CreditUpdate records for {FRAMES} data records: a threshold \
+         of {THRESHOLD} advertises at most one grant per {THRESHOLD} records, \
+         so at most {ceiling} of them, and one per record is the volume this \
+         threshold exists to cut"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

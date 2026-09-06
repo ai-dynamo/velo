@@ -49,6 +49,18 @@ pub(super) enum Applied {
     Fault(CloseReason),
 }
 
+/// What a reconcile pass may advertise back to the sender.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GrantPolicy {
+    /// Advertise only once the slot's pending credit has reached half its
+    /// window. The arrival path and the drain doorbell, each of which visits a
+    /// slot about once per record that slot moved.
+    HalfWindow,
+    /// Advertise whatever is pending. The periodic tick, which is what bounds
+    /// how long a remainder below the threshold waits.
+    Everything,
+}
+
 /// One receive-side slot.
 pub(super) struct IngressSlot {
     /// Index and generation this slot answers to.
@@ -242,11 +254,67 @@ impl IngressSlot {
     /// one-megabyte slot cap — it is the byte side that has to win, and it wins
     /// by throttling the next grant rather than by refusing a record whose
     /// frame credit was already given.
-    pub(super) fn take_grant(&mut self) -> Option<u32> {
+    ///
+    /// Under [`GrantPolicy::HalfWindow`] it is withheld again until the pending
+    /// credit reaches [`grant_threshold`](Self::grant_threshold). Without that
+    /// rule a grant is minted per drained record: the arrival path visits every
+    /// slot a batch delivered into or a pump named, which is about once per
+    /// record a slot moved, and each visit advertised whatever that one drain
+    /// had freed. On the tier-3 rig's frontend that was 61.7 million
+    /// `CreditUpdate` records against about 66 million data records received —
+    /// each of them a reply staged into a batcher, a batch on the wire, and a
+    /// control record the peer decodes and applies.
+    ///
+    /// **Why this cannot stall a sender.** What the sender may still spend is
+    /// `limit - outstanding`, and `outstanding` counts every record this side
+    /// has not advertised back: those sitting in the buffer or the hold, plus
+    /// those drained and not yet granted. A sender about to run out therefore
+    /// has `limit` records split between those two groups, so at least
+    /// `limit / 2` are in one of them. If they are the ones this side still
+    /// holds, the consumer is behind and withholding is what a window is for.
+    /// If they are the drained ones, the grant is due and the next visit mints
+    /// it. A sender with a full window in hand never waits on the threshold,
+    /// whatever the split.
+    ///
+    /// The hold is the case worth spelling out, because a record parked there
+    /// is one nobody can drain: a gap can leave the pending credit below the
+    /// threshold with the sender parked on an empty window. That is not a
+    /// deadlock. The record that closes the gap spent its credit before the
+    /// sender parked and is already in flight — a rendezvous payload resolving
+    /// outside the ordered lane is how it got ahead of its own predecessor —
+    /// so when it lands the hold releases into the buffer and the consumer's
+    /// drains reach the threshold.
+    ///
+    /// **What is lost, and what is owed.** A grant lost to an epoch death is
+    /// lost exactly as it was before this rule; only its size changed, because
+    /// `retire_epoch` drops the account with whatever it was holding either
+    /// way. On `finish_close` the slot leaves the table and its sender has
+    /// nothing left to spend credit on, so no grant is owed and none is
+    /// drained out on the way. Neither path is new, and no test showed a case
+    /// where the larger unadvertised remainder matters.
+    pub(super) fn take_grant(&mut self, policy: GrantPolicy) -> Option<u32> {
         if self.buffered_bytes >= self.byte_watermark {
             return None;
         }
+        if policy == GrantPolicy::HalfWindow
+            && self.account.pending_grant() < self.grant_threshold()
+        {
+            return None;
+        }
         self.account.take_pending_grant()
+    }
+
+    /// Pending credit at which [`GrantPolicy::HalfWindow`] advertises.
+    ///
+    /// Derived from the window rather than configured: an operator who widens
+    /// the window widens this with it, so the ratio of credit records to data
+    /// records stays put and there is no second number to keep consistent with
+    /// the first. Never zero — the halving rounds to zero at a window of one,
+    /// and a threshold of zero is not a rule but the absence of one — so a
+    /// window of 1 or 2 advertises per record, which is what the credit tests'
+    /// deliberately tiny windows have always done.
+    fn grant_threshold(&self) -> u32 {
+        (self.account.limit() / 2).max(1)
     }
 
     /// Inject the `Dropped` sentinel a consumer sees when its sender dies.

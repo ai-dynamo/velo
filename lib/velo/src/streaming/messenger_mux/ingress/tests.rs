@@ -812,6 +812,160 @@ fn credit_is_withheld_while_the_slot_is_over_its_byte_watermark() {
 }
 
 // ---------------------------------------------------------------------------
+// Grant threshold
+// ---------------------------------------------------------------------------
+
+/// A window big enough for the threshold to be a rule rather than a rounding
+/// case, and the one the mux ships with.
+const FULL_WINDOW: u32 = 256;
+
+/// The default window against a slot byte budget wide enough to hold it, so
+/// the byte watermark never binds and the only rule under test is the
+/// threshold.
+fn wide_window_config() -> MuxConfig {
+    MuxConfig {
+        initial_credit: FULL_WINDOW,
+        slot_byte_budget: 64 * 1024,
+        ..config()
+    }
+}
+
+/// Deliver a full window into one slot and hand back its consumer.
+fn full_window(registry: &IngressRegistry, config: &MuxConfig, id: SlotId) -> Consumer {
+    let consumer = register(registry, config, SESSION);
+    open(registry, config, id, 1);
+    let payload = batch(1, 1, |encoder| {
+        for seq in 1..=FULL_WINDOW {
+            encoder.push_data(id, seq, &item(seq as u8)).unwrap();
+        }
+    });
+    handle_batch(registry, config, None, peer(), &payload);
+    consumer
+}
+
+/// The discriminator: a grant is minted once per half window, not once per
+/// drained record.
+///
+/// Since the arrival path learned to answer the dirty lane, a slot is
+/// reconciled on every batch that delivered into it or that its pump listed,
+/// which is about once per record — so almost every drained record became its
+/// own `CreditUpdate`. On the tier-3 rig's frontend that was 61.7 million of
+/// them for about 66 million data records received, against 28.8 million for
+/// the same work before. Each one is a reply staged into a batcher, a batch on
+/// the wire, and a control record the peer decodes and applies.
+#[test]
+fn a_grant_is_minted_once_per_half_window_not_once_per_drained_record() {
+    let config = wide_window_config();
+    let registry = IngressRegistry::default();
+    let id = slot(0, 0);
+    let consumer = full_window(&registry, &config, id);
+
+    // One drain, one reconcile pass, all the way through the window.
+    let mut grants: Vec<(u32, u32)> = Vec::new();
+    for drained in 1..=FULL_WINDOW {
+        assert_eq!(consumer.pump_n(1).len(), 1);
+        for reply in registry.sweep_drained(peer()) {
+            match reply {
+                ReplyRecord::CreditUpdate {
+                    slot: granted,
+                    delta,
+                } => {
+                    assert_eq!(granted, id, "the grant names the slot that drained");
+                    grants.push((drained, delta));
+                }
+                other => panic!("unexpected reply: {other:?}"),
+            }
+        }
+    }
+
+    let threshold = FULL_WINDOW / 2;
+    assert_eq!(
+        grants,
+        vec![(threshold, threshold), (FULL_WINDOW, threshold)],
+        "a {FULL_WINDOW}-record window has a threshold of {threshold}, so \
+         draining it one record at a time must mint 2 grants of {threshold}, \
+         at drains {threshold} and {FULL_WINDOW}; it minted {} of them",
+        grants.len()
+    );
+}
+
+/// The periodic sweep grants what the threshold withheld, so a remainder waits
+/// at most one `MuxConfig::credit_sweep_interval` and never longer.
+///
+/// Nothing is waiting on it — a sender with a window in hand cannot reach the
+/// threshold's withholding, per `IngressSlot::take_grant` — but a slot that
+/// goes quiet mid-window must not carry the remainder for the rest of its life
+/// either, because the next window's arithmetic starts from it.
+#[test]
+fn the_periodic_sweep_grants_the_remainder_the_threshold_withholds() {
+    const DRAINED: u32 = 10;
+
+    let config = wide_window_config();
+    let registry = IngressRegistry::default();
+    let id = slot(0, 0);
+    let consumer = full_window(&registry, &config, id);
+
+    assert_eq!(consumer.pump_n(DRAINED as usize).len(), DRAINED as usize);
+    assert!(
+        registry.sweep_drained(peer()).is_empty(),
+        "{DRAINED} records drained against a threshold of {}, so the doorbell \
+         has nothing to advertise yet",
+        FULL_WINDOW / 2
+    );
+    assert_eq!(
+        registry.sweep_credit(peer()),
+        vec![ReplyRecord::CreditUpdate {
+            slot: id,
+            delta: DRAINED
+        }],
+        "the periodic tick is what bounds how long a sub-threshold remainder \
+         waits, so it grants whatever is pending"
+    );
+}
+
+/// The byte watermark withholds a grant the threshold would allow.
+///
+/// The two rules are independent and both must hold: the threshold is about
+/// how *often* credit is advertised, the watermark about whether the slot has
+/// room for what advertising it would let in.
+#[test]
+fn the_byte_watermark_withholds_a_grant_the_threshold_would_allow() {
+    let config = MuxConfig {
+        initial_credit: 4,
+        // One item is well over this, so any record left in the buffer keeps
+        // the slot over its watermark.
+        slot_byte_budget: 1,
+        ..config()
+    };
+    let registry = IngressRegistry::default();
+    let consumer = register(&registry, &config, SESSION);
+    let id = slot(0, 0);
+    open(&registry, &config, id, 1);
+
+    let payload = batch(1, 1, |encoder| {
+        for seq in 1..=4u32 {
+            encoder.push_data(id, seq, &item(seq as u8)).unwrap();
+        }
+    });
+    handle_batch(&registry, &config, None, peer(), &payload);
+
+    assert_eq!(consumer.pump_n(2).len(), 2);
+    assert!(
+        registry.sweep_drained(peer()).is_empty(),
+        "2 of a 4-record window drained, which meets the threshold, but two \
+         records still occupy the buffer and the watermark is what decides"
+    );
+
+    assert_eq!(consumer.pump_n(2).len(), 2);
+    assert_eq!(
+        registry.sweep_drained(peer()),
+        vec![ReplyRecord::CreditUpdate { slot: id, delta: 4 }],
+        "occupancy is back to zero, so both rules are satisfied and the whole \
+         window comes back at once"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Reconcile scope
 // ---------------------------------------------------------------------------
 
@@ -963,6 +1117,13 @@ fn a_batch_returns_the_credit_of_every_slot_that_drained() {
 /// The visit holds the same per-peer mutex the inbound batch path takes, and
 /// runs up to once per `MuxConfig::drain_visit_floor` per peer, so what it
 /// walks is hot-path cost.
+///
+/// Two records drained rather than one, because the doorbell mints a grant
+/// only once the slot's pending credit has reached half its window and the
+/// window here is [`config`]'s 4. The count under test is the *visit* count,
+/// which one drain would have measured just as well; the grant is asserted
+/// alongside it so a visit that walked the right slot and returned nothing
+/// cannot pass, and that assertion is what needs the threshold met.
 #[test]
 fn a_doorbell_visit_reconciles_only_the_slots_that_drained() {
     let config = config();
@@ -971,15 +1132,17 @@ fn a_doorbell_visit_reconciles_only_the_slots_that_drained() {
     let id = slot(7, 0);
 
     let payload = batch(1, 1, |encoder| {
-        encoder.push_data(id, 1, &item(1)).unwrap();
+        for seq in 1..=2u32 {
+            encoder.push_data(id, seq, &item(seq as u8)).unwrap();
+        }
     });
     handle_batch(&registry, &config, None, peer(), &payload);
-    assert_eq!(consumers[7].pump().len(), 1);
+    assert_eq!(consumers[7].pump().len(), 2);
 
     let before = registry.reconcile_visits(peer());
     assert_eq!(
         registry.sweep_drained(peer()),
-        vec![ReplyRecord::CreditUpdate { slot: id, delta: 1 }],
+        vec![ReplyRecord::CreditUpdate { slot: id, delta: 2 }],
         "the visit answers the drain that rang for it"
     );
     let visits = registry.reconcile_visits(peer()) - before;

@@ -1317,3 +1317,77 @@ naming an index a different slot has taken costs that slot one visit that reads
 that slot's own count, whatever it is. Neither can misplace credit, because the
 lane carries an index and no quantity and the quantity lives in the
 `DrainSignal` the slot itself holds.
+
+---
+
+## Addendum, 2026-09-06: a grant per half window, not a grant per drained record
+
+Superseding the objection recorded in the 2026-09-01 addendum above, under
+"Wakes coalesce per peer, not per record": that "a per-slot record threshold —
+the other candidate — withholds credit for the first `T` records of every slot
+and still posts once per slot per threshold, so it is worse on both latency and
+volume".
+
+That objection was about *posting*, in a design where credit came back from a
+whole-table walk on every batch and the only question was how often a draining
+pump should ring a doorbell. It is still right about posting, and the pump still
+posts per drain. It says nothing about a threshold tied to the window and
+applied to whether a visit *advertises*, which is what this addendum adds.
+
+**What changed under it.** Since the addendum above, the arrival path reconciles
+every slot a batch delivered into together with every slot a pump named on the
+dirty lane. That is about one visit per record a slot moved, and each visit
+advertised whatever that one drain had freed — so almost every drained record
+became its own `CreditUpdate`. Measured on the tier-3 rig's frontend: 61.7
+million credit-update records against about 66 million data records received,
+0.93 grants per record, where the same work took 28.8 million before the arrival
+path answered the lane. (The counter that reads them apart by record type,
+`velo_streaming_mux_records_sent_total{record_type}`, is not in this branch; the
+rig ran an integration build that carries it.) Each
+one is a reply staged into the frontend's batcher, a batch on the wire when the
+reply linger runs out, and a control record the worker's batcher decodes and
+applies. mux18p returns credit once per 64 KiB of a 256 KiB window for the same
+reason.
+
+**The rule now.** A slot advertises when its pending credit reaches
+`max(1, limit / 2)` — half the window the receiver negotiated — on the arrival
+path and on the doorbell. The periodic tick advertises whatever is pending, so a
+remainder below the threshold waits at most one `MuxConfig::credit_sweep_interval`
+and the ledger never carries it further. The byte watermark is unchanged and
+still withholds independently of both. There is no new configuration: the
+threshold is derived from the window, so widening the window widens it too and
+the ratio of credit records to data records stays put.
+
+**Why it withholds nothing a sender can use.** What a sender may still spend is
+`limit - outstanding`, and `outstanding` counts every record this side has not
+advertised back: those sitting in the buffer or the ahead-of-sequence hold, plus
+those drained and not yet granted. A sender about to run out therefore has
+`limit` records split between those two groups, so at least `limit / 2` are in
+one of them. If they are the records this side still holds, the consumer is
+behind and withholding is what a window is for. If they are the drained ones,
+the grant is due and the next visit mints it. A sender with a full window in hand
+never waits on the threshold, whatever the split.
+
+The hold is the case worth stating, because a record parked there is one nobody
+can drain: a gap can leave the pending credit below the threshold with the sender
+parked on an empty window. That is not a deadlock. The record that closes the gap
+spent its credit before the sender parked and is already in flight — a rendezvous
+payload resolving outside the ordered lane is how it got ahead of its own
+predecessor — so when it lands the hold releases into the buffer and the
+consumer's drains carry the slot past the threshold.
+
+One number above changes with this rule. The 2026-09-01 addendum puts the
+doorbell floor's cost at "up to one floor per window, so `floor / initial_credit`
+per record", which is "under 8 µs a record" at the default window. A window's
+credit now comes back in at most two grants, so it is at most two waits per
+window and about 16 µs a record there. The rest of that paragraph stands,
+including the ~3 s a window of 8 costs the doorbell test — that test runs in the
+same 3.15 s under this rule as it did before it.
+
+Small windows keep their meaning. At `limit` 4 the threshold is 2, and at 1 or 2
+it is 1, so the credit tests' deliberately tiny windows advertise as they always
+did. A grant lost to an epoch death is lost exactly as before — only its size
+changed, since `retire_epoch` drops the account with whatever it was holding
+either way — and `finish_close` takes the slot out of the table, after which
+there is no sender left to advertise to, so nothing is owed on close and no
+remainder is drained out on the way.

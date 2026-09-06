@@ -92,6 +92,16 @@
 //! credit was freed. That is what lets the three paths run concurrently — a
 //! redundant visit finds a count of zero, where a delta would double-count.
 //!
+//! **A visit does not always advertise.** The first two paths see a slot about
+//! once per record that slot moved, so advertising whatever each visit found
+//! freed made a `CreditUpdate` per drained record — 61.7 million of them
+//! against about 66 million data records received, measured on the tier-3
+//! rig's frontend. They therefore advertise only once a slot's pending credit
+//! reaches half its negotiated window; the periodic tick advertises whatever is
+//! pending, which bounds how long a remainder below that threshold waits. No
+//! sender can stall on it: `ingress::slot::IngressSlot::take_grant` carries the
+//! argument and the tests that pin it.
+//!
 //! It still differs from `BATCHING.md` § P8, which specifies an exact
 //! `credit.release(1)` per handoff. Releasing an amount from the pump is the
 //! part that was not adopted: releasing needs the peer's mutex, and taking it
@@ -300,6 +310,12 @@ pub struct MuxConfig {
     /// nothing being taken out, and one whose drain found the lane full. It
     /// also carries batcher eviction, whose granularity it sets.
     ///
+    /// It is also the bound on a remainder the grant threshold withheld. The
+    /// arrival path and the doorbell advertise a slot's credit only once half
+    /// its window has drained; this tick advertises whatever is left. Nothing
+    /// waits on that remainder — `IngressSlot::take_grant` has the argument —
+    /// but the ledger must not carry it for the life of a quiet slot either.
+    ///
     /// It was 2 ms when the sweep was the only way credit came back, which is
     /// what made that interval load-bearing rather than a tuning choice. Every
     /// tick walks every slot of every ingress peer to find the few with
@@ -340,9 +356,10 @@ pub struct MuxConfig {
     /// reconciles the slots its pumps named on the dirty lane, so a peer that
     /// keeps sending never reaches this floor at all. A drain whose listing
     /// found the lane full is not on the lane and so not on this path either;
-    /// `credit_sweep_interval` is what covers it. That is one wait per window,
-    /// so what it costs per record is `floor / initial_credit` — negligible at
-    /// the default 256-record window, and visible at the small windows the
+    /// `credit_sweep_interval` is what covers it. That is at most two waits per
+    /// window — a grant covers half a window, so a window takes two of them —
+    /// so what it costs per record is `2 x floor / initial_credit`: about 16 µs
+    /// at the default 256-record window, and visible at the small windows the
     /// credit tests use deliberately.
     ///
     /// Defaults to 2 ms, which is the interval the sweep itself ran at while it
@@ -699,7 +716,9 @@ impl MuxCore {
     ///
     /// The whole-table walk, and the only visitor of a slot nobody named — the
     /// one parked with nothing arriving and nothing being taken out, and the
-    /// one whose drain found the peer's dirty lane full.
+    /// one whose drain found the peer's dirty lane full. It is also the only
+    /// pass that advertises a pending grant below the half-window threshold,
+    /// which is what bounds how long such a remainder waits.
     fn sweep_peer(&self, peer: WorkerId) {
         // Taken down before the reconcile, not after: a record drained while
         // this visit is in progress must be able to post a fresh wake, or its
@@ -712,7 +731,9 @@ impl MuxCore {
     ///
     /// Scoped to the slots a pump named on that peer's dirty lane, because a
     /// wake means those slots drained and says nothing about the rest — and
-    /// this walk holds the mutex the inbound batch path takes.
+    /// this walk holds the mutex the inbound batch path takes. Like the arrival
+    /// path it advertises only once half a slot's window has drained, so a
+    /// visit that walks the right slot may still stage nothing.
     ///
     /// Counted here rather than where the wake is received, so the series
     /// measures walks and not wakes — a wake the floor deferred is counted once,

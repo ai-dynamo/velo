@@ -333,7 +333,9 @@ impl SlotCreditAccount {
     }
 
     /// Data credit `C` granted to the peer.
-    #[cfg(test)]
+    ///
+    /// Read on the grant path, not only by the tests: half of it is the
+    /// pending credit at which a slot advertises.
     pub(crate) const fn limit(&self) -> u32 {
         self.limit
     }
@@ -371,7 +373,9 @@ impl SlotCreditAccount {
     }
 
     /// Credit released but not yet advertised, awaiting a `CreditUpdate`.
-    #[cfg(test)]
+    ///
+    /// Read on the grant path, not only by the tests: it is what the threshold
+    /// is compared against.
     pub(crate) const fn pending_grant(&self) -> u32 {
         self.ungranted
     }
