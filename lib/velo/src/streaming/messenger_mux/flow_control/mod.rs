@@ -304,10 +304,12 @@ impl SlotCredit {
 /// Receiver-side per-slot accounting against the mux-owned `C + 1` buffer.
 ///
 /// `admit` is called by the applier before `try_send`; `release` by
-/// `reader_pump` after each successful handoff to `frame_tx` — exact, O(1) and
-/// immediate, because flume has no consumed-callback, a per-slot drain task
-/// would reintroduce the per-stream tasks the mux exists to remove, and polling
-/// the receiver's length is only a sampled approximation.
+/// `IngressSlot::reconcile`, with the exact count `reader_pump` reported on
+/// that slot's `DrainSignal`. The pump counts rather than releases because
+/// releasing needs the peer's mutex; the count itself is exact and O(1),
+/// because flume has no consumed-callback, a per-slot drain task would
+/// reintroduce the per-stream tasks the mux exists to remove, and polling the
+/// receiver's length is only a sampled approximation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SlotCreditAccount {
     limit: u32,
@@ -346,6 +348,11 @@ impl SlotCreditAccount {
     /// Bounded by [`buffer_depth`](Self::buffer_depth) — that bound is the
     /// invariant, and `velo_streaming_mux_reader_stall_total > 0` is what a
     /// break in it looks like from the outside.
+    ///
+    /// Read only by the tests that pin that bound. The reconcile releases the
+    /// count the pump reported and lets [`release`](Self::release) clamp
+    /// against this field, rather than reading it and subtracting.
+    #[cfg(test)]
     pub(crate) const fn buffered(&self) -> u32 {
         self.buffered
     }

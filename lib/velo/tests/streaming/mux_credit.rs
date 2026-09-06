@@ -8,9 +8,14 @@
 //! each successful handoff to `frame_tx` — exact, O(1), and immediate", with a
 //! background sweep only reclaiming credit for slots whose pump died.
 //!
-//! What shipped instead reconciles buffer occupancy on every inbound batch and
-//! on a periodic sweep. The same document records that deviation and argues
-//! "the effect is the same and the sweep bounds the latency".
+//! What shipped instead had the pump ring a doorbell and a reconcile pass
+//! decide the amount — `reader_pump` counts the record on the slot's
+//! `DrainSignal` and names the slot on its peer's dirty lane, and the arrival
+//! path, the doorbell and the periodic sweep release what those counts say.
+//! Releasing from the pump itself is the part that was not adopted, because it
+//! needs the peer's mutex. Before any of that the sweep alone returned credit,
+//! and the same document argues "the effect is the same and the sweep bounds
+//! the latency".
 //!
 //! The effect is not the same, and this file is what shows it. The sweep runs
 //! at `credit_sweep_interval` and per tick walks every slot of every ingress
@@ -29,8 +34,9 @@
 //!
 //! Every test here goes through the real `Velo` attach path rather than binding
 //! the transport directly, because that is the only path with a `reader_pump`
-//! in it — and `reader_pump` is where the drain is observable. A test that
-//! polls the receiver `bind` returns would never exercise the hook at all.
+//! in it — and `reader_pump` is where the drain is counted. A test that polls
+//! the receiver `bind` returns drains nothing as far as the ledger knows, and
+//! its producer would park at the end of its first window.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -387,20 +393,21 @@ async fn draining_and_sweeping_together_never_overspend_the_window() {
 
 /// The doorbell's per-peer visit rate is floored, not just coalesced.
 ///
-/// `sweep_peer` takes the peer's wake down *before* it walks, which is what
-/// stops a drain landing mid-walk from being swallowed. What that ordering does
-/// not do is bound how often the walk happens: the first record drained after a
-/// visit clears the flag arms it again, so the sweep task runs
-/// wake -> clear -> walk every slot -> re-armed, back to back. Coalescing bounds
-/// visits by the *number of drain bursts*, which is a property of the traffic
-/// and of nothing else.
+/// `visit_drained_peer` takes the peer's wake down *before* it walks, which is
+/// what stops a drain landing mid-walk from being swallowed. What that ordering
+/// does not do is bound how often the walk happens: the first record drained
+/// after a visit clears the flag arms it again, so the sweep task runs
+/// wake -> clear -> walk -> re-armed, back to back. Coalescing bounds visits by
+/// the *number of drain bursts*, which is a property of the traffic and of
+/// nothing else.
 ///
-/// The walk is not free. It iterates every slot of the peer, asks flume for each
-/// slot buffer's `len()` — a channel-lock acquisition apiece — and holds the peer
-/// mutex `handle_batch` needs on the ingress hot path. The workload this mux
-/// exists for is one peer carrying hundreds to thousands of slots, so a visit
-/// rate set by the traffic rather than by need is hot-path contention. Hence a
-/// floor: at most one doorbell visit per peer per `drain_visit_floor`.
+/// The walk is not free. It holds the peer mutex `handle_batch` needs on the
+/// ingress hot path, so on the workload this mux exists for — one peer carrying
+/// hundreds to thousands of slots — a visit rate set by the traffic rather than
+/// by need is hot-path contention. Hence a floor: at most one doorbell visit
+/// per peer per `drain_visit_floor`. The walk was over every slot of the peer
+/// when the floor was added and is now over the peer's dirty lane alone, which
+/// shortens the visit without changing what its rate needs bounding for.
 ///
 /// The shape here makes the unfloored rate a structural number rather than a
 /// race between two tasks. With a window of `WINDOW` records the producer sends

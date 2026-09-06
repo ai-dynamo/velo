@@ -95,6 +95,12 @@ async fn mux_pair(config: MuxConfig) -> Pair {
 }
 
 impl Pair {
+    /// `bind` on the consumer mux, with the drain signal the attach path would
+    /// hand the pump it spawns.
+    async fn bind(&self, anchor_id: u64, session_id: u64) -> BoundSlot {
+        bind_slot(&self.consumer, anchor_id, session_id).await
+    }
+
     fn snapshot(&self) -> MetricSnapshot {
         MetricSnapshot::from_registry(&self.registry)
     }
@@ -130,6 +136,42 @@ async fn recv(rx: &flume::Receiver<Vec<u8>>) -> Vec<u8> {
         .await
         .expect("timed out waiting for a frame")
         .expect("frame channel closed")
+}
+
+/// One bound slot's consumer side, standing in for `reader_pump`.
+///
+/// The attach path hands the pump both the receiver `bind` returned and the
+/// drain signal the mux parked for that pair, and the pump counts every record
+/// it takes out on that signal. Credit is returned against that count, so a
+/// test taking records straight from the receiver would look to the ledger like
+/// a stream whose pump had died — and the first thing that reaches is
+/// `credit_returns_let_a_producer_outrun_its_window`, whose producer would park
+/// after four records and never be woken.
+struct BoundSlot {
+    rx: flume::Receiver<Vec<u8>>,
+    drain: Arc<ingress::DrainSignal>,
+}
+
+impl BoundSlot {
+    /// Take one record, counting it the way `reader_pump` does.
+    async fn recv(&self) -> Vec<u8> {
+        let frame = recv(&self.rx).await;
+        self.drain.drained();
+        frame
+    }
+
+    fn is_disconnected(&self) -> bool {
+        self.rx.is_disconnected()
+    }
+}
+
+/// `bind` on `mux`, with the drain signal the attach path would hand the pump.
+async fn bind_slot(mux: &MessengerMuxTransport, anchor_id: u64, session_id: u64) -> BoundSlot {
+    let rx = mux.bind(anchor_id, session_id).await.expect("bind");
+    let drain = mux
+        .take_drain_signal(anchor_id, session_id)
+        .expect("bind parks a drain signal for the attach path to take");
+    BoundSlot { rx, drain }
 }
 
 async fn eventually(mut predicate: impl FnMut() -> bool) {
@@ -190,7 +232,7 @@ async fn the_transport_answers_to_the_negotiated_key_and_advertises_no_endpoint(
 async fn a_stream_round_trips_and_ends_on_its_terminal() {
     let pair = mux_pair(test_config()).await;
 
-    let rx = pair.consumer.bind(1, 1).await.expect("bind");
+    let rx = pair.bind(1, 1).await;
     let tx = pair
         .producer
         .connect(pair.consumer_worker, 1, 1)
@@ -205,9 +247,9 @@ async fn a_stream_round_trips_and_ends_on_its_terminal() {
         .expect("send terminal");
 
     for n in 0..8u32 {
-        assert_eq!(recv(&rx).await, item(n), "frame {n} out of order");
+        assert_eq!(rx.recv().await, item(n), "frame {n} out of order");
     }
-    assert_eq!(recv(&rx).await, *cached_finalized());
+    assert_eq!(rx.recv().await, *cached_finalized());
     eventually(|| rx.is_disconnected()).await;
     assert_eq!(
         pair.live_slots(),
@@ -226,7 +268,7 @@ async fn credit_returns_let_a_producer_outrun_its_window() {
     })
     .await;
 
-    let rx = pair.consumer.bind(2, 2).await.expect("bind");
+    let rx = pair.bind(2, 2).await;
     let tx = pair
         .producer
         .connect(pair.consumer_worker, 2, 2)
@@ -244,9 +286,9 @@ async fn credit_returns_let_a_producer_outrun_its_window() {
     });
 
     for n in 0..FRAMES {
-        assert_eq!(recv(&rx).await, item(n), "frame {n} out of order");
+        assert_eq!(rx.recv().await, item(n), "frame {n} out of order");
     }
-    assert_eq!(recv(&rx).await, *cached_finalized());
+    assert_eq!(rx.recv().await, *cached_finalized());
     producer.await.expect("producer task");
     pair.assert_no_reader_stall();
 }
@@ -255,8 +297,8 @@ async fn credit_returns_let_a_producer_outrun_its_window() {
 async fn concurrent_sessions_on_one_anchor_stay_separate() {
     let pair = mux_pair(test_config()).await;
 
-    let rx_a = pair.consumer.bind(5, 1).await.expect("bind a");
-    let rx_b = pair.consumer.bind(5, 2).await.expect("bind b");
+    let rx_a = pair.bind(5, 1).await;
+    let rx_b = pair.bind(5, 2).await;
     let tx_a = pair
         .producer
         .connect(pair.consumer_worker, 5, 1)
@@ -274,8 +316,8 @@ async fn concurrent_sessions_on_one_anchor_stay_separate() {
     }
 
     for n in 0..16u32 {
-        assert_eq!(recv(&rx_a).await, item(n));
-        assert_eq!(recv(&rx_b).await, item(1000 + n));
+        assert_eq!(rx_a.recv().await, item(n));
+        assert_eq!(rx_b.recv().await, item(1000 + n));
     }
     pair.assert_no_reader_stall();
 }
@@ -284,7 +326,7 @@ async fn concurrent_sessions_on_one_anchor_stay_separate() {
 async fn a_session_nobody_bound_is_rejected_without_disturbing_a_live_one() {
     let pair = mux_pair(test_config()).await;
 
-    let rx = pair.consumer.bind(9, 1).await.expect("bind");
+    let rx = pair.bind(9, 1).await;
     let live = pair
         .producer
         .connect(pair.consumer_worker, 9, 1)
@@ -301,7 +343,7 @@ async fn a_session_nobody_bound_is_rejected_without_disturbing_a_live_one() {
     eventually(|| orphan.is_disconnected()).await;
 
     live.send_async(item(1)).await.expect("live send");
-    assert_eq!(recv(&rx).await, item(1));
+    assert_eq!(rx.recv().await, item(1));
     assert!(!live.is_disconnected());
 }
 
@@ -309,7 +351,7 @@ async fn a_session_nobody_bound_is_rejected_without_disturbing_a_live_one() {
 async fn dropping_a_producer_without_a_terminal_injects_dropped() {
     let pair = mux_pair(test_config()).await;
 
-    let rx = pair.consumer.bind(11, 1).await.expect("bind");
+    let rx = pair.bind(11, 1).await;
     let tx = pair
         .producer
         .connect(pair.consumer_worker, 11, 1)
@@ -317,11 +359,11 @@ async fn dropping_a_producer_without_a_terminal_injects_dropped() {
         .expect("connect");
 
     tx.send_async(item(1)).await.expect("send item");
-    assert_eq!(recv(&rx).await, item(1));
+    assert_eq!(rx.recv().await, item(1));
     drop(tx);
 
     assert_eq!(
-        recv(&rx).await,
+        rx.recv().await,
         *cached_dropped(),
         "a stream that ends without a terminal is `Dropped`, never `TransportError`"
     );
@@ -335,7 +377,7 @@ async fn live_slots_returns_to_zero_when_the_producers_go_away() {
     let mut receivers = Vec::new();
     let mut senders = Vec::new();
     for session in 0..4u64 {
-        receivers.push(pair.consumer.bind(20, session).await.expect("bind"));
+        receivers.push(pair.bind(20, session).await);
         senders.push(
             pair.producer
                 .connect(pair.consumer_worker, 20, session)
@@ -347,13 +389,13 @@ async fn live_slots_returns_to_zero_when_the_producers_go_away() {
         tx.send_async(item(1)).await.expect("send");
     }
     for rx in &receivers {
-        assert_eq!(recv(rx).await, item(1));
+        assert_eq!(rx.recv().await, item(1));
     }
     eventually(|| pair.live_slots() == 8.0).await;
 
     drop(senders);
     for rx in &receivers {
-        assert_eq!(recv(rx).await, *cached_dropped());
+        assert_eq!(rx.recv().await, *cached_dropped());
     }
     eventually(|| pair.live_slots() == 0.0).await;
     pair.assert_no_reader_stall();
@@ -372,7 +414,7 @@ async fn dropping_the_transports_tears_every_slot_down_promptly() {
     let mut receivers = Vec::new();
     let mut senders = Vec::new();
     for session in 0..4u64 {
-        receivers.push(pair.consumer.bind(30, session).await.expect("bind"));
+        receivers.push(pair.bind(30, session).await);
         senders.push(
             pair.producer
                 .connect(pair.consumer_worker, 30, session)
@@ -381,12 +423,12 @@ async fn dropping_the_transports_tears_every_slot_down_promptly() {
         );
     }
     // One bind with no `connect` behind it, so an accept window really is open.
-    let _pending = pair.consumer.bind(30, 99).await.expect("pending bind");
+    let _pending = pair.bind(30, 99).await;
     for tx in &senders {
         tx.send_async(item(1)).await.expect("send");
     }
     for rx in &receivers {
-        assert_eq!(recv(rx).await, item(1));
+        assert_eq!(rx.recv().await, item(1));
     }
     eventually(|| pair.live_slots() == 8.0).await;
 
@@ -397,7 +439,7 @@ async fn dropping_the_transports_tears_every_slot_down_promptly() {
 
     for rx in &receivers {
         assert_eq!(
-            recv(rx).await,
+            rx.recv().await,
             *cached_dropped(),
             "a consumer must not wait out its heartbeat watchdog for a sender \
              that has already been dismantled"
@@ -574,7 +616,7 @@ async fn one_flush_reaches_every_peer_batcher() {
         let worker = messenger.instance_id().worker_id();
         for slot in 0..SLOTS_PER_PEER {
             let id = (peer as u64 + 1) * 100 + slot;
-            receivers.push(mux.bind(id, id).await.expect("bind"));
+            receivers.push(bind_slot(&mux, id, id).await);
             senders.push(producer.connect(worker, id, id).await.expect("connect"));
         }
         consumer_muxes.push(mux);
@@ -609,7 +651,7 @@ async fn one_flush_reaches_every_peer_batcher() {
 
     for (n, rx) in receivers.iter().enumerate() {
         assert_eq!(
-            recv(rx).await,
+            rx.recv().await,
             item(n as u32),
             "slot {n} did not receive the record its peer's flush carried"
         );

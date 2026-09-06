@@ -17,11 +17,57 @@ use crate::streaming::messenger_mux::protocol::{BatchEncoder, RecordType, SlotId
 use crate::streaming::sender::{cached_dropped, cached_finalized};
 
 /// A drain signal whose wakes go nowhere, for tests that drive the registry
-/// directly. The claim path still runs, so `open_slot` naming the peer is
-/// covered; nothing consumes the lane because these tests have no sweep task.
+/// directly. The claim path still runs, so `open_slot` naming the peer, the
+/// slot index and the dirty lane is covered; nothing consumes the wake lane
+/// because these tests have no sweep task.
 fn test_drain() -> Arc<DrainSignal> {
     let (tx, _rx) = flume::bounded(16);
     Arc::new(DrainSignal::new(tx))
+}
+
+/// The consumer side of one bound slot: the receiver `bind` handed the anchor,
+/// and the drain signal `reader_pump` would hold.
+///
+/// Both are needed because credit is returned against what the pump *counted*.
+/// Taking a frame out of `rx` without telling the signal is what a dead pump
+/// looks like, not what a draining consumer looks like, and reconciles nothing.
+struct Consumer {
+    rx: flume::Receiver<Vec<u8>>,
+    drain: Arc<DrainSignal>,
+}
+
+impl Consumer {
+    /// Take everything available, counting each record the way `reader_pump`
+    /// does.
+    fn pump(&self) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        while let Ok(frame) = self.rx.try_recv() {
+            self.drain.drained();
+            out.push(frame);
+        }
+        out
+    }
+
+    /// Take exactly `n` records, counting each.
+    fn pump_n(&self, n: usize) -> Vec<Vec<u8>> {
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let frame = self.rx.try_recv().expect("a record to take");
+            self.drain.drained();
+            out.push(frame);
+        }
+        out
+    }
+}
+
+/// Register a bind for `(ANCHOR, session)` and return its consumer side.
+fn register(registry: &IngressRegistry, config: &MuxConfig, session: u64) -> Consumer {
+    let (tx, rx) = flume::bounded(
+        crate::streaming::messenger_mux::flow_control::slot_buffer_depth(config.initial_credit),
+    );
+    let drain = test_drain();
+    registry.register_bind(ANCHOR, session, tx, Arc::clone(&drain));
+    Consumer { rx, drain }
 }
 
 const PEER: u64 = 0xABCD;
@@ -56,15 +102,12 @@ fn item(n: u8) -> Vec<u8> {
     rmp_serde::to_vec(&crate::streaming::frame::StreamFrame::Item(n)).expect("encode item")
 }
 
-/// A registry with one bound anchor, plus the receiver the consumer would hold.
-fn bound() -> (IngressRegistry, flume::Receiver<Vec<u8>>, MuxConfig) {
+/// A registry with one bound anchor, plus that anchor's consumer side.
+fn bound() -> (IngressRegistry, Consumer, MuxConfig) {
     let config = config();
     let registry = IngressRegistry::default();
-    let (tx, rx) = flume::bounded(
-        crate::streaming::messenger_mux::flow_control::slot_buffer_depth(config.initial_credit),
-    );
-    registry.register_bind(ANCHOR, SESSION, tx, test_drain());
-    (registry, rx, config)
+    let consumer = register(&registry, &config, SESSION);
+    (registry, consumer, config)
 }
 
 /// Open slot `id` at `frame_seq = 0` and return the resulting outcome.
@@ -75,6 +118,9 @@ fn open(registry: &IngressRegistry, config: &MuxConfig, id: SlotId, epoch: u64) 
     handle_batch(registry, config, None, peer(), &payload)
 }
 
+/// Take everything the consumer can see, without counting it on a drain
+/// signal. For the tests that assert on frames rather than on credit — a
+/// record taken this way is one whose pump died, as far as the ledger knows.
 fn drain(rx: &flume::Receiver<Vec<u8>>) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     while let Ok(frame) = rx.try_recv() {
@@ -89,7 +135,7 @@ fn drain(rx: &flume::Receiver<Vec<u8>>) -> Vec<Vec<u8>> {
 
 #[test]
 fn open_slot_claims_the_matching_bind_and_grants_no_credit() {
-    let (registry, _rx, config) = bound();
+    let (registry, _consumer, config) = bound();
     let id = slot(0, 0);
 
     let outcome = open(&registry, &config, id, 1);
@@ -107,7 +153,7 @@ fn open_slot_claims_the_matching_bind_and_grants_no_credit() {
 
 #[test]
 fn open_slot_for_an_unregistered_anchor_rejects_that_slot_only() {
-    let (registry, _rx, config) = bound();
+    let (registry, _consumer, config) = bound();
     let id = slot(3, 0);
 
     let payload = batch(1, 0, |encoder| {
@@ -135,7 +181,7 @@ fn open_slot_for_an_unregistered_anchor_rejects_that_slot_only() {
 /// lookup — it names no entry this table ever had or ever will.
 #[test]
 fn an_out_of_range_open_slot_is_rejected_without_touching_the_table() {
-    let (registry, _rx, config) = bound();
+    let (registry, _consumer, config) = bound();
     let id = slot(MAX_INGRESS_SLOTS_PER_PEER as u32, 0);
 
     let payload = batch(1, 0, |encoder| {
@@ -327,7 +373,7 @@ fn a_duplicate_open_retires_the_incumbent_through_the_ordinary_close() {
 /// this lane split; not chased here.
 #[test]
 fn a_same_id_duplicate_with_no_bind_is_rejected_without_disturbing_the_incumbent() {
-    let (registry, rx, config) = bound();
+    let (registry, consumer, config) = bound();
     let id = slot(0, 0);
     open(&registry, &config, id, 1);
     assert_eq!(registry.live_slots(peer()), 1);
@@ -361,12 +407,12 @@ fn a_same_id_duplicate_with_no_bind_is_rejected_without_disturbing_the_incumbent
         encoder.push_data(id, 1, &item(1)).unwrap();
     });
     handle_batch(&registry, &config, None, peer(), &payload);
-    assert_eq!(drain(&rx), vec![item(1)]);
+    assert_eq!(consumer.pump(), vec![item(1)]);
 }
 
 #[test]
 fn records_for_a_slot_that_never_opened_are_dropped() {
-    let (registry, rx, config) = bound();
+    let (registry, consumer, config) = bound();
 
     let payload = batch(1, 0, |encoder| {
         encoder.push_data(slot(5, 0), 0, &item(1)).unwrap();
@@ -374,7 +420,7 @@ fn records_for_a_slot_that_never_opened_are_dropped() {
     let outcome = handle_batch(&registry, &config, None, peer(), &payload);
 
     assert!(outcome.replies.is_empty());
-    assert!(drain(&rx).is_empty());
+    assert!(consumer.pump().is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -383,7 +429,7 @@ fn records_for_a_slot_that_never_opened_are_dropped() {
 
 #[test]
 fn data_applies_in_frame_seq_order() {
-    let (registry, rx, config) = bound();
+    let (registry, consumer, config) = bound();
     let id = slot(0, 0);
     open(&registry, &config, id, 1);
 
@@ -396,7 +442,7 @@ fn data_applies_in_frame_seq_order() {
     });
     handle_batch(&registry, &config, None, peer(), &payload);
 
-    let frames = drain(&rx);
+    let frames = consumer.pump();
     assert_eq!(frames.len(), 4);
     for (n, frame) in frames.iter().enumerate() {
         assert_eq!(frame, &item(n as u8), "frame {n} out of order");
@@ -405,7 +451,7 @@ fn data_applies_in_frame_seq_order() {
 
 #[test]
 fn ahead_of_sequence_records_are_held_until_the_gap_closes() {
-    let (registry, rx, config) = bound();
+    let (registry, consumer, config) = bound();
     let id = slot(0, 0);
     open(&registry, &config, id, 1);
 
@@ -417,7 +463,7 @@ fn ahead_of_sequence_records_are_held_until_the_gap_closes() {
     });
     handle_batch(&registry, &config, None, peer(), &payload);
     assert!(
-        drain(&rx).is_empty(),
+        consumer.pump().is_empty(),
         "nothing may be delivered while the gap is open"
     );
 
@@ -426,13 +472,13 @@ fn ahead_of_sequence_records_are_held_until_the_gap_closes() {
     });
     handle_batch(&registry, &config, None, peer(), &payload);
 
-    let frames = drain(&rx);
+    let frames = consumer.pump();
     assert_eq!(frames, vec![item(1), item(2), item(3)]);
 }
 
 #[test]
 fn records_behind_the_sequence_are_dropped_as_duplicates() {
-    let (registry, rx, config) = bound();
+    let (registry, consumer, config) = bound();
     let id = slot(0, 0);
     open(&registry, &config, id, 1);
 
@@ -442,7 +488,7 @@ fn records_behind_the_sequence_are_dropped_as_duplicates() {
     });
     handle_batch(&registry, &config, None, peer(), &payload);
 
-    assert_eq!(drain(&rx), vec![item(1)]);
+    assert_eq!(consumer.pump(), vec![item(1)]);
     assert_eq!(registry.live_slots(peer()), 1, "a duplicate is not a fault");
 }
 
@@ -503,7 +549,7 @@ fn a_record_at_the_wrong_generation_is_dropped_and_metered() {
     let metrics = crate::observability::VeloMetrics::register(&registry_metrics).unwrap();
     let mux_metrics = metrics.bind_mux();
 
-    let (registry, rx, config) = bound();
+    let (registry, consumer, config) = bound();
     let id = slot(0, 3);
     let payload = batch(1, 0, |encoder| {
         encoder.push_open_slot(id, 0, ANCHOR, SESSION).unwrap();
@@ -518,7 +564,7 @@ fn a_record_at_the_wrong_generation_is_dropped_and_metered() {
     handle_batch(&registry, &config, Some(&mux_metrics), peer(), &payload);
 
     assert!(
-        drain(&rx).is_empty(),
+        consumer.pump().is_empty(),
         "a stale generation must never surface inside the stream now holding the index"
     );
     let snapshot =
@@ -535,7 +581,7 @@ fn a_stale_epoch_batch_is_discarded_wholesale() {
     let metrics = crate::observability::VeloMetrics::register(&registry_metrics).unwrap();
     let mux_metrics = metrics.bind_mux();
 
-    let (registry, rx, config) = bound();
+    let (registry, consumer, config) = bound();
     let id = slot(0, 0);
     open(&registry, &config, id, 5);
 
@@ -545,7 +591,7 @@ fn a_stale_epoch_batch_is_discarded_wholesale() {
     });
     handle_batch(&registry, &config, Some(&mux_metrics), peer(), &payload);
 
-    assert!(drain(&rx).is_empty());
+    assert!(consumer.pump().is_empty());
     let snapshot =
         crate::observability::test_helpers::MetricSnapshot::from_registry(&registry_metrics);
     assert_eq!(
@@ -560,7 +606,7 @@ fn a_stale_epoch_batch_is_discarded_wholesale() {
 
 #[test]
 fn a_newer_epoch_retires_the_old_slots_with_exactly_one_dropped() {
-    let (registry, rx, config) = bound();
+    let (registry, consumer, config) = bound();
     let id = slot(0, 0);
     open(&registry, &config, id, 1);
 
@@ -582,7 +628,7 @@ fn a_newer_epoch_retires_the_old_slots_with_exactly_one_dropped() {
         0,
         "slots do not survive an epoch — that is what makes exactly-one-Dropped provable"
     );
-    assert_eq!(drain(&rx), vec![item(1), cached_dropped().clone()]);
+    assert_eq!(consumer.pump(), vec![item(1), cached_dropped().clone()]);
 }
 
 // ---------------------------------------------------------------------------
@@ -591,7 +637,7 @@ fn a_newer_epoch_retires_the_old_slots_with_exactly_one_dropped() {
 
 #[test]
 fn terminal_then_close_delivers_the_terminal_and_injects_nothing() {
-    let (registry, rx, config) = bound();
+    let (registry, consumer, config) = bound();
     let id = slot(0, 0);
     open(&registry, &config, id, 1);
 
@@ -606,12 +652,12 @@ fn terminal_then_close_delivers_the_terminal_and_injects_nothing() {
     assert_eq!(outcome.closed, 1);
     assert_eq!(registry.live_slots(peer()), 0);
     assert_eq!(
-        drain(&rx),
+        consumer.pump(),
         vec![cached_finalized().clone()],
         "a terminal spends the reserve and closes without a spurious Dropped"
     );
     assert!(
-        rx.is_disconnected(),
+        consumer.rx.is_disconnected(),
         "dropping the mux-side sender is what makes reader_pump exit its usual Err branch"
     );
 }
@@ -627,10 +673,7 @@ fn a_terminal_gets_through_after_the_data_credit_is_spent() {
         ..config()
     };
     let registry = IngressRegistry::default();
-    let (tx, rx) = flume::bounded(
-        crate::streaming::messenger_mux::flow_control::slot_buffer_depth(config.initial_credit),
-    );
-    registry.register_bind(ANCHOR, SESSION, tx, test_drain());
+    let consumer = register(&registry, &config, SESSION);
     let id = slot(0, 0);
     open(&registry, &config, id, 1);
 
@@ -645,7 +688,7 @@ fn a_terminal_gets_through_after_the_data_credit_is_spent() {
 
     assert_eq!(outcome.closed, 1);
     assert_eq!(
-        drain(&rx),
+        consumer.pump(),
         vec![item(1), cached_finalized().clone()],
         "data exhaustion must never be what a slot fails to deliver its terminal on"
     );
@@ -653,7 +696,7 @@ fn a_terminal_gets_through_after_the_data_credit_is_spent() {
 
 #[test]
 fn a_terminal_close_defers_behind_records_still_in_the_hold() {
-    let (registry, rx, config) = bound();
+    let (registry, consumer, config) = bound();
     let id = slot(0, 0);
     open(&registry, &config, id, 1);
 
@@ -676,7 +719,7 @@ fn a_terminal_close_defers_behind_records_still_in_the_hold() {
     handle_batch(&registry, &config, None, peer(), &payload);
 
     assert_eq!(
-        drain(&rx),
+        consumer.pump(),
         vec![item(1), cached_finalized().clone()],
         "the consumer sees Finalized, not the Dropped an early close would have injected"
     );
@@ -685,7 +728,7 @@ fn a_terminal_close_defers_behind_records_still_in_the_hold() {
 
 #[test]
 fn a_non_terminal_close_from_the_receiver_is_routed_to_the_batcher() {
-    let (registry, _rx, config) = bound();
+    let (registry, _consumer, config) = bound();
     let id = slot(0, 0);
     open(&registry, &config, id, 1);
 
@@ -714,7 +757,7 @@ fn a_non_terminal_close_from_the_receiver_is_routed_to_the_batcher() {
 
 #[test]
 fn credit_is_returned_as_the_consumer_drains() {
-    let (registry, rx, config) = bound();
+    let (registry, consumer, config) = bound();
     let id = slot(0, 0);
     open(&registry, &config, id, 1);
 
@@ -729,7 +772,7 @@ fn credit_is_returned_as_the_consumer_drains() {
         "nothing has drained yet, so there is nothing to grant back"
     );
 
-    assert_eq!(drain(&rx).len(), 4);
+    assert_eq!(consumer.pump().len(), 4);
     let replies = registry.sweep_credit(peer());
     assert_eq!(
         replies,
@@ -748,10 +791,7 @@ fn credit_is_withheld_while_the_slot_is_over_its_byte_watermark() {
         ..config()
     };
     let registry = IngressRegistry::default();
-    let (tx, rx) = flume::bounded(
-        crate::streaming::messenger_mux::flow_control::slot_buffer_depth(config.initial_credit),
-    );
-    registry.register_bind(ANCHOR, SESSION, tx, test_drain());
+    let consumer = register(&registry, &config, SESSION);
     let id = slot(0, 0);
     open(&registry, &config, id, 1);
 
@@ -761,7 +801,7 @@ fn credit_is_withheld_while_the_slot_is_over_its_byte_watermark() {
         }
     });
     handle_batch(&registry, &config, None, peer(), &payload);
-    assert_eq!(drain(&rx).len(), 2);
+    assert_eq!(consumer.pump().len(), 2);
 
     // Occupancy is back to zero, so the watermark no longer binds and the
     // credit flows.
@@ -782,21 +822,13 @@ const MANY_SLOTS: u32 = 1_000;
 
 /// Open `count` slots on one peer in a single batch, at indexes `0..count`.
 ///
-/// The receivers come back so the caller can keep them alive: dropping one
+/// The consumers come back so the caller can keep them alive: dropping one
 /// turns the next record for that slot into a `ConsumerGone` fault and retires
 /// the slot these tests are counting.
-fn open_many(
-    registry: &IngressRegistry,
-    config: &MuxConfig,
-    count: u32,
-) -> Vec<flume::Receiver<Vec<u8>>> {
-    let depth =
-        crate::streaming::messenger_mux::flow_control::slot_buffer_depth(config.initial_credit);
-    let mut receivers = Vec::with_capacity(count as usize);
+fn open_many(registry: &IngressRegistry, config: &MuxConfig, count: u32) -> Vec<Consumer> {
+    let mut consumers = Vec::with_capacity(count as usize);
     for index in 0..count {
-        let (tx, rx) = flume::bounded(depth);
-        registry.register_bind(ANCHOR, SESSION + u64::from(index), tx, test_drain());
-        receivers.push(rx);
+        consumers.push(register(registry, config, SESSION + u64::from(index)));
     }
 
     let payload = batch(1, 0, |encoder| {
@@ -808,16 +840,16 @@ fn open_many(
     });
     handle_batch(registry, config, None, peer(), &payload);
     assert_eq!(registry.live_slots(peer()), count as usize);
-    receivers
+    consumers
 }
 
-/// The cost this scope exists to remove: one slot-buffer length read, under
-/// that channel's lock, for every slot the pass visits.
+/// The cost this scope exists to remove: a visit per live slot per batch, on a
+/// peer holding a thousand of them, under the mutex the batch path needs.
 #[test]
 fn a_batch_reconciles_only_the_slots_it_delivered_into() {
     let config = config();
     let registry = IngressRegistry::default();
-    let _receivers = open_many(&registry, &config, MANY_SLOTS);
+    let _consumers = open_many(&registry, &config, MANY_SLOTS);
 
     let before = registry.reconcile_visits(peer());
     let payload = batch(1, 1, |encoder| {
@@ -828,19 +860,20 @@ fn a_batch_reconciles_only_the_slots_it_delivered_into() {
 
     assert_eq!(
         visits, 1,
-        "a batch delivering into 1 of the peer's {MANY_SLOTS} slots reconciled \
-         {visits} of them, and every visit reads a slot buffer's length under \
-         that channel's lock"
+        "nothing has drained, so the peer's dirty lane is empty and a batch \
+         delivering into 1 of its {MANY_SLOTS} slots must reconcile that one; \
+         it reconciled {visits}"
     );
 }
 
-/// Control: the sweep keeps the whole-table walk, because it is the backstop
-/// for every slot no batch delivered into.
+/// Control: the periodic sweep keeps the whole-table walk, because it is the
+/// backstop for a slot nothing named — one parked with nothing arriving and
+/// nothing being taken out, and one whose drain found the dirty lane full.
 #[test]
 fn the_sweep_reconciles_every_slot() {
     let config = config();
     let registry = IngressRegistry::default();
-    let _receivers = open_many(&registry, &config, MANY_SLOTS);
+    let _consumers = open_many(&registry, &config, MANY_SLOTS);
 
     let before = registry.reconcile_visits(peer());
     assert!(
@@ -856,12 +889,21 @@ fn the_sweep_reconciles_every_slot() {
     );
 }
 
-/// The batch carries the touched slot's grant; the sweep carries the rest.
+/// The discriminator: a batch returns the credit of every slot that drained,
+/// not only of the slots it delivered into.
+///
+/// This replaces a test whose premise was the defect. That test asserted a
+/// batch "says nothing about the slot it did not touch", and leaving those
+/// slots to the doorbell was measured on the tier-3 rig: every stream sends
+/// about four records more than its 256-record window, so the tail of every
+/// stream waited on a per-peer, rate-limited walk instead of the peer's next
+/// inbound batch. Slot-credit exhaustion went from 13 to about 20,500 per
+/// worker process and throughput halved.
 #[test]
-fn a_batch_returns_the_credit_of_the_slot_it_touched_and_the_sweep_the_rest() {
+fn a_batch_returns_the_credit_of_every_slot_that_drained() {
     let config = config();
     let registry = IngressRegistry::default();
-    let receivers = open_many(&registry, &config, 2);
+    let consumers = open_many(&registry, &config, 2);
     let a = slot(0, 0);
     let b = slot(1, 0);
 
@@ -873,8 +915,10 @@ fn a_batch_returns_the_credit_of_the_slot_it_touched_and_the_sweep_the_rest() {
     });
     let outcome = handle_batch(&registry, &config, None, peer(), &payload);
     assert!(outcome.replies.is_empty(), "nothing has drained yet");
-    assert_eq!(drain(&receivers[0]).len(), 2);
-    assert_eq!(drain(&receivers[1]).len(), 2);
+
+    // Only B's consumer drains. A's records are still in its buffer, so A has
+    // nothing to give back and every grant below is B's.
+    assert_eq!(consumers[1].pump().len(), 2);
 
     // A second batch that delivers into A alone.
     let payload = batch(1, 2, |encoder| {
@@ -883,34 +927,215 @@ fn a_batch_returns_the_credit_of_the_slot_it_touched_and_the_sweep_the_rest() {
     let outcome = handle_batch(&registry, &config, None, peer(), &payload);
     assert_eq!(
         outcome.replies,
-        vec![ReplyRecord::CreditUpdate { slot: a, delta: 2 }],
-        "the batch answers for the slot it delivered into and says nothing \
-         about the one it did not"
+        vec![ReplyRecord::CreditUpdate { slot: b, delta: 2 }],
+        "B's pump counted two records out and named B on the peer's dirty \
+         lane, so this batch must carry B's grant even though it delivered \
+         only into A; without it B's sender waits for a doorbell visit"
     );
+
+    assert!(
+        registry.sweep_credit(peer()).is_empty(),
+        "and carries it once: the batch already took B's count, and A has \
+         drained nothing"
+    );
+
+    // A's turn, by the same route.
+    assert_eq!(consumers[0].pump().len(), 3);
+    let payload = batch(1, 3, |encoder| {
+        encoder.push_data(b, 3, &item(3)).unwrap();
+    });
+    let outcome = handle_batch(&registry, &config, None, peer(), &payload);
+    assert_eq!(
+        outcome.replies,
+        vec![ReplyRecord::CreditUpdate { slot: a, delta: 3 }],
+        "the rule is symmetric: the batch into B returns A's credit"
+    );
+}
+
+/// A doorbell visit walks the slots that drained, not the peer's whole table.
+///
+/// The visit holds the same per-peer mutex the inbound batch path takes, and
+/// runs up to once per `MuxConfig::drain_visit_floor` per peer, so what it
+/// walks is hot-path cost.
+#[test]
+fn a_doorbell_visit_reconciles_only_the_slots_that_drained() {
+    let config = config();
+    let registry = IngressRegistry::default();
+    let consumers = open_many(&registry, &config, MANY_SLOTS);
+    let id = slot(7, 0);
+
+    let payload = batch(1, 1, |encoder| {
+        encoder.push_data(id, 1, &item(1)).unwrap();
+    });
+    handle_batch(&registry, &config, None, peer(), &payload);
+    assert_eq!(consumers[7].pump().len(), 1);
+
+    let before = registry.reconcile_visits(peer());
+    assert_eq!(
+        registry.sweep_drained(peer()),
+        vec![ReplyRecord::CreditUpdate { slot: id, delta: 1 }],
+        "the visit answers the drain that rang for it"
+    );
+    let visits = registry.reconcile_visits(peer()) - before;
+
+    assert_eq!(
+        visits, 1,
+        "1 of the peer's {MANY_SLOTS} slots drained, and the lane names it, so \
+         the doorbell must visit 1; it visited {visits}"
+    );
+}
+
+/// The grant is what the pump counted, not what the slot buffer holds.
+///
+/// Occupancy was only ever a proxy for the drain, and only right while the mux
+/// was the buffer's sole writer — which the ledger had no way to check. Here a
+/// record goes into the buffer behind the mux's back, so the two answers
+/// differ and only the counted one is correct.
+#[test]
+fn the_grant_is_what_the_pump_counted_not_what_the_channel_holds() {
+    let config = config();
+    let registry = IngressRegistry::default();
+    let (tx, rx) = flume::bounded(
+        crate::streaming::messenger_mux::flow_control::slot_buffer_depth(config.initial_credit),
+    );
+    let drain = test_drain();
+    registry.register_bind(ANCHOR, SESSION, tx.clone(), Arc::clone(&drain));
+    let consumer = Consumer { rx, drain };
+    let id = slot(0, 0);
+    open(&registry, &config, id, 1);
+
+    // Three delivered, two taken out.
+    let payload = batch(1, 1, |encoder| {
+        for seq in 1..=3u32 {
+            encoder.push_data(id, seq, &item(seq as u8)).unwrap();
+        }
+    });
+    handle_batch(&registry, &config, None, peer(), &payload);
+    assert_eq!(consumer.pump_n(2).len(), 2);
+
+    // A fourth record the mux never admitted. The buffer now holds two, and
+    // occupancy says one record drained where two did.
+    tx.try_send(item(9)).expect("room in the C + 1 buffer");
 
     assert_eq!(
         registry.sweep_credit(peer()),
-        vec![ReplyRecord::CreditUpdate { slot: b, delta: 2 }],
-        "B's credit is not lost: the sweep carries it, with the delta its \
-         consumer actually drained"
+        vec![ReplyRecord::CreditUpdate { slot: id, delta: 2 }],
+        "two records were counted out of the buffer, so two credits come back \
+         however many records the buffer happens to hold"
     );
+}
+
+/// A full dirty lane costs a listing, not the credit.
+///
+/// The lane is the fast path and the periodic walk is what stands behind it.
+/// Filling and emptying a lane of `MAX_INGRESS_SLOTS_PER_PEER` entries is why
+/// this test runs in tens of milliseconds rather than microseconds.
+#[test]
+fn a_drain_that_cannot_list_still_gets_its_credit_from_the_periodic_walk() {
+    let (registry, consumer, config) = bound();
+    let id = slot(0, 0);
+    open(&registry, &config, id, 1);
+
+    let payload = batch(1, 1, |encoder| {
+        for seq in 1..=2u32 {
+            encoder.push_data(id, seq, &item(seq as u8)).unwrap();
+        }
+    });
+    handle_batch(&registry, &config, None, peer(), &payload);
+
+    // Fill the lane after the batch, because the batch pass drains it.
+    let (lane_tx, lane_rx) = registry.drained_lane(peer());
+    for _ in 0..MAX_INGRESS_SLOTS_PER_PEER {
+        lane_tx.try_send(u32::MAX).expect("the lane has room");
+    }
+    assert!(lane_tx.try_send(u32::MAX).is_err(), "the lane is full");
+
+    assert_eq!(consumer.pump().len(), 2);
+    assert_eq!(
+        registry.sweep_credit(peer()),
+        vec![ReplyRecord::CreditUpdate { slot: id, delta: 2 }],
+        "the listing had nowhere to go, so the whole-table walk is what finds \
+         the count the pump left on the slot"
+    );
+
+    let mut spilled = 0;
+    while let Ok(index) = lane_rx.try_recv() {
+        assert_eq!(index, u32::MAX, "a listing landed on a full lane");
+        spilled += 1;
+    }
+    assert_eq!(spilled, MAX_INGRESS_SLOTS_PER_PEER);
+
+    // With room again, the next drain lists: a failed listing puts the flag
+    // back down rather than claiming a visit that is not coming.
+    let payload = batch(1, 2, |encoder| {
+        encoder.push_data(id, 3, &item(3)).unwrap();
+    });
+    handle_batch(&registry, &config, None, peer(), &payload);
+    assert_eq!(consumer.pump().len(), 1);
+    assert_eq!(
+        lane_rx.try_recv().expect("the slot is listed again"),
+        id.index()
+    );
+}
+
+/// A held record earns its credit when it leaves the buffer, never when it
+/// enters the hold.
+///
+/// The hold is ahead-of-sequence storage on this side of the buffer: the
+/// record has spent the peer's credit but has been handed to nobody, so
+/// returning credit for it would let the peer hold more than `C` records
+/// against a `C + 1` buffer.
+#[test]
+fn a_held_record_earns_its_credit_only_when_the_consumer_takes_it() {
+    let (registry, consumer, config) = bound();
+    let id = slot(0, 0);
+    open(&registry, &config, id, 1);
+
+    // seq 2 arrives first and parks in the hold.
+    let payload = batch(1, 1, |encoder| {
+        encoder.push_data(id, 2, &item(2)).unwrap();
+    });
+    handle_batch(&registry, &config, None, peer(), &payload);
     assert!(
         registry.sweep_credit(peer()).is_empty(),
-        "and carries it once — A's third record is still in its buffer, and \
-         B has nothing further to return"
+        "a record in the hold has been taken out of nothing"
+    );
+
+    // seq 1 closes the gap and the hold releases behind it: both are in the
+    // buffer now, and neither has been taken out.
+    let payload = batch(1, 2, |encoder| {
+        encoder.push_data(id, 1, &item(1)).unwrap();
+    });
+    handle_batch(&registry, &config, None, peer(), &payload);
+    assert!(
+        registry.sweep_credit(peer()).is_empty(),
+        "in the buffer is not drained either"
+    );
+
+    assert_eq!(consumer.pump_n(1), vec![item(1)]);
+    assert_eq!(
+        registry.sweep_credit(peer()),
+        vec![ReplyRecord::CreditUpdate { slot: id, delta: 1 }]
+    );
+    assert_eq!(consumer.pump_n(1), vec![item(2)]);
+    assert_eq!(
+        registry.sweep_credit(peer()),
+        vec![ReplyRecord::CreditUpdate { slot: id, delta: 1 }],
+        "the held record is counted once, on its way out, and not again"
     );
 }
 
 /// The ledger is unchanged by the scope: every credit a consumer drained comes
 /// back exactly once, whichever pass mints it.
 ///
-/// Passes whether the batch pass walks the whole table or only what it touched,
-/// which is what makes it a control on the arithmetic rather than on the scope.
+/// Passes whatever the batch pass's scope is, because it tallies every pass
+/// together — which is what makes it a control on the arithmetic rather than
+/// on the scope.
 #[test]
 fn no_grant_is_lost_or_double_counted_when_a_batch_touches_one_of_two_slots() {
     let config = config();
     let registry = IngressRegistry::default();
-    let receivers = open_many(&registry, &config, 2);
+    let consumers = open_many(&registry, &config, 2);
     let a = slot(0, 0);
     let b = slot(1, 0);
 
@@ -921,8 +1146,8 @@ fn no_grant_is_lost_or_double_counted_when_a_batch_touches_one_of_two_slots() {
         }
     });
     handle_batch(&registry, &config, None, peer(), &payload);
-    assert_eq!(drain(&receivers[0]).len(), 2);
-    assert_eq!(drain(&receivers[1]).len(), 2);
+    assert_eq!(consumers[0].pump().len(), 2);
+    assert_eq!(consumers[1].pump().len(), 2);
 
     let payload = batch(1, 2, |encoder| {
         encoder.push_data(a, 3, &item(3)).unwrap();
@@ -956,7 +1181,7 @@ fn no_grant_is_lost_or_double_counted_when_a_batch_touches_one_of_two_slots() {
 /// reconcile no slot at all, which is the regression this pins.
 #[test]
 fn a_held_record_marks_its_slot_and_its_release_is_reconciled_in_the_same_batch() {
-    let (registry, rx, config) = bound();
+    let (registry, consumer, config) = bound();
     let id = slot(0, 0);
     open(&registry, &config, id, 1);
 
@@ -972,7 +1197,7 @@ fn a_held_record_marks_its_slot_and_its_release_is_reconciled_in_the_same_batch(
         "a held record has spent credit only a reconcile gives back, so its \
          slot is visited: {visits} visits"
     );
-    assert!(drain(&rx).is_empty(), "seq 2 waits for seq 1");
+    assert!(consumer.pump().is_empty(), "seq 2 waits for seq 1");
 
     // The gap closes, and the hold releases behind it, in one batch.
     let before = registry.reconcile_visits(peer());
@@ -983,7 +1208,7 @@ fn a_held_record_marks_its_slot_and_its_release_is_reconciled_in_the_same_batch(
     let visits = registry.reconcile_visits(peer()) - before;
     assert_eq!(visits, 1, "the releasing batch visits its slot: {visits}");
     assert_eq!(
-        drain(&rx),
+        consumer.pump(),
         vec![item(1), item(2)],
         "the release hands the consumer both records, in sequence"
     );
@@ -1005,18 +1230,18 @@ fn a_held_record_marks_its_slot_and_its_release_is_reconciled_in_the_same_batch(
 
 #[test]
 fn shutdown_retires_every_slot() {
-    let (registry, rx, config) = bound();
+    let (registry, consumer, config) = bound();
     let id = slot(0, 0);
     open(&registry, &config, id, 1);
 
     assert_eq!(registry.shutdown(), 1);
     assert_eq!(registry.live_slots(peer()), 0);
-    assert_eq!(drain(&rx), vec![cached_dropped().clone()]);
+    assert_eq!(consumer.pump(), vec![cached_dropped().clone()]);
 }
 
 #[test]
 fn a_heartbeat_record_reaches_the_consumer_as_a_heartbeat_frame() {
-    let (registry, rx, config) = bound();
+    let (registry, consumer, config) = bound();
     let id = slot(0, 0);
     open(&registry, &config, id, 1);
 
@@ -1026,7 +1251,7 @@ fn a_heartbeat_record_reaches_the_consumer_as_a_heartbeat_frame() {
     handle_batch(&registry, &config, None, peer(), &payload);
 
     assert_eq!(
-        drain(&rx),
+        consumer.pump(),
         vec![crate::streaming::sender::cached_heartbeat().clone()],
         "a heartbeat is a Data-class record: dropping one under saturation is \
          the per-slot saturation signal reader_pump's watchdog watches for"

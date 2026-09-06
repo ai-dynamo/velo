@@ -23,9 +23,11 @@
 //! channel" proof collapses the moment a second writer exists.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
 
 use super::super::flow_control::{ByteBudget, CreditClass, SlotCreditAccount, try_reserve_pair};
 use super::super::protocol::{CloseReason, RecordType, SlotId};
+use super::DrainSignal;
 use crate::streaming::sender::{cached_dropped, cached_heartbeat, is_terminal_sentinel};
 
 /// What applying a record did.
@@ -53,10 +55,17 @@ pub(super) struct IngressSlot {
     pub(super) id: SlotId,
     /// The mux-owned `C + 1`-deep buffer handed to the anchor by `bind`.
     frame_tx: flume::Sender<Vec<u8>>,
+    /// The signal this slot's `reader_pump` counts its drains on. Shared with
+    /// that pump, and with nothing else: `bind` creates one per bind and
+    /// `open_slot` removes the bind as it claims it, so one signal reaches at
+    /// most one slot.
+    drain: Arc<DrainSignal>,
     account: SlotCreditAccount,
     /// Encoded sizes of the records currently sitting in `frame_tx`, oldest
-    /// first. Popped as the reconcile step observes them drain, which is how
-    /// byte occupancy stays exact without a per-slot drain task.
+    /// first. One entry per record that *entered* the channel — a record
+    /// parked in the hold has none until its release puts it there. Popped as
+    /// the pump reports them drained, which is how byte occupancy stays exact
+    /// without a per-slot drain task.
     sizes: VecDeque<u32>,
     buffered_bytes: u64,
     /// Occupancy above which credit stops being advertised.
@@ -98,6 +107,7 @@ impl IngressSlot {
     pub(super) fn new(
         id: SlotId,
         frame_tx: flume::Sender<Vec<u8>>,
+        drain: Arc<DrainSignal>,
         initial_credit: u32,
         slot_byte_budget: u32,
         first_seq: u32,
@@ -105,6 +115,7 @@ impl IngressSlot {
         Self {
             id,
             frame_tx,
+            drain,
             account: SlotCreditAccount::new(initial_credit),
             sizes: VecDeque::new(),
             buffered_bytes: 0,
@@ -122,7 +133,7 @@ impl IngressSlot {
         self.hold.len()
     }
 
-    /// Put this slot on the batch's reconcile list, reporting whether the
+    /// Put this slot on the pass's reconcile list, reporting whether the
     /// caller now owes the list an entry.
     pub(super) fn mark_touched(&mut self) -> bool {
         !std::mem::replace(&mut self.touched, true)
@@ -185,25 +196,27 @@ impl IngressSlot {
         })
     }
 
-    /// Account for records the consumer has drained and report the credit now
-    /// waiting to be advertised.
+    /// Account for the records the pump reports drained and report the credit
+    /// now waiting to be advertised.
     ///
-    /// Occupancy is *reconciled* rather than observed at the drain point:
-    /// `flume` has no consumed-callback, and a per-slot drain task would
-    /// reintroduce exactly the per-stream tasks the mux exists to delete. The
-    /// count is exact at every sample — only its timing is sampled — and the
-    /// sweep in [`super`] is what guarantees a slot with no further arrivals
-    /// still gets its credit back.
+    /// The count is the pump's own, taken with
+    /// [`DrainSignal::take_drained`](super::DrainSignal::take_drained) — which
+    /// clears the listing before it swaps, so a drain racing this pass lists
+    /// the slot again rather than losing its record; that method's doc has the
+    /// interleaving. Nothing here reads `frame_tx.len()`. Inferring the drain
+    /// from occupancy needed that read, which takes the slot channel's lock,
+    /// and it was only ever right because the mux was the channel's sole
+    /// writer — a fact the ledger had no way to check.
     ///
-    /// Sampled per slot rather than per table: a batch reconciles only the
-    /// slots it delivered into, so a slot whose consumer drained while no
-    /// record arrived for it is sampled by the drain doorbell or the periodic
-    /// sweep instead. `frame_tx.len()` takes that channel's lock, which is the
-    /// cost the narrower scope removes.
+    /// `sizes` can be shorter than the count, and the pop is bounded by it
+    /// rather than by the count for that reason. The one producer of a channel
+    /// entry with no `sizes` entry is `inject_dropped`, whose caller drops the
+    /// slot immediately after, so no live slot reaches it; the guard is here
+    /// because the alternative to a bound is an underflow, not because a path
+    /// leads to it. `SlotCreditAccount::release` clamps the credit half the
+    /// same way.
     pub(super) fn reconcile(&mut self) {
-        let in_channel = self.frame_tx.len() as u32;
-        let resident = in_channel.saturating_add(self.hold.len() as u32);
-        let drained = self.account.buffered().saturating_sub(resident);
+        let drained = self.drain.take_drained();
         if drained == 0 {
             return;
         }

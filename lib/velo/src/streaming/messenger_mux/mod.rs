@@ -72,28 +72,30 @@
 //! credit starvation, which nothing but the consumer can end, that the withheld
 //! queue exists for.
 //!
-//! Credit comes back from three places, and which one gets there first decides
-//! what the sweep interval costs. The arrival path reconciles on every inbound
-//! batch, over the slots that batch delivered into and no others — a peer's
-//! other slots cost nothing to a batch that said nothing about them.
-//! A draining consumer posts its peer through
-//! [`ingress::DrainSignal`], and the sweep task reconciles that peer alone — no
-//! more often than once per [`MuxConfig::drain_visit_floor`], because clearing
-//! the wake before the walk means a consumer that keeps up re-arms it
-//! immediately and would otherwise have the task spin over its slot table.
-//! The periodic tick is the backstop for what neither reaches — a slot parked
-//! with nothing arriving *and* nothing being taken out — and it carries batcher
-//! eviction.
+//! Credit comes back from three places, and each visits only slots that
+//! something named. A draining consumer's pump counts the record on that
+//! slot's [`ingress::DrainSignal`], puts the slot's index on its peer's dirty
+//! lane, and posts the peer. The **arrival path** then reconciles, on every
+//! inbound batch, the slots that batch delivered into together with the slots
+//! on that lane — so the credit a stream's tail waits on rides the peer's next
+//! batch, which arrives in tens of microseconds. The **doorbell** walks the
+//! same lane when the sweep task answers a wake, no more often than once per
+//! [`MuxConfig::drain_visit_floor`]; it is what covers a peer that has gone
+//! quiet. The **periodic tick** walks the whole table, for the slot nothing
+//! named — one parked with nothing arriving *and* nothing being taken out, or
+//! one whose drain found the lane full — and it carries batcher eviction.
 //!
-//! The drain path is a doorbell, not a ledger: it carries no quantity, and
-//! `IngressSlot::reconcile` remains the only thing that decides how much credit
-//! was freed. That is what lets it run concurrently with the sweep — a
-//! redundant visit recomputes the same answer, where a delta would double-count.
+//! The lane is a doorbell, not a ledger: an entry names a slot and carries no
+//! quantity. The quantity is the count on that slot's own signal, and
+//! `IngressSlot::reconcile` taking it is the only thing that decides how much
+//! credit was freed. That is what lets the three paths run concurrently — a
+//! redundant visit finds a count of zero, where a delta would double-count.
 //!
 //! It still differs from `BATCHING.md` § P8, which specifies an exact
 //! `credit.release(1)` per handoff. Releasing an amount from the pump is the
-//! part that was not adopted, for the reason above. See the dated addendum at
-//! the end of that document.
+//! part that was not adopted: releasing needs the peer's mutex, and taking it
+//! per record would trade a periodic cost for a worse per-record one. See the
+//! dated addenda at the end of that document.
 
 pub(crate) mod flow_control;
 pub(crate) mod ingress;
@@ -290,10 +292,12 @@ pub struct MuxConfig {
     /// How often the credit sweep runs.
     ///
     /// A backstop, not the primary mechanism. Credit comes back from the
-    /// arrival path on every inbound batch and from the consumer draining
-    /// (`ingress::DrainSignal`); this covers only what neither reaches — a slot
-    /// parked with nothing further arriving *and* nothing being taken out — and
-    /// carries batcher eviction, whose granularity it also sets.
+    /// arrival path on every inbound batch — for the slots that batch
+    /// delivered into and the slots a draining pump named on the peer's dirty
+    /// lane — and from the doorbell over that same lane. This covers only what
+    /// neither reaches: a slot parked with nothing further arriving *and*
+    /// nothing being taken out, and one whose drain found the lane full. It
+    /// also carries batcher eviction, whose granularity it sets.
     ///
     /// It was 2 ms when the sweep was the only way credit came back, which is
     /// what made that interval load-bearing rather than a tuning choice. Every
@@ -314,11 +318,13 @@ pub struct MuxConfig {
     /// before it walks, because a drain landing mid-walk must be able to post a
     /// fresh one; on a peer whose consumer is keeping up, the first record
     /// drained during the walk does exactly that, and the sweep task turns
-    /// wake -> clear -> walk as fast as it can. Each of those walks iterates
-    /// every slot of the peer and holds the mutex the inbound batch path takes,
-    /// so on the shape this mux exists for — one peer, hundreds to thousands of
-    /// slots, a consumer that keeps up — the doorbell becomes hot-path
-    /// contention.
+    /// wake -> clear -> walk as fast as it can. Each of those walks holds the
+    /// mutex the inbound batch path takes, so on the shape this mux exists for
+    /// — one peer, hundreds to thousands of slots, a consumer that keeps up —
+    /// the doorbell becomes hot-path contention. It walked every slot of the
+    /// peer when this floor was added; it now walks the dirty lane's slots
+    /// alone, which shortens each visit but does not change what the rate needs
+    /// bounding for.
     ///
     /// Under the floor a wake arriving too soon is *not* cleared and *not*
     /// walked: it is scheduled for when the peer next comes due. The flag stays
@@ -684,24 +690,24 @@ impl MuxCore {
         self.batcher(peer).reply(replies);
     }
 
-    /// Return whatever credit one peer has to return.
+    /// Reconcile every slot of one peer, on the periodic tick.
     ///
-    /// The drain-driven path: a consumer took records out of a slot's buffer,
-    /// so that peer — and only that peer — has credit worth reconciling. The
-    /// periodic sweep runs the same body across every peer.
+    /// The whole-table walk, and the only visitor of a slot nobody named — the
+    /// one parked with nothing arriving and nothing being taken out, and the
+    /// one whose drain found the peer's dirty lane full.
     fn sweep_peer(&self, peer: WorkerId) {
         // Taken down before the reconcile, not after: a record drained while
         // this visit is in progress must be able to post a fresh wake, or its
         // credit waits for the periodic backstop.
         self.ingress.clear_pending_wake(peer);
-        let replies = self.ingress.sweep_credit(peer);
-        if !replies.is_empty() {
-            let batcher = self.batcher(peer);
-            self.send_replies(&batcher, peer, &replies);
-        }
+        self.return_credit(peer, self.ingress.sweep_credit(peer));
     }
 
-    /// One doorbell-driven visit: reconcile the peer that rang, and count it.
+    /// One doorbell-driven visit: reconcile the slots of the peer that rang.
+    ///
+    /// Scoped to the slots a pump named on that peer's dirty lane, because a
+    /// wake means those slots drained and says nothing about the rest — and
+    /// this walk holds the mutex the inbound batch path takes.
     ///
     /// Counted here rather than where the wake is received, so the series
     /// measures walks and not wakes — a wake the floor deferred is counted once,
@@ -710,7 +716,17 @@ impl MuxCore {
         if let Some(metrics) = &self.metrics {
             metrics.drain_visit();
         }
-        self.sweep_peer(peer);
+        self.ingress.clear_pending_wake(peer);
+        self.return_credit(peer, self.ingress.sweep_drained(peer));
+    }
+
+    /// Hand a reconcile pass's grants to the peer's batcher.
+    fn return_credit(&self, peer: WorkerId, replies: Vec<peer_batcher::ReplyRecord>) {
+        if replies.is_empty() {
+            return;
+        }
+        let batcher = self.batcher(peer);
+        self.send_replies(&batcher, peer, &replies);
     }
 
     /// One sweep tick: return credit, then age out idle batchers.
@@ -914,13 +930,15 @@ async fn deferred_visit_due(due: Option<tokio::time::Instant>) {
 /// Spawn the credit-return and eviction sweep.
 ///
 /// Two sources, and which one does the work matters for cost. A draining
-/// consumer posts its peer on the drain lane, and this reconciles **that peer
-/// only** — bounded above by the drains, and bounded below by
-/// [`MuxConfig::drain_visit_floor`], which is what keeps a consumer that keeps
-/// up from turning the doorbell into a spin over the peer's slot table. The
-/// ticker is the backstop for what draining cannot reach: a slot parked with
-/// nothing further arriving and no consumer taking anything out, and batcher
-/// eviction, which free-rides on the same tick.
+/// consumer posts its peer on the wake lane, and this reconciles **the slots
+/// of that peer its pumps named** — bounded above by the drains, and bounded
+/// below by [`MuxConfig::drain_visit_floor`], which is what keeps a consumer
+/// that keeps up from turning the doorbell into a spin over the peer's slot
+/// table. The ticker walks the whole table, as the backstop for what neither
+/// the arrival path nor the doorbell reaches: a slot parked with nothing
+/// further arriving and no consumer taking anything out, a slot whose drain
+/// found the dirty lane full, and batcher eviction, which free-rides on the
+/// same tick.
 ///
 /// Before this, the ticker was the only source and ran at 500 Hz, walking every
 /// slot of every peer to find the few with credit to return — work that scales

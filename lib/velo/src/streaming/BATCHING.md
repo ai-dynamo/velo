@@ -1234,3 +1234,69 @@ residency from scratch, so a grant is never lost and a redundant visit still
 costs nothing. Striding through a few untouched slots on each batch would buy a
 latency bound the doorbell already gives, at the price of the lock reads this
 change exists to remove.
+
+---
+
+## Addendum, 2026-09-05: the arrival path also returns the credit of every slot that drained
+
+Superseding the addendum above, which narrowed the arrival path's reconcile to
+the slots a batch delivered into and left every other slot's credit to the drain
+doorbell and the periodic sweep. That narrowing was right about the cost and
+wrong about the backstop, and the tier-3 rig measured the difference.
+
+**What it broke.** Every stream sends about four records more than its initial
+window — 8,388,536 data records over 32,275 streams on one mocker process,
+against a window of 256 — so the tail of every stream needs a grant. Before the
+narrowing that grant rode the peer's next inbound batch, which arrives every few
+tens of microseconds. After it, the grant waited for a doorbell visit, and the
+doorbell is a per-peer, rate-limited, single-task walk. Worker
+`velo_streaming_slot_credit_exhausted_total` went from 13 to about 20,500 per
+process. The frontend sent 2.35 million credit updates instead of 28.8 million,
+in 48,403 batches instead of about a million. Doorbell visits fell from about
+2,500 per second to 644 across eight peers — about one visit per peer per 12 ms,
+and far less under bursts. The frontend's ordered lane for `_stream_batch`
+oscillated between 9,000 and 305,000 batches per second with a mean wait of 1.4 s
+per batch, against 0.36 ms before. Throughput halved to 1,516 req/s, TTFT p50
+went from 55 ms to 331 ms, and frontend CPU per request rose to 15.85 ms.
+
+**The rule now.** The pump names the slot it drained, and the arrival path
+answers both lists.
+
+- `reader_pump` counts the record on that slot's `DrainSignal` — an exact
+  `AtomicU32` of records taken out since the last reconcile — puts the slot's
+  index on a bounded per-peer *dirty lane*, and posts the peer as before. It
+  takes no lock and no peer mutex; that discipline is unchanged.
+- `handle_batch` reconciles the union of the slots the batch delivered into and
+  the slots on the lane, deduplicated through the touched flag the batch pass
+  already uses. So the credit for a slot that drained comes back on the peer's
+  next inbound batch, which is the latency before the narrowing, at a cost
+  proportional to the slots that received or drained rather than to the slots
+  the peer holds open.
+- The doorbell walks that lane too, and covers a peer with no further batches
+  arriving.
+- The periodic tick keeps the whole-table walk, as the backstop for a slot whose
+  listing found the lane full. A visit is now an atomic swap rather than a
+  slot-channel length read, so the walk costs what the tick can afford.
+
+**The count replaces the occupancy estimate.** `IngressSlot::reconcile` no
+longer reads `frame_tx.len()`. It clears the listing, swaps the count to zero,
+pops that many entries from `sizes` and releases them on the credit account.
+Clearing before swapping is what makes a concurrent drain safe: a drain landing
+between the two steps finds the listing down and lists the slot again, so the
+next pass finds either a count of zero or the new drain, and never a count with
+nothing coming to fetch it.
+
+This also corrects the last paragraph of the 2026-09-01 addendum, which is left
+standing above. Its conclusion holds — the sweep still does not reclaim credit
+for a slot whose pump died — but the mechanism it names is gone. The reason is
+no longer that `frame_tx.len()` stays pinned once the receiver is dropped; it is
+that a dead pump counts no drains. Such a slot is still closed by the next
+arrival finding it unknown rather than reclaimed by any sweep.
+
+**What a lost lane entry and a stale one cost.** A full lane puts the listing
+flag back down, so the drain keeps its count and the next drain lists again; the
+periodic walk is what returns that credit meanwhile. An entry naming a slot that
+has since closed costs the next pass one visit that finds nothing, and an entry
+naming an index a different slot has taken costs that slot one visit that finds a
+count of zero. Neither can misplace credit, because the lane carries an index and
+no quantity and the quantity lives in the `DrainSignal` the slot itself holds.
