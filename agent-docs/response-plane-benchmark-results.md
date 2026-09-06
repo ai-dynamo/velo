@@ -282,3 +282,20 @@ A likely mechanism: with a half-window threshold the receiver holds drained-but-
 | sum | 3.71 | 3.20 |
 
 The velo-only work fell by 0.5 ms/req. The aggregate fell by 0.15 (13.70 to 13.55) because the axum shutdown-watch bucket swung the other way: 1.89 ms/req on velo3 against 0.43 on mux18p in this rep, 1.36 against 2.21 on `t3-prof5`. That bucket tracks the draw, not the response plane. The reader pump and the anchor channel, 1.86 ms/req together, are now the whole of velo's addressable surplus.
+
+## Addendum 2026-09-06 night: isolation `t3-now2e72`; the verdict on W2(e) and the inline receiver
+
+Matrix `t3-t3-now2e72` (job 2742370), the same node pair as `t3-w2e72`, tree 94dc8eb (the integration tip without PR #85), the same adapter with the inline receiver, 72 workers, three reps per arm. Columns as in the addendum above.
+
+| draw | arm | req/s | TTFT p50 ms | p95 | p99 | ITL p50 ms | ITL p99 ms | CPU ms/req | credit updates | frontend batches | exhaustion | errors |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 holder | mux18p | 3,309 | 30.1 | 144 | 831 | 1.77 | 61.4 | 10.35 | | | | 0 |
+| 3 holders | mux18p | 3,211 | 48.3 | 183 | 777 | 1.67 | 61.0 | 11.37 | | | | 0 |
+| 3 holders | velo3 | 3,447 | 45.4 | 173 | 842 | 1.69 | 33.0 | 13.01 | 52.7 M | 242,355 | 377 (101) | 0 |
+| 3 holders | velo3 | 3,133 | 44.5 | 166 | 930 | 1.59 | 65.7 | 12.99 | 58.2 M | 281,605 | 334 (107) | 0 |
+| 5 holders | mux18p | 3,330 | 55.1 | 248 | 762 | 5.85 | 30.5 | 12.17 | | | | 0 |
+| 6 holders | velo3 | 3,142 | 55.5 | 231 | 867 | 4.14 | 37.2 | 13.40 | 59.4 M | 258,763 | 276 (118) | 0 |
+
+Without #85, worker credit exhaustion is back at 276 to 377 per rep (`t3-final72`: 246 to 368), and velo3's ITL p99 sits inside mux18p's range on the same nodes (33, 37 and 66 against 31, 61 and 61). With #85 on the same nodes it was 44 to 76 against 35 to 42, and exhaustion reached 1,431. The ITL p50 of 4 to 6 ms in the five- and six-holder reps belongs to the draw and hits both arms. CPU per request is unchanged either way (13.0 to 13.4 here).
+
+**Verdict.** PR #85 owns the tail cost and bought no CPU. It closes with this measurement in its body. The inline receiver is cleared: the tails and the exhaustion without #85 are at their `t3-final72` levels, and it removed about 0.2 ms/req of adapter work. The integration branch reverts the #85 merge (its content is 94dc8eb again, which is the wheel now installed). The first-token picture is unchanged: velo3 3 to 4 ms ahead of mux18p at a matched three-holder draw (45.4 and 44.5 against 48.3), and level at the heaviest draws (55.5 against 55.1).

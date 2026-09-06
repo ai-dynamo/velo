@@ -726,3 +726,10 @@ The per-record trace (diagnosis section 9) found no flush lever; the levers are 
 ### Update 2026-09-06, late: priority ruling
 
 The author ruled that CPU per request is a bonus, not a bar: cut it only when latency and tails do not pay for it (plan addendum of this night). PR #85 and the inline receiver are judged on `t3-now2e72` (running, job 2742370, tree 94dc8eb in the main tree until the job ends, then back to `integration/response-plane-wheel`). Whichever owns the ITL tail is dropped; #85 closes with the measurement if it is the one.
+
+### Update 2026-09-06 night: W2(e) closed on the isolation matrix
+
+- **`t3-now2e72`** (94dc8eb with the inline receiver, same nodes as `t3-w2e72`): exhaustion 276 to 377 per rep, ITL p99 inside mux18p's range, CPU unchanged. PR #85 owns the tail and bought no CPU: closed with the measurement in a comment. The review loop over #85 was stopped.
+- **Integration branch**: `integration/response-plane-wheel` is f4dccc6 plus a signed-off revert of the #85 merge, so its content is 94dc8eb. The installed wheel (both venvs share one editable extension, see the earlier update) is 94dc8eb with the inline receiver. `integration/no-w2e` (94dc8eb) can be deleted.
+- **Adapter**: the inline receiver stays in `dyn-pin` (uncommitted, with the one-runtime fix); both belong upstream in dynamo. The graceful-shutdown note and the unread `DYN_VELO_RESPONSE_BUFFER_CAPACITY` still apply.
+- **Next**: the starved-slot urgent grant on #83, then TTFT p99 at 72 workers. Every CPU change gets a same-matrix tail check (plan addendum of this night).
