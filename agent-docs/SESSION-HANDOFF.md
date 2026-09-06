@@ -685,3 +685,7 @@ Open on the branches: PR #83 is the folded second cut (1567d2d, pushed, body rew
 ### Update 2026-09-06 evening: CPU attribution done; final matrices queued
 
 Diagnosis section 8 and the plan addendum of this evening carry the one-runtime CPU partition (`t3-prof5`) and the 32-worker run. Queued on `aiperf-venv-b` (tree 3834c9b, both second cuts): `t3-final72` (job 2741447) and `t3-final32` (job 2741448, `RIG_FRONTEND_WORKER_THREADS=32`), three reps each of velo3 and mux18p. The PR #83 review loop is still running; its fixes, when it returns, are committed with `-s` and pushed like the others. Rig state: venv-a holds the 065c545 wheel plus the one-runtime adapter, venv-b holds 3834c9b plus the same adapter; both venvs are `RIG_VENV` targets. The `integration/w2a-only` and `integration/w2d-only` branches and the `velo-w2donly` worktree are leftovers of the isolation plan and can be deleted.
+
+### Update 2026-09-06 night: final matrices on 3834c9b
+
+`t3-t3-final72` and `t3-t3-final32` are in the results addendum of this evening. Verdict on the final tree with one runtime: velo3 ahead on p50 at a matched draw (39.3 to 43.5 against 45.7 to 46.4), p99 40 to 70 ms behind, CPU 1.9 to 2.9 ms/req above, zero errors, six reps each. 32 workers is not a lever: it trades 2 ms/req of CPU for velo's tails. Still running: the PR #83 review loop (pass 2 fixer); commit and push its fixes when it returns. The results page carries the headline and the conclusions at the top.

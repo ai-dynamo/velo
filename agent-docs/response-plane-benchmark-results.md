@@ -225,3 +225,24 @@ Matrix `t3-t3-w2-onert3` (job 2741140), three reps per arm, the W2 integration t
 | 6 holders | velo3 | 3,036 | 57.4 | 182 | 822 | 26.9 | 14.03 | 0 |
 
 At a matched draw velo3's first token is 4 to 7 ms ahead of mux18p at p50 and within the rep-to-rep spread at p99. Worker credit exhaustion is 25 to 74 per process (13 before W2, about 21,000 under the collapse), the frontend's lane wait is 0.2 to 0.4 ms per batch, and the thread count is 154 (242 with two runtimes). Frontend CPU per request is the open item: velo3 12.3 to 14.0 against mux18p 9.5 to 10.0. Both arms sit above their iso3 values (7.5 for mux18p then), so part of the shift is the environment: with nats-server off the frontend's cores and one runtime, more of the 72 workers idle-spin. A 32-worker run of both arms (`t3-w2-wt32`) and a per-subtree attribution of the one-runtime profile (`t3-prof5`) are in progress.
+
+## Addendum 2026-09-06 evening: the final tree at 72 and at 32 workers
+
+Matrices `t3-t3-final72` (job 2741447) and `t3-t3-final32` (job 2741448, `RIG_FRONTEND_WORKER_THREADS=32`), tree 3834c9b (both W2 second cuts: slot-named credit return; a heartbeat timer that never fires under traffic), the frontend on one tokio runtime, three reps per arm, grouped by draw.
+
+| workers | draw | arm | req/s | TTFT p50 ms | p95 | p99 | ITL p99 ms | CPU ms/req | errors |
+|---|---|---|---|---|---|---|---|---|---|
+| 72 | 1 holder | mux18p | 2,274 | 46.4 | 207 | 771 | 105.1 | 10.06 | 0 |
+| 72 | 1 holder | mux18p | 2,323 | 46.2 | 201 | 788 | 101.5 | 9.95 | 0 |
+| 72 | 1 holder | velo3 | 2,440 | 39.5 | 206 | 830 | 99.8 | 11.87 | 0 |
+| 72 | 2 holders | mux18p | 2,835 | 45.7 | 104 | 779 | 44.1 | 10.30 | 0 |
+| 72 | 2 holders | velo3 | 2,824 | 39.3 | 116 | 852 | 50.2 | 13.23 | 0 |
+| 72 | 2 holders | velo3 | 2,818 | 43.5 | 115 | 822 | 45.6 | 13.19 | 0 |
+| 32 | 1 holder | mux18p | 2,302 | 46.6 | 226 | 862 | 104.9 | 9.43 | 0 |
+| 32 | 1 holder | mux18p | 2,348 | 46.0 | 226 | 882 | 102.1 | 9.35 | 0 |
+| 32 | 1 holder | velo3 | 2,391 | 47.3 | 366 | 949 | 99.0 | 11.21 | 0 |
+| 32 | 1 holder | velo3 | 2,333 | 43.3 | 317 | 962 | 102.7 | 10.76 | 0 |
+| 32 | 2 holders | mux18p | 2,797 | 46.8 | 120 | 848 | 45.5 | 9.62 | 0 |
+| 32 | 4 holders | velo3 | 3,001 | 57.6 | 177 | 966 | 34.5 | 10.01 | 0 |
+
+At 72 workers velo3's p50 is 2 to 7 ms ahead of mux18p at a matched draw, its p99 40 to 70 ms behind, and its CPU per request 1.9 to 2.9 ms above. At 32 workers the CPU gap shrinks to 1.4 to 1.8 ms, but velo3's p95 grows from about 206 to 317 to 366 ms at a one-holder draw and its p50 lead disappears; mux18p is unchanged. Velo's larger task count needs the workers. The rig stays at 72, and the CPU clause is judged there. Worker credit exhaustion 0 to 102 per process; every rep zero errors.
