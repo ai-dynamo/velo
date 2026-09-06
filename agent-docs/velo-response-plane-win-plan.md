@@ -167,3 +167,7 @@ Rulings.
 2. No first-token claim is booked for any of them. TTFT is compared only at a matched backlog draw (diagnosis section 6); until such a comparison exists, arms are ordered by CPU per request.
 3. Not built: a credit-grant threshold (refuted; `BATCHING.md` already rejects it), a connection pool per peer, lane sharding, a bigger initial credit, header reshaping. Each was measured or traced as not on the path.
 4. Started 2026-09-06: (d) on `w2d-touched-slot-reconcile` off `w8-control-map-bound`, (a) on `w2a-pump-timer-hoist` off `w3-zero-rtt-attach` (the pump file is W3's).
+
+## Addendum 2026-09-06 night: (d)'s first cut starved the credit tail
+
+Ruling 1 above said the doorbell and the sweep are enough backstops for a slot a batch did not touch. Measured, they are not: every stream on this workload needs one grant for its last four records, and that grant must ride the peer's next inbound batch, not a rate-limited per-peer walk (see the handoff for the numbers: credit exhaustion 13 to 20,500 per worker process, throughput halved, lane wait 0.36 ms to 1.4 s). The corrected rule for (d): the pump names the slot it drained (an exact atomic count plus a per-peer lane of slot indexes, no lock), and the batch handler reconciles touched plus listed slots. The full walk survives only on the periodic tick, where it is now lock-free. (a) stands as built.
