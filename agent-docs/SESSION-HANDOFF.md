@@ -664,3 +664,16 @@ The host's perf runs inside the image once its directory and five shared librari
 ### Update 2026-09-06 morning: the collapse mechanism, and one runtime for the frontend
 
 Two read-only investigations (a collapse hunt with two investigators and a refuter per hypothesis, then a runtime-topology check with a refuter) settled the W2 collapse: see diagnosis section 7. The dynamo frontend runs two 72-worker tokio runtimes (dynamo's, holding the velo node; pyo3-async-runtimes', holding the HTTP handlers, the reader pumps and the adapter consumers), and every record's lane-to-pump wake is a `push_remote_task` on the second runtime's injection mutex. W2 removed the accidental pacing and the convoy starved runtime A's timers. Neither W2 change is wrong on its own; the discriminating wheels (`integration/w2a-only`, `integration/w2d-only`) were cancelled in favour of testing the fix. The adapter fix (`dyn-pin` `lib/bindings/python/rust/lib.rs`: `init_with_runtime(primary)` behind `has_existing_runtime`) is built into venv-a with the full W2 integration tree (065c545) and runs as `t3-w2-onert`. Also worth taking from the hunt: the pinned heartbeat timer now fires once per deadline per stream under traffic (harmless at 5 s, but the intent was "never fires under traffic"; a bounded re-arm from the receive arm restores it), and a starved slot's grant should be staged urgent rather than waiting the reply linger. Both go to PRs #84 and #83 respectively.
+
+### Update 2026-09-06 midday: one runtime clears the collapse; velo3 at mux18p's first-token level
+
+`t3-t3-w2-onert` (job 2741018; the W2 integration tree 065c545, the adapter initialising the pyo3 bridge with dynamo's runtime, thread count 154 instead of 242, no "already initialised" warning):
+
+| arm | draw (holders) | req/s | TTFT p50 | p95 | p99 | ITL p99 | CPU ms/req | worker credit exhaustion |
+|---|---|---|---|---|---|---|---|---|
+| velo3 | 6 | 3,116 | 46.1 | 168 | 823 | 38.6 | 13.6 | 68 |
+| mux18p | 1 | 3,014 | 44.6 | 157 | 827 | 75.8 | 10.4 | n/a |
+
+One rep. The lane wait is back to 0.42 ms per batch. At a six-holder draw, velo3 before this ran 73 to 83 ms; mux18p at a one-holder draw is the same 44 to 48 it always was. CPU per request is the open question: both arms are higher than in iso3 (mux18p 7.5 then, 10.4 now), so the environment shifted with the pinning and runtime changes, and the velo3 to mux18p ratio (1.31) is what it was. A three-rep matrix (`t3-w2-onert3`, job 2741140) and a profile (`t3-prof5`, job 2741141) are queued. The 621 client-disconnect errors on velo3's frontend log are the same kind iso3 showed (186 to 284 per rep) and aiperf reported zero errors.
+
+Open on the branches: PR #83 is the folded second cut (1567d2d, pushed, body rewritten); a fresh review pass is running. PR #84's tree carries uncommitted review fixes and one red test; the second cut of (a) (bounded re-arm from the receive arm, so the timer never fires under traffic) is being implemented in `velo-w2a` and will commit both. The starved-slot urgent grant is a follow-up for #83. The adapter change is rig-local (`dyn-pin`), uncommitted like the other adapter changes, and belongs upstream in dynamo's Python bindings.
