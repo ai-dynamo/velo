@@ -322,3 +322,22 @@ Source: aiperf's per-request `inter_chunk_latency` lists in `aiperf/profile_expo
 At a matched draw the sign flips between reps above 50 and 100 ms: velo3 is lower at one holder, higher at two, and both at three. Above 500 ms velo3 is equal or higher in all six matched comparisons, at 227 to 4,951 gaps of 63.5 million per rep. Along the stream, long gaps are spread evenly over the ten deciles for both arms (10.1 to 11.0 percent above 50 ms in every decile of the one-holder pair). In the last four token positions velo3 shows a small uptick against the rest of its stream (1.08x above 100 ms, 1.37x above 500 ms; mux18p 1.01x and 1.10x), at 76 to 106 gaps per rep. That uptick is the credit tail: the sender needs one grant for its last few records.
 
 **What it settles.** Velo's ITL tail is the backlog draw, as mux18p's is. A sender runs out of credit about 300 times per rep and waits under 2 ms (the reply window plus the lane wait and two hops), and only 21 to 30 percent of credit batches wait out the window at all. The starved-slot urgent grant left open on PR #83 has under 1 ms to win on about 300 of 250,000 streams. It is not built (plan addendum of this night; design facts in the session brief).
+
+## Addendum 2026-09-10: first-token p99 decomposed per request; the reported p99 is the start burst
+
+Method: `.research/analysis/ttft-join` (`extract.py`, `a2_join.py`, and the new `a9_tail.py`) on every request of the six reps of `t3-now2e72`. Client TTFT splits per request into A (client start to the frontend's `request received` line), B (that line to the worker handler's `request received` line, skew-corrected per mocker process) and C (worker ingress to the first token at the client). The three sum to the client's TTFT. The tail set is the requests at or above the rep's p99; its excess over the median band (p45 to p55) is attributed segment by segment. "Steady state" is the requests that started 10 s or later into the profiling phase (about 200,000 of 250,000 per rep).
+
+| rep | arm | draw | TTFT p50 | p90 | p99, all | p99, steady state | tail excess A / B / C, all | tail excess A / B / C, steady state |
+|---|---|---|---|---|---|---|---|---|
+| 2 | velo3 | 3 holders | 45.4 | 101 | 842 | 181 | +89 / +472 / +320 | +63 / 0 / +132 |
+| 3 | velo3 | 3 holders | 44.5 | 116 | 930 | 171 | +66 / +593 / +252 | +39 / +1 / +125 |
+| 2 | mux18p | 3 holders | 48.3 | 116 | 777 | 229 | +127 / +400 / +240 | +77 / 0 / +158 |
+| 1 | velo3 | 6 holders | 55.5 | 127 | 867 | 265 | +188 / +411 / +224 | +106 / 0 / +180 |
+| 3 | mux18p | 5 holders | 55.1 | 141 | 762 | 308 | +31 / +513 / +157 | +112 / 0 / +209 |
+| 1 | mux18p | 1 holder | 30.1 | 109 | 831 | 158 | +56 / +523 / +233 | +7 / +1 / +142 |
+
+**The reported p99 is the start of the run.** In all six reps, every request at or above p99 started within the first 0.2 s of the profiling phase (p90 of the tail's start time is 0.2 s in each rep). The rig passes `--warmup-request-count 8192`, and the profiling phase still opens with an instantaneous burst of 8,192 requests; the warm-up removes cold caches, not the burst. At the burst the excess is mostly B, 400 to 593 ms: the request plane and each mocker process's ingest absorbing 1,024 simultaneous requests. C adds 157 to 320 and A 31 to 188. Both arms show the same shape. velo3's C is 40 to 80 ms above mux18p's in two of the three pairings, inside mux18p's own spread of 157 to 240.
+
+**In steady state the tail is the hot mocker process and the frontend's HTTP ingress, in both arms.** B is zero. C carries 125 to 209 ms: the p90-to-p99 band sits 59 to 89 percent on one mocker process with 3,000 to 6,400 requests in flight. A carries 39 to 112 ms, the wait between the client's send and the frontend's `request received` line, and mux18p's rep 3 has the largest (112). Nothing in the steady-state tail is the response plane.
+
+**Verdict on the p99 clause.** Steady-state TTFT p99 at a matched draw: velo3 181 and 171 ms against mux18p 229 at three holders; 265 against 308 at five to six holders. Steady-state p90: 87 and 96 against 103; 101 against 116. velo3 is ahead on both. With p50 ahead (results addendum of 2026-09-06 night), throughput equal at a matched draw and zero errors, every clause of the bar is met at a matched draw in steady state on this rig; CPU per request is 2 to 3 ms above and is recorded, not required. The rig's summary will report steady-state percentiles next to the raw ones so the burst no longer stands in for the plane.

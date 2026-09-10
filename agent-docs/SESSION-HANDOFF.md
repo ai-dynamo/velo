@@ -739,3 +739,7 @@ The author ruled that CPU per request is a bonus, not a bar: cut it only when la
 ### Update 2026-09-06 night: the urgent grant sized from the per-token data and not built
 
 Three read-only readers (receiver grant path, sender stall path, aiperf per-token gaps) fed `scratchpad/w2/BRIEF-w9-urgent-grant.md`. Ruling: not built (plan and results addenda of this night). The analysis script is `.research/analysis/itl/analyze_itl.py <matrix dir>`. The `velo-ug` worktree and `w9-urgent-grant` branch were created and removed. Next: decompose first-token p99 per request at a matched draw on `t3-now2e72` before proposing a mechanism.
+
+### Update 2026-09-10: first-token p99 decomposed; the bar is met in steady state
+
+`a9_tail.py` (in `.research/analysis/ttft-join`, joined data under `out-now2e72`, output `tail-now2e72.txt`) shows the reported TTFT p99 is the 8,192-request burst that opens the profiling phase (every p99 request in every rep started within 0.2 s; the excess is B, 400 to 593 ms, in both arms). Steady-state p99 (started 10 s or later): velo3 181, 171, 265 against mux18p 229, 308, 158; ahead at both matched draws. Results addendum, diagnosis section 10 and plan addendum of this date carry it. Next: add steady-state TTFT columns to `summarize.py` (reads `profile_export.jsonl`, fields `request_start_ns` and `time_to_first_token`); then the optional items in the plan addendum.
