@@ -1,0 +1,46 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
+# W7: batcher-instrument hot-path cost, accepted un-measured
+
+Written 2026-09-05, PR #80 (`w7-batcher-instruments`), pass 2 review response.
+
+## The finding
+
+`MuxMetricsHandle::record_sent`, at the shape it had when this PR was opened (`5713955:lib/velo/src/observability.rs:696`, `pub(crate) fn record_sent(&self, kind: RecordType)` — since replaced by the pre-bound `records_sent` described in the addendum below, so this line number is deliberately not a current-HEAD one), made one `CounterVec::with_label_values` lookup (hash + `RwLock` read + `Arc` clone) and one `Counter::inc()` call per record, called from seven call sites (`records.rs:123, :218, :224, :272, :274`; `mod.rs:547, :601`) — i.e. per record, not per batch: an N-record batch made N lookups and N atomic adds. `::batcher_wake` at that same commit already made one lookup and one CAS per wake, the rate it still has today. Both add unmeasured atomic traffic to the outbound batch path. On the shape that motivated this PR (about one record per batch, one batch per wake, 1.77M batches in rep1-velo0) `record_sent`'s per-record rate and the pre-existing `metrics.batch(...)` call's per-batch rate were close to the same; a batch packing more than one record is where they would have diverged, which is exactly the per-batch array design (see below) this PR moved to instead.
+
+This is the same mechanism `agent-docs/w0-egress-instrumentation-cost.md` names on the egress-write path and closes with a written acceptance rather than a measurement, so a later pass does not re-raise it as new information. That note is this one's template — it lands in this tree with the pending rebase onto `w0-ingest-metrics` @ `882e8ca` (the commit that added it); until then it is reachable only as `git show 882e8ca:agent-docs/w0-egress-instrumentation-cost.md` from a checkout that has that ref.
+
+## Disposition: accepted, un-measured, for this PR
+
+No A/B has been taken in this PR. Reasons:
+
+- The A/B this would need — `examples/examples/response_plane_bench.rs` before/after this PR's HEAD, on the aarch64 compute node, multiple reps compared on means — is a benchmarking task, not a code-review fixer pass, and this pass cannot run `cargo` on the login node regardless.
+- By this point in pass 2's rewrite, `record_sent(kind)`'s seven per-record call sites above are gone: `BatchEncoder::push` now increments a `[u16; RECORD_TYPE_COUNT]` array in-line (`record_type_counts`), and a new `records_sent(counts)` reads it out once per batch. The per-record cost is one bounds-checked `u16` increment inside `push`'s single funnel, no allocation, no lock, no label lookup — compliant with the campaign's hot-path rule for this PR series ("no label lookup on the per-message path (pre-bind collectors). Per-batch observations are fine; per-record are forbidden" — a fixer-campaign ruling carried in the orchestrator's brief, not a file in this repository). The label lookups this note is about are `records_sent(counts)`'s own, per *batch* (at most 5, only for record types actually present — `count > 0` gates the lookup), which that rule permits and which the pre-existing `metrics.batch(...)` already does at the same call site. This shape did not reach a commit of its own — pass 3 pre-bound it (addendum below) before any of this landed as `c8f322a`.
+- ARM64 LSE makes the plain `fetch_add`s in the counter/bucket path cheap; the genuine contention risk is the `AtomicF64` CAS retry loop inside `Counter::inc_by`, which is exactly the kind of thing a measurement settles and reading does not.
+
+One caveat worth recording either way: `batcher_wake`'s lookup is per-wake, not per-batch, so under `FlushPolicy::Manual` or a starved slot a wake can fire with no batch behind it — that one series' lookup rate is not bounded by the batch rate. Under the default `Auto { on_admission: true }`, wakes are approximately batches.
+
+## What to do before this cost is spent for real
+
+If a future pass (or the orchestrator) decides the batcher-instrument arm needs measuring before merge, run the A/B named above — one rep, means not percentiles, recorded in `agent-docs/response-plane-benchmark-results.md` against the existing baseline — before shipping these instruments enabled by default.
+
+If it regresses, the cheapest lever is pre-binding `records_sent_total`'s five children in `bind_mux` via `std::array::from_fn`, the same pattern `bind_transport` already uses for `TransportMetricsHandle` (`lib/velo/src/observability.rs`, function `bind_transport`) — that collapses `records_sent`'s per-batch lookups to zero, leaving only the `inc_by` CAS.
+
+This note closes the loop so a later pass does not re-raise the same un-measured claim as new information; it does not claim the cost is acceptable, only that it is accepted, unmeasured, for this PR.
+
+## Addendum, 2026-09-05: the pre-bind lever above was pulled
+
+Pass 3 review found the caveat two paragraphs up — "`batcher_wake`'s lookup is per-wake, not per-batch" — was not a caveat on an otherwise-compliant design; it was the actual shape of the cost. `Work::Slot(_, SlotItem::Frame(_))` is one `select!` wake per item pulled off `SlotStream::poll_next` (`slot_stream.rs`), which yields exactly one queued record per poll. So a `Frame` wake's `CounterVec::with_label_values` lookup is on the per-record path *by construction*, not only in the low-batch-occupancy regime this note measured against — the "wakes are approximately batches" framing above undersold it. That is a violation of the campaign hot-path rule quoted above ("no label lookup on the per-message path"), not a workload-dependent cost to accept unmeasured.
+
+`records_sent` and `batcher_wake` are both now pre-bound in `bind_mux` — `records_sent` into a `[Counter; RECORD_TYPE_COUNT]` array built by indexing `RECORD_TYPE_LABELS` directly (position `i` files under `RECORD_TYPE_LABELS[i]`, which is `RecordType::count_index`'s own range), `batcher_wake` into a `[Counter; 5]` array indexed by `BatcherWake::index` — the same pattern `bind_transport` already used for `TransportMetricsHandle`. Both hot-path methods are now a plain array index and an atomic add; no `CounterVec` lookup remains on either path. The A/B this note called for is accordingly moot for the label-lookup cost; the `AtomicF64` CAS these counters still pay is unchanged and was never what this note was about.
+
+What is accepted now, precisely: one `AtomicF64` compare-exchange-weak retry loop (`prometheus` 0.14's `atomic64.rs:107-121`) per wake, on a `Counter` child shared node-wide per `MuxCore`. That sits beside a pre-existing, identically-shaped CAS this PR did not introduce — `FlushGate::stage` (`peer_batcher/flush_gate.rs:85-95`) calls `MuxMetricsHandle::staged_records_delta` (`lib/velo/src/observability.rs`, function `staged_records_delta`), a `Gauge::add` CAS once per `FlushGate::stage` call, which every call site makes with one record — two for a terminal and its close — already, today, without this PR. A reading of that hot-path rule that would condemn the new per-wake CAS condemns that pre-existing one on the same grounds; this note accepts both, un-measured, for the reason given above.
+
+## Addendum, 2026-09-05: named-field alternative to `RecordType::count_index`, rejected
+
+A pass-5 review flagged `RecordType::count_index`'s doc comment for carrying this design litigation inline, against the repo's own rule that history belongs in git and design rulings belong here. Moved verbatim:
+
+`count_index`'s own exhaustive match, rather than a reuse of `RecordType::as_u8`'s wire discriminant, is what forces a new variant to get an arm there — a `match` with no catch-all makes the compiler stop the next author at that site instead of silently accepting an unindexed type. It does not by itself prove the index fits `RECORD_TYPE_LABELS`; that still needs a matching entry appended there. No cheap const construct closes the one residual this leaves (a variant built directly, never reaching `RecordType::from_u8`, whose `count_index()` arm collides with another's) on stable Rust, which has no way to enumerate an enum's variants in a const or reflective context. A named-field design — five named fields carried in three places instead of one indexed array — would close that residual at compile time, at the cost of paying it in code volume instead: every one of the three places (`BatchEncoder`'s count storage, `RECORD_TYPE_LABELS`, and whatever reads a count back out by type) grows a field per variant rather than a slot, and the compiler enforces the correspondence between the three sets of fields, not between a match arm and an array bound. Rejected for this PR: the array is already the shape `bind_mux`'s pre-bind pattern uses everywhere else in this file (`TransportMetricsHandle`, `HandlerResponseMetrics`), and five named fields in three places is more code to review for a taxonomy that changes rarely. Treat growing `RecordType` as growing `RECORD_TYPE_LABELS` and the `from_u8` arm in the same change, and let a reviewer's eyes be the check for the one residual case no test in the tree reaches.

@@ -40,8 +40,10 @@
 //! legacy one and lets this node advertise [`MESSENGER_MUX_KEY`] on its attach
 //! requests; [`crate::streaming::negotiation`] is where an attach then picks
 //! between the two, and picks the mux only when both peers named it. Setting
-//! `enabled` back to `false` stops the advertisement and is therefore the whole
-//! rollback.
+//! `enabled` back to `false` stops the advertisement, and on the node that
+//! mints zero-RTT tickets that is the whole rollback; a producer rolled back
+//! alone is refused by a consumer that still pre-binds for it, so the minting
+//! side goes first or both go together — see [`MuxConfig::enabled`].
 //!
 //! ## The producer's contract under the mux
 //!
@@ -60,9 +62,11 @@
 //! - **The bound is bytes, and overrunning it ends the stream.** That queue is
 //!   capped at the per-slot byte budget (1 MiB by default). A producer that runs
 //!   further ahead than that on a slot nobody is draining has its slot closed:
-//!   the consumer receives `Dropped`, the producer's channel starts erroring,
-//!   and the peer's other slots are untouched. `SATURATION.md` describes it from
-//!   the operator's side.
+//!   the producer's channel starts erroring at once, the consumer receives
+//!   `Dropped` (deferred behind an outstanding singleton's admission if the
+//!   slot is fenced — see the fence paragraph in `BATCHING.md`), and the
+//!   peer's other slots are untouched. `SATURATION.md` describes it from the
+//!   operator's side.
 //!
 //! The exception is a batcher parked on *admission* rather than on credit. That
 //! suspends the task, inlet drain included — but it is bounded by the
@@ -70,17 +74,40 @@
 //! credit starvation, which nothing but the consumer can end, that the withheld
 //! queue exists for.
 //!
-//! One deviation from `BATCHING.md` survives: `reader_pump` returns credit by
-//! *reconciliation* — the mux compares the buffer's occupancy against what it
-//! admitted — rather than through the exact `credit.release(1)` hook the
-//! document describes. The effect is the same and the sweep bounds the latency;
-//! what it costs is that a return is one sweep tick late when no further batch
-//! arrives to drive reconciliation on the arrival path.
+//! Credit comes back from three places. Two of them visit only slots that
+//! something named; the third is the whole-table backstop. A draining
+//! consumer's pump counts the record on that
+//! slot's [`ingress::DrainSignal`], puts the slot's index on its peer's dirty
+//! lane, and posts the peer. The **arrival path** then reconciles, on every
+//! inbound batch, the slots that batch delivered into together with the slots
+//! on that lane — so the credit a stream's tail waits on rides the peer's next
+//! batch, which arrives in tens of microseconds. The **doorbell** walks the
+//! same lane when the sweep task answers a wake, no more often than once per
+//! [`MuxConfig::drain_visit_floor`]; it is what covers a peer that has gone
+//! quiet. The **periodic tick** walks the whole table, for the slot nothing
+//! named — one parked with nothing arriving *and* nothing being taken out, or
+//! one whose drain found the lane full — and it carries batcher eviction.
+//!
+//! The lane is a doorbell, not a ledger: an entry names a slot and carries no
+//! quantity. The quantity is the count on that slot's own signal, and
+//! `IngressSlot::reconcile` taking it is the only thing that decides how much
+//! credit was freed. That is what lets the three paths run concurrently — a
+//! redundant visit finds a count of zero, where a delta would double-count.
+//!
+//! It still differs from `BATCHING.md` § P8, which specifies an exact
+//! `credit.release(1)` per handoff. Releasing an amount from the pump is the
+//! part that was not adopted: releasing needs the peer's mutex, and taking it
+//! per record would trade a periodic cost for a worse per-record one. See the
+//! dated addenda at the end of that document.
 
+mod config;
 pub(crate) mod flow_control;
 pub(crate) mod ingress;
 pub(crate) mod peer_batcher;
 pub(crate) mod protocol;
+mod sweep;
+#[cfg(test)]
+mod test_support;
 #[cfg(test)]
 mod tests;
 
@@ -94,7 +121,7 @@ use futures::future::BoxFuture;
 use tokio_util::sync::CancellationToken;
 use velo_ext::{TransportKey, WorkerAddress, WorkerId};
 
-use self::flow_control::{DEFAULT_PEER_BYTE_BUDGET, DEFAULT_SLOT_BYTE_BUDGET, NegotiatedLimits};
+use self::flow_control::NegotiatedLimits;
 use self::ingress::IngressRegistry;
 use self::peer_batcher::{
     BatcherContext, BatcherHandle, BatcherMap, OpenRejected, OpenSlotRequest,
@@ -102,6 +129,8 @@ use self::peer_batcher::{
 use crate::messenger::{Context, Handler, Messenger};
 use crate::observability::{MuxMetricsHandle, VeloMetrics};
 use crate::streaming::transport::FrameTransport;
+
+pub use self::config::{AutoFlush, FlushPolicy, MuxConfig};
 
 /// The streaming-transport key this mux answers to.
 ///
@@ -118,13 +147,25 @@ pub const MESSENGER_MUX_KEY: &str = "messenger-mux-v1";
 /// The active-message handler every batch travels through.
 pub(crate) const STREAM_BATCH_HANDLER: &str = "_stream_batch";
 
-/// How long a `bind()` waits for the `OpenSlot` that claims it.
+/// How long a bind waits for the `OpenSlot` that claims it.
 ///
 /// Deliberately the same 60 s the TCP transport gives a pending session, and
 /// deliberately measuring the same thing: "time until a batch bearing this
-/// `OpenSlot` arrives". `OpenSlot` is eager precisely so this cannot quietly
-/// become "time until the producer produces its first token" and expire a queued
-/// request with a long prefill.
+/// `OpenSlot` arrives". That sentence holds without qualification for
+/// `FrameTransport::bind`'s attach-path caller: a sender has already asked by
+/// the time the bind exists, so the window is one response leg plus one batch
+/// leg, and `OpenSlot` is eager precisely so it cannot quietly become "time
+/// until the producer produces its first token" there.
+///
+/// It does not hold for `MessengerMuxTransport::prebind`'s zero-RTT caller,
+/// where the same clock starts before any sender has asked at all: the window
+/// there is envelope transit plus however long the ticket sits in a request
+/// envelope before its worker calls `open_anchor_stream`, which can be exactly
+/// the producer-side wait the paragraph above rules out for `bind`. See
+/// `AnchorManager::prebind_anchor`'s doc for that bound. An attach that adopts
+/// an existing pre-bind does not restart this timer either way — adoption
+/// takes over the bind `prebind` already registered rather than calling
+/// `bind` again, so it inherits whatever is left of the 60 s, not a fresh one.
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Attempts `connect` makes before giving up on a batcher that keeps retiring
@@ -132,178 +173,12 @@ const ACCEPT_TIMEOUT: Duration = Duration::from_secs(60);
 /// eviction sweeps inside one attach.
 const CONNECT_ATTEMPTS: usize = 3;
 
-/// Conditions on which an [`FlushPolicy::Auto`] batcher writes itself.
+/// Peer wakes the drain lane holds before it starts dropping them.
 ///
-/// A struct rather than more enum variants because these compose: a batcher may
-/// hold both, and `BATCHING.md`'s original "opportunistic" and "windowed"
-/// policies are the two of them taken one at a time.
-///
-/// Deliberately **not** `#[non_exhaustive]`, for the same reason [`MuxConfig`]
-/// is not: that attribute forbids `AutoFlush { on_admission: false,
-/// ..Default::default() }` outside this crate, and the update idiom is worth
-/// more than the bump a future condition costs. The version gate is what makes
-/// such a bump a decision rather than an accident.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AutoFlush {
-    /// Write whatever is staged at the end of every wake, having first taken
-    /// everything already queued.
-    ///
-    /// The historical default, and it cannot make anything worse: the batcher
-    /// never waits for work that has not arrived, it only notices that more is
-    /// *already* there and takes all of it. The name is the mechanism — a flush
-    /// parks until the transport admits it, so "at the end of every wake" is in
-    /// practice "as soon as the peer admitted the last batch".
-    pub on_admission: bool,
-    /// Also write once this long has passed since the oldest staged record.
-    ///
-    /// `Some(w)` with `on_admission: false` is the windowed policy
-    /// `BATCHING.md` specifies: a batch forms for up to `w` and then goes,
-    /// trading up to `w` of latency for packing. `None` is no timer at all.
-    pub max_linger: Option<Duration>,
-}
-
-impl Default for AutoFlush {
-    fn default() -> Self {
-        Self {
-            on_admission: true,
-            max_linger: None,
-        }
-    }
-}
-
-impl AutoFlush {
-    /// Add a linger window, so a batch also goes out `window` after its oldest
-    /// record was staged.
-    #[must_use]
-    pub const fn with_max_linger(mut self, window: Duration) -> Self {
-        self.max_linger = Some(window);
-        self
-    }
-}
-
-/// When a peer batcher writes what it has staged.
-///
-/// See `BATCHING.md` § "Flush policy". Both policies obey the same two
-/// overrides — a batch at its size clamp goes, and the records that carry
-/// liveness go — and under both,
-/// [`Velo::flush_batch`](crate::Velo::flush_batch) writes immediately. What
-/// they differ on is whether anything *else* does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum FlushPolicy {
-    /// The batcher decides, on the conditions in [`AutoFlush`].
-    ///
-    /// The default is `AutoFlush::default()`, which is byte-for-byte the
-    /// behaviour every mux had before this knob existed.
-    Auto(AutoFlush),
-    /// The application decides, through
-    /// [`Velo::flush_batch`](crate::Velo::flush_batch).
-    ///
-    /// The policy a serving loop wants: one write per forward pass carrying
-    /// that pass's whole fan-out to each peer, and nothing lingering into the
-    /// next pass. **There is no timer.** A producer that stops calling
-    /// `flush_batch` leaves its last records staged until something else moves
-    /// them; `velo_streaming_mux_staged_records` is where that shows.
-    Manual,
-}
-
-impl Default for FlushPolicy {
-    fn default() -> Self {
-        Self::Auto(AutoFlush::default())
-    }
-}
-
-impl FlushPolicy {
-    /// The window a staged batch is running against, if any.
-    pub(crate) const fn max_linger(self) -> Option<Duration> {
-        match self {
-            Self::Auto(auto) => auto.max_linger,
-            Self::Manual => None,
-        }
-    }
-
-    /// Whether reaching the end of a wake is itself a reason to write.
-    pub(crate) const fn on_admission(self) -> bool {
-        match self {
-            Self::Auto(auto) => auto.on_admission,
-            Self::Manual => false,
-        }
-    }
-}
-
-/// Construction-time tuning for the mux, and the switch that installs one.
-///
-/// Reached from the `Velo` builder as `.messenger_mux(MuxConfig { enabled: true,
-/// ..Default::default() })`. Defaults are chosen so `enabled` is the only
-/// decision an operator has to make.
-#[derive(Debug, Clone)]
-pub struct MuxConfig {
-    /// Whether to install the mux at all.
-    ///
-    /// **Defaults to `false`, and stays that way** — the mux is opt-in, not the
-    /// default transport. This flag is also the rollback: set it back to
-    /// `false` and the node stops registering `messenger-mux-v1` and stops
-    /// advertising it on attach, so the next attach negotiates the legacy path
-    /// with no code change and no wire change. That is what makes a canary
-    /// safe, and why activation is config-only.
-    pub enabled: bool,
-    /// Configured ceiling on one batch. Further clamped at flush time by the
-    /// effective eager budget and by `COALESCE_THRESHOLD`, whichever binds
-    /// first.
-    pub max_batch_bytes: usize,
-    /// Data credit `C` granted to each new slot, and therefore the depth of the
-    /// `C + 1` buffer `bind` hands the anchor.
-    ///
-    /// Advertised verbatim as the attach response's `initial_credit`, so it
-    /// must never be zero: zero on the wire means *this peer is not offering
-    /// the mux*. Building a mux refuses a zero rather than letting a node
-    /// install one it then tells every peer to ignore.
-    pub initial_credit: u32,
-    /// Bytes one slot may hold in flight — the replacement for the ~1 MiB the
-    /// kernel socket used to enforce per stream for free. Zero means the
-    /// default, which is the same thing it means on the wire.
-    pub slot_byte_budget: u32,
-    /// Bytes all of one peer's slots may hold in flight between them.
-    pub peer_byte_budget: u64,
-    /// How often the credit sweep runs.
-    ///
-    /// The arrival path returns credit on every inbound batch, so this only
-    /// matters for a slot that has parked with nothing further arriving to
-    /// trigger reconciliation — where it is the difference between resuming and
-    /// deadlocking, at one interval of added latency.
-    pub credit_sweep_interval: Duration,
-    /// How long a batcher may sit idle with no slots before it is evicted.
-    pub batcher_idle_ttl: Duration,
-    /// When a batcher writes what it has staged.
-    ///
-    /// Defaults to [`FlushPolicy::Auto`] on [`AutoFlush::default`], which is
-    /// the behaviour every mux had before this knob existed.
-    pub flush_policy: FlushPolicy,
-}
-
-impl Default for MuxConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            max_batch_bytes: 60 * 1024,
-            initial_credit: 256,
-            slot_byte_budget: DEFAULT_SLOT_BYTE_BUDGET,
-            peer_byte_budget: DEFAULT_PEER_BYTE_BUDGET,
-            credit_sweep_interval: Duration::from_millis(2),
-            batcher_idle_ttl: Duration::from_secs(60),
-            flush_policy: FlushPolicy::Auto(AutoFlush::default()),
-        }
-    }
-}
-
-impl MuxConfig {
-    /// Sweep ticks a batcher must sit idle through before it may be evicted.
-    fn idle_ticks(&self) -> u32 {
-        let interval = self.credit_sweep_interval.as_millis().max(1);
-        let ttl = self.batcher_idle_ttl.as_millis();
-        u32::try_from(ttl / interval).unwrap_or(u32::MAX).max(1)
-    }
-}
+/// Wakes coalesce naturally — many slots of one peer post the same `WorkerId`,
+/// and one reconcile of that peer serves all of them — so this does not need to
+/// scale with slot count. It needs to absorb a burst across distinct peers.
+const DRAIN_WAKE_CAPACITY: usize = 1024;
 
 /// The `messenger-mux-v1` [`FrameTransport`].
 ///
@@ -336,9 +211,44 @@ struct MuxCore {
     /// batch of the new one as stale and discard it wholesale.
     epochs: Arc<AtomicU64>,
     cancel: CancellationToken,
+    /// Peers with credit to return, posted by draining consumers. See
+    /// [`ingress::DrainSignal`].
+    drain_tx: flume::Sender<WorkerId>,
+    drain_rx: flume::Receiver<WorkerId>,
+    /// Drain signals waiting to be collected by the attach that will spawn the
+    /// pump holding them.
+    ///
+    /// `bind` cannot hand this back directly — `FrameTransport::bind` returns a
+    /// receiver and nothing else, and widening that trait would be a breaking
+    /// change to `velo-ext` for every out-of-tree implementor. So the signal is
+    /// parked here for the attach path to take, which it does a few lines after
+    /// `bind` returns. Take-once: whoever collects it owns it, and the bind
+    /// expiry that already exists drops any that was never collected.
+    drains: DashMap<(u64, u64), Arc<ingress::DrainSignal>>,
+    /// A barrier handed to every batcher this core spawns, installed by the
+    /// tests that need one held mid-wake. See [`peer_batcher::test_hooks`].
+    #[cfg(test)]
+    hooks: std::sync::OnceLock<Arc<peer_batcher::test_hooks::TestHooks>>,
 }
 
 impl MessengerMuxTransport {
+    /// Take the [`ingress::DrainSignal`] `bind` parked for this pair.
+    ///
+    /// Called once by the attach path, between `bind` returning and the pump
+    /// being spawned. Returns `None` for a pair this transport did not bind,
+    /// which is the honest answer for the legacy per-stream transports — they
+    /// have no mux credit to return.
+    pub(crate) fn take_drain_signal(
+        &self,
+        anchor_id: u64,
+        session_id: u64,
+    ) -> Option<Arc<ingress::DrainSignal>> {
+        self.core
+            .drains
+            .remove(&(anchor_id, session_id))
+            .map(|(_, signal)| signal)
+    }
+
     /// Build a mux over `messenger` and register its `_stream_batch` handler.
     ///
     /// Registration is for the messenger's lifetime: there is no
@@ -350,6 +260,12 @@ impl MessengerMuxTransport {
     /// Fails on `initial_credit = 0`, which is not a small window but the wire
     /// encoding of *"not offering the mux"*. A node that installed one would
     /// advertise a key and then tell every peer to ignore it.
+    ///
+    /// Fails on `credit_sweep_interval = 0` too. The sweep ticks on a
+    /// `tokio::time::interval`, which panics on a zero period — inside the
+    /// spawned sweep task, so without this check the build returned `Ok` and
+    /// the mux ran with no periodic credit backstop, no batcher eviction, and
+    /// nobody reading the drain doorbell, which that task alone consumes.
     pub(crate) fn new(
         messenger: Arc<Messenger>,
         config: MuxConfig,
@@ -357,12 +273,22 @@ impl MessengerMuxTransport {
     ) -> Result<Arc<Self>> {
         let limits = NegotiatedLimits::from_wire(config.initial_credit, config.slot_byte_budget)
             .map_err(|error| anyhow!("messenger mux: {error}"))?;
+        if config.credit_sweep_interval.is_zero() {
+            return Err(anyhow!(
+                "messenger mux: credit_sweep_interval must be non-zero; the sweep ticks on it"
+            ));
+        }
         // Normalised so every reader of the config sees the effective budget
         // rather than the "use the default" zero.
         let config = MuxConfig {
             slot_byte_budget: limits.slot_byte_budget(),
             ..config
         };
+        // Bounded, and deliberately lossy on overflow: a wake is a hint that a
+        // peer has credit to return, and a dropped hint costs latency the
+        // periodic sweep still bounds. Sized so a burst across many peers does
+        // not discard wakes it could have kept.
+        let (drain_tx, drain_rx) = flume::bounded::<WorkerId>(DRAIN_WAKE_CAPACITY);
         let core = Arc::new(MuxCore {
             messenger: Arc::clone(&messenger),
             config,
@@ -374,6 +300,11 @@ impl MessengerMuxTransport {
             // zeroed header from reading as a legitimate one.
             epochs: Arc::new(AtomicU64::new(1)),
             cancel: CancellationToken::new(),
+            drain_tx,
+            drain_rx,
+            drains: DashMap::new(),
+            #[cfg(test)]
+            hooks: std::sync::OnceLock::new(),
         });
 
         let handler_core = Arc::downgrade(&core);
@@ -393,7 +324,7 @@ impl MessengerMuxTransport {
         .build();
         messenger.register_streaming_handler(handler)?;
 
-        spawn_sweep(&core);
+        sweep::spawn_sweep(&core);
 
         Ok(Arc::new(Self {
             core,
@@ -422,7 +353,7 @@ impl MuxCore {
                             batchers: Arc::clone(&self.batchers),
                             cancel: self.cancel.clone(),
                             #[cfg(test)]
-                            hooks: None,
+                            hooks: self.hooks.get().cloned(),
                         },
                     )
                 })
@@ -473,35 +404,123 @@ impl MuxCore {
         }
     }
 
-    /// Queue control records back to `peer`, re-resolving once if the batcher
-    /// exited between resolution and the write.
+    /// Queue control records back to `peer`, re-resolving while the batcher
+    /// in hand has stopped reading.
     ///
     /// Control is coalesced state rather than a queue, so nothing here can fail
-    /// on the write — the liveness check is what stands in for a `SendError`.
-    /// Losing the race costs nothing: a batcher exits on cancellation, which is
-    /// the transport going away, or on retirement, which requires zero live
-    /// slots on both sides and so no credit anyone is waiting for.
+    /// on the write — `reply`'s answer is what stands in for a `SendError`, and
+    /// it is decided under the inbox lock the batcher's last drain also takes.
+    /// So a reply either rode that drain or comes back refused, with no third
+    /// case, and a refused one goes to whatever batcher now owns the peer. A
+    /// liveness check *before* the write, which this used to be, cannot see a
+    /// task that has already taken its last drain, and a reply posted there
+    /// was applied by nobody. That is not always credit nobody wanted:
+    /// eviction needs zero live slots on both sides, and the `CloseSlot`
+    /// `close_claimed_slot` posts is what brought the ingress side to zero —
+    /// the idle producer it names has no other way to learn, because every
+    /// later record it sends is dropped here as `ClosedSlot` with no reply.
+    ///
+    /// The loop runs once in practice. A further turn needs the batcher
+    /// `batcher()` just handed back to be evicted inside this call, which is
+    /// a sweep tick landing in microseconds of straight-line code; it cannot
+    /// spin, because a tick is what each turn waits for.
     fn send_replies(
         &self,
         batcher: &Arc<BatcherHandle>,
         peer: WorkerId,
         replies: &[peer_batcher::ReplyRecord],
     ) {
-        if batcher.is_alive() {
-            batcher.reply(replies);
+        if batcher.reply(replies) {
             return;
         }
-        self.batcher(peer).reply(replies);
+        while !self.batcher(peer).reply(replies) {}
+    }
+
+    /// Reconcile every slot of one peer, on the periodic tick.
+    ///
+    /// The whole-table walk, and the only visitor of a slot nobody named — the
+    /// one parked with nothing arriving and nothing being taken out, and the
+    /// one whose drain found the peer's dirty lane full.
+    fn sweep_peer(&self, peer: WorkerId) {
+        // Taken down before the reconcile, not after: a record drained while
+        // this visit is in progress must be able to post a fresh wake, or its
+        // credit waits for the periodic backstop.
+        self.ingress.clear_pending_wake(peer);
+        self.return_credit(peer, self.ingress.sweep_credit(peer));
+    }
+
+    /// One doorbell-driven visit: reconcile the slots of the peer that rang.
+    ///
+    /// Scoped to the slots a pump named on that peer's dirty lane, because a
+    /// wake means those slots drained and says nothing about the rest — and
+    /// this walk holds the mutex the inbound batch path takes.
+    ///
+    /// Counted here rather than where the wake is received, so the series
+    /// measures walks and not wakes — a wake the floor deferred is counted once,
+    /// on the visit it coalesced into.
+    fn visit_drained_peer(&self, peer: WorkerId) {
+        if let Some(metrics) = &self.metrics {
+            metrics.drain_visit();
+        }
+        self.ingress.clear_pending_wake(peer);
+        self.return_credit(peer, self.ingress.sweep_drained(peer));
+    }
+
+    /// Hand a reconcile pass's grants to the peer's batcher.
+    fn return_credit(&self, peer: WorkerId, replies: Vec<peer_batcher::ReplyRecord>) {
+        if replies.is_empty() {
+            return;
+        }
+        let batcher = self.batcher(peer);
+        self.send_replies(&batcher, peer, &replies);
+    }
+
+    /// Retire a slot whose consumer has gone and tell its owner.
+    ///
+    /// Two halves, and both are needed. The local retire is what returns
+    /// `live_slots` to zero — nothing else does, because the sweep reads
+    /// only what the slot's own pump counted drained, and a pump whose
+    /// consumer is gone counts nothing; the next record to arrive would
+    /// close the slot by finding its receiver gone, but an idle producer
+    /// sends none. The reply is what that idle producer needs, since the
+    /// fault that carries the same news to it otherwise rides on the next
+    /// record it sends.
+    fn close_claimed_slot(&self, peer: WorkerId, slot: protocol::SlotId) {
+        // Checked before touching the ingress table, not after: this runs
+        // from a `Drop` that can land on a thread with no runtime under it
+        // (`StreamController::cancel` guards its own spawn the same way and
+        // for the same reason, `streaming/anchor.rs`), and resolving a
+        // batcher may need to spawn its task. Retiring the slot first and
+        // discovering only afterward that there is nowhere to post the reply
+        // would leave the peer worse off than doing nothing at all: the
+        // reactive `ConsumerGone` fault a live slot would otherwise raise on
+        // its next record can no longer find a slot to raise it on. With no
+        // runtime, do nothing -- the peer learns on its next record, exactly
+        // as if this path did not exist.
+        if tokio::runtime::Handle::try_current().is_err() {
+            tracing::debug!(
+                peer = %peer,
+                "messenger mux: no runtime to post a slot close on; the peer learns on its next record"
+            );
+            return;
+        }
+        let Some(reply) = self
+            .ingress
+            .close_consumer_gone(peer, slot, self.metrics.as_ref())
+        else {
+            return;
+        };
+        if let Some(metrics) = &self.metrics {
+            metrics.slot_closed();
+        }
+        let batcher = self.batcher(peer);
+        self.send_replies(&batcher, peer, &[reply]);
     }
 
     /// One sweep tick: return credit, then age out idle batchers.
     fn sweep(&self) {
         for peer in self.ingress.peers() {
-            let replies = self.ingress.sweep_credit(peer);
-            if !replies.is_empty() {
-                let batcher = self.batcher(peer);
-                self.send_replies(&batcher, peer, &replies);
-            }
+            self.sweep_peer(peer);
         }
 
         let threshold = self.config.idle_ticks();
@@ -540,26 +559,56 @@ impl Drop for MuxCore {
     }
 }
 
-/// Spawn the periodic credit-return and eviction sweep.
-fn spawn_sweep(core: &Arc<MuxCore>) {
-    let weak = Arc::downgrade(core);
+/// Register the receive buffer for one `(anchor_id, session_id)` and open the
+/// accept window on it.
+///
+/// The body [`FrameTransport::bind`] and
+/// [`MessengerMuxTransport::prebind`] share. `bind` is async because the trait
+/// is; **nothing in here awaits**, and that is what lets the zero-RTT path call
+/// it synchronously while registering a request. Anything a future accept-window
+/// change touches — the reaper this window is a candidate to become — is here,
+/// once, rather than in two places that would drift.
+fn open_bind(core: &Arc<MuxCore>, anchor_id: u64, session_id: u64) -> flume::Receiver<Vec<u8>> {
+    // `C + 1`: `C` data credits plus the one reserved terminal credit.
+    // Credit is issued against *this* buffer and never against the
+    // anchor's `frame_tx`, which has writers other than the mux.
+    let (frame_tx, frame_rx) = flume::bounded::<Vec<u8>>(core.limits.slot_buffer_depth());
+    let drain = Arc::new(ingress::DrainSignal::new(core.drain_tx.clone()));
+    core.drains
+        .insert((anchor_id, session_id), Arc::clone(&drain));
+    core.ingress
+        .register_bind(anchor_id, session_id, frame_tx, drain);
+
+    // `Weak`, and cancellable. A strong handle here would pin the whole
+    // transport alive for the full accept window after the last owner
+    // dropped it — a minute of leaked slots, batcher tasks and ingress
+    // state per outstanding bind, and a `live_slots` gauge that only
+    // comes back to zero when the timers do.
+    let expiry = Arc::downgrade(core);
     let cancel = core.cancel.clone();
-    let interval = core.config.credit_sweep_interval;
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tokio::select! {
-                biased;
-                () = cancel.cancelled() => return,
-                _ = ticker.tick() => {}
-            }
-            let Some(core) = weak.upgrade() else {
-                return;
-            };
-            core.sweep();
+        tokio::select! {
+            () = cancel.cancelled() => return,
+            () = tokio::time::sleep(ACCEPT_TIMEOUT) => {}
+        }
+        let Some(core) = expiry.upgrade() else {
+            return;
+        };
+        // Whether or not the bind was still there, drop any drain
+        // signal no attach collected. Without this an attach that
+        // failed between `bind` and `take_drain_signal` would leak one
+        // entry per attempt for the process's life.
+        core.drains.remove(&(anchor_id, session_id));
+        if core.ingress.expire_bind(anchor_id, session_id) {
+            tracing::warn!(
+                anchor_id,
+                session_id,
+                "messenger mux: no OpenSlot arrived before the accept window closed"
+            );
         }
     });
+
+    frame_rx
 }
 
 impl FrameTransport for MessengerMuxTransport {
@@ -580,39 +629,7 @@ impl FrameTransport for MessengerMuxTransport {
         session_id: u64,
     ) -> BoxFuture<'_, Result<flume::Receiver<Vec<u8>>>> {
         let core = Arc::clone(&self.core);
-        Box::pin(async move {
-            // `C + 1`: `C` data credits plus the one reserved terminal credit.
-            // Credit is issued against *this* buffer and never against the
-            // anchor's `frame_tx`, which has writers other than the mux.
-            let (frame_tx, frame_rx) = flume::bounded::<Vec<u8>>(core.limits.slot_buffer_depth());
-            core.ingress.register_bind(anchor_id, session_id, frame_tx);
-
-            // `Weak`, and cancellable. A strong handle here would pin the whole
-            // transport alive for the full accept window after the last owner
-            // dropped it — a minute of leaked slots, batcher tasks and ingress
-            // state per outstanding bind, and a `live_slots` gauge that only
-            // comes back to zero when the timers do.
-            let expiry = Arc::downgrade(&core);
-            let cancel = core.cancel.clone();
-            tokio::spawn(async move {
-                tokio::select! {
-                    () = cancel.cancelled() => return,
-                    () = tokio::time::sleep(ACCEPT_TIMEOUT) => {}
-                }
-                let Some(core) = expiry.upgrade() else {
-                    return;
-                };
-                if core.ingress.expire_bind(anchor_id, session_id) {
-                    tracing::warn!(
-                        anchor_id,
-                        session_id,
-                        "messenger mux: no OpenSlot arrived before the accept window closed"
-                    );
-                }
-            });
-
-            Ok(frame_rx)
-        })
+        Box::pin(async move { Ok(open_bind(&core, anchor_id, session_id)) })
     }
 
     /// Opens a slot at *this node's* limits.
@@ -639,6 +656,91 @@ impl MessengerMuxTransport {
     /// The window this node advertises to a peer negotiating an attach.
     pub(crate) fn advertised_limits(&self) -> NegotiatedLimits {
         self.core.limits
+    }
+
+    /// Bind a slot before any sender has asked for one.
+    ///
+    /// The synchronous twin of [`FrameTransport::bind`], and identical to it:
+    /// the trait's `bind` is async only because the trait is, and its body has
+    /// no await in it. Zero-RTT setup needs the receiver *now*, while
+    /// registering a request, so it takes this door instead of paying a future
+    /// for nothing.
+    ///
+    /// Nothing about the resulting bind is special. A peer's `OpenSlot` claims
+    /// it by the same `(anchor_id, session_id)` lookup, the accept window runs
+    /// the same 60 s, and [`release_bind`](Self::release_bind) is what an owner
+    /// that gives up before then calls.
+    pub(crate) fn prebind(&self, anchor_id: u64, session_id: u64) -> flume::Receiver<Vec<u8>> {
+        open_bind(&self.core, anchor_id, session_id)
+    }
+
+    /// Give back a bind nobody claimed, along with the drain signal parked with
+    /// it.
+    ///
+    /// The accept window does the same thing when it expires, and stays as the
+    /// backstop. This is for the owner that already knows: a pre-bound anchor
+    /// whose request died before its first token knows a minute earlier than
+    /// the timer does, and at the rate a frontend registers requests that
+    /// minute is thousands of leaked binds.
+    ///
+    /// Idempotent: a bind already claimed or already released is not there to
+    /// remove, and removing nothing is the right answer for both.
+    pub(crate) fn release_bind(&self, anchor_id: u64, session_id: u64) {
+        self.core.drains.remove(&(anchor_id, session_id));
+        self.core.ingress.expire_bind(anchor_id, session_id);
+    }
+
+    /// Retire a live slot whose consumer has gone, and tell the peer that owns
+    /// it to abandon its end.
+    ///
+    /// The receive side already reaches this verdict on its own — a record
+    /// arriving for a slot whose consumer dropped the receiver faults with
+    /// `CloseReason::UnknownSlot` — but only on the *next* record, and an idle
+    /// producer sends none. This is the same close on a different trigger.
+    ///
+    /// Idempotent, and silent where there is nothing to close: a stream that
+    /// ended on its own terminal retired the slot then, so the ordinary end of
+    /// a stream costs no extra record on the wire.
+    pub(crate) fn close_claimed_slot(&self, peer: WorkerId, slot: protocol::SlotId) {
+        self.core.close_claimed_slot(peer, slot);
+    }
+
+    /// Binds registered and neither claimed nor released.
+    #[cfg(test)]
+    pub(crate) fn pending_binds(&self) -> usize {
+        self.core.ingress.bind_count()
+    }
+
+    /// Drain signals a bind parked and no attach has collected.
+    #[cfg(test)]
+    pub(crate) fn parked_drains(&self) -> usize {
+        self.core.drains.len()
+    }
+
+    /// Live receive-side slots for `peer`.
+    #[cfg(test)]
+    pub(crate) fn live_ingress_slots(&self, peer: WorkerId) -> usize {
+        self.core.ingress.live_slots(peer)
+    }
+
+    /// The ids of `peer`'s live receive-side slots.
+    ///
+    /// A test that has to name a slot would otherwise have to re-derive the
+    /// sender's allocation order, which is the allocator's business and not the
+    /// test's.
+    #[cfg(test)]
+    pub(crate) fn live_slot_ids(&self, peer: WorkerId) -> Vec<protocol::SlotId> {
+        self.core.ingress.live_slot_ids(peer)
+    }
+
+    /// The window one of `peer`'s live receive-side slots opened holding.
+    #[cfg(test)]
+    pub(crate) fn slot_open_terms(
+        &self,
+        peer: WorkerId,
+        id: protocol::SlotId,
+    ) -> Option<(u32, u64)> {
+        self.core.ingress.slot_open_terms(peer, id)
     }
 
     /// Write what every batcher has staged, to every peer.

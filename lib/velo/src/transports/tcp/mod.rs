@@ -13,6 +13,7 @@
 pub(crate) mod framing;
 mod listener;
 mod transport;
+mod writer;
 
 pub use framing::TcpFrameCodec;
 pub use listener::{RuntimeConfig, TcpListener, TcpListenerBuilder};

@@ -387,6 +387,74 @@ fn the_batch_fills_at_the_record_count_ceiling() {
 }
 
 // ---------------------------------------------------------------------------
+// Record-type taxonomy
+// ---------------------------------------------------------------------------
+
+/// Proves what `BatchEncoder::push` actually needs from [`RecordType::count_index`]:
+/// every variant [`RecordType::from_u8`] can decode has a `count_index()` that
+/// is in range for `record_type_counts` and shared with no other decodable
+/// variant. That is weaker, on purpose, than requiring the wire discriminant
+/// (`as_u8`) to equal `count_index()` — `count_index`'s own doc disclaims that
+/// coupling, so a test that required it would fail a compliant reorder of
+/// either side. It also pins that the one record type
+/// `peer_batcher/tests/instruments.rs` never drives onto the wire —
+/// `slot_heartbeat` is decode-only for now, per `BATCHING.md` — still carries
+/// the label `VeloMetrics::bind_mux` would file it under.
+///
+/// The residual this cannot reach: a variant constructed directly and pushed
+/// without ever gaining a [`RecordType::from_u8`] arm — the way
+/// `#[cfg(test)]` `push_heartbeat` builds `SlotHeartbeat` without decoding it
+/// — is invisible to a loop driven by `from_u8`. An out-of-range
+/// `count_index()` on such a variant still panics `BatchEncoder::push`; an
+/// in-range one that collides with another variant's does not — it silently
+/// files that variant's records under the colliding variant's label, and
+/// nothing in the tree catches it.
+///
+/// `BatcherWake`'s five sources need no equivalent assertion, for a stronger
+/// reason than `RecordType`'s: it has no `from_u8` to decode and enumerate,
+/// so there is nothing to drive a loop like this one's over.
+/// `instruments.rs`'s `wakes_are_counted_by_source` and `linger_wake_is_counted`
+/// already drive all five through the real `velo_streaming_mux_batcher_wakes_total`
+/// counter and assert on the literal label text, so a `BatcherWake::index` arm
+/// reordered out of step with its source array fails there as a wrong-label
+/// assertion, not silently.
+#[test]
+fn decodable_record_type_has_in_range_unique_count_index() {
+    let mut seen = [false; RECORD_TYPE_COUNT];
+    for raw in 0..=u8::MAX {
+        let Some(decoded) = RecordType::from_u8(raw) else {
+            continue;
+        };
+        let index = decoded.count_index();
+        assert!(
+            index < RECORD_TYPE_COUNT,
+            "RecordType::from_u8({raw}) decoded to {decoded:?}, whose \
+             count_index() {index} is out of range for RECORD_TYPE_COUNT \
+             ({RECORD_TYPE_COUNT}) -- BatchEncoder::push would write out \
+             of bounds into record_type_counts"
+        );
+        assert!(
+            !seen[index],
+            "RecordType::from_u8({raw}) decoded to {decoded:?}, whose \
+             count_index() {index} another decodable variant already claims"
+        );
+        seen[index] = true;
+    }
+    assert!(
+        seen.iter().all(|&visited| visited),
+        "some index in 0..RECORD_TYPE_COUNT is never produced by a \
+         decodable RecordType, so that slot of record_type_counts would \
+         always read zero"
+    );
+
+    assert_eq!(
+        RECORD_TYPE_LABELS[RecordType::SlotHeartbeat.count_index()],
+        "slot_heartbeat",
+        "the one record-type label no behavioral test in instruments.rs reaches"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Malformed input
 // ---------------------------------------------------------------------------
 
@@ -874,6 +942,7 @@ fn the_sequence_gap_counts_skipped_batches_through_the_wrap() {
     assert_eq!(batch_seq_gap(u32::MAX, 0), 1);
     assert_eq!(batch_seq_gap(u32::MAX - 1, 2), 4);
     // A duplicate or reordered batch reads as an enormous gap, which is why
-    // the value meters and does not decide.
+    // `note_batch_seq` asks `batch_seq_is_newer` first and never asks this
+    // about one.
     assert_eq!(batch_seq_gap(5, 4), u32::MAX);
 }

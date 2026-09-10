@@ -351,10 +351,17 @@ pub trait Transport: Send + Sync {
     /// Install a transport-scoped observability handle.
     ///
     /// The runtime calls this once per transport during startup with a handle
-    /// pre-bound to this transport's `key`. Implementations typically store it
-    /// in an [`OnceLock`](std::sync::OnceLock) and call its methods on the
-    /// hot path; transports that do not emit metrics can leave the default
-    /// no-op.
+    /// pre-bound to this transport's `key`, and always calls it before
+    /// [`start`](Transport::start) — an implementation may rely on that order
+    /// and capture the handle once at `start()` rather than re-reading an
+    /// [`OnceLock`](std::sync::OnceLock) on every frame. That guarantee is the
+    /// runtime's; it does not hold for a transport driven by hand (a test, or
+    /// an embedder that calls `start()` directly) — call this before `start()`
+    /// there too, since a listener or accept loop that snapshots the handle at
+    /// `start()` time will not see one installed afterward. A transport whose
+    /// inbound path runs on a thread the runtime does not otherwise
+    /// synchronize with (an FFI callback, say) should still read the
+    /// `OnceLock` per call rather than lean on the ordering.
     fn set_observability(&self, _observability: std::sync::Arc<dyn TransportObservability>) {}
 
     /// Notification hook for Phase 1 (Gate) of graceful shutdown.

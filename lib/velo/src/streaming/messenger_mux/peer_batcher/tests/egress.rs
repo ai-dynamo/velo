@@ -4,8 +4,10 @@
 //! Packing, clamps, credit, terminals, oversized records, and the
 //! unconditional inlet drain.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use super::super::test_hooks::TestHooks;
 use super::super::*;
 use super::support::*;
 use crate::streaming::messenger_mux::protocol::{BATCH_HEADER_LEN, RECORD_HEADER_LEN, RecordType};
@@ -737,5 +739,63 @@ async fn an_oversized_record_goes_alone_and_fences_only_its_slot() {
     assert_eq!(
         successor.frame_seq, 2,
         "frame_seq carries the order proof past a resolve that is not lane-ordered"
+    );
+}
+
+/// `send_singleton` fences its slot even when the transport admits the
+/// rendezvous record synchronously.
+///
+/// `fire_singleton`'s `FenceSkip::IfAdmitted` optimization is scoped to
+/// `open_detached`'s `OpenSlot` alone (`an_admitted_open_slot_is_never_fenced`,
+/// `open_ack.rs`, pins that arm on `MuxConfig::async_open_ack`, where
+/// `open_detached` calls `fire_singleton(.., FenceSkip::IfAdmitted, ..)`).
+/// `send_singleton` always passes `FenceSkip::Never`: a rendezvous record's
+/// bytes are resolved by the receiver's ordered dispatcher in a detached task
+/// before dispatch, so the sender's admission order says nothing about the
+/// order the receiver applies it in, and `fire_singleton` fences it
+/// unconditionally regardless of how synchronously the transport admits it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_synchronously_admitted_rendezvous_record_still_fences_its_slot() {
+    let cap = 256;
+    let hooks = Arc::new(TestHooks::default());
+    let harness = harness_with_hooks(
+        MuxConfig {
+            max_batch_bytes: cap,
+            ..MuxConfig::default()
+        },
+        Some(Arc::clone(&hooks)),
+    )
+    .await;
+
+    // `MuxConfig::default()` leaves `async_open_ack` off, so this open takes
+    // `open_awaited`, which never calls `fire_singleton` at all — the fence
+    // count below is a baseline of zero because nothing has fired a singleton
+    // yet, not because an admitted `OpenSlot` skipped a fence. That property
+    // belongs to `an_admitted_open_slot_is_never_fenced` (`open_ack.rs`),
+    // which drives the harness through `open_detached` instead.
+    let (inlet, id) = harness.open(1, 1).await;
+    harness.grant(id, 8);
+    assert_eq!(
+        hooks.fenced_count(),
+        0,
+        "baseline: opening a slot under the awaited-ack default never calls \
+         fire_singleton, so nothing has fenced yet"
+    );
+
+    let oversized = rmp_serde::to_vec(&crate::streaming::frame::StreamFrame::Item(vec![
+        7u8;
+        cap * 2
+    ]))
+    .expect("encode oversized");
+    inlet.send(oversized.clone()).expect("queue oversized");
+
+    let batch = harness.next_batch().await;
+    assert_eq!(batch.records[0].data, oversized);
+    assert_eq!(
+        hooks.fenced_count(),
+        1,
+        "a rendezvous record must fence its slot regardless of whether the \
+         transport admitted it synchronously; only open_detached's eager \
+         OpenSlot may skip the fence on that path"
     );
 }

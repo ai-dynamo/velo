@@ -168,9 +168,14 @@ required-features = ["test-helpers"]
 
 [[test]]
 name = "streaming_mux_negotiation"
-# A directory module: the negotiation suite proper in `mod.rs`, and the
-# outcome-observability tests that share its fixtures beside it.
+# A directory module: the negotiation suite proper in `mod.rs`, with the
+# outcome-observability and zero-RTT suites beside it, sharing its fixtures.
 path = "tests/streaming/mux_negotiation/mod.rs"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "streaming_mux_credit"
+path = "tests/streaming/mux_credit.rs"
 required-features = ["test-helpers"]
 
 [[test]]
@@ -211,7 +216,11 @@ required-features = ["test-helpers"]
 [[test]]
 name = "transports_ucx"
 path = "tests/transports/ucx_integration.rs"
-required-features = ["ucx"]
+# `test-helpers` for `MetricSnapshot`: the suite asserts that UCX records the
+# inbound frames it admits, which is the numerator of the messenger's derived
+# inbound-queue depth. Both features are required to run this suite directly:
+# `cargo test --features ucx,test-helpers --test transports_ucx`.
+required-features = ["ucx", "test-helpers"]
 
 [[test]]
 name = "rendezvous_rdma"

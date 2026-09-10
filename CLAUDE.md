@@ -50,7 +50,7 @@ The bug class that motivated the workspace collapse: a 0.1.1 "patch" of an inter
 1. **Only `velo` and `velo-ext` are publishable.** Any new crate added to the workspace must have `publish = false` in its `Cargo.toml` unless there is a deliberate, documented reason to publish it. Adding a third publishable crate reopens the bug class.
 2. **`velo-ext` is `=`-pinned in `[workspace.dependencies]`.** The line is:
    ```toml
-   velo-ext = { path = "lib/velo-ext", version = "=0.5.0" }
+   velo-ext = { path = "lib/velo-ext", version = "=0.5.1" }
    ```
    The `=` is load-bearing. Caret (the cargo default) lets a future "compatible" patch silently re-resolve downstream lockfiles. Do not relax this to a caret requirement.
 3. **Bumping `velo-ext` requires bumping `velo` in the same PR.** The `=` pin in `[workspace.dependencies]` must be updated to track. CI will fail otherwise.
@@ -110,7 +110,7 @@ All transports implement the `Transport` trait (`lib/velo-ext/src/transport.rs`,
 
 1. Create `lib/velo/src/transports/<name>/` with `mod.rs`, `transport.rs`, optionally `listener.rs`
 2. Implement the `Transport` trait (from `velo_ext`)
-3. Route every inbound `MessageType::Message` through `TransportAdapter::admit_message` — never pre-filter on `ShutdownState::is_draining()`. Where the transport has a return path to the sender, answer `AdmitOutcome::Draining` with a `MessageType::ShuttingDown` frame echoing the rejected request's header (`transport_shutdown_tests!` asserts that echo reaches the sender for TCP and UDS); where it does not — gRPC's client-side read half — record the rejection and drop
+3. Route every inbound `MessageType::Message` through `TransportAdapter::admit_message` — never pre-filter on `ShutdownState::is_draining()`. Where the transport has a return path to the sender, answer `AdmitOutcome::Draining` with a `MessageType::ShuttingDown` frame echoing the rejected request's header (`transport_shutdown_tests!` asserts that echo reaches the sender for TCP and UDS); where it does not — gRPC's client-side read half — record the rejection and drop. On the `Admitted` arm, and only that arm, call `record_frame(Direction::Inbound, "message", ...)` on the observability handle — the messenger's inbound-queue-depth reading is `frames_total{inbound,message,accepted} - inbound_dequeued_total`, so an admitted frame with no matching `record_frame` call drives that derived depth negative. Record every other inbound message type as it is routed, too, the way `transports::ingress::route_frame` does for `Response`/`Ack`/`Event`/`ShuttingDown` — `bind_transport` pre-creates a child series per direction x message_type, so a family where only `message` ever moves reads as "no responses arrived", not "responses are uninstrumented", which is a worse failure to debug than a family that is dark throughout
 4. Feature-gate via a new feature in `lib/velo/Cargo.toml` and a `#[cfg(feature = "<name>")] pub mod <name>;` line in `lib/velo/src/transports.rs`
 5. Add a test factory in `lib/velo/tests/transports/common/mod.rs`, create `lib/velo/tests/transports/<name>_integration.rs` using the `transport_integration_tests!` macro, and add a matching `[[test]]` entry in `lib/velo/Cargo.toml`
 6. Update `examples/examples/ping_pong.rs` with transport selection
@@ -133,3 +133,4 @@ velo-ext = "0.5"  # exact pin tracked by velo's workspace
 - Prefer `Bytes` / `BytesMut` for message data (zero-copy slicing via `split_to().freeze()`). When converting from owned `Vec<u8>`, use `Bytes::from(vec)` (O(1) ownership transfer) not `Bytes::copy_from_slice(&vec)` (O(n) memcpy).
 - Use `DashMap` for lock-free concurrent state, `flume` for bounded channels
 - For ZMQ socket options that need non-Send thread isolation, use `OnceLock` for set-once values (lock-free reads) instead of `Mutex<Option<T>>` when the value never needs to be cleared.
+- The review skills' 1000-line-file threshold applies to `src` files, not test modules (`tests.rs`, `#[cfg(test)] mod tests`, `tests/*.rs`). Splitting a test file to dodge it routinely costs more than it buys — a `tests/*.rs` split needs a matching `[[test]]` entry in `lib/velo/Cargo.toml` and can break a hard-coded `--test <name>` invocation elsewhere (CI, a rig script). Note the length in review, don't split on sight.

@@ -18,18 +18,22 @@
 //! contract, reached by dropping a receiver exactly as the TCP egress pump does.
 //!
 //! > **The inlet is drained unconditionally.** A slot that cannot *send* — out
-//! > of credit, or fencing a rendezvous singleton — still has its records
-//! > pulled, into [`EgressSlot`]'s withheld queue.
+//! > of credit, or fenced behind a singleton whose admission has not answered
+//! > (a rendezvous transfer, or an `OpenSlot` under `MuxConfig::async_open_ack`)
+//! > — still has its records pulled, into [`EgressSlot`]'s withheld queue.
 //!
-//! That is not an optimisation. `finalize`, `detach` and `Drop` reach the inlet
-//! through a **synchronous** `flume::Sender::send`, which blocks when the
-//! channel is full — and under mux a starved slot's channel would never drain,
-//! so the block would be permanent, on a runtime worker thread, from inside a
-//! `Drop` in async context. TCP never had this failure mode: its egress pump
-//! drains at socket speed, so a full channel is transient. Credit can park a
-//! slot indefinitely, so it is not. The withheld queue is where the backpressure
-//! goes instead, bounded by the slot's byte cap rather than by a channel that
-//! control traffic has to get through.
+//! That is not an optimisation. A slot parked on credit whose inlet nobody
+//! pulled would leave every terminal sent through it — `finalize`, `detach`,
+//! `Drop` — waiting on a channel that never makes room. TCP never had this
+//! problem: its egress pump drains at socket speed, so a full channel is
+//! transient. Credit can park a slot indefinitely, so it is not. The withheld
+//! queue is where the backpressure goes instead, bounded by the slot's byte cap
+//! rather than by a channel that control traffic has to get through.
+//!
+//! Draining unconditionally keeps the inlet *moving*; it does not keep it from
+//! being momentarily full, so it was never the whole guarantee. The other half is
+//! [`send_terminal`](crate::streaming::sender), which is why a terminal on a full
+//! inlet now waits as a task rather than as a blocked runtime worker.
 
 use std::collections::VecDeque;
 use std::pin::Pin;
@@ -46,8 +50,10 @@ use crate::streaming::messenger_mux::flow_control::{CreditClass, SlotCredit};
 /// Close signalling for one slot's inlet, shared between the batcher task and
 /// the stream it polls.
 ///
-/// One flag, because there is only one thing to say: draining never stops for
-/// any reason short of the slot ending.
+/// One flag, because there is only one thing to say: draining stops when the
+/// gate closes, whether that is the slot ending or `EgressSlot::disconnect`
+/// cutting the producer off ahead of a deferred close — the two are the same
+/// signal to a stream that only ever sees its gate close once.
 pub(super) struct SlotGate {
     closed: AtomicBool,
     waker: AtomicWaker,
@@ -238,13 +244,27 @@ pub(super) struct EgressSlot {
     pub(super) next_seq: u32,
     /// Records pulled from the inlet that the slot may not send yet.
     pub(super) withheld: WithheldQueue,
-    /// Set once the producer has gone, so the `CloseSlot{PeerGone}` that tells
-    /// the consumer can wait behind whatever is still withheld.
-    pub(super) inlet_closed: bool,
+    /// Set once the slot is dying without a terminal — its producer went, or it
+    /// ran past its byte cap — so the `CloseSlot{PeerGone}` that tells the
+    /// consumer can wait behind whatever is still withheld and behind the fence.
+    ///
+    /// Nothing more arrives for the slot once it is set: the producer left of
+    /// its own accord in the first case and was disconnected in the second, so
+    /// the deferred close is always the slot's last record.
+    pub(super) close_owed: bool,
     gate: Arc<SlotGate>,
-    /// A rendezvous singleton is outstanding. `BATCHING.md` § "Slots": at most
-    /// one per slot, and the slot's later records wait for its admission so
-    /// `frame_seq` order survives the unordered resolve.
+    /// A singleton sent outside the batch is outstanding for this slot — a
+    /// rendezvous transfer, or the `OpenSlot` under `MuxConfig::async_open_ack`
+    /// whose admission did not resolve synchronously. `BATCHING.md` §
+    /// "Slots": at most one *fenced* singleton per slot, and the slot's later
+    /// records wait for its admission so `frame_seq` order survives the
+    /// unordered resolve. Only an `OpenSlot` the transport admitted
+    /// synchronously ever skips this — per-target FIFO already orders anything
+    /// dispatched after it, so there is nothing left for a fence to buy. A
+    /// rendezvous record always sets this: its bytes are resolved by the
+    /// receiver's ordered dispatcher in a detached task before dispatch, so
+    /// the sender's admission order says nothing about the order the receiver
+    /// applies it in.
     fenced: bool,
     /// Whether the slot is currently withholding for want of credit, so the
     /// starvation meter ticks once per episode rather than once per record.
@@ -252,7 +272,8 @@ pub(super) struct EgressSlot {
 }
 
 impl EgressSlot {
-    /// Whether a rendezvous singleton is outstanding for this slot.
+    /// Whether an outstanding singleton (rendezvous, or an `OpenSlot` under
+    /// `MuxConfig::async_open_ack`) fences this slot.
     pub(super) const fn is_fenced(&self) -> bool {
         self.fenced
     }
@@ -276,14 +297,31 @@ impl EgressSlot {
         self.starved = false;
     }
 
-    /// Fence the slot behind an outstanding rendezvous singleton.
+    /// Fence the slot behind an outstanding singleton (rendezvous, or an
+    /// `OpenSlot` under `MuxConfig::async_open_ack`).
     pub(super) fn fence(&mut self) {
         self.fenced = true;
     }
 
-    /// Release the rendezvous fence.
+    /// Release the fence once the singleton's admission has resolved.
     pub(super) fn unfence(&mut self) {
         self.fenced = false;
+    }
+
+    /// End the producer's inlet without retiring the slot.
+    ///
+    /// The slow-consumer kill has two halves, and behind a fence they no longer
+    /// travel together: the producer must be cut off at once — that is what the
+    /// kill is *for* — while the `CloseSlot` its consumer is owed is the slot's
+    /// next record and may not overtake the one still awaiting admission.
+    ///
+    /// Hence a gate close with the entry left in the table. Retiring the slot
+    /// here instead would bump the generation and free the index, and the
+    /// outstanding singleton's resolution — which names the `SlotId` it was sent
+    /// under — would then be rejected as stale: the deferred close would never
+    /// be written and the slot would sit in `live_slots` for good.
+    pub(super) fn disconnect(&self) {
+        self.gate.close();
     }
 
     /// Take the next `frame_seq` for a record this side is emitting.
@@ -373,7 +411,7 @@ impl EgressSlots {
             credit,
             next_seq: 0,
             withheld: WithheldQueue::new(slot_byte_budget),
-            inlet_closed: false,
+            close_owed: false,
             gate,
             fenced: false,
             starved: false,

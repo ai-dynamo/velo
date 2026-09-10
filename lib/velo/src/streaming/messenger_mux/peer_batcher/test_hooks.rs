@@ -15,7 +15,7 @@
 //! this is: a barrier the loop offers only when a test installed one, and a
 //! no-op — one `Option` check per wake, in `cfg(test)` builds only — otherwise.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::sync::Notify;
@@ -31,16 +31,38 @@ pub(crate) struct TestHooks {
     /// The loop is sitting at the barrier right now.
     parked: AtomicBool,
     resume: Notify,
+    /// Times `fire_singleton` has raised the fence.
+    ///
+    /// Whether a singleton's admission resolves before a test can observe the
+    /// slot's withheld queue is a genuine race against the watcher task
+    /// `fire_singleton` spawns — on an uncongested peer that race can go
+    /// either way, which makes the withheld gauge alone unfit for pinning "no
+    /// fence was raised at all". The fence itself, in contrast, is decided
+    /// synchronously on the batcher's own task before that task ever yields,
+    /// so counting it is race-free.
+    fenced: AtomicU64,
+    /// The next singleton watcher to finish holds its report at the gate
+    /// below instead of calling `singleton_resolved` right away.
+    ///
+    /// Exists to pin the one property racing the real watcher cannot show:
+    /// that an admission which never fenced writes nothing for a test to
+    /// later mistake for a *different*, still-outstanding singleton's answer.
+    /// Without this, "wait for the unfenced watcher's write, then fence a
+    /// second singleton on the same slot, then see which lands first" is a
+    /// coin flip against the scheduler — this makes the interleaving a
+    /// decision the test makes instead of one it hopes for.
+    resolutions_held: AtomicBool,
+    resolutions_gate: Notify,
 }
 
 impl TestHooks {
     /// Hold the loop at the barrier the next time it reaches one.
-    pub(super) fn pause(&self) {
+    pub(crate) fn pause(&self) {
         self.paused.store(true, Ordering::Release);
     }
 
     /// Let it continue.
-    pub(super) fn release(&self) {
+    pub(crate) fn release(&self) {
         self.paused.store(false, Ordering::Release);
         self.resume.notify_waiters();
     }
@@ -50,7 +72,7 @@ impl TestHooks {
     /// A positive fact, so a test that arranges state "while it is parked"
     /// really does. Polled rather than notified because the alternative is a
     /// wakeup protocol whose own races would need testing.
-    pub(super) async fn wait_until_parked(&self) {
+    pub(crate) async fn wait_until_parked(&self) {
         let deadline = tokio::time::Instant::now() + PATIENCE;
         while tokio::time::Instant::now() < deadline {
             if self.parked.load(Ordering::Acquire) {
@@ -59,6 +81,42 @@ impl TestHooks {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         panic!("the batcher never reached the barrier within {PATIENCE:?}");
+    }
+
+    /// Record that `fire_singleton` raised the fence.
+    pub(super) fn note_fenced(&self) {
+        self.fenced.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Times the fence has been raised so far.
+    pub(super) fn fenced_count(&self) -> u64 {
+        self.fenced.load(Ordering::Relaxed)
+    }
+
+    /// Hold every singleton watcher's report from here on, until released.
+    pub(super) fn hold_resolutions(&self) {
+        self.resolutions_held.store(true, Ordering::Release);
+    }
+
+    /// Let every held report through.
+    pub(super) fn release_resolutions(&self) {
+        self.resolutions_held.store(false, Ordering::Release);
+        self.resolutions_gate.notify_waiters();
+    }
+
+    /// Called by a singleton's watcher task once its admission has answered,
+    /// before it reports that answer onward. A no-op when nothing is holding.
+    pub(super) async fn await_resolutions_release(&self) {
+        loop {
+            // Registered before the check, for the same reason `barrier`
+            // registers its own wait first: a release landing between the two
+            // is held as a permit rather than missed.
+            let released = self.resolutions_gate.notified();
+            if !self.resolutions_held.load(Ordering::Acquire) {
+                return;
+            }
+            released.await;
+        }
     }
 
     /// Called by the run loop on each wake, before its drain loop runs.
