@@ -41,7 +41,7 @@ One draft PR, #86 (`response-plane` against `main`): `main` at a15f52d merged wi
 | credit on the next batch (#83) | Credit returns on the next batch for every slot that drained, named by the pump. The doorbell and the sweep are backstops. | With #84 and one runtime: p50 ahead of mux18p. |
 | one timer per stream (#84) | One pinned timer per stream in the reader pump, re-armed from the receive path. | The pump's timer subtree from 7.3 to 0.15 percent of the frontend's samples. |
 
-Versions: `velo` 0.13.0 (breaking on 0.12.0), `velo-ext` 0.5.1 with the pin `=0.5.1`; the semver gate passed against `origin/main`. Gate on the merge commit: fmt and clippy clean, 1,472 tests passed, 5 failed. The five are `main`'s own UCX idle-endpoint reaper tests (#69), which time out at 72 test threads and pass at 8 and serially; a run of `main` alone at the same parallelism settles whether they are `main`'s. The docs are PR #76.
+Versions: `velo` 0.13.0 (breaking on 0.12.0), `velo-ext` 0.5.1 with the pin `=0.5.1`; the semver gate passed against `origin/main`. Gate on the merge commit: fmt and clippy clean, 1,472 tests passed, 5 failed. The five are `main`'s own UCX idle-endpoint reaper tests (#69): `main` alone fails them the same way at 72 test threads and passes at 8 and serially, so they are `main`'s and load-dependent. The docs are PR #76.
 
 ## What changed in the harness
 
