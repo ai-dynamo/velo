@@ -28,22 +28,20 @@ Zero errors in eighteen reps of both arms.
 
 ## What changed in velo
 
-All draft PRs on `ai-dynamo/velo`, stacked on `drain-credit-return`. Every commit is signed off. Tests land with the code, each with a fail-before run (`.research/rig/failbefore-*.sh`).
+One draft PR, #86 (`response-plane` against `main`): `main` at a15f52d merged with the integration branch every rig matrix since 2026-09-06 ran on. The eight stacked draft PRs (#77 to #84) and the base branch `drain-credit-return` are folded into it and closed. #85 (one grant per half window) was measured and rejected and is not in it. Every commit is signed off. Tests landed with the code, each with a fail-before run (`.research/rig/failbefore-*.sh`).
 
-| PR | branch | change | measured |
-|---|---|---|---|
-| #77 | `w0-ingest-metrics` | Instruments the inbound queue and the attach round trip. | Located the backlog draw and the lane wait. No behaviour change. |
-| #78 | `w3-zero-rtt-attach` | Zero-RTT stream setup with prompt cancel. | Worker-to-client segment from 78 to 48 ms at p50. |
-| #79 | `w4-async-open-ack` | Acknowledges a stream open without waiting for its OpenSlot admission. | About 9 ms more on that segment with #78. Nothing alone. |
-| #80 | `w7-batcher-instruments` | Counts a batcher's sent records by type and its wakes by source. | Named the credit reply that multiplied batches tenfold under zero-RTT. |
-| #81 | `w7-reply-linger` | Credit replies form a batch for 1 ms instead of each writing one. | 4 to 6 times fewer frontend batches, 0.4 ms/req. |
-| #82 | `w8-control-map-bound` | Bounds the control maps by what the batcher allocated, not by a size cap. | Removed the HTTP 500s at the control cap. |
-| #83 | `w2d-touched-slot-reconcile` | Credit returns on the next batch for every slot that drained, named by the pump. The doorbell and the sweep are backstops. | With #84 and one runtime: p50 ahead of mux18p. |
-| #84 | `w2a-pump-timer-hoist` | One timer per stream in the reader pump, re-armed from the receive path, never firing under traffic. | The pump's timer subtree from 7.3 to 0.15 percent of the frontend's samples. |
-| #85 | `w2e-grant-threshold` | One grant per half window. | Closed: no CPU change, ITL p99 above mux18p's, exhaustion up. |
-| #76 | `response-plane-docs` | The campaign documents under `agent-docs/`. | |
+| piece (former PR) | change | measured |
+|---|---|---|
+| drain-driven credit return (base branch) | Credit returns when the consumer drains, with a per-peer visit floor (breaking). Two fixes: the drain-visit heap bounded to one entry per peer, and no runtime worker blocks on a terminal sentinel. | The base every arm ran on. |
+| instruments (#77, #80) | The inbound queue, the attach round trip, the egress writers, and the batcher's sent records by type and wakes by source. | Located the backlog draw, the lane wait and the reply that multiplied batches. |
+| zero-RTT stream setup (#78) | The worker sends without waiting for the attach round trip; cancel is restored in band. | Worker-to-client segment from 78 to 48 ms at p50. |
+| detached open ack (#79) | A stream open is acknowledged without waiting for its OpenSlot admission. | About 9 ms more on that segment with zero-RTT. |
+| reply linger (#81) | Credit replies form a batch for 1 ms instead of each writing one. | 4 to 6 times fewer frontend batches, 0.4 ms/req. |
+| control-map bound (#82) | The control maps are bounded by what the batcher allocated, not by a size cap. | Removed the HTTP 500s at the control cap. |
+| credit on the next batch (#83) | Credit returns on the next batch for every slot that drained, named by the pump. The doorbell and the sweep are backstops. | With #84 and one runtime: p50 ahead of mux18p. |
+| one timer per stream (#84) | One pinned timer per stream in the reader pump, re-armed from the receive path. | The pump's timer subtree from 7.3 to 0.15 percent of the frontend's samples. |
 
-The base branch `drain-credit-return` is not on `main`. It carries the drain-driven credit return with a per-peer visit floor (8a06493, a breaking change), the drain-visit heap bound (3eab5c9), the terminal-sentinel deadlock fix (af58539) and the load bench example (46e613d). It needs its own PR before the stack. The workspace version differs across the branches: `main` 0.12.0, the base 0.11.0, #77, #80 and #81 at 0.13.0 with `velo-ext` pinned at 0.5.1, the rest at 0.11.0 or 0.12.0. It is reconciled when the stack rebases. No PR carries the `human-review` tag yet: every review loop ended with residual doc-level findings, not a clean pass.
+Versions: `velo` 0.13.0 (breaking on 0.12.0), `velo-ext` 0.5.1 with the pin `=0.5.1`; the semver gate passed against `origin/main`. Gate on the merge commit: fmt and clippy clean, 1,472 tests passed, 5 failed. The five are `main`'s own UCX idle-endpoint reaper tests (#69), which time out at 72 test threads and pass at 8 and serially; a run of `main` alone at the same parallelism settles whether they are `main`'s. The docs are PR #76.
 
 ## What changed in the harness
 
