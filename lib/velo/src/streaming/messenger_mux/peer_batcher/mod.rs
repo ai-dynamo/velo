@@ -317,6 +317,7 @@ pub(crate) fn spawn(peer: WorkerId, ctx: BatcherContext) -> Arc<BatcherHandle> {
         streams: SelectAll::new(),
         stopping: false,
         async_open_ack,
+        staged_credit: Vec::new(),
         #[cfg(test)]
         hooks: ctx.hooks,
     };
@@ -367,6 +368,14 @@ struct Batcher {
     /// Whether an open acks before its `OpenSlot` is admitted. See
     /// [`MuxConfig::async_open_ack`].
     async_open_ack: bool,
+    /// Credit replies encoded into the batch the writer currently has open.
+    ///
+    /// `FlowControl::take_pending_grant` zeroes the ingress account's
+    /// `ungranted` when the reply is minted, so between that point and the
+    /// write the open batch holds the only copy of that credit. This is that
+    /// copy, kept so a batch thrown away rather than written can hand it back
+    /// — see [`Batcher::repost_staged_credit`].
+    staged_credit: Vec<(SlotId, u32)>,
     #[cfg(test)]
     hooks: Option<Arc<TestHooks>>,
 }
@@ -815,11 +824,17 @@ impl Batcher {
     /// not belong to that slot's outbound counter, and their order comes from
     /// batch position.
     async fn on_reply(&mut self, slot: SlotId, entry: PeerControl) {
-        if entry.credit > 0 {
-            self.push_reply(RecordType::CreditUpdate, |encoder| {
-                encoder.push_credit_update(slot, 0, entry.credit)
-            })
-            .await;
+        if entry.credit > 0
+            && self
+                .push_reply(RecordType::CreditUpdate, |encoder| {
+                    encoder.push_credit_update(slot, 0, entry.credit)
+                })
+                .await
+        {
+            // Recorded after the await, so a `push_reply` that had to flush
+            // the previous batch first attributes this credit to the batch it
+            // actually landed in rather than to the one already gone.
+            self.staged_credit.push((slot, entry.credit));
         }
         if let Some(reason) = entry.close {
             self.push_reply(RecordType::CloseSlot, |encoder| {
@@ -835,7 +850,7 @@ impl Batcher {
         &mut self,
         kind: RecordType,
         write: impl FnOnce(&mut BatchEncoder) -> Result<(), EncodeError>,
-    ) {
+    ) -> bool {
         let needed = record_encoded_len(4).unwrap_or(usize::MAX);
         self.ensure_batch();
         if !self.fits(needed, 1) {
@@ -854,7 +869,9 @@ impl Batcher {
             } else {
                 self.gate.stage_urgent(1);
             }
+            return true;
         }
+        false
     }
 
     fn on_retire(&mut self) {
@@ -899,6 +916,14 @@ impl Batcher {
     /// progress again.
     async fn flush(&mut self) {
         self.gate.cleared();
+        // Whatever credit this batch carries goes with the write either way.
+        // Admitted, it is the peer's. Refused, it dies with the epoch the
+        // refusal kills, and deliberately: a transport that refused this
+        // batch will not take the one a re-post rebuilds either, so re-posting
+        // here is an unbounded retry at the reply window's cadence rather than
+        // a recovery. `epoch_death` therefore finds nothing to hand back on
+        // this path, and everything to hand back on its other two.
+        self.staged_credit.clear();
         if let Err(writer::FlushFailed(error)) = self.writer.flush().await {
             tracing::warn!(
                 peer = %self.peer,
@@ -947,13 +972,46 @@ impl Batcher {
         self.publish_live_slots();
         // The staged batch goes with the epoch, so the gate must forget it too.
         // Otherwise the staged gauge — the one signal a forgotten flush shows up
-        // in — drifts up by a batch per epoch death and cries wolf. A staged
-        // credit reply discarded here is credit lost for good — see
-        // agent-docs/w7-reply-linger-credit-loss.md for which of this
-        // function's three call sites can reach it without a flush first.
+        // in — drifts up by a batch per epoch death and cries wolf. The credit
+        // that batch was carrying does not go with it: `repost_staged_credit`
+        // below hands it back, because the ingress slots it belongs to outlive
+        // the epoch. See agent-docs/w7-reply-linger-credit-loss.md and its
+        // 2026-09-11 addendum.
         self.gate.discarded();
+        self.repost_staged_credit();
         self.writer
             .reset_epoch(self.epochs.fetch_add(1, Ordering::Relaxed));
+    }
+
+    /// Hand back the credit a batch was carrying when it was thrown away.
+    ///
+    /// The slots this credit belongs to are *ingress* slots — the peer's
+    /// egress into us — and `close_all` above closes this side's egress slots,
+    /// so they outlive the epoch and their sender is still waiting on a window
+    /// nothing else re-derives. Posting it back to the control state puts it
+    /// where the drained reply came from, so the next batch re-advertises it.
+    ///
+    /// Safe to take the inbox lock here: all three callers reach this with the
+    /// drained control already released, never mid-`mutate`.
+    fn repost_staged_credit(&mut self) {
+        if self.staged_credit.is_empty() {
+            return;
+        }
+        let staged = std::mem::take(&mut self.staged_credit);
+        let replies: Vec<ReplyRecord> = staged
+            .iter()
+            .map(|&(slot, delta)| ReplyRecord::CreditUpdate { slot, delta })
+            .collect();
+        let recovered = self.control.reply(&replies);
+        if let Some(metrics) = &self.metrics {
+            for (_, delta) in staged {
+                if recovered {
+                    metrics.credit_reposted(delta);
+                } else {
+                    metrics.credit_lost(delta);
+                }
+            }
+        }
     }
 
     /// Close every slot on the way out, so producers learn immediately.
@@ -980,6 +1038,13 @@ impl Batcher {
         // Anything still staged dies with the task: the slots it belongs to are
         // being closed in the next line, so their consumers learn through
         // `Dropped` rather than through a batch nobody is left to admit.
+        //
+        // No `repost_staged_credit` here, and it is not an omission. The
+        // retirement path forces a write before it reaches this line, so it
+        // arrives with nothing staged. The two exits that skip that write both
+        // come from the whole mux going away, where there is no later batch to
+        // re-advertise into — and the inbox is closed one line above, so a
+        // re-post would be refused anyway.
         self.gate.discarded();
         let closed = self.slots.close_all();
         self.streams = SelectAll::new();

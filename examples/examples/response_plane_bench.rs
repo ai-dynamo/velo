@@ -35,8 +35,8 @@
 //! # The experiment it was built for
 //!
 //! `--credit-sweep-interval-ms` is the A/B. Hold everything else fixed, run it
-//! at 2 (velo's default) and again at 500, and the CPU difference is the
-//! sweep's cost with nothing else moving.
+//! at 2 (the pre-drain-hook cadence; velo's own default is 200) and again at
+//! 500, and the CPU difference is the sweep's cost with nothing else moving.
 //!
 //! **Scale `--engines`, not `--anchor-hosts`.** The sweep walks a node's
 //! *ingress* peers — the peers it receives batches from — so an anchor host's
@@ -394,7 +394,6 @@ struct EngineStats {
     requests: u32,
     tokens: u64,
     passes: u64,
-    writes: f64,
 }
 
 /// One decode engine: continuous batching, one token per active request per pass.
@@ -494,7 +493,6 @@ async fn engine(
         }
     }
 
-    stats.writes = node.wire_writes(mux);
     Ok(stats)
 }
 
@@ -661,7 +659,12 @@ async fn main() -> Result<()> {
         lat.merge(l)?;
     }
 
-    let wire_writes: f64 = engine_stats.iter().map(|s| s.writes).sum();
+    // Read after the hosts have every terminal, not when each engine's loop
+    // exits: `finalize` only stages a terminal, so the last batch of a run is
+    // still unwritten at that point. Sampling there undercounts writes and
+    // inflates `tokens_per_write` — the one number this example exists to
+    // report.
+    let wire_writes: f64 = engines.iter().map(|node| node.wire_writes(mux)).sum();
     let tokens: u64 = engine_stats.iter().map(|s| s.tokens).sum();
     let tokens_per_write = if wire_writes > 0.0 {
         tokens as f64 / wire_writes

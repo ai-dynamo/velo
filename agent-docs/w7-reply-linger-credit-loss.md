@@ -85,3 +85,45 @@ time. Pinned today by
 which characterizes loss path 1 under a live `reply_linger` window and is
 deliberately not a passing invariant — it is the hole, kept green so a change
 to it is a deliberate decision rather than a silent regression.
+
+## Addendum, 2026-09-11: loss path 1 is closed, loss path 2 is left open on purpose
+
+The body above stands as the analysis. What changed is the answer to "what
+fixing this would need", and only for loss path 1.
+
+`Batcher` now keeps its own copy of the credit it encodes into the batch the
+writer has open (`staged_credit`, one `(SlotId, u32)` per `CreditUpdate`).
+`epoch_death` hands that copy back to the control state through
+`ControlInbox::reply`, which is where the drained reply came from, so the next
+batch re-advertises it. This is the first of the two remedies the body named —
+re-post on discard — chosen over deferring the `ungranted` zeroing. The second remedy must carry
+write-confirmation from the batcher back into `PeerIngress` per slot, across
+the boundary `flush_gate.rs` states it keeps.
+
+Why the hand-back is correct rather than a double grant: the slots this credit
+belongs to are *ingress* slots, the peer's egress into us. `epoch_death`'s
+`close_all` closes this side's *egress* slots, so the ingress slots outlive the
+epoch and their sender is still waiting on a window nothing else re-derives —
+`take_pending_grant` zeroed `ungranted` at mint time and no later reconcile
+reaches the same occupancy.
+
+**Loss path 2 stays open, deliberately.** `Batcher::flush` clears
+`staged_credit` before it attempts the write, so a refused batch's credit is
+not handed back. A transport that refused this batch will not take the one a
+re-post rebuilds either. The re-post also wakes the task, so closing path 2
+turns a permanently failing transport into an unbounded retry paced by
+`reply_linger`. The batcher calls `mark_active` on every wake, so the idle
+reaper never reaches it. Losing the credit of a peer whose writes are failing
+costs nothing the failing epoch has not already cost. Spinning does. If that
+judgement is revisited, bound the retry rather than remove the clear.
+
+Two counters make both arms visible:
+`velo_streaming_mux_credit_reposted_total` for credit handed back, and
+`velo_streaming_mux_credit_lost_total` for a hand-back refused because the
+batcher had already taken its last drain. The second must stay at zero.
+
+Pinned by
+`peer_batcher::tests::reply_linger::epoch_death_returns_the_credit_its_discarded_batch_carried`,
+which replaces the characterization test the body names. That test asserted
+the loss; it was removed rather than inverted in place, because what it pinned
+no longer happens.

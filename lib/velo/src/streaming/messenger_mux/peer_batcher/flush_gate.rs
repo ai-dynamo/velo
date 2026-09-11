@@ -265,14 +265,12 @@ impl FlushGate {
     /// signal, so a discarded batch that kept its count would read as an
     /// application that stopped flushing.
     ///
-    /// A pending credit reply discarded here is credit lost for good, and
-    /// `reply_linger` widens the window in which that can happen — this file
-    /// knows nothing about slots, credit or epochs, so the mechanism (which
-    /// call sites can reach here without a flush first, and why) lives in
-    /// `agent-docs/w7-reply-linger-credit-loss.md`, cross-referenced from
-    /// [`epoch_death`](super::Batcher::epoch_death) and from
-    /// `FlowControl::take_pending_grant`. Pinned today by
-    /// `super::tests::reply_linger::epoch_death_discards_a_staged_reply_and_the_credit_is_lost`.
+    /// A pending credit reply discarded here used to be credit lost for good.
+    /// It is not any more: this file knows nothing about slots, credit or
+    /// epochs, so the caller keeps its own copy of what it staged and hands it
+    /// back — see [`epoch_death`](super::Batcher::epoch_death) and
+    /// `FlowControl::take_pending_grant`. Pinned by
+    /// `super::tests::reply_linger::epoch_death_returns_the_credit_its_discarded_batch_carried`.
     pub(super) fn discarded(&mut self) {
         self.forget_staged();
     }

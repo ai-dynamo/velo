@@ -108,9 +108,13 @@ impl TestHooks {
     /// before it reports that answer onward. A no-op when nothing is holding.
     pub(super) async fn await_resolutions_release(&self) {
         loop {
-            // Registered before the check, for the same reason `barrier`
-            // registers its own wait first: a release landing between the two
-            // is held as a permit rather than missed.
+            // Constructed before the check, for the same reason `barrier`
+            // constructs its own wait first. `notified` snapshots the
+            // `notify_waiters` generation counter, and the future's first poll
+            // completes on a mismatch — so a release landing between the two
+            // is carried by this future. Construct it after the check instead
+            // and the release has nothing to land on: `notify_waiters` stores
+            // no permit. Both halves are pinned in this file's `tests`.
             let released = self.resolutions_gate.notified();
             if !self.resolutions_held.load(Ordering::Acquire) {
                 return;
@@ -126,8 +130,9 @@ impl TestHooks {
         }
         self.parked.store(true, Ordering::Release);
         loop {
-            // Registered before the check, so a release landing between the two
-            // is held as a permit rather than missed.
+            // Constructed before the check, so a release landing between the
+            // two is carried by this future rather than lost — see
+            // `await_resolutions_release` for the mechanism.
             let resumed = self.resume.notified();
             if !self.paused.load(Ordering::Acquire) {
                 break;
@@ -135,5 +140,51 @@ impl TestHooks {
             resumed.await;
         }
         self.parked.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The property both waits above are built on, stated on the primitive
+    /// itself: a `Notified` constructed *before* a `notify_waiters` still
+    /// completes on its first poll.
+    ///
+    /// `Notify::notified` reads the `notify_waiters` generation counter into
+    /// the future at construction, and the first poll compares it against the
+    /// live one before anything else. The release is therefore carried by the
+    /// future, not held on the `Notify` — which is what makes constructing
+    /// before the flag read sufficient, with no registration and no permit
+    /// involved.
+    #[tokio::test]
+    async fn a_release_after_construction_completes_the_wait() {
+        let gate = Notify::new();
+        let waiter = gate.notified();
+        gate.notify_waiters();
+        tokio::time::timeout(PATIENCE, waiter)
+            .await
+            .expect("a release after construction must complete the wait");
+    }
+
+    /// The other half, and why the order is load-bearing rather than
+    /// stylistic: a `notify_waiters` landing *before* the future exists is
+    /// gone, because there is no permit for a later future to find.
+    ///
+    /// Constructing after the flag read — the shape this file deliberately
+    /// does not use — puts the release in exactly this window, and the wait
+    /// never ends.
+    #[tokio::test(start_paused = true)]
+    async fn a_release_before_construction_is_lost() {
+        let gate = Notify::new();
+        gate.notify_waiters();
+        let waiter = gate.notified();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), waiter)
+                .await
+                .is_err(),
+            "notify_waiters stores no permit: a wait constructed after it has \
+             nothing to find, which is the bug the construct-first order avoids"
+        );
     }
 }

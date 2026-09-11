@@ -50,8 +50,16 @@ async fn inbound_frames_are_recorded_on_every_message_type() {
 
     use crate::common::TransportFactory;
 
-    let sender = UcxFactory::create().await.expect("ucx sender");
-    let receiver = UcxFactory::create().await.expect("ucx receiver");
+    // Bounded like every other await here: a UCX worker that never finishes
+    // starting would otherwise hang the whole target rather than fail this test.
+    let sender = tokio::time::timeout(OUTER_TEST_TIMEOUT, UcxFactory::create())
+        .await
+        .expect("the ucx sender must start within the deadline")
+        .expect("ucx sender");
+    let receiver = tokio::time::timeout(OUTER_TEST_TIMEOUT, UcxFactory::create())
+        .await
+        .expect("the ucx receiver must start within the deadline")
+        .expect("ucx receiver");
 
     let registry = Registry::new();
     let metrics = VeloMetrics::register(&registry).expect("register metrics");

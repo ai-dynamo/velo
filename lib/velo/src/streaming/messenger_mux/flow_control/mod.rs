@@ -421,8 +421,11 @@ impl SlotCreditAccount {
     /// there is nothing to advertise.
     ///
     /// This zeroes `ungranted` at mint time, before the record it becomes is
-    /// even staged — see `agent-docs/w7-reply-linger-credit-loss.md` for why
-    /// that makes the batch carrying it the credit's only remaining copy.
+    /// even staged, so from here until the write the batch carrying it holds
+    /// the only copy of that credit. A batch thrown away rather than written
+    /// hands it back — see `Batcher::repost_staged_credit` — which is what
+    /// keeps the zeroing safe. `agent-docs/w7-reply-linger-credit-loss.md`
+    /// records the loss this used to be and the 2026-09-11 addendum the fix.
     pub(crate) fn take_pending_grant(&mut self) -> Option<u32> {
         let delta = self.ungranted;
         if delta == 0 {

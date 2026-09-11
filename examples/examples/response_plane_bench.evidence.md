@@ -133,7 +133,7 @@ Five repetitions per cell, 2000 requests, 32-token responses, max-batch 8, 2 anc
 
 Reading it out: at 256 ingress peers, velo's default 2 ms sweep costs **+21% CPU per token, +36% wall time, −26% throughput and +44% TTFT p99** against a sweep that is effectively switched off. Nothing else changed between the arms.
 
-## It only appears above ~64 peers
+## It only appears above ~64 peers (RETRACTED — see the banner above)
 
 Three repetitions per cell, same workload, CPU per token in µs:
 
@@ -149,7 +149,7 @@ Flat at roughly 7–8% — the noise floor of this rig — through 64 peers, the
 
 **Dynamo's published rig is 512 workers against 2 frontends, which is 256 ingress peers per frontend.** The measurement lands on their operating point rather than near it, which is worth saying plainly and also worth being suspicious of — see the caveats.
 
-## Caveats, including one that cuts against the headline
+## Caveats, including one that cuts against the headline (RETRACTED — see the banner above)
 
 **The first scan over-read the effect.** Three repetitions put 256 peers at 1.51×; five repetitions put it at 1.21×. The 1.51× was one unlucky run in a three-sample median. **21% is the number to quote**, and the 1.51× row above is retained only to show the scaling shape, not as a magnitude. If a decision rests on this, run more repetitions first.
 
@@ -161,7 +161,7 @@ Flat at roughly 7–8% — the noise floor of this rig — through 64 peers, the
 
 **Longer sweeps are not free.** The sweep is the backstop that un-parks a slot which ran out of credit with nothing further arriving, and batcher eviction free-rides on it. Raising the interval to 500 ms is a measurement instrument, not a proposed default. The fix the plan recommends is drain-driven credit return, which removes the need for the sweep to be the primary mechanism at all; the interval can then be relaxed without giving up the backstop.
 
-## What this does and does not establish
+## What this does and does not establish (RETRACTED — see the banner above; the standing conclusion is "What this establishes" under the exclusive-node measurement)
 
 Established: gap 1 is real, it is worth roughly a fifth of CPU per token and a quarter of throughput at 256 ingress peers, and it is invisible below about 64. The optimisation work has a measured justification.
 

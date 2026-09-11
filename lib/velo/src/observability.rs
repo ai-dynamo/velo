@@ -874,6 +874,8 @@ pub(crate) struct MuxMetricsHandle {
     hold_overflow_total: Counter,
     control_refused_total: Counter,
     epoch_deaths_total: Counter,
+    credit_reposted_total: Counter,
+    credit_lost_total: Counter,
     batch_seq_gaps_total: Counter,
     drain_visits_total: Counter,
     records_sent: [Counter; crate::streaming::messenger_mux::protocol::RECORD_TYPE_COUNT],
@@ -1019,6 +1021,16 @@ impl MuxMetricsHandle {
         self.epoch_deaths_total.inc();
     }
 
+    /// `delta` credit from a discarded batch went back to the control state.
+    pub(crate) fn credit_reposted(&self, delta: u32) {
+        self.credit_reposted_total.inc_by(f64::from(delta));
+    }
+
+    /// `delta` credit from a discarded batch had nowhere to go back to.
+    pub(crate) fn credit_lost(&self, delta: u32) {
+        self.credit_lost_total.inc_by(f64::from(delta));
+    }
+
     /// `batches` batches were skipped between the expected and received
     /// `batch_seq`.
     pub(crate) fn batch_seq_gap(&self, batches: u32) {
@@ -1090,6 +1102,8 @@ pub struct VeloMetrics {
     streaming_mux_hold_overflow_total: Counter,
     streaming_mux_control_refused_total: Counter,
     streaming_mux_epoch_deaths_total: Counter,
+    streaming_mux_credit_reposted_total: Counter,
+    streaming_mux_credit_lost_total: Counter,
     streaming_mux_batch_seq_gaps_total: Counter,
     streaming_mux_drain_visits_total: Counter,
     streaming_mux_records_sent_total: CounterVec,
@@ -1720,6 +1734,27 @@ impl VeloMetrics {
                  signal the mux has.",
             ))?,
         )?;
+        let streaming_mux_credit_reposted_total = register_collector(
+            registry,
+            Counter::with_opts(Opts::new(
+                "velo_streaming_mux_credit_reposted_total",
+                "Ingress credit that was minted into a batch the epoch then \
+                 threw away, and handed back to the control state so a later \
+                 batch re-advertises it. `take_pending_grant` zeroes the \
+                 slot's `ungranted` at mint time, so without this the sender's \
+                 window would shrink by the delta for the life of the slot.",
+            ))?,
+        )?;
+        let streaming_mux_credit_lost_total = register_collector(
+            registry,
+            Counter::with_opts(Opts::new(
+                "velo_streaming_mux_credit_lost_total",
+                "Ingress credit from a discarded batch that was not handed \
+                 back, because the batcher had already taken its last drain. \
+                 The sender's window for that slot is short by this much until \
+                 the slot closes. Expected to stay at zero.",
+            ))?,
+        )?;
         let streaming_mux_batch_seq_gaps_total = register_collector(
             registry,
             Counter::with_opts(Opts::new(
@@ -1933,6 +1968,8 @@ impl VeloMetrics {
             streaming_mux_hold_overflow_total,
             streaming_mux_control_refused_total,
             streaming_mux_epoch_deaths_total,
+            streaming_mux_credit_reposted_total,
+            streaming_mux_credit_lost_total,
             streaming_mux_batch_seq_gaps_total,
             streaming_mux_drain_visits_total,
             streaming_mux_records_sent_total,
@@ -2142,6 +2179,8 @@ impl VeloMetrics {
             hold_overflow_total: self.streaming_mux_hold_overflow_total.clone(),
             control_refused_total: self.streaming_mux_control_refused_total.clone(),
             epoch_deaths_total: self.streaming_mux_epoch_deaths_total.clone(),
+            credit_reposted_total: self.streaming_mux_credit_reposted_total.clone(),
+            credit_lost_total: self.streaming_mux_credit_lost_total.clone(),
             batch_seq_gaps_total: self.streaming_mux_batch_seq_gaps_total.clone(),
             drain_visits_total: self.streaming_mux_drain_visits_total.clone(),
             records_sent,
