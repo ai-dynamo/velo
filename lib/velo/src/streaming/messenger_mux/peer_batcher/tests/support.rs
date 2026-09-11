@@ -94,6 +94,13 @@ pub(super) struct Harness {
     pub(super) batches: flume::Receiver<Bytes>,
     pub(super) registry: prometheus::Registry,
     pub(super) cancel: CancellationToken,
+    /// The peer registry this batcher was spawned against, so a test can put a
+    /// replacement batcher for the same peer in it — the shape `on_retire`
+    /// meets when a `connect()` loses the race with the sweep.
+    batchers: Arc<BatcherMap>,
+    peer: WorkerId,
+    metrics: Arc<VeloMetrics>,
+    epochs: Arc<AtomicU64>,
     // Held so the messengers outlive the batcher.
     _sender: Arc<Messenger>,
     _capture: Arc<Messenger>,
@@ -168,14 +175,16 @@ pub(super) async fn harness_with_hooks(
     let metrics = Arc::new(VeloMetrics::register(&registry).expect("register metrics"));
     let cancel = CancellationToken::new();
     let peer = capture.instance_id().worker_id();
+    let batchers: Arc<BatcherMap> = Arc::new(DashMap::new());
+    let epochs = Arc::new(AtomicU64::new(1));
     let handle = spawn(
         peer,
         BatcherContext {
             messenger: Arc::clone(&sender),
             config: config.clone(),
             metrics: Some(metrics.bind_mux()),
-            epochs: Arc::new(AtomicU64::new(1)),
-            batchers: Arc::new(DashMap::new()),
+            epochs: Arc::clone(&epochs),
+            batchers: Arc::clone(&batchers),
             cancel: cancel.clone(),
             hooks,
         },
@@ -187,6 +196,10 @@ pub(super) async fn harness_with_hooks(
         batches,
         registry,
         cancel,
+        batchers,
+        peer,
+        metrics,
+        epochs,
         _sender: sender,
         _capture: capture,
     }
@@ -338,6 +351,30 @@ impl Harness {
     /// An application flush, as `Velo::flush_batch` delivers it.
     pub(super) fn flush_batch(&self) {
         self.handle.kick_flush();
+    }
+
+    /// Put a second batcher for the same peer in the registry, as a
+    /// `connect()` that lost the race with the sweep does.
+    ///
+    /// This is the shape `on_retire` meets on its `Occupied` arm: it stops
+    /// while it still holds live slots, so its final drain can still reach
+    /// `epoch_death`. The returned handle is where a reply the retiring
+    /// batcher refuses has to end up.
+    pub(super) fn install_replacement(&self) -> Arc<BatcherHandle> {
+        let handle = spawn(
+            self.peer,
+            BatcherContext {
+                messenger: Arc::clone(&self._sender),
+                config: self.config.clone(),
+                metrics: Some(self.metrics.bind_mux()),
+                epochs: Arc::clone(&self.epochs),
+                batchers: Arc::clone(&self.batchers),
+                cancel: self.cancel.clone(),
+                hooks: None,
+            },
+        );
+        self.batchers.insert(self.peer, Arc::clone(&handle));
+        handle
     }
 }
 

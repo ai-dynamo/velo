@@ -469,3 +469,69 @@ async fn a_cancelled_batcher_is_unregistered_before_it_refuses_a_reply() {
         );
     }
 }
+
+/// Credit refused by a retiring batcher reaches the one that replaced it.
+///
+/// `on_retire`'s `Occupied` arm stops a batcher that still holds live slots,
+/// so its final drain can still reach `epoch_death` — and that drain runs
+/// after `ControlInbox::close`. `on_control` applies `peers` before `mine`, so
+/// a credit reply in that drain is staged first and the failed singleton
+/// behind it then discards the batch carrying it. The hand-back
+/// `repost_staged_credit` makes is refused by the closed inbox, which is the
+/// one way the credit can still go missing.
+///
+/// It must not. The slot the credit belongs to is an ingress slot, which
+/// outlives both the epoch and this batcher, and the registry already holds
+/// the batcher that took the peer over. That is where the credit goes.
+#[tokio::test(flavor = "multi_thread")]
+async fn credit_refused_by_a_retiring_batcher_reaches_its_replacement() {
+    let hooks = Arc::new(TestHooks::default());
+    let harness = harness_with_hooks(MuxConfig::default(), Some(Arc::clone(&hooks))).await;
+    let (_inlet, slot) = harness.open(1, 1).await;
+
+    // The `connect()` that lost the race, already serving the peer.
+    let _replacement = harness.install_replacement();
+
+    // The sweep's eviction by hand. `try_retire` would refuse this batcher —
+    // it holds a live slot — which is exactly the arm under test.
+    hooks.pause();
+    harness.handle.retire();
+    hooks.wait_until_parked().await;
+
+    // Both land in the drain that `close` takes: the credit is staged, and
+    // the failed singleton behind it kills the epoch that was carrying it.
+    harness
+        .handle
+        .reply(&[ReplyRecord::CreditUpdate { slot, delta: 7 }]);
+    harness.handle.control.singleton_resolved(slot, false);
+    hooks.release();
+
+    // Waited on first and on its own: without the epoch death this test never
+    // reached the race, and the credit assertions below would pass vacuously.
+    eventually(|| {
+        harness
+            .snapshot()
+            .counter("velo_streaming_mux_epoch_deaths_total", &[])
+            >= 1.0
+    })
+    .await;
+    eventually(|| {
+        let snapshot = harness.snapshot();
+        snapshot.counter("velo_streaming_mux_credit_reposted_total", &[])
+            + snapshot.counter("velo_streaming_mux_credit_lost_total", &[])
+            >= 7.0
+    })
+    .await;
+
+    let snapshot = harness.snapshot();
+    assert_eq!(
+        snapshot.counter("velo_streaming_mux_credit_lost_total", &[]),
+        0.0,
+        "a replacement was in the registry, so nothing had to be written off"
+    );
+    assert_eq!(
+        snapshot.counter("velo_streaming_mux_credit_reposted_total", &[]),
+        7.0,
+        "the whole delta must reach the batcher that took the peer over"
+    );
+}

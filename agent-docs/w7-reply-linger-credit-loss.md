@@ -117,10 +117,21 @@ reaper never reaches it. Losing the credit of a peer whose writes are failing
 costs nothing the failing epoch has not already cost. Spinning does. If that
 judgement is revisited, bound the retry rather than remove the clear.
 
+The hand-back has a second destination, because the inbox is not always open
+when `epoch_death` runs. `on_retire`'s `Occupied` arm stops a batcher that
+still holds live slots, so the drain that `ControlInbox::close` takes can still
+reach `epoch_death`, and `on_control` applies `peers` before `mine`. A credit
+reply in that drain is staged first and the failed singleton behind it discards
+the batch. The refused hand-back then goes to the batcher that took the peer
+over, which is the answer `MuxCore::send_replies` already gives a refused
+writer. One attempt, not that function's loop: the loop terminates because it
+can spawn a batcher, and the batcher task can only read the registry.
+
 Two counters make both arms visible:
 `velo_streaming_mux_credit_reposted_total` for credit handed back, and
-`velo_streaming_mux_credit_lost_total` for a hand-back refused because the
-batcher had already taken its last drain. The second must stay at zero.
+`velo_streaming_mux_credit_lost_total` for credit that reached neither
+destination. The second must stay at zero. Pinned by
+`peer_batcher::tests::control::credit_refused_by_a_retiring_batcher_reaches_its_replacement`.
 
 Pinned by
 `peer_batcher::tests::reply_linger::epoch_death_returns_the_credit_its_discarded_batch_carried`,

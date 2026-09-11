@@ -1749,10 +1749,10 @@ impl VeloMetrics {
             registry,
             Counter::with_opts(Opts::new(
                 "velo_streaming_mux_credit_lost_total",
-                "Ingress credit from a discarded batch that was not handed \
-                 back, because the batcher had already taken its last drain. \
-                 The sender's window for that slot is short by this much until \
-                 the slot closes. Expected to stay at zero.",
+                "Ingress credit from a discarded batch that reached neither \
+                 the batcher's own control state nor the batcher that took the \
+                 peer over. The sender's window for that slot is short by this \
+                 much until the slot closes. Expected to stay at zero.",
             ))?,
         )?;
         let streaming_mux_batch_seq_gaps_total = register_collector(

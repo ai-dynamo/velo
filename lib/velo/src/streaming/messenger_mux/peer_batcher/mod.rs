@@ -991,6 +991,14 @@ impl Batcher {
     /// nothing else re-derives. Posting it back to the control state puts it
     /// where the drained reply came from, so the next batch re-advertises it.
     ///
+    /// The inbox refuses this once the task has taken its last drain, which
+    /// `on_retire`'s `Occupied` arm makes reachable: it stops a batcher that
+    /// still holds live slots, so the drain that `close` takes can still reach
+    /// `epoch_death`. The credit then goes to whichever batcher took the peer
+    /// over, the same answer `MuxCore::send_replies` gives a refused writer.
+    /// One attempt, not `send_replies`' loop: that loop terminates because it
+    /// can spawn a batcher, and this side can only read the registry.
+    ///
     /// Safe to take the inbox lock here: all three callers reach this with the
     /// drained control already released, never mid-`mutate`.
     fn repost_staged_credit(&mut self) {
@@ -1002,7 +1010,10 @@ impl Batcher {
             .iter()
             .map(|&(slot, delta)| ReplyRecord::CreditUpdate { slot, delta })
             .collect();
-        let recovered = self.control.reply(&replies);
+        let recovered = self.control.reply(&replies)
+            || self
+                .replacement()
+                .is_some_and(|handle| handle.reply(&replies));
         if let Some(metrics) = &self.metrics {
             for (_, delta) in staged {
                 if recovered {
@@ -1012,6 +1023,15 @@ impl Batcher {
                 }
             }
         }
+    }
+
+    /// The batcher that has taken this peer over, when it is not this one.
+    ///
+    /// Cloned out rather than used through the guard: holding a `DashMap` shard
+    /// lock across `reply`'s own mutex buys nothing and orders two locks.
+    fn replacement(&self) -> Option<Arc<BatcherHandle>> {
+        let entry = self.batchers.get(&self.peer)?;
+        (!Arc::ptr_eq(entry.value(), &self.handle)).then(|| Arc::clone(entry.value()))
     }
 
     /// Close every slot on the way out, so producers learn immediately.
