@@ -75,7 +75,11 @@ the same `Arc<BatcherHandle>` the task holds for its own lifetime. The
 `stopping` branch (peer retirement) is not among these exits: it forces a
 write before it tears down, so retirement loses no staged credit.
 
-## What fixing this would need
+## What fixing this would need (SUPERSEDED — see the 2026-09-11 addendum)
+
+The test this section names no longer exists. Loss path 1 is closed and the
+addendum below records how. The reasoning is kept because it is what the fix
+was built from.
 
 Neither loss path is `flush_gate.rs`'s to close, and neither is in scope for
 `w7-reply-linger`. A fix would re-post the pending grant on discard, or defer
@@ -127,10 +131,19 @@ over, which is the answer `MuxCore::send_replies` already gives a refused
 writer. One attempt, not that function's loop: the loop terminates because it
 can spawn a batcher, and the batcher task can only read the registry.
 
-Two counters make both arms visible:
-`velo_streaming_mux_credit_reposted_total` for credit handed back, and
-`velo_streaming_mux_credit_lost_total` for credit that reached neither
-destination. The second must stay at zero. Pinned by
+Two counters make both arms visible.
+`velo_streaming_mux_credit_reposted_total` counts credit handed back.
+`velo_streaming_mux_credit_lost_total` counts credit that a hand-back was
+attempted for and that reached neither destination.
+
+`credit_lost_total` must stay at zero, and loss path 2 does not soften that.
+Path 2's credit never reaches either counter, because `Batcher::flush` clears
+`staged_credit` before the write and `repost_staged_credit` then returns on an
+empty set. Path 2 remains what the body says it is: a loss with no counter of
+its own. Movement on `credit_lost_total` therefore means the recovery path
+itself failed, which is worth an alarm rather than a tolerance.
+
+Pinned by
 `peer_batcher::tests::control::credit_refused_by_a_retiring_batcher_reaches_its_replacement`.
 
 Pinned by
