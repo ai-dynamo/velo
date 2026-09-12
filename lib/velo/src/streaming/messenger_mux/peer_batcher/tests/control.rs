@@ -490,7 +490,7 @@ async fn credit_refused_by_a_retiring_batcher_reaches_its_replacement() {
     let (_inlet, slot) = harness.open(1, 1).await;
 
     // The `connect()` that lost the race, already serving the peer.
-    let _replacement = harness.install_replacement();
+    let replacement = harness.install_replacement();
 
     // The sweep's eviction by hand. `try_retire` would refuse this batcher —
     // it holds a live slot — which is exactly the arm under test.
@@ -534,4 +534,18 @@ async fn credit_refused_by_a_retiring_batcher_reaches_its_replacement() {
         7.0,
         "the whole delta must reach the batcher that took the peer over"
     );
+
+    // The counters above prove which recovery arm ran. The wire is the real
+    // outcome: make the replacement flush and verify that it retained the
+    // original slot and delta rather than merely accepting the hand-off.
+    replacement.kick_flush();
+    let batch = harness.next_batch().await;
+    let recovered: Vec<_> = batch
+        .records
+        .iter()
+        .filter(|record| record.kind == RecordType::CreditUpdate)
+        .collect();
+    assert_eq!(recovered.len(), 1, "credit is handed off exactly once");
+    assert_eq!(recovered[0].slot, slot, "the hand-off preserves the slot");
+    assert_eq!(recovered[0].credit, 7, "the hand-off preserves the delta");
 }
