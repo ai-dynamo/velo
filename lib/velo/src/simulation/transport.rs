@@ -152,7 +152,16 @@ impl Transport for SimTransport {
         &self,
         _observability: std::sync::Arc<dyn velo_ext::TransportObservability>,
     ) {
-        // No-op for simulation
+        // No-op for simulation: the handle would have to reach `SimFabric`,
+        // which delivers to the *target* instance's adapter and so needs the
+        // target's handle, and `set_observability` runs before `start()` — the
+        // point at which a `SimTransport` first learns its own instance id.
+        //
+        // The consequence is the messenger's derived inbound-queue depth
+        // (`frames_total{inbound,message,accepted} - inbound_dequeued_total`):
+        // the fabric admits without recording, so under this transport the
+        // accepted side stays at zero and the difference runs negative. The
+        // README's metric section says so beside the recipe.
     }
 
     fn begin_drain(&self) {

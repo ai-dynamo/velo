@@ -26,7 +26,6 @@
 //! payload gets one [`DecodeError`], not a loop and not an allocation.
 
 use bytes::{BufMut, BytesMut};
-#[cfg(test)]
 use std::cmp::Ordering;
 use std::fmt;
 use std::iter::FusedIterator;
@@ -257,7 +256,47 @@ pub(crate) enum RecordType {
     SlotHeartbeat = 4,
 }
 
+/// The label value `velo_streaming_mux_records_sent_total` files each
+/// [`RecordType`] under, indexed by [`RecordType::count_index`].
+pub(crate) const RECORD_TYPE_LABELS: [&str; 5] = [
+    "data",
+    "open_slot",
+    "close_slot",
+    "credit_update",
+    "slot_heartbeat",
+];
+
+/// Number of [`RecordType`] variants — the width of a per-type count array.
+pub(crate) const RECORD_TYPE_COUNT: usize = RECORD_TYPE_LABELS.len();
+
 impl RecordType {
+    /// Dense index into [`RECORD_TYPE_LABELS`] and `BatchEncoder`'s per-type
+    /// count array.
+    ///
+    /// A variant added here without a matching [`RECORD_TYPE_LABELS`] entry
+    /// panics on its first `push()` — an out-of-bounds write into
+    /// `record_type_counts`, sized by [`RECORD_TYPE_COUNT`].
+    /// `protocol::tests::decodable_record_type_has_in_range_unique_count_index`
+    /// catches an in-range collision too, for every variant [`Self::from_u8`]
+    /// decodes. It cannot reach a variant constructed directly without a
+    /// [`Self::from_u8`] arm — `#[cfg(test)]` `push_heartbeat` builds
+    /// `SlotHeartbeat` that way. An out-of-range arm there still panics
+    /// `push`; an in-range arm colliding with another variant's does not — it
+    /// silently files that variant's records under the colliding variant's
+    /// label in `velo_streaming_mux_records_sent_total`, and no test in the
+    /// tree catches it. Grow this match, [`RECORD_TYPE_LABELS`] and the
+    /// [`Self::from_u8`] arm together (see `agent-docs/w7-batcher-instrument-cost.md`
+    /// for the named-field alternative considered and rejected for this).
+    pub(crate) const fn count_index(self) -> usize {
+        match self {
+            Self::Data => 0,
+            Self::OpenSlot => 1,
+            Self::CloseSlot => 2,
+            Self::CreditUpdate => 3,
+            Self::SlotHeartbeat => 4,
+        }
+    }
+
     /// Decodes a discriminant, or `None` for a type this build does not know.
     pub(crate) const fn from_u8(value: u8) -> Option<Self> {
         match value {
@@ -459,6 +498,13 @@ pub(crate) const fn record_encoded_len(body_len: usize) -> Option<usize> {
 pub(crate) struct BatchEncoder {
     buf: BytesMut,
     record_count: u16,
+    /// Records appended so far, by [`RecordType::count_index`] index.
+    ///
+    /// Tracked here rather than by the batcher's caller counting `push`
+    /// invocations, because this is the one funnel every record already goes
+    /// through — a discarded batch (an epoch death, or the task tearing down)
+    /// simply never reads this out, so nothing staged can be counted as sent.
+    record_type_counts: [u16; RECORD_TYPE_COUNT],
 }
 
 impl BatchEncoder {
@@ -477,12 +523,19 @@ impl BatchEncoder {
         Self {
             buf,
             record_count: 0,
+            record_type_counts: [0; RECORD_TYPE_COUNT],
         }
     }
 
     /// Records appended so far.
     pub(crate) const fn record_count(&self) -> u16 {
         self.record_count
+    }
+
+    /// Records appended so far, by type — read once when the batch is handed
+    /// to the messenger, alongside [`Self::record_count`], never per record.
+    pub(crate) const fn record_type_counts(&self) -> [u16; RECORD_TYPE_COUNT] {
+        self.record_type_counts
     }
 
     /// Whether the batch is worth sending.
@@ -588,6 +641,7 @@ impl BatchEncoder {
         self.buf.put_u32(len);
         write_body(&mut self.buf);
         self.record_count += 1;
+        self.record_type_counts[record_type.count_index()] += 1;
         Ok(())
     }
 }
@@ -822,13 +876,15 @@ impl FusedIterator for BatchDecoder<'_> {}
 /// value reads as stale from the other's vantage. Nothing sane can be said
 /// about two sequences two billion batches apart, and the alternative is a
 /// silent, arbitrary tie-break.
-#[cfg(test)]
 pub(crate) fn batch_seq_cmp(a: u32, b: u32) -> Ordering {
     (a.wrapping_sub(b) as i32).cmp(&0)
 }
 
 /// Whether `candidate` is newer than `last_seen` under [`batch_seq_cmp`].
-#[cfg(test)]
+///
+/// The receiver's gap meter asks this before it meters anything: a batch that
+/// is not newer than the last one seen is a duplicate or arrived after its
+/// successor, and neither is a gap.
 pub(crate) fn batch_seq_is_newer(candidate: u32, last_seen: u32) -> bool {
     batch_seq_cmp(candidate, last_seen) == Ordering::Greater
 }
@@ -837,7 +893,10 @@ pub(crate) fn batch_seq_is_newer(candidate: u32, last_seen: u32) -> bool {
 /// arrived: `0` when `received` is exactly what was expected.
 ///
 /// Feeds the gap meter, not a decision — the mux does not retransmit, so a gap
-/// is reported and moved past.
+/// is reported and moved past. Only meaningful when `received` is newer than
+/// the last sequence seen ([`batch_seq_is_newer`]): asked about a batch
+/// behind it, the wrapped difference is near `u32::MAX`, which is why the
+/// meter checks first.
 pub(crate) fn batch_seq_gap(expected: u32, received: u32) -> u32 {
     received.wrapping_sub(expected)
 }

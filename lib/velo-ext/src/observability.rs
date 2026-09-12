@@ -13,6 +13,10 @@
 //! transports — without depending on the runtime crate or its concrete
 //! metrics implementation.
 
+use std::time::Duration;
+
+use crate::transport::MessageType;
+
 /// Direction of a transport frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {
@@ -84,15 +88,30 @@ impl TransportRejection {
 /// concerns.
 ///
 /// All methods take `&self` and have implementations that are typically lock-free
-/// — they are safe to call from any hot path. Default impls are intentionally
-/// not provided: every method represents an observable signal a real
-/// implementation would care about.
+/// — they are safe to call from any hot path.
+///
+/// The frame, rejection, gauge and backpressure methods carry no default: each
+/// names a signal any real implementation would care about, and a transport
+/// that reported none of them would be invisible. The three egress methods do
+/// carry defaults, for two reasons. A transport whose `send_message` hands the
+/// frame straight to the wire has no queue in front of a writer and nothing to
+/// report; and adding a bare method to this trait would break every
+/// out-of-tree implementation, which is a major bump and a coordinated `velo`
+/// release (see `CONTRIBUTING.md`, *velo-ext API stability*).
 pub trait TransportObservability: Send + Sync {
     /// Record an accepted frame.
     ///
     /// `message_type` is one of the well-known
     /// [`MessageType`](crate::transport::MessageType) label strings:
     /// `"message"`, `"response"`, `"ack"`, `"event"`, or `"shutting_down"`.
+    ///
+    /// For `direction: Inbound, message_type: "message"`, the runtime derives
+    /// its inbound-queue-depth reading as this counter minus the dequeue
+    /// counter, so every call site that admits an inbound `Message` frame
+    /// **must** call this — a transport that admits without recording drives
+    /// the derived depth negative. Call this on the `Admitted` arm only, once
+    /// [`TransportAdapter::admit_message`](crate::transport::TransportAdapter::admit_message)
+    /// has returned.
     fn record_frame(&self, direction: Direction, message_type: &str, bytes: usize);
 
     /// Record a rejected or dropped frame.
@@ -108,4 +127,50 @@ pub trait TransportObservability: Send + Sync {
     /// queued in the target's [`AdmissionGate`](crate::admission::AdmissionGate)
     /// instead of admitted on the spot.
     fn record_send_backpressure(&self);
+
+    /// Record how long one outbound frame waited between this transport's
+    /// send attempt and the per-connection writer taking it off the send
+    /// queue.
+    ///
+    /// Observed once per frame, by the writer, at the moment of dequeue. Stamp
+    /// the frame before offering it to the
+    /// [`AdmissionGate`](crate::admission::AdmissionGate), not after: the wait
+    /// then spans the gate's pending queue as well as the bounded channel
+    /// behind it, which is the reading that matters — the gate is where a
+    /// saturated connection actually backs up, and a frame the gate still
+    /// holds is one [`record_frame`](Self::record_frame) has not yet counted
+    /// as accepted.
+    fn record_egress_queue_wait(&self, _wait: Duration) {}
+
+    /// Record `count` frames of one `message_type` that a completed socket
+    /// write handed to the kernel's send buffer.
+    ///
+    /// Called once per message type per write, after the write returns — a
+    /// writer that coalesces several frames into one write reports them
+    /// together, so this counts frames and not writes. It stops short of the
+    /// wire: a write returns once the kernel took the bytes, so a frame
+    /// counted here can still sit in the socket's send buffer.
+    ///
+    /// This takes [`MessageType`] directly rather than the label string
+    /// [`record_frame`](Self::record_frame) takes: `record_frame` is a
+    /// required method, so changing its signature would break every
+    /// out-of-tree implementation, but this method is new and carries a
+    /// default, so nothing outside this crate can yet depend on a particular
+    /// parameter type. Taking the enum turns an unknown-label case a
+    /// `&str` parameter would force implementations to handle into something
+    /// unrepresentable.
+    ///
+    /// Paired with [`record_frame`](Self::record_frame)'s outbound count, this
+    /// is what makes the egress queue's depth derivable without sampling a
+    /// channel length.
+    fn record_frames_written(&self, _message_type: MessageType, _count: u64) {}
+
+    /// Record the wall time of one write, which may carry several coalesced
+    /// frames.
+    ///
+    /// A long write means the socket's send buffer is full and the wire or the
+    /// receiver is the constraint. A short write beside a long
+    /// [`record_egress_queue_wait`](Self::record_egress_queue_wait) means the
+    /// writer is starved of runtime time, or the queue is simply long.
+    fn record_egress_write_duration(&self, _duration: Duration) {}
 }

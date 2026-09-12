@@ -11,12 +11,14 @@
 
 #[cfg(feature = "distributed-tracing")]
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use prometheus::{
     Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramOpts, HistogramVec, Opts, Registry,
     exponential_buckets,
 };
+use velo_ext::MessageType;
 
 #[cfg(feature = "distributed-tracing")]
 use opentelemetry::propagation::{Extractor, Injector};
@@ -35,6 +37,38 @@ const TRANSPORT_DIRECTIONS: [&str; 2] = ["inbound", "outbound"];
 const TRANSPORT_MESSAGE_TYPES: [&str; 5] = ["message", "response", "ack", "event", "shutting_down"];
 const HANDLER_RESPONSE_TYPES: [&str; 3] = ["fire_and_forget", "ack_nack", "unary"];
 const HANDLER_OUTCOMES: [&str; 2] = ["success", "error"];
+
+/// Bucket edges for `velo_streaming_anchor_attach_rtt_seconds`.
+///
+/// Placed by hand rather than taken from the house recipe
+/// `exponential_buckets(0.0005, 2.0, 16)`, whose top edges fall at 0.256,
+/// 0.512, 1.024 and 2.048 s. The effect this histogram exists to size — an
+/// attach round trip queued behind a busy receiver's ingest backlog — lands
+/// between those edges, so a percentile read off them is accurate only to a
+/// factor of two, which is the same factor as the effect. These resolve the
+/// 0.1-2 s band instead, while keeping enough short edges to show that a
+/// healthy attach is sub-millisecond.
+const ATTACH_RTT_BUCKETS: &[f64] = &[
+    0.001, 0.005, 0.02, 0.05, 0.1, 0.2, 0.35, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0,
+];
+
+/// Bucket edges shared by `velo_transport_egress_queue_wait_seconds` and
+/// `velo_transport_write_duration_seconds`.
+///
+/// Off the house recipe for the same reason as [`ATTACH_RTT_BUCKETS`]: an
+/// egress queue deep enough to matter sits in the 0.1-1 s band, where
+/// `exponential_buckets(0.0005, 2.0, 16)` has edges only at 0.128, 0.256, 0.512
+/// and 1.024, so a percentile read there is good to a factor of two — the same
+/// factor as the effect.
+///
+/// The two histograms share one ladder deliberately. Neither answers anything
+/// alone; the reading is their *difference*. A long queue wait with short
+/// writes is a starved or oversubscribed writer, and a long queue wait with
+/// long writes is a slow wire or a slow receiver. Comparing two distributions
+/// binned differently is comparing nothing.
+const EGRESS_BUCKETS: &[f64] = &[
+    0.0005, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.35, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0,
+];
 
 // ---------------------------------------------------------------------------
 // Type-safe label enums
@@ -311,6 +345,15 @@ pub(crate) enum StreamingOp {
     Finalize,
     /// Cancel an anchor (terminal).
     Cancel,
+    /// Mint a zero-RTT ticket ahead of any sender asking
+    /// (`AnchorManager::prebind_anchor`). The zero-RTT counterpart to
+    /// `Attach`'s handler run, on the node that mints rather than answers.
+    Prebind,
+    /// Open a sender on terms already known -- a minted ticket or an
+    /// attach response -- and connect its transport
+    /// (`AnchorManager::open_stream_sender`, the tail both remote open paths
+    /// share). Recorded on the node that opens, whichever door it came in.
+    Open,
 }
 
 impl StreamingOp {
@@ -321,6 +364,8 @@ impl StreamingOp {
             Self::Detach => "detach",
             Self::Finalize => "finalize",
             Self::Cancel => "cancel",
+            Self::Prebind => "prebind",
+            Self::Open => "open",
         }
     }
 }
@@ -373,7 +418,12 @@ pub mod labels {
     pub const MSG_SHUTTING_DOWN: &str = "shutting_down";
 }
 
-// Keep for the record_frame fallback when message_type is an unknown &str.
+// `record_frame`'s only caller of this: its `message_type` stays `&str`
+// because it is a required trait method and every out-of-tree implementation
+// already calls it with the well-known label strings, so changing its
+// signature is a breaking change (see CONTRIBUTING.md, *velo-ext API
+// stability*). `record_frames_written` used to share this lookup but now
+// takes `MessageType` directly and indexes without a fallback.
 fn transport_message_type_index(message_type: &str) -> Option<usize> {
     match message_type {
         "message" => Some(0),
@@ -413,14 +463,37 @@ impl Drop for GaugeGuard {
 // TransportMetricsHandle
 // ---------------------------------------------------------------------------
 
+/// Egress-instrument children for one transport, built the first time that
+/// transport actually reports one of the three egress observations.
+#[derive(Clone)]
+struct EgressChildren {
+    frames_written: [Counter; TRANSPORT_MESSAGE_TYPES.len()],
+    egress_queue_wait: Histogram,
+    write_duration: Histogram,
+}
+
 /// A transport-scoped metrics handle with pre-bound child collectors.
 #[derive(Clone)]
 pub struct TransportMetricsHandle {
     transport_frames_total: CounterVec,
     transport_frame_bytes_total: CounterVec,
+    transport_frames_written_total: CounterVec,
+    transport_egress_queue_wait_seconds: HistogramVec,
+    transport_write_duration_seconds: HistogramVec,
     transport: String,
     accepted_frames: [[Counter; TRANSPORT_MESSAGE_TYPES.len()]; TRANSPORT_DIRECTIONS.len()],
     frame_bytes: [[Counter; TRANSPORT_MESSAGE_TYPES.len()]; TRANSPORT_DIRECTIONS.len()],
+    /// Filled on the first `record_frames_written` / `record_egress_queue_wait`
+    /// / `record_egress_write_duration` call, so a transport gets Prometheus
+    /// children if and only if it actually publishes — by construction, with
+    /// no allowlist of transport labels to keep in step with which
+    /// implementations run a coalescing writer. A transport that never calls
+    /// any of the three (gRPC, NATS, ZMQ, UCX; any out-of-tree implementation
+    /// with no per-connection writer) leaves this empty forever, so its
+    /// `frames_written_total` — the term subtracted from
+    /// `frames_total{outbound,accepted}` to get queue depth — has no
+    /// always-zero series to read as a permanent backlog.
+    egress: OnceLock<EgressChildren>,
     registered_peers: Gauge,
     active_connections: Gauge,
     send_error: Counter,
@@ -456,6 +529,56 @@ impl TransportMetricsHandle {
                     .inc_by(bytes as f64);
             }
         }
+    }
+
+    /// The transport's egress children, built on first use.
+    ///
+    /// Every call site here is a real observation — a coalescing writer only
+    /// calls these three methods when it has already decided (via
+    /// `records_egress`, which just asks whether a handle exists at all) that
+    /// something is watching — so "first call" and "first thing this
+    /// transport actually publishes" are the same event.
+    fn egress_children(&self) -> &EgressChildren {
+        self.egress.get_or_init(|| {
+            let transport = self.transport.as_str();
+            EgressChildren {
+                frames_written: std::array::from_fn(|message_type_idx| {
+                    self.transport_frames_written_total
+                        .with_label_values(&[transport, TRANSPORT_MESSAGE_TYPES[message_type_idx]])
+                }),
+                egress_queue_wait: self
+                    .transport_egress_queue_wait_seconds
+                    .with_label_values(&[transport]),
+                write_duration: self
+                    .transport_write_duration_seconds
+                    .with_label_values(&[transport]),
+            }
+        })
+    }
+
+    /// Record `count` frames of one message type reaching the wire.
+    ///
+    /// [`MessageType`] is a closed, `#[repr(u8)]` enum, so every discriminant
+    /// names a real slot in `egress_children().frames_written` — there is no
+    /// unknown-label case left to fall back on the way [`Self::record_frame`]
+    /// does for its `&str` parameter. `frames_written_total_covers_every_message_type`
+    /// is what keeps that true if the enum ever grows.
+    pub fn record_frames_written(&self, message_type: MessageType, count: u64) {
+        self.egress_children().frames_written[message_type as usize].inc_by(count as f64);
+    }
+
+    /// Record how long one frame waited in front of its connection's writer.
+    pub fn record_egress_queue_wait(&self, wait: Duration) {
+        self.egress_children()
+            .egress_queue_wait
+            .observe(wait.as_secs_f64());
+    }
+
+    /// Record the wall time of one write on a connection's writer.
+    pub fn record_egress_write_duration(&self, duration: Duration) {
+        self.egress_children()
+            .write_duration
+            .observe(duration.as_secs_f64());
     }
 
     /// Record a transport rejection.
@@ -511,6 +634,18 @@ impl velo_ext::TransportObservability for TransportMetricsHandle {
 
     fn record_send_backpressure(&self) {
         TransportMetricsHandle::record_send_backpressure(self);
+    }
+
+    fn record_egress_queue_wait(&self, wait: Duration) {
+        TransportMetricsHandle::record_egress_queue_wait(self, wait);
+    }
+
+    fn record_frames_written(&self, message_type: MessageType, count: u64) {
+        TransportMetricsHandle::record_frames_written(self, message_type, count);
+    }
+
+    fn record_egress_write_duration(&self, duration: Duration) {
+        TransportMetricsHandle::record_egress_write_duration(self, duration);
     }
 }
 
@@ -632,7 +767,9 @@ pub(crate) enum MuxDropReason {
     /// A producer ran past the byte cap on a slot that could not send, and the
     /// slot was closed with everything it was holding.
     WithheldOverflow,
-    /// A rendezvous singleton resolved for a slot that had already closed.
+    /// A singleton — a rendezvous transfer, or an `OpenSlot` under
+    /// `MuxConfig::async_open_ack` — failed to resolve for a slot that had
+    /// already closed.
     StaleSingleton,
     /// The record's `frame_seq` was behind the slot's next expected sequence.
     Duplicate,
@@ -671,6 +808,51 @@ impl MuxDirection {
     }
 }
 
+/// The label value `velo_streaming_mux_batcher_wakes_total` files each
+/// [`BatcherWake`] source under, indexed by [`BatcherWake::index`].
+const MUX_WAKE_SOURCES: [&str; 5] = ["open", "control", "frame", "inlet_closed", "linger"];
+
+/// What woke a peer batcher's task, for `velo_streaming_mux_batcher_wakes_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BatcherWake {
+    /// An `OpenSlot` request from a producer.
+    Open,
+    /// Coalesced control: grants, closes, replies, kicks, a retirement, or a
+    /// singleton admission result.
+    Control,
+    /// A producer queued a record on one of this batcher's slots.
+    Frame,
+    /// Every producer handle for this slot dropped, and no terminal went out
+    /// ahead of it.
+    InletClosed,
+    /// A staged batch's window ran out — the policy's `max_linger`, or a
+    /// pending credit reply's `MuxConfig::reply_linger`; the two share this
+    /// variant rather than one each. Under the default `max_linger: None`,
+    /// every `Linger` wake is a reply window.
+    Linger,
+}
+
+impl BatcherWake {
+    /// Dense index into [`MUX_WAKE_SOURCES`] and `MuxMetricsHandle`'s
+    /// pre-bound `batcher_wakes` array — one select-loop wake fires this on
+    /// every trip, including a bare `Frame` wake for a single queued record,
+    /// so this stays a plain array index rather than a label lookup.
+    ///
+    /// A variant added here without a matching [`MUX_WAKE_SOURCES`] entry
+    /// panics on its first [`MuxMetricsHandle::batcher_wake`] call — an
+    /// out-of-bounds read of `batcher_wakes`. Grow both in the same change,
+    /// same hazard as [`RecordType::count_index`](crate::streaming::messenger_mux::protocol::RecordType::count_index).
+    const fn index(self) -> usize {
+        match self {
+            Self::Open => 0,
+            Self::Control => 1,
+            Self::Frame => 2,
+            Self::InletClosed => 3,
+            Self::Linger => 4,
+        }
+    }
+}
+
 /// Collectors for the `messenger-mux-v1` streaming transport.
 ///
 /// Bound once per mux transport via [`VeloMetrics::bind_mux`] so the hot paths
@@ -692,10 +874,58 @@ pub(crate) struct MuxMetricsHandle {
     hold_overflow_total: Counter,
     control_refused_total: Counter,
     epoch_deaths_total: Counter,
+    credit_reposted_total: Counter,
+    credit_lost_total: Counter,
     batch_seq_gaps_total: Counter,
+    drain_visits_total: Counter,
+    records_sent: [Counter; crate::streaming::messenger_mux::protocol::RECORD_TYPE_COUNT],
+    batcher_wakes: [Counter; MUX_WAKE_SOURCES.len()],
 }
 
 impl MuxMetricsHandle {
+    /// An outbound batch of `counts.iter().sum()` records — as
+    /// [`RecordType::count_index`](crate::streaming::messenger_mux::protocol::RecordType::count_index)
+    /// breaks them down — went to the peer.
+    ///
+    /// Deriving the total from `counts` here, rather than a separate
+    /// `BatchEncoder::record_count` read, keeps
+    /// `velo_streaming_mux_records_sent_total` and
+    /// `velo_streaming_mux_records_per_batch{direction="sent"}` in sync by
+    /// construction. A batch discarded before it gets here (an epoch death,
+    /// or the task tearing down) is never counted; a batch the messenger goes
+    /// on to refuse — a failed `dispatch` or `am_send_streaming` call — is
+    /// counted here all the same. [`Self::batch`] stays free-standing for the
+    /// `Received` side (`ingress::mod`'s inbound-batch count), which has no
+    /// per-type breakdown to derive a total from.
+    ///
+    /// `counts[index]`'s label is already resolved — pre-bound in
+    /// [`VeloMetrics::bind_mux`] the same way [`Self::batcher_wake`]'s array
+    /// is — so the per-type loop below is a plain array index and an atomic
+    /// add, no label lookup at any count.
+    pub(crate) fn batch_sent(
+        &self,
+        counts: [u16; crate::streaming::messenger_mux::protocol::RECORD_TYPE_COUNT],
+    ) {
+        let total: usize = counts.iter().map(|&count| usize::from(count)).sum();
+        self.batch(MuxDirection::Sent, total);
+        for (count, counter) in counts.into_iter().zip(&self.records_sent) {
+            if count > 0 {
+                counter.inc_by(f64::from(count));
+            }
+        }
+    }
+
+    /// A batcher's task woke for `source`.
+    ///
+    /// Pre-bound array index, not a label lookup: this fires once per
+    /// select-loop trip, and a `Frame` wake is one record by construction
+    /// (`SlotStream::poll_next` yields exactly one queued item per poll), so
+    /// this is on the per-record path regardless of how many records a wake's
+    /// batch ends up carrying.
+    pub(crate) fn batcher_wake(&self, source: BatcherWake) {
+        self.batcher_wakes[source.index()].inc();
+    }
+
     /// A slot came into existence on either side of the mux.
     pub(crate) fn slot_opened(&self) {
         self.live_slots.inc();
@@ -775,7 +1005,8 @@ impl MuxMetricsHandle {
         self.staged_records.add(delta as f64);
     }
 
-    /// A batcher's coalesced control state refused a new slot key at its cap.
+    /// A batcher's coalesced control state refused a slot key: an index it
+    /// never allocated, or a rejection past the reject lane's cap.
     pub(crate) fn control_refused(&self) {
         self.control_refused_total.inc();
     }
@@ -790,10 +1021,27 @@ impl MuxMetricsHandle {
         self.epoch_deaths_total.inc();
     }
 
+    /// `delta` credit from a discarded batch went back to the control state.
+    pub(crate) fn credit_reposted(&self, delta: u32) {
+        self.credit_reposted_total.inc_by(f64::from(delta));
+    }
+
+    /// `delta` credit from a discarded batch had nowhere to go back to.
+    pub(crate) fn credit_lost(&self, delta: u32) {
+        self.credit_lost_total.inc_by(f64::from(delta));
+    }
+
     /// `batches` batches were skipped between the expected and received
     /// `batch_seq`.
     pub(crate) fn batch_seq_gap(&self, batches: u32) {
         self.batch_seq_gaps_total.inc_by(f64::from(batches));
+    }
+
+    /// The sweep task walked one peer's slots because that peer's consumer
+    /// drained. Counted per walk, not per wake: a wake held back by
+    /// `MuxConfig::drain_visit_floor` lands on the walk it coalesced into.
+    pub(crate) fn drain_visit(&self) {
+        self.drain_visits_total.inc();
     }
 }
 
@@ -806,6 +1054,9 @@ impl MuxMetricsHandle {
 pub struct VeloMetrics {
     transport_frames_total: CounterVec,
     transport_frame_bytes_total: CounterVec,
+    transport_frames_written_total: CounterVec,
+    transport_egress_queue_wait_seconds: HistogramVec,
+    transport_write_duration_seconds: HistogramVec,
     transport_rejections_total: CounterVec,
     transport_send_backpressure_total: CounterVec,
     transport_registered_peers: GaugeVec,
@@ -823,14 +1074,17 @@ pub struct VeloMetrics {
     messenger_client_resolution_total: CounterVec,
     messenger_pending_responses: Gauge,
     messenger_response_slot_exhausted_total: Counter,
+    messenger_inbound_dequeued_total: Counter,
     streaming_anchor_operations_total: CounterVec,
     streaming_anchor_operation_duration_seconds: HistogramVec,
+    streaming_anchor_attach_rtt_seconds: HistogramVec,
     streaming_active_anchors: Gauge,
     streaming_backpressure_total: CounterVec,
     streaming_reader_pump_backpressure_total: Counter,
     streaming_server_pump_backpressure_total: Counter,
     streaming_producer_send_backpressure_total: Counter,
     streaming_heartbeat_watchdog_firings_total: Counter,
+    streaming_unclaimed_bind_reaped_total: Counter,
     streaming_egress_flushes_total: Counter,
     streaming_frames_written_total: Counter,
     // Messenger-mux metrics
@@ -848,7 +1102,12 @@ pub struct VeloMetrics {
     streaming_mux_hold_overflow_total: Counter,
     streaming_mux_control_refused_total: Counter,
     streaming_mux_epoch_deaths_total: Counter,
+    streaming_mux_credit_reposted_total: Counter,
+    streaming_mux_credit_lost_total: Counter,
     streaming_mux_batch_seq_gaps_total: Counter,
+    streaming_mux_drain_visits_total: Counter,
+    streaming_mux_records_sent_total: CounterVec,
+    streaming_mux_batcher_wakes_total: CounterVec,
     // Rendezvous metrics
     rendezvous_operations_total: CounterVec,
     rendezvous_operation_duration_seconds: HistogramVec,
@@ -895,6 +1154,68 @@ impl VeloMetrics {
                     "Logical frame bytes observed by Velo transports.",
                 ),
                 &["transport", "direction", "message_type"],
+            )?,
+        )?;
+        let transport_frames_written_total = register_collector(
+            registry,
+            CounterVec::new(
+                Opts::new(
+                    "velo_transport_frames_written_total",
+                    "Frames a transport's per-connection writer handed to the kernel's socket \
+                     send buffer, counted once the write returned. Subtract this from \
+                     velo_transport_frames_total{direction=\"outbound\",outcome=\"accepted\"} on \
+                     the same transport to get that transport's egress queue depth. Published \
+                     only by the coalescing writer the TCP and UDS transports run — the \
+                     `transport` label is whatever TransportKey the transport was built with, \
+                     not a fixed name, so select on this series' presence rather than on a \
+                     transport-name pattern; see the README's Observability section for the \
+                     identity's limits.",
+                ),
+                &["transport", "message_type"],
+            )?,
+        )?;
+        let transport_egress_queue_wait_seconds = register_collector(
+            registry,
+            HistogramVec::new(
+                HistogramOpts::new(
+                    "velo_transport_egress_queue_wait_seconds",
+                    "Time one outbound frame spent between the transport's send \
+                     attempt and its connection's writer taking it off the send \
+                     queue. Stamped before admission, so it covers the \
+                     admission gate's pending queue as well as the bounded \
+                     per-connection channel behind it. Observed once per frame, \
+                     by the writer, at the dequeue — including a frame whose \
+                     write then failed, so this count is at least \
+                     velo_transport_frames_written_total and equals it only on \
+                     a connection that never faulted. Published only by the \
+                     coalescing writer the TCP and UDS transports run — select \
+                     on this series' presence, not on the `transport` label's \
+                     value.",
+                )
+                .buckets(EGRESS_BUCKETS.to_vec()),
+                &["transport"],
+            )?,
+        )?;
+        let transport_write_duration_seconds = register_collector(
+            registry,
+            HistogramVec::new(
+                HistogramOpts::new(
+                    "velo_transport_write_duration_seconds",
+                    "Wall time of one write on a connection's writer. One \
+                     observation per write, and a write carries as many frames \
+                     as the writer had queued — so this count is at most \
+                     velo_transport_frames_written_total and equals it only \
+                     when nothing ever coalesced. Large values mean the \
+                     socket's send buffer is full and the wire or the receiver \
+                     is the constraint; small values beside a large \
+                     velo_transport_egress_queue_wait_seconds mean the writer \
+                     is starved or the queue is simply long. Published only by \
+                     the coalescing writer the TCP and UDS transports run — \
+                     select on this series' presence, not on the `transport` \
+                     label's value.",
+                )
+                .buckets(EGRESS_BUCKETS.to_vec()),
+                &["transport"],
             )?,
         )?;
         let transport_rejections_total = register_collector(
@@ -1067,6 +1388,24 @@ impl VeloMetrics {
                 "Response slot acquisitions that hit the per-worker capacity ceiling.",
             ))?,
         )?;
+        let messenger_inbound_dequeued_total = register_collector(
+            registry,
+            Counter::with_opts(Opts::new(
+                "velo_messenger_inbound_dequeued_total",
+                "Messages the dispatch loop took off the messenger's inbound \
+                 queue. Subtract this from velo_transport_frames_total{direction=\"inbound\",\
+                 message_type=\"message\",outcome=\"accepted\"} to get that queue's \
+                 depth — there is deliberately no gauge for it, because a \
+                 sampled channel length reads the wrong number under exactly \
+                 the load that makes the depth interesting. Sum the frame \
+                 counter across transports before subtracting: it is per \
+                 transport and this one is per instance. The identity holds \
+                 while the instance is live — messages abandoned when a \
+                 Timeout shutdown tears the dispatch loop down are never \
+                 counted here, so from teardown onward the derived depth reads \
+                 high by the abandoned count.",
+            ))?,
+        )?;
         let streaming_anchor_operations_total = register_collector(
             registry,
             CounterVec::new(
@@ -1088,6 +1427,37 @@ impl VeloMetrics {
                     prometheus::Error::Msg(format!("invalid streaming histogram buckets: {e}"))
                 })?),
                 &["operation", "outcome", "transport_scheme"],
+            )?,
+        )?;
+        let streaming_anchor_attach_rtt_seconds = register_collector(
+            registry,
+            HistogramVec::new(
+                HistogramOpts::new(
+                    "velo_streaming_anchor_attach_rtt_seconds",
+                    "Wall time a remote anchor attach spent in flight, measured \
+                     by the sender across the round trip to either the \
+                     _anchor_attach or _mpsc_anchor_attach handler — the two \
+                     attach kinds share this one series, so a subtraction \
+                     against it is a population average, not a per-kind \
+                     reading. Its excess over \
+                     velo_streaming_anchor_operation_duration_seconds\
+                     {operation=\"attach\"} on the receiver, which both \
+                     handlers record into as well, bounds that receiver's \
+                     ingest queueing from above; the sender's own send path, \
+                     both wire legs, the receiver's handler-spawn delay and \
+                     the sender task's wake latency are inside the bracket \
+                     too. The two are not directly comparable on their \
+                     labels: this series' transport_scheme is the sender's \
+                     own advertised-vs-answered view, which folds to \
+                     \"unknown\" on an ordinary mixed-deployment negotiation \
+                     rather than naming the key the receiver actually used, \
+                     and the two histograms live in different registries on \
+                     different nodes, so a comparison must sum both labels \
+                     away rather than match on them, and covers only the \
+                     outcome=\"success\" population.",
+                )
+                .buckets(ATTACH_RTT_BUCKETS.to_vec()),
+                &["outcome", "transport_scheme"],
             )?,
         )?;
         let streaming_active_anchors = register_collector(
@@ -1146,6 +1516,21 @@ impl VeloMetrics {
                  frames and was force-cleaned with a Dropped sentinel. Confirmed \
                  saturation event — typically the lagging indicator of the cascade \
                  surfaced by the *_backpressure_total counters above.",
+            ))?,
+        )?;
+        let streaming_unclaimed_bind_reaped_total = register_collector(
+            registry,
+            Counter::with_opts(Opts::new(
+                "velo_streaming_unclaimed_bind_reaped_total",
+                "Reader-pump reap of a mux bind (a zero-RTT pre-bind, an ordinary \
+                 attach whose peer never sent its OpenSlot, or an attach that \
+                 adopted a pre-bind) whose accept window closed with no sender \
+                 having claimed it. Distinct from the heartbeat-watchdog firing \
+                 above: this is the accept window catching what the watchdog \
+                 either cannot see yet (no sender exists) or would catch too \
+                 late (the watchdog's threshold exceeds the accept window's \
+                 remaining span, at heartbeat_interval >= 20s -- see \
+                 streaming/BATCHING.md).",
             ))?,
         )?;
         let streaming_egress_flushes_total = register_collector(
@@ -1263,9 +1648,9 @@ impl VeloMetrics {
                 "velo_streaming_mux_rendezvous_singletons_total",
                 "Records larger than the effective eager budget, sent alone in \
                  their batch so the messenger stages them through rendezvous. \
-                 Each one fences its own slot until admission resolves and pays \
-                 a round trip; a rising rate means frames are outgrowing the \
-                 target's eager budget.",
+                 Each one pays a round trip and fences its own slot until the \
+                 admission resolves; a rising rate means frames are outgrowing \
+                 the target's eager budget.",
             ))?,
         )?;
         let streaming_mux_held_records = register_collector(
@@ -1284,7 +1669,9 @@ impl VeloMetrics {
                 "velo_streaming_mux_withheld_records",
                 "Records the egress batcher has pulled from producer inlets but \
                  may not send yet — a slot out of credit, or fencing a \
-                 rendezvous singleton. The inlet is drained regardless of \
+                 singleton (a rendezvous transfer, or an OpenSlot under \
+                 MuxConfig::async_open_ack) whose admission has not resolved. \
+                 The inlet is drained regardless of \
                  whether the slot can send, because `finalize`, `detach` and \
                  `Drop` reach it through a synchronous send that a full channel \
                  would block forever; this gauge is where that backpressure \
@@ -1296,22 +1683,36 @@ impl VeloMetrics {
             Gauge::new(
                 "velo_streaming_mux_staged_records",
                 "Records packed into batches the egress batchers have open but \
-                 have not written. Transient under `FlushPolicy::Auto`, where \
-                 every wake ends in a write. Under `FlushPolicy::Manual` the \
-                 application owns the flush and there is no timer behind it, so \
-                 a plateau here is a producer that stopped calling \
-                 `flush_batch` — the one failure mode that policy has. Bounded \
-                 by the batch clamps, so it costs latency rather than memory.",
+                 have not written. Transient under `FlushPolicy::Auto` with \
+                 `on_admission` set, where every wake that stages anything \
+                 besides credit replies ends in a write and a batch holding \
+                 only credit replies is held for up to `MuxConfig::reply_linger`. \
+                 Under `FlushPolicy::Manual`, or `Auto { on_admission: false, \
+                 max_linger: None }` — the two policies with no timer of \
+                 their own — a pending credit reply still holds the whole \
+                 batch it is in for that same bound, data included, so a \
+                 plateau beyond it is a producer that stopped calling \
+                 `flush_batch` (under `Auto { max_linger: Some(_) }` instead, \
+                 the same plateau means that window's own timer stalled). \
+                 Bounded by the batch clamps, so it costs latency rather than \
+                 memory.",
             )?,
         )?;
         let streaming_mux_control_refused_total = register_collector(
             registry,
             Counter::with_opts(Opts::new(
                 "velo_streaming_mux_control_refused_total",
-                "Coalesced control entries a peer batcher refused because its \
-                 pending-control map was at capacity. Legitimate entries are \
-                 bounded by live slots, so anything here means a peer is naming \
-                 slot ids that were never alive.",
+                "Coalesced control entries a peer batcher refused, for either of \
+                 two reasons: a grant or close named a slot index this side \
+                 never allocated, or a burst of `OpenSlot`s this side never \
+                 admitted filled the bounded lane that carries their \
+                 rejections. Either way the peer's own accounting is not at \
+                 risk: a real held-slot credit or close reply is never refused. \
+                 Not counted here: an ordinary stale-generation race, where a \
+                 grant or close names an index this side allocated but at a \
+                 generation that is not the one currently live there — that \
+                 is dropped silently rather than signalled, since it is \
+                 expected traffic rather than a hostile peer.",
             ))?,
         )?;
         let streaming_mux_hold_overflow_total = register_collector(
@@ -1333,6 +1734,27 @@ impl VeloMetrics {
                  signal the mux has.",
             ))?,
         )?;
+        let streaming_mux_credit_reposted_total = register_collector(
+            registry,
+            Counter::with_opts(Opts::new(
+                "velo_streaming_mux_credit_reposted_total",
+                "Ingress credit that was minted into a batch the epoch then \
+                 threw away, and handed back to the control state so a later \
+                 batch re-advertises it. `take_pending_grant` zeroes the \
+                 slot's `ungranted` at mint time, so without this the sender's \
+                 window would shrink by the delta for the life of the slot.",
+            ))?,
+        )?;
+        let streaming_mux_credit_lost_total = register_collector(
+            registry,
+            Counter::with_opts(Opts::new(
+                "velo_streaming_mux_credit_lost_total",
+                "Ingress credit from a discarded batch that reached neither \
+                 the batcher's own control state nor the batcher that took the \
+                 peer over. The sender's window for that slot is short by this \
+                 much until the slot closes. Expected to stay at zero.",
+            ))?,
+        )?;
         let streaming_mux_batch_seq_gaps_total = register_collector(
             registry,
             Counter::with_opts(Opts::new(
@@ -1340,8 +1762,61 @@ impl VeloMetrics {
                 "Batches missing between the expected and received batch_seq \
                  within one epoch. Reported and moved past — the mux does not \
                  retransmit — so this is the count of batches whose records the \
-                 per-slot frame_seq machinery had to recover from.",
+                 per-slot frame_seq machinery had to recover from. A batch that \
+                 arrives after its successor was already counted as missing is \
+                 not counted again: the meter keeps a high-water mark, so a \
+                 reordered pair costs one, never a wrapped u32.",
             ))?,
+        )?;
+        let streaming_mux_drain_visits_total = register_collector(
+            registry,
+            Counter::with_opts(Opts::new(
+                "velo_streaming_mux_drain_visits_total",
+                "Per-peer credit reconciles the sweep task ran because a \
+                 consumer drained, counted once per walk actually performed. \
+                 Wakes deferred by MuxConfig::drain_visit_floor are not counted \
+                 until the walk they coalesced into runs, and the periodic \
+                 sweep's own walks are not counted at all, so this divided by \
+                 elapsed time is the doorbell's real per-peer visit rate and is \
+                 bounded above by 1/drain_visit_floor per peer.",
+            ))?,
+        )?;
+        let streaming_mux_records_sent_total = register_collector(
+            registry,
+            CounterVec::new(
+                Opts::new(
+                    "velo_streaming_mux_records_sent_total",
+                    "Mux records a batcher packed for its peer, by record type \
+                     — this series only ever describes what a node sends, so \
+                     it carries no direction label of its own. Compared with \
+                     velo_streaming_mux_batches_total{direction=\"sent\"} it \
+                     says what those outbound batches are made of, which is \
+                     the question a batch count alone cannot answer: a rise in \
+                     small batches is either data arriving one record at a \
+                     time or control flushed as it comes.",
+                ),
+                &["record_type"],
+            )?,
+        )?;
+        let streaming_mux_batcher_wakes_total = register_collector(
+            registry,
+            CounterVec::new(
+                Opts::new(
+                    "velo_streaming_mux_batcher_wakes_total",
+                    "Wakes of the per-peer batcher tasks, by what woke them: a \
+                     producer's open, coalesced control, a queued record, a \
+                     departed producer, or the linger timer. This attributes \
+                     what woke the task, not what it wrote: one wake can \
+                     still write more than one batch (a size clamp or an \
+                     oversized record flushes inline), and a batch held open \
+                     only by `MuxConfig::reply_linger` writes on the first \
+                     end-of-wake check after the window elapses — a `linger` \
+                     wake only when the batcher was otherwise idle at the \
+                     deadline, a `control` or `frame` wake when one arrives \
+                     first (measured 21-30% linger on the tier-3 frontend).",
+                ),
+                &["source"],
+            )?,
         )?;
 
         // -- Rendezvous metrics --
@@ -1446,6 +1921,9 @@ impl VeloMetrics {
         Ok(Self {
             transport_frames_total,
             transport_frame_bytes_total,
+            transport_frames_written_total,
+            transport_egress_queue_wait_seconds,
+            transport_write_duration_seconds,
             transport_rejections_total,
             transport_send_backpressure_total,
             transport_registered_peers,
@@ -1462,15 +1940,18 @@ impl VeloMetrics {
             messenger_dispatch_failures_total,
             messenger_client_resolution_total,
             messenger_pending_responses,
+            messenger_inbound_dequeued_total,
             messenger_response_slot_exhausted_total,
             streaming_anchor_operations_total,
             streaming_anchor_operation_duration_seconds,
+            streaming_anchor_attach_rtt_seconds,
             streaming_active_anchors,
             streaming_backpressure_total,
             streaming_reader_pump_backpressure_total,
             streaming_server_pump_backpressure_total,
             streaming_producer_send_backpressure_total,
             streaming_heartbeat_watchdog_firings_total,
+            streaming_unclaimed_bind_reaped_total,
             streaming_egress_flushes_total,
             streaming_frames_written_total,
             streaming_mux_live_slots,
@@ -1487,7 +1968,12 @@ impl VeloMetrics {
             streaming_mux_hold_overflow_total,
             streaming_mux_control_refused_total,
             streaming_mux_epoch_deaths_total,
+            streaming_mux_credit_reposted_total,
+            streaming_mux_credit_lost_total,
             streaming_mux_batch_seq_gaps_total,
+            streaming_mux_drain_visits_total,
+            streaming_mux_records_sent_total,
+            streaming_mux_batcher_wakes_total,
             rendezvous_operations_total,
             rendezvous_operation_duration_seconds,
             rendezvous_bytes_total,
@@ -1541,9 +2027,13 @@ impl VeloMetrics {
         TransportMetricsHandle {
             transport_frames_total: self.transport_frames_total.clone(),
             transport_frame_bytes_total: self.transport_frame_bytes_total.clone(),
+            transport_frames_written_total: self.transport_frames_written_total.clone(),
+            transport_egress_queue_wait_seconds: self.transport_egress_queue_wait_seconds.clone(),
+            transport_write_duration_seconds: self.transport_write_duration_seconds.clone(),
             transport: transport.clone(),
             accepted_frames,
             frame_bytes,
+            egress: OnceLock::new(),
             registered_peers: self
                 .transport_registered_peers
                 .with_label_values(&[transport_label]),
@@ -1627,10 +2117,19 @@ impl VeloMetrics {
 
     /// Bind ordered-dispatch collectors for a specific handler label.
     ///
-    /// Applies the same `_`-prefix filter as [`Self::bind_handler`], so system
-    /// handlers stay out of the per-handler series.
+    /// Applies the same `_`-prefix filter as [`Self::bind_handler`], with one
+    /// exception: `_stream_batch`. That handler is the messenger mux's only
+    /// ingress lane, so filtering it out leaves the lane depth and wait series
+    /// dark on the single path carrying every streamed record — the one place
+    /// they are worth having, and the reason the series exist at all.
+    ///
+    /// The exception is scoped to ordered dispatch. Per-handler request,
+    /// duration and byte series stay off for every `_` handler, because those
+    /// are per-handler cardinality that system traffic should not add to.
     pub(crate) fn bind_ordered_dispatcher(&self, handler: &str) -> Option<OrderedMetricsHandle> {
-        if !Self::should_track_handler(handler) {
+        if !Self::should_track_handler(handler)
+            && handler != crate::streaming::messenger_mux::STREAM_BATCH_HANDLER
+        {
             return None;
         }
 
@@ -1654,6 +2153,17 @@ impl VeloMetrics {
     /// batchers and the `_stream_batch` ingress lane, so the hot paths hold
     /// concrete collectors instead of resolving label values per record.
     pub(crate) fn bind_mux(&self) -> MuxMetricsHandle {
+        use crate::streaming::messenger_mux::protocol::RECORD_TYPE_LABELS;
+
+        let records_sent = std::array::from_fn(|index| {
+            self.streaming_mux_records_sent_total
+                .with_label_values(&[RECORD_TYPE_LABELS[index]])
+        });
+        let batcher_wakes = std::array::from_fn(|index| {
+            self.streaming_mux_batcher_wakes_total
+                .with_label_values(&[MUX_WAKE_SOURCES[index]])
+        });
+
         MuxMetricsHandle {
             live_slots: self.streaming_mux_live_slots.clone(),
             reader_stall_total: self.streaming_mux_reader_stall_total.clone(),
@@ -1669,7 +2179,12 @@ impl VeloMetrics {
             hold_overflow_total: self.streaming_mux_hold_overflow_total.clone(),
             control_refused_total: self.streaming_mux_control_refused_total.clone(),
             epoch_deaths_total: self.streaming_mux_epoch_deaths_total.clone(),
+            credit_reposted_total: self.streaming_mux_credit_reposted_total.clone(),
+            credit_lost_total: self.streaming_mux_credit_lost_total.clone(),
             batch_seq_gaps_total: self.streaming_mux_batch_seq_gaps_total.clone(),
+            drain_visits_total: self.streaming_mux_drain_visits_total.clone(),
+            records_sent,
+            batcher_wakes,
         }
     }
 
@@ -1700,6 +2215,36 @@ impl VeloMetrics {
     /// backpressure path.
     pub(crate) fn inc_response_slot_exhausted(&self) {
         self.messenger_response_slot_exhausted_total.inc();
+    }
+
+    /// The inbound-dequeue counter itself, for the messenger's dispatch loop.
+    ///
+    /// Handed out rather than wrapped in a `record_*` method so the loop
+    /// resolves the collector once, outside itself: it is the single consumer
+    /// of `message_rx` and every message on the node passes through it.
+    pub(crate) fn bind_inbound_dequeued(&self) -> Counter {
+        self.messenger_inbound_dequeued_total.clone()
+    }
+
+    /// Record the wall time one remote anchor attach spent in flight.
+    ///
+    /// Deliberately separate from [`Self::record_streaming_operation`]: that
+    /// one is stamped inside the *receiving* handler and answers "how long did
+    /// the handler take", while this is stamped by the *sender* around the
+    /// round trip and answers "how long did the caller wait". The gap between
+    /// them is an upper bound on the receiver's ingest queueing — it also
+    /// carries both wire legs, the handler-spawn delay and the sender task's
+    /// own wake latency — and bounding that queueing is the only reason to
+    /// carry both.
+    pub(crate) fn record_attach_rtt(
+        &self,
+        outcome: HandlerOutcome,
+        transport_scheme: &str,
+        elapsed: Duration,
+    ) {
+        self.streaming_anchor_attach_rtt_seconds
+            .with_label_values(&[outcome.as_str(), transport_scheme])
+            .observe(elapsed.as_secs_f64());
     }
 
     /// Record a streaming control-plane operation.
@@ -1754,6 +2299,17 @@ impl VeloMetrics {
     /// Record a heartbeat-watchdog firing in the reader pump.
     pub(crate) fn record_heartbeat_watchdog_firing(&self) {
         self.streaming_heartbeat_watchdog_firings_total.inc();
+    }
+
+    /// Record the reader pump reaping a mux bind whose accept window closed
+    /// with no sender having claimed it. See
+    /// [`record_heartbeat_watchdog_firing`](Self::record_heartbeat_watchdog_firing)
+    /// for the sibling reaper this one is not: that one fires once a sender's
+    /// silence outlasts its tolerance, this one fires when no sender ever
+    /// showed up (or adopted a pre-bind and then never sent its `OpenSlot`)
+    /// before the mux gave the slot back.
+    pub(crate) fn record_unclaimed_bind_reaped(&self) {
+        self.streaming_unclaimed_bind_reaped_total.inc();
     }
 
     /// Record one batch reaching the wire on the streaming egress path,
@@ -1956,6 +2512,24 @@ pub mod test_helpers {
                 .unwrap_or(0.0)
         }
 
+        /// Sum of every counter series of `name` whose labels are a superset of
+        /// `labels`, or 0.0 if none match.
+        ///
+        /// [`Self::counter`] returns the *first* matching series, which is the
+        /// wrong reading for a family that is partitioned by a label the caller
+        /// does not want to pin — `velo_transport_frames_written_total` is per
+        /// `message_type`, and the conservation identity it takes part in is a
+        /// statement about the whole family.
+        pub fn counter_sum(&self, name: &str, labels: &[(&str, &str)]) -> f64 {
+            self.0
+                .iter()
+                .filter(|family| family.name() == name)
+                .flat_map(|family| family.get_metric().iter())
+                .filter(|metric| labels_match(metric, labels))
+                .map(|metric| metric.get_counter().value())
+                .sum()
+        }
+
         /// Gauge value for `name` with the given label pairs, or 0.0 if absent.
         pub fn gauge(&self, name: &str, labels: &[(&str, &str)]) -> f64 {
             self.find_metric(name, labels)
@@ -1977,19 +2551,60 @@ pub mod test_helpers {
                 .unwrap_or(0.0)
         }
 
+        /// Sum of every histogram series' sample count for `name` whose labels
+        /// are a superset of `labels`, or 0 if none match.
+        ///
+        /// [`Self::histogram_count`] returns the *first* matching series, the
+        /// same trap [`Self::counter_sum`] exists to avoid for counters: a
+        /// family partitioned by a label the caller leaves unpinned (for
+        /// example `velo_streaming_anchor_attach_rtt_seconds`, labelled by
+        /// both `outcome` and `transport_scheme`) silently reads one child's
+        /// count instead of the family's.
+        pub fn histogram_count_sum(&self, name: &str, labels: &[(&str, &str)]) -> u64 {
+            self.0
+                .iter()
+                .filter(|family| family.name() == name)
+                .flat_map(|family| family.get_metric().iter())
+                .filter(|metric| labels_match(metric, labels))
+                .map(|metric| metric.get_histogram().sample_count())
+                .sum()
+        }
+
+        /// Sum of every histogram series' sample sum for `name` whose labels
+        /// are a superset of `labels`, or 0.0 if none match. See
+        /// [`Self::histogram_count_sum`].
+        pub fn histogram_sum_sum(&self, name: &str, labels: &[(&str, &str)]) -> f64 {
+            self.0
+                .iter()
+                .filter(|family| family.name() == name)
+                .flat_map(|family| family.get_metric().iter())
+                .filter(|metric| labels_match(metric, labels))
+                .map(|metric| metric.get_histogram().sample_sum())
+                .sum()
+        }
+
         fn find_metric(
             &self,
             name: &str,
             labels: &[(&str, &str)],
         ) -> Option<&prometheus::proto::Metric> {
-            let family = self.0.iter().find(|f| f.name() == name)?;
-            family.get_metric().iter().find(|m| {
-                let pairs = m.get_label();
-                labels
-                    .iter()
-                    .all(|(k, v)| pairs.iter().any(|lp| lp.name() == *k && lp.value() == *v))
-            })
+            let family = self.0.iter().find(|family| family.name() == name)?;
+            family
+                .get_metric()
+                .iter()
+                .find(|metric| labels_match(metric, labels))
         }
+    }
+
+    /// Whether `metric`'s label set contains every pair in `labels`.
+    ///
+    /// A subset match, so a caller can pin the labels it cares about and
+    /// ignore the rest.
+    fn labels_match(metric: &prometheus::proto::Metric, labels: &[(&str, &str)]) -> bool {
+        let pairs = metric.get_label();
+        labels
+            .iter()
+            .all(|(k, v)| pairs.iter().any(|lp| lp.name() == *k && lp.value() == *v))
     }
 }
 
@@ -2030,6 +2645,16 @@ mod tests {
             Duration::from_millis(1),
         );
         metrics.set_streaming_active_anchors(2);
+        // A `HistogramVec` with no children collects no family at all, so the
+        // name assertion below only means anything once one has been observed.
+        metrics.record_attach_rtt(HandlerOutcome::Success, "tcp", Duration::from_millis(1));
+
+        // Same reason as the line above: a `CounterVec` or `HistogramVec` with
+        // no children collects no family, so the egress names below only mean
+        // something once something has been observed on them.
+        handle.record_frames_written(MessageType::Message, 2);
+        handle.record_egress_queue_wait(Duration::from_millis(2));
+        handle.record_egress_write_duration(Duration::from_micros(50));
 
         let names: Vec<_> = registry
             .gather()
@@ -2045,6 +2670,206 @@ mod tests {
         assert!(names.contains(&"velo_streaming_active_anchors".to_string()));
         assert!(names.contains(&"velo_streaming_anchor_operations_total".to_string()));
         assert!(names.contains(&"velo_streaming_anchor_operation_duration_seconds".to_string()));
+        assert!(names.contains(&"velo_messenger_inbound_dequeued_total".to_string()));
+        assert!(names.contains(&"velo_streaming_anchor_attach_rtt_seconds".to_string()));
+        assert!(names.contains(&"velo_transport_frames_written_total".to_string()));
+        assert!(names.contains(&"velo_transport_egress_queue_wait_seconds".to_string()));
+        assert!(names.contains(&"velo_transport_write_duration_seconds".to_string()));
+    }
+
+    /// The egress instruments land on the labels the depth identity subtracts
+    /// on: `velo_transport_frames_written_total` is per transport *and* per
+    /// message type, because the outbound frame counter it is subtracted from
+    /// is too.
+    #[test]
+    fn egress_instruments_read_back_through_the_bound_handle() {
+        use super::test_helpers::MetricSnapshot;
+
+        let registry = Registry::new();
+        let metrics = VeloMetrics::register(&registry).expect("register metrics");
+        let handle = metrics.bind_transport("tcp");
+
+        handle.record_frames_written(MessageType::Message, 3);
+        handle.record_frames_written(MessageType::Response, 1);
+        handle.record_egress_queue_wait(Duration::from_millis(4));
+        handle.record_egress_write_duration(Duration::from_micros(120));
+
+        let snap = MetricSnapshot::from_registry(&registry);
+        assert_eq!(
+            snap.counter(
+                "velo_transport_frames_written_total",
+                &[("transport", "tcp"), ("message_type", "message")]
+            ),
+            3.0
+        );
+        assert_eq!(
+            snap.counter(
+                "velo_transport_frames_written_total",
+                &[("transport", "tcp"), ("message_type", "response")]
+            ),
+            1.0
+        );
+        assert_eq!(
+            snap.counter_sum(
+                "velo_transport_frames_written_total",
+                &[("transport", "tcp")]
+            ),
+            4.0,
+            "the family sums across message types"
+        );
+        assert_eq!(
+            snap.histogram_count(
+                "velo_transport_egress_queue_wait_seconds",
+                &[("transport", "tcp")]
+            ),
+            1
+        );
+        assert!(
+            (snap.histogram_sum(
+                "velo_transport_egress_queue_wait_seconds",
+                &[("transport", "tcp")]
+            ) - 0.004)
+                .abs()
+                < 1e-9,
+            "the wait is recorded in seconds"
+        );
+        assert_eq!(
+            snap.histogram_count(
+                "velo_transport_write_duration_seconds",
+                &[("transport", "tcp")]
+            ),
+            1
+        );
+    }
+
+    /// `TransportMetricsHandle::record_frames_written` indexes
+    /// `egress_children().frames_written` by `message_type as usize` with no
+    /// bounds check — the old `&str` signature had an `Option` fallback for
+    /// an unrecognized label, but `MessageType` is closed, so the enum itself
+    /// is supposed to make that case unrepresentable. This is what keeps that
+    /// true if a future discriminant is ever added above `ShuttingDown`
+    /// without widening `TRANSPORT_MESSAGE_TYPES` to match — the mirror of
+    /// `tally_has_one_slot_per_message_type` in `transports::coalesce::tests`.
+    ///
+    /// The bounds check alone would still pass if `TRANSPORT_MESSAGE_TYPES`
+    /// were merely reordered (no discriminant added or removed) — the slot
+    /// would exist, just under the wrong Prometheus label, and nothing here
+    /// or in `record_frames_written` itself would notice. The second
+    /// assertion below closes that: it ties each slot's string back to
+    /// `transports::message_type_label`, the function that already gives
+    /// every discriminant its canonical label, so the two can no longer
+    /// silently drift apart.
+    #[test]
+    fn frames_written_total_covers_every_message_type() {
+        for byte in 0..=u8::MAX {
+            if let Some(msg_type) = MessageType::from_u8(byte) {
+                assert!(
+                    (msg_type as usize) < TRANSPORT_MESSAGE_TYPES.len(),
+                    "{msg_type:?} (discriminant {byte}) has no frames_written slot — \
+                     widen TRANSPORT_MESSAGE_TYPES"
+                );
+                assert_eq!(
+                    TRANSPORT_MESSAGE_TYPES[msg_type as usize],
+                    crate::transports::message_type_label(msg_type),
+                    "{msg_type:?}'s frames_written slot is labelled \
+                     {:?}, but its canonical label is {:?} — \
+                     TRANSPORT_MESSAGE_TYPES has drifted out of discriminant order",
+                    TRANSPORT_MESSAGE_TYPES[msg_type as usize],
+                    crate::transports::message_type_label(msg_type)
+                );
+            }
+        }
+    }
+
+    /// The two egress histograms must share one bucket ladder. Neither answers
+    /// anything alone — the reading is their difference — and two
+    /// distributions binned differently cannot be subtracted. This test is what
+    /// stops a later tidy-up from moving one of them onto the house recipe.
+    #[test]
+    fn egress_histograms_share_one_bucket_ladder() {
+        let registry = Registry::new();
+        let metrics = VeloMetrics::register(&registry).expect("register metrics");
+        let handle = metrics.bind_transport("tcp");
+        handle.record_egress_queue_wait(Duration::from_millis(1));
+        handle.record_egress_write_duration(Duration::from_millis(1));
+
+        let families = registry.gather();
+        for name in [
+            "velo_transport_egress_queue_wait_seconds",
+            "velo_transport_write_duration_seconds",
+        ] {
+            let family = families
+                .iter()
+                .find(|f| f.name() == name)
+                .unwrap_or_else(|| panic!("{name} family"));
+            let edges: Vec<f64> = family.get_metric()[0]
+                .get_histogram()
+                .get_bucket()
+                .iter()
+                .map(|b| b.upper_bound())
+                .collect();
+            assert_eq!(edges, EGRESS_BUCKETS.to_vec(), "{name} is off the ladder");
+        }
+    }
+
+    /// `bind_transport` must not pre-create the egress instruments' Prometheus
+    /// children for a transport that never publishes them. gRPC has no
+    /// per-connection coalescing writer, so it never calls
+    /// `record_frames_written`/`record_egress_queue_wait`/
+    /// `record_egress_write_duration` — an always-zero child on it would
+    /// still be a real series, and `frames_written_total` is documented as
+    /// the term subtracted from `frames_total{outbound,accepted}` to get
+    /// queue depth: a zero denominator beside a real, growing numerator reads
+    /// as a permanent backlog, not as "not instrumented".
+    #[test]
+    fn egress_instruments_are_not_bound_on_a_transport_that_never_publishes_them() {
+        let registry = Registry::new();
+        let metrics = VeloMetrics::register(&registry).expect("register metrics");
+        let _grpc_handle = metrics.bind_transport("grpc");
+
+        let has_series_for =
+            |families: &[prometheus::proto::MetricFamily], name: &str, transport: &str| {
+                families.iter().any(|family| {
+                    family.name() == name
+                        && family.get_metric().iter().any(|metric| {
+                            metric
+                                .get_label()
+                                .iter()
+                                .any(|l| l.name() == "transport" && l.value() == transport)
+                        })
+                })
+            };
+
+        let families = registry.gather();
+        for name in [
+            "velo_transport_frames_written_total",
+            "velo_transport_egress_queue_wait_seconds",
+            "velo_transport_write_duration_seconds",
+        ] {
+            assert!(
+                !has_series_for(&families, name, "grpc"),
+                "{name} must have no series for grpc, which never publishes it"
+            );
+        }
+
+        // TCP does publish these, and calling the recorders must still
+        // produce them — the lazy build must not narrow this to nothing.
+        let tcp_handle = metrics.bind_transport("tcp");
+        tcp_handle.record_frames_written(MessageType::Message, 1);
+        tcp_handle.record_egress_queue_wait(Duration::from_millis(1));
+        tcp_handle.record_egress_write_duration(Duration::from_millis(1));
+
+        let families = registry.gather();
+        for name in [
+            "velo_transport_frames_written_total",
+            "velo_transport_egress_queue_wait_seconds",
+            "velo_transport_write_duration_seconds",
+        ] {
+            assert!(
+                has_series_for(&families, name, "tcp"),
+                "{name} must still have a series for tcp, which does publish it"
+            );
+        }
     }
 
     #[test]
@@ -2073,6 +2898,81 @@ mod tests {
         let metrics = VeloMetrics::register(&registry).expect("register metrics");
         assert!(metrics.bind_ordered_dispatcher("_internal").is_none());
         assert!(metrics.bind_ordered_dispatcher("user_handler").is_some());
+        // `_stream_batch` is the one exception to the `_` filter. It is the
+        // mux's only ingress lane, so with it excluded the lane depth and wait
+        // histograms are dark on the single path that carries every streamed
+        // record — the one place an operator needs them.
+        assert!(
+            metrics
+                .bind_ordered_dispatcher(crate::streaming::messenger_mux::STREAM_BATCH_HANDLER)
+                .is_some(),
+            "the mux ingress lane must reach the ordered-dispatch collectors"
+        );
+        // The exception is scoped to ordered dispatch. Per-handler request,
+        // duration and byte series stay off for every `_` handler, so the
+        // allowlist must not widen that surface on its way past.
+        assert!(
+            metrics
+                .bind_handler(crate::streaming::messenger_mux::STREAM_BATCH_HANDLER)
+                .is_none(),
+            "the ordered-lane allowlist must not leak into the per-handler series"
+        );
+    }
+
+    #[test]
+    fn inbound_dequeue_counter_counts_every_departure() {
+        use super::test_helpers::MetricSnapshot;
+
+        let registry = Registry::new();
+        let metrics = VeloMetrics::register(&registry).expect("register metrics");
+        let dequeued = metrics.bind_inbound_dequeued();
+
+        dequeued.inc();
+        dequeued.inc();
+        dequeued.inc();
+
+        assert_eq!(
+            MetricSnapshot::from_registry(&registry)
+                .counter("velo_messenger_inbound_dequeued_total", &[]),
+            3.0,
+            "the handed-out collector must write into the registered family"
+        );
+    }
+
+    /// The attach RTT histogram does not use the house bucket recipe, and the
+    /// edges it uses instead are the point of the metric.
+    ///
+    /// `exponential_buckets(0.0005, 2.0, 16)` — what every other Velo histogram
+    /// takes — has its top edges at 0.256, 0.512, 1.024 and 2.048 s. An attach
+    /// queued behind a busy receiver's ingest backlog lands between them, so a
+    /// percentile read there is good only to a factor of two: the same factor
+    /// as the effect. These edges resolve that band instead, and this test is
+    /// what stops a later tidy-up from folding them back into the recipe.
+    #[test]
+    fn attach_rtt_buckets_resolve_the_second_scale() {
+        let registry = Registry::new();
+        let metrics = VeloMetrics::register(&registry).expect("register metrics");
+        metrics.record_attach_rtt(HandlerOutcome::Success, "tcp", Duration::from_millis(1));
+
+        let families = registry.gather();
+        let family = families
+            .iter()
+            .find(|f| f.name() == "velo_streaming_anchor_attach_rtt_seconds")
+            .expect("attach rtt family");
+        let edges: Vec<f64> = family.get_metric()[0]
+            .get_histogram()
+            .get_bucket()
+            .iter()
+            .map(|b| b.upper_bound())
+            .collect();
+
+        for edge in [0.1, 0.2, 0.35, 0.5, 0.75, 1.0, 1.5, 2.0] {
+            assert!(
+                edges.contains(&edge),
+                "missing the {edge}s edge; the second scale is where the answer lives. \
+                 got {edges:?}"
+            );
+        }
     }
 
     #[test]

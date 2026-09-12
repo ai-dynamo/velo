@@ -6,8 +6,9 @@
 //! Read against `egress.rs`, which pins the same batcher under the default
 //! policy: everything there is the regression that `Auto` did not change. What
 //! is asserted here is the difference — that `Manual` holds ordinary records
-//! and only ordinary records, that a kick moves them, and that neither policy
-//! can hold back the records something else is waiting on.
+//! until a kick moves them, that a close or a terminal moves the batch it was
+//! staged into regardless, and that a `CreditUpdate` moves within
+//! `MuxConfig::reply_linger` even when a data record is staged beside it.
 //!
 //! Every test drives the real batcher against a real messenger, so the
 //! assertions are the decoded wire bytes rather than an accounting mirror.
@@ -210,16 +211,25 @@ async fn a_flush_with_nothing_staged_writes_nothing() {
 // What no policy may hold back
 // ---------------------------------------------------------------------------
 
-/// A `CreditUpdate` owed to a peer goes without waiting to be flushed.
+/// A `CreditUpdate` owed to a peer goes within the reply window, without
+/// waiting for a flush.
 ///
 /// The sharpest case of the rule, and the reason it is correctness rather than
 /// polish: the peer's sender is parked waiting for this window, and no
-/// application on *this* side knows it owes that peer anything. If credit could
-/// wait for `flush_batch`, a node with a quiet producer would starve a busy
-/// one.
+/// application on *this* side knows it owes that peer anything. If credit
+/// could wait for `flush_batch`, a node with a quiet producer would starve a
+/// busy one. Bounded by an explicit short `reply_linger` rather than
+/// `RECV_TIMEOUT`, so this discriminates a held reply from one that moved —
+/// the assertion held at any `reply_linger` under five seconds before
+/// `flush_gate` bounded a reply's window to records joining it either way.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_credit_reply_moves_under_manual() {
-    let harness = harness(manual()).await;
+    let window = Duration::from_millis(50);
+    let harness = harness(MuxConfig {
+        reply_linger: window,
+        ..manual()
+    })
+    .await;
     let peer_slot = SlotId::new(7, 0).expect("index fits u24");
 
     harness
@@ -229,11 +239,55 @@ async fn a_credit_reply_moves_under_manual() {
             delta: 32,
         }]);
 
-    let batch = harness.next_batch().await;
+    let batch = tokio::time::timeout(window * 4, harness.next_batch())
+        .await
+        .expect("a credit reply must not wait past its own window");
     assert_eq!(batch.records.len(), 1);
     assert_eq!(batch.records[0].kind, RecordType::CreditUpdate);
     assert_eq!(batch.records[0].slot, peer_slot);
     assert_eq!(batch.records[0].credit, 32);
+}
+
+/// A reply joining a batch that already holds a staged data record keeps its
+/// own window, under `Manual`, end to end through the running batcher.
+///
+/// The regression this file previously could not see: staging a data record
+/// first left the gate's `staged == 0` guard on `stage_reply` never firing, so
+/// the reply's window never started and nothing under `Manual` — no policy, no
+/// timer — ever rescued it. `await_staged(1)` is the positive fact that the
+/// data record reached the gate before the reply is sent, which is what makes
+/// this Family A rather than a reply-alone case.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_credit_reply_moves_under_manual_behind_a_staged_record() {
+    let window = Duration::from_millis(50);
+    let harness = harness(MuxConfig {
+        reply_linger: window,
+        ..manual()
+    })
+    .await;
+    let (inlet, _) = harness.open_credited(1, 1, CREDIT).await;
+
+    inlet.send(item(0)).expect("stage a record");
+    harness.await_staged(1).await;
+
+    let peer_slot = SlotId::new(7, 0).expect("index fits u24");
+    harness
+        .handle
+        .reply(&[super::super::ReplyRecord::CreditUpdate {
+            slot: peer_slot,
+            delta: 32,
+        }]);
+
+    let batch = tokio::time::timeout(window * 4, harness.next_batch())
+        .await
+        .expect("a reply joining an already-staged batch keeps its own window under Manual");
+    let kinds: Vec<RecordType> = batch.records.iter().map(|r| r.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![RecordType::Data, RecordType::CreditUpdate],
+        "the data record staged first must ride out in the same write as the \
+         reply that carries it — not just the reply reaching the wire on its own"
+    );
 }
 
 /// So does a close the peer is waiting on.
@@ -402,69 +456,12 @@ async fn an_auto_window_writes_without_a_kick() {
 /// hope.
 #[tokio::test(flavor = "current_thread")]
 async fn kicks_during_an_admission_park_neither_double_send_nor_reorder() {
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicU64;
-
-    use dashmap::DashMap;
-    use tokio_util::sync::CancellationToken;
-
-    use super::super::{BatcherContext, OpenSlotRequest, spawn};
-    use super::support::{OwnedBatch, StallingTransport, eventually};
-    use crate::messenger::Messenger;
-    use crate::observability::VeloMetrics;
-    use crate::streaming::messenger_mux::flow_control::SlotCredit;
+    use super::support::{eventually, stalled_harness};
 
     const QUEUED: u32 = 120;
 
-    let (transport, wire) = StallingTransport::new(tokio::runtime::Handle::current());
-    let sender = Messenger::builder()
-        .add_transport(Arc::clone(&transport) as Arc<dyn velo_ext::Transport>)
-        .build()
-        .await
-        .expect("sender messenger");
-    let peer_instance = velo_ext::InstanceId::new_v4();
-    sender
-        .register_peer(velo_ext::PeerInfo::new(
-            peer_instance,
-            velo_ext::WorkerAddress::from_encoded(
-                rmp_serde::to_vec(&std::collections::HashMap::from([(
-                    "stalling".to_string(),
-                    b"stalling".to_vec(),
-                )]))
-                .expect("encode"),
-            ),
-        ))
-        .expect("register peer");
-
-    let registry = prometheus::Registry::new();
-    let metrics = Arc::new(VeloMetrics::register(&registry).expect("register metrics"));
-    let cancel = CancellationToken::new();
-    let handle = spawn(
-        peer_instance.worker_id(),
-        BatcherContext {
-            messenger: Arc::clone(&sender),
-            config: manual(),
-            metrics: Some(metrics.bind_mux()),
-            epochs: Arc::new(AtomicU64::new(1)),
-            batchers: Arc::new(DashMap::new()),
-            cancel: cancel.clone(),
-            hooks: None,
-        },
-    );
-
-    let (inlet, inlet_rx) = flume::bounded::<Vec<u8>>(512);
-    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-    handle
-        .open_slot(OpenSlotRequest {
-            anchor_id: 1,
-            session_id: 1,
-            inlet: inlet_rx,
-            credit: SlotCredit::new(CREDIT),
-            slot_byte_budget: MuxConfig::default().slot_byte_budget,
-            ack: ack_tx,
-        })
-        .await
-        .expect("queue OpenSlot");
+    let harness = stalled_harness(manual()).await;
+    let (inlet, ack_rx) = harness.open(1, 1, CREDIT).await;
     tokio::time::timeout(RECV_TIMEOUT, ack_rx)
         .await
         .expect("ack")
@@ -473,13 +470,7 @@ async fn kicks_during_an_admission_park_neither_double_send_nor_reorder() {
 
     // The eager `OpenSlot` flush is the first write; it takes the gate's one
     // free place, so every flush after it parks.
-    let open = OwnedBatch::decode(&{
-        let (_, payload) = tokio::time::timeout(RECV_TIMEOUT, wire.recv_async())
-            .await
-            .expect("the OpenSlot flush must reach the wire")
-            .expect("wire open");
-        payload
-    });
+    let open = harness.next_wire_batch().await;
     assert_eq!(open.records[0].kind, RecordType::OpenSlot);
 
     let batches = |registry: &prometheus::Registry| {
@@ -490,14 +481,14 @@ async fn kicks_during_an_admission_park_neither_double_send_nor_reorder() {
     // offered to the messenger, so it counts batches offered, not batches
     // landed. Wait for the OpenSlot flush to be accounted before building on
     // the number.
-    eventually(|| batches(&registry) == 1.0).await;
+    eventually(|| batches(&harness.registry) == 1.0).await;
 
     // The read above drained the OpenSlot batch off the wire, so this write
     // takes the one free place rather than parking. It is the write *after* it
     // that has nowhere to go.
     inlet.send(item(0)).expect("stage a record");
-    handle.kick_flush();
-    eventually(|| wire.is_full() && batches(&registry) == 2.0).await;
+    harness.handle.kick_flush();
+    eventually(|| harness.wire.is_full() && batches(&harness.registry) == 2.0).await;
 
     // Park the batcher, and wait for the fact rather than assuming it: the gate
     // took this frame into its FIFO instead of admitting it, so the batcher is
@@ -505,10 +496,10 @@ async fn kicks_during_an_admission_park_neither_double_send_nor_reorder() {
     // a batch *count* here would be waiting on the wrong thing — the count
     // moves before the send, so it cannot distinguish offered from parked.
     inlet.send(item(1)).expect("stage a record");
-    handle.kick_flush();
-    eventually(|| transport.stalled() == 1).await;
-    let parked_at = batches(&registry);
-    let offered_at_park = transport.offered();
+    harness.handle.kick_flush();
+    eventually(|| harness.transport.stalled() == 1).await;
+    let parked_at = batches(&harness.registry);
+    let offered_at_park = harness.transport.offered();
 
     // The producer keeps going: more of the stream, and a flush per pass, all
     // while the batcher is suspended.
@@ -520,17 +511,17 @@ async fn kicks_during_an_admission_park_neither_double_send_nor_reorder() {
     // to offer anything. Yielding hands it that chance 118 times over.
     for n in 2..QUEUED {
         inlet.send(item(n)).expect("stage a record");
-        handle.kick_flush();
+        harness.handle.kick_flush();
         tokio::task::yield_now().await;
     }
     assert_eq!(
-        transport.offered(),
+        harness.transport.offered(),
         offered_at_park,
         "once the batcher is parked in an admission nothing more may be offered \
          to the messenger, however many times the application asks"
     );
     assert_eq!(
-        batches(&registry),
+        batches(&harness.registry),
         parked_at,
         "and no further batch may even be built behind the parked one"
     );
@@ -538,16 +529,11 @@ async fn kicks_during_an_admission_park_neither_double_send_nor_reorder() {
     // Open the gate and collect everything, in the order it was written.
     let mut seen: Vec<u32> = Vec::new();
     while (seen.len() as u32) < QUEUED {
-        let (_, payload) = tokio::time::timeout(RECV_TIMEOUT, wire.recv_async())
-            .await
-            .expect("the batcher must resume once the gate drains")
-            .expect("wire open");
-        for record in OwnedBatch::decode(&payload).records {
+        for record in harness.next_wire_batch().await.records {
             assert_eq!(record.kind, RecordType::Data);
             seen.push(record.frame_seq);
         }
     }
-    cancel.cancel();
 
     // `OpenSlot` took frame_seq 0, so the data records are 1..=QUEUED.
     let expected: Vec<u32> = (1..=QUEUED).collect();

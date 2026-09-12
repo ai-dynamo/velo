@@ -107,8 +107,9 @@ the part that actually matters — **one write instead of 32**.
 ## Measured results
 
 The validation methodology below calls the batching ratio
-(`frames_written / egress_flushes`) *"the cheapest and most decisive
-experiment."* It has been run. Both numbers come from
+(`velo_streaming_frames_written_total / velo_streaming_egress_flushes_total`)
+*"the cheapest and most decisive experiment."* It has been run. Both numbers
+come from
 `lib/velo/tests/streaming/tcp_batching.rs` on TCP loopback, and both are
 reproducible with `cargo test --all-features --test streaming_tcp_batching --
 --nocapture`.
@@ -318,13 +319,30 @@ the consumer.
 One narrow exception survives, and it is self-inflicted. Rendezvous payloads
 resolve in a detached task *before* dispatch, so an oversized record routed that
 way is not ordered against the eager batches around it — the ordered dispatcher
-says so itself, and warns once per handler. Two mechanisms bound it. Egress
-fences the slot: at most one rendezvous record per slot is outstanding, and the
-batcher withholds that slot's later records until the staged send is admitted.
-Ingress holds records arriving ahead of `frame_seq` in that slot's own buffer,
-bounded by credit already granted, applying them when the gap closes. Overflow
-closes **that slot** with `Dropped` and meters it; other slots are untouched and
-the lane never blocks.
+says so itself, and warns once per handler. Two mechanisms bound it:
+
+1. Egress fences the slot: at most one *fenced* singleton per slot is
+   outstanding — a rendezvous record, which always fences, or
+   (`MuxConfig::async_open_ack`) the slot's own `OpenSlot`, which skips the
+   fence only when the transport already admitted it synchronously, since
+   per-target FIFO then already orders anything dispatched after it and there
+   is nothing left for a fence to buy — and only that singleton's own
+   resolution lifts a fence it did raise. While the fence is up, the batcher
+   withholds that slot's later records until the staged send is admitted —
+   its `CloseSlot` included, since a close is the slot's next record too and
+   may not overtake the one still awaiting admission. The `OpenSlot` case is
+   the sharper of the two: there the receiver has not bound the slot at all,
+   so a `CloseSlot` that arrived first would name a slot it cannot resolve
+   and is dropped as `closed_slot`, leaving the stream for the consumer's
+   heartbeat watchdog to find. Only the record waits; the slow-consumer
+   kill's other half, ending the producer's inlet, happens the moment the
+   byte cap is exceeded regardless of the fence (`SATURATION.md`) — a
+   producer left running ahead into a slot whose records are already being
+   discarded is the thing the byte cap exists to stop.
+2. Ingress holds records arriving ahead of `frame_seq` in that slot's own
+   buffer, bounded by credit already granted, applying them when the gap
+   closes. Overflow closes **that slot** with `Dropped` and meters it; other
+   slots are untouched and the lane never blocks.
 
 #### `OpenSlot` is eager
 
@@ -336,6 +354,25 @@ producer produces its first token"* and would expire a queued request with a lon
 prefill. It costs a record, not a send. The reverse race — an `OpenSlot` for an
 `(anchor_id, session_id)` that was never registered — must **not** fail the peer:
 the receiver replies `CloseSlot{unknown}` and discards that slot's records.
+
+Eager is about the *write*, not about the ack. `MuxConfig::async_open_ack`
+separates the two: the `OpenSlot` is still cut into a batch of its own and still
+handed to the transport before `connect` returns, so the accept window keeps
+measuring the same thing, but the ack no longer waits for the transport to admit
+it. On a congested peer that wait is a place in a send queue that is already
+full, and a worker cannot start producing until it comes free. The open then
+behaves exactly like an over-budget singleton: unless the admission is already
+behind it — synchronously `Admitted`, as it is on an uncongested peer, where
+per-target FIFO already orders it ahead of anything sent after it — the slot
+is fenced until the admission resolves, so its first record cannot overtake
+the `OpenSlot` that claims it, and a failed admission is epoch death either
+way. The default is off — the awaited ack is what shipped.
+
+The ack it skips is the open's own. The `OpenSlot` still goes in a batch of its
+own, so whatever was already staged for the peer is written first and *that*
+write still parks on admission: an open is wait-free only when nothing is
+staged, and when something is it costs one frame more than the awaited path,
+which packs the `OpenSlot` into the staged batch instead.
 
 #### Peer loss
 
@@ -450,13 +487,34 @@ worker thread from inside a `Drop` in async context.
 > document prefers to the watchdog kill, made deterministic; `SATURATION.md`
 > describes it from the operator's side.
 
-The batcher's own control inlet is bounded the same way, and for the same
-reason. Credit returns, closes and singleton resolutions arrive as **coalesced
-per-slot state** rather than as messages: credit accumulates into a `u32`, a
-close dominates the credit for its slot, and a failed singleton dominates a
-successful one. A queue would have been unbounded exactly when it matters — a
-flush parks on admission precisely when the peer is congested, which is when its
-ingress lane is busiest returning credit — so the batcher is *woken*, never fed.
+The batcher's own control inlet is bounded for the same reason, but not by a
+byte cap — a slot's credit and close are state a peer can only ever hold one
+of, not a queue a byte budget can drain. Credit returns, closes and singleton
+resolutions arrive as **coalesced per-slot state** rather than as messages:
+credit accumulates into a `u32`, a close dominates the credit for its slot,
+and a failed singleton dominates a successful one. A queue would have been
+unbounded exactly when it matters — a flush parks on admission precisely when
+the peer is congested, which is when its ingress lane is busiest returning
+credit — so the batcher is *woken*, never fed. Each of these maps is keyed by
+slot id — index plus an 8-bit generation the writer chose, not by index
+alone — so a fixed size cap was the wrong shape for what it was guarding
+against, which is a peer naming ids that were never alive. What actually
+bounds each map is distinct (index, generation) pairs written since the last
+drain, not one entry per live slot: the map of what a peer owes this side's
+own slots is bounded by which indices this batcher has ever allocated, and
+the map of what this side owes the peer's slots is bounded by which indices
+the ingress table has ever admitted — both up to 256 keys per index, the
+width of the generation, if that index is closed and reopened repeatedly
+between two drains — plus the one sub-lane that answers an `OpenSlot` this
+side never admitted. The id that lane rejects can still be one this side
+holds live under a different, admitted `OpenSlot`, so no table's size limit
+bounds it either; that sub-lane is capped by count instead, which is safe
+because dropping one of those costs no credit — the sender's slot just keeps
+streaming into one the receiver already discarded until its own producer
+finishes, unlike a dropped `CreditUpdate`, which is unrecoverable. `drain`
+is what actually caps the accumulation window in practice — it takes every
+map under one lock hold — and `peer_batcher::control::ControlState`'s field
+docs give the bound each map carries.
 Attach requests keep a queue, bounded, because each carries its own channel and
 its own waiting caller and there is nothing to merge.
 
@@ -468,13 +526,27 @@ per-target admission gate as `SendOutcome::{Admitted, Pending(SendAdmission)}`,
 reserving the ticket synchronously so an unpolled slow-path send cannot be
 overtaken. A batcher therefore learns at the send site, in order, that its peer is
 congested, and parks itself rather than a runtime worker. It is also what the
-rendezvous fence in [Slots](#slots) is made of.
+singleton fence in [Slots](#slots) is made of.
 
 > **Invariant.** A slot never has more than `C` frames outstanding against a
 > `C + 1`-deep buffer, so the applier only `try_send`s into space credit already
 > reserved and **never blocks its lane** — which matters because the lane runs
 > each handler to completion before pulling the next batch.
 > `velo_streaming_mux_reader_stall_total > 0` is a bug, not a tuning signal.
+
+> **Watching the lane.** `velo_messenger_ordered_lane_depth{handler="_stream_batch"}`
+> and `velo_messenger_ordered_lane_wait_seconds{handler="_stream_batch"}` report
+> the ingress lane directly. `_stream_batch` is the one `_`-prefixed handler
+> exempted from the ordered-dispatch metric filter, precisely because it is the
+> lane this section is about. Both are observed once per *batch*, so a wait read
+> there is the wait of a batch, not of a record — `velo_streaming_mux_records_per_batch`
+> is what says how many records that one wait covered.
+>
+> The lane carries the credit-return direction too: grants and peer-closes ride
+> home to the producer as `ReplyRecord`s in ordinary `_stream_batch` batches. On
+> a node that both sends and receives streams the wait distribution therefore
+> mixes record-carrying data batches with credit-only ones, which are not the
+> same size of work.
 
 ### Terminal sentinels
 
@@ -543,9 +615,9 @@ separates them is only *who* decides.
 
 | Policy | Trigger | Added latency | Default |
 |---|---|---|---|
-| **`Auto { on_admission }`** | end of every wake, having first drained what is already queued | **none** | **on** |
+| **`Auto { on_admission }`** | end of every wake, having first drained what is already queued | **none** (≤ `reply_linger` for a replies-only batch) | **on** |
 | **`Auto { max_linger }`** | up to `max_linger` after the batch's first record | ≤ window | off |
-| **`Manual`** | `flush_batch()` | the caller's | off |
+| **`Manual`** | `flush_batch()` | the caller's; a batch holding a pending reply is written on the first end-of-wake check once `reply_linger` elapses (the window plus whatever remains of that drain pass), carrying whatever is staged with it | off |
 
 The two `Auto` conditions are a struct rather than two variants because they
 compose — a batcher may hold both, and holding neither is a legitimate if
@@ -555,11 +627,13 @@ admits it, so "at the end of every wake" is in practice "as soon as the peer too
 the last batch". `max_linger` is the windowed policy, demoted from a policy to a
 condition. `Manual` replaces the hinted one.
 
-Opportunistic is the default precisely because it cannot make anything worse:
+Opportunistic is the default precisely because, on its own, it cannot make anything worse:
 the egress task never waits for work that has not arrived. It simply notices
 that more work is *already* queued and takes all of it. Under load, batches
 form; under no load, behaviour is identical to today minus one syscall's worth
-of bookkeeping.
+of bookkeeping. The one exception is a batch holding nothing but pending
+credit replies, which waits for `MuxConfig::reply_linger` under every
+policy — see the `CreditUpdate` bullet below.
 
 **Two reasons to write override every policy**, and they are why a burst is a
 hint rather than a frame boundary:
@@ -567,11 +641,29 @@ hint rather than a frame boundary:
 - **A batch at a clamp goes.** The byte cap, the record cap and the eager budget
   each cut a batch where they bind, because holding a full batch buys nothing —
   there is no room left to batch into.
-- **Records that carry liveness go.** `OpenSlot` keeps its own eager flush, and
-  a `CloseSlot`, a `CreditUpdate` or a terminal moves the batch it was staged
-  into. A `CreditUpdate` held back is a peer's sender starved with nothing left
-  to rescue it, and no application on this side knows it owes that peer
-  anything — so this is correctness, not courtesy.
+- **Records that carry liveness go.** The awaited open path's `OpenSlot` keeps
+  its own eager flush, and a `CloseSlot` or a terminal moves the batch it was
+  staged into. (`MuxConfig::async_open_ack`'s detached open bypasses this
+  policy entirely, dispatching straight to the transport — see
+  § "Configuration".) A
+  `CreditUpdate` moves too, but on its own clock: `MuxConfig::reply_linger`
+  (1 ms by default) starts the moment a reply with no window already running
+  joins the batch, and the window is a property of *that reply*, not of the
+  batch staying replies-only — a data record joining afterward does not cancel
+  it. Whether data cuts the wait short depends on the policy: under
+  `on_admission`, any record that is not a credit reply ends the wait at once,
+  because the batch is no longer replies-only and `on_admission` has its own
+  reason to write it; a batch holding nothing but replies waits out the window.
+  Under `Manual` and `Auto { on_admission: false }`, nothing about ordinary
+  staging cuts it short, so the reply keeps its bound and any data staged with
+  it rides out in the same write. Held for good, a reply is a peer's sender
+  starved with nothing left to rescue it, and no application on this side knows
+  it owes that peer anything — so no policy may hold one past its window.
+  Held for a millisecond it costs that sender `reply_linger / initial_credit`
+  per record and turns one batch per reply into one per sweep visit — measured
+  on the tier-3 rig, arms that differ only in this window, as 4.3x-5.9x fewer
+  outbound batches across 3 reps on a receiver whose egress is otherwise idle
+  (see `agent-docs/w7-reply-linger-measurement.md`).
 
 Credit starvation also cuts a batch, from the other direction: a slot with no
 credit contributes nothing to the batch at all, and its records wait in the
@@ -626,14 +718,17 @@ one it makes itself, at the end of the pass it is already writing.
 #### The one failure mode
 
 Under `Manual`, records that end up staged after the last `flush_batch` wait for
-the next one, and **nothing rescues them** — there is no timer behind the policy,
-which is what makes "one write per pass, carrying that pass" a property of the
-code rather than of the scheduler. Usually that means a producer that stopped
-calling it. It also covers a subtler case: a slot starved of credit has its
-records in the withheld queue rather than the batch, so a grant arriving after
-the flush releases them into the *next* pass's batch. That one is bounded by the
-stream's own end, since a terminal and an inlet close are both records that move
-on their own.
+the next one, and **nothing rescues them for the application's own records** —
+there is no timer behind the policy for those, which is what makes "one write
+per pass, carrying that pass" a property of the code rather than of the
+scheduler. Usually that means a producer that stopped calling it. It also
+covers a subtler case: a slot starved of credit has its records in the withheld
+queue rather than the batch, so a grant arriving after the flush releases them
+into the *next* pass's batch. That one is bounded by the stream's own end,
+since a terminal and an inlet close are both records that move on their own.
+The one record this section does not describe is a pending credit reply:
+`MuxConfig::reply_linger` carries it, and whatever else is staged with it, out
+after that window regardless of policy — see the `CreditUpdate` bullet above.
 
 The cost is latency rather than memory either way, since staged records are
 bounded by the same clamps as any batch, and `velo_streaming_mux_staged_records`
@@ -742,6 +837,7 @@ let node = Velo::builder()
         max_batch_bytes: 60 * 1024,   // further clamped by the eager budget
         initial_credit: 256,          // advertised verbatim; zero is refused
         flush_policy: FlushPolicy::Manual,   // default: Auto, opportunistic
+        async_open_ack: true,         // default: false; see the warning below
         ..Default::default()
     })?
     .build()
@@ -756,6 +852,15 @@ let node = Velo::builder()
 > half a configuration: the other half is the producer calling `flush_batch()`,
 > and a node configured this way whose producer does not is a node whose streams
 > stop. Set it where you own the send loop.
+>
+> **`async_open_ack` trades the awaited `OpenSlot` for a second way to lose a
+> stream, and measurement so far has not shown the open it is meant to speed
+> up.** The mechanism and its per-open cost are on the field's own rustdoc
+> (`MuxConfig::async_open_ack`); the kill it opens on a congested peer is in
+> `SATURATION.md` § "Under the messenger mux"; the numbers are in
+> `agent-docs/w4a-async-open-ack-status.md`. Set it where a stalled peer's
+> queue depth is bounded and you have measured the open it is meant to speed
+> up at your own concurrency — not on the expectation that it will.
 
 Activation is opt-in and stays that way for this work; the mux is not the default
 transport. Defaults are otherwise chosen so `enabled` is the only decision an
@@ -774,24 +879,47 @@ New series, alongside the existing `velo_streaming_*` collectors:
 |---|---|
 | `velo_streaming_egress_flushes_total` | Batches the per-stream egress pump handed to the socket. A unit of coalescing, not a syscall: a frame too large to pack is written segmented and still counts as one |
 | `velo_streaming_frames_written_total` | Logical frames written |
-| `velo_streaming_connections_open` | Gauge of open streaming connections |
-| `velo_streaming_batch_records_per_flush` | Histogram of records per batch |
-| `velo_streaming_batch_bytes_per_flush` | Histogram of bytes per batch |
-| `velo_streaming_batch_flush_total{reason}` | Mux-era flush reasons: `opportunistic\|window\|hint\|cap\|starved\|watchdog\|terminal`. Distinct from `egress_flushes_total`, which counts per-stream pump flushes and ships today |
+| `velo_streaming_connections_open` | Gauge of open streaming connections. Specified here; nothing registers it yet |
+| `velo_streaming_batch_records_per_flush` | Histogram of records per batch. Specified here; nothing registers it yet — `velo_streaming_mux_records_per_batch{direction}` below is what ships |
+| `velo_streaming_batch_bytes_per_flush` | Histogram of bytes per batch. Specified here; nothing registers it yet |
+| `velo_streaming_batch_flush_total{reason}` | Mux-era flush reasons: `opportunistic\|window\|hint\|cap\|starved\|watchdog\|terminal`. Distinct from `egress_flushes_total`, which counts per-stream pump flushes and ships today. Specified here; nothing registers it yet |
 | `velo_streaming_mux_batches_total{direction}` | `_stream_batch` active messages packed (`sent`) or decoded (`received`) |
 | `velo_streaming_mux_records_per_batch{direction}` | Histogram of records carried by one of them. Labelled like its sibling and for the same reason: every mux node is both ends at once — credit rides back on `_stream_batch` — so an unlabelled sum would mix a node's own packing with its peers' and be attributable to neither |
-| `velo_streaming_mux_staged_records` | Gauge of records packed into batches the batchers have open but have not written. Transient under `Auto`; under `Manual` a plateau is a producer that stopped calling `flush_batch()`, which is that policy's one failure mode |
+| `velo_streaming_mux_staged_records` | Gauge of records packed into batches the batchers have open but have not written. Transient under `Auto` with `on_admission` set, where every wake that stages anything besides credit replies ends in a write and a batch holding only credit replies is held for up to `MuxConfig::reply_linger`. Under `Manual`, or `Auto { on_admission: false, max_linger: None }` — the two policies with no timer of their own — a pending credit reply still holds the whole batch it is in for that same bound, data included, so a plateau beyond it is a producer that stopped calling `flush_batch()` (under `Auto { max_linger: Some(_) }` instead, the same plateau means that window's own timer stalled) |
 | `velo_streaming_mux_live_slots` | Gauge; must return to zero at teardown |
 | `velo_streaming_mux_reader_stall_total` | **Should always be zero.** Non-zero means the credit invariant is broken |
 | `velo_streaming_mux_generation_mismatch_total` | Stale records dropped by the generation check |
+| `velo_streaming_mux_batch_seq_gaps_total` | Batches missing between the expected and received `batch_seq` within one epoch — reported and moved past, since the mux does not retransmit, so this is how many batches the per-slot `frame_seq` machinery had to recover from. The meter keeps a high-water mark: a batch behind the mark — a duplicate, or one that arrived after its successor — is not metered and does not move the mark, so an inverted pair costs exactly one (the single batch its later half looked like when it arrived first), never a wrapped `u32`. A detached open under `async_open_ack` can invert a pair this way |
 | `velo_streaming_slot_credit_exhausted_total` | Per-slot credit starvation events |
+| `velo_streaming_mux_drain_visits_total` | Per-peer credit reconciles the sweep task ran because a consumer drained, counted per walk. Divided by elapsed time it is the doorbell's visit rate, which `MuxConfig::drain_visit_floor` caps at `1 / floor` per peer; the periodic sweep's own walks are not counted |
+| `velo_streaming_mux_records_sent_total{record_type}` | Records a batcher packed for its peer, by type (`data`, `open_slot`, `close_slot`, `credit_update`). `slot_heartbeat` is a valid decode value but nothing emits one yet — P10 below is unimplemented. This series only ever describes what a node sends, so it carries no `direction` label of its own; compared with `velo_streaming_mux_batches_total{direction="sent"}` it says what those outbound batches are made of, and only this series tells whether a rise in small batches is data arriving one record at a time or control flushed as it comes |
+| `velo_streaming_mux_batcher_wakes_total{source}` | Wakes of the per-peer batcher tasks, by what woke them (`open`, `control`, `frame`, `inlet_closed`, `linger`). This attributes what woke the task, not what it wrote: one wake can still write more than one batch (a size clamp or an oversized record flushes inline), and a batch held open only by `MuxConfig::reply_linger` writes on the first end-of-wake check after the window elapses — a `linger` wake only when the batcher was otherwise idle at the deadline, a `control` or `frame` wake when one arrives first (measured 21-30% linger on the tier-3 frontend) |
+| `velo_streaming_mux_credit_reposted_total` | Ingress credit that was minted into a batch an epoch death then threw away, and handed back to the batcher's control state so a later batch re-advertises it. `FlowControl::take_pending_grant` zeroes the slot's `ungranted` at mint time, so between the mint and the write the batch holds the only copy. The slots it belongs to are ingress slots, which `close_all` does not close, so the sender is still waiting on that window. Movement here is ordinary epoch-death accounting, not a fault of its own — read it beside `velo_streaming_mux_epoch_deaths_total` |
+| `velo_streaming_mux_credit_lost_total` | **Should always be zero.** The same credit, where the hand-back reached neither the batcher's own control state nor the batcher that took the peer over. A closed inbox alone does not move it: `on_retire`'s `Occupied` arm stops a batcher that still holds live slots, so its final drain can reach `epoch_death` after the inbox closed, and the credit then goes to the replacement in the registry. The sender's window for that slot stays short by this much until the slot closes |
+| `velo_streaming_unclaimed_bind_reaped_total` | Mux binds the reader pump's transport-closed arm reaped because the 60 s accept window closed with no sender having claimed them: a zero-RTT pre-bind whose ticket was never opened, an ordinary attach whose peer never sent its `OpenSlot`, or an attach that adopted a pre-bind and whose `OpenSlot` never arrived either. Each reap also injects a `Dropped` sentinel, so the consumer sees `SenderDropped` rather than a bare close. Distinct from `velo_streaming_heartbeat_watchdog_firings_total`, which counts a claimed session that went silent: the watchdog cannot see a bind with no sender yet, and at `heartbeat_interval >= 20 s` its threshold outlasts the accept window, so this series is the one that moves for a ticket minted and never opened — see the 2026-09-04 addendum below |
 
-> **`frames_written / egress_flushes` is the batching ratio** and the single
-> number that says whether this is working. It is meaningful at any scale, which
-> is why it ships before the protocol does. It counts flushes rather than
-> syscalls -- `write_all` may loop internally, an oversized frame is written
-> segmented as a single batch, and TCP segmentation is the kernel's call -- so
-> read it as "how much the pump batched", not "how many syscalls were saved".
+> **Below the mux, on the messenger connection.** A `_stream_batch` active
+> message is an ordinary messenger frame, so it queues behind the *transport's*
+> per-connection writer as well. `velo_transport_egress_queue_wait_seconds`
+> reports that wait — stamped before admission, so it covers the admission
+> gate's pending queue as well as the bounded channel — and
+> `velo_transport_frames_written_total` is what the outbound frame counter is
+> subtracted from to get that queue's depth. They are the transport-level twins
+> of `velo_streaming_egress_flushes_total` and `velo_streaming_frames_written_total`
+> above, and they are where a batch that the mux already packed goes on
+> waiting. Published only by the coalescing writer the TCP and UDS transports
+> run — the `transport` label is whatever `TransportKey` the transport was
+> built with, not a fixed "tcp"/"uds" string, so select on the series'
+> presence rather than on a transport-name pattern — see the README's
+> Observability section for the identity's full set of limits.
+
+> **`velo_streaming_frames_written_total` / `velo_streaming_egress_flushes_total`
+> is the batching ratio** and the single number that says whether this is
+> working. It is meaningful at any scale, which is why it ships before the
+> protocol does. It counts flushes rather than syscalls -- `write_all` may loop
+> internally, an oversized frame is written segmented as a single batch, and
+> TCP segmentation is the kernel's call -- so read it as "how much the pump
+> batched", not "how many syscalls were saved".
 
 ### A meaning change operators must know about
 
@@ -799,6 +927,30 @@ New series, alongside the existing `velo_streaming_*` collectors:
 4096-deep connect-side channel was full."* Under mux it means *"this slot ran
 out of credit."* Arguably a more useful signal, but dashboards built on the old
 meaning will shift under them. `SATURATION.md` is updated in the same change.
+
+`velo_transport_frames_total{transport="nats"|"zmq",direction="outbound",outcome="accepted"}`
+and the matching `velo_transport_frame_bytes_total` used to be recorded twice
+per frame on NATS and ZMQ — once by `finalize_send_outcome` on admission and
+again by each transport's own sender task after the wire send succeeded.
+Fixing that double count halves both series' outbound values on these two
+transports. The trigger also moves: the count now fires on admission, the
+same as every other transport, rather than after the publish/send call
+returns — so a frame that is admitted but whose wire send later fails is now
+counted outbound-accepted and separately as a `send_error` rejection, instead
+of not being counted outbound at all. The per-frame byte value itself is
+unchanged; only the number of observations halves.
+
+`velo_transport_frames_total{transport="ucx",direction="inbound",*}` and the
+matching `velo_transport_frame_bytes_total` used to be permanently zero — the
+UCX admit path never called `record_frame` on the inbound side, unlike every
+other transport. It now does, so a dashboard or alert that treated UCX as
+uninstrumented on inbound will start showing real traffic.
+
+`velo_streaming_anchor_operations_total{operation="attach"}` and
+`velo_streaming_anchor_operation_duration_seconds{operation="attach"}` used to
+be populated by SPSC attaches only. MPSC attaches now record into the same two
+series, so the attach population and its duration mean both shift under an
+operator who was reading `{operation="attach"}` as an SPSC-only signal.
 
 ---
 
@@ -986,13 +1138,23 @@ above where they belong; what they cost is worth stating in one place.
   a set of conditions that compose, so "opportunistic" and "windowed" stopped
   being alternatives and became `on_admission` and `max_linger`. Nothing about
   either behaviour changed; there is simply no longer a reason to pick one.
-- **`Manual` has no watchdog.** The specification's F2 — a gate watchdog that
-  force-opens after 5 ms — is gone with the gate. Under `Manual` a forgotten
-  flush is not degraded into the windowed policy; it stalls the records it
-  staged, and the deployment that wants the old behaviour configures the window
-  explicitly. Making the manual policy quietly stop being manual is the worse
-  failure: it would mean the determinism the policy exists for holds only until
-  something is slow.
+- **`Manual` has no watchdog, for the application's own records.** The
+  specification's F2 — a gate watchdog that force-opens after 5 ms — is gone
+  with the gate. Under `Manual` a forgotten flush is not degraded into the
+  windowed policy; the application's own records stall until it flushes, and
+  the deployment that wants the old behaviour configures the window explicitly.
+  Making the manual policy quietly stop being manual is the worse failure: it
+  would mean the determinism the policy exists for holds only until something
+  is slow. **Amendment, `reply_linger`:** a pending credit reply is the one
+  thing this ruling carves out — nothing on this side of the reply knows a peer
+  is owed one, so `Manual` cannot leave it stalled indefinitely the way it
+  leaves the application's own records. `MuxConfig::reply_linger` carries a
+  pending reply, and whatever else is staged alongside it, out after a bounded
+  wait regardless of policy. That is a narrower failure than the one this
+  ruling forecloses: only a reply's *arrival* ever starts a clock the
+  application did not ask for; the write that clock triggers still carries the
+  whole batch, so a pass with a credit reply in it can be split across two
+  writes under `Manual` instead of the one the application asked for.
 
 ### Why the mux surface is not in `velo-ext` yet
 
@@ -1034,3 +1196,356 @@ The cost of deferring the rest is bounded: out-of-tree `FrameTransport`s get no
 multiplexing for a release or two, and nothing else breaks. Because a receiver
 never offers `messenger-mux-v1` unless the mux is installed and enabled, a
 mux-less deployment degrades correctly by construction.
+
+---
+
+## Addendum, 2026-09-01: credit is returned by draining after all
+
+Superseding, by addition rather than rewrite, the two claims recorded above: that
+"credit is returned by reconciling buffer occupancy, not by `reader_pump`", and
+that doing so has "the same effect" because "the sweep bounds the latency".
+
+The effect was not the same, and the reason is structural. The sweep ran at
+`credit_sweep_interval` — 2 ms — and each tick walked every slot of every ingress
+peer, taking the same per-peer mutex the inbound batch path takes, to find the
+few slots with anything to return. That is work proportional to *peers x slots x
+time*, against credit returns proportional to *drains*. At the shape a
+512-worker deployment presents to each of two frontends — 256 ingress peers —
+the two diverge badly.
+
+**What that costs in CPU is not currently a measured number.** The figures first
+written here came from a rig run on a shared login node, and a paired
+re-measurement showed the machine noise to be as large as the effect. They are
+retracted rather than revised; see the banner in
+`examples/examples/response_plane_bench.evidence.md`. A clean measurement under
+an exclusive allocation is what should replace them.
+
+What does not depend on that measurement: the sweep was the *only* path
+returning credit to a slot whose peer had gone quiet, which is why 2 ms was
+load-bearing rather than a tuning choice, and why the interval could not be
+relaxed before this change. `lib/velo/tests/streaming/mux_credit.rs` pins that
+directly — with the sweep unreachable, a draining consumer's stream died at
+frame 4 of a 4-credit window before the hook and completes after it.
+
+So P8's original instinct — return credit where the record actually leaves the
+buffer — was right, and the deviation was a false economy at scale. What landed
+now differs from the P8 text in two ways, both deliberate:
+
+**The pump rings a doorbell; it does not release credit.** P8 asks
+`reader_pump` for `credit.release(1)` per handoff. It instead posts the *peer* on
+a bounded lane, and the sweep task runs the reconcile it already knew how to run.
+The reason is the surviving sweep: two paths each releasing an amount for the same
+drained record double-count, and `release` clamping per call does not save the
+pair. Reconciliation recomputes residency from scratch and is therefore
+idempotent, so a redundant visit is free and a lost one is only late. The
+invariant this protects is that the account's residency belief must never
+*under*-estimate: understate it and `admit` stops bounding the physical buffer,
+`deliver` overflows a `C + 1` channel, and the slot dies as a protocol error.
+
+**Wakes coalesce per peer, not per record.** A per-peer `AtomicBool` is set by
+the first drain and taken down by the sweep task before it reconciles, so a drain
+landing mid-visit posts a fresh wake rather than being swallowed. Per-record
+posting would have replaced a periodic cost with a worse per-record one; a
+per-slot record threshold — the other candidate — withholds credit for the first
+`T` records of every slot and still posts once per slot per threshold, so it is
+worse on both latency and volume.
+
+**Coalescing bounds the visits above; a floor bounds them below.** Taking the
+wake down before the walk is what stops a mid-walk drain being swallowed, and it
+is also what lets a consumer that keeps up re-arm the flag immediately: the task
+then runs wake → clear → walk every slot → re-armed, back to back, at a rate set
+by the traffic rather than by need. Since each walk holds the same per-peer mutex
+the inbound batch path takes, that is contention on the hot path of the shape
+this mux is for. So `MuxConfig::drain_visit_floor` — **2 ms**, the interval the
+sweep itself used to run at — is a ceiling on how often the doorbell may
+reconcile one peer. A wake arriving inside the floor is neither cleared nor
+walked: it is scheduled for when that peer next comes due, and because the flag
+stays up, the drains until then coalesce into that scheduled visit. No wake is
+lost; one is delayed by at most the floor. `velo_streaming_mux_drain_visits_total`
+counts the walks, so the rate is observable in production, and
+`lib/velo/tests/streaming/mux_credit.rs` pins it: before the floor, a stream
+drained through an 8-record window rang the doorbell 1000 times in ~270 ms —
+roughly seven times what the floor allows — and after it, the same 1000 walks are
+spread across ~3 s.
+
+The floor's own cost is credit latency, and only for a producer already parked
+with nothing arriving to reconcile it on the arrival path: it waits up to one
+floor per window, so `floor / initial_credit` per record — and on the
+drain-driven return path this stacks with `MuxConfig::reply_linger` rather than
+replacing it, since the reply still has to cross the receiver's egress batcher
+once the floor has let the walk run, giving `(floor + reply_linger) /
+initial_credit` per record. At the default 256-record window that is under
+12 µs a record; the ~3 s above is what the floor alone cost at a window of 8,
+measured before `reply_linger` existed — which is why the credit tests
+configure small windows on purpose.
+
+Consequently `credit_sweep_interval` now defaults to **200 ms**. It may not be
+zero — the sweep ticks on a `tokio::time::interval`, which has no zero period —
+and the build refuses one the way it refuses a zero `initial_credit`; the two
+neighbouring knobs, `drain_visit_floor` and `reply_linger`, are the ones where
+`Duration::ZERO` means "off". `idle_ticks()` derives from it, so batcher
+eviction is unaffected in wall-clock terms: the TTL is `ticks × interval` either
+way.
+
+Both anchor kinds are hooked. MPSC negotiates the mux in the same version as
+SPSC, so `mpsc_reader_pump` carries the same signal; leaving it out would have
+made the relaxed interval a silent hundred-fold regression for MPSC streams.
+
+One claim in P8 above is **still not true of the implementation**, and is left
+standing here rather than quietly corrected because the fix is not part of this
+change: "a background sweep reclaims credit for slots whose pump died". It does
+not, on any interval. `IngressSlot::reconcile` measures against `frame_tx.len()`,
+which stays pinned once the receiver is dropped, so a dead pump's slot is closed
+by the next arrival finding it unknown rather than reclaimed by the sweep.
+
+---
+
+## Addendum, 2026-09-04: a slot can be bound before anyone asks for it
+
+Superseding, by addition, two claims above: that setup costs "1 active-message
+round trip" in the resource table, and that "there is no `bind_muxed`" because
+"the window it would have taken is not known at bind time — the *receiver*
+chooses it".
+
+The second sentence is the answer to the first. The receiver chooses every field
+of `AnchorAttachResponse::Ok` without needing anything from the sender, so
+nothing obliges it to wait to be asked. `MessengerMuxTransport::prebind` is the
+synchronous twin of `bind` — the same body, called while a request is being
+registered rather than while an attach is being served — and
+`AnchorManager::prebind_anchor` wraps it with everything else the attach handler
+does on the round trip: allocate the routing session, take the drain signal,
+spawn `reader_pump`. What comes back is a `StreamOpenTicket`, the same five
+values the response carries, for the application to put in the request envelope
+it already sends the worker. The worker opens on it with
+`AnchorManager::open_anchor_stream`, its first batch's `OpenSlot` claims the
+pre-bound slot exactly as an attached sender's would, and no `_anchor_attach`
+crosses the wire.
+
+Nothing on the wire changed. The attach request and response gain and lose no
+field; `StreamOpenTicket` is a separate type carried in the application's own
+envelope, and a worker that receives no ticket attaches exactly as before. With
+no mux installed no ticket is minted at all, so `MuxConfig::enabled` is a
+complete rollback on the node that mints -- the minting side alone.
+
+It is not symmetric. A producer rolled back to `MuxConfig::enabled = false`
+still advertises a non-empty key set (`advertised_keys` always returns at
+least the default transport's key), just not `messenger-mux-v1`. Attaching
+against a consumer that still pre-binds does not fall through to that
+default: `adopt_prebind`'s key-mismatch check refuses the attach outright
+(documented on `AnchorAttachRequest::supported_transport_keys` in
+`control.rs`), where the base branch served it. Roll the minting side back
+first, or roll both back together -- never the producer alone while a
+consumer still pre-binds.
+
+A ticket may sit in a request envelope for up to the 60 s accept window before
+its worker opens it — that bound, not a fraction of it, because heartbeat
+detection does not start until the `OpenSlot` that claims the bind arrives.
+Counting silence before a sender exists as a miss would cap the wait at
+`DETECTION_MULTIPLIER * heartbeat_interval` (15 s at the manager default: a
+`DETECTION_MULTIPLIER` of 3 times a 5 s heartbeat) regardless of what the
+application configured; gating the miss count on the claim is what makes the
+accept window the true backstop rather than a claim the watchdog beat to it.
+The one thing this does *not* do is honour a configured `unattached_timeout`
+during the wait — `prebind_anchor` still pauses that timer, same as attach —
+so a pre-bind's own bound is the fixed 60 s regardless of what an ordinary
+unattached anchor was configured for.
+
+That fixed bound is a pre-bind's bound, not an adopted attach's. A sender that
+attaches the ordinary way onto a pre-bound slot (the first seam below) is
+handed a slot whose `OpenSlot` has not yet arrived either, but it is no longer
+waiting on its ticket — `PreBind::adopt` clears `PumpContext::prebound` the
+instant the attach handler adopts it, and the pump falls straight back to the
+ordinary `DETECTION_MULTIPLIER * heartbeat_interval` window every other attach
+gets, restarting from wherever the pump's current window happened to be, not
+from adoption. `PreBind::adopt` does not restart the bind's own 60 s accept
+window either — see `ACCEPT_TIMEOUT`'s doc — so an adopting sender that dies
+before its first record is caught by whichever deadline comes first: the
+watchdog, at `DETECTION_MULTIPLIER * heartbeat_interval` measured loosely from
+adoption, or the pre-bind's already-running accept window, at whatever is left
+of the 60 s. At the manager default (5 s heartbeat) the watchdog usually wins
+and the catch is in seconds; at `heartbeat_interval >= 20 s` — the 30 s this
+crate's own `cancel.rs` example configures, say — the watchdog's threshold
+exceeds 60 s and the accept window always wins instead, so the catch is up to
+60 s, not seconds. Either way `control::reader_pump`'s transport-closed arm
+reaps the registry entry once the accept window closes on an unclaimed bind,
+regardless of which door (`prebind_anchor` or an adopted attach) was expecting
+the sender — so the adopting sender is always caught, just not always quickly.
+Each such reap counts once under `velo_streaming_unclaimed_bind_reaped_total`,
+which is the series to watch for it: the watchdog counter never moves for a
+bind the accept window reclaimed first.
+
+The gate that gives a pre-bind this exemption is `PumpContext::prebound`, not
+`drain.claimed()` by itself: the mux parks a `DrainSignal` for *every* bind,
+including an ordinary attach's, and that signal reads unclaimed for as long as
+the peer's `OpenSlot` is still in flight — always at least until after the
+attach response has already returned. `prebound` is what tells a real pre-bind
+(no sender has shown up yet) from an ordinary attach whose peer just hasn't
+opened its slot yet (a sender exists, and heartbeat detection must run for it
+exactly as it always has). It is an `Arc<AtomicBool>` rather than a value fixed
+at spawn for exactly the adoption case above: the one cell is shared between
+the pump and the `PreBind` it was spawned for, so a write either side makes is
+visible to the other immediately, with no second `OpenSlot` required.
+
+Four seams follow from a slot existing before its sender does:
+
+- **A sender that attaches anyway must be given the slot that is waiting, not a
+  second one.** The attach handler adopts an unclaimed pre-bind and answers with
+  its ticket's own session id. A pre-bind whose `OpenSlot` has already arrived is
+  refused instead — that stream is running, and a second opener may not have it.
+  A sender that cannot speak the pre-bound key is refused and the bind is
+  released, so its retry meets a clean anchor — and the release re-arms the
+  anchor's unattached timer, which the pre-bind had paused. The co-located
+  branch of `attach_stream_anchor` follows the same rule from the other side: a
+  same-worker sender writes straight into the anchor's channel, so an unclaimed
+  pre-bind will never have a sender and is released, while a claimed one is
+  refused as an already-attached anchor.
+- **A request that dies before its first token must give the bind back.**
+  `PreBind`'s `Drop` does it, which needs no new call site: every path that kills
+  an anchor already removes its registry entry. The 60 s accept window stays as
+  the backstop rather than as the mechanism.
+- **Cancellation loses its direct route and gets another.** Zero-RTT never sends
+  an attach, so the anchor never learns a `StreamCancelHandle` and cannot poison
+  its producer. The receive side already closes a slot whose consumer has gone —
+  `CloseReason::UnknownSlot`, on the next record to arrive — and an idle producer
+  sends no next record. So a claimed `PreBind`'s `Drop` posts that same close
+  itself, on a trigger that does not wait for traffic.
+- **Detach must give back what it took.** `Detached` is not terminal — the
+  registry entry survives it so a new sender may reattach — but zero-RTT never
+  sets `attachment`, so a claimed pre-bind is the only thing that would
+  otherwise say a sender is here. Both places `Detached` is handled (the
+  `StreamAnchor` poll arm and the `_anchor_detach` handler) take the pre-bind
+  and resume the unattached timer, so the anchor is genuinely unattached again
+  rather than permanently unattachable — but they differ on the pump the
+  pre-bind was feeding, and deliberately so. `_anchor_detach` cancels it: an
+  administrative detach severs the connection outright. The poll arm does not,
+  because a `Detached` frame can only reach it in-band, through that same
+  pump, which means the pre-bind it sees is always still claimed — but
+  `Detached` is terminal at the ingress, retired in the same batch apply that
+  puts the frame into the bind's buffer, so by the time the poll arm runs
+  there is no live slot left for a close to reach. Cancelling here would race
+  an already-finished teardown for nothing, not reclaim a stream still
+  running.
+
+Credit is exact by construction and not by agreement: `prebind` sizes its buffer
+at `slot_buffer_depth()` from the same `NegotiatedLimits` the ticket quotes, and
+`open_slot` still emits no `CreditUpdate` on the claim, so the `2C`-against-a-
+`C + 1`-buffer hazard P8 closed stays closed.
+
+---
+
+## Addendum, 2026-09-05: the arrival path reconciles the slots a batch touched
+
+Narrowing, by addition, the claim recorded above that the mux "compares what it
+admitted against what is still queued, on every inbound batch and on a periodic
+sweep". The comparison per batch is now over the slots that batch delivered
+into, not over the peer's whole table.
+
+The two quantities were never related. A batch's reconcile pass walked every
+live slot of the sending peer and read each slot buffer's length, which takes
+that channel's lock; the number of slots is set by how many streams the peer
+holds open, and the number a batch has anything to say about is set by how many
+of them produced a record in that window. On the tier-3 rig a frontend peer
+holds about a thousand slots, a batch delivers into about eleven of them, and
+the frontend receives about six million batches per rep — so, in a `perf` flat
+profile from the tier-3 rig's exclusive two-node allocation (run `t3-prof2`;
+rig artifacts live outside the repo, not under a tracked path),
+`flume::Shared::len` was 2.1 percent of that node's 72 cores, the largest
+velo-only cost on it, and it did not fall when the traffic did. This is a
+different measurement from the one retracted above: that one was the periodic
+sweep's cost; this one is the arrival-path walk's, on a clean exclusive
+allocation rather than a shared login node.
+
+So `handle_batch` records the indexes it delivers into, in a scratch list on the
+peer's ingress state, and reconciles those. A record that parks in the reorder
+hold marks its slot too: it has spent credit, and it may release the whole hold
+later in the same batch. Opening a slot marks nothing — it opens with an empty
+buffer and nothing to give back. Closing one takes it out of the table before
+the pass runs, which is what the whole-table walk did with it as well — but
+only when the close takes effect at once. A close deferred behind the hold (the
+owner's `CloseSlot` outrunning a rendezvous singleton still resolving outside
+the ordered lane) leaves the slot live, and whether the pass visits it follows
+the ordinary marking rule: the held record ahead of the close already marked
+it, in the common shape where a held terminal and its close arrive together, so
+the deferred close does not change what the pass does. The narrower case — the
+close is the only record this batch has for that slot, its predecessor having
+arrived in an earlier one — leaves the slot unmarked and untouched, the
+ordinary case for a slot with nothing delivered into it this batch, and it is
+reached the same way: the drain doorbell or the sweep behind it.
+
+Nothing about the ledger changed, only which slots are sampled and when. A slot
+whose consumer drained while no record arrived for it is reconciled by the drain
+doorbell, within `MuxConfig::drain_visit_floor` (2 ms) of that drain, and by the
+periodic sweep behind it; both still walk the whole table, and both recompute
+residency from scratch, so a grant is never lost and a redundant visit mints
+nothing. Striding through a few untouched slots on each batch would buy a
+latency bound the doorbell already gives, at the price of the lock reads this
+change exists to remove.
+
+---
+
+## Addendum, 2026-09-05: the arrival path also returns the credit of every slot that drained
+
+Superseding the addendum above, which narrowed the arrival path's reconcile to
+the slots a batch delivered into and left every other slot's credit to the drain
+doorbell and the periodic sweep. That narrowing was right about the cost and
+wrong about the backstop, and the tier-3 rig measured the difference.
+
+**What it broke.** Every stream sends about four records more than its initial
+window — 8,388,536 data records over 32,275 streams on one mocker process,
+against a window of 256 — so the tail of every stream needs a grant. Before the
+narrowing that grant rode the peer's next inbound batch, which arrives every few
+tens of microseconds. After it, the grant waited for a doorbell visit, and the
+doorbell is a per-peer, rate-limited, single-task walk. Worker
+`velo_streaming_slot_credit_exhausted_total` went from 13 to about 20,500 per
+process. The frontend sent 2.35 million credit updates instead of 28.8 million,
+in 48,403 batches instead of about a million. Doorbell visits fell from about
+2,500 per second to 644 across eight peers — about one visit per peer per 12 ms,
+and far less under bursts. The frontend's ordered lane for `_stream_batch`
+oscillated between 9,000 and 305,000 batches per second with a mean wait of 1.4 s
+per batch, against 0.36 ms before. Throughput halved to 1,516 req/s, TTFT p50
+went from 55 ms to 331 ms, and frontend CPU per request rose to 15.85 ms.
+
+**The rule now.** The pump names the slot it drained, and the arrival path
+answers both lists.
+
+- `reader_pump` counts the record on that slot's `DrainSignal` — an exact
+  `AtomicU32` of records taken out since the last reconcile — puts the slot's
+  index on a bounded per-peer *dirty lane*, and posts the peer as before. It
+  takes no lock and no peer mutex; that discipline is unchanged.
+- `handle_batch` reconciles the union of the slots the batch delivered into and
+  the slots on the lane, deduplicated through the touched flag the batch pass
+  already uses. So the credit for a slot that drained comes back on the peer's
+  next inbound batch, which is the latency before the narrowing, at a cost
+  proportional to the slots that received or drained rather than to the slots
+  the peer holds open.
+- The doorbell walks that lane too, and covers a peer with no further batches
+  arriving.
+- The periodic tick keeps the whole-table walk, as the backstop for a slot whose
+  listing found the lane full. It drains the lane outright before it
+  reconciles, so an entry that walk empties does not survive to relist a slot
+  on its own account. A visit is now an atomic swap rather than a slot-channel
+  length read, so the walk costs what the tick can afford.
+
+**The count replaces the occupancy estimate.** `IngressSlot::reconcile` no
+longer reads `frame_tx.len()`. It clears the listing, swaps the count to zero,
+pops that many entries from `sizes` and releases them on the credit account.
+Clearing before swapping is what makes a concurrent drain safe: a drain landing
+between the two steps finds the listing down and lists the slot again, so the
+next pass finds either a count of zero or the new drain, and never a count with
+nothing coming to fetch it.
+
+This also corrects the last paragraph of the 2026-09-01 addendum, which is left
+standing above. Its conclusion holds — the sweep still does not reclaim credit
+for a slot whose pump died — but the mechanism it names is gone. The reason is
+no longer that `frame_tx.len()` stays pinned once the receiver is dropped; it is
+that a dead pump counts no drains. Such a slot is still closed by the next
+arrival finding it unknown rather than reclaimed by any sweep.
+
+**What a lost lane entry and a stale one cost.** A full lane puts the listing
+flag back down, so the drain keeps its count and the next drain lists again; the
+periodic walk is what returns that credit meanwhile. An entry naming a slot that
+has since closed costs the next pass one visit that finds nothing, and an entry
+naming an index a different slot has taken costs that slot one visit that reads
+that slot's own count, whatever it is. Neither can misplace credit, because the
+lane carries an index and no quantity and the quantity lives in the
+`DrainSignal` the slot itself holds.

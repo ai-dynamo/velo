@@ -473,6 +473,19 @@ pub(crate) struct WorkerShared {
     /// Reply endpoints observed by the AM recv trampoline, awaiting the main
     /// loop's freshness stamps.
     pub reply_eps: Arc<ReplyEpSightings>,
+    /// Written once by `Transport::set_observability`, read by both the
+    /// transport (any thread) and the AM receive callback.
+    ///
+    /// It lives here rather than on `UcxTransport` because the receive
+    /// callback runs on the progress thread and reaches only this struct — and
+    /// because a `OnceLock` read is a plain atomic load, which is what makes it
+    /// usable there at all. A `Mutex` would put a lock on the AM callback path.
+    /// The runtime always calls `set_observability` before `start()` (see
+    /// `Transport::set_observability`'s rustdoc in `velo-ext`), but that
+    /// guarantee does not reach this callback: the progress thread is not one
+    /// the runtime otherwise synchronizes with, so the callback reads the
+    /// slot per frame rather than capture the handle once at `start()`.
+    pub metrics: OnceLock<Arc<dyn velo_ext::TransportObservability>>,
 }
 
 /// What the progress thread reports back once UCX is initialised.
@@ -706,19 +719,19 @@ unsafe extern "C" fn rma_trampoline(
 /// Shared context for all AM recv handlers.
 struct RecvShared {
     adapter: TransportAdapter,
-    ring_tx: flume::Sender<Cmd>,
-    pending_pings: Arc<DashMap<u64, tokio::sync::oneshot::Sender<()>>>,
-    /// Where inbound reply endpoints are handed to the main loop, so traffic
-    /// *from* a peer counts as use of its endpoint. See [`ReplyEpSightings`].
-    reply_eps: Arc<ReplyEpSightings>,
-    /// Whether to record those sightings at all — true only when the idle reaper
-    /// is configured, which is the only reader of what they produce.
+    /// Whether to record reply-endpoint sightings at all — true only when the
+    /// idle reaper is configured, which is the only reader of what they
+    /// produce.
     ///
     /// Set once at worker start and never mutated, so this costs a predictable
     /// branch on a struct the callback has already dereferenced. Without it,
     /// every process that never enables the reaper would still pay two atomics
     /// per inbound frame to fill a ring nothing drains.
     stamp_inbound: bool,
+    /// The state the transport side shares with the progress thread. The
+    /// callback reads `ring_tx`, `pending_pings`, `reply_eps` and `metrics`
+    /// through it, so there is one copy of each and nothing to keep in step.
+    worker: Arc<WorkerShared>,
 }
 
 /// How many reply-endpoint sightings the recv trampoline can hand over between
@@ -822,7 +835,7 @@ unsafe extern "C" fn recv_trampoline(
         // pings, responses, events, drain echoes — and so the hot path is one
         // branch and two relaxed atomics regardless of what arrived.
         if ra.shared.stamp_inbound && !p.reply_ep.is_null() {
-            ra.shared.reply_eps.record(p.reply_ep as usize);
+            ra.shared.worker.reply_eps.record(p.reply_ep as usize);
         }
 
         if p.recv_attr & sys::ucp_am_recv_attr_t_UCP_AM_RECV_ATTR_FLAG_RNDV as u64 != 0 {
@@ -851,7 +864,7 @@ unsafe extern "C" fn recv_trampoline(
             AM_KIND_PING => {
                 if header.len() >= 8 && !p.reply_ep.is_null() {
                     let token = u64::from_le_bytes(header[..8].try_into().unwrap());
-                    let _ = ra.shared.ring_tx.try_send(Cmd::PongTo {
+                    let _ = ra.shared.worker.ring_tx.try_send(Cmd::PongTo {
                         reply_ep: p.reply_ep as usize,
                         token,
                     });
@@ -860,13 +873,33 @@ unsafe extern "C" fn recv_trampoline(
             AM_KIND_PONG => {
                 if header.len() >= 8 {
                     let token = u64::from_le_bytes(header[..8].try_into().unwrap());
-                    if let Some((_, tx)) = ra.shared.pending_pings.remove(&token) {
+                    if let Some((_, tx)) = ra.shared.worker.pending_pings.remove(&token) {
                         let _ = tx.send(());
                     }
                 }
             }
             kind => {
                 let adapter = &ra.shared.adapter;
+                // Taken before any arm below moves the two buffers into a
+                // stream.
+                let frame_bytes = header.len() + payload.len();
+                // Every inbound type is recorded, not just `Message`, and that
+                // is the whole point: `bind_transport` pre-creates a child for
+                // every direction x message_type at zero, so a family where
+                // only `message` ever moves does not read as "responses are not
+                // instrumented" — it reads as "no responses arrived". The
+                // shared exit path in `transports::ingress` records all four
+                // for TCP and UDS; this is the same contract on the AM
+                // callback.
+                let record = |message_type: MessageType| {
+                    if let Some(metrics) = ra.shared.worker.metrics.get() {
+                        metrics.record_frame(
+                            crate::observability::Direction::Inbound,
+                            crate::transports::message_type_label(message_type),
+                            frame_bytes,
+                        );
+                    }
+                };
                 match MessageType::from_u8(kind) {
                     Some(MessageType::Message) => {
                         // The drain gate: `admit_message` acquires the
@@ -875,13 +908,24 @@ unsafe extern "C" fn recv_trampoline(
                         // message is work `wait_for_drain` can see. Sync, so
                         // it is callable from this AM callback.
                         match adapter.admit_message(header, payload) {
-                            AdmitOutcome::Admitted => {}
+                            AdmitOutcome::Admitted => {
+                                // Every other transport records this, and the
+                                // messenger's inbound-queue depth is derived as
+                                // accepted minus dequeued — so a transport that
+                                // admits silently makes that difference read
+                                // negative, which surfaces as a healthy zero.
+                                // Recorded only on `Admitted`, matching
+                                // `ingress::route_frame`: a drain-rejected
+                                // message is a rejection, not inbound traffic.
+                                record(MessageType::Message);
+                            }
                             AdmitOutcome::Draining { header, .. } => {
                                 // Echo the header back as ShuttingDown, like the
                                 // TCP listener's per-frame drain gate.
                                 if !p.reply_ep.is_null()
                                     && ra
                                         .shared
+                                        .worker
                                         .ring_tx
                                         .try_send(Cmd::ShuttingDownTo {
                                             reply_ep: p.reply_ep as usize,
@@ -900,12 +944,15 @@ unsafe extern "C" fn recv_trampoline(
                         }
                     }
                     Some(MessageType::Response) => {
+                        record(MessageType::Response);
                         let _ = adapter.response_stream.send((header, payload));
                     }
                     Some(MessageType::ShuttingDown) => {
+                        record(MessageType::ShuttingDown);
                         let _ = adapter.shutdown_stream.send((header, payload));
                     }
-                    Some(MessageType::Ack) | Some(MessageType::Event) => {
+                    Some(event @ (MessageType::Ack | MessageType::Event)) => {
+                        record(event);
                         let _ = adapter.event_stream.send((header, payload));
                     }
                     None => {
@@ -1199,9 +1246,7 @@ unsafe fn init_ucx(
         // -- AM handlers -----------------------------------------------------
         let recv_shared = Arc::new(RecvShared {
             adapter: adapter.clone(),
-            ring_tx: shared.ring_tx.clone(),
-            pending_pings: Arc::clone(&shared.pending_pings),
-            reply_eps: Arc::clone(&shared.reply_eps),
+            worker: Arc::clone(shared),
             stamp_inbound: config.ep_idle_timeout.is_some(),
         });
         let mut recv_args = Vec::with_capacity(AM_KIND_COUNT as usize);

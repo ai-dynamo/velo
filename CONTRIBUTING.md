@@ -84,17 +84,17 @@ pre-commit run --all-files
 
 ## velo-ext API stability
 
-`velo-ext` is the published trait surface that out-of-tree implementors of `Transport`, `FrameTransport`, `PeerDiscovery`, and `ServiceDiscovery` compile against. Every change to it propagates to every downstream impl, so the bar is higher than for the runtime crate.
+`velo-ext` is the published trait surface that out-of-tree implementors of `Transport`, `FrameTransport`, `PeerDiscovery`, `ServiceDiscovery`, and `TransportObservability` compile against. Every change to it propagates to every downstream impl, so the bar is higher than for the runtime crate.
 
 When changing `lib/velo-ext/`:
 
-1. **New trait methods MUST land with default implementations.** Adding a bare method is a breaking change for every external impl — and a major-version bump while we are pre-1.0 means a coordinated `velo` release.
+1. **New trait methods MUST land with default implementations.** Adding a bare method is a breaking change for every external impl — and a major-version bump while we are pre-1.0 means a coordinated `velo` release. A defaulted addition is the compatible case and takes the patch position (`0.5.0` → `0.5.1`): cargo reads `0.y` as the breaking position while we are pre-1.0, so `0.y.z` is where additions go, and `cargo semver-checks` accepts it on that basis.
 2. **Signature, bound, or parameter changes to existing trait methods are breaking** (minor bump pre-1.0). They require a `velo` bump in the same PR so the runtime's exact `=` pin tracks.
 3. **Removing a trait, type, or public item is breaking** and requires a major bump.
 4. **`velo`'s dep on `velo-ext` is an exact `=` pin in `[workspace.dependencies]`.** Bumping `velo-ext` without bumping the pin will break the workspace lockfile.
 5. **The CI `semver:` job is the enforcement gate** — it runs `cargo semver-checks` per changed crate against `origin/main` and fails the build if a breaking change is not paired with a sufficient version bump. Use the `semver:skip` PR label only with explicit reviewer agreement.
 
-Any other workspace crate (`velo-messenger`, `velo-transports`, `velo-streaming`, etc.) is marked `publish = false` and is internal to this repository. External consumers can only depend on `velo` and `velo-ext`, so internal API changes do not require version coordination.
+Any other workspace crate is marked `publish = false` and is internal to this repository — `crates/ucx-rs` is the one documented exception, versioned independently as a leaf FFI crate (see `CLAUDE.md`, *Workspace layout*). External consumers can only depend on `velo` and `velo-ext`, so internal API changes do not require version coordination.
 
 ## DCO & Licensing
 

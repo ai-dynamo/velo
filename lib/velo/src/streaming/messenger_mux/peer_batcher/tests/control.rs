@@ -4,17 +4,74 @@
 //! Coalesced control, epoch death, and teardown.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use dashmap::DashMap;
 use tokio_util::sync::CancellationToken;
 
+use super::super::test_hooks::TestHooks;
 use super::super::*;
 use super::support::*;
-use crate::observability::VeloMetrics;
 use crate::streaming::messenger_mux::protocol::RecordType;
 use crate::streaming::sender::cached_finalized;
+
+/// A reply that lands after the drain that carried `retire` is not lost.
+///
+/// Retirement is decided in two places: the sweep claims the handle under the
+/// registry lock and posts `retire` as control, and the task reads it on its
+/// next drain and decides to stop. A reply posted between that drain and the
+/// task's exit used to be applied by nobody — the drain loop is skipped once
+/// `stopping` is set and nothing read the inbox again — while the liveness
+/// flag the mux checked *before* posting still said alive. Where it bit: the
+/// zero-RTT prompt close, `close_claimed_slot`, retires the last ingress slot
+/// for the peer (which is what makes the batcher evictable) and only then
+/// posts the `CloseSlot` that is the idle producer's one notification. Lost,
+/// the producer's `StreamSender` stayed open for good: every later record it
+/// sends is dropped at the receiver as `ClosedSlot`, with no reply.
+///
+/// Now the task's last read closes the inbox under its lock, so a reply
+/// either rides the final flush or is refused and its writer re-resolves.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reply_posted_after_the_retire_drain_rides_the_final_flush() {
+    let hooks = Arc::new(TestHooks::default());
+    let harness = harness_with_hooks(MuxConfig::default(), Some(Arc::clone(&hooks))).await;
+
+    // The sweep's eviction, by hand: claim, then post. With no slot ever
+    // opened the batcher is idle from birth, so `retire` is its first wake.
+    hooks.pause();
+    assert!(
+        harness.handle.try_retire(0),
+        "an idle batcher holding no slots is evictable"
+    );
+    harness.handle.retire();
+    // Parked past the drain that carried `retire`, with `stopping` decided
+    // and the exit one step away.
+    hooks.wait_until_parked().await;
+
+    let slot = SlotId::from_raw(7);
+    let close = [ReplyRecord::CloseSlot {
+        slot,
+        reason: CloseReason::UnknownSlot,
+    }];
+    assert!(
+        harness.handle.reply(&close),
+        "the inbox is open until the task's last read, so the reply is taken"
+    );
+    hooks.release();
+
+    let batch = harness.next_batch().await;
+    assert_eq!(batch.records.len(), 1, "the reply rides the final flush");
+    assert_eq!(batch.records[0].kind, RecordType::CloseSlot);
+    assert_eq!(batch.records[0].slot, slot);
+
+    // The batch reaching the wire means the final flush ran, and the last
+    // read is before it; from here on a writer is told to re-resolve.
+    assert!(
+        !harness.handle.reply(&close),
+        "past its last read the batcher refuses the reply rather than losing it"
+    );
+}
 
 // ---------------------------------------------------------------------------
 // Control is state, not a queue
@@ -25,94 +82,35 @@ use crate::streaming::sender::cached_finalized;
 /// The stall is not exotic: a flush parks whenever the peer is congested, and a
 /// congested peer is exactly when its ingress lane is busiest returning credit.
 /// An unbounded control queue in that window is unbounded memory. Coalesced
-/// state is O(live slots) whatever the arrival rate, and the deltas it merged
-/// still deliver once the peer un-parks.
+/// state does not grow with arrival rate — see `ControlState`'s struct doc for
+/// the bound each map actually carries — and the deltas it merged still
+/// deliver once the peer un-parks.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stalled_batcher_coalesces_control_instead_of_queueing_it() {
-    let (transport, wire) = StallingTransport::new(tokio::runtime::Handle::current());
-    let sender = Messenger::builder()
-        .add_transport(transport)
-        .build()
-        .await
-        .expect("sender messenger");
-    // A peer id the transport accepts. Nothing ever reads the far end; the
-    // gate is the only thing under test.
-    let peer_instance = velo_ext::InstanceId::new_v4();
-    sender
-        .register_peer(velo_ext::PeerInfo::new(
-            peer_instance,
-            velo_ext::WorkerAddress::from_encoded(
-                rmp_serde::to_vec(&std::collections::HashMap::from([(
-                    "stalling".to_string(),
-                    b"stalling".to_vec(),
-                )]))
-                .expect("encode"),
-            ),
-        ))
-        .expect("register peer");
+    let harness = stalled_harness(MuxConfig::default()).await;
 
-    let registry = prometheus::Registry::new();
-    let metrics = Arc::new(VeloMetrics::register(&registry).expect("register metrics"));
-    let cancel = CancellationToken::new();
-    let handle = spawn(
-        peer_instance.worker_id(),
-        BatcherContext {
-            messenger: Arc::clone(&sender),
-            config: MuxConfig::default(),
-            metrics: Some(metrics.bind_mux()),
-            epochs: Arc::new(AtomicU64::new(1)),
-            batchers: Arc::new(DashMap::new()),
-            cancel: cancel.clone(),
-            hooks: None,
-        },
-    );
-
-    // Open a slot. Its eager `OpenSlot` flush takes the gate's one free place.
-    //
-    // The inlet is deep because a batcher parked on admission is not draining
-    // it — admission parking suspends the whole task, including the inlet
-    // drain that credit starvation cannot suspend. That park is bounded by the
-    // transport's own progress, which is the situation a socket was always in;
-    // credit starvation is the unbounded one, and that is the one the withheld
-    // queue exists for.
-    let (inlet, inlet_rx) = flume::bounded::<Vec<u8>>(512);
-    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-    handle
-        .open_slot(OpenSlotRequest {
-            anchor_id: 1,
-            session_id: 1,
-            inlet: inlet_rx,
-            credit: SlotCredit::new(0),
-            slot_byte_budget: MuxConfig::default().slot_byte_budget,
-            ack: ack_tx,
-        })
-        .await
-        .expect("queue OpenSlot");
+    // Open a slot. Its eager `OpenSlot` flush takes the gate's one free place,
+    // and taking it back off the wire here is what frees that place again.
+    let (inlet, ack_rx) = harness.open(1, 1, 0).await;
     let opened = tokio::time::timeout(RECV_TIMEOUT, ack_rx)
         .await
         .expect("ack")
         .expect("ack delivered");
     assert!(opened.is_ok());
 
-    let open_batch = OwnedBatch::decode(&{
-        let (_, payload) = tokio::time::timeout(RECV_TIMEOUT, wire.recv_async())
-            .await
-            .expect("the OpenSlot flush must reach the wire")
-            .expect("wire open");
-        payload
-    });
+    let open_batch = harness.next_wire_batch().await;
     let id = open_batch.records[0].slot;
 
     // Fill the gate's one place and leave it filled. Nothing drains `wire`
     // until the release phase, so every flush after this one parks.
-    handle.grant(id, 1);
+    harness.handle.grant(id, 1);
     inlet.send(item(0)).expect("queue record");
-    eventually(|| wire.is_full()).await;
+    eventually(|| harness.wire.is_full()).await;
 
     // A control write the batcher can act on, so the flush it triggers is the
     // one that parks. After this the batcher is inside `flush().await` and
     // cannot take anything else off the control state.
-    handle.reply(&[ReplyRecord::CloseSlot {
+    harness.handle.reply(&[ReplyRecord::CloseSlot {
         slot: SlotId::from_raw(u32::MAX),
         reason: CloseReason::UnknownSlot,
     }]);
@@ -120,8 +118,8 @@ async fn a_stalled_batcher_coalesces_control_instead_of_queueing_it() {
         crate::observability::test_helpers::MetricSnapshot::from_registry(registry)
             .counter("velo_streaming_mux_batches_total", &[("direction", "sent")])
     };
-    eventually(|| batches(&registry) >= 3.0).await;
-    let parked_at = batches(&registry);
+    eventually(|| batches(&harness.registry) >= 3.0).await;
+    let parked_at = batches(&harness.registry);
 
     // More records than the one credit already granted, so the merged grant is
     // what decides whether they flow.
@@ -134,14 +132,16 @@ async fn a_stalled_batcher_coalesces_control_instead_of_queueing_it() {
     const MERGED: u32 = 10_000;
     let mut peak_pending = 0;
     for _ in 0..MERGED {
-        handle.grant(id, 1);
-        handle.reply(&[ReplyRecord::CreditUpdate { slot: id, delta: 1 }]);
-        peak_pending = peak_pending.max(handle.pending_control());
+        harness.handle.grant(id, 1);
+        harness
+            .handle
+            .reply(&[ReplyRecord::CreditUpdate { slot: id, delta: 1 }]);
+        peak_pending = peak_pending.max(harness.handle.pending_control());
     }
     // The stall was real: a batcher keeping up would have packed some of those
     // twenty thousand writes into batches by now.
     assert_eq!(
-        batches(&registry),
+        batches(&harness.registry),
         parked_at,
         "nothing may reach the messenger while the peer's gate is full"
     );
@@ -162,11 +162,11 @@ async fn a_stalled_batcher_coalesces_control_instead_of_queueing_it() {
         if tokio::time::Instant::now() >= deadline {
             break false;
         }
-        match wire.try_recv() {
+        match harness.wire.try_recv() {
             Ok((_, payload)) => records.extend(OwnedBatch::decode(&payload).records),
             Err(_) => tokio::time::sleep(Duration::from_millis(2)).await,
         }
-        if handle.pending_control() == 0
+        if harness.handle.pending_control() == 0
             && records
                 .iter()
                 .filter(|r| r.kind == RecordType::Data)
@@ -181,7 +181,7 @@ async fn a_stalled_batcher_coalesces_control_instead_of_queueing_it() {
         settled,
         "the coalesced control must deliver once the peer un-parks: \
          {} entries still pending, {} of {QUEUED} records out",
-        handle.pending_control(),
+        harness.handle.pending_control(),
         records
             .iter()
             .filter(|r| r.kind == RecordType::Data)
@@ -224,7 +224,6 @@ async fn a_stalled_batcher_coalesces_control_instead_of_queueing_it() {
     {
         assert_eq!(record.data, item(n as u32), "record {n} out of order");
     }
-    cancel.cancel();
 }
 
 // ---------------------------------------------------------------------------
@@ -389,5 +388,150 @@ async fn cancelling_the_transport_closes_every_producer_channel() {
             .snapshot()
             .gauge("velo_streaming_mux_live_slots", &[]),
         0.0
+    );
+}
+
+/// A cancelled batcher leaves the registry before it refuses a reply.
+///
+/// `send_replies` re-resolves a refused reply through the registry and loops
+/// until a batcher takes it, and that loop terminates only if a closed batcher
+/// is never the registered one. The retire path holds it because the sweep
+/// removes the entry before posting `retire`. Cancellation is the other exit,
+/// and it closed the inbox first and unregistered second, so a writer refused
+/// in between resolved the same batcher again. Nothing writes after cancel
+/// today — it comes only from `MuxCore::drop` — which is exactly why the
+/// order is pinned here rather than argued from the callers.
+///
+/// The window is the few instructions between the two, so one attempt would
+/// prove little; the writer spins on a thread of its own, as `send_replies`
+/// spins, and the scenario runs enough times that the old order cannot pass
+/// by luck. Each attempt cancels only once the inbox has taken a reply — the
+/// writer provably inside its spin — because an attempt that cancelled first
+/// would find the inbox closed and the entry gone under either order, and a
+/// blocking-pool thread on a loaded runner can start later than any sleep
+/// budgets for.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_batcher_is_unregistered_before_it_refuses_a_reply() {
+    let (sender, capture, _batches) = capture_pair().await;
+    let peer = capture.instance_id().worker_id();
+
+    for attempt in 0..64 {
+        let cancel = CancellationToken::new();
+        let batchers: Arc<BatcherMap> = Arc::new(DashMap::new());
+        let handle = spawn(
+            peer,
+            BatcherContext {
+                messenger: Arc::clone(&sender),
+                config: MuxConfig::default(),
+                metrics: None,
+                epochs: Arc::new(AtomicU64::new(1)),
+                batchers: Arc::clone(&batchers),
+                cancel: cancel.clone(),
+                hooks: None,
+            },
+        );
+        batchers.insert(peer, Arc::clone(&handle));
+
+        let spinning = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let handle = Arc::clone(&handle);
+            let batchers = Arc::clone(&batchers);
+            let spinning = Arc::clone(&spinning);
+            tokio::task::spawn_blocking(move || {
+                let close = [ReplyRecord::CloseSlot {
+                    slot: SlotId::from_raw(7),
+                    reason: CloseReason::UnknownSlot,
+                }];
+                // The first reply taken is what the cancel below waits for; if
+                // it is refused instead nothing raises the flag and the wait
+                // times out, which is the loud failure a stray close deserves.
+                if handle.reply(&close) {
+                    spinning.store(true, Ordering::Release);
+                    while handle.reply(&close) {
+                        std::hint::spin_loop();
+                    }
+                }
+                // Refused. A re-resolve now must not hand this batcher back.
+                batchers
+                    .get(&peer)
+                    .is_some_and(|entry| Arc::ptr_eq(entry.value(), &handle))
+            })
+        };
+        // The exit being raced starts only once the writer is in its spin.
+        eventually(|| spinning.load(Ordering::Acquire)).await;
+        cancel.cancel();
+
+        let still_registered = writer.await.expect("writer thread");
+        assert!(
+            !still_registered,
+            "attempt {attempt}: the batcher refused a reply while still the \
+             registered one, so a writer re-resolving would get it back"
+        );
+    }
+}
+
+/// Credit refused by a retiring batcher reaches the one that replaced it.
+///
+/// `on_retire`'s `Occupied` arm stops a batcher that still holds live slots,
+/// so its final drain can still reach `epoch_death` — and that drain runs
+/// after `ControlInbox::close`. `on_control` applies `peers` before `mine`, so
+/// a credit reply in that drain is staged first and the failed singleton
+/// behind it then discards the batch carrying it. The hand-back
+/// `repost_staged_credit` makes is refused by the closed inbox, which is the
+/// one way the credit can still go missing.
+///
+/// It must not. The slot the credit belongs to is an ingress slot, which
+/// outlives both the epoch and this batcher, and the registry already holds
+/// the batcher that took the peer over. That is where the credit goes.
+#[tokio::test(flavor = "multi_thread")]
+async fn credit_refused_by_a_retiring_batcher_reaches_its_replacement() {
+    let hooks = Arc::new(TestHooks::default());
+    let harness = harness_with_hooks(MuxConfig::default(), Some(Arc::clone(&hooks))).await;
+    let (_inlet, slot) = harness.open(1, 1).await;
+
+    // The `connect()` that lost the race, already serving the peer.
+    let _replacement = harness.install_replacement();
+
+    // The sweep's eviction by hand. `try_retire` would refuse this batcher —
+    // it holds a live slot — which is exactly the arm under test.
+    hooks.pause();
+    harness.handle.retire();
+    hooks.wait_until_parked().await;
+
+    // Both land in the drain that `close` takes: the credit is staged, and
+    // the failed singleton behind it kills the epoch that was carrying it.
+    harness
+        .handle
+        .reply(&[ReplyRecord::CreditUpdate { slot, delta: 7 }]);
+    harness.handle.control.singleton_resolved(slot, false);
+    hooks.release();
+
+    // Waited on first and on its own: without the epoch death this test never
+    // reached the race, and the credit assertions below would pass vacuously.
+    eventually(|| {
+        harness
+            .snapshot()
+            .counter("velo_streaming_mux_epoch_deaths_total", &[])
+            >= 1.0
+    })
+    .await;
+    eventually(|| {
+        let snapshot = harness.snapshot();
+        snapshot.counter("velo_streaming_mux_credit_reposted_total", &[])
+            + snapshot.counter("velo_streaming_mux_credit_lost_total", &[])
+            >= 7.0
+    })
+    .await;
+
+    let snapshot = harness.snapshot();
+    assert_eq!(
+        snapshot.counter("velo_streaming_mux_credit_lost_total", &[]),
+        0.0,
+        "a replacement was in the registry, so nothing had to be written off"
+    );
+    assert_eq!(
+        snapshot.counter("velo_streaming_mux_credit_reposted_total", &[]),
+        7.0,
+        "the whole delta must reach the batcher that took the peer over"
     );
 }

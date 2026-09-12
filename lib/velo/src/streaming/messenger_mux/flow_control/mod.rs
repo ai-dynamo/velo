@@ -28,8 +28,9 @@
 //! > `C + 1`-deep buffer, so the applier only `try_send`s into space credit
 //! > already reserved and never blocks its lane.
 //!
-//! [`slot_buffer_depth`] is that arithmetic, and
-//! [`SlotCreditAccount::buffered`] is the occupancy it bounds.
+//! [`slot_buffer_depth`] is that arithmetic, and `SlotCreditAccount`'s private
+//! `buffered` field is the occupancy it bounds — a `#[cfg(test)]` accessor
+//! reads it back for the tests that pin the bound, so it is not a link here.
 
 use super::protocol::RecordType;
 
@@ -124,7 +125,8 @@ impl NegotiatedLimits {
         self.slot_byte_budget
     }
 
-    /// `C + 1` — the depth `bind_muxed` sizes its receiver to.
+    /// `C + 1` — the depth `open_bind` (the body `bind` and `prebind` share)
+    /// sizes its receiver to.
     pub(crate) const fn slot_buffer_depth(&self) -> usize {
         slot_buffer_depth(self.initial_credit)
     }
@@ -304,10 +306,12 @@ impl SlotCredit {
 /// Receiver-side per-slot accounting against the mux-owned `C + 1` buffer.
 ///
 /// `admit` is called by the applier before `try_send`; `release` by
-/// `reader_pump` after each successful handoff to `frame_tx` — exact, O(1) and
-/// immediate, because flume has no consumed-callback, a per-slot drain task
-/// would reintroduce the per-stream tasks the mux exists to remove, and polling
-/// the receiver's length is only a sampled approximation.
+/// `IngressSlot::reconcile`, with the exact count `reader_pump` reported on
+/// that slot's `DrainSignal`. The pump counts rather than releases because
+/// releasing needs the peer's mutex; the count itself is exact and O(1),
+/// because flume has no consumed-callback, a per-slot drain task would
+/// reintroduce the per-stream tasks the mux exists to remove, and polling the
+/// receiver's length is only a sampled approximation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SlotCreditAccount {
     limit: u32,
@@ -346,6 +350,11 @@ impl SlotCreditAccount {
     /// Bounded by [`buffer_depth`](Self::buffer_depth) — that bound is the
     /// invariant, and `velo_streaming_mux_reader_stall_total > 0` is what a
     /// break in it looks like from the outside.
+    ///
+    /// Read only by the tests that pin that bound. The reconcile releases the
+    /// count the pump reported and lets [`release`](Self::release) clamp
+    /// against this field, rather than reading it and subtracting.
+    #[cfg(test)]
     pub(crate) const fn buffered(&self) -> u32 {
         self.buffered
     }
@@ -410,6 +419,13 @@ impl SlotCreditAccount {
 
     /// Takes the pending grant for a `CreditUpdate` record, or `None` when
     /// there is nothing to advertise.
+    ///
+    /// This zeroes `ungranted` at mint time, before the record it becomes is
+    /// even staged, so from here until the write the batch carrying it holds
+    /// the only copy of that credit. A batch thrown away rather than written
+    /// hands it back — see `Batcher::repost_staged_credit` — which is what
+    /// keeps the zeroing safe. `agent-docs/w7-reply-linger-credit-loss.md`
+    /// records the loss this used to be and the 2026-09-11 addendum the fix.
     pub(crate) fn take_pending_grant(&mut self) -> Option<u32> {
         let delta = self.ungranted;
         if delta == 0 {

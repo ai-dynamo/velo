@@ -16,6 +16,10 @@
 //! - [`anchor::AnchorManager`]: creates and tracks streaming anchors
 //! - [`anchor::StreamAnchor`]: typed receive stream for anchor consumers
 //! - [`anchor::AttachError`]: errors for exclusive-attach operations
+//! - [`anchor::AnchorManager::prebind_anchor`] /
+//!   [`anchor::AnchorManager::open_anchor_stream`]: zero-RTT stream setup — the
+//!   receiver mints the terms as a [`control::StreamOpenTicket`] and the sender
+//!   opens on them, with no `_anchor_attach` round trip
 //!
 //! Sender:
 //! - [`sender::StreamSender`]: typed sender for pushing frames with heartbeat and drop safety
@@ -28,8 +32,9 @@ pub mod grpc_transport;
 pub mod handle;
 /// Batched, multiplexed streaming over the Messenger (`messenger-mux-v1`).
 ///
-/// The transport itself is internal — it is opt-in and selected at attach time,
-/// so nothing outside this crate constructs or names it. What is re-exported
+/// The transport itself is internal — it is opt-in and selected when a
+/// stream's terms are decided, at attach or at pre-bind for zero-RTT setup, so
+/// nothing outside this crate constructs or names it. What is re-exported
 /// below is only what a caller must be able to say: how to configure it, and
 /// the key it answers to, which is what
 /// [`StreamSender::negotiated_transport`] is compared against.
