@@ -624,6 +624,42 @@ mod tests {
         assert!(inbox.take().is_none(), "the drain leaves nothing behind");
     }
 
+    /// Credit is a wire `u32`, so coalescing more than it can represent must
+    /// preserve the largest valid window rather than wrap to a small grant.
+    /// Pin both directions: `mine` is credit the peer grants our slot, while
+    /// `peers` is credit this side returns for one of the peer's slots.
+    #[test]
+    fn coalesced_credit_saturates_at_the_wire_limit() {
+        let inbox = inbox_with(1);
+        let owned = slot(0, 0);
+        let peer = slot(7, 3);
+
+        inbox.grant(owned, u32::MAX - 1);
+        inbox.grant(owned, 2);
+        assert!(inbox.reply(&[
+            ReplyRecord::CreditUpdate {
+                slot: peer,
+                delta: u32::MAX - 1,
+            },
+            ReplyRecord::CreditUpdate {
+                slot: peer,
+                delta: 2,
+            },
+        ]));
+
+        let drained = inbox.take().expect("credit is pending");
+        assert_eq!(
+            drained.mine[&owned.raw()].credit,
+            u32::MAX,
+            "an oversized inbound grant must not wrap"
+        );
+        assert_eq!(
+            drained.peers[&peer.raw()].credit,
+            u32::MAX,
+            "an oversized returned grant must not wrap"
+        );
+    }
+
     #[test]
     fn a_close_dominates_and_the_first_reason_wins() {
         let inbox = inbox_with(8);
