@@ -15,7 +15,16 @@ use bytes::Bytes;
 
 use velo::queue::WorkQueueBackend;
 use velo::queue::backends::nats::NatsQueueBackend;
-use velo::queue::options::NextOptions;
+use velo::queue::options::{AckPolicy, NextOptions};
+
+/// Extract the payload bytes from a `DeliveredMessage` result option.
+fn bytes(msg: Option<velo::queue::DeliveredMessage>) -> Option<Bytes> {
+    msg.map(|m| m.bytes)
+}
+
+fn batch_bytes(batch: Vec<velo::queue::DeliveredMessage>) -> Vec<Bytes> {
+    batch.into_iter().map(|m| m.bytes).collect()
+}
 
 fn nats_url() -> String {
     std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_owned())
@@ -68,13 +77,13 @@ async fn test_nats_basic_send_recv() {
     let (backend, _guard) = setup("basic").await;
 
     let sender = backend.sender("basic").await.unwrap();
-    let receiver = backend.receiver("basic").await.unwrap();
+    let receiver = backend.receiver("basic", AckPolicy::Auto).await.unwrap();
 
     let data = Bytes::from_static(b"hello nats");
     sender.send(data.clone()).await.unwrap();
 
     let received = receiver.recv().await.unwrap();
-    assert_eq!(received, Some(data));
+    assert_eq!(bytes(received), Some(data));
 }
 
 #[tokio::test]
@@ -82,7 +91,7 @@ async fn test_nats_ordering() {
     let (backend, _guard) = setup("ordering").await;
 
     let sender = backend.sender("ordering").await.unwrap();
-    let receiver = backend.receiver("ordering").await.unwrap();
+    let receiver = backend.receiver("ordering", AckPolicy::Auto).await.unwrap();
 
     for i in 0u8..10 {
         sender.send(Bytes::from(vec![i])).await.unwrap();
@@ -90,7 +99,7 @@ async fn test_nats_ordering() {
 
     for i in 0u8..10 {
         let received = receiver.recv().await.unwrap();
-        assert_eq!(received, Some(Bytes::from(vec![i])));
+        assert_eq!(bytes(received), Some(Bytes::from(vec![i])));
     }
 }
 
@@ -99,7 +108,7 @@ async fn test_nats_batch_send_recv() {
     let (backend, _guard) = setup("batch").await;
 
     let sender = backend.sender("batch").await.unwrap();
-    let receiver = backend.receiver("batch").await.unwrap();
+    let receiver = backend.receiver("batch", AckPolicy::Auto).await.unwrap();
 
     for i in 0u8..5 {
         sender.send(Bytes::from(vec![i])).await.unwrap();
@@ -108,7 +117,7 @@ async fn test_nats_batch_send_recv() {
     let opts = NextOptions::new()
         .batch_size(5)
         .timeout(Duration::from_secs(5));
-    let batch = receiver.recv_batch(&opts).await.unwrap();
+    let batch = batch_bytes(receiver.recv_batch(&opts).await.unwrap());
     assert_eq!(batch.len(), 5);
     for (idx, item) in batch.iter().enumerate() {
         assert_eq!(*item, Bytes::from(vec![idx as u8]));
@@ -120,7 +129,7 @@ async fn test_nats_batch_timeout_partial() {
     let (backend, _guard) = setup("partial").await;
 
     let sender = backend.sender("partial").await.unwrap();
-    let receiver = backend.receiver("partial").await.unwrap();
+    let receiver = backend.receiver("partial", AckPolicy::Auto).await.unwrap();
 
     // Send 2 items but request batch of 5
     sender.send(Bytes::from_static(b"a")).await.unwrap();
@@ -138,7 +147,7 @@ async fn test_nats_try_send() {
     let (backend, _guard) = setup("trysend").await;
 
     let sender = backend.sender("trysend").await.unwrap();
-    let receiver = backend.receiver("trysend").await.unwrap();
+    let receiver = backend.receiver("trysend", AckPolicy::Auto).await.unwrap();
 
     sender.try_send(Bytes::from_static(b"try")).unwrap();
 
@@ -146,7 +155,7 @@ async fn test_nats_try_send() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     let received = receiver.recv().await.unwrap();
-    assert_eq!(received, Some(Bytes::from_static(b"try")));
+    assert_eq!(bytes(received), Some(Bytes::from_static(b"try")));
 }
 
 #[tokio::test]
@@ -163,18 +172,18 @@ async fn test_nats_multiple_queues_independent() {
 
     let sender_a = backend.sender("queue_a").await.unwrap();
     let sender_b = backend.sender("queue_b").await.unwrap();
-    let receiver_a = backend.receiver("queue_a").await.unwrap();
-    let receiver_b = backend.receiver("queue_b").await.unwrap();
+    let receiver_a = backend.receiver("queue_a", AckPolicy::Auto).await.unwrap();
+    let receiver_b = backend.receiver("queue_b", AckPolicy::Auto).await.unwrap();
 
     sender_a.send(Bytes::from_static(b"aa")).await.unwrap();
     sender_b.send(Bytes::from_static(b"bb")).await.unwrap();
 
     assert_eq!(
-        receiver_a.recv().await.unwrap(),
+        bytes(receiver_a.recv().await.unwrap()),
         Some(Bytes::from_static(b"aa"))
     );
     assert_eq!(
-        receiver_b.recv().await.unwrap(),
+        bytes(receiver_b.recv().await.unwrap()),
         Some(Bytes::from_static(b"bb"))
     );
 }
@@ -190,7 +199,7 @@ async fn test_nats_recv_returns_none_on_close() {
 
     // Obtain a receiver before closing the backend.
     let receiver = backend
-        .receiver("close_signal")
+        .receiver("close_signal", AckPolicy::Auto)
         .await
         .expect("receiver creation failed");
 
@@ -209,5 +218,5 @@ async fn test_nats_recv_returns_none_on_close() {
         .expect("recv() did not return within 5 seconds after close()")
         .expect("task panicked");
 
-    assert_eq!(result.unwrap(), None, "expected Ok(None) after close()");
+    assert!(result.unwrap().is_none(), "expected Ok(None) after close()");
 }
