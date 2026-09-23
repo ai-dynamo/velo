@@ -1,6 +1,6 @@
 # Batched streaming
 
-The messenger mux carries every stream to one peer over the Messenger connection that already exists to that peer. It packs the records for that peer into `_stream_batch` active messages. Its transport key is `messenger-mux-v1`. The mux is opt-in and is negotiated per attach. Senders do not change: `StreamSender::send` stages a record, and the layer below it decides when to write.
+The messenger mux carries every stream to one peer over the Messenger connection that already exists to that peer. It packs the records for that peer into `_stream_batch` active messages. Its transport key is `messenger-mux-v2`. The mux is opt-in and is negotiated per attach. Senders do not change: `StreamSender::send` stages a record, and the layer below it decides when to write.
 
 This chapter describes how the mux works. The [Tune batched streaming](../guides/tune-batched-streaming.md) guide tells you how to configure it. The [Batched streaming design](../development/batched-streaming-design.md) chapter records why it works this way and which alternatives were rejected.
 
@@ -85,12 +85,12 @@ _stream_batch payload:
   [16 B batch header][record_count x record]
 
 batch header:
-  [u8 mux_version = 1][u8 flags][u16 record_count][u64 peer_epoch][u32 batch_seq]
+  [u8 mux_version = 2][u8 flags][u16 record_count][u64 peer_epoch][u32 batch_seq]
 
 record:
   [u8 record_type][u32 slot][u32 frame_seq][u32 len][len bytes body]
 
-record_type: 0 = Data, 1 = OpenSlot, 2 = CloseSlot, 3 = CreditUpdate, 4 = SlotHeartbeat
+record_type: 0 = Data, 1 = OpenSlot, 2 = CloseSlot, 3 = CreditUpdate, 4 = SlotHeartbeat, 5 = StopSlot
 ```
 
 Every multi-byte field is big-endian, in the header and in each record. Senders write `flags` as zero, and receivers ignore unknown bits.
@@ -105,6 +105,7 @@ Record bodies:
 - **`OpenSlot`** carries `[u64 anchor_id][u64 session_id]`. This is the 16-byte attach handshake, moved into a record.
 - **`CloseSlot`** carries `[u8 reason]`: `0` terminal sent, `1` peer gone, `2` unknown slot, `3` protocol error.
 - **`CreditUpdate`** carries `[u32 delta]` from receiver to sender.
+- **`StopSlot`** has no body. It requests graceful producer stop, without closing the slot or discarding data. A close takes precedence. It uses the existing peer epoch and slot generation. Early stop is retained by the pre-bind until OpenSlot claims it.
 - **`SlotHeartbeat`** has no body. The decoder accepts it, but no sender emits it. See [Heartbeats](#heartbeats).
 
 `CloseSlot` travels in both directions and has no direction bit. The reason carries the direction. `TerminalSent` and `PeerGone` travel from slot owner to receiver. `UnknownSlot` and `ProtocolError` travel from receiver to slot owner. Both sides can hold a slot at the same dense index, and the reason tells them apart.
@@ -356,19 +357,19 @@ At serving depth, `Manual` is both higher and repeatable. A batcher that writes 
 
 ## Negotiation and compatibility
 
-The attach selects the mux. No wire magic exists. `AnchorAttachRequest` and `MpscAnchorAttachRequest` carry `supported_transport_keys` (with `#[serde(default)]`, so an older sender deserializes as advertising nothing). The attach handler intersects the sender's keys with its installed transports. It picks `messenger-mux-v1` only when both sides name it. Otherwise it answers with its default key.
+The attach selects the mux. No wire magic exists. `AnchorAttachRequest` and `MpscAnchorAttachRequest` carry `supported_transport_keys` (with `#[serde(default)]`, so an older sender deserializes as advertising nothing). The attach handler intersects the sender's keys with its installed transports. It picks `messenger-mux-v2` only when both sides name it. Otherwise it answers with its default key.
 
 The sender reads the answer:
 
-- A key other than `messenger-mux-v1` is the per-stream path, and the credit fields do not apply. Every older receiver answers this way.
-- `messenger-mux-v1` with a window opens a slot that already holds that window.
-- `messenger-mux-v1` with no window (`initial_credit` zero) is refused. No shipped receiver answers this, and a node with a mux cannot advertise a zero window. A fallback to another transport reaches nothing that listens, and the stream hangs until the watchdog fires.
+- A key other than `messenger-mux-v2` is the per-stream path, and the credit fields do not apply. Every older receiver answers this way.
+- `messenger-mux-v2` with a window opens a slot that already holds that window.
+- `messenger-mux-v2` with no window (`initial_credit` zero) is refused. No shipped receiver answers this, and a node with a mux cannot advertise a zero window. A fallback to another transport reaches nothing that listens, and the stream hangs until the watchdog fires.
 
-A node with the mux enabled registers both `messenger-mux-v1` and its configured per-stream transport, so it still serves older peers. `resolve_transport` fails on an unknown key in a non-empty registry, so a receiver that answers the mux on its own breaks every older sender. SPSC and MPSC anchors both negotiate the mux.
+A node with the mux enabled registers both `messenger-mux-v2` and its configured per-stream transport, so it still serves older peers. `resolve_transport` fails on an unknown key in a non-empty registry, so a receiver that answers the mux on its own breaks every older sender. SPSC and MPSC anchors both negotiate the mux.
 
 `StreamSender::negotiated_transport()` returns the key that the attach settled on. It returns `None` for a same-worker attach, which uses no transport. Compare it with the public constant `MESSENGER_MUX_KEY`.
 
-`MuxConfig::enabled = false` is the rollback. The node stops advertising `messenger-mux-v1`, and the next attach negotiates the per-stream path with no code or wire change. See [Zero-RTT stream setup](#zero-rtt-stream-setup) for the order when tickets are in use.
+`MuxConfig::enabled = false` is the rollback. The node stops advertising `messenger-mux-v2`, and the next attach negotiates the per-stream path with no code or wire change. See [Zero-RTT stream setup](#zero-rtt-stream-setup) for the order when tickets are in use.
 
 ## Observability
 
@@ -381,3 +382,7 @@ The mux series all start with `velo_streaming_mux_`. The most important ones:
 - `velo_messenger_ordered_lane_wait_seconds{handler="_stream_batch"}` shows the ingress lane wait, one sample per batch.
 
 The [Metrics reference](../appendix/metrics.md) lists every series. [Stream saturation](../operations/saturation.md) explains how to read them under load.
+
+### Peer loss
+
+A batcher with live producer slots checks its selected message transport every five seconds. A failed check closes the producer slots and triggers their cancellation and stop tokens, including idle producers. The check is per peer, not per token or stream. It does not change the selected transport or permit a fallback.

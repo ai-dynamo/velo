@@ -138,6 +138,7 @@ pub struct StreamSender<T> {
     registry: Arc<DashMap<u64, AnchorEntry>>,
     /// User-facing cancellation signal: fires when _stream_cancel is received.
     cancel_token: CancellationToken,
+    stop_token: CancellationToken,
     /// Key in the sender-side registry for cleanup and for the _stream_cancel handler.
     sender_stream_id: u64,
     /// Sender-side registry shared with the _stream_cancel handler.
@@ -196,6 +197,11 @@ impl<T: Serialize> StreamSender<T> {
             sender_registry,
             poison_tx,
         } = cancel;
+        let stop_token = sender_registry
+            .senders
+            .get(&sender_stream_id)
+            .map(|entry| entry.stop_token.clone())
+            .unwrap_or_else(|| cancel_token.child_token());
         let heartbeat_cancel = CancellationToken::new();
 
         // Spawn heartbeat background task
@@ -224,6 +230,7 @@ impl<T: Serialize> StreamSender<T> {
             tx,
             handle,
             heartbeat_cancel,
+            stop_token,
             sent_terminal: false,
             registry,
             cancel_token,
@@ -271,18 +278,15 @@ impl<T: Serialize> StreamSender<T> {
     /// # }
     /// ```
     ///
-    /// This fires only for a stream opened by attach. A sender built by
-    /// [`AnchorManager::open_anchor_stream`](crate::streaming::AnchorManager::open_anchor_stream)
-    /// (or [`Velo::open_anchor_stream`](crate::Velo::open_anchor_stream)) never
-    /// sent an attach, so the consumer never learned a `StreamCancelHandle` to
-    /// reach it by, and this token never cancels for it -- a dropped consumer
-    /// surfaces there as `SendError::ChannelClosed` on the next `send`
-    /// instead, posted promptly once the pre-bind's reclamation runs. The
-    /// `tokio::select!` above is still correct for that case: the token side
-    /// just never fires, so the loop exits through the `send` error the way
-    /// the corrected example above does.
+    /// Also fires for ticket opens, including an idle producer whose slot closes.
     pub fn cancellation_token(&self) -> CancellationToken {
         self.cancel_token.clone()
+    }
+
+    /// Fires when the consumer requests graceful stop or cancels the stream.
+    /// The producer can send buffered output and finalize after graceful stop.
+    pub fn stop_token(&self) -> CancellationToken {
+        self.stop_token.clone()
     }
 
     /// Send a typed item through the channel.
@@ -296,7 +300,7 @@ impl<T: Serialize> StreamSender<T> {
     /// - [`SendError::ChannelClosed`] if the receiver has been dropped.
     pub async fn send(&self, item: T) -> Result<(), SendError> {
         // Check if the poison channel has been disconnected (rx_closer dropped by _stream_cancel handler).
-        if self.poison_tx.is_disconnected() {
+        if self.cancel_token.is_cancelled() || self.poison_tx.is_disconnected() {
             return Err(SendError::ChannelClosed);
         }
         let bytes = rmp_serde::to_vec(&StreamFrame::Item(item))
@@ -311,10 +315,11 @@ impl<T: Serialize> StreamSender<T> {
                 if let Some(m) = self.metrics.as_ref() {
                     m.record_producer_send_backpressure();
                 }
-                self.tx
-                    .send_async(b)
-                    .await
-                    .map_err(|_| SendError::ChannelClosed)
+                tokio::select! {
+                    biased;
+                    _ = self.cancel_token.cancelled() => Err(SendError::ChannelClosed),
+                    result = self.tx.send_async(b) => result.map_err(|_| SendError::ChannelClosed),
+                }
             }
             Err(flume::TrySendError::Disconnected(_)) => Err(SendError::ChannelClosed),
         }
@@ -548,6 +553,7 @@ mod tests {
 
         // Insert the SenderEntry into the registry (simulating what attach_stream_anchor does)
         let entry = crate::streaming::control::SenderEntry {
+            stop_token: cancel_token.child_token(),
             cancel_token: cancel_token.clone(),
             rx_closer: std::sync::Mutex::new(Some(poison_rx)),
         };

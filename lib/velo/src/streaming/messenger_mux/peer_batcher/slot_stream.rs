@@ -231,6 +231,10 @@ pub(super) struct WithheldOverflow {
 
 /// One live egress slot.
 pub(super) struct EgressSlot {
+    pub(super) lifecycle: Option<(
+        tokio_util::sync::CancellationToken,
+        tokio_util::sync::CancellationToken,
+    )>,
     /// Index and generation as they travel on the wire.
     pub(super) id: SlotId,
     /// What this side may still send. Opens at the window the peer advertised
@@ -321,6 +325,9 @@ impl EgressSlot {
     /// under — would then be rejected as stale: the deferred close would never
     /// be written and the slot would sit in `live_slots` for good.
     pub(super) fn disconnect(&self) {
+        if let Some((cancel, _)) = &self.lifecycle {
+            cancel.cancel();
+        }
         self.gate.close();
     }
 
@@ -407,6 +414,7 @@ impl EgressSlots {
         };
 
         self.entries[index as usize] = Some(EgressSlot {
+            lifecycle: None,
             id,
             credit,
             next_seq: 0,
@@ -439,7 +447,7 @@ impl EgressSlots {
         let Some(slot) = self.entries.get_mut(index as usize).and_then(Option::take) else {
             return false;
         };
-        slot.gate.close();
+        slot.disconnect();
         self.generations[index as usize] = slot.id.generation().wrapping_add(1);
         self.free.push(index);
         self.live -= 1;

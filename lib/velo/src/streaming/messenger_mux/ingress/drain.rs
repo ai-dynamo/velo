@@ -44,6 +44,8 @@ pub(crate) struct DrainSignal {
     /// Whose bind this turned out to be, and where its drains are posted. All
     /// of it arrives together when an `OpenSlot` claims the bind.
     claim: OnceLock<SlotClaim>,
+    // Serializes claim with early stop/cancel; neither side can miss the other.
+    lifecycle: std::sync::Mutex<u8>,
     /// Records this slot's pump has taken out of the buffer since the last
     /// [`IngressSlot::reconcile`](super::slot::IngressSlot::reconcile) swapped
     /// it to zero.
@@ -68,6 +70,7 @@ impl DrainSignal {
     pub(crate) fn new(wake: flume::Sender<WorkerId>) -> Self {
         Self {
             claim: OnceLock::new(),
+            lifecycle: std::sync::Mutex::new(0),
             drained: AtomicU32::new(0),
             listed: AtomicBool::new(false),
             wake,
@@ -83,13 +86,29 @@ impl DrainSignal {
         slot: SlotId,
         pending: Arc<AtomicBool>,
         lane: flume::Sender<u32>,
-    ) {
+    ) -> u8 {
+        let lifecycle = self.lifecycle.lock().unwrap();
         let _ = self.claim.set(SlotClaim {
             peer,
             slot,
             pending,
             lane,
         });
+        *lifecycle
+    }
+
+    pub(crate) fn request_stop(&self) -> Option<(WorkerId, SlotId)> {
+        let mut state = self.lifecycle.lock().unwrap();
+        if *state != 0 {
+            return None;
+        }
+        *state = 1;
+        self.claimed()
+    }
+
+    pub(crate) fn cancel(&self) -> Option<(WorkerId, SlotId)> {
+        *self.lifecycle.lock().unwrap() = 2;
+        self.claimed()
     }
 
     /// The peer and slot that claimed this bind, once one has.

@@ -56,7 +56,8 @@ pub struct UcxConfig {
     /// makes loaded submission a plain ring push. Default 20 µs.
     pub spin_us: u64,
     /// Capacity of the command ring between senders and the progress thread.
-    /// The per-peer admission gates queue (and preserve order) beyond it.
+    /// Also bounds each peer's queued and outstanding sends. Admission waits
+    /// for UCX completion when a peer exhausts its send permits.
     pub channel_capacity: usize,
     /// Override for `UCX_TLS` (e.g. `"rc_verbs,ud_verbs,self"` or `"tcp"`),
     /// applied only when the environment does not already set it. Note an
@@ -120,7 +121,9 @@ impl Default for UcxConfig {
 /// gates admitted. An epoch is retired when the peer's endpoint fails.
 #[derive(Clone)]
 struct ConnHandle {
-    gate: AdmissionGate<Cmd>,
+    admission: Arc<Mutex<()>>,
+    gate: AdmissionGate<SendTask>,
+    _lifetime: Arc<tokio_util::sync::DropGuard>,
 }
 
 /// UCX messenger transport. See the module docs for the model.
@@ -239,8 +242,65 @@ impl UcxTransport {
         let handle = self
             .connections
             .entry(peer)
-            .or_insert_with(|| ConnHandle {
-                gate: AdmissionGate::new(self.ring_tx.clone(), rt.clone()),
+            .or_insert_with(|| {
+                let (tx, rx) = flume::bounded::<SendTask>(self.config.channel_capacity);
+                let gate = AdmissionGate::new(tx, rt.clone());
+                let cancel = tokio_util::sync::CancellationToken::new();
+                let lifetime = Arc::new(cancel.clone().drop_guard());
+                let permits = Arc::new(tokio::sync::Semaphore::new(self.config.channel_capacity));
+                let ring = self.ring_tx.clone();
+                let doorbell = self.shared.doorbell.clone();
+                let pending = gate.clone();
+                rt.spawn(async move {
+                    loop {
+                        let mut task = tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => break,
+                            task = rx.recv_async() => match task { Ok(task) => task, Err(_) => break },
+                        };
+                        let permit = tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => {
+                                task.fail("ucx connection closed");
+                                break;
+                            }
+                            permit = permits.clone().acquire_owned() => permit.expect("send permits remain open"),
+                        };
+                        task.permit = Some(permit);
+                        match ring.try_send(Cmd::Send(task)) {
+                            Ok(()) => {}
+                            Err(flume::TrySendError::Disconnected(command)) => {
+                                command.refuse_for_shutdown();
+                                break;
+                            }
+                            Err(flume::TrySendError::Full(Cmd::Send(task))) => {
+                                let header = task.header.clone();
+                                let payload = task.payload.clone();
+                                let on_error = task.on_error.clone();
+                                tokio::select! {
+                                    biased;
+                                    _ = cancel.cancelled() => {
+                                        on_error.on_error(header, payload, "ucx connection closed".into());
+                                        break;
+                                    }
+                                    result = ring.send_async(Cmd::Send(task)) => {
+                                        if let Err(error) = result {
+                                            error.0.refuse_for_shutdown();
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            Err(flume::TrySendError::Full(_)) => unreachable!("only sends enter the peer queue"),
+                        }
+                        doorbell.ring();
+                    }
+                    pending.fail_all(AdmissionError::ChannelClosed);
+                    while let Ok(task) = rx.try_recv() {
+                        task.fail("ucx connection closed");
+                    }
+                });
+                ConnHandle { admission: Arc::new(Mutex::new(())), gate, _lifetime: lifetime }
             })
             .clone();
         if let Some(m) = self.shared.metrics.get() {
@@ -250,28 +310,22 @@ impl UcxTransport {
     }
 
     fn admit(&self, handle: &ConnHandle, task: SendTask) -> SendOutcome {
-        match handle.gate.send(Cmd::Send(task)) {
-            SendOutcome::Admitted => {
-                // The frame is on the ring: wake the progress thread now.
-                self.shared.doorbell.ring();
-                SendOutcome::Admitted
-            }
-            SendOutcome::Pending(admission) => {
-                if let Some(m) = self.shared.metrics.get() {
-                    m.record_send_backpressure();
-                }
-                // The ring push happens later, from the gate's driver task —
-                // ring the doorbell when it actually lands, so a queued frame
-                // does not wait out the park timeout. The park's bounded
-                // timeout remains the backstop.
-                let doorbell = Arc::clone(&self.shared.doorbell);
-                SendOutcome::Pending(admission.on_resolved(move |result| {
-                    if result.is_ok() {
-                        doorbell.ring();
-                    }
-                }))
-            }
+        // Serialize the capacity check with admission. The gate's driver can
+        // only reduce the queue while this lock is held.
+        let admission = handle.admission.lock().unwrap_or_else(|e| e.into_inner());
+        if handle.gate.queued_len() >= self.config.channel_capacity {
+            drop(admission);
+            task.fail("ucx peer admission queue full");
+            return SendOutcome::Admitted;
         }
+        let outcome = handle.gate.send(task);
+        drop(admission);
+        if matches!(&outcome, SendOutcome::Pending(_))
+            && let Some(m) = self.shared.metrics.get()
+        {
+            m.record_send_backpressure();
+        }
+        outcome
     }
 
     /// Retire a peer's epoch after its endpoint failed: queued frames belong
@@ -353,6 +407,7 @@ impl Transport for UcxTransport {
         let task = SendTask {
             peer: instance_id,
             msg_type: message_type,
+            permit: None,
             header,
             payload,
             on_error,

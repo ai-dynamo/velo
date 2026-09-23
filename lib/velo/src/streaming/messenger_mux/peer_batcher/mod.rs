@@ -64,6 +64,7 @@ mod writer;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use dashmap::DashMap;
 use futures::future::FutureExt;
@@ -105,6 +106,7 @@ pub(crate) struct OpenSlotRequest {
     pub(crate) anchor_id: u64,
     pub(crate) session_id: u64,
     pub(crate) inlet: flume::Receiver<Vec<u8>>,
+    pub(crate) lifecycle: Option<(CancellationToken, CancellationToken)>,
     /// The ledger the slot opens with — the window the receiver advertised on
     /// its attach response, already granted.
     ///
@@ -140,12 +142,24 @@ const OPEN_QUEUE_DEPTH: usize = 64;
 /// enforced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReplyRecord {
+    StopSlot {
+        slot: SlotId,
+    },
     /// Additional data credit for the peer's slot.
-    CreditUpdate { slot: SlotId, delta: u32 },
+    CreditUpdate {
+        slot: SlotId,
+        delta: u32,
+    },
     /// Tell the peer to abandon a slot the ingress holds and is closing.
-    CloseSlot { slot: SlotId, reason: CloseReason },
+    CloseSlot {
+        slot: SlotId,
+        reason: CloseReason,
+    },
     /// Tell the peer to abandon an `OpenSlot` the ingress never admitted.
-    RejectSlot { slot: SlotId, reason: CloseReason },
+    RejectSlot {
+        slot: SlotId,
+        reason: CloseReason,
+    },
 }
 
 /// Why an `OpenSlot` command was refused.
@@ -173,6 +187,10 @@ pub(crate) struct BatcherHandle {
 }
 
 impl BatcherHandle {
+    pub(crate) fn peer_stopped(&self, slot: SlotId) {
+        self.control.peer_stopped(slot);
+    }
+
     /// Queue an attach, waiting if this batcher already has `OPEN_QUEUE_DEPTH`
     /// of them outstanding.
     pub(crate) async fn open_slot(
@@ -334,6 +352,7 @@ enum Work {
     /// the decision it leads to is [`FlushGate::should_flush`] reading the
     /// deadline as state.
     Linger,
+    Probe,
 }
 
 /// Whether [`Batcher::fire_singleton`] may skip the fence on a synchronously
@@ -383,6 +402,11 @@ struct Batcher {
 impl Batcher {
     async fn run(mut self, opens: flume::Receiver<OpenSlotRequest>) {
         let cancel = self.cancel.clone();
+        let mut probe = tokio::time::interval_at(
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            Duration::from_secs(5),
+        );
+        probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let control = Arc::clone(&self.control);
         loop {
             let deadline = self.gate.deadline();
@@ -398,6 +422,7 @@ impl Batcher {
                     // Drained by the pass below between the wake and the take.
                     None => continue,
                 },
+                _ = probe.tick(), if self.slots.live() > 0 => Work::Probe,
                 Some((index, item)) = self.streams.next() => Work::Slot(index, item),
                 () = linger_until(deadline) => Work::Linger,
             };
@@ -408,7 +433,7 @@ impl Batcher {
                     Work::Slot(_, SlotItem::InletClosed) => BatcherWake::InletClosed,
                     Work::Open(_) => BatcherWake::Open,
                     Work::Control(_) => BatcherWake::Control,
-                    Work::Linger => BatcherWake::Linger,
+                    Work::Linger | Work::Probe => BatcherWake::Linger,
                 });
             }
             self.dispatch(work).await;
@@ -494,6 +519,11 @@ impl Batcher {
             Work::Open(request) => self.on_open_slot(request).await,
             Work::Control(drained) => self.on_control(drained).await,
             Work::Linger => {}
+            Work::Probe => {
+                if !self.writer.peer_is_alive().await {
+                    self.epoch_death();
+                }
+            }
         }
     }
 
@@ -554,6 +584,11 @@ impl Batcher {
         }
         let mut touched = false;
         if let Some(live) = self.slots.get_mut_checked(slot) {
+            if entry.stop
+                && let Some((_, stop)) = &live.lifecycle
+            {
+                stop.cancel();
+            }
             if entry.credit > 0 {
                 live.credit.grant(entry.credit);
                 touched = true;
@@ -577,6 +612,7 @@ impl Batcher {
             anchor_id,
             session_id,
             inlet,
+            lifecycle,
             credit,
             slot_byte_budget,
             ack,
@@ -596,6 +632,10 @@ impl Batcher {
         // information the control inbox has no other way to see, published
         // here because `entry_mine`'s bound needs it and nothing shorter than
         // this call site can hand it over.
+        self.slots
+            .get_mut_checked(id)
+            .expect("allocated slot")
+            .lifecycle = lifecycle;
         self.control.note_allocated(id);
         self.streams.push(stream);
         self.publish_live_slots();
@@ -824,6 +864,10 @@ impl Batcher {
     /// not belong to that slot's outbound counter, and their order comes from
     /// batch position.
     async fn on_reply(&mut self, slot: SlotId, entry: PeerControl) {
+        if entry.stop && entry.close.is_none() {
+            self.push_reply(RecordType::StopSlot, |encoder| encoder.push_stop_slot(slot))
+                .await;
+        }
         if entry.credit > 0
             && self
                 .push_reply(RecordType::CreditUpdate, |encoder| {

@@ -179,6 +179,7 @@ pub(crate) struct BatchOutcome {
     pub(crate) grants: Vec<(SlotId, u32)>,
     /// `CloseSlot`s addressed to slots *we* own, likewise.
     pub(crate) peer_closes: Vec<(SlotId, CloseReason)>,
+    pub(crate) peer_stops: Vec<SlotId>,
     /// Slots this batch created.
     pub(crate) opened: usize,
     /// Slots this batch retired.
@@ -586,6 +587,7 @@ fn apply_record(
         RecordBody::CloseSlot { reason } => {
             close_slot(state, ctx, record.slot, record.frame_seq, reason, outcome);
         }
+        RecordBody::StopSlot => outcome.peer_stops.push(record.slot),
         RecordBody::Data(body) => deliver(state, ctx, record, body.to_vec(), outcome),
         RecordBody::SlotHeartbeat => deliver(state, ctx, record, heartbeat_frame(), outcome),
     }
@@ -680,7 +682,7 @@ fn open_slot(
     // The bind now has an owner, so its drain signal can start counting and
     // posting. Before this point it is inert: nothing has been delivered on
     // this slot, so nothing can have drained.
-    bind.drain.claimed_by(
+    let lifecycle = bind.drain.claimed_by(
         ctx.peer,
         id,
         ctx.registry.pending_wake(ctx.peer),
@@ -697,6 +699,11 @@ fn open_slot(
     );
     state.slots[index] = Some(slot);
     outcome.opened += 1;
+    if lifecycle == 2 {
+        fail_slot(state, ctx, id, CloseReason::UnknownSlot, outcome);
+    } else if lifecycle == 1 {
+        outcome.replies.push(ReplyRecord::StopSlot { slot: id });
+    }
 }
 
 fn close_slot(

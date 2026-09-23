@@ -995,7 +995,7 @@ mod tests {
             handle: StreamAnchorHandle::pack_mpsc(WorkerId::from_u64(1), 2),
             session_id: 3,
             stream_cancel_handle: StreamCancelHandle::pack(WorkerId::from_u64(4), 5),
-            supported_transport_keys: vec![TransportKey::new("messenger-mux-v1")],
+            supported_transport_keys: vec![TransportKey::new("messenger-mux-v2")],
         };
         let decoded: MpscAnchorAttachRequest =
             rmp_serde::from_slice(&rmp_serde::to_vec(&req).expect("encode")).expect("decode");
@@ -1005,11 +1005,11 @@ mod tests {
                 .iter()
                 .map(TransportKey::as_str)
                 .collect::<Vec<_>>(),
-            ["messenger-mux-v1"],
+            ["messenger-mux-v2"],
         );
 
         let resp = MpscAnchorAttachResponse::Ok {
-            streaming_transport_key: TransportKey::new("messenger-mux-v1"),
+            streaming_transport_key: TransportKey::new("messenger-mux-v2"),
             heartbeat_interval_ms: 5000,
             sender_id: 7,
             routing_session_id: 8,

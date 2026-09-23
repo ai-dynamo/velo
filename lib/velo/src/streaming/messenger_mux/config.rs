@@ -135,7 +135,7 @@ pub struct MuxConfig {
     ///
     /// **Defaults to `false`, and stays that way** — the mux is opt-in, not the
     /// default transport. This flag is also the rollback: set it back to
-    /// `false` and the node stops registering `messenger-mux-v1` and stops
+    /// `false` and the node stops registering `messenger-mux-v2` and stops
     /// advertising it on attach, so the next attach negotiates the legacy path
     /// with no code change and no wire change. That is what makes a canary
     /// safe, and why activation is config-only.

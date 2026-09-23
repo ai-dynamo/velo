@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Batched, multiplexed streaming over the Messenger — the `messenger-mux-v1`
+//! Batched, multiplexed streaming over the Messenger — the `messenger-mux-v2`
 //! transport described by `docs/src/concepts/batched-streaming.md`.
 //!
 //! Today one stream owns one connection: X concurrent streams to one peer means
@@ -142,7 +142,7 @@ pub use self::config::{AutoFlush, FlushPolicy, MuxConfig};
 /// [`StreamSender::negotiated_transport`](crate::streaming::StreamSender::negotiated_transport)
 /// is compared against — a caller that had to spell the string itself would be
 /// re-deriving the one value negotiation is keyed on.
-pub const MESSENGER_MUX_KEY: &str = "messenger-mux-v1";
+pub const MESSENGER_MUX_KEY: &str = "messenger-mux-v2";
 
 /// The active-message handler every batch travels through.
 pub(crate) const STREAM_BATCH_HANDLER: &str = "_stream_batch";
@@ -180,7 +180,7 @@ const CONNECT_ATTEMPTS: usize = 3;
 /// scale with slot count. It needs to absorb a burst across distinct peers.
 const DRAIN_WAKE_CAPACITY: usize = 1024;
 
-/// The `messenger-mux-v1` [`FrameTransport`].
+/// The `messenger-mux-v2` [`FrameTransport`].
 ///
 /// Holds no listener and no connections. `connect` allocates a slot on the
 /// peer's batcher; `bind` registers a buffer the peer's `OpenSlot` will claim.
@@ -232,6 +232,11 @@ struct MuxCore {
 }
 
 impl MessengerMuxTransport {
+    pub(crate) fn request_stop(&self, peer: WorkerId, slot: protocol::SlotId) {
+        self.core
+            .return_credit(peer, vec![peer_batcher::ReplyRecord::StopSlot { slot }]);
+    }
+
     /// Take the [`ingress::DrainSignal`] `bind` parked for this pair.
     ///
     /// Called once by the attach path, between `bind` returning and the pump
@@ -380,12 +385,18 @@ impl MuxCore {
             }
         }
 
-        if outcome.replies.is_empty() && outcome.grants.is_empty() && outcome.peer_closes.is_empty()
+        if outcome.replies.is_empty()
+            && outcome.grants.is_empty()
+            && outcome.peer_closes.is_empty()
+            && outcome.peer_stops.is_empty()
         {
             return;
         }
 
         let batcher = self.batcher(peer);
+        for slot in outcome.peer_stops {
+            batcher.peer_stopped(slot);
+        }
         for (slot, delta) in outcome.grants {
             batcher.grant(slot, delta);
         }
@@ -769,6 +780,17 @@ impl MessengerMuxTransport {
         session_id: u64,
         limits: NegotiatedLimits,
     ) -> BoxFuture<'_, Result<flume::Sender<Vec<u8>>>> {
+        self.connect_controlled(peer, anchor_id, session_id, limits, None)
+    }
+
+    pub(crate) fn connect_controlled(
+        &self,
+        peer: WorkerId,
+        anchor_id: u64,
+        session_id: u64,
+        limits: NegotiatedLimits,
+        lifecycle: Option<(CancellationToken, CancellationToken)>,
+    ) -> BoxFuture<'_, Result<flume::Sender<Vec<u8>>>> {
         let core = Arc::clone(&self.core);
         Box::pin(async move {
             for _ in 0..CONNECT_ATTEMPTS {
@@ -787,6 +809,7 @@ impl MessengerMuxTransport {
                         anchor_id,
                         session_id,
                         inlet: inlet_rx,
+                        lifecycle: lifecycle.clone(),
                         credit: limits.open_credit(),
                         slot_byte_budget: limits.slot_byte_budget(),
                         ack: ack_tx,

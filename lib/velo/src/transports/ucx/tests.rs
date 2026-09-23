@@ -401,6 +401,89 @@ async fn shutdown_fails_queued_sends() {
     b.transport.shutdown();
 }
 
+// A held command stands in for a UCX send that has not completed. This makes
+// pressure and cleanup deterministic without timing a network transfer.
+#[tokio::test]
+async fn send_budget_bounds_admission_and_releases_on_peer_retirement() {
+    use super::super::address::{AM_ID_BASE, BLOB_VERSION, UcxEndpoint};
+    let transport = UcxTransport::new(
+        "ucx".into(),
+        UcxConfig {
+            channel_capacity: 1,
+            ..Default::default()
+        },
+    );
+    transport
+        .runtime
+        .set(tokio::runtime::Handle::current())
+        .unwrap();
+    let peer = InstanceId::new_v4();
+    transport.shared.peers.insert(
+        peer,
+        UcxEndpoint {
+            v: BLOB_VERSION,
+            am_id_base: AM_ID_BASE,
+            eager_max: 1024,
+            incarnation: 1,
+            worker_addr: vec![],
+        },
+    );
+    let rx = transport.ring_rx.lock().unwrap().take().unwrap();
+    let errors = CountingErrors::new();
+    let send = || {
+        transport.send_message(
+            peer,
+            Bytes::new(),
+            Bytes::from_static(b"data"),
+            MessageType::Message,
+            errors.clone(),
+        )
+    };
+    assert!(send().is_admitted());
+    let held = tokio::time::timeout(T, rx.recv_async())
+        .await
+        .unwrap()
+        .unwrap();
+    // One command holds the permit, one may wait for it, and one fits in the
+    // channel. The following ticket must wait before admission.
+    let ticket = loop {
+        if let SendOutcome::Pending(ticket) = send() {
+            break ticket;
+        }
+    };
+    assert_eq!(
+        transport.connections.get(&peer).unwrap().gate.queued_len(),
+        1
+    );
+    send();
+    assert_eq!(errors.count(), 1, "excess queue entry must fail explicitly");
+    ticket.cancel();
+    assert_eq!(
+        transport.connections.get(&peer).unwrap().gate.queued_len(),
+        0
+    );
+    let next = send();
+    transport.shared.failed_peers.insert(peer, ());
+    transport.reap_failed_connection(peer);
+    if let SendOutcome::Pending(ticket) = next {
+        assert!(tokio::time::timeout(T, ticket).await.unwrap().is_err());
+    }
+    // Completion releases the outstanding permit and its retained buffers.
+    drop(held);
+    tokio::time::timeout(T, async {
+        while errors.count() < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(transport.connections.is_empty());
+    assert!(
+        rx.is_empty(),
+        "retired sends must not reach the progress thread"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // RMA
 // ---------------------------------------------------------------------------

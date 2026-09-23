@@ -289,7 +289,7 @@ impl VeloBuilder {
     }
 
     /// Install the batched, multiplexed streaming transport
-    /// (`messenger-mux-v1`), described in `docs/src/concepts/batched-streaming.md`.
+    /// (`messenger-mux-v2`), described in `docs/src/concepts/batched-streaming.md`.
     ///
     /// **Opt-in, and the mux is not the default transport.**
     /// [`MuxConfig::enabled`](crate::streaming::MuxConfig::enabled) defaults to
@@ -302,7 +302,7 @@ impl VeloBuilder {
     /// advertised. So a canary is one node with the flag on, talking the mux to
     /// other canaries and the legacy path to everything else, and **rollback is
     /// the same flag**: set it back to `false` and the node stops advertising
-    /// `messenger-mux-v1`, so the next attach negotiates the legacy path. No
+    /// `messenger-mux-v2`, so the next attach negotiates the legacy path. No
     /// code change, no wire change, and no coordination with peers, because a
     /// key that is never advertised is never selected.
     ///
@@ -409,7 +409,7 @@ impl VeloBuilder {
 
         // Step 5: Build the mux, if it was switched on. It joins the registry
         // *beside* the legacy transport rather than replacing it: negotiation
-        // answers `messenger-mux-v1` only to peers that advertised it, and
+        // answers `messenger-mux-v2` only to peers that advertised it, and
         // every other peer is still answered — and must still be served — on
         // the legacy key.
         let mux = match self.mux_config.filter(|config| config.enabled) {
@@ -994,9 +994,8 @@ impl Velo {
     /// `_anchor_attach` round trip, because `ticket` already carries what one
     /// would have returned.
     ///
-    /// No attach means no `StreamCancelHandle`, so the returned sender's
-    /// `cancellation_token` never fires; a dropped consumer surfaces as a
-    /// send error instead.
+    /// The mux carries stop and cancel through the ticket's session and slot
+    /// identity. Both producer tokens work even before the first item is sent.
     pub async fn open_anchor_stream<T: serde::Serialize>(
         &self,
         handle: StreamAnchorHandle,

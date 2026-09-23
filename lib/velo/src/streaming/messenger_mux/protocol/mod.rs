@@ -34,9 +34,9 @@ use std::ops::Range;
 /// Mux wire version carried in every batch header.
 ///
 /// Bumped only for a change that an older peer cannot skip past. Negotiation
-/// (`messenger-mux-v1`) already keeps unequal versions from meeting; the
+/// (`messenger-mux-v2`) already keeps unequal versions from meeting; the
 /// field is the belt to that pair of braces.
-pub(crate) const MUX_VERSION: u8 = 1;
+pub(crate) const MUX_VERSION: u8 = 2;
 
 /// Encoded size of a batch header.
 pub(crate) const BATCH_HEADER_LEN: usize = 16;
@@ -254,16 +254,19 @@ pub(crate) enum RecordType {
     CreditUpdate = 3,
     /// Per-slot liveness beat. No body.
     SlotHeartbeat = 4,
+    /// Graceful stop request, receiver to producer. No body.
+    StopSlot = 5,
 }
 
 /// The label value `velo_streaming_mux_records_sent_total` files each
 /// [`RecordType`] under, indexed by [`RecordType::count_index`].
-pub(crate) const RECORD_TYPE_LABELS: [&str; 5] = [
+pub(crate) const RECORD_TYPE_LABELS: [&str; 6] = [
     "data",
     "open_slot",
     "close_slot",
     "credit_update",
     "slot_heartbeat",
+    "stop_slot",
 ];
 
 /// Number of [`RecordType`] variants — the width of a per-type count array.
@@ -294,6 +297,7 @@ impl RecordType {
             Self::CloseSlot => 2,
             Self::CreditUpdate => 3,
             Self::SlotHeartbeat => 4,
+            Self::StopSlot => 5,
         }
     }
 
@@ -305,6 +309,7 @@ impl RecordType {
             2 => Some(Self::CloseSlot),
             3 => Some(Self::CreditUpdate),
             4 => Some(Self::SlotHeartbeat),
+            5 => Some(Self::StopSlot),
             _ => None,
         }
     }
@@ -324,7 +329,10 @@ impl RecordType {
     /// the watchdog kill that `docs/src/operations/saturation.md` documents.
     #[cfg(test)]
     pub(crate) const fn is_control(self) -> bool {
-        matches!(self, Self::OpenSlot | Self::CloseSlot | Self::CreditUpdate)
+        matches!(
+            self,
+            Self::OpenSlot | Self::CloseSlot | Self::CreditUpdate | Self::StopSlot
+        )
     }
 }
 
@@ -377,6 +385,8 @@ pub(crate) enum RecordBody<'a> {
     CreditUpdate { delta: u32 },
     /// Liveness only.
     SlotHeartbeat,
+    /// Graceful stop keeps the slot open for remaining output.
+    StopSlot,
 }
 
 impl RecordBody<'_> {
@@ -389,6 +399,7 @@ impl RecordBody<'_> {
             Self::CloseSlot { .. } => RecordType::CloseSlot,
             Self::CreditUpdate { .. } => RecordType::CreditUpdate,
             Self::SlotHeartbeat => RecordType::SlotHeartbeat,
+            Self::StopSlot => RecordType::StopSlot,
         }
     }
 }
@@ -508,6 +519,10 @@ pub(crate) struct BatchEncoder {
 }
 
 impl BatchEncoder {
+    pub(crate) fn push_stop_slot(&mut self, slot: SlotId) -> Result<(), EncodeError> {
+        self.push(RecordType::StopSlot, slot, 0, 0, |_| {})
+    }
+
     /// Opens a batch in a fresh buffer.
     pub(crate) fn new(peer_epoch: u64, batch_seq: u32) -> Self {
         Self::with_buffer(BytesMut::new(), peer_epoch, batch_seq)
@@ -809,6 +824,12 @@ fn decode_body(
                 return Err(mismatch(4));
             }
             Ok(RecordBody::CreditUpdate { delta })
+        }
+        RecordType::StopSlot => {
+            if !body.is_empty() {
+                return Err(mismatch(0));
+            }
+            Ok(RecordBody::StopSlot)
         }
         RecordType::SlotHeartbeat => {
             if !body.is_empty() {

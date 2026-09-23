@@ -65,6 +65,7 @@ use crate::observability::MuxMetricsHandle;
 /// Coalesced control for one slot **this** batcher owns.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct OwnedControl {
+    pub(super) stop: bool,
     /// Credit granted since the batcher last looked.
     pub(super) credit: u32,
     /// The receiver asked us to abandon the slot.
@@ -77,6 +78,7 @@ pub(super) struct OwnedControl {
 /// Coalesced control to send back for one slot the **peer** owns.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct PeerControl {
+    pub(super) stop: bool,
     /// Credit to advertise.
     pub(super) credit: u32,
     /// A close to send.
@@ -488,6 +490,14 @@ impl ControlInbox {
         });
     }
 
+    pub(super) fn peer_stopped(&self, slot: SlotId) {
+        self.mutate(|state| {
+            if let Some(entry) = state.entry_mine(slot) {
+                entry.stop = true;
+            }
+        });
+    }
+
     /// The receiver asked us to abandon a slot we own.
     pub(super) fn peer_closed(&self, slot: SlotId, reason: CloseReason) {
         self.mutate(|state| {
@@ -521,6 +531,9 @@ impl ControlInbox {
         self.mutate(|state| {
             for record in records {
                 match *record {
+                    ReplyRecord::StopSlot { slot } => {
+                        state.entry_peer(slot).stop = true;
+                    }
                     ReplyRecord::CreditUpdate { slot, delta } => {
                         let entry = state.entry_peer(slot);
                         entry.credit = entry.credit.saturating_add(delta);

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Attach-time negotiation of `messenger-mux-v1`, over two real `Velo` nodes.
+//! Attach-time negotiation of `messenger-mux-v2`, over two real `Velo` nodes.
 //!
 //! The unit tests beside `streaming/negotiation.rs` pin the decision table; this
 //! file checks that two nodes actually reach those verdicts across a wire, and

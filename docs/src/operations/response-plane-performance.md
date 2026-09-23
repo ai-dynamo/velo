@@ -164,12 +164,14 @@ UCX did not beat TCP, and it did not hold its tail. The failure chain:
 5. The reader-pump watchdog (3 × 5 s) killed 1,722 streams. Every log line showed `anchor_frame_tx_len=0` and `transport_rx_len=0`. `closed_slot` drops were 1,722 × 255 exactly, so no record had arrived before each kill.
 6. The worker was healthy the whole time. It completed all 27,702 of its requests.
 
-The defect is that the UCX send path has no backpressure edge beyond its shared ring:
+The measured revision had no UCX backpressure edge beyond its shared ring:
 
 - `ucp_am_send_nbx` never refuses. An exhausted endpoint returns a request pointer, not an error.
 - `inflight_ops` counts posted operations but does not gate admission.
 - The per-peer admission gate queues without a bound.
 - All peers share one 1,024-entry ring into the progress thread. TCP gives each connection a 256-entry channel and a blocking write.
+
+Version 0.14 bounds queued and outstanding sends per peer. A send permit is released on UCX completion or failure, and peer retirement cancels pending admission. The progress thread can still process control and endpoint cleanup when a data peer is full. This change requires a new saturation measurement; it does not change the historical results below.
 
 Because admission never blocks, the on-admission flush policy never parks, and batches collapse. UCX carried 6.97 to 8.65 records per batch against 18 to 29 over TCP with the same settings. That is 2.6 to 4.1 times the message rate for the same records.
 
