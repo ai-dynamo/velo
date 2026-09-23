@@ -24,21 +24,21 @@ pub(super) const ALPN: &[u8] = b"velo-quic/1";
 
 /// The server name every dialer presents. The pinned fingerprint, not the
 /// name, is what identifies the peer.
-pub(super) const SERVER_NAME: &str = "velo";
+pub(crate) const SERVER_NAME: &str = "velo";
 
 /// A SHA-256 certificate fingerprint.
 pub type Fingerprint = [u8; 32];
 
 /// A transport's certificate and key, and the fingerprint that peers pin.
-pub(super) struct Identity {
+pub(crate) struct Identity {
     pub(super) cert: CertificateDer<'static>,
     pub(super) key: PrivatePkcs8KeyDer<'static>,
-    pub(super) fingerprint: Fingerprint,
+    pub(crate) fingerprint: Fingerprint,
 }
 
 impl Identity {
     /// Generate a fresh self-signed certificate.
-    pub(super) fn generate() -> Result<Self> {
+    pub(crate) fn generate() -> Result<Self> {
         let certified = rcgen::generate_simple_self_signed(vec![SERVER_NAME.to_string()])
             .context("failed to generate the QUIC certificate")?;
         let cert = certified.cert.der().clone();
@@ -65,7 +65,7 @@ fn provider() -> Arc<CryptoProvider> {
 }
 
 /// Build the rustls server config for `identity`, with the velo ALPN.
-pub(super) fn server_crypto(identity: &Identity) -> Result<rustls::ServerConfig> {
+pub(crate) fn server_crypto(identity: &Identity) -> Result<rustls::ServerConfig> {
     let mut crypto = rustls::ServerConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])
         .context("failed to select TLS 1.3")?

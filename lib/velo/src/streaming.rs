@@ -41,6 +41,8 @@ pub mod handle;
 pub(crate) mod messenger_mux;
 pub mod mpsc;
 pub(crate) mod negotiation;
+#[cfg(feature = "quic")]
+pub mod quic_transport;
 pub mod sender;
 pub mod tcp_transport;
 pub mod transport;
@@ -56,6 +58,8 @@ pub use messenger_mux::{AutoFlush, FlushPolicy, MESSENGER_MUX_KEY, MuxConfig};
 pub use mpsc::{
     MpscAnchorConfig, MpscFrame, MpscStreamAnchor, MpscStreamController, MpscStreamSender, SenderId,
 };
+#[cfg(feature = "quic")]
+pub use quic_transport::{QUIC_STREAM_KEY, QuicFrameTransport, QuicStreamConfig};
 pub use sender::StreamSender;
 pub use tcp_transport::TcpFrameTransport;
 pub use transport::FrameTransport;

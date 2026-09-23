@@ -401,7 +401,7 @@ async fn egress_pump(
 /// `#[repr(transparent)]` documents the layout equivalence; nothing here
 /// depends on it, since the wrap is an ordinary move.
 #[repr(transparent)]
-struct EgressFrame(Vec<u8>);
+pub(crate) struct EgressFrame(pub(crate) Vec<u8>);
 
 impl Coalescable for EgressFrame {
     /// The streaming data plane has no per-frame error handler, so there is

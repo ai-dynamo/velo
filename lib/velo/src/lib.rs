@@ -156,6 +156,12 @@ impl Default for GrpcConfig {
 ///   [`GrpcFrameTransport`](crate::streaming::GrpcFrameTransport). Only
 ///   available when the `grpc` feature is enabled. Same advertise-and-select
 ///   semantics as `Tcp`.
+///
+/// - [`StreamConfig::Quic`]: QUIC-based streaming via
+///   [`QuicFrameTransport`](crate::streaming::QuicFrameTransport), one QUIC
+///   stream for each velo stream on one connection per peer. Only available
+///   when the `quic` feature is enabled. Pass `None` for the defaults on
+///   `0.0.0.0:0`.
 #[derive(Debug, Clone)]
 pub enum StreamConfig {
     /// TCP-based streaming transport (TcpFrameTransport).
@@ -163,6 +169,9 @@ pub enum StreamConfig {
     /// gRPC-based streaming transport (GrpcFrameTransport).
     #[cfg(feature = "grpc")]
     Grpc(Option<GrpcConfig>),
+    /// QUIC-based streaming transport (QuicFrameTransport).
+    #[cfg(feature = "quic")]
+    Quic(Option<crate::streaming::QuicStreamConfig>),
 }
 
 /// High-level facade for the Velo distributed system.
@@ -391,6 +400,19 @@ impl VeloBuilder {
                     grpc.set_metrics(Arc::clone(m));
                 }
                 grpc as _
+            }
+            #[cfg(feature = "quic")]
+            StreamConfig::Quic(quic_cfg) => {
+                let quic =
+                    crate::streaming::QuicFrameTransport::with_config(quic_cfg.unwrap_or_default())
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!("Failed to start QUIC streaming transport: {e:#}")
+                        })?;
+                if let Some(m) = self.metrics.as_ref() {
+                    quic.set_metrics(Arc::clone(m));
+                }
+                quic as _
             }
         };
 
