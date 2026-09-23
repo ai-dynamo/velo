@@ -12,15 +12,17 @@
 //!    listener and its certificate fingerprint in the `WorkerAddress`.
 //! 2. `bind(anchor, session)` registers a sender keyed by `(anchor, session)`
 //!    and returns the matching receiver.
-//! 3. `connect(peer, anchor, session)` takes the one QUIC connection to that
+//! 3. `connect(peer, anchor, session)` takes the next QUIC connection to that
 //!    peer (and dials it on first use), opens a unidirectional stream, writes
 //!    the same 16-byte handshake as TCP, and spawns a writer that sends the
 //!    frames with the TCP frame codec.
 //! 4. The accept side reads the handshake from each new stream, looks up the
 //!    registered sender, and pumps the frames into it.
 //!
-//! One connection per peer carries every stream to that peer, so a new stream
-//! costs no handshake after the first. QUIC does the multiplexing and the flow
+//! By default one connection carries every stream to a peer, so a new stream
+//! costs no handshake after the first. `connections_per_peer(n)` dials `n`
+//! connections, each from its own UDP socket, and spreads the streams over
+//! them round-robin. QUIC does the multiplexing and the flow
 //! control for each stream. A lost packet delays only the streams whose data
 //! it carried, where one TCP connection would delay all of them. Loss recovery
 //! and congestion control are per connection, though, so a run of losses
@@ -105,6 +107,16 @@ pub struct QuicStreamConfig {
     pub max_mtu: Option<u16>,
     /// Flow-control window of each stream, in bytes.
     pub stream_receive_window: Option<u32>,
+    /// Connections to each peer (default 1). Each one dials from its own UDP
+    /// socket, so a reuse-port listener hashes them to different sockets, and
+    /// streams go round-robin across them. Loss recovery and congestion
+    /// control are per connection, so more connections spread a burst over
+    /// more receive queues and limit how many streams one stalled connection
+    /// holds.
+    pub connections_per_peer: usize,
+    /// Log each connection's quinn statistics at this interval, and once when
+    /// it closes, on both ends. Off by default; for diagnosis.
+    pub stats_interval: Option<Duration>,
 }
 
 impl QuicStreamConfig {
@@ -115,6 +127,8 @@ impl QuicStreamConfig {
             server_endpoints: DEFAULT_SERVER_ENDPOINTS,
             max_mtu: None,
             stream_receive_window: None,
+            connections_per_peer: 1,
+            stats_interval: None,
         }
     }
 
@@ -133,6 +147,18 @@ impl QuicStreamConfig {
     /// Set the flow-control window of each stream.
     pub fn stream_receive_window(mut self, bytes: u32) -> Self {
         self.stream_receive_window = Some(bytes);
+        self
+    }
+
+    /// Set the number of connections to each peer.
+    pub fn connections_per_peer(mut self, count: usize) -> Self {
+        self.connections_per_peer = count.max(1);
+        self
+    }
+
+    /// Log each connection's quinn statistics at this interval.
+    pub fn stats_interval(mut self, interval: Duration) -> Self {
+        self.stats_interval = Some(interval);
         self
     }
 }
@@ -154,8 +180,8 @@ struct PeerEntry {
 type SessionRegistry = DashMap<(u64, u64), flume::Sender<Vec<u8>>>;
 type Metrics = Arc<OnceLock<Arc<crate::observability::VeloMetrics>>>;
 
-/// QUIC [`FrameTransport`]: one connection per peer, one QUIC stream per velo
-/// stream. See the module docs.
+/// QUIC [`FrameTransport`]: one QUIC stream per velo stream, over one or more
+/// connections per peer. See the module docs.
 pub struct QuicFrameTransport {
     key: TransportKey,
     bind_addr: SocketAddr,
@@ -163,12 +189,17 @@ pub struct QuicFrameTransport {
     local_interfaces: OnceLock<Vec<InterfaceEndpoint>>,
     transport_config: Arc<quinn::TransportConfig>,
     peers: DashMap<WorkerId, PeerEntry>,
-    /// The live connection to each peer. Read on every `connect`.
-    connections: DashMap<WorkerId, quinn::Connection>,
-    /// Serialises the dial to each peer, so that concurrent first streams to
-    /// one peer share one handshake instead of racing several.
-    dial_locks: DashMap<WorkerId, Arc<tokio::sync::Mutex<()>>>,
-    client_endpoint: quinn::Endpoint,
+    /// The live connections to each peer, keyed by peer and connection
+    /// index. Read on every `connect`.
+    connections: DashMap<(WorkerId, usize), quinn::Connection>,
+    /// Serialises each dial, so that concurrent first streams on one
+    /// connection share one handshake instead of racing several.
+    dial_locks: DashMap<(WorkerId, usize), Arc<tokio::sync::Mutex<()>>>,
+    /// One dial endpoint (and UDP socket) per connection index.
+    client_endpoints: Vec<quinn::Endpoint>,
+    /// Round-robin cursor over the connection indexes.
+    next_connection: std::sync::atomic::AtomicUsize,
+    stats_interval: Option<Duration>,
     server_endpoints: Vec<quinn::Endpoint>,
     registry: Arc<SessionRegistry>,
     cancel: CancellationToken,
@@ -191,7 +222,10 @@ impl QuicFrameTransport {
         let server_sockets =
             bind_server_sockets(config.bind_addr, config.server_endpoints, buffers)?;
         let bind_addr = server_sockets[0].local_addr()?;
-        let client_socket = bind_client_socket(bind_addr, buffers)?;
+        let connections_per_peer = config.connections_per_peer.max(1);
+        let client_sockets = (0..connections_per_peer)
+            .map(|_| bind_client_socket(bind_addr, buffers))
+            .collect::<Result<Vec<_>>>()?;
 
         let mut transport_config = quinn::TransportConfig::default();
         // The dialer opens unidirectional streams only; nothing flows back.
@@ -233,8 +267,13 @@ impl QuicFrameTransport {
                 .context("failed to create a QUIC stream server endpoint")?,
             );
         }
-        let client_endpoint = quinn::Endpoint::new(endpoint_config, None, client_socket, runtime)
-            .context("failed to create the QUIC stream client endpoint")?;
+        let client_endpoints = client_sockets
+            .into_iter()
+            .map(|socket| {
+                quinn::Endpoint::new(endpoint_config.clone(), None, socket, runtime.clone())
+                    .context("failed to create a QUIC stream client endpoint")
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         let info = QuicEndpointInfo {
             endpoints: resolve_advertise_endpoints(bind_addr, &InterfaceFilter::All)?,
@@ -247,12 +286,16 @@ impl QuicFrameTransport {
         let registry: Arc<SessionRegistry> = Arc::new(DashMap::new());
         let cancel = CancellationToken::new();
         let metrics: Metrics = Arc::new(OnceLock::new());
-        for endpoint in &server_endpoints {
+        for (index, endpoint) in server_endpoints.iter().enumerate() {
             tokio::spawn(run_accept_loop(
                 endpoint.clone(),
-                registry.clone(),
-                cancel.clone(),
-                metrics.clone(),
+                AcceptContext {
+                    socket: index,
+                    registry: registry.clone(),
+                    cancel: cancel.clone(),
+                    metrics: metrics.clone(),
+                    stats_interval: config.stats_interval,
+                },
             ));
         }
 
@@ -265,7 +308,9 @@ impl QuicFrameTransport {
             peers: DashMap::new(),
             connections: DashMap::new(),
             dial_locks: DashMap::new(),
-            client_endpoint,
+            client_endpoints,
+            next_connection: std::sync::atomic::AtomicUsize::new(0),
+            stats_interval: config.stats_interval,
             server_endpoints,
             registry,
             cancel,
@@ -284,15 +329,21 @@ impl QuicFrameTransport {
         self.bind_addr
     }
 
-    /// The live connection to `peer`, dialed if there is none.
+    /// The next connection to `peer` in round-robin order, dialed if it is
+    /// not live.
     async fn connection_to(&self, peer: WorkerId) -> Result<quinn::Connection> {
-        if let Some(connection) = self.live_connection(peer) {
+        let index = self
+            .next_connection
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % self.client_endpoints.len();
+        let slot = (peer, index);
+        if let Some(connection) = self.live_connection(slot) {
             return Ok(connection);
         }
-        let lock = self.dial_locks.entry(peer).or_default().clone();
+        let lock = self.dial_locks.entry(slot).or_default().clone();
         let _dial = lock.lock().await;
         // Another stream may have dialed while this one waited.
-        if let Some(connection) = self.live_connection(peer) {
+        if let Some(connection) = self.live_connection(slot) {
             return Ok(connection);
         }
         let entry = self
@@ -302,8 +353,7 @@ impl QuicFrameTransport {
                 anyhow!("QUIC streaming: peer {peer} not registered (call register_peer first)")
             })?
             .clone();
-        let connecting = self
-            .client_endpoint
+        let connecting = self.client_endpoints[index]
             .connect_with(entry.client_config, entry.addr, tls::SERVER_NAME)
             .context("QUIC streaming: failed to start the handshake")?;
         let connection = tokio::time::timeout(CONNECT_TIMEOUT, connecting)
@@ -315,12 +365,15 @@ impl QuicFrameTransport {
                 )
             })?
             .with_context(|| format!("QUIC streaming: handshake with peer {peer} failed"))?;
-        self.connections.insert(peer, connection.clone());
+        if let Some(interval) = self.stats_interval {
+            spawn_stats_monitor(connection.clone(), interval, "dial", index);
+        }
+        self.connections.insert(slot, connection.clone());
         Ok(connection)
     }
 
-    fn live_connection(&self, peer: WorkerId) -> Option<quinn::Connection> {
-        let connection = self.connections.get(&peer)?;
+    fn live_connection(&self, slot: (WorkerId, usize)) -> Option<quinn::Connection> {
+        let connection = self.connections.get(&slot)?;
         connection
             .close_reason()
             .is_none()
@@ -329,7 +382,15 @@ impl QuicFrameTransport {
 
     #[cfg(test)]
     fn cached_connection(&self, peer: WorkerId) -> Option<quinn::Connection> {
-        self.connections.get(&peer).map(|c| c.clone())
+        self.connections.get(&(peer, 0)).map(|c| c.clone())
+    }
+
+    #[cfg(test)]
+    fn open_dial_connections(&self) -> usize {
+        self.client_endpoints
+            .iter()
+            .map(quinn::Endpoint::open_connections)
+            .sum()
     }
 }
 
@@ -339,33 +400,48 @@ impl Drop for QuicFrameTransport {
         for endpoint in &self.server_endpoints {
             endpoint.close(quinn::VarInt::from_u32(0), b"shutdown");
         }
-        self.client_endpoint
-            .close(quinn::VarInt::from_u32(0), b"shutdown");
+        for endpoint in &self.client_endpoints {
+            endpoint.close(quinn::VarInt::from_u32(0), b"shutdown");
+        }
     }
 }
 
-/// Accept connections on one server endpoint until the transport drops.
-async fn run_accept_loop(
-    endpoint: quinn::Endpoint,
+/// Everything the accept side of one server socket needs.
+#[derive(Clone)]
+struct AcceptContext {
+    /// Index of the server socket in the reuse-port group, for the logs.
+    socket: usize,
     registry: Arc<SessionRegistry>,
     cancel: CancellationToken,
     metrics: Metrics,
-) {
+    stats_interval: Option<Duration>,
+}
+
+/// Accept connections on one server endpoint until the transport drops.
+async fn run_accept_loop(endpoint: quinn::Endpoint, ctx: AcceptContext) {
     loop {
         let incoming = tokio::select! {
             biased;
-            _ = cancel.cancelled() => return,
+            _ = ctx.cancel.cancelled() => return,
             incoming = endpoint.accept() => match incoming {
                 Some(incoming) => incoming,
                 None => return,
             },
         };
-        let registry = registry.clone();
-        let cancel = cancel.clone();
-        let metrics = metrics.clone();
+        let ctx = ctx.clone();
         tokio::spawn(async move {
             match incoming.await {
-                Ok(connection) => serve_connection(connection, registry, cancel, metrics).await,
+                Ok(connection) => {
+                    tracing::debug!(
+                        socket = ctx.socket,
+                        remote = %connection.remote_address(),
+                        "QUIC streaming: accepted a connection"
+                    );
+                    if let Some(interval) = ctx.stats_interval {
+                        spawn_stats_monitor(connection.clone(), interval, "accept", ctx.socket);
+                    }
+                    serve_connection(connection, ctx).await
+                }
                 Err(e) => tracing::debug!("QUIC streaming: inbound handshake failed: {e:#}"),
             }
         });
@@ -373,21 +449,22 @@ async fn run_accept_loop(
 }
 
 /// Accept the streams that one peer opens, one task for each.
-async fn serve_connection(
-    connection: quinn::Connection,
-    registry: Arc<SessionRegistry>,
-    cancel: CancellationToken,
-    metrics: Metrics,
-) {
+async fn serve_connection(connection: quinn::Connection, ctx: AcceptContext) {
     loop {
         let stream = tokio::select! {
             biased;
-            _ = cancel.cancelled() => return,
+            _ = ctx.cancel.cancelled() => return,
             stream = connection.accept_uni() => stream,
         };
         match stream {
             Ok(recv) => {
-                tokio::spawn(serve_stream(recv, registry.clone(), metrics.get().cloned()));
+                tokio::spawn(serve_stream(
+                    recv,
+                    ctx.registry.clone(),
+                    ctx.metrics.get().cloned(),
+                    connection.clone(),
+                    ctx.socket,
+                ));
             }
             Err(e) => {
                 tracing::debug!(
@@ -406,6 +483,8 @@ async fn serve_stream(
     mut recv: quinn::RecvStream,
     registry: Arc<SessionRegistry>,
     metrics: Option<Arc<crate::observability::VeloMetrics>>,
+    connection: quinn::Connection,
+    socket: usize,
 ) {
     let mut handshake = [0u8; 16];
     match tokio::time::timeout(HANDSHAKE_TIMEOUT, recv.read_exact(&mut handshake)).await {
@@ -416,6 +495,7 @@ async fn serve_stream(
         }
         Err(_) => {
             tracing::warn!("QUIC streaming handshake timed out after {HANDSHAKE_TIMEOUT:?}");
+            log_stats(&connection, "accept", socket, "handshake timeout");
             return;
         }
     }
@@ -540,6 +620,54 @@ impl WriterObserver for EgressObserver {
     }
 }
 
+/// Log `connection`'s quinn statistics every `interval`, and once when it
+/// closes. The task holds a handle but exits when the connection closes, so it
+/// does not keep a closed connection's state alive.
+fn spawn_stats_monitor(
+    connection: quinn::Connection,
+    interval: Duration,
+    role: &'static str,
+    socket: usize,
+) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(interval);
+        tick.tick().await;
+        loop {
+            tokio::select! {
+                _ = tick.tick() => log_stats(&connection, role, socket, "periodic"),
+                reason = connection.closed() => {
+                    log_stats(&connection, role, socket, &format!("closed: {reason}"));
+                    return;
+                }
+            }
+        }
+    });
+}
+
+/// One line of quinn statistics for `connection`. `socket` is the server
+/// socket index on the accept side, and the dial endpoint index on the dial
+/// side (`usize::MAX` where it is not known).
+fn log_stats(connection: &quinn::Connection, role: &'static str, socket: usize, event: &str) {
+    let stats = connection.stats();
+    tracing::info!(
+        role,
+        socket,
+        event,
+        connection = connection.stable_id(),
+        remote = %connection.remote_address(),
+        rtt_us = stats.path.rtt.as_micros() as u64,
+        cwnd = stats.path.cwnd,
+        congestion_events = stats.path.congestion_events,
+        lost_packets = stats.path.lost_packets,
+        lost_bytes = stats.path.lost_bytes,
+        sent_packets = stats.path.sent_packets,
+        udp_tx_datagrams = stats.udp_tx.datagrams,
+        udp_rx_datagrams = stats.udp_rx.datagrams,
+        current_mtu = stats.path.current_mtu,
+        "QUIC streaming connection stats"
+    );
+}
+
 impl FrameTransport for QuicFrameTransport {
     fn key(&self) -> TransportKey {
         self.key.clone()
@@ -627,6 +755,7 @@ impl FrameTransport for QuicFrameTransport {
             })
             .await
             .map_err(|_| {
+                log_stats(&connection, "dial", usize::MAX, "stream open timeout");
                 anyhow!(
                     "QUIC streaming: opening a stream to peer {peer} timed out after {HANDSHAKE_TIMEOUT:?}"
                 )
@@ -796,11 +925,51 @@ mod tests {
         let connection = client.cached_connection(server_worker).unwrap();
         assert_eq!(client.connections.len(), 1);
         assert_eq!(
-            client.client_endpoint.open_connections(),
+            client.open_dial_connections(),
             1,
             "every stream to one peer must ride one connection"
         );
         assert!(connection.close_reason().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn streams_spread_over_the_configured_connections() {
+        // With four connections per peer, streams go round-robin over four
+        // connections, each from its own UDP socket, so a reuse-port listener
+        // can hash them to different receive queues.
+        let server = loopback().await;
+        let client = QuicFrameTransport::with_config(
+            QuicStreamConfig::new("127.0.0.1:0".parse().unwrap()).connections_per_peer(4),
+        )
+        .await
+        .unwrap();
+        let (server_worker, server_peer) = fresh_peer(server.address());
+        client.register(&server_peer).unwrap();
+        let mut handles = Vec::new();
+        for i in 0u64..16 {
+            let server = server.clone();
+            let client = client.clone();
+            handles.push(tokio::spawn(async move {
+                let rx = server.bind(i, 0).await.unwrap();
+                let tx = client.connect(server_worker, i, 0).await.unwrap();
+                tx.send_async(item(i)).await.unwrap();
+                assert_eq!(recv(&rx).await, item(i));
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert_eq!(client.open_dial_connections(), 4);
+        let ports: std::collections::HashSet<u16> = client
+            .client_endpoints
+            .iter()
+            .map(|e| e.local_addr().unwrap().port())
+            .collect();
+        assert_eq!(
+            ports.len(),
+            4,
+            "each connection must dial from its own socket"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
