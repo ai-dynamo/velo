@@ -8,7 +8,7 @@ At two nodes and ten streams on loopback, the mux is the same speed as the per-s
 
 ### V1: resource-ceiling arithmetic
 
-The per-stream path uses one socket per remote stream: one file descriptor in each process, about 2 MiB of requested socket buffer and 4 tasks across the two ends. At the default `ulimit -n` of 1,024, a process stops below 1,024 concurrent remote streams, less its other descriptors. This is a hard wall, not a slope. A small-scale null result cannot refute it, which is why it comes first. The intended test opens N streams and counts `/proc/self/fd`. That test is not built.
+The per-stream path uses one socket per remote stream: one file descriptor and about 2 MiB of requested socket buffer in each process, and 4 tasks across the two ends. At the default `ulimit -n` of 1,024, a process stops below 1,024 concurrent remote streams, less its other descriptors. This is a hard wall, not a slope. A small-scale null result cannot refute it, which is why it comes first. The intended test opens N streams and counts `/proc/self/fd`. That test is not built.
 
 ### V2: analytical cost model
 

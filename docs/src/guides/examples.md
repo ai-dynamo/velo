@@ -5,7 +5,7 @@ The examples are in the `examples/` crate. This crate is not a workspace member.
 | Example | What it shows | Features |
 |---|---|---|
 | `ping_pong` | Round-trip time for unary messages between two instances | `zmq` or `grpc` for those transports |
-| `throughput` | Messages per second, bytes per second, and p50/p95/p99 for sequential, concurrent, and pipelined sends | `zmq` or `grpc` for those transports |
+| `throughput` | Messages per second and bytes per second for sequential, concurrent, and pipelined sends, and p50/p95/p99 for sequential and concurrent sends | `zmq` or `grpc` for those transports |
 | `tx_budget` | The latency budget of the send path, one layer at a time | none |
 | `mpsc_fanin` | Many producers into one MPSC anchor | none |
 | `batched_streaming` | Batched streaming over the mux, in the shape of LLM serving | none |

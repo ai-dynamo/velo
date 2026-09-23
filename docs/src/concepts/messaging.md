@@ -25,7 +25,7 @@ node_a.am_sync("process")?.payload(&job)?.instance(b).send().await?;
 // Unary with raw bytes.
 let reply: Bytes = node_a.unary("ping")?.raw_payload(Bytes::new()).instance(b).send().await?;
 
-// Typed unary. Serialization is MessagePack (rmp-serde).
+// Typed unary. Payloads are JSON (serde_json).
 let reply: MyResponse = node_a.typed_unary::<MyResponse>("rpc")?.payload(&req)?.instance(b).send().await?;
 ```
 

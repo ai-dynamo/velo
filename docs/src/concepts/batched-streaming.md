@@ -15,14 +15,14 @@ Each remote stream on the per-stream path costs the following:
 | Resource | Cost per stream |
 |---|---|
 | Sockets | 1 socket, 2 file descriptors (one per side) |
-| Socket buffers | 1 MiB send and 1 MiB receive requested (Linux doubles the request) |
+| Socket buffers | 1 MiB send and 1 MiB receive requested at each end (Linux doubles the request) |
 | Channel slots | 4,096 on the connect side, 4,096 on the bind side |
 | Tokio tasks | 4: heartbeat, egress pump, accept pump, reader pump |
 | Setup latency | 1 active-message round trip plus 1 TCP dial round trip |
 
 Per token, the stream pays one `rmp_serde` allocation, one channel hop, one `encode_frame` and, because `TCP_NODELAY` is set, one syscall and one TCP segment.
 
-This cost is a ceiling, not a slope. Each remote stream holds one socket, with one file descriptor in each of the two processes. Across both ends, 1,024 concurrent remote streams need 2,048 descriptors, about 2 GiB of requested socket buffer and about 4,096 tasks. Each process holds one descriptor per stream. At the default `ulimit -n` of 1,024, a process stops below 1,024 concurrent remote streams, less the descriptors that it uses for other things.
+This cost is a ceiling, not a slope. Each remote stream holds one socket, with one file descriptor in each of the two processes. Across both ends, 1,024 concurrent remote streams need 2,048 descriptors, about 4 GiB of requested socket buffer and about 4,096 tasks. Each process holds one descriptor per stream. At the default `ulimit -n` of 1,024, a process stops below 1,024 concurrent remote streams, less the descriptors that it uses for other things.
 
 ### Per-stream coalescing cannot reach the forward-pass shape
 
