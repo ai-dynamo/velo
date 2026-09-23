@@ -205,7 +205,7 @@ async fn eventually(mut predicate: impl FnMut() -> bool) {
 /// falls back to the legacy path, with no error anywhere to say why.
 #[test]
 fn the_negotiated_key_is_the_string_that_shipped() {
-    assert_eq!(MESSENGER_MUX_KEY, "messenger-mux-v1");
+    assert_eq!(MESSENGER_MUX_KEY, "messenger-mux-v2");
 }
 
 #[tokio::test(flavor = "multi_thread")]

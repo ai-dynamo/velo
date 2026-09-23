@@ -181,9 +181,10 @@ impl CreditClass {
     /// `reader_pump`'s `DETECTION_MULTIPLIER` stops firing on a saturated slot.
     pub(crate) const fn of(record_type: RecordType, is_terminal: bool) -> Self {
         match record_type {
-            RecordType::OpenSlot | RecordType::CloseSlot | RecordType::CreditUpdate => {
-                Self::Control
-            }
+            RecordType::OpenSlot
+            | RecordType::CloseSlot
+            | RecordType::CreditUpdate
+            | RecordType::LifecycleSlot => Self::Control,
             RecordType::Data if is_terminal => Self::Terminal,
             RecordType::Data | RecordType::SlotHeartbeat => Self::Data,
         }

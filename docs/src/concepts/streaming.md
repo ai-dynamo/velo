@@ -38,7 +38,9 @@ while let Some(frame) = anchor.next().await {
 | `SenderError(String)` | The producer could not serialize an item |
 | `TransportError(String)` | The network failed during delivery |
 
-The consumer can cancel the stream with `anchor.cancel()` or with a cloned `StreamController`. The producer sees the cancel through `sender.cancellation_token()`.
+The consumer can request graceful stop with `anchor.controller().request_stop()`. The producer observes `sender.stop_token()` and can send its final output, then call `finalize()`. Stop is idempotent and does not discard buffered output.
+
+The consumer can cancel the stream with `anchor.cancel()` or a cloned `StreamController`. Cancel triggers both producer tokens and ends delivery. Dropping the consumer also cancels. Stop and cancel made before attach or ticket open are retained; the producer observes them when it opens, even if it sends no data. Transport failure remains a stream error.
 
 ## Many producers (MPSC)
 
@@ -89,4 +91,4 @@ sender.finalize()?;
 
 Call `prebind_anchor` from a runtime context, because it starts tasks. A ticket that the worker never opens does not stay forever. After a 60 s accept window, the bind is reclaimed and the anchor sees `SenderDropped`. `velo_streaming_unclaimed_bind_reaped_total` counts these tickets.
 
-A sender opened from a ticket never sent `_anchor_attach`, so it has no cancel handle, and `sender.cancellation_token()` never fires. Use the result of `send` and `finalize` instead. A consumer that has gone shows as a send error.
+Ticket senders support `stop_token()` and `cancellation_token()` through messenger mux version 2. The existing slot-open exchange carries the stream session identity; no extra stream registration is needed. A peer epoch and slot generation reject stale lifecycle signals. Applications that require this lifecycle must require `messenger-mux-v2`; legacy attach fallback does not establish that capability.

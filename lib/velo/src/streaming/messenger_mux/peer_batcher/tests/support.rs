@@ -274,6 +274,7 @@ impl Harness {
                 anchor_id,
                 session_id,
                 inlet: inlet_rx,
+                lifecycle: None,
                 // The default is deliberately starved. On the attach path a
                 // slot opens holding the window its peer advertised, but most
                 // arms below are about what the batcher does once a slot has
@@ -499,6 +500,7 @@ impl StalledHarness {
                 anchor_id,
                 session_id,
                 inlet: inlet_rx,
+                lifecycle: None,
                 credit: SlotCredit::new(credit),
                 slot_byte_budget: self.config.slot_byte_budget,
                 ack: ack_tx,

@@ -126,7 +126,7 @@ The price of `Manual` is also known. A per-pass flush caps a batch at that pass'
 
 ### Negotiate per attach and register both transports
 
-The receiver answers `messenger-mux-v1` only when the sender named it. `resolve_transport` fails on an unknown key, so a receiver that chooses the mux on its own breaks every older sender. A node with the mux registers both keys. The wire version lives in the key, so incompatible versions never pair. A zero window with the mux key is refused, because a fallback connects to a transport where nothing listens.
+The receiver answers `messenger-mux-v2` only when the sender named it. `resolve_transport` fails on an unknown key, so a receiver that chooses the mux on its own breaks every older sender. A node with the mux registers both keys. The wire version lives in the key, so incompatible versions never pair. A zero window with the mux key is refused, because a fallback connects to a transport where nothing listens.
 
 ### Credit return: the pump posts, the reconcile decides
 
@@ -194,7 +194,7 @@ The mux is a user of the Messenger send path, not something a transport implemen
 
 The additions this work made to `velo-ext` were shaped to last. `Transport::max_message_size(target) -> Option<usize>` has a default, and `None` means unknown, which costs the caller a conservative budget. `SendOutcome::Pending(SendAdmission)` changed a published enum, so it shipped once, as a coordinated `velo-ext` and `velo` release. The egress recorders on `TransportObservability` have no-op defaults.
 
-The cost of deferral is bounded. Out-of-tree `FrameTransport`s get no multiplexing, and nothing else breaks. A receiver offers `messenger-mux-v1` only when the mux is installed and enabled, so a deployment without the mux degrades correctly.
+The cost of deferral is bounded. Out-of-tree `FrameTransport`s get no multiplexing, and nothing else breaks. A receiver offers `messenger-mux-v2` only when the mux is installed and enabled, so a deployment without the mux degrades correctly.
 
 Methods that the mux needs outside the trait (`advertised_limits`, `connect_negotiated`, `take_drain_signal`, `prebind`, `release_bind`, `close_claimed_slot`) are inherent on the concrete `MessengerMuxTransport`. `AnchorManager` already holds the concrete type, so none of them needs a trait change.
 

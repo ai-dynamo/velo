@@ -128,6 +128,8 @@ pub struct StreamCancelRequest {
 pub struct SenderEntry {
     /// Fires when `_stream_cancel` is received — user-facing via `cancellation_token()`.
     pub cancel_token: tokio_util::sync::CancellationToken,
+    /// Graceful stop leaves the response channel open.
+    pub stop_token: tokio_util::sync::CancellationToken,
 
     /// Drop this to signal cancellation to `StreamSender::send()` via
     /// `poison_tx.is_disconnected()`. Wrapped in `Mutex<Option<...>>` so the
@@ -180,6 +182,47 @@ pub fn create_stream_cancel_handler(
     .build()
 }
 
+/// Send a graceful stop through the identity established by attach.
+pub(crate) fn request_sender_stop(
+    handle: StreamCancelHandle,
+    registry: &SenderRegistry,
+    messenger: Option<&Arc<crate::messenger::Messenger>>,
+) {
+    let (worker, sender_stream_id) = handle.unpack();
+    // Stream IDs are local to a worker. Do not cancel an unrelated local sender.
+    if let Some(messenger) = messenger {
+        let messenger = Arc::clone(messenger);
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move {
+                let payload = serde_json::to_vec(&StreamCancelRequest { sender_stream_id })
+                    .expect("stream identity");
+                let _ = messenger
+                    .am_send_streaming("_stream_stop")
+                    .expect("stream stop handler")
+                    .raw_payload(bytes::Bytes::from(payload))
+                    .worker(worker)
+                    .send()
+                    .await;
+            });
+        }
+    } else if let Some(entry) = registry.senders.get(&sender_stream_id) {
+        entry.stop_token.cancel();
+    }
+}
+
+pub(crate) fn create_stream_stop_handler(
+    registry: Arc<SenderRegistry>,
+) -> crate::messenger::Handler {
+    crate::messenger::Handler::am_handler("_stream_stop", move |ctx: crate::messenger::Context| {
+        let req = serde_json::from_slice::<StreamCancelRequest>(&ctx.payload)?;
+        if let Some(entry) = registry.senders.get(&req.sender_stream_id) {
+            entry.stop_token.cancel();
+        }
+        Ok(())
+    })
+    .build()
+}
+
 // ---------------------------------------------------------------------------
 // Request / Response types
 // ---------------------------------------------------------------------------
@@ -202,7 +245,7 @@ pub struct AnchorAttachRequest {
     /// asked to `connect()` on.
     ///
     /// The receiver intersects this with its own installed set and prefers
-    /// `messenger-mux-v1` when it appears in both. `#[serde(default)]` means a
+    /// `messenger-mux-v2` when it appears in both. `#[serde(default)]` means a
     /// sender that predates negotiation deserializes as one advertising
     /// nothing, which is exactly right: an empty list can never intersect, so
     /// absent a pre-bound slot on the anchor, such a sender is always answered
@@ -430,7 +473,7 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::messe
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                     + 1;
                 // Which transport this attach rides is decided here, from what
-                // the sender advertised: `messenger-mux-v1` when both sides
+                // the sender advertised: `messenger-mux-v2` when both sides
                 // named it, and otherwise exactly the local default this
                 // handler answered with before negotiation existed.
                 let selection = manager.select_streaming_transport(&req.supported_transport_keys);
@@ -512,6 +555,13 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::messe
                             // Mark as attached and store cancel handle for upstream cancel routing
                             entry.attachment = true;
                             entry.stream_cancel_handle = Some(req.stream_cancel_handle);
+                            if entry.stop_requested {
+                                request_sender_stop(
+                                    req.stream_cancel_handle,
+                                    &manager.sender_registry,
+                                    manager.messenger_lock.get(),
+                                );
+                            }
 
                             // Drop shard lock before spawning
                             drop(occ);

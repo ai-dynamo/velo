@@ -194,6 +194,7 @@ pub(crate) struct AnchorEntry {
     /// ordinary attach path, which is every anchor whose application sends no
     /// ticket.
     pub prebind: Option<PreBind>,
+    pub stop_requested: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -223,19 +224,9 @@ pub(crate) struct AnchorEntry {
 ///   learns a `StreamCancelHandle` either, and this is the only prompt path
 ///   left.
 ///
-/// Three races follow from `is_claimed` being an unlocked `OnceLock` read
-/// rather than something the registry's shard lock also covers, and none of
-/// them leak: an `OpenSlot` claiming between [`PreBind::drop`]'s read and its
-/// `release_bind` leaves a live slot with no close posted, discovered on the
-/// producer's next record or heartbeat; one claiming right after
-/// [`AnchorManager::adopt_prebind`] reads `is_claimed` for its verdict hands
-/// the attaching sender terms already in use, whose `OpenSlot` is then
-/// refused `UnknownSlot`; and one claiming between the co-located branch of
-/// [`AnchorManager::attach_stream_anchor`]'s guard read and its release below
-/// is evicted correctly rather than left as a second writer — that branch
-/// cancels this bind's pump before the release runs, so the claim has
-/// already lost its only route to the anchor's channel by the time
-/// [`PreBind::drop`] posts the close.
+/// Claim and lifecycle changes are serialized by `DrainSignal`. An early stop
+/// or cancel is therefore applied when OpenSlot claims the bind. Adoption still
+/// checks the claim before it transfers ownership; a competing open is refused.
 pub(crate) struct PreBind {
     /// The anchor this slot was bound for. Half of the bind's key; the other
     /// half is `ticket.routing_session_id`.
@@ -317,8 +308,10 @@ impl Drop for PreBind {
         let Some(mux) = self.mux.upgrade() else {
             return;
         };
-        match self.drain.claimed() {
-            Some((peer, slot)) => mux.close_claimed_slot(peer, slot),
+        match self.drain.cancel() {
+            Some((peer, slot)) => {
+                mux.cancel_claimed_session(peer, slot, self.ticket.routing_session_id)
+            }
             None => mux.release_bind(self.anchor_id, self.ticket.routing_session_id),
         }
     }
@@ -336,7 +329,17 @@ struct SenderIdentity {
     sender_stream_id: u64,
     cancel_token: CancellationToken,
     poison_tx: flume::Sender<()>,
-    poison_rx: flume::Receiver<()>,
+    stop_token: CancellationToken,
+    registry: Arc<crate::streaming::control::SenderRegistry>,
+    armed: bool,
+}
+
+impl Drop for SenderIdentity {
+    fn drop(&mut self) {
+        if self.armed {
+            self.registry.senders.remove(&self.sender_stream_id);
+        }
+    }
 }
 
 /// What an incoming `_anchor_attach` may do with a pre-bound slot.
@@ -358,6 +361,7 @@ pub(crate) enum PrebindAdoption {
 /// Wrapped in `Arc` so `StreamController` can outlive `StreamAnchor` being
 /// moved into StreamExt combinators.
 struct StreamControllerInner {
+    worker_id: velo_ext::WorkerId,
     local_id: u64,
     registry: Arc<DashMap<u64, AnchorEntry>>,
     /// Sibling MPSC registry — held so the shared gauge update includes MPSC
@@ -385,6 +389,31 @@ pub struct StreamController {
 }
 
 impl StreamController {
+    /// Request graceful stop without closing the response stream.
+    /// An early request is retained until a producer attaches or opens its ticket.
+    pub fn request_stop(&self) {
+        let Some(mut entry) = self.inner.registry.get_mut(&self.inner.local_id) else {
+            return;
+        };
+        if entry.stop_requested {
+            return;
+        }
+        entry.stop_requested = true;
+        if let Some(prebind) = &entry.prebind {
+            if let Some((peer, slot)) = prebind.drain.request_stop()
+                && let Some(mux) = prebind.mux.upgrade()
+            {
+                mux.request_stop(peer, slot, prebind.ticket.routing_session_id);
+            }
+        } else if let Some(handle) = entry.stream_cancel_handle {
+            crate::streaming::control::request_sender_stop(
+                handle,
+                &self.inner.sender_registry,
+                self.inner.messenger.as_ref(),
+            );
+        }
+    }
+
     /// Cancel the stream: remove the anchor from the registry and send a
     /// `_stream_cancel` AM to the sender's worker (fire-and-forget).
     ///
@@ -432,7 +461,10 @@ impl StreamController {
         // the entry was already removed (e.g. finalize/detach ran first).
         if let Some(handle) = stream_cancel_handle {
             let (sender_worker_id, sender_stream_id) = handle.unpack();
-            if let Some((_, entry)) = self.inner.sender_registry.senders.remove(&sender_stream_id) {
+            if sender_worker_id == self.inner.worker_id
+                && let Some((_, entry)) =
+                    self.inner.sender_registry.senders.remove(&sender_stream_id)
+            {
                 drop(entry.rx_closer.lock().unwrap().take());
                 entry.cancel_token.cancel();
             }
@@ -541,6 +573,7 @@ impl<T> StreamAnchor<T> {
             metrics,
         } = ctx;
         let inner = Arc::new(StreamControllerInner {
+            worker_id: handle.unpack().0,
             local_id,
             registry: registry.clone(),
             mpsc_registry: mpsc_registry.clone(),
@@ -895,7 +928,7 @@ pub struct AnchorManager {
     #[builder(setter(skip), default = "std::sync::OnceLock::new()")]
     pub(crate) messenger_lock: std::sync::OnceLock<Arc<crate::messenger::Messenger>>,
 
-    /// The `messenger-mux-v1` transport, when one is installed.
+    /// The `messenger-mux-v2` transport, when one is installed.
     ///
     /// Held as its concrete type rather than only as a registry entry because
     /// negotiation needs things the `FrameTransport` trait does not carry: the
@@ -994,6 +1027,7 @@ impl AnchorManager {
             heartbeat_interval,
             stream_cancel_handle: None, // populated on attach
             prebind: None,              // populated by `prebind_anchor`
+            stop_requested: false,
         };
 
         self.registry.insert(local_id, entry);
@@ -1100,7 +1134,7 @@ impl AnchorManager {
     ///
     /// Separate from the transport registry, which the mux also joins: the
     /// registry answers "can I `connect()` on this key", while this answers
-    /// "may I offer, and drive, `messenger-mux-v1`". Both are needed and they
+    /// "may I offer, and drive, `messenger-mux-v2`". Both are needed and they
     /// are set together by the builder.
     pub(crate) fn install_mux(
         &self,
@@ -1249,6 +1283,9 @@ impl AnchorManager {
                         // slot to a sender that used it instead of the
                         // ticket -- see `PumpContext::prebound`.
                         let prebound = Arc::new(AtomicBool::new(true));
+                        if entry.stop_requested {
+                            drain.request_stop();
+                        }
                         entry.prebind = Some(PreBind {
                             anchor_id: local_id,
                             ticket: ticket.clone(),
@@ -1427,6 +1464,13 @@ impl AnchorManager {
                     let prebind = entry.prebind.take().expect("the verdict says it is there");
                     entry.attachment = true;
                     entry.stream_cancel_handle = Some(req.stream_cancel_handle);
+                    if entry.stop_requested {
+                        crate::streaming::control::request_sender_stop(
+                            req.stream_cancel_handle,
+                            &self.sender_registry,
+                            self.messenger_lock.get(),
+                        );
+                    }
                     (PrebindAdoption::Adopted(prebind.adopt()), None)
                 }
             }
@@ -1488,13 +1532,15 @@ impl AnchorManager {
     /// `CreditUpdate` used to cost.
     async fn connect_streaming(
         &self,
-        key: &velo_ext::TransportKey,
+        ticket: &crate::streaming::control::StreamOpenTicket,
         peer: velo_ext::WorkerId,
         anchor_id: u64,
-        session_id: u64,
-        initial_credit: u32,
-        slot_byte_budget: u32,
+        lifecycle: Option<(CancellationToken, CancellationToken)>,
     ) -> Result<flume::Sender<Vec<u8>>, AttachError> {
+        let key = &ticket.streaming_transport_key;
+        let session_id = ticket.routing_session_id;
+        let initial_credit = ticket.initial_credit;
+        let slot_byte_budget = ticket.slot_byte_budget;
         match crate::streaming::negotiation::choose(key, initial_credit, slot_byte_budget) {
             Ok(crate::streaming::negotiation::Connect::Mux(limits)) => {
                 let mux = self.mux.get().ok_or_else(|| {
@@ -1504,7 +1550,7 @@ impl AnchorManager {
                     ))
                 })?;
                 Ok(mux
-                    .connect_negotiated(peer, anchor_id, session_id, limits)
+                    .connect_controlled(peer, anchor_id, session_id, limits, lifecycle)
                     .await?)
             }
             Ok(crate::streaming::negotiation::Connect::Legacy) => {
@@ -1749,6 +1795,12 @@ impl AnchorManager {
             &self.sender_registry,
         )))?;
 
+        messenger.register_streaming_handler(
+            crate::streaming::control::create_stream_stop_handler(Arc::clone(
+                &self.sender_registry,
+            )),
+        )?;
+
         // MPSC handlers — share the same SenderRegistry so `_stream_cancel`
         // covers both SPSC and MPSC senders uniformly.
         messenger.register_streaming_handler(
@@ -1905,17 +1957,14 @@ impl AnchorManager {
     /// already released or has expired still returns `Ok` here and only
     /// surfaces later, as a send failure on the returned `StreamSender`.
     ///
-    /// No `_anchor_attach` means no `StreamCancelHandle` either, so the
-    /// returned sender's
-    /// [`cancellation_token`](crate::streaming::sender::StreamSender::cancellation_token)
-    /// never fires; a dropped consumer surfaces as a send error instead.
+    /// Slot lifecycle signals reach the producer even before its first send.
     ///
     /// # Errors
     /// - [`AttachError::TransportError`] if `handle` names this node's own
     ///   worker id (a ticket is for a *different* worker to open; a
     ///   same-worker sender should use
     ///   [`attach_stream_anchor`](Self::attach_stream_anchor) instead), if
-    ///   the ticket names `messenger-mux-v1` but this node has no mux
+    ///   the ticket names `messenger-mux-v2` but this node has no mux
     ///   installed, if the ticket names a transport key this node cannot
     ///   resolve, or if staging the local slot fails after retrying a
     ///   batcher that keeps retiring underneath it.
@@ -1967,11 +2016,24 @@ impl AnchorManager {
     /// Allocate the sender-side identity one stream is opened under.
     fn new_sender_identity(&self) -> SenderIdentity {
         let (poison_tx, poison_rx) = flume::bounded::<()>(1);
+        let sender_stream_id = self.next_sender_stream_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let cancel_token = CancellationToken::new();
+        let stop_token = cancel_token.child_token();
+        self.sender_registry.senders.insert(
+            sender_stream_id,
+            crate::streaming::control::SenderEntry {
+                cancel_token: cancel_token.clone(),
+                stop_token: stop_token.clone(),
+                rx_closer: std::sync::Mutex::new(Some(poison_rx)),
+            },
+        );
         SenderIdentity {
-            sender_stream_id: self.next_sender_stream_id.fetch_add(1, Ordering::Relaxed) + 1,
-            cancel_token: CancellationToken::new(),
+            sender_stream_id,
+            cancel_token,
+            stop_token,
             poison_tx,
-            poison_rx,
+            registry: self.sender_registry.clone(),
+            armed: true,
         }
     }
 
@@ -1986,7 +2048,7 @@ impl AnchorManager {
         &self,
         handle: StreamAnchorHandle,
         ticket: &crate::streaming::control::StreamOpenTicket,
-        identity: SenderIdentity,
+        mut identity: SenderIdentity,
     ) -> Result<crate::streaming::sender::StreamSender<T>, AttachError> {
         let started = Instant::now();
         let (handle_worker_id, local_id) = handle.unpack();
@@ -1995,12 +2057,10 @@ impl AnchorManager {
         // bound streaming transport, then connect by WorkerId.
         let frame_tx = match self
             .connect_streaming(
-                &ticket.streaming_transport_key,
+                ticket,
                 handle_worker_id,
                 local_id,
-                ticket.routing_session_id,
-                ticket.initial_credit,
-                ticket.slot_byte_budget,
+                Some((identity.cancel_token.clone(), identity.stop_token.clone())),
             )
             .await
         {
@@ -2016,21 +2076,10 @@ impl AnchorManager {
             }
         };
 
-        let SenderIdentity {
-            sender_stream_id,
-            cancel_token,
-            poison_tx,
-            poison_rx,
-        } = identity;
-
-        // Register SenderEntry for _stream_cancel routing
-        self.sender_registry.senders.insert(
-            sender_stream_id,
-            crate::streaming::control::SenderEntry {
-                cancel_token: cancel_token.clone(),
-                rx_closer: std::sync::Mutex::new(Some(poison_rx)),
-            },
-        );
+        let sender_stream_id = identity.sender_stream_id;
+        let cancel_token = identity.cancel_token.clone();
+        let poison_tx = identity.poison_tx.clone();
+        identity.armed = false;
 
         // Build StreamSender: frame_tx from the transport (not a local registry
         // frame_tx). No local AnchorEntry is created for the remote anchor.
@@ -2189,9 +2238,13 @@ impl AnchorManager {
                     let (poison_tx, poison_rx) = flume::bounded::<()>(1);
 
                     let sender_entry = crate::streaming::control::SenderEntry {
+                        stop_token: cancel_token.child_token(),
                         cancel_token: cancel_token.clone(),
                         rx_closer: std::sync::Mutex::new(Some(poison_rx)),
                     };
+                    if entry.stop_requested {
+                        sender_entry.stop_token.cancel();
+                    }
                     self.sender_registry
                         .senders
                         .insert(sender_stream_id, sender_entry);
@@ -2388,6 +2441,7 @@ impl AnchorManager {
 
         // Register SenderEntry outside the shard lock.
         let sender_entry = crate::streaming::control::SenderEntry {
+            stop_token: cancel_token.child_token(),
             cancel_token: cancel_token.clone(),
             rx_closer: std::sync::Mutex::new(Some(poison_rx)),
         };
@@ -2482,16 +2536,21 @@ impl AnchorManager {
                 };
                 let frame_tx = self
                     .connect_streaming(
-                        &streaming_transport_key,
+                        &crate::streaming::control::StreamOpenTicket {
+                            streaming_transport_key: streaming_transport_key.clone(),
+                            heartbeat_interval_ms,
+                            routing_session_id: connect_session_id,
+                            initial_credit,
+                            slot_byte_budget,
+                        },
                         handle_worker_id,
                         local_id,
-                        connect_session_id,
-                        initial_credit,
-                        slot_byte_budget,
+                        None,
                     )
                     .await?;
 
                 let sender_entry = crate::streaming::control::SenderEntry {
+                    stop_token: cancel_token.child_token(),
                     cancel_token: cancel_token.clone(),
                     rx_closer: std::sync::Mutex::new(Some(poison_rx)),
                 };

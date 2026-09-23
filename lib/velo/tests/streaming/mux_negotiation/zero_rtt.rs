@@ -19,6 +19,83 @@ use super::*;
 use velo::streaming::AttachError;
 use velo::streaming::control::{AnchorAttachRequest, StreamOpenTicket};
 
+/// Stop leaves output usable; cancel wakes an idle producer on both open paths.
+#[tokio::test(flavor = "multi_thread")]
+async fn native_lifecycle_survives_early_stop_and_escalation() {
+    let (consumer, producer) = pair(Some(mux_config()), Some(mux_config())).await;
+    for ticket_open in [false, true] {
+        for early in [false, true] {
+            let mut anchor = consumer.velo.create_anchor::<u32>();
+            let controller = anchor.controller();
+            if early {
+                controller.request_stop();
+            }
+            let sender = if ticket_open {
+                let ticket = consumer.velo.prebind_anchor(anchor.handle()).unwrap();
+                producer
+                    .velo
+                    .open_anchor_stream::<u32>(anchor.handle(), ship(ticket))
+                    .await
+                    .unwrap()
+            } else {
+                producer
+                    .velo
+                    .attach_anchor::<u32>(anchor.handle())
+                    .await
+                    .unwrap()
+            };
+            controller.request_stop();
+            controller.request_stop();
+            tokio::time::timeout(Duration::from_secs(5), sender.stop_token().cancelled())
+                .await
+                .unwrap();
+            assert!(!sender.cancellation_token().is_cancelled());
+            sender.send(42).await.unwrap();
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(5), anchor.next())
+                    .await
+                    .unwrap(),
+                Some(Ok(StreamFrame::Item(42)))
+            ));
+            controller.cancel();
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                sender.cancellation_token().cancelled(),
+            )
+            .await
+            .unwrap();
+            assert!(sender.stop_token().is_cancelled());
+            assert!(sender.send(43).await.is_err());
+        }
+    }
+}
+
+/// An unused or claimed ticket must cancel without a subsequent producer send.
+#[tokio::test(flavor = "multi_thread")]
+async fn ticket_cancel_wakes_idle_producer() {
+    let (consumer, producer) = pair(Some(mux_config()), Some(mux_config())).await;
+    for before_open in [false, true] {
+        let anchor = consumer.velo.create_anchor::<u32>();
+        let ticket = consumer.velo.prebind_anchor(anchor.handle()).unwrap();
+        if before_open {
+            anchor.controller().cancel();
+        }
+        let sender = producer
+            .velo
+            .open_anchor_stream::<u32>(anchor.handle(), ship(ticket))
+            .await
+            .unwrap();
+        drop(anchor);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            sender.cancellation_token().cancelled(),
+        )
+        .await
+        .unwrap();
+        assert!(sender.stop_token().is_cancelled());
+    }
+}
+
 /// A ticket as the worker receives it: through the encoding, never by
 /// reference. An application carries one in the request envelope it already
 /// sends, so anything that failed to serialise would fail there and not here.

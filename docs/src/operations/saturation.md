@@ -2,7 +2,7 @@
 
 If streaming traffic shows sender errors, missed deadlines, or a `Dropped` frame with no producer crash, use this runbook. The usual cause is saturation. The producer generates frames faster than the consumer drains them. Velo reports saturation through Prometheus counters and one log line. This page tells you which signals to read and what to do.
 
-The signals differ between the per-stream path and the messenger mux. Read [The per-stream cascade](#the-per-stream-cascade) for streams with one TCP or gRPC connection each. Read [Saturation under the mux](#saturation-under-the-mux) for streams that negotiated `messenger-mux-v1`.
+The signals differ between the per-stream path and the messenger mux. Read [The per-stream cascade](#the-per-stream-cascade) for streams with one TCP or gRPC connection each. Read [Saturation under the mux](#saturation-under-the-mux) for streams that negotiated `messenger-mux-v2`.
 
 ## The per-stream cascade
 

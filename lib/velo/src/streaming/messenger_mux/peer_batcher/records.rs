@@ -275,6 +275,9 @@ impl Batcher {
         }
 
         if terminal {
+            if let Some(slot) = self.slots.get_mut(index) {
+                slot.lifecycle = None;
+            }
             self.close_local(index);
         }
     }
@@ -321,6 +324,9 @@ impl Batcher {
         // `fire_singleton`, has to stay a choice made here rather than inside
         // `fire_singleton` itself.
         if terminal {
+            if let Some(slot) = self.slots.get_mut(index) {
+                slot.lifecycle = None;
+            }
             self.close_local(index);
         }
     }
