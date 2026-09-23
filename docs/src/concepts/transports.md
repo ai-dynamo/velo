@@ -88,7 +88,7 @@ For the tuning settings and the measured cost against TCP, see [QUIC performance
 Streams without the mux use a `FrameTransport`. TCP is the default. gRPC is available with the `grpc` feature, and QUIC with the `quic` feature. See [Streaming](streaming.md).
 
 - **TCP** (`tcp-stream`) opens one TCP connection for each stream.
-- **QUIC** (`quic-stream`, `StreamConfig::Quic`) opens one QUIC connection for each peer and one unidirectional QUIC stream for each velo stream. A new stream to a known peer costs no handshake. QUIC gives each stream its own flow control, so a slow consumer or a lost packet stalls only the streams involved. The stream starts with the same 16-byte handshake as TCP and carries frames in the TCP frame codec. The transport uses the same sockets, certificate pinning, and MTU limit as the QUIC messenger transport.
+- **QUIC** (`quic-stream`, `StreamConfig::Quic`) opens one QUIC connection for each peer and one unidirectional QUIC stream for each velo stream. A new stream to a known peer costs no handshake. QUIC gives each stream its own flow control, so a slow consumer stalls only its own stream, and a lost packet delays only the streams whose data it carried. Loss recovery and congestion control are per connection, though: a run of losses on one connection slows every stream on it. The stream starts with the same 16-byte handshake as TCP and carries frames in the TCP frame codec. The transport uses the same sockets, certificate pinning, and MTU limit as the QUIC messenger transport.
 
 Unlike the mux, neither transport batches records from different streams into one frame. quinn puts frames that are ready at the same time into one packet.
 

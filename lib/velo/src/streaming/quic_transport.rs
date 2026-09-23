@@ -21,10 +21,12 @@
 //!
 //! One connection per peer carries every stream to that peer, so a new stream
 //! costs no handshake after the first. QUIC does the multiplexing and the flow
-//! control for each stream. A lost packet stalls only the streams whose data
-//! it carried, where one TCP connection would stall all of them. There is no
-//! batching across streams: each stream writes its own frames, and quinn puts
-//! the frames that are ready at the same time into one packet.
+//! control for each stream. A lost packet delays only the streams whose data
+//! it carried, where one TCP connection would delay all of them. Loss recovery
+//! and congestion control are per connection, though, so a run of losses
+//! slows every stream to that peer. There is no batching across streams: each
+//! stream writes its own frames, and quinn puts the frames that are ready at
+//! the same time into one packet.
 //!
 //! [`TcpFrameTransport`]: crate::streaming::TcpFrameTransport
 
