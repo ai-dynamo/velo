@@ -93,9 +93,8 @@ fn direction_index(d: Direction) -> usize {
 #[cfg(all(target_os = "linux", feature = "ucx"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RdmaRegistrationKind {
-    /// A pool arena velo allocated and registered itself. Emitted from the
-    /// pool, whose production consumer is Phase 3.
-    #[allow(dead_code)]
+    /// A pool arena velo allocated and registered itself. Emitted by the arena
+    /// allocator in `rendezvous::rdma`.
     Arena,
     /// Memory a caller supplied and holds a `RegionGuard` for.
     External,
@@ -121,12 +120,24 @@ impl RdmaRegistrationKind {
 /// payload was under the threshold, whether the kill switch is on, or whether
 /// something actually went wrong.
 ///
-/// Both sides emit into it, and they see different reasons. Only the owner can
-/// say [`NotPinned`](Self::NotPinned) or [`BelowMin`](Self::BelowMin); only the
-/// consumer can say [`DecodeError`](Self::DecodeError),
-/// [`PoolExhausted`](Self::PoolExhausted) or [`GetFailed`](Self::GetFailed).
-/// Reading one instance's series therefore tells you what *that* instance
-/// decided, which is what a rollout wants to know.
+/// It counts decisions, not transfers. Both sides record, at different points:
+///
+/// - The owner records at staging ([`KillSwitch`](Self::KillSwitch),
+///   [`Budget`](Self::Budget), [`PoolExhausted`](Self::PoolExhausted)) and when
+///   it answers an acquire ([`NotPinned`](Self::NotPinned),
+///   [`BelowMin`](Self::BelowMin), [`Ok`](Self::Ok) as it sends the
+///   descriptor, before the GET runs).
+/// - The consumer records when it decides whether to offer
+///   ([`NotConfigured`](Self::NotConfigured), [`KillSwitch`](Self::KillSwitch),
+///   [`NoOffer`](Self::NoOffer)) and when it pulls
+///   ([`DecodeError`](Self::DecodeError), [`Budget`](Self::Budget),
+///   [`PoolExhausted`](Self::PoolExhausted), [`GetFailed`](Self::GetFailed),
+///   and [`Ok`](Self::Ok) after the GET completes).
+///
+/// So one transfer can count more than once. With the kill switch on, a slot
+/// counts `kill_switch` at staging and again at each acquire. The owner's
+/// `no_offer` also counts the chunked re-acquire after a failed GET. Read one
+/// instance's series as what *that* instance decided.
 ///
 /// Gated with the RDMA path itself: on a build without it there is no decision
 /// to record, and a series that is always zero is worse than absent.
@@ -937,7 +948,7 @@ impl MuxMetricsHandle {
     }
 
     /// The applier could not `try_send` into a slot buffer credit had already
-    /// reserved space in. Always a bug — see `BATCHING.md` § "Flow control".
+    /// reserved space in. Always a bug — see `docs/src/concepts/batched-streaming.md` § "Flow control".
     pub(crate) fn reader_stall(&self) {
         self.reader_stall_total.inc();
     }
@@ -1529,8 +1540,7 @@ impl VeloMetrics {
                  above: this is the accept window catching what the watchdog \
                  either cannot see yet (no sender exists) or would catch too \
                  late (the watchdog's threshold exceeds the accept window's \
-                 remaining span, at heartbeat_interval >= 20s -- see \
-                 streaming/BATCHING.md).",
+                 remaining span, at heartbeat_interval >= 20s).",
             ))?,
         )?;
         let streaming_egress_flushes_total = register_collector(
@@ -1557,7 +1567,7 @@ impl VeloMetrics {
             ))?,
         )?;
 
-        // -- Messenger-mux metrics (streaming/BATCHING.md § "Observability") --
+        // -- Messenger-mux metrics (see docs/src/concepts/batched-streaming.md § "Observability") --
         let streaming_mux_live_slots = register_collector(
             registry,
             Gauge::new(
@@ -1892,7 +1902,7 @@ impl VeloMetrics {
             CounterVec::new(
                 Opts::new(
                     "velo_rendezvous_rdma_path_total",
-                    "Rendezvous transfers by the path taken and what decided it.",
+                    "Rendezvous path decisions, by the path chosen and the reason. Owner and consumer both record, so one transfer can count more than once.",
                 ),
                 &["path", "reason"],
             )?,
@@ -2318,7 +2328,7 @@ impl VeloMetrics {
     /// `frames_written / egress_flushes` is the coalescing ratio — the direct
     /// measure of how much write coalescing is buying, and the number to check
     /// before investing in the full multiplexed protocol. See
-    /// `streaming/BATCHING.md`.
+    /// `docs/src/concepts/batched-streaming.md`.
     ///
     /// A batch is a unit of coalescing, not a syscall: a frame too large to
     /// pack is written segmented and still counts once, with `frames = 1`. Only

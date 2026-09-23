@@ -21,7 +21,7 @@
 //! [`DescriptorBackend`] rather than a new wire protocol. Nothing
 //! backend-specific appears in the layout: the key material is a byte string
 //! whose meaning belongs entirely to the named backend. That is the exact
-//! mistake PR #40 made by putting `velo_nixl::MemType` on the wire.
+//! mistake an earlier version made by putting `velo_nixl::MemType` on the wire.
 //!
 //! # Layout
 //!
@@ -138,7 +138,8 @@ pub(crate) struct RdmaDescriptor {
     pub backend: DescriptorBackend,
     /// The owner's registration generation, so a descriptor that outlived its
     /// registration is detectable rather than silently wrong. Carried through
-    /// for diagnostics in v1; a Phase-5 consumer-side rkey cache keys on it.
+    /// for diagnostics in v1; a deferred consumer-side rkey cache (see
+    /// `docs/src/development/rdma-design.md`, D3) would key on it.
     pub generation: u64,
     /// Absolute address in the owner's address space.
     pub addr: u64,

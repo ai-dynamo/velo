@@ -295,7 +295,7 @@ async fn a_real_admission_failure_reaches_the_detached_watcher() {
 /// once had, a peer holding more live slots than the cap filled the map with
 /// legitimate grants and the `OpenSlot` resolution behind them was refused,
 /// leaving the slot fenced until the consumer's heartbeat watchdog gave up
-/// (HTTP 500s on the tier-3 rig's `velo4a` and `velo34` arms). Now `mine` is
+/// (observed as HTTP 500s under load). Now `mine` is
 /// bounded by which index the batcher has actually allocated: a flood of
 /// bogus ids is counted and dropped, and the resolution of a slot this
 /// batcher owns — kept in its own lane, `resolutions` — lands whatever else
@@ -567,9 +567,8 @@ async fn the_awaited_ack_closes_a_departed_producer_s_slot_at_once() {
 //
 // `async_open_ack` is not what opens the deferral branch. `send_singleton`
 // fences any over-budget non-terminal record, so a mux running the shipped
-// default reaches a fenced slot with a close owed on it, and these two arms are
-// that configuration. They pin the behaviour the isolation matrix's `velo0` arm
-// runs.
+// default reaches a fenced slot with a close owed on it, and these two tests
+// pin the behaviour that configuration produces.
 
 /// Long enough for the batcher to have acted, short enough to keep the suite
 /// quick. Only ever used to give a *negative* fact time to become false.

@@ -7,7 +7,7 @@
 //! happily with `record_count` and `batch_seq` swapped, or with every field
 //! little-endian — it only proves the encoder and decoder agree with each
 //! other, which they would even if both were wrong. E2's peer has to interop
-//! with `BATCHING.md`, so the layout is pinned to literal byte arrays here.
+//! with `docs/src/concepts/batched-streaming.md`, so the layout is pinned to literal byte arrays here.
 
 use super::*;
 
@@ -398,7 +398,7 @@ fn the_batch_fills_at_the_record_count_ceiling() {
 /// coupling, so a test that required it would fail a compliant reorder of
 /// either side. It also pins that the one record type
 /// `peer_batcher/tests/instruments.rs` never drives onto the wire —
-/// `slot_heartbeat` is decode-only for now, per `BATCHING.md` — still carries
+/// `slot_heartbeat` is decode-only for now, per `docs/src/concepts/batched-streaming.md` — still carries
 /// the label `VeloMetrics::bind_mux` would file it under.
 ///
 /// The residual this cannot reach: a variant constructed directly and pushed

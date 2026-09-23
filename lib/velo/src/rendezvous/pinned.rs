@@ -5,10 +5,11 @@
 //!
 //! A [`PinnedSlot`] is two things that must not drift apart: the *staging* that
 //! keeps some registered bytes alive, and the *remote description* of where
-//! those bytes are. PR #40 kept them as three independent fields on the slot —
-//! a mode flag, an optional descriptor, an optional buffer — which made every
-//! combination representable and only one of them meaningful. Here the staging
-//! owns the description, so a slot that exists has both or neither.
+//! those bytes are. An earlier version kept them as three independent fields
+//! on the slot — a mode flag, an optional descriptor, an optional buffer —
+//! which made every combination representable and only one of them
+//! meaningful. Here the staging owns the description, so a slot that exists
+//! has both or neither.
 //!
 //! # A remote description is not a lifetime
 //!

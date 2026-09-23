@@ -22,8 +22,8 @@
 //! peer *may* read with an RDMA GET, not memory that only an RDMA consumer can
 //! reach: an old consumer, a consumer without the UCX transport, one whose GET
 //! failed, and one below the RDMA size threshold all pull it chunk by chunk.
-//! Bifurcating the two — a pinned slot that refuses non-RDMA readers — was PR
-//! #40's worst property and is explicitly excluded by the plan.
+//! Bifurcating the two — a pinned slot that refuses non-RDMA readers — was an
+//! earlier version's worst property, and this store never reintroduces it.
 //!
 //! # Lease deadlines are for RDMA leases only
 //!
@@ -32,7 +32,7 @@
 //! by the *consumer's* NIC and the owner sees nothing at all, so an RDMA lease
 //! carries a deadline and a reaper force-releases it (D8). Chunked leases keep
 //! their existing no-deadline behaviour deliberately: giving them one would
-//! change the semantics of a path this phase is not otherwise touching.
+//! change the semantics of a path this store does not otherwise touch.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -142,7 +142,7 @@ pub(crate) struct DataSlot {
     /// When this slot was created.
     #[allow(dead_code)]
     pub created_at: Instant,
-    /// Optional time-to-live. Data is eligible for reaping after this duration.
+    /// Optional time-to-live. Stored, but nothing reaps on it yet.
     #[allow(dead_code)]
     pub ttl: Option<Duration>,
 }
@@ -205,7 +205,8 @@ pub enum LeaseOutcome {
 /// Options for registering data.
 #[derive(Debug, Clone)]
 pub struct RegisterOptions {
-    /// Optional time-to-live for the staged data.
+    /// Optional time-to-live for the staged data. It is stored with the slot,
+    /// but it is not enforced yet: nothing reaps a slot when it expires.
     pub ttl: Option<Duration>,
 }
 

@@ -548,7 +548,7 @@ impl RendezvousManager {
         // and a half timeouts after its last renewal. The floor keeps a tiny
         // timeout from turning the reaper into a spin.
         let lease_period = (config.lease_timeout / 2).max(std::time::Duration::from_millis(10));
-        // The same task also sweeps the arena pool (Phase 4), so it ticks at
+        // The same task also sweeps the arena pool, so it ticks at
         // whichever of the two duties needs it sooner. One task rather than two
         // because they have identical lifetimes — both exist exactly when an
         // RDMA backend does — and identical exits, and because a second timer
@@ -1225,7 +1225,7 @@ impl Drop for LeaseGuard {
 }
 
 /// The RDMA subsystem's periodic tick: force-release expired leases (D8), and
-/// sweep the arena pool for arenas nothing is using (Phase 4).
+/// sweep the arena pool for arenas nothing is using.
 ///
 /// Two duties in one task because they have the same lifetime — both exist
 /// exactly when an RDMA backend does — the same orderly exit, and the same
@@ -1241,7 +1241,7 @@ impl Drop for LeaseGuard {
 /// owner sees, no error it is told about, and nothing to time out. Without this
 /// task, a consumer that crashes between `_rv_acquire` and `_rv_release` leaves
 /// the read lock and its reference held forever, and the slot becomes immortal.
-/// That compounding leak is the failure PR #40 shipped.
+/// That compounding leak is the failure an earlier version shipped.
 ///
 /// # Why the scan collects before it acts
 ///
@@ -1273,7 +1273,7 @@ async fn reap_expired_leases(
 
         let registry = registry.upgrade();
 
-        // Pool reclamation (Phase 4) before the lease sweep, so a slot released
+        // Pool reclamation before the lease sweep, so a slot released
         // by *this* tick's force-releases is reclaimed by the next one rather
         // than being looked at in the same pass it was freed in. Awaiting it
         // here is what serialises the two duties: an arena unmap and a lease

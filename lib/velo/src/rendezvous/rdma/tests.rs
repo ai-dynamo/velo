@@ -344,7 +344,7 @@ async fn pool_dedicates_an_arena_to_oversize_requests() {
 }
 
 /// Over the registered-bytes ceiling the pool refuses with `BudgetExceeded`,
-/// which is the signal Phase 3 turns into "stage chunked instead" — never a
+/// which `rdma_pull` turns into a fallback to chunked staging — never a
 /// panic and never a hard failure of the staging operation (D4).
 #[tokio::test]
 async fn pool_budget_exhaustion_is_a_refusal() {
@@ -484,7 +484,7 @@ async fn pool_concurrent_alloc_and_free() {
 }
 
 // ---------------------------------------------------------------------------
-// Pool reclamation (Phase 4)
+// Pool reclamation
 // ---------------------------------------------------------------------------
 
 /// A pool whose empty arenas are reclaimable almost immediately.
@@ -898,7 +898,7 @@ async fn the_rendezvous_tick_reclaims_arenas_without_being_asked() {
     assert_eq!(transport.live_rkeys(), 0);
 }
 
-/// The soak the plan names, on the mock backend so the cycle count can be high:
+/// The registration-layer soak, on the mock backend so the cycle count can be high:
 /// allocate, transfer, release, sweep — and assert the registered-byte total and
 /// the arena count come back to the same place every time.
 ///
@@ -1107,7 +1107,7 @@ async fn guard_dropped_off_runtime_still_deregisters() {
 
 /// `unregister` waits for the region in-flight count to drain before unmapping.
 ///
-/// Phase 3 acquires one of these guards per RDMA lease; this is the mechanism
+/// `rdma_pull` acquires one of these guards per RDMA lease; this is the mechanism
 /// that stops a registration being pulled out from under a transfer. Asserted
 /// as "pending while held, resolves after release" rather than by sleeping past
 /// a guessed interval.
@@ -1687,7 +1687,8 @@ async fn velo_without_ucx_transport_refuses_registration() {
 /// write, and a claim released only on the error arm survives it: the arm never
 /// runs. The failure is silent and permanent — enough cancellations and every
 /// later registration answers `BudgetExceeded` for the life of the process,
-/// which Phase 3 reads as "stage chunked" and never reports as broken.
+/// which `rdma_pull` reads as a fallback to chunked staging and never reports
+/// as broken.
 #[tokio::test(flavor = "multi_thread")]
 async fn cancelled_registration_returns_its_budget() {
     let (backend, registry) = mock_registry(RdmaConfig::default());

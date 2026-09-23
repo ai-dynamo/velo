@@ -6,7 +6,7 @@
 //! Two ways in, one lifecycle out of both:
 //!
 //! * **Pool** ([`arena`]) — velo owns the pages, registers them in big arenas,
-//!   and hands out suballocated [`PinnedBuf`]s. Phase 3 stages slot data here.
+//!   and hands out suballocated [`PinnedBuf`]s. Slot data is staged here.
 //! * **External** ([`region`]) — the caller owns the pages and holds a
 //!   [`RegionGuard`] for as long as they stay registered.
 //!
@@ -263,8 +263,8 @@ impl RegistryShared {
 /// Owns the arena pool and every external registration for one velo instance.
 ///
 /// Constructed by `VeloBuilder::build` once the transports have started, and
-/// hung off [`Velo`](crate::Velo). Phase 3 reaches it through the runtime-
-/// internal accessor to stage pinned slots and to issue GETs.
+/// hung off [`Velo`](crate::Velo), reached through the runtime-internal
+/// accessor to stage pinned slots and to issue GETs.
 pub(crate) struct RdmaRegistry {
     shared: Arc<RegistryShared>,
     pool: ArenaSet,
@@ -513,7 +513,7 @@ impl RdmaRegistry {
         self.shared.backend.get(req).await
     }
 
-    /// Unmap arenas nothing is using any more (Phase 4's pool reclamation).
+    /// Unmap arenas nothing is using any more (the pool reclamation sweep).
     ///
     /// Driven by the rendezvous lease reaper's tick, which is the one periodic
     /// task this subsystem already has and which exists exactly when a pool

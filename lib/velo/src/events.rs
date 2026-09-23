@@ -1,7 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-#![doc = include_str!("../README.md")]
+//! Generational events for coordinating async tasks, locally or across instances.
+//!
+//! An [`Event`] has a compact `u128` [`EventHandle`]. [`EventManager::local`]
+//! gives a local manager. A `Velo` instance gives a distributed one, where a
+//! wait on a remote handle subscribes to the owning instance. Dropping an
+//! [`Event`] without triggering it poisons it, so no waiter is left waiting.
+//!
+//! See the "Events" chapter of the book (`docs/src/concepts/events.md`).
 #![deny(missing_docs)]
 
 // Core types
@@ -16,7 +23,7 @@ mod status;
 // Core event storage engine
 mod base;
 
-// Internal synchronization (see docs/slot-state-machine.md)
+// Internal synchronization: one lock per entry (see `slot`).
 pub(crate) mod slot;
 
 // ── Re-exports ───────────────────────────────────────────────────────

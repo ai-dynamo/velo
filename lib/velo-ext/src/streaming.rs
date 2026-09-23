@@ -76,7 +76,7 @@ pub trait FrameTransport: Send + Sync {
     /// Velo builder can merge it into the local PeerInfo's WorkerAddress.
     /// Implementations that do not open their own listener (e.g., a transport
     /// that piggybacks on the messenger) should return
-    /// [`WorkerAddress::default`].
+    /// [`WorkerAddress::empty`].
     fn address(&self) -> WorkerAddress;
 
     /// Notify this transport that a peer's [`PeerInfo`] is now known.

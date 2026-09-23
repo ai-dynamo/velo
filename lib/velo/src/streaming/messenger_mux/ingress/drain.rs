@@ -15,7 +15,7 @@ use super::super::protocol::SlotId;
 /// Told when the consumer takes a record out of the buffer credit is issued
 /// against, so credit comes back by draining instead of by a timer.
 ///
-/// `BATCHING.md` § P8 specifies this: `reader_pump` "gains an
+/// `docs/src/development/batched-streaming-design.md` specifies this: `reader_pump` "gains an
 /// `Option<CreditReturn>` and calls `credit.release(1)` after each successful
 /// handoff to `frame_tx` — exact, O(1), and immediate", leaving the sweep to
 /// reclaim only for slots whose pump died. Two halves of that landed and one

@@ -11,13 +11,13 @@
 //! # Endpoint resolution
 //!
 //! There is no endpoint string in the streaming attach handshake. The
-//! transport advertises its listener interface(s) via [`Self::address`] (which
+//! transport advertises its listener interface(s) via `address` (which
 //! the Velo builder merges into the local PeerInfo's WorkerAddress). When a
 //! peer is registered (via `Velo::register_peer` or discovery), the transport
 //! extracts the peer's endpoint, resolves the best socket address using
 //! [`select_best_endpoint`], and caches it keyed by [`WorkerId`].
 //!
-//! [`Self::connect`] looks up the cached SocketAddr by `WorkerId` — no
+//! `connect` looks up the cached SocketAddr by `WorkerId` — no
 //! per-attach DNS or string parsing happens.
 //!
 //! # Connection lifecycle
@@ -411,7 +411,7 @@ impl Coalescable for EgressFrame {
     /// double live memory on the path coalescing exists to speed up.
     ///
     /// A dead socket surfaces to the consumer as a missing terminal and is
-    /// caught by the heartbeat watchdog (see `SATURATION.md`).
+    /// caught by the heartbeat watchdog (see `docs/src/operations/saturation.md`).
     type FailureToken = ();
 
     fn msg_type(&self) -> MessageType {

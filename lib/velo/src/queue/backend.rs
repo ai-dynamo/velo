@@ -4,8 +4,8 @@
 //! Backend trait definitions for work queue implementations.
 //!
 //! Backend traits operate on raw [`Bytes`] — serialization and deserialization
-//! are handled by the typed [`WorkQueueSender`](crate::WorkQueueSender) and
-//! [`WorkQueueReceiver`](crate::WorkQueueReceiver) wrappers.
+//! are handled by the typed [`WorkQueueSender`](crate::queue::WorkQueueSender) and
+//! [`WorkQueueReceiver`](crate::queue::WorkQueueReceiver) wrappers.
 
 use std::future::Future;
 use std::pin::Pin;

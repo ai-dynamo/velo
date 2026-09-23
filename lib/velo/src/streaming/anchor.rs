@@ -145,7 +145,7 @@ pub struct AnchorConfig {
 /// The check-and-set is performed atomically via [`dashmap::mapref::entry::Entry`]
 /// to prevent TOCTOU races. The reader pump takes ownership of the transport
 /// receiver directly rather than storing it in the entry.
-// Fields are consumed by Phase 7+ control handlers and Phase 8 data path.
+// Fields are consumed by the control handlers and the data-path pump.
 #[allow(dead_code)]
 pub(crate) struct AnchorEntry {
     /// Raw-bytes frame delivery channel to the [`StreamAnchor<T>`] consumer.
@@ -477,7 +477,7 @@ impl StreamController {
 ///
 /// ```rust,no_run
 /// use futures::StreamExt;
-/// use crate::streaming::{AnchorManager, StreamFrame};
+/// use velo::streaming::{AnchorManager, StreamFrame};
 ///
 /// # async fn example(mgr: &AnchorManager) -> anyhow::Result<()> {
 /// // Consumer creates an anchor
@@ -809,9 +809,9 @@ impl<T: DeserializeOwned> Stream for StreamAnchor<T> {
 /// starts at 0 and is incremented with `fetch_add(1)` -- the *result + 1*
 /// is the first valid local ID (i.e., IDs start at 1; 0 is reserved).
 ///
-/// The `registry` is wrapped in an `Arc` so that control handlers (Phase 7)
-/// and the data-path pump (Phase 8) can hold a cheap clone of the registry
-/// reference without holding a reference to the whole `AnchorManager`.
+/// The `registry` is wrapped in an `Arc` so that control handlers and the
+/// data-path pump can hold a cheap clone of the registry reference without
+/// holding a reference to the whole `AnchorManager`.
 ///
 /// Use [`AnchorManagerBuilder`] for optional configuration (e.g. `default_unattached_timeout`,
 /// `default_heartbeat_interval`), or [`AnchorManager::new`] as a convenience constructor
@@ -1063,8 +1063,8 @@ impl AnchorManager {
 
     /// Remove an anchor from the registry and return its entry (if present).
     ///
-    /// Cancels the entry's token before returning. Used by control path cleanup
-    /// handlers (Phase 7) and drop impls.
+    /// Cancels the entry's token before returning. Used by control-path cleanup
+    /// handlers and drop impls.
     #[allow(dead_code)]
     pub(crate) fn remove_anchor(&self, local_id: u64) -> Option<AnchorEntry> {
         self.registry.remove(&local_id).map(|(_, entry)| {
@@ -1076,8 +1076,8 @@ impl AnchorManager {
 
     /// Inject a raw sentinel frame into the anchor's delivery channel.
     ///
-    /// This is a non-blocking best-effort send used by the control path (Phase 7).
-    /// The data path (Phase 8) will use a blocking variant for `Item` frames.
+    /// This is a non-blocking best-effort send used by the control path.
+    /// `Item` frames go through `StreamSender::send` instead, not this method.
     ///
     /// # Note
     /// The registry reference is dropped before any other operation to ensure we do
@@ -1721,7 +1721,7 @@ impl AnchorManager {
     /// `_stream_cancel` (on `self.sender_registry`).
     ///
     /// Stores the messenger in `messenger_lock` (write-once) for use by
-    /// `attach_remote` in Phase 12 Plan 02.
+    /// `attach_remote`.
     ///
     /// # Errors
     ///
@@ -1939,7 +1939,7 @@ impl AnchorManager {
         // opening its own ticket. Unlike `attach_stream_anchor`'s same-worker
         // case, there is no co-located path to take instead: zero-RTT
         // deliberately never sets `attachment` for a claimed slot (see
-        // `streaming/BATCHING.md`), so a co-located write here would have to
+        // `docs/src/concepts/batched-streaming.md`), so a co-located write here would have to
         // either invent a second claim representation or reuse `attachment`
         // with a meaning that depends on where the producer landed -- the
         // "two spellings of one rule" this crate's `CLAUDE.md` singles out.
@@ -2304,7 +2304,7 @@ impl AnchorManager {
         )
     }
 
-    /// Attach a sender to an MPSC anchor. Like [`attach_stream_anchor`] but
+    /// Attach a sender to an MPSC anchor. Like [`Self::attach_stream_anchor`] but
     /// targets the MPSC registry: multiple senders may attach concurrently,
     /// and each attach allocates a fresh [`crate::streaming::mpsc::SenderId`].
     pub async fn attach_mpsc_stream_anchor<T: serde::Serialize>(
@@ -2788,7 +2788,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // StreamAnchor<T> Stream impl tests (Plan 08-03, Task 1)
+    // StreamAnchor<T> Stream impl tests
     // -----------------------------------------------------------------------
 
     /// Helper: create a raw channel pair + StreamAnchor for testing Stream impl.
@@ -3116,7 +3116,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // AnchorManagerBuilder + default_unattached_timeout tests (Plan 08-04, Task 1)
+    // AnchorManagerBuilder + default_unattached_timeout tests
     // -----------------------------------------------------------------------
 
     #[test]
@@ -3272,7 +3272,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // StreamAnchor::set_timeout tests (Plan 08-04, Task 2)
+    // StreamAnchor::set_timeout tests
     // -----------------------------------------------------------------------
 
     #[tokio::test]
@@ -3397,7 +3397,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Registry injection tests (Plan 09-01, Task 2)
+    // Registry injection tests
     // -----------------------------------------------------------------------
 
     #[test]

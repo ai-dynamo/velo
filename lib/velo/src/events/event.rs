@@ -18,7 +18,7 @@ static DROP_POISON_REASON: LazyLock<Arc<str>> =
 /// Routing layer for event completion operations.
 ///
 /// Only three methods — just the operations that need local-vs-remote routing
-/// in a distributed setup. [`EventSystemBase`](crate::EventSystemBase) implements
+/// in a distributed setup. `EventSystemBase` implements
 /// this for the local path; a distributed backend would add network routing.
 pub trait EventBackend: Send + Sync {
     /// Mark the event as successfully completed, waking all waiters.

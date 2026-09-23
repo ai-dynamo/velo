@@ -73,7 +73,7 @@ pub enum RdmaError {
 
     /// The registered-bytes budget would be exceeded by this registration.
     ///
-    /// Phase 3's callers treat this as "stage chunked instead" — pool
+    /// `rdma_pull`'s callers treat this as "stage chunked instead" — pool
     /// exhaustion falls back to the active-message path and is never a hard
     /// failure of the staging operation (D4).
     #[error(
@@ -152,7 +152,7 @@ pub(crate) struct BackendRegion {
 /// One remote read: `len` bytes at `remote_addr` on `peer`, landing at
 /// `local_offset` inside a locally registered region.
 ///
-/// Phase 3 builds these from an owner-authored wire descriptor. The consumer
+/// The consumer builds these from an owner-authored wire descriptor. It
 /// never computes `remote_addr` itself — that is the property that makes
 /// software-emulated RMA (which validates nothing) safe over `UCX_TLS=tcp`.
 #[derive(Debug, Clone)]
@@ -175,8 +175,8 @@ pub(crate) struct BackendGet {
 /// An RDMA provider the registration layer can register memory with and pull
 /// remote memory through. See the module docs for the contract.
 pub(crate) trait RdmaBackend: Send + Sync {
-    /// Wire-level discriminator for this backend (`"ucx"`). Phase 3 puts it in
-    /// the descriptor and in the consumer's capability offer.
+    /// Wire-level discriminator for this backend (`"ucx"`). It goes in the
+    /// descriptor and in the consumer's capability offer.
     fn key(&self) -> &str;
 
     /// Register `[ptr, ptr + len)` and pack a key for it.

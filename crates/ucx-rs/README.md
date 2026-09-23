@@ -24,9 +24,10 @@ Set `UCX_DIR=/path/to/ucx` to link a preinstalled UCX (>= 1.17) instead.
 | `cma`    | no      | Cross-memory-attach shared memory transport. |
 | `bindgen`| no      | Regenerate the checked-in bindings: `UCX_RS_REGEN_BINDINGS=1 cargo build --features bindgen` (needs libclang). The feature alone is a no-op, so `--all-features` CI never rewrites tracked sources. |
 
-CI without RDMA packages should build with `--no-default-features` (TCP and
-shared-memory transports are always compiled in), or install
-`libibverbs-dev librdmacm-dev` — headers only, no hardware needed.
+A standalone build of `ucx-rs` without RDMA packages can use
+`--no-default-features` (TCP and shared-memory transports are always compiled
+in). velo's `ucx` feature uses the default features, so a velo build always
+needs `libibverbs-dev librdmacm-dev` — headers only, no hardware needed.
 
 ## Scope
 

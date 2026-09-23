@@ -27,8 +27,8 @@
 //! # What it demonstrates
 //!
 //! A forward pass is X sends spread across X *different* streams, never many
-//! frames queued on one. That is the case `streaming/BATCHING.md` § "Measured
-//! results" singles out: per-stream write coalescing can only pack frames
+//! frames queued on one. That is the case `docs/src/development/batched-streaming-design.md`
+//! singles out: per-stream write coalescing can only pack frames
 //! sitting on the same stream, so here it has nothing to work with and the
 //! ratio is exactly **1.00 — one token, one write**.
 //!
@@ -73,8 +73,7 @@
 //! with per-token latency, which for a decode engine is the wrong trade.
 //!
 //! Every number above, with its command and its unedited output, is in
-//! [`batched_streaming.evidence.md`](batched_streaming.evidence.md) beside
-//! this file.
+//! `docs/src/operations/benchmarking.md`.
 //!
 //! Either way the ratio tracks how many of an engine's active requests live on
 //! the same host, so it climbs with the batch as long as there are enough
@@ -880,16 +879,16 @@ async fn main() -> Result<()> {
         );
         println!("Run with --legacy for the same workload at one write per token.");
     } else {
-        // BATCHING.md defines the batching ratio as
+        // docs/src/concepts/batched-streaming.md defines the batching ratio as
         // `frames_written / egress_flushes`, which is the canonical number and
         // sits a shade above the token ratio: the frame counter also sees the
         // heartbeats and the per-stream terminal, which are not tokens.
         let frames: f64 = engine_stats.iter().map(|s| s.frames).sum();
         println!(
-            "\n{writes:.0} writes for {tokens} tokens — {ratio:.2} : 1. BATCHING.md's own \
+            "\n{writes:.0} writes for {tokens} tokens — {ratio:.2} : 1. The book's batching \
              ratio,\nframes_written / egress_flushes, reads {:.2} : 1 here, higher only because \
              it counts\nthe heartbeats and terminals that a token count does not. Either way it \
-             is the\nlimitation that document measures rather than a failure: a forward pass \
+             is the\nlimitation the book measures rather than a failure: a forward pass \
              puts one\nframe on each of many different streams, and per-stream coalescing can \
              only pack\nframes queued on the same one. Run without --legacy to bucket them by \
              destination.",

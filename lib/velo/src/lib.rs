@@ -289,7 +289,7 @@ impl VeloBuilder {
     }
 
     /// Install the batched, multiplexed streaming transport
-    /// (`messenger-mux-v1`), described in `streaming/BATCHING.md`.
+    /// (`messenger-mux-v1`), described in `docs/src/concepts/batched-streaming.md`.
     ///
     /// **Opt-in, and the mux is not the default transport.**
     /// [`MuxConfig::enabled`](crate::streaming::MuxConfig::enabled) defaults to
@@ -599,7 +599,7 @@ impl Velo {
     ///    messenger shutdown below. Closing the inbound gate first means no new
     ///    request can ask for an RDMA transfer while registrations are being
     ///    torn down.
-    /// 2. The registry sweep (D8 steps 1 to 3): registrations refused,
+    /// 2. The registry sweep: registrations refused,
     ///    in-flight transfers drained, every region and arena unmapped.
     /// 3. Messenger gate, drain and teardown, unchanged.
     /// 4. Every registration that survived step 2 is declared released.
@@ -757,7 +757,7 @@ impl Velo {
     /// A burst between two calls is a *hint*, not a frame boundary: the size
     /// clamps, the records that carry liveness, and credit may each cut a wire
     /// batch in between, so a caller may not assume what it bracketed arrives as
-    /// one `_stream_batch`. See `streaming/BATCHING.md` § "Flush policy".
+    /// one `_stream_batch`. See `docs/src/concepts/batched-streaming.md` § "Flush policy".
     pub fn flush_batch(&self) {
         self.anchor_manager.flush_mux_batches();
     }
@@ -896,7 +896,7 @@ impl Velo {
     /// transport sees the peer alongside the messenger transports. Calling
     /// `messenger.discover_and_register_peer` directly would skip the
     /// streaming-side `register()` and surface as "peer not registered" on
-    /// the next [`AnchorManager::attach_anchor`](crate::streaming::AnchorManager::attach_anchor).
+    /// the next [`Self::attach_anchor`].
     pub async fn discover_and_register_peer(&self, instance_id: InstanceId) -> Result<()> {
         let discovery = self.messenger.discovery().ok_or_else(|| {
             anyhow::anyhow!(
@@ -1291,7 +1291,7 @@ impl Velo {
         self.rdma.as_ref()
     }
 
-    /// The registration layer, for Phase 3 staging and transfers.
+    /// The registration layer, for staging and transfers.
     #[cfg(all(target_os = "linux", feature = "ucx"))]
     pub(crate) fn rdma_registry(
         &self,

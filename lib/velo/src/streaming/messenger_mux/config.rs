@@ -15,7 +15,7 @@ use super::flow_control::{DEFAULT_PEER_BYTE_BUDGET, DEFAULT_SLOT_BYTE_BUDGET};
 /// Conditions on which an [`FlushPolicy::Auto`] batcher writes itself.
 ///
 /// A struct rather than more enum variants because these compose: a batcher may
-/// hold both, and `BATCHING.md`'s original "opportunistic" and "windowed"
+/// hold both, and `docs/src/concepts/batched-streaming.md`'s original "opportunistic" and "windowed"
 /// policies are the two of them taken one at a time.
 ///
 /// Deliberately **not** `#[non_exhaustive]`, for the same reason [`MuxConfig`]
@@ -41,7 +41,7 @@ pub struct AutoFlush {
     /// Also write once this long has passed since the oldest staged record.
     ///
     /// `Some(w)` with `on_admission: false` is the windowed policy
-    /// `BATCHING.md` specifies: a batch forms for up to `w` and then goes,
+    /// `docs/src/concepts/batched-streaming.md` specifies: a batch forms for up to `w` and then goes,
     /// trading up to `w` of latency for packing. `None` is no timer at all.
     pub max_linger: Option<Duration>,
 }
@@ -67,7 +67,7 @@ impl AutoFlush {
 
 /// When a peer batcher writes what it has staged.
 ///
-/// See `BATCHING.md` § "Flush policy". Both policies obey the same two
+/// See `docs/src/concepts/batched-streaming.md` § "Flush policy". Both policies obey the same two
 /// overrides — a batch at its size clamp goes, and the records that carry
 /// liveness go (a close or a terminal at once, a credit reply within
 /// [`MuxConfig::reply_linger`]) — and under both,
@@ -146,7 +146,7 @@ pub struct MuxConfig {
     /// pre-binds for it, is refused at attach rather than served over the
     /// default transport: `adopt_prebind` will not adopt a pre-bind whose key
     /// the sender no longer offers. Roll the minting side back first, or both
-    /// together; `BATCHING.md`'s 2026-09-04 addendum has the whole argument.
+    /// together; see `docs/src/development/batched-streaming-design.md` for the whole argument.
     pub enabled: bool,
     /// Configured ceiling on one batch. Further clamped at flush time by the
     /// effective eager budget and by `COALESCE_THRESHOLD`, whichever binds
@@ -185,8 +185,8 @@ pub struct MuxConfig {
     ///
     /// The magnitude of what the old interval cost is not currently a
     /// measured number: the figures first quoted here were taken on a shared
-    /// login node and are retracted. See the banner in
-    /// `examples/examples/response_plane_bench.evidence.md`.
+    /// login node and are retracted. See
+    /// `docs/src/operations/response-plane-performance.md`.
     ///
     /// Must be non-zero. The sweep ticks on a `tokio::time::interval`, which
     /// has no zero period, so building a mux refuses a zero here the way it
@@ -282,7 +282,7 @@ pub struct MuxConfig {
     /// workers and 8,192-way concurrency, the second past a control-cap fix
     /// this branch also carries: TTFT p95 is worse than baseline in every rep
     /// for every flagged arm, both times; p50 does not improve. See
-    /// `agent-docs/w4a-async-open-ack-status.md` for the numbers.
+    /// `docs/src/operations/response-plane-performance.md` for the numbers.
     ///
     /// **The per-open cost is not amortized the way a packed flush is, and is
     /// paid whether or not the wait it removes was on the critical path.**
@@ -312,7 +312,7 @@ pub struct MuxConfig {
     /// not the slot has room to spend. On a peer whose send queue is the
     /// congested one this flag exists to route around, a producer that starts
     /// generating right away can fill the slot's byte cap before its own
-    /// `OpenSlot` is admitted, and the slow-consumer kill (`SATURATION.md`)
+    /// `OpenSlot` is admitted, and the slow-consumer kill (`docs/src/operations/saturation.md`)
     /// destroys the stream on that basis — a healthy consumer never entered
     /// into it. Because `peer_byte_budget` bounds ingress only, nothing caps
     /// how many slots may be open this way against one congested peer at once:
@@ -331,7 +331,7 @@ pub struct MuxConfig {
     /// 4.3x-5.9x across 3 reps. Records per batch moved too (roughly 20-22 to
     /// roughly 96-105), but not by the same ratio, because the two arms did
     /// not carry equal total `CreditUpdate` volume — see
-    /// `agent-docs/w7-reply-linger-measurement.md` for the numbers, why the
+    /// `docs/src/operations/response-plane-performance.md` for the numbers, why the
     /// two ratios do not have to match, and why that document's request-level
     /// numbers (throughput, TTFT, ITL) do not establish a benefit from this
     /// window on their own. What the receiver's own instrumentation does

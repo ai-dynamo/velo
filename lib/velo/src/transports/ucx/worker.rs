@@ -104,7 +104,7 @@
 //!
 //! [`UcxConfig::ep_idle_timeout`](super::transport::UcxConfig::ep_idle_timeout)
 //! turns on a periodic scan that closes endpoints nothing has used for a while.
-//! **Off by default**, decided at the plan's sign-off: closing an endpoint is
+//! **Off by default**, per D9: closing an endpoint is
 //! visible to the peer, and the ~14 ms of lazy wireup the next use pays back is
 //! a real cost to trade against idle NIC resources. D9 also draws the line this
 //! reaper sits on — memory registrations are evicted by *byte budget*, never by
@@ -152,7 +152,7 @@
 //! the stamp aged out can still be on the wire at the close. The FORCE close
 //! then purges it with `UCS_ERR_CANCELED` into `send_trampoline`, which reports
 //! it through `on_error` with the original buffers — the identical contract
-//! `reap_failed_eps` has had since Phase 0, so the failure is delivered rather
+//! `reap_failed_eps` has always had, so the failure is delivered rather
 //! than silent. Two residual terms remain, and both are real:
 //!
 //! * **Congestion.** [`MIN_EP_IDLE_TIMEOUT`](super::transport) floors the
@@ -421,7 +421,7 @@ pub(crate) struct WorkerShared {
     /// AMs on the stale one.
     pub reg_epoch: Arc<AtomicU64>,
     /// Regions currently held by `ucp_mem_map`. Maintained by the progress
-    /// thread only; readable from anywhere as a gauge. Phase 3's
+    /// thread only; readable from anywhere as a gauge. The
     /// `rdma_registered_bytes` metric reads from here, and the tests assert it
     /// returns to zero — a non-zero value after every region has been accounted
     /// for is a leaked registration, the failure this whole module guards.
@@ -1208,7 +1208,7 @@ unsafe fn init_ucx(
         params.field_mask = (sys::ucp_params_field_UCP_PARAM_FIELD_FEATURES
             | sys::ucp_params_field_UCP_PARAM_FIELD_MT_WORKERS_SHARED)
             as u64;
-        // RMA is requested now so the rendezvous GET path (P2) shares this
+        // RMA is requested so the rendezvous GET path shares this
         // context; WAKEUP is mandatory for the efd/arm/signal protocol.
         params.features = (sys::ucp_feature_UCP_FEATURE_AM
             | sys::ucp_feature_UCP_FEATURE_RMA

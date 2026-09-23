@@ -11,8 +11,7 @@
 //! dozen requests, and it measures no latency at all.
 //!
 //! That is not enough to settle the question this harness was built for.
-//! `agent-docs/dynamo-response-plane-competitive-plan.md` claims three
-//! frontend-side costs that scale as `O(peers x slots)`:
+//! Three frontend-side costs are claimed to scale as `O(peers x slots)`:
 //!
 //! 1. the credit sweep walking every slot of every peer at 500 Hz,
 //! 2. per-stream tokio tasks and a per-frame timer in `reader_pump`,
@@ -60,7 +59,7 @@
 //! do not compare this harness's CPU column against it.
 //!
 //! **Loopback removes wire time**, which exaggerates the syscall term. That
-//! cuts in the mux's favour, as `BATCHING.md` section V5 already says.
+//! cuts in the mux's favour, as `docs/src/concepts/batched-streaming.md` already says.
 //!
 //! **Request dispatch is an in-process channel**, standing in for the request
 //! plane, exactly as `batched_streaming` does. The *response* path is real:

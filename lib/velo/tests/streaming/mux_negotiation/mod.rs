@@ -439,7 +439,7 @@ async fn concurrent_streams_to_one_peer_share_the_batch_flow() {
 /// running 40 frames apiece are past it almost at once and every `finalize` is
 /// offered to a full channel. That used to block the calling thread; on a runtime
 /// with `W` workers, `W` of those blocked the executor that drains the inlets, and
-/// the process deadlocked rather than failing — `agent-docs/mux-negotiation-hang.md`
+/// the process deadlocked rather than failing — `docs/src/development/batched-streaming-design.md`
 /// has the evidence.
 ///
 /// The window is deliberately the smallest a peer may advertise (zero is

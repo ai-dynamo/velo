@@ -6,8 +6,6 @@
 //! All per-entry state — generation tracking, completion status, and waker
 //! registration — is consolidated under a single `parking_lot::Mutex`,
 //! eliminating stale-completion races by construction.
-//!
-//! See `docs/slot-state-machine.md` for the formal state machine specification.
 
 mod completion;
 pub(crate) mod entry;

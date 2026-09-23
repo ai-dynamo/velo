@@ -3,8 +3,8 @@
 
 //! Trait-based extension point for transparent large payload handling.
 //!
-//! These traits allow external crates (e.g., `velo-rendezvous`) to plug into the
-//! messenger send/receive path without creating a circular dependency.
+//! These traits let the rendezvous module (`crate::rendezvous`) plug into the
+//! messenger send/receive path, so the messenger does not depend on it.
 //!
 //! **Sender side** ([`LargePayloadStager`]): When a payload exceeds a threshold,
 //! the stager stores it locally and returns a handle string to embed in the message
