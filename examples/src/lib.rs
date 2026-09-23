@@ -119,9 +119,8 @@ pub fn init_tracing() {
 /// A loopback QUIC builder, tuned by environment variables so a sweep can
 /// vary the transport without new flags:
 ///
-/// - `VELO_QUIC_MAX_MTU`, `VELO_QUIC_INITIAL_MTU` (bytes)
-/// - `VELO_QUIC_STREAM_WINDOW` (bytes), `VELO_QUIC_SEND_WINDOW` (bytes)
-/// - `VELO_QUIC_INITIAL_WINDOW` (bytes)
+/// - `VELO_QUIC_MAX_MTU` (bytes)
+/// - `VELO_QUIC_STREAM_WINDOW` (bytes)
 /// - `VELO_QUIC_SERVER_ENDPOINTS` (count)
 #[cfg(feature = "quic")]
 pub fn quic_from_env() -> Result<velo::transports::quic::QuicTransportBuilder> {
@@ -139,17 +138,8 @@ pub fn quic_from_env() -> Result<velo::transports::quic::QuicTransportBuilder> {
     if let Some(v) = env("VELO_QUIC_MAX_MTU")? {
         builder = builder.max_mtu(v);
     }
-    if let Some(v) = env("VELO_QUIC_INITIAL_MTU")? {
-        builder = builder.initial_mtu(v);
-    }
     if let Some(v) = env("VELO_QUIC_STREAM_WINDOW")? {
         builder = builder.stream_receive_window(v);
-    }
-    if let Some(v) = env("VELO_QUIC_SEND_WINDOW")? {
-        builder = builder.send_window(v);
-    }
-    if let Some(v) = env("VELO_QUIC_INITIAL_WINDOW")? {
-        builder = builder.initial_window(v);
     }
     if let Some(v) = env("VELO_QUIC_SERVER_ENDPOINTS")? {
         builder = builder.server_endpoints(v);

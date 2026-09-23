@@ -660,10 +660,7 @@ pub struct QuicTransportBuilder {
     server_endpoints: usize,
     udp_buffers: BufferSizes,
     stream_receive_window: Option<u32>,
-    send_window: Option<u64>,
     max_mtu: Option<u16>,
-    initial_mtu: Option<u16>,
-    initial_window: Option<u64>,
     keep_alive_interval: Duration,
 }
 
@@ -683,10 +680,7 @@ impl QuicTransportBuilder {
                 send: DEFAULT_UDP_SEND_BUFFER,
             },
             stream_receive_window: None,
-            send_window: None,
             max_mtu: None,
-            initial_mtu: None,
-            initial_window: None,
             keep_alive_interval: Duration::from_secs(5),
         }
     }
@@ -752,13 +746,6 @@ impl QuicTransportBuilder {
         self
     }
 
-    /// Connection send window in bytes (default: quinn's, 8 times its stream
-    /// window).
-    pub fn send_window(mut self, bytes: u64) -> Self {
-        self.send_window = Some(bytes);
-        self
-    }
-
     /// Largest UDP payload this transport sends or accepts (default: quinn's
     /// 1452 for probing and 1472 to receive, sized for a 1500-byte Ethernet
     /// MTU).
@@ -770,25 +757,6 @@ impl QuicTransportBuilder {
     /// path MTU is found, not assumed.
     pub fn max_mtu(mut self, bytes: u16) -> Self {
         self.max_mtu = Some(bytes);
-        self
-    }
-
-    /// Packet size a new connection starts at, before discovery (default
-    /// 1200). Raise it only when every path is known to carry it: a value
-    /// above the path MTU loses packets until black-hole detection lowers it.
-    pub fn initial_mtu(mut self, bytes: u16) -> Self {
-        self.initial_mtu = Some(bytes);
-        self
-    }
-
-    /// Initial congestion window in bytes (default: 10 packets of the largest
-    /// size, and at least quinn's 14720).
-    ///
-    /// quinn's Cubic window does not grow on acknowledgements while the sender
-    /// is application-limited, and request/response traffic usually is. So
-    /// the initial window is the window such a connection keeps.
-    pub fn initial_window(mut self, bytes: u64) -> Self {
-        self.initial_window = Some(bytes);
         self
     }
 
@@ -820,9 +788,6 @@ impl QuicTransportBuilder {
         if let Some(window) = self.stream_receive_window {
             transport_config.stream_receive_window(window.into());
         }
-        if let Some(window) = self.send_window {
-            transport_config.send_window(window);
-        }
         let mut endpoint_config = quinn::EndpointConfig::default();
         let max_mtu = self.max_mtu.map(clamp_to_gso_batch);
         if let Some(max_mtu) = max_mtu {
@@ -833,16 +798,6 @@ impl QuicTransportBuilder {
             discovery.upper_bound(max_mtu);
             transport_config.mtu_discovery_config(Some(discovery));
         }
-        if let Some(initial) = self.initial_mtu {
-            transport_config.initial_mtu(initial);
-        }
-        let largest_packet = u64::from(max_mtu.unwrap_or(QUINN_MAX_PACKET).max(QUINN_MAX_PACKET));
-        let initial_window = self
-            .initial_window
-            .unwrap_or((10 * largest_packet).max(QUINN_INITIAL_WINDOW));
-        let mut cubic = quinn::congestion::CubicConfig::default();
-        cubic.initial_window(initial_window);
-        transport_config.congestion_controller_factory(Arc::new(cubic));
         let transport_config = Arc::new(transport_config);
 
         let identity = Identity::generate()?;
@@ -920,9 +875,6 @@ pub(super) fn clamp_to_gso_batch(requested: u16) -> u16 {
     requested.min(GSO_SAFE_MAX_MTU)
 }
 
-/// quinn's default MTU discovery bound and initial congestion window.
-const QUINN_MAX_PACKET: u16 = 1452;
-const QUINN_INITIAL_WINDOW: u64 = 14720;
 const DEFAULT_UDP_RECV_BUFFER: usize = 8 * 1024 * 1024;
 const DEFAULT_UDP_SEND_BUFFER: usize = 4 * 1024 * 1024;
 

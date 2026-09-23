@@ -78,6 +78,7 @@ graph LR
 - **Server sockets form a reuse-port group** (Linux). `server_endpoints(n)` binds `n` UDP sockets on one port. The kernel hashes each peer to one socket, so the receive queues and buffer ceilings add up. A node that many peers send to, such as a frontend, gains from more sockets. The default is 4. Each socket costs a quinn endpoint and its buffers.
 - **The dial socket is separate.** Dials use their own socket on an ephemeral port. A reply to a dial from a group member can hash to another member, which does not know the connection and drops the reply.
 - **UDP buffers are checked.** The transport requests 8 MiB receive and 4 MiB send buffers on each socket, reads back what the kernel granted, and logs a warning when `net.core.rmem_max` or `net.core.wmem_max` clamped the request. A clamped UDP buffer shows up later as dropped datagrams, not as an error.
+- **Packets are at most 6550 bytes.** quinn sends up to 10 packets in one GSO batch, and a larger packet makes the batch exceed the UDP datagram limit. The batch is then lost with no error. `max_mtu` is lowered to 6550.
 - **quinn 0.11.12 is the minimum.** It pulls quinn-proto 0.11.18. Older quinn-proto can fail an ordered, lossless stream of many small chunks with `too many gaps in stream buffer`.
 
 For the tuning settings and the measured cost against TCP, see [QUIC performance](../operations/quic-performance.md).
