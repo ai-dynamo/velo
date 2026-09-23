@@ -38,8 +38,8 @@ use crate::harness::tier::Tier;
 /// The messenger-backed transport is not an option here. The AM-backed
 /// `VeloFrameTransport` was deleted for known correctness problems under
 /// multi-stream concurrency, and its replacement — `messenger-mux-v1`, see
-/// `lib/velo/src/streaming/BATCHING.md` — is not selectable until attach-time
-/// negotiation lands.
+/// `docs/src/concepts/batched-streaming.md` — is not yet exposed as a soak
+/// harness option.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 #[value(rename_all = "lower")]
 enum StreamTransport {

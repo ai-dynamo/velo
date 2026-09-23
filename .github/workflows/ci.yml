@@ -288,6 +288,16 @@ jobs:
       if: always()
       run: /tmp/use-sccache.sh show-stats "examples" || true
 
+  book:
+    name: Book
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 #v6.0.1
+    - name: Build book and check links
+      env:
+        INSTALL_TOOLS: "1"
+      run: bash scripts/build-book.sh
+
   semver:
     name: Semver Check
     needs: pr-metadata
@@ -327,7 +337,7 @@ jobs:
     runs-on: prod-velo-default-v1
     container:
       image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.3
-    needs: [pr-metadata, fmt, clippy, deny, test, soak-smoke, coverage, examples, semver]
+    needs: [pr-metadata, fmt, clippy, deny, test, soak-smoke, coverage, examples, book, semver]
     if: always()
     steps:
     - name: Check all jobs

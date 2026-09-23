@@ -21,7 +21,7 @@ edition = "2024"
 description = "Velo Active Messenging Library"
 authors = ["NVIDIA Inc. <sw-dl-dynamo@nvidia.com>"]
 license = "Apache-2.0"
-homepage = "https://github.com/ai-dynamo/velo"
+homepage = "https://ai-dynamo.github.io/velo/"
 repository = "https://github.com/ai-dynamo/velo.git"
 keywords = ["nvidia", "distributed"]
 

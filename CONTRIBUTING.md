@@ -81,6 +81,7 @@ pre-commit run --all-files
 - Code coverage must not decrease
 - No compiler warnings
 - All tests must pass
+- Update the book (`docs/src/`) and `README.md` for any change in behavior. `agent-docs/` is for work in progress and never merges to `main`. See [Documentation](docs/src/development/documentation.md).
 
 ## velo-ext API stability
 
