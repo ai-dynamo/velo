@@ -73,3 +73,42 @@ The worker node drops about 1,790 datagrams per arm in every arm, TCP arms inclu
 - dyn-pin: `DYN_VELO_RESPONSE_TRANSPORT=quic`; `DYN_VELO_QUIC_SERVER_ENDPOINTS`, `DYN_VELO_QUIC_MAX_MTU`, `DYN_VELO_QUIC_STREAM_WINDOW` mapped onto `QuicTransportBuilder`, parsed from raw values and logged on the "velo response plane listening" line; velo features `["ucx", "quic"]`; quinn 0.11.12; `quic_response.rs` at 14876 plus `RESPONSE_BUFFER_CAPACITY` 16,384. Patches and tarballs under `.research/logs/quic-sweep/`.
 - Rig: arms `velo-tcp`, `velo-quic`, `velo-quic-mtu`, `dynamo-quic`; `assert-transit.sh TRANSPORT LOGDIR` asserts every velo arm (not only ucx); `host-limits.sh` snapshots the sysctls, NIC MTU, and UDP counters per arm; `RIG_PARTITION` in `run-ctr.sh` and `t3-submit.sh`; `quic-gate-wheel.sh`, `quic-smoke.sh`; `dbg/arm-parity-check.sh` accepts hyphenated arm names.
 - The shared wheel now carries velo 0.13.1 and quinn 0.11.12, and `/work/velo` is on `quic-sweep`. Any other rig run uses that wheel until it is rebuilt.
+
+## Addendum 2026-09-23: QUIC frame transport (`t3-qfs1`)
+
+Question: velo-quic carries the messenger mux over one QUIC stream per peer. Dynamo's QUIC plane is closer to "QUIC does the multiplexing". Is a velo `FrameTransport` over QUIC, one QUIC stream per velo stream with no mux, a better comparison and a better transport?
+
+Built `QuicFrameTransport` (branch `quic-frame-transport`, commit 06351db; `StreamConfig::Quic`): one connection per peer, dialed on first use under a per-peer dial lock; one unidirectional stream per velo stream with the TCP frame transport's 16-byte handshake and frame codec; the QUIC messenger transport's reuse-port sockets, pinned certificate, and MTU clamp. Ten unit tests plus a facade end-to-end test; three mutations (no dial lock, no `Dropped` injection, handshake ignores the session) each turn their tests red, with a green control. Adapter: `DYN_VELO_RESPONSE_STREAM_TRANSPORT=mux|quic|tcp` (mux off for the frame transports, zero-RTT refused off the mux, the attach assertion expects the arm's key). Measured on `quic-sweep` at 47c7b46 (the merge), tcpo ptyche0349/0350, image 260903, same load as `t3-quic1`.
+
+Arms: `velo-quicfs` (QUIC frame transport, messenger on TCP, no zero-RTT, frontend 32 endpoints), `velo-tcpfs` (velo's per-stream TCP frame transport, the control for "one stream per response"), `velo-quic`, `velo-tcp`, `dynamo-quic` (batch interval 0). Post-run checks: `assert-stream-transport.sh` (every process resolved the arm's stream transport, no attach negotiated another) passed on every frame-transport rep; transit and zero-RTT checks passed on the rest.
+
+| Rep | Arm | hold | req/s | Errors | TTFT p50 | TTFT p99 | ITL p99 | CPU | Frontend drops | Frontend datagrams |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | velo-quicfs | 8 | 2,932 | 0 | 57.2 | 131.1 | 32.4 | 16.68 | 27,694 | 2.74M |
+| 2 | velo-quicfs | (1)* | 2,560 | 1,482 | 48.0 | 8,181 | 54.6 | 17.02 | 19,962 | 4.89M |
+| 3 | velo-quicfs | (1)* | 2,535 | 1,271 | 48.1 | 9,731 | 56.5 | 17.56 | 18,558 | 4.93M |
+| 1-3 | velo-tcpfs | 8 | 334-610 | 200,835-229,504 | 38-55 | 103-1,265 | 2-24 | 12.5-14.9 | 0 | - |
+| 1, 3 | velo-quic | 1 | 2,254-2,276 | 0 | 41.5-42.4 | 230-232 | 106-107 | 12.2-12.7 | 4,226-4,510 | 4.80-4.87M |
+| 2 | velo-quic | 2 | 2,742 | 0 | 41.8 | 113.0 | 45.2 | 13.15 | 2,633 | 4.47M |
+| 1 | velo-tcp | 1 | 2,340 | 0 | 41.4 | 223.8 | 103.3 | 11.70 | 0 | - |
+| 2, 3 | velo-tcp | 2 | 2,654-2,874 | 0 | 39.8-42.0 | 107-117 | 42-48 | 12.7-12.8 | 0 | - |
+| 1, 3 | dynamo-quic | 1 | 1,991-2,016 | 0 | 42.9-43.4 | 262-264 | 122-123 | 13.5-13.8 | 128,551-132,765 | 44.8-45.0M |
+| 2 | dynamo-quic | 2 | 2,397 | 0 | 39.4 | 139.6 | 63.4 | 13.90 | 93,599 | 45.4M |
+
+\* The hold count for velo-quicfs reps 2 and 3 is contaminated: the stalled process's mean first-response time (about 1 s) makes it the only "holder" by construction.
+
+### Findings
+
+- **Per-stream TCP (velo-tcpfs) does not survive this load.** 80-92% of requests fail. The workers log `transport bind failed: Cannot assign requested address (os error 99)`: one TCP connection per stream at about 2,500 new streams/s to one frontend address fills the ephemeral port range with TIME_WAIT. This is the architecture the mux replaced, and the reason it did.
+- **velo-quicfs has a burst failure on this rig.** In 2 of 3 reps, one worker process's connection (mocker_3, the process holding the backlog both times) went silent for about 20 s starting at the opening burst of 8,192 requests: the frontend accepted its new streams but their 16-byte handshakes did not arrive within 20 s, the worker's stream opens timed out at 20 s, and open streams got no frames, so the frontend's 15 s heartbeat watchdog dropped them (1,402-1,625 watchdog events). The connection then recovered, and the rest of the run had no errors. 1,271-1,482 requests failed per bad rep (0.5-0.6%), and steady first-token p99 went to 8-10 s. Rep 1 had no stall and no errors.
+- **Mechanism (inference, not verified):** QUIC loss recovery backing off on one connection after a run of losses. The frontend dropped 18.5k-27.7k datagrams per velo-quicfs rep (0.4-1.0%), against 2.6k-4.5k for the mux over QUIC. Each connection hashes to one frontend socket whose buffer is clamped to 425,984 B, and a hot process opens about a thousand streams on its one connection at the burst. Confirming needs quinn's connection stats (lost packets, congestion events, PTO count) logged from the worker at the stall; not instrumented yet.
+- **Packets are not the cost.** velo-quicfs's frontend received 2.7-4.9M datagrams per run, the same as velo-quic and a tenth of dynamo-quic's 45M: quinn packs frames from many streams into each packet. The "no batching across streams" concern does not show in packet count.
+- **CPU is the cost.** velo-quicfs used 16.7-17.6 ms of frontend CPU per request, against 12.2-13.2 for velo-quic, 11.7-12.8 for velo-tcp, and 13.5-14.4 for dynamo-quic. Candidates, unprofiled: two tasks per stream on the accept side plus an expiry task per bind, a per-frame `Vec` copy, and per-stream quinn state.
+- **No matched-draw comparison against dynamo-quic exists for velo-quicfs.** Its one clean rep drew 8 holders, which no other arm drew in this matrix.
+- **velo-quic against velo-tcp, second matrix.** At one holder (n = 2 against 1) and two holders (n = 1 against 2), throughput, first-token latency, ITL, and CPU agree within the spread, as in `t3-quic1`. The earlier ruling stands with more pairs.
+
+### Next, if the frame transport is to go on
+
+1. Instrument: log `quinn::Connection::stats()` (path lost packets, congestion events, cwnd, RTT) when a stream open times out and at teardown, then rerun velo-quicfs to confirm or refute the loss-recovery mechanism.
+2. If confirmed, the candidate remedy is several connections per peer (Dynamo's plane uses 8 bulk connections per worker), which spreads a hot process's streams over several sockets and caps what one stall takes down. A stream-open retry on a fresh connection is the other candidate.
+3. Profile the frontend CPU of velo-quicfs before any tuning.
