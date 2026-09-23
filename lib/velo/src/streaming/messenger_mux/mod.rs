@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Batched, multiplexed streaming over the Messenger — the `messenger-mux-v1`
-//! transport described by `BATCHING.md`.
+//! transport described by `docs/src/concepts/batched-streaming.md`.
 //!
 //! Today one stream owns one connection: X concurrent streams to one peer means
 //! X sockets, X egress pumps, X heartbeat timers, and one `write` syscall per
@@ -64,8 +64,8 @@
 //!   further ahead than that on a slot nobody is draining has its slot closed:
 //!   the producer's channel starts erroring at once, the consumer receives
 //!   `Dropped` (deferred behind an outstanding singleton's admission if the
-//!   slot is fenced — see the fence paragraph in `BATCHING.md`), and the
-//!   peer's other slots are untouched. `SATURATION.md` describes it from the
+//!   slot is fenced — see the fence paragraph in `docs/src/concepts/batched-streaming.md`), and the
+//!   peer's other slots are untouched. `docs/src/operations/saturation.md` describes it from the
 //!   operator's side.
 //!
 //! The exception is a batcher parked on *admission* rather than on credit. That
@@ -94,7 +94,7 @@
 //! credit was freed. That is what lets the three paths run concurrently — a
 //! redundant visit finds a count of zero, where a delta would double-count.
 //!
-//! It still differs from `BATCHING.md` § P8, which specifies an exact
+//! It still differs from `docs/src/concepts/batched-streaming.md`, which specifies an exact
 //! `credit.release(1)` per handoff. Releasing an amount from the pump is the
 //! part that was not adopted: releasing needs the peer's mutex, and taking it
 //! per record would trade a periodic cost for a worse per-record one. See the

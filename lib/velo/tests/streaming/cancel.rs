@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Integration tests for upstream cancellation (Phase 11).
+//! Integration tests for upstream cancellation.
 //!
 //! TEST-CANCEL-01: Drop StreamAnchor with attached sender — token fires, send() fails.
 //! TEST-CANCEL-02: StreamController::cancel() with attached sender — same effect.

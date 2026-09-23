@@ -25,3 +25,4 @@ codecov.json
 *.log
 core
 .envrc
+.book-tools/

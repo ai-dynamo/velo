@@ -136,7 +136,6 @@ pub struct StreamSender<T> {
     sent_terminal: bool,
     /// Registry reference for clearing the attachment flag on detach.
     registry: Arc<DashMap<u64, AnchorEntry>>,
-    // --- Phase 11 additions ---
     /// User-facing cancellation signal: fires when _stream_cancel is received.
     cancel_token: CancellationToken,
     /// Key in the sender-side registry for cleanup and for the _stream_cancel handler.
@@ -146,7 +145,6 @@ pub struct StreamSender<T> {
     /// Poison channel sender: when rx_closer (the receiver) is dropped by _stream_cancel handler,
     /// this becomes disconnected and send() returns ChannelClosed.
     poison_tx: flume::Sender<()>,
-    // --- end Phase 11 ---
     /// Optional metrics handle for producer-side backpressure observability.
     /// `None` for in-process AnchorManager constructions that skip metrics
     /// (test fixtures and direct AnchorManagerBuilder users).
@@ -262,7 +260,7 @@ impl<T: Serialize> StreamSender<T> {
     /// Use in a `tokio::select!` to stop production proactively:
     /// ```no_run
     /// # async fn example() {
-    /// # let mut sender: crate::streaming::StreamSender<u32> = todo!();
+    /// # let mut sender: velo::streaming::StreamSender<u32> = todo!();
     /// # async fn produce() -> u32 { 0 }
     /// loop {
     ///     tokio::select! {

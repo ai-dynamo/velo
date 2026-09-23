@@ -3,7 +3,7 @@
 
 //! Where mux credit comes back from — the consumer draining, or the sweep.
 //!
-//! `BATCHING.md` § P8 specifies that credit is returned by `reader_pump`,
+//! `docs/src/development/batched-streaming-design.md` specifies that credit is returned by `reader_pump`,
 //! which "gains an `Option<CreditReturn>` and calls `credit.release(1)` after
 //! each successful handoff to `frame_tx` — exact, O(1), and immediate", with a
 //! background sweep only reclaiming credit for slots whose pump died.
@@ -23,7 +23,7 @@
 //! that grows as `O(peers x slots)` while the credit it finds does not. What
 //! that costs in CPU is not currently a measured number; the figures first
 //! quoted here were taken on a shared machine and are retracted
-//! (`examples/examples/response_plane_bench.evidence.md`).
+//! (see `docs/src/operations/response-plane-performance.md`).
 //!
 //! The correctness claim below does not depend on that measurement at all.
 //!

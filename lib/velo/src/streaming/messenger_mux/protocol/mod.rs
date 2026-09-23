@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Wire encode/decode for the messenger mux, per `BATCHING.md` § "Frame
-//! envelope" and § "Slots".
+//! Wire encode/decode for the messenger mux, per `docs/src/concepts/batched-streaming.md`
+//! § "Frame envelope" and § "Slots".
 //!
 //! Pure and synchronous: no I/O, no async, no allocation sized by an untrusted
 //! wire field. A batch is the payload of one `_stream_batch` active message:
@@ -34,8 +34,8 @@ use std::ops::Range;
 /// Mux wire version carried in every batch header.
 ///
 /// Bumped only for a change that an older peer cannot skip past. Negotiation
-/// (`messenger-mux-v1`, Stage F) already keeps unequal versions from meeting;
-/// the field is the belt to that pair of braces.
+/// (`messenger-mux-v1`) already keeps unequal versions from meeting; the
+/// field is the belt to that pair of braces.
 pub(crate) const MUX_VERSION: u8 = 1;
 
 /// Encoded size of a batch header.
@@ -45,8 +45,8 @@ pub(crate) const BATCH_HEADER_LEN: usize = 16;
 ///
 /// 13 bytes: ~33 % overhead on a 40-byte token, up from the 9-byte layout a
 /// dedicated connection could afford. The two sequences are what buy ordering
-/// now that a private TCP connection is not providing it free. `BATCHING.md`
-/// says it plainly — measure before shrinking them.
+/// now that a private TCP connection is not providing it free.
+/// `docs/src/concepts/batched-streaming.md` says it plainly — measure before shrinking them.
 pub(crate) const RECORD_HEADER_LEN: usize = 13;
 
 /// Records one batch can carry, the ceiling of the `u16` `record_count` field.
@@ -285,7 +285,7 @@ impl RecordType {
     /// silently files that variant's records under the colliding variant's
     /// label in `velo_streaming_mux_records_sent_total`, and no test in the
     /// tree catches it. Grow this match, [`RECORD_TYPE_LABELS`] and the
-    /// [`Self::from_u8`] arm together (see `agent-docs/w7-batcher-instrument-cost.md`
+    /// [`Self::from_u8`] arm together (see `docs/src/operations/response-plane-performance.md`
     /// for the named-field alternative considered and rejected for this).
     pub(crate) const fn count_index(self) -> usize {
         match self {
@@ -317,11 +317,11 @@ impl RecordType {
     /// Whether this type rides the reserved control capacity.
     ///
     /// Exactly `OpenSlot`, `CloseSlot` and `CreditUpdate` — the list
-    /// `BATCHING.md` § "Flow control" gives, and `SlotHeartbeat` is
-    /// deliberately not on it. A heartbeat dropped under saturation *is* the
-    /// per-slot saturation signal `reader_pump`'s `DETECTION_MULTIPLIER`
-    /// watches for; granting it a reserve would delete the watchdog kill that
-    /// `SATURATION.md` documents.
+    /// `docs/src/concepts/batched-streaming.md` § "Flow control" gives, and
+    /// `SlotHeartbeat` is deliberately not on it. A heartbeat dropped under
+    /// saturation *is* the per-slot saturation signal `reader_pump`'s
+    /// `DETECTION_MULTIPLIER` watches for; granting it a reserve would delete
+    /// the watchdog kill that `docs/src/operations/saturation.md` documents.
     #[cfg(test)]
     pub(crate) const fn is_control(self) -> bool {
         matches!(self, Self::OpenSlot | Self::CloseSlot | Self::CreditUpdate)

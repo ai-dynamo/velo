@@ -13,7 +13,7 @@
 //!
 //! `_stream_cancel` is **not** duplicated — the existing SPSC handler at
 //! `control.rs:152` is keyed off `sender_stream_id` and works for MPSC
-//! senders unchanged (they register in the same [`SenderRegistry`]).
+//! senders unchanged (they register in the same `SenderRegistry`).
 
 use std::sync::Arc;
 use std::time::Instant;

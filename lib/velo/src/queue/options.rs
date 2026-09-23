@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-/// Options for [`WorkQueueReceiver::next_with_options`](crate::WorkQueueReceiver::next_with_options).
+/// Options for [`WorkQueueReceiver::next_with_options`](crate::queue::WorkQueueReceiver::next_with_options).
 ///
 /// Controls batch fetching behavior: the receiver will block until `batch_size`
 /// items are collected **or** `timeout` elapses, whichever comes first.

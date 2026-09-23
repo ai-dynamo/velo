@@ -63,16 +63,10 @@ pub struct UcxConfig {
     /// RC-only list cannot wire up — UCX needs a `ud`-class transport alongside
     /// RC for wireup/keepalive.
     ///
-    /// **Do not reach for `"rc_mlx5,ud_mlx5"` against the vendored UCX today.**
-    /// The mlx5 transports register but query zero devices, because
-    /// `crates/ucx-rs/build.rs` links `uct_ib_mlx5` ahead of `uct_ib` and the
-    /// verbs memory domain wins the open. UCX answers a setting naming only
-    /// unavailable transports by falling back — silently, as far as a caller
-    /// can tell — so the symptom is a deployment that believes it is on RDMA
-    /// and is not (measured 2026-08-29,
-    /// `agent-docs/2026-08-29-rdma-phase3-hardware-checkpoint.md` §2).
-    /// `UCX_IB_MLX5_DEVX=y` in the environment forces the DEVX domain open and
-    /// is a working workaround until the link order is fixed.
+    /// UCX answers a list that names only unavailable transports by falling
+    /// back, with no error. A deployment can then believe it is on RDMA and
+    /// not be. Check the lane as `docs/src/guides/ucx-rdma.md` ("Verify the
+    /// lane") describes.
     pub tls: Option<String>,
     /// Override for `UCX_NET_DEVICES` (e.g. `"mlx5_0:1"`), applied only when
     /// the environment does not already set it.
@@ -207,8 +201,8 @@ impl UcxTransport {
     ///
     /// The authoritative count, maintained by the progress thread itself, and
     /// the one thing that can prove a registration was really released rather
-    /// than merely forgotten by a bookkeeping layer above. Phase 2 asserts on
-    /// it from `rendezvous::rdma`, which cannot reach `shared` directly.
+    /// than merely forgotten by a bookkeeping layer above. `rendezvous::rdma`
+    /// asserts on it, since it cannot reach `shared` directly.
     ///
     /// A test and diagnostics accessor: nothing on a production path reads it,
     /// which is why it carries an explicit allow rather than being deleted.
@@ -658,8 +652,8 @@ impl UcxTransportBuilder {
     /// The first operation to a peer pays UCX's lazy endpoint wireup, measured
     /// at roughly **14 ms** on a CX-7 InfiniBand fabric against a warm RDMA read
     /// of 108–229 µs. Closing an idle endpoint hands that bill to whoever uses
-    /// the peer next, which is why this is off by default and why the plan's
-    /// sign-off (D9) left it that way: an idle endpoint costs NIC resources, and
+    /// the peer next, which is why this is off by default: D9 (see
+    /// `docs/src/development/rdma-design.md`) keeps it that way: an idle endpoint costs NIC resources, and
     /// a reconnect costs two orders of magnitude more than the operation that
     /// triggers it. Turn it on when a process talks to far more peers over its
     /// lifetime than it talks to at any one time.

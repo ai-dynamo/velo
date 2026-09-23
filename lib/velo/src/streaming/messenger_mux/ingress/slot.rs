@@ -163,7 +163,7 @@ impl IngressSlot {
     /// Apply a `Data` or `SlotHeartbeat` record.
     ///
     /// `frame_seq` is compared with plain ordering rather than modulo: it is
-    /// per slot, `BATCHING.md` calls `u32` unreachable there, and the egress
+    /// per slot, `docs/src/concepts/batched-streaming.md` calls `u32` unreachable there, and the egress
     /// counter saturates instead of wrapping — so a value below `next_seq` is a
     /// duplicate and never a wrap.
     pub(super) fn apply_data(

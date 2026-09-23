@@ -4,7 +4,7 @@
 //! End-to-end coverage for the coalescing egress pump in `TcpFrameTransport`.
 //!
 //! The streaming write path packs whatever is already queued into a single
-//! `write_all` (see `lib/velo/src/streaming/BATCHING.md`). These tests pin the
+//! `write_all` (see `docs/src/concepts/batched-streaming.md`). These tests pin the
 //! three properties that make that safe:
 //!
 //! 1. **Ordering** survives coalescing — frames arrive in send order.
@@ -254,9 +254,9 @@ async fn terminal_in_same_batch_flushes_preceding_frames() {
 /// protocol removes by bucketing on destination worker rather than on stream.
 ///
 /// This test asserts the *limitation*, not a win. It exists so the boundary
-/// between what P2 (coalescing) and P4 (multiplexing) each buy is measured
+/// between what coalescing and multiplexing each buy is measured
 /// rather than assumed — and so it fails loudly if someone later claims
-/// coalescing alone solved this. See `streaming/BATCHING.md`.
+/// coalescing alone solved this. See `docs/src/concepts/batched-streaming.md`.
 #[tokio::test(flavor = "multi_thread")]
 async fn forward_pass_shape_does_not_coalesce_per_stream() {
     const STREAMS: usize = 32;

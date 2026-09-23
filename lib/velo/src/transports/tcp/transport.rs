@@ -688,8 +688,8 @@ async fn connection_writer_inner(
 
     // Coalescing writer: several queued messages become one `write_all`. See
     // `crate::transports::coalesce` for why that is wire-compatible with an
-    // unmodified peer and adds no latency, and `streaming/BATCHING.md` for the
-    // wider rationale. Messages still queued when this returns are reported by
+    // unmodified peer and adds no latency, and `docs/src/concepts/batched-streaming.md`
+    // for the wider rationale. Messages still queued when this returns are reported by
     // `connection_writer_task`'s drain.
     run_coalescing_writer(
         &mut write_half,

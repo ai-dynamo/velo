@@ -22,7 +22,7 @@ use std::sync::Arc;
 ///
 /// ```no_run
 /// # async fn example() -> Result<(), async_nats::ConnectError> {
-/// use crate::transports::nats::utils::connect;
+/// use velo::transports::nats::utils::connect;
 /// let client = connect("nats://localhost:4222").await?;
 /// # Ok(())
 /// # }
@@ -46,7 +46,7 @@ pub async fn connect(url: &str) -> Result<Arc<async_nats::Client>, async_nats::C
 ///
 /// ```no_run
 /// # async fn example() -> Result<(), async_nats::ConnectError> {
-/// use crate::transports::nats::utils::connect_with_options;
+/// use velo::transports::nats::utils::connect_with_options;
 /// let options = async_nats::ConnectOptions::new()
 ///     .name("velo-instance-1");
 /// let client = connect_with_options("nats://localhost:4222", options).await?;

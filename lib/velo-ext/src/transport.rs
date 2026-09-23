@@ -255,8 +255,8 @@ pub enum ShutdownPolicy {
 /// Out-of-tree implementors should `impl Transport for MyTransport`. The
 /// default [`set_observability`](Transport::set_observability) hook is a no-op
 /// — implementors only need to override it if they want to integrate with
-/// the runtime's metrics handle (which they recover via
-/// [`ObservabilityHook::downcast`]).
+/// the runtime's metrics handle, which arrives as an
+/// `Arc<dyn TransportObservability>`.
 pub trait Transport: Send + Sync {
     /// Unique key identifying this transport (e.g. `"tcp"`, `"grpc"`).
     fn key(&self) -> TransportKey;

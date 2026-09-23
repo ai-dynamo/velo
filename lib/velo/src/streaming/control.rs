@@ -259,8 +259,9 @@ pub enum AnchorAttachResponse {
         /// Bytes one mux slot may hold in flight.
         ///
         /// Zero here means something different from zero above: *use the
-        /// default*. The asymmetry is deliberate and `BATCHING.md` is its
-        /// authority — a credit window cannot be defaulted safely because only
+        /// default*. The asymmetry is deliberate and
+        /// `docs/src/concepts/batched-streaming.md` is its authority — a
+        /// credit window cannot be defaulted safely because only
         /// the receiver knows what it allocated, whereas the byte cap is a
         /// memory bound both sides can agree on without being told. The mux's
         /// internal `NegotiatedLimits::from_wire` is the one place that split

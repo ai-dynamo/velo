@@ -26,7 +26,7 @@
 //!   `velo_rendezvous_rdma_path_total` at the end. "It worked" is true on the
 //!   chunked path too, so the metric is the only honest answer, and the
 //!   consumer exits non-zero if it did not get the fast path.
-//! * **What a fallback looks like.** Run it with `UCX_TLS` unset to something
+//! * **What a fallback looks like.** Run it with `UCX_TLS` set to a transport
 //!   that cannot reach the peer, or with `VELO_RDMA_RENDEZVOUS_DISABLE=1`, and
 //!   it still transfers correctly — the reason label changes and the exit code
 //!   says the fast path was not used.

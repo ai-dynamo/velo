@@ -1788,11 +1788,11 @@ async fn a_prebound_slot_opens_on_the_terms_its_ticket_quotes() {
 /// with `ChannelClosed` -- a caller cannot tell the two apart from the
 /// `Ok(sender)` alone, and has already lost the item it tried to send. The
 /// fix is not "take the co-located path": zero-RTT deliberately never sets
-/// `attachment` for a claimed slot (see `BATCHING.md`), so there is no
-/// existing claim representation a co-located write could reuse without
-/// making `attachment` mean two different things depending on where the
-/// producer happened to land. Nothing in this PR claims same-worker ticket
-/// open is supported -- every zero-RTT test pairs two nodes, and the README
+/// `attachment` for a claimed slot (see `docs/src/concepts/batched-streaming.md`),
+/// so there is no existing claim representation a co-located write could
+/// reuse without making `attachment` mean two different things depending on
+/// where the producer happened to land. Same-worker ticket open is not
+/// supported -- every zero-RTT test pairs two nodes, and the README
 /// example mints on one and opens on the other -- so the fix is to fail
 /// immediately with a clear error instead of a confusing deferred one.
 #[tokio::test(flavor = "multi_thread")]

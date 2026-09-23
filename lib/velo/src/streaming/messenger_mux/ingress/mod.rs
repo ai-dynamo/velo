@@ -493,12 +493,10 @@ pub(crate) fn handle_batch(
     // to the doorbell was measured and is not an option: the doorbell is a
     // per-peer, rate-limited, single-task walk, and every stream in the serving
     // shape sends about four records more than its initial window, so the tail
-    // of every stream waited on it. `BATCHING.md` § "Addendum, 2026-09-05: the
-    // arrival path also returns the credit of every slot that drained" has the
-    // numbers. Credit still does not come back *from* the pump, for the reason
-    // the 2026-09-01 addendum gives under "The pump rings a doorbell; it does
-    // not release credit": releasing there means taking this peer's mutex per
-    // record.
+    // of every stream waited on it. `docs/src/development/batched-streaming-design.md`
+    // has the numbers for why the arrival path also returns the credit of
+    // every slot that drained. Credit still does not come back *from* the
+    // pump: releasing there means taking this peer's mutex per record.
     list_drained_slots(&mut state);
     collect_touched_grants(&mut state, &mut outcome.replies);
     outcome

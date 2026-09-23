@@ -13,14 +13,14 @@
 //! | Backend | Feature | Description |
 //! |---------|---------|-------------|
 //! | [`InMemoryBackend`](backends::memory::InMemoryBackend) | *(always)* | `DashMap` + `flume` channels, for testing |
-//! | [`MessengerQueueBackend`](backends::messenger::MessengerQueueBackend) | `messenger` | Actor on a velo instance via active messages |
-//! | [`NatsQueueBackend`](backends::nats::NatsQueueBackend) | `nats` | NATS JetStream with WorkQueue retention |
+//! | [`MessengerQueueBackend`](backends::messenger::MessengerQueueBackend) | `queue-messenger` | Actor on a velo instance via active messages |
+//! | [`NatsQueueBackend`](backends::nats::NatsQueueBackend) | `nats-queue` | NATS JetStream with WorkQueue retention |
 //!
 //! ## Quick Start
 //!
 //! ```rust,no_run
 //! use serde::{Serialize, Deserialize};
-//! use crate::queue::{sender, receiver, backends::memory::InMemoryBackend};
+//! use velo::queue::{sender, receiver, backends::memory::InMemoryBackend};
 //!
 //! #[derive(Serialize, Deserialize, Debug, PartialEq)]
 //! struct Job { id: u64, payload: String }

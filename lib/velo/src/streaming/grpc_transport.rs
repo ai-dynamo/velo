@@ -10,8 +10,8 @@
 //!
 //! Endpoint resolution: there is no endpoint string in the streaming attach
 //! handshake. The transport advertises its listener interface(s) via
-//! [`Self::address`]. Peers are registered via [`Self::register`], which
-//! caches a [`SocketAddr`] keyed by [`WorkerId`]. [`Self::connect`] looks up
+//! `address`. Peers are registered via `register`, which
+//! caches a [`SocketAddr`] keyed by [`WorkerId`]. `connect` looks up
 //! the cached SocketAddr and dials it.
 
 use std::net::SocketAddr;

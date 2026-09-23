@@ -251,8 +251,8 @@ impl RdmaEndpoint {
     /// The memory must stay allocated and un-freed until the matching
     /// [`unmap_region`](Self::unmap_region) resolves (or the transport has shut
     /// down): UCX holds the pages pinned and a peer holding the packed rkey can
-    /// read them at any time. Phase 2's registration layer owns that contract
-    /// for callers outside this module; nothing here can enforce it.
+    /// read them at any time. The registration layer in `rendezvous::rdma` owns
+    /// that contract for callers outside this module; nothing here can enforce it.
     ///
     /// **Cancellation rolls the registration back.** Dropping this future means
     /// no region exists under the id it was minting — the progress thread either
@@ -540,8 +540,8 @@ pub(crate) fn validate_packed_rkey(packed: &[u8]) -> Result<(), RmaError> {
 /// error: the unpack succeeds against a real local memory domain, the GET
 /// posts, and `uct_rc_verbs` escalates the HCA completion error to `ucs_fatal`,
 /// aborting the process. Over `UCX_TLS=tcp` the same blob comes back as an
-/// ordinary `Err`, so no tcp-only test can reach the class (measured
-/// 2026-08-29, `agent-docs/2026-08-29-rdma-phase3-hardware-checkpoint.md` §3).
+/// ordinary `Err`, so no tcp-only test can reach the class (see
+/// `docs/src/operations/rdma-performance.md`).
 ///
 /// What keeps that unreachable is D3 — single-use rkeys plus revalidation at
 /// every acquire — not this function. Anything that lets an rkey outlive its

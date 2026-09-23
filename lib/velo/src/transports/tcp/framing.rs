@@ -285,7 +285,7 @@ impl TcpFrameCodec {
         Ok(())
     }
 
-    /// Encode and write a frame synchronously. See [`encode_frame`] for the
+    /// Encode and write a frame synchronously. See [`Self::encode_frame`] for the
     /// coalescing rationale.
     #[inline]
     pub fn encode_frame_sync<W: Write>(

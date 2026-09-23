@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Credit bookkeeping for the messenger mux, per `BATCHING.md` § "Flow
-//! control".
+//! Credit bookkeeping for the messenger mux, per `docs/src/concepts/batched-streaming.md`
+//! § "Flow control".
 //!
 //! Pure and synchronous. Two ledgers, because the two sides of a slot keep
 //! different books:
@@ -85,8 +85,8 @@ pub(crate) enum NegotiationError {
 /// MPSC anchor capacity is caller-configurable, so the receiver advertises what
 /// it can absorb rather than both sides assuming a constant.
 ///
-/// The two zero values do **not** mean the same thing, and `BATCHING.md` is the
-/// authority on the difference: `initial_credit = 0` is a legacy peer and the
+/// The two zero values do **not** mean the same thing, and `docs/src/concepts/batched-streaming.md`
+/// is the authority on the difference: `initial_credit = 0` is a legacy peer and the
 /// mux is unusable, while `slot_byte_budget = 0` merely means "use the
 /// default".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -424,8 +424,8 @@ impl SlotCreditAccount {
     /// even staged, so from here until the write the batch carrying it holds
     /// the only copy of that credit. A batch thrown away rather than written
     /// hands it back — see `Batcher::repost_staged_credit` — which is what
-    /// keeps the zeroing safe. `agent-docs/w7-reply-linger-credit-loss.md`
-    /// records the loss this used to be and the 2026-09-11 addendum the fix.
+    /// keeps the zeroing safe. `docs/src/development/batched-streaming-design.md`
+    /// records the loss this used to be and the fix.
     pub(crate) fn take_pending_grant(&mut self) -> Option<u32> {
         let delta = self.ungranted;
         if delta == 0 {

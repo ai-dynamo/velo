@@ -4,11 +4,10 @@
 //! The rendezvous RDMA path, end to end over `UCX_TLS=tcp`.
 //!
 //! Same code path as an RDMA lane with no hardware requirement, so this runs on
-//! stock CI runners. What tcp cannot see is recorded in the plan's
-//! test-fidelity ledger; what it *can* see is every decision this phase makes:
-//! which path an acquire takes, what happens when a descriptor is malformed,
-//! what happens when the GET fails, and what the owner does about a consumer
-//! that never comes back.
+//! stock CI runners. It cannot see everything a real RDMA lane can, but it can
+//! see every decision the rendezvous path makes: which path an acquire takes,
+//! what happens when a descriptor is malformed, what happens when the GET
+//! fails, and what the owner does about a consumer that never comes back.
 //!
 //! # Assertions are on the path metric, not on timing
 //!
@@ -1073,9 +1072,9 @@ async fn a_failed_write_after_the_fallback_returns_its_fresh_lease() {
 /// A consumer that takes an RDMA lease and never comes back has its lease
 /// force-released, and the slot goes with it.
 ///
-/// This is the leak PR #40 shipped: the owner cannot see an RDMA GET finish, so
-/// without a deadline a crashed consumer's read lock *and* its reference are
-/// held forever and the slot is immortal.
+/// This is the leak that shipped without a lease deadline: the owner cannot
+/// see an RDMA GET finish, so a crashed consumer's read lock *and* its
+/// reference are held forever and the slot is immortal.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_reaper_force_releases_an_abandoned_lease() {
     let pair = Pair::with_configs(

@@ -5,9 +5,11 @@
 //!     own the native UCX libraries; downstream crates read `DEP_UCX_RS_*`.
 //!     NOT `links = "ucx"` — `lamellar-ucx-sys` 0.1.0 already claims that key on
 //!     crates.io (verified), and cargo hard-errors on a collision.
-//!   * Emits every link flag needed to statically absorb UCX into the consumer,
-//!     including the `-Wl,--undefined=` constructor forcing that the shipped
-//!     `.pc` files document. Miss one of those and UCX links but mis-initialises.
+//!   * Emits every link flag needed to statically absorb UCX into the consumer.
+//!     The constructors that the shipped `.pc` files force with
+//!     `-Wl,--undefined=` are kept alive by `#[used]` symbol references in
+//!     `src/lib.rs` instead (see the constructor note below). Miss one and UCX links but
+//!     mis-initialises.
 //!
 //! Escape hatch: set `UCX_DIR=/opt/ucx` to link a preinstalled UCX (>= 1.17)
 //! instead of building the vendored tarball.

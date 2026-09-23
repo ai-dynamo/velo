@@ -43,13 +43,14 @@
 //! instance has keys out to, and the safety of a [`PinnedBuf`] rests on that
 //! trust domain — not on the borrow checker, which cannot see the NIC.
 //!
-//! A consequence for Phase 3: a GET destination should be expressed as
-//! `&mut PinnedBuf`, so the exclusion against *local* readers is carried by the
-//! borrow checker for the duration of the transfer, instead of by a convention
-//! about who holds the buffer. Handing a shared reference to a range the NIC is
-//! actively filling would be a race Rust would otherwise let through silently.
+//! A GET destination is therefore borrowed with `&mut` (see `rdma_destination`
+//! in `rendezvous::write`), so the exclusion against *local* readers is
+//! carried by the borrow checker for the duration of the transfer, instead of
+//! by a convention about who holds the buffer. Handing a shared reference to a
+//! range the NIC is actively filling would be a race Rust would otherwise let
+//! through silently.
 //!
-//! # Reclamation (Phase 4)
+//! # Reclamation
 //!
 //! Arenas are append-only until something gives them back. Two things do, and
 //! they are deliberately different because the risk is different.
@@ -72,8 +73,8 @@
 //! **Empty dedicated arenas, unconditionally.** A dedicated arena backs exactly
 //! one oversize request and is never offered to the general search, so once its
 //! single suballocation is gone it can never be used again — it is pure charge
-//! against the budget. Phase 2 shipped with no way to give one back, and said so
-//! on [`RdmaPoolConfig::dedicated_arena_min`]: a workload staging repeatedly at
+//! against the budget. An earlier version shipped with no way to give one
+//! back, and said so on [`RdmaPoolConfig::dedicated_arena_min`]: a workload staging repeatedly at
 //! that size walked into the registered-bytes budget within a session and fell
 //! back to chunked from then on. Reclaiming these needs no timer and no
 //! retention, and closing that gap is not optional enough to hide behind a knob.
@@ -117,8 +118,8 @@ pub struct RdmaPoolConfig {
     /// MiB on a 1 GiB object.
     ///
     /// A dedicated arena is never offered to the general search, so once its one
-    /// suballocation is dropped nothing can ever use it again. Phase 2 shipped
-    /// with no way to give one back, and the consequence was written down here:
+    /// suballocation is dropped nothing can ever use it again. An earlier
+    /// version shipped with no way to give one back, and the consequence was written down here:
     /// a workload repeatedly staging at or above this size walked into
     /// [`registered_bytes_budget`](Self::registered_bytes_budget) within a
     /// single session (16 allocations at the defaults) and fell back to chunked
@@ -137,7 +138,7 @@ pub struct RdmaPoolConfig {
     /// A mostly-empty arena still costs its full size.
     ///
     /// Over budget, [`ArenaSet::alloc`] answers [`RdmaError::BudgetExceeded`]
-    /// and Phase 3's callers stage chunked instead — pool exhaustion is never a
+    /// and `rdma_pull`'s callers stage chunked instead — pool exhaustion is never a
     /// hard failure of the staging operation (D4).
     pub registered_bytes_budget: u64,
     /// Unmap a pooled arena that has been **empty** for this long. `None` (the
@@ -217,9 +218,9 @@ const NOT_EMPTY: u64 = u64::MAX;
 
 /// Where some registered bytes currently live, as a peer would address them.
 ///
-/// Deliberately **not** `Serialize`: the wire descriptor is D7's business and
-/// ships in Phase 3. Deriving an encoding here would pre-commit a wire shape
-/// before the version / flags / backend framing exists.
+/// Deliberately **not** `Serialize`: the wire descriptor is `rendezvous::descriptor`'s
+/// business (D7). Deriving an encoding here would duplicate the version /
+/// flags / backend framing that module already owns.
 #[derive(Debug, Clone)]
 pub(crate) struct RemoteRef {
     /// Absolute address in this process's address space.
@@ -960,7 +961,7 @@ impl ArenaSet {
     /// Cut `len` registered bytes out of the pool, growing it if needed.
     ///
     /// [`RdmaError::BudgetExceeded`] is the expected refusal under pressure;
-    /// Phase 3's callers answer it by staging chunked, so it is a routing
+    /// `rdma_pull`'s callers answer it by staging chunked, so it is a routing
     /// decision rather than a failure.
     pub(crate) async fn alloc(&self, len: usize) -> Result<PinnedBuf, RdmaError> {
         if len == 0 {

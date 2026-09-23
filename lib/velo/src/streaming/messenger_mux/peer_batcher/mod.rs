@@ -4,8 +4,8 @@
 //! The per-peer egress batcher — one task, one peer, every stream to it.
 //!
 //! A node talking to Y peers holds Y of these however many streams it holds,
-//! which is the whole O(X) → O(Y) argument in `BATCHING.md` § "Riding the
-//! Messenger" made concrete. The batcher owns the slot table for its peer, packs
+//! which is the whole O(X) → O(Y) argument in `docs/src/concepts/batched-streaming.md`
+//! § "Riding the Messenger" made concrete. The batcher owns the slot table for its peer, packs
 //! records from every slot into `_stream_batch` active messages, and is the one
 //! place that decides when a batch is cut.
 //!
@@ -23,8 +23,8 @@
 //!
 //! The other direction of the same coin: **any** failed admission is epoch
 //! death. `FireResult` erases `AdmissionError` into a string, so the
-//! `{ConnectionReplaced, ChannelClosed}` pair `BATCHING.md` names cannot be
-//! matched on — but the superset is the correct rule anyway. A batch that never
+//! `{ConnectionReplaced, ChannelClosed}` pair `docs/src/concepts/batched-streaming.md`
+//! names cannot be matched on — but the superset is the correct rule anyway. A batch that never
 //! reached the wire leaves a `frame_seq` gap in every slot packed into it, and
 //! the mux does not retransmit, so those slots can never make progress again.
 //! Failing them and bumping the epoch is what makes "exactly one `Dropped` per
@@ -90,8 +90,8 @@ use crate::streaming::messenger_mux::flow_control::{CreditClass, SlotCredit};
 use crate::streaming::sender::is_terminal_sentinel;
 use crate::transports::AdmissionState;
 
-/// The per-peer batcher registry, keyed by the batching key from `BATCHING.md`
-/// § "Why bucketing by destination is free".
+/// The per-peer batcher registry, keyed by the batching key from
+/// `docs/src/concepts/batched-streaming.md` § "Why bucketing by destination is free".
 pub(crate) type BatcherMap = DashMap<WorkerId, Arc<BatcherHandle>>;
 
 /// Attach requests queued for a batcher.
@@ -708,8 +708,8 @@ impl Batcher {
         // peer in the rig is registered long before its first stream opens —
         // and removing even that one belongs to a per-class `batch_seq`, a
         // follow-up scoped and tracked in
-        // `agent-docs/w4a-async-open-ack-status.md` rather than a fix owed
-        // here.
+        // `docs/src/operations/response-plane-performance.md` rather than a
+        // fix owed here.
         let seq = self.open_seq(id);
         self.fire_singleton(id, FenceSkip::IfAdmitted, |encoder| {
             encoder.push_open_slot(id, seq, anchor_id, session_id)
@@ -744,7 +744,7 @@ impl Batcher {
     /// just below, which does record it. The always-fences behavior itself is
     /// unconditional because a rendezvous record's bytes are resolved by the
     /// receiver's ordered dispatcher in a detached task before dispatch
-    /// (`BATCHING.md` § "Slots"), so nothing about the *sender's* admission
+    /// (`docs/src/concepts/batched-streaming.md` § "Slots"), so nothing about the *sender's* admission
     /// order says anything about the order the receiver applies it in.
     ///
     /// The `tokio::spawn` below always watches the admission — even an
@@ -975,8 +975,7 @@ impl Batcher {
         // in — drifts up by a batch per epoch death and cries wolf. The credit
         // that batch was carrying does not go with it: `repost_staged_credit`
         // below hands it back, because the ingress slots it belongs to outlive
-        // the epoch. See agent-docs/w7-reply-linger-credit-loss.md and its
-        // 2026-09-11 addendum.
+        // the epoch. See `docs/src/development/batched-streaming-design.md`.
         self.gate.discarded();
         self.repost_staged_credit();
         self.writer

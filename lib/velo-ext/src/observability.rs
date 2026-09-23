@@ -102,7 +102,7 @@ pub trait TransportObservability: Send + Sync {
     /// Record an accepted frame.
     ///
     /// `message_type` is one of the well-known
-    /// [`MessageType`](crate::transport::MessageType) label strings:
+    /// [`MessageType`] label strings:
     /// `"message"`, `"response"`, `"ack"`, `"event"`, or `"shutting_down"`.
     ///
     /// For `direction: Inbound, message_type: "message"`, the runtime derives

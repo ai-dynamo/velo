@@ -32,8 +32,7 @@ pub struct InstanceId(Uuid);
 impl InstanceId {
     /// Create a new random v4 InstanceId.
     ///
-    /// This is exposed for testing and special cases. In production, use
-    /// [`InstanceFactory::create()`] instead.
+    /// This is exposed for testing and special cases.
     pub fn new_v4() -> Self {
         loop {
             let instance_id = InstanceId(Uuid::new_v4());

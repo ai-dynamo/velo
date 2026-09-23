@@ -9,7 +9,7 @@
 //! required by any RDMA stack), and `UCX_TLS=tcp` runs the identical code
 //! path with no RDMA hardware at all (which is how CI exercises this module).
 //!
-//! Architecture (see `docs/proposals/ibverbs-transport.md` §11 for the full
+//! Architecture (see `docs/src/development/rdma-design.md` for the full
 //! design record and the measurements behind each choice):
 //!
 //! * **No listener.** The `WorkerAddress` blob carries the packed
@@ -29,9 +29,8 @@
 //! [`AdmissionGate`]: crate::transports::AdmissionGate
 
 mod address;
-// The RMA surface is Phase 1 of the rendezvous RDMA work: the mechanics land
-// first, the registration layer that calls them lands in Phase 2, so most of
-// this module has no in-crate caller yet outside its tests.
+// The RMA surface backs the rendezvous registration layer in `rendezvous::rdma`;
+// some items here have no caller yet outside this module's own tests.
 #[allow(dead_code)]
 pub(crate) mod rma;
 mod transport;

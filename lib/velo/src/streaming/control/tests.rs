@@ -238,7 +238,7 @@ async fn reader_pump_unclaimed_bind_reap_increments_counter() {
 /// the `try_send(Dropped)` cannot land, so the consumer sees a clean EOF
 /// instead of `StreamFrame::Dropped`. The watchdog firing counter is the
 /// authoritative operator signal — it must still tick. See
-/// `lib/velo/src/streaming/SATURATION.md` for the documented behavior
+/// `docs/src/operations/saturation.md` for the documented behavior
 /// this test pins in place.
 #[tokio::test(flavor = "multi_thread")]
 async fn reader_pump_watchdog_saturated_channel_drops_sentinel_silently() {
@@ -297,8 +297,9 @@ async fn reader_pump_watchdog_saturated_channel_drops_sentinel_silently() {
 
     // Consumer drains the pre-filled byte, then sees clean EOF -- not a
     // Dropped sentinel. This is the documented saturated-cascade behavior
-    // (SATURATION.md): the warn-log + watchdog firing counter are
-    // authoritative; the consumer-visible terminal frame is best-effort.
+    // (docs/src/operations/saturation.md): the warn-log + watchdog firing
+    // counter are authoritative; the consumer-visible terminal frame is
+    // best-effort.
     let pre_existing = frame_rx
         .try_recv()
         .expect("the pre-filled byte must be drainable");
@@ -790,7 +791,7 @@ async fn test_anchor_cancel_handler() {
 }
 
 // -----------------------------------------------------------------------
-// reader_pump tests (Plan 08-03, Task 2)
+// reader_pump tests
 // -----------------------------------------------------------------------
 
 /// Helper: set up infrastructure for reader_pump tests.

@@ -225,8 +225,8 @@ async fn a_starved_slot_keeps_draining_so_a_synchronous_terminal_never_blocks() 
 
 /// Run-ahead past the byte cap kills that slot, and only that slot.
 ///
-/// This is the per-slot slow-consumer kill `BATCHING.md` prefers to the
-/// heartbeat watchdog: deterministic, scoped, and metered.
+/// This is the per-slot slow-consumer kill `docs/src/concepts/batched-streaming.md`
+/// prefers to the heartbeat watchdog: deterministic, scoped, and metered.
 #[tokio::test(flavor = "multi_thread")]
 async fn withheld_overflow_closes_the_starved_slot_and_leaves_the_others_alone() {
     let harness = harness(MuxConfig {
@@ -383,8 +383,8 @@ async fn a_terminal_spends_the_reserve_when_data_credit_is_gone() {
 /// mistake for a bug. Letting the terminal past would reorder the stream — the
 /// consumer would see the end before records it is owed — so the terminal waits,
 /// and what ends the stream is `reader_pump`'s heartbeat watchdog on the
-/// consumer's side, which is the mechanism `SATURATION.md` documents for a
-/// consumer that stopped draining. The other exit is the byte cap: a producer
+/// consumer's side, which is the mechanism `docs/src/operations/saturation.md`
+/// documents for a consumer that stopped draining. The other exit is the byte cap: a producer
 /// that keeps sending gets the per-slot kill instead.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_terminal_behind_starved_predecessors_waits_for_them() {

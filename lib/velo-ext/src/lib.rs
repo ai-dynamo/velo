@@ -5,9 +5,8 @@
 
 //! Extension trait surface for Velo.
 //!
-//! Out-of-tree implementors of [`Transport`](transport::Transport),
-//! [`FrameTransport`](streaming::FrameTransport), and
-//! [`PeerDiscovery`](discovery::PeerDiscovery) depend on this crate. It
+//! Out-of-tree implementors of [`Transport`], [`FrameTransport`], and
+//! [`PeerDiscovery`] depend on this crate. It
 //! contains the trait definitions and the value/error types that appear in
 //! their signatures — nothing more. Anyone who only *uses* Velo should depend
 //! on the `velo` crate; only plugin authors should reach for `velo-ext`.

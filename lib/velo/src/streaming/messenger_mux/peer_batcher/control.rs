@@ -8,7 +8,7 @@
 //! admission — the peer is congested, which is exactly when its ingress lane is
 //! busiest returning credit — and a stalled batcher facing a peer that keeps
 //! sending grows that queue without bound. Unbounded *and* unread is the shape
-//! `BATCHING.md` warns about for lane channels, reproduced one layer up.
+//! `docs/src/concepts/batched-streaming.md` warns about for lane channels, reproduced one layer up.
 //!
 //! So control is state, not a queue. Every entry is keyed by slot and merged in
 //! place:

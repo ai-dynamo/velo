@@ -408,7 +408,7 @@ async fn shutdown_fails_queued_sends() {
 /// A page-aligned heap allocation owned by the test frame.
 ///
 /// Registered memory must stay allocated for as long as UCX has it pinned.
-/// Phase 2's arena pool owns that concern for real callers; here every test
+/// The arena pool in `rendezvous::rdma` owns that concern for real callers; here every test
 /// declares its buffers *before* its [`Node`]s so they drop last, and unmaps or
 /// shuts down explicitly before returning.
 struct PageBuf {
@@ -821,11 +821,10 @@ async fn get_unknown_peer() {
 /// The printed size settles the `md_map` question for CI: over `UCX_TLS=tcp`
 /// the measured packed rkey is exactly **9 bytes** — the header alone, with no
 /// per-memory-domain key material, because the tcp MD registers nothing. Real
-/// InfiniBand packs a key per MD on top of that: measured **20 B** on
-/// 2026-08-29 (`agent-docs/2026-08-29-rdma-phase3-hardware-checkpoint.md` §6),
-/// on a build whose mlx5 memory domain never opened. An independent probe on a
-/// DEVX memory domain measured 19 B on the same UCX
-/// (`docs/proposals/ibverbs-transport.md:919-920`).
+/// InfiniBand packs a key per MD on top of that: measured **20 B** (see
+/// `docs/src/operations/rdma-performance.md`), on a build whose mlx5 memory
+/// domain never opened. An independent probe on a DEVX memory domain measured
+/// 19 B on the same UCX (see `docs/src/development/rdma-design.md`).
 ///
 /// So the size is memory-domain-dependent, and `>= 9` stays the tightest bound
 /// CI can assert. Tightening it to the 20 would pin a value that build produces
@@ -1154,8 +1153,8 @@ async fn out_of_range_mem_type_is_refused_before_ucx() {
 /// The rejection is not. On InfiniBand a local mlx5 memory domain *does*
 /// correspond, `ucp_ep_rkey_unpack` succeeds, the GET posts with unusable key
 /// material, and `uct_rc_verbs` escalates the HCA completion error to
-/// `ucs_fatal` — **this same blob aborts the process** (measured 2026-08-29,
-/// `agent-docs/2026-08-29-rdma-phase3-hardware-checkpoint.md` §3). The name
+/// `ucs_fatal` — **this same blob aborts the process** (see
+/// `docs/src/operations/rdma-performance.md`). The name
 /// says `over_tcp` because reading it as a statement about the class would be
 /// reading it as "this failure mode is contained", which is the opposite of
 /// what the hardware run found.
@@ -2359,7 +2358,7 @@ async fn eager_wireup_and_the_reaper_compose() {
 /// Register / transfer / release, repeatedly, asserting the transport-side
 /// lifecycle counters return to where they started every cycle.
 ///
-/// The soak the plan names, at the transport layer: what it can prove that a
+/// The transport-layer soak: what it can prove that a
 /// single round trip cannot is that nothing *accumulates* — not registrations,
 /// not unpacked keys, not endpoints. The registration-layer half of the same
 /// property (registered bytes returning to baseline) lives in

@@ -255,8 +255,8 @@ pub(super) struct EgressSlot {
     gate: Arc<SlotGate>,
     /// A singleton sent outside the batch is outstanding for this slot — a
     /// rendezvous transfer, or the `OpenSlot` under `MuxConfig::async_open_ack`
-    /// whose admission did not resolve synchronously. `BATCHING.md` §
-    /// "Slots": at most one *fenced* singleton per slot, and the slot's later
+    /// whose admission did not resolve synchronously. `docs/src/concepts/batched-streaming.md`
+    /// § "Slots": at most one *fenced* singleton per slot, and the slot's later
     /// records wait for its admission so `frame_seq` order survives the
     /// unordered resolve. Only an `OpenSlot` the transport admitted
     /// synchronously ever skips this — per-target FIFO already orders anything
@@ -327,7 +327,7 @@ impl EgressSlot {
     /// Take the next `frame_seq` for a record this side is emitting.
     ///
     /// Saturating rather than wrapping: `u32` per slot is unreachable in
-    /// practice (`BATCHING.md` says so explicitly), and wrapping to zero would
+    /// practice (`docs/src/concepts/batched-streaming.md` says so explicitly), and wrapping to zero would
     /// silently tell the receiver that every subsequent record is a stale
     /// duplicate.
     pub(super) fn take_seq(&mut self) -> u32 {
