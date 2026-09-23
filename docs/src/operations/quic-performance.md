@@ -29,7 +29,7 @@ The transport lowers `max_mtu` to 6550 and logs a warning. The test `large_frame
 
 ## Loopback measurements
 
-Measured on 2026-09-23 on one aarch64 workstation (20 cores, shared, load average near 8), over loopback, with the `throughput` example and 5,000 messages for each cell. Two reps for each configuration. These numbers show direction only. The cluster sweep gives the numbers that count.
+Measured on 2026-09-23 on one aarch64 workstation (20 cores, shared, load average near 8), over loopback, with the `throughput` example and 5,000 messages for each cell. Two reps for each configuration. These numbers show direction only. For the numbers on a cluster, see [Response plane on a cluster](#response-plane-on-a-cluster).
 
 | Case | TCP | QUIC, default | QUIC, `max_mtu` 6550 |
 |---|---|---|---|
@@ -62,3 +62,37 @@ Measured on the same workstation with `response_plane_bench` (2 anchor hosts, 64
 | QUIC, `max_mtu` 6550 | 7,500–9,600 | 54–102 | 2.1–2.3 | 0.58–0.69 |
 
 In the two quieter reps, QUIC matched TCP on throughput and first-token latency (11,300 and 11,000 against 11,600 and 11,000 requests/s). It used 15% to 30% more CPU for each request. The mux batches many token records into each frame, so the per-message cost of QUIC matters less here than in the one-at-a-time tests. `max_mtu` 6550 was slower in all three reps with these small frames. Use it only for traffic with large messages.
+
+## Response plane on a cluster
+
+Measured on 2026-09-23 with Dynamo's response plane on two nodes. Each node has 144 Grace aarch64 cores. The nodes connect through 200G Ethernet at MTU 1500. One node runs the frontend, etcd, NATS, and the load generator. The frontend has cores 0-71 and the load generator has cores 72-143. The other node runs 512 mock workers in 8 processes. Each run sends 250,000 requests at concurrency 8,192, with 1,024 input tokens and 256 output tokens. Each configuration ran three times, and the runs of the four configurations alternated.
+
+The hosts have `net.core.rmem_max` and `net.core.wmem_max` at 212,992. The transport requests 8 MiB and 4 MiB for each socket, and the kernel gives 425,984 bytes. The transport logs one receive-buffer and one send-buffer clamp warning for each socket. The frontend used 32 server endpoints. The workers used the default of 4.
+
+The configurations:
+
+- **Velo, TCP.** The messenger mux over the TCP transport. The frontend mints the stream terms at registration (zero-RTT attach), and batches write when the transport admits them.
+- **Velo, QUIC.** The same configuration over the QUIC transport.
+- **Multiplexed TCP.** A multiplexed TCP response plane that does not use velo, for reference.
+- **Dynamo QUIC.** Dynamo's own QUIC response plane on quinn 0.11.12, with 32 server endpoints and no batch interval.
+
+A mock-worker process that holds a share of the 8,192 open requests answers late. Throughput and first-token latency change with the number of these processes in a run. The table therefore compares runs with the same number, shown as "Holders". Steady state is the requests that started 10 s or more after the first request. ITL is the mean inter-token latency of each request. CPU is frontend CPU time for each request. Drops is the `RcvbufErrors` count of the frontend host for the run.
+
+| Configuration | Holders | Runs | Requests/s | TTFT p50 (ms) | TTFT p99 (ms) | ITL p99 (ms) | CPU (ms/request) | Drops |
+|---|---|---|---|---|---|---|---|---|
+| Velo, TCP | 1 | 1 | 2,282 | 41.9 | 227 | 105 | 12.0 | 0 |
+| Velo, QUIC | 1 | 2 | 2,212–2,246 | 40.7–42.7 | 232–236 | 107–110 | 12.2–12.6 | 3,898–5,818 |
+| Multiplexed TCP | 1 | 1 | 2,371 | 45.8 | 216 | 101 | 9.9 | 0 |
+| Dynamo QUIC | 1 | 1 | 2,109 | 42.4 | 248 | 115 | 13.8 | 160,179 |
+| Velo, TCP | 2 | 1 | 2,760 | 41.1 | 115 | 49 | 13.1 | 0 |
+| Velo, QUIC | 2 | 1 | 2,742 | 38.9 | 112 | 45 | 13.1 | 5,132 |
+| Multiplexed TCP | 2 | 2 | 2,825–2,912 | 44.7–45.5 | 108–111 | 47–49 | 10.0 | 0 |
+| Dynamo QUIC | 2 | 2 | 2,328–2,496 | 38.9–39.1 | 123–148 | 51–68 | 14.0–14.4 | 82,184–94,359 |
+
+TTFT p50 and p99 are steady-state values. One run of Velo over TCP had 7 holders and is not in the table. No run had client errors.
+
+- **QUIC shows no cost for velo here.** At the same number of holders, velo over QUIC and velo over TCP agree on throughput, latency, and CPU. The differences are 1% to 5%, and one or two runs for each cell cannot resolve them. On loopback, QUIC used 15% to 30% more CPU for each request. On the cluster, most of the frontend CPU is outside the transport, and the mux puts many records in each frame.
+- **The clamped buffer loses about 0.1% of datagrams.** With 32 endpoints, the velo frontend received 4.7 to 5.3 million datagrams in each run and dropped about 0.1% of them. The drops did not show in the tail latency.
+- **Velo over QUIC is ahead of Dynamo QUIC.** With 2 holders, velo moved 2,742 requests/s against 2,328 to 2,496. It also had a lower first-token p99, a lower ITL p99, and 6% to 9% less CPU. The Dynamo frontend dropped 16 to 18 times as many datagrams with 2 holders, and 27 to 41 times as many with 1 holder. It received about 0.7 datagrams for each output token, against 0.07 to 0.08 for velo. With the batch interval at 0, Dynamo sends close to one packet for each token record. The velo mux puts many records in each frame. Dynamo's default interval of 5 ms was not measured.
+- **`max_mtu` 6550 was not measured.** The path MTU of the cluster is 1500, so a larger `max_mtu` has no effect.
+
