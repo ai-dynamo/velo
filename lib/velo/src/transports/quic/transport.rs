@@ -852,7 +852,7 @@ impl Default for QuicTransportBuilder {
 /// Server sockets in the reuse-port group by default. Dynamo's QUIC plane
 /// measured 8 and 32 on a frontend; 32 cost about 50 MiB of RSS. A frontend
 /// sets a higher count with [`QuicTransportBuilder::server_endpoints`].
-const DEFAULT_SERVER_ENDPOINTS: usize = 4;
+pub(crate) const DEFAULT_SERVER_ENDPOINTS: usize = 4;
 /// Largest packet size at which quinn's send batches still fit in one UDP
 /// datagram: 65507 bytes of UDP payload over quinn's 10-packet batch.
 ///
@@ -864,7 +864,7 @@ const DEFAULT_SERVER_ENDPOINTS: usize = 4;
 /// 64 KiB messages: 2,666 msg/s at 6550 bytes, 115 msg/s at 6560.
 pub(super) const GSO_SAFE_MAX_MTU: u16 = (65_507 / 10) as u16;
 
-pub(super) fn clamp_to_gso_batch(requested: u16) -> u16 {
+pub(crate) fn clamp_to_gso_batch(requested: u16) -> u16 {
     if requested > GSO_SAFE_MAX_MTU {
         warn!(
             requested,
@@ -875,8 +875,8 @@ pub(super) fn clamp_to_gso_batch(requested: u16) -> u16 {
     requested.min(GSO_SAFE_MAX_MTU)
 }
 
-const DEFAULT_UDP_RECV_BUFFER: usize = 8 * 1024 * 1024;
-const DEFAULT_UDP_SEND_BUFFER: usize = 4 * 1024 * 1024;
+pub(crate) const DEFAULT_UDP_RECV_BUFFER: usize = 8 * 1024 * 1024;
+pub(crate) const DEFAULT_UDP_SEND_BUFFER: usize = 4 * 1024 * 1024;
 
 #[cfg(test)]
 #[path = "tests.rs"]

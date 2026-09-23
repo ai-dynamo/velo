@@ -14,10 +14,14 @@
 //! fingerprint travels in the `WorkerAddress` entry, and dialers accept only
 //! that certificate.
 
-mod endpoint;
+pub(crate) mod endpoint;
 mod listener;
 pub mod tls;
 mod transport;
 
 pub use endpoint::QuicEndpointInfo;
 pub use transport::{QuicTransport, QuicTransportBuilder};
+// The streaming `QuicFrameTransport` shares the sockets, TLS, and MTU limit.
+pub(crate) use transport::{
+    DEFAULT_SERVER_ENDPOINTS, DEFAULT_UDP_RECV_BUFFER, DEFAULT_UDP_SEND_BUFFER, clamp_to_gso_batch,
+};

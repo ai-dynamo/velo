@@ -38,9 +38,9 @@ impl QuicEndpointInfo {
 
 /// Requested and effective UDP buffer sizes of one socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct BufferSizes {
-    pub(super) recv: usize,
-    pub(super) send: usize,
+pub(crate) struct BufferSizes {
+    pub(crate) recv: usize,
+    pub(crate) send: usize,
 }
 
 /// Bind the server sockets: `count` sockets on one port.
@@ -54,7 +54,7 @@ pub(super) struct BufferSizes {
 /// The first socket binds without `SO_REUSEPORT` and joins after the bind.
 /// With a requested port of 0, this stops the kernel from picking a port
 /// that an unrelated reuse-port group already holds.
-pub(super) fn bind_server_sockets(
+pub(crate) fn bind_server_sockets(
     requested: SocketAddr,
     count: usize,
     buffers: BufferSizes,
@@ -100,7 +100,7 @@ pub(super) fn bind_server_sockets(
 /// It is separate from the server sockets and has its own ephemeral port. A
 /// dial from a reuse-port member would get its replies hashed to any member
 /// of the group, and a member that does not own the connection drops them.
-pub(super) fn bind_client_socket(
+pub(crate) fn bind_client_socket(
     server: SocketAddr,
     buffers: BufferSizes,
 ) -> Result<std::net::UdpSocket> {

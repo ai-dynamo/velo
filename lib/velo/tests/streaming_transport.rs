@@ -363,3 +363,104 @@ async fn test_discover_and_register_peer_fans_out_to_streaming() {
         .expect("stream ok");
     assert!(matches!(frame, StreamFrame::Item(7)));
 }
+
+// ---------------------------------------------------------------------------
+// QUIC streaming transport through the facade
+// ---------------------------------------------------------------------------
+
+/// Two Velo instances on `StreamConfig::Quic` with the mux off: a remote
+/// attach must negotiate `quic-stream`, and every frame of every stream must
+/// arrive in order, ending with the finalize. Many streams run at once so
+/// they share the one QUIC connection between the two nodes, which is the
+/// configuration the transport exists for.
+#[cfg(feature = "quic")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_quic_streaming_end_to_end_through_the_facade() {
+    use futures::StreamExt;
+    use velo::StreamConfig;
+    use velo::streaming::{QUIC_STREAM_KEY, QuicStreamConfig, StreamFrame};
+
+    let mk = || async {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let transport = Arc::new(
+            velo::transports::tcp::TcpTransportBuilder::new()
+                .from_listener(listener)
+                .unwrap()
+                .build()
+                .unwrap(),
+        );
+        velo::Velo::builder()
+            .add_transport(transport)
+            .stream_config(StreamConfig::Quic(Some(QuicStreamConfig::new(
+                "127.0.0.1:0".parse().unwrap(),
+            ))))
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
+    };
+    let a = mk().await;
+    let b = mk().await;
+
+    let registry = &a.anchor_manager().transport_registry;
+    assert!(
+        registry.contains_key(QUIC_STREAM_KEY),
+        "StreamConfig::Quic must wire QuicFrameTransport; registry: {:?}",
+        registry.keys().collect::<Vec<_>>()
+    );
+    let advertised = a
+        .peer_info()
+        .worker_address()
+        .available_transports()
+        .unwrap();
+    assert!(advertised.iter().any(|k| k.as_str() == QUIC_STREAM_KEY));
+
+    a.register_peer(b.peer_info()).unwrap();
+    b.register_peer(a.peer_info()).unwrap();
+
+    const STREAMS: u32 = 32;
+    const ITEMS: u32 = 200;
+    let mut tasks = Vec::new();
+    for stream in 0..STREAMS {
+        let a = a.clone();
+        let b = b.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut anchor = b.create_anchor::<u32>();
+            let sender = a.attach_anchor::<u32>(anchor.handle()).await.unwrap();
+            assert_eq!(
+                sender.negotiated_transport().map(|k| k.as_str()),
+                Some(QUIC_STREAM_KEY)
+            );
+            let producer = tokio::spawn(async move {
+                for i in 0..ITEMS {
+                    sender.send(stream * ITEMS + i).await.unwrap();
+                }
+                sender.finalize().unwrap();
+            });
+            for i in 0..ITEMS {
+                let frame = tokio::time::timeout(std::time::Duration::from_secs(10), anchor.next())
+                    .await
+                    .expect("no stall")
+                    .expect("frame")
+                    .expect("stream ok");
+                assert!(
+                    matches!(frame, StreamFrame::Item(v) if v == stream * ITEMS + i),
+                    "stream {stream}: frame {i} out of order: {frame:?}"
+                );
+            }
+            let end = tokio::time::timeout(std::time::Duration::from_secs(10), anchor.next())
+                .await
+                .expect("no stall at the end")
+                .expect("the finalize frame")
+                .expect("stream ok");
+            assert!(
+                matches!(end, StreamFrame::Finalized),
+                "stream {stream}: expected Finalized after the items, got {end:?}"
+            );
+            producer.await.unwrap();
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+}
