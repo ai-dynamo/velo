@@ -140,7 +140,7 @@ With `MuxConfig::async_open_ack` enabled, a healthy consumer is not necessary fo
 
 This exposure does not compose the way the ordinary kill does. `peer_byte_budget` bounds the receive side only. N concurrent opens into a stalled peer can hold N times the slot byte budget in egress memory. The default awaited open serializes new opens behind the same admission and bounds this to one wait at a time.
 
-No signal separates this kill from the ordinary one. Both report `withheld_overflow`. `velo_streaming_mux_withheld_records` has no label, and the `overflow_kill` log line does not say whether the slot was fenced. To tell them apart, you must know whether `async_open_ack` is enabled.
+No signal separates this kill from the ordinary one. Both report `withheld_overflow`. `velo_streaming_mux_withheld_records` has no label, and the `overflow_kill` log line does not say whether the slot was fenced. If `async_open_ack` is disabled, the fenced cause cannot occur, so the kill is the ordinary one. If it is enabled, the metrics cannot tell the two causes apart. You need other evidence, such as the send queue depth of the peer when the slot died.
 
 A slot killed while fenced stays in `velo_streaming_mux_live_slots`. Its deferred `CloseSlot` must not overtake its `OpenSlot`, so the registry entry survives the kill until the admission resolves. If the admission never resolves, the entry, its index, its withheld bytes and its `live_slots` count stay for the rest of the peer's epoch. `batcher_idle_ttl` evicts only a batcher with zero live slots, so it does not bound this.
 

@@ -31,11 +31,14 @@ cargo install --locked mdbook-mermaid --version 0.16.2
 cargo install --locked mdbook-linkcheck --version 0.7.7
 ```
 
-Then build and serve the book:
+Build the book and check its links. This is the command that CI runs:
 
 ```bash
-mdbook-mermaid install docs
-mdbook serve docs --open
+bash scripts/build-book.sh
 ```
 
-`mdbook build docs` also runs the link check. A broken internal link fails the build.
+A broken internal link fails the build. To preview while you edit, serve the book:
+
+```bash
+mdbook serve docs --open
+```

@@ -134,8 +134,9 @@ impl RdmaRegistrationKind {
 ///   [`PoolExhausted`](Self::PoolExhausted), [`GetFailed`](Self::GetFailed),
 ///   and [`Ok`](Self::Ok) after the GET completes).
 ///
-/// So one transfer can count more than once. With the kill switch on, a slot
-/// counts `kill_switch` at staging and again at each acquire. The owner's
+/// So one transfer can count more than once. With the kill switch on, a
+/// nonempty slot staged through the pinned path counts `kill_switch` at staging
+/// and again at each acquire. The owner's
 /// `no_offer` also counts the chunked re-acquire after a failed GET. Read one
 /// instance's series as what *that* instance decided.
 ///

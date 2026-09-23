@@ -22,7 +22,7 @@ Each remote stream on the per-stream path costs the following:
 
 Per token, the stream pays one `rmp_serde` allocation, one channel hop, one `encode_frame` and, because `TCP_NODELAY` is set, one syscall and one TCP segment.
 
-This cost is a ceiling, not a slope. 1,024 concurrent remote streams need 2,048 file descriptors, about 2 GiB of requested socket buffer and about 4,096 tasks. The default `ulimit -n` is 1,024, so a process stops at about 512 concurrent remote streams on any hardware.
+This cost is a ceiling, not a slope. Each remote stream holds one socket, with one file descriptor in each of the two processes. Across both ends, 1,024 concurrent remote streams need 2,048 descriptors, about 2 GiB of requested socket buffer and about 4,096 tasks. Each process holds one descriptor per stream. At the default `ulimit -n` of 1,024, a process stops below 1,024 concurrent remote streams, less the descriptors that it uses for other things.
 
 ### Per-stream coalescing cannot reach the forward-pass shape
 
@@ -72,7 +72,7 @@ flowchart LR
 
 `MessengerMuxTransport` implements the streaming `FrameTransport` contract. It has no dial, no listener, no acceptor and no connection manager. The sender's identity arrives in the active-message envelope, so credit has a return route without a handshake.
 
-Egress is one `PeerBatcher` per remote instance. The batcher is created on the first send to that peer and evicted when it is idle with no live slots. A node that talks to Y peers holds Y batchers, whatever its stream count. The per-stream design is O(X) in tasks and sockets. The mux is O(Y).
+Egress is one `PeerBatcher` per remote instance. The batcher is created on the first send to that peer and evicted when it is idle with no live slots. A node that talks to Y peers holds Y batchers, whatever its stream count. The per-stream design is O(X) in tasks and sockets. With the mux, sockets and batchers are O(Y). Each stream still has its own reader pump and heartbeat task, so tasks stay O(X).
 
 The cost of this design is that streaming no longer owns its wire. It shares queues, framing and backpressure with control traffic. Stream order is no longer a TCP guarantee. It is a protocol obligation, and every record carries a per-slot sequence number for this reason.
 
@@ -297,7 +297,7 @@ Senders stage records, and the peer batcher decides when to write. The policies 
 | Policy | Trigger | Added latency | Default |
 |---|---|---|---|
 | `Auto { on_admission: true }` | End of every wake, after the batcher takes everything already queued | None (up to `reply_linger` for a batch of only credit replies) | Yes |
-| `Auto { max_linger: Some(w) }` | Up to `w` after the oldest staged record | Up to `w` | No |
+| `Auto { on_admission: false, max_linger: Some(w) }` | Up to `w` after the oldest staged record | Up to `w` | No |
 | `Manual` | `Velo::flush_batch()` | Set by the caller. A pending credit reply takes the batch out after `reply_linger`. | No |
 
 `AutoFlush` is a struct, not more enum variants, because its two conditions compose. A batcher can hold both. `on_admission` is named for its mechanism. A flush parks until the transport admits it, so "at the end of every wake" means "as soon as the peer took the last batch". The default cannot make latency worse. The batcher never waits for work that has not arrived. It only takes everything that is already queued.

@@ -22,13 +22,14 @@ velo-ext = "0.5"
 1. Implement `Transport` for your type.
 2. Send each inbound `MessageType::Message` frame through `TransportAdapter::admit_message`. Do not check `ShutdownState::is_draining()` first. See [Shutdown and drain](../concepts/shutdown.md).
 3. If `admit_message` returns `AdmitOutcome::Draining` and your transport has a return path, send a `MessageType::ShuttingDown` frame with the header of the rejected request. If there is no return path, record the rejection and drop the frame.
-4. Route the other inbound types (`Response`, `Ack`, `Event`, `ShuttingDown`) to their lanes on the adapter.
-5. Store the handle that `set_observability` gives you. Record each inbound frame as you route it.
-6. On the `Admitted` arm, and only there, record the frame as inbound `message`.
+4. If `admit_message` returns `AdmitOutcome::Disconnected`, the runtime has stopped. Record `TransportRejection::RouteFailed` through the observability handle and drop the frame.
+5. Route the other inbound types (`Response`, `Ack`, `Event`, `ShuttingDown`) to their lanes on the adapter.
+6. Store the handle that `set_observability` gives you. Record each inbound frame as you route it.
+7. On the `Admitted` arm, and only there, record the frame as inbound `message`.
 
-Step 6 matters because the inbound queue depth is a difference between two counters. If your transport admits a frame and does not record it, the depth goes negative. See [Observability](../operations/observability.md).
+Step 7 matters because the inbound queue depth is a difference between two counters. If your transport admits a frame and does not record it, the depth goes negative. See [Observability](../operations/observability.md).
 
-Step 5 matters because the runtime creates a series for each direction and message type in advance. If only `message` moves, the dashboard reads "no responses arrived", not "responses are not instrumented".
+Step 6 matters because the runtime creates a series for each direction and message type in advance. If only `message` moves, the dashboard reads "no responses arrived", not "responses are not instrumented".
 
 ```rust,ignore
 use std::sync::{Arc, OnceLock};

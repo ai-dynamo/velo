@@ -4,6 +4,9 @@
 
 ```bash
 cargo add velo
+cargo add serde --features derive
+cargo add tokio --features macros,rt-multi-thread
+cargo add anyhow
 ```
 
 The default features are `http`, `nats-transport`, and `grpc`. Add other features as you need them:

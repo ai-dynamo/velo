@@ -1,6 +1,6 @@
 # Shutdown and drain
 
-`Velo::graceful_shutdown(policy)` stops an instance in three phases. It does not lose a request that it already accepted.
+`Velo::graceful_shutdown(policy)` stops an instance in three phases. With `ShutdownPolicy::WaitForever`, it does not lose a request that it already accepted. With `ShutdownPolicy::Timeout(d)`, teardown drops any accepted request that is still queued when `d` expires.
 
 ```mermaid
 sequenceDiagram

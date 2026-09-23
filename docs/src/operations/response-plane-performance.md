@@ -23,11 +23,11 @@ A holder is a mocker process that keeps part of the 8,192-request backlog after 
 | 5 to 6 | velo | 3,142 | 55.5 | 101 | 265 | 13.4 |
 | 5 to 6 | comparison | 3,330 | 55.1 | 116 | 308 | 12.2 |
 
-- At a matched draw, velo's first-token p50 is 2 to 7 ms ahead.
+- At 1 to 3 holders, velo's first-token p50 is 2 to 7 ms ahead. At 5 to 6 holders, the two are level (55.5 against 55.1 ms).
 - Steady-state p90 and p99 are level or ahead.
 - Throughput is equal within the draw.
-- Both planes had zero errors in eighteen reps.
-- Frontend CPU per request is 1.6 to 2.9 ms higher on velo. This is recorded, not a requirement.
+- Every rep in the two matrices had zero errors.
+- Frontend CPU per request is 1.2 to 2.9 ms higher on velo. This is recorded, not a requirement.
 
 ### Against the shipping per-request plane
 

@@ -36,7 +36,7 @@ Call `messenger_mux` once per `Velo` instance. A second call returns an error.
 ```rust
 let sender = velo.attach_anchor::<Token>(handle).await?;
 match sender.negotiated_transport() {
-    Some(key) if key.as_str() == MESSENGER_MUX_KEY => { /* multiplexed */ }
+    Some(key) if key.as_str() == velo::streaming::MESSENGER_MUX_KEY => { /* multiplexed */ }
     Some(_) => { /* one connection per stream */ }
     None => { /* same worker, no transport */ }
 }
@@ -147,8 +147,9 @@ Zero-RTT setup removes the attach round trip from each stream. If the consumer a
 1. On the consumer, create the anchor.
 2. Call `velo.prebind_anchor(handle)` from a runtime context.
 3. If the call returns `Some(ticket)`, put the ticket in the request envelope. `StreamOpenTicket` implements `Serialize` and `Deserialize`.
-4. If the envelope has a ticket, call `velo.open_anchor_stream::<T>(handle, ticket)` on the producer.
-5. If the envelope has no ticket, call `velo.attach_anchor::<T>(handle)`.
+4. If the producer is a different worker and the envelope has a ticket, call `velo.open_anchor_stream::<T>(handle, ticket)` on the producer.
+5. If the producer is the worker that called `prebind_anchor`, call `velo.attach_anchor::<T>(handle)`. `open_anchor_stream` on the minting worker fails at once.
+6. If the envelope has no ticket, call `velo.attach_anchor::<T>(handle)`.
 
 ```rust
 // Consumer, at request registration.
@@ -157,9 +158,10 @@ let ticket = velo.prebind_anchor(anchor.handle());
 send_request(RequestEnvelope { handle: anchor.handle(), ticket }).await?;
 
 // Producer, on receipt.
+let minted_here = envelope.handle.unpack().0 == velo.instance_id().worker_id();
 let sender = match envelope.ticket {
-    Some(ticket) => velo.open_anchor_stream::<Token>(envelope.handle, ticket).await?,
-    None => velo.attach_anchor::<Token>(envelope.handle).await?,
+    Some(ticket) if !minted_here => velo.open_anchor_stream::<Token>(envelope.handle, ticket).await?,
+    _ => velo.attach_anchor::<Token>(envelope.handle).await?,
 };
 ```
 

@@ -8,7 +8,7 @@ At two nodes and ten streams on loopback, the mux is the same speed as the per-s
 
 ### V1: resource-ceiling arithmetic
 
-The per-stream path uses 2 file descriptors, about 2 MiB of requested socket buffer and 4 tasks per remote stream. At the default `ulimit -n` of 1,024, a process stops at about 512 concurrent remote streams. This is a hard wall, not a slope. A small-scale null result cannot refute it, which is why it comes first. The intended test opens N streams and counts `/proc/self/fd`. That test is not built.
+The per-stream path uses one socket per remote stream: one file descriptor in each process, about 2 MiB of requested socket buffer and 4 tasks across the two ends. At the default `ulimit -n` of 1,024, a process stops below 1,024 concurrent remote streams, less its other descriptors. This is a hard wall, not a slope. A small-scale null result cannot refute it, which is why it comes first. The intended test opens N streams and counts `/proc/self/fd`. That test is not built.
 
 ### V2: analytical cost model
 
@@ -22,7 +22,7 @@ mux:         X · (e + f + p) + Y · (s + w)
 The model makes three predictions that a measurement can refute:
 
 - Syscalls and memory improve for any X/Y above 1.
-- CPU crosses over at about `(s + w) / p`. With `s` at 1 to 3 µs and `p` at about 20 ns, the mux costs less CPU for X/Y above 2, and saves more than 20% of streaming CPU above X/Y of 8.
+- CPU crosses over where X/Y exceeds `(s + w) / (s + w_connect + w_recv - p)`. Because `p` (about 20 ns) is small next to `s` (1 to 3 µs), that ratio is near 1. The prediction is that the mux costs less CPU for X/Y above 2, and saves more than 20% of streaming CPU above X/Y of 8.
 - Latency gets slightly worse, by one extra channel hop of 1 to 5 µs. Report this term beside every throughput number.
 
 ### V3: microbenchmarks

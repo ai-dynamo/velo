@@ -24,6 +24,9 @@ Application authors depend on `velo` only. See [Workspace crates](docs/src/devel
 
 ```bash
 cargo add velo
+cargo add serde --features derive
+cargo add tokio --features macros,rt-multi-thread
+cargo add anyhow
 ```
 
 ```rust

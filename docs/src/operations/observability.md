@@ -64,14 +64,19 @@ This is the number of frames in front of the socket: in the bounded send channel
 ### Queueing on the receiver during attach
 
 ```promql
-velo_streaming_anchor_attach_rtt_seconds
-- velo_streaming_anchor_operation_duration_seconds{operation="attach"}
+  sum(rate(velo_streaming_anchor_attach_rtt_seconds_sum{outcome="success"}[5m]))
+/ sum(rate(velo_streaming_anchor_attach_rtt_seconds_count{outcome="success"}[5m]))
+-
+  sum(rate(velo_streaming_anchor_operation_duration_seconds_sum{operation="attach",outcome="success"}[5m]))
+/ sum(rate(velo_streaming_anchor_operation_duration_seconds_count{operation="attach",outcome="success"}[5m]))
 ```
+
+Both families are histograms, so the query compares mean durations from `_sum` and `_count`. The `sum` removes the labels that differ between sender and receiver.
 
 The sender records the round trip. The receiver records the time inside the handler. The difference is an upper bound on the queueing at the receiver: it also includes the send path, both wire legs, the handler spawn, and the wake of the sender task.
 
-- Use `outcome="success"` on both sides. The error populations do not compare.
-- Sum away `transport_scheme` and `instance` on both sides. The two series come from different nodes, and the sender can record `"unknown"` for a scheme that the receiver named.
+- The query uses `outcome="success"` on both sides, because the error populations do not compare.
+- The query sums away `transport_scheme` and `instance`. The two series come from different nodes, and the sender can record `"unknown"` for a scheme that the receiver named.
 - SPSC and MPSC attaches share one RTT series, so the result is an average over both.
 
 ## Batched streaming
