@@ -1177,10 +1177,10 @@ impl VeloMetrics {
                      send buffer, counted once the write returned. Subtract this from \
                      velo_transport_frames_total{direction=\"outbound\",outcome=\"accepted\"} on \
                      the same transport to get that transport's egress queue depth. Published \
-                     only by the coalescing writer the TCP and UDS transports run — the \
+                     only by the coalescing writer of the TCP, UDS and QUIC transports — the \
                      `transport` label is whatever TransportKey the transport was built with, \
                      not a fixed name, so select on this series' presence rather than on a \
-                     transport-name pattern; see the README's Observability section for the \
+                     transport-name pattern; see the book's Observability chapter for the \
                      identity's limits.",
                 ),
                 &["transport", "message_type"],
@@ -1200,7 +1200,7 @@ impl VeloMetrics {
                      write then failed, so this count is at least \
                      velo_transport_frames_written_total and equals it only on \
                      a connection that never faulted. Published only by the \
-                     coalescing writer the TCP and UDS transports run — select \
+                     coalescing writer of the TCP, UDS and QUIC transports — select \
                      on this series' presence, not on the `transport` label's \
                      value.",
                 )
@@ -1222,7 +1222,7 @@ impl VeloMetrics {
                      is the constraint; small values beside a large \
                      velo_transport_egress_queue_wait_seconds mean the writer \
                      is starved or the queue is simply long. Published only by \
-                     the coalescing writer the TCP and UDS transports run — \
+                     the coalescing writer of the TCP, UDS and QUIC transports — \
                      select on this series' presence, not on the `transport` \
                      label's value.",
                 )

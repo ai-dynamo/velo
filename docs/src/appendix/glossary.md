@@ -8,7 +8,7 @@
 | Anchor | The consumer end of a stream. It has a `u128` handle that a producer uses to attach. |
 | Attach | The `_anchor_attach` round trip that connects a producer to an anchor |
 | Batch | One messenger frame that carries records from many streams to one peer |
-| Coalescing writer | The TCP and UDS writer task. It writes small queued frames together, and a large frame as two writes. |
+| Coalescing writer | The TCP, UDS, and QUIC writer task. It writes small queued frames together, and a large frame as two writes. |
 | Credit | The number of records that a sender can send on a slot before the receiver grants more |
 | Drain | The second phase of graceful shutdown. Velo waits until no admitted request is in flight. |
 | Frame transport | A transport for stream frames when the mux is not used (TCP or gRPC) |

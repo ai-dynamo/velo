@@ -25,6 +25,8 @@ zmq = ["dep:zmq"]
 # default feature is on — CI without RDMA packages exercises it over UCX_TLS=tcp,
 # but building still needs libibverbs-dev/librdmacm-dev headers).
 ucx = ["dep:ucx-rs", "dep:serde_bytes", "dep:offset-allocator"]
+# QUIC messenger transport (quinn, TLS 1.3 with a pinned self-signed certificate).
+quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:ring"]
 
 # Discovery backends
 nats-discovery = ["dep:async-nats"]
@@ -60,7 +62,7 @@ prometheus = { workspace = true }
 rmp-serde = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-socket2 = "0.6"
+socket2 = { version = "0.6", features = ["all"] }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true, features = ["codec", "net", "rt", "io-util"] }
@@ -89,6 +91,14 @@ zmq = { workspace = true, optional = true }
 opentelemetry = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 loom-rs = { version = "0.5.0", features = ["sim"], optional = true }
+
+# QUIC transport (feature `quic`). quinn 0.11.12 is the floor: it pulls
+# quinn-proto 0.11.18, whose stream assembler no longer fails ordered,
+# lossless streams with "too many gaps in stream buffer" (quinn-rs/quinn#2826).
+quinn = { version = "0.11.12", optional = true, default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std"] }
+rcgen = { version = "0.14", optional = true, default-features = false, features = ["crypto", "ring"] }
+ring = { version = "0.17", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.31.2", features = ["sched", "net"] }
@@ -257,6 +267,16 @@ path = "tests/transports/tcp_integration.rs"
 [[test]]
 name = "transports_tcp_shutdown"
 path = "tests/transports/tcp_shutdown.rs"
+
+[[test]]
+name = "transports_quic"
+path = "tests/transports/quic_integration.rs"
+required-features = ["quic"]
+
+[[test]]
+name = "transports_quic_shutdown"
+path = "tests/transports/quic_shutdown.rs"
+required-features = ["quic"]
 
 [[test]]
 name = "transports_uds_host_affinity"

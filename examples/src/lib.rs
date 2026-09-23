@@ -34,6 +34,9 @@ pub enum TransportType {
     /// lanes otherwise). Linux only.
     #[cfg(all(target_os = "linux", feature = "ucx"))]
     Ucx,
+    /// QUIC transport (TLS 1.3, pinned self-signed certificate).
+    #[cfg(feature = "quic")]
+    Quic,
 }
 
 /// Build a transport on loopback for an example.
@@ -66,6 +69,8 @@ pub async fn new_transport(ty: TransportType, tag: &str) -> Result<Arc<dyn Trans
                 .bind_endpoint("tcp://127.0.0.1:0")
                 .build()?,
         )),
+        #[cfg(feature = "quic")]
+        TransportType::Quic => Ok(Arc::new(quic_from_env()?.build()?)),
         #[cfg(all(target_os = "linux", feature = "ucx"))]
         TransportType::Ucx => Ok(Arc::new(
             velo::transports::ucx::UcxTransportBuilder::new().build()?,
@@ -109,4 +114,45 @@ pub fn init_tracing() {
     use tracing_subscriber::{EnvFilter, fmt};
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = fmt().with_env_filter(filter).try_init();
+}
+
+/// A loopback QUIC builder, tuned by environment variables so a sweep can
+/// vary the transport without new flags:
+///
+/// - `VELO_QUIC_MAX_MTU`, `VELO_QUIC_INITIAL_MTU` (bytes)
+/// - `VELO_QUIC_STREAM_WINDOW` (bytes), `VELO_QUIC_SEND_WINDOW` (bytes)
+/// - `VELO_QUIC_INITIAL_WINDOW` (bytes)
+/// - `VELO_QUIC_SERVER_ENDPOINTS` (count)
+#[cfg(feature = "quic")]
+pub fn quic_from_env() -> Result<velo::transports::quic::QuicTransportBuilder> {
+    fn env<T: std::str::FromStr>(name: &str) -> Result<Option<T>> {
+        match std::env::var(name) {
+            Ok(v) => v
+                .parse()
+                .map(Some)
+                .map_err(|_| anyhow::anyhow!("{name}={v} is not a number")),
+            Err(_) => Ok(None),
+        }
+    }
+    let mut builder =
+        velo::transports::quic::QuicTransportBuilder::new().bind_addr("127.0.0.1:0".parse()?);
+    if let Some(v) = env("VELO_QUIC_MAX_MTU")? {
+        builder = builder.max_mtu(v);
+    }
+    if let Some(v) = env("VELO_QUIC_INITIAL_MTU")? {
+        builder = builder.initial_mtu(v);
+    }
+    if let Some(v) = env("VELO_QUIC_STREAM_WINDOW")? {
+        builder = builder.stream_receive_window(v);
+    }
+    if let Some(v) = env("VELO_QUIC_SEND_WINDOW")? {
+        builder = builder.send_window(v);
+    }
+    if let Some(v) = env("VELO_QUIC_INITIAL_WINDOW")? {
+        builder = builder.initial_window(v);
+    }
+    if let Some(v) = env("VELO_QUIC_SERVER_ENDPOINTS")? {
+        builder = builder.server_endpoints(v);
+    }
+    Ok(builder)
 }

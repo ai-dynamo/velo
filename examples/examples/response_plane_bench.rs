@@ -146,6 +146,10 @@ struct Args {
     /// establishment and the first attaches do not land in the histograms.
     #[arg(long, default_value_t = 0)]
     warmup_requests: u32,
+
+    /// Messenger transport that carries the mux batches.
+    #[arg(long, value_enum, default_value_t = TransportType::Tcp)]
+    transport: TransportType,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -216,7 +220,7 @@ async fn node(args: &Args, mux_enabled: bool) -> Result<Arc<Node>> {
     let registry = Registry::new();
     let metrics = Arc::new(VeloMetrics::register(&registry)?);
     let builder: VeloBuilder = Velo::builder()
-        .add_transport(new_transport(TransportType::Tcp, "response_plane_bench").await?)
+        .add_transport(new_transport(args.transport, "response_plane_bench").await?)
         .stream_bind_addr(std::net::Ipv4Addr::LOCALHOST.into())
         .metrics(metrics);
     let velo = builder

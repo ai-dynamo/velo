@@ -16,6 +16,8 @@ use velo::transports::zmq::{ZmqTransport, ZmqTransportBuilder};
 // use velo::transports::http::{HttpTransport, HttpTransportBuilder};
 #[cfg(feature = "nats-transport")]
 use velo::transports::nats::{NatsTransport, NatsTransportBuilder};
+#[cfg(feature = "quic")]
+use velo::transports::quic::{QuicTransport, QuicTransportBuilder};
 
 use bytes::Bytes;
 use std::sync::{Arc, Mutex};
@@ -316,6 +318,25 @@ impl TestTransportHandle<UdsTransport> {
     }
 }
 
+// QUIC-specific convenience constructors
+#[cfg(feature = "quic")]
+impl TestTransportHandle<QuicTransport> {
+    /// Create a new QUIC transport on a random loopback port.
+    pub async fn new_quic() -> anyhow::Result<Self> {
+        Self::with_factory(quic_builder).await
+    }
+}
+
+/// Loopback QUIC transport with the reuse-port group enabled, so every test
+/// runs across more than one server socket.
+#[cfg(feature = "quic")]
+fn quic_builder() -> anyhow::Result<QuicTransport> {
+    QuicTransportBuilder::new()
+        .bind_addr("127.0.0.1:0".parse().unwrap())
+        .server_endpoints(2)
+        .build()
+}
+
 // UCX-specific convenience constructors
 #[cfg(all(target_os = "linux", feature = "ucx"))]
 impl TestTransportHandle<UcxTransport> {
@@ -478,6 +499,15 @@ impl TestCluster<UdsTransport> {
             UdsTransportBuilder::new().socket_path(&socket_path).build()
         })
         .await
+    }
+}
+
+// QUIC-specific convenience constructor
+#[cfg(feature = "quic")]
+impl TestCluster<QuicTransport> {
+    /// Create a new QUIC test cluster on loopback.
+    pub async fn new_quic(size: usize) -> anyhow::Result<Self> {
+        Self::with_factory(size, quic_builder).await
     }
 }
 
@@ -699,6 +729,120 @@ impl ShutdownTestClient for UdsShutdownClient {
             .await
             .unwrap();
         stream
+    }
+
+    async fn read_one_frame(stream: &mut Self::Stream) -> (MessageType, Bytes, Bytes) {
+        use futures::StreamExt;
+        use tokio_util::codec::Framed;
+        use velo::transports::tcp::TcpFrameCodec;
+
+        let mut framed = Framed::new(stream, TcpFrameCodec::new());
+        framed.next().await.unwrap().unwrap()
+    }
+}
+
+/// QUIC shutdown test client: a raw quinn client that dials the transport,
+/// opens one stream, and speaks the TCP frame codec on it.
+#[cfg(feature = "quic")]
+pub struct QuicShutdownClient;
+
+/// One raw QUIC stream, with the endpoint and connection kept alive beside it.
+#[cfg(feature = "quic")]
+pub struct QuicRawStream {
+    _endpoint: quinn::Endpoint,
+    _connection: quinn::Connection,
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
+}
+
+#[cfg(feature = "quic")]
+impl tokio::io::AsyncRead for QuicRawStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.recv).poll_read(cx, buf)
+    }
+}
+
+#[cfg(feature = "quic")]
+impl tokio::io::AsyncWrite for QuicRawStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.send)
+            .poll_write(cx, buf)
+            .map_err(std::io::Error::from)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.send).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.send).poll_shutdown(cx)
+    }
+}
+
+#[cfg(feature = "quic")]
+impl ShutdownTestClient for QuicShutdownClient {
+    type Transport = QuicTransport;
+    type Stream = QuicRawStream;
+
+    async fn new_handle() -> anyhow::Result<TestTransportHandle<Self::Transport>> {
+        TestTransportHandle::new_quic().await
+    }
+
+    async fn connect_and_send_frame(
+        handle: &TestTransportHandle<Self::Transport>,
+        msg_type: MessageType,
+        header: &[u8],
+        payload: &[u8],
+    ) -> Self::Stream {
+        use velo::transports::quic::{QuicEndpointInfo, tls};
+        use velo::transports::tcp::TcpFrameCodec;
+
+        let info = {
+            let wa = handle.transport.address();
+            let raw = wa.get_entry(handle.transport.key()).unwrap().unwrap();
+            QuicEndpointInfo::decode(&raw).unwrap()
+        };
+        let addr = info.endpoints[0].socket_addr().unwrap();
+        let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let config = tls::pinned_client_config(info.fingerprint).unwrap();
+        let connection = endpoint
+            .connect_with(config, addr, "velo")
+            .unwrap()
+            .await
+            .unwrap();
+        let (mut send, recv) = connection.open_bi().await.unwrap();
+        TcpFrameCodec::encode_frame(&mut send, msg_type, header, payload)
+            .await
+            .unwrap();
+        // Scenarios often drop the returned stream at once. A dropped TCP
+        // socket still delivers what the kernel holds, but dropping the QUIC
+        // connection discards unsent data. Finish the send side and wait for
+        // the peer to acknowledge it, as the transport's own dialer does.
+        send.finish().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), send.stopped())
+            .await
+            .expect("peer did not acknowledge the frame")
+            .unwrap();
+        QuicRawStream {
+            _endpoint: endpoint,
+            _connection: connection,
+            send,
+            recv,
+        }
     }
 
     async fn read_one_frame(stream: &mut Self::Stream) -> (MessageType, Bytes, Bytes) {
@@ -981,6 +1125,23 @@ impl TransportFactory for UdsFactory {
 
     async fn create_cluster(size: usize) -> anyhow::Result<TestCluster<Self::Transport>> {
         TestCluster::new_uds(size).await
+    }
+}
+
+/// QUIC transport factory
+#[cfg(feature = "quic")]
+pub struct QuicFactory;
+
+#[cfg(feature = "quic")]
+impl TransportFactory for QuicFactory {
+    type Transport = QuicTransport;
+
+    async fn create() -> anyhow::Result<TestTransportHandle<Self::Transport>> {
+        TestTransportHandle::new_quic().await
+    }
+
+    async fn create_cluster(size: usize) -> anyhow::Result<TestCluster<Self::Transport>> {
+        TestCluster::new_quic(size).await
     }
 }
 

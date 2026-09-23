@@ -59,6 +59,9 @@ pub mod grpc;
 #[cfg(feature = "zmq")]
 pub mod zmq;
 
+#[cfg(feature = "quic")]
+pub mod quic;
+
 mod transport;
 
 use std::{collections::HashMap, sync::Arc};

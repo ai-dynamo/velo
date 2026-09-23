@@ -23,7 +23,7 @@ cargo run --example mpsc_fanin --all-features -- --producers 4 --items 40
 
 ## Transport selection (`ping_pong`, `throughput`)
 
-`--transport {tcp,uds,zmq,nats,grpc}` (default: `tcp`).
+`--transport {tcp,uds,zmq,nats,grpc,quic,ucx}` (default: `tcp`).
 
 - `zmq` and `grpc` require building with `--features zmq` / `--features grpc`
   (both enabled by `--all-features`).
