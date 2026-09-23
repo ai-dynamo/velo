@@ -90,7 +90,7 @@ batch header:
 record:
   [u8 record_type][u32 slot][u32 frame_seq][u32 len][len bytes body]
 
-record_type: 0 = Data, 1 = OpenSlot, 2 = CloseSlot, 3 = CreditUpdate, 4 = SlotHeartbeat, 5 = StopSlot
+record_type: 0 = Data, 1 = OpenSlot, 2 = CloseSlot, 3 = CreditUpdate, 4 = SlotHeartbeat, 5 = LifecycleSlot
 ```
 
 Every multi-byte field is big-endian, in the header and in each record. Senders write `flags` as zero, and receivers ignore unknown bits.
@@ -105,7 +105,7 @@ Record bodies:
 - **`OpenSlot`** carries `[u64 anchor_id][u64 session_id]`. This is the 16-byte attach handshake, moved into a record.
 - **`CloseSlot`** carries `[u8 reason]`: `0` terminal sent, `1` peer gone, `2` unknown slot, `3` protocol error.
 - **`CreditUpdate`** carries `[u32 delta]` from receiver to sender.
-- **`StopSlot`** has no body. It requests graceful producer stop, without closing the slot or discarding data. A close takes precedence. It uses the existing peer epoch and slot generation. Early stop is retained by the pre-bind until OpenSlot claims it.
+- **`LifecycleSlot`** carries the 64-bit session identity from `OpenSlot` and a one-byte action (0 = stop, 1 = cancel). Stop leaves the slot open for remaining output. Cancel takes precedence for the same session. Both the queued signal and the live producer check session identity, so a delayed signal cannot target a reused slot even if its compact generation has wrapped. Early stop is retained by the pre-bind until `OpenSlot` claims it.
 - **`SlotHeartbeat`** has no body. The decoder accepts it, but no sender emits it. See [Heartbeats](#heartbeats).
 
 `CloseSlot` travels in both directions and has no direction bit. The reason carries the direction. `TerminalSent` and `PeerGone` travel from slot owner to receiver. `UnknownSlot` and `ProtocolError` travel from receiver to slot owner. Both sides can hold a slot at the same dense index, and the reason tells them apart.

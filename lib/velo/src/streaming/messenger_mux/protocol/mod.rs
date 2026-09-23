@@ -255,7 +255,7 @@ pub(crate) enum RecordType {
     /// Per-slot liveness beat. No body.
     SlotHeartbeat = 4,
     /// Graceful stop request, receiver to producer. No body.
-    StopSlot = 5,
+    LifecycleSlot = 5,
 }
 
 /// The label value `velo_streaming_mux_records_sent_total` files each
@@ -266,7 +266,7 @@ pub(crate) const RECORD_TYPE_LABELS: [&str; 6] = [
     "close_slot",
     "credit_update",
     "slot_heartbeat",
-    "stop_slot",
+    "lifecycle",
 ];
 
 /// Number of [`RecordType`] variants — the width of a per-type count array.
@@ -297,7 +297,7 @@ impl RecordType {
             Self::CloseSlot => 2,
             Self::CreditUpdate => 3,
             Self::SlotHeartbeat => 4,
-            Self::StopSlot => 5,
+            Self::LifecycleSlot => 5,
         }
     }
 
@@ -309,7 +309,7 @@ impl RecordType {
             2 => Some(Self::CloseSlot),
             3 => Some(Self::CreditUpdate),
             4 => Some(Self::SlotHeartbeat),
-            5 => Some(Self::StopSlot),
+            5 => Some(Self::LifecycleSlot),
             _ => None,
         }
     }
@@ -331,7 +331,7 @@ impl RecordType {
     pub(crate) const fn is_control(self) -> bool {
         matches!(
             self,
-            Self::OpenSlot | Self::CloseSlot | Self::CreditUpdate | Self::StopSlot
+            Self::OpenSlot | Self::CloseSlot | Self::CreditUpdate | Self::LifecycleSlot
         )
     }
 }
@@ -386,7 +386,7 @@ pub(crate) enum RecordBody<'a> {
     /// Liveness only.
     SlotHeartbeat,
     /// Graceful stop keeps the slot open for remaining output.
-    StopSlot,
+    LifecycleSlot { session_id: u64, cancel: bool },
 }
 
 impl RecordBody<'_> {
@@ -399,7 +399,7 @@ impl RecordBody<'_> {
             Self::CloseSlot { .. } => RecordType::CloseSlot,
             Self::CreditUpdate { .. } => RecordType::CreditUpdate,
             Self::SlotHeartbeat => RecordType::SlotHeartbeat,
-            Self::StopSlot => RecordType::StopSlot,
+            Self::LifecycleSlot { .. } => RecordType::LifecycleSlot,
         }
     }
 }
@@ -519,8 +519,16 @@ pub(crate) struct BatchEncoder {
 }
 
 impl BatchEncoder {
-    pub(crate) fn push_stop_slot(&mut self, slot: SlotId) -> Result<(), EncodeError> {
-        self.push(RecordType::StopSlot, slot, 0, 0, |_| {})
+    pub(crate) fn push_lifecycle(
+        &mut self,
+        slot: SlotId,
+        session_id: u64,
+        cancel: bool,
+    ) -> Result<(), EncodeError> {
+        self.push(RecordType::LifecycleSlot, slot, 0, 9, |body| {
+            body.extend_from_slice(&session_id.to_be_bytes());
+            body.extend_from_slice(&[u8::from(cancel)]);
+        })
     }
 
     /// Opens a batch in a fresh buffer.
@@ -825,11 +833,14 @@ fn decode_body(
             }
             Ok(RecordBody::CreditUpdate { delta })
         }
-        RecordType::StopSlot => {
-            if !body.is_empty() {
-                return Err(mismatch(0));
+        RecordType::LifecycleSlot => {
+            if body.len() != 9 || body[8] > 1 {
+                return Err(mismatch(9));
             }
-            Ok(RecordBody::StopSlot)
+            Ok(RecordBody::LifecycleSlot {
+                session_id: read_u64(body, 0).expect("length checked"),
+                cancel: body[8] == 1,
+            })
         }
         RecordType::SlotHeartbeat => {
             if !body.is_empty() {

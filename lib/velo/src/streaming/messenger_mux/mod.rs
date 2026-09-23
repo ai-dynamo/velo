@@ -232,9 +232,15 @@ struct MuxCore {
 }
 
 impl MessengerMuxTransport {
-    pub(crate) fn request_stop(&self, peer: WorkerId, slot: protocol::SlotId) {
-        self.core
-            .return_credit(peer, vec![peer_batcher::ReplyRecord::StopSlot { slot }]);
+    pub(crate) fn request_stop(&self, peer: WorkerId, slot: protocol::SlotId, session_id: u64) {
+        self.core.return_credit(
+            peer,
+            vec![peer_batcher::ReplyRecord::LifecycleSlot {
+                slot,
+                session_id,
+                cancel: false,
+            }],
+        );
     }
 
     /// Take the [`ingress::DrainSignal`] `bind` parked for this pair.
@@ -394,8 +400,8 @@ impl MuxCore {
         }
 
         let batcher = self.batcher(peer);
-        for slot in outcome.peer_stops {
-            batcher.peer_stopped(slot);
+        for (slot, session_id, cancel) in outcome.peer_stops {
+            batcher.peer_stopped(slot, session_id, cancel);
         }
         for (slot, delta) in outcome.grants {
             batcher.grant(slot, delta);
@@ -496,7 +502,7 @@ impl MuxCore {
     /// sends none. The reply is what that idle producer needs, since the
     /// fault that carries the same news to it otherwise rides on the next
     /// record it sends.
-    fn close_claimed_slot(&self, peer: WorkerId, slot: protocol::SlotId) {
+    fn close_claimed_slot(&self, peer: WorkerId, slot: protocol::SlotId, session_id: Option<u64>) {
         // Checked before touching the ingress table, not after: this runs
         // from a `Drop` that can land on a thread with no runtime under it
         // (`StreamController::cancel` guards its own spawn the same way and
@@ -515,9 +521,9 @@ impl MuxCore {
             );
             return;
         }
-        let Some(reply) = self
-            .ingress
-            .close_consumer_gone(peer, slot, self.metrics.as_ref())
+        let Some(reply) =
+            self.ingress
+                .close_consumer_gone(peer, slot, self.metrics.as_ref(), session_id)
         else {
             return;
         };
@@ -712,8 +718,18 @@ impl MessengerMuxTransport {
     /// Idempotent, and silent where there is nothing to close: a stream that
     /// ended on its own terminal retired the slot then, so the ordinary end of
     /// a stream costs no extra record on the wire.
+    pub(crate) fn cancel_claimed_session(
+        &self,
+        peer: WorkerId,
+        slot: protocol::SlotId,
+        session_id: u64,
+    ) {
+        self.core.close_claimed_slot(peer, slot, Some(session_id));
+    }
+
+    #[cfg(test)]
     pub(crate) fn close_claimed_slot(&self, peer: WorkerId, slot: protocol::SlotId) {
-        self.core.close_claimed_slot(peer, slot);
+        self.core.close_claimed_slot(peer, slot, None);
     }
 
     /// Binds registered and neither claimed nor released.

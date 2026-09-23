@@ -184,7 +184,7 @@ impl CreditClass {
             RecordType::OpenSlot
             | RecordType::CloseSlot
             | RecordType::CreditUpdate
-            | RecordType::StopSlot => Self::Control,
+            | RecordType::LifecycleSlot => Self::Control,
             RecordType::Data if is_terminal => Self::Terminal,
             RecordType::Data | RecordType::SlotHeartbeat => Self::Data,
         }

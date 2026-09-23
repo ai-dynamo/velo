@@ -309,7 +309,9 @@ impl Drop for PreBind {
             return;
         };
         match self.drain.cancel() {
-            Some((peer, slot)) => mux.close_claimed_slot(peer, slot),
+            Some((peer, slot)) => {
+                mux.cancel_claimed_session(peer, slot, self.ticket.routing_session_id)
+            }
             None => mux.release_bind(self.anchor_id, self.ticket.routing_session_id),
         }
     }
@@ -401,7 +403,7 @@ impl StreamController {
             if let Some((peer, slot)) = prebind.drain.request_stop()
                 && let Some(mux) = prebind.mux.upgrade()
             {
-                mux.request_stop(peer, slot);
+                mux.request_stop(peer, slot, prebind.ticket.routing_session_id);
             }
         } else if let Some(handle) = entry.stream_cancel_handle {
             crate::streaming::control::request_sender_stop(

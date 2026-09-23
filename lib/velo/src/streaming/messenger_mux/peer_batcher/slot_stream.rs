@@ -231,6 +231,7 @@ pub(super) struct WithheldOverflow {
 
 /// One live egress slot.
 pub(super) struct EgressSlot {
+    pub(super) session_id: u64,
     pub(super) lifecycle: Option<(
         tokio_util::sync::CancellationToken,
         tokio_util::sync::CancellationToken,
@@ -414,6 +415,7 @@ impl EgressSlots {
         };
 
         self.entries[index as usize] = Some(EgressSlot {
+            session_id: 0,
             lifecycle: None,
             id,
             credit,

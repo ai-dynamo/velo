@@ -142,24 +142,17 @@ const OPEN_QUEUE_DEPTH: usize = 64;
 /// enforced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReplyRecord {
-    StopSlot {
+    LifecycleSlot {
         slot: SlotId,
+        session_id: u64,
+        cancel: bool,
     },
     /// Additional data credit for the peer's slot.
-    CreditUpdate {
-        slot: SlotId,
-        delta: u32,
-    },
+    CreditUpdate { slot: SlotId, delta: u32 },
     /// Tell the peer to abandon a slot the ingress holds and is closing.
-    CloseSlot {
-        slot: SlotId,
-        reason: CloseReason,
-    },
+    CloseSlot { slot: SlotId, reason: CloseReason },
     /// Tell the peer to abandon an `OpenSlot` the ingress never admitted.
-    RejectSlot {
-        slot: SlotId,
-        reason: CloseReason,
-    },
+    RejectSlot { slot: SlotId, reason: CloseReason },
 }
 
 /// Why an `OpenSlot` command was refused.
@@ -187,8 +180,8 @@ pub(crate) struct BatcherHandle {
 }
 
 impl BatcherHandle {
-    pub(crate) fn peer_stopped(&self, slot: SlotId) {
-        self.control.peer_stopped(slot);
+    pub(crate) fn peer_stopped(&self, slot: SlotId, session_id: u64, cancel: bool) {
+        self.control.peer_stopped(slot, session_id, cancel);
     }
 
     /// Queue an attach, waiting if this batcher already has `OPEN_QUEUE_DEPTH`
@@ -537,6 +530,13 @@ impl Batcher {
         if drained.flush {
             self.gate.kick();
         }
+        for ((raw, session_id), cancel) in drained.lifecycle_replies {
+            let slot = SlotId::from_raw(raw);
+            self.push_reply(RecordType::LifecycleSlot, |encoder| {
+                encoder.push_lifecycle(slot, session_id, cancel)
+            })
+            .await;
+        }
         for (raw, entry) in drained.peers {
             self.on_reply(SlotId::from_raw(raw), entry).await;
         }
@@ -582,13 +582,20 @@ impl Batcher {
             self.on_peer_closed(slot, reason);
             return;
         }
-        let mut touched = false;
-        if let Some(live) = self.slots.get_mut_checked(slot) {
-            if entry.stop
-                && let Some((_, stop)) = &live.lifecycle
-            {
+        if let Some((session_id, cancel)) = entry.lifecycle
+            && let Some(live) = self.slots.get_mut_checked(slot)
+            && live.session_id == session_id
+        {
+            if cancel {
+                self.close_local(slot.index());
+                return;
+            }
+            if let Some((_, stop)) = &live.lifecycle {
                 stop.cancel();
             }
+        }
+        let mut touched = false;
+        if let Some(live) = self.slots.get_mut_checked(slot) {
             if entry.credit > 0 {
                 live.credit.grant(entry.credit);
                 touched = true;
@@ -632,11 +639,10 @@ impl Batcher {
         // information the control inbox has no other way to see, published
         // here because `entry_mine`'s bound needs it and nothing shorter than
         // this call site can hand it over.
-        self.slots
-            .get_mut_checked(id)
-            .expect("allocated slot")
-            .lifecycle = lifecycle;
-        self.control.note_allocated(id);
+        let live = self.slots.get_mut_checked(id).expect("allocated slot");
+        live.lifecycle = lifecycle;
+        live.session_id = session_id;
+        self.control.note_allocated_session(id, session_id);
         self.streams.push(stream);
         self.publish_live_slots();
         if let Some(metrics) = &self.metrics {
@@ -864,10 +870,6 @@ impl Batcher {
     /// not belong to that slot's outbound counter, and their order comes from
     /// batch position.
     async fn on_reply(&mut self, slot: SlotId, entry: PeerControl) {
-        if entry.stop && entry.close.is_none() {
-            self.push_reply(RecordType::StopSlot, |encoder| encoder.push_stop_slot(slot))
-                .await;
-        }
         if entry.credit > 0
             && self
                 .push_reply(RecordType::CreditUpdate, |encoder| {

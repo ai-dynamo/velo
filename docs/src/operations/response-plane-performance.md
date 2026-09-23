@@ -183,7 +183,7 @@ These alternatives were checked and refuted:
 - UCX scheduling is not unfair. The failed peer carried eight times the load of the others.
 - Spinning progress threads do not starve the CPU. There were 9 progress threads on 288 cores.
 
-No tuning setting reaches this mechanism. The fix has two parts. The UCX transport needs a backpressure edge (gate admission on in-flight operations or on a per-peer ring share). Liveness needs a heartbeat path that data cannot block, or a watchdog that can tell a starved stream from a dead one. The UCX inbound path now records frames like every other transport. The other two fixes are not built. [RDMA performance](rdma-performance.md) covers the UCX transport outside the response plane.
+No tuning setting reaches this mechanism. The fix has two parts. The UCX transport needs a backpressure edge (gate admission on in-flight operations or on a per-peer ring share). Liveness needs a heartbeat path that data cannot block, or a watchdog that can tell a starved stream from a dead one. The UCX inbound path records frames like every other transport. Version 0.14 adds the bounded admission edge. Saturation measurements must still check whether data backlog delays stream heartbeats beyond the watchdog. [RDMA performance](rdma-performance.md) covers the UCX transport outside the response plane.
 
 ## Instrumentation cost
 

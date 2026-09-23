@@ -65,7 +65,7 @@ use crate::observability::MuxMetricsHandle;
 /// Coalesced control for one slot **this** batcher owns.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct OwnedControl {
-    pub(super) stop: bool,
+    pub(super) lifecycle: Option<(u64, bool)>,
     /// Credit granted since the batcher last looked.
     pub(super) credit: u32,
     /// The receiver asked us to abandon the slot.
@@ -78,7 +78,6 @@ pub(super) struct OwnedControl {
 /// Coalesced control to send back for one slot the **peer** owns.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct PeerControl {
-    pub(super) stop: bool,
     /// Credit to advertise.
     pub(super) credit: u32,
     /// A close to send.
@@ -229,6 +228,10 @@ struct ControlState {
     /// matching means the key names a stale generation — one this index has
     /// since moved past via a reopen, or one it never had at all.
     live_generations: Vec<Option<u8>>,
+    live_sessions: Vec<u64>,
+    // One coalesced lifecycle signal per locally owned consumer session.
+    // A session is never coalesced with a later reuse of the same slot id.
+    lifecycle_replies: HashMap<(u32, u64), bool>,
     /// Entries refused: an index `mine` never allocated, or a `rejects` key
     /// past its cap. An ordinary stale-generation race is not counted here —
     /// see `entry_mine`.
@@ -244,6 +247,7 @@ impl ControlState {
             && self.peers.is_empty()
             && self.resolutions.is_empty()
             && self.rejects.is_empty()
+            && self.lifecycle_replies.is_empty()
     }
 
     /// The sweep evicted this batcher from the registry.
@@ -265,7 +269,11 @@ impl ControlState {
     /// own allocation history rather than by anything a peer can grow.
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.mine.len() + self.peers.len() + self.resolutions.len() + self.rejects.len()
+        self.mine.len()
+            + self.peers.len()
+            + self.resolutions.len()
+            + self.rejects.len()
+            + self.lifecycle_replies.len()
     }
 
     /// Take everything pending, leaving the state empty.
@@ -293,6 +301,7 @@ impl ControlState {
             flush: std::mem::take(&mut self.flush),
             mine,
             peers,
+            lifecycle_replies: std::mem::take(&mut self.lifecycle_replies),
         }
     }
 
@@ -379,6 +388,7 @@ pub(super) struct DrainedControl {
     pub(super) flush: bool,
     pub(super) mine: HashMap<u32, OwnedControl>,
     pub(super) peers: HashMap<u32, PeerControl>,
+    pub(super) lifecycle_replies: HashMap<(u32, u64), bool>,
 }
 
 /// The state plus the wakeup that tells the batcher to look at it.
@@ -472,13 +482,25 @@ impl ControlInbox {
     /// open just published, never against the one before it. Called before
     /// the peer can possibly have learned `slot`'s id, so by the time a
     /// legitimate grant for it can arrive, this has always already run.
+    #[cfg(test)]
     pub(super) fn note_allocated(&self, slot: SlotId) {
+        self.note_allocated_session(slot, 0);
+    }
+
+    pub(super) fn note_allocated_session(&self, slot: SlotId, session_id: u64) {
         let mut state = self.lock();
         let index = slot.index() as usize;
         if index >= state.live_generations.len() {
             state.live_generations.resize(index + 1, None);
+            state.live_sessions.resize(index + 1, 0);
         }
         state.live_generations[index] = Some(slot.generation());
+        state.live_sessions[index] = session_id;
+        // Drop a pending lifecycle signal from a prior session even when the
+        // compact generation wrapped back to the same value.
+        if let Some(pending) = state.mine.get_mut(&slot.raw()) {
+            pending.lifecycle = None;
+        }
     }
 
     /// An inbound `CreditUpdate` for a slot we own.
@@ -490,10 +512,14 @@ impl ControlInbox {
         });
     }
 
-    pub(super) fn peer_stopped(&self, slot: SlotId) {
+    pub(super) fn peer_stopped(&self, slot: SlotId, session_id: u64, cancel: bool) {
         self.mutate(|state| {
+            if state.live_sessions.get(slot.index() as usize) != Some(&session_id) {
+                return;
+            }
             if let Some(entry) = state.entry_mine(slot) {
-                entry.stop = true;
+                let prior_cancel = entry.lifecycle.is_some_and(|(_, cancelled)| cancelled);
+                entry.lifecycle = Some((session_id, cancel || prior_cancel));
             }
         });
     }
@@ -531,8 +557,15 @@ impl ControlInbox {
         self.mutate(|state| {
             for record in records {
                 match *record {
-                    ReplyRecord::StopSlot { slot } => {
-                        state.entry_peer(slot).stop = true;
+                    ReplyRecord::LifecycleSlot {
+                        slot,
+                        session_id,
+                        cancel,
+                    } => {
+                        *state
+                            .lifecycle_replies
+                            .entry((slot.raw(), session_id))
+                            .or_default() |= cancel;
                     }
                     ReplyRecord::CreditUpdate { slot, delta } => {
                         let entry = state.entry_peer(slot);
@@ -621,6 +654,46 @@ mod tests {
             inbox.note_allocated(slot(index, 0));
         }
         inbox
+    }
+
+    #[test]
+    fn lifecycle_checks_session_after_generation_reuse() {
+        let inbox = ControlInbox::default();
+        let id = slot(0, 0);
+        inbox.note_allocated_session(id, 11);
+        inbox.peer_stopped(id, 11, true);
+        // The compact slot generation can eventually wrap. The full session
+        // still prevents both queued and newly arriving stale cancellation.
+        inbox.note_allocated_session(id, 12);
+        inbox.peer_stopped(id, 11, true);
+        inbox.peer_stopped(id, 12, false);
+        assert_eq!(
+            inbox.take().unwrap().mine[&id.raw()].lifecycle,
+            Some((12, false))
+        );
+        inbox.peer_stopped(id, 12, true);
+        inbox.peer_stopped(id, 12, false);
+        assert_eq!(
+            inbox.take().unwrap().mine[&id.raw()].lifecycle,
+            Some((12, true))
+        );
+    }
+
+    #[test]
+    fn lifecycle_replies_keep_sessions_separate_and_cancel_wins() {
+        let inbox = ControlInbox::default();
+        let id = slot(0, 0);
+        for (session_id, cancel) in [(11, false), (12, false), (11, true), (11, false)] {
+            assert!(inbox.reply(&[ReplyRecord::LifecycleSlot {
+                slot: id,
+                session_id,
+                cancel
+            }]));
+        }
+        let replies = inbox.take().unwrap().lifecycle_replies;
+        assert_eq!(replies.len(), 2);
+        assert!(replies[&(id.raw(), 11)]);
+        assert!(!replies[&(id.raw(), 12)]);
     }
 
     #[test]
