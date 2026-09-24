@@ -265,7 +265,7 @@ The sweep period is the smaller of `lease_timeout / 2` and `arena_reclaim_after 
 - An endpoint is idle only when no send posted on it is in flight and none has completed for the timeout. The reaper counts the sends in flight on each endpoint, and the completion of the last one restarts the idle clock.
 - The reaper never closes an endpoint while an RDMA operation to that peer is outstanding.
 - The scan runs every half timeout, and at least once per second. An endpoint closes between one timeout and one timeout plus one scan period after its last use.
-- Idle time starts when `ucp_ep_create` returns, not before the call. On a GB200 node, a worker's first `ucp_ep_create` took 110 to 150 ms. Across 31 creates in one process during the parallel UCX tests, the median was 630 ms, which is longer than the floor. An endpoint stamped before the call was closed under its first send.
+- Idle time starts when `ucp_ep_create` returns, not before the call. On a GB200 node, a worker's first `ucp_ep_create` took 110 to 150 ms. Across 31 creates in one process during the parallel UCX tests, the median was 630 ms, which is longer than the floor. An eager endpoint stamped before the call was closed before anything used it.
 - A first send between fresh workers also waits while the peer sets up its own endpoint back to us. With the CPUs oversubscribed, a fresh pair's first frame took 360 to 420 ms. With many UCX workers in one process, the peer's step alone took 526 to 573 ms. Before the reaper counted sends in flight, it closed the endpoint under such a send, and the frame was lost.
 - The next use wires up a new endpoint with no error. The peer stays registered.
 
