@@ -24,7 +24,7 @@ use crate::transports::ucx::rma::{
     MAX_PACKED_RKEY, MappedRegion, RdmaEndpoint, RmaError, RmaGetRequest, SYS_DEV_UNKNOWN,
     preparse_packed_rkey,
 };
-use crate::transports::ucx::worker::Cmd;
+use crate::transports::ucx::worker::{Cmd, PARK_MS, ep_scan_period};
 use velo_ext::{InstanceId, MessageType, PeerInfo};
 
 struct CountingErrors {
@@ -2015,7 +2015,8 @@ async fn idle_endpoint_closes_and_the_next_send_wires_up_again() {
 /// 110-150 ms on a GB200 node. Across 31 creates in one process during the
 /// parallel UCX tests, the median was 630 ms, longer than the 500 ms floor. The
 /// new endpoint was stamped from the loop clock read before the call, so it was
-/// already past the timeout when it was created, and the next scan closed it.
+/// already past the timeout when it was created, and the scan in the next loop
+/// pass (at most one `PARK_MS` later) closed it.
 /// That closed an eager endpoint microseconds after it was created, so
 /// `eager_wireup_and_the_reaper_compose` never saw it open. The delay seam
 /// makes the slow create happen here on demand.
@@ -2039,9 +2040,10 @@ async fn a_slow_endpoint_create_does_not_age_the_new_endpoint() {
         wait_until(T, || eps_open(&a) == 1 || eps_closed_idle(&a) >= 1).await,
         "eager wireup did not run"
     );
-    // With a stale stamp the first scan after the create closes the endpoint
-    // at once. With the right stamp it stays open for a full timeout, so a
-    // quarter timeout leaves room for scheduling delay.
+    // With a stale stamp the scan in the next loop pass, at most one
+    // `PARK_MS` after the create, closes the endpoint. With the right stamp it
+    // stays open for a full timeout, so a quarter timeout leaves room for
+    // scheduling delay.
     assert!(
         !wait_until(IDLE / 4, || eps_closed_idle(&a) >= 1).await,
         "the endpoint was closed right after it was created: the create time \
@@ -2061,26 +2063,37 @@ async fn a_slow_endpoint_create_does_not_age_the_new_endpoint() {
 /// endpoint back, inside the peer's `ucp_worker_progress`. In the parallel
 /// `--lib` run that took 526-573 ms, so the reaper closed the endpoint with
 /// the send in flight: the send failed through `on_error` and the frame was
-/// lost. The seam stops the peer's progress thread for twice the timeout,
-/// which holds the send in flight past it on demand. The first check after
-/// arrival proves that the stall really held the send that long.
+/// lost. The seam stops the peer's progress thread for three timeouts, which
+/// holds the send in flight on demand.
 ///
-/// The second half checks the completion stamp. The timeout is 2 s, so the
-/// scan period is 1 s (half the timeout, capped at 1 s), and a parked progress
-/// thread wakes at least every `PARK_MS` (100 ms). If the admission stamp were
-/// the last use, the endpoint would be closed at the first scan after the
-/// send completes: within 1.1 s. With the completion stamp it stays open for a
-/// full 2 s. The bound is 1.5 s, about 0.4 s from each side.
+/// The proof has two parts. `eps_closed_idle(&a) == 0` when the frame arrives
+/// shows the endpoint was not reaped under the send. That only means something
+/// if the send was in flight past the point where a reaper without the count
+/// would have closed it: the endpoint's creation plus one timeout, plus one
+/// scan period, plus one `PARK_MS`. The test measures the creation time and
+/// asserts that the stall outlasted that point. A slow `ucp_ep_create` then
+/// fails the test loudly instead of letting a broken reaper pass. The
+/// `arrived_at - sent_at` check only shows that the seam stalled the peer.
+///
+/// The second part checks the completion stamp. The timeout is 2 s, so the
+/// scan period is 1 s (half the timeout, capped at 1 s), and a due scan runs
+/// at most one `PARK_MS` (100 ms) late. If the admission stamp were the last
+/// use, the endpoint would be closed at the first scan after the send
+/// completed: within 1.1 s. With the completion stamp it stays open for a full
+/// 2 s. The bound is 1.5 s, which leaves 0.4 s on the broken side and 0.5 s on
+/// the correct side.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_send_in_flight_keeps_its_endpoint_open() {
     const TIMEOUT: Duration = Duration::from_secs(2);
+    const STALL: Duration = Duration::from_secs(6);
+    let park = Duration::from_millis(PARK_MS as u64);
     let a = start_node_with(|b| b.ep_idle_timeout(Some(TIMEOUT))).await;
     let b = start_node().await;
     cross_register(&a, &b);
     b.transport
         .shared
         .progress_stall_ms
-        .store((2 * TIMEOUT).as_millis() as u64, Ordering::Relaxed);
+        .store(STALL.as_millis() as u64, Ordering::Relaxed);
     let errs = CountingErrors::new();
 
     let sent_at = std::time::Instant::now();
@@ -2092,7 +2105,15 @@ async fn a_send_in_flight_keeps_its_endpoint_open() {
         errs.clone(),
     );
     assert!(matches!(out, SendOutcome::Admitted));
-    let arrived = recv_message(&b.streams.message_stream, T).await.is_some();
+    assert!(
+        wait_until(T, || eps_open(&a) == 1).await,
+        "the send did not create an endpoint"
+    );
+    let created_at = std::time::Instant::now();
+    // Longer than the stall plus the reap window, so the arrival is waited for.
+    let arrived = recv_message(&b.streams.message_stream, STALL + T)
+        .await
+        .is_some();
     let arrived_at = std::time::Instant::now();
     assert_eq!(
         errs.count(),
@@ -2102,7 +2123,15 @@ async fn a_send_in_flight_keeps_its_endpoint_open() {
     assert!(arrived, "the frame was lost while its send was in flight");
     assert!(
         arrived_at.duration_since(sent_at) >= TIMEOUT,
-        "the stall did not hold the send in flight past the timeout"
+        "the seam did not stall the peer"
+    );
+    let reap_due = TIMEOUT + ep_scan_period(TIMEOUT) + park;
+    let held = arrived_at.duration_since(created_at);
+    assert!(
+        held >= reap_due,
+        "the send was in flight for only {held:?} after its endpoint was created; \
+         it must outlast {reap_due:?} for this test to prove anything. Endpoint \
+         creation was too slow for the stall."
     );
     assert_eq!(
         eps_closed_idle(&a),
@@ -2117,8 +2146,9 @@ async fn a_send_in_flight_keeps_its_endpoint_open() {
     let quiet = arrived_at.elapsed();
     assert!(
         quiet >= TIMEOUT * 3 / 4,
-        "the endpoint was closed {quiet:?} after its send completed; completion \
-         must restart the idle clock"
+        "the endpoint was closed {quiet:?} after its send completed. Either it \
+         was reaped while the send was in flight, or completion did not restart \
+         the idle clock"
     );
 
     a.transport.shutdown();

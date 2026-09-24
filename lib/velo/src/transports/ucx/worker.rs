@@ -142,11 +142,12 @@
 //!   `an_inbound_frame_refreshes_the_endpoint_it_arrived_on` asserts it, because
 //!   connection matching (which the disruption finding below establishes) is a
 //!   weaker claim than pointer identity and would not have been enough.
-//! * [`OpState::end_ep_send`], when the last send in flight on the endpoint
-//!   completes. The endpoint's [`EpSends`] counts sends posted on it and not
-//!   yet completed, and the reaper skips an endpoint while that count is not
-//!   zero. The completion time then restarts the idle clock. Without that, a
-//!   send slower than the timeout would be reaped the instant it completed.
+//! * [`OpState::stamp_ep_drained`], called from `send_trampoline` when the
+//!   last send in flight on the endpoint completes. The endpoint's [`EpSends`]
+//!   counts sends posted on it and not yet completed, and the reaper skips an
+//!   endpoint while that count is not zero. The completion time then restarts
+//!   the idle clock. Without that, a send slower than the timeout would be
+//!   reaped the instant it completed.
 //!
 //! The registry check is deliberately conservative in one direction: an
 //! operation posted on a superseded endpoint still names its peer, so the
@@ -158,13 +159,20 @@
 //! peer's `ucp_worker_progress`. With many UCX workers in one process (the
 //! parallel test suite) that step alone took 526-573 ms, past the 500 ms floor,
 //! and a reaper that read only the stamp FORCE-closed the endpoint under the
-//! send, losing the frame. The count follows `post_am`'s three exits: taken before the post, released on
-//! the inline and synchronous-failure exits, and released in `send_trampoline`
-//! for the asynchronous one. Only that last release reads the clock, and only
-//! when the count falls to zero. The count exists only with the reaper on, so
-//! the default configuration pays nothing. A send that never completes holds
-//! its endpoint open until UCX fails the endpoint, which is the conservative
-//! direction.
+//! send, losing the frame. The count follows `post_am`'s three exits: taken
+//! before the post, released on the inline and synchronous-failure exits, and
+//! released in `send_trampoline` for the asynchronous one. Only that last
+//! release reads the clock, and only when the count falls to zero. The count
+//! exists only with the reaper on, so the default configuration pays nothing.
+//! A send that never completes holds its endpoint open until UCX fails the
+//! endpoint, which is the conservative direction.
+//!
+//! The per-send cost is below what can be measured. `bench_am_send` (in the
+//! tests) on a GB200 node, release build, 6 runs alternating between the code
+//! without the count and with it: with the reaper on, the burst cost and the
+//! round-trip p50 and p99 moved +1% to +3%. With the reaper off, where the
+//! change adds only a `None` check, the same runs moved -6% to -22%. The noise
+//! of this benchmark is therefore at least ±6%.
 //!
 //! Replies posted on a reply endpoint (`Cmd::PongTo`, `Cmd::ShuttingDownTo`)
 //! carry no count, because they do not go through `ensure_ep`. The pointer can
@@ -1238,9 +1246,15 @@ struct WorkerState {
 /// rendezvous lease reaper. The ceiling keeps a generous production timeout from
 /// costing more than one scan a second; the floor keeps a tiny test-sized
 /// timeout from turning the scan into a spin on every loop pass.
-fn ep_scan_period(timeout: Duration) -> Duration {
+pub(super) fn ep_scan_period(timeout: Duration) -> Duration {
     (timeout / 2).clamp(Duration::from_millis(10), Duration::from_secs(1))
 }
+
+/// Backstop park timeout: a lost doorbell costs at most this much latency.
+///
+/// It also bounds how late a due scan can run on an idle worker, which the
+/// reaper tests use to size their margins.
+pub(super) const PARK_MS: c_int = 100;
 
 /// Entry point of the dedicated progress thread.
 pub(crate) fn worker_main(args: WorkerArgs) {
@@ -1476,8 +1490,6 @@ fn drain_ring(
 
 fn run_loop(mut state: WorkerState, ring_rx: flume::Receiver<Cmd>) {
     const DRAIN_BUDGET: usize = 64;
-    /// Backstop park timeout: a lost doorbell costs at most this much latency.
-    const PARK_MS: c_int = 100;
 
     let spin_window = Duration::from_micros(state.config.spin_us);
     // Post-progress drain bound: enough to empty a full ring plus a burst of
@@ -1499,10 +1511,12 @@ fn run_loop(mut state: WorkerState, ring_rx: flume::Receiver<Cmd>) {
                 std::thread::sleep(Duration::from_millis(ms));
             }
         }
-        // The reaper's whole clock. Every `EpEntry::last_used` stamp taken
-        // during this pass comes from here, and the scan at the end of the pass
-        // reads it too. `ensure_ep` only moves it forward, so no stamp is ever
-        // later than the scan that reads it.
+        // The reaper's clock. Every `EpEntry::last_used` stamp taken during
+        // this pass comes from here, and the scan at the end of the pass reads
+        // it too. `ensure_ep` only moves it forward. The one exception is
+        // `EpSends::drained_at`, a real clock read in `send_trampoline`, which
+        // can be later than this value. The scan's `saturating_duration_since`
+        // reads that as zero idle time, which is correct.
         state.now = Instant::now();
 
         // -- drain the ring --------------------------------------------------
@@ -1872,7 +1886,9 @@ impl WorkerState {
         // open by itself, but an endpoint with no send on it, such as an eager
         // one, has only this stamp. Advancing the pass clock, rather than
         // stamping this entry alone, keeps every later stamp in the pass and
-        // the scan that ends it on one clock.
+        // the scan that ends it on one clock. It also makes endpoints stamped
+        // earlier in this pass read as older by the time the create took,
+        // which is their true age in wall-clock time.
         self.now = Instant::now();
 
         self.shared.failed_peers.remove(&peer);

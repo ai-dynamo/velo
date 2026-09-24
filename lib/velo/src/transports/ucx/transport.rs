@@ -89,13 +89,13 @@ pub struct UcxConfig {
 /// holds that endpoint open at any timeout, so a short timeout cancels none of
 /// those sends. (Replies posted on the endpoint UCX hands the receive callback
 /// are not counted.) What a short timeout does is close endpoints between
-/// ordinary uses, and each close makes the next use
-/// pay wireup again and costs the peer a frame (see
-/// [`UcxTransportBuilder::ep_idle_timeout`]). Measured warm wireup is ~14 ms on
-/// CX-7 InfiniBand and upwards of 10 ms over the tcp lane in CI, so half a
-/// second is roughly thirty-five times that. A fresh worker costs more: on a
-/// GB200 node its first `ucp_ep_create` took 110-150 ms, and a fresh pair's
-/// first frame took 360-420 ms to arrive with the node's CPUs oversubscribed.
+/// ordinary uses, and each close makes the next use pay wireup again and costs
+/// the peer a frame (see [`UcxTransportBuilder::ep_idle_timeout`]). Measured
+/// warm wireup is ~14 ms on CX-7 InfiniBand and upwards of 10 ms over the tcp
+/// lane in CI, so half a second is roughly thirty-five times that. A fresh
+/// worker costs more: on a GB200 node its first `ucp_ep_create` took 110-150
+/// ms, and a fresh pair's first frame took 360-420 ms to arrive with the node's
+/// CPUs oversubscribed.
 ///
 /// It is a builder-level ergonomic guard, not an invariant of the reaper: a test
 /// constructing a [`UcxConfig`] directly can go below it deliberately.
@@ -690,19 +690,22 @@ impl UcxTransportBuilder {
     ///
     /// # What it promises
     ///
-    /// An endpoint is closed between one and one and a half timeouts after its
-    /// last use in either direction (the scan runs at half the timeout, capped
-    /// at one a second), and never while an RDMA operation to that peer is
-    /// outstanding. The next use re-establishes it transparently — no error
-    /// surfaces, nothing has to be re-registered.
+    /// An endpoint is closed between one timeout and one timeout plus one scan
+    /// period after its last use in either direction. The scan period is half
+    /// the timeout, capped at one second, so above a two-second timeout the
+    /// window is one timeout plus at most one second. It is never closed while
+    /// an RDMA operation to that peer is outstanding. The next use
+    /// re-establishes it transparently — no error surfaces, nothing has to be
+    /// re-registered.
     ///
     /// An endpoint is idle only when no send posted on it is in flight and none
     /// has completed for the timeout. A send slower than the timeout therefore
     /// keeps its endpoint open, and the idle clock starts again when it
     /// completes. Replies posted on the endpoint UCX hands the receive callback
     /// (pongs and shutting-down echoes) are not counted: the inbound frame that
-    /// caused each one has just refreshed the endpoint. The time `ucp_ep_create`
-    /// takes does not count as idle either.
+    /// caused each one refreshes the endpoint in the same loop pass, before the
+    /// reaper scans. The time `ucp_ep_create` takes does not count as idle
+    /// either.
     ///
     /// Values below half a second are raised to it; see the transport's
     /// `MIN_EP_IDLE_TIMEOUT` for why that is the number.
@@ -789,8 +792,9 @@ impl UcxTransportBuilder {
     /// the first transfer, and the reaper reclaims it again if the peer turns
     /// out never to be used. An eagerly established endpoint's idle clock starts
     /// when `ucp_ep_create` returns, so with both on, a registered-but-never-used
-    /// peer is wired up once and closed one timeout after that wireup. That is the intended
-    /// behaviour, not a conflict.
+    /// peer is wired up once and closed one timeout after that call returned.
+    /// The tcp wireup itself finishes later, in the background. That is the
+    /// intended behaviour, not a conflict.
     pub fn eager_endpoints(mut self, eager: bool) -> Self {
         self.config.eager_endpoints = eager;
         self
