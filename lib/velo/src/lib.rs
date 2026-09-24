@@ -593,8 +593,8 @@ impl Velo {
     ///
     /// # RDMA registrations go first, and are declared released last
     ///
-    /// When an RDMA registration layer is installed, shutdown becomes four
-    /// steps rather than three:
+    /// When an RDMA registration layer is installed, shutdown has four
+    /// steps:
     ///
     /// 1. [`begin_drain`](Self::begin_drain) — idempotent, and repeated by the
     ///    messenger shutdown below. Closing the inbound gate first means no new

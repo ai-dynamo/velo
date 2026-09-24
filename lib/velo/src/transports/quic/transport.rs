@@ -33,7 +33,8 @@ use super::listener::{AcceptContext, OrderlyEnd, run_accept_loop};
 use super::tls;
 
 /// How long a writer that stops waits for the peer to acknowledge its last
-/// bytes before it closes the connection, on every stop including teardown.
+/// bytes before it closes the connection, on every stop including teardown,
+/// unless the connection has already ended.
 /// Closing at once discards what the peer has not acknowledged, which TCP
 /// would still deliver after a close. The dial endpoint closes only after
 /// the writers finish, or after CLOSE_WAIT.
@@ -660,23 +661,38 @@ async fn connection_writer_inner(
     // Finish the stream and give the peer a moment to acknowledge it, on every
     // end including teardown, so the close does not discard frames the writer
     // already wrote. See FINISH_GRACE. Only `Ok(None)` means the peer
-    // acknowledged every byte; a STOP_SENDING code, a lost connection, or the
-    // timeout each leave written frames that the peer may not have read.
+    // acknowledged every byte.
     //
-    // Skipped when the peer already closed the connection: what it did not
-    // read is gone with it, as with a TCP peer that closes. That is the
-    // ordinary end of a peer restart, not worth a warning per connection.
-    if let Some(reason) = connection.close_reason() {
-        debug!("QUIC connection to {instance_id} closed by peer: {reason}");
-    } else if send.finish().is_ok() {
-        match tokio::time::timeout(FINISH_GRACE, send.stopped()).await {
-            Ok(Ok(None)) => {}
-            outcome => warn!(
-                "QUIC: {instance_id} ({}) did not acknowledge the stream end ({outcome:?}); \
-                 frames written but not acknowledged can be lost",
-                peer.addr
-            ),
+    // A peer that closed the connection has gone, and what it did not read is
+    // gone with it, as with a TCP peer that closes. That is the ordinary end of
+    // a peer restart, so it is logged at debug, whether the close came before
+    // the finish or during the wait. Every other end (our own force close at
+    // CLOSE_WAIT, an idle timeout, a reset, a STOP_SENDING, the wait timing
+    // out) can leave written frames unread, so it is a warning.
+    let loss = |why: String| {
+        warn!(
+            "QUIC: {instance_id} ({}) did not acknowledge the stream end ({why}); \
+             frames written but not acknowledged can be lost",
+            peer.addr
+        )
+    };
+    match connection.close_reason() {
+        Some(quinn::ConnectionError::ApplicationClosed(reason)) => {
+            debug!("QUIC connection to {instance_id} closed by peer: {reason}");
         }
+        Some(reason) => loss(format!("connection ended: {reason}")),
+        None if send.finish().is_ok() => {
+            match tokio::time::timeout(FINISH_GRACE, send.stopped()).await {
+                Ok(Ok(None)) => {}
+                Ok(Err(quinn::StoppedError::ConnectionLost(
+                    quinn::ConnectionError::ApplicationClosed(reason),
+                ))) => {
+                    debug!("QUIC connection to {instance_id} closed by peer: {reason}");
+                }
+                outcome => loss(format!("{outcome:?}")),
+            }
+        }
+        None => {}
     }
     connection.close(quinn::VarInt::from_u32(0), b"done");
     if let Some(reader) = reader {

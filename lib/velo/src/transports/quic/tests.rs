@@ -381,7 +381,7 @@ async fn a_dialer_does_not_count_the_servers_shutdown_as_a_decode_error() {
         "the dialer counted the server's shutdown as a decode error"
     );
     assert!(
-        !logs.contains("did not acknowledge the stream end"),
+        !logs.contains("can be lost"),
         "the dialer warned of lost frames on an orderly peer shutdown"
     );
     assert!(errors.0.lock().unwrap().is_empty());
@@ -622,12 +622,14 @@ fn the_senders_exit_closes_its_connection() {
         .build()
         .unwrap();
     let (reason_tx, reason_rx) = std::sync::mpsc::channel();
+    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
     let (peer, peer_id) = rx_rt.block_on(async {
         raw_server(
             1 << 20,
             Duration::from_millis(1500),
             move |connection| async move {
                 let (_send, mut recv) = connection.accept_bi().await.unwrap();
+                let _ = accepted_tx.send(());
                 let _ = recv.read_to_end(usize::MAX).await;
                 let _ = reason_tx.send(connection.closed().await);
             },
@@ -648,7 +650,12 @@ fn the_senders_exit_closes_its_connection() {
             MessageType::Event,
             Arc::new(Errors::default()),
         );
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // The peer sees the stream only once the frame arrives, so the
+        // connection is up before the shutdown under test.
+        tokio::time::timeout(Duration::from_secs(5), accepted_rx)
+            .await
+            .expect("the frame never reached the peer")
+            .unwrap();
         client.shutdown();
         client.closed().await;
         assert_eq!(
@@ -897,4 +904,135 @@ async fn closed_accounts_for_every_frame_when_the_peer_stops_reading() {
         failed, FRAMES,
         "{failed} of {FRAMES} frames failed when closed() returned; the rest are unaccounted for"
     );
+}
+
+/// A writer whose connection ends for any reason but a peer close warns that
+/// frames can be lost. Here the dialer closes by force at CLOSE_WAIT, because
+/// the peer stopped reading: frames sit in the peer's window, written but not
+/// read. Only a peer close is an orderly end; a forced close, an idle timeout
+/// or a reset is not.
+///
+/// The runtime is `current_thread`, so the log subscriber, which is set for
+/// this thread only, sees the writer's end.
+#[tokio::test]
+async fn a_forced_close_warns_of_frames_the_peer_did_not_read() {
+    const FRAMES: usize = 64;
+    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+    let (peer, peer_id) = raw_server(
+        1 << 20,
+        Duration::from_secs(30),
+        move |connection| async move {
+            let _stream = connection.accept_bi().await.unwrap();
+            let _ = accepted_tx.send(());
+            std::future::pending::<()>().await;
+        },
+    );
+    let (client, _client_streams, _) = started().await;
+    client.register(peer).unwrap();
+    let errors = Arc::new(Errors::default());
+    for i in 0..FRAMES {
+        let _ = client.send_message(
+            peer_id,
+            Bytes::from((i as u32).to_be_bytes().to_vec()),
+            Bytes::from(vec![0u8; 64 * 1024]),
+            MessageType::Response,
+            errors.clone(),
+        );
+    }
+    tokio::time::timeout(Duration::from_secs(5), accepted_rx)
+        .await
+        .expect("the writer never reached the peer")
+        .unwrap();
+
+    let logs = CapturedLogs::default();
+    let _logging = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish(),
+    );
+    client.shutdown();
+    client.closed().await;
+    let failed = errors.0.lock().unwrap().len();
+    assert!(
+        failed < FRAMES,
+        "control: no frame fit the peer's window, so none could be lost unreported"
+    );
+    assert!(
+        logs.contains("can be lost"),
+        "{} frames were written into a window the peer never read, and nothing warned",
+        FRAMES - failed
+    );
+}
+
+/// A listener that tears down closes the connection before it drops its
+/// streams. Dropped first, the streams send STOP_SENDING and FIN, which the
+/// dialer's writer reads as a stream the peer stopped with frames unread, and
+/// it warns once per connection on every peer restart. Closed first, the
+/// streams send nothing and the dialer sees an orderly close.
+///
+/// Only the teardown token is cancelled, as `graceful_shutdown` does before it
+/// calls `shutdown()`, so the order under test is the listener's own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_listener_in_teardown_closes_the_connection_before_its_streams() {
+    let server = QuicTransportBuilder::new()
+        .bind_addr("127.0.0.1:0".parse().unwrap())
+        .build()
+        .unwrap();
+    let (adapter, server_streams) = make_channels();
+    let teardown = adapter.shutdown_state.teardown_token().clone();
+    server
+        .start(
+            InstanceId::new_v4(),
+            adapter,
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        .unwrap();
+    let raw = server.address().get_entry(server.key()).unwrap().unwrap();
+    let addr = QuicEndpointInfo::decode(&raw).unwrap().endpoints[0]
+        .socket_addr()
+        .unwrap();
+
+    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    endpoint
+        .set_default_client_config(super::tls::pinned_client_config(server.fingerprint()).unwrap());
+    let connection = endpoint
+        .connect(addr, super::tls::SERVER_NAME)
+        .unwrap()
+        .await
+        .unwrap();
+    let (mut send, _recv) = connection.open_bi().await.unwrap();
+    let mut frame = Vec::new();
+    crate::transports::tcp::TcpFrameCodec::encode_frame_sync(
+        &mut frame,
+        MessageType::Event,
+        b"hdr",
+        b"pay",
+    )
+    .unwrap();
+    send.write_all(&frame).await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        server_streams.event_stream.recv_async(),
+    )
+    .await
+    .expect("the frame arrives")
+    .unwrap();
+
+    teardown.cancel();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), send.stopped())
+        .await
+        .expect("the listener neither stopped the stream nor closed the connection");
+    assert!(
+        matches!(
+            outcome,
+            Err(quinn::StoppedError::ConnectionLost(
+                quinn::ConnectionError::ApplicationClosed(_)
+            ))
+        ),
+        "the listener stopped the stream before it closed the connection: {outcome:?}"
+    );
+    server.shutdown();
 }

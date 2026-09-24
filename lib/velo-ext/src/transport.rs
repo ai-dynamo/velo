@@ -337,7 +337,7 @@ pub trait Transport: Send + Sync {
     ///
     /// This is phase 3 of the runtime's graceful shutdown and the runtime calls
     /// it only after [`ShutdownState::begin_drain`] and the drain wait. Several
-    /// in-tree transports (TCP, UDS, gRPC, UCX) also cancel the *shared*
+    /// in-tree transports (TCP, UDS, QUIC, gRPC, UCX) also cancel the *shared*
     /// [`ShutdownState::teardown_token`] here, which is instance-wide: it stops
     /// every transport's listeners **and** the runtime's inbound message
     /// consumer, which then abandons whatever is still queued. Calling

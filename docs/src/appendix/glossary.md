@@ -21,7 +21,8 @@
 | Rendezvous | Transfer of a large payload by handle. The owner stages the bytes, and the peer pulls them. |
 | RDMA GET | A one-sided read by the NIC of the peer from registered memory on the owner |
 | Slot | The identity of one stream inside the mux, with its own order and credit |
-| Teardown | The third phase of graceful shutdown. Velo cancels tokens and stops the transports. The fourth phase waits for each transport's close to reach the wire. |
+| Teardown | The third phase of graceful shutdown. Velo cancels tokens and stops the transports. |
+| Close | The fourth phase of graceful shutdown. Velo waits for `Transport::closed()` on each transport, so that what it wrote reaches the peer. |
 | Ticket | A `StreamOpenTicket`. It carries the terms of a pre-bound stream. |
 | `TransportKey` | The name of a transport in a `WorkerAddress`, for example `tcp` |
 | `WorkerAddress` | A MessagePack map from `TransportKey` to endpoint bytes |

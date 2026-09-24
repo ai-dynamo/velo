@@ -63,7 +63,7 @@ When the RDMA registration layer is installed, shutdown has four steps:
 
 1. The gate closes. No new request can ask for an RDMA transfer.
 2. The registry sweep runs. New registrations are refused, in-flight transfers drain, and each region and arena is unmapped. Anything staged in registered memory first moves to the heap, so an admitted chunked transfer can finish.
-3. The messenger gate, drain, and teardown run as usual.
+3. The messenger gate, drain, teardown, and close run as usual.
 4. Each registration that survived step 2 is declared released, but only if the backend reports that nothing is still registered.
 
 The order of steps 1 and 2 matters. An RDMA GET is issued by the NIC of the peer, so it never shows in the in-flight count of this instance. If the transport stopped first, Velo would unmap memory that a peer is still reading.

@@ -31,11 +31,11 @@
 
 pub(crate) mod address;
 
-/// Write coalescing shared by the TCP, UDS, and streaming writer loops.
+/// Write coalescing shared by the TCP, UDS, QUIC, and streaming writer loops.
 pub(crate) mod coalesce;
 
-/// Inbound frame routing shared by the TCP/UDS listeners and the read half of
-/// their dialed connections.
+/// Inbound frame routing shared by the TCP, UDS, and QUIC listeners and the
+/// read half of their dialed connections.
 pub(crate) mod ingress;
 
 pub mod tcp;
