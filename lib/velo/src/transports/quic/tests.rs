@@ -381,6 +381,10 @@ async fn a_dialer_does_not_count_the_servers_shutdown_as_a_decode_error() {
         "the dialer counted the server's shutdown as a decode error"
     );
     assert!(
+        client.connections.is_empty(),
+        "control: the dialer's writer never saw the close, so the log check proves nothing"
+    );
+    assert!(
         !logs.contains("can be lost"),
         "the dialer warned of lost frames on an orderly peer shutdown"
     );
@@ -966,15 +970,22 @@ async fn a_forced_close_warns_of_frames_the_peer_did_not_read() {
     );
 }
 
-/// A listener that tears down closes the connection before it drops its
-/// streams. Dropped first, the streams send STOP_SENDING and FIN, which the
-/// dialer's writer reads as a stream the peer stopped with frames unread, and
-/// it warns once per connection on every peer restart. Closed first, the
-/// streams send nothing and the dialer sees an orderly close.
+/// A listener that tears down ends its connections with an application close,
+/// not by stopping the stream first. A STOP_SENDING that reached the dialer
+/// before the close would read as a stream the peer stopped with frames
+/// unread, and the dialer would warn once per connection on every peer
+/// restart.
+///
+/// The listener does not call `close()` itself. Its connection task and its
+/// stream task drop their handles at teardown, and quinn closes the
+/// connection when the last one goes; a closed connection sends only
+/// CONNECTION_CLOSE, which supersedes the STOP_SENDING the dropped stream
+/// queued. The runtime is `current_thread`, so the driver runs only after both
+/// tasks have dropped their handles, which makes that order deterministic.
 ///
 /// Only the teardown token is cancelled, as `graceful_shutdown` does before it
 /// calls `shutdown()`, so the order under test is the listener's own.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 async fn a_listener_in_teardown_closes_the_connection_before_its_streams() {
     let server = QuicTransportBuilder::new()
         .bind_addr("127.0.0.1:0".parse().unwrap())

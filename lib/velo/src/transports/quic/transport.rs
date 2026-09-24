@@ -680,6 +680,9 @@ async fn connection_writer_inner(
         Some(quinn::ConnectionError::ApplicationClosed(reason)) => {
             debug!("QUIC connection to {instance_id} closed by peer: {reason}");
         }
+        Some(quinn::ConnectionError::LocallyClosed) => {
+            loss(format!("closed by force at shutdown, after {CLOSE_WAIT:?}"))
+        }
         Some(reason) => loss(format!("connection ended: {reason}")),
         None if send.finish().is_ok() => {
             match tokio::time::timeout(FINISH_GRACE, send.stopped()).await {
@@ -689,7 +692,8 @@ async fn connection_writer_inner(
                 ))) => {
                     debug!("QUIC connection to {instance_id} closed by peer: {reason}");
                 }
-                outcome => loss(format!("{outcome:?}")),
+                Err(_) => loss(format!("no acknowledgement within {FINISH_GRACE:?}")),
+                Ok(outcome) => loss(format!("{outcome:?}")),
             }
         }
         None => {}
