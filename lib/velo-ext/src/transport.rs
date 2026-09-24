@@ -357,7 +357,10 @@ pub trait Transport: Send + Sync {
     /// kernel delivers them after the process exits. A transport that keeps
     /// written data in user space until the peer acknowledges it (QUIC)
     /// overrides this, so that a process which exits right after graceful
-    /// shutdown does not discard that data. An override must bound its wait.
+    /// shutdown does not discard that data. An override must bound its wait:
+    /// [`ShutdownPolicy::Timeout`] does not cover this step, so the bound adds
+    /// to the caller's deadline. An override must also return at once if
+    /// `shutdown()` has not run, because there is nothing to wait for yet.
     fn closed(&self) -> BoxFuture<'_, ()> {
         Box::pin(std::future::ready(()))
     }

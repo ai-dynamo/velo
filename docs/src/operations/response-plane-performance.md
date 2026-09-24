@@ -187,7 +187,7 @@ No tuning setting reaches this mechanism. The fix has two parts. The UCX transpo
 
 These instruments are on the hot path. Their costs are accepted without an A/B measurement:
 
-- **Egress writer instruments** (`velo_transport_egress_queue_wait_seconds`, `velo_transport_frames_written_total`, `velo_transport_write_duration_seconds`, TCP and UDS only). Per frame: one `Instant::now()` at send, then one `elapsed()` and one histogram observe at dequeue. Per write: a second observe and up to five counter compare-and-swap loops. If this cost shows in a measurement, observe once per write on the oldest frame instead of once per frame.
+- **Egress writer instruments** (`velo_transport_egress_queue_wait_seconds`, `velo_transport_frames_written_total`, `velo_transport_write_duration_seconds`, TCP, UDS and QUIC only). Per frame: one `Instant::now()` at send, then one `elapsed()` and one histogram observe at dequeue. Per write: a second observe and up to five counter compare-and-swap loops. If this cost shows in a measurement, observe once per write on the oldest frame instead of once per frame.
 - **Ordered-lane metrics for `_stream_batch`.** Per batch: four `Arc` clones, one `elapsed()` with one histogram observe, and one gauge increment and decrement. This cost is the measurement of the lane wait itself, so no A/B applies.
 - **Batcher counters** (`velo_streaming_mux_records_sent_total`, `velo_streaming_mux_batcher_wakes_total`). The collectors are pre-bound into arrays. Per record: one `u16` increment. Per wake: one `AtomicF64` compare-and-swap. `velo_streaming_mux_staged_records` already paid one gauge compare-and-swap per staged record.
 

@@ -18,9 +18,9 @@ sequenceDiagram
 ```
 
 1. **Gate.** The drain flag goes up. New inbound requests are refused. Responses, acks, and events continue to flow, so in-flight work can finish.
-2. **Drain.** Velo waits until no admitted request is in flight. `ShutdownPolicy::WaitForever` waits with no limit. `ShutdownPolicy::Timeout(d)` waits up to `d` for the whole call.
+2. **Drain.** Velo waits until no admitted request is in flight. `ShutdownPolicy::WaitForever` waits with no limit. `ShutdownPolicy::Timeout(d)` bounds the drain at `d`. The close step adds the close bound of each transport to that, so the whole call takes at most `d` plus that bound (QUIC: 2.5 seconds).
 3. **Teardown.** Velo cancels the tokens and stops the transports.
-4. **Close.** Velo waits for `Transport::closed()` on each transport. TCP and UDS return at once, because the kernel delivers what they wrote after the process exits. QUIC keeps written data in user space until the peer acknowledges it, so it waits up to 2 seconds for its writers to finish their streams and its connections to close. A process can exit when `graceful_shutdown` returns.
+4. **Close.** Velo waits for `Transport::closed()` on each transport. TCP and UDS return at once, because the kernel delivers what they wrote after the process exits. QUIC keeps written data in user space until the peer acknowledges it, so it waits up to 2 seconds for its writers to finish their streams and its connections to close. Then it closes the rest by force and waits up to 0.5 seconds more, so that each frame it could not deliver is reported as failed. A process can exit when `graceful_shutdown` returns.
 
 `Velo` is `Clone`. If two clones call `graceful_shutdown` at the same time, the first runs the sequence and the second waits for it.
 
@@ -54,7 +54,7 @@ These tests pin the contract:
 | A queued message holds the drain open | `queued_message_holds_drain` (`velo-ext`) |
 | Admission refuses during drain and returns the frame | `admit_message_rejects_during_drain` |
 | The drain waiter does not lose a wakeup when a guard drops at the check | `wait_for_drain_survives_guard_dropped_at_the_check` |
-| The `ShuttingDown` echo reaches the sender over TCP and UDS | `transport_shutdown_tests!` in `lib/velo/tests/transports/common/mod.rs` |
+| The `ShuttingDown` echo reaches the sender over TCP, UDS and QUIC | `transport_shutdown_tests!` in `lib/velo/tests/transports/common/mod.rs` |
 | The echo completes the waiting caller | `drain_rejection_echo_completes_awaiter` |
 
 ## RDMA registrations go first

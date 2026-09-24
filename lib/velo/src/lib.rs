@@ -583,9 +583,10 @@ impl Velo {
         self.messenger.begin_drain();
     }
 
-    /// Perform a graceful 3-phase shutdown of the messenger transports: gate
-    /// inbound requests, wait for in-flight handler invocations per `policy`,
-    /// then tear down. See [`Messenger::graceful_shutdown`].
+    /// Perform a graceful shutdown of the messenger transports: gate inbound
+    /// requests, wait for in-flight handler invocations per `policy`, tear
+    /// down, then wait for each transport's close. See
+    /// [`Messenger::graceful_shutdown`].
     ///
     /// Streaming-plane teardown (anchors, stream transports) is separate and
     /// not covered by this call.
@@ -601,7 +602,7 @@ impl Velo {
     ///    torn down.
     /// 2. The registry sweep: registrations refused,
     ///    in-flight transfers drained, every region and arena unmapped.
-    /// 3. Messenger gate, drain and teardown, unchanged.
+    /// 3. Messenger gate, drain, teardown and close, unchanged.
     /// 4. Every registration that survived step 2 is declared released.
     ///
     /// Step 1 to 2 is load-bearing, not tidiness. An RDMA GET is issued by the
@@ -642,8 +643,11 @@ impl Velo {
     /// # One deadline, not one per phase
     ///
     /// [`ShutdownPolicy::Timeout`] names a bound on *this call*, so the sweep
-    /// and the messenger phase share it rather than each taking the full
+    /// and the messenger drain share it rather than each taking the full
     /// duration — which would make the worst case twice what was asked for.
+    /// The transports' close step comes on top: it is bounded by each
+    /// transport's own [`Transport::closed`] (QUIC: 2.5 s), not by the policy,
+    /// because cutting it short would discard frames already written.
     /// Under [`ShutdownPolicy::WaitForever`] the sweep still takes
     /// [`RdmaConfig::shutdown_timeout`], because a peer that crashed
     /// mid-transfer must not wedge shutdown forever even when the caller is

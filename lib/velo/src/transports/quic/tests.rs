@@ -501,3 +501,149 @@ fn frames_survive_the_runtime_ending_right_after_close() {
     );
     rx_rt.block_on(async { server.shutdown() });
 }
+
+/// A node that only accepts connections must also close them on the wire
+/// before `closed()` returns. Its CONNECTION_CLOSE leaves on the connection
+/// driver's next poll; if the process exits first, each peer learns of the
+/// close only at its idle timeout and counts that as a decode error.
+///
+/// The receiver runs on its own runtime and is dropped right after
+/// `shutdown()` and `closed()`. The dialer has a short idle timeout, so a
+/// missing close would time out within the test.
+#[test]
+fn an_accept_only_node_closes_its_connections_before_it_exits() {
+    let dialer_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let seen = Arc::new(Rejections::default());
+    let client = dialer_rt.block_on(async {
+        let client = QuicTransportBuilder::new()
+            .bind_addr("127.0.0.1:0".parse().unwrap())
+            .idle_timeout(Duration::from_millis(1500))
+            .build()
+            .unwrap();
+        client.set_observability(seen.clone());
+        let (adapter, _streams) = make_channels();
+        client
+            .start(
+                InstanceId::new_v4(),
+                adapter,
+                tokio::runtime::Handle::current(),
+            )
+            .await
+            .unwrap();
+        client
+    });
+
+    let server_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    server_rt.block_on(async {
+        let (server, server_streams, server_id) = started().await;
+        client
+            .register(peer_with_fingerprint(
+                &server,
+                server_id,
+                server.fingerprint(),
+            ))
+            .unwrap();
+        let _ = client.send_message(
+            server_id,
+            Bytes::from_static(b"hdr"),
+            Bytes::from_static(b"pay"),
+            MessageType::Event,
+            Arc::new(Errors::default()),
+        );
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            server_streams.event_stream.recv_async(),
+        )
+        .await
+        .expect("the frame arrives")
+        .unwrap();
+        server.shutdown();
+        server.closed().await;
+    });
+    // The receiver's process exits.
+    drop(server_rt);
+
+    dialer_rt.block_on(async { tokio::time::sleep(Duration::from_secs(3)).await });
+    assert_eq!(
+        seen.decode_errors(),
+        0,
+        "the dialer timed out on a connection the receiver closed without telling it"
+    );
+    dialer_rt.block_on(async { client.shutdown() });
+}
+
+/// When `closed()` gives up on a peer that stopped reading, every frame must
+/// be accounted for by the time it returns: failed through its error handler,
+/// since none was delivered. A writer parked on the peer's flow-control
+/// window fails only once the connection closes; a process that exits on
+/// `closed()`'s return must not beat those failures.
+///
+/// The peer is a raw quinn server with this transport's certificate that
+/// accepts the stream and never reads it, with a 64 KiB stream window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closed_accounts_for_every_frame_when_the_peer_stops_reading() {
+    const FRAMES: usize = 64;
+    const PAYLOAD: usize = 64 * 1024;
+    let identity = super::tls::Identity::generate().unwrap();
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
+        quinn::crypto::rustls::QuicServerConfig::try_from(
+            super::tls::server_crypto(&identity).unwrap(),
+        )
+        .unwrap(),
+    ));
+    let mut transport_config = quinn::TransportConfig::default();
+    transport_config.stream_receive_window(quinn::VarInt::from_u32(64 * 1024));
+    server_config.transport_config(Arc::new(transport_config));
+    let endpoint = quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = endpoint.local_addr().unwrap();
+    let stalled = tokio::spawn(async move {
+        let connection = endpoint.accept().await.unwrap().await.unwrap();
+        let _stream = connection.accept_bi().await.unwrap();
+        std::future::pending::<()>().await;
+    });
+
+    let info = QuicEndpointInfo {
+        endpoints: crate::transports::utils::interfaces::resolve_advertise_endpoints(
+            addr,
+            &crate::transports::utils::interfaces::InterfaceFilter::All,
+        )
+        .unwrap(),
+        fingerprint: identity.fingerprint,
+    };
+    let mut builder = WorkerAddressBuilder::new();
+    builder.add_entry("quic", info.encode().unwrap()).unwrap();
+    let peer_id = InstanceId::new_v4();
+    let (client, _client_streams, _) = started().await;
+    client
+        .register(PeerInfo::new(peer_id, builder.build().unwrap()))
+        .unwrap();
+
+    let errors = Arc::new(Errors::default());
+    for i in 0..FRAMES {
+        let _ = client.send_message(
+            peer_id,
+            Bytes::from((i as u32).to_be_bytes().to_vec()),
+            Bytes::from(vec![0u8; PAYLOAD]),
+            MessageType::Response,
+            errors.clone(),
+        );
+    }
+    // Let the writer fill the window and park.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    client.shutdown();
+    client.closed().await;
+    let failed = errors.0.lock().unwrap().len();
+    assert_eq!(
+        failed, FRAMES,
+        "{failed} of {FRAMES} frames failed when closed() returned; the rest are unaccounted for"
+    );
+    stalled.abort();
+}

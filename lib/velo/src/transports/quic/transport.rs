@@ -39,6 +39,10 @@ use super::tls::{self, Identity};
 /// only after the writers have had this long.
 const FINISH_GRACE: Duration = Duration::from_secs(1);
 
+/// How long `closed()` waits, after it force-closes the dial endpoint, for the
+/// writers that were still blocked to report their frames as failed.
+const FAIL_REPORT_GRACE: Duration = Duration::from_millis(500);
+
 /// Default QUIC idle timeout: three keep-alives. quinn ignores ICMP
 /// unreachable for liveness, so a peer that dies without closing is found only
 /// by this timeout; quinn's own default is 30 s.
@@ -465,9 +469,13 @@ impl Transport for QuicTransport {
     /// Wait for every connection writer to finish its stream (each waits up
     /// to FINISH_GRACE for the peer's acknowledgement) and for the dial
     /// endpoint's connections to close, then close the endpoint. Bounded by
-    /// twice FINISH_GRACE.
+    /// twice FINISH_GRACE plus FAIL_REPORT_GRACE. Returns at once if
+    /// `shutdown()` has not run, because the writers are still live.
     fn closed(&self) -> futures::future::BoxFuture<'_, ()> {
         Box::pin(async move {
+            if !self.cancel_token.is_cancelled() {
+                return;
+            }
             let _ = tokio::time::timeout(FINISH_GRACE * 2, async {
                 self.writers.wait().await;
                 if let Some(endpoint) = self.client_endpoint.get() {
@@ -478,6 +486,10 @@ impl Transport for QuicTransport {
             if let Some(endpoint) = self.client_endpoint.get() {
                 endpoint.close(quinn::VarInt::from_u32(0), b"shutdown");
             }
+            // A writer still blocked on a peer that stopped reading fails its
+            // frames only when the close above ends its write. Wait for those
+            // reports, so every frame is delivered or failed when this returns.
+            let _ = tokio::time::timeout(FAIL_REPORT_GRACE, self.writers.wait()).await;
         })
     }
 
@@ -634,8 +646,16 @@ async fn connection_writer_inner(
     // Finish the stream and give the peer a moment to acknowledge it, on every
     // end including teardown, so the close does not discard frames the writer
     // already wrote. See FINISH_GRACE.
-    if send.finish().is_ok() {
-        let _ = tokio::time::timeout(FINISH_GRACE, send.stopped()).await;
+    if send.finish().is_ok()
+        && tokio::time::timeout(FINISH_GRACE, send.stopped())
+            .await
+            .is_err()
+    {
+        warn!(
+            "QUIC: {instance_id} ({}) did not acknowledge the stream end within {FINISH_GRACE:?}; \
+             frames written but not acknowledged can be lost",
+            peer.addr
+        );
     }
     if let Some(reason) = connection.close_reason() {
         debug!("QUIC connection to {instance_id} closed by peer: {reason}");

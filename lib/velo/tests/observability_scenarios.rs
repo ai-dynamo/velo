@@ -5,7 +5,7 @@
 //!
 //! Each scenario sends messages between two Velo instances and asserts that the
 //! expected Prometheus metrics are recorded.  The `transport_metrics_tests!`
-//! macro parameterises every scenario across TCP and UDS transports.
+//! macro parameterises every scenario across the TCP, UDS and QUIC transports.
 
 use std::sync::Arc;
 use std::time::Duration;

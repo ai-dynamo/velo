@@ -5,9 +5,10 @@
 
 //! Multi-transport active message routing framework.
 //!
-//! `velo-transports` abstracts TCP, HTTP, NATS, gRPC, and UCX behind a unified
-//! [`Transport`] trait with zero-copy [`bytes::Bytes`], fire-and-forget error
-//! callbacks, priority-based peer routing, and 4-phase graceful shutdown.
+//! This module abstracts TCP, UDS, QUIC, HTTP, NATS, gRPC, ZMQ, and UCX behind
+//! a unified [`Transport`] trait with zero-copy [`bytes::Bytes`],
+//! fire-and-forget error callbacks, priority-based peer routing, and 4-phase
+//! graceful shutdown.
 //!
 //! # Architecture
 //!
