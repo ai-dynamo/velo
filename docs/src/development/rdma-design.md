@@ -152,7 +152,7 @@ Destroying the rkey in the callback is safe, from the UCX 1.22 source:
 
 ### What teardown cannot promise
 
-Regions unmap before endpoints close for every region idle at teardown, and for every region whose GETs finish during the flush close. A GET posted to a peer that stopped progressing is the exception. The flush close never completes, and the later FORCE close is a no-op: `ucp_ep_close_nbx` returns `UCS_ERR_NOT_CONNECTED` because the flush close already set the closed flag. That GET completes only inside `ucp_worker_destroy`, after the forced unmap. Over TCP this is silent. On InfiniBand the straggler completes with an access error. The caller still gets an answer. The `abandon_rma_ops` path that covers this has no test. The `progress_stall_ms` test seam can now stall a peer's progress thread, which makes such a test possible, but it is not written.
+Regions unmap before endpoints close for every region idle at teardown, and for every region whose GETs finish during the flush close. A GET posted to a peer that stopped progressing is the exception. The flush close never completes, and the later FORCE close is a no-op: `ucp_ep_close_nbx` returns `UCS_ERR_NOT_CONNECTED` because the flush close already set the closed flag. That GET completes only inside `ucp_worker_destroy`, after the forced unmap. Over TCP this is silent. On InfiniBand the straggler completes with an access error. The caller still gets an answer. The `abandon_rma_ops` path that covers this has no test. The `progress_stall_ms` test seam, which stalls a peer's progress thread, makes one possible.
 
 ## A stale rkey aborts the process on InfiniBand
 

@@ -132,7 +132,10 @@
 //! * [`WorkerState::ensure_ep`], for everything **we** initiate — frame sends,
 //!   ping probes, RMA GETs, eager wireup. Every outbound path resolves an
 //!   endpoint through it, so there is one place that can forget to record a use.
-//! * [`WorkerState::stamp_inbound_use`], for everything the **peer** initiates.
+//! * [`WorkerState::stamp_inbound_use`], for the frames the **peer** sends with
+//!   `UCP_AM_SEND_FLAG_REPLY`: velo sets that flag on Messages and pings only.
+//!   UCX hands the recv callback a reply endpoint only for those, so
+//!   Responses, Events, Acks, Pongs and ShuttingDown echoes do not stamp.
 //!   Without it "idle" would mean "we have not sent", and a peer that only ever
 //!   sends to us would have its endpoint reaped out from under its own traffic —
 //!   repeatedly, since each reap costs it a frame (see below). It rests on a
@@ -190,17 +193,18 @@
 //! (median of 31 creates in one process), past the floor. An endpoint with no
 //! send on it, such as an eager one, has only this stamp to keep it open.
 //!
-//! **When a use is stamped.** [`WorkerState::now`] is read at the top of each
-//! loop pass, again after the progress loop, and after each `ucp_ep_create`.
-//! An inbound frame is received inside the progress loop and stamped after it,
-//! and a command in the flush drain is stamped just before it runs, so both
-//! stamps are late, never early: the endpoint stays open a little longer. A
-//! command in the pass's first drain is stamped with the top-of-pass read, so
-//! its stamp is early by at most the time that drain spent on the commands
-//! before it (at most `DRAIN_BUDGET` of them). The scan then closes an
-//! endpoint once the scan clock is more than one timeout past the stamp. The
-//! scan runs once a scan period, and on an idle worker a due scan runs at most
-//! one [`PARK_MS`] late. A long pass on a busy worker delays it further.
+//! **When a use is stamped.** With the reaper on, [`WorkerState::now`] is
+//! read at the top of each loop pass, again after the progress loop, and after
+//! each `ucp_ep_create`. A command in either drain is stamped with the read
+//! taken before that drain began, so its stamp is early by at most the time
+//! the drain spent on earlier commands (at most `DRAIN_BUDGET` commands in the
+//! first drain, `channel_capacity + DRAIN_BUDGET` in the flush drain). An
+//! inbound frame and `EpSends::drained_at` are late, never early. The scan
+//! closes an endpoint when the scan clock is more than one timeout past
+//! [`EpEntry::last_activity`] (the later of the stamp and `drained_at`), no
+//! send is in flight on it, and no RMA operation names its peer. The scan runs
+//! once a scan period, and on an idle worker a due scan runs at most one
+//! [`PARK_MS`] late. A long pass on a busy worker delays it further.
 //!
 //! **FORCE, like every other close from the main loop.** `close_ep_raw` frees
 //! the leaked `ErrArg` the moment the close is issued, a discipline established
@@ -634,8 +638,10 @@ impl OpState {
     /// Record now as the time the endpoint's last send in flight completed.
     ///
     /// Only `send_trampoline` calls this. An op that completes inside `post_am`
-    /// does so in the pass that stamped `last_used`, so it has nothing newer to
-    /// record and skips the clock read.
+    /// skips it: `ensure_ep` stamped `last_used` in the same drain, at most
+    /// that drain's length earlier (see "When a use is stamped" in the module
+    /// docs), which is close enough that a clock read per inline completion is
+    /// not worth its cost.
     fn stamp_ep_drained(&self) {
         if let Some(sends) = &self.ep_sends {
             // `max(1)`: zero means "never".
@@ -949,10 +955,13 @@ unsafe extern "C" fn recv_trampoline(
         // SAFETY: `param` is valid for the duration of the callback.
         let p = unsafe { &*param };
 
-        // Inbound traffic is use of an endpoint. Recorded here rather than in
-        // the per-kind arms below so that *every* frame from a peer counts —
-        // pings, responses, events, drain echoes — and so the hot path is one
-        // branch and two relaxed atomics regardless of what arrived.
+        // Inbound traffic is use of an endpoint. Only frames the sender
+        // posted with `UCP_AM_SEND_FLAG_REPLY` arrive with a non-null
+        // `reply_ep`, and velo sets that flag on Messages and pings only. So
+        // those stamp, and Responses, Events, Acks, Pongs and ShuttingDown
+        // echoes do not. Recorded here rather than in the per-kind arms below
+        // so the hot path is one branch and two relaxed atomics regardless of
+        // what arrived.
         if ra.shared.stamp_inbound && !p.reply_ep.is_null() {
             ra.shared.worker.reply_eps.record(p.reply_ep as usize);
         }
@@ -1139,11 +1148,9 @@ struct EpEntry {
     /// A plain `Instant`, not an atomic: `EpEntry` never leaves the progress
     /// thread. It is sampled from [`WorkerState::now`] rather than read from the
     /// clock, so stamping costs a copy and no syscall on the send path. That
-    /// clock is read at most three times a pass, so a stamp can be off from
-    /// the use it records by part of one pass. It is late for everything
-    /// except commands in the pass's first drain, which it can precede by up
-    /// to that drain's length. The module docs ("When a use is stamped") give
-    /// the details.
+    /// clock is read twice a pass plus once per `ucp_ep_create`, so a stamp
+    /// for a command can precede the command by up to the length of the drain
+    /// it ran in. The module docs ("When a use is stamped") give the details.
     last_used: Instant,
     /// Sends in flight on this endpoint. `Some` only with the idle reaper on,
     /// which is the only reader, so the default configuration pays nothing.
@@ -1244,10 +1251,12 @@ struct WorkerState {
     /// being waited on with a nested `ucp_worker_progress` — see
     /// `close_ep_raw` for why that matters.
     pending_closes: Vec<sys::ucs_status_ptr_t>,
-    /// Coarse clock for the idle reaper, read at the top of each loop pass,
-    /// again after the progress loop, and after each endpoint creation.
+    /// Coarse clock for the idle reaper. With the reaper on, it is read at the
+    /// top of each loop pass, again after the progress loop, and after each
+    /// endpoint creation. With the reaper off, only the creation read runs, so
+    /// the value is stale; nothing reads it then.
     ///
-    /// One `Instant::now()` per pass instead of one per endpoint use: the send
+    /// Two `Instant::now()` per pass instead of one per endpoint use: the send
     /// path stamps [`EpEntry::last_used`] from this, and an idle timeout is a
     /// seconds-scale quantity that has nothing to gain from a per-command clock
     /// read. The read after the progress loop exists because one progress call
@@ -1514,10 +1523,25 @@ fn drain_ring(
     (false, true)
 }
 
+/// Test seam: sleep once for the milliseconds in `cell`, then clear it.
+///
+/// A load first, so the benchmarks in the test build pay no read-modify-write
+/// per pass.
+#[cfg(test)]
+fn take_test_delay(cell: &AtomicU64) {
+    if cell.load(Ordering::Relaxed) != 0 {
+        let ms = cell.swap(0, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(ms));
+    }
+}
+
 fn run_loop(mut state: WorkerState, ring_rx: flume::Receiver<Cmd>) {
     const DRAIN_BUDGET: usize = 64;
 
     let spin_window = Duration::from_micros(state.config.spin_us);
+    // Only the idle reaper reads `state.now`, so a worker without it skips the
+    // two clock reads per pass.
+    let reaper_on = state.config.ep_idle_timeout.is_some();
     // Post-progress drain bound: enough to empty a full ring plus a burst of
     // racing submitters, without risking an unbounded loop under saturation.
     let flush_budget = state.config.channel_capacity + DRAIN_BUDGET;
@@ -1528,23 +1552,18 @@ fn run_loop(mut state: WorkerState, ring_rx: flume::Receiver<Cmd>) {
             break 'outer;
         }
         #[cfg(test)]
-        {
-            // A load first, so the benchmarks in the test build pay no
-            // read-modify-write per pass.
-            let stall = &state.shared.progress_stall_ms;
-            if stall.load(Ordering::Relaxed) != 0 {
-                let ms = stall.swap(0, Ordering::Relaxed);
-                std::thread::sleep(Duration::from_millis(ms));
-            }
-        }
+        take_test_delay(&state.shared.progress_stall_ms);
         // The reaper's clock. It is read here, again after the progress loop,
-        // and after each `ucp_ep_create`, and only moves forward. Every
+        // and after each `ucp_ep_create`, and only moves forward. The two
+        // per-pass reads run only with the reaper on. Every
         // `EpEntry::last_used` stamp comes from it, and the scan at the end of
         // the pass reads it too. The one exception is `EpSends::drained_at`, a
         // real clock read in `send_trampoline`, which can be later than this
         // value. The scan's `saturating_duration_since` reads that as zero idle
         // time, which is correct.
-        state.now = Instant::now();
+        if reaper_on {
+            state.now = Instant::now();
+        }
 
         // -- drain the ring --------------------------------------------------
         let (_, keep_running) = drain_ring(&mut state, &ring_rx, DRAIN_BUDGET, &mut last_activity);
@@ -1553,13 +1572,7 @@ fn run_loop(mut state: WorkerState, ring_rx: flume::Receiver<Cmd>) {
         }
 
         #[cfg(test)]
-        {
-            let delay = &state.shared.pre_progress_delay_ms;
-            if delay.load(Ordering::Relaxed) != 0 {
-                let ms = delay.swap(0, Ordering::Relaxed);
-                std::thread::sleep(Duration::from_millis(ms));
-            }
-        }
+        take_test_delay(&state.shared.pre_progress_delay_ms);
 
         // -- progress to quiescence -----------------------------------------
         // SAFETY: worker owned by this thread.
@@ -1572,7 +1585,9 @@ fn run_loop(mut state: WorkerState, ring_rx: flume::Receiver<Cmd>) {
         // the pass began, and the next scan could close the endpoint the frame
         // just used. The clock only moves forward, and a later stamp errs
         // toward keeping an endpoint open.
-        state.now = Instant::now();
+        if reaper_on {
+            state.now = Instant::now();
+        }
 
         // -- flush, then reap -------------------------------------------------
         // ORDERING INVARIANT (use-after-free guard): `Cmd::PongTo` and
@@ -2004,7 +2019,8 @@ impl WorkerState {
         }
     }
 
-    /// Refresh [`EpEntry::last_used`] for endpoints an inbound frame arrived on.
+    /// Refresh [`EpEntry::last_used`] for endpoints an inbound Message or ping
+    /// arrived on (the frames sent with `UCP_AM_SEND_FLAG_REPLY`).
     ///
     /// The other half of "idle" — without it, idle would mean "we have not
     /// *sent*", and a peer that only ever sends to us would have its endpoint

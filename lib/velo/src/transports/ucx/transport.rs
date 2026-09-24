@@ -669,10 +669,12 @@ impl UcxTransportBuilder {
     /// # What counts as use — both directions
     ///
     /// Anything this side initiates: a frame send, an RDMA GET, an eager
-    /// wireup. **And anything the peer sends us** — an inbound frame refreshes
-    /// the endpoint it arrived on, so "idle" means idle in both directions and a
-    /// peer that only ever sends to us does not have its endpoint reaped under
-    /// its own traffic. `a_peer_that_keeps_sending_keeps_its_endpoint` pins that.
+    /// wireup. **And the Messages and pings the peer sends us** — the frames
+    /// sent with UCX's REPLY flag, which are the only ones that arrive with a
+    /// reply endpoint — refresh the endpoint they arrived on. So "idle" means
+    /// idle in both directions, and a peer that only ever sends us Messages
+    /// does not have its endpoint reaped under its own traffic. Responses,
+    /// Events, Acks, Pongs and ShuttingDown echoes do not refresh it. `a_peer_that_keeps_sending_keeps_its_endpoint` pins that.
     ///
     /// # Health probes are not free here
     ///
@@ -699,7 +701,8 @@ impl UcxTransportBuilder {
     /// comes between one timeout and one timeout plus one scan period plus
     /// 100 ms after the last use. A long pass on a busy worker delays it
     /// further. Uses are stamped from a clock the progress thread reads a few
-    /// times per pass, not per use. Inbound frames are stamped after they
+    /// times per pass, not per use. Inbound Messages and pings (the frames sent
+    /// with the REPLY flag, the only ones that stamp) are stamped after they
     /// arrive, which errs toward keeping the endpoint open. A send is stamped
     /// at most one command drain before it is posted, which can shorten the
     /// timeout by that much. An endpoint is never closed while an RDMA

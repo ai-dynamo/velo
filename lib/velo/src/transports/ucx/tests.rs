@@ -2040,8 +2040,10 @@ async fn a_slow_endpoint_create_does_not_age_the_new_endpoint() {
         wait_until(T, || eps_open(&a) == 1 || eps_closed_idle(&a) >= 1).await,
         "eager wireup did not run"
     );
-    // With a stale stamp the scan in the next loop pass closes the endpoint,
-    // at most one `PARK_MS` (100 ms) after the create plus scheduling delay.
+    // With a stale stamp the endpoint is closed by the scan in the same pass,
+    // when the create ran in the first drain (the clock is read again after
+    // the progress loop), or at the latest by the next pass's scan, at most one
+    // `PARK_MS` (100 ms) after the create plus scheduling delay.
     // That broken side is the one that needs slack: a window of IDLE / 2
     // (250 ms) gives it 150 ms. The correct side stays open a full IDLE, so it
     // keeps 250 ms.
@@ -2130,11 +2132,13 @@ async fn a_frame_received_late_in_a_long_pass_is_not_stamped_early() {
         0,
         "the frame arrived without the long pass it is meant to arrive in"
     );
-    assert_eq!(eps_closed_idle(&a), 0, "closed before the frame arrived");
+    // One check for "already closed" and "closed soon after": with the stale
+    // stamp the close can land before this line runs, and either way the
+    // cause is the stamp.
     assert!(
         !wait_until(IDLE / 2, || eps_closed_idle(&a) >= 1).await,
-        "the endpoint was closed right after a frame used it: the frame was \
-         stamped with the time its pass began"
+        "the endpoint was closed at or right after the moment a frame used it: \
+         the frame was stamped with the time its pass began"
     );
     assert_eq!(errs.count(), 0);
 
