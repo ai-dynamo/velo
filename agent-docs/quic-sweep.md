@@ -153,3 +153,35 @@ Not on this rig. The frame transport's per-stream work costs 20-35% more fronten
 - A middle connection count (2 or 4) might keep most of the packing and avoid the stall. Not measured.
 - Zero-RTT for frame transports (the frontend pre-binds the session; the worker opens the stream from the ticket) would remove the attach round trip from both velo0 and the frame transports. Not built.
 - A worker-side profile of a stalled rep would confirm the quinn single-connection mechanism.
+
+## Addendum 2026-09-24: 2 and 4 connections per peer (`t3-qfs3`)
+
+Same tree (34aea09) and wheel as `t3-qfs2`; rig-only arms `velo-quicfs2` and `velo-quicfs4` (`DYN_VELO_QUIC_CONNECTIONS_PER_PEER=2|4`, stats every 2 s), control `velo0`. tcpo ptyche0343/0344, 4 reps. No errors, no watchdog events, no stream-open or handshake timeouts in any rep: 0 stalls in 8 frame-transport reps.
+
+Compared at a matched draw (hold):
+
+| hold | Arm | Reps | req/s | TTFT p50 | TTFT p99 | ITL p99 | CPU | Frontend datagrams |
+|---|---|---|---|---|---|---|---|---|
+| 1 | velo-quicfs2 | 1 | 2,079 | 40.7 | 259 | 120 | 14.7 | 20.7M |
+| 1 | velo-quicfs4 | 2 | 2,035-2,061 | 41.2-41.6 | 263-264 | 120-121 | 15.4-15.5 | 34.5-35.0M |
+| 1 | velo0 | 2 | 2,305-2,372 | 42.1-42.4 | 224-228 | 101-104 | 11.8-12.1 | - |
+| 2 | velo-quicfs2 | 2 | 2,458-2,493 | 40.4-41.5 | 128-132 | 55-58 | 15.2-15.3 | 16.9-17.1M |
+| 2 | velo-quicfs4 | 2 | 2,400-2,486 | 38.4-38.7 | 122-144 | 50-65 | 15.9-16.1 | 29.8-31.8M |
+| 2 | velo0 | 1 | 2,809 | 40.9 | 112 | 44 | 12.6 | - |
+| 3 | velo-quicfs2 | 1 | 2,707 | 42.0 | 96 | 38 | 15.8 | 14.4M |
+| 3 | velo0 | 1 | 2,995 | 43.4 | 93 | 30 | 13.6 | - |
+
+### Connection count, all three matrices
+
+| Connections per peer | Reps | Stalled | Frontend datagrams per run | CPU (ms/request) |
+|---|---|---|---|---|
+| 1 | 7 | 4 | 2.7-5.2M | 15.7-17.8 |
+| 2 | 4 | 0 | 14-21M | 14.7-15.8 |
+| 4 | 4 | 0 | 30-35M | 15.4-16.1 |
+| 8 | 4 | 0 | 39-44M | 16.7-17.1 |
+
+### Reading
+
+- **Two connections per peer are enough to remove the stall** on this rig (0 of 4, against 4 of 7 with one), and they keep more of the packing: 14-21M datagrams against 30-44M at 4 and 8. Two is the best frame-transport setting measured, with the lowest CPU of the four counts.
+- **Even at two, the frame transport loses to the mux at a matched draw.** Against velo0 (same attach round trip): 10-12% less throughput at every draw (2,079 against 2,305-2,372; 2,458-2,493 against 2,809; 2,707 against 2,995), 20-25% more frontend CPU (14.7-15.8 against 11.8-13.6), first-token p99 and ITL p99 worse by 3-16 ms and 8-18 ms. First-token p50 is equal to 2 ms better.
+- The ruling of the previous addendum stands: on this rig, the mux (over TCP or QUIC) is the better response plane; the frame transport's per-stream cost shows in frontend CPU and throughput whatever the connection count. Zero-RTT for frame transports would not close this gap: velo0 already pays the attach and still leads, and velo0 and velo-tcp (zero-RTT) are close at a matched draw across matrices (TTFT p50 39.7-41.5 against 39.8-42.0 ms, CPU 13.0 against 12.7-12.8), so zero-RTT is worth little on this rig.
