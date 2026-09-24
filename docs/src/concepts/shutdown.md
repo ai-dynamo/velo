@@ -1,6 +1,6 @@
 # Shutdown and drain
 
-`Velo::graceful_shutdown(policy)` stops an instance in three phases. With `ShutdownPolicy::WaitForever`, it does not lose a request that it already accepted. With `ShutdownPolicy::Timeout(d)`, teardown drops any accepted request that is still queued when `d` expires.
+`Velo::graceful_shutdown(policy)` stops an instance in four phases. With `ShutdownPolicy::WaitForever`, it does not lose a request that it already accepted. With `ShutdownPolicy::Timeout(d)`, teardown drops any accepted request that is still queued when `d` expires.
 
 ```mermaid
 sequenceDiagram
@@ -14,11 +14,13 @@ sequenceDiagram
     Adapter-->>Peer: ShuttingDown (request header echoed)
     Velo->>Velo: 2. Drain: wait until in-flight = 0 (or the timeout)
     Velo->>Velo: 3. Teardown: cancel tokens, stop transports
+    Velo->>Velo: 4. Close: wait until each transport's close is on the wire
 ```
 
 1. **Gate.** The drain flag goes up. New inbound requests are refused. Responses, acks, and events continue to flow, so in-flight work can finish.
 2. **Drain.** Velo waits until no admitted request is in flight. `ShutdownPolicy::WaitForever` waits with no limit. `ShutdownPolicy::Timeout(d)` waits up to `d` for the whole call.
 3. **Teardown.** Velo cancels the tokens and stops the transports.
+4. **Close.** Velo waits for `Transport::closed()` on each transport. TCP and UDS return at once, because the kernel delivers what they wrote after the process exits. QUIC keeps written data in user space until the peer acknowledges it, so it waits up to 2 seconds for its writers to finish their streams and its connections to close. A process can exit when `graceful_shutdown` returns.
 
 `Velo` is `Clone`. If two clones call `graceful_shutdown` at the same time, the first runs the sequence and the second waits for it.
 

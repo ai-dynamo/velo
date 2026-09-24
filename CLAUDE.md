@@ -111,7 +111,7 @@ All transports implement the `Transport` trait (`lib/velo-ext/src/transport.rs`,
 
 - **Fire-and-forget sends** with `TransportErrorHandler` callbacks for failures
 - **Four inbound streams**: message, response, event, shutdown — routed via `TransportAdapter` flume channels. `ShuttingDown` drain rejections carry the rejected *request's* header (request format, not response format), which is why they have their own lane
-- **3-phase graceful shutdown**: Gate (drain flag) → Drain (wait for in-flight) → Teardown (cancel tokens)
+- **4-phase graceful shutdown**: Gate (drain flag) → Drain (wait for in-flight) → Teardown (cancel tokens) → Close (await `Transport::closed()`; QUIC waits there for unacknowledged data, TCP/UDS return at once)
 - **`ShutdownState`** is shared between transport and adapter — `is_draining()` is a best-effort observer for reporting only; admission of inbound `MessageType::Message` frames goes through `TransportAdapter::admit_message`, which acquires the in-flight guard *first* and then re-reads the drain flag, closing the check-then-enqueue race that a bare `is_draining()` gate reopens
 - **`WorkerAddress`** uses MessagePack-encoded maps of `TransportKey` → endpoint bytes
 - **Observability** flows through `Transport::set_observability(Arc<dyn TransportObservability>)` — the runtime hands each transport a pre-bound metrics handle. In-tree transports store it in `OnceLock<Arc<dyn TransportObservability>>` and call trait methods on the hot path. External transport authors get the same handle and emit into the same `velo_transport_*` Prometheus series.

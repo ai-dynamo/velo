@@ -403,3 +403,101 @@ async fn replacing_a_dead_connection_does_not_deadlock() {
     client.shutdown();
     server.shutdown();
 }
+
+/// A process that exits right after graceful shutdown must not discard the
+/// frames its QUIC writers already wrote, and must close its connections so
+/// its peers see an orderly end. TCP gets both for free: the kernel delivers
+/// the tail and sends FIN after the process exits. On QUIC both are in user
+/// space, so `closed()` must finish them before the runtime goes away.
+///
+/// The sender runs on its own runtime, which is dropped right after
+/// `shutdown()` and `closed()`. The receiver has a short idle timeout, so a
+/// connection that died without closing times out within the test and would
+/// be counted as a decode error.
+#[test]
+fn frames_survive_the_runtime_ending_right_after_close() {
+    const FRAMES: usize = 256;
+    const PAYLOAD: usize = 64 * 1024;
+    let rx_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let seen = Arc::new(Rejections::default());
+    let (server, server_streams, server_id) = rx_rt.block_on(async {
+        let server = QuicTransportBuilder::new()
+            .bind_addr("127.0.0.1:0".parse().unwrap())
+            .idle_timeout(Duration::from_millis(1500))
+            .build()
+            .unwrap();
+        server.set_observability(seen.clone());
+        let (adapter, streams) = make_channels();
+        let id = InstanceId::new_v4();
+        server
+            .start(id, adapter, tokio::runtime::Handle::current())
+            .await
+            .unwrap();
+        (server, streams, id)
+    });
+    let server_peer = peer_with_fingerprint(&server, server_id, server.fingerprint());
+
+    let errors = Arc::new(Errors::default());
+    let tx_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let first = tx_rt.block_on(async {
+        let (client, _client_streams, _) = started().await;
+        client.register(server_peer).unwrap();
+        for i in 0..FRAMES {
+            let _ = client.send_message(
+                server_id,
+                Bytes::from((i as u32).to_be_bytes().to_vec()),
+                Bytes::from(vec![0u8; PAYLOAD]),
+                MessageType::Response,
+                errors.clone(),
+            );
+        }
+        // Close once frames are flowing, so it lands mid-stream.
+        let first = tokio::time::timeout(
+            Duration::from_secs(5),
+            server_streams.response_stream.recv_async(),
+        )
+        .await
+        .expect("the first frame arrives")
+        .is_ok();
+        client.shutdown();
+        client.closed().await;
+        first
+    });
+    // The process exits: nothing on this runtime runs again.
+    drop(tx_rt);
+    assert!(first);
+
+    let rest = rx_rt.block_on(async {
+        let mut rest = 0;
+        while let Ok(Ok(_)) = tokio::time::timeout(
+            Duration::from_secs(3),
+            server_streams.response_stream.recv_async(),
+        )
+        .await
+        {
+            rest += 1;
+        }
+        rest
+    });
+    let delivered = 1 + rest;
+    let failed = errors.0.lock().unwrap().len();
+    assert_eq!(
+        delivered + failed,
+        FRAMES,
+        "{delivered} delivered + {failed} failed != {FRAMES} sent: frames vanished when the runtime ended"
+    );
+    assert_eq!(
+        seen.decode_errors(),
+        0,
+        "the receiver counted the sender's exit as a decode error: its connection was not closed"
+    );
+    rx_rt.block_on(async { server.shutdown() });
+}

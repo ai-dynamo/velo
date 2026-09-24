@@ -3526,7 +3526,7 @@ dependencies = [
 
 [[package]]
 name = "velo-ext"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "bytes",

@@ -348,6 +348,20 @@ pub trait Transport: Send + Sync {
     /// you want.
     fn shutdown(&self);
 
+    /// Wait until the teardown that [`shutdown`](Transport::shutdown) started
+    /// has finished its work on the wire.
+    ///
+    /// The runtime's graceful shutdown awaits this on every transport after
+    /// calling `shutdown()`. The default returns at once, which is right for a
+    /// transport whose close hands unsent bytes to the kernel (TCP, UDS): the
+    /// kernel delivers them after the process exits. A transport that keeps
+    /// written data in user space until the peer acknowledges it (QUIC)
+    /// overrides this, so that a process which exits right after graceful
+    /// shutdown does not discard that data. An override must bound its wait.
+    fn closed(&self) -> BoxFuture<'_, ()> {
+        Box::pin(std::future::ready(()))
+    }
+
     /// Install a transport-scoped observability handle.
     ///
     /// The runtime calls this once per transport during startup with a handle

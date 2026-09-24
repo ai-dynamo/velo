@@ -60,6 +60,9 @@ pub struct QuicTransport {
 
     runtime: OnceLock<tokio::runtime::Handle>,
     cancel_token: CancellationToken,
+    /// Every connection writer, so `closed()` can wait for them to finish
+    /// their streams.
+    writers: tokio_util::task::TaskTracker,
     shutdown_state: OnceLock<ShutdownState>,
 
     channel_capacity: usize,
@@ -204,19 +207,22 @@ impl QuicTransport {
             tx,
         };
 
-        rt.spawn(connection_writer_task(
-            instance_id,
-            rx,
-            WriterTaskContext {
-                endpoint,
-                peer,
-                connections: Arc::clone(&self.connections),
-                cancel_token: self.cancel_token.clone(),
-                connect_timeout: self.connect_timeout,
-                reader_ctx: self.dialed_ctx.get().cloned(),
-                metrics: self.metrics.get().cloned(),
-            },
-        ));
+        self.writers.spawn_on(
+            connection_writer_task(
+                instance_id,
+                rx,
+                WriterTaskContext {
+                    endpoint,
+                    peer,
+                    connections: Arc::clone(&self.connections),
+                    cancel_token: self.cancel_token.clone(),
+                    connect_timeout: self.connect_timeout,
+                    reader_ctx: self.dialed_ctx.get().cloned(),
+                    metrics: self.metrics.get().cloned(),
+                },
+            ),
+            rt,
+        );
         Ok(handle)
     }
 
@@ -432,12 +438,15 @@ impl Transport for QuicTransport {
             state.teardown_token().cancel();
         }
         self.cancel_token.cancel();
+        self.writers.close();
         for endpoint in self.server_endpoints.get().into_iter().flatten() {
             endpoint.close(quinn::VarInt::from_u32(0), b"shutdown");
         }
         // Not the dial endpoint yet: closing it now would discard what the
         // writers wrote but the peers have not acknowledged. Each writer
         // finishes its stream and closes its connection within FINISH_GRACE.
+        // `closed()` waits for that; this task covers a caller that does not
+        // await it, as long as the runtime lives.
         if let Some(endpoint) = self.client_endpoint.get().cloned() {
             match self.runtime.get() {
                 Some(rt) => {
@@ -451,6 +460,25 @@ impl Transport for QuicTransport {
         }
         self.connections.clear();
         self.update_connection_gauge();
+    }
+
+    /// Wait for every connection writer to finish its stream (each waits up
+    /// to FINISH_GRACE for the peer's acknowledgement) and for the dial
+    /// endpoint's connections to close, then close the endpoint. Bounded by
+    /// twice FINISH_GRACE.
+    fn closed(&self) -> futures::future::BoxFuture<'_, ()> {
+        Box::pin(async move {
+            let _ = tokio::time::timeout(FINISH_GRACE * 2, async {
+                self.writers.wait().await;
+                if let Some(endpoint) = self.client_endpoint.get() {
+                    endpoint.wait_idle().await;
+                }
+            })
+            .await;
+            if let Some(endpoint) = self.client_endpoint.get() {
+                endpoint.close(quinn::VarInt::from_u32(0), b"shutdown");
+            }
+        })
     }
 
     fn set_observability(&self, observability: Arc<dyn velo_ext::TransportObservability>) {
@@ -886,6 +914,7 @@ impl QuicTransportBuilder {
             connections: Arc::new(DashMap::new()),
             runtime: OnceLock::new(),
             cancel_token: CancellationToken::new(),
+            writers: tokio_util::task::TaskTracker::new(),
             shutdown_state: OnceLock::new(),
             channel_capacity: self.channel_capacity,
             connect_timeout: self.connect_timeout,

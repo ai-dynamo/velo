@@ -7,7 +7,7 @@
 //!
 //! `velo-transports` abstracts TCP, HTTP, NATS, gRPC, and UCX behind a unified
 //! [`Transport`] trait with zero-copy [`bytes::Bytes`], fire-and-forget error
-//! callbacks, priority-based peer routing, and 3-phase graceful shutdown.
+//! callbacks, priority-based peer routing, and 4-phase graceful shutdown.
 //!
 //! # Architecture
 //!
@@ -22,10 +22,11 @@
 //!
 //! # Shutdown
 //!
-//! Graceful shutdown follows three phases:
+//! Graceful shutdown follows four phases:
 //! 1. **Gate** — flip the draining flag; transports reject new inbound requests.
 //! 2. **Drain** — wait for all in-flight requests to complete.
 //! 3. **Teardown** — cancel listeners/writers and call `shutdown()` on each transport.
+//! 4. **Close** — await `closed()` on each transport, so written data reaches the peer.
 
 pub(crate) mod address;
 
@@ -548,11 +549,13 @@ impl VeloBackend {
         }
     }
 
-    /// Perform a graceful 3-phase shutdown.
+    /// Perform a graceful 4-phase shutdown.
     ///
     /// 1. **Gate**: Flip the draining flag and notify each transport via `begin_drain()`.
     /// 2. **Drain**: Wait for all in-flight requests to complete (per `policy`).
     /// 3. **Teardown**: Cancel the teardown token and call `shutdown()` on each transport.
+    /// 4. **Close**: Await each transport's `closed()`, so what it wrote reaches the peer
+    ///    before this returns.
     pub async fn graceful_shutdown(&self, policy: ShutdownPolicy) {
         // Phase 1: Gate
         self.begin_drain();
@@ -572,6 +575,12 @@ impl VeloBackend {
         for transport in self.transports.values() {
             transport.shutdown();
         }
+
+        // Phase 4: Wait for each transport's close to finish on the wire, so a
+        // process that exits right after this returns does not discard frames
+        // a transport keeps in user space (QUIC). Each transport bounds its
+        // own wait; the default returns at once.
+        futures::future::join_all(self.transports.values().map(|t| t.closed())).await;
     }
 }
 
