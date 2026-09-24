@@ -11,8 +11,10 @@
 use std::sync::Arc;
 
 use velo::Velo;
+use velo::streaming::MuxConfig;
 
-async fn default_node() -> Arc<Velo> {
+/// A node on the default, or, with `mux`, one that sets the mux config in code.
+async fn node(mux: Option<MuxConfig>) -> Arc<Velo> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let transport = Arc::new(
         velo::transports::tcp::TcpTransportBuilder::new()
@@ -21,25 +23,32 @@ async fn default_node() -> Arc<Velo> {
             .build()
             .unwrap(),
     );
-    Velo::builder()
-        .add_transport(transport)
-        .build()
-        .await
-        .unwrap()
+    let mut builder = Velo::builder().add_transport(transport);
+    if let Some(config) = mux {
+        builder = builder.messenger_mux(config).unwrap();
+    }
+    builder.build().await.unwrap()
 }
 
-/// Two nodes that never call `messenger_mux()` would stream over the mux; with
-/// the variable set, neither installs it, and the attach negotiates the
-/// per-stream transport. This is the rollback for an application that does not
-/// expose `MuxConfig::enabled`.
+/// Two mux nodes would stream over the mux; with the variable set, neither
+/// installs it, and the attach negotiates the per-stream transport. This is the
+/// rollback for an application that does not expose `MuxConfig::enabled`.
+///
+/// The consumer is on the default and the producer sets `enabled: true` in
+/// code, so the one test pins both halves of the rule: the variable turns the
+/// default off, and it wins over an explicit `enabled: true`.
 #[tokio::test]
 async fn the_kill_switch_turns_the_default_mux_off() {
     // SAFETY: this binary has one test, and it sets the variable before any
     // `Velo` exists, so no other thread reads the environment concurrently.
     unsafe { std::env::set_var("VELO_MESSENGER_MUX_DISABLE", "1") };
 
-    let consumer = default_node().await;
-    let producer = default_node().await;
+    let consumer = node(None).await;
+    let producer = node(Some(MuxConfig {
+        enabled: true,
+        ..MuxConfig::default()
+    }))
+    .await;
     // Both nodes, not just one: negotiation picks the per-stream key whenever
     // either side lacks the mux, so the attach below alone would pass with a
     // producer that kept it.
