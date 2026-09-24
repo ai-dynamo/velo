@@ -2040,15 +2040,103 @@ async fn a_slow_endpoint_create_does_not_age_the_new_endpoint() {
         wait_until(T, || eps_open(&a) == 1 || eps_closed_idle(&a) >= 1).await,
         "eager wireup did not run"
     );
-    // With a stale stamp the scan in the next loop pass, at most one
-    // `PARK_MS` after the create, closes the endpoint. With the right stamp it
-    // stays open for a full timeout, so a quarter timeout leaves room for
-    // scheduling delay.
+    // With a stale stamp the scan in the next loop pass closes the endpoint,
+    // at most one `PARK_MS` (100 ms) after the create plus scheduling delay.
+    // That broken side is the one that needs slack: a window of IDLE / 2
+    // (250 ms) gives it 150 ms. The correct side stays open a full IDLE, so it
+    // keeps 250 ms.
     assert!(
-        !wait_until(IDLE / 4, || eps_closed_idle(&a) >= 1).await,
+        !wait_until(IDLE / 2, || eps_closed_idle(&a) >= 1).await,
         "the endpoint was closed right after it was created: the create time \
          counted as idle time"
     );
+
+    a.transport.shutdown();
+    b.transport.shutdown();
+    assert_rma_balanced(&a);
+    assert_rma_balanced(&b);
+}
+
+/// A frame received late in a long pass is stamped when the pass reaches it,
+/// not when the pass began.
+///
+/// The progress thread reads its clock at the top of each pass, then runs
+/// `ucp_worker_progress` to quiescence. Under load one progress call took
+/// 526-573 ms. A frame received late in that call was stamped with the time
+/// the pass began, so at the 500 ms floor it was already about a timeout old,
+/// and the next pass's scan closed the endpoint it had just used.
+///
+/// Two seams set this up. `progress_stall_ms` holds A's thread at the top of a
+/// pass while B sends, so the frame waits in A's socket. `pre_progress_delay_ms`
+/// then sleeps, in that same pass, after A reads its clock and before it runs
+/// `ucp_worker_progress`, for one and a half timeouts. The frame is therefore
+/// received 750 ms after the pass clock was read. With the stale stamp, the
+/// next scan closes the endpoint within one `PARK_MS` (100 ms) of the frame's
+/// arrival. With a stamp taken after the progress loop, it stays open a full
+/// timeout (500 ms). The window of IDLE / 2 (250 ms) leaves 150 ms on the
+/// broken side and 250 ms on the correct side.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_frame_received_late_in_a_long_pass_is_not_stamped_early() {
+    let a = start_node_with(|b| b.ep_idle_timeout(Some(IDLE))).await;
+    let b = start_node().await;
+    cross_register(&a, &b);
+    let errs = CountingErrors::new();
+
+    // A owns an endpoint to B, and B's path back is wired up, so B's next
+    // frame goes straight to A's socket and stamps A's endpoint on arrival.
+    ping_message(&a, &b, &errs).await;
+    ping_message(&b, &a, &errs).await;
+    assert_eq!(eps_open(&a), 1);
+
+    // Stall A, and wait until it is asleep in the stall: the seam clears its
+    // value just before it sleeps.
+    a.transport
+        .shared
+        .progress_stall_ms
+        .store(IDLE.as_millis() as u64, Ordering::Relaxed);
+    assert!(
+        wait_until(T, || a
+            .transport
+            .shared
+            .progress_stall_ms
+            .load(Ordering::Relaxed)
+            == 0)
+        .await,
+        "A never entered the stall"
+    );
+    // Same pass, after the clock read: the stand-in for a long progress call.
+    a.transport
+        .shared
+        .pre_progress_delay_ms
+        .store((IDLE + IDLE / 2).as_millis() as u64, Ordering::Relaxed);
+    let out = b.transport.send_message(
+        a.instance_id,
+        Bytes::from_static(b"h"),
+        Bytes::from_static(b"p"),
+        MessageType::Message,
+        errs.clone(),
+    );
+    assert!(matches!(out, SendOutcome::Admitted));
+
+    assert!(
+        recv_message(&a.streams.message_stream, T).await.is_some(),
+        "B's frame never reached A"
+    );
+    assert_eq!(
+        a.transport
+            .shared
+            .pre_progress_delay_ms
+            .load(Ordering::Relaxed),
+        0,
+        "the frame arrived without the long pass it is meant to arrive in"
+    );
+    assert_eq!(eps_closed_idle(&a), 0, "closed before the frame arrived");
+    assert!(
+        !wait_until(IDLE / 2, || eps_closed_idle(&a) >= 1).await,
+        "the endpoint was closed right after a frame used it: the frame was \
+         stamped with the time its pass began"
+    );
+    assert_eq!(errs.count(), 0);
 
     a.transport.shutdown();
     b.transport.shutdown();
@@ -2081,7 +2169,8 @@ async fn a_slow_endpoint_create_does_not_age_the_new_endpoint() {
 /// use, the endpoint would be closed at the first scan after the send
 /// completed: within 1.1 s. With the completion stamp it stays open for a full
 /// 2 s. The bound is 1.5 s, which leaves 0.4 s on the broken side and 0.5 s on
-/// the correct side.
+/// the correct side. These margins assume an idle worker, where a due scan runs
+/// at most one `PARK_MS` late (see `PARK_MS`).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_send_in_flight_keeps_its_endpoint_open() {
     const TIMEOUT: Duration = Duration::from_secs(2);

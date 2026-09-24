@@ -173,6 +173,8 @@ impl UcxTransport {
             ep_create_delay_ms: AtomicU64::new(0),
             #[cfg(test)]
             progress_stall_ms: AtomicU64::new(0),
+            #[cfg(test)]
+            pre_progress_delay_ms: AtomicU64::new(0),
         });
         Self {
             key,
@@ -690,13 +692,19 @@ impl UcxTransportBuilder {
     ///
     /// # What it promises
     ///
-    /// An endpoint is closed between one timeout and one timeout plus one scan
-    /// period after its last use in either direction. The scan period is half
-    /// the timeout, capped at one second, so above a two-second timeout the
-    /// window is one timeout plus at most one second. It is never closed while
-    /// an RDMA operation to that peer is outstanding. The next use
-    /// re-establishes it transparently — no error surfaces, nothing has to be
-    /// re-registered.
+    /// An endpoint is closed once one timeout has passed since its last use in
+    /// either direction, at the next scan. The scan period is half the
+    /// timeout, capped at one second, and on an idle worker a due scan runs at
+    /// most 100 ms late (the progress thread's park timeout), so the close
+    /// comes between one timeout and one timeout plus one scan period plus
+    /// 100 ms after the last use. A long pass on a busy worker delays it
+    /// further. Uses are stamped from a clock the progress thread reads a few
+    /// times per pass, not per use. Inbound frames are stamped after they
+    /// arrive, which errs toward keeping the endpoint open. A send is stamped
+    /// at most one command drain before it is posted, which can shorten the
+    /// timeout by that much. An endpoint is never closed while an RDMA
+    /// operation to that peer is outstanding. The next use re-establishes it
+    /// transparently — no error surfaces, nothing has to be re-registered.
     ///
     /// An endpoint is idle only when no send posted on it is in flight and none
     /// has completed for the timeout. A send slower than the timeout therefore
