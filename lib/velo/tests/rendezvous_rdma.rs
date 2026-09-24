@@ -30,7 +30,7 @@
 //!   the variable would switch the path off for every other test building a
 //!   `Velo` at that moment — it would fail its neighbours, not itself. The rule
 //!   it applies is unit-tested exhaustively in `lib.rs`
-//!   (`the_rdma_kill_switch_reads_only_affirmatives`), the field it writes is
+//!   (`the_kill_switches_read_only_affirmatives`), the field it writes is
 //!   exercised here through [`RdmaRendezvousConfig::enabled`], and the two
 //!   together are the same statement without the harness hazard.
 //! * **Descriptor framing.** `rendezvous::descriptor`'s own tests walk every

@@ -8,6 +8,10 @@ The mux is on by default, and most deployments change nothing. Keep the defaults
 
 A `Velo` builder installs the mux with `MuxConfig::default()`. The per-stream transport stays configured beside it, because negotiation needs it to serve peers that do not offer the mux. An attach uses the mux only when both sides advertise `messenger-mux-v1`. Every other pair uses the per-stream path.
 
+To turn the mux off without a code change, set `VELO_MESSENGER_MUX_DISABLE=1` and restart the process. Only `1`, `true`, `yes` and `on` count. Velo reads the variable once, when it builds the node.
+
+A node with the mux runs one sweep task, which wakes five times a second, and registers the `_stream_batch` handler, even if it never streams.
+
 Call `messenger_mux` to change a setting, or to turn the mux off:
 
 ```rust
@@ -164,7 +168,7 @@ let sender = match envelope.ticket {
 };
 ```
 
-`prebind_anchor` returns a ticket whenever the consumer has the mux, and the mux is on by default. A producer without the mux cannot open that ticket: `open_anchor_stream` fails, and `attach_anchor` is refused while the pre-bind is held. So when you roll the mux out, upgrade the producers before the consumers that mint tickets, or keep the mux off on those consumers until every producer has it.
+`prebind_anchor` returns a ticket whenever the consumer has the mux and the anchor can be pre-bound, and the mux is on by default. A producer without the mux cannot open that ticket: `open_anchor_stream` fails, and the first `attach_anchor` is refused. The refusal releases the pre-bind, so a retry attaches on the per-stream path. To avoid these failures when you roll the mux out, upgrade the producers before the consumers that mint tickets, or keep the mux off on those consumers until every producer has it.
 
 A zero-RTT sender has no cancel handle, so its `cancellation_token` never fires. When the consumer drops the anchor, the producer's next `send` returns an error. An idle producer also receives a close from the consumer.
 
@@ -172,9 +176,9 @@ The ticket stays valid for the 60-second accept window. After the window, the co
 
 ## Roll back
 
-1. Set `enabled: false` on the nodes that mint tickets.
+1. Set `enabled: false`, or set `VELO_MESSENGER_MUX_DISABLE=1`, on the nodes that mint tickets.
 2. Restart those nodes.
-3. Set `enabled: false` on the producers.
+3. Do the same on the producers.
 4. Restart the producers.
 
 CAUTION: Do not roll back a producer alone while its consumer still mints tickets. The consumer refuses the producer's attach, because the producer no longer offers the pre-bound key.

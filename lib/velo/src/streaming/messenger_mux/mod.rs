@@ -38,8 +38,9 @@
 //! On by default: `Velo::builder()` installs `MuxConfig::default()` unless
 //! `.messenger_mux(...)` passes another. That registers the transport beside
 //! the configured per-stream one and lets this node advertise
-//! [`MESSENGER_MUX_KEY`] on its attach requests; [`crate::streaming::negotiation`] is where an attach then picks
-//! between the two, and picks the mux only when both peers named it. Setting
+//! [`MESSENGER_MUX_KEY`] on its attach requests;
+//! [`crate::streaming::negotiation`] is where an attach then picks between the
+//! two, and picks the mux only when both peers named it. Setting
 //! `enabled` back to `false` stops the advertisement, and on the node that
 //! mints zero-RTT tickets that is the whole rollback; a producer rolled back
 //! alone is refused by a consumer that still pre-binds for it, so the minting

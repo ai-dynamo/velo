@@ -303,7 +303,10 @@ impl VeloBuilder {
     /// is the same flag**: set it to `false` and the node stops advertising
     /// `messenger-mux-v1`, so the next attach negotiates the per-stream path.
     /// No code change, no wire change, and no coordination with peers, because
-    /// a key that is never advertised is never selected.
+    /// a key that is never advertised is never selected. An application that
+    /// never calls this can still turn the mux off: set
+    /// `VELO_MESSENGER_MUX_DISABLE=1` and restart. The variable is read once,
+    /// in [`build`](Self::build).
     ///
     /// Only one mux may be installed per instance — its `_stream_batch` handler
     /// is registered on the messenger for its lifetime and the messenger
@@ -412,7 +415,16 @@ impl VeloBuilder {
         // `messenger-mux-v1` only to peers that advertised it, and every other
         // peer is still answered — and must still be served — on the
         // per-stream key.
-        let config = self.mux_config.unwrap_or_default();
+        let mut config = self.mux_config.unwrap_or_default();
+        // Read once, here, for the reason the RDMA kill switch is: one process
+        // must not answer half its attaches one way and half the other.
+        if config.enabled && messenger_mux_disabled_by_env() {
+            tracing::info!(
+                "VELO_MESSENGER_MUX_DISABLE is set: the messenger mux is off. \
+                 Streams negotiate the per-stream transport."
+            );
+            config.enabled = false;
+        }
         let mux = if config.enabled {
             let mux = crate::streaming::messenger_mux::MessengerMuxTransport::new(
                 Arc::clone(&messenger),
@@ -532,33 +544,43 @@ impl Default for VeloBuilder {
 }
 
 /// Whether `VELO_RDMA_RENDEZVOUS_DISABLE` asks for the rendezvous RDMA path to
-/// be switched off (D6).
-///
-/// Only `1`, `true`, `yes` and `on` (any case) count. A variable set to
-/// anything else — `0`, `false`, an empty string, a typo — leaves the path
-/// enabled, because a kill switch that fires on a typo is worse than one that
-/// occasionally does not fire on a misspelling: the first silently costs
-/// performance in production, the second is visible the moment somebody checks
-/// the metric.
+/// be switched off (D6). Parsed by [`kill_switch_set`].
 #[cfg(all(target_os = "linux", feature = "ucx"))]
 fn rdma_rendezvous_disabled_by_env() -> bool {
-    rdma_rendezvous_disabled(
+    kill_switch_set(
         std::env::var("VELO_RDMA_RENDEZVOUS_DISABLE")
             .ok()
             .as_deref(),
     )
 }
 
-/// The parsing half of the kill switch, split out so it can be tested.
+/// Whether `VELO_MESSENGER_MUX_DISABLE` asks for the messenger mux to be
+/// switched off. Parsed by [`kill_switch_set`].
+///
+/// The mux is on by default, so an application that never calls
+/// `messenger_mux()` has no configuration of its own to turn it off with.
+/// This variable makes that rollback a restart rather than a rebuild.
+fn messenger_mux_disabled_by_env() -> bool {
+    kill_switch_set(std::env::var("VELO_MESSENGER_MUX_DISABLE").ok().as_deref())
+}
+
+/// The parsing half of every `*_DISABLE` kill switch, split out so it can be
+/// tested.
+///
+/// Only `1`, `true`, `yes` and `on` (any case) count. A variable set to
+/// anything else — `0`, `false`, an empty string, a typo — leaves the feature
+/// enabled, because a kill switch that fires on a typo is worse than one that
+/// occasionally does not fire on a misspelling: the first silently costs
+/// performance in production, the second is visible the moment somebody checks
+/// the metric.
 ///
 /// The environment is process-global and `cargo test` runs in parallel, so a
-/// test that *set* the variable would silently switch the path off for every
+/// test that *set* a variable would silently switch the feature off for every
 /// other test building a `Velo` at that moment. Splitting the decision from the
 /// read means the rule can be checked exhaustively without touching the
-/// process; the end-to-end effect is covered through
-/// [`RdmaRendezvousConfig::enabled`], which is the same field this writes.
-#[cfg(all(target_os = "linux", feature = "ucx"))]
-fn rdma_rendezvous_disabled(value: Option<&str>) -> bool {
+/// process; each switch's end-to-end effect is covered through the config
+/// field it writes, or by a test binary of its own.
+fn kill_switch_set(value: Option<&str>) -> bool {
     value.is_some_and(|v| {
         let v = v.trim().to_ascii_lowercase();
         v == "1" || v == "true" || v == "yes" || v == "on"
@@ -1304,34 +1326,33 @@ impl Velo {
 mod tests {
     use super::*;
 
-    /// The kill switch fires on an affirmative and on nothing else.
+    /// Every kill switch fires on an affirmative and on nothing else.
     ///
     /// The asymmetry is deliberate and worth pinning down: a switch that fired
     /// on a typo would silently cost performance in production, while one that
     /// misses a misspelling shows up the moment anybody reads
     /// `velo_rendezvous_rdma_path_total`.
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
     #[test]
-    fn the_rdma_kill_switch_reads_only_affirmatives() {
+    fn the_kill_switches_read_only_affirmatives() {
         for on in [
             "1", "true", "TRUE", "True", "yes", "YES", "on", "ON", " 1 ", "\ttrue\n",
         ] {
             assert!(
-                rdma_rendezvous_disabled(Some(on)),
-                "{on:?} should switch the rendezvous RDMA path off"
+                kill_switch_set(Some(on)),
+                "{on:?} should switch the feature off"
             );
         }
         for off in [
             "0", "false", "no", "off", "", "  ", "2", "disable", "ture", "1 1",
         ] {
             assert!(
-                !rdma_rendezvous_disabled(Some(off)),
-                "{off:?} must not switch the rendezvous RDMA path off"
+                !kill_switch_set(Some(off)),
+                "{off:?} must not switch the feature off"
             );
         }
         assert!(
-            !rdma_rendezvous_disabled(None),
-            "an unset variable must leave the path enabled"
+            !kill_switch_set(None),
+            "an unset variable must leave the feature on"
         );
     }
 
