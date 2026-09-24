@@ -192,3 +192,70 @@ async fn a_remote_trigger_reaches_a_draining_subscriber() {
         .expect("the trigger never reached the draining subscriber")
         .expect("the event resolved with an error");
 }
+
+/// A remote trigger of a pending event reaches an owner that is draining.
+///
+/// The requester already holds the event's handle, so the trigger completes
+/// work the owner accepted: its own awaiters, and the requester's ack. The
+/// request is sent fire-and-forget, so a refusal echo cannot find the ack's
+/// awaiter and the requester waits forever; the owner's awaiters never resolve
+/// either, and a `WaitForever` drain waits on them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_remote_trigger_request_reaches_a_draining_owner() {
+    let (a, b, _tmp) = make_pair().await;
+    let handle = a.event_manager().new_event().unwrap().into_handle();
+    let awaiter = a.event_manager().awaiter(handle).unwrap();
+
+    a.begin_drain();
+    tokio::time::timeout(Duration::from_secs(5), b.events().trigger(handle))
+        .await
+        .expect("the draining owner never acknowledged the trigger request")
+        .expect("the trigger request failed");
+    tokio::time::timeout(Duration::from_secs(5), awaiter)
+        .await
+        .expect("the owner's own awaiter never resolved")
+        .expect("the event resolved with an error");
+}
+
+/// A subscriber reaches an owner that is draining, for an event the owner
+/// completed before the drain. The owner answers with the completion; nothing
+/// new starts. A refusal echo cannot find the subscriber's waiter, and the
+/// waiter's pending mark stops any retry, so a refused subscribe hangs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_subscribe_reaches_a_draining_owner_of_a_completed_event() {
+    let (a, b, _tmp) = make_pair().await;
+    let handle = a.event_manager().new_event().unwrap().into_handle();
+    a.event_manager().trigger(handle).unwrap();
+
+    a.begin_drain();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        b.event_manager().awaiter(handle).unwrap(),
+    )
+    .await
+    .expect("the draining owner never answered the subscribe")
+    .expect("the event resolved with an error");
+}
+
+/// A subscriber reaches an owner that is draining, for an event still pending.
+/// The owner records one subscription and sends the completion when the event
+/// fires, which here is after the drain began.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_subscribe_reaches_a_draining_owner_of_a_pending_event() {
+    let (a, b, _tmp) = make_pair().await;
+    let handle = a.event_manager().new_event().unwrap().into_handle();
+
+    a.begin_drain();
+    let awaiter = b.event_manager().awaiter(handle).unwrap();
+    let a_ref = a.clone();
+    let b_id = b.instance_id();
+    poll_until(Duration::from_secs(5), move || {
+        a_ref.has_event_subscriber(handle, b_id)
+    })
+    .await;
+    a.event_manager().trigger(handle).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), awaiter)
+        .await
+        .expect("the trigger never reached the subscriber")
+        .expect("the event resolved with an error");
+}

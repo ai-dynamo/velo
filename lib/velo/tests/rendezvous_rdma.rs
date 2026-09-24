@@ -1588,3 +1588,36 @@ async fn a_draining_owner_answers_chunked() {
     assert_eq!(pair.consumer.path_count("ok"), 0);
     shutdown(pair).await;
 }
+
+/// `draining` counts only the acquires the drain changed. A heap-staged slot
+/// is chunked whether or not the owner drains, so a draining owner still
+/// records `not_pinned` for it. Counting it as `draining` would hide the
+/// staging fact behind a transient one, the same disagreement the
+/// `not_configured` label exists to avoid.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_draining_owner_still_records_a_heap_staged_slot_as_not_pinned() {
+    let pair = Pair::new().await;
+    let payload = pattern(1024 * 1024);
+    let handle = pair.owner.velo.register_data(Bytes::from(payload.clone()));
+    // Read before the drain: `_rv_metadata` starts a new consumer, so the gate
+    // refuses it.
+    assert!(!pair.consumer.velo.metadata(handle).await.unwrap().pinned);
+    pair.owner.velo.begin_drain();
+
+    let (data, lease) = pair.consumer.velo.get(handle).await.expect("get");
+    assert_pattern(&data, payload.len());
+    pair.consumer.velo.release(handle, lease).await.unwrap();
+
+    assert_eq!(
+        pair.owner.path_count("not_pinned"),
+        1,
+        "the heap-staged slot was not counted as not_pinned"
+    );
+    assert_eq!(
+        pair.owner.path_count("draining"),
+        0,
+        "the drain was counted for a slot it did not change"
+    );
+    assert_eq!(pair.owner.path_count("ok"), 0);
+    shutdown(pair).await;
+}

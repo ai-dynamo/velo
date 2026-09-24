@@ -226,3 +226,53 @@ async fn a_draining_producer_hears_the_consumers_cancel() {
         .await
         .expect("a draining producer never heard the consumer's cancel");
 }
+
+/// The drain counts a stream message only while its handler runs, not the
+/// stream it serves. So a stream that is open but quiet lets a `WaitForever`
+/// drain finish; teardown then ends the stream. If the drain counted open
+/// streams instead, a node could not shut down while any peer held one open.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_quiet_mux_stream_lets_a_wait_forever_drain_finish() {
+    const BURST: u32 = 256;
+    let (consumer, producer) = pair(Some(mux_config()), Some(mux_config())).await;
+    let mut anchor = consumer.velo.create_anchor::<u32>();
+    let sender = producer
+        .velo
+        .attach_anchor::<u32>(transfer(anchor.handle()))
+        .await
+        .expect("remote attach");
+
+    // A burst larger than the window, then silence: the sender stays open.
+    let send = tokio::spawn(async move {
+        for n in 0..BURST {
+            sender.send(n).await.expect("send item");
+        }
+        sender
+    });
+    let collect = async {
+        let mut items = Vec::with_capacity(BURST as usize);
+        while items.len() < BURST as usize {
+            match anchor.next().await.expect("stream ended early") {
+                Ok(StreamFrame::Item(value)) => items.push(value),
+                other => panic!("unexpected frame: {other:?}"),
+            }
+        }
+        items
+    };
+    let items = tokio::time::timeout(PATIENCE, collect)
+        .await
+        .expect("the burst never arrived");
+    assert_eq!(items, (0..BURST).collect::<Vec<_>>());
+    let _sender = send.await.expect("send task");
+    assert_eq!(consumer.attaches_over(MUX_KEY), 1.0);
+
+    consumer.velo.begin_drain();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        consumer
+            .velo
+            .graceful_shutdown(velo::ShutdownPolicy::WaitForever),
+    )
+    .await
+    .expect("a quiet open stream kept a WaitForever drain waiting");
+}

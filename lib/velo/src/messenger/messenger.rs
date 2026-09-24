@@ -240,7 +240,6 @@ impl Messenger {
         //    task needs to be scheduled first.
         events.set_messenger(system.clone());
         crate::messenger::events::handlers::register_event_handlers(
-            &system.handlers,
             |handler| system.register_drain_exempt_handler(handler),
             events,
         )?;
@@ -401,13 +400,13 @@ impl Messenger {
         &self,
         handler: crate::messenger::handlers::Handler,
     ) -> anyhow::Result<()> {
-        let name: Box<[u8]> = handler.name().as_bytes().into();
-        self.handlers.register_internal_handler(handler)?;
+        // Set, then handler, as in `register_streaming_handler`, so one rule
+        // orders both paths.
         self.drain_exempt
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(name);
-        Ok(())
+            .insert(handler.name().as_bytes().into());
+        self.handlers.register_internal_handler(handler)
     }
 
     /// Enable transparent large payload support.
@@ -671,6 +670,9 @@ mod tests {
         endpoint: String,
         address: WorkerAddress,
         peers: Mutex<HashMap<InstanceId, String>>,
+        /// This transport's own adapter, for tests that feed it frames
+        /// directly. Not the shared registry: another test clears that.
+        adapter: OnceLock<TransportAdapter>,
     }
 
     impl InMemoryTransport {
@@ -681,6 +683,7 @@ mod tests {
                 address: make_test_address(key.as_str(), &endpoint),
                 endpoint,
                 peers: Mutex::new(HashMap::new()),
+                adapter: OnceLock::new(),
             })
         }
     }
@@ -784,6 +787,7 @@ mod tests {
             _rt: tokio::runtime::Handle,
         ) -> BoxFuture<'_, anyhow::Result<()>> {
             let endpoint = self.endpoint.clone();
+            let _ = self.adapter.set(channels.clone());
             Box::pin(async move {
                 test_transport_registry()
                     .lock()
@@ -826,6 +830,55 @@ mod tests {
         let a = InMemoryTransport::new(format!("in-memory://{}", InstanceId::new_v4()));
         let b = InMemoryTransport::new(format!("in-memory://{}", InstanceId::new_v4()));
         (a as Arc<dyn Transport>, b as Arc<dyn Transport>)
+    }
+
+    /// A request header for `handler`, as a peer would send it.
+    fn request_header(handler: &str) -> Bytes {
+        let message = crate::messenger::common::messages::ActiveMessage {
+            metadata: crate::messenger::common::messages::MessageMetadata::new_fire(
+                crate::messenger::common::responses::ResponseId::from_u128(1),
+                handler.to_string(),
+                None,
+            ),
+            payload: Bytes::new(),
+        };
+        message.encode().expect("encode request").0
+    }
+
+    /// Replacing an exempt handler through `register_streaming_handler` drops
+    /// its exemption. The replacement may start new work, and an exemption
+    /// left behind would let that work past the drain gate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replacing_an_exempt_handler_puts_its_name_back_behind_the_drain_gate() {
+        let transport = InMemoryTransport::new(format!("in-memory://{}", InstanceId::new_v4()));
+        let messenger = Messenger::builder()
+            .add_transport(Arc::clone(&transport) as Arc<dyn Transport>)
+            .build()
+            .await
+            .unwrap();
+        let adapter = transport.adapter.get().expect("transport started").clone();
+        let admit = |handler: &str| {
+            matches!(
+                adapter.admit_message(request_header(handler), Bytes::new()),
+                velo_ext::AdmitOutcome::Admitted
+            )
+        };
+
+        messenger
+            .register_drain_exempt_handler(Handler::am_handler("_x", |_ctx| Ok(())).build())
+            .unwrap();
+        messenger.begin_drain();
+        assert!(admit("_x"), "the exempt handler was refused by the drain");
+        // Control: the gate is closed for a name that was never exempt.
+        assert!(!admit("_y"), "the drain let a gated handler through");
+
+        messenger
+            .register_streaming_handler(Handler::am_handler("_x", |_ctx| Ok(())).build())
+            .unwrap();
+        assert!(
+            !admit("_x"),
+            "the replacement handler kept the exemption of the handler it replaced"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

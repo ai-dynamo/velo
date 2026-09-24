@@ -106,17 +106,20 @@ pub fn create_rv_acquire_handler(store: Arc<DataStore>) -> crate::messenger::Han
 /// 6. The consumer's offer does not name the backend this owner serves (D12) —
 ///    a NIXL-only consumer talking to a UCX owner is well-formed and simply
 ///    unservable.
-/// 7. The staging is gone: an external region was deregistered under the slot,
+/// 7. This owner is draining (`draining`). The drain gate lets `_rv_acquire`
+///    through so that a payload staged before the drain can still be pulled,
+///    but the shutdown sweep that follows frees pinned memory, and a
+///    descriptor handed out now could name memory that a peer's NIC is still
+///    reading at that point. It comes after the facts above so that it counts
+///    only the acquires the drain changed: a heap-staged slot on a draining
+///    owner is still `not_pinned`, and one with no registry still
+///    `not_configured`, as the consumer labels it. The flag is read without
+///    ordering: an acquire that races `begin_drain` can still get a
+///    descriptor, which is the same straggler case as an acquire admitted
+///    before the gate.
+/// 8. The staging is gone: an external region was deregistered under the slot,
 ///    or the descriptor would not encode. Counted as `not_pinned`, because from
 ///    the acquire's point of view that is what it now is.
-///
-/// Before all of these, an owner that is draining declines (`draining`). The
-/// drain gate lets `_rv_acquire` through so that a payload staged before the
-/// drain can still be pulled, but the shutdown sweep that follows frees pinned
-/// memory, and a descriptor handed out now could name memory that a peer's
-/// NIC is still reading at that point. The flag is read without ordering: an
-/// acquire that races `begin_drain` can still get a descriptor, which is the
-/// same straggler case as an acquire admitted before the gate.
 ///
 /// A lease that *is* answered with a descriptor gets a deadline, and that is
 /// the only place one is set. Chunked leases stay deadline-free.
@@ -136,10 +139,6 @@ fn rdma_response(
         store.record_path(reason);
         None
     };
-
-    if draining {
-        return decline(RdmaPathReason::Draining);
-    }
 
     let Some(offer) = offer else {
         return decline(RdmaPathReason::NoOffer);
@@ -165,6 +164,9 @@ fn rdma_response(
     let backend = rdma.backend;
     if !offer.backends.iter().any(|name| name == backend.key()) {
         return decline(RdmaPathReason::NoOffer);
+    }
+    if draining {
+        return decline(RdmaPathReason::Draining);
     }
 
     // Built under the slot's map guard and encoded outside it. `None` here is a
