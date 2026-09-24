@@ -167,6 +167,8 @@ impl UcxTransport {
             eps_inbound_unmatched: Arc::new(Default::default()),
             reply_eps: Arc::new(super::worker::ReplyEpSightings::new()),
             metrics: OnceLock::new(),
+            #[cfg(test)]
+            ep_create_delay_ms: AtomicU64::new(0),
         });
         Self {
             key,
@@ -699,7 +701,9 @@ impl UcxTransportBuilder {
     /// slower than the floor under congestion is still killable, and the
     /// admission stamp is taken from a clock sampled at the top of the progress
     /// loop's pass, so the effective budget is the timeout minus however long
-    /// that pass runs.
+    /// that pass runs. Endpoint creation does not count against it: the clock
+    /// moves forward after `ucp_ep_create`, which has been measured slower than
+    /// the floor.
     ///
     /// Values below half a second are raised to it; see the transport's
     /// `MIN_EP_IDLE_TIMEOUT` for why that is the number.

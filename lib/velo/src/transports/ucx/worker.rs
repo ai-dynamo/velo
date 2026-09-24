@@ -161,10 +161,14 @@
 //!   under congestion or backpressure is still killable. The floor shrinks the
 //!   window; it does not eliminate it.
 //! * **Pass latency.** `last_used` is stamped from [`WorkerState::now`], sampled
-//!   once at the top of the loop pass, *before* the ring drain and the
+//!   at the top of the loop pass, *before* the ring drain and the
 //!   progress-to-quiescence that follow it. A send admitted late in a long pass
 //!   is therefore stamped with a time already in the past, so the effective
-//!   budget is `timeout - Δ(pass)` rather than `timeout`.
+//!   budget is `timeout - Δ(pass)` rather than `timeout`. Endpoint creation is
+//!   the exception: `ensure_ep` advances the clock after `ucp_ep_create`,
+//!   because that call alone was measured at 630 ms (median, thirty workers in
+//!   one process), past the floor, and a new endpoint stamped from before it
+//!   was reaped under its first send.
 //!
 //! Closing the gap exactly would mean a per-endpoint operation counter threaded
 //! through `post_am`'s three-exit reclaim discipline — sound, but priced above
@@ -486,6 +490,10 @@ pub(crate) struct WorkerShared {
     /// the runtime otherwise synchronizes with, so the callback reads the
     /// slot per frame rather than capture the handle once at `start()`.
     pub metrics: OnceLock<Arc<dyn velo_ext::TransportObservability>>,
+    /// Test seam: sleep this long after each `ucp_ep_create`, so a test can
+    /// make endpoint creation slower than the idle timeout on demand.
+    #[cfg(test)]
+    pub ep_create_delay_ms: AtomicU64,
 }
 
 /// What the progress thread reports back once UCX is initialised.
@@ -1101,12 +1109,14 @@ struct WorkerState {
     /// being waited on with a nested `ucp_worker_progress` — see
     /// `close_ep_raw` for why that matters.
     pending_closes: Vec<sys::ucs_status_ptr_t>,
-    /// Coarse clock for the idle reaper, refreshed once per loop pass.
+    /// Coarse clock for the idle reaper, refreshed once per loop pass and again
+    /// after each endpoint creation.
     ///
     /// One `Instant::now()` per pass instead of one per endpoint use: the send
     /// path stamps [`EpEntry::last_used`] from this, and an idle timeout is a
     /// seconds-scale quantity that has nothing to gain from a per-command clock
-    /// read.
+    /// read. `ensure_ep` reads the clock again after `ucp_ep_create`, which can
+    /// take longer than the timeout itself.
     now: Instant,
     /// Earliest time [`WorkerState::reap_idle_eps`] will scan again. See
     /// [`ep_scan_period`].
@@ -1376,9 +1386,10 @@ fn run_loop(mut state: WorkerState, ring_rx: flume::Receiver<Cmd>) {
         if state.shared.shutdown_requested.load(Ordering::Acquire) {
             break 'outer;
         }
-        // The reaper's whole clock, sampled once. Every `EpEntry::last_used`
-        // stamp taken during this pass comes from here, so "used this pass"
-        // never reads as older than "scanned this pass".
+        // The reaper's whole clock. Every `EpEntry::last_used` stamp taken
+        // during this pass comes from here, and the scan at the end of the pass
+        // reads it too. `ensure_ep` only moves it forward, so no stamp is ever
+        // later than the scan that reads it.
         state.now = Instant::now();
 
         // -- drain the ring --------------------------------------------------
@@ -1717,6 +1728,22 @@ impl WorkerState {
             }
             ep
         };
+
+        #[cfg(test)]
+        {
+            let ms = self.shared.ep_create_delay_ms.load(Ordering::Relaxed);
+            if ms != 0 {
+                std::thread::sleep(Duration::from_millis(ms));
+            }
+        }
+        // `ucp_ep_create` can outlast the idle timeout: with about thirty UCX
+        // workers in one process creating their first endpoints at once, it
+        // took 630 ms at the median. A stamp from the clock read before the
+        // call would make the endpoint older than the timeout at birth, and the next scan would FORCE-close it with its
+        // first send still in flight. Advancing the pass clock, rather than
+        // stamping this entry alone, keeps every later stamp in the pass and
+        // the scan that ends it on one clock.
+        self.now = Instant::now();
 
         self.shared.failed_peers.remove(&peer);
         self.shared.eps_open.fetch_add(1, Ordering::Relaxed);

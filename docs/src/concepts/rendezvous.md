@@ -264,6 +264,7 @@ The sweep period is the smaller of `lease_timeout / 2` and `arena_reclaim_after 
 - "Used" means both directions. Our sends, GETs, pings, and eager wireup stamp the endpoint. Inbound frames stamp it too, because UCX hands the receive callback the same endpoint pointer that `ucp_ep_create` returned.
 - The reaper never closes an endpoint while an RDMA operation to that peer is outstanding.
 - The scan runs every half timeout, and at least once per second. An endpoint closes between one timeout and one timeout plus one scan period after its last use.
+- Idle time starts when `ucp_ep_create` returns, not before the call. A worker's first `ucp_ep_create` took 110 to 150 ms. With about thirty UCX workers in one process making theirs at once, it took 630 ms at the median, which is longer than the floor. An endpoint stamped before the call was closed under its first send.
 - The next use wires up a new endpoint with no error. The peer stays registered.
 
 **Closing an endpoint costs the peer.** UCX pairs endpoints by remote worker. The peer's own endpoint back to us rides the same connection. After a reap, the peer's next frame to us is admitted and silently lost, with no error at either end. UCX keepalive (about 20 s) then declares the peer's endpoint failed, and the frame after that arrives. The cost is one lost frame and up to one keepalive interval per reaped endpoint. The disruption self-heals.

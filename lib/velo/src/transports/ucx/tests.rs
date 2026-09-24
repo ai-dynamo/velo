@@ -2008,6 +2008,43 @@ async fn idle_endpoint_closes_and_the_next_send_wires_up_again() {
     assert_rma_balanced(&b);
 }
 
+/// The time `ucp_ep_create` takes is not idle time.
+///
+/// That call is not always fast. A worker's first `ucp_ep_create` took
+/// 110-150 ms; with about thirty UCX workers in one process making theirs at
+/// once, as in the parallel `--lib` run, it took 630 ms at the median, longer
+/// than the 500 ms floor. The new endpoint was stamped from the loop clock read before
+/// the call, so it was already past the timeout when it was created. The next
+/// scan FORCE-closed it about 50 ms later with the first send still in flight:
+/// the send failed through `on_error` and the frame never arrived. Five reaper
+/// tests failed that way, but only in the full suite. The delay seam makes the
+/// slow create happen here on demand.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_endpoint_create_does_not_age_the_new_endpoint() {
+    let a = start_node_with(|b| b.ep_idle_timeout(Some(IDLE))).await;
+    let b = start_node().await;
+    cross_register(&a, &b);
+    // Longer than IDLE, the way the measured 630 ms create was.
+    let delay = IDLE + IDLE / 2;
+    a.transport
+        .shared
+        .ep_create_delay_ms
+        .store(delay.as_millis() as u64, Ordering::Relaxed);
+    let errs = CountingErrors::new();
+
+    ping_message(&a, &b, &errs).await;
+    assert_eq!(
+        errs.count(),
+        0,
+        "the first send was cancelled by an idle close of its own new endpoint"
+    );
+
+    a.transport.shutdown();
+    b.transport.shutdown();
+    assert_rma_balanced(&a);
+    assert_rma_balanced(&b);
+}
+
 /// **Measured, and the reason the reaper is off by default.** Closing an idle
 /// endpoint disrupts the *peer's* path back to us.
 ///
