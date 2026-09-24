@@ -156,17 +156,21 @@
 //! than silent. Two residual terms remain, and both are real:
 //!
 //! * **Congestion.** [`MIN_EP_IDLE_TIMEOUT`](super::transport) floors the
-//!   timeout at roughly thirty-five times measured endpoint wireup, which is the
-//!   slowest part of a first send — but a send that takes longer than the floor
-//!   under congestion or backpressure is still killable. The floor shrinks the
-//!   window; it does not eliminate it.
+//!   timeout at roughly thirty-five times measured *warm* endpoint wireup — but
+//!   a send that takes longer than the floor under congestion or backpressure
+//!   is still killable. The floor shrinks the window; it does not eliminate it.
+//!   A first send between fresh workers is the weak case: it also waits for the
+//!   peer to set up its own endpoint back to us, inside the peer's
+//!   `ucp_worker_progress`. With many UCX workers in one process (the parallel
+//!   test suite), that peer-side step alone took 520-570 ms, and the first send
+//!   was reaped while it waited.
 //! * **Pass latency.** `last_used` is stamped from [`WorkerState::now`], sampled
 //!   at the top of the loop pass, *before* the ring drain and the
 //!   progress-to-quiescence that follow it. A send admitted late in a long pass
 //!   is therefore stamped with a time already in the past, so the effective
 //!   budget is `timeout - Δ(pass)` rather than `timeout`. Endpoint creation is
 //!   the exception: `ensure_ep` advances the clock after `ucp_ep_create`,
-//!   because that call alone was measured at 630 ms (median, thirty workers in
+//!   because that call alone was measured at 630 ms (median of 31 creates in
 //!   one process), past the floor, and a new endpoint stamped from before it
 //!   was reaped under its first send.
 //!
@@ -1736,11 +1740,11 @@ impl WorkerState {
                 std::thread::sleep(Duration::from_millis(ms));
             }
         }
-        // `ucp_ep_create` can outlast the idle timeout: with about thirty UCX
-        // workers in one process creating their first endpoints at once, it
-        // took 630 ms at the median. A stamp from the clock read before the
-        // call would make the endpoint older than the timeout at birth, and the next scan would FORCE-close it with its
-        // first send still in flight. Advancing the pass clock, rather than
+        // `ucp_ep_create` can outlast the idle timeout: across 31 creates in
+        // one process during the parallel UCX tests, the median was 630 ms. A
+        // stamp from the clock read before the call would make the endpoint
+        // older than the timeout at birth, and the next scan would FORCE-close
+        // it with its first send still in flight. Advancing the pass clock, rather than
         // stamping this entry alone, keeps every later stamp in the pass and
         // the scan that ends it on one clock.
         self.now = Instant::now();

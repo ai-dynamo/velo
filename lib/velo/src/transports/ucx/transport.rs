@@ -90,10 +90,13 @@ pub struct UcxConfig {
 /// when it completed, so a timeout shorter than the time a send takes on the
 /// wire lets the reaper close an endpoint out from under a send that is still
 /// establishing itself — the frame then fails through `on_error` instead of
-/// arriving. Measured wireup is ~14 ms on CX-7 InfiniBand and upwards of 10 ms
-/// over the tcp lane in CI, so half a second is roughly thirty-five times the
-/// observed cost and leaves the hazard requiring a send an order of magnitude
-/// slower than anything measured.
+/// arriving. Measured warm wireup is ~14 ms on CX-7 InfiniBand and upwards of
+/// 10 ms over the tcp lane in CI, so half a second is roughly thirty-five times
+/// that. A fresh worker costs more: on a GB200 node its first `ucp_ep_create`
+/// took 110-150 ms, and the first send also waits while the peer sets up its
+/// own endpoint back. A fresh pair's first frame took 360-420 ms to arrive with
+/// the node's CPUs oversubscribed. With many UCX workers in one process, each
+/// side took over 500 ms, so there the floor does not cover a first send.
 ///
 /// It is a builder-level ergonomic guard, not an invariant of the reaper: a test
 /// constructing a [`UcxConfig`] directly can go below it deliberately.

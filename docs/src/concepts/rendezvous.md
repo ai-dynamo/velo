@@ -259,12 +259,13 @@ The sweep period is the smaller of `lease_timeout / 2` and `arena_reclaim_after 
 
 ### Endpoint idle reaper
 
-`UcxTransportBuilder::ep_idle_timeout(Some(d))` closes UCX endpoints that nothing used for `d`. It is **off by default and experimental.** Values below 500 ms rise to 500 ms, which is about 35 times the measured endpoint wireup.
+`UcxTransportBuilder::ep_idle_timeout(Some(d))` closes UCX endpoints that nothing used for `d`. It is **off by default and experimental.** Values below 500 ms rise to 500 ms, which is about 35 times the measured warm endpoint wireup.
 
 - "Used" means both directions. Our sends, GETs, pings, and eager wireup stamp the endpoint. Inbound frames stamp it too, because UCX hands the receive callback the same endpoint pointer that `ucp_ep_create` returned.
 - The reaper never closes an endpoint while an RDMA operation to that peer is outstanding.
 - The scan runs every half timeout, and at least once per second. An endpoint closes between one timeout and one timeout plus one scan period after its last use.
-- Idle time starts when `ucp_ep_create` returns, not before the call. A worker's first `ucp_ep_create` took 110 to 150 ms. With about thirty UCX workers in one process making theirs at once, it took 630 ms at the median, which is longer than the floor. An endpoint stamped before the call was closed under its first send.
+- Idle time starts when `ucp_ep_create` returns, not before the call. On a GB200 node, a worker's first `ucp_ep_create` took 110 to 150 ms. Across 31 creates in one process during the parallel UCX tests, the median was 630 ms, which is longer than the floor. An endpoint stamped before the call was closed under its first send.
+- A first send between fresh workers also waits while the peer sets up its own endpoint back to us. With the CPUs oversubscribed, a fresh pair's first frame took 360 to 420 ms. With many UCX workers in one process, the peer's step alone took 520 to 570 ms. The reaper then closes the endpoint under the first send, which fails through `on_error`. The reaper does not track sends in flight.
 - The next use wires up a new endpoint with no error. The peer stays registered.
 
 **Closing an endpoint costs the peer.** UCX pairs endpoints by remote worker. The peer's own endpoint back to us rides the same connection. After a reap, the peer's next frame to us is admitted and silently lost, with no error at either end. UCX keepalive (about 20 s) then declares the peer's endpoint failed, and the frame after that arrives. The cost is one lost frame and up to one keepalive interval per reaped endpoint. The disruption self-heals.
