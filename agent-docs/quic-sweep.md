@@ -113,3 +113,43 @@ Arms: `velo-quicfs` (QUIC frame transport, messenger on TCP, no zero-RTT, fronte
 2. Instrument: log `quinn::Connection::stats()` (lost packets, congestion events, cwnd, RTT) on both ends when a stream open times out and at teardown. Both ends, because the alternative is that the frontend's single driver task for the hot connection falls behind and the socket overflows for that reason; a frontend profile would show one hot quinn task. Rerun velo-quicfs with velo0 as the control.
 3. If loss recovery is confirmed, the candidate remedy is several connections per peer (Dynamo's plane uses 8 bulk connections per worker), which spreads a hot process's streams over several sockets and caps what one stall takes down. A stream-open retry on a fresh connection is the other candidate.
 4. Profile the frontend CPU of velo-quicfs against velo0 before any tuning.
+
+## Addendum 2026-09-23 (later): diagnosis and several connections per peer (`t3-qfs2`)
+
+Tree `quic-sweep` at 34aea09 (merge of `quic-frame-transport` 65063c0: `connections_per_peer`, `stats_interval`). tcpo ptyche0352/0353, image 260903, same load, 4 reps. Arms: `velo-quicfs` (1 connection per peer), `velo-quicfs8` (8 connections per peer, each from its own UDP socket), both logging quinn stats every 2 s on both ends; `velo0` (mux, no zero-RTT), the control that pays the same attach round trip. `/proc/net/udp` snapshotted per arm for per-socket drops. `analysis/quic/qstats.py` reads both.
+
+| Arm | Reps | Stalled reps | Errors | hold | req/s | TTFT p50 | TTFT p99 | ITL p99 | CPU | Frontend datagrams | Frontend drops |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| velo-quicfs | 1, 2 | 2 | 3,143; 1,001 | (1)* | 2,742; 2,587 | 56.1; 47.7 | 107; 8,965 | 32; 47 | 17.8; 17.6 | 2.8M; 5.2M | 34k; 31k |
+| velo-quicfs | 3, 4 | 0 | 0 | 6; 4 | 2,673; 2,782 | 47.7; 49.0 | 122; 122 | 44; 46 | 17.3; 15.7 | 5.0M; 5.0M | 15k; 32k |
+| velo-quicfs8 | 1, 2, 4 | 0 | 0 | 2 | 2,408-2,433 | 38.3-39.3 | 124-135 | 51-61 | 16.7-17.1 | 38.8-40.2M | 42k-47k |
+| velo-quicfs8 | 3 | 0 | 0 | 1 | 2,040 | 43.4 | 259 | 120 | 16.71 | 44.2M | 48k |
+| velo0 | 1, 2, 4 | 0 | 0 | 2 | 2,797-2,838 | 39.7-41.5 | 114-116 | 44-49 | 12.96-13.04 | - | 0 |
+| velo0 | 3 | 0 | 0 | 4 | 2,832 | 42.3 | 128 | 55 | 12.86 | - | 0 |
+
+\* contaminated by the stall, as before. The stalled process was the one holding the backlog (mocker_3 in rep 1, mocker_4 in rep 2), so the stall follows the hot process, not an index.
+
+### What the diagnosis showed (rep 1, mocker_3)
+
+- **Not network loss.** The stalled connection lost no packets after the opening burst (7,317 lost, all in the first 4 s, the same as every other connection's 6,500-8,500). RTT stayed near 0.3 ms apart from one 494 ms sample in the burst. cwnd grew to 11-61 MB. Congestion control did not limit it.
+- **Not one overflowed frontend socket.** Socket inodes map to reuse-port indexes (inode = 427 + index in rep 1). The stalled connection sat on socket 10, which dropped 4,344 datagrams; socket 8, carrying two healthy connections, dropped 10,747. Drops spread over every socket in use. The one-socket hypothesis is refuted.
+- **The sender slowed down.** From 23:26:52 to 23:27:20 the stalled worker sent 1,500-3,000 packets per 2 s, against about 23,000 from a healthy worker. The frontend received exactly what was sent (its counters for that connection match the worker's). The frontend's "handshake timeout" is the receive side of this: QUIC opens every lower-numbered stream when a higher one arrives, so the frontend saw streams the worker had opened but not yet written for over 20 s. The worker's stream opens timed out at 20 s, and the frontend's 15 s heartbeat watchdog dropped the open streams. After the dropped streams cleared, the worker's send rate went to about 30,000 per 2 s.
+- **Mechanism (inference, the worker is not profiled):** send-side throughput collapse on the hot worker's single connection. A few thousand per-stream writer tasks funnel into one quinn connection, whose state is behind one lock and whose I/O runs on one driver task; the 494 ms RTT sample during the burst fits a starved driver. Eight connections give that process eight locks and eight drivers, and the stall did not occur in 4 of 4 reps (against 4 of 7 with one connection across both matrices).
+
+### Findings
+
+- **Several connections per peer removes the stall** on this rig: 0 of 4 reps, 0 errors.
+- **But it gives up packing.** With 8 connections the frontend received 39-44M datagrams per run, 8 times as many as with one (5M) and close to dynamo-quic's 45M: each connection has fewer frames ready at once, so quinn puts fewer in each packet.
+- **Against the fair control (velo0, two holders), velo-quicfs8 loses.** 2,408-2,433 req/s against 2,797-2,838 (14% less), first-token p99 124-135 ms against 114-116, ITL p99 51-61 against 44-49, frontend CPU 16.7-17.1 ms/request against 13.0 (about 30% more). First-token p50 is 1-3 ms better (38.3-39.3 against 39.7-41.5).
+- **The zero-RTT confound is settled.** velo0 pays the same attach round trip as velo-quicfs and runs at 13.0 ms/request, so the attach does not explain the frame transport's CPU. The frame transport itself costs about 3-5 ms/request more than the mux on the frontend.
+- **One connection, clean reps (3, 4):** 2,673-2,782 req/s at 4-6 holders against velo0's 2,832 at 4, CPU 15.7-17.3 against 12.9. Close on throughput when it does not stall, still more CPU.
+
+### Ruling on "could the frame transport beat the mux?"
+
+Not on this rig. The frame transport's per-stream work costs 20-35% more frontend CPU than the mux at every connection count. With one connection it batches as well as the mux over QUIC but stalls under the burst; with eight it does not stall but sends eight times the packets and loses 14% of throughput against velo0. Its one advantage is a first-token p50 a few milliseconds lower. The mux over QUIC with zero-RTT (velo-quic) remains the better QUIC design here.
+
+### Open
+
+- A middle connection count (2 or 4) might keep most of the packing and avoid the stall. Not measured.
+- Zero-RTT for frame transports (the frontend pre-binds the session; the worker opens the stream from the ticket) would remove the attach round trip from both velo0 and the frame transports. Not built.
+- A worker-side profile of a stalled rep would confirm the quinn single-connection mechanism.
