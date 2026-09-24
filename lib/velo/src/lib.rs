@@ -309,10 +309,10 @@ impl VeloBuilder {
     /// in [`build`](Self::build), and it wins over `enabled: true` set in
     /// code, as an operator's switch must.
     ///
-    /// Only one mux may be installed per instance — its `_stream_batch` handler
-    /// is registered on the messenger for its lifetime and the messenger
-    /// refuses a duplicate handler name. Calling this twice fails here rather
-    /// than at the second attach.
+    /// Only one mux may be installed per instance: its `_stream_batch` handler
+    /// is registered on the messenger for its lifetime. The messenger would
+    /// replace a second registration without an error, so this check is the
+    /// guard. Calling this twice fails here.
     pub fn messenger_mux(mut self, config: crate::streaming::MuxConfig) -> Result<Self> {
         if self.mux_config.is_some() {
             return Err(anyhow::anyhow!(

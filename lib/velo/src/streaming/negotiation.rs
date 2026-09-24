@@ -17,8 +17,8 @@
 //! prefers `messenger-mux-v1` **only** when the sender named it, because
 //! `resolve_transport` hard-errors on a key it does not know and a receiver that
 //! answered the mux unilaterally would break every older sender. A node with the
-//! mux enabled therefore registers both it and the configured legacy transport,
-//! and keeps serving legacy peers unchanged.
+//! mux enabled therefore registers both it and the configured per-stream
+//! transport, and keeps serving peers without the mux unchanged.
 //!
 //! The credit fields carry the rest of the agreement, and their two zeros mean
 //! different things: no window means *not offering the mux*, no byte cap means

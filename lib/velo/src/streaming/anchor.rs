@@ -1726,7 +1726,7 @@ impl AnchorManager {
     /// # Errors
     ///
     /// Returns `Err` if called twice (OnceLock already set) or if any
-    /// handler registration fails (e.g., duplicate handler name).
+    /// handler registration fails.
     ///
     /// # Panics
     ///
