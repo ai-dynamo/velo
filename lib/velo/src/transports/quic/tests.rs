@@ -21,6 +21,33 @@ impl TransportErrorHandler for Errors {
     }
 }
 
+/// Log lines captured for one test, through `tracing::subscriber::set_default`.
+#[derive(Clone, Default)]
+struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+impl CapturedLogs {
+    fn contains(&self, needle: &str) -> bool {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).contains(needle)
+    }
+}
+
+impl std::io::Write for CapturedLogs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+    type Writer = CapturedLogs;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
 async fn started() -> (QuicTransport, DataStreams, InstanceId) {
     let transport = QuicTransportBuilder::new()
         .bind_addr("127.0.0.1:0".parse().unwrap())
@@ -296,14 +323,19 @@ async fn started_observed(observed: Arc<Rejections>) -> (QuicTransport, DataStre
 }
 
 /// A server that shuts down ends its connections in the ordinary way; it is
-/// not a malformed frame. The dialer must not count it as `DecodeError`, which
+/// not a malformed frame, and no frame was lost. The dialer must neither count
+/// it as `DecodeError` nor warn of lost frames. `DecodeError`
 /// on TCP means a frame failed to parse. Without this a single restart bumps
-/// the counter on every peer, and the counter stops meaning anything.
+/// the counter, and logs a warning, on every peer, and both stop meaning
+/// anything.
 ///
 /// The server shuts down first, while the dialer's reader is still live, so
 /// the reader sees the close. The other order proves nothing: the dialer's own
 /// shutdown stops its reader before the server's close arrives.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+///
+/// The runtime is `current_thread`, so the log subscriber, which is set for
+/// this thread only, sees the writer's end.
+#[tokio::test]
 async fn a_dialer_does_not_count_the_servers_shutdown_as_a_decode_error() {
     let client_seen = Arc::new(Rejections::default());
     let (client, _client_streams, _) = started_observed(client_seen.clone()).await;
@@ -332,6 +364,14 @@ async fn a_dialer_does_not_count_the_servers_shutdown_as_a_decode_error() {
     .expect("the frame arrives")
     .unwrap();
 
+    let logs = CapturedLogs::default();
+    let _logging = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish(),
+    );
     server.shutdown();
     server.closed().await;
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -339,6 +379,10 @@ async fn a_dialer_does_not_count_the_servers_shutdown_as_a_decode_error() {
         client_seen.decode_errors(),
         0,
         "the dialer counted the server's shutdown as a decode error"
+    );
+    assert!(
+        !logs.contains("did not acknowledge the stream end"),
+        "the dialer warned of lost frames on an orderly peer shutdown"
     );
     assert!(errors.0.lock().unwrap().is_empty());
     client.shutdown();
@@ -450,15 +494,14 @@ async fn replacing_a_dead_connection_does_not_deadlock() {
 }
 
 /// A process that exits right after graceful shutdown must not discard the
-/// frames its QUIC writers already wrote, and must close its connections so
-/// its peers see an orderly end. TCP gets both for free: the kernel delivers
-/// the tail and sends FIN after the process exits. On QUIC both are in user
-/// space, so `closed()` must finish them before the runtime goes away.
+/// frames its QUIC writers already wrote. TCP gets this for free: the kernel
+/// delivers the tail after the process exits. On QUIC the tail is in user
+/// space, so `closed()` must finish it before the runtime goes away. That the
+/// connection is also closed on the wire is
+/// `the_senders_exit_closes_its_connection`.
 ///
 /// The sender runs on its own runtime, which is dropped right after
-/// `shutdown()` and `closed()`. The receiver has a short idle timeout, so a
-/// connection that died without closing times out within the test and would
-/// be counted as a decode error.
+/// `shutdown()` and `closed()`.
 #[test]
 fn frames_survive_the_runtime_ending_right_after_close() {
     const FRAMES: usize = 256;
@@ -468,22 +511,7 @@ fn frames_survive_the_runtime_ending_right_after_close() {
         .enable_all()
         .build()
         .unwrap();
-    let seen = Arc::new(Rejections::default());
-    let (server, server_streams, server_id) = rx_rt.block_on(async {
-        let server = QuicTransportBuilder::new()
-            .bind_addr("127.0.0.1:0".parse().unwrap())
-            .idle_timeout(Duration::from_millis(1500))
-            .build()
-            .unwrap();
-        server.set_observability(seen.clone());
-        let (adapter, streams) = make_channels();
-        let id = InstanceId::new_v4();
-        server
-            .start(id, adapter, tokio::runtime::Handle::current())
-            .await
-            .unwrap();
-        (server, streams, id)
-    });
+    let (server, server_streams, server_id) = rx_rt.block_on(started());
     let server_peer = peer_with_fingerprint(&server, server_id, server.fingerprint());
 
     let errors = Arc::new(Errors::default());
@@ -623,6 +651,11 @@ fn the_senders_exit_closes_its_connection() {
         tokio::time::sleep(Duration::from_millis(200)).await;
         client.shutdown();
         client.closed().await;
+        assert_eq!(
+            client.client_endpoint.get().unwrap().open_connections(),
+            0,
+            "closed() returned with a dialed connection still open"
+        );
     });
     drop(tx_rt);
 
@@ -641,8 +674,11 @@ fn the_senders_exit_closes_its_connection() {
 /// `closed()`'s return must not leave any pending.
 ///
 /// A one-slot channel and a peer that never reads keep the frames in the
-/// gate. The runtime is `current_thread`, so no gate driver runs between
-/// `closed()` returning and the check.
+/// gate. The gate is failed by its own driver: the writer drops its receiver
+/// when it ends, which wakes the driver. On a `current_thread` runtime that
+/// wake is queued ahead of `closed()`'s next poll, so the driver resolves
+/// every ticket before `closed()` returns. On a multi-threaded runtime the two
+/// race, and nothing in `closed()` orders them.
 #[tokio::test]
 async fn closed_fails_frames_still_waiting_in_the_gate() {
     const FRAMES: usize = 32;
@@ -782,6 +818,13 @@ fn accept_only_node_closes_before_it_exits(server_rt: tokio::runtime::Runtime) {
         .unwrap();
         server.shutdown();
         server.closed().await;
+        for endpoint in server.server_endpoints.get().into_iter().flatten() {
+            assert_eq!(
+                endpoint.open_connections(),
+                0,
+                "closed() returned with a server connection still open"
+            );
+        }
     });
     // The receiver's process exits.
     drop(server_rt);
@@ -811,39 +854,18 @@ fn accept_only_node_closes_before_it_exits(server_rt: tokio::runtime::Runtime) {
 async fn closed_accounts_for_every_frame_when_the_peer_stops_reading() {
     const FRAMES: usize = 64;
     const PAYLOAD: usize = 64 * 1024;
-    let identity = super::tls::Identity::generate().unwrap();
-    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
-        quinn::crypto::rustls::QuicServerConfig::try_from(
-            super::tls::server_crypto(&identity).unwrap(),
-        )
-        .unwrap(),
-    ));
-    let mut transport_config = quinn::TransportConfig::default();
-    transport_config.stream_receive_window(quinn::VarInt::from_u32(64 * 1024));
-    server_config.transport_config(Arc::new(transport_config));
-    let endpoint = quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
-    let addr = endpoint.local_addr().unwrap();
-    let stalled = tokio::spawn(async move {
-        let connection = endpoint.accept().await.unwrap().await.unwrap();
-        let _stream = connection.accept_bi().await.unwrap();
-        std::future::pending::<()>().await;
-    });
-
-    let info = QuicEndpointInfo {
-        endpoints: crate::transports::utils::interfaces::resolve_advertise_endpoints(
-            addr,
-            &crate::transports::utils::interfaces::InterfaceFilter::All,
-        )
-        .unwrap(),
-        fingerprint: identity.fingerprint,
-    };
-    let mut builder = WorkerAddressBuilder::new();
-    builder.add_entry("quic", info.encode().unwrap()).unwrap();
-    let peer_id = InstanceId::new_v4();
+    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+    let (peer, peer_id) = raw_server(
+        64 * 1024,
+        Duration::from_secs(30),
+        move |connection| async move {
+            let _stream = connection.accept_bi().await.unwrap();
+            let _ = accepted_tx.send(());
+            std::future::pending::<()>().await;
+        },
+    );
     let (client, _client_streams, _) = started().await;
-    client
-        .register(PeerInfo::new(peer_id, builder.build().unwrap()))
-        .unwrap();
+    client.register(peer).unwrap();
 
     let errors = Arc::new(Errors::default());
     for i in 0..FRAMES {
@@ -855,8 +877,19 @@ async fn closed_accounts_for_every_frame_when_the_peer_stops_reading() {
             errors.clone(),
         );
     }
-    // Let the writer fill the window and park.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // The peer sees the stream only once the writer's first bytes arrive, so
+    // the handshake is done and the writer is writing its first frame into a
+    // window smaller than that frame: it is parked, which is the case under
+    // test. Without this, a slow handshake would let shutdown fail every
+    // frame before any writer existed.
+    tokio::time::timeout(Duration::from_secs(5), accepted_rx)
+        .await
+        .expect("the writer never reached the peer")
+        .unwrap();
+    assert!(
+        errors.0.lock().unwrap().is_empty(),
+        "a frame failed before shutdown"
+    );
     client.shutdown();
     client.closed().await;
     let failed = errors.0.lock().unwrap().len();
@@ -864,5 +897,4 @@ async fn closed_accounts_for_every_frame_when_the_peer_stops_reading() {
         failed, FRAMES,
         "{failed} of {FRAMES} frames failed when closed() returned; the rest are unaccounted for"
     );
-    stalled.abort();
 }

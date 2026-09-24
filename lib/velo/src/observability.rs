@@ -1173,8 +1173,9 @@ impl VeloMetrics {
             CounterVec::new(
                 Opts::new(
                     "velo_transport_frames_written_total",
-                    "Frames a transport's per-connection writer handed to the kernel's socket \
-                     send buffer, counted once the write returned. Subtract this from \
+                    "Frames a transport's per-connection writer handed to its send buffer \
+                     (the kernel socket buffer for TCP and UDS, quinn's user-space buffer for \
+                     QUIC), counted once the write returned. Subtract this from \
                      velo_transport_frames_total{direction=\"outbound\",outcome=\"accepted\"} on \
                      the same transport to get that transport's egress queue depth. Published \
                      only by the coalescing writer of the TCP, UDS and QUIC transports — the \

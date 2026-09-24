@@ -3,7 +3,24 @@
 
 //! [`QuicTransportBuilder`]: the transport's options and their defaults.
 
-use super::*;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use dashmap::DashMap;
+use tokio_util::sync::CancellationToken;
+use tracing::warn;
+use velo_ext::TransportKey;
+
+use crate::transports::tcp::framing::DEFAULT_SHRINK_THRESHOLD;
+use crate::transports::utils::interfaces::{InterfaceFilter, resolve_advertise_endpoints};
+
+use super::super::endpoint::{
+    BufferSizes, QuicEndpointInfo, bind_client_socket, bind_server_sockets,
+};
+use super::super::tls::{self, Identity};
+use super::QuicTransport;
 
 /// Default QUIC idle timeout: three keep-alives. quinn ignores ICMP
 /// unreachable for liveness, so a peer that dies without closing is found only

@@ -19,7 +19,7 @@ use crate::transports::coalesce::{
     Coalescable, EgressMetrics, WriterFailure, WriterObserver, run_coalescing_writer,
 };
 use crate::transports::ingress::{DialedReaderContext, run_dialed_reader};
-use crate::transports::tcp::framing::{DEFAULT_MAX_FRAME_SIZE, DEFAULT_SHRINK_THRESHOLD};
+use crate::transports::tcp::framing::DEFAULT_MAX_FRAME_SIZE;
 use crate::transports::transport::{
     AdmissionError, AdmissionGate, HealthCheckError, SendOutcome, ShutdownState, TransportError,
     TransportErrorHandler,
@@ -28,9 +28,9 @@ use crate::transports::utils::interfaces::{
     InterfaceEndpoint, InterfaceFilter, resolve_advertise_endpoints, select_best_endpoint,
 };
 
-use super::endpoint::{BufferSizes, QuicEndpointInfo, bind_client_socket, bind_server_sockets};
+use super::endpoint::QuicEndpointInfo;
 use super::listener::{AcceptContext, OrderlyEnd, run_accept_loop};
-use super::tls::{self, Identity};
+use super::tls;
 
 /// How long a writer that stops waits for the peer to acknowledge its last
 /// bytes before it closes the connection, on every stop including teardown.
@@ -43,7 +43,7 @@ const FINISH_GRACE: Duration = Duration::from_secs(1);
 /// the connections to close before it closes the dial endpoint by force.
 /// Twice FINISH_GRACE, so a writer that was mid-write when teardown began
 /// still gets its full acknowledgement wait.
-const CLOSE_WAIT: Duration = Duration::from_secs(2 * FINISH_GRACE.as_secs());
+const CLOSE_WAIT: Duration = FINISH_GRACE.saturating_mul(2);
 
 /// How long `closed()` waits, after it force-closes the dial endpoint, for the
 /// writers that were still blocked to report their frames as failed.
@@ -452,9 +452,10 @@ impl Transport for QuicTransport {
         }
         // Not the dial endpoint yet: closing it now would discard what the
         // writers wrote but the peers have not acknowledged. Each writer
-        // finishes its stream and closes its connection within FINISH_GRACE.
-        // `closed()` waits for that; this task covers a caller that does not
-        // await it, as long as the runtime lives.
+        // finishes its stream and closes its connection within FINISH_GRACE
+        // of its last write; a writer parked on a peer's flow control is
+        // closed by force at CLOSE_WAIT. `closed()` waits for that; this task
+        // covers a caller that does not await it, as long as the runtime lives.
         if let Some(endpoint) = self.client_endpoint.get().cloned() {
             match self.runtime.get() {
                 Some(rt) => {
@@ -658,11 +659,16 @@ async fn connection_writer_inner(
 
     // Finish the stream and give the peer a moment to acknowledge it, on every
     // end including teardown, so the close does not discard frames the writer
-    // already wrote. See FINISH_GRACE.
-    // Only `Ok(None)` means the peer acknowledged every byte. A STOP_SENDING
-    // code, a lost connection, or the timeout each leave written frames that
-    // the peer may not have read.
-    if send.finish().is_ok() {
+    // already wrote. See FINISH_GRACE. Only `Ok(None)` means the peer
+    // acknowledged every byte; a STOP_SENDING code, a lost connection, or the
+    // timeout each leave written frames that the peer may not have read.
+    //
+    // Skipped when the peer already closed the connection: what it did not
+    // read is gone with it, as with a TCP peer that closes. That is the
+    // ordinary end of a peer restart, not worth a warning per connection.
+    if let Some(reason) = connection.close_reason() {
+        debug!("QUIC connection to {instance_id} closed by peer: {reason}");
+    } else if send.finish().is_ok() {
         match tokio::time::timeout(FINISH_GRACE, send.stopped()).await {
             Ok(Ok(None)) => {}
             outcome => warn!(
@@ -671,9 +677,6 @@ async fn connection_writer_inner(
                 peer.addr
             ),
         }
-    }
-    if let Some(reason) = connection.close_reason() {
-        debug!("QUIC connection to {instance_id} closed by peer: {reason}");
     }
     connection.close(quinn::VarInt::from_u32(0), b"done");
     if let Some(reader) = reader {
