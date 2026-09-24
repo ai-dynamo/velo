@@ -395,6 +395,10 @@ where
 /// kernel then delivers it after the socket closes, and whatever was still
 /// queued fails through `on_error`. A transport that closes its connection
 /// without waiting for the peer to acknowledge what it wrote loses the tail.
+///
+/// Limits: the frame count equals the default channel capacity, so no frame
+/// waits in the admission gate, and the test does not call `closed()`. The
+/// transports' own unit tests cover both.
 pub async fn every_frame_is_delivered_or_failed_across_teardown<C: ShutdownTestClient>()
 where
     C::Transport: 'static,

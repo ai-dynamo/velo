@@ -247,10 +247,10 @@ async fn large_frames_round_trip_at_a_jumbo_mtu() {
 
 #[test]
 fn a_max_mtu_above_the_gso_batch_limit_is_lowered() {
-    use super::GSO_SAFE_MAX_MTU;
+    use super::builder::GSO_SAFE_MAX_MTU;
     assert_eq!(GSO_SAFE_MAX_MTU, 6550);
-    assert_eq!(super::clamp_to_gso_batch(8952), 6550);
-    assert_eq!(super::clamp_to_gso_batch(1452), 1452);
+    assert_eq!(super::builder::clamp_to_gso_batch(8952), 6550);
+    assert_eq!(super::builder::clamp_to_gso_batch(1452), 1452);
 }
 
 /// Records rejections, for the one test that needs to count them.
@@ -295,16 +295,19 @@ async fn started_observed(observed: Arc<Rejections>) -> (QuicTransport, DataStre
     (transport, streams, id)
 }
 
-/// A peer that shuts down ends its connection in the ordinary way; it is not
-/// a malformed frame. Neither side may count it as `DecodeError`, which on
-/// TCP means a frame failed to parse. Without this a single restart bumps the
-/// counter on every peer, and the counter stops meaning anything.
+/// A server that shuts down ends its connections in the ordinary way; it is
+/// not a malformed frame. The dialer must not count it as `DecodeError`, which
+/// on TCP means a frame failed to parse. Without this a single restart bumps
+/// the counter on every peer, and the counter stops meaning anything.
+///
+/// The server shuts down first, while the dialer's reader is still live, so
+/// the reader sees the close. The other order proves nothing: the dialer's own
+/// shutdown stops its reader before the server's close arrives.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_peer_shutting_down_is_not_a_decode_error() {
+async fn a_dialer_does_not_count_the_servers_shutdown_as_a_decode_error() {
     let client_seen = Arc::new(Rejections::default());
-    let server_seen = Arc::new(Rejections::default());
     let (client, _client_streams, _) = started_observed(client_seen.clone()).await;
-    let (server, server_streams, server_id) = started_observed(server_seen.clone()).await;
+    let (server, server_streams, server_id) = started().await;
     client
         .register(peer_with_fingerprint(
             &server,
@@ -329,24 +332,66 @@ async fn a_peer_shutting_down_is_not_a_decode_error() {
     .expect("the frame arrives")
     .unwrap();
 
-    // The server's accepted stream, and then the client's dialed reader, each
-    // see the other end go away.
-    client.shutdown();
-    tokio::time::sleep(Duration::from_millis(500)).await;
     server.shutdown();
+    server.closed().await;
     tokio::time::sleep(Duration::from_millis(500)).await;
-
-    assert_eq!(
-        server_seen.decode_errors(),
-        0,
-        "the server counted the client's shutdown as a decode error"
-    );
     assert_eq!(
         client_seen.decode_errors(),
         0,
-        "the client counted the server's shutdown as a decode error"
+        "the dialer counted the server's shutdown as a decode error"
     );
     assert!(errors.0.lock().unwrap().is_empty());
+    client.shutdown();
+}
+
+/// The accept side of the same rule. The peer is a raw quinn client that sends
+/// one whole frame and then closes the connection without finishing its
+/// stream, so the listener's read ends on the close rather than on a clean
+/// end of stream. That is an orderly end, not a decode error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_listener_does_not_count_a_peer_closing_as_a_decode_error() {
+    let server_seen = Arc::new(Rejections::default());
+    let (server, server_streams, _) = started_observed(server_seen.clone()).await;
+    let raw = server.address().get_entry(server.key()).unwrap().unwrap();
+    let addr = QuicEndpointInfo::decode(&raw).unwrap().endpoints[0]
+        .socket_addr()
+        .unwrap();
+
+    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    endpoint
+        .set_default_client_config(super::tls::pinned_client_config(server.fingerprint()).unwrap());
+    let connection = endpoint
+        .connect(addr, super::tls::SERVER_NAME)
+        .unwrap()
+        .await
+        .unwrap();
+    let (mut send, _recv) = connection.open_bi().await.unwrap();
+    let mut frame = Vec::new();
+    crate::transports::tcp::TcpFrameCodec::encode_frame_sync(
+        &mut frame,
+        MessageType::Event,
+        b"hdr",
+        b"pay",
+    )
+    .unwrap();
+    send.write_all(&frame).await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        server_streams.event_stream.recv_async(),
+    )
+    .await
+    .expect("the frame arrives")
+    .unwrap();
+
+    connection.close(quinn::VarInt::from_u32(0), b"bye");
+    endpoint.wait_idle().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        server_seen.decode_errors(),
+        0,
+        "the listener counted the peer's close as a decode error"
+    );
+    server.shutdown();
 }
 
 /// Replacing a dead connection must not update the connection gauge while the
@@ -494,12 +539,164 @@ fn frames_survive_the_runtime_ending_right_after_close() {
         FRAMES,
         "{delivered} delivered + {failed} failed != {FRAMES} sent: frames vanished when the runtime ended"
     );
-    assert_eq!(
-        seen.decode_errors(),
-        0,
-        "the receiver counted the sender's exit as a decode error: its connection was not closed"
-    );
     rx_rt.block_on(async { server.shutdown() });
+}
+
+/// A raw quinn server with this transport's certificate and `window` as its
+/// stream receive window, and the peer that names it. `serve` gets each
+/// accepted connection.
+fn raw_server<F, Fut>(window: u32, idle: Duration, serve: F) -> (PeerInfo, InstanceId)
+where
+    F: FnOnce(quinn::Connection) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let identity = super::tls::Identity::generate().unwrap();
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
+        quinn::crypto::rustls::QuicServerConfig::try_from(
+            super::tls::server_crypto(&identity).unwrap(),
+        )
+        .unwrap(),
+    ));
+    let mut transport_config = quinn::TransportConfig::default();
+    transport_config.stream_receive_window(quinn::VarInt::from_u32(window));
+    transport_config.max_idle_timeout(Some(idle.try_into().unwrap()));
+    server_config.transport_config(Arc::new(transport_config));
+    let endpoint = quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = endpoint.local_addr().unwrap();
+    tokio::spawn(async move {
+        let connection = endpoint.accept().await.unwrap().await.unwrap();
+        serve(connection).await;
+        drop(endpoint);
+    });
+
+    let info = QuicEndpointInfo {
+        endpoints: crate::transports::utils::interfaces::resolve_advertise_endpoints(
+            addr,
+            &crate::transports::utils::interfaces::InterfaceFilter::All,
+        )
+        .unwrap(),
+        fingerprint: identity.fingerprint,
+    };
+    let mut builder = WorkerAddressBuilder::new();
+    builder.add_entry("quic", info.encode().unwrap()).unwrap();
+    let peer_id = InstanceId::new_v4();
+    (PeerInfo::new(peer_id, builder.build().unwrap()), peer_id)
+}
+
+/// A sender that exits right after `closed()` closes its connection on the
+/// wire; its peer sees an application close, not an idle timeout. The peer is
+/// a raw quinn server, so the test reads the close reason directly.
+#[test]
+fn the_senders_exit_closes_its_connection() {
+    let rx_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (reason_tx, reason_rx) = std::sync::mpsc::channel();
+    let (peer, peer_id) = rx_rt.block_on(async {
+        raw_server(
+            1 << 20,
+            Duration::from_millis(1500),
+            move |connection| async move {
+                let (_send, mut recv) = connection.accept_bi().await.unwrap();
+                let _ = recv.read_to_end(usize::MAX).await;
+                let _ = reason_tx.send(connection.closed().await);
+            },
+        )
+    });
+
+    let tx_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    tx_rt.block_on(async {
+        let (client, _client_streams, _) = started().await;
+        client.register(peer).unwrap();
+        let _ = client.send_message(
+            peer_id,
+            Bytes::from_static(b"hdr"),
+            Bytes::from_static(b"pay"),
+            MessageType::Event,
+            Arc::new(Errors::default()),
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        client.shutdown();
+        client.closed().await;
+    });
+    drop(tx_rt);
+
+    let reason = reason_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the connection ends");
+    assert!(
+        matches!(reason, quinn::ConnectionError::ApplicationClosed(_)),
+        "the sender exited without closing its connection: {reason:?}"
+    );
+}
+
+/// Frames still waiting in the admission gate when the transport shuts down
+/// are failed by the time `closed()` returns. The runtime reports a failed
+/// admission to the sender's error handler, so a process that exits on
+/// `closed()`'s return must not leave any pending.
+///
+/// A one-slot channel and a peer that never reads keep the frames in the
+/// gate. The runtime is `current_thread`, so no gate driver runs between
+/// `closed()` returning and the check.
+#[tokio::test]
+async fn closed_fails_frames_still_waiting_in_the_gate() {
+    const FRAMES: usize = 32;
+    let (peer, peer_id) = raw_server(
+        64 * 1024,
+        Duration::from_secs(30),
+        |connection| async move {
+            let _stream = connection.accept_bi().await.unwrap();
+            std::future::pending::<()>().await;
+        },
+    );
+    let client = QuicTransportBuilder::new()
+        .bind_addr("127.0.0.1:0".parse().unwrap())
+        .channel_capacity(1)
+        .build()
+        .unwrap();
+    let (adapter, _streams) = make_channels();
+    client
+        .start(
+            InstanceId::new_v4(),
+            adapter,
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        .unwrap();
+    client.register(peer).unwrap();
+
+    let errors = Arc::new(Errors::default());
+    let mut pending = Vec::new();
+    for i in 0..FRAMES {
+        if let velo_ext::SendOutcome::Pending(admission) = client.send_message(
+            peer_id,
+            Bytes::from((i as u32).to_be_bytes().to_vec()),
+            Bytes::from(vec![0u8; 64 * 1024]),
+            MessageType::Response,
+            errors.clone(),
+        ) {
+            pending.push(admission);
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!pending.is_empty(), "the gate never queued a frame");
+    client.shutdown();
+    client.closed().await;
+    let still = pending
+        .iter()
+        .filter(|a| a.state() == velo_ext::AdmissionState::Pending)
+        .count();
+    assert_eq!(
+        still,
+        0,
+        "{still} of {} gated frames were still pending when closed() returned",
+        pending.len()
+    );
 }
 
 /// A node that only accepts connections must also close them on the wire
@@ -512,6 +709,29 @@ fn frames_survive_the_runtime_ending_right_after_close() {
 /// missing close would time out within the test.
 #[test]
 fn an_accept_only_node_closes_its_connections_before_it_exits() {
+    accept_only_node_closes_before_it_exits(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap(),
+    );
+}
+
+/// The same on a `current_thread` runtime, where nothing else runs while
+/// `closed()` is being polled. If `closed()` is ready on its first poll, the
+/// connection drivers never run again, and no CONNECTION_CLOSE leaves.
+#[test]
+fn an_accept_only_node_on_a_current_thread_runtime_closes_its_connections() {
+    accept_only_node_closes_before_it_exits(
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap(),
+    );
+}
+
+fn accept_only_node_closes_before_it_exits(server_rt: tokio::runtime::Runtime) {
     let dialer_rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -537,11 +757,6 @@ fn an_accept_only_node_closes_its_connections_before_it_exits() {
         client
     });
 
-    let server_rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
     server_rt.block_on(async {
         let (server, server_streams, server_id) = started().await;
         client
@@ -587,7 +802,11 @@ fn an_accept_only_node_closes_its_connections_before_it_exits() {
 /// `closed()`'s return must not beat those failures.
 ///
 /// The peer is a raw quinn server with this transport's certificate that
-/// accepts the stream and never reads it, with a 64 KiB stream window.
+/// accepts the stream and never reads it, with a 64 KiB stream window. The
+/// window is smaller than one frame, so no write ever completes and every
+/// frame stays with the writer. With a larger window some frames would count
+/// as written, never be read, and never be reported: that loss is the same as
+/// a TCP peer that stops reading, and the writer only warns about it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn closed_accounts_for_every_frame_when_the_peer_stops_reading() {
     const FRAMES: usize = 64;
