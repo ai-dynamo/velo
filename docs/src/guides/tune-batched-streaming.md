@@ -164,6 +164,8 @@ let sender = match envelope.ticket {
 };
 ```
 
+`prebind_anchor` returns a ticket whenever the consumer has the mux, and the mux is on by default. A producer without the mux cannot open that ticket: `open_anchor_stream` fails, and `attach_anchor` is refused while the pre-bind is held. So when you roll the mux out, upgrade the producers before the consumers that mint tickets, or keep the mux off on those consumers until every producer has it.
+
 A zero-RTT sender has no cancel handle, so its `cancellation_token` never fires. When the consumer drops the anchor, the producer's next `send` returns an error. An idle producer also receives a close from the consumer.
 
 The ticket stays valid for the 60-second accept window. After the window, the consumer reaps the bind and sees `SenderDropped`.
@@ -176,6 +178,8 @@ The ticket stays valid for the 60-second accept window. After the window, the co
 4. Restart the producers.
 
 CAUTION: Do not roll back a producer alone while its consumer still mints tickets. The consumer refuses the producer's attach, because the producer no longer offers the pre-bound key.
+
+Rolling the mux out needs the reverse order: producers first, then the consumers that mint tickets. See [Use zero-RTT stream setup](#use-zero-rtt-stream-setup).
 
 Without zero-RTT setup, the order does not matter. Each new attach negotiates the per-stream path.
 

@@ -343,8 +343,8 @@ impl VeloBuilder {
     ///    PeerInfo's WorkerAddress (so peers can discover the streaming
     ///    listener alongside messenger endpoints).
     /// 5. Create AnchorManager via builder, with the streaming transport
-    ///    wired in as both the default and the only registry entry (keyed by
-    ///    its TransportKey).
+    ///    wired in as the default and registered under its TransportKey,
+    ///    beside the mux unless the mux is switched off.
     /// 6. Register streaming control-plane handlers on Messenger.
     /// 7. Assemble Velo struct, holding a clone of the streaming transport
     ///    so `register_peer` can fan out to it on every newly-known peer.
@@ -393,8 +393,8 @@ impl VeloBuilder {
             }
         };
 
-        // Step 4: Build the streaming-transport registry (single entry keyed
-        // by the chosen transport's TransportKey). The AnchorManager passes
+        // Step 4: Build the streaming-transport registry, keyed by
+        // TransportKey: the chosen transport here, and the mux in Step 5. The AnchorManager passes
         // the response's `streaming_transport_key` through this map to find
         // the FrameTransport on the client side at attach time.
         let mut registry: std::collections::HashMap<
@@ -412,21 +412,21 @@ impl VeloBuilder {
         // `messenger-mux-v1` only to peers that advertised it, and every other
         // peer is still answered — and must still be served — on the
         // per-stream key.
-        let mux = match self.mux_config.unwrap_or_default() {
-            config if config.enabled => {
-                let mux = crate::streaming::messenger_mux::MessengerMuxTransport::new(
-                    Arc::clone(&messenger),
-                    config,
-                    self.metrics.clone(),
-                )?;
-                let mux_key = crate::streaming::FrameTransport::key(mux.as_ref());
-                registry.insert(
-                    mux_key.as_str().to_string(),
-                    Arc::clone(&mux) as Arc<dyn crate::streaming::FrameTransport>,
-                );
-                Some(mux)
-            }
-            _ => None,
+        let config = self.mux_config.unwrap_or_default();
+        let mux = if config.enabled {
+            let mux = crate::streaming::messenger_mux::MessengerMuxTransport::new(
+                Arc::clone(&messenger),
+                config,
+                self.metrics.clone(),
+            )?;
+            let mux_key = crate::streaming::FrameTransport::key(mux.as_ref());
+            registry.insert(
+                mux_key.as_str().to_string(),
+                Arc::clone(&mux) as Arc<dyn crate::streaming::FrameTransport>,
+            );
+            Some(mux)
+        } else {
+            None
         };
 
         let anchor_manager = Arc::new(

@@ -176,6 +176,8 @@ Credit is exact by construction. `prebind` sizes its buffer from the same `Negot
 
 The rollback is not symmetric. Disable the mux on the minting side first, or on both sides together. A producer that disables the mux alone still advertises its default transport key. A consumer that still pre-binds refuses that attach, because the key does not match the pre-bind.
 
+The rollout has the same asymmetry in reverse. The mux is on by default, so a consumer mints tickets as soon as it runs a version with the mux. A producer without the mux cannot open them. Upgrade the producers first, or keep the mux off on the consumers that mint tickets until every producer has it.
+
 ### Peer loss
 
 Loss of Messenger connectivity, peer eviction and batcher eviction all end in epoch death. Every live slot in the dying epoch that has not seen a terminal receives an injected `StreamFrame::Dropped`. The consumer sees `StreamError::SenderDropped`, the same as on the per-stream path. `TransportError` stays reserved for protocol violations. A reconnect bumps the epoch, and slots do not survive it. As a result, each failed live slot gets exactly one `Dropped`.

@@ -130,7 +130,7 @@ use velo_examples::{TransportType, new_transport};
 /// requests-per-host, and `--max-batch` already moves it.
 const HOSTS: usize = 3;
 
-/// The streaming transport a node advertises only when the mux is switched on.
+/// The streaming transport a node advertises unless the mux is switched off.
 const MUX_KEY: &str = velo::streaming::MESSENGER_MUX_KEY;
 
 /// The streaming transport every node has: one TCP connection per stream.

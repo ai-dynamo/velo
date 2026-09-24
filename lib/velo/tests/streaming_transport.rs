@@ -13,10 +13,10 @@ use std::sync::Arc;
 // ---------------------------------------------------------------------------
 
 /// Validates that VeloBuilder.stream_config(StreamConfig::Tcp(None)) creates a
-/// TcpFrameTransport and populates the transport_registry with both "tcp" and
-/// "velo" schemes. This is the canonical backward-compat test for GRPC-08:
-/// StreamConfig::Tcp(None) must produce identical AnchorManager setup as the
-/// old stream_bind_addr(0.0.0.0) call.
+/// TcpFrameTransport and registers it under `tcp-stream`, beside the mux that
+/// the builder installs by default. This is the canonical backward-compat
+/// test for GRPC-08: StreamConfig::Tcp(None) must produce identical
+/// AnchorManager setup as the old stream_bind_addr(0.0.0.0) call.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_velo_builder_tcp_transport() {
     use velo::StreamConfig;
@@ -244,7 +244,7 @@ async fn test_velo_facade_mpsc_with_config() {
 
 /// `Velo::builder().add_transport(t).build()` — no `.stream_config()` and no
 /// `.messenger_mux()` call — must wire a TCP streaming transport under the
-/// `tcp-stream` key and the mux under `messenger-mux-v1`, and advertise both.
+/// `tcp-stream` key and the mux under `messenger-mux-v1`, and register both.
 /// The default-config path otherwise has zero coverage: every other test in
 /// this file calls `.stream_config(...)` explicitly, so a regression that
 /// swapped either builder default would slip through CI.
@@ -326,9 +326,16 @@ async fn test_discover_and_register_peer_fans_out_to_streaming() {
                 .build()
                 .unwrap(),
         );
+        // The mux is off: the mux never consults the per-stream peer table,
+        // so under it the fan-out this test guards would go unexercised.
         velo::Velo::builder()
             .add_transport(transport)
             .discovery(discovery.clone() as Arc<dyn PeerDiscovery>)
+            .messenger_mux(velo::streaming::MuxConfig {
+                enabled: false,
+                ..velo::streaming::MuxConfig::default()
+            })
+            .unwrap()
             .build()
             .await
             .unwrap()
@@ -358,6 +365,11 @@ async fn test_discover_and_register_peer_fans_out_to_streaming() {
     let handle = anchor.handle();
     let sender = a.attach_anchor::<u32>(handle).await.expect(
         "attach_anchor must succeed when discover_and_register_peer fanned out to streaming",
+    );
+    assert_eq!(
+        sender.negotiated_transport().map(|k| k.as_str()),
+        Some("tcp-stream"),
+        "the stream must ride the per-stream transport the fan-out feeds"
     );
 
     sender.send(7).await.unwrap();
@@ -415,8 +427,9 @@ async fn negotiated_key(mux: Option<velo::streaming::MuxConfig>) -> String {
         .expect("remote attach");
     let key = sender
         .negotiated_transport()
-        .map(|k| k.as_str().to_string())
-        .unwrap_or_default();
+        .expect("a remote attach negotiates a transport")
+        .as_str()
+        .to_string();
     sender.send(7).await.unwrap();
     sender.finalize().unwrap();
     let frame = tokio::time::timeout(std::time::Duration::from_secs(5), anchor.next())

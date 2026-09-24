@@ -55,7 +55,13 @@ If one of these criteria holds, the design stops or changes:
 - **`velo_streaming_heartbeat_watchdog_firings_total` rises after heartbeat consolidation.** Then the consolidation lost real failure detection.
 - **Throughput improves because added latency lets the consumer catch up.** This is the trap. Always report latency beside throughput, and watch time to first token. Any windowed or hinted flush policy can make it worse, which is why the default flush does not wait.
 
-Note of 2026-09-24: the mux is now on by default. The reason is a failure of the per-stream path, not the latency criterion above. On a cluster, the per-stream path failed 80% to 92% of requests at about 2,500 new streams per second, because the workers could not get a local port. See [Batched streaming](../concepts/batched-streaming.md). The X/Y of 1 latency test was not measured again. A deployment with one stream per peer that sees a latency cost can set `enabled: false`.
+Note of 2026-09-24: the mux is now on by default. The latency criterion above no longer decides the default, and it was not measured again. What decides it is a failure of the per-stream path: on a cluster, it failed 80% to 92% of requests at about 2,500 new streams per second, because the workers could not get a local port. See [Batched streaming](../concepts/batched-streaming.md). The latency criterion is now a reason for one deployment to set `enabled: false`: one with one stream per peer that measures a latency cost.
+
+The change of default has these effects that an operator can see:
+
+- A consumer with the mux mints zero-RTT tickets, and a producer without the mux cannot open them. Upgrade producers before the consumers that mint tickets.
+- `velo_streaming_producer_send_backpressure_total` changes meaning. See [Saturation](../operations/saturation.md).
+- A slow consumer is killed by the slot byte budget (`withheld_overflow`), not by the heartbeat watchdog after 15 seconds. See [Saturation](../operations/saturation.md).
 
 ## Rulings
 
