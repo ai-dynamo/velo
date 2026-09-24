@@ -85,18 +85,15 @@ pub struct UcxConfig {
 
 /// Floor on [`UcxConfig::ep_idle_timeout`].
 ///
-/// Sized to **dominate endpoint wireup**, which is the one thing a short timeout
-/// actually breaks. `last_used` records when an operation was *admitted*, not
-/// when it completed, so a timeout shorter than the time a send takes on the
-/// wire lets the reaper close an endpoint out from under a send that is still
-/// establishing itself — the frame then fails through `on_error` instead of
-/// arriving. Measured warm wireup is ~14 ms on CX-7 InfiniBand and upwards of
-/// 10 ms over the tcp lane in CI, so half a second is roughly thirty-five times
-/// that. A fresh worker costs more: on a GB200 node its first `ucp_ep_create`
-/// took 110-150 ms, and the first send also waits while the peer sets up its
-/// own endpoint back. A fresh pair's first frame took 360-420 ms to arrive with
-/// the node's CPUs oversubscribed. With many UCX workers in one process, each
-/// side took over 500 ms, so there the floor does not cover a first send.
+/// Sized to **dominate endpoint wireup**. A send in flight holds its endpoint
+/// open at any timeout, so a short timeout loses no frame of ours. What it does
+/// is close endpoints between ordinary uses, and each close makes the next use
+/// pay wireup again and costs the peer a frame (see
+/// [`UcxTransportBuilder::ep_idle_timeout`]). Measured warm wireup is ~14 ms on
+/// CX-7 InfiniBand and upwards of 10 ms over the tcp lane in CI, so half a
+/// second is roughly thirty-five times that. A fresh worker costs more: on a
+/// GB200 node its first `ucp_ep_create` took 110-150 ms, and a fresh pair's
+/// first frame took 360-420 ms to arrive with the node's CPUs oversubscribed.
 ///
 /// It is a builder-level ergonomic guard, not an invariant of the reaper: a test
 /// constructing a [`UcxConfig`] directly can go below it deliberately.
@@ -172,6 +169,8 @@ impl UcxTransport {
             metrics: OnceLock::new(),
             #[cfg(test)]
             ep_create_delay_ms: AtomicU64::new(0),
+            #[cfg(test)]
+            progress_stall_ms: AtomicU64::new(0),
         });
         Self {
             key,
@@ -695,18 +694,10 @@ impl UcxTransportBuilder {
     /// outstanding. The next use re-establishes it transparently — no error
     /// surfaces, nothing has to be re-registered.
     ///
-    /// What it does **not** promise is that an Active Message send admitted just
-    /// before the timeout expired has landed. `last_used` records admission, not
-    /// completion, so a send still on the wire when its endpoint is reaped fails
-    /// through its `TransportErrorHandler` with the original buffers — the same
-    /// contract a peer-failure reap has always had. The floor below **shrinks**
-    /// that window rather than closing it, and two residuals survive: a send
-    /// slower than the floor under congestion is still killable, and the
-    /// admission stamp is taken from a clock sampled at the top of the progress
-    /// loop's pass, so the effective budget is the timeout minus however long
-    /// that pass runs. Endpoint creation does not count against it: the clock
-    /// moves forward after `ucp_ep_create`, which was measured as slower than
-    /// the floor.
+    /// An endpoint is idle only when no send posted on it is in flight and none
+    /// has completed for the timeout. A send slower than the timeout therefore
+    /// keeps its endpoint open, and the idle clock starts again when it
+    /// completes. The time `ucp_ep_create` takes does not count as idle either.
     ///
     /// Values below half a second are raised to it; see the transport's
     /// `MIN_EP_IDLE_TIMEOUT` for why that is the number.

@@ -2014,30 +2014,109 @@ async fn idle_endpoint_closes_and_the_next_send_wires_up_again() {
 /// 110-150 ms on a GB200 node. Across 31 creates in one process during the
 /// parallel UCX tests, the median was 630 ms, longer than the 500 ms floor. The
 /// new endpoint was stamped from the loop clock read before the call, so it was
-/// already past the timeout when it was created. The next scan FORCE-closed it
-/// about 50 ms later with the first send still in flight: the send failed
-/// through `on_error` and the frame never arrived. The same stale stamp let an
-/// eager endpoint be closed microseconds after it was created, so
+/// already past the timeout when it was created, and the next scan closed it.
+/// That closed an eager endpoint microseconds after it was created, so
 /// `eager_wireup_and_the_reaper_compose` never saw it open. The delay seam
 /// makes the slow create happen here on demand.
+///
+/// The endpoint is eager, so no send is posted on it. A send in flight holds
+/// its endpoint open by itself, which would hide a stale create stamp.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slow_endpoint_create_does_not_age_the_new_endpoint() {
-    let a = start_node_with(|b| b.ep_idle_timeout(Some(IDLE))).await;
+    let a = start_node_with(|b| b.eager_endpoints(true).ep_idle_timeout(Some(IDLE))).await;
     let b = start_node().await;
-    cross_register(&a, &b);
-    // Longer than IDLE, the way the measured 630 ms create was.
+    // Longer than IDLE, the way the measured 630 ms create was. Set before the
+    // registration, which is what creates the eager endpoint.
     let delay = IDLE + IDLE / 2;
     a.transport
         .shared
         .ep_create_delay_ms
         .store(delay.as_millis() as u64, Ordering::Relaxed);
+    cross_register(&a, &b);
+
+    assert!(
+        wait_until(T, || eps_open(&a) == 1 || eps_closed_idle(&a) >= 1).await,
+        "eager wireup did not run"
+    );
+    // With a stale stamp the first scan after the create closes the endpoint
+    // at once. With the right stamp it stays open for a full timeout, so a
+    // quarter timeout leaves room for scheduling delay.
+    assert!(
+        !wait_until(IDLE / 4, || eps_closed_idle(&a) >= 1).await,
+        "the endpoint was closed right after it was created: the create time \
+         counted as idle time"
+    );
+
+    a.transport.shutdown();
+    b.transport.shutdown();
+    assert_rma_balanced(&a);
+    assert_rma_balanced(&b);
+}
+
+/// A send still in flight keeps its endpoint open, and its completion restarts
+/// the idle clock.
+///
+/// A first send between fresh workers waits while the peer sets up its own
+/// endpoint back, inside the peer's `ucp_worker_progress`. In the parallel
+/// `--lib` run that took 526-573 ms, so the reaper closed the endpoint with
+/// the send in flight: the send failed through `on_error` and the frame was
+/// lost. The seam stops the peer's progress thread for twice the timeout,
+/// which holds the send in flight past it on demand.
+///
+/// The second half checks the completion stamp. The send was admitted about
+/// two timeouts before it completed. If the admission stamp were the last
+/// use, the first scan after completion would close the endpoint, within one
+/// scan period (half the timeout). The endpoint must instead stay open for a
+/// full timeout after completion. The bound is three quarters of the timeout,
+/// which leaves a quarter on each side for scheduling delay.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_send_in_flight_keeps_its_endpoint_open() {
+    const TIMEOUT: Duration = Duration::from_secs(1);
+    let a = start_node_with_config(UcxConfig {
+        tls: Some("tcp".into()),
+        ep_idle_timeout: Some(TIMEOUT),
+        ..UcxConfig::default()
+    })
+    .await;
+    let b = start_node().await;
+    cross_register(&a, &b);
+    b.transport
+        .shared
+        .progress_stall_ms
+        .store((2 * TIMEOUT).as_millis() as u64, Ordering::Relaxed);
     let errs = CountingErrors::new();
 
-    ping_message(&a, &b, &errs).await;
+    let out = a.transport.send_message(
+        b.instance_id,
+        Bytes::from_static(b"h"),
+        Bytes::from_static(b"p"),
+        MessageType::Message,
+        errs.clone(),
+    );
+    assert!(matches!(out, SendOutcome::Admitted));
+    let arrived = recv_message(&b.streams.message_stream, T).await.is_some();
+    let arrived_at = std::time::Instant::now();
     assert_eq!(
         errs.count(),
         0,
-        "the first send was cancelled by an idle close of its own new endpoint"
+        "the send failed: its endpoint was closed while the send was in flight"
+    );
+    assert!(arrived, "the frame was lost while its send was in flight");
+    assert_eq!(
+        eps_closed_idle(&a),
+        0,
+        "the endpoint was closed while its send was in flight"
+    );
+
+    assert!(
+        wait_until(T, || eps_closed_idle(&a) >= 1).await,
+        "the endpoint was never closed after its send completed"
+    );
+    let quiet = arrived_at.elapsed();
+    assert!(
+        quiet >= TIMEOUT * 3 / 4,
+        "the endpoint was closed {quiet:?} after its send completed; completion \
+         must restart the idle clock"
     );
 
     a.transport.shutdown();

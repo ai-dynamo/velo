@@ -124,9 +124,10 @@
 //! been observed empty. Running last also means it only ever sees endpoints the
 //! earlier passes decided to keep.
 //!
-//! **"In use" means idle in both directions, plus the RMA op registry.** An
-//! endpoint is a candidate when `now - last_used > timeout` *and* no entry in
-//! [`WorkerState::rma_ops`] names its peer. Two sites stamp `last_used`:
+//! **"In use" means idle in both directions, plus every operation in
+//! flight.** An endpoint is idle only when no send posted on it is in flight,
+//! no entry in [`WorkerState::rma_ops`] names its peer, and nothing has used it
+//! for the timeout. Three sites record a use:
 //!
 //! * [`WorkerState::ensure_ep`], for everything **we** initiate — frame sends,
 //!   ping probes, RMA GETs, eager wireup. Every outbound path resolves an
@@ -141,43 +142,40 @@
 //!   `an_inbound_frame_refreshes_the_endpoint_it_arrived_on` asserts it, because
 //!   connection matching (which the disruption finding below establishes) is a
 //!   weaker claim than pointer identity and would not have been enough.
+//! * [`OpState::end_ep_send`], when the last send in flight on the endpoint
+//!   completes. The endpoint's [`EpSends`] counts sends posted on it and not
+//!   yet completed, and the reaper skips an endpoint while that count is not
+//!   zero. The completion time then restarts the idle clock. Without that, a
+//!   send slower than the timeout would be reaped the instant it completed.
 //!
 //! The registry check is deliberately conservative in one direction: an
 //! operation posted on a superseded endpoint still names its peer, so the
 //! reaper declines to close the replacement while it is outstanding.
 //!
-//! **What is still not tracked is an AM send in flight on a candidate
-//! endpoint**, and the gap is shrunk rather than closed. `last_used` records
-//! when a send was *admitted*, not when it completed, so a send admitted before
-//! the stamp aged out can still be on the wire at the close. The FORCE close
-//! then purges it with `UCS_ERR_CANCELED` into `send_trampoline`, which reports
-//! it through `on_error` with the original buffers — the identical contract
-//! `reap_failed_eps` has always had, so the failure is delivered rather
-//! than silent. Two residual terms remain, and both are real:
+//! **Why sends in flight are counted.** An earlier version stamped only the
+//! admission of a send, and priced a per-endpoint count above what it bought.
+//! Measurement overturned that. A first send between fresh workers waits while
+//! the peer sets up its own endpoint back to us, inside the peer's
+//! `ucp_worker_progress`. With many UCX workers in one process (the parallel
+//! test suite) that step alone took 526-573 ms, past the 500 ms floor, so the
+//! reaper FORCE-closed the endpoint under the send and the frame was lost. The
+//! count follows `post_am`'s three exits: taken before the post, released on
+//! the inline and synchronous-failure exits, and released in `send_trampoline`
+//! for the asynchronous one. Only that last release reads the clock, and only
+//! when the count falls to zero. The count exists only with the reaper on, so
+//! the default configuration pays nothing. A send that never completes holds
+//! its endpoint open until UCX fails the endpoint, which is the conservative
+//! direction.
 //!
-//! * **Congestion.** [`MIN_EP_IDLE_TIMEOUT`](super::transport) floors the
-//!   timeout at roughly thirty-five times measured *warm* endpoint wireup — but
-//!   a send that takes longer than the floor under congestion or backpressure
-//!   is still killable. The floor shrinks the window. It does not remove it.
-//!   A first send between fresh workers is the weak case: it also waits for the
-//!   peer to set up its own endpoint back to us, inside the peer's
-//!   `ucp_worker_progress`. With many UCX workers in one process (the parallel
-//!   test suite), that peer-side step alone took 526-573 ms, and the first send
-//!   was reaped while it waited.
-//! * **Pass latency.** `last_used` is stamped from [`WorkerState::now`], sampled
-//!   at the top of the loop pass, *before* the ring drain and the
-//!   progress-to-quiescence that follow it. A send admitted late in a long pass
-//!   is therefore stamped with a time already in the past, so the effective
-//!   budget is `timeout - Δ(pass)` rather than `timeout`. Endpoint creation is
-//!   the exception: `ensure_ep` advances the clock after `ucp_ep_create`,
-//!   because that call alone was measured at 630 ms (median of 31 creates in
-//!   one process), past the floor, and a new endpoint stamped from before it
-//!   was reaped under its first send.
+//! Replies posted on a reply endpoint (`Cmd::PongTo`, `Cmd::ShuttingDownTo`)
+//! carry no count: that endpoint is not looked up in `eps`. They are control
+//! traffic, and their loss is logged, not reported.
 //!
-//! Closing the gap exactly would mean a per-endpoint operation counter threaded
-//! through `post_am`'s three-exit reclaim discipline — sound, but priced above
-//! what it buys for a knob that is off by default and whose worst case is a
-//! correctly-reported send failure.
+//! **Endpoint creation is not idle time.** `last_used` is stamped from
+//! [`WorkerState::now`], sampled at the top of the loop pass, but `ensure_ep`
+//! advances that clock after `ucp_ep_create`. The call was measured at 630 ms
+//! (median of 31 creates in one process), past the floor. An eager endpoint
+//! stamped from before it was reaped before anything used it.
 //!
 //! **FORCE, like every other close from the main loop.** `close_ep_raw` frees
 //! the leaked `ErrArg` the moment the close is issued, a discipline established
@@ -498,6 +496,12 @@ pub(crate) struct WorkerShared {
     /// make endpoint creation slower than the idle timeout on demand.
     #[cfg(test)]
     pub ep_create_delay_ms: AtomicU64,
+    /// Test seam: the progress loop sleeps this long once, at the top of its
+    /// next pass, and then clears it. A peer that stops progressing is what
+    /// holds a first send in flight: the sender waits for the peer's half of
+    /// the wireup.
+    #[cfg(test)]
+    pub progress_stall_ms: AtomicU64,
 }
 
 /// What the progress thread reports back once UCX is initialised.
@@ -537,9 +541,72 @@ enum OpKind {
 struct OpState {
     kind: OpKind,
     inflight: Arc<AtomicUsize>,
+    /// The send count of the endpoint this op was posted on, when the idle
+    /// reaper is on and the endpoint is one we own. `None` otherwise.
+    ep_sends: Option<Arc<EpSends>>,
+}
+
+/// Sends in flight on one endpoint, and when the last of them completed.
+///
+/// The idle reaper reads both. An endpoint with a send in flight is not idle,
+/// and the moment its last send completes counts as a use. Without the second
+/// part, a send slower than the timeout would be reaped the instant it
+/// completed.
+///
+/// Shared by the endpoint's [`EpEntry`] and each [`OpState`] posted on it,
+/// because a FORCE close drops the entry while its sends still complete. Only
+/// the progress thread touches it, so every access is `Relaxed`.
+struct EpSends {
+    /// Sends posted on the endpoint and not yet completed.
+    inflight: AtomicUsize,
+    /// When `inflight` last fell to zero from an asynchronous completion, as
+    /// nanoseconds after `born`. Zero means never.
+    drained_at_ns: AtomicU64,
+    born: Instant,
+}
+
+impl EpSends {
+    fn new() -> Self {
+        Self {
+            inflight: AtomicUsize::new(0),
+            drained_at_ns: AtomicU64::new(0),
+            born: Instant::now(),
+        }
+    }
+
+    /// When the last send in flight completed, if one ever did asynchronously.
+    fn drained_at(&self) -> Option<Instant> {
+        match self.drained_at_ns.load(Ordering::Relaxed) {
+            0 => None,
+            ns => Some(self.born + Duration::from_nanos(ns)),
+        }
+    }
 }
 
 impl OpState {
+    /// Count this op against its endpoint. Called before the post.
+    fn begin_ep_send(&self) {
+        if let Some(sends) = &self.ep_sends {
+            sends.inflight.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Release the count taken by [`Self::begin_ep_send`].
+    ///
+    /// `stamp` is true for asynchronous completions only. An op that completes
+    /// inside `post_am` does so in the same pass that stamped `last_used`, so
+    /// it has nothing newer to record and skips the clock read.
+    fn end_ep_send(&self, stamp: bool) {
+        if let Some(sends) = &self.ep_sends
+            && sends.inflight.fetch_sub(1, Ordering::Relaxed) == 1
+            && stamp
+        {
+            // `max(1)`: zero means "never".
+            let ns = (sends.born.elapsed().as_nanos() as u64).max(1);
+            sends.drained_at_ns.store(ns, Ordering::Relaxed);
+        }
+    }
+
     fn complete(self: Arc<Self>, status: sys::ucs_status_t) {
         if status != sys::ucs_status_t_UCS_OK
             && let Some(state) = Arc::into_inner(self)
@@ -580,6 +647,7 @@ unsafe extern "C" fn send_trampoline(
         // SAFETY: see contract above — exactly one reclaim per posted op.
         let state = unsafe { Arc::from_raw(user_data as *const OpState) };
         state.inflight.fetch_sub(1, Ordering::AcqRel);
+        state.end_ep_send(true);
         state.complete(status);
     }));
     if !request.is_null() {
@@ -1035,6 +1103,27 @@ struct EpEntry {
     /// resolution is one loop pass, which is four orders of magnitude finer than
     /// any idle timeout worth configuring.
     last_used: Instant,
+    /// Sends in flight on this endpoint. `Some` only with the idle reaper on,
+    /// which is the only reader, so the default configuration pays nothing.
+    sends: Option<Arc<EpSends>>,
+}
+
+impl EpEntry {
+    /// The latest use the reaper knows of: the last stamp, or the completion
+    /// of the last send in flight, whichever is later.
+    fn last_activity(&self) -> Instant {
+        match self.sends.as_ref().and_then(|s| s.drained_at()) {
+            Some(drained) => drained.max(self.last_used),
+            None => self.last_used,
+        }
+    }
+
+    /// Whether a send posted on this endpoint has not completed yet.
+    fn has_send_in_flight(&self) -> bool {
+        self.sends
+            .as_ref()
+            .is_some_and(|s| s.inflight.load(Ordering::Relaxed) != 0)
+    }
 }
 
 /// One `ucp_mem_map`ed region, owned by the progress thread.
@@ -1390,6 +1479,16 @@ fn run_loop(mut state: WorkerState, ring_rx: flume::Receiver<Cmd>) {
         if state.shared.shutdown_requested.load(Ordering::Acquire) {
             break 'outer;
         }
+        #[cfg(test)]
+        {
+            // A load first, so the benchmarks in the test build pay no
+            // read-modify-write per pass.
+            let stall = &state.shared.progress_stall_ms;
+            if stall.load(Ordering::Relaxed) != 0 {
+                let ms = stall.swap(0, Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(ms));
+            }
+        }
         // The reaper's whole clock. Every `EpEntry::last_used` stamp taken
         // during this pass comes from here, and the scan at the end of the pass
         // reads it too. `ensure_ep` only moves it forward, so no stamp is ever
@@ -1495,7 +1594,7 @@ impl WorkerState {
         match cmd {
             Cmd::Send(task) => {
                 match self.ensure_ep(task.peer) {
-                    Ok(ep) => {
+                    Ok((ep, ep_sends)) => {
                         let kind = task.msg_type.as_u8();
                         // Message-type frames carry the REPLY flag so the
                         // receiver's drain gate can echo ShuttingDown without
@@ -1508,6 +1607,7 @@ impl WorkerState {
                                 on_error: task.on_error,
                             },
                             inflight: Arc::clone(&self.shared.inflight_ops),
+                            ep_sends,
                         });
                         self.post_am(ep, kind, task.header, task.payload, reply, op);
                     }
@@ -1516,13 +1616,14 @@ impl WorkerState {
             }
             Cmd::Ping { peer, token } => {
                 match self.ensure_ep(peer) {
-                    Ok(ep) => {
+                    Ok((ep, ep_sends)) => {
                         let header = Bytes::copy_from_slice(&token.to_le_bytes());
                         let op = Arc::new(OpState {
                             kind: OpKind::Control {
                                 _hold: header.clone(),
                             },
                             inflight: Arc::clone(&self.shared.inflight_ops),
+                            ep_sends,
                         });
                         self.post_am(ep, AM_KIND_PING, header, Bytes::new(), true, op);
                     }
@@ -1543,6 +1644,9 @@ impl WorkerState {
                         _hold: header.clone(),
                     },
                     inflight: Arc::clone(&self.shared.inflight_ops),
+                    // A reply endpoint UCX handed the recv callback. It is not
+                    // looked up in `eps`, so it carries no send count.
+                    ep_sends: None,
                 });
                 self.post_am(
                     reply_ep as sys::ucp_ep_h,
@@ -1559,6 +1663,9 @@ impl WorkerState {
                         _hold: header.clone(),
                     },
                     inflight: Arc::clone(&self.shared.inflight_ops),
+                    // A reply endpoint UCX handed the recv callback. It is not
+                    // looked up in `eps`, so it carries no send count.
+                    ep_sends: None,
                 });
                 self.post_am(
                     reply_ep as sys::ucp_ep_h,
@@ -1616,6 +1723,7 @@ impl WorkerState {
         op: Arc<OpState>,
     ) {
         self.shared.inflight_ops.fetch_add(1, Ordering::AcqRel);
+        op.begin_ep_send();
         let user_data = Arc::into_raw(op) as *mut c_void;
 
         // SAFETY: header/payload are owned by the OpState referenced from
@@ -1658,6 +1766,7 @@ impl WorkerState {
                 // touch user_data for an inline-completed op.
                 let state = unsafe { Arc::from_raw(user_data as *const OpState) };
                 state.inflight.fetch_sub(1, Ordering::AcqRel);
+                state.end_ep_send(false);
                 drop(state);
             }
             Err(status) => {
@@ -1666,6 +1775,7 @@ impl WorkerState {
                 // SAFETY: as above.
                 let state = unsafe { Arc::from_raw(user_data as *const OpState) };
                 state.inflight.fetch_sub(1, Ordering::AcqRel);
+                state.end_ep_send(false);
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     state.complete(status)
                 }));
@@ -1673,7 +1783,12 @@ impl WorkerState {
         }
     }
 
-    fn ensure_ep(&mut self, peer: InstanceId) -> anyhow::Result<sys::ucp_ep_h> {
+    /// The endpoint to `peer`, created if there is none, with its send count
+    /// (see [`EpSends`]) for an op about to be posted on it.
+    fn ensure_ep(
+        &mut self,
+        peer: InstanceId,
+    ) -> anyhow::Result<(sys::ucp_ep_h, Option<Arc<EpSends>>)> {
         let blob = self
             .shared
             .peers
@@ -1688,7 +1803,7 @@ impl WorkerState {
                 // here, so there is exactly one place that can forget to record
                 // a use.
                 entry.last_used = self.now;
-                return Ok(entry.ep);
+                return Ok((entry.ep, entry.sends.clone()));
             }
             // The peer was re-registered with a new incarnation. Sends must
             // switch to a fresh endpoint NOW (the old incarnation may still be
@@ -1751,6 +1866,10 @@ impl WorkerState {
 
         self.shared.failed_peers.remove(&peer);
         self.shared.eps_open.fetch_add(1, Ordering::Relaxed);
+        let sends = self
+            .config
+            .ep_idle_timeout
+            .map(|_| Arc::new(EpSends::new()));
         self.eps.insert(
             peer,
             EpEntry {
@@ -1758,10 +1877,11 @@ impl WorkerState {
                 err_arg,
                 incarnation: blob.incarnation,
                 last_used: self.now,
+                sends: sends.clone(),
             },
         );
         debug!("ucx: created endpoint to {peer}");
-        Ok(ep)
+        Ok((ep, sends))
     }
 
     /// Close endpoints that `ensure_ep` replaced mid-drain.
@@ -1891,9 +2011,11 @@ impl WorkerState {
             .eps
             .iter()
             .filter(|(peer, entry)| {
-                self.now.saturating_duration_since(entry.last_used) > timeout
-                    // The in-flight exclusion. `rma_ops` holds every posted RMA
-                    // operation that has not completed, and
+                self.now.saturating_duration_since(entry.last_activity()) > timeout
+                    // A send in flight is a use: closing now would cancel it.
+                    && !entry.has_send_in_flight()
+                    // The in-flight exclusion for RMA. `rma_ops` holds every
+                    // posted RMA operation that has not completed, and
                     // `drain_rma_completions` has just run, so this is the
                     // freshest answer available on this thread. Scanning it is
                     // O(outstanding ops) — a handful — once per scan period.
@@ -2252,7 +2374,7 @@ impl WorkerState {
         }
         validate_packed_rkey(&req.packed_rkey)?;
 
-        let ep = self
+        let (ep, _) = self
             .ensure_ep(req.peer)
             .map_err(|e| RmaError::EndpointUnavailable(e.to_string()))?;
 
