@@ -15,7 +15,7 @@ NOTE: Velo is experimental. Its design, development, and tests are still in prog
 
 | Crate | For | Contents |
 |---|---|---|
-| `velo` | Application authors | The runtime: messaging, streaming, rendezvous, events, queues, discovery, all in-tree transports (TCP, UDS, NATS, gRPC, ZMQ, UCX), metrics |
+| `velo` | Application authors | The runtime: messaging, streaming, rendezvous, events, queues, discovery, all in-tree transports (TCP, UDS, NATS, gRPC, ZMQ, UCX, QUIC), metrics |
 | `velo-ext` | Authors of out-of-tree plugins | The stable trait surface: `Transport`, `FrameTransport`, `PeerDiscovery`, `ServiceDiscovery`, `TransportObservability`, and the types they use |
 
 Application authors depend on `velo` only. See [Workspace crates](docs/src/development/architecture.md) and [Versioning](docs/src/development/versioning.md).

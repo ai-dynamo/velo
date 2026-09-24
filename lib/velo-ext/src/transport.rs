@@ -337,7 +337,7 @@ pub trait Transport: Send + Sync {
     ///
     /// This is phase 3 of the runtime's graceful shutdown and the runtime calls
     /// it only after [`ShutdownState::begin_drain`] and the drain wait. Several
-    /// in-tree transports (TCP, UDS, gRPC, UCX) also cancel the *shared*
+    /// in-tree transports (TCP, UDS, QUIC, gRPC, UCX) also cancel the *shared*
     /// [`ShutdownState::teardown_token`] here, which is instance-wide: it stops
     /// every transport's listeners **and** the runtime's inbound message
     /// consumer, which then abandons whatever is still queued. Calling
@@ -347,6 +347,23 @@ pub trait Transport: Send + Sync {
     /// the runtime's graceful shutdown instead unless that is precisely what
     /// you want.
     fn shutdown(&self);
+
+    /// Wait until the teardown that [`shutdown`](Transport::shutdown) started
+    /// has finished its work on the wire.
+    ///
+    /// The runtime's graceful shutdown awaits this on every transport after
+    /// calling `shutdown()`. The default returns at once, which is right for a
+    /// transport whose close hands unsent bytes to the kernel (TCP, UDS): the
+    /// kernel delivers them after the process exits. A transport that keeps
+    /// written data in user space until the peer acknowledges it (QUIC)
+    /// overrides this, so that a process which exits right after graceful
+    /// shutdown does not discard that data. An override must bound its wait:
+    /// [`ShutdownPolicy::Timeout`] does not cover this step, so the bound adds
+    /// to the caller's deadline. An override must also return at once if
+    /// `shutdown()` has not run, because there is nothing to wait for yet.
+    fn closed(&self) -> BoxFuture<'_, ()> {
+        Box::pin(std::future::ready(()))
+    }
 
     /// Install a transport-scoped observability handle.
     ///

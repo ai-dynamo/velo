@@ -531,7 +531,7 @@ impl Messenger {
         self.backend.begin_drain();
     }
 
-    /// Perform a graceful 3-phase shutdown of this instance's messenger
+    /// Perform a graceful 4-phase shutdown of this instance's messenger
     /// transports.
     ///
     /// 1. **Gate** — new inbound requests are rejected (see
@@ -541,6 +541,9 @@ impl Messenger {
     ///    inbound queue, which are counted from the moment a transport admits
     ///    them. Their responses still flow out through the gate.
     /// 3. **Teardown** — cancel listeners, connections, and transports.
+    /// 4. **Close** — wait for each transport's
+    ///    [`Transport::closed`](velo_ext::Transport::closed), so what it wrote
+    ///    is on the wire (bounded by the transport, not by `policy`).
     ///
     /// After this returns the instance can no longer send or receive, and no
     /// further handler is dispatched.

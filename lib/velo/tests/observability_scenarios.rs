@@ -5,7 +5,7 @@
 //!
 //! Each scenario sends messages between two Velo instances and asserts that the
 //! expected Prometheus metrics are recorded.  The `transport_metrics_tests!`
-//! macro parameterises every scenario across TCP and UDS transports.
+//! macro parameterises every scenario across the TCP, UDS and QUIC transports.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,6 +42,16 @@ fn new_uds_transport(dir: &tempfile::TempDir) -> Arc<velo::transports::uds::UdsT
     Arc::new(
         UdsTransportBuilder::new()
             .socket_path(path)
+            .build()
+            .unwrap(),
+    )
+}
+
+#[cfg(feature = "quic")]
+fn new_quic_transport() -> Arc<velo::transports::quic::QuicTransport> {
+    Arc::new(
+        velo::transports::quic::QuicTransportBuilder::new()
+            .bind_addr("127.0.0.1:0".parse().unwrap())
             .build()
             .unwrap(),
     )
@@ -706,6 +716,16 @@ macro_rules! transport_metrics_tests {
 
 transport_metrics_tests!(tcp, {
     VeloPair::new(new_tcp_transport(), new_tcp_transport())
+});
+
+// ---------------------------------------------------------------------------
+// QUIC suite: the same coalescing writer and dialed reader as TCP, so the
+// same conservation identities hold.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "quic")]
+transport_metrics_tests!(quic, {
+    VeloPair::new(new_quic_transport(), new_quic_transport())
 });
 
 // ---------------------------------------------------------------------------

@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Inbound frame routing shared by the messenger TCP/UDS listeners and the
-//! read half of their dialed connections.
+//! Inbound frame routing shared by the messenger TCP, UDS, and QUIC listeners,
+//! and the reader for the read half of dialed TCP, UDS, and QUIC connections.
 //!
 //! Accepted sockets have always been read — that is what the listeners do.
 //! Dialed sockets used to be write-only: the connection writer pushed frames
