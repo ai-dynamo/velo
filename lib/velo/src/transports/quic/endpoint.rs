@@ -70,9 +70,11 @@ pub(super) fn bind_server_sockets(
     first
         .bind(&requested.into())
         .with_context(|| format!("failed to bind QUIC socket on {requested}"))?;
+    // SO_REUSEPORT alone forms the group. SO_REUSEADDR is left off: on Linux
+    // two UDP sockets that both set it skip the port conflict check, so any
+    // process could bind the group's port.
     #[cfg(target_os = "linux")]
     if count > 1 {
-        first.set_reuse_address(true)?;
         first.set_reuse_port(true)?;
     }
     let bound: SocketAddr = first
@@ -85,7 +87,6 @@ pub(super) fn bind_server_sockets(
     for index in 1..count {
         let socket = new_udp_socket(bound)?;
         size_buffers(&socket, buffers);
-        socket.set_reuse_address(true)?;
         #[cfg(target_os = "linux")]
         socket.set_reuse_port(true)?;
         socket
@@ -196,6 +197,15 @@ mod tests {
         let server = bind_server_sockets("127.0.0.1:0".parse().unwrap(), 2, SMALL).unwrap();
         let addr = server[0].local_addr().unwrap();
         assert!(std::net::UdpSocket::bind(addr).is_err());
+        // Nor may a socket with SO_REUSEADDR alone. On Linux two UDP sockets
+        // that both set SO_REUSEADDR skip the port conflict check, so if the
+        // group set it, any process could bind the group's port.
+        let reuse_addr_only = new_udp_socket(addr).unwrap();
+        reuse_addr_only.set_reuse_address(true).unwrap();
+        assert!(
+            reuse_addr_only.bind(&addr.into()).is_err(),
+            "a socket with SO_REUSEADDR alone bound the group's port"
+        );
     }
 
     #[test]

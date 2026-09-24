@@ -9,7 +9,7 @@ use velo_ext::{
     DataStreams, InstanceId, MessageType, PeerInfo, Transport, TransportErrorHandler, make_channels,
 };
 
-use super::{QuicEndpointInfo, QuicTransport, QuicTransportBuilder};
+use super::{ConnectionHandle, QuicEndpointInfo, QuicTransport, QuicTransportBuilder};
 use crate::transports::address::WorkerAddressBuilder;
 
 #[derive(Default)]
@@ -347,4 +347,59 @@ async fn a_peer_shutting_down_is_not_a_decode_error() {
         "the client counted the server's shutdown as a decode error"
     );
     assert!(errors.0.lock().unwrap().is_empty());
+}
+
+/// Replacing a dead connection must not update the connection gauge while the
+/// map entry is held. The gauge reads `len()`, which read-locks every shard,
+/// and the shard that the entry holds for writing is not reentrant: the
+/// thread would wait on itself, and every later operation on that shard
+/// behind it. The dead entry is seeded directly because in normal use it only
+/// appears in a race between `reap_stale_connection` and `entry()`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replacing_a_dead_connection_does_not_deadlock() {
+    // Observed, so the gauge update runs.
+    let (client, _client_streams, _) = started_observed(Arc::new(Rejections::default())).await;
+    let (server, _server_streams, server_id) = started().await;
+    client
+        .register(peer_with_fingerprint(
+            &server,
+            server_id,
+            server.fingerprint(),
+        ))
+        .unwrap();
+
+    let rt = tokio::runtime::Handle::current();
+    let (tx, rx) = flume::bounded(1);
+    drop(rx);
+    client.connections.insert(
+        server_id,
+        ConnectionHandle {
+            gate: crate::transports::transport::AdmissionGate::new(tx.clone(), rt.clone()),
+            tx,
+        },
+    );
+
+    let client = Arc::new(client);
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn({
+        let client = client.clone();
+        move || {
+            let installed = client.install_connection(server_id, &rt).is_ok();
+            let _ = done_tx.send(installed);
+        }
+    });
+    let installed = done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("install_connection deadlocked replacing a dead connection");
+    assert!(installed);
+    assert!(
+        !client
+            .connections
+            .get(&server_id)
+            .unwrap()
+            .tx
+            .is_disconnected()
+    );
+    client.shutdown();
+    server.shutdown();
 }

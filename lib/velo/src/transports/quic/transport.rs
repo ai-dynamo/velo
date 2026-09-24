@@ -147,6 +147,16 @@ impl QuicTransport {
         }
 
         let rt = self.runtime.get().ok_or(TransportError::NotStarted)?;
+        self.install_connection(instance_id, rt)
+    }
+
+    /// Put a live connection in the map for `instance_id`: the one already
+    /// there if it is live, else a new one.
+    fn install_connection(
+        &self,
+        instance_id: crate::InstanceId,
+        rt: &tokio::runtime::Handle,
+    ) -> Result<ConnectionHandle> {
         let handle = match self.connections.entry(instance_id) {
             dashmap::mapref::entry::Entry::Occupied(mut entry) => {
                 if !entry.get().tx.is_disconnected() {
@@ -155,17 +165,19 @@ impl QuicTransport {
                     entry.get().retire();
                     let handle = self.create_connection(instance_id, rt)?;
                     entry.insert(handle.clone());
-                    self.update_connection_gauge();
                     handle
                 }
             }
             dashmap::mapref::entry::Entry::Vacant(entry) => {
                 let handle = self.create_connection(instance_id, rt)?;
                 entry.insert(handle.clone());
-                self.update_connection_gauge();
                 handle
             }
         };
+        // After the match, not inside it: the gauge reads `len()`, which
+        // read-locks every shard, and an occupied entry still holds its
+        // shard's write lock, which is not reentrant.
+        self.update_connection_gauge();
         Ok(handle)
     }
 
