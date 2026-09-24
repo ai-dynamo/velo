@@ -7,6 +7,10 @@
 //! environment variable: in a shared binary it would switch the mux off for
 //! every other test building a `Velo` at the same time. The parsing rule is
 //! pinned by `the_kill_switches_read_only_affirmatives` in `lib.rs`.
+//!
+//! The tests that expect the default mux, such as
+//! `two_default_nodes_stream_over_the_mux`, fail when the variable is set in
+//! the environment that runs them. That is the switch working.
 
 use std::sync::Arc;
 

@@ -41,19 +41,6 @@ use crate::streaming::handle::StreamAnchorHandle;
 /// but the multiplier itself is a protocol constant agreed by both sides.
 pub const DETECTION_MULTIPLIER: u8 = 3;
 
-/// Handlers that serve a stream already open. The messenger's drain gate lets
-/// them through: the stream was accepted before the drain, and finishing
-/// accepted work is what the drain is for. Refusing them cut a mux stream at
-/// once, because the mux carries its records and its credit as active
-/// messages. `_anchor_attach` is not here: an attach opens a new stream.
-pub(crate) const OPEN_STREAM_HANDLERS: &[&str] = &[
-    crate::streaming::messenger_mux::STREAM_BATCH_HANDLER,
-    "_stream_cancel",
-    "_anchor_detach",
-    "_anchor_finalize",
-    "_anchor_cancel",
-];
-
 /// Default heartbeat interval (milliseconds) used when `AnchorAttachResponse::Ok` is
 /// deserialized from a wire payload that predates the `heartbeat_interval_ms` field.
 /// Matches the historical hardcoded 5s constant.

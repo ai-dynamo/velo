@@ -115,7 +115,12 @@ struct ShutdownStateInner {
 /// stream. The runtime that owns the header format installs one of these with
 /// [`ShutdownState::set_drain_exemption`]. It must be cheap and must not
 /// block, because transports call it on their receive path.
-pub type DrainExemption = Arc<dyn Fn(&[u8]) -> bool + Send + Sync>;
+///
+/// The unwind-safety bounds keep [`ShutdownState`] and the guards that share
+/// its state `UnwindSafe` and `RefUnwindSafe`, as they were before this type
+/// existed. Removing an auto trait is a breaking change.
+pub type DrainExemption =
+    Arc<dyn Fn(&[u8]) -> bool + Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe>;
 
 impl ShutdownState {
     /// Create a new shutdown state. Not draining, zero in-flight.
@@ -871,6 +876,17 @@ mod tests {
             .expect("wait_for_drain must complete once the queued message is released")
             .expect("waiter task panicked");
         assert_eq!(streams.shutdown_state.in_flight_count(), 0);
+    }
+
+    /// The shutdown types are held across `catch_unwind` downstream. The
+    /// exemption must not take `UnwindSafe` or `RefUnwindSafe` from them:
+    /// removing an auto trait is a breaking change.
+    #[test]
+    fn the_shutdown_types_stay_unwind_safe() {
+        fn unwind_safe<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+        unwind_safe::<ShutdownState>();
+        unwind_safe::<InFlightGuard>();
+        unwind_safe::<InboundMessage>();
     }
 
     /// A header the installed exemption accepts is admitted during the drain,

@@ -267,15 +267,22 @@ impl RendezvousManager {
             create_rv_release_handler,
         };
 
+        // Every rendezvous handler serves a payload that is already staged,
+        // which only an admitted or sent message does. The drain gate lets
+        // them through, so a large record or response in flight is not lost.
         messenger
-            .register_streaming_handler(create_rv_metadata_handler(Arc::clone(&self.store)))?;
-        messenger.register_streaming_handler(create_rv_acquire_handler(Arc::clone(&self.store)))?;
-        messenger.register_streaming_handler(create_rv_pull_handler(Arc::clone(&self.store)))?;
-        messenger.register_streaming_handler(create_rv_ref_handler(Arc::clone(&self.store)))?;
-        messenger.register_streaming_handler(create_rv_detach_handler(Arc::clone(&self.store)))?;
-        messenger.register_streaming_handler(create_rv_release_handler(Arc::clone(&self.store)))?;
+            .register_drain_exempt_handler(create_rv_metadata_handler(Arc::clone(&self.store)))?;
         messenger
-            .register_streaming_handler(create_rv_lease_renew_handler(Arc::clone(&self.store)))?;
+            .register_drain_exempt_handler(create_rv_acquire_handler(Arc::clone(&self.store)))?;
+        messenger.register_drain_exempt_handler(create_rv_pull_handler(Arc::clone(&self.store)))?;
+        messenger.register_drain_exempt_handler(create_rv_ref_handler(Arc::clone(&self.store)))?;
+        messenger
+            .register_drain_exempt_handler(create_rv_detach_handler(Arc::clone(&self.store)))?;
+        messenger
+            .register_drain_exempt_handler(create_rv_release_handler(Arc::clone(&self.store)))?;
+        messenger.register_drain_exempt_handler(create_rv_lease_renew_handler(Arc::clone(
+            &self.store,
+        )))?;
 
         self.messenger_lock
             .set(messenger)

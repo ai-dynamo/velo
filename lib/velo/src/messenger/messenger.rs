@@ -35,7 +35,15 @@ pub struct Messenger {
     /// Late-bound large payload resolver for transparent rendezvous (receiver side).
     large_payload_resolver:
         Arc<std::sync::OnceLock<Arc<dyn crate::messenger::large_payload::LargePayloadResolver>>>,
+    /// Names of the handlers the drain gate lets through. See
+    /// [`register_drain_exempt_handler`](Self::register_drain_exempt_handler).
+    drain_exempt: DrainExemptNames,
 }
+
+/// Handler names the drain gate lets through. A std lock rather than a
+/// `DashSet`: the gate's check must be `RefUnwindSafe` (see
+/// `velo_ext::DrainExemption`), and it is read only while draining.
+type DrainExemptNames = Arc<std::sync::RwLock<std::collections::HashSet<Box<[u8]>>>>;
 
 /// Builder for Messenger allowing incremental configuration.
 pub struct MessengerBuilder {
@@ -108,19 +116,27 @@ impl Messenger {
         // 1. Setup infrastructure
         let (backend, data_streams) = VeloBackend::new(transports, metrics.clone()).await?;
         let backend = Arc::new(backend);
-        // Streams opened before a drain keep flowing through it. See
-        // `OPEN_STREAM_HANDLERS`. Installed before this messenger exists, so
-        // before anything can begin a drain.
-        backend
+        // Work accepted before a drain keeps flowing through it. See
+        // `register_drain_exempt_handler`. Installed before this messenger
+        // exists, so before anything can begin a drain.
+        let drain_exempt = DrainExemptNames::default();
+        let exempt = Arc::clone(&drain_exempt);
+        if !backend
             .shutdown_state()
-            .set_drain_exemption(Arc::new(|header: &[u8]| {
+            .set_drain_exemption(Arc::new(move |header: &[u8]| {
                 crate::messenger::common::messages::handler_name_from_request_header(header)
                     .is_some_and(|name| {
-                        crate::streaming::control::OPEN_STREAM_HANDLERS
-                            .iter()
-                            .any(|open| open.as_bytes() == name)
+                        exempt
+                            .read()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .contains(name)
                     })
-            }));
+            }))
+        {
+            tracing::warn!(
+                "a transport installed its own drain exemption; open streams stop at the drain gate"
+            );
+        }
         let instance_id = backend.instance_id();
         let worker_id = instance_id.worker_id();
         let response_manager =
@@ -215,6 +231,7 @@ impl Messenger {
             runtime,
             tracker,
             large_payload_resolver,
+            drain_exempt,
         });
 
         // 7. Register event and system handlers BEFORE unblocking the message
@@ -361,6 +378,30 @@ impl Messenger {
         handler: crate::messenger::handlers::Handler,
     ) -> anyhow::Result<()> {
         self.handlers.register_internal_handler(handler)
+    }
+
+    /// Register an internal handler that the drain gate lets through.
+    ///
+    /// Use it only for a handler that serves work this node or its peer
+    /// accepted before the drain: the messages of an open stream, or the pull
+    /// of a payload that an admitted message staged. Refusing those does not
+    /// stop new work; it cuts work already accepted, with no error to the
+    /// sender when the message is fire-and-forget. A handler that starts new
+    /// work, such as an attach, must stay gated.
+    ///
+    /// The drain counts an exempt message while its handler runs, as it counts
+    /// any admitted message. It does not count the stream the message serves.
+    pub(crate) fn register_drain_exempt_handler(
+        &self,
+        handler: crate::messenger::handlers::Handler,
+    ) -> anyhow::Result<()> {
+        let name: Box<[u8]> = handler.name().as_bytes().into();
+        self.handlers.register_internal_handler(handler)?;
+        self.drain_exempt
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(name);
+        Ok(())
     }
 
     /// Enable transparent large payload support.
@@ -562,7 +603,9 @@ impl Messenger {
     /// Under [`ShutdownPolicy::WaitForever`](crate::transports::ShutdownPolicy)
     /// that costs nothing: the drain wait only completes once the queue is
     /// empty *and* every accepted handler has finished, so every admitted
-    /// request ran to completion. Under
+    /// request ran to completion. The messages of open streams that the gate
+    /// lets through are counted the same way, so a producer that keeps
+    /// streaming into this node keeps that wait going until it pauses. Under
     /// [`ShutdownPolicy::Timeout`](crate::transports::ShutdownPolicy) it is the
     /// point of the timeout, and two things outlive the return.
     ///

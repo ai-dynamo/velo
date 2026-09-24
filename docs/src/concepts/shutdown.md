@@ -22,7 +22,20 @@ sequenceDiagram
 
 `Velo` is `Clone`. If two clones call `graceful_shutdown` at the same time, the first runs the sequence and the second waits for it.
 
-A stream that was open before the drain keeps flowing through it. The messenger mux sends its records and its credit as active messages, so the gate lets the handlers that serve an open stream through (`_stream_batch`, `_stream_cancel`, and the `_anchor_*` handlers other than `_anchor_attach`). An attach opens a new stream, so the gate refuses it. Teardown ends the mux streams, because they ride the messenger. The per-stream transports have their own teardown, which `graceful_shutdown` does not do.
+Work that was accepted before the drain keeps flowing through it. The messenger mux sends its records and its credit as active messages, so the gate lets through the handlers that serve accepted work:
+
+- `_stream_batch`, which carries the records and credit of open mux streams.
+- `_stream_cancel`, and the detach, finalize and cancel handlers of SPSC and MPSC anchors.
+- The rendezvous handlers (`_rv_*`). A record or response too large for one message is staged, and the receiver pulls it with these handlers.
+
+Each of these handlers is registered as exempt where it is registered, so the list cannot drift from the code. An attach opens a new stream, so the gate refuses it. A zero-RTT stream whose pre-bind was made before the drain is not an attach, so its first record can open the slot during the drain.
+
+The drain counts an exempt message while its handler runs. It does not count the stream that the message serves. This has two results:
+
+- A producer that sends without a pause keeps a `ShutdownPolicy::WaitForever` drain waiting until it stops.
+- A stream with a quiet gap lets the drain finish. Teardown then ends the mux streams, because they ride the messenger.
+
+To let open streams finish, call `begin_drain`, wait until your streams end, and then call `graceful_shutdown`. The per-stream transports have their own teardown, which `graceful_shutdown` does not do.
 
 ## A refused request fails fast
 

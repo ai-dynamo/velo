@@ -323,7 +323,8 @@ impl MessengerMuxTransport {
         // peer are handled on that peer's lane, by one task, in arrival order.
         .ordered()
         .build();
-        messenger.register_streaming_handler(handler)?;
+        // Records and credit of open streams: see `register_drain_exempt_handler`.
+        messenger.register_drain_exempt_handler(handler)?;
 
         sweep::spawn_sweep(&core);
 

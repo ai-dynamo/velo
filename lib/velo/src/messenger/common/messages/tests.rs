@@ -630,7 +630,7 @@ fn test_headers_all_response_types() {
 fn the_handler_name_reads_in_place_from_an_encoded_header() {
     let mut headers = HashMap::new();
     headers.insert("k".to_string(), "v".to_string());
-    for (name, headers) in [("_stream_batch", None), ("h", Some(headers))] {
+    for (name, headers) in [("_stream_batch", None), ("handler", Some(headers))] {
         let (header, _, _) = ActiveMessage {
             metadata: MessageMetadata::new_fire(
                 ResponseId::from_u128(7),

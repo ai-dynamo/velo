@@ -613,8 +613,12 @@ impl Velo {
     /// then tear down. See [`Messenger::graceful_shutdown`].
     ///
     /// Streams opened before the drain keep flowing through it: the gate lets
-    /// their messages through. Teardown ends the streams that ride the
-    /// messenger mux. The per-stream transports have their own teardown, which
+    /// their messages through. The drain counts each such message while its
+    /// handler runs, not the stream, so a producer that never pauses keeps a
+    /// `WaitForever` drain waiting, and a quiet stream lets it finish. Teardown
+    /// then ends the streams that ride the messenger mux. To let streams
+    /// finish, call [`begin_drain`](Self::begin_drain), wait for them, then
+    /// call this. The per-stream transports have their own teardown, which
     /// this call does not cover.
     ///
     /// # RDMA registrations go first, and are declared released last

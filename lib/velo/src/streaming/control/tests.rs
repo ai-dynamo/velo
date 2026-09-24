@@ -1980,31 +1980,3 @@ fn a_ticket_missing_a_minted_field_fails_rather_than_silently_defaulting() {
          cross a short-heartbeat anchor's watchdog and tear down a live stream"
     );
 }
-
-/// Every name the drain gate lets through is a handler a default node
-/// registers. A renamed handler would drop out of the exemption silently, and
-/// its stream would stop at the next drain.
-#[tokio::test(flavor = "multi_thread")]
-async fn every_open_stream_handler_is_registered() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let transport = Arc::new(
-        crate::transports::tcp::TcpTransportBuilder::new()
-            .from_listener(listener)
-            .unwrap()
-            .build()
-            .unwrap(),
-    );
-    let velo = crate::Velo::builder()
-        .add_transport(transport)
-        .build()
-        .await
-        .unwrap();
-    let registered = velo.messenger().list_local_handlers();
-    for name in OPEN_STREAM_HANDLERS {
-        assert!(
-            registered.iter().any(|h| h == name),
-            "{name} is exempt from the drain but not registered"
-        );
-    }
-    assert!(!OPEN_STREAM_HANDLERS.contains(&"_anchor_attach"));
-}
