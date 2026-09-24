@@ -306,7 +306,8 @@ impl VeloBuilder {
     /// a key that is never advertised is never selected. An application that
     /// never calls this can still turn the mux off: set
     /// `VELO_MESSENGER_MUX_DISABLE=1` and restart. The variable is read once,
-    /// in [`build`](Self::build).
+    /// in [`build`](Self::build), and it wins over `enabled: true` set in
+    /// code, as an operator's switch must.
     ///
     /// Only one mux may be installed per instance — its `_stream_batch` handler
     /// is registered on the messenger for its lifetime and the messenger
@@ -397,9 +398,10 @@ impl VeloBuilder {
         };
 
         // Step 4: Build the streaming-transport registry, keyed by
-        // TransportKey: the chosen transport here, and the mux in Step 5. The AnchorManager passes
-        // the response's `streaming_transport_key` through this map to find
-        // the FrameTransport on the client side at attach time.
+        // TransportKey: the chosen transport here, and the mux in Step 5.
+        // The AnchorManager passes the response's `streaming_transport_key`
+        // through this map to find the FrameTransport on the client side at
+        // attach time.
         let mut registry: std::collections::HashMap<
             String,
             Arc<dyn crate::streaming::FrameTransport>,
@@ -1330,8 +1332,9 @@ mod tests {
     ///
     /// The asymmetry is deliberate and worth pinning down: a switch that fired
     /// on a typo would silently cost performance in production, while one that
-    /// misses a misspelling shows up the moment anybody reads
-    /// `velo_rendezvous_rdma_path_total`.
+    /// misses a misspelling shows up the moment anybody reads the feature's
+    /// signal: `velo_rendezvous_rdma_path_total` for RDMA, and
+    /// `StreamSender::negotiated_transport()` for the mux.
     #[test]
     fn the_kill_switches_read_only_affirmatives() {
         for on in [

@@ -1123,7 +1123,7 @@ impl AnchorManager {
     ///
     /// `None` means *no ticket was minted; attach the ordinary way*, and as a
     /// return it is never an error. With no mux installed nothing here can run
-    /// and every stream behaves exactly as it does today — which is what keeps
+    /// and every stream takes the per-stream path — which is what keeps
     /// `MuxConfig::enabled` the complete rollback for this path too, and why
     /// that `None` alone is silent.
     ///

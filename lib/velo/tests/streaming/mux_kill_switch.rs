@@ -34,19 +34,24 @@ async fn default_node() -> Arc<Velo> {
 /// expose `MuxConfig::enabled`.
 #[tokio::test]
 async fn the_kill_switch_turns_the_default_mux_off() {
-    // SAFETY: this binary has one test, and it sets the variable before it
-    // builds any node, on a current-thread runtime.
+    // SAFETY: this binary has one test, and it sets the variable before any
+    // `Velo` exists, so no other thread reads the environment concurrently.
     unsafe { std::env::set_var("VELO_MESSENGER_MUX_DISABLE", "1") };
 
     let consumer = default_node().await;
     let producer = default_node().await;
-    assert!(
-        !consumer
-            .anchor_manager()
-            .transport_registry
-            .contains_key(velo::streaming::MESSENGER_MUX_KEY),
-        "the kill switch must keep the mux out of the registry"
-    );
+    // Both nodes, not just one: negotiation picks the per-stream key whenever
+    // either side lacks the mux, so the attach below alone would pass with a
+    // producer that kept it.
+    for node in [&consumer, &producer] {
+        assert!(
+            !node
+                .anchor_manager()
+                .transport_registry
+                .contains_key(velo::streaming::MESSENGER_MUX_KEY),
+            "the kill switch must keep the mux out of every registry"
+        );
+    }
     consumer.register_peer(producer.peer_info()).unwrap();
     producer.register_peer(consumer.peer_info()).unwrap();
 

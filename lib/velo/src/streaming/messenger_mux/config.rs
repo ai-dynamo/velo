@@ -146,7 +146,8 @@ pub struct MuxConfig {
     /// registering `messenger-mux-v1` and stops advertising it on attach, so
     /// the next attach negotiates the per-stream path with no code change and
     /// no wire change. `VELO_MESSENGER_MUX_DISABLE=1` does the same at
-    /// build time, for an application that does not expose this field.
+    /// build time, for an application that does not expose this field; it
+    /// wins over `enabled: true` set in code.
     ///
     /// Complete on the node that mints zero-RTT tickets — with no mux there is
     /// no ticket, and every stream attaches the ordinary way — but not

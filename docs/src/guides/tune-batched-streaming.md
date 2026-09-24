@@ -8,7 +8,7 @@ The mux is on by default, and most deployments change nothing. Keep the defaults
 
 A `Velo` builder installs the mux with `MuxConfig::default()`. The per-stream transport stays configured beside it, because negotiation needs it to serve peers that do not offer the mux. An attach uses the mux only when both sides advertise `messenger-mux-v1`. Every other pair uses the per-stream path.
 
-To turn the mux off without a code change, set `VELO_MESSENGER_MUX_DISABLE=1` and restart the process. Only `1`, `true`, `yes` and `on` count. Velo reads the variable once, when it builds the node.
+To turn the mux off without a code change, set `VELO_MESSENGER_MUX_DISABLE=1` and restart the process. Only `1`, `true`, `yes` and `on` (any case) count. Velo reads the variable once, when it builds the node. The variable wins over `enabled: true` set in code, so a benchmark that must measure the mux must not inherit it.
 
 A node with the mux runs one sweep task, which wakes five times a second, and registers the `_stream_batch` handler, even if it never streams.
 

@@ -372,7 +372,7 @@ A node with the mux enabled registers both `messenger-mux-v1` and its configured
 
 `StreamSender::negotiated_transport()` returns the key that the attach settled on. It returns `None` for a same-worker attach, which uses no transport. Compare it with the public constant `MESSENGER_MUX_KEY`.
 
-`MuxConfig::enabled = false` is the rollback. The node stops advertising `messenger-mux-v1`, and the next attach negotiates the per-stream path with no code or wire change. See [Zero-RTT stream setup](#zero-rtt-stream-setup) for the order when tickets are in use.
+`MuxConfig::enabled = false`, or `VELO_MESSENGER_MUX_DISABLE=1` at startup, is the rollback. The node stops advertising `messenger-mux-v1`, and the next attach negotiates the per-stream path with no code or wire change. See [Zero-RTT stream setup](#zero-rtt-stream-setup) for the order when tickets are in use.
 
 ## Observability
 

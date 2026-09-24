@@ -63,8 +63,8 @@ async fn test_velo_builder_tcp_transport() {
 // ---------------------------------------------------------------------------
 
 /// Validates that VeloBuilder.stream_config(StreamConfig::Grpc(None)) creates a
-/// GrpcFrameTransport and populates the transport_registry with both "grpc" and
-/// "velo" schemes.
+/// GrpcFrameTransport and registers it under `grpc-stream`, beside the mux that
+/// the builder installs by default.
 #[cfg(feature = "grpc")]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_velo_builder_grpc_transport() {
