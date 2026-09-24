@@ -1004,5 +1004,6 @@ async fn a_zero_credit_window_is_refused_at_build_time() {
     );
 }
 
+mod drain;
 mod outcome;
 mod zero_rtt;

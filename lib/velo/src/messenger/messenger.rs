@@ -108,6 +108,19 @@ impl Messenger {
         // 1. Setup infrastructure
         let (backend, data_streams) = VeloBackend::new(transports, metrics.clone()).await?;
         let backend = Arc::new(backend);
+        // Streams opened before a drain keep flowing through it. See
+        // `OPEN_STREAM_HANDLERS`. Installed before this messenger exists, so
+        // before anything can begin a drain.
+        backend
+            .shutdown_state()
+            .set_drain_exemption(Arc::new(|header: &[u8]| {
+                crate::messenger::common::messages::handler_name_from_request_header(header)
+                    .is_some_and(|name| {
+                        crate::streaming::control::OPEN_STREAM_HANDLERS
+                            .iter()
+                            .any(|open| open.as_bytes() == name)
+                    })
+            }));
         let instance_id = backend.instance_id();
         let worker_id = instance_id.worker_id();
         let response_manager =
@@ -519,7 +532,8 @@ impl Messenger {
     }
 
     /// Begin Phase 1 (Gate) of graceful shutdown: reject new inbound requests
-    /// while responses, acks, and events keep flowing.
+    /// while responses, acks, events, and the messages of streams already
+    /// open keep flowing.
     ///
     /// Transport listeners answer each rejected request with a ShuttingDown
     /// correlation reply, so remote senders fail fast ("peer is shutting

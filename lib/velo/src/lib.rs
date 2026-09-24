@@ -601,7 +601,8 @@ impl Velo {
     }
 
     /// Begin Phase 1 (Gate) of graceful shutdown: reject new inbound requests
-    /// while responses, acks, and events keep flowing. See
+    /// while responses, acks, events, and the messages of streams already open
+    /// keep flowing. See
     /// [`Messenger::begin_drain`].
     pub fn begin_drain(&self) {
         self.messenger.begin_drain();
@@ -611,8 +612,10 @@ impl Velo {
     /// inbound requests, wait for in-flight handler invocations per `policy`,
     /// then tear down. See [`Messenger::graceful_shutdown`].
     ///
-    /// Streaming-plane teardown (anchors, stream transports) is separate and
-    /// not covered by this call.
+    /// Streams opened before the drain keep flowing through it: the gate lets
+    /// their messages through. Teardown ends the streams that ride the
+    /// messenger mux. The per-stream transports have their own teardown, which
+    /// this call does not cover.
     ///
     /// # RDMA registrations go first, and are declared released last
     ///

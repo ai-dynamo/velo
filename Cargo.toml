@@ -30,7 +30,7 @@ keywords = ["nvidia", "distributed"]
 # external implementors compile against. A non-`=` requirement would let a
 # future "compatible" patch silently re-resolve downstream lockfiles, which
 # is exactly the bug that motivated the velo / velo-ext split.
-velo-ext = { path = "lib/velo-ext", version = "=0.5.1" }
+velo-ext = { path = "lib/velo-ext", version = "=0.5.2" }
 
 # External dependencies.
 #

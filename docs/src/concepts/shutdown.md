@@ -16,13 +16,13 @@ sequenceDiagram
     Velo->>Velo: 3. Teardown: cancel tokens, stop transports
 ```
 
-1. **Gate.** The drain flag goes up. New inbound requests are refused. Responses, acks, and events continue to flow, so in-flight work can finish.
+1. **Gate.** The drain flag goes up. New inbound requests are refused. Responses, acks, events, and the messages of open streams continue to flow, so in-flight work can finish.
 2. **Drain.** Velo waits until no admitted request is in flight. `ShutdownPolicy::WaitForever` waits with no limit. `ShutdownPolicy::Timeout(d)` waits up to `d` for the whole call.
 3. **Teardown.** Velo cancels the tokens and stops the transports.
 
 `Velo` is `Clone`. If two clones call `graceful_shutdown` at the same time, the first runs the sequence and the second waits for it.
 
-The streaming plane (anchors and frame transports) has its own teardown. `graceful_shutdown` does not stop it.
+A stream that was open before the drain keeps flowing through it. The messenger mux sends its records and its credit as active messages, so the gate lets the handlers that serve an open stream through (`_stream_batch`, `_stream_cancel`, and the `_anchor_*` handlers other than `_anchor_attach`). An attach opens a new stream, so the gate refuses it. Teardown ends the mux streams, because they ride the messenger. The per-stream transports have their own teardown, which `graceful_shutdown` does not do.
 
 ## A refused request fails fast
 

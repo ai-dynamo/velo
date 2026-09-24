@@ -34,7 +34,7 @@ pub use id::{InstanceId, PeerInfo, TransportKey, WorkerAddress, WorkerAddressErr
 pub use observability::{Direction, TransportObservability, TransportRejection};
 pub use streaming::FrameTransport;
 pub use transport::{
-    AdmitOutcome, DataStreams, HealthCheckError, InFlightGuard, InboundMessage, MessageType,
-    ShutdownPolicy, ShutdownState, Transport, TransportAdapter, TransportError,
+    AdmitOutcome, DataStreams, DrainExemption, HealthCheckError, InFlightGuard, InboundMessage,
+    MessageType, ShutdownPolicy, ShutdownState, Transport, TransportAdapter, TransportError,
     TransportErrorHandler, make_channels,
 };

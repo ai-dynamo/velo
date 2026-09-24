@@ -623,3 +623,36 @@ fn test_headers_all_response_types() {
     assert_eq!(decoded.metadata.response_type, ResponseType::Unary);
     assert!(decoded.metadata.headers.is_some());
 }
+
+/// The drain gate reads the handler name without a full decode, so it must
+/// agree with the encoder, and must refuse input that is not a request header.
+#[test]
+fn the_handler_name_reads_in_place_from_an_encoded_header() {
+    let mut headers = HashMap::new();
+    headers.insert("k".to_string(), "v".to_string());
+    for (name, headers) in [("_stream_batch", None), ("h", Some(headers))] {
+        let (header, _, _) = ActiveMessage {
+            metadata: MessageMetadata::new_fire(
+                ResponseId::from_u128(7),
+                name.to_string(),
+                headers,
+            ),
+            payload: Bytes::new(),
+        }
+        .encode()
+        .unwrap();
+        assert_eq!(
+            handler_name_from_request_header(&header),
+            Some(name.as_bytes())
+        );
+        // Cut inside the name.
+        assert_eq!(
+            handler_name_from_request_header(&header[..20 + name.len() - 1]),
+            None
+        );
+    }
+    assert_eq!(handler_name_from_request_header(&[]), None);
+    let mut wrong_schema = vec![0u8; FIXED_HEADER_SIZE + 1];
+    wrong_schema[0] = CURRENT_SCHEMA_VERSION + 1;
+    assert_eq!(handler_name_from_request_header(&wrong_schema), None);
+}
