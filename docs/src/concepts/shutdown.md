@@ -16,13 +16,27 @@ sequenceDiagram
     Velo->>Velo: 3. Teardown: cancel tokens, stop transports
 ```
 
-1. **Gate.** The drain flag goes up. New inbound requests are refused. Responses, acks, and events continue to flow, so in-flight work can finish.
+1. **Gate.** The drain flag goes up. New inbound requests are refused. Responses, acks, events, and the messages of open streams continue to flow, so in-flight work can finish.
 2. **Drain.** Velo waits until no admitted request is in flight. `ShutdownPolicy::WaitForever` waits with no limit. `ShutdownPolicy::Timeout(d)` waits up to `d` for the whole call.
 3. **Teardown.** Velo cancels the tokens and stops the transports.
 
 `Velo` is `Clone`. If two clones call `graceful_shutdown` at the same time, the first runs the sequence and the second waits for it.
 
-The streaming plane (anchors and frame transports) has its own teardown. `graceful_shutdown` does not stop it.
+Work that was accepted before the drain keeps flowing through it. The messenger mux sends its records and its credit as active messages, so the gate lets through the handlers that serve accepted work:
+
+- `_stream_batch`, which carries the records and credit of open mux streams.
+- `_stream_cancel`, the detach, finalize and cancel handlers of SPSC anchors, and the detach and cancel handlers of MPSC anchors.
+- The rendezvous handlers that pull a staged payload and end its lease (`_rv_acquire`, `_rv_pull`, `_rv_detach`, `_rv_release`, `_rv_lease_renew`). A record or response too large for one message is staged, and the receiver pulls it with these handlers. A draining owner answers the pull chunked, never by RDMA. `_rv_metadata` and `_rv_ref` start a new consumer, so the gate refuses them. A handle that an application staged itself can still be pulled with `get` during the drain.
+- The event handlers `_event_trigger`, `_event_trigger_request` and `_event_subscribe`. `_event_trigger` completes an awaiter of work that this node already accepted. `_event_trigger_request` completes an event that this node already created, and it acknowledges the requester. The requester sends it fire-and-forget, so a refusal would never reach the requester's wait. `_event_subscribe` answers at once for an event that is already complete, or records one subscriber for a pending event. None of the three starts new work.
+
+Each handler declares its exemption in the code where it is registered, so the gate cannot disagree with the code. The list above is kept by hand. An attach opens a new stream, so the gate refuses it. A detached SPSC anchor therefore waits out its unattached timeout during a drain, because no new sender can attach. A zero-RTT stream is not an attach: its first record opens the slot that `prebind_anchor` bound, during the drain as well. `prebind_anchor` does not check the drain, so a node that keeps making pre-binds while it drains keeps accepting streams.
+
+The drain counts an exempt message while its handler runs. It does not count the stream that the message serves. This has two results:
+
+- The drain finishes at the first moment that no message is in flight. A stream message is in flight only for microseconds, and consecutive batches are at least a credit round trip apart. An open stream, busy or quiet, therefore does not hold `graceful_shutdown` open.
+- Teardown then ends the mux streams, because they ride the messenger.
+
+To let open streams finish, call `begin_drain`, wait until your streams end, and then call `graceful_shutdown`. The per-stream transports have their own teardown, which `graceful_shutdown` does not do.
 
 ## A refused request fails fast
 
@@ -59,7 +73,7 @@ These tests pin the contract:
 
 When the RDMA registration layer is installed, shutdown has four steps:
 
-1. The gate closes. No new request can ask for an RDMA transfer.
+1. The gate closes. No new request can start. The pull of a payload staged before the drain still passes the gate, but a draining owner answers it chunked, never by RDMA.
 2. The registry sweep runs. New registrations are refused, in-flight transfers drain, and each region and arena is unmapped. Anything staged in registered memory first moves to the heap, so an admitted chunked transfer can finish.
 3. The messenger gate, drain, and teardown run as usual.
 4. Each registration that survived step 2 is declared released, but only if the backend reports that nothing is still registered.

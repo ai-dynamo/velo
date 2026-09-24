@@ -35,11 +35,12 @@
 //!
 //! ## How a deployment reaches it
 //!
-//! Opt-in, through `Velo::builder().messenger_mux(MuxConfig { enabled: true,
-//! ..Default::default() })`. That registers the transport beside the configured
-//! legacy one and lets this node advertise [`MESSENGER_MUX_KEY`] on its attach
-//! requests; [`crate::streaming::negotiation`] is where an attach then picks
-//! between the two, and picks the mux only when both peers named it. Setting
+//! On by default: `Velo::builder()` installs `MuxConfig::default()` unless
+//! `.messenger_mux(...)` passes another. That registers the transport beside
+//! the configured per-stream one and lets this node advertise
+//! [`MESSENGER_MUX_KEY`] on its attach requests;
+//! [`crate::streaming::negotiation`] is where an attach then picks between the
+//! two, and picks the mux only when both peers named it. Setting
 //! `enabled` back to `false` stops the advertisement, and on the node that
 //! mints zero-RTT tickets that is the whole rollback; a producer rolled back
 //! alone is refused by a consumer that still pre-binds for it, so the minting
@@ -252,10 +253,11 @@ impl MessengerMuxTransport {
     /// Build a mux over `messenger` and register its `_stream_batch` handler.
     ///
     /// Registration is for the messenger's lifetime: there is no
-    /// handler-deregistration hook, and `register_streaming_handler` refuses a
-    /// duplicate name, so at most one mux may be installed per messenger — a
-    /// second attempt fails here rather than producing two batchers racing for
-    /// one handler name.
+    /// handler-deregistration hook. The messenger does not refuse a duplicate
+    /// name either; a second registration silently replaces the first handler.
+    /// So the one-mux rule lives in `VeloBuilder::messenger_mux`, which fails
+    /// when a mux config is already set, and `VeloBuilder::build` calls this
+    /// once, so no two muxes race for one handler name.
     ///
     /// Fails on `initial_credit = 0`, which is not a small window but the wire
     /// encoding of *"not offering the mux"*. A node that installed one would
@@ -322,7 +324,8 @@ impl MessengerMuxTransport {
         // peer are handled on that peer's lane, by one task, in arrival order.
         .ordered()
         .build();
-        messenger.register_streaming_handler(handler)?;
+        // Records and credit of open streams: see `register_drain_exempt_handler`.
+        messenger.register_drain_exempt_handler(handler)?;
 
         sweep::spawn_sweep(&core);
 

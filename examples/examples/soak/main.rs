@@ -39,7 +39,8 @@ use crate::harness::tier::Tier;
 /// `VeloFrameTransport` was deleted for known correctness problems under
 /// multi-stream concurrency, and its replacement — `messenger-mux-v1`, see
 /// `docs/src/concepts/batched-streaming.md` — is not yet exposed as a soak
-/// harness option.
+/// harness option. The harness turns the mux off, which the builder installs
+/// by default, so the soak exercises the transport selected here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 #[value(rename_all = "lower")]
 enum StreamTransport {

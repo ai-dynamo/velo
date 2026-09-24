@@ -126,19 +126,28 @@ impl FlushPolicy {
 
 /// Construction-time tuning for the mux, and the switch that installs one.
 ///
-/// Reached from the `Velo` builder as `.messenger_mux(MuxConfig { enabled: true,
-/// ..Default::default() })`. Defaults are chosen so `enabled` is the only
-/// decision an operator has to make.
+/// The `Velo` builder installs `MuxConfig::default()` unless
+/// `.messenger_mux(...)` passes another. Tune it with
+/// `.messenger_mux(MuxConfig { max_batch_bytes: ..., ..Default::default() })`,
+/// and turn it off with `.messenger_mux(MuxConfig { enabled: false,
+/// ..Default::default() })`. Defaults are chosen so that most deployments
+/// change nothing.
 #[derive(Debug, Clone)]
 pub struct MuxConfig {
     /// Whether to install the mux at all.
     ///
-    /// **Defaults to `false`, and stays that way** — the mux is opt-in, not the
-    /// default transport. This flag is also the rollback: set it back to
-    /// `false` and the node stops registering `messenger-mux-v1` and stops
-    /// advertising it on attach, so the next attach negotiates the legacy path
-    /// with no code change and no wire change. That is what makes a canary
-    /// safe, and why activation is config-only.
+    /// **Defaults to `true`.** The per-stream transport opens a connection for
+    /// each stream; at a few thousand new streams a second that exhausts the
+    /// local port range, and the mux carries the same streams over the
+    /// connection each peer already has. The mux still negotiates per attach,
+    /// so a peer that does not offer it is served on the per-stream transport.
+    ///
+    /// This flag is also the rollback: set it to `false` and the node stops
+    /// registering `messenger-mux-v1` and stops advertising it on attach, so
+    /// the next attach negotiates the per-stream path with no code change and
+    /// no wire change. `VELO_MESSENGER_MUX_DISABLE=1` does the same at
+    /// build time, for an application that does not expose this field; it
+    /// wins over `enabled: true` set in code.
     ///
     /// Complete on the node that mints zero-RTT tickets — with no mux there is
     /// no ticket, and every stream attaches the ordinary way — but not
@@ -384,7 +393,7 @@ pub struct MuxConfig {
 impl Default for MuxConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             max_batch_bytes: 60 * 1024,
             initial_credit: 256,
             slot_byte_budget: DEFAULT_SLOT_BYTE_BUDGET,

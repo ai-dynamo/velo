@@ -1123,7 +1123,7 @@ impl AnchorManager {
     ///
     /// `None` means *no ticket was minted; attach the ordinary way*, and as a
     /// return it is never an error. With no mux installed nothing here can run
-    /// and every stream behaves exactly as it does today — which is what keeps
+    /// and every stream takes the per-stream path — which is what keeps
     /// `MuxConfig::enabled` the complete rollback for this path too, and why
     /// that `None` alone is silent.
     ///
@@ -1726,7 +1726,7 @@ impl AnchorManager {
     /// # Errors
     ///
     /// Returns `Err` if called twice (OnceLock already set) or if any
-    /// handler registration fails (e.g., duplicate handler name).
+    /// handler registration fails.
     ///
     /// # Panics
     ///
@@ -1742,10 +1742,13 @@ impl AnchorManager {
         };
 
         messenger.register_streaming_handler(create_anchor_attach_handler(Arc::clone(self)))?;
-        messenger.register_streaming_handler(create_anchor_detach_handler(Arc::clone(self)))?;
-        messenger.register_streaming_handler(create_anchor_finalize_handler(Arc::clone(self)))?;
-        messenger.register_streaming_handler(create_anchor_cancel_handler(Arc::clone(self)))?;
-        messenger.register_streaming_handler(create_stream_cancel_handler(Arc::clone(
+        // Everything but the attaches serves a stream already open, so the
+        // drain gate lets it through; an attach opens a new stream.
+        messenger.register_drain_exempt_handler(create_anchor_detach_handler(Arc::clone(self)))?;
+        messenger
+            .register_drain_exempt_handler(create_anchor_finalize_handler(Arc::clone(self)))?;
+        messenger.register_drain_exempt_handler(create_anchor_cancel_handler(Arc::clone(self)))?;
+        messenger.register_drain_exempt_handler(create_stream_cancel_handler(Arc::clone(
             &self.sender_registry,
         )))?;
 
@@ -1754,10 +1757,10 @@ impl AnchorManager {
         messenger.register_streaming_handler(
             crate::streaming::mpsc::control::create_mpsc_anchor_attach_handler(Arc::clone(self)),
         )?;
-        messenger.register_streaming_handler(
+        messenger.register_drain_exempt_handler(
             crate::streaming::mpsc::control::create_mpsc_anchor_detach_handler(Arc::clone(self)),
         )?;
-        messenger.register_streaming_handler(
+        messenger.register_drain_exempt_handler(
             crate::streaming::mpsc::control::create_mpsc_anchor_cancel_handler(Arc::clone(self)),
         )?;
 

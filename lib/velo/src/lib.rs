@@ -288,28 +288,31 @@ impl VeloBuilder {
             .unwrap()
     }
 
-    /// Install the batched, multiplexed streaming transport
+    /// Configure the batched, multiplexed streaming transport
     /// (`messenger-mux-v1`), described in `docs/src/concepts/batched-streaming.md`.
     ///
-    /// **Opt-in, and the mux is not the default transport.**
-    /// [`MuxConfig::enabled`](crate::streaming::MuxConfig::enabled) defaults to
-    /// `false`, and calling this with it left `false` is exactly the same node
-    /// as not calling it at all: nothing is registered and nothing is
-    /// advertised.
+    /// **The mux is on by default.** A builder that never calls this installs
+    /// `MuxConfig::default()`, whose
+    /// [`enabled`](crate::streaming::MuxConfig::enabled) is `true`. Call this
+    /// to tune it, or with `enabled: false` to turn it off, in which case
+    /// nothing is registered and nothing is advertised.
     ///
-    /// The legacy transport stays configured either way — a mux-enabled node
-    /// registers both, and each attach picks between them from what the peer
-    /// advertised. So a canary is one node with the flag on, talking the mux to
-    /// other canaries and the legacy path to everything else, and **rollback is
-    /// the same flag**: set it back to `false` and the node stops advertising
-    /// `messenger-mux-v1`, so the next attach negotiates the legacy path. No
-    /// code change, no wire change, and no coordination with peers, because a
-    /// key that is never advertised is never selected.
+    /// The per-stream transport stays configured either way — a mux-enabled
+    /// node registers both, and each attach picks between them from what the
+    /// peer advertised, so a peer without the mux is still served. **Rollback
+    /// is the same flag**: set it to `false` and the node stops advertising
+    /// `messenger-mux-v1`, so the next attach negotiates the per-stream path.
+    /// No code change, no wire change, and no coordination with peers, because
+    /// a key that is never advertised is never selected. An application that
+    /// never calls this can still turn the mux off: set
+    /// `VELO_MESSENGER_MUX_DISABLE=1` and restart. The variable is read once,
+    /// in [`build`](Self::build), and it wins over `enabled: true` set in
+    /// code, as an operator's switch must.
     ///
-    /// Only one mux may be installed per instance — its `_stream_batch` handler
-    /// is registered on the messenger for its lifetime and the messenger
-    /// refuses a duplicate handler name. Calling this twice fails here rather
-    /// than at the second attach.
+    /// Only one mux may be installed per instance: its `_stream_batch` handler
+    /// is registered on the messenger for its lifetime. The messenger would
+    /// replace a second registration without an error, so this check is the
+    /// guard. Calling this twice fails here.
     pub fn messenger_mux(mut self, config: crate::streaming::MuxConfig) -> Result<Self> {
         if self.mux_config.is_some() {
             return Err(anyhow::anyhow!(
@@ -344,8 +347,8 @@ impl VeloBuilder {
     ///    PeerInfo's WorkerAddress (so peers can discover the streaming
     ///    listener alongside messenger endpoints).
     /// 5. Create AnchorManager via builder, with the streaming transport
-    ///    wired in as both the default and the only registry entry (keyed by
-    ///    its TransportKey).
+    ///    wired in as the default and registered under its TransportKey,
+    ///    beside the mux unless the mux is switched off.
     /// 6. Register streaming control-plane handlers on Messenger.
     /// 7. Assemble Velo struct, holding a clone of the streaming transport
     ///    so `register_peer` can fan out to it on every newly-known peer.
@@ -394,10 +397,11 @@ impl VeloBuilder {
             }
         };
 
-        // Step 4: Build the streaming-transport registry (single entry keyed
-        // by the chosen transport's TransportKey). The AnchorManager passes
-        // the response's `streaming_transport_key` through this map to find
-        // the FrameTransport on the client side at attach time.
+        // Step 4: Build the streaming-transport registry, keyed by
+        // TransportKey: the chosen transport here, and the mux in Step 5.
+        // The AnchorManager passes the response's `streaming_transport_key`
+        // through this map to find the FrameTransport on the client side at
+        // attach time.
         let mut registry: std::collections::HashMap<
             String,
             Arc<dyn crate::streaming::FrameTransport>,
@@ -407,26 +411,36 @@ impl VeloBuilder {
             Arc::clone(&stream_transport),
         );
 
-        // Step 5: Build the mux, if it was switched on. It joins the registry
-        // *beside* the legacy transport rather than replacing it: negotiation
-        // answers `messenger-mux-v1` only to peers that advertised it, and
-        // every other peer is still answered — and must still be served — on
-        // the legacy key.
-        let mux = match self.mux_config.filter(|config| config.enabled) {
-            Some(config) => {
-                let mux = crate::streaming::messenger_mux::MessengerMuxTransport::new(
-                    Arc::clone(&messenger),
-                    config,
-                    self.metrics.clone(),
-                )?;
-                let mux_key = crate::streaming::FrameTransport::key(mux.as_ref());
-                registry.insert(
-                    mux_key.as_str().to_string(),
-                    Arc::clone(&mux) as Arc<dyn crate::streaming::FrameTransport>,
-                );
-                Some(mux)
-            }
-            None => None,
+        // Step 5: Build the mux unless the caller switched it off (it is on by
+        // default; see `messenger_mux`). It joins the registry *beside* the
+        // per-stream transport rather than replacing it: negotiation answers
+        // `messenger-mux-v1` only to peers that advertised it, and every other
+        // peer is still answered — and must still be served — on the
+        // per-stream key.
+        let mut config = self.mux_config.unwrap_or_default();
+        // Read once, here, for the reason the RDMA kill switch is: one process
+        // must not answer half its attaches one way and half the other.
+        if config.enabled && messenger_mux_disabled_by_env() {
+            tracing::info!(
+                "VELO_MESSENGER_MUX_DISABLE is set: the messenger mux is off. \
+                 Streams negotiate the per-stream transport."
+            );
+            config.enabled = false;
+        }
+        let mux = if config.enabled {
+            let mux = crate::streaming::messenger_mux::MessengerMuxTransport::new(
+                Arc::clone(&messenger),
+                config,
+                self.metrics.clone(),
+            )?;
+            let mux_key = crate::streaming::FrameTransport::key(mux.as_ref());
+            registry.insert(
+                mux_key.as_str().to_string(),
+                Arc::clone(&mux) as Arc<dyn crate::streaming::FrameTransport>,
+            );
+            Some(mux)
+        } else {
+            None
         };
 
         let anchor_manager = Arc::new(
@@ -532,33 +546,43 @@ impl Default for VeloBuilder {
 }
 
 /// Whether `VELO_RDMA_RENDEZVOUS_DISABLE` asks for the rendezvous RDMA path to
-/// be switched off (D6).
-///
-/// Only `1`, `true`, `yes` and `on` (any case) count. A variable set to
-/// anything else — `0`, `false`, an empty string, a typo — leaves the path
-/// enabled, because a kill switch that fires on a typo is worse than one that
-/// occasionally does not fire on a misspelling: the first silently costs
-/// performance in production, the second is visible the moment somebody checks
-/// the metric.
+/// be switched off (D6). Parsed by [`kill_switch_set`].
 #[cfg(all(target_os = "linux", feature = "ucx"))]
 fn rdma_rendezvous_disabled_by_env() -> bool {
-    rdma_rendezvous_disabled(
+    kill_switch_set(
         std::env::var("VELO_RDMA_RENDEZVOUS_DISABLE")
             .ok()
             .as_deref(),
     )
 }
 
-/// The parsing half of the kill switch, split out so it can be tested.
+/// Whether `VELO_MESSENGER_MUX_DISABLE` asks for the messenger mux to be
+/// switched off. Parsed by [`kill_switch_set`].
+///
+/// The mux is on by default, so an application that never calls
+/// `messenger_mux()` has no configuration of its own to turn it off with.
+/// This variable makes that rollback a restart rather than a rebuild.
+fn messenger_mux_disabled_by_env() -> bool {
+    kill_switch_set(std::env::var("VELO_MESSENGER_MUX_DISABLE").ok().as_deref())
+}
+
+/// The parsing half of every `*_DISABLE` kill switch, split out so it can be
+/// tested.
+///
+/// Only `1`, `true`, `yes` and `on` (any case) count. A variable set to
+/// anything else — `0`, `false`, an empty string, a typo — leaves the feature
+/// enabled, because a kill switch that fires on a typo is worse than one that
+/// occasionally does not fire on a misspelling: the first silently costs
+/// performance in production, the second is visible the moment somebody checks
+/// the metric.
 ///
 /// The environment is process-global and `cargo test` runs in parallel, so a
-/// test that *set* the variable would silently switch the path off for every
+/// test that *set* a variable would silently switch the feature off for every
 /// other test building a `Velo` at that moment. Splitting the decision from the
 /// read means the rule can be checked exhaustively without touching the
-/// process; the end-to-end effect is covered through
-/// [`RdmaRendezvousConfig::enabled`], which is the same field this writes.
-#[cfg(all(target_os = "linux", feature = "ucx"))]
-fn rdma_rendezvous_disabled(value: Option<&str>) -> bool {
+/// process; each switch's end-to-end effect is covered through the config
+/// field it writes, or by a test binary of its own.
+fn kill_switch_set(value: Option<&str>) -> bool {
     value.is_some_and(|v| {
         let v = v.trim().to_ascii_lowercase();
         v == "1" || v == "true" || v == "yes" || v == "on"
@@ -577,7 +601,8 @@ impl Velo {
     }
 
     /// Begin Phase 1 (Gate) of graceful shutdown: reject new inbound requests
-    /// while responses, acks, and events keep flowing. See
+    /// while responses, acks, events, and the messages of streams already open
+    /// keep flowing. See
     /// [`Messenger::begin_drain`].
     pub fn begin_drain(&self) {
         self.messenger.begin_drain();
@@ -587,8 +612,14 @@ impl Velo {
     /// inbound requests, wait for in-flight handler invocations per `policy`,
     /// then tear down. See [`Messenger::graceful_shutdown`].
     ///
-    /// Streaming-plane teardown (anchors, stream transports) is separate and
-    /// not covered by this call.
+    /// Streams opened before the drain keep flowing through it: the gate lets
+    /// their messages through. The drain counts each such message only while
+    /// its handler runs, not the stream, so an open stream, busy or quiet, does
+    /// not hold this call open. Teardown then ends the streams that ride the
+    /// messenger mux. To let streams
+    /// finish, call [`begin_drain`](Self::begin_drain), wait for them, then
+    /// call this. The per-stream transports have their own teardown, which
+    /// this call does not cover.
     ///
     /// # RDMA registrations go first, and are declared released last
     ///
@@ -597,8 +628,9 @@ impl Velo {
     ///
     /// 1. [`begin_drain`](Self::begin_drain) — idempotent, and repeated by the
     ///    messenger shutdown below. Closing the inbound gate first means no new
-    ///    request can ask for an RDMA transfer while registrations are being
-    ///    torn down.
+    ///    request can start while registrations are being torn down. The pull
+    ///    of a payload staged before the drain still passes the gate, but a
+    ///    draining owner answers it chunked, never with an RDMA descriptor.
     /// 2. The registry sweep: registrations refused,
     ///    in-flight transfers drained, every region and arena unmapped.
     /// 3. Messenger gate, drain and teardown, unchanged.
@@ -1304,34 +1336,34 @@ impl Velo {
 mod tests {
     use super::*;
 
-    /// The kill switch fires on an affirmative and on nothing else.
+    /// Every kill switch fires on an affirmative and on nothing else.
     ///
     /// The asymmetry is deliberate and worth pinning down: a switch that fired
     /// on a typo would silently cost performance in production, while one that
-    /// misses a misspelling shows up the moment anybody reads
-    /// `velo_rendezvous_rdma_path_total`.
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    /// misses a misspelling shows up the moment anybody reads the feature's
+    /// signal: `velo_rendezvous_rdma_path_total` for RDMA, and
+    /// `StreamSender::negotiated_transport()` for the mux.
     #[test]
-    fn the_rdma_kill_switch_reads_only_affirmatives() {
+    fn the_kill_switches_read_only_affirmatives() {
         for on in [
             "1", "true", "TRUE", "True", "yes", "YES", "on", "ON", " 1 ", "\ttrue\n",
         ] {
             assert!(
-                rdma_rendezvous_disabled(Some(on)),
-                "{on:?} should switch the rendezvous RDMA path off"
+                kill_switch_set(Some(on)),
+                "{on:?} should switch the feature off"
             );
         }
         for off in [
             "0", "false", "no", "off", "", "  ", "2", "disable", "ture", "1 1",
         ] {
             assert!(
-                !rdma_rendezvous_disabled(Some(off)),
-                "{off:?} must not switch the rendezvous RDMA path off"
+                !kill_switch_set(Some(off)),
+                "{off:?} must not switch the feature off"
             );
         }
         assert!(
-            !rdma_rendezvous_disabled(None),
-            "an unset variable must leave the path enabled"
+            !kill_switch_set(None),
+            "an unset variable must leave the feature on"
         );
     }
 

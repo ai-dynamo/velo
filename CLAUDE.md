@@ -60,7 +60,7 @@ The bug class that motivated the workspace collapse: a 0.1.1 "patch" of an inter
 1. **Only `velo` and `velo-ext` are publishable.** Any new crate added to the workspace must have `publish = false` in its `Cargo.toml` unless there is a deliberate, documented reason to publish it. Adding a third publishable crate reopens the bug class.
 2. **`velo-ext` is `=`-pinned in `[workspace.dependencies]`.** The line is:
    ```toml
-   velo-ext = { path = "lib/velo-ext", version = "=0.5.1" }
+   velo-ext = { path = "lib/velo-ext", version = "=0.5.2" }
    ```
    The `=` is load-bearing. Caret (the cargo default) lets a future "compatible" patch silently re-resolve downstream lockfiles. Do not relax this to a caret requirement.
 3. **Bumping `velo-ext` requires bumping `velo` in the same PR.** The `=` pin in `[workspace.dependencies]` must be updated to track. CI will fail otherwise.
@@ -71,7 +71,7 @@ The bug class that motivated the workspace collapse: a 0.1.1 "patch" of an inter
 ### What lives in `velo-ext` (and why it must stay small)
 
 - Trait definitions: `Transport`, `FrameTransport`, `PeerDiscovery`, `ServiceDiscovery`, `TransportObservability`
-- Value/error types referenced by those traits: `WorkerId`, `InstanceId`, `PeerInfo`, `WorkerAddress`, `TransportKey`, `MessageType`, `TransportError`, `HealthCheckError`, `SendOutcome`, `SendAdmission`, `AdmissionError`, `AdmissionState`, `ShutdownState`, `Direction`, `TransportRejection`, etc.
+- Value/error types referenced by those traits: `WorkerId`, `InstanceId`, `PeerInfo`, `WorkerAddress`, `TransportKey`, `MessageType`, `TransportError`, `HealthCheckError`, `SendOutcome`, `SendAdmission`, `AdmissionError`, `AdmissionState`, `ShutdownState`, `Direction`, `TransportRejection`, `DrainExemption`, etc.
 - Channel plumbing types used in trait signatures: `TransportAdapter`, `DataStreams`, `make_channels`, `AdmissionGate`
 
 What does **not** live in `velo-ext`:
@@ -112,7 +112,7 @@ All transports implement the `Transport` trait (`lib/velo-ext/src/transport.rs`,
 - **Fire-and-forget sends** with `TransportErrorHandler` callbacks for failures
 - **Four inbound streams**: message, response, event, shutdown — routed via `TransportAdapter` flume channels. `ShuttingDown` drain rejections carry the rejected *request's* header (request format, not response format), which is why they have their own lane
 - **3-phase graceful shutdown**: Gate (drain flag) → Drain (wait for in-flight) → Teardown (cancel tokens)
-- **`ShutdownState`** is shared between transport and adapter — `is_draining()` is a best-effort observer for reporting only; admission of inbound `MessageType::Message` frames goes through `TransportAdapter::admit_message`, which acquires the in-flight guard *first* and then re-reads the drain flag, closing the check-then-enqueue race that a bare `is_draining()` gate reopens
+- **`ShutdownState`** is shared between transport and adapter — `is_draining()` is a best-effort observer for reporting only; admission of inbound `MessageType::Message` frames goes through `TransportAdapter::admit_message`, which acquires the in-flight guard *first* and then re-reads the drain flag, closing the check-then-enqueue race that a bare `is_draining()` gate reopens. While draining, it refuses the frame unless the `DrainExemption` installed with `ShutdownState::set_drain_exemption` lets its header through; the messenger installs one that passes the handlers registered through `Messenger::register_drain_exempt_handler`, which serve work already accepted
 - **`WorkerAddress`** uses MessagePack-encoded maps of `TransportKey` → endpoint bytes
 - **Observability** flows through `Transport::set_observability(Arc<dyn TransportObservability>)` — the runtime hands each transport a pre-bound metrics handle. In-tree transports store it in `OnceLock<Arc<dyn TransportObservability>>` and call trait methods on the hot path. External transport authors get the same handle and emit into the same `velo_transport_*` Prometheus series.
 

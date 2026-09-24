@@ -15,6 +15,7 @@ use crate::admission::SendOutcome;
 use crate::id::{InstanceId, PeerInfo, TransportKey, WorkerAddress};
 use crate::observability::TransportObservability;
 
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::Notify;
@@ -71,7 +72,8 @@ pub enum HealthCheckError {
 /// Shared shutdown coordinator for graceful multi-phase shutdown.
 ///
 /// **Phases**:
-/// 1. **Gate** — `begin_drain()` flips the draining flag; transports reject new inbound requests.
+/// 1. **Gate** — `begin_drain()` flips the draining flag; transports reject new inbound requests,
+///    except those the installed [`DrainExemption`] lets through.
 /// 2. **Drain** — `wait_for_drain()` blocks until all in-flight guards are dropped.
 /// 3. **Teardown** — `teardown_token().cancel()` kills listeners and writer tasks.
 ///
@@ -102,7 +104,23 @@ struct ShutdownStateInner {
     in_flight: AtomicUsize,
     drain_complete: Notify,
     teardown_token: CancellationToken,
+    drain_exemption: OnceLock<DrainExemption>,
 }
+
+/// Decides, from the header of an inbound [`MessageType::Message`] frame,
+/// whether the drain gate lets it through.
+///
+/// The gate refuses new work. Some messages are not new work: they serve a
+/// stream that was open before the drain began, and refusing them cuts that
+/// stream. The runtime that owns the header format installs one of these with
+/// [`ShutdownState::set_drain_exemption`]. It must be cheap and must not
+/// block, because transports call it on their receive path.
+///
+/// The unwind-safety bounds keep [`ShutdownState`] and the guards that share
+/// its state `UnwindSafe` and `RefUnwindSafe`, as they were before this type
+/// existed. Removing an auto trait is a breaking change.
+pub type DrainExemption =
+    Arc<dyn Fn(&[u8]) -> bool + Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe>;
 
 impl ShutdownState {
     /// Create a new shutdown state. Not draining, zero in-flight.
@@ -113,6 +131,7 @@ impl ShutdownState {
                 in_flight: AtomicUsize::new(0),
                 drain_complete: Notify::new(),
                 teardown_token: CancellationToken::new(),
+                drain_exemption: OnceLock::new(),
             }),
         }
     }
@@ -206,6 +225,25 @@ impl ShutdownState {
     /// Get the Phase 3 teardown token. Cancel this to kill listeners/writers.
     pub fn teardown_token(&self) -> &CancellationToken {
         &self.inner.teardown_token
+    }
+
+    /// Install the check that lets some messages through the drain gate. See
+    /// [`DrainExemption`]. Set once; returns `false`, and keeps the first, if
+    /// one is already installed.
+    ///
+    /// An exempt message is still admitted with an in-flight guard, so the
+    /// drain waits for it like any other admitted message.
+    pub fn set_drain_exemption(&self, exemption: DrainExemption) -> bool {
+        self.inner.drain_exemption.set(exemption).is_ok()
+    }
+
+    /// Whether the drain gate lets this header through. Consulted only while
+    /// draining, so the check costs nothing before the drain begins.
+    fn is_drain_exempt(&self, header: &[u8]) -> bool {
+        self.inner
+            .drain_exemption
+            .get()
+            .is_some_and(|exempt| exempt(header))
     }
 }
 
@@ -602,7 +640,9 @@ impl TransportAdapter {
     pub fn admit_message(&self, header: Bytes, payload: Bytes) -> AdmitOutcome {
         let guard = self.shutdown_state.acquire();
 
-        if self.shutdown_state.is_draining_for_admission() {
+        if self.shutdown_state.is_draining_for_admission()
+            && !self.shutdown_state.is_drain_exempt(&header)
+        {
             drop(guard);
             return AdmitOutcome::Draining { header, payload };
         }
@@ -836,6 +876,55 @@ mod tests {
             .expect("wait_for_drain must complete once the queued message is released")
             .expect("waiter task panicked");
         assert_eq!(streams.shutdown_state.in_flight_count(), 0);
+    }
+
+    /// The shutdown types are held across `catch_unwind` downstream. The
+    /// exemption must not take `UnwindSafe` or `RefUnwindSafe` from them:
+    /// removing an auto trait is a breaking change.
+    #[test]
+    fn the_shutdown_types_stay_unwind_safe() {
+        fn unwind_safe<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+        unwind_safe::<ShutdownState>();
+        unwind_safe::<InFlightGuard>();
+        unwind_safe::<InboundMessage>();
+    }
+
+    /// A header the installed exemption accepts is admitted during the drain,
+    /// and it holds a guard like any admitted message, so the drain waits for
+    /// it. Any other header is still refused.
+    #[tokio::test]
+    async fn an_exempt_message_passes_the_drain_gate_and_is_counted() {
+        let (adapter, streams) = make_channels();
+        assert!(
+            adapter
+                .shutdown_state
+                .set_drain_exemption(Arc::new(|header: &[u8]| header == b"exempt"))
+        );
+        assert!(
+            !adapter
+                .shutdown_state
+                .set_drain_exemption(Arc::new(|_: &[u8]| true)),
+            "the first exemption stays installed"
+        );
+        adapter.shutdown_state.begin_drain();
+
+        assert!(matches!(
+            adapter.admit_message(Bytes::from_static(b"exempt"), Bytes::new()),
+            AdmitOutcome::Admitted
+        ));
+        assert!(matches!(
+            adapter.admit_message(Bytes::from_static(b"other"), Bytes::new()),
+            AdmitOutcome::Draining { .. }
+        ));
+        assert_eq!(adapter.shutdown_state.in_flight_count(), 1);
+
+        let queued = streams
+            .message_stream
+            .try_recv()
+            .expect("the exempt message");
+        assert_eq!(&queued.header[..], b"exempt");
+        drop(queued);
+        assert_eq!(adapter.shutdown_state.in_flight_count(), 0);
     }
 
     /// Admission during drain rejects and hands the frame back, and the guard

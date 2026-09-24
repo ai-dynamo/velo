@@ -175,6 +175,11 @@ pub(crate) enum RdmaPathReason {
     /// indistinguishable from an instance that was never asked. Naming it means
     /// "why is nothing using RDMA" has an answer on every node.
     NotConfigured,
+    /// The owner is draining. The shutdown sweep that follows frees pinned
+    /// memory, so a descriptor handed out now could name memory that a peer's
+    /// NIC is still reading when the sweep frees it. The pull is served
+    /// chunked instead.
+    Draining,
 }
 
 #[cfg(all(target_os = "linux", feature = "ucx"))]
@@ -200,6 +205,7 @@ impl RdmaPathReason {
             Self::GetFailed => "get_failed",
             Self::Budget => "budget",
             Self::NotConfigured => "not_configured",
+            Self::Draining => "draining",
         }
     }
 }

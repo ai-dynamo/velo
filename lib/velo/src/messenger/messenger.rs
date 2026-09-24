@@ -35,7 +35,15 @@ pub struct Messenger {
     /// Late-bound large payload resolver for transparent rendezvous (receiver side).
     large_payload_resolver:
         Arc<std::sync::OnceLock<Arc<dyn crate::messenger::large_payload::LargePayloadResolver>>>,
+    /// Names of the handlers the drain gate lets through. See
+    /// [`register_drain_exempt_handler`](Self::register_drain_exempt_handler).
+    drain_exempt: DrainExemptNames,
 }
+
+/// Handler names the drain gate lets through. A std lock rather than a
+/// `DashSet`: the gate's check must be `RefUnwindSafe` (see
+/// `velo_ext::DrainExemption`), and it is read only while draining.
+type DrainExemptNames = Arc<std::sync::RwLock<std::collections::HashSet<Box<[u8]>>>>;
 
 /// Builder for Messenger allowing incremental configuration.
 pub struct MessengerBuilder {
@@ -108,6 +116,27 @@ impl Messenger {
         // 1. Setup infrastructure
         let (backend, data_streams) = VeloBackend::new(transports, metrics.clone()).await?;
         let backend = Arc::new(backend);
+        // Work accepted before a drain keeps flowing through it. See
+        // `register_drain_exempt_handler`. Installed before this messenger
+        // exists, so before anything can begin a drain.
+        let drain_exempt = DrainExemptNames::default();
+        let exempt = Arc::clone(&drain_exempt);
+        if !backend
+            .shutdown_state()
+            .set_drain_exemption(Arc::new(move |header: &[u8]| {
+                crate::messenger::common::messages::handler_name_from_request_header(header)
+                    .is_some_and(|name| {
+                        exempt
+                            .read()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .contains(name)
+                    })
+            }))
+        {
+            tracing::warn!(
+                "a transport installed its own drain exemption; open streams stop at the drain gate"
+            );
+        }
         let instance_id = backend.instance_id();
         let worker_id = instance_id.worker_id();
         let response_manager =
@@ -202,6 +231,7 @@ impl Messenger {
             runtime,
             tracker,
             large_payload_resolver,
+            drain_exempt,
         });
 
         // 7. Register event and system handlers BEFORE unblocking the message
@@ -209,7 +239,10 @@ impl Messenger {
         //    handlers are in the map as soon as these calls return — no async
         //    task needs to be scheduled first.
         events.set_messenger(system.clone());
-        crate::messenger::events::handlers::register_event_handlers(&system.handlers, events)?;
+        crate::messenger::events::handlers::register_event_handlers(
+            |handler| system.register_drain_exempt_handler(handler),
+            events,
+        )?;
         crate::messenger::server::register_system_handlers(&system.handlers)?;
 
         // 8. Initialize hub's system reference. This unblocks wait_for_system()
@@ -339,14 +372,40 @@ impl Messenger {
     /// handlers from outside this crate. Bypasses the underscore-prefix
     /// restriction enforced by [`Messenger::register_handler`].
     ///
-    /// # Errors
-    ///
-    /// Returns an error if a handler with the same name has already been
-    /// registered.
+    /// A handler of the same name is replaced. The replacement is gated by the
+    /// drain like any request, even if the handler it replaced was exempt.
     pub fn register_streaming_handler(
         &self,
         handler: crate::messenger::handlers::Handler,
     ) -> anyhow::Result<()> {
+        self.drain_exempt
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(handler.name().as_bytes());
+        self.handlers.register_internal_handler(handler)
+    }
+
+    /// Register an internal handler that the drain gate lets through.
+    ///
+    /// Use it only for a handler that serves work this node or its peer
+    /// accepted before the drain: the messages of an open stream, or the pull
+    /// of a payload that an admitted message staged. Refusing those does not
+    /// stop new work; it cuts work already accepted, with no error to the
+    /// sender when the message is fire-and-forget. A handler that starts new
+    /// work, such as an attach, must stay gated.
+    ///
+    /// The drain counts an exempt message while its handler runs, as it counts
+    /// any admitted message. It does not count the stream the message serves.
+    pub(crate) fn register_drain_exempt_handler(
+        &self,
+        handler: crate::messenger::handlers::Handler,
+    ) -> anyhow::Result<()> {
+        // Set, then handler, as in `register_streaming_handler`, so one rule
+        // orders both paths.
+        self.drain_exempt
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(handler.name().as_bytes().into());
         self.handlers.register_internal_handler(handler)
     }
 
@@ -519,7 +578,8 @@ impl Messenger {
     }
 
     /// Begin Phase 1 (Gate) of graceful shutdown: reject new inbound requests
-    /// while responses, acks, and events keep flowing.
+    /// while responses, acks, events, and the messages of streams already
+    /// open keep flowing.
     ///
     /// Transport listeners answer each rejected request with a ShuttingDown
     /// correlation reply, so remote senders fail fast ("peer is shutting
@@ -548,7 +608,9 @@ impl Messenger {
     /// Under [`ShutdownPolicy::WaitForever`](crate::transports::ShutdownPolicy)
     /// that costs nothing: the drain wait only completes once the queue is
     /// empty *and* every accepted handler has finished, so every admitted
-    /// request ran to completion. Under
+    /// request ran to completion. The messages of open streams that the gate
+    /// lets through are counted the same way, but only while each handler
+    /// runs, so an open stream does not hold the wait open. Under
     /// [`ShutdownPolicy::Timeout`](crate::transports::ShutdownPolicy) it is the
     /// point of the timeout, and two things outlive the return.
     ///
@@ -608,6 +670,9 @@ mod tests {
         endpoint: String,
         address: WorkerAddress,
         peers: Mutex<HashMap<InstanceId, String>>,
+        /// This transport's own adapter, for tests that feed it frames
+        /// directly. Not the shared registry: another test clears that.
+        adapter: OnceLock<TransportAdapter>,
     }
 
     impl InMemoryTransport {
@@ -618,6 +683,7 @@ mod tests {
                 address: make_test_address(key.as_str(), &endpoint),
                 endpoint,
                 peers: Mutex::new(HashMap::new()),
+                adapter: OnceLock::new(),
             })
         }
     }
@@ -721,6 +787,7 @@ mod tests {
             _rt: tokio::runtime::Handle,
         ) -> BoxFuture<'_, anyhow::Result<()>> {
             let endpoint = self.endpoint.clone();
+            let _ = self.adapter.set(channels.clone());
             Box::pin(async move {
                 test_transport_registry()
                     .lock()
@@ -763,6 +830,55 @@ mod tests {
         let a = InMemoryTransport::new(format!("in-memory://{}", InstanceId::new_v4()));
         let b = InMemoryTransport::new(format!("in-memory://{}", InstanceId::new_v4()));
         (a as Arc<dyn Transport>, b as Arc<dyn Transport>)
+    }
+
+    /// A request header for `handler`, as a peer would send it.
+    fn request_header(handler: &str) -> Bytes {
+        let message = crate::messenger::common::messages::ActiveMessage {
+            metadata: crate::messenger::common::messages::MessageMetadata::new_fire(
+                crate::messenger::common::responses::ResponseId::from_u128(1),
+                handler.to_string(),
+                None,
+            ),
+            payload: Bytes::new(),
+        };
+        message.encode().expect("encode request").0
+    }
+
+    /// Replacing an exempt handler through `register_streaming_handler` drops
+    /// its exemption. The replacement may start new work, and an exemption
+    /// left behind would let that work past the drain gate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replacing_an_exempt_handler_puts_its_name_back_behind_the_drain_gate() {
+        let transport = InMemoryTransport::new(format!("in-memory://{}", InstanceId::new_v4()));
+        let messenger = Messenger::builder()
+            .add_transport(Arc::clone(&transport) as Arc<dyn Transport>)
+            .build()
+            .await
+            .unwrap();
+        let adapter = transport.adapter.get().expect("transport started").clone();
+        let admit = |handler: &str| {
+            matches!(
+                adapter.admit_message(request_header(handler), Bytes::new()),
+                velo_ext::AdmitOutcome::Admitted
+            )
+        };
+
+        messenger
+            .register_drain_exempt_handler(Handler::am_handler("_x", |_ctx| Ok(())).build())
+            .unwrap();
+        messenger.begin_drain();
+        assert!(admit("_x"), "the exempt handler was refused by the drain");
+        // Control: the gate is closed for a name that was never exempt.
+        assert!(!admit("_y"), "the drain let a gated handler through");
+
+        messenger
+            .register_streaming_handler(Handler::am_handler("_x", |_ctx| Ok(())).build())
+            .unwrap();
+        assert!(
+            !admit("_x"),
+            "the replacement handler kept the exemption of the handler it replaced"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

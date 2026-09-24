@@ -227,6 +227,7 @@ timeout 300 cargo test -p velo --features ucx,test-helpers --lib transports::ucx
 | Owner reports `no_offer` | The consumer sent no offer: it has no UCX, its kill switch is on, or this was the fallback acquire after a failed GET. | Read the consumer's own `path_total` reasons. |
 | Either side reports `kill_switch` | `VELO_RDMA_RENDEZVOUS_DISABLE` is set to an affirmative value, or `RdmaRendezvousConfig::enabled` is `false`. | Unset the variable and restart. |
 | `not_configured` | UCX was added with `add_transport`. | Use `add_ucx_transport`. |
+| Owner reports `draining` | The owner called `begin_drain`. It serves pulls of staged payloads chunked until it shuts down. | Nothing to do. This is expected during a shutdown. |
 | `pool_exhausted` on transparent sends | No arena is mapped. | Call `register_data_pinned` once at startup. |
 | `budget` | The registered-bytes budget is spent. | Raise `RdmaPoolConfig::registered_bytes_budget`, or set `arena_reclaim_after`. |
 | `ibv_reg_mr` fails at 32 MiB | The memlock limit is 8 MiB. | Set `ulimit -l unlimited`, or grant `IPC_LOCK` in a container. |

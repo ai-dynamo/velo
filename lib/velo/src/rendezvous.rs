@@ -267,15 +267,25 @@ impl RendezvousManager {
             create_rv_release_handler,
         };
 
+        // A pull and its lease (acquire, pull, detach, release, renew) serve a
+        // payload staged before the drain, such as a large record or response
+        // already in flight, so the drain gate lets them through. A draining
+        // owner answers such an acquire chunked, never by RDMA; see
+        // `rdma_response`. `_rv_metadata` and `_rv_ref` start a new consumer,
+        // which is new work, so they stay gated.
         messenger
             .register_streaming_handler(create_rv_metadata_handler(Arc::clone(&self.store)))?;
-        messenger.register_streaming_handler(create_rv_acquire_handler(Arc::clone(&self.store)))?;
-        messenger.register_streaming_handler(create_rv_pull_handler(Arc::clone(&self.store)))?;
-        messenger.register_streaming_handler(create_rv_ref_handler(Arc::clone(&self.store)))?;
-        messenger.register_streaming_handler(create_rv_detach_handler(Arc::clone(&self.store)))?;
-        messenger.register_streaming_handler(create_rv_release_handler(Arc::clone(&self.store)))?;
         messenger
-            .register_streaming_handler(create_rv_lease_renew_handler(Arc::clone(&self.store)))?;
+            .register_drain_exempt_handler(create_rv_acquire_handler(Arc::clone(&self.store)))?;
+        messenger.register_drain_exempt_handler(create_rv_pull_handler(Arc::clone(&self.store)))?;
+        messenger.register_streaming_handler(create_rv_ref_handler(Arc::clone(&self.store)))?;
+        messenger
+            .register_drain_exempt_handler(create_rv_detach_handler(Arc::clone(&self.store)))?;
+        messenger
+            .register_drain_exempt_handler(create_rv_release_handler(Arc::clone(&self.store)))?;
+        messenger.register_drain_exempt_handler(create_rv_lease_renew_handler(Arc::clone(
+            &self.store,
+        )))?;
 
         self.messenger_lock
             .set(messenger)
@@ -610,10 +620,11 @@ impl RendezvousManager {
     /// otherwise consume the whole shutdown budget on a drain that cannot
     /// finish, starving every later unmap and the messenger phase after it.
     ///
-    /// The bytes are *copied to the heap*, not discarded. The messenger has
-    /// only just gated new inbound requests, so a chunked pull admitted before
-    /// that gate is still entitled to finish; dropping its slot would turn a
-    /// completion into "chunk not found" mid-transfer. The copy costs one pass
+    /// The bytes are *copied to the heap*, not discarded. A chunked pull
+    /// admitted before the gate, or during the drain (the gate lets the pull
+    /// handlers through, and a draining owner answers every acquire chunked),
+    /// is still entitled to finish; dropping its slot would turn a completion
+    /// into "chunk not found" mid-transfer. The copy costs one pass
     /// over everything staged, transiently, and that is the price of not
     /// breaking a transfer already in progress.
     ///

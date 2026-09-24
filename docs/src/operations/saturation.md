@@ -83,7 +83,7 @@ Apply these in order, from the smallest change to the largest:
 1. **Slow the producer.** A `tokio::time::sleep` of 100 µs between sends, or `tokio::task::yield_now().await`, often ends saturation. The producer does not know the consumer's rate. Back off voluntarily, or use the producer-side backpressure counter as feedback.
 2. **Speed up the consumer.** Move work out of the `anchor.next().await` loop into a separate task. The anchor consumer must only take each frame and hand it on.
 3. **Resize the MPSC anchor channel.** `MpscAnchorConfig::channel_capacity` sets the depth of an MPSC anchor channel (256 by default). A larger channel absorbs bigger bursts at a memory cost per anchor. The SPSC anchor channel is fixed at 256.
-4. **Reduce the number of concurrent anchors on the per-stream path.** Each anchor adds channel memory and a reader pump. If your application creates one anchor per work item, batch the work items into one anchor. For many streams to few peers, enable the mux instead. See [Tune batched streaming](../guides/tune-batched-streaming.md).
+4. **Reduce the number of concurrent anchors on the per-stream path.** Each anchor adds channel memory and a reader pump. If your application creates one anchor per work item, batch the work items into one anchor. For many streams to few peers, use the mux, which is on by default. See [Tune batched streaming](../guides/tune-batched-streaming.md).
 
 ## Saturation under the mux
 
@@ -132,7 +132,7 @@ The knob is `MuxConfig::slot_byte_budget`. A larger budget gives a slow consumer
 | `velo_streaming_mux_reader_stall_total` | Must be zero. A non-zero value is a bug in the credit invariant. |
 | `velo_streaming_mux_live_slots` | Gauge of open slots. It must return to zero at teardown. |
 
-`velo_streaming_producer_send_backpressure_total` changes meaning under the mux. On the per-stream path it means that the 4,096-deep connect-side channel was full. Dashboards built on that meaning shift when the mux is enabled. Watch `velo_streaming_slot_credit_exhausted_total` for consumer-driven saturation.
+`velo_streaming_producer_send_backpressure_total` changes meaning under the mux. On the per-stream path it means that the 4,096-deep connect-side channel was full. Dashboards built on that meaning shift once streams negotiate the mux, which they do by default. Watch `velo_streaming_slot_credit_exhausted_total` for consumer-driven saturation.
 
 ### The async_open_ack exposure
 

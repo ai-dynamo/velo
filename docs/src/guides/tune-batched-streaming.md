@@ -1,12 +1,18 @@
 # Tune batched streaming
 
-Use this guide to enable the messenger mux, choose a flush policy and change its settings. Read [Batched streaming](../concepts/batched-streaming.md) first for the mechanisms that each setting controls.
+Use this guide to change the settings of the messenger mux, choose a flush policy, or turn the mux off. Read [Batched streaming](../concepts/batched-streaming.md) first for the mechanisms that each setting controls.
 
-The defaults are chosen so that `enabled` is the only decision most deployments make. Keep the other defaults until a measurement shows a reason to change one.
+The mux is on by default, and most deployments change nothing. Keep the defaults until a measurement shows a reason to change one.
 
-## Enable the mux
+## The mux is on by default
 
-Set `MuxConfig::enabled` on the `Velo` builder. Keep the per-stream transport configured. Negotiation needs it to serve peers that do not offer the mux.
+A `Velo` builder installs the mux with `MuxConfig::default()`. The per-stream transport stays configured beside it, because negotiation needs it to serve peers that do not offer the mux. An attach uses the mux only when both sides advertise `messenger-mux-v1`. Every other pair uses the per-stream path.
+
+To turn the mux off without a code change, set `VELO_MESSENGER_MUX_DISABLE=1` and restart the process. Only `1`, `true`, `yes` and `on` (any case) count. Velo reads the variable once, when it builds the node. The variable wins over `enabled: true` set in code, so a benchmark that must measure the mux must not inherit it.
+
+A node with the mux runs one sweep task, which wakes five times a second, and registers the `_stream_batch` handler, even if it never streams.
+
+Call `messenger_mux` to change a setting, or to turn the mux off:
 
 ```rust
 use velo::streaming::MuxConfig;
@@ -17,14 +23,12 @@ let velo = Velo::builder()
     // The per-stream path stays configured. Negotiation picks per attach.
     .stream_config(StreamConfig::Tcp(Some(TcpConfig::new(bind_addr))))?
     .messenger_mux(MuxConfig {
-        enabled: true,
+        enabled: false, // Turn the mux off. Omit this line to keep it on.
         ..Default::default()
     })?
     .build()
     .await?;
 ```
-
-Enable the mux on both nodes of a pair. An attach uses the mux only when both sides advertise `messenger-mux-v1`. Every other pair uses the per-stream path.
 
 Call `messenger_mux` once per `Velo` instance. A second call returns an error.
 
@@ -58,7 +62,6 @@ If you own a loop that produces one record per stream per pass, use `FlushPolicy
 ```rust
 let velo = Velo::builder()
     .messenger_mux(MuxConfig {
-        enabled: true,
         flush_policy: FlushPolicy::Manual,
         ..Default::default()
     })?
@@ -86,7 +89,7 @@ All settings are fields of `MuxConfig`. Always build it with `..Default::default
 
 | Field | Default | What it controls |
 |---|---|---|
-| `enabled` | `false` | Installs the mux and advertises `messenger-mux-v1`. Setting it back to `false` is the rollback. |
+| `enabled` | `true` | Installs the mux and advertises `messenger-mux-v1`. Setting it to `false` is the rollback. |
 | `max_batch_bytes` | 60 KiB | The configured cap on one batch. The eager budget and the 64 KiB coalescing threshold also clamp it. |
 | `initial_credit` | 256 | Data credit C per slot. Each slot buffer holds C+1 records. Zero is refused at build time. |
 | `slot_byte_budget` | 1 MiB | Bytes one slot can hold in flight, and the cap on its withheld queue. Zero means the default. |
@@ -165,18 +168,22 @@ let sender = match envelope.ticket {
 };
 ```
 
+`prebind_anchor` returns a ticket whenever the consumer has the mux and the anchor can be pre-bound, and the mux is on by default. A producer without the mux cannot open that ticket: `open_anchor_stream` fails, and the first `attach_anchor` is refused. The refusal releases the pre-bind, so a retry attaches on the per-stream path. To avoid these failures when you roll the mux out, upgrade the producers before the consumers that mint tickets, or keep the mux off on those consumers until every producer has it.
+
 A zero-RTT sender has no cancel handle, so its `cancellation_token` never fires. When the consumer drops the anchor, the producer's next `send` returns an error. An idle producer also receives a close from the consumer.
 
 The ticket stays valid for the 60-second accept window. After the window, the consumer reaps the bind and sees `SenderDropped`.
 
 ## Roll back
 
-1. Set `enabled: false` on the nodes that mint tickets.
+1. Set `enabled: false`, or set `VELO_MESSENGER_MUX_DISABLE=1`, on the nodes that mint tickets.
 2. Restart those nodes.
-3. Set `enabled: false` on the producers.
+3. Do the same on the producers.
 4. Restart the producers.
 
 CAUTION: Do not roll back a producer alone while its consumer still mints tickets. The consumer refuses the producer's attach, because the producer no longer offers the pre-bound key.
+
+Rolling the mux out needs the reverse order: producers first, then the consumers that mint tickets. See [Use zero-RTT stream setup](#use-zero-rtt-stream-setup).
 
 Without zero-RTT setup, the order does not matter. Each new attach negotiates the per-stream path.
 

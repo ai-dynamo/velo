@@ -30,7 +30,7 @@
 //!   the variable would switch the path off for every other test building a
 //!   `Velo` at that moment — it would fail its neighbours, not itself. The rule
 //!   it applies is unit-tested exhaustively in `lib.rs`
-//!   (`the_rdma_kill_switch_reads_only_affirmatives`), the field it writes is
+//!   (`the_kill_switches_read_only_affirmatives`), the field it writes is
 //!   exercised here through [`RdmaRendezvousConfig::enabled`], and the two
 //!   together are the same statement without the harness hazard.
 //! * **Descriptor framing.** `rendezvous::descriptor`'s own tests walk every
@@ -1564,5 +1564,60 @@ async fn transparent_staging_rides_the_rdma_path_once_the_pool_is_warm() {
         1,
         "the receiver resolved the payload over the chunked path"
     );
+    shutdown(pair).await;
+}
+
+/// A draining owner answers a pinned slot chunked, never by RDMA. The shutdown
+/// sweep that follows the drain frees pinned memory, so a descriptor handed
+/// out during the drain can name memory that a peer's NIC is still reading
+/// when the sweep frees it. The pull itself is served, because the payload
+/// was staged before the drain.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_draining_owner_answers_chunked() {
+    let pair = Pair::new().await;
+    let payload = pattern(1024 * 1024);
+    let handle = pair.owner.velo.register_data_pinned(&payload).await;
+    pair.owner.velo.begin_drain();
+
+    let (data, lease) = pair.consumer.velo.get(handle).await.expect("get");
+    assert_pattern(&data, payload.len());
+    pair.consumer.velo.release(handle, lease).await.unwrap();
+
+    assert_eq!(pair.owner.path_count("draining"), 1);
+    assert_eq!(pair.owner.path_count("ok"), 0);
+    assert_eq!(pair.consumer.path_count("ok"), 0);
+    shutdown(pair).await;
+}
+
+/// `draining` counts only the acquires the drain changed. A heap-staged slot
+/// is chunked whether or not the owner drains, so a draining owner still
+/// records `not_pinned` for it. Counting it as `draining` would hide the
+/// staging fact behind a transient one, the same disagreement the
+/// `not_configured` label exists to avoid.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_draining_owner_still_records_a_heap_staged_slot_as_not_pinned() {
+    let pair = Pair::new().await;
+    let payload = pattern(1024 * 1024);
+    let handle = pair.owner.velo.register_data(Bytes::from(payload.clone()));
+    // Read before the drain: `_rv_metadata` starts a new consumer, so the gate
+    // refuses it.
+    assert!(!pair.consumer.velo.metadata(handle).await.unwrap().pinned);
+    pair.owner.velo.begin_drain();
+
+    let (data, lease) = pair.consumer.velo.get(handle).await.expect("get");
+    assert_pattern(&data, payload.len());
+    pair.consumer.velo.release(handle, lease).await.unwrap();
+
+    assert_eq!(
+        pair.owner.path_count("not_pinned"),
+        1,
+        "the heap-staged slot was not counted as not_pinned"
+    );
+    assert_eq!(
+        pair.owner.path_count("draining"),
+        0,
+        "the drain was counted for a slot it did not change"
+    );
+    assert_eq!(pair.owner.path_count("ok"), 0);
     shutdown(pair).await;
 }

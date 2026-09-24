@@ -1,6 +1,6 @@
 # Batched streaming
 
-The messenger mux carries every stream to one peer over the Messenger connection that already exists to that peer. It packs the records for that peer into `_stream_batch` active messages. Its transport key is `messenger-mux-v1`. The mux is opt-in and is negotiated per attach. Senders do not change: `StreamSender::send` stages a record, and the layer below it decides when to write.
+The messenger mux carries every stream to one peer over the Messenger connection that already exists to that peer. It packs the records for that peer into `_stream_batch` active messages. Its transport key is `messenger-mux-v1`. The mux is on by default and is negotiated per attach. Senders do not change: `StreamSender::send` stages a record, and the layer below it decides when to write.
 
 This chapter describes how the mux works. The [Tune batched streaming](../guides/tune-batched-streaming.md) guide tells you how to configure it. The [Batched streaming design](../development/batched-streaming-design.md) chapter records why it works this way and which alternatives were rejected.
 
@@ -23,6 +23,8 @@ Each remote stream on the per-stream path costs the following:
 Per token, the stream pays one `rmp_serde` allocation, one channel hop, one `encode_frame` and, because `TCP_NODELAY` is set, one syscall and one TCP segment.
 
 This cost is a ceiling, not a slope. Each remote stream holds one socket, with one file descriptor in each of the two processes. Across both ends, 1,024 concurrent remote streams need 2,048 descriptors, about 4 GiB of requested socket buffer and about 4,096 tasks. Each process holds one descriptor per stream. At the default `ulimit -n` of 1,024, a process stops below 1,024 concurrent remote streams, less the descriptors that it uses for other things.
+
+The rate of new streams is a limit too. On a cluster (2026-09-23, two Grace nodes on 200G Ethernet, 512 mock workers in 8 processes, concurrency 8,192), a response plane that opened about 2,500 streams per second on the per-stream path failed 80% to 92% of its requests. The workers could not get a local port (`Cannot assign requested address`). The mux carried the same load with no errors. For this reason the mux is the default.
 
 ### Per-stream coalescing cannot reach the forward-pass shape
 
@@ -173,6 +175,8 @@ The ticket can wait in an envelope for the full 60-second accept window. Heartbe
 Credit is exact by construction. `prebind` sizes its buffer from the same `NegotiatedLimits` that the ticket quotes. `open_slot` emits no `CreditUpdate` on the claim, so the sender never holds 2C credit against a C+1 buffer.
 
 The rollback is not symmetric. Disable the mux on the minting side first, or on both sides together. A producer that disables the mux alone still advertises its default transport key. A consumer that still pre-binds refuses that attach, because the key does not match the pre-bind.
+
+The rollout has the same asymmetry in reverse. The mux is on by default, so a consumer mints tickets as soon as it runs a version with the mux. A producer without the mux cannot open them. Upgrade the producers first, or keep the mux off on the consumers that mint tickets until every producer has it.
 
 ### Peer loss
 
@@ -368,7 +372,7 @@ A node with the mux enabled registers both `messenger-mux-v1` and its configured
 
 `StreamSender::negotiated_transport()` returns the key that the attach settled on. It returns `None` for a same-worker attach, which uses no transport. Compare it with the public constant `MESSENGER_MUX_KEY`.
 
-`MuxConfig::enabled = false` is the rollback. The node stops advertising `messenger-mux-v1`, and the next attach negotiates the per-stream path with no code or wire change. See [Zero-RTT stream setup](#zero-rtt-stream-setup) for the order when tickets are in use.
+`MuxConfig::enabled = false`, or `VELO_MESSENGER_MUX_DISABLE=1` at startup, is the rollback. The node stops advertising `messenger-mux-v1`, and the next attach negotiates the per-stream path with no code or wire change. See [Zero-RTT stream setup](#zero-rtt-stream-setup) for the order when tickets are in use.
 
 ## Observability
 
