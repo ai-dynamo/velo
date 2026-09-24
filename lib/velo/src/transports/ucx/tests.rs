@@ -1775,9 +1775,10 @@ async fn ping_message_to(
 /// The builder raises a sub-floor idle timeout rather than honouring it.
 ///
 /// Asserted on its own because every other reaper test uses a value at or above
-/// the floor, so nothing else would notice the clamp disappearing — and what it
-/// guards against is a timeout shorter than endpoint wireup, which fails as lost
-/// sends rather than as anything the reaper reports.
+/// the floor, so nothing else would notice the clamp disappearing. What the
+/// floor guards against is a timeout shorter than endpoint wireup: endpoints
+/// then close between ordinary uses, each next use pays wireup again, and each
+/// close costs the peer a frame. The reaper reports none of that.
 #[test]
 fn a_sub_floor_ep_idle_timeout_is_clamped() {
     let clamped = UcxTransportBuilder::new()
@@ -2061,23 +2062,19 @@ async fn a_slow_endpoint_create_does_not_age_the_new_endpoint() {
 /// `--lib` run that took 526-573 ms, so the reaper closed the endpoint with
 /// the send in flight: the send failed through `on_error` and the frame was
 /// lost. The seam stops the peer's progress thread for twice the timeout,
-/// which holds the send in flight past it on demand.
+/// which holds the send in flight past it on demand. The first check after
+/// arrival proves that the stall really held the send that long.
 ///
-/// The second half checks the completion stamp. The send was admitted about
-/// two timeouts before it completed. If the admission stamp were the last
-/// use, the first scan after completion would close the endpoint, within one
-/// scan period (half the timeout). The endpoint must instead stay open for a
-/// full timeout after completion. The bound is three quarters of the timeout,
-/// which leaves a quarter on each side for scheduling delay.
+/// The second half checks the completion stamp. The timeout is 2 s, so the
+/// scan period is 1 s (half the timeout, capped at 1 s), and a parked progress
+/// thread wakes at least every `PARK_MS` (100 ms). If the admission stamp were
+/// the last use, the endpoint would be closed at the first scan after the
+/// send completes: within 1.1 s. With the completion stamp it stays open for a
+/// full 2 s. The bound is 1.5 s, about 0.4 s from each side.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_send_in_flight_keeps_its_endpoint_open() {
-    const TIMEOUT: Duration = Duration::from_secs(1);
-    let a = start_node_with_config(UcxConfig {
-        tls: Some("tcp".into()),
-        ep_idle_timeout: Some(TIMEOUT),
-        ..UcxConfig::default()
-    })
-    .await;
+    const TIMEOUT: Duration = Duration::from_secs(2);
+    let a = start_node_with(|b| b.ep_idle_timeout(Some(TIMEOUT))).await;
     let b = start_node().await;
     cross_register(&a, &b);
     b.transport
@@ -2086,6 +2083,7 @@ async fn a_send_in_flight_keeps_its_endpoint_open() {
         .store((2 * TIMEOUT).as_millis() as u64, Ordering::Relaxed);
     let errs = CountingErrors::new();
 
+    let sent_at = std::time::Instant::now();
     let out = a.transport.send_message(
         b.instance_id,
         Bytes::from_static(b"h"),
@@ -2102,6 +2100,10 @@ async fn a_send_in_flight_keeps_its_endpoint_open() {
         "the send failed: its endpoint was closed while the send was in flight"
     );
     assert!(arrived, "the frame was lost while its send was in flight");
+    assert!(
+        arrived_at.duration_since(sent_at) >= TIMEOUT,
+        "the stall did not hold the send in flight past the timeout"
+    );
     assert_eq!(
         eps_closed_idle(&a),
         0,
@@ -2211,10 +2213,11 @@ async fn reaping_disrupts_the_peers_path_back() {
 ///
 /// *A sub-floor timeout, set on the config directly.* The reaper has to act
 /// faster than a 64 MiB transfer over the tcp lane, while the builder's floor is
-/// sized for the opposite concern — dominating endpoint wireup. Going under it
-/// isolates the exclusion from transfer timing, which is what is under test, and
-/// nothing here sends an Active Message, so the hazard the floor guards against
-/// is out of play entirely.
+/// sized for the opposite concern — dominating endpoint wireup, so that
+/// endpoints do not close between ordinary uses and re-pay wireup and a peer
+/// frame each time. Going under it isolates the exclusion from transfer timing,
+/// which is what is under test. Nothing here sends an Active Message, and the
+/// idle peer's close is the point of the test, so those costs do not apply.
 ///
 /// *Eager wireup, no frames.* Both endpoints are established by registration
 /// alone, so neither depends on an AM completing.

@@ -152,14 +152,13 @@
 //! operation posted on a superseded endpoint still names its peer, so the
 //! reaper declines to close the replacement while it is outstanding.
 //!
-//! **Why sends in flight are counted.** An earlier version stamped only the
-//! admission of a send, and priced a per-endpoint count above what it bought.
-//! Measurement overturned that. A first send between fresh workers waits while
-//! the peer sets up its own endpoint back to us, inside the peer's
-//! `ucp_worker_progress`. With many UCX workers in one process (the parallel
-//! test suite) that step alone took 526-573 ms, past the 500 ms floor, so the
-//! reaper FORCE-closed the endpoint under the send and the frame was lost. The
-//! count follows `post_am`'s three exits: taken before the post, released on
+//! **Why sends in flight are counted.** An admission stamp alone does not make
+//! an endpoint busy for as long as its send takes. A first send between fresh
+//! workers waits while the peer sets up its own endpoint back to us, inside the
+//! peer's `ucp_worker_progress`. With many UCX workers in one process (the
+//! parallel test suite) that step alone took 526-573 ms, past the 500 ms floor,
+//! and a reaper that read only the stamp FORCE-closed the endpoint under the
+//! send, losing the frame. The count follows `post_am`'s three exits: taken before the post, released on
 //! the inline and synchronous-failure exits, and released in `send_trampoline`
 //! for the asynchronous one. Only that last release reads the clock, and only
 //! when the count falls to zero. The count exists only with the reaper on, so
@@ -168,14 +167,18 @@
 //! direction.
 //!
 //! Replies posted on a reply endpoint (`Cmd::PongTo`, `Cmd::ShuttingDownTo`)
-//! carry no count: that endpoint is not looked up in `eps`. They are control
-//! traffic, and their loss is logged, not reported.
+//! carry no count, because they do not go through `ensure_ep`. The pointer can
+//! still equal an endpoint we own (that identity is what the inbound stamp rests
+//! on), so such a reply rides an endpoint the reaper tracks without counting on
+//! it. The window is covered anyway: the inbound frame that caused the reply is
+//! stamped by `stamp_inbound_use` in the same pass, before the scan, so the
+//! endpoint is a full timeout from idle when the reply is posted.
 //!
 //! **Endpoint creation is not idle time.** `last_used` is stamped from
 //! [`WorkerState::now`], sampled at the top of the loop pass, but `ensure_ep`
 //! advances that clock after `ucp_ep_create`. The call was measured at 630 ms
-//! (median of 31 creates in one process), past the floor. An eager endpoint
-//! stamped from before it was reaped before anything used it.
+//! (median of 31 creates in one process), past the floor. An endpoint with no
+//! send on it, such as an eager one, has only this stamp to keep it open.
 //!
 //! **FORCE, like every other close from the main loop.** `close_ep_raw` frees
 //! the leaked `ErrArg` the moment the close is issued, a discipline established
@@ -566,11 +569,11 @@ struct EpSends {
 }
 
 impl EpSends {
-    fn new() -> Self {
+    fn new(born: Instant) -> Self {
         Self {
             inflight: AtomicUsize::new(0),
             drained_at_ns: AtomicU64::new(0),
-            born: Instant::now(),
+            born,
         }
     }
 
@@ -591,16 +594,21 @@ impl OpState {
         }
     }
 
-    /// Release the count taken by [`Self::begin_ep_send`].
+    /// Release the count taken by [`Self::begin_ep_send`]. Returns whether
+    /// that left the endpoint with no send in flight.
+    fn end_ep_send(&self) -> bool {
+        self.ep_sends
+            .as_ref()
+            .is_some_and(|sends| sends.inflight.fetch_sub(1, Ordering::Relaxed) == 1)
+    }
+
+    /// Record now as the time the endpoint's last send in flight completed.
     ///
-    /// `stamp` is true for asynchronous completions only. An op that completes
-    /// inside `post_am` does so in the same pass that stamped `last_used`, so
-    /// it has nothing newer to record and skips the clock read.
-    fn end_ep_send(&self, stamp: bool) {
-        if let Some(sends) = &self.ep_sends
-            && sends.inflight.fetch_sub(1, Ordering::Relaxed) == 1
-            && stamp
-        {
+    /// Only `send_trampoline` calls this. An op that completes inside `post_am`
+    /// does so in the pass that stamped `last_used`, so it has nothing newer to
+    /// record and skips the clock read.
+    fn stamp_ep_drained(&self) {
+        if let Some(sends) = &self.ep_sends {
             // `max(1)`: zero means "never".
             let ns = (sends.born.elapsed().as_nanos() as u64).max(1);
             sends.drained_at_ns.store(ns, Ordering::Relaxed);
@@ -647,7 +655,9 @@ unsafe extern "C" fn send_trampoline(
         // SAFETY: see contract above — exactly one reclaim per posted op.
         let state = unsafe { Arc::from_raw(user_data as *const OpState) };
         state.inflight.fetch_sub(1, Ordering::AcqRel);
-        state.end_ep_send(true);
+        if state.end_ep_send() {
+            state.stamp_ep_drained();
+        }
         state.complete(status);
     }));
     if !request.is_null() {
@@ -1766,7 +1776,7 @@ impl WorkerState {
                 // touch user_data for an inline-completed op.
                 let state = unsafe { Arc::from_raw(user_data as *const OpState) };
                 state.inflight.fetch_sub(1, Ordering::AcqRel);
-                state.end_ep_send(false);
+                state.end_ep_send();
                 drop(state);
             }
             Err(status) => {
@@ -1775,7 +1785,7 @@ impl WorkerState {
                 // SAFETY: as above.
                 let state = unsafe { Arc::from_raw(user_data as *const OpState) };
                 state.inflight.fetch_sub(1, Ordering::AcqRel);
-                state.end_ep_send(false);
+                state.end_ep_send();
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     state.complete(status)
                 }));
@@ -1857,9 +1867,10 @@ impl WorkerState {
         }
         // `ucp_ep_create` can outlast the idle timeout: across 31 creates in
         // one process during the parallel UCX tests, the median was 630 ms. A
-        // stamp from the clock read before the call made the endpoint older
-        // than the timeout at birth. The next scan then FORCE-closed it with
-        // its first send still in flight. Advancing the pass clock, rather than
+        // stamp from the clock read before the call would make the endpoint
+        // older than the timeout at birth. A send in flight holds its endpoint
+        // open by itself, but an endpoint with no send on it, such as an eager
+        // one, has only this stamp. Advancing the pass clock, rather than
         // stamping this entry alone, keeps every later stamp in the pass and
         // the scan that ends it on one clock.
         self.now = Instant::now();
@@ -1869,7 +1880,7 @@ impl WorkerState {
         let sends = self
             .config
             .ep_idle_timeout
-            .map(|_| Arc::new(EpSends::new()));
+            .map(|_| Arc::new(EpSends::new(self.now)));
         self.eps.insert(
             peer,
             EpEntry {

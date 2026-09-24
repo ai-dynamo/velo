@@ -85,9 +85,11 @@ pub struct UcxConfig {
 
 /// Floor on [`UcxConfig::ep_idle_timeout`].
 ///
-/// Sized to **dominate endpoint wireup**. A send in flight holds its endpoint
-/// open at any timeout, so a short timeout loses no frame of ours. What it does
-/// is close endpoints between ordinary uses, and each close makes the next use
+/// Sized to **dominate endpoint wireup**. A send posted on an endpoint we own
+/// holds that endpoint open at any timeout, so a short timeout cancels none of
+/// those sends. (Replies posted on the endpoint UCX hands the receive callback
+/// are not counted.) What a short timeout does is close endpoints between
+/// ordinary uses, and each close makes the next use
 /// pay wireup again and costs the peer a frame (see
 /// [`UcxTransportBuilder::ep_idle_timeout`]). Measured warm wireup is ~14 ms on
 /// CX-7 InfiniBand and upwards of 10 ms over the tcp lane in CI, so half a
@@ -697,7 +699,10 @@ impl UcxTransportBuilder {
     /// An endpoint is idle only when no send posted on it is in flight and none
     /// has completed for the timeout. A send slower than the timeout therefore
     /// keeps its endpoint open, and the idle clock starts again when it
-    /// completes. The time `ucp_ep_create` takes does not count as idle either.
+    /// completes. Replies posted on the endpoint UCX hands the receive callback
+    /// (pongs and shutting-down echoes) are not counted: the inbound frame that
+    /// caused each one has just refreshed the endpoint. The time `ucp_ep_create`
+    /// takes does not count as idle either.
     ///
     /// Values below half a second are raised to it; see the transport's
     /// `MIN_EP_IDLE_TIMEOUT` for why that is the number.
@@ -783,8 +788,8 @@ impl UcxTransportBuilder {
     /// be usable together: eager wireup amortises the connection cost away from
     /// the first transfer, and the reaper reclaims it again if the peer turns
     /// out never to be used. An eagerly established endpoint's idle clock starts
-    /// at registration, so with both on, a registered-but-never-used peer is
-    /// wired up once and closed one timeout later. That is the intended
+    /// when `ucp_ep_create` returns, so with both on, a registered-but-never-used
+    /// peer is wired up once and closed one timeout after that wireup. That is the intended
     /// behaviour, not a conflict.
     pub fn eager_endpoints(mut self, eager: bool) -> Self {
         self.config.eager_endpoints = eager;

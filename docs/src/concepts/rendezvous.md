@@ -262,11 +262,11 @@ The sweep period is the smaller of `lease_timeout / 2` and `arena_reclaim_after 
 `UcxTransportBuilder::ep_idle_timeout(Some(d))` closes UCX endpoints that nothing used for `d`. It is **off by default and experimental.** Values below 500 ms rise to 500 ms, which is about 35 times the measured warm endpoint wireup.
 
 - "Used" means both directions. Our sends, GETs, pings, and eager wireup stamp the endpoint. Inbound frames stamp it too, because UCX hands the receive callback the same endpoint pointer that `ucp_ep_create` returned.
-- An endpoint is idle only when no send posted on it is in flight and none has completed for the timeout. The reaper counts the sends in flight on each endpoint, and the completion of the last one restarts the idle clock.
+- An endpoint is idle only when no send posted on it is in flight and none has completed for the timeout. The reaper counts the sends in flight on each endpoint, and the completion of the last one restarts the idle clock. Replies on the endpoint that UCX hands the receive callback (pongs and shutting-down echoes) are not counted. The inbound frame that caused each reply refreshes the endpoint just before the reply is sent.
 - The reaper never closes an endpoint while an RDMA operation to that peer is outstanding.
 - The scan runs every half timeout, and at least once per second. An endpoint closes between one timeout and one timeout plus one scan period after its last use.
-- Idle time starts when `ucp_ep_create` returns, not before the call. On a GB200 node, a worker's first `ucp_ep_create` took 110 to 150 ms. Across 31 creates in one process during the parallel UCX tests, the median was 630 ms, which is longer than the floor. An eager endpoint stamped before the call was closed before anything used it.
-- A first send between fresh workers also waits while the peer sets up its own endpoint back to us. With the CPUs oversubscribed, a fresh pair's first frame took 360 to 420 ms. With many UCX workers in one process, the peer's step alone took 526 to 573 ms. Before the reaper counted sends in flight, it closed the endpoint under such a send, and the frame was lost.
+- Idle time starts when `ucp_ep_create` returns, not before the call. On a GB200 node, a worker's first `ucp_ep_create` took 110 to 150 ms. Across 31 creates in one process during the parallel UCX tests, the median was 630 ms, which is longer than the floor. An endpoint with no send on it, such as an eager one, has only this stamp to keep it open.
+- A first send between fresh workers also waits while the peer sets up its own endpoint back to us. With the CPUs oversubscribed, a fresh pair's first frame took 360 to 420 ms. With many UCX workers in one process, the peer's step alone took 526 to 573 ms. The count of sends in flight keeps the endpoint open for that time.
 - The next use wires up a new endpoint with no error. The peer stays registered.
 
 **Closing an endpoint costs the peer.** UCX pairs endpoints by remote worker. The peer's own endpoint back to us rides the same connection. After a reap, the peer's next frame to us is admitted and silently lost, with no error at either end. UCX keepalive (about 20 s) then declares the peer's endpoint failed, and the frame after that arrives. The cost is one lost frame and up to one keepalive interval per reaped endpoint. The disruption self-heals.
@@ -277,7 +277,7 @@ Patterns where the reaper is safe: peers idle in both directions, and send-only 
 
 `UcxTransportBuilder::eager_endpoints(true)` creates the endpoint at `register()` instead of at first use. It is off by default. The first GET on a fresh peer pair costs about 14 ms of UCX wireup, against about 108 µs for a warm GET (measured on 2026-08-29, see [RDMA performance](../operations/rdma-performance.md)). Eager wireup moves that cost off the first transfer. The hint is fire-and-forget: `register()` does not wait, and a dropped hint falls back to lazy wireup.
 
-With both knobs on, a peer that is registered but never used is wired up once and closed one timeout later.
+With both knobs on, a peer that is registered but never used is wired up once and closed one timeout after the wireup completes.
 
 ## Shutdown ordering
 
