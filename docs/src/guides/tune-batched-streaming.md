@@ -1,12 +1,14 @@
 # Tune batched streaming
 
-Use this guide to enable the messenger mux, choose a flush policy and change its settings. Read [Batched streaming](../concepts/batched-streaming.md) first for the mechanisms that each setting controls.
+Use this guide to change the settings of the messenger mux, choose a flush policy, or turn the mux off. Read [Batched streaming](../concepts/batched-streaming.md) first for the mechanisms that each setting controls.
 
-The defaults are chosen so that `enabled` is the only decision most deployments make. Keep the other defaults until a measurement shows a reason to change one.
+The mux is on by default, and most deployments change nothing. Keep the defaults until a measurement shows a reason to change one.
 
-## Enable the mux
+## The mux is on by default
 
-Set `MuxConfig::enabled` on the `Velo` builder. Keep the per-stream transport configured. Negotiation needs it to serve peers that do not offer the mux.
+A `Velo` builder installs the mux with `MuxConfig::default()`. The per-stream transport stays configured beside it, because negotiation needs it to serve peers that do not offer the mux. An attach uses the mux only when both sides advertise `messenger-mux-v1`. Every other pair uses the per-stream path.
+
+Call `messenger_mux` to change a setting, or to turn the mux off:
 
 ```rust
 use velo::streaming::MuxConfig;
@@ -17,14 +19,12 @@ let velo = Velo::builder()
     // The per-stream path stays configured. Negotiation picks per attach.
     .stream_config(StreamConfig::Tcp(Some(TcpConfig::new(bind_addr))))?
     .messenger_mux(MuxConfig {
-        enabled: true,
+        enabled: false, // Turn the mux off. Omit this line to keep it on.
         ..Default::default()
     })?
     .build()
     .await?;
 ```
-
-Enable the mux on both nodes of a pair. An attach uses the mux only when both sides advertise `messenger-mux-v1`. Every other pair uses the per-stream path.
 
 Call `messenger_mux` once per `Velo` instance. A second call returns an error.
 
@@ -58,7 +58,6 @@ If you own a loop that produces one record per stream per pass, use `FlushPolicy
 ```rust
 let velo = Velo::builder()
     .messenger_mux(MuxConfig {
-        enabled: true,
         flush_policy: FlushPolicy::Manual,
         ..Default::default()
     })?
@@ -86,7 +85,7 @@ All settings are fields of `MuxConfig`. Always build it with `..Default::default
 
 | Field | Default | What it controls |
 |---|---|---|
-| `enabled` | `false` | Installs the mux and advertises `messenger-mux-v1`. Setting it back to `false` is the rollback. |
+| `enabled` | `true` | Installs the mux and advertises `messenger-mux-v1`. Setting it to `false` is the rollback. |
 | `max_batch_bytes` | 60 KiB | The configured cap on one batch. The eager budget and the 64 KiB coalescing threshold also clamp it. |
 | `initial_credit` | 256 | Data credit C per slot. Each slot buffer holds C+1 records. Zero is refused at build time. |
 | `slot_byte_budget` | 1 MiB | Bytes one slot can hold in flight, and the cap on its withheld queue. Zero means the default. |

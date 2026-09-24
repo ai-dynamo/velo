@@ -288,23 +288,22 @@ impl VeloBuilder {
             .unwrap()
     }
 
-    /// Install the batched, multiplexed streaming transport
+    /// Configure the batched, multiplexed streaming transport
     /// (`messenger-mux-v1`), described in `docs/src/concepts/batched-streaming.md`.
     ///
-    /// **Opt-in, and the mux is not the default transport.**
-    /// [`MuxConfig::enabled`](crate::streaming::MuxConfig::enabled) defaults to
-    /// `false`, and calling this with it left `false` is exactly the same node
-    /// as not calling it at all: nothing is registered and nothing is
-    /// advertised.
+    /// **The mux is on by default.** A builder that never calls this installs
+    /// `MuxConfig::default()`, whose
+    /// [`enabled`](crate::streaming::MuxConfig::enabled) is `true`. Call this
+    /// to tune it, or with `enabled: false` to turn it off, in which case
+    /// nothing is registered and nothing is advertised.
     ///
-    /// The legacy transport stays configured either way — a mux-enabled node
-    /// registers both, and each attach picks between them from what the peer
-    /// advertised. So a canary is one node with the flag on, talking the mux to
-    /// other canaries and the legacy path to everything else, and **rollback is
-    /// the same flag**: set it back to `false` and the node stops advertising
-    /// `messenger-mux-v1`, so the next attach negotiates the legacy path. No
-    /// code change, no wire change, and no coordination with peers, because a
-    /// key that is never advertised is never selected.
+    /// The per-stream transport stays configured either way — a mux-enabled
+    /// node registers both, and each attach picks between them from what the
+    /// peer advertised, so a peer without the mux is still served. **Rollback
+    /// is the same flag**: set it to `false` and the node stops advertising
+    /// `messenger-mux-v1`, so the next attach negotiates the per-stream path.
+    /// No code change, no wire change, and no coordination with peers, because
+    /// a key that is never advertised is never selected.
     ///
     /// Only one mux may be installed per instance — its `_stream_batch` handler
     /// is registered on the messenger for its lifetime and the messenger
@@ -407,13 +406,14 @@ impl VeloBuilder {
             Arc::clone(&stream_transport),
         );
 
-        // Step 5: Build the mux, if it was switched on. It joins the registry
-        // *beside* the legacy transport rather than replacing it: negotiation
-        // answers `messenger-mux-v1` only to peers that advertised it, and
-        // every other peer is still answered — and must still be served — on
-        // the legacy key.
-        let mux = match self.mux_config.filter(|config| config.enabled) {
-            Some(config) => {
+        // Step 5: Build the mux unless the caller switched it off (it is on by
+        // default; see `messenger_mux`). It joins the registry *beside* the
+        // per-stream transport rather than replacing it: negotiation answers
+        // `messenger-mux-v1` only to peers that advertised it, and every other
+        // peer is still answered — and must still be served — on the
+        // per-stream key.
+        let mux = match self.mux_config.unwrap_or_default() {
+            config if config.enabled => {
                 let mux = crate::streaming::messenger_mux::MessengerMuxTransport::new(
                     Arc::clone(&messenger),
                     config,
@@ -426,7 +426,7 @@ impl VeloBuilder {
                 );
                 Some(mux)
             }
-            None => None,
+            _ => None,
         };
 
         let anchor_manager = Arc::new(

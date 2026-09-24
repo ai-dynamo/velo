@@ -49,11 +49,13 @@ The plan sweeps X over {1, 8, 64, 256, 1024, 4096} and Y over {1, 2, 8, 32} at a
 If one of these criteria holds, the design stops or changes:
 
 - **The batching ratio does not improve at X/Y of 64.** Then sends are not clustered in time and the premise is wrong. This is the cheapest and most decisive test. The per-stream path measures 1.00 for the forward-pass shape, and the mux measures 2.19 to 5.38 in `batched_streaming`.
-- **p99 per-frame latency at X/Y of 1 is more than twice the per-stream figure.** Then negotiation must default to off. The mux is off by default.
+- **p99 per-frame latency at X/Y of 1 is more than twice the per-stream figure.** Then negotiation must default to off. The mux was off by default until 2026-09-24 (see the note below).
 - **CPU does not fall at X/Y of 64.** Then encode dominates, and the fix is a cheaper codec. On the external serving rig, the mux cost 8.09 ms of frontend CPU per request against 10.48 for one connection per request.
 - **Measurable head-of-line blocking under mixed fast and slow consumers.** Then the credit design failed.
 - **`velo_streaming_heartbeat_watchdog_firings_total` rises after heartbeat consolidation.** Then the consolidation lost real failure detection.
 - **Throughput improves because added latency lets the consumer catch up.** This is the trap. Always report latency beside throughput, and watch time to first token. Any windowed or hinted flush policy can make it worse, which is why the default flush does not wait.
+
+Note of 2026-09-24: the mux is now on by default. The reason is a failure of the per-stream path, not the latency criterion above. On a cluster, the per-stream path failed 80% to 92% of requests at about 2,500 new streams per second, because the workers could not get a local port. See [Batched streaming](../concepts/batched-streaming.md). The X/Y of 1 latency test was not measured again. A deployment with one stream per peer that sees a latency cost can set `enabled: false`.
 
 ## Rulings
 

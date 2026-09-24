@@ -1,6 +1,6 @@
 # Batched streaming
 
-The messenger mux carries every stream to one peer over the Messenger connection that already exists to that peer. It packs the records for that peer into `_stream_batch` active messages. Its transport key is `messenger-mux-v1`. The mux is opt-in and is negotiated per attach. Senders do not change: `StreamSender::send` stages a record, and the layer below it decides when to write.
+The messenger mux carries every stream to one peer over the Messenger connection that already exists to that peer. It packs the records for that peer into `_stream_batch` active messages. Its transport key is `messenger-mux-v1`. The mux is on by default and is negotiated per attach. Senders do not change: `StreamSender::send` stages a record, and the layer below it decides when to write.
 
 This chapter describes how the mux works. The [Tune batched streaming](../guides/tune-batched-streaming.md) guide tells you how to configure it. The [Batched streaming design](../development/batched-streaming-design.md) chapter records why it works this way and which alternatives were rejected.
 
@@ -23,6 +23,8 @@ Each remote stream on the per-stream path costs the following:
 Per token, the stream pays one `rmp_serde` allocation, one channel hop, one `encode_frame` and, because `TCP_NODELAY` is set, one syscall and one TCP segment.
 
 This cost is a ceiling, not a slope. Each remote stream holds one socket, with one file descriptor in each of the two processes. Across both ends, 1,024 concurrent remote streams need 2,048 descriptors, about 4 GiB of requested socket buffer and about 4,096 tasks. Each process holds one descriptor per stream. At the default `ulimit -n` of 1,024, a process stops below 1,024 concurrent remote streams, less the descriptors that it uses for other things.
+
+The rate of new streams is a limit too. On a cluster (2026-09-23, two Grace nodes on 200G Ethernet, 512 mock workers in 8 processes, concurrency 8,192), a response plane that opened about 2,500 streams per second on the per-stream path failed 80% to 92% of its requests. The workers could not get a local port (`Cannot assign requested address`). The mux carried the same load with no errors. For this reason the mux is the default.
 
 ### Per-stream coalescing cannot reach the forward-pass shape
 

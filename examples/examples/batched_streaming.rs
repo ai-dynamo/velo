@@ -339,9 +339,9 @@ impl Node {
 
 /// Build a node on loopback with the mux either installed or rolled back.
 ///
-/// `enabled: false` is the documented rollback, and is the same node as never
-/// calling `messenger_mux` at all: nothing is registered, nothing is
-/// advertised, and every attach negotiates the legacy path.
+/// `enabled: false` is the documented rollback: nothing is registered, nothing
+/// is advertised, and every attach negotiates the per-stream path. The builder
+/// installs the mux by default, so the rollback has to be asked for.
 async fn node(mux_enabled: bool, flush: Flush) -> Result<Arc<Node>> {
     // A registry per node. Two `VeloMetrics::register` calls against one
     // registry would collide on collector names, and per-node registries are
