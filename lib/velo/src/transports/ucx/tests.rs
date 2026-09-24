@@ -2564,3 +2564,77 @@ async fn bench_rma() {
     pair.puller.transport.shutdown();
     assert_pair_balanced(&pair);
 }
+
+/// Active Message send cost over the tcp lane, with the idle reaper off and on.
+///
+/// The reaper adds per-send bookkeeping, so the two rows are the price of that
+/// bookkeeping. Two measures: a one-way burst (the progress thread's per-send
+/// cost is on its critical path) and a ping-pong round trip. Run with
+/// `cargo test --features ucx -p velo --lib bench_am_send -- --ignored --nocapture --test-threads=1`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "benchmark: prints timings, asserts nothing"]
+async fn bench_am_send() {
+    const BURST: usize = 200_000;
+    const ROUND_TRIPS: usize = 20_000;
+    const WARMUP: usize = 2_000;
+    let header = Bytes::from(vec![7u8; 64]);
+    let payload = Bytes::from(vec![9u8; 64]);
+
+    for (label, timeout) in [
+        ("reaper off", None),
+        ("reaper on ", Some(Duration::from_secs(3600))),
+    ] {
+        let a = start_node_with(|b| b.ep_idle_timeout(timeout)).await;
+        let b = start_node_with(|b| b.ep_idle_timeout(timeout)).await;
+        cross_register(&a, &b);
+        let errs = CountingErrors::new();
+        let send = |from: &Node, to: &Node| {
+            let _ = from.transport.send_message(
+                to.instance_id,
+                header.clone(),
+                payload.clone(),
+                MessageType::Message,
+                errs.clone(),
+            );
+        };
+
+        for _ in 0..WARMUP {
+            send(&a, &b);
+            recv_message(&b.streams.message_stream, T).await.unwrap();
+            send(&b, &a);
+            recv_message(&a.streams.message_stream, T).await.unwrap();
+        }
+
+        let started = std::time::Instant::now();
+        for _ in 0..BURST {
+            send(&a, &b);
+        }
+        for _ in 0..BURST {
+            recv_message(&b.streams.message_stream, T).await.unwrap();
+        }
+        let burst = started.elapsed();
+
+        let mut rtts = Vec::with_capacity(ROUND_TRIPS);
+        for _ in 0..ROUND_TRIPS {
+            let started = std::time::Instant::now();
+            send(&a, &b);
+            recv_message(&b.streams.message_stream, T).await.unwrap();
+            send(&b, &a);
+            recv_message(&a.streams.message_stream, T).await.unwrap();
+            rtts.push(started.elapsed());
+        }
+        rtts.sort();
+        println!(
+            "bench_am_send {label}: burst {:>7.1} ns/frame  rtt p50 {:>9.3?} p99 {:>9.3?}  errors {}",
+            burst.as_nanos() as f64 / BURST as f64,
+            rtts[ROUND_TRIPS / 2],
+            rtts[ROUND_TRIPS * 99 / 100],
+            errs.count()
+        );
+
+        a.transport.shutdown();
+        b.transport.shutdown();
+        assert_rma_balanced(&a);
+        assert_rma_balanced(&b);
+    }
+}
