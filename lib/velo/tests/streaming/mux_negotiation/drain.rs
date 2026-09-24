@@ -166,9 +166,9 @@ async fn an_mpsc_detach_reaches_a_draining_consumer() {
     .expect("a draining consumer refused the detach of an open stream");
 }
 
-/// The drain counts each admitted stream message while its handler runs, so a
-/// producer that keeps sending keeps the drain waiting. Under
-/// `ShutdownPolicy::Timeout` the call is still bounded.
+/// The drain counts each admitted stream message while its handler runs. With
+/// a producer streaming into the node, a `ShutdownPolicy::Timeout` shutdown
+/// still returns within its bound.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_timed_shutdown_is_bounded_while_a_stream_flows() {
     let (consumer, producer) = pair(Some(mux_config()), Some(mux_config())).await;
@@ -191,7 +191,7 @@ async fn a_timed_shutdown_is_bounded_while_a_stream_flows() {
             }
         })
     };
-    let draining = tokio::spawn(async move { while anchor.next().await.is_some() {} });
+    let consuming = tokio::spawn(async move { while anchor.next().await.is_some() {} });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     tokio::time::timeout(
@@ -204,7 +204,7 @@ async fn a_timed_shutdown_is_bounded_while_a_stream_flows() {
     .expect("graceful shutdown under a timeout policy did not return");
     stop.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(5), producing).await;
-    draining.abort();
+    consuming.abort();
 }
 
 /// A consumer that cancels its anchor tells the producer with `_stream_cancel`.

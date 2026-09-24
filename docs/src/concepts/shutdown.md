@@ -29,12 +29,12 @@ Work that was accepted before the drain keeps flowing through it. The messenger 
 - The rendezvous handlers that pull a staged payload and end its lease (`_rv_acquire`, `_rv_pull`, `_rv_detach`, `_rv_release`, `_rv_lease_renew`). A record or response too large for one message is staged, and the receiver pulls it with these handlers. A draining owner answers the pull chunked, never by RDMA. `_rv_metadata` and `_rv_ref` start a new consumer, so the gate refuses them. A handle that an application staged itself can still be pulled with `get` during the drain.
 - The event handlers `_event_trigger`, `_event_trigger_request` and `_event_subscribe`. `_event_trigger` completes an awaiter of work that this node already accepted. `_event_trigger_request` completes an event that this node already created, and it acknowledges the requester. The requester sends it fire-and-forget, so a refusal would never reach the requester's wait. `_event_subscribe` answers at once for an event that is already complete, or records one subscriber for a pending event. None of the three starts new work.
 
-Each of these handlers is registered as exempt where it is registered, so the list cannot drift from the code. An attach opens a new stream, so the gate refuses it. A detached SPSC anchor therefore waits out its unattached timeout during a drain, because no new sender can attach. A zero-RTT stream whose pre-bind was made before the drain is not an attach, so its first record can open the slot during the drain.
+Each handler declares its exemption in the code where it is registered, so the gate cannot disagree with the code. The list above is kept by hand. An attach opens a new stream, so the gate refuses it. A detached SPSC anchor therefore waits out its unattached timeout during a drain, because no new sender can attach. A zero-RTT stream is not an attach: its first record opens the slot that `prebind_anchor` bound, during the drain as well. `prebind_anchor` does not check the drain, so a node that keeps making pre-binds while it drains keeps accepting streams.
 
 The drain counts an exempt message while its handler runs. It does not count the stream that the message serves. This has two results:
 
-- A producer that sends without a pause keeps a `ShutdownPolicy::WaitForever` drain waiting until it stops.
-- A stream with a quiet gap lets the drain finish. Teardown then ends the mux streams, because they ride the messenger.
+- The drain finishes at the first moment that no message is in flight. A stream message is in flight only for microseconds, and consecutive batches are at least a credit round trip apart. An open stream, busy or quiet, therefore does not hold `graceful_shutdown` open.
+- Teardown then ends the mux streams, because they ride the messenger.
 
 To let open streams finish, call `begin_drain`, wait until your streams end, and then call `graceful_shutdown`. The per-stream transports have their own teardown, which `graceful_shutdown` does not do.
 

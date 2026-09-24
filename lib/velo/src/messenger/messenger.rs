@@ -609,8 +609,8 @@ impl Messenger {
     /// that costs nothing: the drain wait only completes once the queue is
     /// empty *and* every accepted handler has finished, so every admitted
     /// request ran to completion. The messages of open streams that the gate
-    /// lets through are counted the same way, so a producer that keeps
-    /// streaming into this node keeps that wait going until it pauses. Under
+    /// lets through are counted the same way, but only while each handler
+    /// runs, so an open stream does not hold the wait open. Under
     /// [`ShutdownPolicy::Timeout`](crate::transports::ShutdownPolicy) it is the
     /// point of the timeout, and two things outlive the return.
     ///
