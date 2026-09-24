@@ -239,7 +239,11 @@ impl Messenger {
         //    handlers are in the map as soon as these calls return — no async
         //    task needs to be scheduled first.
         events.set_messenger(system.clone());
-        crate::messenger::events::handlers::register_event_handlers(&system.handlers, events)?;
+        crate::messenger::events::handlers::register_event_handlers(
+            &system.handlers,
+            |handler| system.register_drain_exempt_handler(handler),
+            events,
+        )?;
         crate::messenger::server::register_system_handlers(&system.handlers)?;
 
         // 8. Initialize hub's system reference. This unblocks wait_for_system()
@@ -369,14 +373,16 @@ impl Messenger {
     /// handlers from outside this crate. Bypasses the underscore-prefix
     /// restriction enforced by [`Messenger::register_handler`].
     ///
-    /// # Errors
-    ///
-    /// Returns an error if a handler with the same name has already been
-    /// registered.
+    /// A handler of the same name is replaced. The replacement is gated by the
+    /// drain like any request, even if the handler it replaced was exempt.
     pub fn register_streaming_handler(
         &self,
         handler: crate::messenger::handlers::Handler,
     ) -> anyhow::Result<()> {
+        self.drain_exempt
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(handler.name().as_bytes());
         self.handlers.register_internal_handler(handler)
     }
 

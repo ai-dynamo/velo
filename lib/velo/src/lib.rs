@@ -628,8 +628,9 @@ impl Velo {
     ///
     /// 1. [`begin_drain`](Self::begin_drain) — idempotent, and repeated by the
     ///    messenger shutdown below. Closing the inbound gate first means no new
-    ///    request can ask for an RDMA transfer while registrations are being
-    ///    torn down.
+    ///    request can start while registrations are being torn down. The pull
+    ///    of a payload staged before the drain still passes the gate, but a
+    ///    draining owner answers it chunked, never with an RDMA descriptor.
     /// 2. The registry sweep: registrations refused,
     ///    in-flight transfers drained, every region and arena unmapped.
     /// 3. Messenger gate, drain and teardown, unchanged.

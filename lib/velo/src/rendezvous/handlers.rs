@@ -68,6 +68,7 @@ pub fn create_rv_acquire_handler(store: Arc<DataStore>) -> crate::messenger::Han
                 lease_id,
                 total_len,
                 ctx.input.rdma.as_ref(),
+                ctx.msg.backend().shutdown_state().is_draining(),
             ) {
                 return Ok(response);
             }
@@ -109,6 +110,14 @@ pub fn create_rv_acquire_handler(store: Arc<DataStore>) -> crate::messenger::Han
 ///    or the descriptor would not encode. Counted as `not_pinned`, because from
 ///    the acquire's point of view that is what it now is.
 ///
+/// Before all of these, an owner that is draining declines (`draining`). The
+/// drain gate lets `_rv_acquire` through so that a payload staged before the
+/// drain can still be pulled, but the shutdown sweep that follows frees pinned
+/// memory, and a descriptor handed out now could name memory that a peer's
+/// NIC is still reading at that point. The flag is read without ordering: an
+/// acquire that races `begin_drain` can still get a descriptor, which is the
+/// same straggler case as an acquire admitted before the gate.
+///
 /// A lease that *is* answered with a descriptor gets a deadline, and that is
 /// the only place one is set. Chunked leases stay deadline-free.
 #[cfg(all(target_os = "linux", feature = "ucx"))]
@@ -118,6 +127,7 @@ fn rdma_response(
     lease_id: u64,
     total_len: u64,
     offer: Option<&crate::rendezvous::protocol::RdmaOffer>,
+    draining: bool,
 ) -> Option<AcquireResponse> {
     use crate::observability::RdmaPathReason;
     use crate::rendezvous::store::StageMode;
@@ -126,6 +136,10 @@ fn rdma_response(
         store.record_path(reason);
         None
     };
+
+    if draining {
+        return decline(RdmaPathReason::Draining);
+    }
 
     let Some(offer) = offer else {
         return decline(RdmaPathReason::NoOffer);

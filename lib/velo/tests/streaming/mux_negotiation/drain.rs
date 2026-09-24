@@ -136,7 +136,9 @@ async fn large_records(drain: bool) {
 
 /// MPSC streams negotiate the mux too, so the control messages that serve an
 /// open MPSC stream pass the drain like the SPSC ones. No client sends
-/// `_mpsc_anchor_detach` today, so the test sends it through the messenger.
+/// `_mpsc_anchor_detach` today, so the test sends it through the messenger. It
+/// shows that the gate passes the message; the handler is idempotent and
+/// answers the same for a sender that never attached.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_mpsc_detach_reaches_a_draining_consumer() {
     let (consumer, producer) = pair(Some(mux_config()), Some(mux_config())).await;
@@ -203,4 +205,24 @@ async fn a_timed_shutdown_is_bounded_while_a_stream_flows() {
     stop.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(5), producing).await;
     draining.abort();
+}
+
+/// A consumer that cancels its anchor tells the producer with `_stream_cancel`.
+/// A draining producer must still hear it; otherwise it keeps producing for a
+/// consumer that left, until teardown.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_draining_producer_hears_the_consumers_cancel() {
+    let (consumer, producer) = pair(Some(mux_config()), Some(mux_config())).await;
+    let anchor = consumer.velo.create_anchor::<u32>();
+    let sender = producer
+        .velo
+        .attach_anchor::<u32>(transfer(anchor.handle()))
+        .await
+        .expect("remote attach");
+    let cancelled = sender.cancellation_token();
+    producer.velo.begin_drain();
+    let _controller = anchor.cancel();
+    tokio::time::timeout(PATIENCE, cancelled.cancelled())
+        .await
+        .expect("a draining producer never heard the consumer's cancel");
 }

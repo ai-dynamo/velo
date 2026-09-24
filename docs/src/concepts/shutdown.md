@@ -25,10 +25,11 @@ sequenceDiagram
 Work that was accepted before the drain keeps flowing through it. The messenger mux sends its records and its credit as active messages, so the gate lets through the handlers that serve accepted work:
 
 - `_stream_batch`, which carries the records and credit of open mux streams.
-- `_stream_cancel`, and the detach, finalize and cancel handlers of SPSC and MPSC anchors.
-- The rendezvous handlers (`_rv_*`). A record or response too large for one message is staged, and the receiver pulls it with these handlers.
+- `_stream_cancel`, the detach, finalize and cancel handlers of SPSC anchors, and the detach and cancel handlers of MPSC anchors.
+- The rendezvous handlers that pull a staged payload and end its lease (`_rv_acquire`, `_rv_pull`, `_rv_detach`, `_rv_release`, `_rv_lease_renew`). A record or response too large for one message is staged, and the receiver pulls it with these handlers. A draining owner answers the pull chunked, never by RDMA. `_rv_metadata` and `_rv_ref` start a new consumer, so the gate refuses them. A handle that an application staged itself can still be pulled with `get` during the drain.
+- `_event_trigger`, which completes an awaiter of work that this node already accepted.
 
-Each of these handlers is registered as exempt where it is registered, so the list cannot drift from the code. An attach opens a new stream, so the gate refuses it. A zero-RTT stream whose pre-bind was made before the drain is not an attach, so its first record can open the slot during the drain.
+Each of these handlers is registered as exempt where it is registered, so the list cannot drift from the code. An attach opens a new stream, so the gate refuses it. A detached SPSC anchor therefore waits out its unattached timeout during a drain, because no new sender can attach. A zero-RTT stream whose pre-bind was made before the drain is not an attach, so its first record can open the slot during the drain.
 
 The drain counts an exempt message while its handler runs. It does not count the stream that the message serves. This has two results:
 
@@ -72,7 +73,7 @@ These tests pin the contract:
 
 When the RDMA registration layer is installed, shutdown has four steps:
 
-1. The gate closes. No new request can ask for an RDMA transfer.
+1. The gate closes. No new request can start. The pull of a payload staged before the drain still passes the gate, but a draining owner answers it chunked, never by RDMA.
 2. The registry sweep runs. New registrations are refused, in-flight transfers drain, and each region and arena is unmapped. Anything staged in registered memory first moves to the heap, so an admitted chunked transfer can finish.
 3. The messenger gate, drain, and teardown run as usual.
 4. Each registration that survived step 2 is declared released, but only if the backend reports that nothing is still registered.

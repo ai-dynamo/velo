@@ -166,3 +166,29 @@ async fn remote_event_poison() {
         "Remote event poison should resolve subscriber's awaiter with Err"
     );
 }
+
+/// A trigger from an event's owner completes an awaiter on a node that is
+/// draining. The awaiter belongs to work that node already accepted; if the
+/// trigger is refused, that work never completes and a `WaitForever` drain
+/// never ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_remote_trigger_reaches_a_draining_subscriber() {
+    let (a, b, _tmp) = make_pair().await;
+    let em_a = a.event_manager();
+    let event = em_a.new_event().unwrap();
+    let handle = event.handle();
+    let awaiter = b.event_manager().awaiter(handle).unwrap();
+    let a_ref = a.clone();
+    let b_id = b.instance_id();
+    poll_until(Duration::from_secs(5), move || {
+        a_ref.has_event_subscriber(handle, b_id)
+    })
+    .await;
+
+    b.begin_drain();
+    em_a.trigger(handle).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), awaiter)
+        .await
+        .expect("the trigger never reached the draining subscriber")
+        .expect("the event resolved with an error");
+}

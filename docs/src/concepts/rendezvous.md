@@ -66,6 +66,7 @@ The owner answers `AcquireResponse::Rdma` only if every check below passes. The 
 
 | # | Check | Reason label on refusal |
 |---|---|---|
+| 0 | The owner is not draining. The shutdown sweep that follows a drain frees pinned memory. | `draining` |
 | 1 | The consumer sent an RDMA offer. | `no_offer` |
 | 2 | This instance has an RDMA registry (UCX was added with `add_ucx_transport`). | `not_configured` |
 | 3 | The RDMA path is enabled on this owner (the kill switch is off). | `kill_switch` |
@@ -350,7 +351,7 @@ The switch acts on both roles. An owner with it on never answers `Rdma` and stag
 
 Both sides record into `path_total`, at different points:
 
-- The owner records at staging time, when `register_data_pinned` falls back (`kill_switch`, `budget`, `pool_exhausted`). It also records at each acquire (`no_offer`, `not_configured`, `kill_switch`, `not_pinned`, `below_min`, `ok`).
+- The owner records at staging time, when `register_data_pinned` falls back (`kill_switch`, `budget`, `pool_exhausted`). It also records at each acquire (`draining`, `no_offer`, `not_configured`, `kill_switch`, `not_pinned`, `below_min`, `ok`).
 - The consumer records when it builds its offer (`not_configured`, `kill_switch`, `no_offer`), after a failure (`decode_error`, `pool_exhausted`, `get_failed`), and when a GET completes (`ok`).
 
 The series counts decisions, not transfers. With the owner's kill switch on, one slot adds `kill_switch` once at staging and again at each acquire. A fallback acquire carries no offer, so the owner also counts `no_offer` for a consumer whose GET failed. The owner counts `ok` when it sends a descriptor, before the GET runs. The consumer's `ok` is the proof that a GET completed.

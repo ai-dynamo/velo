@@ -451,3 +451,30 @@ async fn test_transparent_large_payload_am_send() {
 
     assert_eq!(received_len.load(Ordering::SeqCst), size);
 }
+
+/// A draining owner still serves `get` on a staged handle: the pull serves a
+/// payload that was staged before the drain. It refuses `ref_handle` and
+/// `metadata`, because those start a new consumer, and that is new work.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_draining_owner_serves_get_but_refuses_a_new_consumer() {
+    let pair = VeloPair::new().await;
+    let payload = Bytes::from(vec![0x5a; 1024 * 1024]);
+    let handle = pair.owner.register_data(payload);
+    pair.owner.begin_drain();
+
+    assert!(
+        pair.consumer.ref_handle(handle).await.is_err(),
+        "a draining owner took a new reference"
+    );
+    assert!(
+        pair.consumer.metadata(handle).await.is_err(),
+        "a draining owner answered a metadata query"
+    );
+    let (data, lease) = pair
+        .consumer
+        .get(handle)
+        .await
+        .expect("a draining owner refused the pull of a staged payload");
+    assert_eq!(data.len(), 1024 * 1024);
+    pair.consumer.release(handle, lease).await.unwrap();
+}

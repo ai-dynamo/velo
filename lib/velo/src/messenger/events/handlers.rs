@@ -16,8 +16,14 @@ use super::VeloEvents;
 /// discarded rather than propagated. For `_event_trigger_request`, ACK/NACK
 /// semantics are managed internally via response channels in `handle_trigger_request`,
 /// not through the handler's `Result`.
+///
+/// `_event_trigger` goes through `register_drain_exempt`: it completes an
+/// awaiter of work this node already accepted, so the drain gate lets it
+/// through. Refused, that work would never complete, and a `WaitForever` drain
+/// would wait on it forever.
 pub(crate) fn register_event_handlers(
     handlers: &HandlerManager,
+    register_drain_exempt: impl Fn(Handler) -> anyhow::Result<()>,
     events: Arc<VeloEvents>,
 ) -> anyhow::Result<()> {
     // _event_subscribe: Remote node subscribes to a local event
@@ -38,7 +44,7 @@ pub(crate) fn register_event_handlers(
 
     // _event_trigger: Completion notification from remote owner to subscriber
     let events_clone = events.clone();
-    handlers.register_internal_handler(
+    register_drain_exempt(
         Handler::am_handler("_event_trigger", move |ctx| {
             if let Err(e) = events_clone.handle_trigger(ctx.payload) {
                 tracing::warn!("_event_trigger handler error: {}", e);

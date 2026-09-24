@@ -1566,3 +1566,25 @@ async fn transparent_staging_rides_the_rdma_path_once_the_pool_is_warm() {
     );
     shutdown(pair).await;
 }
+
+/// A draining owner answers a pinned slot chunked, never by RDMA. The shutdown
+/// sweep that follows the drain frees pinned memory, so a descriptor handed
+/// out during the drain can name memory that a peer's NIC is still reading
+/// when the sweep frees it. The pull itself is served, because the payload
+/// was staged before the drain.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_draining_owner_answers_chunked() {
+    let pair = Pair::new().await;
+    let payload = pattern(1024 * 1024);
+    let handle = pair.owner.velo.register_data_pinned(&payload).await;
+    pair.owner.velo.begin_drain();
+
+    let (data, lease) = pair.consumer.velo.get(handle).await.expect("get");
+    assert_pattern(&data, payload.len());
+    pair.consumer.velo.release(handle, lease).await.unwrap();
+
+    assert_eq!(pair.owner.path_count("draining"), 1);
+    assert_eq!(pair.owner.path_count("ok"), 0);
+    assert_eq!(pair.consumer.path_count("ok"), 0);
+    shutdown(pair).await;
+}
