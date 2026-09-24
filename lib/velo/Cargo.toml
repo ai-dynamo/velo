@@ -276,7 +276,8 @@ required-features = ["quic"]
 [[test]]
 name = "transports_quic_shutdown"
 path = "tests/transports/quic_shutdown.rs"
-required-features = ["quic"]
+# test-helpers: the raw client pins the listener's certificate with `tls`.
+required-features = ["quic", "test-helpers"]
 
 [[test]]
 name = "transports_uds_host_affinity"

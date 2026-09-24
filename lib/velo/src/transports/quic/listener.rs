@@ -17,6 +17,7 @@ use velo_ext::{MessageType, TransportAdapter, TransportErrorHandler};
 use crate::observability::TransportRejection;
 use crate::transports::ingress::{Routed, route_frame};
 use crate::transports::tcp::TcpFrameCodec;
+use crate::transports::tcp::framing::maybe_shrink_read_buffer;
 
 /// Everything an accepted stream needs besides the stream itself.
 #[derive(Clone)]
@@ -27,6 +28,45 @@ pub(super) struct AcceptContext {
     pub(super) metrics: Option<Arc<dyn velo_ext::TransportObservability>>,
     /// The shutdown teardown token. It stops accept loops and stream readers.
     pub(super) teardown: CancellationToken,
+    /// See `QuicTransportBuilder::shrink_threshold`.
+    pub(super) shrink_threshold: usize,
+}
+
+/// A QUIC receive stream that reads an orderly close as the end of the stream.
+///
+/// quinn reports a connection that the peer closed as an `io::Error`
+/// (`NotConnected`), where TCP gives the reader a clean end of stream. Read as
+/// an error, it would be counted as `DecodeError` on every peer on each
+/// restart. A close with an application code, or a local close, is an
+/// ordinary end. A lost connection or a reset stream stays an error, and a
+/// frame cut off by the close is still a decode error, which the codec reports
+/// at the end of the stream.
+pub(super) struct OrderlyEnd(pub(super) quinn::RecvStream);
+
+impl tokio::io::AsyncRead for OrderlyEnd {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match std::pin::Pin::new(&mut self.0).poll_read(cx, buf) {
+            std::task::Poll::Ready(Err(e)) if is_orderly_close(&e) => {
+                std::task::Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
+    }
+}
+
+fn is_orderly_close(error: &std::io::Error) -> bool {
+    matches!(
+        error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<quinn::ReadError>()),
+        Some(quinn::ReadError::ConnectionLost(
+            quinn::ConnectionError::ApplicationClosed(_) | quinn::ConnectionError::LocallyClosed
+        ))
+    )
 }
 
 /// Accept connections on one server endpoint until teardown.
@@ -83,7 +123,7 @@ async fn serve_stream(
     ctx: AcceptContext,
     peer: std::net::SocketAddr,
 ) {
-    let mut framed = FramedRead::new(recv, TcpFrameCodec::new());
+    let mut framed = FramedRead::new(OrderlyEnd(recv), TcpFrameCodec::new());
     loop {
         let frame = tokio::select! {
             biased;
@@ -92,6 +132,7 @@ async fn serve_stream(
         };
         match frame {
             Some(Ok((msg_type, header, payload))) => {
+                let frame_size = header.len() + payload.len();
                 match route_frame(
                     msg_type,
                     header,
@@ -112,6 +153,11 @@ async fn serve_stream(
                     }
                     Err(e) => warn!("QUIC: failed to route {msg_type:?} from {peer}: {e:#}"),
                 }
+                maybe_shrink_read_buffer(
+                    framed.read_buffer_mut(),
+                    ctx.shrink_threshold,
+                    frame_size,
+                );
             }
             Some(Err(e)) => {
                 if let Some(metrics) = ctx.metrics.as_ref() {

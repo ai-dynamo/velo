@@ -27,7 +27,8 @@ pub struct QuicEndpointInfo {
 impl QuicEndpointInfo {
     /// Encode as MessagePack for a `WorkerAddress` entry.
     pub fn encode(&self) -> Result<Vec<u8>> {
-        rmp_serde::to_vec(self).context("failed to encode the QUIC endpoint")
+        // Named fields, so a field can be added later without breaking peers.
+        rmp_serde::to_vec_named(self).context("failed to encode the QUIC endpoint")
     }
 
     /// Decode a `WorkerAddress` entry.

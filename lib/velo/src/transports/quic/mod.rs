@@ -16,7 +16,12 @@
 
 mod endpoint;
 mod listener;
+// Public only for the integration tests, which dial a transport with a raw
+// quinn client; it would otherwise put quinn's types in velo's API.
+#[cfg(feature = "test-helpers")]
 pub mod tls;
+#[cfg(not(feature = "test-helpers"))]
+pub(crate) mod tls;
 mod transport;
 
 pub use endpoint::QuicEndpointInfo;

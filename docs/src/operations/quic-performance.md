@@ -11,12 +11,14 @@ This chapter records what the QUIC transport costs against TCP, the settings tha
 | `max_mtu(bytes)` | quinn's (1452) | Upper bound for path MTU discovery. Values above 6550 are lowered to 6550. |
 | `stream_receive_window(bytes)` | quinn's | Flow-control window for the stream. |
 | `keep_alive_interval(d)` | 5 s | QUIC keep-alive. |
+| `idle_timeout(d)` | 15 s | A connection that receives nothing for this long is closed. This is how a peer that died without closing is found. quinn's own default is 30 s. |
+| `shrink_threshold(bytes)` | The TCP transport's | Read-buffer size above which a reader gives memory back after a frame. |
 
 The examples read `VELO_QUIC_MAX_MTU`, `VELO_QUIC_STREAM_WINDOW`, and `VELO_QUIC_SERVER_ENDPOINTS`, so a sweep can change them without new flags.
 
 ## Packets above 6550 bytes are lost
 
-quinn gives up to 10 packets to one GSO send, and it does not limit the size of the batch. A UDP datagram holds at most 65507 bytes. Above 6550 bytes a packet, a full batch is too large, and the kernel returns `EMSGSIZE`. quinn-udp 0.5 treats `EMSGSIZE` as success, because it expects that error only from MTU probes. So the whole batch is lost with no error, and each flight waits for a loss-probe timeout.
+quinn gives up to 10 packets to one GSO send, and it does not limit the size of the batch. A UDP datagram holds at most 65507 bytes. When a packet is larger than 6550 bytes, a full batch is too large, and the kernel returns `EMSGSIZE`. quinn-udp 0.5 treats `EMSGSIZE` as success, because it expects that error only from MTU probes. So the whole batch is lost with no error, and each flight waits for a loss-probe timeout.
 
 Measured on loopback with 64 KiB messages, one at a time:
 

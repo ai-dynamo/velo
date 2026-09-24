@@ -383,3 +383,61 @@ where
 
     handle_b.streams.shutdown_state.teardown_token().cancel();
 }
+
+/// Every frame handed to the transport before teardown either reaches the peer
+/// or comes back through `on_error`. Nothing may vanish between the two: a
+/// frame the writer counted as written that the peer never saw is a silent
+/// loss, and its caller waits out a response timeout instead of failing fast.
+///
+/// Large frames keep data in flight when teardown lands, which is the window
+/// this is about. The coalescing writer checks cancellation only between
+/// batches, so a batch it started is written in full; on TCP and UDS the
+/// kernel then delivers it after the socket closes, and whatever was still
+/// queued fails through `on_error`. A transport that closes its connection
+/// without waiting for the peer to acknowledge what it wrote loses the tail.
+pub async fn every_frame_is_delivered_or_failed_across_teardown<C: ShutdownTestClient>()
+where
+    C::Transport: 'static,
+{
+    const FRAMES: usize = 256;
+    const PAYLOAD: usize = 64 * 1024;
+    let handle_a = C::new_handle().await.unwrap();
+    let handle_b = C::new_handle().await.unwrap();
+    handle_a.register_peer(&handle_b).unwrap();
+
+    for i in 0..FRAMES {
+        handle_a.send(
+            handle_b.instance_id,
+            (i as u32).to_be_bytes().to_vec(),
+            vec![0u8; PAYLOAD],
+            MessageType::Response,
+        );
+    }
+    // Tear down once frames are flowing, so it lands mid-stream.
+    timeout(
+        Duration::from_secs(5),
+        handle_b.streams.response_stream.recv_async(),
+    )
+    .await
+    .expect("the first frame arrives")
+    .expect("recv");
+    let mut delivered = 1;
+    handle_a.streams.shutdown_state.teardown_token().cancel();
+    handle_a.transport.shutdown();
+
+    while let Ok(Ok(_)) = timeout(
+        Duration::from_secs(3),
+        handle_b.streams.response_stream.recv_async(),
+    )
+    .await
+    {
+        delivered += 1;
+    }
+    let failed = handle_a.error_handler.error_count();
+    assert_eq!(
+        delivered + failed,
+        FRAMES,
+        "{delivered} delivered + {failed} failed != {FRAMES} sent: frames vanished across teardown"
+    );
+    handle_b.streams.shutdown_state.teardown_token().cancel();
+}

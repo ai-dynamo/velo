@@ -252,3 +252,99 @@ fn a_max_mtu_above_the_gso_batch_limit_is_lowered() {
     assert_eq!(super::clamp_to_gso_batch(8952), 6550);
     assert_eq!(super::clamp_to_gso_batch(1452), 1452);
 }
+
+/// Records rejections, for the one test that needs to count them.
+#[derive(Default)]
+struct Rejections(Mutex<Vec<velo_ext::TransportRejection>>);
+
+impl velo_ext::TransportObservability for Rejections {
+    fn record_frame(&self, _: velo_ext::Direction, _: &str, _: usize) {}
+    fn record_rejection(&self, reason: velo_ext::TransportRejection) {
+        self.0.lock().unwrap().push(reason);
+    }
+    fn set_registered_peers(&self, _: usize) {}
+    fn set_active_connections(&self, _: usize) {}
+    fn record_send_backpressure(&self) {}
+}
+
+impl Rejections {
+    fn decode_errors(&self) -> usize {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| **r == velo_ext::TransportRejection::DecodeError)
+            .count()
+    }
+}
+
+/// A started transport whose observability handle is in place before
+/// `start`, which is when the accept loops take it.
+async fn started_observed(observed: Arc<Rejections>) -> (QuicTransport, DataStreams, InstanceId) {
+    let transport = QuicTransportBuilder::new()
+        .bind_addr("127.0.0.1:0".parse().unwrap())
+        .build()
+        .unwrap();
+    transport.set_observability(observed);
+    let (adapter, streams) = make_channels();
+    let id = InstanceId::new_v4();
+    transport
+        .start(id, adapter, tokio::runtime::Handle::current())
+        .await
+        .unwrap();
+    (transport, streams, id)
+}
+
+/// A peer that shuts down ends its connection in the ordinary way; it is not
+/// a malformed frame. Neither side may count it as `DecodeError`, which on
+/// TCP means a frame failed to parse. Without this a single restart bumps the
+/// counter on every peer, and the counter stops meaning anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peer_shutting_down_is_not_a_decode_error() {
+    let client_seen = Arc::new(Rejections::default());
+    let server_seen = Arc::new(Rejections::default());
+    let (client, _client_streams, _) = started_observed(client_seen.clone()).await;
+    let (server, server_streams, server_id) = started_observed(server_seen.clone()).await;
+    client
+        .register(peer_with_fingerprint(
+            &server,
+            server_id,
+            server.fingerprint(),
+        ))
+        .unwrap();
+
+    let errors = Arc::new(Errors::default());
+    let _ = client.send_message(
+        server_id,
+        Bytes::from_static(b"hdr"),
+        Bytes::from_static(b"pay"),
+        MessageType::Event,
+        errors.clone(),
+    );
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        server_streams.event_stream.recv_async(),
+    )
+    .await
+    .expect("the frame arrives")
+    .unwrap();
+
+    // The server's accepted stream, and then the client's dialed reader, each
+    // see the other end go away.
+    client.shutdown();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    server.shutdown();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert_eq!(
+        server_seen.decode_errors(),
+        0,
+        "the server counted the client's shutdown as a decode error"
+    );
+    assert_eq!(
+        client_seen.decode_errors(),
+        0,
+        "the client counted the server's shutdown as a decode error"
+    );
+    assert!(errors.0.lock().unwrap().is_empty());
+}

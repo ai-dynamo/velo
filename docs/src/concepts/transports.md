@@ -44,6 +44,8 @@ TCP, UDS, and QUIC use a coalescing writer. Small frames that wait in the send c
 
 A frame above 64 KB (`COALESCE_THRESHOLD`) goes out directly, as two writes. The first write is the preamble and the header, staged in a 256 B stack buffer. The second write is the payload, with no copy. Three writes cost two extra syscalls on a `TCP_NODELAY` socket, and they put small segments on the wire before each large payload. The writer does not use `write_vectored`, because TCP can return a short write for it past about 128 KB.
 
+These costs are for TCP and UDS. On QUIC, quinn copies each write into its own send buffer, so the payload write is not free of copies there, and the three writes cost no extra syscalls.
+
 The reader reserves the full frame length as soon as it has parsed the preamble. Without this, the read buffer grows by doubling from 8 KB, and each step copies all the bytes received so far. On loopback, the two changes together cut the 8 MB round trip from 6.46 ms to 4.70 ms.
 
 The writer publishes `velo_transport_frames_written_total`, `velo_transport_write_duration_seconds`, and `velo_transport_egress_queue_wait_seconds`. gRPC, NATS, ZMQ, and UCX have no such writer and do not publish these series. See [Observability](../operations/observability.md).
@@ -73,6 +75,7 @@ graph LR
 ```
 
 - **One stream for each connection.** The dialer opens one bidirectional stream and writes velo frames on it with the TCP frame codec. One stream keeps the order of messages from one peer. Ordered handlers and batched streaming rely on that order. Several streams would remove head-of-line blocking after a packet loss, but they would also reorder messages from one peer.
+- **Shutdown waits for acknowledgement.** When a writer stops, even at teardown, it finishes its stream and waits up to 1 second for the peer to acknowledge what it wrote. The dial socket closes after that. A QUIC close discards unacknowledged data, which TCP would still deliver after a close.
 - **The reverse direction carries only drain echoes.** The listener writes a `ShuttingDown` frame back on the same stream when it refuses a request during drain. The dialer reads it with the same code as TCP.
 - **The certificate is pinned.** Each transport makes a self-signed certificate and puts its SHA-256 fingerprint in its `WorkerAddress` entry. A dialer accepts only that certificate and checks the TLS 1.3 handshake signature. A different listener on a reused port fails the handshake.
 - **Server sockets form a reuse-port group** (Linux). `server_endpoints(n)` binds `n` UDP sockets on one port. The kernel hashes each peer to one socket, so the receive queues and buffer ceilings add up. A node that many peers send to, such as a frontend, gains from more sockets. The default is 4. Each socket costs a quinn endpoint and its buffers.

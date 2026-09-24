@@ -55,7 +55,7 @@ sum by (job, instance, transport) (velo_transport_frames_total{direction="outbou
 This is the number of frames in front of the socket: in the bounded send channel, or staged in the writer. It has these limits:
 
 - It does not include frames held in the admission gate. `velo_transport_send_backpressure_total` counts those, and `velo_transport_egress_queue_wait_seconds` covers both the gate and the channel.
-- It stops at the kernel. The sockets have a 2 MiB send buffer. To see bytes below the counter, read `tx_queue` for the socket.
+- It stops at the kernel. The sockets have a 2 MiB send buffer. To see bytes below the counter, read `tx_queue` for the socket. On QUIC it stops at quinn's send buffer instead, in user space, and a frame counted as written can still wait there for the peer's acknowledgement.
 - It can go negative for a short time. Clamp at zero.
 - It stays high after a frame fails: a replaced connection, a socket error, a failed connect, or a stop of the writer. Those frames were accepted and never written.
 - Only the coalescing writer (TCP, UDS, and QUIC) publishes `frames_written`. gRPC, NATS, ZMQ, and UCX have no such series, so the query returns no rows for them. Do not add `or vector(0)`, because zero reads as "queue empty", not "not measured".

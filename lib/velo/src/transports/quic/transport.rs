@@ -29,13 +29,20 @@ use crate::transports::utils::interfaces::{
 };
 
 use super::endpoint::{BufferSizes, QuicEndpointInfo, bind_client_socket, bind_server_sockets};
-use super::listener::{AcceptContext, run_accept_loop};
+use super::listener::{AcceptContext, OrderlyEnd, run_accept_loop};
 use super::tls::{self, Identity};
 
-/// How long a finished stream waits for the peer to acknowledge its last
-/// bytes before the connection closes. Closing at once would discard
-/// unacknowledged data, which TCP would still deliver after a close.
+/// How long a writer that stops waits for the peer to acknowledge its last
+/// bytes before it closes the connection, on every stop including teardown.
+/// Closing at once discards what the peer has not acknowledged, which TCP
+/// would still deliver after a close. `shutdown()` closes the dial endpoint
+/// only after the writers have had this long.
 const FINISH_GRACE: Duration = Duration::from_secs(1);
+
+/// Default QUIC idle timeout: three keep-alives. quinn ignores ICMP
+/// unreachable for liveness, so a peer that dies without closing is found only
+/// by this timeout; quinn's own default is 30 s.
+const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// QUIC messenger transport.
 ///
@@ -45,6 +52,8 @@ pub struct QuicTransport {
     key: TransportKey,
     bind_addr: SocketAddr,
     local_address: WorkerAddress,
+    fingerprint: tls::Fingerprint,
+    shrink_threshold: usize,
 
     peers: Arc<DashMap<crate::InstanceId, PeerEntry>>,
     connections: Arc<DashMap<crate::InstanceId, ConnectionHandle>>,
@@ -115,14 +124,7 @@ impl SendTask {
 impl QuicTransport {
     /// The SHA-256 fingerprint of this transport's certificate.
     pub fn fingerprint(&self) -> tls::Fingerprint {
-        self.address_info()
-            .map(|info| info.fingerprint)
-            .unwrap_or_default()
-    }
-
-    fn address_info(&self) -> Option<QuicEndpointInfo> {
-        let raw = self.local_address.get_entry(&self.key).ok()??;
-        QuicEndpointInfo::decode(&raw).ok()
+        self.fingerprint
     }
 
     fn reap_stale_connection(&self, instance_id: crate::InstanceId) {
@@ -223,6 +225,10 @@ impl QuicTransport {
             send_msg.on_error("Transport not started");
             return SendOutcome::Admitted;
         }
+        if self.cancel_token.is_cancelled() {
+            send_msg.on_error("Transport shut down");
+            return SendOutcome::Admitted;
+        }
         match self.get_or_create_connection(instance_id) {
             Ok(handle) => self.admit(&handle, send_msg),
             Err(e) => {
@@ -271,14 +277,11 @@ impl QuicTransport {
                 .context("failed to create a QUIC server endpoint")?,
             );
         }
-        let mut client =
+        // No default client config: every dial passes the peer's pinned one,
+        // and a dial that does not fails instead of trusting anything.
+        let client =
             quinn::Endpoint::new(self.endpoint_config.clone(), None, client_socket, runtime)
                 .context("failed to create the QUIC client endpoint")?;
-        // Every dial overrides this with the peer's pinned config; the default
-        // only guards a dial that forgets to.
-        let mut default = tls::pinned_client_config([0; 32])?;
-        default.transport_config(self.transport_config.clone());
-        client.set_default_client_config(default);
         let _ = self.client_endpoint.set(client);
         Ok(servers)
     }
@@ -381,7 +384,7 @@ impl Transport for QuicTransport {
                     adapter: channels.clone(),
                     error_handler: Arc::new(LogErrorHandler),
                     transport_key: self.key.as_str().to_string(),
-                    shrink_threshold: DEFAULT_SHRINK_THRESHOLD,
+                    shrink_threshold: self.shrink_threshold,
                 })
                 .ok();
             self.shutdown_state
@@ -394,6 +397,7 @@ impl Transport for QuicTransport {
                 error_handler: Arc::new(LogErrorHandler),
                 transport_key: self.key.as_str().to_string(),
                 metrics: self.metrics.get().cloned(),
+                shrink_threshold: self.shrink_threshold,
             };
             for endpoint in &servers {
                 rt.spawn(run_accept_loop(endpoint.clone(), ctx.clone()));
@@ -419,8 +423,19 @@ impl Transport for QuicTransport {
         for endpoint in self.server_endpoints.get().into_iter().flatten() {
             endpoint.close(quinn::VarInt::from_u32(0), b"shutdown");
         }
-        if let Some(endpoint) = self.client_endpoint.get() {
-            endpoint.close(quinn::VarInt::from_u32(0), b"shutdown");
+        // Not the dial endpoint yet: closing it now would discard what the
+        // writers wrote but the peers have not acknowledged. Each writer
+        // finishes its stream and closes its connection within FINISH_GRACE.
+        if let Some(endpoint) = self.client_endpoint.get().cloned() {
+            match self.runtime.get() {
+                Some(rt) => {
+                    rt.spawn(async move {
+                        let _ = tokio::time::timeout(FINISH_GRACE * 2, endpoint.wait_idle()).await;
+                        endpoint.close(quinn::VarInt::from_u32(0), b"shutdown");
+                    });
+                }
+                None => endpoint.close(quinn::VarInt::from_u32(0), b"shutdown"),
+            }
         }
         self.connections.clear();
         self.update_connection_gauge();
@@ -502,6 +517,10 @@ async fn connection_writer_task(
         warn!("QUIC: connection to {instance_id} ({addr}) failed: {e:#}");
     }
 
+    // Drain queued messages and notify their error handlers. The same small
+    // race as the TCP writer: a sender can `try_send` between the drain and
+    // `drop(rx)`, and that one message is dropped silently (see the TODO in
+    // `tcp/transport.rs`).
     while let Ok(msg) = rx.try_recv() {
         msg.on_error("Connection closed");
     }
@@ -551,7 +570,7 @@ async fn connection_writer_inner(
     let conn_cancel = cancel_token.child_token();
     let reader = reader_ctx.map(|reader_ctx| {
         tokio::spawn(run_dialed_reader(
-            recv,
+            OrderlyEnd(recv),
             reader_ctx,
             metrics.clone(),
             conn_cancel.clone(),
@@ -572,9 +591,10 @@ async fn connection_writer_inner(
     )
     .await;
 
-    // On an orderly end, finish the stream and give the peer a moment to
-    // acknowledge it, so the last frames are not discarded by the close.
-    if !conn_cancel.is_cancelled() && send.finish().is_ok() {
+    // Finish the stream and give the peer a moment to acknowledge it, on every
+    // end including teardown, so the close does not discard frames the writer
+    // already wrote. See FINISH_GRACE.
+    if send.finish().is_ok() {
         let _ = tokio::time::timeout(FINISH_GRACE, send.stopped()).await;
     }
     if let Some(reason) = connection.close_reason() {
@@ -662,6 +682,8 @@ pub struct QuicTransportBuilder {
     stream_receive_window: Option<u32>,
     max_mtu: Option<u16>,
     keep_alive_interval: Duration,
+    idle_timeout: Duration,
+    shrink_threshold: usize,
 }
 
 impl QuicTransportBuilder {
@@ -682,6 +704,8 @@ impl QuicTransportBuilder {
             stream_receive_window: None,
             max_mtu: None,
             keep_alive_interval: Duration::from_secs(5),
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            shrink_threshold: DEFAULT_SHRINK_THRESHOLD,
         }
     }
 
@@ -766,6 +790,24 @@ impl QuicTransportBuilder {
         self
     }
 
+    /// How long a connection may go without receiving anything before it is
+    /// closed (default 15 s, three keep-alives). This is how a peer that died
+    /// without closing is found; its epoch fails at this point, and the
+    /// frames queued on it go to their error handlers.
+    pub fn idle_timeout(mut self, timeout: Duration) -> Self {
+        self.idle_timeout = timeout;
+        self
+    }
+
+    /// Read-buffer size above which a reader gives the excess back after a
+    /// frame (default: the TCP transport's). The codec reserves the whole
+    /// frame length, so without this one large frame pins that much memory
+    /// per connection for its life.
+    pub fn shrink_threshold(mut self, bytes: usize) -> Self {
+        self.shrink_threshold = bytes;
+        self
+    }
+
     /// Bind the sockets, make the certificate, and build the transport.
     pub fn build(self) -> Result<QuicTransport> {
         let key = self.key.unwrap_or_else(|| TransportKey::from("quic"));
@@ -785,6 +827,11 @@ impl QuicTransportBuilder {
         transport_config.max_concurrent_uni_streams(0u32.into());
         transport_config.datagram_receive_buffer_size(None);
         transport_config.keep_alive_interval(Some(self.keep_alive_interval));
+        transport_config.max_idle_timeout(Some(
+            self.idle_timeout
+                .try_into()
+                .context("QUIC idle_timeout is out of range")?,
+        ));
         if let Some(window) = self.stream_receive_window {
             transport_config.stream_receive_window(window.into());
         }
@@ -821,6 +868,8 @@ impl QuicTransportBuilder {
             key,
             bind_addr,
             local_address,
+            fingerprint: identity.fingerprint,
+            shrink_threshold: self.shrink_threshold,
             peers: Arc::new(DashMap::new()),
             connections: Arc::new(DashMap::new()),
             runtime: OnceLock::new(),

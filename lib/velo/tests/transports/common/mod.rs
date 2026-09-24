@@ -743,11 +743,11 @@ impl ShutdownTestClient for UdsShutdownClient {
 
 /// QUIC shutdown test client: a raw quinn client that dials the transport,
 /// opens one stream, and speaks the TCP frame codec on it.
-#[cfg(feature = "quic")]
+#[cfg(all(feature = "quic", feature = "test-helpers"))]
 pub struct QuicShutdownClient;
 
 /// One raw QUIC stream, with the endpoint and connection kept alive beside it.
-#[cfg(feature = "quic")]
+#[cfg(all(feature = "quic", feature = "test-helpers"))]
 pub struct QuicRawStream {
     _endpoint: quinn::Endpoint,
     _connection: quinn::Connection,
@@ -755,7 +755,7 @@ pub struct QuicRawStream {
     recv: quinn::RecvStream,
 }
 
-#[cfg(feature = "quic")]
+#[cfg(all(feature = "quic", feature = "test-helpers"))]
 impl tokio::io::AsyncRead for QuicRawStream {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
@@ -766,7 +766,7 @@ impl tokio::io::AsyncRead for QuicRawStream {
     }
 }
 
-#[cfg(feature = "quic")]
+#[cfg(all(feature = "quic", feature = "test-helpers"))]
 impl tokio::io::AsyncWrite for QuicRawStream {
     fn poll_write(
         mut self: std::pin::Pin<&mut Self>,
@@ -793,7 +793,7 @@ impl tokio::io::AsyncWrite for QuicRawStream {
     }
 }
 
-#[cfg(feature = "quic")]
+#[cfg(all(feature = "quic", feature = "test-helpers"))]
 impl ShutdownTestClient for QuicShutdownClient {
     type Transport = QuicTransport;
     type Stream = QuicRawStream;
@@ -1075,6 +1075,12 @@ macro_rules! transport_shutdown_tests {
                 tokio::time::timeout(OUTER_TEST_TIMEOUT, shutdown_scenarios::connection_writer_exits_on_teardown::<$client>())
                     .await
                     .expect("connection_writer_exits_on_teardown timed out");
+            }
+            #[tokio::test]
+            async fn [<test_ $prefix _every_frame_is_delivered_or_failed_across_teardown>]() {
+                tokio::time::timeout(OUTER_TEST_TIMEOUT, shutdown_scenarios::every_frame_is_delivered_or_failed_across_teardown::<$client>())
+                    .await
+                    .expect("every_frame_is_delivered_or_failed_across_teardown timed out");
             }
             #[tokio::test]
             async fn [<test_ $prefix _drain_rejection_reaches_sender>]() {
