@@ -705,7 +705,7 @@ impl UcxTransportBuilder {
     /// admission stamp is taken from a clock sampled at the top of the progress
     /// loop's pass, so the effective budget is the timeout minus however long
     /// that pass runs. Endpoint creation does not count against it: the clock
-    /// moves forward after `ucp_ep_create`, which has been measured slower than
+    /// moves forward after `ucp_ep_create`, which was measured as slower than
     /// the floor.
     ///
     /// Values below half a second are raised to it; see the transport's

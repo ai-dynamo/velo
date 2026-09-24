@@ -158,11 +158,11 @@
 //! * **Congestion.** [`MIN_EP_IDLE_TIMEOUT`](super::transport) floors the
 //!   timeout at roughly thirty-five times measured *warm* endpoint wireup — but
 //!   a send that takes longer than the floor under congestion or backpressure
-//!   is still killable. The floor shrinks the window; it does not eliminate it.
+//!   is still killable. The floor shrinks the window. It does not remove it.
 //!   A first send between fresh workers is the weak case: it also waits for the
 //!   peer to set up its own endpoint back to us, inside the peer's
 //!   `ucp_worker_progress`. With many UCX workers in one process (the parallel
-//!   test suite), that peer-side step alone took 520-570 ms, and the first send
+//!   test suite), that peer-side step alone took 526-573 ms, and the first send
 //!   was reaped while it waited.
 //! * **Pass latency.** `last_used` is stamped from [`WorkerState::now`], sampled
 //!   at the top of the loop pass, *before* the ring drain and the
@@ -1742,9 +1742,9 @@ impl WorkerState {
         }
         // `ucp_ep_create` can outlast the idle timeout: across 31 creates in
         // one process during the parallel UCX tests, the median was 630 ms. A
-        // stamp from the clock read before the call would make the endpoint
-        // older than the timeout at birth, and the next scan would FORCE-close
-        // it with its first send still in flight. Advancing the pass clock, rather than
+        // stamp from the clock read before the call made the endpoint older
+        // than the timeout at birth. The next scan then FORCE-closed it with
+        // its first send still in flight. Advancing the pass clock, rather than
         // stamping this entry alone, keeps every later stamp in the pass and
         // the scan that ends it on one clock.
         self.now = Instant::now();
