@@ -418,30 +418,47 @@ where
         );
     }
     // Tear down once frames are flowing, so it lands mid-stream.
-    timeout(
+    let (first, _) = timeout(
         Duration::from_secs(5),
         handle_b.streams.response_stream.recv_async(),
     )
     .await
     .expect("the first frame arrives")
     .expect("recv");
-    let mut delivered = 1;
+    let mut delivered = vec![first];
     handle_a.streams.shutdown_state.teardown_token().cancel();
     handle_a.transport.shutdown();
 
-    while let Ok(Ok(_)) = timeout(
+    while let Ok(Ok((header, _))) = timeout(
         Duration::from_secs(3),
         handle_b.streams.response_stream.recv_async(),
     )
     .await
     {
-        delivered += 1;
+        delivered.push(header);
     }
-    let failed = handle_a.error_handler.error_count();
-    assert_eq!(
-        delivered + failed,
-        FRAMES,
-        "{delivered} delivered + {failed} failed != {FRAMES} sent: frames vanished across teardown"
+    let failed: Vec<_> = handle_a
+        .error_handler
+        .get_errors()
+        .into_iter()
+        .map(|(header, _, _)| header)
+        .collect();
+
+    // Each frame accounted for exactly once, by its header. Matching counts
+    // alone would let a frame reported twice (delivered and failed, or
+    // delivered twice) hide one that vanished.
+    let mut seen = vec![0usize; FRAMES];
+    for header in delivered.iter().chain(&failed) {
+        let index = u32::from_be_bytes(header[..].try_into().expect("a 4-byte header")) as usize;
+        seen[index] += 1;
+    }
+    let missing: Vec<_> = (0..FRAMES).filter(|&i| seen[i] == 0).collect();
+    let twice: Vec<_> = (0..FRAMES).filter(|&i| seen[i] > 1).collect();
+    assert!(
+        missing.is_empty() && twice.is_empty(),
+        "{} delivered, {} failed: frames {missing:?} vanished across teardown, frames {twice:?} were reported more than once",
+        delivered.len(),
+        failed.len()
     );
     handle_b.streams.shutdown_state.teardown_token().cancel();
 }
