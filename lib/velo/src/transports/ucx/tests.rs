@@ -2777,8 +2777,11 @@ async fn bench_rma() {
 /// Active Message send cost over the tcp lane, with the idle reaper off and on.
 ///
 /// The reaper adds per-send bookkeeping, so the two rows are the price of that
-/// bookkeeping. Two measures: a one-way burst (the progress thread's per-send
-/// cost is on its critical path) and a ping-pong round trip. Run with
+/// bookkeeping. Three measures: a one-way burst of Messages (the progress
+/// thread's per-send cost is on its critical path), the same burst of
+/// Responses, and a ping-pong round trip. Responses are measured apart because
+/// velo sends Messages with UCX's REPLY flag and Responses without it, and a
+/// change to what a frame carries shows only in the kind it changes. Run with
 /// `cargo test --features ucx -p velo --lib bench_am_send -- --ignored --nocapture --test-threads=1`.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "benchmark: prints timings, asserts nothing"]
@@ -2797,15 +2800,16 @@ async fn bench_am_send() {
         let b = start_node_with(|b| b.ep_idle_timeout(timeout)).await;
         cross_register(&a, &b);
         let errs = CountingErrors::new();
-        let send = |from: &Node, to: &Node| {
+        let send_kind = |from: &Node, to: &Node, kind: MessageType| {
             let _ = from.transport.send_message(
                 to.instance_id,
                 header.clone(),
                 payload.clone(),
-                MessageType::Message,
+                kind,
                 errs.clone(),
             );
         };
+        let send = |from: &Node, to: &Node| send_kind(from, to, MessageType::Message);
 
         for _ in 0..WARMUP {
             send(&a, &b);
@@ -2823,6 +2827,15 @@ async fn bench_am_send() {
         }
         let burst = started.elapsed();
 
+        let started = std::time::Instant::now();
+        for _ in 0..BURST {
+            send_kind(&a, &b, MessageType::Response);
+        }
+        for _ in 0..BURST {
+            recv(&b.streams.response_stream, T).await.unwrap();
+        }
+        let resp_burst = started.elapsed();
+
         let mut rtts = Vec::with_capacity(ROUND_TRIPS);
         for _ in 0..ROUND_TRIPS {
             let started = std::time::Instant::now();
@@ -2834,8 +2847,9 @@ async fn bench_am_send() {
         }
         rtts.sort();
         println!(
-            "bench_am_send {label}: burst {:>7.1} ns/frame  rtt p50 {:>9.3?} p99 {:>9.3?}  errors {}",
+            "bench_am_send {label}: burst {:>7.1} ns/frame  resp burst {:>7.1} ns/frame  rtt p50 {:>9.3?} p99 {:>9.3?}  errors {}",
             burst.as_nanos() as f64 / BURST as f64,
+            resp_burst.as_nanos() as f64 / BURST as f64,
             rtts[ROUND_TRIPS / 2],
             rtts[ROUND_TRIPS * 99 / 100],
             errs.count()
