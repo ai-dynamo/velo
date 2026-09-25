@@ -127,10 +127,7 @@
 //! **"In use" means idle in both directions, plus every operation in
 //! flight.** An endpoint is idle only when no send posted on it is in flight,
 //! no entry in [`WorkerState::rma_ops`] names its peer, and nothing has used it
-//! for the timeout. An RDMA GET's completion does not restart the idle clock,
-//! unlike a send's: `drain_rma_completions` writes no stamp, so after a GET
-//! slower than the timeout the endpoint can be closed at the next scan. Three
-//! sites record a use:
+//! for the timeout. Four sites record a use:
 //!
 //! * [`WorkerState::ensure_ep`], for everything **we** initiate — frame sends,
 //!   ping probes, RMA GETs, eager wireup. Every outbound path resolves an
@@ -156,6 +153,9 @@
 //!   endpoint while that count is not zero. The completion time then restarts
 //!   the idle clock. Without that, a send slower than the timeout would be
 //!   reaped the instant it completed.
+//! * [`WorkerState::drain_rma_completions`], when an RMA operation completes.
+//!   Its registry entry kept the endpoint open while it was outstanding, and
+//!   the completion restarts the idle clock, for the same reason as a send's.
 //!
 //! The registry check is deliberately conservative in one direction: an
 //! operation posted on a superseded endpoint still names its peer, so the
@@ -209,7 +209,8 @@
 //! in the same drain advanced the clock. Either way its stamp is early by at
 //! most the time the drain spent on earlier commands (at most `DRAIN_BUDGET`
 //! commands in the first drain, `channel_capacity + DRAIN_BUDGET` in the flush
-//! drain). An inbound frame and `EpSends::drained_at` are late, never early.
+//! drain). An inbound frame, `EpSends::drained_at`, and an RMA completion that
+//! ran inside the progress loop are late, never early.
 //! The scan closes an endpoint when the scan clock is more than one timeout
 //! past [`EpEntry::last_activity`] (the later of the stamp and `drained_at`),
 //! no send is in flight on it, and no RMA operation names its peer. The scan
@@ -2641,10 +2642,24 @@ impl WorkerState {
             }
             std::mem::take(&mut *guard)
         };
+        let reaper_on = self.config.ep_idle_timeout.is_some();
         for (region_id, op_id) in completed {
             // The operation has already answered its caller; teardown no longer
             // needs to know about it.
-            self.rma_ops.remove(&op_id);
+            let op = self.rma_ops.remove(&op_id);
+            // The completion is a use of the endpoint, as a send's is. While
+            // the operation was outstanding its registry entry kept the
+            // endpoint open; without this stamp the last use on record is the
+            // post, so a GET slower than the timeout would leave its endpoint
+            // to be closed at the next scan. `self.now` was read after the
+            // progress loop that ran the completion callback, so the stamp is
+            // not early.
+            if reaper_on
+                && let Some(op) = op
+                && let Some(entry) = self.eps.get_mut(&op.peer)
+            {
+                entry.last_used = self.now;
+            }
             let released = match self.regions.get_mut(&region_id) {
                 Some(entry) => {
                     entry.inflight = entry.inflight.saturating_sub(1);

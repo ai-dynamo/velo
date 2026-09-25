@@ -716,12 +716,9 @@ impl UcxTransportBuilder {
     /// arrive, which errs toward keeping the endpoint open. A send is stamped
     /// at most one command drain before it is posted, which can shorten the
     /// timeout by that much. An endpoint is never closed while an RDMA
-    /// operation to that peer is outstanding. A GET's completion does not
-    /// restart the idle clock, unlike a send's: only the stamp from posting
-    /// the GET counts, so a GET slower than the timeout can leave the endpoint
-    /// to be closed at the first scan after it completes. The next use
-    /// re-establishes it transparently — no error surfaces, nothing has to be
-    /// re-registered.
+    /// operation to that peer is outstanding, and the operation's completion
+    /// restarts the idle clock. The next use re-establishes it
+    /// transparently — no error surfaces, nothing has to be re-registered.
     ///
     /// An endpoint is idle only when no send posted on it is in flight and none
     /// has completed for the timeout. A send slower than the timeout therefore
