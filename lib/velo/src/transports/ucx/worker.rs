@@ -178,16 +178,17 @@
 //! inline and synchronous-failure exits, and released in `send_trampoline` for
 //! the asynchronous one. Only that last release reads the clock, and only when
 //! the count falls to zero. The count exists only with the reaper on, so with
-//! the reaper off (the default) a send pays only a `None` check, plus one clock
-//! read per `ucp_ep_create`. A send that never completes holds its endpoint
-//! open until UCX fails the endpoint, which is the conservative direction.
+//! the reaper off (the default) a send pays only two `None` checks, plus one
+//! clock read per `ucp_ep_create`. A send that never completes holds its
+//! endpoint open until UCX fails the endpoint, which is the conservative
+//! direction.
 //!
 //! The per-send cost is below what can be measured. `bench_am_send` (in the
-//! tests) on a GB200 node, release build, 6 runs alternating between the code
-//! without the count and with it: with the reaper on, the burst cost and the
-//! round-trip p50 and p99 moved +1% to +3%. With the reaper off, where the
-//! change adds only a `None` check, the same runs moved -6% to -22%. The noise
-//! of this benchmark is therefore at least ±6%.
+//! tests) on a GB200 node, release build, 6 runs of each, alternating between
+//! the code without the count and with it: with the reaper on, the burst cost
+//! and the round-trip p50 and p99 moved +1.0% to +2.9%. With the reaper off,
+//! where the change adds only two `None` checks, the same runs moved -5.8% to
+//! -21.5%. The noise of this benchmark is therefore at least ±6%.
 //!
 //! Replies posted on a reply endpoint (`Cmd::PongTo`, `Cmd::ShuttingDownTo`)
 //! carry no count, because they do not go through `ensure_ep`. The pointer can
@@ -229,8 +230,9 @@
 //! for FORCE closes (UCX will not call the handler after a FORCE close is
 //! issued). A flush-mode close would need teardown Phase A's deferred free
 //! instead, and would hang on exactly the peer an idle endpoint is most likely
-//! to belong to — one that has gone away. A candidate has no outstanding RMA
-//! operation by construction, so FORCE has nothing to cancel.
+//! to belong to — one that has gone away. A candidate has no RMA operation and
+//! no counted send in flight; the one thing FORCE can still cancel is an
+//! uncounted reply (see the reply paragraph above).
 //!
 //! **What the peer pays.** Closing an endpoint is not a local act. UCX pairs
 //! endpoints by remote worker, so velo's REPLY-flagged Active Messages cause a
@@ -240,10 +242,11 @@
 //! next Message is admitted and silently lost (measured). By the same inferred
 //! mechanism, its next ping gets no Pong, so its `check_health` returns
 //! `Timeout` (or `ConnectionFailed` if keepalive fails the endpoint while the
-//! probe is waiting). Its Responses and Events still arrive (measured: 8 of 8
-//! in every run). Acks carry no REPLY flag either, so the same is expected, but
-//! it was not measured. Why: per the UCX source, a REPLY-flagged frame carries
-//! an endpoint id for the reply path, and a frame whose endpoint id no longer
+//! probe is waiting). Its Responses and Events still arrive (measured over the
+//! tcp lane: 8 of 8 in each of 8 runs, 4 streaming Responses and 4 streaming
+//! Events). Acks carry no REPLY flag either, so the same is expected, but it
+//! was not measured. Why: per the UCX source, a REPLY-flagged frame carries an
+//! endpoint id for the reply path, and a frame whose endpoint id no longer
 //! resolves is dropped. That is inferred from the source and a measurement, not
 //! proven. UCX keepalive (~20 s by default) then declares the peer's endpoint
 //! failed, and the frame after that takes velo's existing failed-connection
@@ -254,7 +257,7 @@
 //! that the first frame does not arrive). The disruption lasts up to a
 //! keepalive interval per reaped endpoint and heals itself. Both close modes
 //! were measured by hand and behave identically, so FORCE is kept for the
-//! reasons below. `reaping_disrupts_the_peers_path_back` pins the FORCE case.
+//! reasons above. `reaping_disrupts_the_peers_path_back` pins the FORCE case.
 //! The operator-facing version is on
 //! [`UcxTransportBuilder::ep_idle_timeout`](super::transport::UcxTransportBuilder::ep_idle_timeout).
 //! This is the concrete cost D9 deferred ("connection-pool policy revisited
@@ -998,8 +1001,8 @@ unsafe extern "C" fn recv_trampoline(
         // `reply_ep`, and velo sets that flag on Messages and pings only. So
         // those stamp, and Responses, Events, Acks, Pongs and ShuttingDown
         // echoes do not. Recorded here rather than in the per-kind arms below
-        // so the hot path is one branch and two relaxed atomics regardless of
-        // what arrived.
+        // so the hot path is one branch, plus two relaxed atomics for a
+        // REPLY-flagged frame, whatever kind it is.
         if ra.shared.stamp_inbound && !p.reply_ep.is_null() {
             ra.shared.worker.reply_eps.record(p.reply_ep as usize);
         }
@@ -1195,7 +1198,7 @@ struct EpEntry {
     last_used: Instant,
     /// Sends in flight on this endpoint. `Some` only with the idle reaper on,
     /// which is the only reader, so with the reaper off (the default) a send
-    /// pays only a `None` check, plus one clock read per `ucp_ep_create`.
+    /// pays only two `None` checks, plus one clock read per `ucp_ep_create`.
     sends: Option<Arc<EpSends>>,
 }
 

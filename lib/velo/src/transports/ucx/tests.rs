@@ -1778,8 +1778,8 @@ async fn ping_message_to(
 /// the floor, so nothing else would notice the clamp disappearing. What the
 /// floor guards against is a timeout shorter than endpoint wireup: endpoints
 /// then close between ordinary uses, each next use pays wireup again, and each
-/// close costs the peer at least one lost Message, or a ping that times out.
-/// The reaper reports none of that.
+/// close costs the peer its next Messages and pings to us, if it sends any
+/// before keepalive fails its endpoint. The reaper reports none of that.
 #[test]
 fn a_sub_floor_ep_idle_timeout_is_clamped() {
     let clamped = UcxTransportBuilder::new()
@@ -2154,11 +2154,11 @@ async fn a_frame_received_late_in_a_long_pass_is_not_stamped_early() {
 /// the idle clock.
 ///
 /// A first send between fresh workers waits while the peer sets up its own
-/// endpoint back, inside the peer's `ucp_worker_progress`. In the parallel
-/// `--lib` run the peer's progress loop that contained that step took 526-573
-/// ms, so the reaper closed the endpoint with the send in flight: the send
-/// failed through `on_error` and the frame was lost. The seam stops the peer's
-/// progress thread for three timeouts, which holds the send in flight on
+/// endpoint back, inside the peer's `ucp_worker_progress`. In parallel
+/// UCX-module runs the peer's progress loop that contained that step took
+/// 526-573 ms, so the reaper closed the endpoint with the send in flight: the
+/// send failed through `on_error` and the frame was lost. The seam stops the
+/// peer's progress thread for three timeouts, which holds the send in flight on
 /// demand.
 ///
 /// The proof has two parts. `eps_closed_idle(&a) == 0` when the frame arrives
@@ -2584,8 +2584,9 @@ async fn eager_wireup_follows_a_re_registration() {
 
 /// Eager wireup and the idle reaper together, which is the combination the
 /// builder docs promise composes: an endpoint established at registration and
-/// never used is reclaimed one timeout later, and a use after that wires up a
-/// new one. Intended behaviour, asserted so it stays intended.
+/// never used is reclaimed about one timeout later (see the close window), and
+/// a use after that wires up a new one. Intended behaviour, asserted so it
+/// stays intended.
 #[tokio::test(flavor = "multi_thread")]
 async fn eager_wireup_and_the_reaper_compose() {
     let a = start_node_with(|b| b.eager_endpoints(true).ep_idle_timeout(Some(IDLE))).await;

@@ -90,16 +90,16 @@ pub struct UcxConfig {
 /// those sends. (Replies posted on the endpoint UCX hands the receive callback
 /// are not counted.) What a short timeout does is close endpoints between
 /// ordinary uses, and each close makes the next use pay wireup again and costs
-/// the peer at least one lost Message, or a ping that times out (see
-/// [`UcxTransportBuilder::ep_idle_timeout`]). The first RDMA GET on a fresh
-/// two-process pair over CX-7 InfiniBand (`rc_verbs`) took ~14 ms, wireup
-/// included, and wireup over the tcp lane in CI takes upwards of 10 ms, so half
-/// a second is roughly thirty-five times that. In the in-process test harness
-/// over tcp on a GB200 node, with several UCX workers per process, one
-/// `ucp_ep_create` call took 110-150 ms, and 630 ms at the median across 31
-/// creates in one process; the cause is not isolated. In that harness a fresh
-/// pair's first frame took 360-420 ms to arrive with the node's CPUs
-/// oversubscribed.
+/// the peer its next Messages and pings to us, if it sends any before keepalive
+/// fails its endpoint (see [`UcxTransportBuilder::ep_idle_timeout`]). The first
+/// RDMA GET on a fresh two-process pair over CX-7 InfiniBand (`rc_verbs`) took
+/// ~14 ms, wireup included, and wireup over the tcp lane in CI takes upwards of
+/// 10 ms, so half a second is roughly thirty-five times the 14 ms. In the
+/// in-process test harness over tcp on a GB200 node, with several UCX workers
+/// per process, one `ucp_ep_create` call took 110-150 ms, and 630 ms at the
+/// median across 31 creates in one process; the cause is not isolated. In that
+/// harness a fresh pair's first frame took 360-420 ms to arrive with the node's
+/// CPUs oversubscribed.
 ///
 /// It is a builder-level ergonomic guard, not an invariant of the reaper: a test
 /// constructing a [`UcxConfig`] directly can go below it deliberately.
@@ -699,13 +699,13 @@ impl UcxTransportBuilder {
     ///
     /// For a peer this instance *only* probes, it is a create/reap/disrupt
     /// generator: each probe wires an endpoint up, the reaper closes it one
-    /// timeout later, and every close costs that peer at least one lost
-    /// Message, or a ping that times out (see below). Probing on an interval
-    /// longer than this timeout therefore manufactures exactly the disruption
-    /// this knob is trying to be worth. There is no periodic prober in-tree —
-    /// `check_health` has no in-tree periodic caller — so this only applies to
-    /// a caller that has built one; if you have, either probe faster than the
-    /// timeout or do not enable this.
+    /// timeout later, and every close costs that peer its next Messages and
+    /// pings to us, if it sends any before keepalive fails its endpoint (see
+    /// below). Probing on an interval longer than this timeout therefore
+    /// manufactures exactly the disruption this knob is trying to be worth.
+    /// There is no periodic prober in-tree — `check_health` has no in-tree
+    /// periodic caller — so this only applies to a caller that has built one;
+    /// if you have, either probe faster than the timeout or do not enable this.
     ///
     /// # What it promises
     ///
@@ -764,7 +764,8 @@ impl UcxTransportBuilder {
     ///    `Timeout` (or `ConnectionFailed` if keepalive fails the endpoint
     ///    while the probe is waiting). Later pings are expected to be lost the
     ///    same way (inferred, not measured). Its Responses and Events still
-    ///    arrive (measured: 8 of 8 in every run). Acks carry no REPLY flag
+    ///    arrive (measured over the tcp lane: 8 of 8 in each of 8 runs, 4
+    ///    streaming Responses and 4 streaming Events). Acks carry no REPLY flag
     ///    either, so the same is expected, but it was not measured.
     /// 2. UCX keepalive (default interval ~20 s) eventually declares the peer's
     ///    endpoint failed and fires its error handler.
@@ -790,9 +791,10 @@ impl UcxTransportBuilder {
     ///   cost above, whichever side speaks first, when the peer keeps its
     ///   endpoint to us. If we speak first, our send arrives with no error
     ///   (`idle_endpoint_closes_and_the_next_send_wires_up_again`), and the
-    ///   peer still loses its next Messages and pings to us. If the peer also
-    ///   runs the reaper and has closed its own endpoint, its next send creates
-    ///   a fresh one; that case is not measured.
+    ///   peer still loses its next Messages to us, and, by the same inferred
+    ///   mechanism, its pings. If the peer also runs the reaper and has closed
+    ///   its own endpoint, its next send creates a fresh one; that case is not
+    ///   measured.
     /// * **Send-side-only fan-out** — this instance sends to many peers it never
     ///   hears from. Reaping costs nothing, since the disruption is to the
     ///   *peer's* path back and no peer is using one.
@@ -859,7 +861,7 @@ impl UcxTransportBuilder {
     /// when `ucp_ep_create` returns, so with both on, a registered-but-never-used
     /// peer is wired up once and closed about one timeout (see the close window
     /// in [`ep_idle_timeout`](Self::ep_idle_timeout)) after that call returned.
-    /// The tcp wireup itself finishes later, in the background. That is the
+    /// The UCX wireup itself finishes later, in the background. That is the
     /// intended behaviour, not a conflict.
     pub fn eager_endpoints(mut self, eager: bool) -> Self {
         self.config.eager_endpoints = eager;
