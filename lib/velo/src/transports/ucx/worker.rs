@@ -141,7 +141,10 @@
 //!   below). UCX's `reply_ep` cannot carry this: UCX sets it only for frames
 //!   sent with `UCP_AM_SEND_FLAG_REPLY`, which velo sets on Messages and pings
 //!   only, so a peer streaming Responses or Events back to us would go
-//!   unseen.
+//!   unseen. The receive callback hands senders to the main loop through
+//!   [`SenderSightings`], which holds each sender once per pass; a pass with
+//!   more distinct senders than it holds stamps every endpoint rather than
+//!   lose one.
 //! * [`OpState::stamp_ep_drained`], called from `send_trampoline` when the
 //!   last send in flight on the endpoint completes. The endpoint's [`EpSends`]
 //!   counts sends posted on it and not yet completed, and the reaper skips an
@@ -189,10 +192,6 @@
 //! timeout, less the length of that drain, after the reply is posted. If the
 //! reply endpoint is not one we own, the reaper never closes it. Either way
 //! nothing depends on which pointer UCX hands out.
-//! The exception: if more than `SENDER_SLOTS` frames arrived before the
-//! drain, the oldest sightings were overwritten (see [`SenderSightings`]),
-//! and the endpoint the reply went out on may not be refreshed, so it can be
-//! closed in the same pass.
 //!
 //! **Endpoint creation is not idle time.** `last_used` is stamped from
 //! [`WorkerState::now`], and `ensure_ep` advances that clock after
@@ -882,15 +881,13 @@ pub(crate) const SENDER_TAG_LEN: usize = 8;
 /// passes of the main loop.
 ///
 /// The loop drains this only in `stamp_inbound_use`, which runs in a pass that
-/// observed the command ring empty. So the window is every frame received
-/// since the last such pass, at least one full progress loop.
-/// `SenderSightings::record` does not deduplicate, so more than eight such
-/// frames in that window overwrite the oldest sightings. A lost sighting means
-/// that frame did not refresh its endpoint. If no later sighting refreshes it,
-/// the endpoint can be closed one timeout after its previous stamp, including
-/// right after a pong was posted on it. Under fan-in from many peers this is a
-/// real limit, not a bound the ring enforces.
-const SENDER_SLOTS: usize = 8;
+/// observed the command ring empty, and any number of frames can arrive
+/// between two such passes. So the ring holds each sender once (see [`SenderSightings::record`]),
+/// and a pass that saw more distinct senders than this reports the overflow
+/// instead of dropping sightings. Losing one is not harmless: it can be the
+/// last frame a peer sends before it goes quiet, or the ping whose pong rides
+/// our endpoint uncounted.
+pub(super) const SENDER_SLOTS: usize = 8;
 
 /// Sender incarnations seen by the AM recv trampoline, on their way to the main
 /// loop's [`EpEntry::last_used`] stamps.
@@ -900,8 +897,8 @@ const SENDER_SLOTS: usize = 8;
 /// or reach `WorkerState`, so what it can do is publish a value the loop picks
 /// up — and unlike an RMA completion, which happens once per transfer, this
 /// happens once per *inbound frame*. That rules out a mutex and a `Vec`: it is
-/// a fixed ring of atomics, one `fetch_add` and one `store` per frame, no
-/// allocation and no lock.
+/// a fixed ring of atomics, at most eight loads plus one `fetch_add` and one
+/// `store` per frame, no allocation and no lock.
 ///
 /// A slot holds a sender's incarnation as `usize` (every target UCX builds on
 /// is 64-bit). The main loop compares it against the incarnation each endpoint
@@ -925,24 +922,44 @@ impl SenderSightings {
     }
 
     /// Publish one sighting. Runs on the progress thread inside an AM callback.
+    ///
+    /// A sender already in the ring is not recorded again. Without that, a
+    /// burst of frames from one peer in one pass overwrote every other peer's
+    /// sighting. With it, only more than [`SENDER_SLOTS`] *distinct* senders
+    /// in one pass can overflow the ring, and `drain_into` reports that.
     pub(super) fn record(&self, sender: usize) {
+        // Relaxed is enough: the recorder and the drainer are the same thread
+        // (the progress thread), and the atomics exist only to make the ring
+        // shareable.
+        if self
+            .slots
+            .iter()
+            .any(|slot| slot.load(Ordering::Relaxed) == sender)
+        {
+            return;
+        }
         let seq = self.recorded.fetch_add(1, Ordering::Relaxed);
         self.slots[seq % SENDER_SLOTS].store(sender, Ordering::Release);
     }
 
     /// Take everything published since the last call. Progress thread only.
-    pub(super) fn drain_into(&self, seen: &mut usize, out: &mut Vec<usize>) {
+    ///
+    /// Returns `true` when more distinct senders were recorded than the ring
+    /// holds, so some sightings were overwritten and `out` is incomplete.
+    pub(super) fn drain_into(&self, seen: &mut usize, out: &mut Vec<usize>) -> bool {
         let recorded = self.recorded.load(Ordering::Acquire);
         if recorded == *seen {
-            return;
+            return false;
         }
+        let overflowed = recorded.wrapping_sub(*seen) > SENDER_SLOTS;
         *seen = recorded;
         for slot in &self.slots {
-            let ep = slot.swap(0, Ordering::AcqRel);
-            if ep != 0 {
-                out.push(ep);
+            let sender = slot.swap(0, Ordering::AcqRel);
+            if sender != 0 {
+                out.push(sender);
             }
         }
+        overflowed
     }
 }
 
@@ -2082,13 +2099,25 @@ impl WorkerState {
             return;
         }
         self.sender_scratch.clear();
-        self.shared
+        let overflowed = self
+            .shared
             .senders
             .drain_into(&mut self.seen_senders, &mut self.sender_scratch);
+        let now = self.now;
+        if overflowed {
+            // More distinct peers sent to us in this pass than the ring holds,
+            // so some of their sightings are gone. Stamping every endpoint
+            // cannot miss one of them. It keeps an idle endpoint open one
+            // timeout longer, which only costs an idle endpoint's resources;
+            // missing a stamp can cost a peer a frame.
+            for entry in self.eps.values_mut() {
+                entry.last_used = now;
+            }
+            return;
+        }
         if self.sender_scratch.is_empty() {
             return;
         }
-        let now = self.now;
         let (mut stamped, mut unmatched) = (0u64, 0u64);
         for &seen in &self.sender_scratch {
             let mut hit = false;

@@ -684,11 +684,10 @@ impl UcxTransportBuilder {
     /// `a_peer_that_keeps_sending_responses_keeps_its_endpoint` and
     /// `a_peer_that_keeps_sending_events_keeps_its_endpoint` pin that.
     ///
-    /// The progress thread keeps at most eight of these refreshes until it
-    /// drains them, at most once per loop pass. If more than eight frames,
-    /// from all peers together, arrive before a drain, the oldest are
-    /// overwritten and those frames do not refresh their endpoints. Under heavy
-    /// fan-in, a peer that keeps sending can therefore still be reaped.
+    /// The progress thread holds each sender once until it drains them. If
+    /// more than eight different peers send frames between two drains, it
+    /// stamps every endpoint instead, so no sender is missed. Under heavy
+    /// fan-in, idle endpoints can therefore stay open longer.
     ///
     /// # Health probes are not free here
     ///
@@ -729,9 +728,8 @@ impl UcxTransportBuilder {
     /// completes. Replies posted on the endpoint UCX hands the receive callback
     /// (Pongs and ShuttingDown echoes) are not counted: the inbound frame that
     /// caused each one refreshes the endpoint in the same loop pass, before the
-    /// reaper scans, unless more than eight REPLY-flagged frames arrived before
-    /// that refresh was drained (see above). The time `ucp_ep_create` takes
-    /// does not count as idle either.
+    /// reaper scans. The time `ucp_ep_create` takes does not count as idle
+    /// either.
     ///
     /// Values below half a second are raised to it; see the transport's
     /// `MIN_EP_IDLE_TIMEOUT` for why that is the number.
@@ -763,8 +761,7 @@ impl UcxTransportBuilder {
     /// keepalive interval of disruption *per reaped endpoint*. That is what
     /// makes the bidirectional freshness stamp above load-bearing rather than a
     /// nicety: a peer that keeps sending us frames of any kind is not reaped,
-    /// unless more than eight frames arrive between two drains and overwrite
-    /// its refreshes (see above), so it does not pay this.
+    /// so it does not pay this.
     ///
     /// Which leaves the patterns where it is still paid, and they are the ones
     /// to check before enabling:
@@ -776,9 +773,6 @@ impl UcxTransportBuilder {
     ///   hears from. Reaping costs nothing, since the disruption is to the
     ///   *peer's* path back and no peer is using one.
     /// * **Probe-only peers** — see the health-probe section above. Avoid.
-    /// * **Heavy fan-in** — more than eight frames, from all peers together,
-    ///   between two drains of the refreshes. The oldest refreshes are lost, so
-    ///   a peer that is sending can be reaped as if it were idle.
     ///
     /// Note what is *not* on that list: "one-directional" is not by itself a
     /// safe answer, because the receiving side of a one-directional flow is the

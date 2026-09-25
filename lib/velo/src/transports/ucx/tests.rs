@@ -24,7 +24,7 @@ use crate::transports::ucx::rma::{
     MAX_PACKED_RKEY, MappedRegion, RdmaEndpoint, RmaError, RmaGetRequest, SYS_DEV_UNKNOWN,
     preparse_packed_rkey,
 };
-use crate::transports::ucx::worker::{Cmd, PARK_MS, SenderSightings, ep_scan_period};
+use crate::transports::ucx::worker::{Cmd, PARK_MS, SENDER_SLOTS, SenderSightings, ep_scan_period};
 use velo_ext::{InstanceId, MessageType, PeerInfo};
 
 struct CountingErrors {
@@ -1937,6 +1937,40 @@ fn a_sighting_is_not_overwritten_by_a_burst_from_another_sender() {
         "P's sighting was overwritten by eight sightings of Q: {out:x?}"
     );
     assert!(out.contains(&Q));
+}
+
+/// More distinct senders in one pass than the ring holds is reported, not
+/// silently dropped: the main loop then stamps every endpoint, so none of
+/// the lost senders can be reaped under its own traffic.
+#[test]
+fn more_senders_in_one_pass_than_the_ring_holds_is_reported() {
+    let ring = SenderSightings::new();
+    let (mut seen, mut out) = (0, Vec::new());
+    for sender in 1..=SENDER_SLOTS {
+        ring.record(sender);
+    }
+    assert!(
+        !ring.drain_into(&mut seen, &mut out),
+        "a full ring is not an overflow"
+    );
+    assert_eq!(out.len(), SENDER_SLOTS);
+
+    out.clear();
+    for sender in 1..=SENDER_SLOTS + 1 {
+        ring.record(sender);
+    }
+    assert!(
+        ring.drain_into(&mut seen, &mut out),
+        "{} distinct senders fit in {SENDER_SLOTS} slots only by losing one, \
+         and the loss was not reported",
+        SENDER_SLOTS + 1
+    );
+
+    out.clear();
+    assert!(
+        !ring.drain_into(&mut seen, &mut out) && out.is_empty(),
+        "a drained ring reported sightings again"
+    );
 }
 
 /// The consequence that matters operationally: a peer that only ever *sends*
