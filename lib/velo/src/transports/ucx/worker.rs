@@ -127,7 +127,10 @@
 //! **"In use" means idle in both directions, plus every operation in
 //! flight.** An endpoint is idle only when no send posted on it is in flight,
 //! no entry in [`WorkerState::rma_ops`] names its peer, and nothing has used it
-//! for the timeout. Three sites record a use:
+//! for the timeout. An RDMA GET's completion does not restart the idle clock,
+//! unlike a send's: `drain_rma_completions` writes no stamp, so after a GET
+//! slower than the timeout the endpoint can be closed at the next scan. Three
+//! sites record a use:
 //!
 //! * [`WorkerState::ensure_ep`], for everything **we** initiate — frame sends,
 //!   ping probes, RMA GETs, eager wireup. Every outbound path resolves an
@@ -137,11 +140,13 @@
 //!   UCX hands the recv callback a reply endpoint only for those, so
 //!   Responses, Events, Acks, Pongs and ShuttingDown echoes do not stamp.
 //!   Without it "idle" would mean "we have not sent", and a peer that only ever
-//!   sends to us would have its endpoint reaped out from under its own traffic —
-//!   repeatedly, since each reap costs it a frame (see below). It rests on a
-//!   measured fact rather than an assumed one: the `reply_ep` UCX hands the recv
-//!   callback for a peer we hold an endpoint to is the *same pointer* as the
-//!   endpoint `ucp_ep_create` gave us.
+//!   sends us Messages would have its endpoint reaped out from under its own
+//!   traffic — repeatedly, since each reap costs it a frame (see below). A peer
+//!   that only streams Responses, Events or Acks to us still has that problem,
+//!   because those frames do not stamp. It rests on a measured fact rather than
+//!   an assumed one: the `reply_ep` UCX hands the recv callback for a peer we
+//!   hold an endpoint to is the *same pointer* as the endpoint `ucp_ep_create`
+//!   gave us.
 //!   `an_inbound_frame_refreshes_the_endpoint_it_arrived_on` asserts it, because
 //!   connection matching (which the disruption finding below establishes) is a
 //!   weaker claim than pointer identity and would not have been enough.
@@ -193,17 +198,18 @@
 //! (median of 31 creates in one process), past the floor. An endpoint with no
 //! send on it, such as an eager one, has only this stamp to keep it open.
 //!
-//! **When a use is stamped.** With the reaper on, [`WorkerState::now`] is
-//! read at the top of each loop pass, again after the progress loop, and after
-//! each `ucp_ep_create`. A command in either drain is stamped with the read
-//! taken before that drain began, so its stamp is early by at most the time
-//! the drain spent on earlier commands (at most `DRAIN_BUDGET` commands in the
-//! first drain, `channel_capacity + DRAIN_BUDGET` in the flush drain). An
-//! inbound frame and `EpSends::drained_at` are late, never early. The scan
-//! closes an endpoint when the scan clock is more than one timeout past
-//! [`EpEntry::last_activity`] (the later of the stamp and `drained_at`), no
-//! send is in flight on it, and no RMA operation names its peer. The scan runs
-//! once a scan period, and on an idle worker a due scan runs at most one
+//! **When a use is stamped.** With the reaper on, [`WorkerState::now`] is read
+//! at the top of each loop pass, again after the progress loop, and after each
+//! `ucp_ep_create`. A command in either drain is stamped with the read taken
+//! before that drain began, or with a later read if a `ucp_ep_create` earlier
+//! in the same drain advanced the clock. Either way its stamp is early by at
+//! most the time the drain spent on earlier commands (at most `DRAIN_BUDGET`
+//! commands in the first drain, `channel_capacity + DRAIN_BUDGET` in the flush
+//! drain). An inbound frame and `EpSends::drained_at` are late, never early.
+//! The scan closes an endpoint when the scan clock is more than one timeout
+//! past [`EpEntry::last_activity`] (the later of the stamp and `drained_at`),
+//! no send is in flight on it, and no RMA operation names its peer. The scan
+//! runs once a scan period, and on an idle worker a due scan runs at most one
 //! [`PARK_MS`] late. A long pass on a busy worker delays it further.
 //!
 //! **FORCE, like every other close from the main loop.** `close_ep_raw` frees
@@ -865,7 +871,7 @@ struct RecvShared {
 /// The loop drains this on every pass, so the window is one iteration of a loop
 /// that spins. Eight is far more than that window can fill under any traffic a
 /// single worker sustains, and losing a sighting costs nothing worse than a
-/// freshness stamp the *next* inbound frame from that peer sets anyway.
+/// freshness stamp the *next* Message or ping from that peer sets anyway.
 const REPLY_EP_SLOTS: usize = 8;
 
 /// Reply endpoints seen by the AM recv trampoline, on their way to the main
@@ -875,9 +881,9 @@ const REPLY_EP_SLOTS: usize = 8;
 /// A recv callback runs inside `ucp_worker_progress` and may not touch the ring
 /// or reach `WorkerState`, so what it can do is publish a value the loop picks
 /// up — and unlike an RMA completion, which happens once per transfer, this
-/// happens once per *inbound frame*. That rules out a mutex and a `Vec`: it is a
-/// fixed ring of atomics, one `fetch_add` and one `store` per frame, no
-/// allocation and no lock.
+/// happens once per *REPLY-flagged inbound frame* (every Message and ping).
+/// That rules out a mutex and a `Vec`: it is a fixed ring of atomics, one
+/// `fetch_add` and one `store` per frame, no allocation and no lock.
 ///
 /// # These are integers, not pointers
 ///
@@ -1143,14 +1149,17 @@ struct EpEntry {
     /// The peer incarnation this endpoint was created from; compared against
     /// the peers map after re-registrations.
     incarnation: u64,
-    /// When [`WorkerState::ensure_ep`] last handed this endpoint out.
+    /// When [`WorkerState::ensure_ep`] last handed this endpoint out, or
+    /// [`WorkerState::stamp_inbound_use`] last saw a Message or ping arrive on
+    /// it, whichever is later.
     ///
     /// A plain `Instant`, not an atomic: `EpEntry` never leaves the progress
-    /// thread. It is sampled from [`WorkerState::now`] rather than read from the
-    /// clock, so stamping costs a copy and no syscall on the send path. That
-    /// clock is read twice a pass plus once per `ucp_ep_create`, so a stamp
-    /// for a command can precede the command by up to the length of the drain
-    /// it ran in. The module docs ("When a use is stamped") give the details.
+    /// thread. It is sampled from [`WorkerState::now`] rather than read from
+    /// the clock, so stamping costs a copy and no syscall on the send path.
+    /// With the reaper on, that clock is read twice a pass plus once per
+    /// `ucp_ep_create`, so a stamp for a command can precede the command by up
+    /// to the length of the drain it ran in. The module docs ("When a use is
+    /// stamped") give the details.
     last_used: Instant,
     /// Sends in flight on this endpoint. `Some` only with the idle reaper on,
     /// which is the only reader, so the default configuration pays nothing.
@@ -1254,7 +1263,8 @@ struct WorkerState {
     /// Coarse clock for the idle reaper. With the reaper on, it is read at the
     /// top of each loop pass, again after the progress loop, and after each
     /// endpoint creation. With the reaper off, only the creation read runs, so
-    /// the value is stale; nothing reads it then.
+    /// the value is stale. `ensure_ep` still copies it into `last_used`, but
+    /// nothing uses it then.
     ///
     /// Two `Instant::now()` per pass instead of one per endpoint use: the send
     /// path stamps [`EpEntry::last_used`] from this, and an idle timeout is a
@@ -2023,9 +2033,11 @@ impl WorkerState {
     /// arrived on (the frames sent with `UCP_AM_SEND_FLAG_REPLY`).
     ///
     /// The other half of "idle" — without it, idle would mean "we have not
-    /// *sent*", and a peer that only ever sends to us would have its endpoint
-    /// reaped underneath its own traffic. See the module docs for why the
-    /// sighting is an integer comparison and never a dereference.
+    /// *sent*", and a peer that only ever sends us Messages would have its
+    /// endpoint reaped underneath its own traffic. Responses, Events and Acks
+    /// carry no reply endpoint, so a peer that only streams those to us is not
+    /// covered. See the module docs for why the sighting is an integer
+    /// comparison and never a dereference.
     ///
     /// Runs only with the reaper configured: the stamps it writes are read by
     /// nothing else, and the match below is linear in the endpoints this worker

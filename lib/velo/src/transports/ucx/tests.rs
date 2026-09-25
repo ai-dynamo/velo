@@ -1882,9 +1882,10 @@ async fn an_inbound_frame_refreshes_the_endpoint_it_arrived_on() {
     assert_rma_balanced(&b);
 }
 
-/// The consequence that matters operationally: a peer that only ever *sends* to
-/// us keeps its endpoint alive, instead of having it reaped and blackholed under
-/// its own traffic.
+/// The consequence that matters operationally: a peer that only ever *sends*
+/// us Messages keeps its endpoint alive, instead of having it reaped and
+/// blackholed under its own traffic. It pins the Message case only: Responses,
+/// Events and Acks do not refresh the endpoint, and no test pins that yet.
 ///
 /// This is the mutation target for the inbound stamp — remove it and the
 /// endpoint here is reaped on schedule, which the assertion catches.

@@ -672,9 +672,12 @@ impl UcxTransportBuilder {
     /// wireup. **And the Messages and pings the peer sends us** — the frames
     /// sent with UCX's REPLY flag, which are the only ones that arrive with a
     /// reply endpoint — refresh the endpoint they arrived on. So "idle" means
-    /// idle in both directions, and a peer that only ever sends us Messages
-    /// does not have its endpoint reaped under its own traffic. Responses,
-    /// Events, Acks, Pongs and ShuttingDown echoes do not refresh it. `a_peer_that_keeps_sending_keeps_its_endpoint` pins that.
+    /// idle in both directions for Messages and pings: a peer that keeps
+    /// sending us Messages does not have its endpoint reaped under its own
+    /// traffic, and `a_peer_that_keeps_sending_keeps_its_endpoint` pins that
+    /// case. Responses, Events, Acks, Pongs and ShuttingDown echoes do not
+    /// refresh the endpoint, so a peer that only streams those to us is reaped
+    /// on schedule. No test pins that non-refresh yet.
     ///
     /// # Health probes are not free here
     ///
@@ -706,8 +709,12 @@ impl UcxTransportBuilder {
     /// arrive, which errs toward keeping the endpoint open. A send is stamped
     /// at most one command drain before it is posted, which can shorten the
     /// timeout by that much. An endpoint is never closed while an RDMA
-    /// operation to that peer is outstanding. The next use re-establishes it
-    /// transparently — no error surfaces, nothing has to be re-registered.
+    /// operation to that peer is outstanding. A GET's completion does not
+    /// restart the idle clock, unlike a send's: only the stamp from posting
+    /// the GET counts, so a GET slower than the timeout can leave the endpoint
+    /// to be closed at the first scan after it completes. The next use
+    /// re-establishes it transparently — no error surfaces, nothing has to be
+    /// re-registered.
     ///
     /// An endpoint is idle only when no send posted on it is in flight and none
     /// has completed for the timeout. A send slower than the timeout therefore
@@ -742,7 +749,9 @@ impl UcxTransportBuilder {
     /// So it self-heals, at a cost of one lost frame and up to a keepalive
     /// interval of disruption *per reaped endpoint*. That is what makes the
     /// bidirectional freshness stamp above load-bearing rather than a nicety: a
-    /// peer that keeps sending is never reaped, so it never pays this.
+    /// peer that keeps sending Messages or pings is never reaped, so it never
+    /// pays this. A peer that keeps sending only Responses, Events or Acks does
+    /// not refresh the stamp, so it can still be reaped and pay it.
     ///
     /// Which leaves the patterns where it is still paid, and they are the ones
     /// to check before enabling:
@@ -754,12 +763,18 @@ impl UcxTransportBuilder {
     ///   hears from. Reaping costs nothing, since the disruption is to the
     ///   *peer's* path back and no peer is using one.
     /// * **Probe-only peers** — see the health-probe section above. Avoid.
+    /// * **Peers that stream Responses or Events to us** for longer than the
+    ///   timeout, while this side sends nothing. Those frames do not refresh
+    ///   the endpoint, so it is reaped mid-stream and the peer loses a frame.
+    ///   Avoid, or use a timeout longer than the longest such stream.
     ///
     /// Note what is *not* on that list: "one-directional" is not by itself a
     /// safe answer, because the receiving side of a one-directional flow is the
     /// worst case — it is the side whose path back gets disrupted. The stamp
-    /// makes that case correct now, but a deployment reasoning about the knob
-    /// should reason about it per-direction rather than per-link.
+    /// makes that case correct only when the flow is Messages or pings. A flow
+    /// of Responses, Events or Acks toward us is not covered, as the list
+    /// above says. A deployment reasoning about the knob should reason about
+    /// it per-direction, and per frame type, rather than per-link.
     ///
     /// This is why the default is off, and why D9 left connection-pool policy to
     /// be revisited with exactly this measurement in hand.
