@@ -141,12 +141,14 @@
 //!   Responses, Events, Acks, Pongs and ShuttingDown echoes do not stamp.
 //!   Without it "idle" would mean "we have not sent", and a peer that only ever
 //!   sends us Messages would have its endpoint reaped out from under its own
-//!   traffic — repeatedly, since each reap costs it one lost Message or a ping
-//!   that times out (see below). A peer that only streams Responses, Events or
-//!   Acks to us still has that problem, because those frames do not stamp. It
-//!   rests on a measured fact rather than an assumed one: the `reply_ep` UCX
-//!   hands the recv callback for a peer we hold an endpoint to is the *same
-//!   pointer* as the endpoint `ucp_ep_create` gave us.
+//!   traffic — repeatedly, since after each reap its Messages and pings to us
+//!   are lost, silently, until keepalive (~20 s) fails its endpoint; the first
+//!   loss is a Message with no error, or a ping that times out (see below). A
+//!   peer that only streams Responses, Events or Acks to us still has that
+//!   problem, because those frames do not stamp. It rests on a measured fact
+//!   rather than an assumed one: the `reply_ep` UCX hands the recv callback for
+//!   a peer we hold an endpoint to is the *same pointer* as the endpoint
+//!   `ucp_ep_create` gave us.
 //!   `an_inbound_frame_refreshes_the_endpoint_it_arrived_on` asserts it, because
 //!   connection matching (which the disruption finding below establishes) is a
 //!   weaker claim than pointer identity and would not have been enough.
@@ -171,7 +173,8 @@
 //! before the post, released on the inline and synchronous-failure exits, and
 //! released in `send_trampoline` for the asynchronous one. Only that last
 //! release reads the clock, and only when the count falls to zero. The count
-//! exists only with the reaper on, so the default configuration pays nothing.
+//! exists only with the reaper on, so with the reaper off (the default) a
+//! send pays only a `None` check, plus one clock read per `ucp_ep_create`.
 //! A send that never completes holds its endpoint open until UCX fails the
 //! endpoint, which is the conservative direction.
 //!
@@ -232,16 +235,21 @@
 //! building a fresh one. After a reap the peer's next REPLY-flagged frame to us
 //! is dropped. Its next Message is admitted and silently lost (measured). By
 //! the same inferred mechanism, its next ping gets no Pong, so its
-//! `check_health` returns `Timeout`. Its Responses and Events still arrive
-//! (measured: 8 of 8 in every run). Acks carry no REPLY flag either, so the
-//! same is expected, but it was not measured. Why: per the UCX source, a
+//! `check_health` returns `Timeout` (or `ConnectionFailed` if keepalive fails
+//! the endpoint while the probe is waiting). Its Responses and Events still
+//! arrive (measured: 8 of 8 in every run). Acks carry no REPLY flag either, so
+//! the same is expected, but it was not measured. Why: per the UCX source, a
 //! REPLY-flagged frame carries an endpoint id for the reply path, and a frame
 //! whose endpoint id no longer resolves is dropped. That is inferred from the
 //! source and a measurement, not proven. UCX keepalive (~20 s by default) then
 //! declares the peer's endpoint failed, and the frame after that takes velo's
-//! existing failed-connection path and arrives. One lost Message (or a ping
-//! that times out) and up to a keepalive interval of disruption, per reaped
-//! endpoint, self-healing. Both close modes were measured and behave
+//! existing failed-connection path and arrives. So after each reap the peer's
+//! Messages and pings to us are lost, silently, until keepalive (~20 s) fails
+//! its endpoint; the first loss is a Message with no error, or a ping that
+//! times out. Re-sending does not help (measured by hand;
+//! `reaping_disrupts_the_peers_path_back` asserts only that the first frame
+//! does not arrive). The disruption lasts up to a keepalive interval per reaped
+//! endpoint and heals itself. Both close modes were measured and behave
 //! identically, so FORCE is kept for the reasons below.
 //! `reaping_disrupts_the_peers_path_back` pins it and
 //! [`UcxTransportBuilder::ep_idle_timeout`](super::transport::UcxTransportBuilder::ep_idle_timeout)
@@ -544,17 +552,18 @@ pub(crate) struct WorkerShared {
     /// make endpoint creation slower than the idle timeout on demand.
     #[cfg(test)]
     pub ep_create_delay_ms: AtomicU64,
-    /// Test seam: the progress loop sleeps this long once, at the top of its
-    /// next pass, and then clears it. A peer that stops progressing is what
-    /// holds a first send in flight: the sender waits for the peer's half of
-    /// the wireup.
+    /// Test seam: at the top of its next pass, the progress loop clears this
+    /// cell and then sleeps once for the value it held (see
+    /// [`take_test_delay`] for why the order matters). A peer that stops
+    /// progressing is what holds a first send in flight: the sender waits for
+    /// the peer's half of the wireup.
     #[cfg(test)]
     pub progress_stall_ms: AtomicU64,
-    /// Test seam: the progress loop sleeps this long once, after the pass
-    /// clock is read and before `ucp_worker_progress`, and then clears it. It
-    /// stands in for a long progress call: a frame that waits in the socket
-    /// meanwhile is received late in the pass, well after the pass clock was
-    /// read.
+    /// Test seam: after the pass clock is read and before
+    /// `ucp_worker_progress`, the progress loop clears this cell and then
+    /// sleeps once for the value it held (see [`take_test_delay`]). It stands
+    /// in for a long progress loop: a frame that waits in the socket meanwhile
+    /// is received late in the pass, well after the pass clock was read.
     #[cfg(test)]
     pub pre_progress_delay_ms: AtomicU64,
 }
@@ -604,8 +613,10 @@ struct OpState {
 /// Sends in flight on one endpoint, and when the last of them completed.
 ///
 /// The idle reaper reads both. An endpoint with a send in flight is not idle,
-/// and the moment its last send completes counts as a use. Without the second
-/// part, a send slower than the timeout would be reaped the instant it
+/// and the moment its last send completes asynchronously counts as a use. A
+/// send that completes inline, inside `post_am`, records no completion time:
+/// the `ensure_ep` stamp from the same drain stands in for it. Without the
+/// second part, a send slower than the timeout would be reaped the instant it
 /// completed.
 ///
 /// Shared by the endpoint's [`EpEntry`] and each [`OpState`] posted on it,
@@ -1180,7 +1191,8 @@ struct EpEntry {
     /// stamped") give the details.
     last_used: Instant,
     /// Sends in flight on this endpoint. `Some` only with the idle reaper on,
-    /// which is the only reader, so the default configuration pays nothing.
+    /// which is the only reader, so with the reaper off (the default) a send
+    /// pays only a `None` check, plus one clock read per `ucp_ep_create`.
     sends: Option<Arc<EpSends>>,
 }
 
@@ -1287,9 +1299,10 @@ struct WorkerState {
     /// Two `Instant::now()` per pass instead of one per endpoint use: the send
     /// path stamps [`EpEntry::last_used`] from this, and an idle timeout is a
     /// seconds-scale quantity that has nothing to gain from a per-command clock
-    /// read. The read after the progress loop exists because one progress call
-    /// can outlast the timeout under load. `ensure_ep` reads the clock again
-    /// after `ucp_ep_create`, which can take longer than the timeout itself.
+    /// read. The read after the progress loop exists because one progress loop
+    /// (`ucp_worker_progress` run to quiescence) can outlast the timeout under
+    /// load. `ensure_ep` reads the clock again after `ucp_ep_create`, which can
+    /// take longer than the timeout itself.
     now: Instant,
     /// Earliest time [`WorkerState::reap_idle_eps`] will scan again. See
     /// [`ep_scan_period`].
@@ -1551,7 +1564,13 @@ fn drain_ring(
     (false, true)
 }
 
-/// Test seam: sleep once for the milliseconds in `cell`, then clear it.
+/// Test seam: clear `cell`, then sleep once for the milliseconds it held.
+///
+/// The order is load-bearing. A test that sees the cell read zero knows the
+/// progress thread has taken the value and is in, or entering, the sleep, with
+/// no progress call left before it.
+/// `a_frame_received_late_in_a_long_pass_is_not_stamped_early` relies on that
+/// to send while the thread is stalled.
 ///
 /// A load first, so the benchmarks in the test build pay no read-modify-write
 /// per pass.
@@ -1607,9 +1626,9 @@ fn run_loop(mut state: WorkerState, ring_rx: flume::Receiver<Cmd>) {
         while unsafe { sys::ucp_worker_progress(state.worker) } != 0 {
             last_activity = Instant::now();
         }
-        // Read the clock again: one progress call was measured at 526-573 ms
+        // Read the clock again: one progress loop was measured at 526-573 ms
         // under load. Without this, the flush drain and `stamp_inbound_use`
-        // below would stamp a frame received late in that call with the time
+        // below would stamp a frame received late in that loop with the time
         // the pass began, and the next scan could close the endpoint the frame
         // just used. The clock only moves forward, and a later stamp errs
         // toward keeping an endpoint open.
