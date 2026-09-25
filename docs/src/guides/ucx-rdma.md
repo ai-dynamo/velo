@@ -146,6 +146,14 @@ Do not use the system `ucx_info` to verify velo's build. The system UCX loads it
 
 Do not trust a configuration header that a program prints. The environment overrides the builder, so a header that says `UCX_TLS=tcp` can describe a run on InfiniBand. The `UCX_PROTO_INFO` table is the truth.
 
+## Version compatibility
+
+Two velo nodes can talk over UCX only if they use the same UCX wire version. Each node publishes that version in its UCX address, and `register()` refuses a peer on a different one.
+
+The current version is 2. Version 2 starts every frame header with the sender's 8-byte incarnation, so that the [endpoint idle reaper](../concepts/rendezvous.md#endpoint-idle-reaper) can tell which peer sent each frame. A version-1 node would misread those 8 bytes, so the two versions refuse each other instead.
+
+**Upgrade all UCX peers together.** During a rolling upgrade, an old node and a new node cannot reach each other over UCX. `register()` returns `InvalidEndpoint`, and the refusing node logs a warning: `ucx: rejecting peer blob: unsupported ucx blob version 1 (expected 2)`.
+
 ## Run the two-process example
 
 The example stages 8 MiB on an owner and pulls it on a consumer, with a TCP control plane and UCX beside it. The consumer exits non-zero if the transfer did not take the RDMA path.
@@ -232,4 +240,5 @@ timeout 300 cargo test -p velo --features ucx,test-helpers --lib transports::ucx
 | `ibv_reg_mr` fails at 32 MiB | The memlock limit is 8 MiB. | Set `ulimit -l unlimited`, or grant `IPC_LOCK` in a container. |
 | Process abort: `rc_verbs_impl.h:104 Fatal: receive completion ... with error` | A GET used an unusable or stale rkey on InfiniBand. | Report it. The single-use rkey rule was broken, or the TCP-only test above ran on InfiniBand. |
 | `ucp_ep.c:2222 UCX ERROR ep ... has already been closed` at teardown on InfiniBand | A double close during teardown. Assertions still pass. | None. This is known log noise. |
+| `register()` returns `InvalidEndpoint`, with the warning `ucx: rejecting peer blob: unsupported ucx blob version` | The peer runs a velo with a different UCX wire version. | Upgrade all UCX peers together. See [Version compatibility](#version-compatibility). |
 | `tcp_ep ... recv(-1) failed: Input/output error` on a peer | The endpoint idle reaper closed an endpoint. | None, if `ep_idle_timeout` is on. The node that logged this loses its Messages to the node that closed the endpoint, and, inferred, its pings, until keepalive fails its endpoint (about 20 s). See [Endpoint idle reaper](../concepts/rendezvous.md#endpoint-idle-reaper). |
