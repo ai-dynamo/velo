@@ -1778,8 +1778,8 @@ async fn ping_message_to(
 /// the floor, so nothing else would notice the clamp disappearing. What the
 /// floor guards against is a timeout shorter than endpoint wireup: endpoints
 /// then close between ordinary uses, each next use pays wireup again, and each
-/// close costs the peer one lost Message (or a ping that times out). The reaper
-/// reports none of that.
+/// close costs the peer its next Messages and pings to us, if it sends any
+/// before keepalive fails its endpoint. The reaper reports none of that.
 #[test]
 fn a_sub_floor_ep_idle_timeout_is_clamped() {
     let clamped = UcxTransportBuilder::new()
@@ -2233,8 +2233,8 @@ async fn a_slow_endpoint_create_does_not_age_the_new_endpoint() {
 /// not when the pass began.
 ///
 /// The progress thread reads its clock at the top of each pass, then runs
-/// `ucp_worker_progress` to quiescence. Under load one progress call took
-/// 526-573 ms. A frame received late in that call was stamped with the time
+/// `ucp_worker_progress` to quiescence. Under load one progress loop took
+/// 526-573 ms. A frame received late in that loop was stamped with the time
 /// the pass began, so at the 500 ms floor it was already about a timeout old,
 /// and the next pass's scan closed the endpoint it had just used.
 ///
@@ -2276,7 +2276,7 @@ async fn a_frame_received_late_in_a_long_pass_is_not_stamped_early() {
         .await,
         "A never entered the stall"
     );
-    // Same pass, after the clock read: the stand-in for a long progress call.
+    // Same pass, after the clock read: the stand-in for a long progress loop.
     a.transport
         .shared
         .pre_progress_delay_ms
@@ -2322,11 +2322,12 @@ async fn a_frame_received_late_in_a_long_pass_is_not_stamped_early() {
 /// the idle clock.
 ///
 /// A first send between fresh workers waits while the peer sets up its own
-/// endpoint back, inside the peer's `ucp_worker_progress`. In the parallel
-/// `--lib` run that took 526-573 ms, so the reaper closed the endpoint with
-/// the send in flight: the send failed through `on_error` and the frame was
-/// lost. The seam stops the peer's progress thread for three timeouts, which
-/// holds the send in flight on demand.
+/// endpoint back, inside the peer's `ucp_worker_progress`. In parallel
+/// UCX-module runs the peer's progress loop that contained that step took
+/// 526-573 ms, so the reaper closed the endpoint with the send in flight: the
+/// send failed through `on_error` and the frame was lost. The seam stops the
+/// peer's progress thread for three timeouts, which holds the send in flight on
+/// demand.
 ///
 /// The proof has two parts. `eps_closed_idle(&a) == 0` when the frame arrives
 /// shows the endpoint was not reaped under the send. That only means something
@@ -2437,18 +2438,23 @@ async fn a_send_in_flight_keeps_its_endpoint_open() {
 /// 1. The peer's next Message (a REPLY-flagged frame, as this test sends) to us
 ///    is admitted and **silently lost**: no `on_error`, no arrival. Re-sending
 ///    does not help, and neither does our side establishing a fresh endpoint of
-///    its own. Its Responses and Events still arrive (measured separately,
-///    not asserted here).
+///    its own (measured by hand; this test asserts only that the first frame
+///    does not arrive). By the same inferred mechanism, its next ping gets no
+///    Pong (not measured). Its Responses and Events still arrive
+///    (measured separately, not asserted here). Acks carry no REPLY flag
+///    either, so the same is expected, but it was not measured.
 /// 2. UCX keepalive (default interval ~20 s) eventually declares the peer's
 ///    endpoint failed, which fires its error handler and populates its
 ///    `failed_peers`.
 /// 3. The frame *after* that goes through velo's existing failed-connection
 ///    reaping onto a fresh endpoint and arrives normally.
 ///
-/// So it self-heals, at the cost of one lost Message (or a ping that times out)
-/// and up to a keepalive interval of disruption per reap — which is a real
-/// price to pay for reclaiming an idle connection, and exactly the input D9's
-/// "connection-pool policy revisited later" was waiting for.
+/// So it self-heals, but until keepalive fails the peer's endpoint its Messages
+/// and pings to us are lost, silently; the first loss is a Message with no
+/// error, or (inferred) a ping that times out. That is up to a keepalive
+/// interval of disruption per reap — which is a real price to pay for
+/// reclaiming an idle connection, and exactly the input D9's "connection-pool
+/// policy revisited later" was waiting for.
 ///
 /// This test pins the finding rather than the design intent. The window is short
 /// because step 2 cannot happen inside it; if this ever *does* arrive, UCX or
@@ -2509,12 +2515,13 @@ async fn reaping_disrupts_the_peers_path_back() {
 /// would pass trivially whenever the transfer happened to finish first.
 ///
 /// *A sub-floor timeout, set on the config directly.* The reaper has to act
-/// faster than a 64 MiB transfer over the tcp lane, while the builder's floor is
-/// sized for the opposite concern — dominating endpoint wireup, so that
-/// endpoints do not close between ordinary uses and re-pay wireup and a peer
-/// frame each time. Going under it isolates the exclusion from transfer timing,
-/// which is what is under test. Nothing here sends an Active Message, and the
-/// idle peer's close is the point of the test, so those costs do not apply.
+/// faster than a 64 MiB transfer over the tcp lane, while the builder's floor
+/// is sized for the opposite concern — dominating endpoint wireup, so that
+/// endpoints do not close between ordinary uses and re-pay wireup each time,
+/// while the peer loses its Messages and pings to us until keepalive fails its
+/// endpoint. Going under it isolates the exclusion from transfer timing, which
+/// is what is under test. Nothing here sends an Active Message, and the idle
+/// peer's close is the point of the test, so those costs do not apply.
 ///
 /// *Eager wireup, no frames.* Both endpoints are established by registration
 /// alone, so neither depends on an AM completing.
@@ -2641,7 +2648,8 @@ async fn an_endpoint_with_an_inflight_get_is_not_reaped() {
 /// endpoint, the last use on record is the moment the GET was posted. A GET
 /// slower than the timeout then leaves the endpoint closed at the first scan
 /// after it completes. No data is lost, but the next use pays a fresh wireup,
-/// and the close costs the peer one lost Message (or a ping that times out).
+/// and the peer loses its next Messages and pings to us, if it sends any
+/// before keepalive fails its endpoint.
 ///
 /// Over the tcp lane a GET needs the owner's progress thread, so stalling that
 /// thread holds the GET. The timeout is 2 s, so the scan period is 1 s, and a
@@ -2870,8 +2878,9 @@ async fn eager_wireup_follows_a_re_registration() {
 
 /// Eager wireup and the idle reaper together, which is the combination the
 /// builder docs promise composes: an endpoint established at registration and
-/// never used is reclaimed one timeout later, and a use after that wires up a
-/// new one. Intended behaviour, asserted so it stays intended.
+/// never used is reclaimed about one timeout later (see the close window), and
+/// a use after that wires up a new one. Intended behaviour, asserted so it
+/// stays intended.
 #[tokio::test(flavor = "multi_thread")]
 async fn eager_wireup_and_the_reaper_compose() {
     let a = start_node_with(|b| b.eager_endpoints(true).ep_idle_timeout(Some(IDLE))).await;
@@ -3077,7 +3086,7 @@ async fn bench_rma() {
 /// Responses, and a ping-pong round trip. Responses are measured apart because
 /// velo sends Messages with UCX's REPLY flag and Responses without it, and a
 /// change to what a frame carries shows only in the kind it changes. Run with
-/// `cargo test --features ucx -p velo --lib bench_am_send -- --ignored --nocapture --test-threads=1`.
+/// `timeout 300 cargo test --release --features ucx -p velo --lib bench_am_send -- --ignored --nocapture --test-threads=1`.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "benchmark: prints timings, asserts nothing"]
 async fn bench_am_send() {

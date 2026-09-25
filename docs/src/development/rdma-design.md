@@ -148,7 +148,7 @@ Destroying the rkey in the callback is safe, from the UCX 1.22 source:
 - **Every RMA reply resolves, including at teardown.** `ucp_worker_destroy` does not run user callbacks for operations still outstanding when the bounded drain expires. The worker keeps an `Arc` of every posted operation, and teardown answers each survivor with `ShuttingDown`. The reply sits in a take-once slot, so a late callback cannot answer twice.
 - **Offsets are relative to the mapped pointer.** `ucp_mem_map` rounds the pinned range out to page boundaries. A GET destination offset is measured from the caller's pointer and checked against the caller's length. A caller cannot name a byte inside the registration but outside its allocation.
 - **A cancelled map rolls back.** The region id is minted before the command is pushed. A dropped `map_region` future pushes an unmap for that id, and the progress thread also rolls back when it finds the reply channel closed.
-- **Endpoints close only after the ring is observed empty.** Reply commands carry raw endpoint pointers. The failed-endpoint reaper, the revalidation pass, and the idle reaper all run after the post-progress drain sees an empty ring. An earlier order let a FORCE close free an endpoint that a queued reply still named.
+- **Endpoints close only after the ring is observed empty.** Reply commands carry raw endpoint pointers. The parked-endpoint close, the failed-endpoint reaper, the revalidation pass, and the idle reaper all run after the post-progress drain sees an empty ring. An earlier order let a FORCE close free an endpoint that a queued reply still named.
 
 ### What teardown cannot promise
 
