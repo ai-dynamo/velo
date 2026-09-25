@@ -152,6 +152,8 @@ pub struct UcxTransport {
 impl UcxTransport {
     fn new(key: TransportKey, config: UcxConfig) -> Self {
         let (ring_tx, ring_rx) = flume::bounded(config.channel_capacity);
+        // Never zero: the receiver's sighting slots use zero for "empty".
+        let incarnation = (uuid::Uuid::new_v4().as_u128() as u64).max(1);
         let shared = Arc::new(WorkerShared {
             ring_tx: ring_tx.clone(),
             doorbell: Arc::new(Doorbell::new()),
@@ -167,7 +169,8 @@ impl UcxTransport {
             eps_closed_idle: Arc::new(Default::default()),
             eps_stamped_inbound: Arc::new(Default::default()),
             eps_inbound_unmatched: Arc::new(Default::default()),
-            reply_eps: Arc::new(super::worker::ReplyEpSightings::new()),
+            senders: Arc::new(super::worker::SenderSightings::new()),
+            incarnation,
             metrics: OnceLock::new(),
             #[cfg(test)]
             ep_create_delay_ms: AtomicU64::new(0),
@@ -179,7 +182,7 @@ impl UcxTransport {
         Self {
             key,
             config,
-            incarnation: uuid::Uuid::new_v4().as_u128() as u64,
+            incarnation,
             ring_tx,
             ring_rx: Mutex::new(Some(ring_rx)),
             shared,

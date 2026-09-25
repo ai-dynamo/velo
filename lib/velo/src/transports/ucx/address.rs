@@ -12,7 +12,12 @@
 use serde::{Deserialize, Serialize};
 
 /// Wire version of the blob. Bump on incompatible layout changes.
-pub(crate) const BLOB_VERSION: u8 = 1;
+///
+/// Also the version of the frame layout, since `register` is the only place a
+/// peer's version is checked. 2: every frame header starts with the sender's
+/// incarnation (`worker::SENDER_TAG_LEN`). A version-1 peer would read those
+/// bytes as its own header.
+pub(crate) const BLOB_VERSION: u8 = 2;
 
 /// Fixed base for velo's UCX Active Message id space.
 ///

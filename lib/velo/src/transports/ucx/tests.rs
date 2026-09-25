@@ -2000,17 +2000,11 @@ async fn a_peer_that_keeps_answering_keeps_its_endpoint(kind: MessageType) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "defect 1: a Response is sent without UCP_AM_SEND_FLAG_REPLY, so it \
-            arrives with no reply endpoint and never refreshes the receiver's \
-            endpoint; the receiver reaps it under the stream"]
 async fn a_peer_that_keeps_sending_responses_keeps_its_endpoint() {
     a_peer_that_keeps_answering_keeps_its_endpoint(MessageType::Response).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "defect 1: an Event is sent without UCP_AM_SEND_FLAG_REPLY, so it \
-            arrives with no reply endpoint and never refreshes the receiver's \
-            endpoint; the receiver reaps it under the stream"]
 async fn a_peer_that_keeps_sending_events_keeps_its_endpoint() {
     a_peer_that_keeps_answering_keeps_its_endpoint(MessageType::Event).await;
 }
