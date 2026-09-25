@@ -1809,83 +1809,111 @@ fn a_sub_floor_ep_idle_timeout_is_clamped() {
     );
 }
 
-/// **The load-bearing empirical fact.** For a peer we have an endpoint to, is
-/// the `reply_ep` UCX hands the recv callback the *same pointer* as the endpoint
-/// we created to that peer?
+/// Every kind of frame a peer sends us refreshes our endpoint to that peer, and
+/// a frame from a peer we hold no endpoint to refreshes nothing.
 ///
-/// The inbound freshness stamp is only possible if it is. Connection matching —
-/// which the reap-disruption finding establishes UCX does — is not the same
-/// claim: UCX could route the peer's frames over our connection while handing
-/// the callback a distinct `ucp_ep_h` wrapper, and then there would be nothing
-/// at this layer to stamp.
-///
-/// The two counters split the answer. `eps_stamped_inbound` rises only when a
-/// sighting matched an endpoint this worker owns; `eps_inbound_unmatched` rises
-/// when it matched nothing. Both are ordinary in general — a peer we have never
-/// sent to replies on an endpoint UCX made and we do not own — so what settles
-/// it is the *directional* case below: A sends to B (so A owns an endpoint to
-/// B), then B sends to A, and A's stamp count must move.
+/// The stamp keys on the sender's incarnation, which starts every frame
+/// header, not on UCX's `reply_ep`. UCX sets `reply_ep` only for frames sent
+/// with `UCP_AM_SEND_FLAG_REPLY` (Messages and pings), so a stamp keyed on it
+/// missed Responses, Events, Acks, Pongs and ShuttingDown echoes. This test
+/// sends one frame of each kind from B to A, waits for A's stamp count to move
+/// by one each time, and checks that none of them went unmatched. A pong is
+/// covered by A probing B. Then a third node C, which A has no endpoint to,
+/// sends A a Message: that must count as unmatched and stamp nothing.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_inbound_frame_refreshes_the_endpoint_it_arrived_on() {
+async fn an_inbound_frame_refreshes_the_endpoint_to_its_sender() {
     // The reaper gates the stamping work, so it has to be on — at a timeout far
     // longer than this test, since nothing here is about reaping.
     let a = start_node_with(|b| b.ep_idle_timeout(Some(Duration::from_secs(3600)))).await;
     let b = start_node().await;
+    let c = start_node().await;
     cross_register(&a, &b);
+    cross_register(&a, &c);
     let errs = CountingErrors::new();
+    let stamped = || {
+        a.transport
+            .shared
+            .eps_stamped_inbound
+            .load(Ordering::SeqCst)
+    };
+    let unmatched = || {
+        a.transport
+            .shared
+            .eps_inbound_unmatched
+            .load(Ordering::SeqCst)
+    };
 
-    // A now owns an endpoint to B.
+    // A now owns an endpoint to B, and none to C.
     ping_message(&a, &b, &errs).await;
     assert_eq!(eps_open(&a), 1);
-    let before = a
-        .transport
-        .shared
-        .eps_stamped_inbound
-        .load(Ordering::SeqCst);
+    let unmatched_before = unmatched();
 
-    // B sends to A. If the reply endpoint A's callback sees is the one A
-    // created, this stamps it.
-    ping_message(&b, &a, &errs).await;
-
-    let stamped = wait_until(T, || {
-        a.transport
-            .shared
-            .eps_stamped_inbound
-            .load(Ordering::SeqCst)
-            > before
-    })
-    .await;
-    let unmatched = a
-        .transport
-        .shared
-        .eps_inbound_unmatched
-        .load(Ordering::SeqCst);
-    println!(
-        "reply_ep identity: stamped={} unmatched={unmatched}",
-        a.transport
-            .shared
-            .eps_stamped_inbound
-            .load(Ordering::SeqCst)
-    );
+    for kind in [
+        MessageType::Message,
+        MessageType::Response,
+        MessageType::Event,
+        MessageType::Ack,
+        MessageType::ShuttingDown,
+    ] {
+        let before = stamped();
+        let out = b.transport.send_message(
+            a.instance_id,
+            Bytes::from_static(b"h"),
+            Bytes::from_static(b"p"),
+            kind,
+            errs.clone(),
+        );
+        assert!(matches!(out, SendOutcome::Admitted));
+        assert!(
+            wait_until(T, || stamped() > before).await,
+            "a {kind:?} frame from B did not refresh A's endpoint to B \
+             (unmatched: {})",
+            unmatched() - unmatched_before
+        );
+    }
+    // A pong: A probes B, and B's answer arrives at A.
+    let before = stamped();
+    assert!(a.transport.check_health(b.instance_id, T).await.is_ok());
     assert!(
-        stamped,
-        "an inbound frame from a peer we hold an endpoint to did not refresh it \
-         (unmatched sightings: {unmatched}). UCX is handing the recv callback a \
-         reply endpoint that is not the one `ucp_ep_create` gave us, so no inbound \
-         freshness stamp is possible at this layer — see the operator guidance on \
-         UcxTransportBuilder::ep_idle_timeout, which depends on this holding."
+        wait_until(T, || stamped() > before).await,
+        "a pong from B did not refresh A's endpoint to B"
     );
+    // A ping: B probes A.
+    let before = stamped();
+    assert!(b.transport.check_health(a.instance_id, T).await.is_ok());
+    assert!(
+        wait_until(T, || stamped() > before).await,
+        "a ping from B did not refresh A's endpoint to B"
+    );
+    assert_eq!(
+        unmatched(),
+        unmatched_before,
+        "a frame from B matched no endpoint, though A holds one to B"
+    );
+
+    // C's frame arrives, and matches nothing: A has no endpoint to C.
+    let before = stamped();
+    ping_message(&c, &a, &errs).await;
+    assert!(
+        wait_until(T, || unmatched() > unmatched_before).await,
+        "a frame from a peer A holds no endpoint to was not counted as unmatched"
+    );
+    assert_eq!(stamped(), before, "a frame from C stamped an endpoint");
+    assert_eq!(eps_open(&a), 1);
+    assert_eq!(errs.count(), 0);
 
     a.transport.shutdown();
     b.transport.shutdown();
+    c.transport.shutdown();
     assert_rma_balanced(&a);
     assert_rma_balanced(&b);
+    assert_rma_balanced(&c);
 }
 
 /// The consequence that matters operationally: a peer that only ever *sends*
 /// us Messages keeps its endpoint alive, instead of having it reaped and
-/// blackholed under its own traffic. It pins the Message case only: Responses,
-/// Events and Acks do not refresh the endpoint.
+/// blackholed under its own traffic. The Response and Event cases are pinned
+/// by the two tests after this one.
 ///
 /// This is the mutation target for the inbound stamp — remove it and the
 /// endpoint here is reaped on schedule, which the assertion catches.

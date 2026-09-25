@@ -325,8 +325,11 @@ impl Transport for UcxTransport {
             .get_entry(&self.key)
             .map_err(|_| TransportError::NoEndpoint)?
             .ok_or(TransportError::NoEndpoint)?;
+        // A warning, not a debug line: a refused blob is a misconfigured or
+        // mixed-version fleet (a blob version 1 peer after the move to 2), and
+        // `InvalidEndpoint` alone does not say which.
         let endpoint = UcxEndpoint::decode(&entry).map_err(|e| {
-            debug!("ucx: rejecting peer blob: {e}");
+            warn!("ucx: rejecting peer blob: {e}");
             TransportError::InvalidEndpoint
         })?;
         let peer = peer_info.instance_id();
@@ -672,22 +675,20 @@ impl UcxTransportBuilder {
     /// # What counts as use — both directions
     ///
     /// Anything this side initiates: a frame send, an RDMA GET, an eager
-    /// wireup. **And the Messages and pings the peer sends us** — the frames
-    /// sent with UCX's REPLY flag, which are the only ones that arrive with a
-    /// reply endpoint — refresh the endpoint they arrived on. So "idle" means
-    /// idle in both directions for Messages and pings: a peer that keeps
-    /// sending us Messages does not have its endpoint reaped under its own
-    /// traffic, and `a_peer_that_keeps_sending_keeps_its_endpoint` pins that
-    /// case. Responses, Events, Acks, Pongs and ShuttingDown echoes do not
-    /// refresh the endpoint, so a peer that only streams those to us is reaped
-    /// on schedule.
+    /// wireup. **And every frame the peer sends us**, of any kind. Each frame
+    /// starts with its sender's incarnation, and the receiver refreshes the
+    /// endpoint to the peer whose blob carries it. So "idle" means idle in
+    /// both directions: a peer that keeps sending us Messages, or keeps
+    /// streaming Responses or Events back to us, does not have its endpoint
+    /// reaped under its own traffic. `a_peer_that_keeps_sending_keeps_its_endpoint`,
+    /// `a_peer_that_keeps_sending_responses_keeps_its_endpoint` and
+    /// `a_peer_that_keeps_sending_events_keeps_its_endpoint` pin that.
     ///
     /// The progress thread keeps at most eight of these refreshes until it
-    /// drains them, at most once per loop pass. If more than eight Messages and
-    /// pings, from all peers together, arrive before a drain, the oldest are
+    /// drains them, at most once per loop pass. If more than eight frames,
+    /// from all peers together, arrive before a drain, the oldest are
     /// overwritten and those frames do not refresh their endpoints. Under heavy
-    /// fan-in, a peer that keeps sending Messages can therefore still be
-    /// reaped.
+    /// fan-in, a peer that keeps sending can therefore still be reaped.
     ///
     /// # Health probes are not free here
     ///
@@ -714,8 +715,7 @@ impl UcxTransportBuilder {
     /// comes between one timeout and one timeout plus one scan period plus
     /// 100 ms after the last use. A long pass on a busy worker delays it
     /// further. Uses are stamped from a clock the progress thread reads a few
-    /// times per pass, not per use. Inbound Messages and pings (the frames sent
-    /// with the REPLY flag, the only ones that stamp) are stamped after they
+    /// times per pass, not per use. Inbound frames are stamped after they
     /// arrive, which errs toward keeping the endpoint open. A send is stamped
     /// at most one command drain before it is posted, which can shorten the
     /// timeout by that much. An endpoint is never closed while an RDMA
@@ -762,12 +762,9 @@ impl UcxTransportBuilder {
     /// So it self-heals, at a cost of one lost Message or ping and up to a
     /// keepalive interval of disruption *per reaped endpoint*. That is what
     /// makes the bidirectional freshness stamp above load-bearing rather than a
-    /// nicety: a peer that keeps sending Messages or pings is not reaped, unless
-    /// more than eight REPLY-flagged frames arrive between two drains and
-    /// overwrite its refreshes (see above), so it does not pay this. A peer
-    /// that keeps sending only Responses, Events or Acks does not refresh the
-    /// stamp, so our endpoint to it can still be reaped, and it then pays with
-    /// its next Message or ping.
+    /// nicety: a peer that keeps sending us frames of any kind is not reaped,
+    /// unless more than eight frames arrive between two drains and overwrite
+    /// its refreshes (see above), so it does not pay this.
     ///
     /// Which leaves the patterns where it is still paid, and they are the ones
     /// to check before enabling:
@@ -779,22 +776,23 @@ impl UcxTransportBuilder {
     ///   hears from. Reaping costs nothing, since the disruption is to the
     ///   *peer's* path back and no peer is using one.
     /// * **Probe-only peers** — see the health-probe section above. Avoid.
-    /// * **Peers that stream Responses or Events to us** for longer than the
-    ///   timeout, while this side sends nothing. Those frames do not refresh
-    ///   the endpoint, so it can be reaped mid-stream. The stream itself still
-    ///   arrives, but the peer then loses its next Message or ping to us.
-    ///   Avoid, or use a timeout longer than the longest such stream.
-    /// * **Heavy fan-in** — more than eight Messages and pings, from all peers
-    ///   together, between two drains of the refreshes. The oldest refreshes
-    ///   are lost, so a peer that is sending can be reaped as if it were idle.
+    /// * **Heavy fan-in** — more than eight frames, from all peers together,
+    ///   between two drains of the refreshes. The oldest refreshes are lost, so
+    ///   a peer that is sending can be reaped as if it were idle.
     ///
     /// Note what is *not* on that list: "one-directional" is not by itself a
     /// safe answer, because the receiving side of a one-directional flow is the
     /// worst case — it is the side whose path back gets disrupted. The stamp
-    /// makes that case correct only when the flow is Messages or pings. A flow
-    /// of Responses, Events or Acks toward us is not covered, as the list
-    /// above says. A deployment reasoning about the knob should reason about
-    /// it per-direction, and per frame type, rather than per-link.
+    /// makes that case correct, for every frame kind, but a deployment
+    /// reasoning about the knob should reason about it per-direction rather
+    /// than per-link.
+    ///
+    /// # Wire compatibility
+    ///
+    /// The sender tag that makes every frame kind count is part of the frame
+    /// layout, which the blob version (2) covers. A node on blob version 1
+    /// and a node on version 2 refuse each other at registration, so all UCX
+    /// peers must be upgraded together.
     ///
     /// This is why the default is off, and why D9 left connection-pool policy to
     /// be revisited with exactly this measurement in hand.

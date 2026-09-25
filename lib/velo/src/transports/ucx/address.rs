@@ -13,10 +13,17 @@ use serde::{Deserialize, Serialize};
 
 /// Wire version of the blob. Bump on incompatible layout changes.
 ///
-/// Also the version of the frame layout, since `register` is the only place a
-/// peer's version is checked. 2: every frame header starts with the sender's
-/// incarnation (`worker::SENDER_TAG_LEN`). A version-1 peer would read those
-/// bytes as its own header.
+/// It also versions the frame layout, because `register` is the only place a
+/// peer's version is checked.
+///
+/// Version 2 moved it: every frame header now starts with the sender's
+/// incarnation (`worker::SENDER_TAG_LEN`), so that the idle reaper can tell
+/// which peer sent a Response or an Event. A version-1 peer would read those
+/// eight bytes as the start of velo's own header, and a version-2 peer would
+/// strip eight bytes of a version-1 header. Refusing the peer at registration
+/// turns that silent corruption into an error. The cost is that version 1
+/// and version 2 nodes cannot talk over UCX at all, so all UCX peers must be
+/// upgraded together.
 pub(crate) const BLOB_VERSION: u8 = 2;
 
 /// Fixed base for velo's UCX Active Message id space.
@@ -114,6 +121,23 @@ mod tests {
     fn blob_rejects_wrong_version() {
         let ep = UcxEndpoint {
             v: BLOB_VERSION + 1,
+            am_id_base: AM_ID_BASE,
+            eager_max: 0,
+            incarnation: 0,
+            worker_addr: vec![0],
+        };
+        let bytes = rmp_serde::to_vec(&ep).unwrap();
+        assert!(UcxEndpoint::decode(&bytes).is_err());
+    }
+
+    /// A version-1 peer frames without the sender tag, so it must be refused
+    /// at registration rather than have eight bytes of every header misread.
+    /// This is the wire break: version 1 and version 2 nodes cannot pair.
+    #[test]
+    fn blob_rejects_a_peer_without_the_sender_tag() {
+        assert_eq!(BLOB_VERSION, 2);
+        let ep = UcxEndpoint {
+            v: 1,
             am_id_base: AM_ID_BASE,
             eager_max: 0,
             incarnation: 0,

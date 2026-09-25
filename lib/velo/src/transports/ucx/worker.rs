@@ -178,18 +178,21 @@
 //! of this benchmark is therefore at least ±6%.
 //!
 //! Replies posted on a reply endpoint (`Cmd::PongTo`, `Cmd::ShuttingDownTo`)
-//! carry no count, because they do not go through `ensure_ep`. The pointer can
-//! still equal an endpoint we own (that identity is what the inbound stamp rests
-//! on), so such a reply rides an endpoint the reaper tracks without counting on
-//! it. The window is covered, unless more than `SENDER_SLOTS`
-//! frames arrived before the drain: the inbound frame that
-//! caused the reply is stamped by `stamp_inbound_use` in the same pass, before
-//! the scan, with the clock read after the progress loop. The reply is posted
-//! in the flush drain just after that read, so the endpoint cannot be closed
-//! until one timeout, less the length of that drain, after the reply is posted.
-//! If more than `SENDER_SLOTS` such frames arrived, the oldest sightings were
-//! overwritten (see [`SenderSightings`]), and the endpoint the reply went out
-//! on may not be refreshed, so it can be closed in the same pass.
+//! carry no count, because they do not go through `ensure_ep`. UCX can hand
+//! the receive callback the very endpoint we own to that peer (it did in every
+//! measurement over the tcp lane), so such a reply can ride an endpoint the
+//! reaper tracks without counting on it. The window is covered anyway: the
+//! inbound frame that caused the reply stamps our endpoint to its sender, by
+//! incarnation, in `stamp_inbound_use` in the same pass, before the scan, with
+//! the clock read after the progress loop. The reply is posted in the flush
+//! drain just after that read, so the endpoint cannot be closed until one
+//! timeout, less the length of that drain, after the reply is posted. If the
+//! reply endpoint is not one we own, the reaper never closes it. Either way
+//! nothing depends on which pointer UCX hands out.
+//! The exception: if more than `SENDER_SLOTS` frames arrived before the
+//! drain, the oldest sightings were overwritten (see [`SenderSightings`]),
+//! and the endpoint the reply went out on may not be refreshed, so it can be
+//! closed in the same pass.
 //!
 //! **Endpoint creation is not idle time.** `last_used` is stamped from
 //! [`WorkerState::now`], and `ensure_ep` advances that clock after
@@ -489,7 +492,7 @@ pub(crate) struct WorkerShared {
     pub eps_open: Arc<AtomicUsize>,
     /// Inbound frames whose sender matched an endpoint this worker owns, so the
     /// idle reaper's freshness stamp was refreshed by traffic *from* the peer.
-    /// `an_inbound_frame_refreshes_the_endpoint_it_arrived_on` reads it.
+    /// `an_inbound_frame_refreshes_the_endpoint_to_its_sender` reads it.
     pub eps_stamped_inbound: Arc<AtomicU64>,
     /// Inbound frames whose sender matched no endpoint this worker owns:
     /// routine for a peer we have never sent to.
@@ -2157,18 +2160,20 @@ impl WorkerState {
                 // NOTED RISK, for whoever changes close timing next. Every close
                 // that existed before this one was reactive — a peer failed, or
                 // was re-registered — so this is the first site that FORCE-closes
-                // the endpoint of a peer that is alive and well. The reply
-                // commands carrying raw `ucp_ep_h` values (`Cmd::PongTo`,
-                // `Cmd::ShuttingDownTo`) are covered by the ring-drain guard
-                // this block sits inside; the *other* window, a reply endpoint
-                // UCX itself hands out for an inbound AM, is covered only by the
-                // empirical result that it is the same pointer as ours and thus
-                // dies with it. That is measured
-                // (`an_inbound_frame_refreshes_the_endpoint_it_arrived_on`), not
-                // guaranteed by the ring drain. A future change that closes
-                // endpoints from anywhere else, or at any other point in the
-                // pass, must re-establish it rather than assume the drain guard
-                // covers it.
+                // the endpoint of a peer that is alive and well. Two things make
+                // that safe here. First, the reply commands carrying raw
+                // `ucp_ep_h` values (`Cmd::PongTo`, `Cmd::ShuttingDownTo`) are
+                // enqueued only from AM callbacks, and this block runs only
+                // after the ring has been observed empty, so no such command
+                // can name a closed endpoint. Second, a reply those commands
+                // posted may ride this very endpoint without a send count (UCX
+                // can hand the callback our own endpoint). The inbound frame
+                // that caused it stamped this endpoint by the sender's
+                // incarnation in `stamp_inbound_use`, earlier in this same
+                // pass, so the scan cannot pick it for another timeout. A
+                // future change that closes endpoints from anywhere else, or
+                // before `stamp_inbound_use` in the pass, must re-establish
+                // both rather than assume they still hold.
                 self.close_ep(entry, true);
                 self.shared.eps_closed_idle.fetch_add(1, Ordering::Relaxed);
             }
