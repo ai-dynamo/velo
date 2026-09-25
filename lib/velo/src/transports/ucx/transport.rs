@@ -90,12 +90,13 @@ pub struct UcxConfig {
 /// those sends. (Replies posted on the endpoint UCX hands the receive callback
 /// are not counted.) What a short timeout does is close endpoints between
 /// ordinary uses, and each close makes the next use pay wireup again and costs
-/// the peer a frame (see [`UcxTransportBuilder::ep_idle_timeout`]). Measured
-/// wireup, on a worker that has already created an endpoint, is ~14 ms on CX-7
-/// InfiniBand and upwards of 10 ms over the tcp lane in CI, so half a second is
-/// roughly thirty-five times that. A fresh worker costs more: on a GB200 node
-/// its first `ucp_ep_create` took 110-150 ms, and a fresh pair's first frame
-/// took 360-420 ms to arrive with the node's CPUs oversubscribed.
+/// the peer one lost Message or a ping that times out (see
+/// [`UcxTransportBuilder::ep_idle_timeout`]). Measured wireup, on a worker that
+/// has already created an endpoint, is ~14 ms on CX-7 InfiniBand and upwards of
+/// 10 ms over the tcp lane in CI, so half a second is roughly thirty-five times
+/// that. A fresh worker costs more: on a GB200 node its first `ucp_ep_create`
+/// took 110-150 ms, and a fresh pair's first frame took 360-420 ms to arrive
+/// with the node's CPUs oversubscribed.
 ///
 /// It is a builder-level ergonomic guard, not an invariant of the reaper: a test
 /// constructing a [`UcxConfig`] directly can go below it deliberately.
@@ -698,12 +699,13 @@ impl UcxTransportBuilder {
     ///
     /// For a peer this instance *only* probes, it is a create/reap/disrupt
     /// generator: each probe wires an endpoint up, the reaper closes it one
-    /// timeout later, and every close costs that peer a frame (see below).
-    /// Probing on an interval longer than this timeout therefore manufactures
-    /// exactly the disruption this knob is trying to be worth. There is no
-    /// periodic prober in-tree — `check_health` has no in-tree periodic caller —
-    /// so this only applies to a caller that has built one; if you have, either
-    /// probe faster than the timeout or do not enable this.
+    /// timeout later, and every close costs that peer one lost Message or a
+    /// ping that times out (see below). Probing on an interval longer than this
+    /// timeout therefore manufactures exactly the disruption this knob is
+    /// trying to be worth. There is no periodic prober in-tree — `check_health`
+    /// has no in-tree periodic caller — so this only applies to a caller that
+    /// has built one; if you have, either probe faster than the timeout or do
+    /// not enable this.
     ///
     /// # What it promises
     ///
@@ -747,18 +749,21 @@ impl UcxTransportBuilder {
     /// from the source and a measurement, not proven. Measured over the tcp
     /// lane, with both close modes:
     ///
-    /// 1. The peer's next Message or ping to us is admitted and **silently
-    ///    lost** — no error at its end, no arrival at ours. Retrying does not
+    /// 1. The peer's next Message to us is admitted and **silently lost** —
+    ///    no error at its end, no arrival at ours (measured). Retrying does not
     ///    help, and neither does this side establishing a fresh endpoint of its
-    ///    own. Its Responses, Events and Acks still arrive (measured: 8 of 8 in
-    ///    every run).
+    ///    own. By the same inferred mechanism, its next ping gets no Pong, so
+    ///    its `check_health` returns `Timeout` (or `ConnectionFailed` once step
+    ///    2 has marked the endpoint failed). Its Responses and Events still
+    ///    arrive (measured: 8 of 8 in every run). Acks carry no REPLY flag
+    ///    either, so the same is expected, but it was not measured.
     /// 2. UCX keepalive (default interval ~20 s) eventually declares the peer's
     ///    endpoint failed and fires its error handler.
     /// 3. The frame after that takes velo's existing failed-connection path onto
     ///    a fresh endpoint and arrives normally.
     ///
-    /// So it self-heals, at a cost of one lost Message or ping and up to a
-    /// keepalive interval of disruption *per reaped endpoint*. That is what
+    /// So it self-heals, at a cost of one lost Message (or a ping that times
+    /// out) and up to a keepalive interval of disruption *per reaped endpoint*. That is what
     /// makes the bidirectional freshness stamp above load-bearing rather than a
     /// nicety: a peer that keeps sending us frames of any kind is not reaped,
     /// so it does not pay this.
@@ -767,8 +772,8 @@ impl UcxTransportBuilder {
     /// to check before enabling:
     ///
     /// * **Genuinely symmetric-idle peers** — neither side has spoken for a
-    ///   timeout. Reaping costs whoever speaks first one frame. This is the case
-    ///   the knob is for.
+    ///   timeout. Reaping costs whoever speaks first one lost Message (or a
+    ///   ping that times out). This is the case the knob is for.
     /// * **Send-side-only fan-out** — this instance sends to many peers it never
     ///   hears from. Reaping costs nothing, since the disruption is to the
     ///   *peer's* path back and no peer is using one.

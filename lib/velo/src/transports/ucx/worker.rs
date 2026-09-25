@@ -137,8 +137,8 @@
 //!   and the stamp goes to the endpoint whose peer blob carries that
 //!   incarnation. Without it "idle" would mean "we have not sent", and a peer
 //!   that only ever sends to us would have its endpoint reaped out from under
-//!   its own traffic — repeatedly, since each reap costs it a frame (see
-//!   below). UCX's `reply_ep` cannot carry this: UCX sets it only for frames
+//!   its own traffic — repeatedly, since each reap costs it one lost Message
+//!   or a ping that times out (see below). UCX's `reply_ep` cannot carry this: UCX sets it only for frames
 //!   sent with `UCP_AM_SEND_FLAG_REPLY`, which velo sets on Messages and pings
 //!   only, so a peer streaming Responses or Events back to us would go
 //!   unseen. The receive callback hands senders to the main loop through
@@ -226,15 +226,18 @@
 //! UCX pairs endpoints by remote worker, so velo's REPLY-flagged Active
 //! Messages cause a matching endpoint to exist on the peer, and the peer's own
 //! `ucp_ep_create` back to us is matched onto *that* connection rather than
-//! building a fresh one. After a reap the peer's next REPLY-flagged frame to
-//! us, its next Message or ping, is admitted and silently lost. Its Responses,
-//! Events and Acks still arrive (measured: 8 of 8 in every run). Why: per the
-//! UCX source, a REPLY-flagged frame carries an endpoint id for the reply path,
-//! and a frame whose endpoint id no longer resolves is dropped. That is
-//! inferred from the source and a measurement, not proven. UCX keepalive (~20 s
-//! by default) then declares the peer's endpoint failed, and the frame after
-//! that takes velo's existing failed-connection path and arrives. One lost
-//! Message or ping and up to a keepalive interval of disruption, per reaped
+//! building a fresh one. After a reap the peer's next REPLY-flagged frame to us
+//! is dropped. Its next Message is admitted and silently lost (measured). By
+//! the same inferred mechanism, its next ping gets no Pong, so its
+//! `check_health` returns `Timeout`. Its Responses and Events still arrive
+//! (measured: 8 of 8 in every run). Acks carry no REPLY flag either, so the
+//! same is expected, but it was not measured. Why: per the UCX source, a
+//! REPLY-flagged frame carries an endpoint id for the reply path, and a frame
+//! whose endpoint id no longer resolves is dropped. That is inferred from the
+//! source and a measurement, not proven. UCX keepalive (~20 s by default) then
+//! declares the peer's endpoint failed, and the frame after that takes velo's
+//! existing failed-connection path and arrives. One lost Message (or a ping
+//! that times out) and up to a keepalive interval of disruption, per reaped
 //! endpoint, self-healing. Both close modes were measured and behave
 //! identically, so FORCE is kept for the reasons below.
 //! `reaping_disrupts_the_peers_path_back` pins it and
@@ -859,7 +862,7 @@ struct RecvShared {
     /// Set once at worker start and never mutated, so this costs a predictable
     /// branch on a struct the callback has already dereferenced. Without it,
     /// every process that never enables the reaper would still pay two atomics
-    /// per inbound frame to fill a ring nothing drains.
+    /// per REPLY-flagged inbound frame to fill a ring nothing drains.
     stamp_inbound: bool,
     /// The state the transport side shares with the progress thread. The
     /// callback reads `ring_tx`, `pending_pings`, `senders` and `metrics`
@@ -878,7 +881,7 @@ struct RecvShared {
 pub(crate) const SENDER_TAG_LEN: usize = 8;
 
 /// How many sender sightings the recv trampoline can hand over between two
-/// passes of the main loop.
+/// drains.
 ///
 /// The loop drains this only in `stamp_inbound_use`, which runs in a pass that
 /// observed the command ring empty, and any number of frames can arrive
@@ -1190,8 +1193,8 @@ struct EpEntry {
     /// the peers map after re-registrations.
     incarnation: u64,
     /// When [`WorkerState::ensure_ep`] last handed this endpoint out, or
-    /// [`WorkerState::stamp_inbound_use`] last saw a Message or ping arrive on
-    /// it, whichever is later.
+    /// [`WorkerState::stamp_inbound_use`] last saw a frame from its peer, or
+    /// an RMA operation to that peer completed, whichever is latest.
     ///
     /// A plain `Instant`, not an atomic: `EpEntry` never leaves the progress
     /// thread. It is sampled from [`WorkerState::now`] rather than read from

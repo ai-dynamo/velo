@@ -1681,8 +1681,8 @@ async fn truncated_rkey_is_refused_before_ucx() {
 /// abandoned-operation path: measured, UCX completes the GET with
 /// `Endpoint timeout` rather than leaving it outstanding, so the reply comes
 /// from the normal completion route. `WorkerState::abandon_rma_ops` remains the
-/// backstop for a peer that stops progressing without closing — a state this
-/// harness cannot produce, and a hardware-checkpoint item.
+/// backstop for a peer that stops progressing without closing, which this
+/// test does not exercise.
 #[tokio::test(flavor = "multi_thread")]
 async fn peer_shutdown_during_get_answers_caller() {
     const LEN: usize = 64 * 1024 * 1024;
@@ -1778,7 +1778,8 @@ async fn ping_message_to(
 /// the floor, so nothing else would notice the clamp disappearing. What the
 /// floor guards against is a timeout shorter than endpoint wireup: endpoints
 /// then close between ordinary uses, each next use pays wireup again, and each
-/// close costs the peer a frame. The reaper reports none of that.
+/// close costs the peer one lost Message (or a ping that times out). The reaper
+/// reports none of that.
 #[test]
 fn a_sub_floor_ep_idle_timeout_is_clamped() {
     let clamped = UcxTransportBuilder::new()
@@ -2031,9 +2032,9 @@ async fn a_peer_that_keeps_sending_keeps_its_endpoint() {
 /// count B's frames as use of its endpoint to B. If A reaps that endpoint
 /// under the stream, the stream itself survives over the tcp lane: Responses
 /// and Events sent after the reap were measured to arrive. What the reap
-/// costs is B's next Message or ping to A, which is lost without an error
-/// (`reaping_disrupts_the_peers_path_back`), and the wireup A's next send
-/// pays. So the endpoint count is the assertion that fails here, not the
+/// costs is B's next Message to A, which is lost without an error
+/// (`reaping_disrupts_the_peers_path_back`), or B's next ping, which gets no
+/// Pong, and the wireup A's next send pays. So the endpoint count is the assertion that fails here, not the
 /// arrival count.
 ///
 /// `a_peer_that_keeps_sending_keeps_its_endpoint` is the control: the same
@@ -2436,17 +2437,18 @@ async fn a_send_in_flight_keeps_its_endpoint_open() {
 /// 1. The peer's next Message (a REPLY-flagged frame, as this test sends) to us
 ///    is admitted and **silently lost**: no `on_error`, no arrival. Re-sending
 ///    does not help, and neither does our side establishing a fresh endpoint of
-///    its own. Its Responses, Events and Acks still arrive.
+///    its own. Its Responses and Events still arrive (measured separately,
+///    not asserted here).
 /// 2. UCX keepalive (default interval ~20 s) eventually declares the peer's
 ///    endpoint failed, which fires its error handler and populates its
 ///    `failed_peers`.
 /// 3. The frame *after* that goes through velo's existing failed-connection
 ///    reaping onto a fresh endpoint and arrives normally.
 ///
-/// So it self-heals, at the cost of one lost frame and up to a keepalive
-/// interval of disruption per reap — which is a real price to pay for reclaiming
-/// an idle connection, and exactly the input D9's "connection-pool policy
-/// revisited later" was waiting for.
+/// So it self-heals, at the cost of one lost Message (or a ping that times out)
+/// and up to a keepalive interval of disruption per reap — which is a real
+/// price to pay for reclaiming an idle connection, and exactly the input D9's
+/// "connection-pool policy revisited later" was waiting for.
 ///
 /// This test pins the finding rather than the design intent. The window is short
 /// because step 2 cannot happen inside it; if this ever *does* arrive, UCX or
@@ -2639,7 +2641,7 @@ async fn an_endpoint_with_an_inflight_get_is_not_reaped() {
 /// endpoint, the last use on record is the moment the GET was posted. A GET
 /// slower than the timeout then leaves the endpoint closed at the first scan
 /// after it completes. No data is lost, but the next use pays a fresh wireup,
-/// and the close costs the peer a frame.
+/// and the close costs the peer one lost Message (or a ping that times out).
 ///
 /// Over the tcp lane a GET needs the owner's progress thread, so stalling that
 /// thread holds the GET. The timeout is 2 s, so the scan period is 1 s, and a
