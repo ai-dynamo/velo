@@ -141,12 +141,12 @@
 //!   Responses, Events, Acks, Pongs and ShuttingDown echoes do not stamp.
 //!   Without it "idle" would mean "we have not sent", and a peer that only ever
 //!   sends us Messages would have its endpoint reaped out from under its own
-//!   traffic — repeatedly, since each reap costs it a frame (see below). A peer
-//!   that only streams Responses, Events or Acks to us still has that problem,
-//!   because those frames do not stamp. It rests on a measured fact rather than
-//!   an assumed one: the `reply_ep` UCX hands the recv callback for a peer we
-//!   hold an endpoint to is the *same pointer* as the endpoint `ucp_ep_create`
-//!   gave us.
+//!   traffic — repeatedly, since each reap costs it one lost Message or a ping
+//!   that times out (see below). A peer that only streams Responses, Events or
+//!   Acks to us still has that problem, because those frames do not stamp. It
+//!   rests on a measured fact rather than an assumed one: the `reply_ep` UCX
+//!   hands the recv callback for a peer we hold an endpoint to is the *same
+//!   pointer* as the endpoint `ucp_ep_create` gave us.
 //!   `an_inbound_frame_refreshes_the_endpoint_it_arrived_on` asserts it, because
 //!   connection matching (which the disruption finding below establishes) is a
 //!   weaker claim than pointer identity and would not have been enough.
@@ -184,17 +184,18 @@
 //!
 //! Replies posted on a reply endpoint (`Cmd::PongTo`, `Cmd::ShuttingDownTo`)
 //! carry no count, because they do not go through `ensure_ep`. The pointer can
-//! still equal an endpoint we own (that identity is what the inbound stamp rests
-//! on), so such a reply rides an endpoint the reaper tracks without counting on
-//! it. The window is covered, unless more than `REPLY_EP_SLOTS`
-//! REPLY-flagged frames arrived before the drain: the inbound frame that
-//! caused the reply is stamped by `stamp_inbound_use` in the same pass, before
-//! the scan, with the clock read after the progress loop. The reply is posted
-//! in the flush drain just after that read, so the endpoint cannot be closed
-//! until one timeout, less the length of that drain, after the reply is posted.
-//! If more than `REPLY_EP_SLOTS` such frames arrived, the oldest sightings were
-//! overwritten (see [`ReplyEpSightings`]), and the endpoint the reply went out
-//! on may not be refreshed, so it can be closed in the same pass.
+//! still equal an endpoint we own (that identity is what the inbound stamp
+//! rests on), so such a reply rides an endpoint the reaper tracks without
+//! counting on it. The window is covered for one timeout, less the length of
+//! the flush drain, unless more than `REPLY_EP_SLOTS` REPLY-flagged frames
+//! arrived before the drain: the inbound frame that caused the reply is stamped
+//! by `stamp_inbound_use` in the same pass, before the scan, with the clock
+//! read after the progress loop. The reply is posted in the flush drain just
+//! after that read, so the endpoint cannot be closed until one timeout, less
+//! the length of that drain, after the reply is posted. If more than
+//! `REPLY_EP_SLOTS` such frames arrived, the oldest sightings were overwritten
+//! (see [`ReplyEpSightings`]), and the endpoint the reply went out on may not
+//! be refreshed, so it can be closed in the same pass.
 //!
 //! **Endpoint creation is not idle time.** `last_used` is stamped from
 //! [`WorkerState::now`], and `ensure_ep` advances that clock after
@@ -228,15 +229,18 @@
 //! UCX pairs endpoints by remote worker, so velo's REPLY-flagged Active
 //! Messages cause a matching endpoint to exist on the peer, and the peer's own
 //! `ucp_ep_create` back to us is matched onto *that* connection rather than
-//! building a fresh one. After a reap the peer's next REPLY-flagged frame to
-//! us, its next Message or ping, is admitted and silently lost. Its Responses,
-//! Events and Acks still arrive (measured: 8 of 8 in every run). Why: per the
-//! UCX source, a REPLY-flagged frame carries an endpoint id for the reply path,
-//! and a frame whose endpoint id no longer resolves is dropped. That is
-//! inferred from the source and a measurement, not proven. UCX keepalive (~20 s
-//! by default) then declares the peer's endpoint failed, and the frame after
-//! that takes velo's existing failed-connection path and arrives. One lost
-//! Message or ping and up to a keepalive interval of disruption, per reaped
+//! building a fresh one. After a reap the peer's next REPLY-flagged frame to us
+//! is dropped. Its next Message is admitted and silently lost (measured). By
+//! the same inferred mechanism, its next ping gets no Pong, so its
+//! `check_health` returns `Timeout`. Its Responses and Events still arrive
+//! (measured: 8 of 8 in every run). Acks carry no REPLY flag either, so the
+//! same is expected, but it was not measured. Why: per the UCX source, a
+//! REPLY-flagged frame carries an endpoint id for the reply path, and a frame
+//! whose endpoint id no longer resolves is dropped. That is inferred from the
+//! source and a measurement, not proven. UCX keepalive (~20 s by default) then
+//! declares the peer's endpoint failed, and the frame after that takes velo's
+//! existing failed-connection path and arrives. One lost Message (or a ping
+//! that times out) and up to a keepalive interval of disruption, per reaped
 //! endpoint, self-healing. Both close modes were measured and behave
 //! identically, so FORCE is kept for the reasons below.
 //! `reaping_disrupts_the_peers_path_back` pins it and
@@ -866,7 +870,7 @@ struct RecvShared {
     /// Set once at worker start and never mutated, so this costs a predictable
     /// branch on a struct the callback has already dereferenced. Without it,
     /// every process that never enables the reaper would still pay two atomics
-    /// per inbound frame to fill a ring nothing drains.
+    /// per REPLY-flagged inbound frame to fill a ring nothing drains.
     stamp_inbound: bool,
     /// The state the transport side shares with the progress thread. The
     /// callback reads `ring_tx`, `pending_pings`, `reply_eps` and `metrics`
@@ -875,7 +879,7 @@ struct RecvShared {
 }
 
 /// How many reply-endpoint sightings the recv trampoline can hand over between
-/// two passes of the main loop.
+/// two drains.
 ///
 /// The loop drains this only in `stamp_inbound_use`, which runs in a pass that
 /// observed the command ring empty. So the window is every REPLY-flagged frame
