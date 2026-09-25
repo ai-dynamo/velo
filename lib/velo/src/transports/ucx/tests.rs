@@ -2789,7 +2789,7 @@ async fn bench_rma() {
 /// The reaper adds per-send bookkeeping, so the two rows are the price of that
 /// bookkeeping. Two measures: a one-way burst (the progress thread's per-send
 /// cost is on its critical path) and a ping-pong round trip. Run with
-/// `cargo test --features ucx -p velo --lib bench_am_send -- --ignored --nocapture --test-threads=1`.
+/// `timeout 300 cargo test --release --features ucx -p velo --lib bench_am_send -- --ignored --nocapture --test-threads=1`.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "benchmark: prints timings, asserts nothing"]
 async fn bench_am_send() {

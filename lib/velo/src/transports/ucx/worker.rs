@@ -170,8 +170,8 @@
 //! **Why sends in flight are counted.** An admission stamp alone does not make
 //! an endpoint busy for as long as its send takes. A first send between fresh
 //! workers waits while the peer sets up its own endpoint back to us, inside the
-//! peer's `ucp_worker_progress`. With many UCX workers in one process (the
-//! parallel test suite) the peer's progress loop that contained that step took
+//! peer's `ucp_worker_progress`. With many UCX workers in one process (parallel
+//! UCX-module runs) the peer's progress loop that contained that step took
 //! 526-573 ms, past the 500 ms floor, and a reaper that read only the stamp
 //! FORCE-closed the endpoint under the send, losing the frame. The count
 //! follows `post_am`'s three exits: taken before the post, released on the
@@ -242,23 +242,23 @@
 //! next Message is admitted and silently lost (measured). By the same inferred
 //! mechanism, its next ping gets no Pong, so its `check_health` returns
 //! `Timeout` (or `ConnectionFailed` if keepalive fails the endpoint while the
-//! probe is waiting). Its Responses and Events still arrive (measured over the
-//! tcp lane: 8 of 8 in each of 8 runs, 4 streaming Responses and 4 streaming
-//! Events). Acks carry no REPLY flag either, so the same is expected, but it
-//! was not measured. Why: per the UCX source, a REPLY-flagged frame carries an
-//! endpoint id for the reply path, and a frame whose endpoint id no longer
-//! resolves is dropped. That is inferred from the source and a measurement, not
-//! proven. UCX keepalive (~20 s by default) then declares the peer's endpoint
-//! failed, and the frame after that takes velo's existing failed-connection
-//! path and arrives. So after each reap the peer's Messages and pings to us are
-//! lost, silently, until keepalive (~20 s) fails its endpoint; the first loss
-//! is a Message with no error, or a ping that times out. Re-sending does not
-//! help (measured by hand; `reaping_disrupts_the_peers_path_back` asserts only
-//! that the first frame does not arrive). The disruption lasts up to a
-//! keepalive interval per reaped endpoint and heals itself. Both close modes
-//! were measured by hand and behave identically, so FORCE is kept for the
-//! reasons above. `reaping_disrupts_the_peers_path_back` pins the FORCE case.
-//! The operator-facing version is on
+//! probe is waiting). Its Responses and Events still arrive (measured: 8 of 8
+//! arrived in every recorded run). Acks carry no REPLY flag either, so the same
+//! is expected, but it was not measured. Why: per the UCX source, a
+//! REPLY-flagged frame carries an endpoint id for the reply path, and a frame
+//! whose endpoint id no longer resolves is dropped. That is inferred from the
+//! source and a measurement, not proven. UCX keepalive (~20 s by default) then
+//! declares the peer's endpoint failed, and the frame after that takes velo's
+//! existing failed-connection path and arrives. So after each reap the peer's
+//! Messages and pings to us are lost, silently, until keepalive (~20 s) fails
+//! its endpoint; the first loss is a Message with no error, or a ping that
+//! times out. Re-sending does not help (measured by hand;
+//! `reaping_disrupts_the_peers_path_back` asserts only that the first frame
+//! does not arrive). The disruption lasts up to a keepalive interval per reaped
+//! endpoint and heals itself. Both close modes were measured by hand and behave
+//! identically, so FORCE is kept for the reasons above.
+//! `reaping_disrupts_the_peers_path_back` pins the FORCE case. The
+//! operator-facing version is on
 //! [`UcxTransportBuilder::ep_idle_timeout`](super::transport::UcxTransportBuilder::ep_idle_timeout).
 //! This is the concrete cost D9 deferred ("connection-pool policy revisited
 //! later") and the sharpest reason the knob is off.
@@ -1001,8 +1001,8 @@ unsafe extern "C" fn recv_trampoline(
         // `reply_ep`, and velo sets that flag on Messages and pings only. So
         // those stamp, and Responses, Events, Acks, Pongs and ShuttingDown
         // echoes do not. Recorded here rather than in the per-kind arms below
-        // so the hot path is one branch, plus two relaxed atomics for a
-        // REPLY-flagged frame, whatever kind it is.
+        // so the hot path is one branch, plus a relaxed `fetch_add` and a
+        // release store for a REPLY-flagged frame, whatever kind it is.
         if ra.shared.stamp_inbound && !p.reply_ep.is_null() {
             ra.shared.worker.reply_eps.record(p.reply_ep as usize);
         }

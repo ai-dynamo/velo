@@ -698,14 +698,15 @@ impl UcxTransportBuilder {
     /// interval shorter than this timeout means nothing is ever reaped.
     ///
     /// For a peer this instance *only* probes, it is a create/reap/disrupt
-    /// generator: each probe wires an endpoint up, the reaper closes it one
-    /// timeout later, and every close costs that peer its next Messages and
-    /// pings to us, if it sends any before keepalive fails its endpoint (see
-    /// below). Probing on an interval longer than this timeout therefore
-    /// manufactures exactly the disruption this knob is trying to be worth.
-    /// There is no periodic prober in-tree — `check_health` has no in-tree
-    /// periodic caller — so this only applies to a caller that has built one;
-    /// if you have, either probe faster than the timeout or do not enable this.
+    /// generator: each probe wires an endpoint up, the reaper closes it about
+    /// one timeout later (see the close window), and every close costs that
+    /// peer its next Messages and pings to us, if it sends any before keepalive
+    /// fails its endpoint (see below). Probing on an interval longer than this
+    /// timeout therefore manufactures exactly the disruption this knob is
+    /// trying to be worth. There is no periodic prober in-tree — `check_health`
+    /// has no in-tree periodic caller — so this only applies to a caller that
+    /// has built one; if you have, either probe faster than the timeout or do
+    /// not enable this.
     ///
     /// # What it promises
     ///
@@ -764,9 +765,9 @@ impl UcxTransportBuilder {
     ///    `Timeout` (or `ConnectionFailed` if keepalive fails the endpoint
     ///    while the probe is waiting). Later pings are expected to be lost the
     ///    same way (inferred, not measured). Its Responses and Events still
-    ///    arrive (measured over the tcp lane: 8 of 8 in each of 8 runs, 4
-    ///    streaming Responses and 4 streaming Events). Acks carry no REPLY flag
-    ///    either, so the same is expected, but it was not measured.
+    ///    arrive (measured: 8 of 8 arrived in every recorded run). Acks carry
+    ///    no REPLY flag either, so the same is expected, but it was not
+    ///    measured.
     /// 2. UCX keepalive (default interval ~20 s) eventually declares the peer's
     ///    endpoint failed and fires its error handler.
     /// 3. The frame after that takes velo's existing failed-connection path onto
@@ -801,9 +802,9 @@ impl UcxTransportBuilder {
     /// * **Probe-only peers** — see the health-probe section above. Avoid.
     /// * **Peers that stream Responses, Events or Acks to us** for longer than
     ///   the timeout, while this side sends nothing. Those frames do not
-    ///   refresh the endpoint, so it can be reaped mid-stream. The stream itself
-    ///   still arrives, but the peer then loses its next Message to us, or its
-    ///   next ping times out.
+    ///   refresh the endpoint, so it can be reaped mid-stream. The stream
+    ///   itself still arrives, but the peer loses its next Messages and pings
+    ///   to us, if it sends any before keepalive fails its endpoint.
     ///   Avoid, or use a timeout longer than the longest such stream.
     /// * **Heavy fan-in** — more than eight Messages and pings, from all peers
     ///   together, between two drains of the refreshes. The oldest refreshes
