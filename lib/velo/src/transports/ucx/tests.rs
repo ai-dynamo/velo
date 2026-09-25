@@ -1932,6 +1932,85 @@ async fn a_peer_that_keeps_sending_keeps_its_endpoint() {
     assert_rma_balanced(&b);
 }
 
+/// A peer that answers us keeps its endpoint, the same as a peer that sends us
+/// Messages.
+///
+/// The common shape of traffic: A sends B one request, and B streams frames
+/// back for longer than the idle timeout while A sends nothing more. A must
+/// count B's frames as use of its endpoint to B. If A reaps that endpoint,
+/// B's path back breaks (see `reaping_disrupts_the_peers_path_back`), and B's
+/// next frame is lost without an error at either end.
+///
+/// `a_peer_that_keeps_sending_keeps_its_endpoint` is the control: the same
+/// schedule with Message frames passes. The frames here are collected after
+/// the stream ends, with a short bound, so a lost frame costs this test a
+/// second and not `T` per frame.
+async fn a_peer_that_keeps_answering_keeps_its_endpoint(kind: MessageType) {
+    let a = start_node_with(|b| b.ep_idle_timeout(Some(IDLE))).await;
+    let b = start_node().await;
+    cross_register(&a, &b);
+    let errs = CountingErrors::new();
+
+    // A owns an endpoint to B, and B's path back to A rides it. No frame goes
+    // from B to A before the stream: a Message would stamp A's endpoint and
+    // hide the defect.
+    ping_message(&a, &b, &errs).await;
+    assert_eq!(eps_open(&a), 1);
+
+    let stream = match kind {
+        MessageType::Response => &a.streams.response_stream,
+        MessageType::Event => &a.streams.event_stream,
+        other => panic!("no stream check for {other:?}"),
+    };
+    // One frame per quarter timeout, for two timeouts.
+    const FRAMES: usize = 8;
+    for i in 0..FRAMES {
+        let out = b.transport.send_message(
+            a.instance_id,
+            Bytes::from_static(b"h"),
+            Bytes::from(vec![i as u8]),
+            kind,
+            errs.clone(),
+        );
+        assert!(matches!(out, SendOutcome::Admitted));
+        tokio::time::sleep(IDLE / 4).await;
+    }
+    let closed = eps_closed_idle(&a);
+    let mut arrived = 0;
+    while arrived < FRAMES && recv(stream, Duration::from_secs(1)).await.is_some() {
+        arrived += 1;
+    }
+
+    assert_eq!(
+        closed, 0,
+        "A reaped its endpoint to B while B was sending {kind:?} frames to A \
+         ({arrived} of {FRAMES} arrived)"
+    );
+    assert_eq!(arrived, FRAMES, "{kind:?} frames from B were lost");
+    assert_eq!(errs.count(), 0);
+
+    a.transport.shutdown();
+    b.transport.shutdown();
+    assert_rma_balanced(&a);
+    assert_rma_balanced(&b);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "defect 1: a Response is sent without UCP_AM_SEND_FLAG_REPLY, so it \
+            arrives with no reply endpoint and never refreshes the receiver's \
+            endpoint; the receiver reaps it under the stream"]
+async fn a_peer_that_keeps_sending_responses_keeps_its_endpoint() {
+    a_peer_that_keeps_answering_keeps_its_endpoint(MessageType::Response).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "defect 1: an Event is sent without UCP_AM_SEND_FLAG_REPLY, so it \
+            arrives with no reply endpoint and never refreshes the receiver's \
+            endpoint; the receiver reaps it under the stream"]
+async fn a_peer_that_keeps_sending_events_keeps_its_endpoint() {
+    a_peer_that_keeps_answering_keeps_its_endpoint(MessageType::Event).await;
+}
+
 /// The default is off, and "off" has to mean *never*, not *rarely*.
 ///
 /// D9's sign-off left the reaper disabled because a reconnect costs ~14 ms of
