@@ -24,7 +24,7 @@ use crate::transports::ucx::rma::{
     MAX_PACKED_RKEY, MappedRegion, RdmaEndpoint, RmaError, RmaGetRequest, SYS_DEV_UNKNOWN,
     preparse_packed_rkey,
 };
-use crate::transports::ucx::worker::{Cmd, PARK_MS, ep_scan_period};
+use crate::transports::ucx::worker::{Cmd, PARK_MS, SenderSightings, ep_scan_period};
 use velo_ext::{InstanceId, MessageType, PeerInfo};
 
 struct CountingErrors {
@@ -1908,6 +1908,35 @@ async fn an_inbound_frame_refreshes_the_endpoint_to_its_sender() {
     assert_rma_balanced(&a);
     assert_rma_balanced(&b);
     assert_rma_balanced(&c);
+}
+
+/// A sender seen once in a pass is still seen when many frames from another
+/// sender follow it in the same pass.
+///
+/// The receive callback publishes each frame's sender into a fixed ring that
+/// the main loop drains once per pass. When one pass received more frames than
+/// the ring has slots, the newest overwrote the oldest. So a peer that sent
+/// one ping, followed in the same pass by a burst of Messages from a busy
+/// peer, lost its stamp. The pong answering that ping rides our endpoint to
+/// the pinger without a send count, so the reaper could close that endpoint
+/// in the same pass, under the pong. Eight frames from one peer in one pass is
+/// ordinary traffic.
+#[test]
+fn a_sighting_is_not_overwritten_by_a_burst_from_another_sender() {
+    const P: usize = 0x5051;
+    const Q: usize = 0x5152;
+    let ring = SenderSightings::new();
+    ring.record(P);
+    for _ in 0..8 {
+        ring.record(Q);
+    }
+    let (mut seen, mut out) = (0, Vec::new());
+    ring.drain_into(&mut seen, &mut out);
+    assert!(
+        out.contains(&P),
+        "P's sighting was overwritten by eight sightings of Q: {out:x?}"
+    );
+    assert!(out.contains(&Q));
 }
 
 /// The consequence that matters operationally: a peer that only ever *sends*

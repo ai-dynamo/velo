@@ -925,13 +925,13 @@ impl SenderSightings {
     }
 
     /// Publish one sighting. Runs on the progress thread inside an AM callback.
-    fn record(&self, sender: usize) {
+    pub(super) fn record(&self, sender: usize) {
         let seq = self.recorded.fetch_add(1, Ordering::Relaxed);
         self.slots[seq % SENDER_SLOTS].store(sender, Ordering::Release);
     }
 
     /// Take everything published since the last call. Progress thread only.
-    fn drain_into(&self, seen: &mut usize, out: &mut Vec<usize>) {
+    pub(super) fn drain_into(&self, seen: &mut usize, out: &mut Vec<usize>) {
         let recorded = self.recorded.load(Ordering::Acquire);
         if recorded == *seen {
             return;
