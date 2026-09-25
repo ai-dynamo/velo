@@ -91,11 +91,11 @@ pub struct UcxConfig {
 /// are not counted.) What a short timeout does is close endpoints between
 /// ordinary uses, and each close makes the next use pay wireup again and costs
 /// the peer a frame (see [`UcxTransportBuilder::ep_idle_timeout`]). Measured
-/// warm wireup is ~14 ms on CX-7 InfiniBand and upwards of 10 ms over the tcp
-/// lane in CI, so half a second is roughly thirty-five times that. A fresh
-/// worker costs more: on a GB200 node its first `ucp_ep_create` took 110-150
-/// ms, and a fresh pair's first frame took 360-420 ms to arrive with the node's
-/// CPUs oversubscribed.
+/// wireup, on a worker that has already created an endpoint, is ~14 ms on CX-7
+/// InfiniBand and upwards of 10 ms over the tcp lane in CI, so half a second is
+/// roughly thirty-five times that. A fresh worker costs more: on a GB200 node
+/// its first `ucp_ep_create` took 110-150 ms, and a fresh pair's first frame
+/// took 360-420 ms to arrive with the node's CPUs oversubscribed.
 ///
 /// It is a builder-level ergonomic guard, not an invariant of the reaper: a test
 /// constructing a [`UcxConfig`] directly can go below it deliberately.
@@ -677,7 +677,14 @@ impl UcxTransportBuilder {
     /// traffic, and `a_peer_that_keeps_sending_keeps_its_endpoint` pins that
     /// case. Responses, Events, Acks, Pongs and ShuttingDown echoes do not
     /// refresh the endpoint, so a peer that only streams those to us is reaped
-    /// on schedule. No test pins that non-refresh yet.
+    /// on schedule.
+    ///
+    /// The progress thread keeps at most eight of these refreshes until it
+    /// drains them, at most once per loop pass. If more than eight Messages and
+    /// pings, from all peers together, arrive before a drain, the oldest are
+    /// overwritten and those frames do not refresh their endpoints. Under heavy
+    /// fan-in, a peer that keeps sending Messages can therefore still be
+    /// reaped.
     ///
     /// # Health probes are not free here
     ///
@@ -720,10 +727,11 @@ impl UcxTransportBuilder {
     /// has completed for the timeout. A send slower than the timeout therefore
     /// keeps its endpoint open, and the idle clock starts again when it
     /// completes. Replies posted on the endpoint UCX hands the receive callback
-    /// (pongs and shutting-down echoes) are not counted: the inbound frame that
+    /// (Pongs and ShuttingDown echoes) are not counted: the inbound frame that
     /// caused each one refreshes the endpoint in the same loop pass, before the
-    /// reaper scans. The time `ucp_ep_create` takes does not count as idle
-    /// either.
+    /// reaper scans, unless more than eight REPLY-flagged frames arrived before
+    /// that refresh was drained (see above). The time `ucp_ep_create` takes
+    /// does not count as idle either.
     ///
     /// Values below half a second are raised to it; see the transport's
     /// `MIN_EP_IDLE_TIMEOUT` for why that is the number.
@@ -732,26 +740,34 @@ impl UcxTransportBuilder {
     ///
     /// Closing an endpoint is not a local act. UCX pairs endpoints by remote
     /// worker: velo's REPLY-flagged Active Messages cause UCX to create a
-    /// matching endpoint on the peer, and the peer's own `ucp_ep_create` back to
-    /// this instance is then *matched onto that same connection* instead of
-    /// building a fresh one. Closing this side leaves the peer holding an
-    /// endpoint over a connection that no longer exists. Measured over the tcp
+    /// matching endpoint on the peer, and the peer's own `ucp_ep_create` back
+    /// to this instance is then *matched onto that same connection* instead of
+    /// building a fresh one. After this side closes, the peer's next
+    /// REPLY-flagged frame to us is dropped. Why: per the UCX source, a
+    /// REPLY-flagged frame carries an endpoint id for the reply path, and a
+    /// frame whose endpoint id no longer resolves is dropped. That is inferred
+    /// from the source and a measurement, not proven. Measured over the tcp
     /// lane, with both close modes:
     ///
-    /// 1. The peer's next frame to us is admitted and **silently lost** — no
-    ///    error at its end, no arrival at ours. Retrying does not help, and
-    ///    neither does this side establishing a fresh endpoint of its own.
+    /// 1. The peer's next Message or ping to us is admitted and **silently
+    ///    lost** — no error at its end, no arrival at ours. Retrying does not
+    ///    help, and neither does this side establishing a fresh endpoint of its
+    ///    own. Its Responses, Events and Acks still arrive (measured: 8 of 8 in
+    ///    every run).
     /// 2. UCX keepalive (default interval ~20 s) eventually declares the peer's
     ///    endpoint failed and fires its error handler.
     /// 3. The frame after that takes velo's existing failed-connection path onto
     ///    a fresh endpoint and arrives normally.
     ///
-    /// So it self-heals, at a cost of one lost frame and up to a keepalive
-    /// interval of disruption *per reaped endpoint*. That is what makes the
-    /// bidirectional freshness stamp above load-bearing rather than a nicety: a
-    /// peer that keeps sending Messages or pings is never reaped, so it never
-    /// pays this. A peer that keeps sending only Responses, Events or Acks does
-    /// not refresh the stamp, so it can still be reaped and pay it.
+    /// So it self-heals, at a cost of one lost Message or ping and up to a
+    /// keepalive interval of disruption *per reaped endpoint*. That is what
+    /// makes the bidirectional freshness stamp above load-bearing rather than a
+    /// nicety: a peer that keeps sending Messages or pings is not reaped, unless
+    /// more than eight REPLY-flagged frames arrive between two drains and
+    /// overwrite its refreshes (see above), so it does not pay this. A peer
+    /// that keeps sending only Responses, Events or Acks does not refresh the
+    /// stamp, so our endpoint to it can still be reaped, and it then pays with
+    /// its next Message or ping.
     ///
     /// Which leaves the patterns where it is still paid, and they are the ones
     /// to check before enabling:
@@ -765,8 +781,12 @@ impl UcxTransportBuilder {
     /// * **Probe-only peers** — see the health-probe section above. Avoid.
     /// * **Peers that stream Responses or Events to us** for longer than the
     ///   timeout, while this side sends nothing. Those frames do not refresh
-    ///   the endpoint, so it is reaped mid-stream and the peer loses a frame.
+    ///   the endpoint, so it can be reaped mid-stream. The stream itself still
+    ///   arrives, but the peer then loses its next Message or ping to us.
     ///   Avoid, or use a timeout longer than the longest such stream.
+    /// * **Heavy fan-in** — more than eight Messages and pings, from all peers
+    ///   together, between two drains of the refreshes. The oldest refreshes
+    ///   are lost, so a peer that is sending can be reaped as if it were idle.
     ///
     /// Note what is *not* on that list: "one-directional" is not by itself a
     /// safe answer, because the receiving side of a one-directional flow is the
@@ -818,7 +838,8 @@ impl UcxTransportBuilder {
     /// the first transfer, and the reaper reclaims it again if the peer turns
     /// out never to be used. An eagerly established endpoint's idle clock starts
     /// when `ucp_ep_create` returns, so with both on, a registered-but-never-used
-    /// peer is wired up once and closed one timeout after that call returned.
+    /// peer is wired up once and closed about one timeout (see the close window
+    /// in [`ep_idle_timeout`](Self::ep_idle_timeout)) after that call returned.
     /// The tcp wireup itself finishes later, in the background. That is the
     /// intended behaviour, not a conflict.
     pub fn eager_endpoints(mut self, eager: bool) -> Self {

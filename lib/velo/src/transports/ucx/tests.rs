@@ -1885,7 +1885,7 @@ async fn an_inbound_frame_refreshes_the_endpoint_it_arrived_on() {
 /// The consequence that matters operationally: a peer that only ever *sends*
 /// us Messages keeps its endpoint alive, instead of having it reaped and
 /// blackholed under its own traffic. It pins the Message case only: Responses,
-/// Events and Acks do not refresh the endpoint, and no test pins that yet.
+/// Events and Acks do not refresh the endpoint.
 ///
 /// This is the mutation target for the inbound stamp — remove it and the
 /// endpoint here is reaped on schedule, which the assertion catches.
@@ -2017,10 +2017,10 @@ async fn idle_endpoint_closes_and_the_next_send_wires_up_again() {
 /// parallel UCX tests, the median was 630 ms, longer than the 500 ms floor. The
 /// new endpoint was stamped from the loop clock read before the call, so it was
 /// already past the timeout when it was created, and the scan in the next loop
-/// pass (at most one `PARK_MS` later) closed it.
-/// That closed an eager endpoint microseconds after it was created, so
-/// `eager_wireup_and_the_reaper_compose` never saw it open. The delay seam
-/// makes the slow create happen here on demand.
+/// pass (at most one `PARK_MS` later) closed it. That closed an eager endpoint
+/// microseconds after it was created, so `eager_wireup_and_the_reaper_compose`
+/// never saw it open. The delay seam makes the slow create happen here on
+/// demand.
 ///
 /// The endpoint is eager, so no send is posted on it. A send in flight holds
 /// its endpoint open by itself, which would hide a stale create stamp.
@@ -2257,15 +2257,18 @@ async fn a_send_in_flight_keeps_its_endpoint_open() {
 /// UCX pairs endpoints by remote worker: our REPLY-flagged Active Messages make
 /// UCX create a matching endpoint on the peer, and the peer's own
 /// `ucp_ep_create` back to us is then *matched onto that same connection* rather
-/// than building a fresh one. Closing our side — FORCE or flush, both were
-/// measured — leaves the peer holding an endpoint over a connection that no
-/// longer exists.
+/// than building a fresh one. After our side closes — FORCE or flush, both were
+/// measured — the peer's next REPLY-flagged frame to us is dropped. Why: per
+/// the UCX source, a REPLY-flagged frame carries an endpoint id for the reply
+/// path, and a frame whose endpoint id no longer resolves is dropped. That is
+/// inferred from the source and a measurement, not proven.
 ///
 /// Measured consequences, in order:
 ///
-/// 1. The peer's next frame to us is admitted and **silently lost**: no
-///    `on_error`, no arrival. Re-sending does not help, and neither does our
-///    side establishing a fresh endpoint of its own.
+/// 1. The peer's next Message (a REPLY-flagged frame, as this test sends) to us
+///    is admitted and **silently lost**: no `on_error`, no arrival. Re-sending
+///    does not help, and neither does our side establishing a fresh endpoint of
+///    its own. Its Responses, Events and Acks still arrive.
 /// 2. UCX keepalive (default interval ~20 s) eventually declares the peer's
 ///    endpoint failed, which fires its error handler and populates its
 ///    `failed_peers`.
