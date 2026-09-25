@@ -85,15 +85,21 @@ pub struct UcxConfig {
 
 /// Floor on [`UcxConfig::ep_idle_timeout`].
 ///
-/// Sized to **dominate endpoint wireup**, which is the one thing a short timeout
-/// actually breaks. `last_used` records when an operation was *admitted*, not
-/// when it completed, so a timeout shorter than the time a send takes on the
-/// wire lets the reaper close an endpoint out from under a send that is still
-/// establishing itself — the frame then fails through `on_error` instead of
-/// arriving. Measured wireup is ~14 ms on CX-7 InfiniBand and upwards of 10 ms
-/// over the tcp lane in CI, so half a second is roughly thirty-five times the
-/// observed cost and leaves the hazard requiring a send an order of magnitude
-/// slower than anything measured.
+/// Sized to **dominate endpoint wireup**. A send posted on an endpoint we own
+/// holds that endpoint open at any timeout, so a short timeout cancels none of
+/// those sends. (Replies posted on the endpoint UCX hands the receive callback
+/// are not counted.) What a short timeout does is close endpoints between
+/// ordinary uses, and each close makes the next use pay wireup again and costs
+/// the peer its next Messages and pings to us, if it sends any before keepalive
+/// fails its endpoint (see [`UcxTransportBuilder::ep_idle_timeout`]). The first
+/// RDMA GET on a fresh two-process pair over CX-7 InfiniBand (`rc_verbs`) took
+/// ~14 ms, wireup included, and wireup over the tcp lane in CI takes upwards of
+/// 10 ms, so half a second is roughly thirty-five times the 14 ms. In the
+/// in-process test harness over tcp on a GB200 node, with several UCX workers
+/// per process, one `ucp_ep_create` call took 110-150 ms, and 630 ms at the
+/// median across 31 creates in one process; the cause is not isolated. In that
+/// harness a fresh pair's first frame took 360-420 ms to arrive with the node's
+/// CPUs oversubscribed.
 ///
 /// It is a builder-level ergonomic guard, not an invariant of the reaper: a test
 /// constructing a [`UcxConfig`] directly can go below it deliberately.
@@ -167,6 +173,12 @@ impl UcxTransport {
             eps_inbound_unmatched: Arc::new(Default::default()),
             reply_eps: Arc::new(super::worker::ReplyEpSightings::new()),
             metrics: OnceLock::new(),
+            #[cfg(test)]
+            ep_create_delay_ms: AtomicU64::new(0),
+            #[cfg(test)]
+            progress_stall_ms: AtomicU64::new(0),
+            #[cfg(test)]
+            pre_progress_delay_ms: AtomicU64::new(0),
         });
         Self {
             key,
@@ -661,10 +673,22 @@ impl UcxTransportBuilder {
     /// # What counts as use — both directions
     ///
     /// Anything this side initiates: a frame send, an RDMA GET, an eager
-    /// wireup. **And anything the peer sends us** — an inbound frame refreshes
-    /// the endpoint it arrived on, so "idle" means idle in both directions and a
-    /// peer that only ever sends to us does not have its endpoint reaped under
-    /// its own traffic. `a_peer_that_keeps_sending_keeps_its_endpoint` pins that.
+    /// wireup. **And the Messages and pings the peer sends us** — the frames
+    /// sent with UCX's REPLY flag, which are the only ones that arrive with a
+    /// reply endpoint — refresh the endpoint they arrived on. So "idle" means
+    /// idle in both directions for Messages and pings: a peer that keeps
+    /// sending us Messages does not have its endpoint reaped under its own
+    /// traffic, and `a_peer_that_keeps_sending_keeps_its_endpoint` pins that
+    /// case. Responses, Events, Acks, Pongs and ShuttingDown echoes do not
+    /// refresh the endpoint, so our endpoint to a peer that only streams those
+    /// to us is reaped on schedule.
+    ///
+    /// The progress thread keeps at most eight of these refreshes until it
+    /// drains them, at most once per loop pass. If more than eight Messages and
+    /// pings, from all peers together, arrive before a drain, the oldest are
+    /// overwritten and those frames do not refresh their endpoints. Under heavy
+    /// fan-in, a peer that keeps sending Messages can therefore still be
+    /// reaped.
     ///
     /// # Health probes are not free here
     ///
@@ -674,32 +698,46 @@ impl UcxTransportBuilder {
     /// interval shorter than this timeout means nothing is ever reaped.
     ///
     /// For a peer this instance *only* probes, it is a create/reap/disrupt
-    /// generator: each probe wires an endpoint up, the reaper closes it one
-    /// timeout later, and every close costs that peer a frame (see below).
-    /// Probing on an interval longer than this timeout therefore manufactures
-    /// exactly the disruption this knob is trying to be worth. There is no
-    /// periodic prober in-tree — `check_health` has no in-tree periodic caller —
-    /// so this only applies to a caller that has built one; if you have, either
-    /// probe faster than the timeout or do not enable this.
+    /// generator: each probe wires an endpoint up, the reaper closes it about
+    /// one timeout later (see the close window), and every close costs that
+    /// peer its next Messages and pings to us, if it sends any before keepalive
+    /// fails its endpoint (see below). Probing on an interval longer than this
+    /// timeout therefore manufactures exactly the disruption this knob is
+    /// trying to be worth. There is no periodic prober in-tree — `check_health`
+    /// has no in-tree periodic caller — so this only applies to a caller that
+    /// has built one; if you have, either probe faster than the timeout or do
+    /// not enable this.
     ///
     /// # What it promises
     ///
-    /// An endpoint is closed between one and one and a half timeouts after its
-    /// last use in either direction (the scan runs at half the timeout, capped
-    /// at one a second), and never while an RDMA operation to that peer is
-    /// outstanding. The next use re-establishes it transparently — no error
-    /// surfaces, nothing has to be re-registered.
+    /// An endpoint is closed once one timeout has passed since its last use in
+    /// either direction, at the next scan. The scan period is half the
+    /// timeout, capped at one second, and on an idle worker a due scan runs at
+    /// most 100 ms late (the progress thread's park timeout), so the close
+    /// comes between one timeout and one timeout plus one scan period plus
+    /// 100 ms after the last use. A long pass on a busy worker delays it
+    /// further. Uses are stamped from a clock the progress thread reads a few
+    /// times per pass, not per use. Inbound Messages and pings (the frames sent
+    /// with the REPLY flag, the only ones that stamp) are stamped after they
+    /// arrive, which errs toward keeping the endpoint open. A send is stamped
+    /// at most one command drain before it is posted, which can shorten the
+    /// timeout by that much. An endpoint is never closed while an RDMA
+    /// operation to that peer is outstanding. A GET's completion does not
+    /// restart the idle clock, unlike a send's: only the stamp from posting
+    /// the GET counts, so a GET slower than the timeout can leave the endpoint
+    /// to be closed at the first scan after it completes. The next use
+    /// re-establishes it transparently — no error surfaces, nothing has to be
+    /// re-registered.
     ///
-    /// What it does **not** promise is that an Active Message send admitted just
-    /// before the timeout expired has landed. `last_used` records admission, not
-    /// completion, so a send still on the wire when its endpoint is reaped fails
-    /// through its `TransportErrorHandler` with the original buffers — the same
-    /// contract a peer-failure reap has always had. The floor below **shrinks**
-    /// that window rather than closing it, and two residuals survive: a send
-    /// slower than the floor under congestion is still killable, and the
-    /// admission stamp is taken from a clock sampled at the top of the progress
-    /// loop's pass, so the effective budget is the timeout minus however long
-    /// that pass runs.
+    /// An endpoint is idle only when no send posted on it is in flight and none
+    /// has completed for the timeout. A send slower than the timeout therefore
+    /// keeps its endpoint open, and the idle clock starts again when it
+    /// completes. Replies posted on the endpoint UCX hands the receive callback
+    /// (Pongs and ShuttingDown echoes) are not counted: the inbound frame that
+    /// caused each one refreshes the endpoint in the same loop pass, before the
+    /// reaper scans, unless more than eight REPLY-flagged frames arrived before
+    /// that refresh was drained (see above). The time `ucp_ep_create` takes
+    /// does not count as idle either.
     ///
     /// Values below half a second are raised to it; see the transport's
     /// `MIN_EP_IDLE_TIMEOUT` for why that is the number.
@@ -708,41 +746,77 @@ impl UcxTransportBuilder {
     ///
     /// Closing an endpoint is not a local act. UCX pairs endpoints by remote
     /// worker: velo's REPLY-flagged Active Messages cause UCX to create a
-    /// matching endpoint on the peer, and the peer's own `ucp_ep_create` back to
-    /// this instance is then *matched onto that same connection* instead of
-    /// building a fresh one. Closing this side leaves the peer holding an
-    /// endpoint over a connection that no longer exists. Measured over the tcp
+    /// matching endpoint on the peer, and the peer's own `ucp_ep_create` back
+    /// to this instance is then *matched onto that same connection* instead of
+    /// building a fresh one. After this side closes, the peer's next
+    /// REPLY-flagged frame to us is dropped. Why: per the UCX source, a
+    /// REPLY-flagged frame carries an endpoint id for the reply path, and a
+    /// frame whose endpoint id no longer resolves is dropped. That is inferred
+    /// from the source and a measurement, not proven. Measured over the tcp
     /// lane, with both close modes:
     ///
-    /// 1. The peer's next frame to us is admitted and **silently lost** — no
-    ///    error at its end, no arrival at ours. Retrying does not help, and
-    ///    neither does this side establishing a fresh endpoint of its own.
+    /// 1. The peer's next Message to us is admitted and **silently lost** — no
+    ///    error at its end, no arrival at ours (measured). Every Message it
+    ///    sends after that is lost too, until step 2: retrying does not help,
+    ///    and neither does this side establishing a fresh endpoint of its own
+    ///    (measured by hand; `reaping_disrupts_the_peers_path_back` asserts
+    ///    only that the first frame does not arrive). By the same inferred
+    ///    mechanism, its next ping gets no Pong, so its `check_health` returns
+    ///    `Timeout` (or `ConnectionFailed` if keepalive fails the endpoint
+    ///    while the probe is waiting). Later pings are expected to be lost the
+    ///    same way (inferred, not measured). Its Responses and Events still
+    ///    arrive (measured: 8 of 8 arrived in every recorded run). Acks carry
+    ///    no REPLY flag either, so the same is expected, but it was not
+    ///    measured.
     /// 2. UCX keepalive (default interval ~20 s) eventually declares the peer's
     ///    endpoint failed and fires its error handler.
     /// 3. The frame after that takes velo's existing failed-connection path onto
     ///    a fresh endpoint and arrives normally.
     ///
-    /// So it self-heals, at a cost of one lost frame and up to a keepalive
-    /// interval of disruption *per reaped endpoint*. That is what makes the
-    /// bidirectional freshness stamp above load-bearing rather than a nicety: a
-    /// peer that keeps sending is never reaped, so it never pays this.
+    /// So it self-heals. Per reaped endpoint, the peer's Messages and pings to
+    /// us are lost, silently, until keepalive (~20 s) fails its endpoint; the
+    /// first loss is a Message with no error, or a ping that times out. That is
+    /// what makes the bidirectional freshness stamp above load-bearing rather
+    /// than a nicety: a peer that keeps sending Messages or pings is not
+    /// reaped, unless more than eight REPLY-flagged frames arrive between two
+    /// drains and overwrite its refreshes (see above), so it does not pay this.
+    /// A peer that keeps sending only Responses, Events or Acks does not
+    /// refresh the stamp, so our endpoint to it can still be reaped, and it
+    /// then pays the same cost.
     ///
     /// Which leaves the patterns where it is still paid, and they are the ones
     /// to check before enabling:
     ///
     /// * **Genuinely symmetric-idle peers** — neither side has spoken for a
-    ///   timeout. Reaping costs whoever speaks first one frame. This is the case
-    ///   the knob is for.
+    ///   timeout. This is the case the knob is for, and it still carries the
+    ///   cost above, whichever side speaks first, when the peer keeps its
+    ///   endpoint to us. If we speak first, our send arrives with no error
+    ///   (`idle_endpoint_closes_and_the_next_send_wires_up_again`), and the
+    ///   peer still loses its next Messages to us, and, by the same inferred
+    ///   mechanism, its pings. If the peer also runs the reaper and has closed
+    ///   its own endpoint, its next send creates a fresh one; that case is not
+    ///   measured.
     /// * **Send-side-only fan-out** — this instance sends to many peers it never
     ///   hears from. Reaping costs nothing, since the disruption is to the
     ///   *peer's* path back and no peer is using one.
     /// * **Probe-only peers** — see the health-probe section above. Avoid.
+    /// * **Peers that stream Responses, Events or Acks to us** for longer than
+    ///   the timeout, while this side sends nothing. Those frames do not
+    ///   refresh the endpoint, so it can be reaped mid-stream. The stream
+    ///   itself still arrives, but the peer loses its next Messages and pings
+    ///   to us, if it sends any before keepalive fails its endpoint.
+    ///   Avoid, or use a timeout longer than the longest such stream.
+    /// * **Heavy fan-in** — more than eight Messages and pings, from all peers
+    ///   together, between two drains of the refreshes. The oldest refreshes
+    ///   are lost, so a peer that is sending can be reaped as if it were idle.
     ///
     /// Note what is *not* on that list: "one-directional" is not by itself a
     /// safe answer, because the receiving side of a one-directional flow is the
     /// worst case — it is the side whose path back gets disrupted. The stamp
-    /// makes that case correct now, but a deployment reasoning about the knob
-    /// should reason about it per-direction rather than per-link.
+    /// makes that case correct only when the flow is Messages or pings. A flow
+    /// of Responses, Events or Acks toward us is not covered, as the list
+    /// above says. A deployment reasoning about the knob should reason about
+    /// it per-direction, and per frame type, rather than per-link.
     ///
     /// This is why the default is off, and why D9 left connection-pool policy to
     /// be revisited with exactly this measurement in hand.
@@ -785,9 +859,11 @@ impl UcxTransportBuilder {
     /// be usable together: eager wireup amortises the connection cost away from
     /// the first transfer, and the reaper reclaims it again if the peer turns
     /// out never to be used. An eagerly established endpoint's idle clock starts
-    /// at registration, so with both on, a registered-but-never-used peer is
-    /// wired up once and closed one timeout later. That is the intended
-    /// behaviour, not a conflict.
+    /// when `ucp_ep_create` returns, so with both on, a registered-but-never-used
+    /// peer is wired up once and closed about one timeout (see the close window
+    /// in [`ep_idle_timeout`](Self::ep_idle_timeout)) after that call returned.
+    /// The UCX wireup itself finishes later, in the background. That is the
+    /// intended behaviour, not a conflict.
     pub fn eager_endpoints(mut self, eager: bool) -> Self {
         self.config.eager_endpoints = eager;
         self
