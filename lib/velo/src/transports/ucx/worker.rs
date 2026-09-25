@@ -133,8 +133,12 @@
 //! sites record a use:
 //!
 //! * [`WorkerState::ensure_ep`], for everything **we** initiate — frame sends,
-//!   ping probes, RMA GETs, eager wireup. Every outbound path resolves an
-//!   endpoint through it, so there is one place that can forget to record a use.
+//!   ping probes, RMA GETs, eager wireup. Every path that resolves an endpoint
+//!   by peer (`Send`, `Ping`, `EnsureEp`, `prepare_get`) goes through it, so
+//!   there is one place that can forget to record a use. Replies are the
+//!   exception: `PongTo` and `ShuttingDownTo` post on the endpoint the recv
+//!   callback handed us, with `ep_sends: None`, add no stamp, and rely on the
+//!   inbound stamp (see the reply paragraph below).
 //! * [`WorkerState::stamp_inbound_use`], for the frames the **peer** sends with
 //!   `UCP_AM_SEND_FLAG_REPLY`: velo sets that flag on Messages and pings only.
 //!   UCX hands the recv callback a reply endpoint only for those, so
@@ -167,16 +171,16 @@
 //! an endpoint busy for as long as its send takes. A first send between fresh
 //! workers waits while the peer sets up its own endpoint back to us, inside the
 //! peer's `ucp_worker_progress`. With many UCX workers in one process (the
-//! parallel test suite) that step alone took 526-573 ms, past the 500 ms floor,
-//! and a reaper that read only the stamp FORCE-closed the endpoint under the
-//! send, losing the frame. The count follows `post_am`'s three exits: taken
-//! before the post, released on the inline and synchronous-failure exits, and
-//! released in `send_trampoline` for the asynchronous one. Only that last
-//! release reads the clock, and only when the count falls to zero. The count
-//! exists only with the reaper on, so with the reaper off (the default) a
-//! send pays only a `None` check, plus one clock read per `ucp_ep_create`.
-//! A send that never completes holds its endpoint open until UCX fails the
-//! endpoint, which is the conservative direction.
+//! parallel test suite) the peer's progress loop that contained that step took
+//! 526-573 ms, past the 500 ms floor, and a reaper that read only the stamp
+//! FORCE-closed the endpoint under the send, losing the frame. The count
+//! follows `post_am`'s three exits: taken before the post, released on the
+//! inline and synchronous-failure exits, and released in `send_trampoline` for
+//! the asynchronous one. Only that last release reads the clock, and only when
+//! the count falls to zero. The count exists only with the reaper on, so with
+//! the reaper off (the default) a send pays only a `None` check, plus one clock
+//! read per `ucp_ep_create`. A send that never completes holds its endpoint
+//! open until UCX fails the endpoint, which is the conservative direction.
 //!
 //! The per-send cost is below what can be measured. `bench_am_send` (in the
 //! tests) on a GB200 node, release build, 6 runs alternating between the code
@@ -228,34 +232,33 @@
 //! to belong to — one that has gone away. A candidate has no outstanding RMA
 //! operation by construction, so FORCE has nothing to cancel.
 //!
-//! **What the peer pays, measured.** Closing an endpoint is not a local act.
-//! UCX pairs endpoints by remote worker, so velo's REPLY-flagged Active
-//! Messages cause a matching endpoint to exist on the peer, and the peer's own
-//! `ucp_ep_create` back to us is matched onto *that* connection rather than
-//! building a fresh one. After a reap the peer's next REPLY-flagged frame to us
-//! is dropped. Its next Message is admitted and silently lost (measured). By
-//! the same inferred mechanism, its next ping gets no Pong, so its
-//! `check_health` returns `Timeout` (or `ConnectionFailed` if keepalive fails
-//! the endpoint while the probe is waiting). Its Responses and Events still
-//! arrive (measured: 8 of 8 in every run). Acks carry no REPLY flag either, so
-//! the same is expected, but it was not measured. Why: per the UCX source, a
-//! REPLY-flagged frame carries an endpoint id for the reply path, and a frame
-//! whose endpoint id no longer resolves is dropped. That is inferred from the
-//! source and a measurement, not proven. UCX keepalive (~20 s by default) then
-//! declares the peer's endpoint failed, and the frame after that takes velo's
-//! existing failed-connection path and arrives. So after each reap the peer's
-//! Messages and pings to us are lost, silently, until keepalive (~20 s) fails
-//! its endpoint; the first loss is a Message with no error, or a ping that
-//! times out. Re-sending does not help (measured by hand;
-//! `reaping_disrupts_the_peers_path_back` asserts only that the first frame
-//! does not arrive). The disruption lasts up to a keepalive interval per reaped
-//! endpoint and heals itself. Both close modes were measured and behave
-//! identically, so FORCE is kept for the reasons below.
-//! `reaping_disrupts_the_peers_path_back` pins it and
-//! [`UcxTransportBuilder::ep_idle_timeout`](super::transport::UcxTransportBuilder::ep_idle_timeout)
-//! carries the operator-facing version. This is the concrete cost D9 deferred
-//! ("connection-pool policy revisited later") and the sharpest reason the knob
-//! is off.
+//! **What the peer pays.** Closing an endpoint is not a local act. UCX pairs
+//! endpoints by remote worker, so velo's REPLY-flagged Active Messages cause a
+//! matching endpoint to exist on the peer, and the peer's own `ucp_ep_create`
+//! back to us is matched onto *that* connection rather than building a fresh
+//! one. After a reap the peer's next REPLY-flagged frame to us is dropped. Its
+//! next Message is admitted and silently lost (measured). By the same inferred
+//! mechanism, its next ping gets no Pong, so its `check_health` returns
+//! `Timeout` (or `ConnectionFailed` if keepalive fails the endpoint while the
+//! probe is waiting). Its Responses and Events still arrive (measured: 8 of 8
+//! in every run). Acks carry no REPLY flag either, so the same is expected, but
+//! it was not measured. Why: per the UCX source, a REPLY-flagged frame carries
+//! an endpoint id for the reply path, and a frame whose endpoint id no longer
+//! resolves is dropped. That is inferred from the source and a measurement, not
+//! proven. UCX keepalive (~20 s by default) then declares the peer's endpoint
+//! failed, and the frame after that takes velo's existing failed-connection
+//! path and arrives. So after each reap the peer's Messages and pings to us are
+//! lost, silently, until keepalive (~20 s) fails its endpoint; the first loss
+//! is a Message with no error, or a ping that times out. Re-sending does not
+//! help (measured by hand; `reaping_disrupts_the_peers_path_back` asserts only
+//! that the first frame does not arrive). The disruption lasts up to a
+//! keepalive interval per reaped endpoint and heals itself. Both close modes
+//! were measured by hand and behave identically, so FORCE is kept for the
+//! reasons below. `reaping_disrupts_the_peers_path_back` pins the FORCE case.
+//! The operator-facing version is on
+//! [`UcxTransportBuilder::ep_idle_timeout`](super::transport::UcxTransportBuilder::ep_idle_timeout).
+//! This is the concrete cost D9 deferred ("connection-pool policy revisited
+//! later") and the sharpest reason the knob is off.
 //!
 //! Recreation on *our* side is transparent and needs no extra machinery: the peer stays in
 //! `WorkerShared::peers` with its incarnation intact, so the next `ensure_ep`
@@ -1640,11 +1643,11 @@ fn run_loop(mut state: WorkerState, ring_rx: flume::Receiver<Cmd>) {
         // ORDERING INVARIANT (use-after-free guard): `Cmd::PongTo` and
         // `Cmd::ShuttingDownTo` carry raw `ucp_ep_h` pointers captured by the
         // recv trampoline, i.e. they are enqueued ONLY from AM callbacks,
-        // which run ONLY inside `ucp_worker_progress` on this thread. The three
-        // paths that free endpoints (`revalidate_eps`, `reap_failed_eps`,
-        // `reap_idle_eps`) therefore run only (a) after the ring has been
-        // drained to empty
-        // following the progress call above, and (b) via FORCE closes that
+        // which run ONLY inside `ucp_worker_progress` on this thread. The four
+        // paths that free endpoints (`close_parked`, `revalidate_eps`,
+        // `reap_failed_eps`, `reap_idle_eps`) therefore run only (a) after the
+        // ring has been drained to empty following the progress call above,
+        // and (b) via FORCE closes that
         // never call `ucp_worker_progress` themselves (`close_ep_raw` defers
         // any close request to `poll_pending_closes`). Together these make
         // "a reply command exists for an endpoint that has been freed"
@@ -1660,7 +1663,8 @@ fn run_loop(mut state: WorkerState, ring_rx: flume::Receiver<Cmd>) {
         // invariants in the module docs.
         state.drain_rma_completions();
         if observed_empty {
-            // All four close endpoints; all are only safe here (see above).
+            // All four paths that free endpoints; all are only safe here (see
+            // above).
             state.close_parked();
             state.revalidate_eps();
             state.reap_failed_eps();
@@ -1926,11 +1930,12 @@ impl WorkerState {
             .ok_or_else(|| anyhow::anyhow!("peer {peer} not registered"))?;
         if let Some(entry) = self.eps.get_mut(&peer) {
             if entry.incarnation == blob.incarnation {
-                // The single freshness stamp for the idle reaper. Every path
-                // that touches an endpoint — `Cmd::Send`, `Cmd::Ping`,
-                // `Cmd::EnsureEp`, and `prepare_get`'s RMA lookup — arrives
-                // here, so there is exactly one place that can forget to record
-                // a use.
+                // The freshness stamp for every path that resolves an
+                // endpoint by peer — `Cmd::Send`, `Cmd::Ping`, `Cmd::EnsureEp`,
+                // and `prepare_get`'s RMA lookup — so there is exactly one
+                // place that can forget to record a use. Replies
+                // (`Cmd::PongTo`, `Cmd::ShuttingDownTo`) do not come here; they
+                // rely on the inbound stamp (see the module docs).
                 entry.last_used = self.now;
                 return Ok((entry.ep, entry.sends.clone()));
             }

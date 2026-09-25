@@ -91,12 +91,15 @@ pub struct UcxConfig {
 /// are not counted.) What a short timeout does is close endpoints between
 /// ordinary uses, and each close makes the next use pay wireup again and costs
 /// the peer at least one lost Message, or a ping that times out (see
-/// [`UcxTransportBuilder::ep_idle_timeout`]). Measured wireup, on a worker that
-/// has already created an endpoint, is ~14 ms on CX-7 InfiniBand and upwards of
-/// 10 ms over the tcp lane in CI, so half a second is roughly thirty-five times
-/// that. A fresh worker costs more: on a GB200 node its first `ucp_ep_create`
-/// took 110-150 ms, and a fresh pair's first frame took 360-420 ms to arrive
-/// with the node's CPUs oversubscribed.
+/// [`UcxTransportBuilder::ep_idle_timeout`]). The first RDMA GET on a fresh
+/// two-process pair over CX-7 InfiniBand (`rc_verbs`) took ~14 ms, wireup
+/// included, and wireup over the tcp lane in CI takes upwards of 10 ms, so half
+/// a second is roughly thirty-five times that. In the in-process test harness
+/// over tcp on a GB200 node, with several UCX workers per process, one
+/// `ucp_ep_create` call took 110-150 ms, and 630 ms at the median across 31
+/// creates in one process; the cause is not isolated. In that harness a fresh
+/// pair's first frame took 360-420 ms to arrive with the node's CPUs
+/// oversubscribed.
 ///
 /// It is a builder-level ergonomic guard, not an invariant of the reaper: a test
 /// constructing a [`UcxConfig`] directly can go below it deliberately.
@@ -752,16 +755,17 @@ impl UcxTransportBuilder {
     /// lane, with both close modes:
     ///
     /// 1. The peer's next Message to us is admitted and **silently lost** — no
-    ///    error at its end, no arrival at ours (measured). Every Message and
-    ///    ping it sends after that is lost too, until step 2: retrying does not
-    ///    help, and neither does this side establishing a fresh endpoint of its
-    ///    own (measured by hand; `reaping_disrupts_the_peers_path_back` asserts
+    ///    error at its end, no arrival at ours (measured). Every Message it
+    ///    sends after that is lost too, until step 2: retrying does not help,
+    ///    and neither does this side establishing a fresh endpoint of its own
+    ///    (measured by hand; `reaping_disrupts_the_peers_path_back` asserts
     ///    only that the first frame does not arrive). By the same inferred
     ///    mechanism, its next ping gets no Pong, so its `check_health` returns
     ///    `Timeout` (or `ConnectionFailed` if keepalive fails the endpoint
-    ///    while the probe is waiting). Its Responses and Events still arrive
-    ///    (measured: 8 of 8 in every run). Acks carry no REPLY flag either, so
-    ///    the same is expected, but it was not measured.
+    ///    while the probe is waiting). Later pings are expected to be lost the
+    ///    same way (inferred, not measured). Its Responses and Events still
+    ///    arrive (measured: 8 of 8 in every run). Acks carry no REPLY flag
+    ///    either, so the same is expected, but it was not measured.
     /// 2. UCX keepalive (default interval ~20 s) eventually declares the peer's
     ///    endpoint failed and fires its error handler.
     /// 3. The frame after that takes velo's existing failed-connection path onto
@@ -783,10 +787,12 @@ impl UcxTransportBuilder {
     ///
     /// * **Genuinely symmetric-idle peers** — neither side has spoken for a
     ///   timeout. This is the case the knob is for, and it still carries the
-    ///   cost above, whichever side speaks first. If we speak first, our send
-    ///   arrives with no error
+    ///   cost above, whichever side speaks first, when the peer keeps its
+    ///   endpoint to us. If we speak first, our send arrives with no error
     ///   (`idle_endpoint_closes_and_the_next_send_wires_up_again`), and the
-    ///   peer still loses its next Messages and pings to us.
+    ///   peer still loses its next Messages and pings to us. If the peer also
+    ///   runs the reaper and has closed its own endpoint, its next send creates
+    ///   a fresh one; that case is not measured.
     /// * **Send-side-only fan-out** — this instance sends to many peers it never
     ///   hears from. Reaping costs nothing, since the disruption is to the
     ///   *peer's* path back and no peer is using one.

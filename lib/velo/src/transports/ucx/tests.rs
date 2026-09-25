@@ -2155,10 +2155,11 @@ async fn a_frame_received_late_in_a_long_pass_is_not_stamped_early() {
 ///
 /// A first send between fresh workers waits while the peer sets up its own
 /// endpoint back, inside the peer's `ucp_worker_progress`. In the parallel
-/// `--lib` run that took 526-573 ms, so the reaper closed the endpoint with
-/// the send in flight: the send failed through `on_error` and the frame was
-/// lost. The seam stops the peer's progress thread for three timeouts, which
-/// holds the send in flight on demand.
+/// `--lib` run the peer's progress loop that contained that step took 526-573
+/// ms, so the reaper closed the endpoint with the send in flight: the send
+/// failed through `on_error` and the frame was lost. The seam stops the peer's
+/// progress thread for three timeouts, which holds the send in flight on
+/// demand.
 ///
 /// The proof has two parts. `eps_closed_idle(&a) == 0` when the frame arrives
 /// shows the endpoint was not reaped under the send. That only means something
