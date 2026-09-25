@@ -2542,6 +2542,131 @@ async fn an_endpoint_with_an_inflight_get_is_not_reaped() {
     assert_rma_balanced(&idle_peer);
 }
 
+/// The completion of an RDMA GET restarts the idle clock, the same as the
+/// completion of a send.
+///
+/// An outstanding GET keeps its endpoint open (the test above). When the GET
+/// completes, its registry entry goes, and if nothing else stamped the
+/// endpoint, the last use on record is the moment the GET was posted. A GET
+/// slower than the timeout then leaves the endpoint closed at the first scan
+/// after it completes. No data is lost, but the next use pays a fresh wireup,
+/// and the close costs the peer a frame.
+///
+/// Over the tcp lane a GET needs the owner's progress thread, so stalling that
+/// thread holds the GET. The timeout is 2 s, so the scan period is 1 s, and a
+/// due scan runs at most one `PARK_MS` (100 ms) late. Without a completion
+/// stamp the endpoint closes within 1.1 s of the completion. With it, the
+/// endpoint stays open a full 2 s. The bound is 1.5 s, as in
+/// `a_send_in_flight_keeps_its_endpoint_open`. The test also checks that the
+/// GET was held past the point where the post stamp alone would have let a
+/// scan close the endpoint. Without that check, a GET that did not wait on the
+/// owner would pass the test for no reason.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_rma_get_slower_than_the_timeout_restarts_the_idle_clock() {
+    const TIMEOUT: Duration = Duration::from_secs(2);
+    const STALL: Duration = Duration::from_secs(5);
+    const LEN: usize = 64 * 1024;
+    let park = Duration::from_millis(PARK_MS as u64);
+    let mut src = PageBuf::new(LEN);
+    let dst = PageBuf::new(LEN);
+    src.fill_pattern();
+
+    let puller = start_node_with(|b| b.ep_idle_timeout(Some(TIMEOUT))).await;
+    let owner = start_node().await;
+    cross_register(&puller, &owner);
+    let owner_rma = owner.transport.rdma_endpoint();
+    let puller_rma = puller.transport.rdma_endpoint();
+    let remote = owner_rma
+        .map_region(src.addr(), LEN)
+        .await
+        .expect("map src");
+    let local = puller_rma
+        .map_region(dst.addr(), LEN)
+        .await
+        .expect("map dst");
+    let req = RmaGetRequest {
+        peer: owner.instance_id,
+        remote_addr: src.addr() as u64,
+        packed_rkey: remote.packed_rkey.clone(),
+        local_region: local.region_id,
+        local_offset: 0,
+        len: LEN as u64,
+    };
+
+    // A warm GET wires the endpoint up, so the timed GET below waits only on
+    // the owner.
+    tokio::time::timeout(T, puller_rma.get(req.clone()))
+        .await
+        .expect("warm get must not hang")
+        .expect("warm get succeeds");
+    assert_eq!(eps_open(&puller), 1);
+    assert_eq!(eps_closed_idle(&puller), 0);
+
+    // Stall the owner, and wait until it is asleep in the stall: the seam
+    // clears its value just before it sleeps.
+    owner
+        .transport
+        .shared
+        .progress_stall_ms
+        .store(STALL.as_millis() as u64, Ordering::Relaxed);
+    assert!(
+        wait_until(T, || owner
+            .transport
+            .shared
+            .progress_stall_ms
+            .load(Ordering::Relaxed)
+            == 0)
+        .await,
+        "the owner never entered the stall"
+    );
+
+    let posted_at = std::time::Instant::now();
+    tokio::time::timeout(STALL + T, puller_rma.get(req))
+        .await
+        .expect("get must not hang")
+        .expect("get succeeds");
+    let done_at = std::time::Instant::now();
+    let reap_due = TIMEOUT + ep_scan_period(TIMEOUT) + park;
+    let held = done_at.duration_since(posted_at);
+    assert!(
+        held >= reap_due,
+        "the GET took only {held:?}; it must outlast {reap_due:?} for this test \
+         to prove anything. It did not wait on the owner's progress."
+    );
+    assert_eq!(
+        eps_closed_idle(&puller),
+        0,
+        "the endpoint was closed while the GET was outstanding"
+    );
+    assert_eq!(dst.as_slice(), src.as_slice(), "the GET must have landed");
+
+    assert!(
+        !wait_until(TIMEOUT * 3 / 4, || eps_closed_idle(&puller) >= 1).await,
+        "the endpoint was closed within {:?} of the GET completing: the \
+         completion did not restart the idle clock",
+        TIMEOUT * 3 / 4
+    );
+    // And it is closed later: the completion restarts the clock, it does not
+    // stop it.
+    assert!(
+        wait_until(T, || eps_closed_idle(&puller) >= 1).await,
+        "the endpoint was never closed after the GET completed"
+    );
+
+    puller_rma
+        .unmap_region(local.region_id)
+        .await
+        .expect("unmap dst");
+    owner_rma
+        .unmap_region(remote.region_id)
+        .await
+        .expect("unmap src");
+    puller.transport.shutdown();
+    owner.transport.shutdown();
+    assert_rma_balanced(&puller);
+    assert_rma_balanced(&owner);
+}
+
 /// Teardown racing an idle close: the close may still be parked in
 /// `pending_closes` when `shutdown()` arrives, and the endpoint must be
 /// accounted for exactly once either way.
