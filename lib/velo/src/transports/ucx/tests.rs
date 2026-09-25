@@ -1937,9 +1937,13 @@ async fn a_peer_that_keeps_sending_keeps_its_endpoint() {
 ///
 /// The common shape of traffic: A sends B one request, and B streams frames
 /// back for longer than the idle timeout while A sends nothing more. A must
-/// count B's frames as use of its endpoint to B. If A reaps that endpoint,
-/// B's path back breaks (see `reaping_disrupts_the_peers_path_back`), and B's
-/// next frame is lost without an error at either end.
+/// count B's frames as use of its endpoint to B. If A reaps that endpoint
+/// under the stream, the stream itself survives over the tcp lane: Responses
+/// and Events sent after the reap were measured to arrive. What the reap
+/// costs is B's next Message or ping to A, which is lost without an error
+/// (`reaping_disrupts_the_peers_path_back`), and the wireup A's next send
+/// pays. So the endpoint count is the assertion that fails here, not the
+/// arrival count.
 ///
 /// `a_peer_that_keeps_sending_keeps_its_endpoint` is the control: the same
 /// schedule with Message frames passes. The frames here are collected after
