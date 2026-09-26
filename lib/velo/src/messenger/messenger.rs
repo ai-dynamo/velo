@@ -479,6 +479,11 @@ impl Messenger {
     }
 
     /// Wait for a specific handler to become available on a remote instance.
+    ///
+    /// Returns at once when the peer's known handler list already names it:
+    /// a registered handler does not go away while its instance lives, and a
+    /// refresh is a `_hello` round trip through the peer. Callers that ask per
+    /// request would otherwise put that round trip on every request.
     pub async fn wait_for_handler(
         &self,
         instance_id: InstanceId,
@@ -487,6 +492,9 @@ impl Messenger {
         const MAX_ATTEMPTS: u32 = 10;
         const DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
+        if self.client.handler_known(instance_id, handler_name) {
+            return Ok(());
+        }
         for _ in 0..MAX_ATTEMPTS {
             self.refresh_handlers(instance_id).await?;
 
@@ -871,6 +879,64 @@ mod tests {
         assert!(
             handlers.iter().any(|handler| handler == "_event_subscribe"),
             "expected _event_subscribe to be available immediately after startup"
+        );
+    }
+
+    /// Waiting for a handler the peer is already known to have does not
+    /// handshake again.
+    ///
+    /// `wait_for_handler` refreshed the peer's handler list with a full
+    /// `_hello` round trip on every call, so a caller that asks once per
+    /// request -- Dynamo's velo response plane asks before every `generate`
+    /// -- put a round trip through the peer's messenger on every request's
+    /// critical path. On a busy peer that round trip is the slowest thing in
+    /// the request: a saturated frontend took its median first token from
+    /// under 100 ms to several hundred.
+    #[tokio::test]
+    async fn waiting_for_a_known_handler_does_not_handshake_again() {
+        // TCP loopback rather than the in-memory pair: other tests here clear
+        // the shared in-memory registry, which can land mid-handshake.
+        fn tcp() -> Arc<dyn Transport> {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+            Arc::new(
+                crate::transports::tcp::TcpTransportBuilder::new()
+                    .from_listener(listener)
+                    .expect("from_listener")
+                    .build()
+                    .expect("build transport"),
+            )
+        }
+        let registry = prometheus::Registry::new();
+        let metrics = Arc::new(crate::observability::VeloMetrics::register(&registry).unwrap());
+        let (transport_a, transport_b) = (tcp(), tcp());
+        let a = Messenger::builder()
+            .add_transport(transport_a)
+            .metrics(metrics)
+            .build()
+            .await
+            .unwrap();
+        let b = Messenger::builder()
+            .add_transport(transport_b)
+            .build()
+            .await
+            .unwrap();
+        a.register_peer(b.peer_info()).unwrap();
+        b.register_peer(a.peer_info()).unwrap();
+
+        for _ in 0..3 {
+            a.wait_for_handler(b.instance_id(), "_list_handlers")
+                .await
+                .unwrap();
+        }
+
+        let snapshot = crate::observability::test_helpers::MetricSnapshot::from_registry(&registry);
+        let handshakes = snapshot.counter(
+            "velo_messenger_client_resolution_total",
+            &[("path", "handshake"), ("outcome", "attempt")],
+        );
+        assert_eq!(
+            handshakes, 1.0,
+            "the first wait learns the list; the rest read it"
         );
     }
 

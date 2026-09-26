@@ -399,6 +399,12 @@ impl ActiveMessageClient {
             .ok_or_else(|| anyhow::anyhow!("Failed to get handlers for instance {}", instance_id))
     }
 
+    /// Whether the peer's last known handler list names `handler`. No round
+    /// trip: `false` means unknown, not absent.
+    pub(crate) fn handler_known(&self, instance_id: InstanceId, handler: &str) -> bool {
+        self.peer_registry.handler_exists(instance_id, handler)
+    }
+
     /// Refresh the handler list for a peer
     pub(crate) async fn refresh_handler_list(&self, instance_id: InstanceId) -> Result<()> {
         self.handshake_with_peer(instance_id).await
