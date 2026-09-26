@@ -174,7 +174,7 @@ pub(crate) fn reap_unclaimed(
 /// Exits when its token is cancelled, when the mux closes the bind's buffer
 /// (the stream ended, or an unclaimed bind was released — which it reaps on
 /// the spot, as the pump did on seeing its receiver close), or when it fires.
-async fn stream_watchdog(
+pub(crate) async fn stream_watchdog(
     rx: flume::Receiver<Vec<u8>>,
     frame_tx: flume::Sender<Vec<u8>>,
     cancel_token: CancellationToken,
@@ -255,4 +255,67 @@ async fn stream_watchdog(
         }
     }
     cancel_token.cancel();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry() -> crate::streaming::anchor::AnchorEntry {
+        crate::streaming::anchor::AnchorEntry {
+            feed: Default::default(),
+            frame_tx: flume::bounded(4).0,
+            cancel_token: CancellationToken::new(),
+            active_pump_token: None,
+            attachment: false,
+            timeout_cancel: None,
+            unattached_timeout: None,
+            heartbeat_interval: std::time::Duration::from_secs(5),
+            stream_cancel_handle: None,
+            prebind: None,
+            stop_requested: false,
+        }
+    }
+
+    fn unclaimed_feed(pump_token: CancellationToken) -> DirectFeed {
+        let (wake, _) = flume::unbounded();
+        DirectFeed {
+            rx: flume::bounded(1).1,
+            drain: Arc::new(DrainSignal::new(wake)),
+            pump_token,
+        }
+    }
+
+    /// A retired feed never reaps; an abandoned one reaps exactly once.
+    ///
+    /// Releasing a pre-bind on a transport mismatch cancels its pump token and
+    /// then drops the bind, which closes it exactly as the accept window does.
+    /// The entry that close would reap is the one the winning attach is about
+    /// to reuse, so the cancelled token is what must stop the reap -- whichever
+    /// of the consumer and the watchdog sees the close.
+    #[test]
+    fn a_retired_feed_does_not_reap_and_an_abandoned_one_reaps_once() {
+        let ctx = crate::streaming::anchor::AnchorContext {
+            registry: Arc::new(dashmap::DashMap::new()),
+            mpsc_registry: Arc::new(dashmap::DashMap::new()),
+            metrics: None,
+        };
+        ctx.registry.insert(1, entry());
+
+        let retired = CancellationToken::new();
+        retired.cancel();
+        assert!(!reap_unclaimed(&unclaimed_feed(retired), 1, &ctx));
+        assert!(
+            ctx.registry.contains_key(&1),
+            "a retired feed must leave the entry"
+        );
+
+        let abandoned = unclaimed_feed(CancellationToken::new());
+        assert!(reap_unclaimed(&abandoned, 1, &ctx));
+        assert!(!ctx.registry.contains_key(&1));
+        assert!(
+            !reap_unclaimed(&abandoned, 1, &ctx),
+            "the second sight of the close is a no-op"
+        );
+    }
 }

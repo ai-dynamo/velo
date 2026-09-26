@@ -205,7 +205,7 @@ impl DrainSignal {
     }
 
     /// The mux let go of this bind's buffer. Idempotent.
-    pub(super) fn close(&self) {
+    pub(crate) fn close(&self) {
         self.closed.cancel();
     }
 

@@ -2039,6 +2039,9 @@ async fn a_removed_anchor_withdraws_its_feed() {
 
     anchor.controller().cancel();
     assert!(!node.manager.registry.contains_key(&local_id));
-    assert!(cell.current().is_none(), "the removed entry must withdraw its feed");
+    assert!(
+        cell.current().is_none(),
+        "the removed entry must withdraw its feed"
+    );
     drop(anchor);
 }

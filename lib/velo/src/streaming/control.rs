@@ -319,6 +319,8 @@ pub enum AnchorAttachResponse {
 mod feed;
 mod pump;
 mod ticket;
+#[cfg(test)]
+pub(crate) use feed::stream_watchdog;
 pub(crate) use feed::{DirectFeed, FeedCell, reap_unclaimed, start_direct_stream};
 pub(crate) use pump::{PumpContext, note_timer_arm, note_timer_fire, reader_pump};
 #[cfg(test)]
@@ -569,37 +571,35 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::messe
                             // Drop shard lock before spawning
                             drop(occ);
 
-                            // Spawn reader pump as background task
+                            // Start the stream's consumer side
                             let (_, local_id) = req.handle.unpack();
                             // Only the mux parks a drain signal, and only for
-                            // the pair it just bound. Every other transport
-                            // returns `None` and the pump's per-frame cost is
-                            // one `Option` check.
-                            let drain = manager.take_mux_drain_signal(local_id, routing_session_id);
-                            let direct = drain.is_some();
-                            let pump = PumpContext {
-                                local_id,
-                                heartbeat_deadline: heartbeat_interval,
-                                drain,
-                                // This is the ordinary attach path: a
-                                // sender is already on the wire, not a
-                                // zero-RTT pre-bind waiting for one. No
-                                // `PreBind` exists to share a flag with,
-                                // so this one starts and stays `false`.
-                                prebound: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
-                                    false,
-                                )),
-                            };
-                            if direct {
-                                // A mux bind: the consumer reads the slot
-                                // buffer itself (see `control::feed`).
+                            // the pair it just bound: a mux bind's consumer
+                            // reads the slot buffer itself (see
+                            // `control::feed`); every other transport gets a
+                            // reader pump.
+                            if let Some(drain) =
+                                manager.take_mux_drain_signal(local_id, routing_session_id)
+                            {
                                 start_direct_stream(
                                     &feed,
                                     receiver,
                                     pump_frame_tx,
                                     pump_cancel,
                                     manager.anchor_context(),
-                                    pump,
+                                    PumpContext {
+                                        local_id,
+                                        heartbeat_deadline: heartbeat_interval,
+                                        drain: Some(drain),
+                                        // This is the ordinary attach path: a
+                                        // sender is already on the wire, not a
+                                        // zero-RTT pre-bind waiting for one. No
+                                        // `PreBind` exists to share a flag with,
+                                        // so this one starts and stays `false`.
+                                        prebound: std::sync::Arc::new(
+                                            std::sync::atomic::AtomicBool::new(false),
+                                        ),
+                                    },
                                 );
                             } else {
                                 tokio::spawn(reader_pump(
@@ -607,7 +607,8 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::messe
                                     pump_frame_tx, // cloned from entry
                                     pump_cancel,   // cloned from entry
                                     manager.anchor_context(),
-                                    pump,
+                                    local_id,
+                                    heartbeat_interval,
                                 ));
                             }
 
