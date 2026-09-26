@@ -57,6 +57,22 @@ Velo loses by about 64% here, and the loss is latency-bound, not CPU-bound: the 
 - The frontend's ordered lanes are not CPU-bound on the rig (2.5% of 72 cores for 8 lanes); the 1.25 ms mean lane wait is scheduling delay behind a runtime 87% busy with Dynamo's HTTP pipeline. Velo is about 12% of frontend CPU on the rig (reader pump 5.4%, lane 2.5%, listener 0.4%, batcher 0.2%, anchor polling inside the HTTP body).
 - Next: profile a mocker node in the 8-process shape (`wprof1`) to find what grows superlinearly with streams per process.
 
+## Levers 1 and 4, and the frontend-bound rig (2026-09-26)
+
+Commits: `a2b895a` direct feed, `d3de70e` withdraw fix (adversarial review), `55e1253` reader_pump cleanup, `3a2b366`/`d1a5d52` docs, `d63f112` lever 4 cheap half, `4df8aa5` wait_for_handler.
+
+Bench (fe us/record median of 3): lever 1 5.87 -> 5.33 (12 peers), 7.71 -> 7.38 (48); lever 4 5.34 -> 5.20 (12), noise (48). Cumulative from da848eb: 6.66 -> 5.20 (-22%) at 12 peers, 8.60 -> 7.30 (-15%) at 48. Messenger per-batch allocations measured at ~0.35% of frontend CPU together: left alone.
+
+Rig, 16 x 32 workers, OSL 900 (tables in `.research/results/t3-<tag>/ab-table.md`):
+
+| tag | frontend | build | QUIC req/s | velo req/s | velo vs QUIC fe CPU | notes |
+|---|---|---|---|---|---|---|
+| fe32base | 32 cores | da848eb | 2,154 / 2,178 | 2,140 / 2,138 | 13.6-13.8 vs 12.0 | worker node 93-96% busy |
+| fe32l1 | 32 cores | 55e1253 | 2,243 / 2,261 | 2,331 / 2,220 | 12.6-13.1 vs 11.7 | velo ITL p99 ~4 ms vs ~6 ms |
+| fe24l1 | 24 cores (frontend-bound) | 55e1253 | 1,914 / 1,660 | 1,997 / 2,024 | 11.3-11.5 vs 11.5-13.7 | velo TTFT p50 219-640 ms vs QUIC 83-93 ms |
+
+TTFT under frontend saturation: the frontend's `transport_roundtrip` stage (request-plane send to first response frame polled) was 468 / 220 ms mean for velo against 62 / 71 ms for QUIC. Frontend ordered-lane wait was ~25 ms per batch during load, inbound queue empty, so the lane explains a part only. Cause found: jthomson's adapter calls `Velo::wait_for_handler(peer, "_stream_stop")` before every generate, and `wait_for_handler` always refreshed with a full `_hello` round trip through the (saturated) frontend's messenger. `4df8aa5` returns at once when the known handler list names the handler. Rig A/B of that fix: `fe24l4` (before, d1a5d52) vs `fe24hf` (after, 4df8aa5), 4 reps each with QUIC as the fixed reference in each allocation.
+
 ## Open design questions (need a ruling)
 
 1. Remove the reader pump from the mux data path: the consumer reads the slot buffer and posts drains; the pump survives only as a lifecycle/watchdog task stamped from ingress. Prototype (`proto-direct` branch, watchdog dropped) measured -12% to -18% frontend CPU. Reopens `batched-streaming-design.md:79-83` by a different mechanism; buffering per stream shrinks from C+1+256 to C+1.
