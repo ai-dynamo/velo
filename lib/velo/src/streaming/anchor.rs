@@ -3008,7 +3008,7 @@ mod tests {
                 velo_ext::WorkerId::from_u64(7),
                 crate::streaming::messenger_mux::protocol::SlotId::from_raw(0),
                 Arc::new(AtomicBool::new(false)),
-                flume::unbounded::<u32>().0,
+                Arc::new(crate::streaming::messenger_mux::ingress::DirtySlots::new()),
             );
             let ticket = crate::streaming::control::StreamOpenTicket {
                 streaming_transport_key: velo_ext::TransportKey::new("mock-stream"),

@@ -170,11 +170,12 @@ pub struct MuxConfig {
     ///
     /// A backstop, not the primary mechanism. Credit comes back from the
     /// arrival path on every inbound batch — for the slots that batch
-    /// delivered into and the slots a draining pump named on the peer's dirty
-    /// lane — and from the doorbell over that same lane. This covers only what
-    /// neither reaches: a slot parked with nothing further arriving *and*
-    /// nothing being taken out, and one whose drain found the lane full. It
-    /// also carries batcher eviction, whose granularity it sets.
+    /// delivered into and the slots a draining consumer listed in the peer's
+    /// dirty set — and from the doorbell over that same set. This covers only
+    /// what neither reaches: a slot parked with nothing further arriving *and*
+    /// nothing being taken out, and one whose listing could not post the
+    /// peer's wake. It also carries batcher eviction, whose granularity it
+    /// sets.
     ///
     /// It was 2 ms when the sweep was the only way credit came back, which is
     /// what made that interval load-bearing rather than a tuning choice. Every
@@ -206,7 +207,7 @@ pub struct MuxConfig {
     /// mutex the inbound batch path takes, so on the shape this mux exists for
     /// — one peer, hundreds to thousands of slots, a consumer that keeps up —
     /// the doorbell becomes hot-path contention. It walked every slot of the
-    /// peer when this floor was added; it now walks the dirty lane's slots
+    /// peer when this floor was added; it now walks the dirty set's slots
     /// alone, which shortens each visit but does not change what the rate needs
     /// bounding for.
     ///
@@ -220,9 +221,9 @@ pub struct MuxConfig {
     /// producer parked out of credit on a peer sending this side no further
     /// batch waits up to this long for the return its consumer's drain has
     /// already earned. Only that producer — any inbound batch from the peer
-    /// reconciles the slots its pumps named on the dirty lane, so a peer that
-    /// keeps sending never reaches this floor at all. A drain whose listing
-    /// found the lane full is not on the lane and so not on this path either;
+    /// reconciles the slots listed in its dirty set, so a peer that keeps
+    /// sending never reaches this floor at all. A listing whose wake could not
+    /// be posted never rings the doorbell, so it is not on this path either;
     /// `credit_sweep_interval` is what covers it. That is one wait per window,
     /// so what it costs per record is `floor / initial_credit` — negligible at
     /// the default 256-record window, and visible at the small windows the

@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use velo_ext::WorkerId;
 
 use super::super::protocol::SlotId;
+use super::dirty::DirtySlots;
 
 /// Told when the consumer takes a record out of the buffer credit is issued
 /// against, so credit comes back by draining instead of by a timer.
@@ -23,11 +24,11 @@ use super::super::protocol::SlotId;
 ///
 /// **The pump counts, and it names its slot.** `drained` is the exact number
 /// of records this slot's pump has taken out of the buffer since the last
-/// reconcile, and `listed` says whether the slot is already on its peer's
-/// dirty lane waiting for one. That is what lets a reconcile be exact without
-/// reading the slot channel's length — a read that takes that channel's lock,
-/// which is what made the arrival path's whole-table walk expensive enough to
-/// narrow in the first place.
+/// reconcile, and the slot's bit in its peer's [`DirtySlots`] says whether it
+/// is already listed waiting for one. That is what lets a reconcile be exact
+/// without reading the slot channel's length — a read that takes that
+/// channel's lock, which is what made the arrival path's whole-table walk
+/// expensive enough to narrow in the first place.
 ///
 /// **The pump does not release credit.** Releasing needs the peer's mutex —
 /// the same one the inbound batch path takes — and taking it per record would
@@ -50,8 +51,6 @@ pub(crate) struct DrainSignal {
     /// [`IngressSlot::reconcile`](super::slot::IngressSlot::reconcile) swapped
     /// it to zero.
     drained: AtomicU32,
-    /// Whether this slot's index is already sitting on the peer's dirty lane.
-    listed: AtomicBool,
     wake: flume::Sender<WorkerId>,
 }
 
@@ -60,10 +59,10 @@ struct SlotClaim {
     peer: WorkerId,
     /// The peer's "a credit-return visit is already queued" flag.
     pending: Arc<AtomicBool>,
-    /// The slot this bind became, whose index names it on the lane.
+    /// The slot this bind became, whose index names it in the dirty set.
     slot: SlotId,
-    /// The peer's dirty-slot lane, for naming this slot as having drained.
-    lane: flume::Sender<u32>,
+    /// The peer's dirty-slot set, for naming this slot as having drained.
+    dirty: Arc<DirtySlots>,
 }
 
 impl DrainSignal {
@@ -72,27 +71,26 @@ impl DrainSignal {
             claim: OnceLock::new(),
             lifecycle: std::sync::Mutex::new(0),
             drained: AtomicU32::new(0),
-            listed: AtomicBool::new(false),
             wake,
         }
     }
 
     /// Name the peer this bind turned out to belong to, its slot index, that
-    /// peer's dirty lane and its pending-wake flag. Called once, when an
+    /// peer's dirty-slot set and its pending-wake flag. Called once, when an
     /// `OpenSlot` claims the bind.
     pub(crate) fn claimed_by(
         &self,
         peer: WorkerId,
         slot: SlotId,
         pending: Arc<AtomicBool>,
-        lane: flume::Sender<u32>,
+        dirty: Arc<DirtySlots>,
     ) -> u8 {
         let lifecycle = self.lifecycle.lock().unwrap();
         let _ = self.claim.set(SlotClaim {
             peer,
             slot,
             pending,
-            lane,
+            dirty,
         });
         *lifecycle
     }
@@ -123,86 +121,74 @@ impl DrainSignal {
     ///
     /// The count comes first and is unconditional, because it is the only
     /// record of the drain that survives — the listing and the wake are both
-    /// best-effort hints about *when* to look, and a reconcile that arrives by
-    /// any route reads the same number.
+    /// hints about *when* to look, and a reconcile that arrives by any route
+    /// reads the same number.
     ///
     /// The listing is per *slot* and the wake is per *peer*, which is the
-    /// granularity each does its work at: one lane entry is all a reconcile
-    /// needs to find this slot, and one wake is all the sweep task needs to
-    /// come and drain the lane. `listed` and the peer's `pending` flag are the
-    /// two coalescers, and each is taken down by the visit it summoned.
+    /// granularity each does its work at: one bit in the peer's
+    /// [`DirtySlots`] is all a reconcile needs to find this slot, and one wake
+    /// is all the sweep task needs to come and take the set. The set's own
+    /// dedup and the peer's `pending` flag are the two coalescers, and each is
+    /// taken down by the visit it summoned.
     ///
-    /// `try_send` rather than an await on both: this runs on the pump's task,
-    /// in the path of every frame, and must never park it. **A full lane puts
-    /// `listed` back down**, and a full wake lane puts `pending` back down, for
-    /// the same reason: leaving either up claims a visit is coming when none
-    /// is, and every later drain would coalesce into something that was
-    /// dropped. Clearing costs this one drain its hint and lets the next one
-    /// try again; the periodic sweep's whole-table walk is what bounds the gap
-    /// if no next one comes, and the count is still there when it arrives.
+    /// **Only the drain that lists the slot touches `pending`.** Every
+    /// consumer of the peer's streams drains into that one flag, so a write
+    /// per record bounces its cache line between every thread running one of
+    /// them. A drain that finds its slot already listed has nothing to add: the
+    /// drain that listed it either posted a wake or found one already
+    /// outstanding, a visit takes `pending` down *before* it takes the set
+    /// (`MuxCore::visit_drained_peer`, `MuxCore::sweep_peer`), and the arrival
+    /// path's own take leaves the slot unlisted, so the next drain lists it
+    /// again and does the `pending` step itself. Either way the listing this
+    /// drain rode on is answered by a take that also collects its count.
+    ///
+    /// `try_send` rather than an await on the wake: this runs on the
+    /// consumer's path for every record and must never park it. **A full wake
+    /// lane puts `pending` back down**: leaving it up claims a visit is coming
+    /// when none is, and every later listing would coalesce into something
+    /// that was dropped. The periodic sweep's whole-table walk bounds the gap
+    /// until the next listing tries again.
     ///
     /// A per-slot record threshold was the alternative to the wake and is
     /// worse on both counts: it withholds credit for the first `T` records of
     /// every slot, which is latency on the path this change exists to speed up,
     /// and with a thousand slots on one peer it still posts a thousand times.
     ///
-    /// Both flag updates below are RMWs (`swap`), never a load followed by a
-    /// conditional swap: a plain `listed.load` could return a stale `true`
-    /// while a concurrent [`take_drained`](Self::take_drained) has already
-    /// cleared it but not yet finished swapping the count out, and a pump that
-    /// trusts that stale read declines to list — stranding this drain's count
-    /// until the periodic walk finds it, which is the tail-of-stream stall
-    /// this whole mechanism exists to remove. An RMW has no such window: it is
-    /// guaranteed to observe the value immediately preceding it in `listed`'s
-    /// own modification order, so it always sees a concurrent clear. The same
-    /// argument is why `claim.pending.swap` below is a swap and not a load.
+    /// Orderings: the count's `fetch_add` is `Relaxed` and the listing's
+    /// `fetch_or` is `AcqRel`, so a take whose swap reads the listing (or any
+    /// later RMW on its word) sees the count. `pending` is a `swap`, never a
+    /// load followed by a store, so a concurrent clear is always observed.
     pub(crate) fn drained(&self) {
         let Some(claim) = self.claim.get() else {
             // Nothing has been delivered on this bind yet, so nothing drained.
             return;
         };
         self.drained.fetch_add(1, Ordering::Relaxed);
-        if !self.listed.swap(true, Ordering::AcqRel)
-            && claim.lane.try_send(claim.slot.index()).is_err()
-        {
-            self.listed.store(false, Ordering::Release);
+        if !claim.dirty.mark(claim.slot.index()) {
+            return; // already listed; that listing's visit collects this count
         }
         if claim.pending.swap(true, Ordering::AcqRel) {
             return; // a wake for this peer is already outstanding
         }
         if self.wake.try_send(claim.peer).is_err() {
-            // Nobody will take the flag down, so let the next drain try again
-            // rather than leaving this peer permanently marked as pending.
+            // Nobody will take the flag down, so let the next listing try
+            // again rather than leaving this peer permanently marked pending.
             claim.pending.store(false, Ordering::Release);
         }
     }
 
-    /// Clear the listing, then take the drain count.
+    /// Take the drain count.
     ///
-    /// The order is what makes a concurrent drain safe, and it is the reverse
-    /// of [`drained`](Self::drained)'s. A drain landing between the two steps
-    /// finds `listed` down and lists the slot again, so the next pass sees
-    /// either a count of zero (this pass had already taken its record) or the
-    /// new drain — never a count with nothing to come and fetch it. Swapping
-    /// first and clearing after loses exactly that case: the drain would find
-    /// `listed` still up, decline to list, and its credit would wait for the
-    /// periodic walk.
-    ///
-    /// That guarantee is not a consequence of the abstract Rust/C++ memory
-    /// model on its own: `listed`'s `store` here and `drained`'s `fetch_add`
-    /// in [`drained`](Self::drained) are on different atomics joined only by
-    /// program order on each side, which is the store-buffering shape that
-    /// model permits between `Release`/`Acquire` operations on different
-    /// locations, closed only by making every operation on both sides
-    /// `SeqCst`. Where the model permits it, the failure is bounded rather
-    /// than a lost drain: the count stays on `drained` and the slot is not
-    /// relisted, which is the same degradation as a lane entry lost to a full
-    /// lane, and the periodic whole-table walk already covers that within one
-    /// `credit_sweep_interval`. Not observed on the x86-64 and AArch64
-    /// targets this crate is built and measured for; a target that needs the
-    /// tighter guarantee promotes this pair to `SeqCst` instead.
+    /// Called only for a slot whose listing the caller already took out of the
+    /// peer's [`DirtySlots`] (or, on the whole-table walk, after taking every
+    /// listing): clearing the listing first is what makes a concurrent drain
+    /// safe. A drain landing after the take finds its bit clear and lists the
+    /// slot again, so the next pass sees either a count of zero (this call
+    /// already took its record) or the new drain — never a count with nothing
+    /// to come and fetch it. Both sides are RMWs (`fetch_or` against `swap` on
+    /// the slot's word, then `fetch_add` against this `swap`), so unlike the
+    /// store-then-swap this replaced there is no store-buffering window.
     pub(super) fn take_drained(&self) -> u32 {
-        self.listed.store(false, Ordering::Release);
         self.drained.swap(0, Ordering::AcqRel)
     }
 }

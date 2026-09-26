@@ -1000,7 +1000,7 @@ async fn test_pump_reaps_a_claimed_prebind_after_missed_heartbeats() {
         peer,
         slot,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        flume::unbounded::<u32>().0,
+        std::sync::Arc::new(crate::streaming::messenger_mux::ingress::DirtySlots::new()),
     );
 
     // Same generous margin as the sibling test above and as

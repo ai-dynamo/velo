@@ -18,7 +18,7 @@ use crate::streaming::sender::{cached_dropped, cached_finalized};
 
 /// A drain signal whose wakes go nowhere, for tests that drive the registry
 /// directly. The claim path still runs, so `open_slot` naming the peer, the
-/// slot index and the dirty lane is covered; nothing consumes the wake lane
+/// slot index and the dirty set is covered; nothing consumes the wake lane
 /// because these tests have no sweep task.
 fn test_drain() -> Arc<DrainSignal> {
     let (tx, _rx) = flume::bounded(16);
@@ -910,10 +910,10 @@ fn open_many(registry: &IngressRegistry, config: &MuxConfig, count: u32) -> Vec<
 /// peer holding a thousand of them, under the mutex the batch path needs.
 ///
 /// Named for the surviving rule, not the first cut's: a batch reconciles the
-/// slots it delivered into *and* the slots on the dirty lane, and this case
+/// slots it delivered into *and* the slots in the dirty set, and this case
 /// has none of the latter, so the assertion below only exercises the first
 /// half. [`a_batch_returns_the_credit_of_every_slot_that_drained`] is the
-/// counterpart that exercises the dirty-lane half.
+/// counterpart that exercises the dirty-set half.
 #[test]
 fn a_batch_reconciles_the_slots_it_delivered_into_and_no_others_when_nothing_drained() {
     let config = config();
@@ -929,7 +929,7 @@ fn a_batch_reconciles_the_slots_it_delivered_into_and_no_others_when_nothing_dra
 
     assert_eq!(
         visits, 1,
-        "nothing has drained, so the peer's dirty lane is empty and a batch \
+        "nothing has drained, so the peer's dirty set is empty and a batch \
          delivering into 1 of its {MANY_SLOTS} slots must reconcile that one; \
          it reconciled {visits}"
     );
@@ -937,7 +937,7 @@ fn a_batch_reconciles_the_slots_it_delivered_into_and_no_others_when_nothing_dra
 
 /// Control: the periodic sweep keeps the whole-table walk, because it is the
 /// backstop for a slot nothing named — one parked with nothing arriving and
-/// nothing being taken out, and one whose drain found the dirty lane full.
+/// nothing being taken out, and one whose listing could not post its wake.
 #[test]
 fn the_sweep_reconciles_every_slot() {
     let config = config();
@@ -1049,7 +1049,7 @@ fn a_doorbell_visit_reconciles_only_the_slots_that_drained() {
 
     assert_eq!(
         visits, 1,
-        "1 of the peer's {MANY_SLOTS} slots drained, and the lane names it, so \
+        "1 of the peer's {MANY_SLOTS} slots drained, and the set names it, so \
          the doorbell must visit 1; it visited {visits}"
     );
 }
@@ -1117,18 +1117,15 @@ fn the_grant_is_what_the_pump_counted_not_what_the_channel_holds() {
     );
 }
 
-/// A full dirty lane costs a listing, not the credit — and the periodic walk
-/// that answers it also empties the lane, not just the slots.
+/// The periodic walk takes the whole dirty set, not just the slots.
 ///
-/// The lane is the fast path and the periodic walk is what stands behind it.
-/// The walk reconciles every live slot regardless of what is on the lane, so
-/// it drains the lane too: leaving an entry behind would let the next real
-/// listing for the same index queue a second one, and "one entry per slot
-/// with something outstanding" would stop being true. Filling and emptying a
-/// lane of `MAX_INGRESS_SLOTS_PER_PEER` entries is why this test runs in tens
-/// of milliseconds rather than microseconds.
+/// The walk reconciles every live slot regardless of what is listed, so it
+/// discards the listings too: one left behind would send the next pass to an
+/// index whose credit was already returned. After the walk the set is empty,
+/// and the next drain lists its slot again rather than finding a stale bit
+/// and assuming a visit is on its way.
 #[test]
-fn a_drain_that_cannot_list_still_gets_its_credit_from_the_periodic_walk() {
+fn the_periodic_walk_takes_the_dirty_set_and_the_next_drain_lists_again() {
     let (registry, consumer, config) = bound();
     let id = slot(0, 0);
     open(&registry, &config, id, 1);
@@ -1139,40 +1136,26 @@ fn a_drain_that_cannot_list_still_gets_its_credit_from_the_periodic_walk() {
         }
     });
     handle_batch(&registry, &config, None, peer(), &payload);
-
-    // Fill the lane after the batch, because the batch pass drains it.
-    let (lane_tx, lane_rx) = registry.drained_lane(peer());
-    for _ in 0..MAX_INGRESS_SLOTS_PER_PEER {
-        lane_tx.try_send(u32::MAX).expect("the lane has room");
-    }
-    assert!(lane_tx.try_send(u32::MAX).is_err(), "the lane is full");
-
     assert_eq!(consumer.pump().len(), 2);
+
+    let dirty = registry.dirty_slots(peer());
     assert_eq!(
         registry.sweep_credit(peer()),
         vec![ReplyRecord::CreditUpdate { slot: id, delta: 2 }],
-        "the listing had nowhere to go, so the whole-table walk is what finds \
-         the count the pump left on the slot"
+        "the whole-table walk returns what the consumer drained"
     );
+    let mut left = Vec::new();
+    dirty.take(|index| left.push(index));
+    assert!(left.is_empty(), "the walk must take the set: {left:?}");
 
-    assert!(
-        lane_rx.try_recv().is_err(),
-        "the walk that just reconciled this slot must also have drained the \
-         fill entries it invalidated; one left behind here is what lets a \
-         later drain of the same slot queue a second entry for it"
-    );
-
-    // With room again, the next drain lists: a failed listing puts the flag
-    // back down rather than claiming a visit that is not coming.
     let payload = batch(1, 2, |encoder| {
         encoder.push_data(id, 3, &item(3)).unwrap();
     });
     handle_batch(&registry, &config, None, peer(), &payload);
     assert_eq!(consumer.pump().len(), 1);
-    assert_eq!(
-        lane_rx.try_recv().expect("the slot is listed again"),
-        id.index()
-    );
+    let mut listed = Vec::new();
+    dirty.take(|index| listed.push(index));
+    assert_eq!(listed, vec![id.index()], "the slot is listed again");
 }
 
 /// A held record earns its credit when it leaves the buffer, never when it
@@ -1322,7 +1305,7 @@ fn a_held_record_marks_its_slot_and_its_release_is_reconciled_in_the_same_batch(
 }
 
 /// A dense index closed and reopened, with a drain of the retired slot still
-/// on the lane: the entry names the index, so the pass finds the
+/// listed: the listing names the index, so the pass finds the
 /// *replacement* there instead. That visit is spurious but grants the
 /// replacement nothing, because the count a reconcile reads belongs to the
 /// slot and not to the index — the replacement claimed its own bind's
@@ -1427,6 +1410,43 @@ fn a_heartbeat_record_reaches_the_consumer_as_a_heartbeat_frame() {
 /// it names, and a pre-bind's owner closes the slot it names; a second claim
 /// overwriting either would send credit to the wrong peer's lane, or close a
 /// slot belonging to a stream that is still running.
+/// Only the drain that lists its slot touches the peer's shared pending flag.
+///
+/// Every consumer of a peer's streams drains into that one flag, so a write
+/// per record bounces its cache line between every thread running one of the
+/// peer's streams. A drain of a slot that is already listed has nothing to
+/// add: the drain that listed it already made sure a visit is coming, and a
+/// visit takes the flag down before it takes the listings, so it collects
+/// this drain's count too.
+#[test]
+fn a_drain_of_a_listed_slot_leaves_the_pending_flag_alone() {
+    let (wake_tx, wake_rx) = flume::bounded(8);
+    let drain = DrainSignal::new(wake_tx);
+    let pending = Arc::new(AtomicBool::new(false));
+    drain.claimed_by(
+        peer(),
+        slot(3, 0),
+        Arc::clone(&pending),
+        Arc::new(DirtySlots::new()),
+    );
+
+    drain.drained();
+    assert!(
+        pending.load(Ordering::Acquire),
+        "the listing drain arms the wake"
+    );
+    assert_eq!(wake_rx.len(), 1);
+
+    // A visit takes the flag down first, then takes the listings.
+    pending.store(false, Ordering::Release);
+    drain.drained();
+    assert!(
+        !pending.load(Ordering::Acquire),
+        "a drain of a slot still listed must not write the shared flag"
+    );
+    assert_eq!(wake_rx.len(), 1, "and must not post a second wake");
+}
+
 #[test]
 fn drain_signal_claim_stays_write_once() {
     let drain = test_drain();
@@ -1436,14 +1456,14 @@ fn drain_signal_claim_stays_write_once() {
     let second = SlotId::new(9, 1).expect("slot id");
     let other_peer = WorkerId::from_u64(PEER + 1);
 
-    let lane = flume::unbounded::<u32>().0;
+    let dirty = Arc::new(DirtySlots::new());
     drain.claimed_by(
         peer(),
         first,
         Arc::new(AtomicBool::new(false)),
-        lane.clone(),
+        Arc::clone(&dirty),
     );
-    drain.claimed_by(other_peer, second, Arc::new(AtomicBool::new(false)), lane);
+    drain.claimed_by(other_peer, second, Arc::new(AtomicBool::new(false)), dirty);
 
     assert_eq!(
         drain.claimed(),

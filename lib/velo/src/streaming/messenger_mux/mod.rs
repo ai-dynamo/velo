@@ -77,18 +77,19 @@
 //! Credit comes back from three places. Two of them visit only slots that
 //! something named; the third is the whole-table backstop. A draining
 //! consumer's pump counts the record on that
-//! slot's [`ingress::DrainSignal`], puts the slot's index on its peer's dirty
-//! lane, and posts the peer. The **arrival path** then reconciles, on every
-//! inbound batch, the slots that batch delivered into together with the slots
-//! on that lane — so the credit a stream's tail waits on rides the peer's next
-//! batch, which arrives in tens of microseconds. The **doorbell** walks the
-//! same lane when the sweep task answers a wake, no more often than once per
+//! slot's [`ingress::DrainSignal`], lists the slot in its peer's
+//! [`ingress::DirtySlots`], and posts the peer if the listing is new. The
+//! **arrival path** then reconciles, on every inbound batch, the slots that
+//! batch delivered into together with the slots in that set — so the credit a
+//! stream's tail waits on rides the peer's next batch, which arrives in tens of
+//! microseconds. The **doorbell** takes the same set when the sweep task
+//! answers a wake, no more often than once per
 //! [`MuxConfig::drain_visit_floor`]; it is what covers a peer that has gone
 //! quiet. The **periodic tick** walks the whole table, for the slot nothing
 //! named — one parked with nothing arriving *and* nothing being taken out, or
-//! one whose drain found the lane full — and it carries batcher eviction.
+//! one whose listing could not post its wake — and it carries batcher eviction.
 //!
-//! The lane is a doorbell, not a ledger: an entry names a slot and carries no
+//! The set is a doorbell, not a ledger: a listing names a slot and carries no
 //! quantity. The quantity is the count on that slot's own signal, and
 //! `IngressSlot::reconcile` taking it is the only thing that decides how much
 //! credit was freed. That is what lets the three paths run concurrently — a
@@ -457,7 +458,7 @@ impl MuxCore {
     ///
     /// The whole-table walk, and the only visitor of a slot nobody named — the
     /// one parked with nothing arriving and nothing being taken out, and the
-    /// one whose drain found the peer's dirty lane full.
+    /// one whose listing could not post the peer's wake.
     fn sweep_peer(&self, peer: WorkerId) {
         // Taken down before the reconcile, not after: a record drained while
         // this visit is in progress must be able to post a fresh wake, or its
@@ -468,7 +469,7 @@ impl MuxCore {
 
     /// One doorbell-driven visit: reconcile the slots of the peer that rang.
     ///
-    /// Scoped to the slots a pump named on that peer's dirty lane, because a
+    /// Scoped to the slots listed in that peer's dirty set, because a
     /// wake means those slots drained and says nothing about the rest — and
     /// this walk holds the mutex the inbound batch path takes.
     ///

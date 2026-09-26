@@ -222,12 +222,12 @@ Transports expose an ordered per-target admission gate as `SendOutcome::{Admitte
 
 Credit comes back from three paths. Two of them visit only slots that something named. The third walks the whole table as a backstop.
 
-- **Drain signal.** When the reader pump forwards a record into the anchor channel, it increments an exact count on the slot's `DrainSignal`. On the first drain after a reconcile, it puts the slot index on a bounded per-peer dirty lane and posts the peer. The pump takes no lock.
-- **Arrival path.** On every inbound batch, `handle_batch` reconciles the slots that the batch delivered into and the slots on the dirty lane. The credit that a stream's tail waits for rides the peer's next batch, which arrives in tens of microseconds.
-- **Doorbell.** The sweep task answers a peer wake by reconciling the slots on its dirty lane. `MuxConfig::drain_visit_floor` (2 ms by default) limits it to one visit per peer per floor. This path covers a peer that sends no further batches.
-- **Periodic tick.** Every `MuxConfig::credit_sweep_interval` (200 ms by default), the sweep walks every slot of every ingress peer. This covers a slot whose drain found the dirty lane full. The same tick evicts idle batchers.
+- **Drain signal.** When the reader pump forwards a record into the anchor channel, it increments an exact count on the slot's `DrainSignal`. It then sets the slot's bit in the peer's dirty set, a lock-free bitmap. Only the drain that sets the bit posts the peer; a drain that finds the bit already set changes nothing shared. The pump takes no lock.
+- **Arrival path.** On every inbound batch, `handle_batch` reconciles the slots that the batch delivered into and the slots in the dirty set. The credit that a stream's tail waits for rides the peer's next batch, which arrives in tens of microseconds.
+- **Doorbell.** The sweep task answers a peer wake by reconciling the slots in its dirty set. `MuxConfig::drain_visit_floor` (2 ms by default) limits it to one visit per peer per floor. This path covers a peer that sends no further batches.
+- **Periodic tick.** Every `MuxConfig::credit_sweep_interval` (200 ms by default), the sweep walks every slot of every ingress peer. This covers a slot whose listing could not post its peer's wake, because the wake queue was full. The same tick evicts idle batchers.
 
-The dirty lane carries an index and no quantity. The quantity is the count on the slot's own `DrainSignal`, and `IngressSlot::reconcile` swaps it to zero. A redundant visit therefore finds a count of zero and grants nothing. The three paths can run concurrently without double-counting. A lost or stale lane entry costs a visit, never credit.
+The dirty set carries an index and no quantity. The quantity is the count on the slot's own `DrainSignal`, and `IngressSlot::reconcile` swaps it to zero. A redundant visit therefore finds a count of zero and grants nothing. The three paths can run concurrently without double-counting. A stale listing costs a visit, never credit.
 
 ```mermaid
 sequenceDiagram
@@ -239,7 +239,7 @@ sequenceDiagram
     P->>I: _stream_batch (Data records)
     I->>I: deliver into slot buffer C+1
     R->>R: forward record to anchor channel
-    R->>R: DrainSignal count += 1, list slot on dirty lane
+    R->>R: DrainSignal count += 1, list slot in dirty set
     R-->>S: post peer wake
     P->>I: next _stream_batch
     I->>I: reconcile touched slots and dirty-lane slots
