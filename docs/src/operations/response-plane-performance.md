@@ -115,9 +115,9 @@ Before the fixes above, these symbols appeared only in velo's profile, as a shar
 |---|---|---|---|
 | `flume::Shared<T>::len` | 2.09% | Per-batch walk of every slot, reading each channel length under its lock | Removed |
 | `parking_lot` lock slow paths | 1.58% | A `timeout` per received record in the reader pump | Removed |
-| `flume::Sender<T>::try_send` | 0.93% | Delivery of each record into its anchor channel | Inherent |
-| `set_active_anchor_gauge` | 0.49% | The gauge recounts the anchor registry on each create and retire | Open |
-| `CancellationToken::is_cancelled` | 0.43% | Per-record checks on the delivery path | Open |
+| `flume::Sender<T>::try_send` | 0.93% | Delivery of each record into its anchor channel | Removed for the mux: the consumer reads the slot buffer directly |
+| `set_active_anchor_gauge` | 0.49% | The gauge recounts the anchor registry on each create and retire | Removed: the gauge is computed when scraped |
+| `CancellationToken::is_cancelled` | 0.43% | Per-record checks on the delivery path | Removed for the mux with the reader pump; the producer's per-send check remains |
 
 These costs are counted from source, not measured:
 
