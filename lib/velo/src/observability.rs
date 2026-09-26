@@ -33,6 +33,33 @@ where
     Ok(collector)
 }
 
+/// Counts that are cheap to read when scraped and costly to keep current.
+type CountSource = Box<dyn Fn() -> usize + Send + Sync>;
+
+/// `velo_streaming_active_anchors`, computed when it is scraped.
+///
+/// The count is the size of the anchor registries, and a `DashMap`'s `len`
+/// takes a read lock on every shard. Setting the gauge on every create and
+/// retire paid that on every request, twice at least, for a number nobody
+/// reads between scrapes (0.4 to 0.5 percent of a frontend's CPU).
+#[derive(Clone)]
+struct ActiveAnchorsGauge {
+    gauge: Gauge,
+    sources: std::sync::Arc<parking_lot::Mutex<Vec<CountSource>>>,
+}
+
+impl prometheus::core::Collector for ActiveAnchorsGauge {
+    fn desc(&self) -> Vec<&prometheus::core::Desc> {
+        self.gauge.desc()
+    }
+
+    fn collect(&self) -> Vec<prometheus::proto::MetricFamily> {
+        let count: usize = self.sources.lock().iter().map(|source| source()).sum();
+        self.gauge.set(count as f64);
+        self.gauge.collect()
+    }
+}
+
 const TRANSPORT_DIRECTIONS: [&str; 2] = ["inbound", "outbound"];
 const TRANSPORT_MESSAGE_TYPES: [&str; 5] = ["message", "response", "ack", "event", "shutting_down"];
 const HANDLER_RESPONSE_TYPES: [&str; 3] = ["fire_and_forget", "ack_nack", "unary"];
@@ -812,11 +839,17 @@ pub(crate) enum MuxDirection {
 }
 
 impl MuxDirection {
+    const ALL: [Self; 2] = [Self::Sent, Self::Received];
+
     fn as_str(self) -> &'static str {
         match self {
             Self::Sent => "sent",
             Self::Received => "received",
         }
+    }
+
+    const fn index(self) -> usize {
+        self as usize
     }
 }
 
@@ -876,8 +909,12 @@ pub(crate) struct MuxMetricsHandle {
     reader_stall_total: Counter,
     generation_mismatch_total: Counter,
     records_dropped_total: CounterVec,
-    batches_total: CounterVec,
-    records_per_batch: HistogramVec,
+    /// Indexed by [`MuxDirection::index`], bound once in
+    /// [`VeloMetrics::bind_mux`]: a label lookup here ran on every batch in
+    /// both directions.
+    batches_total: [Counter; 2],
+    /// Indexed like `batches_total`.
+    records_per_batch: [Histogram; 2],
     credit_exhausted_total: Counter,
     rendezvous_singletons_total: Counter,
     held_records: Gauge,
@@ -983,12 +1020,8 @@ impl MuxMetricsHandle {
     /// batches and receives them, so a count of one that summed the other in
     /// would attribute its peers' packing to itself.
     pub(crate) fn batch(&self, direction: MuxDirection, records: usize) {
-        self.batches_total
-            .with_label_values(&[direction.as_str()])
-            .inc();
-        self.records_per_batch
-            .with_label_values(&[direction.as_str()])
-            .observe(records as f64);
+        self.batches_total[direction.index()].inc();
+        self.records_per_batch[direction.index()].observe(records as f64);
     }
 
     /// A slot ran out of data credit and parked.
@@ -1090,7 +1123,7 @@ pub struct VeloMetrics {
     streaming_anchor_operations_total: CounterVec,
     streaming_anchor_operation_duration_seconds: HistogramVec,
     streaming_anchor_attach_rtt_seconds: HistogramVec,
-    streaming_active_anchors: Gauge,
+    streaming_active_anchors: ActiveAnchorsGauge,
     streaming_backpressure_total: CounterVec,
     streaming_reader_pump_backpressure_total: Counter,
     streaming_server_pump_backpressure_total: Counter,
@@ -1474,10 +1507,13 @@ impl VeloMetrics {
         )?;
         let streaming_active_anchors = register_collector(
             registry,
-            Gauge::with_opts(Opts::new(
-                "velo_streaming_active_anchors",
-                "Anchors currently present in the streaming registry.",
-            ))?,
+            ActiveAnchorsGauge {
+                gauge: Gauge::with_opts(Opts::new(
+                    "velo_streaming_active_anchors",
+                    "Anchors currently present in the streaming registry.",
+                ))?,
+                sources: std::sync::Arc::default(),
+            },
         )?;
         let streaming_backpressure_total = register_collector(
             registry,
@@ -2190,8 +2226,14 @@ impl VeloMetrics {
             reader_stall_total: self.streaming_mux_reader_stall_total.clone(),
             generation_mismatch_total: self.streaming_mux_generation_mismatch_total.clone(),
             records_dropped_total: self.streaming_mux_records_dropped_total.clone(),
-            batches_total: self.streaming_mux_batches_total.clone(),
-            records_per_batch: self.streaming_mux_records_per_batch.clone(),
+            batches_total: MuxDirection::ALL.map(|direction| {
+                self.streaming_mux_batches_total
+                    .with_label_values(&[direction.as_str()])
+            }),
+            records_per_batch: MuxDirection::ALL.map(|direction| {
+                self.streaming_mux_records_per_batch
+                    .with_label_values(&[direction.as_str()])
+            }),
             credit_exhausted_total: self.streaming_slot_credit_exhausted_total.clone(),
             rendezvous_singletons_total: self.streaming_mux_rendezvous_singletons_total.clone(),
             held_records: self.streaming_mux_held_records.clone(),
@@ -2284,9 +2326,16 @@ impl VeloMetrics {
             .observe(elapsed.as_secs_f64());
     }
 
-    /// Set the active-anchor gauge.
-    pub(crate) fn set_streaming_active_anchors(&self, count: usize) {
-        self.streaming_active_anchors.set(count as f64);
+    /// Count `source` into `velo_streaming_active_anchors` whenever it is
+    /// scraped. An anchor manager adds its registries once, when it is built.
+    pub(crate) fn add_active_anchor_source(
+        &self,
+        source: impl Fn() -> usize + Send + Sync + 'static,
+    ) {
+        self.streaming_active_anchors
+            .sources
+            .lock()
+            .push(Box::new(source));
     }
 
     /// Record a streaming backpressure event.
@@ -2667,7 +2716,7 @@ mod tests {
             "velo",
             Duration::from_millis(1),
         );
-        metrics.set_streaming_active_anchors(2);
+        metrics.add_active_anchor_source(|| 2);
         // A `HistogramVec` with no children collects no family at all, so the
         // name assertion below only means anything once one has been observed.
         metrics.record_attach_rtt(HandlerOutcome::Success, "tcp", Duration::from_millis(1));

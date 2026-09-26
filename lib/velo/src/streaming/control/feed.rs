@@ -149,11 +149,6 @@ pub(crate) fn reap_unclaimed(
         .frame_tx
         .try_send(crate::streaming::sender::cached_dropped().clone());
     entry.cancel_token.cancel();
-    crate::streaming::anchor::set_active_anchor_gauge(
-        ctx.metrics.as_ref(),
-        &ctx.registry,
-        &ctx.mpsc_registry,
-    );
     true
 }
 
@@ -243,11 +238,6 @@ pub(crate) async fn stream_watchdog(
                     let _ = frame_tx.try_send(crate::streaming::sender::cached_dropped().clone());
                     if let Some((_, entry)) = ctx.registry.remove(&local_id) {
                         entry.cancel_token.cancel();
-                        crate::streaming::anchor::set_active_anchor_gauge(
-                            ctx.metrics.as_ref(),
-                            &ctx.registry,
-                            &ctx.mpsc_registry,
-                        );
                     }
                     break;
                 }

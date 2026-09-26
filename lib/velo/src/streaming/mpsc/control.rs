@@ -499,7 +499,6 @@ pub fn create_mpsc_anchor_cancel_handler(manager: Arc<AnchorManager>) -> crate::
                         &manager.sender_registry,
                         manager.messenger_lock.get(),
                     );
-                    manager.update_active_anchor_gauge();
                 }
 
                 Ok(())

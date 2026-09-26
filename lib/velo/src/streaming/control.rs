@@ -700,8 +700,6 @@ pub fn create_anchor_detach_handler(manager: Arc<AnchorManager>) -> crate::messe
                         {
                             let tc = AnchorManager::spawn_timeout_task(
                                 Arc::clone(&manager.registry),
-                                Arc::clone(&manager.mpsc_registry),
-                                manager.metrics.clone(),
                                 local_id,
                                 duration,
                                 &entry.cancel_token,

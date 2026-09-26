@@ -191,9 +191,7 @@ pub(crate) async fn reader_pump(
     heartbeat_deadline: Duration,
 ) {
     let crate::streaming::anchor::AnchorContext {
-        registry,
-        mpsc_registry,
-        metrics,
+        registry, metrics, ..
     } = ctx;
     let mut missed_heartbeats: u8 = 0;
     // One timer for the stream, not one per record. `tokio::time::timeout`
@@ -368,11 +366,6 @@ pub(crate) async fn reader_pump(
                     // so no stale entry remains (ANCR-04)
                     if let Some((_, entry)) = registry.remove(&local_id) {
                         entry.cancel_token.cancel();
-                        crate::streaming::anchor::set_active_anchor_gauge(
-                            metrics.as_ref(),
-                            &registry,
-                            &mpsc_registry,
-                        );
                     }
                     break;
                 }
