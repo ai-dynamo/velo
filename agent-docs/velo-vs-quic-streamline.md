@@ -73,6 +73,32 @@ Rig, 16 x 32 workers, OSL 900 (tables in `.research/results/t3-<tag>/ab-table.md
 
 TTFT under frontend saturation: the frontend's `transport_roundtrip` stage (request-plane send to first response frame polled) was 468 / 220 ms mean for velo against 62 / 71 ms for QUIC. Frontend ordered-lane wait was ~25 ms per batch during load, inbound queue empty, so the lane explains a part only. Cause found: jthomson's adapter calls `Velo::wait_for_handler(peer, "_stream_stop")` before every generate, and `wait_for_handler` always refreshed with a full `_hello` round trip through the (saturated) frontend's messenger. `4df8aa5` returns at once when the known handler list names the handler. Rig A/B of that fix: `fe24l4` (before, d1a5d52) vs `fe24hf` (after, 4df8aa5), 4 reps each with QUIC as the fixed reference in each allocation.
 
+## Where velo's first token waits under a saturated frontend (2026-09-26, `fe24dc`)
+
+Rig-local instruments (Dynamo tree, `.research/rig/dyn-15231-rig-local.patch`): the worker observes handler entry to the engine's first item and to that item's `send` returning, next to the frontend's `request_plane_roundtrip_ttft`. `.research/rig/ttft-decomp.py` prints the split. Dynamo's own `time_to_first_response` stops at the prologue, not the first token, so the rig could not separate mocker queueing from the response path before this.
+
+fe24dc: 24 frontend cores, 16 x 32 workers, arms dq, jv, and jl (jv with `on_admission: false, max_linger: 5 ms`), 3 reps each, interleaved.
+
+| rep | req/s | TTFT p50 | ITL p99 | worker first token sent (ms) | response path (ms) | worker egress wait (ms) | FE CPU ms/req | node A irq cores |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| rep2-dq | 1,814 | 80 | 27.8 | 31.8 | 22.8 | - | 12.0 | 5.9 |
+| rep3-dq | 1,164 | 92 | 54.1 | 50.9 | 43.1 | - | 20.0 | 15.6 |
+| rep2-jv | 1,444 | 815 | 20.9 | 44.2 | 666 | 194 | 16.2 | 12.9 |
+| rep3-jv | 2,100 | 130 | 4.8 | 9.4 | 68 | 6.4 | 10.9 | 5.2 |
+| rep2-jl | 2,036 | 158 | 5.8 | 8.9 | 114 | 80 | 10.6 | 5.1 |
+| rep3-jl | 1,346 | 509 | 45.8 | 18.5 | 529 | 345 | 17.3 | 13.2 |
+
+Findings:
+
+- The mocker is not where velo's first token waits. The worker has it on the plane about 10 ms after the request arrives; it then spends 68-666 ms reaching the frontend.
+- That time follows the worker's transport egress queue wait, and the egress queue is backpressure: in rep2-jv the frontend's receive queues on the 16 velo connections held 3.2 MB on average (440 KB in rep3-jv) and the worker's send queues 5.0 MB (686 KB). The frontend reader is not draining. A new stream's first record waits behind every bulk byte ahead of it in the same per-peer FIFO.
+- The rig ran in two states. Bad reps, in every arm including QUIC, show 16-20 ms of frontend CPU per request against about 11, and 13-16 cores of irq/softirq on node A against 5-9. Three reps per arm that mix states average two regimes, so fe24dc gives no arm verdict. Per-CPU softirq capture is added to the rig to test whether NET_RX lands on the frontend's pinned cores.
+- Under the same stress the planes fail differently: QUIC holds TTFT near 90 ms and pays in ITL p99 (54 ms); velo holds ITL p99 and pays in TTFT. QUIC's priority connection carries FirstData around the bulk lanes.
+- The 5 ms window does not help: it raised records per batch to 217-238 and left egress wait and TTFT where the environment put them. The "eager first records" flush option (design question 2) cannot help either, since the first record is not waiting on the flush. Not built.
+- Rig defect found on the way: `RIG_WORKER_METRICS_BASE_PORT` 9090 with 16 processes covered 9100, held by node_exporter, so proc10 was never scraped. Every summed worker metric in 16-process runs missed a sixteenth. Default moved to 19090.
+
+Remaining unexplained: response path minus egress wait leaves 34-472 ms. The next build adds frontend adapter histograms (register to prologue received, register to first data polled) to place it.
+
 ## Open design questions (need a ruling)
 
 1. Remove the reader pump from the mux data path: the consumer reads the slot buffer and posts drains; the pump survives only as a lifecycle/watchdog task stamped from ingress. Prototype (`proto-direct` branch, watchdog dropped) measured -12% to -18% frontend CPU. Reopens `batched-streaming-design.md:79-83` by a different mechanism; buffering per stream shrinks from C+1+256 to C+1.
