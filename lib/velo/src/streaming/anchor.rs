@@ -1026,7 +1026,7 @@ impl AnchorManagerBuilder {
             let spsc = Arc::downgrade(&manager.registry);
             let mpsc = Arc::downgrade(&manager.mpsc_registry);
             metrics.add_active_anchor_source(move || {
-                spsc.upgrade().map_or(0, |r| r.len()) + mpsc.upgrade().map_or(0, |r| r.len())
+                Some(spsc.upgrade()?.len() + mpsc.upgrade()?.len())
             });
         }
         Ok(manager)
@@ -1735,8 +1735,9 @@ impl AnchorManager {
 
     /// Returns the number of anchors currently registered.
     ///
-    /// Intended for testing and observability. The Prometheus
-    /// `velo_streaming_active_anchors` gauge reflects the same value.
+    /// Intended for testing and observability. Counts SPSC anchors only; the
+    /// Prometheus `velo_streaming_active_anchors` gauge counts SPSC and MPSC
+    /// anchors of every manager sharing the metrics registry.
     pub fn active_anchor_count(&self) -> usize {
         self.registry.len()
     }
@@ -2406,8 +2407,6 @@ impl AnchorManager {
             timeout_cancel,
             heartbeat_interval,
             max_senders: config.max_senders,
-            spsc_registry: self.registry.clone(),
-            metrics: self.metrics.clone(),
         };
 
         self.mpsc_registry.insert(local_id, entry);
@@ -2690,6 +2689,35 @@ mod tests {
         ) -> BoxFuture<'_, AnyhowResult<flume::Sender<Vec<u8>>>> {
             Box::pin(async { Ok(flume::bounded::<Vec<u8>>(256).0) })
         }
+    }
+
+    /// `velo_streaming_active_anchors` reads the registries when scraped, so
+    /// it follows creates and retires without either touching the gauge.
+    #[tokio::test]
+    async fn the_active_anchor_gauge_follows_the_registries_when_scraped() {
+        let registry = prometheus::Registry::new();
+        let metrics = Arc::new(VeloMetrics::register(&registry).unwrap());
+        let mgr = AnchorManagerBuilder::default()
+            .worker_id(velo_ext::WorkerId::from_u64(1))
+            .transport(
+                Arc::new(MockTransport) as Arc<dyn crate::streaming::transport::FrameTransport>
+            )
+            .metrics(Some(metrics))
+            .build()
+            .unwrap();
+        let gauge = || {
+            crate::observability::test_helpers::MetricSnapshot::from_registry(&registry)
+                .gauge("velo_streaming_active_anchors", &[])
+        };
+        assert_eq!(gauge(), 0.0);
+        let spsc = mgr.create_anchor::<u32>();
+        let mpsc = mgr.create_mpsc_anchor::<u32>();
+        assert_eq!(gauge(), 2.0, "one SPSC and one MPSC anchor");
+        spsc.cancel();
+        assert_eq!(gauge(), 1.0);
+        drop(mpsc);
+        drop(mgr);
+        assert_eq!(gauge(), 0.0, "a dropped manager counts nothing");
     }
 
     fn make_manager() -> AnchorManager {

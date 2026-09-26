@@ -17,9 +17,7 @@ use futures::Stream;
 use serde::de::DeserializeOwned;
 use tokio_util::sync::CancellationToken;
 
-use crate::observability::VeloMetrics;
-
-use crate::streaming::anchor::{AnchorContext, AnchorEntry};
+use crate::streaming::anchor::AnchorContext;
 use crate::streaming::frame::{StreamError, StreamFrame};
 use crate::streaming::handle::StreamAnchorHandle;
 
@@ -68,11 +66,6 @@ pub(crate) struct MpscAnchorEntry {
     pub heartbeat_interval: Duration,
     /// Optional cap on concurrent attached senders.
     pub max_senders: Option<usize>,
-    /// Sibling SPSC registry + metrics snapshot captured at create time so
-    /// detach/timeout paths can update the shared active-anchors gauge
-    /// without round-tripping through `AnchorManager`.
-    pub spsc_registry: Arc<DashMap<u64, AnchorEntry>>,
-    pub metrics: Option<Arc<VeloMetrics>>,
 }
 
 // ---------------------------------------------------------------------------

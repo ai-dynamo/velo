@@ -34,7 +34,8 @@ where
 }
 
 /// Counts that are cheap to read when scraped and costly to keep current.
-type CountSource = Box<dyn Fn() -> usize + Send + Sync>;
+/// `None` means the source is gone for good and can be dropped.
+type CountSource = Box<dyn Fn() -> Option<usize> + Send + Sync>;
 
 /// `velo_streaming_active_anchors`, computed when it is scraped.
 ///
@@ -54,7 +55,17 @@ impl prometheus::core::Collector for ActiveAnchorsGauge {
     }
 
     fn collect(&self) -> Vec<prometheus::proto::MetricFamily> {
-        let count: usize = self.sources.lock().iter().map(|source| source()).sum();
+        let mut count = 0;
+        // A process that rebuilds its managers against one registry would
+        // otherwise keep every dead manager's source, and pay for it on
+        // every scrape.
+        self.sources.lock().retain(|source| match source() {
+            Some(n) => {
+                count += n;
+                true
+            }
+            None => false,
+        });
         self.gauge.set(count as f64);
         self.gauge.collect()
     }
@@ -852,6 +863,10 @@ impl MuxDirection {
         self as usize
     }
 }
+
+// `ALL[i].index() == i`, or the pre-bound children in `bind_mux` would carry
+// each other's labels.
+const _: () = assert!(MuxDirection::ALL[0].index() == 0 && MuxDirection::ALL[1].index() == 1);
 
 /// The label value `velo_streaming_mux_batcher_wakes_total` files each
 /// [`BatcherWake`] source under, indexed by [`BatcherWake::index`].
@@ -2330,7 +2345,7 @@ impl VeloMetrics {
     /// scraped. An anchor manager adds its registries once, when it is built.
     pub(crate) fn add_active_anchor_source(
         &self,
-        source: impl Fn() -> usize + Send + Sync + 'static,
+        source: impl Fn() -> Option<usize> + Send + Sync + 'static,
     ) {
         self.streaming_active_anchors
             .sources
@@ -2716,7 +2731,8 @@ mod tests {
             "velo",
             Duration::from_millis(1),
         );
-        metrics.add_active_anchor_source(|| 2);
+        metrics.add_active_anchor_source(|| Some(2));
+        metrics.add_active_anchor_source(|| None);
         // A `HistogramVec` with no children collects no family at all, so the
         // name assertion below only means anything once one has been observed.
         metrics.record_attach_rtt(HandlerOutcome::Success, "tcp", Duration::from_millis(1));
@@ -2740,6 +2756,17 @@ mod tests {
         assert!(names.contains(&"velo_messenger_client_resolution_total".to_string()));
         assert!(names.contains(&"velo_messenger_pending_responses".to_string()));
         assert!(names.contains(&"velo_streaming_active_anchors".to_string()));
+        assert_eq!(
+            test_helpers::MetricSnapshot::from_registry(&registry)
+                .gauge("velo_streaming_active_anchors", &[]),
+            2.0,
+            "the gauge sums its live sources when scraped"
+        );
+        assert_eq!(
+            metrics.streaming_active_anchors.sources.lock().len(),
+            1,
+            "a gone source is dropped"
+        );
         assert!(names.contains(&"velo_streaming_anchor_operations_total".to_string()));
         assert!(names.contains(&"velo_streaming_anchor_operation_duration_seconds".to_string()));
         assert!(names.contains(&"velo_messenger_inbound_dequeued_total".to_string()));

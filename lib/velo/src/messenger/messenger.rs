@@ -484,6 +484,12 @@ impl Messenger {
     /// a registered handler does not go away while its instance lives, and a
     /// refresh is a `_hello` round trip through the peer. Callers that ask per
     /// request would otherwise put that round trip on every request.
+    ///
+    /// This relies on an instance id naming one process: the transport backend
+    /// mints it with `InstanceId::new_v4()` and nothing can pin it, so a
+    /// restarted peer arrives with an unknown id and is handshaken afresh.
+    /// Letting callers reuse an id across restarts would need the cached list
+    /// dropped when the peer's address changes.
     pub async fn wait_for_handler(
         &self,
         instance_id: InstanceId,
