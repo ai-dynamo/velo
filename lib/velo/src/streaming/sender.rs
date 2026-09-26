@@ -535,8 +535,8 @@ mod tests {
                 "{frame:?}"
             );
         }
-        let nested = rmp_serde::to_vec(&StreamFrame::Item(super::cached_finalized().clone()))
-            .unwrap();
+        let nested =
+            rmp_serde::to_vec(&StreamFrame::Item(super::cached_finalized().clone())).unwrap();
         assert!(!super::is_terminal_sentinel(&nested));
     }
 
