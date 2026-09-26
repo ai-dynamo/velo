@@ -225,7 +225,7 @@ Credit comes back from three paths. Two of them visit only slots that something 
 - **Drain signal.** When the reader pump forwards a record into the anchor channel, it increments an exact count on the slot's `DrainSignal`. It then sets the slot's bit in the peer's dirty set, a lock-free bitmap. Only the drain that sets the bit posts the peer; a drain that finds the bit already set changes nothing shared. The pump takes no lock.
 - **Arrival path.** On every inbound batch, `handle_batch` reconciles the slots that the batch delivered into and the slots in the dirty set. The credit that a stream's tail waits for rides the peer's next batch, which arrives in tens of microseconds.
 - **Doorbell.** The sweep task answers a peer wake by reconciling the slots in its dirty set. `MuxConfig::drain_visit_floor` (2 ms by default) limits it to one visit per peer per floor. This path covers a peer that sends no further batches.
-- **Periodic tick.** Every `MuxConfig::credit_sweep_interval` (200 ms by default), the sweep walks every slot of every ingress peer. This covers a slot whose listing could not post its peer's wake, because the wake queue was full. The same tick evicts idle batchers.
+- **Periodic tick.** Every `MuxConfig::credit_sweep_interval` (200 ms by default), the sweep walks every slot of every ingress peer. This covers a slot that nothing names: parked, with nothing arriving and nothing being taken out. The same tick evicts idle batchers.
 
 The dirty set carries an index and no quantity. The quantity is the count on the slot's own `DrainSignal`, and `IngressSlot::reconcile` swaps it to zero. A redundant visit therefore finds a count of zero and grants nothing. The three paths can run concurrently without double-counting. A stale listing costs a visit, never credit.
 
@@ -242,7 +242,7 @@ sequenceDiagram
     R->>R: DrainSignal count += 1, list slot in dirty set
     R-->>S: post peer wake
     P->>I: next _stream_batch
-    I->>I: reconcile touched slots and dirty-lane slots
+    I->>I: reconcile touched slots and dirty-set slots
     I->>B: CreditUpdate replies
     S->>I: doorbell visit (at most once per drain_visit_floor)
     S->>I: periodic whole-table walk (every credit_sweep_interval)

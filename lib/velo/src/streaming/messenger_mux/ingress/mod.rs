@@ -343,9 +343,7 @@ impl IngressRegistry {
     /// whose only slot has parked out of credit sends nothing more, so no
     /// further batch arrives to drive reconciliation on the arrival path, and
     /// without this the pair deadlocks with the consumer drained and the sender
-    /// parked. It is the backstop for one more: a listing whose wake could not
-    /// be posted because the wake lane was full, which [`sweep_drained`] never
-    /// hears about and [`handle_batch`] reaches only if the peer sends again.
+    /// parked.
     ///
     /// A visit is now an atomic swap per slot rather than a slot-channel length
     /// read, so what this walk costs is bounded by the tick's own interval.

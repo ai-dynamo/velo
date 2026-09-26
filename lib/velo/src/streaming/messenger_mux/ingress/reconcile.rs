@@ -15,7 +15,7 @@ use super::PeerIngress;
 use super::slot::IngressSlot;
 
 /// Reconcile every slot of this peer. The periodic tick's walk, and the
-/// backstop for a listing whose wake could not be posted.
+/// backstop for a slot nothing named.
 ///
 /// Unlike the other two visitors, this one does not route through
 /// [`list_drained_slots`], so it is the one that must take the dirty set

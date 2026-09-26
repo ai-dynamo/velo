@@ -87,7 +87,8 @@
 //! [`MuxConfig::drain_visit_floor`]; it is what covers a peer that has gone
 //! quiet. The **periodic tick** walks the whole table, for the slot nothing
 //! named — one parked with nothing arriving *and* nothing being taken out, or
-//! one whose listing could not post its wake — and it carries batcher eviction.
+//! one listed while the sweep task was shutting down — and it carries batcher
+//! eviction.
 //!
 //! The set is a doorbell, not a ledger: a listing names a slot and carries no
 //! quantity. The quantity is the count on that slot's own signal, and
@@ -174,12 +175,22 @@ const ACCEPT_TIMEOUT: Duration = Duration::from_secs(60);
 /// eviction sweeps inside one attach.
 const CONNECT_ATTEMPTS: usize = 3;
 
-/// Peer wakes the drain lane holds before it starts dropping them.
+/// The lane drain signals post their peer on and the sweep task answers.
 ///
-/// Wakes coalesce naturally — many slots of one peer post the same `WorkerId`,
-/// and one reconcile of that peer serves all of them — so this does not need to
-/// scale with slot count. It needs to absorb a burst across distinct peers.
-const DRAIN_WAKE_CAPACITY: usize = 1024;
+/// Unbounded, because a refused wake strands credit. Only the drain that newly
+/// lists a slot posts its peer; every later drain of that slot rides the
+/// listing and posts nothing, so a wake dropped here leaves the slot listed
+/// with no visit coming until a batch or the periodic tick arrives -- and a
+/// peer whose sender is parked out of credit sends no batch.
+///
+/// Occupancy is bounded without a capacity. A post needs the peer's `pending`
+/// flag to go from down to up, and only a visit to that peer or the periodic
+/// tick takes it down; each doorbell visit consumes the entry that summoned it,
+/// so the lane holds about one entry per peer, plus at most one more per peer
+/// per tick while the sweep task is behind.
+fn drain_wake_lane() -> (flume::Sender<WorkerId>, flume::Receiver<WorkerId>) {
+    flume::unbounded::<WorkerId>()
+}
 
 /// The `messenger-mux-v2` [`FrameTransport`].
 ///
@@ -296,11 +307,7 @@ impl MessengerMuxTransport {
             slot_byte_budget: limits.slot_byte_budget(),
             ..config
         };
-        // Bounded, and deliberately lossy on overflow: a wake is a hint that a
-        // peer has credit to return, and a dropped hint costs latency the
-        // periodic sweep still bounds. Sized so a burst across many peers does
-        // not discard wakes it could have kept.
-        let (drain_tx, drain_rx) = flume::bounded::<WorkerId>(DRAIN_WAKE_CAPACITY);
+        let (drain_tx, drain_rx) = drain_wake_lane();
         let core = Arc::new(MuxCore {
             messenger: Arc::clone(&messenger),
             config,
@@ -457,8 +464,7 @@ impl MuxCore {
     /// Reconcile every slot of one peer, on the periodic tick.
     ///
     /// The whole-table walk, and the only visitor of a slot nobody named — the
-    /// one parked with nothing arriving and nothing being taken out, and the
-    /// one whose listing could not post the peer's wake.
+    /// one parked with nothing arriving and nothing being taken out.
     fn sweep_peer(&self, peer: WorkerId) {
         // Taken down before the reconcile, not after: a record drained while
         // this visit is in progress must be able to post a fresh wake, or its

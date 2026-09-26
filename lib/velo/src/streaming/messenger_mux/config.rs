@@ -173,9 +173,8 @@ pub struct MuxConfig {
     /// delivered into and the slots a draining consumer listed in the peer's
     /// dirty set — and from the doorbell over that same set. This covers only
     /// what neither reaches: a slot parked with nothing further arriving *and*
-    /// nothing being taken out, and one whose listing could not post the
-    /// peer's wake. It also carries batcher eviction, whose granularity it
-    /// sets.
+    /// nothing being taken out. It also carries batcher eviction, whose
+    /// granularity it sets.
     ///
     /// It was 2 ms when the sweep was the only way credit came back, which is
     /// what made that interval load-bearing rather than a tuning choice. Every
@@ -222,9 +221,7 @@ pub struct MuxConfig {
     /// batch waits up to this long for the return its consumer's drain has
     /// already earned. Only that producer — any inbound batch from the peer
     /// reconciles the slots listed in its dirty set, so a peer that keeps
-    /// sending never reaches this floor at all. A listing whose wake could not
-    /// be posted never rings the doorbell, so it is not on this path either;
-    /// `credit_sweep_interval` is what covers it. That is one wait per window,
+    /// sending never reaches this floor at all. That is one wait per window,
     /// so what it costs per record is `floor / initial_credit` — negligible at
     /// the default 256-record window, and visible at the small windows the
     /// credit tests use deliberately. It stacks with

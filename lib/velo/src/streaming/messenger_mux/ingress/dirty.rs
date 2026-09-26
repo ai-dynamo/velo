@@ -80,6 +80,12 @@ impl DirtySlots {
     /// take, never lost (see the module docs).
     pub(crate) fn take(&self, mut visit: impl FnMut(u32)) {
         for (s, summary) in self.summary.iter().enumerate() {
+            // A plain load first: an empty word needs no RMW, and a swap of 0
+            // for 0 would still take the line exclusive under consumers that
+            // `fetch_or` it. A mark landing after this load is the next take's.
+            if summary.load(Ordering::Relaxed) == 0 {
+                continue;
+            }
             let mut words = summary.swap(0, Ordering::AcqRel);
             while words != 0 {
                 let w = words.trailing_zeros() as usize;

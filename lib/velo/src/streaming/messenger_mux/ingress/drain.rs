@@ -143,11 +143,10 @@ impl DrainSignal {
     /// drain rode on is answered by a take that also collects its count.
     ///
     /// `try_send` rather than an await on the wake: this runs on the
-    /// consumer's path for every record and must never park it. **A full wake
-    /// lane puts `pending` back down**: leaving it up claims a visit is coming
-    /// when none is, and every later listing would coalesce into something
-    /// that was dropped. The periodic sweep's whole-table walk bounds the gap
-    /// until the next listing tries again.
+    /// consumer's path for every record and must never park it. The wake lane
+    /// is unbounded (`drain_wake_lane` has why), so the send fails only once
+    /// the sweep task is gone; `pending` goes back down then, since leaving it
+    /// up would claim a visit is coming when none is.
     ///
     /// A per-slot record threshold was the alternative to the wake and is
     /// worse on both counts: it withholds credit for the first `T` records of
@@ -171,8 +170,7 @@ impl DrainSignal {
             return; // a wake for this peer is already outstanding
         }
         if self.wake.try_send(claim.peer).is_err() {
-            // Nobody will take the flag down, so let the next listing try
-            // again rather than leaving this peer permanently marked pending.
+            // The sweep task is gone; nobody will take the flag down.
             claim.pending.store(false, Ordering::Release);
         }
     }

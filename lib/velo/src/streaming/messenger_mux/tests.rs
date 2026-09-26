@@ -1822,3 +1822,24 @@ async fn open_anchor_stream_on_the_minting_worker_fails_fast() {
 
     drop(anchor);
 }
+
+/// The drain wake lane never refuses a wake.
+///
+/// A drain that newly lists its slot is the only one that posts its peer, so
+/// a refused wake leaves that listing with no visit coming: every later drain
+/// of the slot finds it already listed and rides the visit that never comes,
+/// and a peer whose sender is parked out of credit sends no batch to rescue
+/// it. The credit then waits for the periodic walk. The lane's occupancy is
+/// bounded without a capacity -- a post needs the peer's `pending` flag to go
+/// from down to up, and only a visit or the tick takes it down -- so there is
+/// no burst it needs to shed.
+#[test]
+fn the_drain_wake_lane_never_refuses_a_wake() {
+    let (tx, _rx) = drain_wake_lane();
+    for peer in 0..100_000u64 {
+        assert!(
+            tx.try_send(WorkerId::from_u64(peer)).is_ok(),
+            "wake {peer} refused"
+        );
+    }
+}

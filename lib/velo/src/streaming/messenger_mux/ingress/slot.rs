@@ -218,10 +218,10 @@ impl IngressSlot {
     /// now waiting to be advertised.
     ///
     /// The count is the pump's own, taken with
-    /// [`DrainSignal::take_drained`](super::DrainSignal::take_drained) — which
-    /// clears the listing before it swaps, so a drain racing this pass lists
-    /// the slot again rather than losing its record; that method's doc has the
-    /// interleaving. Nothing here reads `frame_tx.len()`. Inferring the drain
+    /// [`DrainSignal::take_drained`](super::DrainSignal::take_drained), after
+    /// the pass already took the slot's listing out of the peer's dirty set, so
+    /// a drain racing this pass lists the slot again rather than losing its
+    /// record; that method's doc has the interleaving. Nothing here reads `frame_tx.len()`. Inferring the drain
     /// from occupancy needed that read, which takes the slot channel's lock,
     /// and it was only ever right because the mux was the channel's sole
     /// writer — a fact the ledger had no way to check.

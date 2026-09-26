@@ -182,9 +182,8 @@ async fn deferred_visit_due(due: Option<tokio::time::Instant>) {
 /// that keeps up from turning the doorbell into a spin over the peer's slot
 /// table. The ticker walks the whole table, as the backstop for what neither
 /// the arrival path nor the doorbell reaches: a slot parked with nothing
-/// further arriving and no consumer taking anything out, a slot whose listing
-/// could not post its peer's wake, and batcher eviction, which free-rides on
-/// the same tick.
+/// further arriving and no consumer taking anything out, and batcher eviction,
+/// which free-rides on the same tick.
 ///
 /// Before this, the ticker was the only source and ran at 500 Hz, walking every
 /// slot of every peer to find the few with credit to return — work that scales

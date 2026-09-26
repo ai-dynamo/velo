@@ -937,7 +937,7 @@ fn a_batch_reconciles_the_slots_it_delivered_into_and_no_others_when_nothing_dra
 
 /// Control: the periodic sweep keeps the whole-table walk, because it is the
 /// backstop for a slot nothing named — one parked with nothing arriving and
-/// nothing being taken out, and one whose listing could not post its wake.
+/// nothing being taken out.
 #[test]
 fn the_sweep_reconciles_every_slot() {
     let config = config();
@@ -997,8 +997,8 @@ fn a_batch_returns_the_credit_of_every_slot_that_drained() {
     assert_eq!(
         outcome.replies,
         vec![ReplyRecord::CreditUpdate { slot: b, delta: 2 }],
-        "B's pump counted two records out and named B on the peer's dirty \
-         lane, so this batch must carry B's grant even though it delivered \
+        "B's pump counted two records out and listed B in the peer's dirty \
+         set, so this batch must carry B's grant even though it delivered \
          only into A; without it B's sender waits for a doorbell visit"
     );
 
@@ -1404,12 +1404,6 @@ fn a_heartbeat_record_reaches_the_consumer_as_a_heartbeat_frame() {
     assert_eq!(RecordType::SlotHeartbeat.as_u8(), 4);
 }
 
-/// The claim is write-once, and the first `OpenSlot` is the one that counts.
-///
-/// Both readers of this cell depend on that. `drained` posts wakes to the peer
-/// it names, and a pre-bind's owner closes the slot it names; a second claim
-/// overwriting either would send credit to the wrong peer's lane, or close a
-/// slot belonging to a stream that is still running.
 /// Only the drain that lists its slot touches the peer's shared pending flag.
 ///
 /// Every consumer of a peer's streams drains into that one flag, so a write
@@ -1445,8 +1439,19 @@ fn a_drain_of_a_listed_slot_leaves_the_pending_flag_alone() {
         "a drain of a slot still listed must not write the shared flag"
     );
     assert_eq!(wake_rx.len(), 1, "and must not post a second wake");
+    assert_eq!(
+        drain.take_drained(),
+        2,
+        "the visit the first listing arranged collects both drains"
+    );
 }
 
+/// The claim is write-once, and the first `OpenSlot` is the one that counts.
+///
+/// Both readers of this cell depend on that. `drained` posts wakes to the peer
+/// it names, and a pre-bind's owner closes the slot it names; a second claim
+/// overwriting either would send credit to the wrong peer's set, or close a
+/// slot belonging to a stream that is still running.
 #[test]
 fn drain_signal_claim_stays_write_once() {
     let drain = test_drain();
