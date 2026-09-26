@@ -38,6 +38,19 @@ Pump-removed prototype: consumer 35%, of which `DrainSignal::drained` 13% (per-r
 - `7a691b7` sentinel check: an `Item` no longer runs a failing `rmp_serde` decode that formats a `String` per record (both ends). Fail-before: allocation count > 0. Under jemalloc the bench gain is within noise.
 - `40172c5` TCP listener: teardown future pinned once per connection. Fail-before: 51 arms for 50 frames.
 
+- `3867d3f` + `820025c` lever 3, credit posting: the per-peer flume dirty lane and per-slot `listed` flag became one lock-free `DirtySlots` bitmap; only the drain that newly lists a slot touches the shared `pending` flag; the drain wake lane is unbounded so a listing never loses its wake. Fail-before: a drain of a listed slot wrote `pending`; wake 1,024 was refused. Bench (3 reps, fe us/record median, ranges): 12 peers 6.66 (6.54-6.67) -> 5.82 (5.70-5.86), -12.5%; 48 peers 8.60 (8.43-9.03) -> 8.11 (7.67-8.13), -5.6%. Adversarial review (fable): no bug; the wake-full degraded mode it found is what `820025c` removes.
+
+## Rig A/B, jthomson's adapter vs Dynamo QUIC (velo-base, 2026-09-25)
+
+One frontend, 8 mocker processes x 64 speedup-10 workers, concurrency 8192, ISL 1024, OSL 900, jemalloc, report rustflags. Results in `.research/results/t3-pr15231-ab`.
+
+| arm | req/s | ITL p50 / p99 ms | frontend cores | frontend CPU ms/req |
+|---|---:|---|---:|---:|
+| Dynamo QUIC | 2,296 / 2,661 | 1.34-1.37 / 3.0-3.1 | 30-35 | 13.1-13.3 |
+| velo (jv) | 1,462 / 1,559 | 4.36-4.39 / 6.9-16.1 | 43-46 | 27.4-31.5 |
+
+Velo loses by about 64% here, and the loss is latency-bound, not CPU-bound: the frontend has idle cores. Mean ordered-lane wait on the frontend is 1.25 ms per batch (2,820 s over 2.25M batches, about 104 records per batch). Worker credit exhaustion about 32k per rep over 250k streams. No second tokio runtime on the per-record path (the extra `tokio-rt-worker` threads are rayon's pool and the small etcd/NATS runtimes inheriting the thread name). Open question: is the per-peer serial ordered lane the rig's ceiling? `peers16` (16 processes x 32 workers) tests it.
+
 ## Open design questions (need a ruling)
 
 1. Remove the reader pump from the mux data path: the consumer reads the slot buffer and posts drains; the pump survives only as a lifecycle/watchdog task stamped from ingress. Prototype (`proto-direct` branch, watchdog dropped) measured -12% to -18% frontend CPU. Reopens `batched-streaming-design.md:79-83` by a different mechanism; buffering per stream shrinks from C+1+256 to C+1.
