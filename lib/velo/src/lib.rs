@@ -28,6 +28,9 @@ pub mod transports;
 #[cfg(feature = "simulation")]
 pub mod simulation;
 
+#[cfg(test)]
+pub(crate) mod test_alloc;
+
 // ── Convenience re-exports for the most-used public types ──────────────────
 
 // Identity / address types live in velo-ext but are re-exported here so the

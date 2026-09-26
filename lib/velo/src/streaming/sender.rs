@@ -89,6 +89,10 @@ pub(crate) fn cached_detached() -> &'static Vec<u8> {
     })
 }
 
+/// How `rmp_serde` encodes every `StreamFrame::Item`: a one-entry map (`0x81`)
+/// keyed by the fixstr `"Item"` (`0xa4` plus four bytes), then the payload.
+pub(crate) const ITEM_PREFIX: &[u8] = &[0x81, 0xa4, b'I', b't', b'e', b'm'];
+
 /// Whether these raw frame bytes are a terminal sentinel.
 ///
 /// Terminal means the stream ends here: `Dropped`, `Detached`, `Finalized` and
@@ -103,7 +107,15 @@ pub(crate) fn cached_detached() -> &'static Vec<u8> {
 /// costs a decode; that decode is also why an ordinary `Item` payload is not
 /// mistaken for one — a payload that happens to deserialize as `StreamFrame<()>`
 /// can only do so as a variant this function then rejects.
+///
+/// Both ends of the mux classify every data record, so an `Item` never reaches
+/// that decode: a frame keyed `"Item"` can only decode as `Item` or fail, never
+/// as `TransportError`, so [`ITEM_PREFIX`] decides it exactly. The failed decode
+/// it replaces formatted an error `String` per record.
 pub(crate) fn is_terminal_sentinel(bytes: &[u8]) -> bool {
+    if bytes.starts_with(ITEM_PREFIX) {
+        return false;
+    }
     if bytes == cached_dropped().as_slice()
         || bytes == cached_detached().as_slice()
         || bytes == cached_finalized().as_slice()
@@ -498,6 +510,63 @@ mod tests {
     use crate::streaming::handle::StreamAnchorHandle;
 
     use super::{StreamSender, StreamSenderCancelInfo};
+
+    /// Every variant, encoded the way a sender encodes it, gets the terminal
+    /// verdict the mux's credit classes depend on: exactly `Dropped`,
+    /// `Detached`, `Finalized` and `TransportError` spend the terminal reserve.
+    /// An `Item` whose payload is itself a sentinel's encoding stays data.
+    #[test]
+    fn terminal_classification_covers_every_variant() {
+        let enc = |f: &StreamFrame<String>| rmp_serde::to_vec(f).unwrap();
+        let cases = [
+            (StreamFrame::Item("x".to_string()), false),
+            (StreamFrame::Item("Finalized".to_string()), false),
+            (StreamFrame::SenderError("e".to_string()), false),
+            (StreamFrame::Heartbeat, false),
+            (StreamFrame::Dropped, true),
+            (StreamFrame::Detached, true),
+            (StreamFrame::Finalized, true),
+            (StreamFrame::TransportError("t".to_string()), true),
+        ];
+        for (frame, terminal) in cases {
+            assert_eq!(
+                super::is_terminal_sentinel(&enc(&frame)),
+                terminal,
+                "{frame:?}"
+            );
+        }
+        let nested = rmp_serde::to_vec(&StreamFrame::Item(super::cached_finalized().clone()))
+            .unwrap();
+        assert!(!super::is_terminal_sentinel(&nested));
+    }
+
+    /// The fast path rests on the encoding: an `Item` is a one-entry map keyed
+    /// `"Item"`, whatever its payload.
+    #[test]
+    fn item_frames_start_with_the_item_prefix() {
+        for bytes in [
+            rmp_serde::to_vec(&StreamFrame::Item(())).unwrap(),
+            rmp_serde::to_vec(&StreamFrame::Item(vec![7u8; 300])).unwrap(),
+            rmp_serde::to_vec(&StreamFrame::Item(bytes::Bytes::from_static(b"data"))).unwrap(),
+        ] {
+            assert!(bytes.starts_with(super::ITEM_PREFIX), "{bytes:02x?}");
+        }
+    }
+
+    /// Every data record on both ends of the mux is classified, so the check
+    /// must not allocate. It used to decode each `Item` as `StreamFrame<()>`
+    /// to rule out `TransportError`, and the failed decode formatted an error
+    /// `String` per record.
+    #[test]
+    fn classifying_an_item_does_not_allocate() {
+        let bytes = rmp_serde::to_vec(&StreamFrame::Item(vec![1u8; 160])).unwrap();
+        // Warm the cached sentinels, which allocate once per process.
+        super::is_terminal_sentinel(&bytes);
+        let (terminal, allocations) =
+            crate::test_alloc::allocations_in(|| super::is_terminal_sentinel(&bytes));
+        assert!(!terminal);
+        assert_eq!(allocations, 0);
+    }
 
     /// Create an empty registry for use in unit tests (no real anchors needed).
     fn empty_registry() -> Arc<DashMap<u64, AnchorEntry>> {
