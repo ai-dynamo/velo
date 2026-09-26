@@ -49,7 +49,13 @@ One frontend, 8 mocker processes x 64 speedup-10 workers, concurrency 8192, ISL 
 | Dynamo QUIC | 2,296 / 2,661 | 1.34-1.37 / 3.0-3.1 | 30-35 | 13.1-13.3 |
 | velo (jv) | 1,462 / 1,559 | 4.36-4.39 / 6.9-16.1 | 43-46 | 27.4-31.5 |
 
-Velo loses by about 64% here, and the loss is latency-bound, not CPU-bound: the frontend has idle cores. Mean ordered-lane wait on the frontend is 1.25 ms per batch (2,820 s over 2.25M batches, about 104 records per batch). Worker credit exhaustion about 32k per rep over 250k streams. No second tokio runtime on the per-record path (the extra `tokio-rt-worker` threads are rayon's pool and the small etcd/NATS runtimes inheriting the thread name). Open question: is the per-peer serial ordered lane the rig's ceiling? `peers16` (16 processes x 32 workers) tests it.
+Velo loses by about 64% here, and the loss is latency-bound, not CPU-bound: the frontend has idle cores. Mean ordered-lane wait on the frontend is 1.25 ms per batch (2,820 s over 2.25M batches, about 104 records per batch). Worker credit exhaustion about 32k per rep over 250k streams. No second tokio runtime on the per-record path (the extra `tokio-rt-worker` threads are rayon's pool and the small etcd/NATS runtimes inheriting the thread name). **Resolved (2026-09-26): the rig is worker-node bound, and velo's worker-side cost grows with streams per process.**
+
+- Both arms saturate the mocker node (about 134 of 144 cores, every mocker process at 16-17 cores in the 8-process shape, 8.2-8.4 cores in the 16-process shape).
+- `peers16`, the same 512 workers as 16 processes x 32: velo 2,231 req/s, TTFT p50 94 ms, ITL p50 / p99 1.27 / 3.77 ms, fe CPU 20.3 ms/req; QUIC 2,247 req/s, 91 ms, 1.28 / 3.13 ms, 15.1 ms/req. Parity on throughput and latency.
+- So at 8 processes (up to 2,645 streams per process) velo's worker-side CPU per request is about 1.6x QUIC's; at 16 processes it is equal. The frontend CPU gap (20.3 vs 15.1 ms/req) matches the published 32 vs 27.
+- The frontend's ordered lanes are not CPU-bound on the rig (2.5% of 72 cores for 8 lanes); the 1.25 ms mean lane wait is scheduling delay behind a runtime 87% busy with Dynamo's HTTP pipeline. Velo is about 12% of frontend CPU on the rig (reader pump 5.4%, lane 2.5%, listener 0.4%, batcher 0.2%, anchor polling inside the HTTP body).
+- Next: profile a mocker node in the 8-process shape (`wprof1`) to find what grows superlinearly with streams per process.
 
 ## Open design questions (need a ruling)
 
