@@ -1496,7 +1496,11 @@ impl VeloMetrics {
                 "Reader-pump forwards that hit the per-anchor frame channel's Full \
                  branch and fell through to send_async. Leading indicator of \
                  consumer-side saturation: this channel (bounded(256)) is the first \
-                 to fill in the saturation cascade.",
+                 to fill in the saturation cascade. Per-stream transports only: a \
+                 messenger-mux stream has no reader pump (its consumer reads the \
+                 slot buffer directly), so this never moves for it; watch \
+                 velo_streaming_slot_credit_exhausted_total there, which the \
+                 producer's node counts.",
             ))?,
         )?;
         let streaming_server_pump_backpressure_total = register_collector(
@@ -1523,19 +1527,25 @@ impl VeloMetrics {
             registry,
             Counter::with_opts(Opts::new(
                 "velo_streaming_heartbeat_watchdog_firings_total",
-                "Reader-pump heartbeat-watchdog firings: a session went \
-                 DETECTION_MULTIPLIER × heartbeat_deadline with no data or heartbeat \
-                 frames and was force-cleaned with a Dropped sentinel. Confirmed \
-                 saturation event — typically the lagging indicator of the cascade \
-                 surfaced by the *_backpressure_total counters above.",
+                "Heartbeat-watchdog firings: a session went DETECTION_MULTIPLIER × \
+                 heartbeat_deadline with no data or heartbeat frames and was \
+                 force-cleaned with a Dropped sentinel. Fired by the reader pump on a \
+                 per-stream transport, where it is typically the lagging indicator of \
+                 the cascade surfaced by the *_backpressure_total counters above. \
+                 Fired by the stream watchdog on a messenger-mux stream, and only \
+                 when nothing arrived for the slot and its buffer was empty, so there \
+                 it means silence upstream of the consumer (a dead or stalled \
+                 producer, or a backlog on its egress or the peer link), never a \
+                 consumer that fell behind.",
             ))?,
         )?;
         let streaming_unclaimed_bind_reaped_total = register_collector(
             registry,
             Counter::with_opts(Opts::new(
                 "velo_streaming_unclaimed_bind_reaped_total",
-                "Reader-pump reap of a mux bind (a zero-RTT pre-bind, an ordinary \
-                 attach whose peer never sent its OpenSlot, or an attach that \
+                "Reap of a mux bind, by its stream watchdog or its consumer (a \
+                 zero-RTT pre-bind, an ordinary attach whose peer never sent its \
+                 OpenSlot, or an attach that \
                  adopted a pre-bind) whose accept window closed with no sender \
                  having claimed it. Distinct from the heartbeat-watchdog firing \
                  above: this is the accept window catching what the watchdog \
@@ -2289,7 +2299,8 @@ impl VeloMetrics {
 
     /// Record reader-pump backpressure: the per-anchor frame channel's
     /// `try_send` returned `Full` and we fell through to `send_async`.
-    /// Leading indicator of consumer-side saturation.
+    /// Leading indicator of consumer-side saturation. Per-stream transports
+    /// only; a mux stream has no reader pump.
     pub(crate) fn record_reader_pump_backpressure(&self) {
         self.streaming_reader_pump_backpressure_total.inc();
     }
@@ -2307,13 +2318,14 @@ impl VeloMetrics {
         self.streaming_producer_send_backpressure_total.inc();
     }
 
-    /// Record a heartbeat-watchdog firing in the reader pump.
+    /// Record a heartbeat-watchdog firing in the reader pump or the mux's
+    /// stream watchdog.
     pub(crate) fn record_heartbeat_watchdog_firing(&self) {
         self.streaming_heartbeat_watchdog_firings_total.inc();
     }
 
-    /// Record the reader pump reaping a mux bind whose accept window closed
-    /// with no sender having claimed it. See
+    /// Record the stream watchdog or consumer reaping a mux bind whose accept
+    /// window closed with no sender having claimed it. See
     /// [`record_heartbeat_watchdog_firing`](Self::record_heartbeat_watchdog_firing)
     /// for the sibling reaper this one is not: that one fires once a sender's
     /// silence outlasts its tolerance, this one fires when no sender ever

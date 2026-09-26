@@ -14,9 +14,9 @@
 //! So for a mux bind the [`StreamAnchor`] polls the slot buffer directly,
 //! ahead of its own channel, and tells the [`DrainSignal`] when *it* takes a
 //! record. What the pump did besides moving data survives in
-//! [`stream_watchdog`], a task that owns no data and wakes only on its timer:
-//! it reaps a bind nobody claimed and injects `Dropped` when a sender goes
-//! silent.
+//! [`stream_watchdog`], a task that owns no data and wakes only on its timer
+//! or when the mux closes the bind: it reaps a bind nobody claimed and injects
+//! `Dropped` when a sender goes silent.
 //!
 //! The rejected alternative was merging the pump into the anchor channel
 //! (`docs/src/development/batched-streaming-design.md`): credit is issued
@@ -130,7 +130,7 @@ pub(crate) fn start_direct_stream(
 /// A cancelled `pump_token` means the bind was *retired*, not abandoned — a
 /// pre-bind released on a transport mismatch cancels it before dropping the
 /// bind, so the entry it would remove, reused by whatever attach wins next, is
-/// left alone. `reader_pump` carries the same guard for the same reason.
+/// left alone.
 pub(crate) fn reap_unclaimed(
     feed: &DirectFeed,
     local_id: u64,

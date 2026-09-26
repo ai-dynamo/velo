@@ -65,7 +65,8 @@ pub(crate) fn cached_heartbeat() -> &'static Vec<u8> {
 }
 
 /// Cached serialized bytes for `StreamFrame::<()>::Dropped`.
-/// Used in Drop impl and reader_pump timeout path.
+/// Used in Drop impl and by the watchdogs (`reader_pump`, `stream_watchdog`)
+/// and the unclaimed-bind reap when they inject `Dropped`.
 pub(crate) fn cached_dropped() -> &'static Vec<u8> {
     static DROPPED: OnceLock<Vec<u8>> = OnceLock::new();
     DROPPED.get_or_init(|| {
@@ -185,7 +186,7 @@ impl<T: Serialize> StreamSender<T> {
     /// via non-blocking `try_send`. It is cancelled when the sender is finalized,
     /// detached, or dropped. `heartbeat_interval` is negotiated by the consumer
     /// via [`crate::streaming::control::AnchorAttachResponse::Ok::heartbeat_interval_ms`]
-    /// — both sides must agree so the consumer's reader pump deadline matches.
+    /// — both sides must agree so the consumer's watchdog deadline matches.
     ///
     /// `registry` is a shared reference to the anchor registry so that
     /// [`detach`](StreamSender::detach) can atomically clear the attachment flag.

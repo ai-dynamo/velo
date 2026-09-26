@@ -67,8 +67,9 @@ pub(crate) const MAX_INGRESS_SLOTS_PER_PEER: usize = 1 << 16;
 struct BindEntry {
     /// The mux-owned `C + 1` buffer whose receiver went to the anchor.
     frame_tx: flume::Sender<Vec<u8>>,
-    /// Handed to `reader_pump` at attach; told which peer it belongs to here,
-    /// when an `OpenSlot` claims this bind.
+    /// Handed to the anchor's direct feed and stream watchdog at attach (or to
+    /// `mpsc_reader_pump` for an MPSC anchor); told which peer it belongs to
+    /// here, when an `OpenSlot` claims this bind.
     drain: Arc<DrainSignal>,
 }
 
@@ -93,15 +94,16 @@ pub(crate) struct IngressRegistry {
     /// the sole other visitor.
     peers: DashMap<WorkerId, Mutex<PeerIngress>>,
     /// Per-peer "a credit-return visit is already queued" flags, read and set by
-    /// draining pumps without taking the peer mutex. See [`DrainSignal`].
+    /// draining consumers without taking the peer mutex. See [`DrainSignal`].
     ///
     /// **Grows with distinct peers and is never pruned**, which mirrors `peers`
     /// above and costs a pointer and a bool per peer this node has ever received
     /// a slot from. Removing an entry is not a matter of picking a moment: a
-    /// pump holds its peer's flag as an `Arc` for the life of its stream, so a
-    /// removal while any such pump lives leaves that pump setting a flag nothing
-    /// reads — permanently true, permanently coalescing, and that peer's credit
-    /// falls back to the periodic sweep for the rest of the stream. So it may
+    /// claimed [`DrainSignal`] holds its peer's flag as an `Arc` for the life of
+    /// its stream, so a removal while any such stream lives leaves its consumer
+    /// setting a flag nothing reads — permanently true, permanently
+    /// coalescing, and that peer's credit falls back to the periodic sweep for
+    /// the rest of the stream. So it may
     /// only be removed under the same visibility that retires slots and binds,
     /// and until that is worth building, unbounded-but-tiny is the honest trade.
     drain_pending: DashMap<WorkerId, Arc<AtomicBool>>,
@@ -282,7 +284,7 @@ impl IngressRegistry {
 
     /// This peer's pending-wake flag, created on first use.
     ///
-    /// Lives on the registry rather than in `PeerIngress` so a draining pump
+    /// Lives on the registry rather than in `PeerIngress` so a draining consumer
     /// can reach it without taking the peer mutex — taking that mutex per
     /// record is the cost this whole change exists to avoid.
     pub(crate) fn pending_wake(&self, peer: WorkerId) -> Arc<AtomicBool> {
@@ -770,8 +772,10 @@ fn finish_close(
     if reason != CloseReason::TerminalSent {
         slot.inject_dropped();
     }
-    // Dropping the mux-side sender is what makes `reader_pump` exit through the
-    // same `Err` branch it uses today when a socket closes. Identical path.
+    // Dropping the slot drops the mux-side sender and fires the drain signal's
+    // `closed`: the consumer's feed ends as a receiver does when a socket
+    // closes, the stream watchdog exits, and an MPSC pump takes its `Err`
+    // branch.
     drop(slot);
     outcome.closed += 1;
 }
@@ -908,7 +912,7 @@ fn retire_epoch(state: &mut PeerIngress, metrics: Option<&MuxMetricsHandle>) -> 
     // panic between a push and the drain), plus any future caller that
     // retires mid-batch. The table is cleared and regrows from index zero, so
     // a left-behind entry would send the next pass to whatever slot takes that
-    // index back — a reconcile of a slot neither the batch nor a pump named.
+    // index back — a reconcile of a slot neither the batch nor a consumer named.
     // Clearing keeps every entry meaning what the pass assumes it means.
     //
     // The dirty set gets no matching clear. A retired index's own consumer can
@@ -917,7 +921,7 @@ fn retire_epoch(state: &mut PeerIngress, metrics: Option<&MuxMetricsHandle>) -> 
     // name it. Left alone, it costs whatever visits the index next one empty visit
     // (nothing, if the index stays closed) or one spurious visit of a
     // replacement (harmless per `collect_touched_grants`'s doc: the visit
-    // reads the replacement's own count, whatever its own pump has drained
+    // reads the replacement's own count, whatever its own consumer has drained
     // since, and that count is always its own — `bind` makes one
     // `DrainSignal` per bind and `open_slot` claims it, so it can never be the
     // retired slot's). `collect_grants`'s periodic walk also takes the whole

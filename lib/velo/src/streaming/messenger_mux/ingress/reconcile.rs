@@ -92,7 +92,7 @@ pub(super) fn list_drained_slots(state: &mut PeerIngress) {
 /// replacement did not earn, because the count a reconcile reads belongs to
 /// the slot rather than to the index: `bind` makes one [`DrainSignal`](super::DrainSignal) per
 /// bind and `open_slot` claims it, so the replacement reads its own count —
-/// zero unless its own pump has already drained something, and either way
+/// zero unless its own consumer has already drained something, and either way
 /// its own credit, never the retired slot's. If the replacement is listed
 /// again later in the same pass, it is visited twice — the first visit takes
 /// the whole count and the pending grant with it, so the second finds zero of

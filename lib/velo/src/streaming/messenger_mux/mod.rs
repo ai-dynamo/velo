@@ -76,8 +76,8 @@
 //!
 //! Credit comes back from three places. Two of them visit only slots that
 //! something named; the third is the whole-table backstop. A draining
-//! consumer's pump counts the record on that
-//! slot's [`ingress::DrainSignal`], lists the slot in its peer's
+//! consumer (the `StreamAnchor` reading its slot buffer directly, or an MPSC
+//! anchor's pump) counts the record on that slot's [`ingress::DrainSignal`], lists the slot in its peer's
 //! [`ingress::DirtySlots`], and posts the peer if the listing is new. The
 //! **arrival path** then reconciles, on every inbound batch, the slots that
 //! batch delivered into together with the slots in that set — so the credit a
@@ -96,11 +96,11 @@
 //! credit was freed. That is what lets the three paths run concurrently — a
 //! redundant visit finds a count of zero, where a delta would double-count.
 //!
-//! It still differs from `docs/src/concepts/batched-streaming.md`, which specifies an exact
-//! `credit.release(1)` per handoff. Releasing an amount from the pump is the
-//! part that was not adopted: releasing needs the peer's mutex, and taking it
-//! per record would trade a periodic cost for a worse per-record one. See the
-//! dated addenda at the end of that document.
+//! The first design released an exact `credit.release(1)` per handoff.
+//! Releasing an amount from the consumer is the part that was not adopted:
+//! releasing needs the peer's mutex, and taking it per record would trade a
+//! periodic cost for a worse per-record one. See "Credit return" in
+//! `docs/src/development/batched-streaming-design.md`.
 
 mod config;
 pub(crate) mod flow_control;
@@ -227,8 +227,8 @@ struct MuxCore {
     /// [`ingress::DrainSignal`].
     drain_tx: flume::Sender<WorkerId>,
     drain_rx: flume::Receiver<WorkerId>,
-    /// Drain signals waiting to be collected by the attach that will spawn the
-    /// pump holding them.
+    /// Drain signals waiting to be collected by the attach that will start the
+    /// feed and watchdog (or MPSC pump) holding them.
     ///
     /// `bind` cannot hand this back directly — `FrameTransport::bind` returns a
     /// receiver and nothing else, and widening that trait would be a breaking
@@ -257,8 +257,8 @@ impl MessengerMuxTransport {
 
     /// Take the [`ingress::DrainSignal`] `bind` parked for this pair.
     ///
-    /// Called once by the attach path, between `bind` returning and the pump
-    /// being spawned. Returns `None` for a pair this transport did not bind,
+    /// Called once by the attach path, between `bind` returning and the
+    /// consumer side being started. Returns `None` for a pair this transport did not bind,
     /// which is the honest answer for the legacy per-stream transports — they
     /// have no mux credit to return.
     pub(crate) fn take_drain_signal(
@@ -503,8 +503,8 @@ impl MuxCore {
     ///
     /// Two halves, and both are needed. The local retire is what returns
     /// `live_slots` to zero — nothing else does, because the sweep reads
-    /// only what the slot's own pump counted drained, and a pump whose
-    /// consumer is gone counts nothing; the next record to arrive would
+    /// only what the slot's own consumer counted drained, and a consumer that
+    /// is gone counts nothing; the next record to arrive would
     /// close the slot by finding its receiver gone, but an idle producer
     /// sends none. The reply is what that idle producer needs, since the
     /// fault that carries the same news to it otherwise rides on the next

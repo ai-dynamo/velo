@@ -60,8 +60,8 @@ flowchart LR
         L --> H[ingress handle_batch]
         H --> Q1[slot buffer C+1]
         H --> Q2[slot buffer C+1]
-        Q1 --> P1[reader pump] --> A1[anchor channel 256] --> C1[StreamAnchor]
-        Q2 --> P2[reader pump] --> A2[anchor channel 256] --> C2[StreamAnchor]
+        Q1 -->|read directly| C1[StreamAnchor]
+        Q2 -->|read directly| C2[StreamAnchor]
         H -.->|CreditUpdate replies| RB[PeerBatcher back to producer]
     end
 ```
@@ -72,7 +72,7 @@ flowchart LR
 
 `MessengerMuxTransport` implements the streaming `FrameTransport` contract. It has no dial, no listener, no acceptor and no connection manager. The sender's identity arrives in the active-message envelope, so credit has a return route without a handshake.
 
-Egress is one `PeerBatcher` per remote instance. The batcher is created on the first send to that peer and evicted when it is idle with no live slots. A node that talks to Y peers holds Y batchers, whatever its stream count. The per-stream design is O(X) in tasks and sockets. With the mux, sockets and batchers are O(Y). Each stream still has its own reader pump and heartbeat task, so tasks stay O(X).
+Egress is one `PeerBatcher` per remote instance. The batcher is created on the first send to that peer and evicted when it is idle with no live slots. A node that talks to Y peers holds Y batchers, whatever its stream count. The per-stream design is O(X) in tasks and sockets. With the mux, sockets and batchers are O(Y). Each stream still has its own stream watchdog on the consumer and heartbeat task on the producer, so tasks stay O(X). The watchdog wakes once per heartbeat window, not once per record.
 
 The cost of this design is that streaming no longer owns its wire. It shares queues, framing and backpressure with control traffic. Stream order is no longer a TCP guarantee. It is a protocol obligation, and every record carries a per-slot sequence number for this reason.
 
@@ -151,13 +151,13 @@ Batches from one peer must not be reordered. The worker writes each `OpenSlot` i
 
 The sender writes `OpenSlot` when the stream attaches, in a flush of its own. It does not wait for the first data record. `bind()` starts a 60-second accept window (`ACCEPT_TIMEOUT`). The window measures the time until a batch that carries the `OpenSlot` arrives. A lazy `OpenSlot` makes the window measure the time until the first token, and a queued request with a long prefill then expires.
 
-An `OpenSlot` for an `(anchor_id, session_id)` pair that was never registered does not fail the peer. The receiver replies `CloseSlot{UnknownSlot}` and discards the records of that slot. When the accept window closes on an unclaimed bind, the reader pump reaps the registry entry, injects `Dropped` and increments `velo_streaming_unclaimed_bind_reaped_total`.
+An `OpenSlot` for an `(anchor_id, session_id)` pair that was never registered does not fail the peer. The receiver replies `CloseSlot{UnknownSlot}` and discards the records of that slot. When the accept window closes on an unclaimed bind, the stream watchdog (or the consumer, if it sees the close first) reaps the registry entry, injects `Dropped` and increments `velo_streaming_unclaimed_bind_reaped_total`.
 
 By default, `connect` returns after the transport admits the `OpenSlot`. `MuxConfig::async_open_ack` changes this. The `OpenSlot` still goes out in a batch of its own before `connect` returns, but the acknowledgement does not wait for admission. If the transport admits the frame synchronously, per-target FIFO already orders the slot's later records behind it, and no fence goes up. Otherwise the slot is fenced until the admission resolves. A failed admission is epoch death in both modes. Measured at load, this option did not improve first-token latency. See [Response plane performance](../operations/response-plane-performance.md).
 
 ### Zero-RTT stream setup
 
-The receiver chooses every field of the attach response without input from the sender. It can therefore bind a slot before any sender asks. `AnchorManager::prebind_anchor` does the work of the attach handler at request registration. It binds the slot, allocates the routing session, takes the drain signal and spawns the reader pump. It returns a `StreamOpenTicket` with the five values an attach response carries. The application puts the ticket in the request envelope that it already sends to the worker.
+The receiver chooses every field of the attach response without input from the sender. It can therefore bind a slot before any sender asks. `AnchorManager::prebind_anchor` does the work of the attach handler at request registration. It binds the slot, allocates the routing session, takes the drain signal, installs the direct feed and spawns the stream watchdog. It returns a `StreamOpenTicket` with the five values an attach response carries. The application puts the ticket in the request envelope that it already sends to the worker.
 
 The worker calls `AnchorManager::open_anchor_stream` with the ticket. Its first batch carries an `OpenSlot`, which claims the pre-bound slot the same way an attached sender's does. No `_anchor_attach` crosses the wire. The wire format does not change: `StreamOpenTicket` is a separate type in the application's envelope. When no mux is installed, `prebind_anchor` returns `None` and the stream attaches the ordinary way.
 
@@ -169,7 +169,7 @@ The pre-bind has these rules:
 - **Cancellation posts a close.** A zero-RTT anchor never learns a `StreamCancelHandle`. When a claimed pre-bind drops, it posts `CloseSlot{UnknownSlot}` to the producer through `close_claimed_slot`. An idle producer learns of the cancel without sending another record.
 - **Detach gives the slot back.** Both places that handle `Detached` release the pre-bind and resume the unattached timer.
 
-The ticket can wait in an envelope for the full 60-second accept window. Heartbeat detection starts only when the `OpenSlot` that claims the bind arrives. Before that, the reader pump does not count a silent window as a miss.
+The ticket can wait in an envelope for the full 60-second accept window. Heartbeat detection starts only when the `OpenSlot` that claims the bind arrives. Before that, the stream watchdog does not count a silent window as a miss.
 
 Credit is exact by construction. `prebind` sizes its buffer from the same `NegotiatedLimits` that the ticket quotes. `open_slot` emits no `CreditUpdate` on the claim, so the sender never holds 2C credit against a C+1 buffer.
 
@@ -187,7 +187,9 @@ The shared resource is the ordering lane of the peer. A `_stream_batch` handler 
 
 ### Credit against a mux-owned buffer
 
-Credit is issued against a mux-owned per-slot buffer, never against the anchor's `frame_tx`. `frame_tx` has other writers: the same-worker attach path, the detach and finalize handlers, the watchdog's `Dropped` injection and M concurrent MPSC senders. Any proof of "C credits against a C-deep channel" fails when a second writer exists. `bind` returns a receiver of depth C+1, and the reader pump moves each record from it into `frame_tx`.
+Credit is issued against a mux-owned per-slot buffer, never against the anchor's `frame_tx`. `frame_tx` has other writers: the same-worker attach path, the detach and finalize handlers, the watchdog's `Dropped` injection and M concurrent MPSC senders. Any proof of "C credits against a C-deep channel" fails when a second writer exists. `bind` returns a receiver of depth C+1. The `StreamAnchor` reads that buffer itself, before its own `frame_tx`, and counts each record it takes. No task sits between the buffer and the consumer.
+
+The mux publishes the buffer to the anchor through a replaceable feed. Retiring the bind (detach, a released pre-bind, a same-worker attach over a pre-bind) or removing the anchor withdraws the feed. The consumer drops a withdrawn feed on its next poll, before it reads that buffer again, so records still unread there are discarded. While a feed is installed, nothing on the anchor channel can jump ahead of a record the consumer can still read.
 
 Invariant: a slot never has more than C data records outstanding against its C+1 buffer. The ingress handler only calls `try_send` into space that credit already reserved, and it never blocks the lane. `velo_streaming_mux_reader_stall_total > 0` is a bug, not a tuning signal.
 
@@ -222,7 +224,7 @@ Transports expose an ordered per-target admission gate as `SendOutcome::{Admitte
 
 Credit comes back from three paths. Two of them visit only slots that something named. The third walks the whole table as a backstop.
 
-- **Drain signal.** When the reader pump forwards a record into the anchor channel, it increments an exact count on the slot's `DrainSignal`. It then sets the slot's bit in the peer's dirty set, a lock-free bitmap. Only the drain that sets the bit posts the peer; a drain that finds the bit already set changes nothing shared. The pump takes no lock.
+- **Drain signal.** When the consumer takes a record out of the slot buffer, it increments an exact count on the slot's `DrainSignal`. It then sets the slot's bit in the peer's dirty set, a lock-free bitmap. Only the drain that sets the bit posts the peer; a drain that finds the bit already set changes nothing shared. The consumer takes no lock.
 - **Arrival path.** On every inbound batch, `handle_batch` reconciles the slots that the batch delivered into and the slots in the dirty set. The credit that a stream's tail waits for rides the peer's next batch, which arrives in tens of microseconds.
 - **Doorbell.** The sweep task answers a peer wake by reconciling the slots in its dirty set. `MuxConfig::drain_visit_floor` (2 ms by default) limits it to one visit per peer per floor. This path covers a peer that sends no further batches.
 - **Periodic tick.** Every `MuxConfig::credit_sweep_interval` (200 ms by default), the sweep walks every slot of every ingress peer. This covers a slot that nothing names: parked, with nothing arriving and nothing being taken out. The same tick evicts idle batchers.
@@ -233,12 +235,12 @@ The dirty set carries an index and no quantity. The quantity is the count on the
 sequenceDiagram
     participant P as Producer batcher
     participant I as Consumer ingress
-    participant R as Reader pump
+    participant R as Consumer (StreamAnchor)
     participant S as Sweep task
     participant B as Consumer batcher
     P->>I: _stream_batch (Data records)
     I->>I: deliver into slot buffer C+1
-    R->>R: forward record to anchor channel
+    R->>R: take record from slot buffer
     R->>R: DrainSignal count += 1, list slot in dirty set
     R-->>S: post peer wake
     P->>I: next _stream_batch
@@ -249,11 +251,11 @@ sequenceDiagram
     B->>P: _stream_batch (CreditUpdate records, after reply_linger)
 ```
 
-Credit for a record returns when the record reaches the anchor channel, not when it enters the mux buffer. Anchor backpressure therefore reaches the sender one hop sooner.
+Credit for a record returns when the consumer takes it, not when it enters the mux buffer. A consumer that stops polling therefore holds its sender to the credit window C: no task moves records onward and returns credit for them.
 
 A producer that ran out of credit sends no batches, so the arrival path does not run for its slots. It waits for the doorbell floor and then for the reply linger. Per record this costs `(drain_visit_floor + reply_linger) / initial_credit`. At the defaults (2 ms, 1 ms and 256) that is under 12 µs per record.
 
-The periodic walk does not reclaim credit for a slot whose pump died, because a dead pump counts no drains. The next record that arrives for such a slot finds its receiver gone and closes the slot with `UnknownSlot`.
+The periodic walk does not reclaim credit for a slot whose consumer is gone, because a consumer that is gone counts no drains. The next record that arrives for such a slot finds its receiver gone and closes the slot with `UnknownSlot`.
 
 ### Reply linger
 
@@ -274,7 +276,7 @@ On the per-stream path, the egress pump writes a terminal, discards anything que
 1. Egress sees `is_terminal_sentinel(body)` for slot S, appends the record to the current batch, marks S draining and drops the inlet receiver of S. Frames queued behind the terminal for S are discarded. Other slots continue.
 2. Egress appends `CloseSlot{TerminalSent}` in the same batch, right after the terminal. Terminal and close are atomic.
 3. The batcher frees the slot, bumps its generation and releases its credit and byte budget. The peer batcher and the peer's ordering lane continue.
-4. On the receive side, the terminal spends the reserved credit. Then `CloseSlot` drops the mux-side sender, and the reader pump exits on the same closed-channel branch as when a socket closes.
+4. On the receive side, the terminal spends the reserved credit. Then `CloseSlot` drops the mux-side sender. The consumer reads the terminal and then sees the buffer close, the same as a receiver does when a socket closes, and the stream watchdog exits.
 5. A `CloseSlot` with any reason other than `TerminalSent`, and every epoch death, injects `Dropped` for a slot that has not delivered a terminal.
 
 `finalize`, `detach` and `Drop` hand the terminal to the inlet without blocking a runtime worker. They call `try_send` first. On a full channel, they hand the record to a task that awaits space. The task holds a clone of the sender, so the channel stays open until the sentinel is in it. With no runtime on the thread, they block, because no worker exists to starve. `detach` clears the attachment flag only after the sentinel is in the channel, so a re-attach cannot put records ahead of the `Detached` frame.
@@ -285,9 +287,13 @@ On the per-stream path, the egress pump writes a terminal, discards anything que
 
 Each `StreamSender` runs a heartbeat task. The task ticks at the heartbeat interval that the consumer advertised and calls `try_send` with a `StreamFrame::Heartbeat` into the sender's channel. On a full channel the heartbeat is dropped. Under the mux, a heartbeat is an ordinary `Data` record. It spends data credit and shares the peer's queues with data.
 
-The reader pump detects silence. It arms one pinned timer per stream. On each received frame, it stamps the time after the forward completes. It moves the deadline only when the deadline is within half a window. Under steady traffic the timer never fires and moves at most twice per deadline. When the timer fires with no frame inside the window, the pump counts a miss. After `DETECTION_MULTIPLIER` misses (3 × 5 s at the manager default), it injects `Dropped` and increments `velo_streaming_heartbeat_watchdog_firings_total`.
+Under the mux, the stream watchdog detects silence. It is one task per stream, and it holds no data. It wakes once per heartbeat window on its own timer, or when the mux closes the bind. A window is live if the ingress delivered anything to the slot during it, or if records still wait unread in the slot buffer. A consumer that is behind leaves its sender without credit, and a sender without credit cannot send a heartbeat, so that silence is not the sender's. After `DETECTION_MULTIPLIER` dead windows (3 × 5 s at the manager default), the watchdog injects `Dropped`, removes the anchor and increments `velo_streaming_heartbeat_watchdog_firings_total`. The windows run on the watchdog's own clock, so detection lands between `DETECTION_MULTIPLIER` and `DETECTION_MULTIPLIER + 1` windows after the last arrival. Before a pre-bound slot has a sender, windows do not count.
 
-A per-stream heartbeat does not detect a hung producer, because it runs on a separate task. It detects process or host death, connection death and sustained saturation. Saturation shows because a full channel drops heartbeats. Under the mux, the Messenger already detects process, host and connection death, and the mux learns of it through epoch death. The one signal a stream heartbeat still carries is per-slot saturation. For this reason heartbeats are not in the reserved control class.
+A non-empty buffer counts as live for as long as it stays non-empty. A consumer that stopped polling while its sender died therefore keeps its anchor until the application drops the anchor.
+
+On the per-stream path, the reader pump detects silence. It arms one pinned timer per stream. On each received frame, it stamps the time after the forward completes. It moves the deadline only when the deadline is within half a window. Under steady traffic the timer never fires and moves at most twice per deadline. When the timer fires with no frame inside the window, the pump counts a miss. After `DETECTION_MULTIPLIER` misses, exactly that many windows after the last frame, it injects `Dropped` and increments the same counter.
+
+A per-stream heartbeat does not detect a hung producer, because it runs on a separate task. It detects process or host death, connection death and sustained saturation. Saturation shows because a full channel drops heartbeats. Under the mux, the Messenger already detects process, host and connection death, and the mux learns of it through epoch death. The one signal a stream heartbeat still carries is per-slot saturation upstream of the consumer, such as a backlog on the producer's egress. For this reason heartbeats are not in the reserved control class. A consumer that has fallen behind is not this signal: the watchdog counts a window with unread records as live.
 
 The wire reserves `SlotHeartbeat` (record type 4) for a cheaper heartbeat. In that design, the batcher emits it only for idle slots, on one peer-level tick. Ingress decodes and applies it, but no sender emits it yet. The [Batched streaming design](../development/batched-streaming-design.md) chapter records that design.
 

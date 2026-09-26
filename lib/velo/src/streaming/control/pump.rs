@@ -19,14 +19,14 @@ use super::DETECTION_MULTIPLIER;
 
 #[cfg(test)]
 tokio::task_local! {
-    /// Counts how many times a pump has armed or re-armed its heartbeat
-    /// timer.
+    /// Counts how many times a pump or a stream watchdog has armed or
+    /// re-armed its heartbeat timer.
     ///
     /// A task-local rather than a field on [`PumpContext`]: the property it
-    /// exists to pin -- that a pump arms one timer for its stream instead of
-    /// one per record -- belongs to the pump's own loop, not to anything a
-    /// caller hands it, so a field would have had to be threaded through all
-    /// three production spawn sites to observe something none of them decide.
+    /// exists to pin -- that a task arms one timer for its stream instead of
+    /// one per record -- belongs to the task's own loop, not to anything a
+    /// caller hands it, so a field would have had to be threaded through every
+    /// production spawn site to observe something none of them decide.
     /// Scoping it per task also keeps each test's count its own while the
     /// suite runs them in parallel, which a process-wide counter could not.
     pub(crate) static TIMER_ARMS: std::sync::Arc<std::sync::atomic::AtomicU64>;
@@ -45,7 +45,8 @@ pub(crate) fn note_timer_arm() {}
 
 #[cfg(test)]
 tokio::task_local! {
-    /// Counts how many times a pump's heartbeat timer has actually elapsed.
+    /// Counts how many times a pump's or watchdog's heartbeat timer has
+    /// actually elapsed.
     ///
     /// A second counter rather than a flag on [`TIMER_ARMS`] because the two
     /// answer different questions and the receive-arm re-arm below moves them
@@ -67,7 +68,9 @@ pub(crate) fn note_timer_fire() {
 #[inline(always)]
 pub(crate) fn note_timer_fire() {}
 
-/// What a reader pump needs beyond its channels.
+/// What a mux-fed task needs beyond its channels: the direct feed's
+/// [`stream_watchdog`](super::feed::stream_watchdog) and `mpsc_reader_pump`.
+/// [`reader_pump`] reads no drain signal and does not take one.
 ///
 /// A struct rather than three more parameters: `mpsc_reader_pump` already
 /// carries a sender id and a registry, and adding the drain hook positionally
@@ -81,21 +84,23 @@ pub(crate) struct PumpContext {
     /// stream -- except while [`awaiting_sender`] holds, which every window a
     /// pre-bind spends with no sender yet does by construction.
     pub(crate) heartbeat_deadline: Duration,
-    /// Told when a record leaves the buffer credit is issued against. `None`
-    /// for every transport that does not do flow control over this seam.
+    /// The mux bind's drain signal. `mpsc_reader_pump` tells it when a record
+    /// leaves the buffer credit is issued against; the watchdog reads its
+    /// arrival count and close. `None` for every transport that does not do
+    /// flow control over this seam.
     pub(crate) drain: Option<std::sync::Arc<crate::streaming::messenger_mux::ingress::DrainSignal>>,
-    /// Whether this pump's slot still has no sender, other than through its
+    /// Whether this task's slot still has no sender, other than through its
     /// own `OpenSlot`.
     ///
     /// `true` only at the one genuine pre-bind spawn site
     /// (`AnchorManager::prebind_anchor`); every ordinary attach spawn passes
     /// a fresh `Arc::new(AtomicBool::new(false))`. Shared with the
-    /// `PreBind` the pump was spawned for, and cleared by
+    /// `PreBind` the task was spawned for, and cleared by
     /// [`PreBind::adopt`](crate::streaming::anchor::PreBind::adopt) the
     /// moment a sender attaches the long way round instead of opening on its
     /// ticket -- the one other door through which a sender can show up, and
     /// the one transition an `Arc<AtomicBool>` exists to carry immediately
-    /// rather than the pump learning it only once that sender's own
+    /// rather than the task learning it only once that sender's own
     /// `OpenSlot` lands.
     ///
     /// `drain.claimed().is_none()` is not a proxy for this on its own: the
@@ -103,26 +108,27 @@ pub(crate) struct PumpContext {
     /// attach's, and that signal stays unclaimed until the peer's `OpenSlot`
     /// arrives -- which is necessarily after the attach response already
     /// returned. See [`awaiting_sender`] for the combined read the
-    /// heartbeat-exemption branch below needs; the transport-closed branch
-    /// needs only the claim, see [`bind_unclaimed`].
+    /// watchdog's heartbeat exemption needs; the unclaimed-bind reap
+    /// (`feed::reap_unclaimed`) needs only the claim, see [`bind_unclaimed`].
     pub(crate) prebound: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
-/// Whether an `OpenSlot` has claimed the mux bind this pump reads from.
+/// Whether an `OpenSlot` has claimed the mux bind this task reads from.
 ///
 /// `None` (a transport with no `DrainSignal`) answers `false`: without a
 /// drain there is no accept window racing to reclaim the bind either, so a
 /// closed transport there has always meant a sender that genuinely departed,
-/// not one still on its way in. This is the condition the reap arm below
-/// gates on -- it does not care which of the two doors in [`awaiting_sender`]
-/// a sender was expected to come through, only whether one has.
+/// not one still on its way in. This is the condition
+/// `feed::reap_unclaimed` gates on -- it does not care which of the two doors
+/// in [`awaiting_sender`] a sender was expected to come through, only whether
+/// one has.
 pub(super) fn bind_unclaimed(
     drain: Option<&crate::streaming::messenger_mux::ingress::DrainSignal>,
 ) -> bool {
     drain.is_some_and(|d| d.claimed().is_none())
 }
 
-/// Whether a pump's slot still has no sender -- the state that must not count
+/// Whether a mux bind still has no sender -- the state that must not count
 /// against the heartbeat watchdog.
 ///
 /// Two different doors let a sender show up, and this has to watch both:
@@ -132,9 +138,9 @@ pub(super) fn bind_unclaimed(
 /// reassigns the slot to a sender that attached the ordinary way instead --
 /// `drain` alone cannot see that sender, since its own `OpenSlot` may still
 /// be seconds or minutes away. `prebound` alone is not enough either: an
-/// ordinary attach's pump starts with an unclaimed `drain` too, for as long
-/// as the peer's own `OpenSlot` is still in flight, and that pump is spawned
-/// with `prebound` already `false` for exactly that reason.
+/// ordinary attach's watchdog starts with an unclaimed `drain` too, for as
+/// long as the peer's own `OpenSlot` is still in flight, and that watchdog is
+/// spawned with `prebound` already `false` for exactly that reason.
 pub(super) fn awaiting_sender(
     prebound: &std::sync::atomic::AtomicBool,
     drain: Option<&crate::streaming::messenger_mux::ingress::DrainSignal>,
@@ -300,17 +306,15 @@ pub(crate) async fn reader_pump(
                 note_timer_fire();
                 // Every path out of this arm re-arms the sleep first. A fired
                 // `Sleep` stays ready until it is reset, so a `continue` past
-                // one turns the pump into a hot loop instead of a wait --
-                // which is exactly what a pre-bind pump, exempt from the
-                // miss count below, would otherwise do on every window.
+                // one turns the pump into a hot loop instead of a wait on
+                // every window.
                 let idle = last_frame.elapsed();
                 if idle < heartbeat_deadline {
                     // A frame landed inside this window, so the deadline that
                     // frame implies has not arrived yet. Reached only when
-                    // the last frame fell in the first half of a window, or
-                    // when there is no sender yet -- the receive arm's push
-                    // keeps a stream carrying records out of this arm
-                    // entirely.
+                    // the last frame fell in the first half of a window --
+                    // the receive arm's push keeps a stream carrying records
+                    // out of this arm entirely.
                     armed_until = last_frame + heartbeat_deadline;
                     sleep.as_mut().reset(armed_until);
                     note_timer_arm();

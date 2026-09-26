@@ -324,7 +324,7 @@ impl RecordType {
     /// Exactly `OpenSlot`, `CloseSlot` and `CreditUpdate` — the list
     /// `docs/src/concepts/batched-streaming.md` § "Flow control" gives, and
     /// `SlotHeartbeat` is deliberately not on it. A heartbeat dropped under
-    /// saturation *is* the per-slot saturation signal `reader_pump`'s
+    /// saturation *is* the per-slot saturation signal the stream watchdog's
     /// `DETECTION_MULTIPLIER` watches for; granting it a reserve would delete
     /// the watchdog kill that `docs/src/operations/saturation.md` documents.
     #[cfg(test)]

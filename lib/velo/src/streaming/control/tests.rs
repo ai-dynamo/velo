@@ -861,15 +861,15 @@ fn make_pump_test_infra() -> (
 /// same shard-lock hold, so a just-adopted pre-bind is never observed with
 /// both set. The pair comes from `attach_stream_anchor`'s co-located branch
 /// instead: it sets `attachment` and releases the `PreBind` without ever
-/// touching the shared `prebound` flag its now-cancelled pump still reads as
-/// `true`, and a fixture that tied the two together could never construct
-/// that pair to test it -- which is exactly why the reader pump's
-/// `!cancel_token.is_cancelled()` guard is load-bearing there.
+/// touching the shared `prebound` flag its now-cancelled watchdog still reads
+/// as `true`, and a fixture that tied the two together could never construct
+/// that pair to test it -- which is exactly why `reap_unclaimed`'s
+/// cancelled-token guard is load-bearing there.
 ///
 /// Returns `(transport_tx, drain, frame_rx, cancel_token, registry, local_id)`.
-/// `frame_rx` must be kept alive (even if unused) for as long as the pump
-/// should run: dropping it disconnects `frame_tx` and the pump exits, same as
-/// [`make_pump_test_infra`].
+/// `frame_rx` is where the watchdog's injected sentinel lands. Unlike
+/// [`make_pump_test_infra`]'s pump, the watchdog does not exit when it is
+/// dropped: it exits on its token, on `drain.close()`, or when it fires.
 #[allow(clippy::type_complexity)]
 fn make_watchdog_test_infra(
     heartbeat_deadline: Duration,
@@ -1022,7 +1022,9 @@ async fn test_watchdog_reaps_an_unclaimed_prebind_when_its_bind_is_reclaimed() {
         make_watchdog_test_infra(Duration::from_secs(5), true, false);
 
     // Simulate the accept window's `release_bind`/`expire_bind`: it drops the
-    // `BindEntry`, and with it the `frame_tx` that feeds this `transport_rx`.
+    // `BindEntry`, and with it the `frame_tx` that feeds this `transport_rx`;
+    // `Drop for BindEntry` fires the drain signal's close, which is what the
+    // watchdog waits on.
     drop(transport_tx);
     drain.close();
 

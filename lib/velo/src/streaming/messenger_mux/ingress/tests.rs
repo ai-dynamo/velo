@@ -26,19 +26,21 @@ fn test_drain() -> Arc<DrainSignal> {
 }
 
 /// The consumer side of one bound slot: the receiver `bind` handed the anchor,
-/// and the drain signal `reader_pump` would hold.
+/// and the drain signal its direct feed holds.
 ///
-/// Both are needed because credit is returned against what the pump *counted*.
-/// Taking a frame out of `rx` without telling the signal is what a dead pump
-/// looks like, not what a draining consumer looks like, and reconciles nothing.
+/// Both are needed because credit is returned against what the consumer
+/// *counted*. Taking a frame out of `rx` without telling the signal is what a
+/// gone consumer looks like, not what a draining one looks like, and
+/// reconciles nothing. (`pump` is named for the reader pump that used to do
+/// this for a mux bind; the `StreamAnchor` now reads the buffer itself.)
 struct Consumer {
     rx: flume::Receiver<Vec<u8>>,
     drain: Arc<DrainSignal>,
 }
 
 impl Consumer {
-    /// Take everything available, counting each record the way `reader_pump`
-    /// does.
+    /// Take everything available, counting each record the way a mux-fed
+    /// `StreamAnchor` does.
     fn pump(&self) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         while let Ok(frame) = self.rx.try_recv() {
@@ -120,7 +122,8 @@ fn open(registry: &IngressRegistry, config: &MuxConfig, id: SlotId, epoch: u64) 
 
 /// Take everything the consumer can see, without counting it on a drain
 /// signal. For the tests that assert on frames rather than on credit — a
-/// record taken this way is one whose pump died, as far as the ledger knows.
+/// record taken this way is one whose consumer is gone, as far as the ledger
+/// knows.
 fn drain(rx: &flume::Receiver<Vec<u8>>) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     while let Ok(frame) = rx.try_recv() {
@@ -1054,8 +1057,8 @@ fn a_doorbell_visit_reconciles_only_the_slots_that_drained() {
     );
 }
 
-/// The grant is what the pump counted, not what the slot buffer holds — and
-/// staying exact holds even once the pump's count outruns `sizes`, the one
+/// The grant is what the consumer counted, not what the slot buffer holds —
+/// and staying exact holds even once that count outruns `sizes`, the one
 /// case R6 asked to pin: `inject_dropped` is the only producer of a channel
 /// entry with no `sizes` entry, and no live slot reaches it, but a record
 /// pushed straight into the buffer behind the mux's back (below) is the same
@@ -1100,7 +1103,7 @@ fn the_grant_is_what_the_pump_counted_not_what_the_channel_holds() {
 
     // Take the rest out: the real seq-3 record, whose `sizes` entry the first
     // reconcile above left behind, plus the injected one that never had one.
-    // The pump counts both, so the next reconcile's drain count (2) outruns
+    // The consumer counts both, so the next reconcile's drain count (2) outruns
     // `sizes` (1 entry) — the `drained > sizes.len()` case R6 asked to decide
     // and test. `reconcile`'s pop loop stops at the one entry `sizes` has, and
     // `SlotCreditAccount::release` clamps the unbounded count against what the
@@ -1309,7 +1312,7 @@ fn a_held_record_marks_its_slot_and_its_release_is_reconciled_in_the_same_batch(
 /// *replacement* there instead. That visit is spurious but grants the
 /// replacement nothing, because the count a reconcile reads belongs to the
 /// slot and not to the index — the replacement claimed its own bind's
-/// `DrainSignal`, and no pump has taken anything out of that one.
+/// `DrainSignal`, and no consumer has taken anything out of that one.
 #[test]
 fn a_reused_index_reconciles_its_replacement_and_grants_it_nothing() {
     let (registry, consumer, config) = bound();

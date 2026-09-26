@@ -18,8 +18,9 @@
 //!
 //! Credit is issued against *this* buffer and never against the anchor's
 //! `frame_tx`, which has writers other than the mux — the local same-worker
-//! attach path, detach and finalize, `reader_pump`'s watchdog injection, and
-//! decisively M concurrent MPSC senders. Any "C credits against a C-deep
+//! attach path, detach and finalize, the watchdog's `Dropped` injection, and
+//! decisively M concurrent MPSC senders. A mux-fed consumer reads this buffer
+//! directly, ahead of `frame_tx`. Any "C credits against a C-deep
 //! channel" proof collapses the moment a second writer exists.
 
 use std::collections::{BTreeMap, VecDeque};
@@ -56,8 +57,10 @@ pub(super) struct IngressSlot {
     pub(super) id: SlotId,
     /// The mux-owned `C + 1`-deep buffer handed to the anchor by `bind`.
     frame_tx: flume::Sender<Vec<u8>>,
-    /// The signal this slot's `reader_pump` counts its drains on. Shared with
-    /// that pump, and with nothing else: `bind` creates one per bind and
+    /// The signal this slot's consumer counts its drains on (the
+    /// `StreamAnchor` reading the buffer directly, or an MPSC anchor's pump),
+    /// and the stream watchdog reads arrivals and the close from. Shared with
+    /// those, and with no other slot: `bind` creates one per bind and
     /// `open_slot` removes the bind as it claims it, so one signal reaches at
     /// most one slot.
     drain: Arc<DrainSignal>,
@@ -65,7 +68,7 @@ pub(super) struct IngressSlot {
     /// Encoded sizes of the records currently sitting in `frame_tx`, oldest
     /// first. One entry per record that *entered* the channel — a record
     /// parked in the hold has none until its release puts it there. Popped as
-    /// the pump reports them drained, which is how byte occupancy stays exact
+    /// the consumer reports them drained, which is how byte occupancy stays exact
     /// without a per-slot drain task.
     sizes: VecDeque<u32>,
     buffered_bytes: u64,
@@ -226,17 +229,18 @@ impl IngressSlot {
         })
     }
 
-    /// Account for the records the pump reports drained and report the credit
-    /// now waiting to be advertised.
+    /// Account for the records the consumer reports drained and report the
+    /// credit now waiting to be advertised.
     ///
-    /// The count is the pump's own, taken with
+    /// The count is the consumer's own, taken with
     /// [`DrainSignal::take_drained`](super::DrainSignal::take_drained), after
     /// the pass already took the slot's listing out of the peer's dirty set, so
     /// a drain racing this pass lists the slot again rather than losing its
-    /// record; that method's doc has the interleaving. Nothing here reads `frame_tx.len()`. Inferring the drain
-    /// from occupancy needed that read, which takes the slot channel's lock,
-    /// and it was only ever right because the mux was the channel's sole
-    /// writer — a fact the ledger had no way to check.
+    /// record; that method's doc has the interleaving. Nothing here reads
+    /// `frame_tx.len()`. Inferring the drain from occupancy needed that read,
+    /// which takes the slot channel's lock, and it was only ever right because
+    /// the mux was the channel's sole writer — a fact the ledger had no way to
+    /// check.
     ///
     /// `sizes` can be shorter than the count, and the pop is bounded by it
     /// rather than by the count for that reason. The one producer of a channel
@@ -366,10 +370,13 @@ fn fault_reason(fault: &DeliverFault) -> Applied {
 /// The bytes a `SlotHeartbeat` record turns into on the way to the consumer.
 ///
 /// A heartbeat is a `Data`-class record on purpose: dropping one under
-/// saturation *is* the per-slot saturation signal `reader_pump`'s
+/// saturation *is* the per-slot saturation signal the stream watchdog's
 /// `DETECTION_MULTIPLIER` watches for, and it is the only thing a streaming beat
 /// still uniquely carries now that the Messenger detects process, host and
-/// connection death itself.
+/// connection death itself. The watchdog charges only a window with no
+/// arrivals *and* an empty slot buffer, so the saturation it sees is upstream
+/// of the consumer (the producer's egress or the peer link), not a consumer
+/// that has fallen behind.
 pub(super) fn heartbeat_frame() -> Vec<u8> {
     cached_heartbeat().clone()
 }

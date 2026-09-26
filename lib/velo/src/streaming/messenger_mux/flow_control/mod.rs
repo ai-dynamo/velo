@@ -11,7 +11,7 @@
 //!   Spends on every record; grows on an inbound `CreditUpdate`.
 //! - [`SlotCreditAccount`] — **ingress**. What this side has *granted* and what
 //!   is sitting in the mux-owned slot buffer. Admits on apply, releases as
-//!   `reader_pump` drains, and hands back the delta to advertise.
+//!   the consumer drains, and hands back the delta to advertise.
 //!
 //! Both are gated by [`CreditClass`], which is where the two reservations live:
 //! one terminal credit spendable at most once, and control records that data
@@ -55,7 +55,7 @@ pub(crate) const DEFAULT_SLOT_BYTE_BUDGET: u32 = 1024 * 1024;
 /// This is the whole "applier never blocks its lane" proof in one line. Credit
 /// is issued against *this* buffer and never against the anchor's `frame_tx`,
 /// which has writers other than the mux — the local same-worker attach path,
-/// detach and finalize, `reader_pump`'s own watchdog injection, and decisively
+/// detach and finalize, the watchdog's `Dropped` injection, and decisively
 /// M concurrent MPSC senders. Any "C credits against a C-deep channel" proof
 /// collapses the moment a second writer exists.
 ///
@@ -177,8 +177,9 @@ impl CreditClass {
     /// `SlotHeartbeat` is deliberately **not** control. A heartbeat dropped
     /// under saturation *is* the per-slot saturation signal — the one thing a
     /// streaming beat still uniquely carries now that the Messenger detects
-    /// process, host and connection death itself. Give it a reserve and
-    /// `reader_pump`'s `DETECTION_MULTIPLIER` stops firing on a saturated slot.
+    /// process, host and connection death itself. Give it a reserve and the
+    /// stream watchdog's `DETECTION_MULTIPLIER` stops firing on a saturated
+    /// slot.
     pub(crate) const fn of(record_type: RecordType, is_terminal: bool) -> Self {
         match record_type {
             RecordType::OpenSlot
@@ -307,8 +308,8 @@ impl SlotCredit {
 /// Receiver-side per-slot accounting against the mux-owned `C + 1` buffer.
 ///
 /// `admit` is called by the applier before `try_send`; `release` by
-/// `IngressSlot::reconcile`, with the exact count `reader_pump` reported on
-/// that slot's `DrainSignal`. The pump counts rather than releases because
+/// `IngressSlot::reconcile`, with the exact count the consumer reported on
+/// that slot's `DrainSignal`. The consumer counts rather than releases because
 /// releasing needs the peer's mutex; the count itself is exact and O(1),
 /// because flume has no consumed-callback, a per-slot drain task would
 /// reintroduce the per-stream tasks the mux exists to remove, and polling the
@@ -353,7 +354,7 @@ impl SlotCreditAccount {
     /// break in it looks like from the outside.
     ///
     /// Read only by the tests that pin that bound. The reconcile releases the
-    /// count the pump reported and lets [`release`](Self::release) clamp
+    /// count the consumer reported and lets [`release`](Self::release) clamp
     /// against this field, rather than reading it and subtracting.
     #[cfg(test)]
     pub(crate) const fn buffered(&self) -> u32 {

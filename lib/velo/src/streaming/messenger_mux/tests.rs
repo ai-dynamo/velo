@@ -102,7 +102,7 @@ async fn mux_pair(config: MuxConfig) -> Pair {
 
 impl Pair {
     /// `bind` on the consumer mux, with the drain signal the attach path would
-    /// hand the pump it spawns.
+    /// hand the direct feed it installs.
     async fn bind(&self, anchor_id: u64, session_id: u64) -> BoundSlot {
         bind_slot(&self.consumer, anchor_id, session_id).await
     }
@@ -144,13 +144,13 @@ async fn recv(rx: &flume::Receiver<Vec<u8>>) -> Vec<u8> {
         .expect("frame channel closed")
 }
 
-/// One bound slot's consumer side, standing in for `reader_pump`.
+/// One bound slot's consumer side, standing in for a mux-fed `StreamAnchor`.
 ///
-/// The attach path hands the pump both the receiver `bind` returned and the
-/// drain signal the mux parked for that pair, and the pump counts every record
-/// it takes out on that signal. Credit is returned against that count, so a
-/// test taking records straight from the receiver would look to the ledger like
-/// a stream whose pump had died — and the first thing that reaches is
+/// The attach path installs a direct feed holding both the receiver `bind`
+/// returned and the drain signal the mux parked for that pair, and the consumer
+/// counts every record it takes out on that signal. Credit is returned against
+/// that count, so a test taking records straight from the receiver would look
+/// to the ledger like a stream whose consumer was gone — and the first thing that reaches is
 /// `credit_returns_let_a_producer_outrun_its_window`, whose producer would park
 /// after four records and never be woken.
 struct BoundSlot {
@@ -159,7 +159,7 @@ struct BoundSlot {
 }
 
 impl BoundSlot {
-    /// Take one record, counting it the way `reader_pump` does.
+    /// Take one record, counting it the way a mux-fed `StreamAnchor` does.
     async fn recv(&self) -> Vec<u8> {
         let frame = recv(&self.rx).await;
         self.drain.drained();
@@ -171,7 +171,7 @@ impl BoundSlot {
     }
 }
 
-/// `bind` on `mux`, with the drain signal the attach path would hand the pump.
+/// `bind` on `mux`, with the drain signal the attach path would hand the feed.
 async fn bind_slot(mux: &MessengerMuxTransport, anchor_id: u64, session_id: u64) -> BoundSlot {
     let rx = mux.bind(anchor_id, session_id).await.expect("bind");
     let drain = mux
@@ -1239,7 +1239,7 @@ async fn prebinding_node(
 /// before its first token — a client that hangs up, a prompt that is refused —
 /// leaves one behind. [`ACCEPT_TIMEOUT`] would collect it eventually and stays
 /// as the backstop, but at the rate a frontend registers requests, a minute of
-/// leaked bind, drain signal and reader pump per abandoned one is not a
+/// leaked bind, drain signal and stream watchdog per abandoned one is not a
 /// reclamation policy.
 ///
 /// The assertion runs with no `.await` between it and the drop, which is what
@@ -1507,7 +1507,7 @@ async fn close_claimed_slot_without_a_runtime_leaves_the_slot_in_place() {
 /// back.
 ///
 /// `prebind_anchor` cancels that timer on purpose: the timer measures "no
-/// sender attached", and a pre-bound anchor has a slot bound and pumped with a
+/// sender attached", and a pre-bound anchor has a slot bound and fed with a
 /// sender on its way to it. A key mismatch takes the pre-bind away again — the
 /// sender has been told the attach failed, so the `OpenSlot` that would have
 /// claimed it never comes — and the anchor is plainly unattached once more.
@@ -1558,7 +1558,7 @@ async fn a_refused_prebind_gives_the_unattached_timer_back() {
 }
 
 /// Adoption is the one transition from "no sender yet" to "a sender exists",
-/// and the pre-bind's pump has to learn it immediately -- not only once the
+/// and the pre-bind's stream watchdog has to learn it immediately -- not only once the
 /// adopting sender's own `OpenSlot` lands.
 ///
 /// An older worker (or one whose envelope carried no ticket) can still attach
@@ -1566,7 +1566,7 @@ async fn a_refused_prebind_gives_the_unattached_timer_back() {
 /// answers it `Ok` on the pre-bind's own terms, but the adopting sender has
 /// not yet opened that slot -- nothing has claimed the pre-bind's drain --
 /// which is exactly the window a sender that dies right after attaching (a
-/// worker crash before its first record) sits in. If the pump still believes
+/// worker crash before its first record) sits in. If the watchdog still believes
 /// no sender exists, that death is invisible to the heartbeat watchdog and
 /// waits for the mux's 60 s accept window instead of the usual
 /// `DETECTION_MULTIPLIER * heartbeat_interval`.
@@ -1602,16 +1602,16 @@ async fn an_adopted_prebind_is_reaped_on_heartbeat_silence_before_its_open_slot(
     );
 
     // The adopting sender has not opened its slot yet -- nothing has claimed
-    // the pre-bind's drain -- so the pump is still deciding purely on
+    // the pre-bind's drain -- so the watchdog is still deciding purely on
     // `PumpContext::prebound`, which adoption must have cleared.
     eventually(|| !node.manager.registry.contains_key(&local_id)).await;
 
     drop(anchor);
 }
 
-/// End-to-end version of the `control::reader_pump` reap-on-reclaim fix,
-/// driven through the real `AnchorManager` / mux stack rather than the
-/// synthetic pump fixture: at a heartbeat interval the watchdog alone cannot
+/// End-to-end version of the reap-on-reclaim fix (`control::reap_unclaimed`,
+/// run by the stream watchdog or the consumer), driven through the real
+/// `AnchorManager` / mux stack rather than a synthetic fixture: at a heartbeat interval the watchdog alone cannot
 /// beat the fixed 60 s accept window with (`>= 20 s` -- `DETECTION_MULTIPLIER`
 /// is 3, so the watchdog's earliest fire from a fresh window is `3 *
 /// heartbeat`), an adopted pre-bind whose sender never delivers its

@@ -177,7 +177,7 @@ async fn deferred_visit_due(due: Option<tokio::time::Instant>) {
 ///
 /// Two sources, and which one does the work matters for cost. A draining
 /// consumer posts its peer on the wake lane, and this reconciles **the slots
-/// of that peer its pumps named** — bounded above by the drains, and bounded
+/// of that peer its consumers named** — bounded above by the drains, and bounded
 /// below by [`MuxConfig::drain_visit_floor`](super::MuxConfig::drain_visit_floor), which is what keeps a consumer
 /// that keeps up from turning the doorbell into a spin over the peer's slot
 /// table. The ticker walks the whole table, as the backstop for what neither

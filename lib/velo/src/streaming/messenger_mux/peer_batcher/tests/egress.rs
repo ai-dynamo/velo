@@ -381,11 +381,11 @@ async fn a_terminal_spends_the_reserve_when_data_credit_is_gone() {
 ///
 /// Pinned because it is the limit of what the reserve buys and it is easy to
 /// mistake for a bug. Letting the terminal past would reorder the stream — the
-/// consumer would see the end before records it is owed — so the terminal waits,
-/// and what ends the stream is `reader_pump`'s heartbeat watchdog on the
-/// consumer's side, which is the mechanism `docs/src/operations/saturation.md`
-/// documents for a consumer that stopped draining. The other exit is the byte cap: a producer
-/// that keeps sending gets the per-slot kill instead.
+/// consumer would see the end before records it is owed — so the terminal waits.
+/// The exit is the byte cap: a producer that keeps sending gets the per-slot
+/// kill. A producer that stops leaves the stream open until the application
+/// drops the anchor, because the stream watchdog counts a window with records
+/// waiting unread as live (`docs/src/operations/saturation.md`).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_terminal_behind_starved_predecessors_waits_for_them() {
     let harness = harness(MuxConfig::default()).await;

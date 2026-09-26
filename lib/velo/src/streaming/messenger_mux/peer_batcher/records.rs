@@ -345,10 +345,11 @@ impl Batcher {
     /// The terminal reserve does **not** apply here, and that is deliberate: it
     /// buys a terminal past an *empty* queue, not past records the consumer is
     /// still owed. A terminal behind starved predecessors therefore waits with
-    /// them, and what ends such a stream is one of the two mechanisms that
-    /// already exist for a consumer that stopped draining — the byte cap, if the
-    /// producer keeps sending, or `reader_pump`'s heartbeat watchdog if it does
-    /// not.
+    /// them. What ends such a stream is the byte cap, if the producer keeps
+    /// sending. If it does not, nothing does until the application drops the
+    /// anchor: the stream watchdog counts a window with records waiting unread
+    /// in the slot buffer as live, so it never fires on a consumer that stopped
+    /// draining.
     pub(super) async fn release_withheld(&mut self, index: u32) {
         loop {
             let next = {

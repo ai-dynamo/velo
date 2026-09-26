@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The per-slot drain signal: what a reader pump counts and posts against,
-//! on its own task, without ever taking the peer mutex.
+//! The per-slot drain signal: what the consumer (a mux-fed `StreamAnchor`,
+//! or an MPSC anchor's pump) counts and posts against, on its own task,
+//! without ever taking the peer mutex.
 
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -16,25 +17,26 @@ use super::dirty::DirtySlots;
 /// Told when the consumer takes a record out of the buffer credit is issued
 /// against, so credit comes back by draining instead of by a timer.
 ///
-/// `docs/src/development/batched-streaming-design.md` specifies this: `reader_pump` "gains an
-/// `Option<CreditReturn>` and calls `credit.release(1)` after each successful
-/// handoff to `frame_tx` — exact, O(1), and immediate", leaving the sweep to
-/// reclaim only for slots whose pump died. Two halves of that landed and one
-/// did not, deliberately.
+/// The first design had `reader_pump` call `credit.release(1)` after each
+/// handoff to `frame_tx` — exact, O(1), and immediate — leaving the sweep to
+/// reclaim only for slots whose consumer was gone
+/// (`docs/src/development/batched-streaming-design.md` has the history). Two
+/// halves of that landed and one did not, deliberately. A mux bind now has no
+/// reader pump: its consumer reads the buffer itself and counts here.
 ///
-/// **The pump counts, and it names its slot.** `drained` is the exact number
-/// of records this slot's pump has taken out of the buffer since the last
+/// **The consumer counts, and it names its slot.** `drained` is the exact number
+/// of records this slot's consumer has taken out of the buffer since the last
 /// reconcile, and the slot's bit in its peer's [`DirtySlots`] says whether it
 /// is already listed waiting for one. That is what lets a reconcile be exact
 /// without reading the slot channel's length — a read that takes that
 /// channel's lock, which is what made the arrival path's whole-table walk
 /// expensive enough to narrow in the first place.
 ///
-/// **The pump does not release credit.** Releasing needs the peer's mutex —
+/// **The consumer does not release credit.** Releasing needs the peer's mutex —
 /// the same one the inbound batch path takes — and taking it per record would
 /// trade a periodic cost for a worse per-record one. Two paths each releasing
 /// an amount for one drained record would also double-count, and the periodic
-/// sweep is still there. So the pump posts and the reconcile decides, which
+/// sweep is still there. So the consumer posts and the reconcile decides, which
 /// keeps every visit idempotent: a redundant one recomputes zero.
 ///
 /// The peer is not known when `bind` creates this: a bind belongs to whoever
@@ -47,7 +49,7 @@ pub(crate) struct DrainSignal {
     claim: OnceLock<SlotClaim>,
     // Serializes claim with early stop/cancel; neither side can miss the other.
     lifecycle: std::sync::Mutex<u8>,
-    /// Records this slot's pump has taken out of the buffer since the last
+    /// Records this slot's consumer has taken out of the buffer since the last
     /// [`IngressSlot::reconcile`](super::slot::IngressSlot::reconcile) swapped
     /// it to zero.
     drained: AtomicU32,
@@ -187,17 +189,6 @@ impl DrainSignal {
         }
     }
 
-    /// Take the drain count.
-    ///
-    /// Called only for a slot whose listing the caller already took out of the
-    /// peer's [`DirtySlots`] (or, on the whole-table walk, after taking every
-    /// listing): clearing the listing first is what makes a concurrent drain
-    /// safe. A drain landing after the take finds its bit clear and lists the
-    /// slot again, so the next pass sees either a count of zero (this call
-    /// already took its record) or the new drain — never a count with nothing
-    /// to come and fetch it. Both sides are RMWs (`fetch_or` against `swap` on
-    /// the slot's word, then `fetch_add` against this `swap`), so unlike the
-    /// store-then-swap this replaced there is no store-buffering window.
     /// A batch delivered into this slot. Once per batch, not per record: the
     /// watchdog only asks whether the count moved during its window.
     pub(super) fn note_arrival(&self) {
@@ -219,6 +210,17 @@ impl DrainSignal {
         self.arrivals.load(Ordering::Relaxed)
     }
 
+    /// Take the drain count.
+    ///
+    /// Called only for a slot whose listing the caller already took out of the
+    /// peer's [`DirtySlots`] (or, on the whole-table walk, after taking every
+    /// listing): clearing the listing first is what makes a concurrent drain
+    /// safe. A drain landing after the take finds its bit clear and lists the
+    /// slot again, so the next pass sees either a count of zero (this call
+    /// already took its record) or the new drain — never a count with nothing
+    /// to come and fetch it. Both sides are RMWs (`fetch_or` against `swap` on
+    /// the slot's word, then `fetch_add` against this `swap`), so unlike the
+    /// store-then-swap this replaced there is no store-buffering window.
     pub(super) fn take_drained(&self) -> u32 {
         self.drained.swap(0, Ordering::AcqRel)
     }

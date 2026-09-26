@@ -104,6 +104,7 @@ All settings are fields of `MuxConfig`. Always build it with `..Default::default
 
 - Keep the default of 256 for token streams.
 - A stream longer than the window needs grants. The consumer node returns credit as its consumer drains, usually when the next batch from the producer arrives. A live consumer therefore rarely stalls its producer.
+- The window is also how far a sender can run ahead of a consumer that stops polling. Credit returns only when the consumer takes a record from the slot buffer.
 - Do not set a small window to save memory. A small window raises the credit-return latency per record. For a producer that ran out of credit, it is `(drain_visit_floor + reply_linger) / initial_credit`.
 - Do not set zero. Zero on the wire means "not offering the mux", and the build refuses it.
 

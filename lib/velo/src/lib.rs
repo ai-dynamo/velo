@@ -972,7 +972,7 @@ impl Velo {
         self.anchor_manager.attach_stream_anchor::<T>(handle).await
     }
 
-    /// Bind and pump a stream for an anchor now, so its sender never has to ask.
+    /// Bind a stream for an anchor now, so its sender never has to ask.
     ///
     /// Delegates to [`AnchorManager::prebind_anchor`](crate::streaming::AnchorManager::prebind_anchor).
     /// Carry the returned [`streaming::control::StreamOpenTicket`] to the worker
@@ -981,8 +981,9 @@ impl Velo {
     /// `None` means no ticket was minted and the worker should
     /// [`attach_anchor`](Velo::attach_anchor) the ordinary way.
     ///
-    /// Must be called from a runtime context: it spawns the reader pump and
-    /// the bind's accept-window task, exactly as the attach handler does.
+    /// Must be called from a runtime context: it spawns the stream watchdog
+    /// and the bind's accept-window task, exactly as the attach handler does
+    /// for a mux bind.
     pub fn prebind_anchor(
         &self,
         handle: StreamAnchorHandle,

@@ -55,7 +55,7 @@ pub(crate) fn set_active_anchor_gauge(
     }
 }
 
-/// Grouped handles needed by anchor constructors and background pumps to
+/// Grouped handles needed by anchor constructors and background tasks to
 /// keep both registries and the metrics collector in a single parameter.
 /// Cheap to clone (all `Arc`s).
 #[derive(Clone)]
@@ -126,9 +126,9 @@ pub struct AnchorConfig {
     pub unattached_timeout: Option<Duration>,
 
     /// The heartbeat cadence the attached sender must emit at, and the
-    /// per-window deadline the consumer reader pump applies. Total tolerance
-    /// before `Dropped` injection is `crate::streaming::control::DETECTION_MULTIPLIER`
-    /// times this value.
+    /// per-window deadline the consumer side (reader pump or mux stream
+    /// watchdog) applies. Total tolerance before `Dropped` injection is about
+    /// `crate::streaming::control::DETECTION_MULTIPLIER` times this value.
     pub heartbeat_interval: Option<Duration>,
 }
 
@@ -143,9 +143,10 @@ pub struct AnchorConfig {
 ///
 /// The `attachment` flag indicates whether a sender is currently attached.
 /// The check-and-set is performed atomically via [`dashmap::mapref::entry::Entry`]
-/// to prevent TOCTOU races. The reader pump takes ownership of the transport
-/// receiver directly rather than storing it in the entry.
-// Fields are consumed by the control handlers and the data-path pump.
+/// to prevent TOCTOU races. A reader pump takes ownership of a per-stream
+/// transport's receiver rather than storing it in the entry; a mux bind's
+/// receiver sits in `feed`, where the consumer reads it.
+// Fields are consumed by the control handlers, the pump and the watchdog.
 #[allow(dead_code)]
 pub(crate) struct AnchorEntry {
     /// The mux slot buffer this anchor's consumer reads directly, when a mux
@@ -160,16 +161,20 @@ pub(crate) struct AnchorEntry {
 
     /// Anchor-lifetime parent token. Created at anchor creation; cancelled only
     /// by finalize/remove/cancel. Child tokens are derived for transient tasks
-    /// (reader pump, timeout) so that stopping a child never poisons the parent.
+    /// (reader pump or stream watchdog, timeout) so that stopping a child never
+    /// poisons the parent.
     pub cancel_token: CancellationToken,
 
-    /// Child token for the currently active reader pump (`None` when no sender
-    /// is attached). Created via `cancel_token.child_token()` on each attach.
-    /// Cancelling this stops the pump without affecting the parent.
+    /// Child token for the currently active reader pump or, for a mux bind,
+    /// stream watchdog (`None` when no sender is attached). Created via
+    /// `cancel_token.child_token()` on each attach or pre-bind. Cancelling it
+    /// stops that task without affecting the parent, but for a mux bind it no
+    /// longer cuts the data path: use [`AnchorEntry::retire_pump`], which also
+    /// withdraws `feed`.
     pub active_pump_token: Option<CancellationToken>,
 
-    /// `true` iff a sender is currently attached. The reader pump owns the
-    /// transport receiver separately (not stored here).
+    /// `true` iff a sender is currently attached. The transport receiver is
+    /// held by the reader pump, or by `feed` for a mux bind, not here.
     pub attachment: bool,
 
     /// Cancels the inactivity timeout task when a sender attaches.
@@ -181,9 +186,9 @@ pub(crate) struct AnchorEntry {
     /// `None` means the anchor never auto-removes while unattached.
     pub unattached_timeout: Option<Duration>,
 
-    /// The negotiated heartbeat cadence for this anchor. The reader pump uses
-    /// this as its per-window deadline; the producer's `StreamSender` uses it
-    /// as its emit interval. Resolved at create-time from per-anchor config or
+    /// The negotiated heartbeat cadence for this anchor. The reader pump or
+    /// stream watchdog uses this as its per-window deadline; the producer's
+    /// `StreamSender` uses it as its emit interval. Resolved at create-time from per-anchor config or
     /// the manager-level default and echoed to the sender via
     /// [`crate::streaming::control::AnchorAttachResponse::Ok::heartbeat_interval_ms`].
     pub heartbeat_interval: Duration,
@@ -194,7 +199,7 @@ pub(crate) struct AnchorEntry {
     /// `None` until a sender attaches.
     pub stream_cancel_handle: Option<crate::streaming::control::StreamCancelHandle>,
 
-    /// The mux slot bound and pumped for this anchor ahead of any sender, when
+    /// The mux slot bound and fed to this anchor ahead of any sender, when
     /// [`AnchorManager::prebind_anchor`] minted a ticket for it. `None` on the
     /// ordinary attach path, which is every anchor whose application sends no
     /// ticket.
@@ -206,13 +211,13 @@ pub(crate) struct AnchorEntry {
 // PreBind
 // ---------------------------------------------------------------------------
 
-/// A mux slot bound and pumped for an anchor before any sender asked for one.
+/// A mux slot bound and fed to an anchor before any sender asked for one.
 ///
 /// Zero-RTT stream setup does at request registration what the attach handler
 /// does on the round trip: allocate the routing session, bind the slot, take
-/// the drain signal, and spawn the reader pump. What is left over is this — the
-/// terms that were minted, the claim token that says whether anyone took them
-/// up, and the means to give the slot back.
+/// the drain signal, and start the direct feed and its watchdog. What is left
+/// over is this — the terms that were minted, the claim token that says whether
+/// anyone took them up, and the means to give the slot back.
 ///
 /// [`Drop`] is the whole reclamation story, and deliberately not a new call
 /// site: every path that kills an anchor already removes its registry entry, so
@@ -246,7 +251,7 @@ pub(crate) struct PreBind {
     /// It is also how [`PreBind::adopt`] defuses `Drop` — see there.
     mux: std::sync::Weak<crate::streaming::messenger_mux::MessengerMuxTransport>,
     /// Shared with the [`PumpContext`](crate::streaming::control::PumpContext)
-    /// of the pump this bind feeds. `true` until [`PreBind::adopt`] clears
+    /// of this bind's stream watchdog. `true` until [`PreBind::adopt`] clears
     /// it — the one transition from "no sender yet" to "a sender exists"
     /// that a sender opening on its ticket the ordinary way (an `OpenSlot`
     /// claiming `drain` directly) never needs a writer for, because
@@ -278,17 +283,17 @@ impl PreBind {
     /// adopted stream.
     fn adopt(mut self) -> crate::streaming::control::StreamOpenTicket {
         self.mux = std::sync::Weak::new();
-        // The pump this pre-bind feeds still reads `prebound` as `true` --
-        // it has no other way to learn a sender just showed up by this door
+        // This pre-bind's watchdog still reads `prebound` as `true` -- it
+        // has no other way to learn a sender just showed up by this door
         // rather than by its own `OpenSlot`, which may still be seconds or
         // minutes away. Clearing it here, in the same place that already
-        // defuses `Drop`, is what stops that pump from exempting a now-live
-        // stream from heartbeat detection. That is the only exemption it
-        // lifts: the pump's transport-closed arm gates on the claim alone
-        // (`bind_unclaimed`, never `prebound`), so an adopted attach whose
-        // `OpenSlot` never arrives is still reaped by the bind's accept
+        // defuses `Drop`, is what stops that watchdog from exempting a
+        // now-live stream from heartbeat detection. That is the only
+        // exemption it lifts: the unclaimed-bind reap gates on the claim
+        // alone (`bind_unclaimed`, never `prebound`), so an adopted attach
+        // whose `OpenSlot` never arrives is still reaped by the bind's accept
         // window, exactly as a pre-bind nobody adopted is -- see
-        // `control::reader_pump`.
+        // `control::reap_unclaimed`.
         self.prebound.store(false, Ordering::Relaxed);
         self.ticket.clone()
     }
@@ -304,14 +309,15 @@ impl Drop for AnchorEntry {
 }
 
 impl AnchorEntry {
-    /// Stop the pump feeding this anchor, and the direct feed with it.
+    /// Stop the pump or watchdog serving this anchor, and withdraw the direct
+    /// feed with it.
     ///
-    /// Cancelling the token used to be enough, because the pump was the only
-    /// route from a bind to the consumer. A mux bind's consumer reads the slot
-    /// buffer itself, so the feed has to come out as well: a bind retired here
-    /// can still be claimed and delivered into by a racing `OpenSlot`, and the
-    /// consumer must not read that as its own stream. The token is returned
-    /// for the caller that still needs it.
+    /// For a per-stream transport the token is enough, because the pump is the
+    /// only route from a bind to the consumer. A mux bind's consumer reads the
+    /// slot buffer itself, so the feed has to come out as well: a bind retired
+    /// here can still be claimed and delivered into by a racing `OpenSlot`,
+    /// and the consumer must not read that as its own stream. The token is
+    /// returned for the caller that still needs it.
     pub(crate) fn retire_pump(&mut self) -> Option<CancellationToken> {
         self.feed.withdraw();
         let token = self.active_pump_token.take();
@@ -653,28 +659,16 @@ impl<T> StreamAnchor<T> {
         self.controller.clone()
     }
 
-    /// Remove this anchor's registry entry, if it is still there.
-    ///
-    /// Every terminal frame owes the registry this, and [`Drop`] cannot be the
-    /// one to pay it: it short-circuits on `terminated`, which a terminal frame
-    /// has just set. An entry left behind costs the frame channel, a permanent
-    /// reading in `velo_streaming_active_anchors`, and — under zero-RTT — the
-    /// [`PreBind`] whose own `Drop` is the only thing that gives the mux slot
-    /// back to its producer.
-    ///
-    /// Called from `poll_next` on every terminal arm, including
-    /// `TransportError` and a frame that fails to deserialize — not only
-    /// `Dropped` and `Finalized` — which cancels `entry.cancel_token` and so
-    /// kills the pump feeding this anchor. That reach is not zero-RTT-specific:
-    /// on every anchor, those two arms used to leave both the registry entry
-    /// and its pump running, with nothing telling either to stop.
     /// The next raw frame: the mux slot buffer first, then the anchor channel.
     ///
     /// Data reaches a mux-fed anchor only through the slot buffer, which the
-    /// mux alone writes; the anchor channel carries sentinels injected here
-    /// (cancel, reap, watchdog) and the heartbeat that announces a new feed.
-    /// Reading the buffer first keeps a sentinel from overtaking data the
-    /// sender already delivered. Every record taken from the buffer is counted
+    /// mux alone writes; the anchor channel carries sentinels injected by the
+    /// runtime (cancel, reap, watchdog) and the heartbeat that announces a new
+    /// feed. While a feed is installed the buffer is read first, so nothing on
+    /// the anchor channel jumps ahead of a record the consumer can still read.
+    /// A feed that is withdrawn (retire, entry removal) is dropped on the next
+    /// poll, before its buffer is read again: records still unread there are
+    /// discarded, not delivered. Every record taken from the buffer is counted
     /// on its drain signal, because that count is the credit the sender gets
     /// back.
     fn poll_frame(&mut self, cx: &mut Context<'_>) -> Poll<Option<Vec<u8>>> {
@@ -716,6 +710,22 @@ impl<T> StreamAnchor<T> {
         }
     }
 
+    /// Remove this anchor's registry entry, if it is still there.
+    ///
+    /// Every terminal frame owes the registry this, and [`Drop`] cannot be the
+    /// one to pay it: it short-circuits on `terminated`, which a terminal frame
+    /// has just set. An entry left behind costs the frame channel, a permanent
+    /// reading in `velo_streaming_active_anchors`, and — under zero-RTT — the
+    /// [`PreBind`] whose own `Drop` is the only thing that gives the mux slot
+    /// back to its producer.
+    ///
+    /// Called from `poll_next` on every terminal arm, including
+    /// `TransportError` and a frame that fails to deserialize — not only
+    /// `Dropped` and `Finalized` — which cancels `entry.cancel_token` and so
+    /// stops the pump or watchdog serving this anchor, and drops the entry,
+    /// which withdraws its direct feed. Without it, those two arms would leave
+    /// both the registry entry and that task running, with nothing telling
+    /// either to stop.
     fn retire(&self) {
         if let Some((_, entry)) = self.registry.remove(&self.local_id) {
             entry.cancel_token.cancel();
@@ -757,7 +767,7 @@ impl<T> StreamAnchor<T> {
 
             // If unattached and a timeout is set, spawn a new timeout task.
             // A pre-bound anchor counts as spoken for: its slot is bound and
-            // pumped and a sender is on its way to it, so the timer that
+            // fed and a sender is on its way to it, so the timer that
             // measures "no sender attached" would be measuring nothing and
             // would remove a stream that is about to run.
             if !entry.attachment && entry.prebind.is_none() {
@@ -838,13 +848,13 @@ impl<T: DeserializeOwned> Stream for StreamAnchor<T> {
                             // the same "anchor is unattached again" signal
                             // Mismatch restores, for the same reason.
                             //
-                            // Unlike Mismatch, this does not cancel
-                            // `active_pump_token`, and that is safe only
-                            // because of an invariant this frame's arrival
-                            // guarantees: an unclaimed pre-bind has no
-                            // connected producer, so nothing could have put a
-                            // `Detached` frame in this anchor's `frame_tx` in
-                            // the first place -- the two writers of that
+                            // Unlike Mismatch, this does not call
+                            // `retire_pump`, and that is safe only because of
+                            // an invariant this frame's arrival guarantees: an
+                            // unclaimed pre-bind has no connected producer, so
+                            // nothing could have put a `Detached` frame in
+                            // this anchor's `frame_tx` or slot buffer in the
+                            // first place -- the two writers of that
                             // sentinel are `StreamSender::detach()`, reachable
                             // only once `open_anchor_stream` has actually
                             // opened the slot (which is what claims it), and
@@ -857,14 +867,17 @@ impl<T: DeserializeOwned> Stream for StreamAnchor<T> {
                             // sentinel, and the ingress applies it through
                             // `deliver()` -> `finish_close(TerminalSent)` in
                             // the same critical section that puts these very
-                            // bytes into the bind's `frame_tx`, retiring the
-                            // slot before this poll arm can ever run.
-                            // `PreBind::drop`'s `close_claimed_slot` therefore
-                            // finds nothing there and is a no-op: there is
+                            // bytes into the slot buffer the consumer reads,
+                            // retiring the slot before this poll arm can ever
+                            // run. `PreBind::drop`'s `close_claimed_slot`
+                            // therefore finds nothing there and is a no-op, and
+                            // the retiring slot closes the bind, which ends the
+                            // watchdog and the feed on their own: there is
                             // nothing left to cancel, not a stream still
                             // running -- unlike `adopt_prebind`'s Mismatch
-                            // arm, which does cancel a pump because its
-                            // pre-bind is genuinely still unclaimed.
+                            // arm, which does retire a watchdog and feed
+                            // because its pre-bind is genuinely still
+                            // unclaimed.
                             // Calling `spawn_timeout_task` under this shard
                             // guard (rather than hoisting it out the way
                             // `AnchorManager::detach`'s two-phase shape does)
@@ -936,7 +949,7 @@ impl<T: DeserializeOwned> Stream for StreamAnchor<T> {
 /// is the first valid local ID (i.e., IDs start at 1; 0 is reserved).
 ///
 /// The `registry` is wrapped in an `Arc` so that control handlers and the
-/// data-path pump can hold a cheap clone of the registry reference without
+/// consumer-side tasks can hold a cheap clone of the registry reference without
 /// holding a reference to the whole `AnchorManager`.
 ///
 /// Use [`AnchorManagerBuilder`] for optional configuration (e.g. `default_unattached_timeout`,
@@ -1241,8 +1254,8 @@ impl AnchorManager {
             .map_err(|_| anyhow::anyhow!("a messenger mux is already installed on this manager"))
     }
 
-    /// Bind and pump a mux slot for `handle` now, so its sender never has to
-    /// ask for one.
+    /// Bind a mux slot for `handle` and start its feed now, so its sender
+    /// never has to ask for one.
     ///
     /// Returns the terms that sender must open on, to be carried to it in
     /// whatever envelope the application already sends — see
@@ -1265,8 +1278,9 @@ impl AnchorManager {
     /// unlike the rollback they are a caller mistake rather than a
     /// configuration.
     ///
-    /// Must be called from a runtime context: it spawns the reader pump and the
-    /// bind's accept-window task, exactly as the attach handler does.
+    /// Must be called from a runtime context: it spawns the stream watchdog and
+    /// the bind's accept-window task, exactly as the attach handler does for a
+    /// mux bind.
     ///
     /// The ticket may sit in a request envelope for up to the mux's 60 s
     /// accept window before its worker opens it: heartbeat detection does not
@@ -1363,8 +1377,8 @@ impl AnchorManager {
                             mux.advertised_limits(),
                         );
                         // A child of the anchor's token, as at attach: finalize,
-                        // cancel and detach stop the pump without poisoning the
-                        // parent.
+                        // cancel and detach stop the watchdog without poisoning
+                        // the parent.
                         let pump_cancel = entry.cancel_token.child_token();
                         entry.active_pump_token = Some(pump_cancel.clone());
                         // The unattached timer measures "no sender is coming".
@@ -1374,7 +1388,7 @@ impl AnchorManager {
                         if let Some(ref tc) = entry.timeout_cancel {
                             tc.cancel();
                         }
-                        // Shared with the pump spawned below and cleared by
+                        // Shared with the watchdog spawned below and cleared by
                         // `PreBind::adopt` the moment an attach hands this
                         // slot to a sender that used it instead of the
                         // ticket -- see `PumpContext::prebound`.
@@ -1510,18 +1524,19 @@ impl AnchorManager {
                     // is being told the attach failed, so it will never send the
                     // `OpenSlot` that would claim it.
                     let released = entry.prebind.take();
-                    // The pump this prebind's own bind fed has to stop with it.
-                    // Left running, it would see its `transport_rx` close once
-                    // `released`'s `Drop` calls `release_bind` below and exit
-                    // through the reader pump's "transport channel closed" arm
-                    // -- which, for an *unclaimed* drain, now removes the
-                    // registry entry so an abandoned pre-bind is actually
-                    // reaped (see `reader_pump`). That entry is this one, still
-                    // very much alive for the next attach to use; without
-                    // cancelling the orphaned pump first, its late exit would
-                    // tear down whatever wins this race. Left `None` on
-                    // purpose, matching `_anchor_detach`: the next attach or
-                    // `prebind_anchor` creates its own.
+                    // The watchdog and feed this prebind's own bind started
+                    // have to stop with it. `released`'s `Drop` calls
+                    // `release_bind` below, which closes the unclaimed bind;
+                    // left running, the watchdog (on `DrainSignal::closed`) or
+                    // the consumer (on its feed's buffer closing) would run
+                    // `control::reap_unclaimed`, which for an *unclaimed* drain
+                    // removes the registry entry so an abandoned pre-bind is
+                    // actually reaped. That entry is this one, still very much
+                    // alive for the next attach to use. `retire_pump` cancels
+                    // the token, which the reap checks, and withdraws the
+                    // feed, so neither can tear down whatever wins this race.
+                    // Left `None` on purpose, matching `_anchor_detach`: the
+                    // next attach or `prebind_anchor` creates its own.
                     entry.retire_pump();
                     // And the anchor is unattached again, so the timer that
                     // measures exactly that has to come back. `prebind_anchor`
@@ -1688,7 +1703,7 @@ impl AnchorManager {
     ///
     /// Uses `DashMap::entry()` to perform the check-and-set atomically under
     /// the shard lock, preventing TOCTOU races between concurrent attach attempts.
-    /// The reader pump takes ownership of the transport receiver separately.
+    /// The reader pump or direct feed holds the transport receiver separately.
     ///
     /// If a timeout task is running, it is cancelled (paused) on successful attach.
     ///
@@ -1778,7 +1793,7 @@ impl AnchorManager {
 
     /// Bundle the SPSC registry, MPSC registry, and metrics collector into
     /// a cheap `Arc`-cloneable context. Used to keep anchor constructors
-    /// and background pumps under clippy's argument threshold.
+    /// and background tasks under clippy's argument threshold.
     pub(crate) fn anchor_context(&self) -> AnchorContext {
         AnchorContext {
             registry: self.registry.clone(),
@@ -1924,7 +1939,8 @@ impl AnchorManager {
     /// Sends an `_anchor_attach` AM to the remote worker, receives the stream endpoint,
     /// calls `transport.connect()` to establish the write channel, and returns a
     /// [`StreamSender<T>`](crate::streaming::sender::StreamSender) that writes directly into the
-    /// transport bridge (which the remote reader_pump forwards to the anchor's frame channel).
+    /// transport bridge (which the remote reader pump forwards to the anchor's frame channel,
+    /// or which, over the mux, the remote consumer reads directly).
     ///
     /// # Errors
     /// - [`AttachError::TransportError`] if `messenger_lock` is not set (register_handlers not called)
@@ -2213,8 +2229,8 @@ impl AnchorManager {
     ///    [`StreamSender<T>`](crate::streaming::sender::StreamSender) for pushing typed frames.
     ///
     /// The StreamSender writes to the entry's `frame_tx` so items flow directly
-    /// to the [`StreamAnchor<T>`] consumer. The transport connection is used by the
-    /// reader pump for cross-worker flows.
+    /// to the [`StreamAnchor<T>`] consumer. The transport connection is used for
+    /// cross-worker flows.
     ///
     /// # Errors
     /// - [`AttachError::AnchorNotFound`] if the handle is not in the registry (local path)
@@ -2279,8 +2295,8 @@ impl AnchorManager {
                     // Snapshot the negotiated heartbeat cadence for the sender.
                     let heartbeat_interval = entry.heartbeat_interval;
 
-                    // Mark as attached (reader pump takes ownership of transport
-                    // receiver separately).
+                    // Mark as attached. The co-located sender needs no reader
+                    // pump or feed: it writes into `frame_tx` itself.
                     entry.attachment = true;
 
                     // Cancel the timeout task while attached (pause timer)
@@ -2300,29 +2316,36 @@ impl AnchorManager {
                     // writes from `open_slot`, under that peer's own mutex, not
                     // this registry's shard lock -- so a remote `OpenSlot` can
                     // still claim the bind in the gap between that read and the
-                    // release below. That is not a leak: the pump feeding this
-                    // slot is cancelled a few lines down, before the prebind is
-                    // taken, so a claim landing in the gap has already lost its
-                    // only route to `frame_tx` -- there is no second writer to
-                    // guard against. `PreBind::drop` sees the claim and posts
+                    // release below. That is not a leak: `retire_pump` a few
+                    // lines down, before the prebind is taken, cancels the
+                    // watchdog and withdraws the feed, so the consumer stops
+                    // reading that slot buffer on its next poll (the test
+                    // `a_retired_pump_withdraws_its_feed` pins this). A claim
+                    // landing in the gap can still have a record read by a
+                    // consumer poll that runs before the withdrawal; the
+                    // reader pump this replaced forwarded such records until
+                    // its own cancel landed, so the window is not new.
+                    // `PreBind::drop` sees the claim and posts
                     // `CloseSlot{UnknownSlot}` to that producer, which is the
-                    // true state of a stream whose pump just died, delivered
-                    // promptly rather than on the producer's next record. It is
-                    // returned out of this block and dropped once the shard
-                    // guard is gone -- `PreBind`'s drop reaches into mux state
-                    // (the ingress registry, a batcher), which is exactly what
+                    // true state of a stream whose consumer side just went
+                    // away, delivered promptly rather than on the producer's
+                    // next record. It is returned out of this block and
+                    // dropped once the shard guard is gone -- `PreBind`'s drop
+                    // reaches into mux state (the ingress registry, a
+                    // batcher), which is exactly what
                     // the two other call sites that release one from under this
                     // same lock (`_anchor_detach`, `adopt_prebind`'s `Mismatch`
                     // arm) exist to avoid doing while holding it.
                     //
-                    // Its pump has to stop with it, and this branch spawns no
-                    // replacement — the co-located sender writes straight into
-                    // `frame_tx` below, no transport in between. Left running,
-                    // the orphaned pump would see its `transport_rx` close once
-                    // the released prebind drops and exit through the reader
-                    // pump's "transport channel closed" arm, which for an
-                    // *unclaimed* drain now removes the registry entry this
-                    // co-located sender is about to become (see `reader_pump`).
+                    // Its watchdog and feed have to stop with it, and this
+                    // branch starts no replacement — the co-located sender
+                    // writes straight into `frame_tx` below, no transport in
+                    // between. Left running, the watchdog would see the bind
+                    // close once the released prebind drops, and
+                    // `control::reap_unclaimed` would remove, for an
+                    // *unclaimed* drain, the registry entry this co-located
+                    // sender is about to become. `retire_pump` cancels the
+                    // token the reap checks and withdraws the feed.
                     entry.retire_pump();
                     let released_prebind = entry.prebind.take();
 
