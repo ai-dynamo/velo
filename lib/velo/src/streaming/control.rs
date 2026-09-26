@@ -706,10 +706,7 @@ pub fn create_anchor_detach_handler(manager: Arc<AnchorManager>) -> crate::messe
                         // not abandoned. Cancelling first is what tells that arm this pump is being
                         // retired on purpose, exactly as `adopt_prebind`'s `Verdict::Mismatch` arm
                         // and the co-located branch of `attach_stream_anchor` already do.
-                        let pump_token = entry.active_pump_token.take();
-                        if let Some(ref token) = pump_token {
-                            token.cancel();
-                        }
+                        let pump_token = entry.retire_pump();
                         (Some((pump_token, entry.frame_tx.clone())), released)
                     }
                 };

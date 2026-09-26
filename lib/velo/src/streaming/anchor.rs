@@ -294,7 +294,33 @@ impl PreBind {
     }
 }
 
+impl Drop for AnchorEntry {
+    /// A removed entry lets go of its feed, so the slot buffer's receiver
+    /// goes with it and the mux sees a consumer that is gone the way it always
+    /// has: a delivery that finds no receiver left.
+    fn drop(&mut self) {
+        self.feed.withdraw();
+    }
+}
+
 impl AnchorEntry {
+    /// Stop the pump feeding this anchor, and the direct feed with it.
+    ///
+    /// Cancelling the token used to be enough, because the pump was the only
+    /// route from a bind to the consumer. A mux bind's consumer reads the slot
+    /// buffer itself, so the feed has to come out as well: a bind retired here
+    /// can still be claimed and delivered into by a racing `OpenSlot`, and the
+    /// consumer must not read that as its own stream. The token is returned
+    /// for the caller that still needs it.
+    pub(crate) fn retire_pump(&mut self) -> Option<CancellationToken> {
+        self.feed.withdraw();
+        let token = self.active_pump_token.take();
+        if let Some(ref token) = token {
+            token.cancel();
+        }
+        token
+    }
+
     /// Whether a pre-bound slot on this anchor already has a sender.
     ///
     /// `attachment` does not answer this. Nothing on the zero-RTT path sets it
@@ -1496,9 +1522,7 @@ impl AnchorManager {
                     // tear down whatever wins this race. Left `None` on
                     // purpose, matching `_anchor_detach`: the next attach or
                     // `prebind_anchor` creates its own.
-                    if let Some(pump_cancel) = entry.active_pump_token.take() {
-                        pump_cancel.cancel();
-                    }
+                    entry.retire_pump();
                     // And the anchor is unattached again, so the timer that
                     // measures exactly that has to come back. `prebind_anchor`
                     // cancelled it because a pre-bind is a sender on its way;
@@ -2299,9 +2323,7 @@ impl AnchorManager {
                     // pump's "transport channel closed" arm, which for an
                     // *unclaimed* drain now removes the registry entry this
                     // co-located sender is about to become (see `reader_pump`).
-                    if let Some(pump_cancel) = entry.active_pump_token.take() {
-                        pump_cancel.cancel();
-                    }
+                    entry.retire_pump();
                     let released_prebind = entry.prebind.take();
 
                     // Allocate sender_stream_id and build SenderEntry

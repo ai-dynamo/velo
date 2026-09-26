@@ -1984,3 +1984,61 @@ async fn the_watchdog_does_not_fire_while_records_wait_unread() {
     eventually(|| !manager.registry.contains_key(&local_id)).await;
     drop(tx);
 }
+
+/// Retiring a mux bind's pump withdraws the feed its consumer reads.
+///
+/// Cancelling the pump token used to cut the data path, because the pump was
+/// the path. With the consumer reading the slot buffer itself, the token only
+/// stops the watchdog, so the feed has to come out too. A co-located attach
+/// over a pre-bind is the case that matters: it cancels the pump and releases
+/// the pre-bind, and a remote `OpenSlot` can still claim that bind in the gap
+/// and deliver into it -- a `Dropped` from the release included. A consumer
+/// still reading the old feed would take that as its own stream ending, under
+/// a co-located sender that is writing to the anchor channel.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retired_pump_withdraws_its_feed() {
+    let node = prebinding_node(test_config(), None).await;
+    let anchor = node.manager.create_anchor::<u32>();
+    let handle = anchor.handle();
+    let (_, local_id) = handle.unpack();
+    node.manager.prebind_anchor(handle).expect("ticket");
+    let installed = |m: &AnchorManager| {
+        m.registry
+            .get(&local_id)
+            .is_some_and(|entry| entry.feed.current().is_some())
+    };
+    assert!(installed(&node.manager), "the pre-bind installs its feed");
+
+    let _sender = node
+        .manager
+        .attach_stream_anchor::<u32>(handle)
+        .await
+        .expect("co-located attach");
+    assert!(
+        !installed(&node.manager),
+        "the co-located attach retired the pre-bind's pump, so its feed must be gone too"
+    );
+    drop(anchor);
+}
+
+/// An anchor leaving the registry takes its feed with it.
+///
+/// The mux learns a consumer is gone when a delivery finds the slot buffer
+/// with no receiver left. The pump's receiver went with the pump, which every
+/// removal cancelled; the feed's receiver lives in the anchor entry, so the
+/// entry has to let go of it when it is removed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_removed_anchor_withdraws_its_feed() {
+    let node = prebinding_node(test_config(), None).await;
+    let anchor = node.manager.create_anchor::<u32>();
+    let handle = anchor.handle();
+    let (_, local_id) = handle.unpack();
+    node.manager.prebind_anchor(handle).expect("ticket");
+    let cell = Arc::clone(&node.manager.registry.get(&local_id).expect("entry").feed);
+    assert!(cell.current().is_some());
+
+    anchor.controller().cancel();
+    assert!(!node.manager.registry.contains_key(&local_id));
+    assert!(cell.current().is_none(), "the removed entry must withdraw its feed");
+    drop(anchor);
+}
