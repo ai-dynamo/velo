@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use velo_ext::WorkerId;
 
@@ -51,6 +51,16 @@ pub(crate) struct DrainSignal {
     /// [`IngressSlot::reconcile`](super::slot::IngressSlot::reconcile) swapped
     /// it to zero.
     drained: AtomicU32,
+    /// Batches that delivered into this slot, bumped once per batch by the
+    /// ingress. The direct feed's watchdog reads it as the sender's liveness:
+    /// it never sees a frame itself.
+    arrivals: AtomicU64,
+    /// Fired when the mux lets go of this bind's buffer: an unclaimed bind
+    /// released or expired, or a claimed slot retired. The direct feed's
+    /// watchdog never receives from the buffer, so it cannot see the close
+    /// the way a receiver does; this is how it learns in time to reap an
+    /// unclaimed bind before its consumer notices anything.
+    closed: tokio_util::sync::CancellationToken,
     wake: flume::Sender<WorkerId>,
 }
 
@@ -71,6 +81,8 @@ impl DrainSignal {
             claim: OnceLock::new(),
             lifecycle: std::sync::Mutex::new(0),
             drained: AtomicU32::new(0),
+            arrivals: AtomicU64::new(0),
+            closed: tokio_util::sync::CancellationToken::new(),
             wake,
         }
     }
@@ -186,6 +198,27 @@ impl DrainSignal {
     /// to come and fetch it. Both sides are RMWs (`fetch_or` against `swap` on
     /// the slot's word, then `fetch_add` against this `swap`), so unlike the
     /// store-then-swap this replaced there is no store-buffering window.
+    /// A batch delivered into this slot. Once per batch, not per record: the
+    /// watchdog only asks whether the count moved during its window.
+    pub(super) fn note_arrival(&self) {
+        self.arrivals.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The mux let go of this bind's buffer. Idempotent.
+    pub(super) fn close(&self) {
+        self.closed.cancel();
+    }
+
+    /// Fires once the mux has let go of this bind's buffer.
+    pub(crate) fn closed(&self) -> tokio_util::sync::CancellationToken {
+        self.closed.clone()
+    }
+
+    /// How many batches have delivered into this slot.
+    pub(crate) fn arrivals(&self) -> u64 {
+        self.arrivals.load(Ordering::Relaxed)
+    }
+
     pub(super) fn take_drained(&self) -> u32 {
         self.drained.swap(0, Ordering::AcqRel)
     }

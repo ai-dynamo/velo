@@ -148,6 +148,11 @@ pub struct AnchorConfig {
 // Fields are consumed by the control handlers and the data-path pump.
 #[allow(dead_code)]
 pub(crate) struct AnchorEntry {
+    /// The mux slot buffer this anchor's consumer reads directly, when a mux
+    /// bind is feeding it. Shared with the [`StreamAnchor<T>`]; see
+    /// [`FeedCell`](crate::streaming::control::FeedCell).
+    pub feed: Arc<crate::streaming::control::FeedCell>,
+
     /// Raw-bytes frame delivery channel to the [`StreamAnchor<T>`] consumer.
     ///
     /// Non-generic so `DashMap<u64, AnchorEntry>` requires no type parameters.
@@ -544,6 +549,16 @@ pub struct StreamAnchor<T> {
     handle: StreamAnchorHandle,
     /// Async stream obtained from consuming the flume::Receiver via `into_stream()`.
     inner_stream: flume::r#async::RecvStream<'static, Vec<u8>>,
+    /// Where a mux bind installs its slot buffer for this consumer to read.
+    feed_cell: Arc<crate::streaming::control::FeedCell>,
+    /// The generation of `feed_cell` that `feed` was taken from.
+    feed_generation: u64,
+    /// The mux slot buffer being read, polled ahead of `inner_stream`. `None`
+    /// before a mux bind and after its buffer closes.
+    feed: Option<(
+        Arc<crate::streaming::control::DirectFeed>,
+        flume::r#async::RecvStream<'static, Vec<u8>>,
+    )>,
     /// Set to true after a terminal sentinel; prevents further polling.
     terminated: bool,
     /// The local ID of the anchor in the registry (for cancel).
@@ -562,6 +577,7 @@ impl<T> StreamAnchor<T> {
     pub(crate) fn new(
         handle: StreamAnchorHandle,
         rx: flume::Receiver<Vec<u8>>,
+        feed_cell: Arc<crate::streaming::control::FeedCell>,
         local_id: u64,
         ctx: AnchorContext,
         sender_registry: Arc<crate::streaming::control::SenderRegistry>,
@@ -586,6 +602,9 @@ impl<T> StreamAnchor<T> {
         Self {
             handle,
             inner_stream: rx.into_stream(),
+            feed_cell,
+            feed_generation: 0,
+            feed: None,
             terminated: false,
             local_id,
             registry,
@@ -623,6 +642,54 @@ impl<T> StreamAnchor<T> {
     /// kills the pump feeding this anchor. That reach is not zero-RTT-specific:
     /// on every anchor, those two arms used to leave both the registry entry
     /// and its pump running, with nothing telling either to stop.
+    /// The next raw frame: the mux slot buffer first, then the anchor channel.
+    ///
+    /// Data reaches a mux-fed anchor only through the slot buffer, which the
+    /// mux alone writes; the anchor channel carries sentinels injected here
+    /// (cancel, reap, watchdog) and the heartbeat that announces a new feed.
+    /// Reading the buffer first keeps a sentinel from overtaking data the
+    /// sender already delivered. Every record taken from the buffer is counted
+    /// on its drain signal, because that count is the credit the sender gets
+    /// back.
+    fn poll_frame(&mut self, cx: &mut Context<'_>) -> Poll<Option<Vec<u8>>> {
+        loop {
+            let generation = self.feed_cell.generation();
+            if generation != self.feed_generation {
+                self.feed_generation = generation;
+                self.feed = self.feed_cell.current().map(|feed| {
+                    let rx = feed.rx.clone().into_stream();
+                    (feed, rx)
+                });
+            }
+            if let Some((feed, rx)) = self.feed.as_mut() {
+                match Pin::new(rx).poll_next(cx) {
+                    Poll::Ready(Some(bytes)) => {
+                        feed.drain.drained();
+                        return Poll::Ready(Some(bytes));
+                    }
+                    Poll::Ready(None) => {
+                        // The stream ended, or its bind was released or
+                        // reaped; anything left to say is on the anchor
+                        // channel.
+                        let (feed, _) = self.feed.take().expect("matched Some above");
+                        crate::streaming::control::reap_unclaimed(
+                            &feed,
+                            self.local_id,
+                            &AnchorContext {
+                                registry: Arc::clone(&self.registry),
+                                mpsc_registry: Arc::clone(&self.mpsc_registry),
+                                metrics: self.metrics.clone(),
+                            },
+                        );
+                        continue;
+                    }
+                    Poll::Pending => {}
+                }
+            }
+            return Pin::new(&mut self.inner_stream).poll_next(cx);
+        }
+    }
+
     fn retire(&self) {
         if let Some((_, entry)) = self.registry.remove(&self.local_id) {
             entry.cancel_token.cancel();
@@ -713,7 +780,7 @@ impl<T: DeserializeOwned> Stream for StreamAnchor<T> {
             return Poll::Ready(None);
         }
         loop {
-            match Pin::new(&mut this.inner_stream).poll_next(cx) {
+            match this.poll_frame(cx) {
                 Poll::Ready(Some(bytes)) => {
                     match rmp_serde::from_slice::<StreamFrame<T>>(&bytes) {
                         Ok(StreamFrame::Heartbeat) => continue, // filter heartbeats
@@ -1017,7 +1084,9 @@ impl AnchorManager {
             )
         });
 
+        let feed = Arc::new(crate::streaming::control::FeedCell::default());
         let entry = AnchorEntry {
+            feed: Arc::clone(&feed),
             frame_tx,
             cancel_token,
             active_pump_token: None,
@@ -1037,6 +1106,7 @@ impl AnchorManager {
         StreamAnchor::new(
             handle,
             frame_rx,
+            feed,
             local_id,
             self.anchor_context(),
             self.sender_registry.clone(),
@@ -1299,13 +1369,15 @@ impl AnchorManager {
                             pump_cancel,
                             entry.heartbeat_interval,
                             prebound,
+                            Arc::clone(&entry.feed),
                         ))
                     }
                 }
             }
         };
 
-        let Some((ticket, frame_tx, pump_cancel, heartbeat_interval, prebound)) = prepared else {
+        let Some((ticket, frame_tx, pump_cancel, heartbeat_interval, prebound, feed)) = prepared
+        else {
             // Nothing took ownership of the bind, so give it straight back
             // rather than leaving the accept window to find it in a minute.
             mux.release_bind(local_id, routing_session_id);
@@ -1322,7 +1394,8 @@ impl AnchorManager {
             return None;
         };
 
-        tokio::spawn(crate::streaming::control::reader_pump(
+        crate::streaming::control::start_direct_stream(
+            &feed,
             receiver,
             frame_tx,
             pump_cancel,
@@ -1337,7 +1410,7 @@ impl AnchorManager {
                 // `PumpContext::prebound`.
                 prebound,
             },
-        ));
+        );
 
         self.record_streaming_operation(
             StreamingOp::Prebind,

@@ -108,6 +108,13 @@ enum DeliverFault {
     ConsumerGone,
 }
 
+impl Drop for IngressSlot {
+    /// The slot is retiring, so the buffer it wrote is closed for good.
+    fn drop(&mut self) {
+        self.drain.close();
+    }
+}
+
 impl IngressSlot {
     /// Open a slot against the buffer `bind` created, granting `initial_credit`.
     pub(super) fn new(
@@ -149,6 +156,11 @@ impl IngressSlot {
     #[cfg(test)]
     pub(super) fn open_terms(&self) -> (u32, u64) {
         (self.account.limit(), self.byte_watermark)
+    }
+
+    /// Tell the slot's drain signal a batch delivered into it.
+    pub(super) fn note_arrival(&self) {
+        self.drain.note_arrival();
     }
 
     /// Put this slot on the pass's reconcile list, reporting whether the

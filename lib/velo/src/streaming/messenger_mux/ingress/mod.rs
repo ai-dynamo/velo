@@ -72,6 +72,17 @@ struct BindEntry {
     drain: Arc<DrainSignal>,
 }
 
+impl Drop for BindEntry {
+    /// A bind leaving the table unclaimed — released, expired, refused or
+    /// torn down — closes its buffer for good. A claimed one lives on as an
+    /// `IngressSlot`, which closes it when it retires.
+    fn drop(&mut self) {
+        if self.drain.claimed().is_none() {
+            self.drain.close();
+        }
+    }
+}
+
 /// Registry of binds and per-peer slot tables.
 #[derive(Default)]
 pub(crate) struct IngressRegistry {
@@ -683,7 +694,7 @@ fn open_slot(
 
     let mut slot = IngressSlot::new(
         id,
-        bind.frame_tx,
+        bind.frame_tx.clone(),
         Arc::clone(&bind.drain),
         ctx.config.initial_credit,
         ctx.config.slot_byte_budget,
@@ -793,6 +804,8 @@ fn deliver(
     // visit that takes a drain count of zero and returns.
     if slot.mark_touched() {
         touched.push(id.index());
+        // First delivery into this slot this batch: the sender is alive.
+        slot.note_arrival();
     }
     let held_before = slot.held();
     let applied = slot.apply_data(record.frame_seq, body, peer_bytes);

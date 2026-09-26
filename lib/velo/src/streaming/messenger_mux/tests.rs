@@ -1843,3 +1843,144 @@ fn the_drain_wake_lane_never_refuses_a_wake() {
         );
     }
 }
+
+/// A consumer that never polls holds its sender to the credit window.
+///
+/// The mux issues credit against the `C + 1` slot buffer. A reader pump that
+/// moves records out of that buffer into the anchor's own channel counts each
+/// move as a drain, so the sender earns the anchor channel's 256 records of
+/// credit on top of `C` while nobody is reading: `C + 1 + 256` records of one
+/// stream sit in the consumer's memory, and a slow HTTP client costs that much
+/// before its sender feels it. With the consumer reading the slot buffer
+/// itself, a drain means the application took the record, so the window is
+/// the only thing a stalled consumer can be owed.
+///
+/// Control: once the consumer reads, every record arrives in order.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_consumer_that_never_polls_holds_its_sender_to_the_window() {
+    const CREDIT: u32 = 8;
+    const SENT: u32 = 300;
+    let config = MuxConfig {
+        initial_credit: CREDIT,
+        ..test_config()
+    };
+    let pair = mux_pair(config).await;
+    let manager = AnchorManagerBuilder::default()
+        .worker_id(pair.consumer_worker)
+        .transport(
+            Arc::clone(&pair.consumer) as Arc<dyn crate::streaming::transport::FrameTransport>
+        )
+        .build()
+        .expect("anchor manager");
+    manager
+        .install_mux(Arc::clone(&pair.consumer))
+        .expect("install mux");
+
+    let mut anchor = manager.create_anchor::<u32>();
+    let (_, local_id) = anchor.handle().unpack();
+    let ticket = manager.prebind_anchor(anchor.handle()).expect("ticket");
+    let tx = pair
+        .producer
+        .connect(pair.consumer_worker, local_id, ticket.routing_session_id)
+        .await
+        .expect("connect");
+    let producer = tokio::spawn(async move {
+        for n in 0..SENT {
+            tx.send_async(item(n)).await.expect("send item");
+        }
+        tx
+    });
+
+    let received = || {
+        pair.snapshot().histogram_sum_sum(
+            "velo_streaming_mux_records_per_batch",
+            &[("direction", "received")],
+        )
+    };
+    // Let the credit loop settle: the sweep runs every millisecond here, so
+    // anything the consumer side can be owed has been granted and sent by now.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let stalled = received();
+    // The window, plus the slot's `OpenSlot` record riding in the same count.
+    assert!(
+        stalled <= f64::from(CREDIT + 2),
+        "nobody polled the anchor, yet the consumer node accepted {stalled} records \
+         against a window of {CREDIT}"
+    );
+
+    for n in 0..SENT {
+        let frame = tokio::time::timeout(RECV_TIMEOUT, anchor.next())
+            .await
+            .expect("timed out waiting for a record")
+            .expect("stream ended early")
+            .expect("record decodes");
+        assert!(
+            matches!(frame, StreamFrame::Item(v) if v == n),
+            "record {n} out of order"
+        );
+    }
+    drop(producer.await.expect("producer"));
+    pair.assert_no_reader_stall();
+}
+
+/// The watchdog does not blame a sender for silence its consumer caused.
+///
+/// A consumer that stops reading leaves records in the slot buffer and its
+/// sender without credit, and a sender without credit cannot send the
+/// heartbeats that prove it is alive. That silence is the consumer's, so the
+/// watchdog treats a window with records still buffered as live, however long
+/// the sender stays quiet. The records are all still there when the consumer
+/// comes back.
+///
+/// Control: once the buffer is empty, the same silence is the sender's, and the
+/// watchdog reaps the anchor.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_watchdog_does_not_fire_while_records_wait_unread() {
+    let heartbeat = Duration::from_millis(50);
+    let pair = mux_pair(test_config()).await;
+    let manager = AnchorManagerBuilder::default()
+        .worker_id(pair.consumer_worker)
+        .transport(
+            Arc::clone(&pair.consumer) as Arc<dyn crate::streaming::transport::FrameTransport>
+        )
+        .build()
+        .expect("anchor manager");
+    manager
+        .install_mux(Arc::clone(&pair.consumer))
+        .expect("install mux");
+
+    let mut anchor = manager.create_anchor_with_config::<u32>(AnchorConfig {
+        heartbeat_interval: Some(heartbeat),
+        ..Default::default()
+    });
+    let (_, local_id) = anchor.handle().unpack();
+    let ticket = manager.prebind_anchor(anchor.handle()).expect("ticket");
+    let tx = pair
+        .producer
+        .connect(pair.consumer_worker, local_id, ticket.routing_session_id)
+        .await
+        .expect("connect");
+    for n in 0..3 {
+        tx.send_async(item(n)).await.expect("send item");
+    }
+    eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 1).await;
+
+    // Twenty windows of silence, with the records unread.
+    tokio::time::sleep(heartbeat * 20).await;
+    assert!(
+        manager.registry.contains_key(&local_id),
+        "records still wait in the buffer, so the silence is the consumer's"
+    );
+    for n in 0..3 {
+        let frame = tokio::time::timeout(RECV_TIMEOUT, anchor.next())
+            .await
+            .expect("timed out waiting for a record")
+            .expect("stream ended early")
+            .expect("record decodes");
+        assert!(matches!(frame, StreamFrame::Item(v) if v == n));
+    }
+
+    // The buffer is empty now, and the sender is still silent.
+    eventually(|| !manager.registry.contains_key(&local_id)).await;
+    drop(tx);
+}

@@ -171,6 +171,7 @@ async fn reader_pump_unclaimed_bind_reap_increments_counter() {
     ctx.registry.insert(
         local_id,
         crate::streaming::anchor::AnchorEntry {
+            feed: Default::default(),
             frame_tx: frame_tx.clone(),
             cancel_token: cancel_token.clone(),
             active_pump_token: None,
@@ -815,6 +816,7 @@ fn make_pump_test_infra() -> (
     registry.insert(
         local_id,
         crate::streaming::anchor::AnchorEntry {
+            feed: Default::default(),
             frame_tx: frame_tx.clone(),
             cancel_token: cancel_token.clone(),
             active_pump_token: None,
@@ -905,6 +907,7 @@ fn make_prebind_pump_test_infra(
     registry.insert(
         local_id,
         crate::streaming::anchor::AnchorEntry {
+            feed: Default::default(),
             frame_tx: frame_tx.clone(),
             cancel_token: cancel_token.clone(),
             active_pump_token: None,
@@ -1488,6 +1491,7 @@ async fn reader_pump_does_not_count_a_blocked_forward_as_heartbeat_silence() {
     registry.insert(
         local_id,
         crate::streaming::anchor::AnchorEntry {
+            feed: Default::default(),
             frame_tx: frame_tx.clone(),
             cancel_token: cancel_token.clone(),
             active_pump_token: None,
@@ -1698,6 +1702,7 @@ async fn test_child_token_reattach_pump_survives() {
     registry.insert(
         local_id,
         crate::streaming::anchor::AnchorEntry {
+            feed: Default::default(),
             frame_tx: frame_tx.clone(),
             cancel_token: parent.clone(),
             active_pump_token: Some(child1.clone()),

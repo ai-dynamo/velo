@@ -115,7 +115,9 @@ pub(crate) struct PumpContext {
 /// not one still on its way in. This is the condition the reap arm below
 /// gates on -- it does not care which of the two doors in [`awaiting_sender`]
 /// a sender was expected to come through, only whether one has.
-fn bind_unclaimed(drain: Option<&crate::streaming::messenger_mux::ingress::DrainSignal>) -> bool {
+pub(super) fn bind_unclaimed(
+    drain: Option<&crate::streaming::messenger_mux::ingress::DrainSignal>,
+) -> bool {
     drain.is_some_and(|d| d.claimed().is_none())
 }
 
@@ -132,7 +134,7 @@ fn bind_unclaimed(drain: Option<&crate::streaming::messenger_mux::ingress::Drain
 /// ordinary attach's pump starts with an unclaimed `drain` too, for as long
 /// as the peer's own `OpenSlot` is still in flight, and that pump is spawned
 /// with `prebound` already `false` for exactly that reason.
-fn awaiting_sender(
+pub(super) fn awaiting_sender(
     prebound: &std::sync::atomic::AtomicBool,
     drain: Option<&crate::streaming::messenger_mux::ingress::DrainSignal>,
 ) -> bool {
