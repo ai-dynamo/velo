@@ -44,8 +44,8 @@ const PATIENCE: Duration = Duration::from_secs(30);
 ///
 /// Deliberate: this is the first stage in which `reader_pump` drains a mux slot
 /// buffer at all, so the credit the pump returns by reconciliation is newly
-/// load-bearing. At the default 256 the window never empties and none of that is
-/// exercised; at 8 it empties constantly and only the return path can refill it.
+/// load-bearing. At a window larger than the traffic (the old 256 default) it never empties
+/// and none of that is exercised; at 8 it empties constantly and only the return path can refill it.
 fn mux_config() -> MuxConfig {
     mux_config_at(8)
 }

@@ -163,9 +163,9 @@ pub struct MuxConfig {
     /// streams at 256 put the first token 96-268 ms behind the worker, and
     /// TTFT p50 was 135-355 ms. At 32 the surplus waits in each stream's own
     /// withheld queue on the producer instead, and TTFT p50 was 88-102 ms, with
-    /// throughput and ITL p99 unchanged and ITL p50 0.1-0.6 ms higher. At 32
+    /// throughput and ITL p99 no worse and ITL p50 0.1-0.6 ms higher. At 32
     /// frontend cores, where the frontend is not the bottleneck, 32 and 256
-    /// measured the same. See `docs/src/operations/response-plane-performance.md`.
+    /// measured the same TTFT p50 and throughput. See `docs/src/operations/response-plane-performance.md`.
     ///
     /// Advertised verbatim as the attach response's `initial_credit`, so it
     /// must never be zero: zero on the wire means *this peer is not offering
@@ -236,7 +236,7 @@ pub struct MuxConfig {
     /// keeps sending never reaches this floor at all. A drain whose listing
     /// found the lane full is not on the lane and so not on this path either;
     /// `credit_sweep_interval` is what covers it. That is one wait per window,
-    /// so what it costs per record is `floor / initial_credit` — about 60 µs at
+    /// so what it costs per record is `floor / initial_credit` — about 63 µs at
     /// the default 2 ms floor and 32-record window, and more at the smaller
     /// windows the credit tests use deliberately. It stacks with
     /// [`reply_linger`](Self::reply_linger) rather than replacing it: the
@@ -380,7 +380,7 @@ pub struct MuxConfig {
     /// wins.
     ///
     /// The return a sender is owed is delayed by at most this long, once per
-    /// window, which per record is `reply_linger / initial_credit`: about 30 µs
+    /// window, which per record is `reply_linger / initial_credit`: about 31 µs
     /// at the default 1 ms linger and 32-record window. On the drain-driven return path this
     /// stacks with [`drain_visit_floor`](Self::drain_visit_floor) rather than
     /// replacing it — a producer parked out of credit can wait for both, in
@@ -417,5 +417,28 @@ impl MuxConfig {
         let interval = self.credit_sweep_interval.as_millis().max(1);
         let ttl = self.batcher_idle_ttl.as_millis();
         u32::try_from(ttl / interval).unwrap_or(u32::MAX).max(1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The default credit window is 32, and a larger one is a TTFT regression.
+    ///
+    /// When the consumer node is the bottleneck, every stream runs at its
+    /// window, so the windows together set how much sits in the shared path
+    /// between a producer and that node: the producer's egress queue, both
+    /// socket buffers and the consumer's reader. A new stream's first record
+    /// queues behind all of it. On the serving rig (8,192 streams, a saturated
+    /// 24-core frontend) a window of 256 put the first token 96-268 ms behind
+    /// the worker and TTFT p50 at 135-355 ms; 32 brought them to 16-31 ms and
+    /// 88-102 ms with throughput no worse. A window that "measures faster" on an
+    /// unsaturated box does not show this, because the cost appears only when
+    /// the consumer falls behind. Re-measure on a saturated consumer before
+    /// changing it; see `docs/src/operations/response-plane-performance.md`.
+    #[test]
+    fn the_default_credit_window_is_32() {
+        assert_eq!(MuxConfig::default().initial_credit, 32);
     }
 }

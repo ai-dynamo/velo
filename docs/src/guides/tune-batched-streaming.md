@@ -100,11 +100,12 @@ All settings are fields of `MuxConfig`. Always build it with `..Default::default
 
 ## Change the credit window
 
-`initial_credit` sets how many records a sender can send on one slot before it needs a grant.
+`initial_credit` sets how many records a sender can send on one slot before it needs a grant. The consumer node's value is the one that counts: it advertises its window when a stream attaches, and the sender uses that.
 
 - Keep the default of 32 for token streams. A larger window lets every stream fill the shared path between a producer and a saturated consumer node, and a new stream's first record then waits behind all of it. See [The credit window and a saturated frontend](../operations/response-plane-performance.md#the-credit-window-and-a-saturated-frontend).
 - A stream longer than the window needs grants. The consumer node returns credit as its consumer drains, usually when the next batch from the producer arrives. A live consumer therefore rarely stalls its producer.
 - Do not set a small window to save memory. A small window raises the credit-return latency per record. For a producer that ran out of credit, it is `(drain_visit_floor + reply_linger) / initial_credit`.
+- Raise the window for a few high-rate streams to an otherwise idle consumer. With no other traffic from the producer, a starved stream gets its credit back only through the doorbell and the reply linger, so a small window caps its rate.
 - Do not set zero. Zero on the wire means "not offering the mux", and the build refuses it.
 
 Each slot buffer holds `initial_credit + 1` records. The byte budgets, not the record count, bound the memory.
