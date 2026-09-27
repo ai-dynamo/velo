@@ -234,6 +234,21 @@ async fn the_transport_answers_to_the_negotiated_key_and_advertises_no_endpoint(
 // Configuration
 // ---------------------------------------------------------------------------
 
+/// The default credit window is 32; a larger default is a TTFT regression
+/// under a saturated consumer.
+///
+/// When the consumer node is the bottleneck, every stream runs at its window,
+/// so the windows together set how much sits in the shared path between a
+/// producer and that node, and a new stream's first record queues behind all
+/// of it. The cost appears only when the consumer falls behind, so a larger
+/// window that "measures faster" on an unsaturated box has not been tested
+/// against it. Re-measure on a saturated consumer before changing this; the
+/// numbers are in `docs/src/operations/response-plane-performance.md`.
+#[test]
+fn the_default_credit_window_is_32() {
+    assert_eq!(MuxConfig::default().initial_credit, 32);
+}
+
 /// A zero sweep interval is refused where the mux is built, not on its first
 /// tick.
 ///

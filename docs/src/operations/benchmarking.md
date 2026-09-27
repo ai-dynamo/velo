@@ -29,6 +29,7 @@ cargo run --release --all-features --example batched_streaming -- --engines 2 --
 | `--pass-delay-ms` | 1 | Gap between forward passes, standing in for GPU time. |
 | `--legacy` | off | Run the same workload on the per-stream path. |
 | `--flush-policy` | `manual` | `manual` calls `flush_batch()` once per pass. `auto` lets the batcher write at every wake. Ignored with `--legacy`. |
+| `--initial-credit` | velo's default (32) | Per-stream credit window. The figures in this book that say "at a credit window of 256" need `--initial-credit 256`. |
 
 The example has three anchor hosts. It fails the run if any request misses a token, sees an unexpected frame, or if the batcher's `velo_streaming_mux_records_per_batch{direction="sent"}` does not account for every token.
 
@@ -63,6 +64,7 @@ cargo run --release --all-features --example response_plane_bench -- --anchor-ho
 | `--credit-sweep-interval-ms` | 2 | `MuxConfig::credit_sweep_interval`. |
 | `--legacy` | off | Run on the per-stream path. |
 | `--flush-policy` | `manual` | `manual` or `auto`, as in `batched_streaming`. |
+| `--initial-credit` | velo's default (32) | Per-stream credit window, as in `batched_streaming`. |
 | `--warmup-requests` | 0 | Leave the first N requests out of the latency histograms. |
 | `--json` | off | Print one line of JSON for scripts. |
 
@@ -121,4 +123,4 @@ Each rule below exists because a measurement without it was wrong.
 11. **Prove a regression test before you trust it.** Revert the fix and make sure that the test fails. A test that passes with the fix reverted proves nothing.
 12. **Check that every process was scraped.** The rig gave worker process p the metrics port `base + p`. With 16 processes the range covered port 9100, which node_exporter holds on the compute nodes. Process 10 served traffic with no `/metrics`, and every summed worker metric missed a sixteenth of the fleet. An empty scrape file must fail the rep.
 13. **Time the first record at both ends before you blame a stage for TTFT.** Dynamo's worker `time_to_first_response` stops when the prologue is sent, not at the first token, so it cannot separate engine queueing from the response path. The rig adds histograms for the engine's first item and for its send on the worker, and for the prologue and the first data item on the frontend. With them, a 200 ms TTFT gap turned out to be the response path (the first token left the worker 10 ms after the request arrived) and not the mocker. See [The credit window and a saturated frontend](response-plane-performance.md#the-credit-window-and-a-saturated-frontend).
-14. **Sort reps by the environment before you compare arms.** On the 2-node rig, reps fall into two states that move every arm, the comparison plane included. In the bad state, frontend CPU per request rose from about 11 to 16–20 ms and irq and softirq time on node A rose from 5–9 to 13–16 cores. Network softirq runs on the frontend's own pinned cores, 5 to 7 of 24, in both planes. Three reps that mix the states average two regimes and settle nothing.
+14. **Sort reps by the environment before you compare arms.** On the 2-node rig, reps fall into two states that move every arm, the comparison plane included. In the bad state, frontend CPU per request rose from about 11 to 16–20 ms and irq and softirq time on node A rose from 5–9 to 13–16 cores. Network softirq runs on the frontend's own pinned cores: with the frontend on 24 cores, it took 5 to 7 of them, in both planes. Three reps that mix the states average two regimes and settle nothing.

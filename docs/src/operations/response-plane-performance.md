@@ -53,7 +53,7 @@ The changes are listed in order of effect. Each one landed with a test that fail
 4. **One timer per stream in the reader pump.** The pump used to build a `tokio::time::timeout` per record. Each one took the time driver's lock twice. The `Sleep` subtree was 7.3% of the frontend's cores, plus 0.8% for the cancellation future. With one pinned timer, the timer subtree fell to 0.15%.
 5. **Reply linger.** Credit replies wait up to 1 ms to share a batch. With zero-RTT setup, the frontend's egress had carried one batch per credit reply: 1,027,872 outbound batches against 97,042 without zero-RTT. The linger cut frontend batches four to six times and saved 0.4 ms of CPU per request.
 6. **Control maps bounded by allocation.** A 4,096-entry control cap was sized for about 1,024 slots per peer. One mocker process held 4,000 to 6,700 live slots. The cap refused credit grants and closes, and with `async_open_ack` it refused the answer that lifts a slot's fence. A fenced slot then waited for the 15 s watchdog, and the client saw an HTTP 500.
-7. **Drain-driven credit return with a visit floor.** Measured on 2026-09-01 on an exclusive 144-core node with the in-process harness at 256 ingress peers, 42 interleaved runs:
+7. **Drain-driven credit return with a visit floor.** Measured on 2026-09-01 on an exclusive 144-core node with the in-process harness at 256 ingress peers, 42 interleaved runs, at a credit window of 256 with streams of 64 tokens, so no stream ran out of credit:
 
 | Change | CPU per token |
 |---|---|
@@ -72,7 +72,7 @@ These changes were measured or traced and did not help. They are recorded so tha
 | Change | What was measured | Verdict |
 |---|---|---|
 | Grant credit once per half window | Measured at a credit window of 256. Credit updates per rep fell from 54–59 million to 2.8–3.1 million. Frontend batches fell from 307,000–484,000 to 7,800–10,200. CPU per request did not change. Inter-token p99 rose to 68 and 76 ms against 40 and 42 ms on the same nodes, and sender credit exhaustion rose to 1,431 per rep. | Rejected. A threshold makes a slow reader exhaust the sender sooner. |
-| An urgent grant for a starved slot | Measured at a credit window of 256, on the 8-process rig with output length 256. A sender runs out of credit about 300 times per rep and waits under 2 ms. Long gaps rise slightly in the last four token positions (76 to 106 gaps of 63.5 million). Only 21% to 30% of credit batches wait out the reply window. | Not built at 256. It has under 1 ms to win on about 300 of 250,000 streams, and an urgent reply per wake returns one batch per wake. On the 16-process rig with output length 900, senders ran out of credit about 240,000 times per rep at 256 and about 1.2 million times at the default of 32, so the question is open again. |
+| An urgent grant for a starved slot | Measured at a credit window of 256, on the 8-process rig with output length 256. A sender runs out of credit about 300 times per rep and waits under 2 ms. Long gaps rise slightly in the last four token positions (76 to 106 gaps of 63.5 million). Only 21% to 30% of credit batches wait out the reply window. | Not built at 256. It has under 1 ms to win on about 300 of 250,000 streams, and an urgent reply per wake returns one batch per wake. On the 16-process rig with output length 900, senders ran out of credit about 240,000 times per rep at 256 and about 1.2 million times at the default of 32, so a starved slot is common at 32. |
 | A 32-worker frontend runtime | CPU per request fell 1.4 to 1.8 ms. TTFT p95 at one holder rose from about 206 ms to 317–366 ms, and the p50 lead disappeared. | Rejected. velo's larger task count needs the workers. |
 | Coalesce SSE flushes | hyper drains the body until `Pending` and flushes once per poll, in both planes. velo flushes about 0.9 times per record, the comparison plane about 0.54, because its body task runs further behind. | No lever. More records per flush need a linger. |
 | A 500 µs data linger on the workers | Frontend inbound batches fell from 7.5–8.6 million to 1.0 million per rep, and CPU fell to 9.10 ms per request. The request path grew: client-to-frontend 8.4–9.1 ms against 5.6, frontend-to-worker 12–13 ms against 5.5. TTFT p50 72 to 76 ms. | Not a ship setting. |
@@ -148,23 +148,28 @@ These mechanisms were found:
 
 ### The credit window and a saturated frontend
 
-When the frontend is the bottleneck, every stream runs at its credit window, and the windows fill the shared path between a worker and the frontend: the worker's egress queue, both socket buffers and the frontend's reader. A new stream's first record queues behind all of it. The comparison plane has no per-request credit, and its worker-side send blocks, so its backlog stays in the producer.
+Measured on 2026-09-26 and 2026-09-27. When the frontend is the bottleneck, every stream runs at its credit window, and the windows fill the shared path between a worker and the frontend: the worker's egress queue, both socket buffers and the frontend's reader. A new stream's first record queues behind all of it. The comparison plane has no per-request credit, and its worker-side send blocks, so its backlog stays in the producer.
 
-Setup: the Dynamo mocker rig with 16 processes of 32 workers, concurrency 8,192, ISL 1,024, OSL 900, speedup 10, 250,000 requests per repetition, the frontend pinned to 24 or 32 cores, and three interleaved repetitions per arm. Each window ran in its own allocation against a 256 arm and, for 32, the comparison plane; the 256 rows span those reference arms. Ranges include every repetition, whatever the environment state. The worker and frontend histograms timed a stream's first record from the worker handing it to the plane to the frontend receiving it.
+Setup: the Dynamo mocker rig with 16 processes of 32 workers, concurrency 8,192, input length 1,024, output length 900, speedup 10 and 250,000 requests per repetition. The frontend was pinned to 24 or 32 cores. Each allocation ran one window against a window of 256, three repetitions per arm with the arms interleaved; ranges cover all three. The last column is a stream's first record (its prologue), from the worker handing it to the plane to the frontend receiving it, as a mean over requests.
 
-| Frontend | Credit window | req/s | TTFT p50 (ms) | ITL p50 (ms) | ITL p99 (ms) | First record, worker to frontend (ms) |
+| Frontend | Window | req/s | TTFT p50 (ms) | ITL p50 (ms) | ITL p99 (ms) | First record (ms) |
 |---|---:|---:|---:|---:|---:|---:|
-| 24 cores | 256 | 1,940 to 2,135 | 135 to 355 | 1.62 to 1.88 | 4.7 to 11.6 | 96 to 268 |
+| 24 cores | 256 | 1,940 to 2,088 | 139 to 355 | 1.65 to 1.88 | 5.3 to 11.6 | 96 to 268 |
 | 24 cores | 32 | 2,022 to 2,102 | 88 to 102 | 1.74 to 2.30 | 4.7 to 4.9 | 16 to 31 |
-| 24 cores | 16 | 2,052 to 2,055 | 77 to 78 | 1.79 to 1.87 | 4.9 to 5.3 | 9 to 11 |
-| 24 cores | 64 | 1,817 to 2,158 | 98 to 207 | 1.68 to 3.13 | 4.5 to 8.6 | 31 to 146 |
 | 24 cores | comparison plane | 1,712 to 2,059 | 84 to 97 | 0.75 to 1.61 | 9.9 to 33.9 | - |
+| 24 cores | 256 | 1,975 to 2,135 | 135 to 210 | 1.62 to 1.69 | 4.7 to 7.9 | 83 to 162 |
+| 24 cores | 16 | 2,052 to 2,055 | 77 to 78 | 1.79 to 1.87 | 4.9 to 5.3 | 9 to 11 |
+| 24 cores | 256 | 1,451 to 2,147 | 156 to 830 | 1.73 to 3.42 | 5.0 to 26.9 | 135 to 672 |
+| 24 cores | 64 | 1,817 to 2,158 | 98 to 207 | 1.68 to 3.13 | 4.5 to 8.6 | 31 to 146 |
 | 32 cores | 256 | 2,117 to 2,164 | 90 to 107 | 1.31 to 1.80 | 4.2 to 4.8 | 21 to 50 |
 | 32 cores | 32 | 2,138 to 2,177 | 93 to 95 | 1.37 to 1.40 | 4.0 to 4.2 | 10 to 11 |
+| 32 cores | comparison plane | 2,115 to 2,389 | 72 to 116 | 1.25 to 1.33 | 5.2 to 12.4 | - |
 
-The 64 row includes a repetition in which the rig's environment degraded both arms of its allocation. Its two good repetitions read 98 ms of TTFT, within the range of 32, but its first record still took 31 ms against 16 to 31 at 32 and 146 ms in the degraded repetition, so 64 leaves more of the shared-path wait in place.
+Rows are grouped by allocation. In the 64 allocation, two of the three 256 repetitions and one of the 64 repetitions fell into the degraded environment state that [Measurement rules](benchmarking.md#measurement-rules) describes. In their good repetitions, 64 read 98 ms of TTFT against 156 ms at 256, and its first record took 31 ms, the top of the range of 32. The data does not separate 64 from 32 beyond that.
 
-The default window is 32, not 16. A window of 16 had the lowest TTFT at 24 cores, but it doubles the per-record credit-return cost (`(drain_visit_floor + reply_linger) / initial_credit`, about 190 µs at 16 against 94 µs at 32) and it was not measured with 32 frontend cores. A window of 32 closes the gap and measured no worse than 256 at 32 cores. At 32, the surplus waits in each stream's own withheld queue on the producer rather than in the shared path: sender credit exhaustion rose from about 240,000 to about 1.2 million events per repetition, worker egress wait fell from 9.5 to 1.2 ms, and the frontend's lane wait fell from 1.8 to 0.7 ms. The cost is more grants per stream, which shows as 0.1 to 0.6 ms of ITL p50. The per-stream backlog itself does not go away while the frontend is the bottleneck; it moves to where it delays only its own stream.
+The default window is 32. At 24 cores it brings velo's TTFT to the comparison plane's, with throughput within noise of 256 in the same allocation and ITL p99 no higher; ITL p50 is 0.1 to 0.4 ms higher, because streams need more grants. At 32 cores, 32 and 256 read the same TTFT p50, throughput and ITL, and the first record still waits less at 32. A window of 16 had the lowest TTFT at 24 cores, but it doubles the per-record credit-return cost (`(drain_visit_floor + reply_linger) / initial_credit`, about 190 µs at 16 against 94 µs at 32), and it was not measured at 32 cores.
+
+At 32 the surplus waits in each stream's own withheld queue on the producer rather than in the shared path. In the first repetition of the 24-core allocation, summed over the 16 worker processes, sender credit exhaustion rose from about 240,000 to about 1.2 million events; the worker's mean egress queue wait per frame fell from 9.5 to 1.2 ms, and the frontend's mean lane wait per batch from 1.8 to 0.7 ms. The per-stream backlog itself does not go away while the frontend is the bottleneck; it moves to where it delays only its own stream.
 
 
 ## UCX transport instability

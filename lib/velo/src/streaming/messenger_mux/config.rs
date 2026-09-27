@@ -159,14 +159,11 @@ pub struct MuxConfig {
     /// and that is why the default is 32 rather than 256. When the consumer
     /// node is the bottleneck, every stream runs at its window, and a new
     /// stream's first record queues behind everything the others have in
-    /// flight. On the serving rig with a saturated 24-core frontend, 8,192
-    /// streams at 256 put the first token 96-268 ms behind the worker, and
-    /// TTFT p50 was 135-355 ms. At 32 the surplus waits in each stream's own
-    /// withheld queue on the producer instead, and TTFT p50 was 88-102 ms, with
-    /// throughput and ITL p99 no worse and ITL p50 0.1-0.6 ms higher. At 32
-    /// frontend cores, with headroom on the frontend, 32 and 256 measured the
-    /// same TTFT p50 and throughput, and 32 still cut the first record's wait
-    /// from 21-50 ms to 10-11 ms. See `docs/src/operations/response-plane-performance.md`.
+    /// flight. At 32 the surplus waits in each stream's own withheld queue on
+    /// the producer instead, where it delays only that stream; the cost is
+    /// more grants per stream. The measurements, and why not 16 or 64, are in
+    /// `docs/src/operations/response-plane-performance.md` ("The credit window
+    /// and a saturated frontend").
     ///
     /// Advertised verbatim as the attach response's `initial_credit`, so it
     /// must never be zero: zero on the wire means *this peer is not offering
@@ -418,28 +415,5 @@ impl MuxConfig {
         let interval = self.credit_sweep_interval.as_millis().max(1);
         let ttl = self.batcher_idle_ttl.as_millis();
         u32::try_from(ttl / interval).unwrap_or(u32::MAX).max(1)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The default credit window is 32, and a larger one is a TTFT regression.
-    ///
-    /// When the consumer node is the bottleneck, every stream runs at its
-    /// window, so the windows together set how much sits in the shared path
-    /// between a producer and that node: the producer's egress queue, both
-    /// socket buffers and the consumer's reader. A new stream's first record
-    /// queues behind all of it. On the serving rig (8,192 streams, a saturated
-    /// 24-core frontend) a window of 256 put the first token 96-268 ms behind
-    /// the worker and TTFT p50 at 135-355 ms; 32 brought them to 16-31 ms and
-    /// 88-102 ms with throughput no worse. A window that "measures faster" on an
-    /// unsaturated box does not show this, because the cost appears only when
-    /// the consumer falls behind. Re-measure on a saturated consumer before
-    /// changing it; see `docs/src/operations/response-plane-performance.md`.
-    #[test]
-    fn the_default_credit_window_is_32() {
-        assert_eq!(MuxConfig::default().initial_credit, 32);
     }
 }

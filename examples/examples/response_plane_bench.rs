@@ -36,6 +36,10 @@
 //! `--credit-sweep-interval-ms` is the A/B. Hold everything else fixed, run it
 //! at 2 (the pre-drain-hook cadence; velo's own default is 200) and again at
 //! 500, and the CPU difference is the sweep's cost with nothing else moving.
+//! That holds only while no stream outruns its credit window: the published
+//! figures were taken at a window of 256 with streams of at most 64 tokens,
+//! and `--initial-credit 256` reproduces that. At the default window of 32, streams longer than 32
+//! tokens need grants, and the sweep also becomes a credit backstop.
 //!
 //! **Scale `--engines`, not `--anchor-hosts`.** The sweep walks a node's
 //! *ingress* peers — the peers it receives batches from — so an anchor host's
@@ -129,6 +133,11 @@ struct Args {
     /// cadence for the A/B.
     #[arg(long, default_value_t = 2)]
     credit_sweep_interval_ms: u64,
+
+    /// Per-stream credit window (`MuxConfig::initial_credit`). Unset keeps
+    /// velo's default.
+    #[arg(long)]
+    initial_credit: Option<u32>,
 
     /// Run on the legacy one-connection-per-stream path instead of the mux.
     #[arg(long)]
@@ -224,6 +233,9 @@ async fn node(args: &Args, mux_enabled: bool) -> Result<Arc<Node>> {
             enabled: mux_enabled,
             flush_policy: args.flush_policy.policy(),
             credit_sweep_interval: Duration::from_millis(args.credit_sweep_interval_ms),
+            initial_credit: args
+                .initial_credit
+                .unwrap_or(MuxConfig::default().initial_credit),
             ..MuxConfig::default()
         })?
         .build()
@@ -505,6 +517,7 @@ struct RunReport {
     max_batch: u32,
     pass_delay_ms: u64,
     credit_sweep_interval_ms: u64,
+    initial_credit: u32,
     flush_policy: String,
     elapsed_ms: u128,
     tokens: u64,
@@ -691,6 +704,9 @@ async fn main() -> Result<()> {
         max_batch: args.max_batch,
         pass_delay_ms: args.pass_delay_ms,
         credit_sweep_interval_ms: args.credit_sweep_interval_ms,
+        initial_credit: args
+            .initial_credit
+            .unwrap_or(MuxConfig::default().initial_credit),
         flush_policy: format!("{:?}", args.flush_policy).to_lowercase(),
         elapsed_ms: elapsed.as_millis(),
         tokens,
