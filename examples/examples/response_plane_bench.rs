@@ -49,8 +49,8 @@
 //!
 //! ```text
 //! # Does the 500 Hz sweep cost anything at 128 ingress peers?
-//! response_plane_bench --anchor-hosts 2 --engines 128 --requests 2000 --credit-sweep-interval-ms 2
-//! response_plane_bench --anchor-hosts 2 --engines 128 --requests 2000 --credit-sweep-interval-ms 500
+//! response_plane_bench --anchor-hosts 2 --engines 128 --requests 2000 --credit-sweep-interval-ms 2 --initial-credit 256
+//! response_plane_bench --anchor-hosts 2 --engines 128 --requests 2000 --credit-sweep-interval-ms 500 --initial-credit 256
 //! ```
 //!
 //! # Honest limits
@@ -134,10 +134,9 @@ struct Args {
     #[arg(long, default_value_t = 2)]
     credit_sweep_interval_ms: u64,
 
-    /// Per-stream credit window (`MuxConfig::initial_credit`). Unset keeps
-    /// velo's default.
-    #[arg(long)]
-    initial_credit: Option<u32>,
+    /// Per-stream credit window (`MuxConfig::initial_credit`).
+    #[arg(long, default_value_t = MuxConfig::default().initial_credit)]
+    initial_credit: u32,
 
     /// Run on the legacy one-connection-per-stream path instead of the mux.
     #[arg(long)]
@@ -233,9 +232,7 @@ async fn node(args: &Args, mux_enabled: bool) -> Result<Arc<Node>> {
             enabled: mux_enabled,
             flush_policy: args.flush_policy.policy(),
             credit_sweep_interval: Duration::from_millis(args.credit_sweep_interval_ms),
-            initial_credit: args
-                .initial_credit
-                .unwrap_or(MuxConfig::default().initial_credit),
+            initial_credit: args.initial_credit,
             ..MuxConfig::default()
         })?
         .build()
@@ -560,12 +557,13 @@ async fn main() -> Result<()> {
     if !args.json {
         println!(
             "response_plane_bench: {} anchor hosts, {} engine(s), {} requests, max-batch {}, \
-             sweep {}ms, {}ms between passes",
+             sweep {}ms, credit window {}, {}ms between passes",
             args.anchor_hosts,
             args.engines,
             args.requests,
             args.max_batch,
             args.credit_sweep_interval_ms,
+            args.initial_credit,
             args.pass_delay_ms
         );
         println!("mode: {mode}");
@@ -704,9 +702,7 @@ async fn main() -> Result<()> {
         max_batch: args.max_batch,
         pass_delay_ms: args.pass_delay_ms,
         credit_sweep_interval_ms: args.credit_sweep_interval_ms,
-        initial_credit: args
-            .initial_credit
-            .unwrap_or(MuxConfig::default().initial_credit),
+        initial_credit: args.initial_credit,
         flush_policy: format!("{:?}", args.flush_policy).to_lowercase(),
         elapsed_ms: elapsed.as_millis(),
         tokens,

@@ -183,10 +183,9 @@ struct Args {
     #[arg(long = "flush-policy", value_enum, default_value_t = Flush::Manual)]
     flush_policy: Flush,
 
-    /// Per-stream credit window (`MuxConfig::initial_credit`). Unset keeps
-    /// velo's default.
-    #[arg(long = "initial-credit")]
-    initial_credit: Option<u32>,
+    /// Per-stream credit window (`MuxConfig::initial_credit`).
+    #[arg(long = "initial-credit", default_value_t = MuxConfig::default().initial_credit)]
+    initial_credit: u32,
 }
 
 /// The two flush policies, as the example exposes them.
@@ -349,7 +348,7 @@ impl Node {
 /// `enabled: false` is the documented rollback, and is the same node as never
 /// calling `messenger_mux` at all: nothing is registered, nothing is
 /// advertised, and every attach negotiates the legacy path.
-async fn node(mux_enabled: bool, flush: Flush, initial_credit: Option<u32>) -> Result<Arc<Node>> {
+async fn node(mux_enabled: bool, flush: Flush, initial_credit: u32) -> Result<Arc<Node>> {
     // A registry per node. Two `VeloMetrics::register` calls against one
     // registry would collide on collector names, and per-node registries are
     // what let the summary attribute writes to the engine that made them.
@@ -363,7 +362,7 @@ async fn node(mux_enabled: bool, flush: Flush, initial_credit: Option<u32>) -> R
         .messenger_mux(MuxConfig {
             enabled: mux_enabled,
             flush_policy: flush.policy(),
-            initial_credit: initial_credit.unwrap_or(MuxConfig::default().initial_credit),
+            initial_credit,
             ..MuxConfig::default()
         })?
         .build()
@@ -635,9 +634,9 @@ async fn main() -> Result<()> {
     };
     println!(
         "batched_streaming: {HOSTS} anchor hosts, {} engine(s), {} requests, \
-         max-batch {}, {expected_tokens} tokens, {}ms between passes\n\
+         max-batch {}, {expected_tokens} tokens, {}ms between passes, credit window {}\n\
          mode: {mode}",
-        args.engines, args.requests, args.max_batch, args.pass_delay_ms
+        args.engines, args.requests, args.max_batch, args.pass_delay_ms, args.initial_credit
     );
 
     // Build the deployment. Hosts own anchors; engines produce tokens.

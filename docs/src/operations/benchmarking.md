@@ -29,7 +29,7 @@ cargo run --release --all-features --example batched_streaming -- --engines 2 --
 | `--pass-delay-ms` | 1 | Gap between forward passes, standing in for GPU time. |
 | `--legacy` | off | Run the same workload on the per-stream path. |
 | `--flush-policy` | `manual` | `manual` calls `flush_batch()` once per pass. `auto` lets the batcher write at every wake. Ignored with `--legacy`. |
-| `--initial-credit` | velo's default (32) | Per-stream credit window. The figures in this book that say "at a credit window of 256" need `--initial-credit 256`. |
+| `--initial-credit` | 32, velo's default | Per-stream credit window, printed in the run header. The figures in this book that say "at a credit window of 256" need `--initial-credit 256`. |
 
 The example has three anchor hosts. It fails the run if any request misses a token, sees an unexpected frame, or if the batcher's `velo_streaming_mux_records_per_batch{direction="sent"}` does not account for every token.
 
@@ -38,9 +38,9 @@ Keep `--pass-delay-ms` above zero for a per-stream comparison. With no gap, the 
 To reproduce the flush-policy comparison in [Batched streaming](../concepts/batched-streaming.md#when-an-explicit-flush-helps), run each configuration five times with `--flush-policy auto` and `--flush-policy manual`:
 
 ```bash
-cargo run --release --all-features --example batched_streaming -- --engines 2 --requests 96 --max-batch 32 --tokens 40 --flush-policy auto
-cargo run --release --all-features --example batched_streaming -- --engines 2 --requests 96 --max-batch 32 --tokens 40 --flush-policy manual
-cargo run --release --all-features --example batched_streaming -- --engines 2 --requests 24 --max-batch 8 --tokens 40 --pass-delay-ms 0 --flush-policy auto
+cargo run --release --all-features --example batched_streaming -- --engines 2 --requests 96 --max-batch 32 --tokens 40 --flush-policy auto --initial-credit 256
+cargo run --release --all-features --example batched_streaming -- --engines 2 --requests 96 --max-batch 32 --tokens 40 --flush-policy manual --initial-credit 256
+cargo run --release --all-features --example batched_streaming -- --engines 2 --requests 24 --max-batch 8 --tokens 40 --pass-delay-ms 0 --flush-policy auto --initial-credit 256
 ```
 
 CI runs `batched_streaming` at the defaults with both flush policies.
@@ -64,7 +64,7 @@ cargo run --release --all-features --example response_plane_bench -- --anchor-ho
 | `--credit-sweep-interval-ms` | 2 | `MuxConfig::credit_sweep_interval`. |
 | `--legacy` | off | Run on the per-stream path. |
 | `--flush-policy` | `manual` | `manual` or `auto`, as in `batched_streaming`. |
-| `--initial-credit` | velo's default (32) | Per-stream credit window, as in `batched_streaming`. |
+| `--initial-credit` | 32, velo's default | Per-stream credit window, as in `batched_streaming`. |
 | `--warmup-requests` | 0 | Leave the first N requests out of the latency histograms. |
 | `--json` | off | Print one line of JSON for scripts. |
 
@@ -74,7 +74,7 @@ The harness reports TTFT and ITL as HDR histograms (p50, p95, p99). It also repo
 
 Sweep `--engines`, not `--anchor-hosts`. The per-peer costs on a frontend scale with its ingress peers, and an anchor host's ingress peers are the engines that stream to it. `--anchor-hosts` moves the smaller side of the same product.
 
-The harness agrees with `batched_streaming`. At `--anchor-hosts 3 --engines 2 --requests 96 --max-batch 32 --tokens 40`, it reports 5.41 tokens per write where `batched_streaming` reports 5.38, both at a credit window of 256.
+The harness agrees with `batched_streaming`. At `--anchor-hosts 3 --engines 2 --requests 96 --max-batch 32 --tokens 40 --initial-credit 256`, it reports 5.41 tokens per write where `batched_streaming` reports 5.38, both at a credit window of 256.
 
 ### Limits of the in-process harness
 
