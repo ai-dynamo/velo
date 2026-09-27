@@ -85,32 +85,9 @@ pub(crate) struct PumpContext {
     /// pre-bind spends with no sender yet does by construction.
     pub(crate) heartbeat_deadline: Duration,
     /// The mux bind's drain signal. `mpsc_reader_pump` tells it when a record
-    /// leaves the buffer credit is issued against; the watchdog reads its
-    /// arrival count and close. `None` for every transport that does not do
-    /// flow control over this seam.
+    /// leaves the buffer credit is issued against. `None` for every transport
+    /// that does not do flow control over this seam.
     pub(crate) drain: Option<std::sync::Arc<crate::streaming::messenger_mux::ingress::DrainSignal>>,
-    /// Whether this task's slot still has no sender, other than through its
-    /// own `OpenSlot`.
-    ///
-    /// `true` only at the one genuine pre-bind spawn site
-    /// (`AnchorManager::prebind_anchor`); every ordinary attach spawn passes
-    /// a fresh `Arc::new(AtomicBool::new(false))`. Shared with the
-    /// `PreBind` the task was spawned for, and cleared by
-    /// [`PreBind::adopt`](crate::streaming::anchor::PreBind::adopt) the
-    /// moment a sender attaches the long way round instead of opening on its
-    /// ticket -- the one other door through which a sender can show up, and
-    /// the one transition an `Arc<AtomicBool>` exists to carry immediately
-    /// rather than the task learning it only once that sender's own
-    /// `OpenSlot` lands.
-    ///
-    /// `drain.claimed().is_none()` is not a proxy for this on its own: the
-    /// mux parks a `DrainSignal` for *every* bind, including an ordinary
-    /// attach's, and that signal stays unclaimed until the peer's `OpenSlot`
-    /// arrives -- which is necessarily after the attach response already
-    /// returned. See [`awaiting_sender`] for the combined read the
-    /// watchdog's heartbeat exemption needs; the unclaimed-bind reap
-    /// (`feed::reap_unclaimed`) needs only the claim, see [`bind_unclaimed`].
-    pub(crate) prebound: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Whether an `OpenSlot` has claimed the mux bind this task reads from.

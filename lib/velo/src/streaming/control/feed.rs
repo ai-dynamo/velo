@@ -29,12 +29,13 @@
 //! [`DrainSignal`]: crate::streaming::messenger_mux::ingress::DrainSignal
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
 use super::DETECTION_MULTIPLIER;
-use super::pump::{PumpContext, awaiting_sender, bind_unclaimed, note_timer_arm, note_timer_fire};
+use super::pump::{awaiting_sender, bind_unclaimed, note_timer_arm, note_timer_fire};
 use crate::streaming::messenger_mux::ingress::DrainSignal;
 
 /// One mux bind's slot buffer, as the consumer reads it.
@@ -48,6 +49,34 @@ pub(crate) struct DirectFeed {
     /// which is what tells a closed `rx` apart from an unclaimed bind reaped
     /// by the accept window.
     pub(crate) pump_token: CancellationToken,
+}
+
+/// What [`stream_watchdog`] needs besides the feed it watches.
+pub(crate) struct WatchdogContext {
+    pub(crate) local_id: u64,
+    pub(crate) heartbeat_deadline: Duration,
+    /// Whether this task's slot still has no sender, other than through its
+    /// own `OpenSlot`.
+    ///
+    /// `true` only at the one genuine pre-bind spawn site
+    /// (`AnchorManager::prebind_anchor`); every ordinary attach spawn passes
+    /// a fresh `Arc::new(AtomicBool::new(false))`. Shared with the
+    /// `PreBind` the task was spawned for, and cleared by
+    /// [`PreBind::adopt`](crate::streaming::anchor::PreBind::adopt) the
+    /// moment a sender attaches the long way round instead of opening on its
+    /// ticket -- the one other door through which a sender can show up, and
+    /// the one transition an `Arc<AtomicBool>` exists to carry immediately
+    /// rather than the task learning it only once that sender's own
+    /// `OpenSlot` lands.
+    ///
+    /// `drain.claimed().is_none()` is not a proxy for this on its own: the
+    /// mux parks a `DrainSignal` for *every* bind, including an ordinary
+    /// attach's, and that signal stays unclaimed until the peer's `OpenSlot`
+    /// arrives -- which is necessarily after the attach response already
+    /// returned. See [`awaiting_sender`] for the combined read the
+    /// watchdog's heartbeat exemption needs; the unclaimed-bind reap
+    /// (`feed::reap_unclaimed`) needs only the claim, see [`bind_unclaimed`].
+    pub(crate) prebound: Arc<AtomicBool>,
 }
 
 /// The anchor's current feed, replaceable across detach and reattach.
@@ -98,25 +127,28 @@ impl FeedCell {
 /// feed, and the frame is queued, so it cannot be lost to a race with the
 /// consumer's next poll. The consumer drops heartbeats before they reach the
 /// application.
+///
+/// Both callers start the feed after dropping the registry's shard lock, so a
+/// cancel can remove the entry in between; the entry's drop then withdraws a
+/// feed that is not installed yet. Checking the registry after the install
+/// closes that gap: either the install lands first and the removal withdraws
+/// it, or the check sees the entry gone and withdraws it here. Anchor ids are
+/// never reused, so a present entry is this anchor's.
 pub(crate) fn start_direct_stream(
     cell: &FeedCell,
-    rx: flume::Receiver<Vec<u8>>,
+    feed: DirectFeed,
     frame_tx: flume::Sender<Vec<u8>>,
-    pump_token: CancellationToken,
     ctx: crate::streaming::anchor::AnchorContext,
-    pump: PumpContext,
+    watch: WatchdogContext,
 ) {
-    let drain = pump
-        .drain
-        .clone()
-        .expect("a direct feed exists only for a mux bind, which always has a drain signal");
-    cell.install(Arc::new(DirectFeed {
-        rx: rx.clone(),
-        drain,
-        pump_token: pump_token.clone(),
-    }));
+    let feed = Arc::new(feed);
+    cell.install(Arc::clone(&feed));
+    if !ctx.registry.contains_key(&watch.local_id) {
+        cell.withdraw();
+        return;
+    }
     let _ = frame_tx.try_send(crate::streaming::sender::cached_heartbeat().clone());
-    tokio::spawn(stream_watchdog(rx, frame_tx, pump_token, ctx, pump));
+    tokio::spawn(stream_watchdog(feed, frame_tx, ctx, watch));
 }
 
 /// Reap a bind nobody claimed whose buffer just closed, exactly once.
@@ -134,15 +166,16 @@ pub(crate) fn start_direct_stream(
 pub(crate) fn reap_unclaimed(
     feed: &DirectFeed,
     local_id: u64,
-    ctx: &crate::streaming::anchor::AnchorContext,
+    registry: &dashmap::DashMap<u64, crate::streaming::anchor::AnchorEntry>,
+    metrics: Option<&crate::observability::VeloMetrics>,
 ) -> bool {
     if !bind_unclaimed(Some(&feed.drain)) || feed.pump_token.is_cancelled() {
         return false;
     }
-    let Some((_, entry)) = ctx.registry.remove(&local_id) else {
+    let Some((_, entry)) = registry.remove(&local_id) else {
         return false;
     };
-    if let Some(m) = ctx.metrics.as_ref() {
+    if let Some(m) = metrics {
         m.record_unclaimed_bind_reaped();
     }
     let _ = entry
@@ -170,24 +203,17 @@ pub(crate) fn reap_unclaimed(
 /// (the stream ended, or an unclaimed bind was released — which it reaps on
 /// the spot, as the pump did on seeing its receiver close), or when it fires.
 pub(crate) async fn stream_watchdog(
-    rx: flume::Receiver<Vec<u8>>,
+    feed: Arc<DirectFeed>,
     frame_tx: flume::Sender<Vec<u8>>,
-    cancel_token: CancellationToken,
     ctx: crate::streaming::anchor::AnchorContext,
-    pump: PumpContext,
+    watch: WatchdogContext,
 ) {
-    let PumpContext {
+    let WatchdogContext {
         local_id,
         heartbeat_deadline,
-        drain,
         prebound,
-    } = pump;
-    let drain = drain.expect("a direct feed exists only for a mux bind");
-    let feed = DirectFeed {
-        rx,
-        drain,
-        pump_token: cancel_token.clone(),
-    };
+    } = watch;
+    let cancel_token = feed.pump_token.clone();
     let mut seen = feed.drain.arrivals();
     let mut missed: u8 = 0;
     let sleep = tokio::time::sleep(heartbeat_deadline);
@@ -204,7 +230,7 @@ pub(crate) async fn stream_watchdog(
             biased;
             _ = &mut cancelled => break,
             _ = &mut closed => {
-                reap_unclaimed(&feed, local_id, &ctx);
+                reap_unclaimed(&feed, local_id, &ctx.registry, ctx.metrics.as_deref());
                 break;
             }
             _ = &mut sleep => {
@@ -283,6 +309,47 @@ mod tests {
     /// The entry that close would reap is the one the winning attach is about
     /// to reuse, so the cancelled token is what must stop the reap -- whichever
     /// of the consumer and the watchdog sees the close.
+    /// A feed started for an anchor that is no longer registered is withdrawn.
+    ///
+    /// The attach handler and `prebind_anchor` start the feed after they drop
+    /// the registry's shard lock. A cancel landing in that gap removes the
+    /// entry first, and the entry's drop withdraws a feed that is not there
+    /// yet; the install that follows would then leave the consumer reading a
+    /// cancelled stream's slot buffer. The pump this replaced was spawned with
+    /// the already-cancelled token and exited at once, so the feed has to check
+    /// the same thing.
+    #[tokio::test]
+    async fn a_feed_started_for_a_removed_anchor_is_withdrawn() {
+        let ctx = crate::streaming::anchor::AnchorContext {
+            registry: Arc::new(dashmap::DashMap::new()),
+            mpsc_registry: Arc::new(dashmap::DashMap::new()),
+            metrics: None,
+        };
+        let cell = FeedCell::default();
+        let (_tx, rx) = flume::bounded::<Vec<u8>>(4);
+        let (frame_tx, _frame_rx) = flume::bounded::<Vec<u8>>(4);
+        let (wake, _) = flume::unbounded();
+        start_direct_stream(
+            &cell,
+            DirectFeed {
+                rx,
+                drain: Arc::new(DrainSignal::new(wake)),
+                pump_token: CancellationToken::new(),
+            },
+            frame_tx,
+            ctx,
+            WatchdogContext {
+                local_id: 1,
+                heartbeat_deadline: Duration::from_secs(5),
+                prebound: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        assert!(
+            cell.current().is_none(),
+            "anchor 1 is not registered, so its feed must not stay installed"
+        );
+    }
+
     #[test]
     fn a_retired_feed_does_not_reap_and_an_abandoned_one_reaps_once() {
         let ctx = crate::streaming::anchor::AnchorContext {
@@ -294,17 +361,22 @@ mod tests {
 
         let retired = CancellationToken::new();
         retired.cancel();
-        assert!(!reap_unclaimed(&unclaimed_feed(retired), 1, &ctx));
+        assert!(!reap_unclaimed(
+            &unclaimed_feed(retired),
+            1,
+            &ctx.registry,
+            None
+        ));
         assert!(
             ctx.registry.contains_key(&1),
             "a retired feed must leave the entry"
         );
 
         let abandoned = unclaimed_feed(CancellationToken::new());
-        assert!(reap_unclaimed(&abandoned, 1, &ctx));
+        assert!(reap_unclaimed(&abandoned, 1, &ctx.registry, None));
         assert!(!ctx.registry.contains_key(&1));
         assert!(
-            !reap_unclaimed(&abandoned, 1, &ctx),
+            !reap_unclaimed(&abandoned, 1, &ctx.registry, None),
             "the second sight of the close is a no-op"
         );
     }

@@ -130,7 +130,6 @@ pub(crate) async fn mpsc_reader_pump(
         // MPSC has no zero-RTT pre-bind path (`AnchorManager::prebind_anchor`
         // refuses `is_mpsc_stream()`), so every spawn here is an ordinary
         // attach and there is nothing to gate on.
-        prebound: _,
     } = pump;
     let mut missed_heartbeats: u8 = 0;
     // One timer per sender, not one per record: see
@@ -420,7 +419,6 @@ pub fn create_mpsc_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::
                         drain,
                         // Always an ordinary attach; see the destructure in
                         // `mpsc_reader_pump`.
-                        prebound: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     },
                 ));
 
@@ -517,7 +515,7 @@ pub fn create_mpsc_anchor_cancel_handler(manager: Arc<AnchorManager>) -> crate::
 mod tests {
     use super::*;
     use crate::streaming::control::{PumpContext, TIMER_ARMS, TIMER_FIRES};
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
     use velo_ext::{TransportKey, WorkerId};
 
@@ -554,7 +552,6 @@ mod tests {
                     local_id: 1,
                     heartbeat_deadline: Duration::from_secs(3600),
                     drain: None,
-                    prebound: Arc::new(AtomicBool::new(false)),
                 },
             ),
         ));
@@ -631,7 +628,6 @@ mod tests {
                         local_id: 1,
                         heartbeat_deadline: deadline,
                         drain: None,
-                        prebound: Arc::new(AtomicBool::new(false)),
                     },
                 ),
             ),
@@ -714,7 +710,6 @@ mod tests {
                     local_id: 1,
                     heartbeat_deadline: deadline,
                     drain: None,
-                    prebound: Arc::new(AtomicBool::new(false)),
                 },
             ),
         ));
@@ -804,7 +799,6 @@ mod tests {
                 local_id: 1,
                 heartbeat_deadline: heartbeat,
                 drain: None,
-                prebound: Arc::new(AtomicBool::new(false)),
             },
         ));
 
@@ -858,7 +852,6 @@ mod tests {
                 local_id: 1,
                 heartbeat_deadline: heartbeat,
                 drain: None,
-                prebound: Arc::new(AtomicBool::new(false)),
             },
         ));
 
@@ -910,7 +903,6 @@ mod tests {
                 local_id: 1,
                 heartbeat_deadline: heartbeat,
                 drain: None,
-                prebound: Arc::new(AtomicBool::new(false)),
             },
         ));
 

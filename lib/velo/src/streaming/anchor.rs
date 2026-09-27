@@ -567,8 +567,6 @@ pub struct StreamAnchor<T> {
     local_id: u64,
     /// Arc clone of the AnchorManager's registry (for cancel).
     registry: Arc<DashMap<u64, AnchorEntry>>,
-    /// Sibling MPSC registry — used when updating the shared active-anchors gauge.
-    mpsc_registry: Arc<DashMap<u64, crate::streaming::mpsc::anchor::MpscAnchorEntry>>,
     /// Shared cancel handle — also held by any [`StreamController`] clones.
     controller: StreamController,
     metrics: Option<Arc<VeloMetrics>>,
@@ -587,7 +585,7 @@ impl<T> StreamAnchor<T> {
     ) -> Self {
         let AnchorContext {
             registry,
-            mpsc_registry,
+            mpsc_registry: _,
             metrics,
         } = ctx;
         let inner = Arc::new(StreamControllerInner {
@@ -609,7 +607,6 @@ impl<T> StreamAnchor<T> {
             terminated: false,
             local_id,
             registry,
-            mpsc_registry,
             controller,
             metrics,
             _phantom: std::marker::PhantomData,
@@ -664,11 +661,8 @@ impl<T> StreamAnchor<T> {
                         crate::streaming::control::reap_unclaimed(
                             &feed,
                             self.local_id,
-                            &AnchorContext {
-                                registry: Arc::clone(&self.registry),
-                                mpsc_registry: Arc::clone(&self.mpsc_registry),
-                                metrics: self.metrics.clone(),
-                            },
+                            &self.registry,
+                            self.metrics.as_deref(),
                         );
                         continue;
                     }
@@ -1352,7 +1346,7 @@ impl AnchorManager {
                         // Shared with the watchdog spawned below and cleared by
                         // `PreBind::adopt` the moment an attach hands this
                         // slot to a sender that used it instead of the
-                        // ticket -- see `PumpContext::prebound`.
+                        // ticket -- see `WatchdogContext::prebound`.
                         let prebound = Arc::new(AtomicBool::new(true));
                         if entry.stop_requested {
                             drain.request_stop();
@@ -1397,18 +1391,20 @@ impl AnchorManager {
 
         crate::streaming::control::start_direct_stream(
             &feed,
-            receiver,
+            crate::streaming::control::DirectFeed {
+                rx: receiver,
+                drain,
+                pump_token: pump_cancel,
+            },
             frame_tx,
-            pump_cancel,
             self.anchor_context(),
-            crate::streaming::control::PumpContext {
+            crate::streaming::control::WatchdogContext {
                 local_id,
                 heartbeat_deadline: heartbeat_interval,
-                drain: Some(drain),
                 // The one genuine pre-bind spawn site: no sender has shown up
                 // yet. The `Arc` is the same cell stored in `PreBind` above,
                 // so `PreBind::adopt` can flip it the moment one does. See
-                // `PumpContext::prebound`.
+                // `WatchdogContext::prebound`.
                 prebound,
             },
         );

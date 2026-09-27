@@ -331,7 +331,7 @@ mod pump;
 mod ticket;
 #[cfg(test)]
 pub(crate) use feed::stream_watchdog;
-pub(crate) use feed::{DirectFeed, FeedCell, reap_unclaimed, start_direct_stream};
+pub(crate) use feed::{DirectFeed, FeedCell, WatchdogContext, reap_unclaimed, start_direct_stream};
 pub(crate) use pump::{PumpContext, note_timer_arm, note_timer_fire, reader_pump};
 #[cfg(test)]
 pub(crate) use pump::{TIMER_ARMS, TIMER_FIRES};
@@ -594,14 +594,16 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::messe
                             {
                                 start_direct_stream(
                                     &feed,
-                                    receiver,
+                                    DirectFeed {
+                                        rx: receiver,
+                                        drain,
+                                        pump_token: pump_cancel,
+                                    },
                                     pump_frame_tx,
-                                    pump_cancel,
                                     manager.anchor_context(),
-                                    PumpContext {
+                                    WatchdogContext {
                                         local_id,
                                         heartbeat_deadline: heartbeat_interval,
-                                        drain: Some(drain),
                                         // This is the ordinary attach path: a
                                         // sender is already on the wire, not a
                                         // zero-RTT pre-bind waiting for one. No
@@ -658,6 +660,14 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::messe
 /// Only after the lock drops does it inject a
 /// [`crate::streaming::frame::StreamFrame::Detached`] sentinel into the frame
 /// channel. The anchor remains in the registry so a new sender may re-attach.
+///
+/// **Not for mux streams.** A mux stream's records sit in the slot buffer the
+/// consumer reads directly, apart from the anchor channel this handler writes
+/// its sentinel into. Retiring or removing the entry withdraws that feed before the
+/// consumer has read what is already buffered, so up to `C` records are lost,
+/// and a sender that re-attaches quickly can have its records read ahead of
+/// the sentinel. No in-tree sender sends this message: a mux stream ends with
+/// its terminal record and `CloseSlot`, in order, on the slot itself.
 ///
 /// Idempotent: if the anchor is not found, returns `Ok(())`.
 pub fn create_anchor_detach_handler(manager: Arc<AnchorManager>) -> crate::messenger::Handler {
@@ -756,6 +766,14 @@ pub fn create_anchor_detach_handler(manager: Arc<AnchorManager>) -> crate::messe
 ///
 /// Atomically removes the anchor from the registry via `remove_anchor()`, injects a
 /// [`crate::streaming::frame::StreamFrame::Finalized`] sentinel, and cancels the `CancellationToken`.
+///
+/// **Not for mux streams.** A mux stream's records sit in the slot buffer the
+/// consumer reads directly, apart from the anchor channel this handler writes
+/// its sentinel into. Retiring or removing the entry withdraws that feed before the
+/// consumer has read what is already buffered, so up to `C` records are lost,
+/// and a sender that re-attaches quickly can have its records read ahead of
+/// the sentinel. No in-tree sender sends this message: a mux stream ends with
+/// its terminal record and `CloseSlot`, in order, on the slot itself.
 ///
 /// Idempotent: if the anchor is already absent, returns `Ok(())`.
 pub fn create_anchor_finalize_handler(manager: Arc<AnchorManager>) -> crate::messenger::Handler {

@@ -188,14 +188,16 @@ async fn stream_watchdog_unclaimed_bind_reap_increments_counter() {
     ));
     let pump_cancel = cancel_token.child_token();
     let pump = tokio::spawn(stream_watchdog(
-        transport_rx,
+        Arc::new(super::DirectFeed {
+            rx: transport_rx,
+            drain: Arc::clone(&drain),
+            pump_token: pump_cancel,
+        }),
         frame_tx,
-        pump_cancel,
         ctx,
-        PumpContext {
+        super::WatchdogContext {
             local_id,
             heartbeat_deadline: std::time::Duration::from_secs(5),
-            drain: Some(Arc::clone(&drain)),
             prebound: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
     ));
@@ -852,7 +854,7 @@ fn make_pump_test_infra() -> (
 /// `false` is an ordinary mux attach whose peer just hasn't sent its
 /// `OpenSlot` yet. Both start with `drain: Some(unclaimed)` -- the mux parks
 /// a `DrainSignal` for every bind, not only a pre-bound one -- which is
-/// exactly the distinction `PumpContext::prebound` exists to carry explicitly
+/// exactly the distinction `WatchdogContext::prebound` exists to carry explicitly
 /// rather than infer from `drain.claimed()`.
 ///
 /// `attachment` is independent of `prebound`, not `!prebound`: adoption is
@@ -923,14 +925,16 @@ fn make_watchdog_test_infra(
         metrics: None,
     };
     tokio::spawn(stream_watchdog(
-        transport_rx,
+        Arc::new(super::DirectFeed {
+            rx: transport_rx,
+            drain: Arc::clone(&drain),
+            pump_token: pump_cancel,
+        }),
         frame_tx,
-        pump_cancel,
         ctx,
-        PumpContext {
+        super::WatchdogContext {
             local_id,
             heartbeat_deadline,
-            drain: Some(Arc::clone(&drain)),
             prebound: Arc::new(std::sync::atomic::AtomicBool::new(prebound)),
         },
     ));
@@ -1044,7 +1048,7 @@ async fn test_watchdog_reaps_an_unclaimed_prebind_when_its_bind_is_reclaimed() {
 /// Finding: `drain.claimed().is_none()` is true of an ordinary mux attach's
 /// pump too, for as long as the peer's `OpenSlot` is still in flight -- which
 /// is always at least until after the attach response this pump was spawned
-/// from already returned (see `PumpContext::prebound`). Before gating on
+/// from already returned (see `WatchdogContext::prebound`). Before gating on
 /// `prebound` instead, this pump silently stopped counting heartbeat misses
 /// for the same window, so a sender that attached and then died before its
 /// first frame went undetected until the mux's 60 s accept-window timer
