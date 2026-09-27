@@ -164,8 +164,9 @@ pub struct MuxConfig {
     /// TTFT p50 was 135-355 ms. At 32 the surplus waits in each stream's own
     /// withheld queue on the producer instead, and TTFT p50 was 88-102 ms, with
     /// throughput and ITL p99 no worse and ITL p50 0.1-0.6 ms higher. At 32
-    /// frontend cores, where the frontend is not the bottleneck, 32 and 256
-    /// measured the same TTFT p50 and throughput. See `docs/src/operations/response-plane-performance.md`.
+    /// frontend cores, with headroom on the frontend, 32 and 256 measured the
+    /// same TTFT p50 and throughput, and 32 still cut the first record's wait
+    /// from 21-50 ms to 10-11 ms. See `docs/src/operations/response-plane-performance.md`.
     ///
     /// Advertised verbatim as the attach response's `initial_credit`, so it
     /// must never be zero: zero on the wire means *this peer is not offering

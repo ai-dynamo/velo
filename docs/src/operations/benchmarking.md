@@ -72,7 +72,7 @@ The harness reports TTFT and ITL as HDR histograms (p50, p95, p99). It also repo
 
 Sweep `--engines`, not `--anchor-hosts`. The per-peer costs on a frontend scale with its ingress peers, and an anchor host's ingress peers are the engines that stream to it. `--anchor-hosts` moves the smaller side of the same product.
 
-The harness agrees with `batched_streaming`. At `--anchor-hosts 3 --engines 2 --requests 96 --max-batch 32 --tokens 40`, it reports 5.41 tokens per write where `batched_streaming` reports 5.38.
+The harness agrees with `batched_streaming`. At `--anchor-hosts 3 --engines 2 --requests 96 --max-batch 32 --tokens 40`, it reports 5.41 tokens per write where `batched_streaming` reports 5.38, both at a credit window of 256.
 
 ### Limits of the in-process harness
 
@@ -84,7 +84,7 @@ The harness agrees with `batched_streaming`. At `--anchor-hosts 3 --engines 2 --
 
 ## The external serving rig
 
-The external rig runs velo as the response plane inside Dynamo's serving stack. It uses Dynamo's own HTTP frontend, its `mocker` engine and the `aiperf` load generator. The same rig runs Dynamo's own response planes, so only the response plane changes between arms. The rig scripts and the Dynamo adapter live outside this repository.
+The external rig runs velo as the response plane inside Dynamo's serving stack. It uses Dynamo's own HTTP frontend, its `mocker` engine and the `aiperf` load generator. The same rig runs Dynamo's own response planes, so only the response plane changes between arms. The rig scripts and the Dynamo adapter live outside this repository. The table below is the shape of the main comparison; other measurements state their own shape.
 
 | Item | Value |
 |---|---|

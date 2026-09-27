@@ -185,7 +185,7 @@ Without zero-RTT setup, the order does not matter. Each new attach negotiates th
 
 These changes were measured and did not help. Do not try them again without a new reason:
 
-- A grant threshold of half a window. It cut credit traffic 19-fold, did not change CPU, and made inter-token p99 worse.
+- A grant threshold of half a window, measured at a window of 256. It cut credit traffic 19-fold, did not change CPU, and made inter-token p99 worse.
 - A 500 µs data linger on the producers (`Auto { max_linger }`). It saved about 1 ms of frontend CPU per request and added about 10 ms to the request path.
 - A shorter `credit_sweep_interval` for faster credit. The arrival path already returns credit on the next batch.
 - `async_open_ack`, as described above.

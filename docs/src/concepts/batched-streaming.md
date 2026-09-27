@@ -345,7 +345,7 @@ The cost is latency, not memory, because the same clamps bound staged records. `
 
 A forward pass that sends to X streams with no `.await` between the sends puts them all in the shared egress queue. The default policy then sees all of them. A producer that awaits between sends (a tokenizer, a sampling callback, anything that yields) delivers each send to the batcher alone, and the ratio falls toward 1.0. Only an explicit flush groups sends that the runtime scheduled apart.
 
-The second reason is determinism. How many records share a batch under `Auto` depends on how the runtime scheduled the batcher against the producer. The `batched_streaming` example (three anchor hosts, two engines, loopback TCP, 20-core arm64 machine) shows the difference in tokens per wire write:
+The second reason is determinism. How many records share a batch under `Auto` depends on how the runtime scheduled the batcher against the producer. The `batched_streaming` example (three anchor hosts, two engines, loopback TCP, 20-core arm64 machine, credit window 256) shows the difference in tokens per wire write:
 
 | Configuration | Legacy per-stream | `Auto` (5 runs) | `Manual` (5 runs) |
 |---|---|---|---|
