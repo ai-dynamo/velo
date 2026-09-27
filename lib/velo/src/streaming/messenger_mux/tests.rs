@@ -1677,6 +1677,48 @@ async fn an_adopted_prebind_with_a_slow_heartbeat_is_reaped_by_the_accept_window
     );
 }
 
+/// An unclaimed pre-bind lives out its 60 s accept window and no longer.
+///
+/// The window is a deadline the credit sweep expires rather than a timer task
+/// per bind, so both edges are pinned here: just short of the window the bind
+/// and its anchor are still there, and one sweep interval past it both are
+/// gone and the consumer sees `SenderDropped`.
+#[tokio::test]
+async fn an_unclaimed_prebind_closes_at_its_accept_window_and_not_before() {
+    tokio::time::pause();
+    let config = test_config();
+    let sweep = config.credit_sweep_interval;
+    let node = prebinding_node(config, None).await;
+    let mut anchor = node.manager.create_anchor::<u32>();
+    let handle = anchor.handle();
+    let (_, local_id) = handle.unpack();
+    node.manager
+        .prebind_anchor(handle)
+        .expect("a mux is installed, so a ticket is minted");
+
+    tokio::time::sleep(ACCEPT_TIMEOUT - Duration::from_millis(500)).await;
+    assert!(
+        node.manager.registry.contains_key(&local_id),
+        "the accept window has not closed yet, so the pre-bound anchor must still be registered"
+    );
+
+    tokio::time::sleep(Duration::from_millis(500) + sweep * 2).await;
+    assert!(
+        !node.manager.registry.contains_key(&local_id),
+        "one sweep past the window, the unclaimed bind must be expired and its anchor reaped"
+    );
+    let next = tokio::time::timeout(Duration::from_millis(50), anchor.next())
+        .await
+        .expect("the bind is closed; the consumer must not block");
+    assert!(
+        matches!(
+            next,
+            Some(Err(crate::streaming::StreamError::SenderDropped))
+        ),
+        "expected SenderDropped, got {next:?}"
+    );
+}
+
 /// Arming an unattached timeout on a pre-bound anchor stores it without
 /// starting it.
 ///

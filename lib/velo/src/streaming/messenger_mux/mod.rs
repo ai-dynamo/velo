@@ -648,13 +648,16 @@ fn open_bind(core: &Arc<MuxCore>, anchor_id: u64, session_id: u64) -> flume::Rec
     // A deadline, not a task: the sweep expires it (`MuxCore::expire_binds`).
     // Nothing here may pin the core either, which a task holding a strong
     // handle would, for the full window after the last owner dropped it.
-    core.bind_deadlines
+    // The clock is read under the lock, so pushes land in deadline order.
+    let mut deadlines = core
+        .bind_deadlines
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push_back((
-            tokio::time::Instant::now() + ACCEPT_TIMEOUT,
-            (anchor_id, session_id),
-        ));
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    deadlines.push_back((
+        tokio::time::Instant::now() + ACCEPT_TIMEOUT,
+        (anchor_id, session_id),
+    ));
+    drop(deadlines);
 
     frame_rx
 }
