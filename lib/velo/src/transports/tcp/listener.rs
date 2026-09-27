@@ -43,6 +43,16 @@ fn note_teardown_arm() {
 #[inline(always)]
 fn note_teardown_arm() {}
 
+/// The one place a connection builds its teardown future, so the count the
+/// test reads is the count of builds, not of a separate call that could drift
+/// from them.
+fn connection_teardown(
+    shutdown_state: &ShutdownState,
+) -> tokio_util::sync::WaitForCancellationFutureOwned {
+    note_teardown_arm();
+    shutdown_state.teardown_token().clone().cancelled_owned()
+}
+
 /// Per-connection configuration handed to [`TcpListener::handle_connection`].
 struct ConnectionContext {
     adapter: TransportAdapter,
@@ -284,8 +294,7 @@ impl TcpListener {
         // Built once per connection: the token is node-wide, so a future
         // rebuilt per frame would register and remove a waiter on one
         // `Notify` shared by every connection, under its lock, per frame.
-        note_teardown_arm();
-        let teardown = shutdown_state.teardown_token().clone().cancelled_owned();
+        let teardown = connection_teardown(&shutdown_state);
         tokio::pin!(teardown);
 
         debug!("Connection from {} ready for frames", peer_addr);
@@ -569,19 +578,19 @@ mod tests {
     /// removes a waiter on one `Notify` shared by every connection -- about 5
     /// percent of a frontend's CPU at small batches. Teardown must still end
     /// the loop while frames are flowing, which is what the rebuilt future
-    /// bought.
+    /// bought, so the client here never stops sending: the cancel lands in the
+    /// middle of the stream.
     #[tokio::test]
     async fn a_connection_arms_its_teardown_once() {
         let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let client = tokio::spawn(async move {
             let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
-            for _ in 0..50 {
-                TcpFrameCodec::encode_frame(&mut s, MessageType::Response, b"h", b"p")
-                    .await
-                    .unwrap();
-            }
-            s
+            // Until the listener side closes the connection.
+            while TcpFrameCodec::encode_frame(&mut s, MessageType::Response, b"h", b"p")
+                .await
+                .is_ok()
+            {}
         });
         let (stream, peer) = listener.accept().await.unwrap();
         let (adapter, streams) = make_channels();
@@ -605,14 +614,21 @@ mod tests {
                 .expect("frame routed")
                 .unwrap();
         }
-        let _client = client.await.unwrap();
+        // Keep taking what is routed, so a full channel is not what stops the
+        // loop; only teardown should.
+        let responses = streams.response_stream.clone();
+        let drainer = tokio::spawn(async move { while responses.recv_async().await.is_ok() {} });
+        assert!(!client.is_finished(), "the client must still be sending");
         shutdown_state.teardown_token().cancel();
         tokio::time::timeout(Duration::from_secs(5), handler)
             .await
-            .expect("teardown ends the connection loop")
+            .expect("teardown ends the connection loop while frames are flowing")
             .unwrap()
             .unwrap();
         assert_eq!(arms.load(std::sync::atomic::Ordering::Relaxed), 1);
+        drop(streams);
+        client.abort();
+        drainer.abort();
     }
 
     #[test]
