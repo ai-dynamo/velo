@@ -162,7 +162,7 @@ pub struct MuxConfig {
     /// flight. On the serving rig with a saturated 24-core frontend, 8,192
     /// streams at 256 put the first token 96-268 ms behind the worker, and
     /// TTFT p50 was 135-355 ms. At 32 the surplus waits in each stream's own
-    /// withheld queue on the producer instead, and TTFT p50 was 77-102 ms, with
+    /// withheld queue on the producer instead, and TTFT p50 was 88-102 ms, with
     /// throughput and ITL p99 unchanged and ITL p50 0.1-0.6 ms higher. At 32
     /// frontend cores, where the frontend is not the bottleneck, 32 and 256
     /// measured the same. See `docs/src/operations/response-plane-performance.md`.
