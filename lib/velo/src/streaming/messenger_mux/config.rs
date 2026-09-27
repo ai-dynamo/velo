@@ -188,6 +188,11 @@ pub struct MuxConfig {
     /// login node and are retracted. See
     /// `docs/src/operations/response-plane-performance.md`.
     ///
+    /// The same tick closes expired accept windows, so an unclaimed bind is
+    /// reclaimed up to one interval after its 60 s window: a long interval
+    /// delays the `SenderDropped` an abandoned ticket's anchor is owed by as
+    /// much.
+    ///
     /// Must be non-zero. The sweep ticks on a `tokio::time::interval`, which
     /// has no zero period, so building a mux refuses a zero here the way it
     /// refuses a zero `initial_credit` — unlike

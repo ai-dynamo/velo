@@ -981,9 +981,8 @@ impl Velo {
     /// `None` means no ticket was minted and the worker should
     /// [`attach_anchor`](Velo::attach_anchor) the ordinary way.
     ///
-    /// Must be called from a runtime context: it spawns the stream watchdog
-    /// and the bind's accept-window task, exactly as the attach handler does
-    /// for a mux bind.
+    /// Must be called from a runtime context: it spawns the stream watchdog,
+    /// exactly as the attach handler does for a mux bind.
     pub fn prebind_anchor(
         &self,
         handle: StreamAnchorHandle,

@@ -259,7 +259,6 @@ Mutation testing showed that both original tests were blind: under a mutation th
 These properties of the current code are known and not yet changed:
 
 - **The sweep does not reclaim credit for a consumer that is gone.** A consumer that is gone counts no drains. The next record for its slot finds the receiver gone and closes the slot with `UnknownSlot`.
-- **Each bind spawns a 60-second accept-window task.** A claim does not cancel it. At 3,000 attaches per second, about 180,000 tasks are live. `expire_bind` is idempotent, so one reaper task with a monotonic deadline queue can replace them. It must keep the unconditional removal of the parked drain signal and the "no OpenSlot arrived" warning.
 - **The per-peer drain flag map never shrinks.** A claimed slot's `DrainSignal` holds its peer's flag as an `Arc` for the life of its stream. Removing the map entry while such a stream lives leaves its consumer setting a flag that nothing reads. That peer's credit then falls back to the periodic sweep. Removal must happen under the same visibility that retires slots and binds.
 - **A fence lift can queue behind opens.** Under `async_open_ack`, the batcher polls the opens channel ahead of coalesced control. While opens for a peer are queued, the resolution that lifts a fence waits.
 - **`velo_streaming_mux_live_slots` counts a slot killed while fenced.** Its registry entry survives until the admission resolves, which can be the rest of the epoch.
