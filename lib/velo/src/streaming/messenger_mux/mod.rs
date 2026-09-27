@@ -565,7 +565,14 @@ impl MuxCore {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let ready = deadlines.partition_point(|(deadline, _)| *deadline <= now);
-            deadlines.drain(..ready).map(|(_, key)| key).collect()
+            let due = deadlines.drain(..ready).map(|(_, key)| key).collect();
+            // A burst of binds leaves the queue's capacity behind it; give
+            // most of it back once the burst has aged out.
+            let floor = deadlines.len().max(1024);
+            if deadlines.capacity() > 4 * floor {
+                deadlines.shrink_to(2 * floor);
+            }
+            due
         };
         for (anchor_id, session_id) in due {
             // Whether or not the bind was still there, drop any drain signal
