@@ -298,9 +298,18 @@ impl IngressRegistry {
 
     /// Take this peer's wake down, so drains landing during the visit post a
     /// fresh one rather than being swallowed by it.
+    ///
+    /// A `swap`, not a store. A drain lists its slot and then `swap`s the flag
+    /// up; if this clear were a plain store, it could land after that set with
+    /// nothing ordering the drain's listing before this visit's take, so the
+    /// take could miss the listing and the drain's wake would be gone with the
+    /// flag -- the slot then waits for the periodic tick. As an `AcqRel` RMW
+    /// the clear either comes before the drain's set, and the drain posts a
+    /// wake, or after it and acquires it, and then the take below sees the
+    /// listing.
     pub(crate) fn clear_pending_wake(&self, peer: WorkerId) {
         if let Some(flag) = self.drain_pending.get(&peer) {
-            flag.store(false, Ordering::Release);
+            flag.swap(false, Ordering::AcqRel);
         }
     }
 

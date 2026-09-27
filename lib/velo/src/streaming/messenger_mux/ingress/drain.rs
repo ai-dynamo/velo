@@ -169,8 +169,10 @@ impl DrainSignal {
     ///
     /// Orderings: the count's `fetch_add` is `Relaxed` and the listing's
     /// `fetch_or` is `AcqRel`, so a take whose swap reads the listing (or any
-    /// later RMW on its word) sees the count. `pending` is a `swap`, never a
-    /// load followed by a store, so a concurrent clear is always observed.
+    /// later RMW on its word) sees the count. Both writers of `pending` are
+    /// RMWs -- this `swap(true)` and the visit's `swap(false)` in
+    /// `IngressRegistry::clear_pending_wake` -- so whichever comes second reads
+    /// the first; see there for why the clear cannot be a store.
     pub(crate) fn drained(&self) {
         let Some(claim) = self.claim.get() else {
             // Nothing has been delivered on this bind yet, so nothing drained.
