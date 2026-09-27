@@ -927,6 +927,14 @@ impl Velo {
     }
 
     /// Wait for a specific handler to become available on a remote instance.
+    ///
+    /// Returns at once, with no network I/O, when the handler list already
+    /// learned for `instance_id` names `handler_name`. Otherwise it refreshes
+    /// the list with a `_hello` round trip until the handler appears. It is
+    /// therefore not a reachability probe: once a handler is known, a later
+    /// call does not check that the peer is still there. The cached list is
+    /// kept for the process's life, which is safe because an instance id names
+    /// one process, and a restarted peer has a new one.
     pub async fn wait_for_handler(
         &self,
         instance_id: InstanceId,

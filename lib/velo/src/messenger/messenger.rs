@@ -895,9 +895,8 @@ mod tests {
     /// `_hello` round trip on every call, so a caller that asks once per
     /// request -- Dynamo's velo response plane asks before every `generate`
     /// -- put a round trip through the peer's messenger on every request's
-    /// critical path. On a busy peer that round trip is the slowest thing in
-    /// the request: a saturated frontend took its median first token from
-    /// under 100 ms to several hundred.
+    /// critical path, and on a saturated peer that round trip waits in the
+    /// peer's messenger queues.
     #[tokio::test]
     async fn waiting_for_a_known_handler_does_not_handshake_again() {
         // TCP loopback rather than the in-memory pair: other tests here clear

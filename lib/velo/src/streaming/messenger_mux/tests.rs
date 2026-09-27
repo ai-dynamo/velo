@@ -1603,7 +1603,7 @@ async fn an_adopted_prebind_is_reaped_on_heartbeat_silence_before_its_open_slot(
 
     // The adopting sender has not opened its slot yet -- nothing has claimed
     // the pre-bind's drain -- so the watchdog is still deciding purely on
-    // `PumpContext::prebound`, which adoption must have cleared.
+    // `WatchdogContext::prebound`, which adoption must have cleared.
     eventually(|| !node.manager.registry.contains_key(&local_id)).await;
 
     drop(anchor);
@@ -2060,6 +2060,65 @@ async fn a_retired_pump_withdraws_its_feed() {
         !installed(&node.manager),
         "the co-located attach retired the pre-bind's pump, so its feed must be gone too"
     );
+    drop(anchor);
+}
+
+/// A consumer that has ended retires its slot, even while the application
+/// still holds the anchor.
+///
+/// A record the consumer cannot decode ends the stream on the consumer side
+/// only: the sender is alive and keeps sending. The anchor still holds
+/// receiver clones of the slot buffer through its feed, so a delivery finding
+/// no receiver is not what retires the slot here. The terminal arm removes the
+/// anchor's entry and cancels its token, and that retires the slot. A change
+/// that kept the entry alive after a terminal error would leave a slot taking
+/// deliveries nobody reads, until the sender filled `C + 1` and parked for
+/// good; this pins that it does not.
+///
+/// The watchdog ending a silent stream retires the slot the same way.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ended_consumer_releases_its_slot_while_the_anchor_is_held() {
+    let pair = mux_pair(test_config()).await;
+    let manager = AnchorManagerBuilder::default()
+        .worker_id(pair.consumer_worker)
+        .transport(
+            Arc::clone(&pair.consumer) as Arc<dyn crate::streaming::transport::FrameTransport>
+        )
+        .build()
+        .expect("anchor manager");
+    manager
+        .install_mux(Arc::clone(&pair.consumer))
+        .expect("install mux");
+
+    let mut anchor = manager.create_anchor::<u32>();
+    let (_, local_id) = anchor.handle().unpack();
+    let ticket = manager.prebind_anchor(anchor.handle()).expect("ticket");
+    let tx = pair
+        .producer
+        .connect(pair.consumer_worker, local_id, ticket.routing_session_id)
+        .await
+        .expect("connect");
+    // 0xc1 is the one byte MessagePack never assigns, so this cannot decode.
+    tx.send_async(vec![0xc1])
+        .await
+        .expect("send the bad record");
+    let ended = tokio::time::timeout(RECV_TIMEOUT, anchor.next())
+        .await
+        .expect("timed out waiting for the bad record");
+    assert!(
+        matches!(
+            ended,
+            Some(Err(crate::streaming::StreamError::DeserializationError(_)))
+        ),
+        "expected DeserializationError, got {ended:?}"
+    );
+
+    // The sender is alive and keeps going. Its next delivery must find nobody
+    // reading, so the slot retires.
+    for n in 0..4 {
+        let _ = tx.try_send(item(n));
+    }
+    eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 0).await;
     drop(anchor);
 }
 
