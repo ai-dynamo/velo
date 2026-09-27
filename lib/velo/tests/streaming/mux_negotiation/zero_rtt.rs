@@ -856,3 +856,72 @@ async fn co_located_local_attach_is_refused_once_the_prebind_is_claimed() {
     // by a released pre-bind nor interleaved with a second sender's frames.
     drain_stream(anchor, sender, 20).await;
 }
+
+/// Finding: every bind left a task behind for the full 60 s accept window.
+///
+/// `open_bind` spawned one timer task per bind that only the transport's own
+/// shutdown cancelled, so an `OpenSlot` claiming the bind did not end it. A
+/// frontend registering 2,000 requests a second carried about 120,000 idle
+/// tasks and timer entries at steady state (146,000 live tasks on the rig
+/// against about 25,000 on the QUIC plane), and each one woke once, a minute
+/// late, to remove a bind that was long gone. The accept window is a property
+/// of the bind, so it must not outlive the bind by a minute; the sweep now
+/// expires binds from one deadline queue and no bind owns a task.
+///
+/// Counts every task on the shared runtime, so it covers the producer's side
+/// as well: once the streams have ended and their anchors are dropped, nothing
+/// per stream may stay alive.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_finished_zero_rtt_stream_leaves_no_task_behind() {
+    const STREAMS: usize = 200;
+    let (consumer, producer) = pair(Some(mux_config()), Some(mux_config())).await;
+    let alive = || {
+        tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks()
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let base = alive();
+
+    let mut anchors = Vec::new();
+    let mut senders = Vec::new();
+    for _ in 0..STREAMS {
+        let anchor = consumer.velo.create_anchor::<u32>();
+        let handle = transfer(anchor.handle());
+        let ticket = ship(consumer.velo.prebind_anchor(handle).expect("ticket"));
+        senders.push(
+            producer
+                .velo
+                .open_anchor_stream::<u32>(handle, ticket)
+                .await
+                .expect("zero-RTT open"),
+        );
+        anchors.push(anchor);
+    }
+    for sender in senders {
+        sender.send(1).await.expect("send");
+        sender.finalize().expect("finalize");
+    }
+    for anchor in &mut anchors {
+        while let Some(frame) = anchor.next().await {
+            if matches!(frame.expect("frame"), StreamFrame::Finalized) {
+                break;
+            }
+        }
+    }
+    drop(anchors);
+
+    // Far inside the 60 s window: a per-bind timer still holds its task here.
+    let settled = tokio::time::timeout(Duration::from_secs(2), async {
+        while alive() > base + STREAMS / 20 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        settled.is_ok(),
+        "{} tasks still alive 2 s after {STREAMS} streams ended (baseline {base}): \
+         something per stream outlives the stream",
+        alive()
+    );
+}

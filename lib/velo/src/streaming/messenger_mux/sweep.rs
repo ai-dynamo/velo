@@ -251,6 +251,7 @@ pub(super) fn spawn_sweep(core: &Arc<MuxCore>) {
             match wake {
                 Wake::Tick => {
                     core.sweep();
+                    core.expire_binds(now);
                     visits.forget_stale(now);
                 }
                 Wake::Peer(peer) => {

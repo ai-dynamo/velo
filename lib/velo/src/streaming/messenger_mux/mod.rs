@@ -113,6 +113,7 @@ mod test_support;
 #[cfg(test)]
 mod tests;
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
@@ -237,6 +238,17 @@ struct MuxCore {
     /// `bind` returns. Take-once: whoever collects it owns it, and the bind
     /// expiry that already exists drops any that was never collected.
     drains: DashMap<(u64, u64), Arc<ingress::DrainSignal>>,
+    /// Accept-window deadlines, one per bind, oldest first.
+    ///
+    /// Every bind gets the same `ACCEPT_TIMEOUT`, so pushing at bind time keeps
+    /// the queue in deadline order and the sweep only ever pops its front. A
+    /// bind claimed or released early stays queued and costs a failed lookup
+    /// when its deadline comes; that is cheaper than finding and removing it.
+    /// It used to be one timer task per bind, which nothing but shutdown
+    /// cancelled: a claimed bind's task lived out the full minute, so a
+    /// frontend opening 2,000 streams a second carried about 120,000 idle
+    /// tasks.
+    bind_deadlines: std::sync::Mutex<VecDeque<(tokio::time::Instant, (u64, u64))>>,
     /// A barrier handed to every batcher this core spawns, installed by the
     /// tests that need one held mid-wake. See [`peer_batcher::test_hooks`].
     #[cfg(test)]
@@ -322,6 +334,7 @@ impl MessengerMuxTransport {
             drain_tx,
             drain_rx,
             drains: DashMap::new(),
+            bind_deadlines: std::sync::Mutex::default(),
             #[cfg(test)]
             hooks: std::sync::OnceLock::new(),
         });
@@ -541,6 +554,35 @@ impl MuxCore {
         self.send_replies(&batcher, peer, &[reply]);
     }
 
+    /// Close the accept window on every bind whose deadline has passed.
+    ///
+    /// Runs on the sweep tick, so a window closes up to one
+    /// `credit_sweep_interval` late -- 200 ms on a 60 s window by default.
+    fn expire_binds(&self, now: tokio::time::Instant) {
+        let due: Vec<(u64, u64)> = {
+            let mut deadlines = self
+                .bind_deadlines
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let ready = deadlines.partition_point(|(deadline, _)| *deadline <= now);
+            deadlines.drain(..ready).map(|(_, key)| key).collect()
+        };
+        for (anchor_id, session_id) in due {
+            // Whether or not the bind was still there, drop any drain signal
+            // no attach collected. Without this an attach that failed between
+            // `bind` and `take_drain_signal` would leak one entry per attempt
+            // for the process's life.
+            self.drains.remove(&(anchor_id, session_id));
+            if self.ingress.expire_bind(anchor_id, session_id) {
+                tracing::warn!(
+                    anchor_id,
+                    session_id,
+                    "messenger mux: no OpenSlot arrived before the accept window closed"
+                );
+            }
+        }
+    }
+
     /// One sweep tick: return credit, then age out idle batchers.
     fn sweep(&self) {
         for peer in self.ingress.peers() {
@@ -589,9 +631,9 @@ impl Drop for MuxCore {
 /// The body [`FrameTransport::bind`] and
 /// [`MessengerMuxTransport::prebind`] share. `bind` is async because the trait
 /// is; **nothing in here awaits**, and that is what lets the zero-RTT path call
-/// it synchronously while registering a request. Anything a future accept-window
-/// change touches — the reaper this window is a candidate to become — is here,
-/// once, rather than in two places that would drift.
+/// it synchronously while registering a request. The accept window is a
+/// deadline the sweep expires (`MuxCore::expire_binds`), queued here, once,
+/// rather than in two places that would drift.
 fn open_bind(core: &Arc<MuxCore>, anchor_id: u64, session_id: u64) -> flume::Receiver<Vec<u8>> {
     // `C + 1`: `C` data credits plus the one reserved terminal credit.
     // Credit is issued against *this* buffer and never against the
@@ -603,34 +645,16 @@ fn open_bind(core: &Arc<MuxCore>, anchor_id: u64, session_id: u64) -> flume::Rec
     core.ingress
         .register_bind(anchor_id, session_id, frame_tx, drain);
 
-    // `Weak`, and cancellable. A strong handle here would pin the whole
-    // transport alive for the full accept window after the last owner
-    // dropped it — a minute of leaked slots, batcher tasks and ingress
-    // state per outstanding bind, and a `live_slots` gauge that only
-    // comes back to zero when the timers do.
-    let expiry = Arc::downgrade(core);
-    let cancel = core.cancel.clone();
-    tokio::spawn(async move {
-        tokio::select! {
-            () = cancel.cancelled() => return,
-            () = tokio::time::sleep(ACCEPT_TIMEOUT) => {}
-        }
-        let Some(core) = expiry.upgrade() else {
-            return;
-        };
-        // Whether or not the bind was still there, drop any drain
-        // signal no attach collected. Without this an attach that
-        // failed between `bind` and `take_drain_signal` would leak one
-        // entry per attempt for the process's life.
-        core.drains.remove(&(anchor_id, session_id));
-        if core.ingress.expire_bind(anchor_id, session_id) {
-            tracing::warn!(
-                anchor_id,
-                session_id,
-                "messenger mux: no OpenSlot arrived before the accept window closed"
-            );
-        }
-    });
+    // A deadline, not a task: the sweep expires it (`MuxCore::expire_binds`).
+    // Nothing here may pin the core either, which a task holding a strong
+    // handle would, for the full window after the last owner dropped it.
+    core.bind_deadlines
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push_back((
+            tokio::time::Instant::now() + ACCEPT_TIMEOUT,
+            (anchor_id, session_id),
+        ));
 
     frame_rx
 }

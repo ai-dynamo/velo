@@ -119,9 +119,10 @@ Before the fixes above, these symbols appeared only in velo's profile, as a shar
 | `set_active_anchor_gauge` | 0.49% | The gauge recounts the anchor registry on each create and retire | Removed: the gauge is computed when scraped |
 | `CancellationToken::is_cancelled` | 0.43% | Per-record checks on the delivery path | Removed for the mux with the reader pump; the producer's per-send check remains |
 
+Removed, measured on the rig rather than in a profile: each bind used to spawn one task that slept for the 60-second accept window, and a claim did not cancel it. A frontend at about 2,000 requests per second held 146,000 live tokio tasks against about 25,000 on the QUIC plane. The accept window is now a deadline in one queue that the credit sweep drains, so a bind owns no task and a window closes up to one sweep interval late. The test `a_finished_zero_rtt_stream_leaves_no_task_behind` holds the task count to its baseline after streams end.
+
 These costs are counted from source, not measured:
 
-- **Accept-window tasks.** Each bind spawns one task that sleeps for the 60-second accept window, and a claim does not cancel it. At 3,000 attaches per second, about 180,000 such tasks and timers are live. This is a memory and task-count cost, not a per-record one.
 - **The per-record copy.** Ingress copies each record body into a `Vec` (one allocation and one `memcpy`, estimated at 35 to 55 ns). Removing it needs `Bytes` from the slot buffer through to the consumer. On the microbenchmark below, `memcpy` was 0.5% of frontend CPU.
 - **Wakes.** `flume` fires a waker only for a parked receiver, so k records for one slot in one batch already cost one wake. With the direct feed, a record makes one hop, from the slot buffer to the consumer.
 

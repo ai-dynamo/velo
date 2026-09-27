@@ -222,10 +222,9 @@ pub(crate) struct PreBind {
     anchor_id: u64,
     ticket: crate::streaming::control::StreamOpenTicket,
     drain: Arc<crate::streaming::messenger_mux::ingress::DrainSignal>,
-    /// `Weak` for the same reason the accept window's task holds one: a strong
-    /// handle inside a registry entry would keep the transport, its batchers
-    /// and its ingress state alive for as long as anything holds the anchor
-    /// registry.
+    /// `Weak` because a strong handle inside a registry entry would keep the
+    /// transport, its batchers and its ingress state alive for as long as
+    /// anything holds the anchor registry.
     ///
     /// It is also how [`PreBind::adopt`] defuses `Drop` — see there.
     mux: std::sync::Weak<crate::streaming::messenger_mux::MessengerMuxTransport>,
@@ -1241,9 +1240,8 @@ impl AnchorManager {
     /// unlike the rollback they are a caller mistake rather than a
     /// configuration.
     ///
-    /// Must be called from a runtime context: it spawns the stream watchdog and
-    /// the bind's accept-window task, exactly as the attach handler does for a
-    /// mux bind.
+    /// Must be called from a runtime context: it spawns the stream watchdog,
+    /// exactly as the attach handler does for a mux bind.
     ///
     /// The ticket may sit in a request envelope for up to the mux's 60 s
     /// accept window before its worker opens it: heartbeat detection does not
@@ -1277,9 +1275,9 @@ impl AnchorManager {
         }
 
         // Fail fast on the common "not pre-bindable" case before minting a
-        // session id or registering a bind: `mux.prebind` spawns the 60 s
-        // accept-window task, and there is no reject path that can cancel it
-        // once running. This is a plain read, not a lock the mutate-and-check
+        // session id or registering a bind: `mux.prebind` queues a 60 s
+        // accept-window deadline, and a bind registered for nothing holds its
+        // buffer until that deadline passes. This is a plain read, not a lock the mutate-and-check
         // below still has to redo -- an entry can change between the two, and
         // that race is the same bounded one every other caller of this check
         // already accepts (see the `Entry::Occupied` arm below).
