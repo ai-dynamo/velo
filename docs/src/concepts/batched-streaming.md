@@ -251,7 +251,7 @@ sequenceDiagram
 
 Credit for a record returns when the record reaches the anchor channel, not when it enters the mux buffer. Anchor backpressure therefore reaches the sender one hop sooner.
 
-A producer that ran out of credit sends no batches, so the arrival path does not run for its slots. It waits for the doorbell floor and then for the reply linger. Per record this costs `(drain_visit_floor + reply_linger) / initial_credit`. At the defaults (2 ms, 1 ms and 256) that is under 12 µs per record.
+A producer that ran out of credit sends no batches, so the arrival path does not run for its slots. It waits for the doorbell floor and then for the reply linger. Per record this costs `(drain_visit_floor + reply_linger) / initial_credit`. At the defaults (2 ms, 1 ms and 32) that is about 94 µs per record.
 
 The periodic walk does not reclaim credit for a slot whose pump died, because a dead pump counts no drains. The next record that arrives for such a slot finds its receiver gone and closes the slot with `UnknownSlot`.
 

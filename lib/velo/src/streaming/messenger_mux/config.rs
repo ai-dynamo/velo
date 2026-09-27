@@ -155,6 +155,18 @@ pub struct MuxConfig {
     /// Data credit `C` granted to each new slot, and therefore the depth of the
     /// `C + 1` buffer `bind` hands the anchor.
     ///
+    /// It also bounds how much of the shared per-peer path one stream can fill,
+    /// and that is why the default is 32 rather than 256. When the consumer
+    /// node is the bottleneck, every stream runs at its window, and a new
+    /// stream's first record queues behind everything the others have in
+    /// flight. On the serving rig with a saturated 24-core frontend, 8,192
+    /// streams at 256 put the first token 96-268 ms behind the worker, and
+    /// TTFT p50 was 135-355 ms. At 32 the surplus waits in each stream's own
+    /// withheld queue on the producer instead, and TTFT p50 was 77-102 ms, with
+    /// throughput and ITL p99 unchanged and ITL p50 0.1-0.6 ms higher. At 32
+    /// frontend cores, where the frontend is not the bottleneck, 32 and 256
+    /// measured the same. See `docs/src/operations/response-plane-performance.md`.
+    ///
     /// Advertised verbatim as the attach response's `initial_credit`, so it
     /// must never be zero: zero on the wire means *this peer is not offering
     /// the mux*. Building a mux refuses a zero rather than letting a node
@@ -224,9 +236,9 @@ pub struct MuxConfig {
     /// keeps sending never reaches this floor at all. A drain whose listing
     /// found the lane full is not on the lane and so not on this path either;
     /// `credit_sweep_interval` is what covers it. That is one wait per window,
-    /// so what it costs per record is `floor / initial_credit` — negligible at
-    /// the default 256-record window, and visible at the small windows the
-    /// credit tests use deliberately. It stacks with
+    /// so what it costs per record is `floor / initial_credit` — about 60 µs at
+    /// the default 2 ms floor and 32-record window, and more at the smaller
+    /// windows the credit tests use deliberately. It stacks with
     /// [`reply_linger`](Self::reply_linger) rather than replacing it: the
     /// return still has to cross the receiver's egress batcher once it is
     /// reconciled here.
@@ -368,8 +380,8 @@ pub struct MuxConfig {
     /// wins.
     ///
     /// The return a sender is owed is delayed by at most this long, once per
-    /// window, which per record is `reply_linger / initial_credit`: nothing at
-    /// the default 256-record window. On the drain-driven return path this
+    /// window, which per record is `reply_linger / initial_credit`: about 30 µs
+    /// at the default 1 ms linger and 32-record window. On the drain-driven return path this
     /// stacks with [`drain_visit_floor`](Self::drain_visit_floor) rather than
     /// replacing it — a producer parked out of credit can wait for both, in
     /// series.
@@ -386,7 +398,7 @@ impl Default for MuxConfig {
         Self {
             enabled: false,
             max_batch_bytes: 60 * 1024,
-            initial_credit: 256,
+            initial_credit: 32,
             slot_byte_budget: DEFAULT_SLOT_BYTE_BUDGET,
             peer_byte_budget: DEFAULT_PEER_BYTE_BUDGET,
             credit_sweep_interval: Duration::from_millis(200),

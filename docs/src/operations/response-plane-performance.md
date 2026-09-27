@@ -8,7 +8,7 @@ The response plane is the path that carries generated tokens from a worker back 
 
 Measured on 2026-09-10 on the external rig that [Benchmarking](benchmarking.md#the-external-serving-rig) describes: 512 mocker workers, concurrency 8,192 and 250,000 requests per rep. The frontend ran on one tokio runtime with 72 workers. Each of two matrices ran three reps per plane.
 
-The velo configuration: mux over TCP, zero-RTT stream setup, write on admission (`FlushPolicy::Auto` with `on_admission`), `reply_linger` 1 ms, `initial_credit` 256, `async_open_ack` off.
+The velo configuration: mux over TCP, zero-RTT stream setup, write on admission (`FlushPolicy::Auto` with `on_admission`), `reply_linger` 1 ms, `initial_credit` 256 (the default when these were measured; now 32, see [The credit window and a saturated frontend](#the-credit-window-and-a-saturated-frontend)), `async_open_ack` off.
 
 A holder is a mocker process that keeps part of the 8,192-request backlog after the opening burst. The holder count sets throughput and the tails for every plane, so reps compare only at a matched holder count. Steady state is the requests that started 10 s or later into the measured phase. Where two reps share a draw, both values are shown.
 
@@ -145,6 +145,24 @@ These mechanisms were found:
 - **The steady-state tail is the hot mocker process and HTTP ingress, in both planes.** In steady state, segment B contributes nothing to p99. Segment C adds 125 to 209 ms, and 59% to 89% of the p90-to-p99 band sits on one mocker process with 3,000 to 6,400 requests in flight. Segment A adds 39 to 112 ms. The raw p99 is the opening burst, described in [Benchmarking](benchmarking.md#steady-state-and-raw-percentiles).
 - **End-to-end and ITL tails measure one mocker process.** Arrivals are equal across the 8 mocker processes. In-flight counts are not: seven sit at 150 to 200 and one at 3,000 to 7,000 for the whole run, in every plane. By Little's law, a request on the hot process stays about 15 s against 0.43 s elsewhere. End-to-end p99 and ITL p99 therefore measure which process holds the backlog, not the plane.
 - **velo's tail discipline is conditional.** Before pinning, velo appeared to keep a much shorter end-to-end tail. That was a starved frontend limiting how many streams ran at once. With the frontend on 48 cores and the load generator on 96, velo held 8.1 s end-to-end p99 at 3,008 req/s against the comparison plane's 25.2 s at 2,460. On a 72/72 split, both planes posted about 11.5 s.
+
+### The credit window and a saturated frontend
+
+When the frontend is the bottleneck, every stream runs at its credit window, and the windows fill the shared path between a worker and the frontend: the worker's egress queue, both socket buffers and the frontend's reader. A new stream's first record queues behind all of it. The comparison plane has no per-request credit, and its worker-side send blocks, so its backlog stays in the producer.
+
+Setup: the Dynamo mocker rig with 16 processes of 32 workers, concurrency 8,192, ISL 1,024, OSL 900, speedup 10, the frontend pinned to 24 or 32 cores, and three interleaved repetitions per arm. The worker and frontend histograms timed a stream's first record from the worker handing it to the plane to the frontend receiving it.
+
+| Frontend | Credit window | req/s | TTFT p50 (ms) | ITL p50 (ms) | ITL p99 (ms) | First record, worker to frontend (ms) |
+|---|---:|---:|---:|---:|---:|---:|
+| 24 cores | 256 | 1,940 to 2,135 | 135 to 355 | 1.62 to 1.88 | 4.7 to 11.6 | 96 to 268 |
+| 24 cores | 32 | 2,022 to 2,102 | 88 to 102 | 1.74 to 2.30 | 4.7 to 4.9 | 16 to 31 |
+| 24 cores | 16 | 2,052 to 2,055 | 77 to 78 | 1.79 to 1.87 | 4.9 to 5.3 | 9 to 11 |
+| 24 cores | comparison plane | 1,712 to 2,059 | 84 to 97 | 0.75 to 1.61 | 9.9 to 33.9 | - |
+| 32 cores | 256 | 2,117 to 2,164 | 90 to 107 | 1.31 to 1.80 | 4.2 to 4.8 | 21 to 50 |
+| 32 cores | 32 | 2,138 to 2,177 | 93 to 95 | 1.37 to 1.40 | 4.0 to 4.2 | 10 to 11 |
+
+The default window is therefore 32. At 32, the surplus waits in each stream's own withheld queue on the producer rather than in the shared path: sender credit exhaustion rose from about 240,000 to about 1.2 million events per repetition, worker egress wait fell from 9.5 to 1.2 ms, and the frontend's lane wait fell from 1.8 to 0.7 ms. The cost is more grants per stream, which shows as 0.1 to 0.6 ms of ITL p50. A window of 64 closed only part of the gap. The per-stream backlog itself does not go away while the frontend is the bottleneck; it moves to where it delays only its own stream.
+
 
 ## UCX transport instability
 

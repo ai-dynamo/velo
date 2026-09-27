@@ -88,7 +88,7 @@ All settings are fields of `MuxConfig`. Always build it with `..Default::default
 |---|---|---|
 | `enabled` | `false` | Installs the mux and advertises `messenger-mux-v2`. Setting it back to `false` is the rollback. |
 | `max_batch_bytes` | 60 KiB | The configured cap on one batch. The eager budget and the 64 KiB coalescing threshold also clamp it. |
-| `initial_credit` | 256 | Data credit C per slot. Each slot buffer holds C+1 records. Zero is refused at build time. |
+| `initial_credit` | 32 | Data credit C per slot. Each slot buffer holds C+1 records. Zero is refused at build time. |
 | `slot_byte_budget` | 1 MiB | Bytes one slot can hold in flight, and the cap on its withheld queue. Zero means the default. |
 | `peer_byte_budget` | 8 MiB | Bytes all slots of one peer can hold in flight on the receive side. |
 | `credit_sweep_interval` | 200 ms | Period of the whole-table credit walk and the batcher eviction check. Zero is refused at build time. |
@@ -102,7 +102,7 @@ All settings are fields of `MuxConfig`. Always build it with `..Default::default
 
 `initial_credit` sets how many records a sender can send on one slot before it needs a grant.
 
-- Keep the default of 256 for token streams.
+- Keep the default of 32 for token streams. A larger window lets every stream fill the shared path between a producer and a saturated consumer node, and a new stream's first record then waits behind all of it. See [The credit window and a saturated frontend](../operations/response-plane-performance.md#the-credit-window-and-a-saturated-frontend).
 - A stream longer than the window needs grants. The consumer node returns credit as its consumer drains, usually when the next batch from the producer arrives. A live consumer therefore rarely stalls its producer.
 - Do not set a small window to save memory. A small window raises the credit-return latency per record. For a producer that ran out of credit, it is `(drain_visit_floor + reply_linger) / initial_credit`.
 - Do not set zero. Zero on the wire means "not offering the mux", and the build refuses it.
