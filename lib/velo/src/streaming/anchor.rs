@@ -1473,7 +1473,7 @@ impl AnchorManager {
                         });
                         // Installed under the shard lock, so a retire or a
                         // removal cannot land between this and the install.
-                        let feed = crate::streaming::control::install_direct_feed(
+                        let (feed, replaced) = crate::streaming::control::install_direct_feed(
                             entry,
                             crate::streaming::control::DirectFeed {
                                 rx: receiver.clone(),
@@ -1492,13 +1492,15 @@ impl AnchorManager {
                             entry.heartbeat_interval,
                             prebound,
                             feed,
+                            replaced,
                         ))
                     }
                 }
             }
         };
 
-        let Some((ticket, frame_tx, heartbeat_interval, prebound, feed)) = prepared else {
+        let Some((ticket, frame_tx, heartbeat_interval, prebound, feed, replaced)) = prepared
+        else {
             // Nothing took ownership of the bind, so give it straight back
             // rather than leaving the accept window to find it in a minute.
             mux.release_bind(local_id, routing_session_id);
@@ -1515,6 +1517,9 @@ impl AnchorManager {
             return None;
         };
 
+        if let Some(replaced) = replaced {
+            replaced.release_slot();
+        }
         drop(receiver);
         crate::streaming::control::launch_direct_stream(
             feed,
@@ -2897,7 +2902,7 @@ mod tests {
         ));
         {
             let mut entry = mgr.registry.get_mut(&local_id).expect("entry");
-            crate::streaming::control::install_direct_feed(
+            let _installed = crate::streaming::control::install_direct_feed(
                 &mut entry,
                 crate::streaming::control::DirectFeed {
                     rx,

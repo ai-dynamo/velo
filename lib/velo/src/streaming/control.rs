@@ -611,7 +611,10 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::messe
                             // Drop shard lock before spawning
                             drop(occ);
 
-                            if let Some(feed) = direct {
+                            if let Some((feed, replaced)) = direct {
+                                if let Some(replaced) = replaced {
+                                    replaced.release_slot();
+                                }
                                 drop(receiver);
                                 launch_direct_stream(
                                     feed,

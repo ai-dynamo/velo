@@ -199,20 +199,26 @@ impl FeedCell {
 /// Takes the entry itself, not its `Arc<FeedCell>`, so a caller can only
 /// reach it through a registry guard: cloning the cell out and installing
 /// after the lock drops does not type-check.
+///
+/// Returns the new feed and the one it replaced, if any. A feed still
+/// installed belongs to a stream this anchor has moved on from, and nothing
+/// else holds it to close its slot, so the caller calls
+/// [`DirectFeed::release_slot`] on it once the shard lock drops: the close
+/// takes the peer's ingress lock.
+#[must_use = "the replaced feed's slot must be closed once the shard lock drops"]
 pub(crate) fn install_direct_feed(
     entry: &mut crate::streaming::anchor::AnchorEntry,
     feed: DirectFeed,
-) -> Arc<DirectFeed> {
+) -> (Arc<DirectFeed>, Option<Arc<DirectFeed>>) {
     let feed = Arc::new(feed);
-    // A feed still installed belongs to a stream this anchor has moved on
-    // from, and nothing else holds it to close its slot.
-    if let Some(replaced) = entry.feed.install(Arc::clone(&feed)) {
-        // Cancelled first, so its watchdog reads the close that follows as a
-        // retirement and leaves the entry, now the new feed's, alone.
+    let replaced = entry.feed.install(Arc::clone(&feed));
+    if let Some(replaced) = &replaced {
+        // Cancelled under the shard lock, the lock a firing watchdog reads
+        // the token under (`fire_watchdog`), so the replaced feed's watchdog
+        // cannot remove the entry, now the new feed's.
         replaced.pump_token.cancel();
-        replaced.release_slot();
     }
-    feed
+    (feed, replaced)
 }
 
 /// Start a mux bind's stream: wake the consumer, spawn the watchdog.
@@ -352,6 +358,9 @@ pub(crate) async fn stream_watchdog(
                 }
                 missed += 1;
                 if missed >= DETECTION_MULTIPLIER {
+                    if !fire_watchdog(&cancel_token, &frame_tx, &ctx.registry, local_id) {
+                        break;
+                    }
                     if let Some(m) = ctx.metrics.as_ref() {
                         m.record_heartbeat_watchdog_firing();
                     }
@@ -362,21 +371,40 @@ pub(crate) async fn stream_watchdog(
                         heartbeat_deadline_ms = heartbeat_deadline.as_millis() as u64,
                         detection_multiplier = DETECTION_MULTIPLIER,
                         "stream_watchdog: nothing arrived from a sender holding credit \
-                         for the detection window, injecting Dropped"
+                         for the detection window, injected Dropped"
                     );
-                    let _ = frame_tx.try_send(crate::streaming::sender::cached_dropped().clone());
-                    // Removing the entry closes the slot and tells the sender
-                    // (`AnchorEntry`'s `Drop`): a sender judged dead sends
-                    // nothing a delivery could fail on.
-                    if let Some((_, entry)) = ctx.registry.remove(&local_id) {
-                        entry.cancel_token.cancel();
-                    }
                     break;
                 }
             }
         }
     }
     cancel_token.cancel();
+}
+
+/// Remove the anchor a watchdog judged dead, and tell its consumer. Returns
+/// whether it fired.
+///
+/// The token is read under the entry's shard lock, the lock
+/// [`install_direct_feed`] cancels a replaced feed's token under. A watchdog
+/// whose `select!` took the timer arm just before an attach replaced its feed
+/// would otherwise remove the new stream's entry and put `Dropped` on its
+/// channel.
+///
+/// Removing the entry closes the slot and tells the sender (`AnchorEntry`'s
+/// `Drop`): a sender judged dead sends nothing a delivery could fail on.
+fn fire_watchdog(
+    cancel_token: &CancellationToken,
+    frame_tx: &flume::Sender<Vec<u8>>,
+    registry: &dashmap::DashMap<u64, crate::streaming::anchor::AnchorEntry>,
+    local_id: u64,
+) -> bool {
+    let Some((_, entry)) = registry.remove_if(&local_id, |_, _| !cancel_token.is_cancelled())
+    else {
+        return false;
+    };
+    let _ = frame_tx.try_send(crate::streaming::sender::cached_dropped().clone());
+    entry.cancel_token.cancel();
+    true
 }
 
 #[cfg(test)]
@@ -407,6 +435,33 @@ mod tests {
             pump_token,
             release: None,
         }
+    }
+
+    /// A watchdog retired while it was firing leaves the entry and its channel
+    /// alone: both belong to the stream that replaced its feed.
+    #[test]
+    fn a_watchdog_retired_mid_firing_leaves_the_new_stream_alone() {
+        let registry = dashmap::DashMap::new();
+        registry.insert(1, entry());
+        let (frame_tx, frame_rx) = flume::unbounded();
+
+        let retired = CancellationToken::new();
+        retired.cancel();
+        assert!(!fire_watchdog(&retired, &frame_tx, &registry, 1));
+        assert!(registry.contains_key(&1), "the new stream's entry stays");
+        assert!(frame_rx.is_empty(), "and its consumer sees no Dropped");
+
+        assert!(fire_watchdog(
+            &CancellationToken::new(),
+            &frame_tx,
+            &registry,
+            1
+        ));
+        assert!(!registry.contains_key(&1));
+        assert_eq!(
+            frame_rx.try_recv().expect("Dropped"),
+            *crate::streaming::sender::cached_dropped()
+        );
     }
 
     /// A retired feed never reaps; an abandoned one reaps exactly once.
