@@ -58,8 +58,9 @@ pub(crate) struct DrainSignal {
     /// count). The direct feed's watchdog reads it as the sender's liveness:
     /// it never sees a frame itself.
     arrivals: AtomicU64,
-    /// Whether the sender holds no data credit, published by the slot. The
-    /// watchdog's exemption: a sender without credit cannot heartbeat.
+    /// Whether the sender holds no data credit and no records wait in the
+    /// reorder hold, published by the slot. The watchdog's exemption: a
+    /// sender without credit cannot heartbeat.
     sender_parked: AtomicBool,
     /// Set with `closed`, readable without a lock; see `is_released`.
     released: AtomicBool,
@@ -221,8 +222,9 @@ impl DrainSignal {
         }
     }
 
-    /// Whether the sender holds no data credit, so cannot send a heartbeat.
-    /// Read by the stream watchdog, which may be up to a credit round trip
+    /// Whether the sender holds no data credit, so cannot send a heartbeat,
+    /// and no records wait in the reorder hold (see `IngressSlot`'s
+    /// `publish_credit`). Read by the stream watchdog, which may be up to a credit round trip
     /// behind; its detection window is several heartbeats long.
     pub(crate) fn sender_parked(&self) -> bool {
         self.sender_parked.load(Ordering::Relaxed)
@@ -257,7 +259,7 @@ impl DrainSignal {
         self.closed.clone()
     }
 
-    /// How many batches have delivered into this slot.
+    /// How many records have been delivered into this slot.
     pub(crate) fn arrivals(&self) -> u64 {
         self.arrivals.load(Ordering::Relaxed)
     }

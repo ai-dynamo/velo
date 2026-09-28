@@ -86,9 +86,8 @@
 //! answers a wake, no more often than once per
 //! [`MuxConfig::drain_visit_floor`]; it is what covers a peer that has gone
 //! quiet. The **periodic tick** walks the whole table, for the slot nothing
-//! named — one parked with nothing arriving *and* nothing being taken out, or
-//! one listed while the sweep task was shutting down — and it carries batcher
-//! eviction.
+//! named — one parked with nothing arriving *and* nothing being taken out —
+//! and it carries batcher eviction.
 //!
 //! The set is a doorbell, not a ledger: a listing names a slot and carries no
 //! quantity. The quantity is the count on that slot's own signal, and

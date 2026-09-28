@@ -895,9 +895,10 @@ impl<T: DeserializeOwned> Stream for StreamAnchor<T> {
                             // `None` by the time it reaches here. So a
                             // `Some(prebind)` seen at this line is always
                             // claimed -- but `Detached` is a terminal
-                            // sentinel, and the ingress applies it through
-                            // `deliver()` -> `finish_close(TerminalSent)` in
-                            // the same critical section that puts these very
+                            // sentinel. Its sender puts it and its
+                            // `CloseSlot{TerminalSent}` in one batch, and the
+                            // ingress retires the slot on that close in the
+                            // same critical section that puts these very
                             // bytes into the slot buffer the consumer reads.
                             // The consumer can read them before that section
                             // ends, but a close it posts takes the same lock
