@@ -160,20 +160,6 @@ impl FeedCell {
         feed
     }
 
-    /// Take `feed` out if it is still the installed one, so the feed of a
-    /// stream that ended does not outlive it, and leave a newer feed alone.
-    pub(crate) fn withdraw_if(&self, feed: &Arc<DirectFeed>) -> Option<Arc<DirectFeed>> {
-        let mut slot = self.feed.lock();
-        if !slot
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, feed))
-        {
-            return None;
-        }
-        self.generation.fetch_add(1, Ordering::Release);
-        slot.take()
-    }
-
     pub(crate) fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
     }
@@ -371,7 +357,7 @@ pub(crate) async fn stream_watchdog(
                         heartbeat_deadline_ms = heartbeat_deadline.as_millis() as u64,
                         detection_multiplier = DETECTION_MULTIPLIER,
                         "stream_watchdog: nothing arrived from a sender holding credit \
-                         for the detection window, injected Dropped"
+                         for the detection window, injecting Dropped"
                     );
                     break;
                 }
@@ -462,6 +448,36 @@ mod tests {
             frame_rx.try_recv().expect("Dropped"),
             *crate::streaming::sender::cached_dropped()
         );
+    }
+
+    /// A mux stream's own `Detached` retires its watchdog with its feed.
+    ///
+    /// Withdrawing the feed alone left the watchdog running with a live token.
+    /// A re-attach then installs into an empty cell, so nothing cancels that
+    /// token, and a firing already under way removes the new stream's entry.
+    #[test]
+    fn an_ended_feed_retires_its_watchdog() {
+        let registry = dashmap::DashMap::new();
+        registry.insert(1, entry());
+        let ended_token = CancellationToken::new();
+        {
+            let mut entry = registry.get_mut(&1).expect("entry");
+            let (ended, _) = install_direct_feed(&mut entry, unclaimed_feed(ended_token.clone()));
+            entry.active_pump_token = Some(ended_token.clone());
+            entry.retire_ended_feed(&ended);
+
+            let newer = CancellationToken::new();
+            let (_, replaced) = install_direct_feed(&mut entry, unclaimed_feed(newer.clone()));
+            assert!(replaced.is_none(), "the ended feed already left the cell");
+            entry.active_pump_token = Some(newer);
+        }
+        let (frame_tx, frame_rx) = flume::unbounded();
+        assert!(
+            !fire_watchdog(&ended_token, &frame_tx, &registry, 1),
+            "the ended stream's watchdog must not fire on the re-attached entry"
+        );
+        assert!(registry.contains_key(&1));
+        assert!(frame_rx.is_empty());
     }
 
     /// A retired feed never reaps; an abandoned one reaps exactly once.

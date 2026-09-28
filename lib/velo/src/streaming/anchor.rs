@@ -319,6 +319,20 @@ impl AnchorEntry {
         token
     }
 
+    /// Retire the pump if `feed` is still the installed one: a mux stream's
+    /// own `Detached` ended it. The watchdog stops with the feed, so it
+    /// cannot fire later on the entry a re-attach reuses. A newer feed is not
+    /// this stream's to stop.
+    pub(crate) fn retire_ended_feed(&mut self, feed: &Arc<crate::streaming::control::DirectFeed>) {
+        if self
+            .feed
+            .current()
+            .is_some_and(|current| Arc::ptr_eq(&current, feed))
+        {
+            self.retire_pump();
+        }
+    }
+
     /// Whether a pre-bound slot on this anchor already has a sender.
     ///
     /// `attachment` does not answer this. Nothing on the zero-RTT path sets it
@@ -930,10 +944,10 @@ impl<T: DeserializeOwned> Stream for StreamAnchor<T> {
                             // poll: a new sender can land in between.
                             //
                             // A mux stream's own `Detached` ends its feed, so
-                            // the feed leaves the cell with it. Left there, it
-                            // would make the next non-mux sender's `Detached`
-                            // read as stale, and the anchor would stay
-                            // attached to nobody. A newer feed stays.
+                            // the feed and its watchdog retire with it. Left
+                            // there, the feed would make the next non-mux
+                            // sender's `Detached` read as stale, and the
+                            // anchor would stay attached to nobody.
                             let from_feed = this.from_feed;
                             let ended_feed = this
                                 .feed
@@ -946,7 +960,7 @@ impl<T: DeserializeOwned> Stream for StreamAnchor<T> {
                                 .filter(|entry| from_feed || entry.feed.current().is_none())
                                 .and_then(|mut entry| {
                                     if let Some(feed) = &ended_feed {
-                                        entry.feed.withdraw_if(feed);
+                                        entry.retire_ended_feed(feed);
                                     }
                                     entry.attachment = false;
                                     let released = entry.prebind.take();
