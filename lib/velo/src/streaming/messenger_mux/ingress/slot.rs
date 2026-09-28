@@ -161,11 +161,6 @@ impl IngressSlot {
         (self.account.limit(), self.byte_watermark)
     }
 
-    /// Tell the slot's drain signal a batch delivered into it.
-    pub(super) fn note_arrival(&self) {
-        self.drain.note_arrival();
-    }
-
     /// Put this slot on the pass's reconcile list, reporting whether the
     /// caller now owes the list an entry.
     pub(super) fn mark_touched(&mut self) -> bool {
@@ -281,11 +276,16 @@ impl IngressSlot {
         grant
     }
 
-    /// Tell the drain signal whether the sender still holds credit, for the
-    /// stream watchdog: a sender without credit cannot heartbeat.
+    /// Tell the drain signal whether the sender is parked on its consumer, for
+    /// the stream watchdog: a sender without credit cannot heartbeat.
+    ///
+    /// Not while records wait in the reorder hold. Credit spent into the hold
+    /// comes back only once the gap closes and the consumer reads them, so a
+    /// gap that never closes would leave the sender "parked" for good and the
+    /// stuck stream exempt from the watchdog.
     fn publish_credit(&self) {
         self.drain
-            .set_sender_parked(!self.account.peer_holds_credit());
+            .set_sender_parked(!self.account.peer_holds_credit() && self.hold.is_empty());
     }
 
     /// Inject the `Dropped` sentinel a consumer sees when its sender dies.
@@ -319,6 +319,7 @@ impl IngressSlot {
             return Applied::Fault(CloseReason::ProtocolError);
         }
         self.hold.insert(frame_seq, body);
+        self.publish_credit();
         Applied::Held
     }
 
@@ -332,6 +333,7 @@ impl IngressSlot {
             super::super::flow_control::release_pair(peer_bytes, &mut self.hold_bytes, len);
             self.next_seq = self.next_seq.saturating_add(1);
         }
+        self.publish_credit();
         Applied::Delivered
     }
 
@@ -350,6 +352,10 @@ impl IngressSlot {
             Ok(()) => {
                 self.sizes.push_back(len);
                 self.buffered_bytes = self.buffered_bytes.saturating_add(u64::from(len));
+                // Counted on delivery, not on arrival at the slot: a record
+                // parked behind a gap proves nothing the consumer can use, and
+                // a gap that never closes must not look like a live stream.
+                self.drain.note_arrival();
                 Ok(())
             }
             Err(flume::TrySendError::Full(_)) => Err(DeliverFault::ReaderStall),

@@ -81,9 +81,9 @@ pub(crate) struct PumpContext {
     /// The anchor's local id, for registry removal on heartbeat loss.
     pub(crate) local_id: u64,
     /// The anchor's configured cadence, carried to the sender on the attach
-    /// response or the ticket. `DETECTION_MULTIPLIER` misses is a dead
-    /// stream -- except while [`awaiting_sender`] holds, which every window a
-    /// pre-bind spends with no sender yet does by construction.
+    /// response. `DETECTION_MULTIPLIER` misses is a dead stream. MPSC has no
+    /// pre-bind path, so unlike the stream watchdog there is no "no sender
+    /// yet" exemption to apply.
     pub(crate) heartbeat_deadline: Duration,
     /// The mux bind's drain signal. `mpsc_reader_pump` tells it when a record
     /// leaves the buffer credit is issued against. `None` for every transport

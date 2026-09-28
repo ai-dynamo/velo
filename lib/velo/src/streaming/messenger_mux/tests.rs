@@ -1263,7 +1263,7 @@ async fn unclaimed_bind_is_reclaimed_on_anchor_death_without_the_timer() {
     assert_eq!(
         mux.parked_drains(),
         0,
-        "`prebind_anchor` collected the drain signal inline, before spawning the pump, so no \
+        "`prebind_anchor` collected the drain signal inline, before spawning the watchdog, so no \
          later attach can find one parked here"
     );
 
@@ -1612,7 +1612,7 @@ async fn an_adopted_prebind_is_reaped_on_heartbeat_silence_before_its_open_slot(
 /// End-to-end version of the reap-on-reclaim fix (`control::reap_unclaimed`,
 /// run by the stream watchdog or the consumer), driven through the real
 /// `AnchorManager` / mux stack rather than a synthetic fixture: at a heartbeat interval the watchdog alone cannot
-/// beat the fixed 60 s accept window with (`>= 20 s` -- `DETECTION_MULTIPLIER`
+/// beat the 60 s accept window with (`>= 20 s` -- `DETECTION_MULTIPLIER`
 /// is 3, so the watchdog's earliest fire from a fresh window is `3 *
 /// heartbeat`), an adopted pre-bind whose sender never delivers its
 /// `OpenSlot` must still be reaped once the accept window closes, and the
@@ -1667,7 +1667,7 @@ async fn an_adopted_prebind_with_a_slow_heartbeat_is_reaped_by_the_accept_window
 
     let next = tokio::time::timeout(Duration::from_millis(50), anchor.next())
         .await
-        .expect("the pump already exited on the accept window; the consumer must not block");
+        .expect("the watchdog already exited on the accept window; the consumer must not block");
     assert!(
         matches!(
             next,
@@ -1945,7 +1945,7 @@ async fn a_consumer_that_never_polls_holds_its_sender_to_the_window() {
     let stalled = received();
     // The window, plus the slot's `OpenSlot` record riding in the same count.
     assert!(
-        stalled <= f64::from(CREDIT + 2),
+        (f64::from(CREDIT)..=f64::from(CREDIT + 2)).contains(&stalled),
         "nobody polled the anchor, yet the consumer node accepted {stalled} records \
          against a window of {CREDIT}"
     );
@@ -2151,30 +2151,46 @@ async fn a_sender_starved_by_the_byte_budget_is_not_reaped() {
 /// and deliver into it -- a `Dropped` from the release included. A consumer
 /// still reading the old feed would take that as its own stream ending, under
 /// a co-located sender that is writing to the anchor channel.
+///
+/// The consumer has read once first, so it holds the feed itself: clearing the
+/// cell is not enough, the withdrawal has to reach its cached copy.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_retired_pump_withdraws_its_feed() {
-    let node = prebinding_node(test_config(), None).await;
-    let anchor = node.manager.create_anchor::<u32>();
-    let handle = anchor.handle();
-    let (_, local_id) = handle.unpack();
-    node.manager.prebind_anchor(handle).expect("ticket");
-    let installed = |m: &AnchorManager| {
-        m.registry
-            .get(&local_id)
-            .is_some_and(|entry| entry.feed.current().is_some())
-    };
-    assert!(installed(&node.manager), "the pre-bind installs its feed");
-
-    let _sender = node
-        .manager
-        .attach_stream_anchor::<u32>(handle)
+    let heartbeat = Duration::from_secs(60);
+    let (_pair, manager, mut anchor, local_id, tx) =
+        watched_anchor::<u32>(test_config(), heartbeat, false).await;
+    // The consumer reads once, so it holds the pre-bind's feed for itself,
+    // not only through the cell.
+    tx.send_async(item(0)).await.expect("send item");
+    let first = tokio::time::timeout(RECV_TIMEOUT, anchor.next())
         .await
-        .expect("co-located attach");
+        .expect("timed out waiting for the first record")
+        .expect("stream ended early")
+        .expect("record decodes");
+    assert!(matches!(first, StreamFrame::Item(0)));
+
+    // What a co-located attach over the pre-bind, or a detach, does to the
+    // stream serving the anchor.
+    let _ = manager
+        .registry
+        .get_mut(&local_id)
+        .expect("entry")
+        .retire_pump();
+    // Whatever reaches the retired buffer now -- a late record, or the
+    // `Dropped` a release can deliver -- belongs to the old stream.
+    tx.send_async(item(99))
+        .await
+        .expect("send into the retired slot");
+    let next = tokio::time::timeout(Duration::from_millis(300), anchor.next()).await;
     assert!(
-        !installed(&node.manager),
-        "the co-located attach retired the pre-bind's pump, so its feed must be gone too"
+        next.is_err(),
+        "the consumer must not read the retired pre-bind's buffer, got {next:?}"
     );
-    drop(anchor);
+    assert!(
+        manager.registry.contains_key(&local_id),
+        "retiring the watchdog leaves the anchor for whatever attaches next"
+    );
+    drop(tx);
 }
 
 /// A consumer that ends the stream on its own side closes its slot at once,
@@ -2233,6 +2249,65 @@ async fn a_watchdog_firing_closes_its_slot() {
     eventually(|| !manager.registry.contains_key(&local_id)).await;
     eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 0).await;
     drop((anchor, tx));
+}
+
+/// Cancelling a stream closes its slot and tells the sender.
+///
+/// A frontend's most common mid-stream end is its client going away, which
+/// drops the anchor and cancels it through its controller. The cancel removes
+/// the anchor, but a slot with no `PreBind` (adopted here, as on an ordinary
+/// attach) and a sender that sends nothing more would otherwise stay live, with
+/// its peer batcher.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelling_a_stream_closes_its_slot() {
+    let heartbeat = Duration::from_secs(60);
+    let (pair, _manager, anchor, _local_id, tx) =
+        watched_anchor::<u32>(test_config(), heartbeat, true).await;
+    tx.send_async(item(0)).await.expect("send item");
+    eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 1).await;
+
+    anchor.controller().cancel();
+    eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 0).await;
+    drop((anchor, tx));
+}
+
+/// Dropping an anchor before any sender opened its slot gives the bind back.
+///
+/// The bind would otherwise wait out the 60 s accept window, one per request
+/// a frontend abandoned before its worker got to it.
+#[tokio::test(flavor = "multi_thread")]
+async fn dropping_an_anchor_before_its_sender_opens_releases_the_bind() {
+    let pair = mux_pair(test_config()).await;
+    let manager = AnchorManagerBuilder::default()
+        .worker_id(pair.consumer_worker)
+        .transport(
+            Arc::clone(&pair.consumer) as Arc<dyn crate::streaming::transport::FrameTransport>
+        )
+        .build()
+        .expect("anchor manager");
+    manager
+        .install_mux(Arc::clone(&pair.consumer))
+        .expect("install mux");
+    let anchor = manager.create_anchor::<u32>();
+    let (_, local_id) = anchor.handle().unpack();
+    manager.prebind_anchor(anchor.handle()).expect("ticket");
+    let request = crate::streaming::control::AnchorAttachRequest {
+        handle: anchor.handle(),
+        session_id: 1,
+        stream_cancel_handle: crate::streaming::control::StreamCancelHandle::pack(
+            pair.producer_worker,
+            1,
+        ),
+        supported_transport_keys: vec![velo_ext::TransportKey::new(MESSENGER_MUX_KEY)],
+    };
+    assert!(matches!(
+        manager.adopt_prebind(local_id, &request),
+        crate::streaming::anchor::PrebindAdoption::Adopted(_)
+    ));
+    assert_eq!(pair.consumer.pending_binds(), 1);
+
+    drop(anchor);
+    eventually(|| pair.consumer.pending_binds() == 0).await;
 }
 
 /// An anchor leaving the registry takes its feed out of the cell.

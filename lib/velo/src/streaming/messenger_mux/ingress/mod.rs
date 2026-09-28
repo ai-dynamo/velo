@@ -817,8 +817,6 @@ fn deliver(
     // visit that takes a drain count of zero and returns.
     if slot.mark_touched() {
         touched.push(id.index());
-        // First delivery into this slot this batch: the sender is alive.
-        slot.note_arrival();
     }
     let held_before = slot.held();
     let applied = slot.apply_data(record.frame_seq, body, peer_bytes);

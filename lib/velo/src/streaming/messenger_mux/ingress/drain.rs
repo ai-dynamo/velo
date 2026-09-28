@@ -162,9 +162,10 @@ impl DrainSignal {
     ///
     /// `try_send` rather than an await on the wake: this runs on the
     /// consumer's path for every record and must never park it. The wake lane
-    /// is unbounded (`drain_wake_lane` has why), so the send fails only once
-    /// the sweep task is gone; `pending` goes back down then, since leaving it
-    /// up would claim a visit is coming when none is.
+    /// is unbounded (`drain_wake_lane` has why) and the mux core holds its
+    /// receiver, so the send fails only once the core itself is gone. If it
+    /// does, `pending` goes back down, since leaving it up would claim a visit
+    /// is coming when none is.
     ///
     /// A per-slot record threshold was the alternative to the wake and is
     /// worse on both counts: it withholds credit for the first `T` records of
@@ -195,8 +196,9 @@ impl DrainSignal {
         }
     }
 
-    /// A batch delivered into this slot. Once per batch, not per record: the
-    /// watchdog only asks whether the count moved during its window.
+    /// A record delivered into this slot's buffer. The watchdog only asks
+    /// whether the count moved during its window; the ingress counts
+    /// deliveries, not records parked in its reorder hold.
     pub(super) fn note_arrival(&self) {
         self.arrivals.fetch_add(1, Ordering::Relaxed);
     }

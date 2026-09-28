@@ -315,11 +315,9 @@ pub(crate) async fn stream_watchdog(
                          for the detection window, injecting Dropped"
                     );
                     let _ = frame_tx.try_send(crate::streaming::sender::cached_dropped().clone());
-                    // The removal below withdraws the feed before the consumer
-                    // could close the slot itself, and a sender judged dead
-                    // sends nothing a delivery could fail on, so close it here
-                    // and tell the sender.
-                    feed.release_slot();
+                    // Removing the entry closes the slot and tells the sender
+                    // (`AnchorEntry`'s `Drop`): a sender judged dead sends
+                    // nothing a delivery could fail on.
                     if let Some((_, entry)) = ctx.registry.remove(&local_id) {
                         entry.cancel_token.cancel();
                     }

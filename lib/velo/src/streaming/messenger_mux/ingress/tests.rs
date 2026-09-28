@@ -479,6 +479,65 @@ fn ahead_of_sequence_records_are_held_until_the_gap_closes() {
     assert_eq!(frames, vec![item(1), item(2), item(3)]);
 }
 
+/// Records waiting behind a gap are neither arrivals nor a parked sender.
+///
+/// The stream watchdog reads two things off the drain signal: whether
+/// anything arrived for the consumer, and whether the sender holds no credit
+/// and so cannot heartbeat. Records parked ahead of a gap reach neither the
+/// consumer nor the buffer, and a gap that never closes -- a batch lost on its
+/// way, a rendezvous payload that failed to resolve -- would stop the stream
+/// for good. If held records counted as arrivals, or a window spent into the
+/// hold counted as a parked sender, that stuck stream would be exempt from the
+/// watchdog forever, with its slot, held bytes and peer batcher kept alive.
+///
+/// Control: the same window delivered in order does park the sender.
+#[test]
+fn records_held_behind_a_gap_do_not_keep_the_stream_alive() {
+    let (registry, consumer, config) = bound();
+    let id = slot(0, 0);
+    open(&registry, &config, id, 1);
+
+    // The whole window (4) spent past a gap at seq 1.
+    let payload = batch(1, 1, |encoder| {
+        for seq in 2..=5 {
+            encoder.push_data(id, seq, &item(seq as u8)).unwrap();
+        }
+    });
+    handle_batch(&registry, &config, None, peer(), &payload);
+    assert!(
+        consumer.pump().is_empty(),
+        "the gap is open, so nothing is delivered"
+    );
+    assert_eq!(
+        consumer.drain.arrivals(),
+        0,
+        "records held behind a gap never reached the consumer"
+    );
+    assert!(
+        !consumer.drain.sender_parked(),
+        "a window spent into the hold is a stuck stream, not a sender waiting on its consumer"
+    );
+}
+
+#[test]
+fn a_window_delivered_in_order_parks_the_sender() {
+    let (registry, consumer, config) = bound();
+    let id = slot(0, 0);
+    open(&registry, &config, id, 1);
+
+    let payload = batch(1, 1, |encoder| {
+        for seq in 1..=4 {
+            encoder.push_data(id, seq, &item(seq as u8)).unwrap();
+        }
+    });
+    handle_batch(&registry, &config, None, peer(), &payload);
+    assert!(consumer.drain.arrivals() > 0);
+    assert!(
+        consumer.drain.sender_parked(),
+        "the window sits unread in the buffer, so the sender holds no credit"
+    );
+}
+
 #[test]
 fn records_behind_the_sequence_are_dropped_as_duplicates() {
     let (registry, consumer, config) = bound();
@@ -724,7 +783,7 @@ fn terminal_then_close_delivers_the_terminal_and_injects_nothing() {
     );
     assert!(
         consumer.rx.is_disconnected(),
-        "dropping the mux-side sender is what makes reader_pump exit its usual Err branch"
+        "dropping the mux-side sender is what ends the consumer's feed"
     );
 }
 
@@ -1000,7 +1059,7 @@ fn a_batch_returns_the_credit_of_every_slot_that_drained() {
     assert_eq!(
         outcome.replies,
         vec![ReplyRecord::CreditUpdate { slot: b, delta: 2 }],
-        "B's pump counted two records out and listed B in the peer's dirty \
+        "B's consumer counted two records out and listed B in the peer's dirty \
          set, so this batch must carry B's grant even though it delivered \
          only into A; without it B's sender waits for a doorbell visit"
     );
@@ -1114,7 +1173,7 @@ fn the_grant_is_what_the_pump_counted_not_what_the_channel_holds() {
     assert_eq!(
         registry.sweep_credit(peer()),
         vec![ReplyRecord::CreditUpdate { slot: id, delta: 1 }],
-        "the pump counted 2 drains but `sizes` and the account both show only \
+        "the consumer counted 2 drains but `sizes` and the account both show only \
          1 record still outstanding, so the grant is 1, clamped by the \
          account rather than inflated by the count"
     );
@@ -1402,7 +1461,7 @@ fn a_heartbeat_record_reaches_the_consumer_as_a_heartbeat_frame() {
         consumer.pump(),
         vec![crate::streaming::sender::cached_heartbeat().clone()],
         "a heartbeat is a Data-class record: dropping one under saturation is \
-         the per-slot saturation signal reader_pump's watchdog watches for"
+         the per-slot saturation signal the stream watchdog watches for"
     );
     assert_eq!(RecordType::SlotHeartbeat.as_u8(), 4);
 }

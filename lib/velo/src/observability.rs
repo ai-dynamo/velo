@@ -1602,7 +1602,9 @@ impl VeloMetrics {
                  above: this is the accept window catching what the watchdog \
                  either cannot see yet (no sender exists) or would catch too \
                  late (the watchdog's threshold exceeds the accept window's \
-                 remaining span, at heartbeat_interval >= 20s).",
+                 remaining span, at heartbeat_interval >= 20s, give or take one \
+                 credit_sweep_interval, since the accept window closes on the sweep \
+                 tick).",
             ))?,
         )?;
         let streaming_egress_flushes_total = register_collector(

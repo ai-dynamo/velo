@@ -278,10 +278,21 @@ impl PreBind {
 }
 
 impl Drop for AnchorEntry {
-    /// A removed entry lets go of its feed, so the slot buffer's receiver
-    /// goes with it and the mux sees a consumer that is gone the way it always
-    /// has: a delivery that finds no receiver left.
+    /// A removed entry closes its mux slot, tells the sender, and lets go of
+    /// its feed.
+    ///
+    /// Every way a stream leaves the registry passes through here: the
+    /// consumer's own terminal, a watchdog firing, a cancel through the
+    /// controller or the anchor's drop, the accept window. Waiting for a
+    /// delivery to find no receiver is not enough, because a sender that is
+    /// dead, or parked on its window, sends nothing to fail on; the slot and its
+    /// peer batcher would stay live. The close is idempotent and checks the
+    /// slot's generation and session, and a stream that ended on its sender's
+    /// terminal has no slot left to close.
     fn drop(&mut self) {
+        if let Some(feed) = self.feed.current() {
+            feed.release_slot();
+        }
         self.feed.withdraw();
     }
 }
@@ -683,16 +694,15 @@ impl<T> StreamAnchor<T> {
     /// serving it, with nothing telling either to stop.
     ///
     /// Called from `poll_next` on every terminal arm, including
-    /// `TransportError` and a frame that fails to deserialize. The feed's
-    /// receiver clones would otherwise outlive the stream while the
-    /// application holds the anchor, and a sender that ended up parked sends
-    /// nothing a delivery could fail on, so the slot is closed through the mux
-    /// and the sender told (`SlotRelease`). After the sender's own terminal
-    /// the slot is already gone and the close finds nothing to do.
+    /// `TransportError` and a frame that fails to deserialize. Removing the
+    /// entry closes the mux slot and tells the sender (`AnchorEntry`'s
+    /// `Drop`); the receiver clones this consumer holds are dropped here, or
+    /// they would outlive the stream while the application holds the
+    /// anchor.
     fn retire(&mut self) {
-        if let Some((feed, _)) = self.feed.take() {
-            feed.release_slot();
-        }
+        // The entry's drop closes the slot; the receiver clones this consumer
+        // took for itself go here.
+        self.feed = None;
         if let Some((_, entry)) = self.registry.remove(&self.local_id) {
             entry.cancel_token.cancel();
         }
@@ -968,6 +978,10 @@ pub struct AnchorManager {
     pub messenger: Option<Arc<crate::messenger::Messenger>>,
 
     /// Shared Prometheus collectors for streaming control-plane metrics.
+    ///
+    /// Set it through the builder. `build` registers this manager as a source
+    /// of `velo_streaming_active_anchors` with these collectors, so collectors
+    /// assigned to the field afterwards never see the gauge.
     #[builder(default)]
     pub metrics: Option<Arc<VeloMetrics>>,
 
