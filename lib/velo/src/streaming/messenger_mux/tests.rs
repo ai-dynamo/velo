@@ -2344,6 +2344,66 @@ async fn an_ordinary_end_takes_no_ingress_lock() {
     }
 }
 
+/// A re-attach over the mux does not overtake what the previous sender sent.
+///
+/// A co-located sender writes into the anchor channel, and its detach queues
+/// `Detached` there. A remote sender that attaches next is read from a mux
+/// feed, which the consumer polls ahead of the anchor channel. If the new feed
+/// were read at once, the new stream's records would overtake the old tail and
+/// its `Detached`, and that late `Detached` would then clear the new stream's
+/// attachment. The consumer reads what the anchor channel already holds first.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reattach_over_the_mux_does_not_overtake_the_detached_tail() {
+    let pair = mux_pair(test_config()).await;
+    let manager = AnchorManagerBuilder::default()
+        .worker_id(pair.consumer_worker)
+        .transport(
+            Arc::clone(&pair.consumer) as Arc<dyn crate::streaming::transport::FrameTransport>
+        )
+        .build()
+        .expect("anchor manager");
+    manager
+        .install_mux(Arc::clone(&pair.consumer))
+        .expect("install mux");
+    let mut anchor = manager.create_anchor::<u32>();
+    let (_, local_id) = anchor.handle().unpack();
+
+    let first = manager
+        .attach_stream_anchor::<u32>(anchor.handle())
+        .await
+        .expect("co-located attach");
+    first.send(0).await.expect("send");
+    first.send(1).await.expect("send");
+    first.detach().expect("detach");
+
+    // The second sender attaches over the mux before the consumer has read
+    // anything the first one sent.
+    let ticket = manager.prebind_anchor(anchor.handle()).expect("ticket");
+    let tx = pair
+        .producer
+        .connect(pair.consumer_worker, local_id, ticket.routing_session_id)
+        .await
+        .expect("connect");
+    tx.send_async(item(100)).await.expect("send");
+    eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 1).await;
+
+    let mut seen = Vec::new();
+    for _ in 0..4 {
+        let frame = tokio::time::timeout(RECV_TIMEOUT, anchor.next())
+            .await
+            .expect("timed out waiting for a frame")
+            .expect("stream ended early")
+            .expect("frame decodes");
+        seen.push(format!("{frame:?}"));
+    }
+    assert_eq!(
+        seen,
+        ["Item(0)", "Item(1)", "Detached", "Item(100)"],
+        "the old sender's tail and its Detached come before the new stream"
+    );
+    drop(tx);
+}
+
 /// Dropping an anchor before any sender opened its slot gives the bind back.
 ///
 /// The bind would otherwise wait out the 60 s accept window, one per request

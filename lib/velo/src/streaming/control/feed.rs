@@ -135,9 +135,16 @@ pub(crate) struct FeedCell {
 }
 
 impl FeedCell {
-    fn install(&self, feed: Arc<DirectFeed>) {
-        *self.feed.lock() = Some(feed);
+    /// Install `feed`, returning the one it replaces, if any.
+    ///
+    /// The generation moves under the same lock as the feed, so a
+    /// [`snapshot`](Self::snapshot) never pairs a feed with another feed's
+    /// generation.
+    fn install(&self, feed: Arc<DirectFeed>) -> Option<Arc<DirectFeed>> {
+        let mut slot = self.feed.lock();
+        let replaced = slot.replace(feed);
         self.generation.fetch_add(1, Ordering::Release);
+        replaced
     }
 
     /// Take the feed out, so the consumer stops reading that slot buffer on
@@ -145,7 +152,8 @@ impl FeedCell {
     /// when the anchor entry is removed: the token alone no longer cuts the
     /// data path, because the consumer is the data path.
     pub(crate) fn withdraw(&self) -> Option<Arc<DirectFeed>> {
-        let feed = self.feed.lock().take();
+        let mut slot = self.feed.lock();
+        let feed = slot.take();
         if feed.is_some() {
             self.generation.fetch_add(1, Ordering::Release);
         }
@@ -158,6 +166,12 @@ impl FeedCell {
 
     pub(crate) fn current(&self) -> Option<Arc<DirectFeed>> {
         self.feed.lock().clone()
+    }
+
+    /// The feed together with the generation it was installed at.
+    pub(crate) fn snapshot(&self) -> (u64, Option<Arc<DirectFeed>>) {
+        let slot = self.feed.lock();
+        (self.generation.load(Ordering::Acquire), slot.clone())
     }
 }
 
@@ -176,7 +190,11 @@ pub(crate) fn install_direct_feed(
     feed: DirectFeed,
 ) -> Arc<DirectFeed> {
     let feed = Arc::new(feed);
-    entry.feed.install(Arc::clone(&feed));
+    // A feed still installed belongs to a stream this anchor has moved on
+    // from, and nothing else holds it to close its slot.
+    if let Some(replaced) = entry.feed.install(Arc::clone(&feed)) {
+        replaced.release_slot();
+    }
     feed
 }
 

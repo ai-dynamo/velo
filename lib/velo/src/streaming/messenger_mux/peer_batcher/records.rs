@@ -38,8 +38,9 @@ impl Batcher {
             return;
         };
         // Terminal-ness costs an `rmp_serde` decode attempt on anything that is
-        // not one of the three cached sentinels, so it is asked only where the
-        // answer changes what happens. On the fast path a record with data
+        // neither an `Item` (recognized by its first bytes) nor one of the
+        // cached sentinels, so it is asked only where the answer changes what
+        // happens. On the fast path a record with data
         // credit behind it is sent either way. On the starved path it decides
         // whether the reserve applies, and the whole reason the reserve exists
         // is that a terminal must not wait on credit a stalled consumer will

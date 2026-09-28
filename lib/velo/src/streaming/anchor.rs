@@ -584,6 +584,10 @@ pub struct StreamAnchor<T> {
     /// Whether the last frame `poll_frame` returned came from `feed` rather
     /// than the anchor channel.
     from_feed: bool,
+    /// Read the anchor channel before a newly installed feed. Anything already
+    /// there was sent before the new sender attached -- a co-located sender's
+    /// tail and its `Detached` -- and must not be overtaken.
+    channel_first: bool,
     /// Set to true after a terminal sentinel; prevents further polling.
     terminated: bool,
     /// The local ID of the anchor in the registry (for cancel).
@@ -628,6 +632,7 @@ impl<T> StreamAnchor<T> {
             feed_generation: 0,
             feed: None,
             from_feed: false,
+            channel_first: false,
             terminated: false,
             local_id,
             registry,
@@ -665,11 +670,22 @@ impl<T> StreamAnchor<T> {
         loop {
             let generation = self.feed_cell.generation();
             if generation != self.feed_generation {
+                let (generation, feed) = self.feed_cell.snapshot();
                 self.feed_generation = generation;
-                self.feed = self.feed_cell.current().map(|feed| {
+                self.channel_first = feed.is_some();
+                self.feed = feed.map(|feed| {
                     let rx = feed.rx.clone().into_stream();
                     (feed, rx)
                 });
+            }
+            if self.channel_first {
+                match Pin::new(&mut self.inner_stream).poll_next(cx) {
+                    Poll::Pending => self.channel_first = false,
+                    ready => {
+                        self.from_feed = false;
+                        return ready;
+                    }
+                }
             }
             if let Some((feed, rx)) = self.feed.as_mut() {
                 match Pin::new(rx).poll_next(cx) {
@@ -893,8 +909,16 @@ impl<T: DeserializeOwned> Stream for StreamAnchor<T> {
                             // function: it never runs synchronously and never
                             // touches the registry itself, so there is
                             // nothing here for it to deadlock against.
-                            let released_prebind =
-                                this.registry.get_mut(&this.local_id).and_then(|mut entry| {
+                            // A `Detached` read off the anchor channel while a
+                            // mux feed is live belongs to an earlier stream: a
+                            // mux stream detaches through its own slot. The
+                            // live stream's attachment and pre-bind are not
+                            // this frame's to clear.
+                            let stale = !this.from_feed && this.feed.is_some();
+                            let released_prebind = (!stale)
+                                .then(|| this.registry.get_mut(&this.local_id))
+                                .flatten()
+                                .and_then(|mut entry| {
                                     entry.attachment = false;
                                     let released = entry.prebind.take();
                                     if released.is_some()
