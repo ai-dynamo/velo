@@ -536,6 +536,16 @@ impl MuxCore {
         // it with nowhere to post the reply.
         let _entered = match tokio::runtime::Handle::try_current() {
             Ok(_) => None,
+            // Only for a thread with no runtime. A destroyed thread-local (a
+            // drop from a TLS destructor) would make `enter` panic inside a
+            // `Drop`, so that case keeps the quiet return below.
+            Err(error) if !error.is_missing_context() => {
+                tracing::debug!(
+                    peer = %peer,
+                    "messenger mux: runtime context unavailable here; the peer learns on its next record"
+                );
+                return;
+            }
             Err(_) => match self.runtime.as_ref() {
                 Some(runtime) => Some(runtime.enter()),
                 None => {

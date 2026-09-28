@@ -76,7 +76,7 @@ Read the channel depths:
 - If `anchor_frame_tx_len` equals `anchor_frame_tx_cap`, the consumer side was saturated.
 - If both depths are near zero, the silence came from upstream of the consumer. The cause is a producer crash, a network partition, or a backlog on the producer's egress.
 
-On a mux stream, the stream watchdog writes a different line:
+On a single-sender mux stream, the stream watchdog writes a different line. An MPSC anchor over the mux keeps its reader pump, whose watchdog writes the line above:
 
 ```text
 stream_watchdog: nothing arrived from a sender holding credit for the detection window, injecting Dropped

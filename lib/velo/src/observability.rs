@@ -1583,7 +1583,8 @@ impl VeloMetrics {
                  force-cleaned with a Dropped sentinel. Fired by the reader pump on a \
                  per-stream transport, where it is typically the lagging indicator of \
                  the cascade surfaced by the *_backpressure_total counters above. \
-                 Fired by the stream watchdog on a messenger-mux stream, and only \
+                 Fired by the stream watchdog on a single-sender messenger-mux \
+                 stream (an MPSC anchor over the mux keeps its reader pump), and only \
                  when nothing was delivered to the slot while its sender held data \
                  credit or had records waiting behind a sequence gap, so there \
                  it means silence upstream of the consumer (a dead or stalled \

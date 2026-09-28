@@ -412,7 +412,7 @@ async fn a_terminal_behind_starved_predecessors_waits_for_them() {
             .snapshot()
             .gauge("velo_streaming_mux_live_slots", &[]),
         1.0,
-        "the slot stays open; it is the consumer's watchdog that ends this stream"
+        "the slot stays open: the sender is parked on its consumer, so nothing ends this stream until the application drops the anchor"
     );
 
     // The moment the consumer resumes, the whole queue drains in order and the

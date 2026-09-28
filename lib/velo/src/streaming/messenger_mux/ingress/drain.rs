@@ -234,6 +234,14 @@ impl DrainSignal {
         self.closed.cancel();
     }
 
+    /// Record that the slot is retiring on its sender's terminal, from a
+    /// consumer that has just read that terminal off the buffer: the ingress
+    /// applied it in the same step that retires the slot, and this lands the
+    /// release a moment before that step does.
+    pub(crate) fn mark_released(&self) {
+        self.released.store(true, Ordering::Release);
+    }
+
     /// Whether the mux has already let go of this bind's buffer: its slot
     /// retired (on the sender's terminal, among others) or its bind released.
     ///

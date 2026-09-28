@@ -144,10 +144,12 @@ impl FeedCell {
     /// its next poll. Called wherever the feed's pump token is cancelled and
     /// when the anchor entry is removed: the token alone no longer cuts the
     /// data path, because the consumer is the data path.
-    pub(crate) fn withdraw(&self) {
-        if self.feed.lock().take().is_some() {
+    pub(crate) fn withdraw(&self) -> Option<Arc<DirectFeed>> {
+        let feed = self.feed.lock().take();
+        if feed.is_some() {
             self.generation.fetch_add(1, Ordering::Release);
         }
+        feed
     }
 
     pub(crate) fn generation(&self) -> u64 {

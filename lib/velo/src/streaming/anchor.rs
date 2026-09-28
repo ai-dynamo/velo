@@ -291,10 +291,12 @@ impl Drop for AnchorEntry {
     /// slot's generation and session, and a stream that ended on its sender's
     /// terminal has no slot left to close.
     fn drop(&mut self) {
-        if let Some(feed) = self.feed.current() {
+        // Withdrawn first, so a consumer still polling moves off the slot
+        // buffer before the close can inject `Dropped` into it and end the
+        // stream with an error instead of cleanly.
+        if let Some(feed) = self.feed.withdraw() {
             feed.release_slot();
         }
-        self.feed.withdraw();
     }
 }
 
@@ -579,6 +581,9 @@ pub struct StreamAnchor<T> {
         Arc<crate::streaming::control::DirectFeed>,
         flume::r#async::RecvStream<'static, Vec<u8>>,
     )>,
+    /// Whether the last frame `poll_frame` returned came from `feed` rather
+    /// than the anchor channel.
+    from_feed: bool,
     /// Set to true after a terminal sentinel; prevents further polling.
     terminated: bool,
     /// The local ID of the anchor in the registry (for cancel).
@@ -622,6 +627,7 @@ impl<T> StreamAnchor<T> {
             feed_cell,
             feed_generation: 0,
             feed: None,
+            from_feed: false,
             terminated: false,
             local_id,
             registry,
@@ -669,6 +675,7 @@ impl<T> StreamAnchor<T> {
                 match Pin::new(rx).poll_next(cx) {
                     Poll::Ready(Some(bytes)) => {
                         feed.drain.drained();
+                        self.from_feed = true;
                         return Poll::Ready(Some(bytes));
                     }
                     Poll::Ready(None) => {
@@ -687,6 +694,7 @@ impl<T> StreamAnchor<T> {
                     Poll::Pending => {}
                 }
             }
+            self.from_feed = false;
             return Pin::new(&mut self.inner_stream).poll_next(cx);
         }
     }
@@ -809,6 +817,16 @@ impl<T: DeserializeOwned> Stream for StreamAnchor<T> {
                         }
                         Ok(StreamFrame::Finalized) => {
                             this.terminated = true;
+                            // A terminal read off the slot buffer was applied
+                            // in the same step that retires the slot, so there
+                            // is nothing left to close. Saying so now saves the
+                            // close its lock trip when the consumer gets here
+                            // before that step's release lands.
+                            if this.from_feed
+                                && let Some((feed, _)) = &this.feed
+                            {
+                                feed.drain.mark_released();
+                            }
                             // Anchor is permanently closed.
                             this.retire();
                             return Poll::Ready(Some(Ok(StreamFrame::Finalized)));
