@@ -1589,8 +1589,8 @@ impl VeloMetrics {
                  credit or had records waiting behind a sequence gap, so there \
                  it means silence upstream of the consumer (a dead or stalled \
                  producer, or a backlog on its egress or the peer link), never a \
-                 consumer that fell behind. An MPSC anchor over the mux keeps its \
-                 reader pump, whose watchdog does not record this counter.",
+                 consumer that fell behind. An MPSC anchor's reader pump, on any \
+                 transport, does not record this counter.",
             ))?,
         )?;
         let streaming_unclaimed_bind_reaped_total = register_collector(

@@ -193,6 +193,9 @@ pub(crate) fn install_direct_feed(
     // A feed still installed belongs to a stream this anchor has moved on
     // from, and nothing else holds it to close its slot.
     if let Some(replaced) = entry.feed.install(Arc::clone(&feed)) {
+        // Cancelled first, so its watchdog reads the close that follows as a
+        // retirement and leaves the entry, now the new feed's, alone.
+        replaced.pump_token.cancel();
         replaced.release_slot();
     }
     feed

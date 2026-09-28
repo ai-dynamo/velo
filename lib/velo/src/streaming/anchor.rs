@@ -597,6 +597,10 @@ pub struct StreamAnchor<T> {
     /// Shared cancel handle — also held by any [`StreamController`] clones.
     controller: StreamController,
     metrics: Option<Arc<VeloMetrics>>,
+    /// Runs after a frame is read and before it is handled, so a test can land
+    /// work in that gap on the same thread.
+    #[cfg(test)]
+    pub(crate) after_frame_hook: Option<Box<dyn FnMut() + Send>>,
     _phantom: std::marker::PhantomData<T>,
 }
 
@@ -638,6 +642,8 @@ impl<T> StreamAnchor<T> {
             registry,
             controller,
             metrics,
+            #[cfg(test)]
+            after_frame_hook: None,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -829,6 +835,10 @@ impl<T: DeserializeOwned> Stream for StreamAnchor<T> {
         loop {
             match this.poll_frame(cx) {
                 Poll::Ready(Some(bytes)) => {
+                    #[cfg(test)]
+                    if let Some(hook) = this.after_frame_hook.as_mut() {
+                        hook();
+                    }
                     match rmp_serde::from_slice::<StreamFrame<T>>(&bytes) {
                         Ok(StreamFrame::Heartbeat) => continue, // filter heartbeats
                         Ok(StreamFrame::Item(data)) => {
@@ -910,14 +920,18 @@ impl<T: DeserializeOwned> Stream for StreamAnchor<T> {
                             // touches the registry itself, so there is
                             // nothing here for it to deadlock against.
                             // A `Detached` read off the anchor channel while a
-                            // mux feed is live belongs to an earlier stream: a
-                            // mux stream detaches through its own slot. The
-                            // live stream's attachment and pre-bind are not
-                            // this frame's to clear.
-                            let stale = !this.from_feed && this.feed.is_some();
-                            let released_prebind = (!stale)
-                                .then(|| this.registry.get_mut(&this.local_id))
-                                .flatten()
+                            // mux feed is installed belongs to an earlier
+                            // stream: a mux stream detaches through its own
+                            // slot. The live stream's attachment and pre-bind
+                            // are not this frame's to clear. Judged under the
+                            // entry's guard, against the entry's own feed, not
+                            // what this consumer cached at the top of its
+                            // poll: a new sender can land in between.
+                            let from_feed = this.from_feed;
+                            let released_prebind = this
+                                .registry
+                                .get_mut(&this.local_id)
+                                .filter(|entry| from_feed || entry.feed.current().is_none())
                                 .and_then(|mut entry| {
                                     entry.attachment = false;
                                     let released = entry.prebind.take();

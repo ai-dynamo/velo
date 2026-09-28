@@ -2404,6 +2404,74 @@ async fn a_reattach_over_the_mux_does_not_overtake_the_detached_tail() {
     drop(tx);
 }
 
+/// A stale `Detached` does not tear down a pre-bind installed while it was
+/// being read.
+///
+/// Whether a `Detached` off the anchor channel is an earlier stream's is a
+/// question about the anchor as it stands, not about what the consumer cached
+/// at the top of its poll: an attach or a pre-bind can land between the read
+/// and the handling. Judged on the cache, the old `Detached` released the new
+/// pre-bind -- its ticket already handed out -- and the new stream died
+/// before it started.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_detached_spares_a_prebind_installed_mid_poll() {
+    let pair = mux_pair(test_config()).await;
+    let manager = Arc::new(
+        AnchorManagerBuilder::default()
+            .worker_id(pair.consumer_worker)
+            .transport(
+                Arc::clone(&pair.consumer) as Arc<dyn crate::streaming::transport::FrameTransport>
+            )
+            .build()
+            .expect("anchor manager"),
+    );
+    manager
+        .install_mux(Arc::clone(&pair.consumer))
+        .expect("install mux");
+    let mut anchor = manager.create_anchor::<u32>();
+    let handle = anchor.handle();
+    let (_, local_id) = handle.unpack();
+
+    let first = manager
+        .attach_stream_anchor::<u32>(handle)
+        .await
+        .expect("co-located attach");
+    first.send(0).await.expect("send");
+    first.detach().expect("detach");
+
+    // After the second frame (the `Detached`) is read and before it is
+    // handled, a new sender's pre-bind lands.
+    let frames = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hook_manager = Arc::clone(&manager);
+    let hook_frames = Arc::clone(&frames);
+    anchor.after_frame_hook = Some(Box::new(move || {
+        if hook_frames.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 1 {
+            hook_manager.prebind_anchor(handle).expect("ticket");
+        }
+    }));
+
+    for expected in ["Item(0)", "Detached"] {
+        let frame = tokio::time::timeout(RECV_TIMEOUT, anchor.next())
+            .await
+            .expect("timed out waiting for a frame")
+            .expect("stream ended early")
+            .expect("frame decodes");
+        assert_eq!(format!("{frame:?}"), expected);
+    }
+    assert!(
+        manager
+            .registry
+            .get(&local_id)
+            .is_some_and(|entry| entry.prebind.is_some()),
+        "the new pre-bind must survive the earlier stream's Detached"
+    );
+    assert_eq!(
+        pair.consumer.pending_binds(),
+        1,
+        "and its bind must stay bound"
+    );
+}
+
 /// Dropping an anchor before any sender opened its slot gives the bind back.
 ///
 /// The bind would otherwise wait out the 60 s accept window, one per request
