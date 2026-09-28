@@ -572,11 +572,12 @@ impl MuxCore {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let ready = deadlines.partition_point(|(deadline, _)| *deadline <= now);
             let due = deadlines.drain(..ready).map(|(_, key)| key).collect();
-            // A burst of binds leaves the queue's capacity behind it; give
-            // most of it back once the burst has aged out.
-            let floor = deadlines.len().max(1024);
-            if deadlines.capacity() > 4 * floor {
-                deadlines.shrink_to(2 * floor);
+            // A burst of binds leaves the queue's capacity behind it. Give it
+            // back only once the queue is nearly empty: the shrink copies what
+            // is left while holding the lock every bind takes, so shrinking a
+            // queue still tens of thousands deep would stall new streams.
+            if deadlines.len() <= 1024 && deadlines.capacity() > 8192 {
+                deadlines.shrink_to(2048);
             }
             due
         };
@@ -777,6 +778,12 @@ impl MessengerMuxTransport {
     #[cfg(test)]
     pub(crate) fn close_claimed_slot(&self, peer: WorkerId, slot: protocol::SlotId) {
         self.core.close_claimed_slot(peer, slot, None);
+    }
+
+    /// Slot closes that went as far as taking a peer's ingress lock.
+    #[cfg(test)]
+    pub(crate) fn consumer_gone_calls(&self) -> usize {
+        self.core.ingress.consumer_gone_calls()
     }
 
     /// Binds registered and neither claimed nor released.

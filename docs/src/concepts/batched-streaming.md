@@ -255,7 +255,7 @@ Credit for a record returns when the consumer takes it, not when it enters the m
 
 A producer that ran out of credit sends no batches, so the arrival path does not run for its slots. It waits for the doorbell floor and then for the reply linger. Per record this costs `(drain_visit_floor + reply_linger) / initial_credit`. At the defaults (2 ms, 1 ms and 256) that is under 12 µs per record.
 
-The periodic walk does not reclaim credit for a slot whose consumer is gone, because a consumer that is gone counts no drains. The next record that arrives for such a slot finds its receiver gone and closes the slot with `UnknownSlot`.
+The periodic walk does not reclaim credit for a slot whose consumer is gone, because a consumer that is gone counts no drains. The slot is closed instead: removing a single-sender anchor closes its slot and tells the sender, whichever way the stream ended. An MPSC anchor's slot still waits for the next record, which finds its receiver gone and closes the slot with `UnknownSlot`.
 
 ### Reply linger
 

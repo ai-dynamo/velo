@@ -93,6 +93,9 @@ pub(crate) struct IngressRegistry {
     /// because the peer's ordering lane is its only writer; the credit sweep is
     /// the sole other visitor.
     peers: DashMap<WorkerId, Mutex<PeerIngress>>,
+    /// Calls into `close_consumer_gone`, each of which takes a peer's lock.
+    #[cfg(test)]
+    consumer_gone_calls: std::sync::atomic::AtomicUsize,
     /// Per-peer "a credit-return visit is already queued" flags, read and set by
     /// draining consumers without taking the peer mutex. See [`DrainSignal`].
     ///
@@ -211,6 +214,9 @@ impl IngressRegistry {
         metrics: Option<&MuxMetricsHandle>,
         session_id: Option<u64>,
     ) -> Option<ReplyRecord> {
+        #[cfg(test)]
+        self.consumer_gone_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let entry = self.peers.get(&peer)?;
         let mut state = lock(entry.value());
         // Generation-checked, because `finish_close` is not: it takes the slot
@@ -323,6 +329,13 @@ impl IngressRegistry {
     ) {
         self.binds
             .insert((anchor_id, session_id), BindEntry { frame_tx, drain });
+    }
+
+    /// Calls into `close_consumer_gone` so far.
+    #[cfg(test)]
+    pub(crate) fn consumer_gone_calls(&self) -> usize {
+        self.consumer_gone_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Drop an unclaimed bind, reporting whether one was there.

@@ -332,6 +332,12 @@ impl AnchorEntry {
 
 impl Drop for PreBind {
     fn drop(&mut self) {
+        // The ordinary end of a zero-RTT stream: its terminal already retired
+        // the slot, so there is nothing to close and no reason to take the
+        // peer's ingress lock, once per request.
+        if self.drain.is_released() {
+            return;
+        }
         let Some(mux) = self.mux.upgrade() else {
             return;
         };
@@ -841,10 +847,13 @@ impl<T: DeserializeOwned> Stream for StreamAnchor<T> {
                             // sentinel, and the ingress applies it through
                             // `deliver()` -> `finish_close(TerminalSent)` in
                             // the same critical section that puts these very
-                            // bytes into the slot buffer the consumer reads,
-                            // retiring the slot before this poll arm can ever
-                            // run. `PreBind::drop`'s `close_claimed_slot`
-                            // therefore finds nothing there and is a no-op, and
+                            // bytes into the slot buffer the consumer reads.
+                            // The consumer can read them before that section
+                            // ends, but a close it posts takes the same lock
+                            // and so lands after the retire, and the slot's
+                            // generation and session checks make it find
+                            // nothing. `PreBind::drop`'s `close_claimed_slot`
+                            // is therefore a no-op here, and
                             // the retiring slot closes the bind, which ends the
                             // watchdog and the feed on their own: there is
                             // nothing left to cancel, not a stream still

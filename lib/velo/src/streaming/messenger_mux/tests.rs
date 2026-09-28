@@ -2309,6 +2309,41 @@ async fn an_anchor_dropped_off_runtime_still_closes_its_slot() {
     drop(tx);
 }
 
+/// An ordinary end takes no ingress lock, on either attach path.
+///
+/// A stream that ends on its sender's terminal has its slot retired by that
+/// terminal, so the close every removal posts finds nothing. Posting it anyway
+/// takes the peer's ingress lock -- the lock batch processing holds -- once per
+/// request. The zero-RTT path posts from two places, the anchor entry and its
+/// `PreBind`, so both have to see the slot already gone.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ordinary_end_takes_no_ingress_lock() {
+    for adopt in [false, true] {
+        let heartbeat = Duration::from_secs(60);
+        let (pair, manager, mut anchor, local_id, tx) =
+            watched_anchor::<u32>(test_config(), heartbeat, adopt).await;
+        tx.send_async(item(0)).await.expect("send item");
+        tx.send_async(cached_finalized().clone())
+            .await
+            .expect("send the terminal");
+        for expected in [StreamFrame::Item(0), StreamFrame::Finalized] {
+            let frame = tokio::time::timeout(RECV_TIMEOUT, anchor.next())
+                .await
+                .expect("timed out waiting for a frame")
+                .expect("stream ended early")
+                .expect("frame decodes");
+            assert_eq!(format!("{frame:?}"), format!("{expected:?}"));
+        }
+        assert!(!manager.registry.contains_key(&local_id));
+        drop((anchor, tx));
+        assert_eq!(
+            pair.consumer.consumer_gone_calls(),
+            0,
+            "adopt={adopt}: the terminal retired the slot, so no close may take the lock"
+        );
+    }
+}
+
 /// Dropping an anchor before any sender opened its slot gives the bind back.
 ///
 /// The bind would otherwise wait out the 60 s accept window, one per request
