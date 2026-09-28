@@ -924,6 +924,7 @@ impl Velo {
     }
 
     /// Wait for a specific handler to become available on a remote instance.
+    /// Uses cached availability; refreshes only when the handler is not known.
     pub async fn wait_for_handler(
         &self,
         instance_id: InstanceId,

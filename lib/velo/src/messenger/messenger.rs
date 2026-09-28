@@ -479,6 +479,7 @@ impl Messenger {
     }
 
     /// Wait for a specific handler to become available on a remote instance.
+    /// Uses cached availability; refreshes only when the handler is not known.
     pub async fn wait_for_handler(
         &self,
         instance_id: InstanceId,
@@ -487,11 +488,14 @@ impl Messenger {
         const MAX_ATTEMPTS: u32 = 10;
         const DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
+        if self.client.has_cached_handler(instance_id, handler_name) {
+            return Ok(());
+        }
+
         for _ in 0..MAX_ATTEMPTS {
             self.refresh_handlers(instance_id).await?;
 
-            let handlers = self.available_handlers(instance_id).await?;
-            if handlers.contains(&handler_name.to_string()) {
+            if self.client.has_cached_handler(instance_id, handler_name) {
                 return Ok(());
             }
 
@@ -838,11 +842,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_system_and_event_handlers_are_available_immediately_after_startup() {
-        test_transport_registry()
-            .lock()
-            .expect("transport registry poisoned")
-            .clear();
-
         let (transport_a, transport_b) = make_transport_pair();
         let a = Messenger::builder()
             .add_transport(transport_a)
@@ -872,6 +871,68 @@ mod tests {
             handlers.iter().any(|handler| handler == "_event_subscribe"),
             "expected _event_subscribe to be available immediately after startup"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_wait_for_handler_reuses_cache_and_refreshes_missing_handlers() {
+        use crate::observability::test_helpers::MetricSnapshot;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let registry = prometheus::Registry::new();
+            let metrics = Arc::new(VeloMetrics::register(&registry).unwrap());
+            let handshakes = || {
+                MetricSnapshot::from_registry(&registry).counter(
+                    "velo_messenger_client_resolution_total",
+                    &[("path", "handshake"), ("outcome", "attempt")],
+                )
+            };
+            let (transport_a, transport_b) = make_transport_pair();
+            let a = Messenger::builder()
+                .add_transport(transport_a)
+                .metrics(metrics)
+                .build()
+                .await
+                .unwrap();
+            let b = Messenger::builder()
+                .add_transport(transport_b.clone())
+                .build()
+                .await
+                .unwrap();
+
+            a.register_peer(b.peer_info()).unwrap();
+            a.wait_for_handler(b.instance_id(), "_hello").await.unwrap();
+            assert_eq!(handshakes(), 1.0, "unknown peers need the initial hello");
+            assert!(b.client.is_peer_registered(a.instance_id()));
+
+            // Dynamo registers the response peer again for each request.
+            for _ in 0..3 {
+                a.register_peer(b.peer_info()).unwrap();
+                a.wait_for_handler(b.instance_id(), "_hello").await.unwrap();
+            }
+            assert_eq!(handshakes(), 1.0, "cached handlers need no round trip");
+
+            b.register_streaming_handler(Handler::am_handler("_late", |_ctx| Ok(())).build())
+                .unwrap();
+            a.wait_for_handler(b.instance_id(), "_late").await.unwrap();
+            assert_eq!(handshakes(), 2.0, "a missing cached handler must refresh");
+
+            // Reuse the address with a new instance, as after a peer restart.
+            b.graceful_shutdown(crate::ShutdownPolicy::Timeout(Duration::from_secs(1)))
+                .await;
+            let restarted = Messenger::builder()
+                .add_transport(transport_b)
+                .build()
+                .await
+                .unwrap();
+            assert_ne!(b.instance_id(), restarted.instance_id());
+            a.register_peer(restarted.peer_info()).unwrap();
+            a.wait_for_handler(restarted.instance_id(), "_hello")
+                .await
+                .unwrap();
+            assert_eq!(handshakes(), 3.0, "new instances need a new handshake");
+        })
+        .await
+        .expect("handler discovery must complete");
     }
 
     /// Exercise the `.await_capacity()` chain on each public builder
