@@ -674,6 +674,13 @@ impl<T> StreamAnchor<T> {
             if let Some((feed, rx)) = self.feed.as_mut() {
                 match Pin::new(rx).poll_next(cx) {
                     Poll::Ready(Some(bytes)) => {
+                        // Withdrawn while this poll was reading it: the record
+                        // belongs to a stream this consumer has left -- a
+                        // `Dropped` a racing cancel's close injected, say --
+                        // so it is discarded like the rest of that buffer.
+                        if self.feed_cell.generation() != self.feed_generation {
+                            continue;
+                        }
                         feed.drain.drained();
                         self.from_feed = true;
                         return Poll::Ready(Some(bytes));
@@ -1064,8 +1071,16 @@ impl AnchorManagerBuilder {
             // anchors alive; a dropped manager counts zero.
             let spsc = Arc::downgrade(&manager.registry);
             let mpsc = Arc::downgrade(&manager.mpsc_registry);
+            // Each registry counts on its own: a `StreamAnchor` keeps the SPSC
+            // registry alive past the manager and the MPSC one does not, so
+            // the source is spent only once both are gone.
             metrics.add_active_anchor_source(move || {
-                Some(spsc.upgrade()?.len() + mpsc.upgrade()?.len())
+                let spsc = spsc.upgrade();
+                let mpsc = mpsc.upgrade();
+                if spsc.is_none() && mpsc.is_none() {
+                    return None;
+                }
+                Some(spsc.map_or(0, |r| r.len()) + mpsc.map_or(0, |r| r.len()))
             });
         }
         Ok(manager)
@@ -2775,6 +2790,83 @@ mod tests {
         drop(mpsc);
         drop(mgr);
         assert_eq!(gauge(), 0.0, "a dropped manager counts nothing");
+    }
+
+    /// The gauge counts each registry on its own.
+    ///
+    /// A `StreamAnchor` holds the SPSC registry and not the MPSC one, so the
+    /// manager can be gone while SPSC anchors still drain. A source that gave
+    /// up when either registry was gone would be pruned then, for good, and
+    /// the gauge would read zero with anchors alive.
+    #[tokio::test]
+    async fn the_active_anchor_gauge_outlives_one_registry() {
+        let registry = prometheus::Registry::new();
+        let metrics = Arc::new(VeloMetrics::register(&registry).unwrap());
+        let mgr = AnchorManagerBuilder::default()
+            .worker_id(velo_ext::WorkerId::from_u64(1))
+            .transport(
+                Arc::new(MockTransport) as Arc<dyn crate::streaming::transport::FrameTransport>
+            )
+            .metrics(Some(metrics))
+            .build()
+            .unwrap();
+        let gauge = || {
+            crate::observability::test_helpers::MetricSnapshot::from_registry(&registry)
+                .gauge("velo_streaming_active_anchors", &[])
+        };
+        let spsc = mgr.create_anchor::<u32>();
+        drop(mgr);
+        assert_eq!(
+            gauge(),
+            1.0,
+            "the MPSC registry went with the manager; the SPSC anchor still counts"
+        );
+        drop(spsc);
+        assert_eq!(gauge(), 0.0);
+    }
+
+    /// A consumer that reads its sender's `Finalized` off the slot buffer marks
+    /// the slot released.
+    ///
+    /// The ingress applied that terminal in the same step that retires the
+    /// slot, and its own release lands a moment after the consumer can read
+    /// the terminal. Marking it here is what keeps an ordinary end from taking
+    /// the ingress lock in that gap. The drain here belongs to no mux, so
+    /// nothing else ever marks it: only the consumer can.
+    #[tokio::test]
+    async fn reading_finalized_off_the_feed_marks_the_slot_released() {
+        let mgr = make_manager();
+        let mut anchor = mgr.create_anchor::<u32>();
+        let (_, local_id) = anchor.handle().unpack();
+        let (tx, rx) = flume::bounded::<Vec<u8>>(4);
+        let (wake, _wake_rx) = flume::unbounded();
+        let drain = Arc::new(crate::streaming::messenger_mux::ingress::DrainSignal::new(
+            wake,
+        ));
+        {
+            let mut entry = mgr.registry.get_mut(&local_id).expect("entry");
+            crate::streaming::control::install_direct_feed(
+                &mut entry,
+                crate::streaming::control::DirectFeed {
+                    rx,
+                    drain: Arc::clone(&drain),
+                    pump_token: CancellationToken::new(),
+                    release: None,
+                },
+            );
+        }
+        tx.send(crate::streaming::sender::cached_finalized().clone())
+            .unwrap();
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), anchor.next())
+            .await
+            .expect("timed out waiting for Finalized")
+            .expect("stream ended early")
+            .expect("frame decodes");
+        assert!(matches!(frame, StreamFrame::Finalized));
+        assert!(
+            drain.is_released(),
+            "the consumer read the terminal off the buffer, so the slot is released"
+        );
     }
 
     fn make_manager() -> AnchorManager {

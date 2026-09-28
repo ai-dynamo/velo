@@ -1584,12 +1584,13 @@ impl VeloMetrics {
                  per-stream transport, where it is typically the lagging indicator of \
                  the cascade surfaced by the *_backpressure_total counters above. \
                  Fired by the stream watchdog on a single-sender messenger-mux \
-                 stream (an MPSC anchor over the mux keeps its reader pump), and only \
+                 stream, and only \
                  when nothing was delivered to the slot while its sender held data \
                  credit or had records waiting behind a sequence gap, so there \
                  it means silence upstream of the consumer (a dead or stalled \
                  producer, or a backlog on its egress or the peer link), never a \
-                 consumer that fell behind.",
+                 consumer that fell behind. An MPSC anchor over the mux keeps its \
+                 reader pump, whose watchdog does not record this counter.",
             ))?,
         )?;
         let streaming_unclaimed_bind_reaped_total = register_collector(
