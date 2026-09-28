@@ -80,7 +80,10 @@ impl DirectFeed {
         let Some(mux) = release.mux.upgrade() else {
             return;
         };
-        match self.drain.claimed() {
+        // `cancel`, not `claimed`: it takes the lock an `OpenSlot`'s claim
+        // takes, so a claim racing this close sees the bind cancelled and
+        // closes the slot itself rather than opening one nobody reads.
+        match self.drain.cancel() {
             Some((peer, slot)) => mux.cancel_claimed_session(peer, slot, release.session_id),
             None => mux.release_bind(release.anchor_id, release.session_id),
         }
@@ -312,6 +315,11 @@ pub(crate) async fn stream_watchdog(
                          for the detection window, injecting Dropped"
                     );
                     let _ = frame_tx.try_send(crate::streaming::sender::cached_dropped().clone());
+                    // The removal below withdraws the feed before the consumer
+                    // could close the slot itself, and a sender judged dead
+                    // sends nothing a delivery could fail on, so close it here
+                    // and tell the sender.
+                    feed.release_slot();
                     if let Some((_, entry)) = ctx.registry.remove(&local_id) {
                         entry.cancel_token.cancel();
                     }

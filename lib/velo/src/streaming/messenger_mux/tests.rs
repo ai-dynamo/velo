@@ -1966,9 +1966,14 @@ async fn a_consumer_that_never_polls_holds_its_sender_to_the_window() {
 }
 
 /// A consumer on the watchdog's test path, with a mux installed.
+///
+/// With `adopt`, an attach adopts the pre-bind before the sender opens its
+/// slot, which consumes the `PreBind`: the stream then has no `PreBind` to
+/// close its slot when it ends, exactly like an ordinary attach.
 async fn watched_anchor<T: serde::de::DeserializeOwned>(
     config: MuxConfig,
     heartbeat: Duration,
+    adopt: bool,
 ) -> (
     Pair,
     AnchorManager,
@@ -1993,6 +1998,24 @@ async fn watched_anchor<T: serde::de::DeserializeOwned>(
     });
     let (_, local_id) = anchor.handle().unpack();
     let ticket = manager.prebind_anchor(anchor.handle()).expect("ticket");
+    if adopt {
+        let request = crate::streaming::control::AnchorAttachRequest {
+            handle: anchor.handle(),
+            session_id: 1,
+            stream_cancel_handle: crate::streaming::control::StreamCancelHandle::pack(
+                pair.producer_worker,
+                1,
+            ),
+            supported_transport_keys: vec![velo_ext::TransportKey::new(MESSENGER_MUX_KEY)],
+        };
+        assert!(
+            matches!(
+                manager.adopt_prebind(local_id, &request),
+                crate::streaming::anchor::PrebindAdoption::Adopted(_)
+            ),
+            "the pre-bind's own key is offered, so this attach adopts it"
+        );
+    }
     let tx = pair
         .producer
         .connect(pair.consumer_worker, local_id, ticket.routing_session_id)
@@ -2019,7 +2042,8 @@ async fn the_watchdog_does_not_fire_while_its_sender_is_parked() {
         initial_credit: CREDIT,
         ..test_config()
     };
-    let (pair, manager, mut anchor, local_id, tx) = watched_anchor::<u32>(config, heartbeat).await;
+    let (pair, manager, mut anchor, local_id, tx) =
+        watched_anchor::<u32>(config, heartbeat, false).await;
     for n in 0..CREDIT {
         tx.send_async(item(n)).await.expect("send item");
     }
@@ -2057,7 +2081,7 @@ async fn the_watchdog_does_not_fire_while_its_sender_is_parked() {
 async fn a_silent_sender_with_credit_is_reaped_while_records_wait_unread() {
     let heartbeat = Duration::from_millis(50);
     let (pair, manager, anchor, local_id, tx) =
-        watched_anchor::<u32>(test_config(), heartbeat).await;
+        watched_anchor::<u32>(test_config(), heartbeat, false).await;
     for n in 0..3 {
         tx.send_async(item(n)).await.expect("send item");
     }
@@ -2092,7 +2116,7 @@ async fn a_sender_starved_by_the_byte_budget_is_not_reaped() {
         ..test_config()
     };
     let (pair, manager, mut anchor, local_id, tx) =
-        watched_anchor::<Vec<u8>>(config, heartbeat).await;
+        watched_anchor::<Vec<u8>>(config, heartbeat, false).await;
     let big =
         |n: u32| rmp_serde::to_vec(&StreamFrame::Item(vec![n as u8; RECORD])).expect("encode item");
     for n in 0..CREDIT {
@@ -2153,39 +2177,24 @@ async fn a_retired_pump_withdraws_its_feed() {
     drop(anchor);
 }
 
-/// A pre-bound consumer that has ended retires its slot, even while the
-/// application still holds the anchor.
+/// A consumer that ends the stream on its own side closes its slot at once,
+/// even while the application still holds the anchor and the sender sends
+/// nothing more.
 ///
 /// A record the consumer cannot decode ends the stream on the consumer side
-/// only: the sender is alive and keeps sending, and the consumer's feed holds
-/// receiver clones of the slot buffer. Ending the stream drops the feed and
-/// closes the slot through the mux (`SlotRelease`); on this pre-bound path the
-/// `PreBind` dropped with the entry closes it too. The ordinary attach path,
-/// which has no `PreBind`, is
-/// `an_attached_consumer_that_ends_on_a_bad_record_releases_its_slot` in the
-/// negotiation tests.
+/// only. If the consumer kept its feed's receiver clones, the slot would
+/// accept later deliveries, the sender would fill its window and park, and a
+/// parked sender sends nothing a delivery could fail on. So ending the stream
+/// closes the slot through the mux and tells the sender (`SlotRelease`). The
+/// pre-bind is adopted first, so no `PreBind` is left to close the slot on the
+/// way out, and the sender sends only the bad record, so no later delivery
+/// retires the slot either: the close has to come from the consumer.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_ended_consumer_releases_its_slot_while_the_anchor_is_held() {
-    let pair = mux_pair(test_config()).await;
-    let manager = AnchorManagerBuilder::default()
-        .worker_id(pair.consumer_worker)
-        .transport(
-            Arc::clone(&pair.consumer) as Arc<dyn crate::streaming::transport::FrameTransport>
-        )
-        .build()
-        .expect("anchor manager");
-    manager
-        .install_mux(Arc::clone(&pair.consumer))
-        .expect("install mux");
-
-    let mut anchor = manager.create_anchor::<u32>();
-    let (_, local_id) = anchor.handle().unpack();
-    let ticket = manager.prebind_anchor(anchor.handle()).expect("ticket");
-    let tx = pair
-        .producer
-        .connect(pair.consumer_worker, local_id, ticket.routing_session_id)
-        .await
-        .expect("connect");
+    // Far longer than the test, so the watchdog is not what closes the slot.
+    let heartbeat = Duration::from_secs(60);
+    let (pair, _manager, mut anchor, _local_id, tx) =
+        watched_anchor::<u32>(test_config(), heartbeat, true).await;
     // 0xc1 is the one byte MessagePack never assigns, so this cannot decode.
     tx.send_async(vec![0xc1])
         .await
@@ -2201,13 +2210,29 @@ async fn an_ended_consumer_releases_its_slot_while_the_anchor_is_held() {
         "expected DeserializationError, got {ended:?}"
     );
 
-    // The sender is alive and keeps going. Its next delivery must find nobody
-    // reading, so the slot retires.
-    for n in 0..4 {
-        let _ = tx.try_send(item(n));
-    }
     eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 0).await;
-    drop(anchor);
+    drop((anchor, tx));
+}
+
+/// A watchdog firing closes its slot and tells the sender.
+///
+/// The watchdog removes the anchor, which withdraws the feed before the
+/// consumer can close the slot itself, and the sender it judged dead sends
+/// nothing a delivery could fail on. With no `PreBind` (adopted here, as on an
+/// ordinary attach), the watchdog has to close the slot, or the slot and its
+/// peer batcher stay live.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_watchdog_firing_closes_its_slot() {
+    let heartbeat = Duration::from_millis(50);
+    let (pair, manager, anchor, local_id, tx) =
+        watched_anchor::<u32>(test_config(), heartbeat, true).await;
+    for n in 0..3 {
+        tx.send_async(item(n)).await.expect("send item");
+    }
+    eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 1).await;
+    eventually(|| !manager.registry.contains_key(&local_id)).await;
+    eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 0).await;
+    drop((anchor, tx));
 }
 
 /// An anchor leaving the registry takes its feed out of the cell.

@@ -1013,7 +1013,7 @@ mod zero_rtt;
 /// window and park, and the watchdog would leave a parked sender alone -- the
 /// slot and its peer batcher would never retire. A pre-bound anchor is closed
 /// by its `PreBind` when that drops; an ordinary attach has no `PreBind`, so
-/// the consumer has to close the slot itself.
+/// the consumer has to close the slot itself, and tell the sender.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_attached_consumer_that_ends_on_a_bad_record_releases_its_slot() {
     let (consumer, producer) = pair(Some(mux_config()), Some(mux_config())).await;
@@ -1037,15 +1037,15 @@ async fn an_attached_consumer_that_ends_on_a_bad_record_releases_its_slot() {
         "a u32 is not a String, got {ended:?}"
     );
 
-    // The sender is alive and keeps going; a send that parks is given up on.
-    for n in 0..32u32 {
-        if tokio::time::timeout(Duration::from_millis(100), sender.send(n))
-            .await
-            .map_or(true, |sent| sent.is_err())
-        {
-            break;
+    // The sender sends nothing more, so no later delivery can fail and retire
+    // the slot, and its first heartbeat is seconds away: the close has to come
+    // from the consumer, and it has to reach the sender.
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while consumer.mux_live_slots() != 0.0 || producer.mux_live_slots() != 0.0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
-    }
-    eventually(|| consumer.mux_live_slots() == 0.0).await;
-    drop(anchor);
+    })
+    .await
+    .expect("the ended consumer must close its slot on both nodes");
+    drop((anchor, sender));
 }

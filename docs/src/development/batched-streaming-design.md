@@ -258,7 +258,7 @@ Mutation testing showed that both original tests were blind: under a mutation th
 
 These properties of the current code are known and not yet changed:
 
-- **The sweep does not reclaim credit for a consumer that is gone.** A consumer that is gone counts no drains. The next record for its slot finds the receiver gone and closes the slot with `UnknownSlot`.
+- **The sweep does not reclaim credit for a consumer that is gone.** A consumer that is gone counts no drains, so its slot is closed instead. A consumer that ends its own stream, a watchdog firing and a cancel each close the slot and tell the sender. An anchor removed any other way leaves its slot to the next record, which finds the receiver gone and closes the slot with `UnknownSlot`.
 - **The per-peer drain flag map never shrinks.** A claimed slot's `DrainSignal` holds its peer's flag as an `Arc` for the life of its stream. Removing the map entry while such a stream lives leaves its consumer setting a flag that nothing reads. That peer's credit then falls back to the periodic sweep. Removal must happen under the same visibility that retires slots and binds.
 - **A fence lift can queue behind opens.** Under `async_open_ack`, the batcher polls the opens channel ahead of coalesced control. While opens for a peer are queued, the resolution that lifts a fence waits.
 - **`velo_streaming_mux_live_slots` counts a slot killed while fenced.** Its registry entry survives until the admission resolves, which can be the rest of the epoch.

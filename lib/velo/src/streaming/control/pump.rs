@@ -68,9 +68,10 @@ pub(crate) fn note_timer_fire() {
 #[inline(always)]
 pub(crate) fn note_timer_fire() {}
 
-/// What a mux-fed task needs beyond its channels: the direct feed's
-/// [`stream_watchdog`](super::feed::stream_watchdog) and `mpsc_reader_pump`.
-/// [`reader_pump`] reads no drain signal and does not take one.
+/// What `mpsc_reader_pump` needs beyond its channels. The direct feed's
+/// [`stream_watchdog`](super::feed::stream_watchdog) takes a
+/// [`WatchdogContext`](super::feed::WatchdogContext) instead, and
+/// [`reader_pump`] reads no drain signal and takes neither.
 ///
 /// A struct rather than three more parameters: `mpsc_reader_pump` already
 /// carries a sender id and a registry, and adding the drain hook positionally
