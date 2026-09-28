@@ -189,11 +189,14 @@ pub(crate) fn reap_unclaimed(
 ///
 /// Wakes once per `heartbeat_deadline`, never per record. A window counts as
 /// live if the ingress delivered anything to the slot during it (the slot's
-/// arrival count moved) or if the buffer still holds records: a consumer that
-/// is behind leaves the sender without credit, and a sender without credit
-/// cannot heartbeat, so that silence is not the sender's. After
-/// `DETECTION_MULTIPLIER` windows with neither, and once a sender exists, the
-/// watchdog injects `Dropped` and removes the anchor, as the pump did.
+/// arrival count moved) or if the sender holds no data credit. Heartbeats
+/// spend data credit, so a sender whose consumer is behind -- the record
+/// window unread, or its credit withheld because the buffer holds its byte
+/// budget -- cannot send one, and that silence is not the sender's. A sender
+/// that still holds credit can heartbeat, so its silence is its own even with
+/// records unread. After `DETECTION_MULTIPLIER` windows with neither, and once
+/// a sender exists, the watchdog injects `Dropped` and removes the anchor, as
+/// the pump did.
 ///
 /// Detection lands between `DETECTION_MULTIPLIER` and one more window after the
 /// last arrival: windows run on the watchdog's own clock, not from the last
@@ -238,8 +241,14 @@ pub(crate) async fn stream_watchdog(
                 sleep.as_mut().reset(tokio::time::Instant::now() + heartbeat_deadline);
                 note_timer_arm();
                 let arrivals = feed.drain.arrivals();
-                if arrivals != seen || !feed.rx.is_empty() {
+                if arrivals != seen {
                     seen = arrivals;
+                    missed = 0;
+                    continue;
+                }
+                // Heartbeats spend data credit, so a sender holding none
+                // cannot send one; that silence is its consumer's, not its own.
+                if feed.drain.sender_parked() {
                     missed = 0;
                     continue;
                 }

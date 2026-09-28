@@ -57,6 +57,9 @@ pub(crate) struct DrainSignal {
     /// ingress. The direct feed's watchdog reads it as the sender's liveness:
     /// it never sees a frame itself.
     arrivals: AtomicU64,
+    /// Whether the sender holds no data credit, published by the slot. The
+    /// watchdog's exemption: a sender without credit cannot heartbeat.
+    sender_parked: AtomicBool,
     /// Fired when the mux lets go of this bind's buffer: an unclaimed bind
     /// released or expired, or a claimed slot retired. The direct feed's
     /// watchdog never receives from the buffer, so it cannot see the close
@@ -84,6 +87,7 @@ impl DrainSignal {
             lifecycle: std::sync::Mutex::new(0),
             drained: AtomicU32::new(0),
             arrivals: AtomicU64::new(0),
+            sender_parked: AtomicBool::new(false),
             closed: tokio_util::sync::CancellationToken::new(),
             wake,
         }
@@ -195,6 +199,22 @@ impl DrainSignal {
     /// watchdog only asks whether the count moved during its window.
     pub(super) fn note_arrival(&self) {
         self.arrivals.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record whether the sender holds any data credit, as the slot's account
+    /// sees it. Written under the peer's mutex on admit, reconcile and grant;
+    /// the store is skipped when nothing changed, since this runs per batch.
+    pub(super) fn set_sender_parked(&self, parked: bool) {
+        if self.sender_parked.load(Ordering::Relaxed) != parked {
+            self.sender_parked.store(parked, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether the sender holds no data credit, so cannot send a heartbeat.
+    /// Read by the stream watchdog, which may be up to a credit round trip
+    /// behind; its detection window is several heartbeats long.
+    pub(crate) fn sender_parked(&self) -> bool {
+        self.sender_parked.load(Ordering::Relaxed)
     }
 
     /// The mux let go of this bind's buffer. Idempotent.

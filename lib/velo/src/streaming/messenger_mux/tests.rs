@@ -1965,21 +1965,18 @@ async fn a_consumer_that_never_polls_holds_its_sender_to_the_window() {
     pair.assert_no_reader_stall();
 }
 
-/// The watchdog does not blame a sender for silence its consumer caused.
-///
-/// A consumer that stops reading leaves records in the slot buffer and its
-/// sender without credit, and a sender without credit cannot send the
-/// heartbeats that prove it is alive. That silence is the consumer's, so the
-/// watchdog treats a window with records still buffered as live, however long
-/// the sender stays quiet. The records are all still there when the consumer
-/// comes back.
-///
-/// Control: once the buffer is empty, the same silence is the sender's, and the
-/// watchdog reaps the anchor.
-#[tokio::test(flavor = "multi_thread")]
-async fn the_watchdog_does_not_fire_while_records_wait_unread() {
-    let heartbeat = Duration::from_millis(50);
-    let pair = mux_pair(test_config()).await;
+/// A consumer on the watchdog's test path, with a mux installed.
+async fn watched_anchor<T: serde::de::DeserializeOwned>(
+    config: MuxConfig,
+    heartbeat: Duration,
+) -> (
+    Pair,
+    AnchorManager,
+    crate::streaming::anchor::StreamAnchor<T>,
+    u64,
+    flume::Sender<Vec<u8>>,
+) {
+    let pair = mux_pair(config).await;
     let manager = AnchorManagerBuilder::default()
         .worker_id(pair.consumer_worker)
         .transport(
@@ -1990,8 +1987,7 @@ async fn the_watchdog_does_not_fire_while_records_wait_unread() {
     manager
         .install_mux(Arc::clone(&pair.consumer))
         .expect("install mux");
-
-    let mut anchor = manager.create_anchor_with_config::<u32>(AnchorConfig {
+    let anchor = manager.create_anchor_with_config::<T>(AnchorConfig {
         heartbeat_interval: Some(heartbeat),
         ..Default::default()
     });
@@ -2002,18 +1998,40 @@ async fn the_watchdog_does_not_fire_while_records_wait_unread() {
         .connect(pair.consumer_worker, local_id, ticket.routing_session_id)
         .await
         .expect("connect");
-    for n in 0..3 {
+    (pair, manager, anchor, local_id, tx)
+}
+
+/// The watchdog does not blame a sender for silence its consumer caused.
+///
+/// Heartbeats spend data credit, so a sender whose consumer stopped reading
+/// runs out of credit and then cannot send the heartbeats that prove it is
+/// alive. That silence is the consumer's, so the watchdog leaves a sender
+/// that holds no credit alone, however long it stays quiet. The records are
+/// all still there when the consumer comes back.
+///
+/// Control: once the consumer has read them, credit goes back to the sender,
+/// the same silence is the sender's, and the watchdog reaps the anchor.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_watchdog_does_not_fire_while_its_sender_is_parked() {
+    const CREDIT: u32 = 8;
+    let heartbeat = Duration::from_millis(50);
+    let config = MuxConfig {
+        initial_credit: CREDIT,
+        ..test_config()
+    };
+    let (pair, manager, mut anchor, local_id, tx) = watched_anchor::<u32>(config, heartbeat).await;
+    for n in 0..CREDIT {
         tx.send_async(item(n)).await.expect("send item");
     }
     eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 1).await;
 
-    // Twenty windows of silence, with the records unread.
+    // Twenty windows of silence, with the whole window unread.
     tokio::time::sleep(heartbeat * 20).await;
     assert!(
         manager.registry.contains_key(&local_id),
-        "records still wait in the buffer, so the silence is the consumer's"
+        "the sender holds no credit, so the silence is the consumer's"
     );
-    for n in 0..3 {
+    for n in 0..CREDIT {
         let frame = tokio::time::timeout(RECV_TIMEOUT, anchor.next())
             .await
             .expect("timed out waiting for a record")
@@ -2022,8 +2040,80 @@ async fn the_watchdog_does_not_fire_while_records_wait_unread() {
         assert!(matches!(frame, StreamFrame::Item(v) if v == n));
     }
 
-    // The buffer is empty now, and the sender is still silent.
+    // The credit is back with the sender, and it is still silent.
     eventually(|| !manager.registry.contains_key(&local_id)).await;
+    drop(tx);
+}
+
+/// A silent sender that still holds credit is reaped, even with records
+/// waiting unread.
+///
+/// A sender with credit left can heartbeat, so if nothing arrives for the
+/// detection window it is gone, whether or not its consumer has read what it
+/// sent. The watchdog used to treat any unread record as proof of life, so a
+/// dead worker behind a slow client -- an HTTP reader that is connected but
+/// behind -- kept its anchor, slot and peer batcher until the client drained.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_silent_sender_with_credit_is_reaped_while_records_wait_unread() {
+    let heartbeat = Duration::from_millis(50);
+    let (pair, manager, anchor, local_id, tx) =
+        watched_anchor::<u32>(test_config(), heartbeat).await;
+    for n in 0..3 {
+        tx.send_async(item(n)).await.expect("send item");
+    }
+    eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 1).await;
+
+    // Nobody reads. Detection is three windows, plus one of clock skew.
+    tokio::time::timeout(heartbeat * 20, async {
+        while manager.registry.contains_key(&local_id) {
+            tokio::time::sleep(heartbeat / 5).await;
+        }
+    })
+    .await
+    .expect("a silent sender that holds credit must be reaped with records unread");
+    drop((anchor, tx));
+}
+
+/// A sender starved by the slot's byte budget is not reaped.
+///
+/// The consumer node stops granting credit while the slot buffer holds its
+/// byte budget, so a consumer that read part of a window of large records can
+/// leave its sender with no credit and fewer than `C` records buffered. That
+/// sender cannot heartbeat either, and the silence is still the consumer's. A
+/// watchdog that looked only at the record count would reap it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sender_starved_by_the_byte_budget_is_not_reaped() {
+    const CREDIT: u32 = 8;
+    const RECORD: usize = 600;
+    let heartbeat = Duration::from_millis(50);
+    let config = MuxConfig {
+        initial_credit: CREDIT,
+        slot_byte_budget: 1024,
+        ..test_config()
+    };
+    let (pair, manager, mut anchor, local_id, tx) =
+        watched_anchor::<Vec<u8>>(config, heartbeat).await;
+    let big =
+        |n: u32| rmp_serde::to_vec(&StreamFrame::Item(vec![n as u8; RECORD])).expect("encode item");
+    for n in 0..CREDIT {
+        tx.send_async(big(n)).await.expect("send item");
+    }
+    eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 1).await;
+    // Read all but two. Two large records still hold the byte budget, so the
+    // credit this read earns is withheld.
+    for _ in 0..CREDIT - 2 {
+        tokio::time::timeout(RECV_TIMEOUT, anchor.next())
+            .await
+            .expect("timed out waiting for a record")
+            .expect("stream ended early")
+            .expect("record decodes");
+    }
+
+    tokio::time::sleep(heartbeat * 20).await;
+    assert!(
+        manager.registry.contains_key(&local_id),
+        "the byte budget withholds the sender's credit, so the silence is the consumer's"
+    );
     drop(tx);
 }
 

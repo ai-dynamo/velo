@@ -261,6 +261,7 @@ impl IngressSlot {
             self.buffered_bytes = self.buffered_bytes.saturating_sub(u64::from(size));
         }
         self.account.release(drained);
+        self.publish_credit();
     }
 
     /// Credit to advertise back to the sender, if any.
@@ -275,7 +276,16 @@ impl IngressSlot {
         if self.buffered_bytes >= self.byte_watermark {
             return None;
         }
-        self.account.take_pending_grant()
+        let grant = self.account.take_pending_grant();
+        self.publish_credit();
+        grant
+    }
+
+    /// Tell the drain signal whether the sender still holds credit, for the
+    /// stream watchdog: a sender without credit cannot heartbeat.
+    fn publish_credit(&self) {
+        self.drain
+            .set_sender_parked(!self.account.peer_holds_credit());
     }
 
     /// Inject the `Dropped` sentinel a consumer sees when its sender dies.
@@ -328,7 +338,9 @@ impl IngressSlot {
     fn admit(&mut self, class: CreditClass) -> Result<(), DeliverFault> {
         self.account
             .admit(class)
-            .map_err(|_| DeliverFault::Overspend)
+            .map_err(|_| DeliverFault::Overspend)?;
+        self.publish_credit();
+        Ok(())
     }
 
     /// Hand one record to the consumer. Never blocks — see the module docs.

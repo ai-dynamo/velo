@@ -379,6 +379,16 @@ impl SlotCreditAccount {
         self.ungranted
     }
 
+    /// Whether the peer still holds data credit, as far as this side knows.
+    ///
+    /// Everything spent and not yet released, plus everything released and
+    /// not yet granted back, is credit the peer does not have. Grants in
+    /// flight and records in flight are the only things this cannot see, and
+    /// both settle within a credit round trip.
+    pub(crate) const fn peer_holds_credit(&self) -> bool {
+        self.data_outstanding.saturating_add(self.ungranted) < self.limit
+    }
+
     /// Admits one record of `class` into the slot.
     ///
     /// An `Err` here means the peer overspent what it was granted: the slot is
