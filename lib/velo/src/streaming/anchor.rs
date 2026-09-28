@@ -927,12 +927,26 @@ impl<T: DeserializeOwned> Stream for StreamAnchor<T> {
                             // entry's guard, against the entry's own feed, not
                             // what this consumer cached at the top of its
                             // poll: a new sender can land in between.
+                            //
+                            // A mux stream's own `Detached` ends its feed, so
+                            // the feed leaves the cell with it. Left there, it
+                            // would make the next non-mux sender's `Detached`
+                            // read as stale, and the anchor would stay
+                            // attached to nobody. A newer feed stays.
                             let from_feed = this.from_feed;
+                            let ended_feed = this
+                                .feed
+                                .as_ref()
+                                .filter(|_| from_feed)
+                                .map(|(feed, _)| Arc::clone(feed));
                             let released_prebind = this
                                 .registry
                                 .get_mut(&this.local_id)
                                 .filter(|entry| from_feed || entry.feed.current().is_none())
                                 .and_then(|mut entry| {
+                                    if let Some(feed) = &ended_feed {
+                                        entry.feed.withdraw_if(feed);
+                                    }
                                     entry.attachment = false;
                                     let released = entry.prebind.take();
                                     if released.is_some()

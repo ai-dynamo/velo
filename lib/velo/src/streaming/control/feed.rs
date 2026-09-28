@@ -160,6 +160,20 @@ impl FeedCell {
         feed
     }
 
+    /// Take `feed` out if it is still the installed one, so the feed of a
+    /// stream that ended does not outlive it, and leave a newer feed alone.
+    pub(crate) fn withdraw_if(&self, feed: &Arc<DirectFeed>) -> Option<Arc<DirectFeed>> {
+        let mut slot = self.feed.lock();
+        if !slot
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, feed))
+        {
+            return None;
+        }
+        self.generation.fetch_add(1, Ordering::Release);
+        slot.take()
+    }
+
     pub(crate) fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
     }

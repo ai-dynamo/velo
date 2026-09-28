@@ -588,6 +588,70 @@ async fn a_sender_without_a_mux_streams_over_the_legacy_path() {
     );
 }
 
+/// A mux stream that detached leaves no feed behind to misjudge the next
+/// sender's `Detached`.
+///
+/// A consumer reads a `Detached` off the anchor channel as an earlier stream's
+/// while a mux feed is installed: a mux stream detaches through its own slot.
+/// If the feed of a mux stream that detached stayed installed, the next
+/// sender to attach without the mux -- a peer without it, or one the per-node
+/// switch turned off -- would have its own `Detached` skipped. The anchor
+/// would then stay attached to nobody and refuse every later attach, with no
+/// timer left to reap it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_detached_mux_stream_leaves_no_feed_to_skip_a_later_detached() {
+    let (consumer, with_mux) = pair(Some(mux_config()), Some(mux_config())).await;
+    let without_mux = node(None).await;
+    consumer
+        .velo
+        .register_peer(without_mux.velo.peer_info())
+        .expect("register the second producer on the consumer");
+    without_mux
+        .velo
+        .register_peer(consumer.velo.peer_info())
+        .expect("register the consumer on the second producer");
+    ready(&without_mux, consumer.velo.instance_id(), "_anchor_attach").await;
+
+    let mut anchor = consumer.velo.create_anchor::<u32>();
+    let handle = transfer(anchor.handle());
+    let mut next = async || {
+        let frame = tokio::time::timeout(PATIENCE, anchor.next())
+            .await
+            .expect("timed out waiting for a frame")
+            .expect("stream ended early")
+            .expect("frame decodes");
+        format!("{frame:?}")
+    };
+
+    let sender = with_mux
+        .velo
+        .attach_anchor::<u32>(handle)
+        .await
+        .expect("mux attach");
+    sender.send(0).await.expect("send");
+    sender.detach().expect("detach");
+    assert_eq!(next().await, "Item(0)");
+    assert_eq!(next().await, "Detached");
+    assert_eq!(consumer.attaches_over(MUX_KEY), 1.0);
+
+    let sender = without_mux
+        .velo
+        .attach_anchor::<u32>(handle)
+        .await
+        .expect("attach without the mux after the mux stream detached");
+    sender.send(1).await.expect("send");
+    sender.detach().expect("detach");
+    assert_eq!(next().await, "Item(1)");
+    assert_eq!(next().await, "Detached");
+    assert_eq!(consumer.attaches_over(LEGACY_KEY), 1.0);
+
+    with_mux
+        .velo
+        .attach_anchor::<u32>(handle)
+        .await
+        .expect("both senders detached, so the anchor takes a third");
+}
+
 /// (d) A mux sender against a receiver without one: SPSC.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_mux_sender_falls_back_when_the_receiver_has_no_mux() {
