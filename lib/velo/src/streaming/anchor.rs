@@ -253,8 +253,9 @@ impl PreBind {
     ///
     /// Clearing the transport handle is what defuses [`Drop`]: from here the
     /// slot is an ordinary attached stream, reclaimed by the paths that reclaim
-    /// those — the attach carried a `StreamCancelHandle`, so the anchor can
-    /// reach its producer directly and needs no close posted on its behalf.
+    /// those -- the anchor entry's own `Drop` closes the slot on removal, and
+    /// the attach carried a `StreamCancelHandle`, so the anchor can reach its
+    /// producer directly as well.
     ///
     /// The ticket is cloned rather than moved out because this type has a
     /// `Drop`; the clone is one `Arc<str>` bump on a path that runs once per
@@ -1379,7 +1380,7 @@ impl AnchorManager {
                         // Installed under the shard lock, so a retire or a
                         // removal cannot land between this and the install.
                         let feed = crate::streaming::control::install_direct_feed(
-                            &entry.feed,
+                            entry,
                             crate::streaming::control::DirectFeed {
                                 rx: receiver.clone(),
                                 drain: Arc::clone(&drain),

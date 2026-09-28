@@ -1458,18 +1458,21 @@ async fn a_close_refused_by_a_retired_batcher_reaches_the_producer_through_its_r
     );
 }
 
-/// A `close_claimed_slot` with no runtime under it must retire nothing.
+/// A `close_claimed_slot` from a thread with no runtime still closes the slot
+/// and tells the sender, through the runtime the mux was built on.
 ///
-/// `PreBind::drop` is the only caller with no guarantee of a runtime -- it can
-/// run wherever a `StreamAnchor` happens to be dropped, the same reason
-/// `StreamController::cancel`'s own `_stream_cancel` spawn guards itself with
-/// `Handle::try_current()` a few lines above it (`streaming/anchor.rs`).
-/// Retiring the slot before checking for a runtime to post the reply on
-/// leaves the producer strictly worse off than doing nothing: the reactive
-/// `ConsumerGone` fault a live slot would otherwise raise on its next record
-/// can no longer find a slot to raise it on.
+/// `PreBind::drop` and `AnchorEntry::drop` can run wherever a `StreamAnchor`
+/// happens to be dropped. The close may have to spawn a batcher task, so it
+/// used to do nothing without a runtime, on the premise that the sender would
+/// learn on its next record; a parked or dead sender sends none. The rule that
+/// premise protected still holds -- never retire a slot without a way to post
+/// the close, or the sender is stranded with neither a proactive close nor a
+/// reactive one -- but a mux built on a runtime always has that way.
+///
+/// Control: the sender's end retires, so the close was posted, not only taken
+/// out of the table.
 #[tokio::test(flavor = "multi_thread")]
-async fn close_claimed_slot_without_a_runtime_leaves_the_slot_in_place() {
+async fn close_claimed_slot_off_runtime_closes_through_the_mux_runtime() {
     let pair = mux_pair(test_config()).await;
 
     let rx = pair.consumer.bind(1, 1).await.expect("bind");
@@ -1487,20 +1490,20 @@ async fn close_claimed_slot_without_a_runtime_leaves_the_slot_in_place() {
 
     let consumer = Arc::clone(&pair.consumer);
     let peer = pair.producer_worker;
-    // A bare OS thread carries no tokio context -- exactly the condition
-    // `PreBind::drop` can hit and `close_claimed_slot`'s own runtime check
-    // exists for.
+    // A bare OS thread carries no tokio context.
     std::thread::spawn(move || consumer.close_claimed_slot(peer, slot))
         .join()
         .expect("close_claimed_slot must not panic off a runtime");
 
-    assert_eq!(
-        pair.consumer.live_ingress_slots(pair.producer_worker),
-        1,
-        "with no runtime to post the close, the slot must stay in the table for \
-         the reactive ConsumerGone path to find -- retiring it here strands the \
-         producer with neither a proactive close nor a reactive one"
-    );
+    assert_eq!(pair.consumer.live_ingress_slots(pair.producer_worker), 0);
+    // The producer's inlet closes once its slot retires on the close.
+    tokio::time::timeout(RECV_TIMEOUT, async {
+        while !tx.is_disconnected() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the close must reach the sender");
 }
 
 /// A pre-bind refused for a key mismatch gives the anchor its unattached timer
@@ -2095,6 +2098,19 @@ async fn a_silent_sender_with_credit_is_reaped_while_records_wait_unread() {
     })
     .await
     .expect("a silent sender that holds credit must be reaped with records unread");
+    // The records the dead sender left in the buffer are not delivered: the
+    // consumer's next frame is the end of the stream.
+    let mut anchor = anchor;
+    let next = tokio::time::timeout(RECV_TIMEOUT, anchor.next())
+        .await
+        .expect("the reaped stream must end, not hang");
+    assert!(
+        matches!(
+            next,
+            Some(Err(crate::streaming::StreamError::SenderDropped))
+        ),
+        "expected SenderDropped before any buffered record, got {next:?}"
+    );
     drop((anchor, tx));
 }
 
@@ -2269,6 +2285,28 @@ async fn cancelling_a_stream_closes_its_slot() {
     anchor.controller().cancel();
     eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 0).await;
     drop((anchor, tx));
+}
+
+/// An anchor dropped on a thread with no runtime still closes its slot.
+///
+/// A drop can land anywhere the application keeps its anchor, including a
+/// plain OS thread. Closing the slot may have to spawn a batcher task, so with
+/// no runtime under the drop the close used to be skipped, on the premise that
+/// the peer learns on its next record -- which a parked or dead sender never
+/// sends. The mux enters the runtime it was built on instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_anchor_dropped_off_runtime_still_closes_its_slot() {
+    let heartbeat = Duration::from_secs(60);
+    let (pair, _manager, anchor, _local_id, tx) =
+        watched_anchor::<u32>(test_config(), heartbeat, true).await;
+    tx.send_async(item(0)).await.expect("send item");
+    eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 1).await;
+
+    std::thread::spawn(move || drop(anchor))
+        .join()
+        .expect("drop on a plain thread");
+    eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 0).await;
+    drop(tx);
 }
 
 /// Dropping an anchor before any sender opened its slot gives the bind back.

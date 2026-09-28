@@ -1025,6 +1025,8 @@ async fn an_attached_consumer_that_ends_on_a_bad_record_releases_its_slot() {
         .await
         .expect("attach over the mux");
     sender.send(7).await.expect("send");
+    // The stream rode the mux, not a fallback transport.
+    eventually(|| consumer.mux_live_slots() == 1.0).await;
 
     let ended = tokio::time::timeout(PATIENCE, anchor.next())
         .await

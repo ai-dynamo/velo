@@ -46,11 +46,21 @@ fn note_teardown_arm() {}
 /// The one place a connection builds its teardown future, so the count the
 /// test reads is the count of builds, not of a separate call that could drift
 /// from them.
+///
+/// On a child token, not the node-wide one. The loop polls this future on
+/// every frame, and each poll locks the token's tree node and, while waiting,
+/// its `Notify` waiter list. On the shared token both are shared by every
+/// connection on the node; a child token has its own of each, so the per-frame
+/// locks are uncontended. Cancelling the node-wide token still reaches every
+/// child.
 fn connection_teardown(
     shutdown_state: &ShutdownState,
 ) -> tokio_util::sync::WaitForCancellationFutureOwned {
     note_teardown_arm();
-    shutdown_state.teardown_token().clone().cancelled_owned()
+    shutdown_state
+        .teardown_token()
+        .child_token()
+        .cancelled_owned()
 }
 
 /// Per-connection configuration handed to [`TcpListener::handle_connection`].

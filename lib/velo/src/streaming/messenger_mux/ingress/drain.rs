@@ -53,13 +53,16 @@ pub(crate) struct DrainSignal {
     /// [`IngressSlot::reconcile`](super::slot::IngressSlot::reconcile) swapped
     /// it to zero.
     drained: AtomicU32,
-    /// Batches that delivered into this slot, bumped once per batch by the
-    /// ingress. The direct feed's watchdog reads it as the sender's liveness:
+    /// Records delivered into this slot's buffer, bumped once per delivered
+    /// record by the ingress (records parked in the reorder hold do not
+    /// count). The direct feed's watchdog reads it as the sender's liveness:
     /// it never sees a frame itself.
     arrivals: AtomicU64,
     /// Whether the sender holds no data credit, published by the slot. The
     /// watchdog's exemption: a sender without credit cannot heartbeat.
     sender_parked: AtomicBool,
+    /// Set with `closed`, readable without a lock; see `is_released`.
+    released: AtomicBool,
     /// Fired when the mux lets go of this bind's buffer: an unclaimed bind
     /// released or expired, or a claimed slot retired. The direct feed's
     /// watchdog never receives from the buffer, so it cannot see the close
@@ -88,6 +91,7 @@ impl DrainSignal {
             drained: AtomicU32::new(0),
             arrivals: AtomicU64::new(0),
             sender_parked: AtomicBool::new(false),
+            released: AtomicBool::new(false),
             closed: tokio_util::sync::CancellationToken::new(),
             wake,
         }
@@ -158,7 +162,11 @@ impl DrainSignal {
     /// (`MuxCore::visit_drained_peer`, `MuxCore::sweep_peer`), and the arrival
     /// path's own take leaves the slot unlisted, so the next drain lists it
     /// again and does the `pending` step itself. Either way the listing this
-    /// drain rode on is answered by a take that also collects its count.
+    /// drain rode on is answered by a take that also collects its count. What
+    /// this saves depends on the shape: with about one record per stream per
+    /// batch, the arrival path's take unlists nearly every slot between
+    /// drains, so nearly every drain lists and reaches `pending`; the `swap`
+    /// usually finds it already up and posts nothing.
     ///
     /// `try_send` rather than an await on the wake: this runs on the
     /// consumer's path for every record and must never park it. The wake lane
@@ -204,8 +212,9 @@ impl DrainSignal {
     }
 
     /// Record whether the sender holds any data credit, as the slot's account
-    /// sees it. Written under the peer's mutex on admit, reconcile and grant;
-    /// the store is skipped when nothing changed, since this runs per batch.
+    /// sees it. Written under the peer's mutex on admit, reconcile, grant and
+    /// the reorder hold, so per record; the store is skipped when nothing
+    /// changed, which keeps it a load in steady state.
     pub(super) fn set_sender_parked(&self, parked: bool) {
         if self.sender_parked.load(Ordering::Relaxed) != parked {
             self.sender_parked.store(parked, Ordering::Relaxed);
@@ -221,7 +230,18 @@ impl DrainSignal {
 
     /// The mux let go of this bind's buffer. Idempotent.
     pub(crate) fn close(&self) {
+        self.released.store(true, Ordering::Release);
         self.closed.cancel();
+    }
+
+    /// Whether the mux has already let go of this bind's buffer: its slot
+    /// retired (on the sender's terminal, among others) or its bind released.
+    ///
+    /// A plain load, where `closed().is_cancelled()` would lock the token: a
+    /// consumer that ends a stream asks this so an ordinary end, whose slot
+    /// the terminal already retired, never takes the peer's ingress lock.
+    pub(crate) fn is_released(&self) -> bool {
+        self.released.load(Ordering::Acquire)
     }
 
     /// Fires once the mux has let go of this bind's buffer.

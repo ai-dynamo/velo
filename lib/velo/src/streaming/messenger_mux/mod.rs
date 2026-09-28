@@ -224,6 +224,9 @@ struct MuxCore {
     /// batch of the new one as stale and discard it wholesale.
     epochs: Arc<AtomicU64>,
     cancel: CancellationToken,
+    /// The runtime the mux was built on, for work that has to spawn when the
+    /// caller has none: a slot close from an anchor dropped off-runtime.
+    runtime: Option<tokio::runtime::Handle>,
     /// Peers with credit to return, posted by draining consumers. See
     /// [`ingress::DrainSignal`].
     drain_tx: flume::Sender<WorkerId>,
@@ -334,6 +337,7 @@ impl MessengerMuxTransport {
             drain_tx,
             drain_rx,
             drains: DashMap::new(),
+            runtime: tokio::runtime::Handle::try_current().ok(),
             bind_deadlines: std::sync::Mutex::default(),
             #[cfg(test)]
             hooks: std::sync::OnceLock::new(),
@@ -523,24 +527,26 @@ impl MuxCore {
     /// fault that carries the same news to it otherwise rides on the next
     /// record it sends.
     fn close_claimed_slot(&self, peer: WorkerId, slot: protocol::SlotId, session_id: Option<u64>) {
-        // Checked before touching the ingress table, not after: this runs
-        // from a `Drop` that can land on a thread with no runtime under it
-        // (`StreamController::cancel` guards its own spawn the same way and
-        // for the same reason, `streaming/anchor.rs`), and resolving a
-        // batcher may need to spawn its task. Retiring the slot first and
-        // discovering only afterward that there is nowhere to post the reply
-        // would leave the peer worse off than doing nothing at all: the
-        // reactive `ConsumerGone` fault a live slot would otherwise raise on
-        // its next record can no longer find a slot to raise it on. With no
-        // runtime, do nothing -- the peer learns on its next record, exactly
-        // as if this path did not exist.
-        if tokio::runtime::Handle::try_current().is_err() {
-            tracing::debug!(
-                peer = %peer,
-                "messenger mux: no runtime to post a slot close on; the peer learns on its next record"
-            );
-            return;
-        }
+        // Resolving a batcher may spawn its task, and this runs from a `Drop`
+        // that can land on a thread with no runtime under it. Enter the runtime
+        // the mux was built on in that case: waiting for the slot's next record
+        // is no answer, because a dead or parked sender sends none. Checked
+        // before touching the ingress table, not after, so a mux with no
+        // runtime at all leaves the slot as it found it rather than retiring
+        // it with nowhere to post the reply.
+        let _entered = match tokio::runtime::Handle::try_current() {
+            Ok(_) => None,
+            Err(_) => match self.runtime.as_ref() {
+                Some(runtime) => Some(runtime.enter()),
+                None => {
+                    tracing::debug!(
+                        peer = %peer,
+                        "messenger mux: no runtime to post a slot close on; the peer learns on its next record"
+                    );
+                    return;
+                }
+            },
+        };
         let Some(reply) =
             self.ingress
                 .close_consumer_gone(peer, slot, self.metrics.as_ref(), session_id)

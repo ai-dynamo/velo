@@ -77,12 +77,18 @@ impl DirectFeed {
         let Some(release) = &self.release else {
             return;
         };
+        // The ordinary end: the sender's terminal retired the slot already,
+        // so there is nothing to close and no reason to take the peer's lock.
+        if self.drain.is_released() {
+            return;
+        }
         let Some(mux) = release.mux.upgrade() else {
             return;
         };
-        // `cancel`, not `claimed`: it takes the lock an `OpenSlot`'s claim
-        // takes, so a claim racing this close sees the bind cancelled and
-        // closes the slot itself rather than opening one nobody reads.
+        // `cancel`, not `claimed`: it marks the bind cancelled under the lock
+        // an `OpenSlot`'s claim takes, so a claim that lands after it finds
+        // the mark and closes the slot itself (`open_slot`'s cancelled arm)
+        // rather than opening one nobody reads.
         match self.drain.cancel() {
             Some((peer, slot)) => mux.cancel_claimed_session(peer, slot, release.session_id),
             None => mux.release_bind(release.anchor_id, release.session_id),
@@ -159,9 +165,16 @@ impl FeedCell {
 /// Under the lock because a retire (`AnchorEntry::retire_pump`) and a removal
 /// both take that lock too: installing after it dropped could put back a feed
 /// that was retired in the gap, over the feed of the attach that replaced it.
-pub(crate) fn install_direct_feed(cell: &FeedCell, feed: DirectFeed) -> Arc<DirectFeed> {
+///
+/// Takes the entry itself, not its `Arc<FeedCell>`, so a caller can only
+/// reach it through a registry guard: cloning the cell out and installing
+/// after the lock drops does not type-check.
+pub(crate) fn install_direct_feed(
+    entry: &mut crate::streaming::anchor::AnchorEntry,
+    feed: DirectFeed,
+) -> Arc<DirectFeed> {
     let feed = Arc::new(feed);
-    cell.install(Arc::clone(&feed));
+    entry.feed.install(Arc::clone(&feed));
     feed
 }
 

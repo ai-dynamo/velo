@@ -594,7 +594,7 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::messe
                                 .take_mux_drain_signal(local_id, routing_session_id)
                                 .map(|drain| {
                                     install_direct_feed(
-                                        &entry.feed,
+                                        entry,
                                         DirectFeed {
                                             rx: receiver.clone(),
                                             drain,
@@ -745,14 +745,25 @@ pub fn create_anchor_detach_handler(manager: Arc<AnchorManager>) -> crate::messe
                         // sees the close. Both are what `retire_pump` does, exactly as
                         // `adopt_prebind`'s `Verdict::Mismatch` arm and the co-located branch of
                         // `attach_stream_anchor` already do.
+                        let retired_feed = entry.feed.current();
                         let pump_token = entry.retire_pump();
-                        (Some((pump_token, entry.frame_tx.clone())), released)
+                        (
+                            Some((pump_token, entry.frame_tx.clone(), retired_feed)),
+                            released,
+                        )
                     }
                 };
                 // shard lock is now dropped
                 drop(released_prebind);
 
-                if let Some((_pump_token, frame_tx)) = maybe_entry_info {
+                if let Some((_pump_token, frame_tx, retired_feed)) = maybe_entry_info {
+                    // The entry stays for a re-attach, so its `Drop` will not
+                    // close this stream's mux slot; with no `PreBind` (an
+                    // ordinary attach) nothing else would tell a parked sender.
+                    // Outside the shard lock, as every other close is.
+                    if let Some(feed) = retired_feed {
+                        feed.release_slot();
+                    }
                     let sentinel_bytes = crate::streaming::sender::cached_detached().clone();
                     let _ = frame_tx.try_send(sentinel_bytes);
                     manager.record_streaming_operation(
