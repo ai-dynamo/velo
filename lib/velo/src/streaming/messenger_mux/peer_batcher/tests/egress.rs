@@ -384,8 +384,8 @@ async fn a_terminal_spends_the_reserve_when_data_credit_is_gone() {
 /// consumer would see the end before records it is owed — so the terminal waits.
 /// The exit is the byte cap: a producer that keeps sending gets the per-slot
 /// kill. A producer that stops leaves the stream open until the application
-/// drops the anchor, because the stream watchdog counts a window with records
-/// waiting unread as live (`docs/src/operations/saturation.md`).
+/// drops the anchor, because the stream watchdog exempts a sender that holds no
+/// credit (`docs/src/operations/saturation.md`).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_terminal_behind_starved_predecessors_waits_for_them() {
     let harness = harness(MuxConfig::default()).await;

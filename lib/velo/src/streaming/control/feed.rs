@@ -49,6 +49,42 @@ pub(crate) struct DirectFeed {
     /// which is what tells a closed `rx` apart from an unclaimed bind reaped
     /// by the accept window.
     pub(crate) pump_token: CancellationToken,
+    /// How to close this feed's slot when the consumer ends the stream itself.
+    /// `None` only in tests that build a feed without a mux.
+    pub(crate) release: Option<SlotRelease>,
+}
+
+/// What a consumer needs to close its own slot.
+///
+/// A consumer that ends the stream on its side -- a record it cannot decode, a
+/// transport error -- leaves a sender that is still sending. The mux learns a
+/// consumer is gone when a delivery finds no receiver, but the consumer's
+/// receiver clones may outlive the stream, and a sender that fills its window
+/// and parks sends nothing more for a delivery to fail on. So the consumer
+/// closes the slot directly and tells the sender, the way a pre-bind's owner
+/// does when it gives up (`PreBind`'s `Drop`).
+pub(crate) struct SlotRelease {
+    pub(crate) mux: std::sync::Weak<crate::streaming::messenger_mux::MessengerMuxTransport>,
+    pub(crate) anchor_id: u64,
+    pub(crate) session_id: u64,
+}
+
+impl DirectFeed {
+    /// Close this feed's slot and tell its sender to abandon its end. A no-op
+    /// where there is nothing to close, including a stream that already ended
+    /// on its own terminal.
+    pub(crate) fn release_slot(&self) {
+        let Some(release) = &self.release else {
+            return;
+        };
+        let Some(mux) = release.mux.upgrade() else {
+            return;
+        };
+        match self.drain.claimed() {
+            Some((peer, slot)) => mux.cancel_claimed_session(peer, slot, release.session_id),
+            None => mux.release_bind(release.anchor_id, release.session_id),
+        }
+    }
 }
 
 /// What [`stream_watchdog`] needs besides the feed it watches.
@@ -114,8 +150,19 @@ impl FeedCell {
     }
 }
 
-/// Start a mux bind's stream: install the feed, wake the consumer, spawn the
-/// watchdog.
+/// Install a mux bind's feed for its consumer. Call with the anchor entry's
+/// shard lock held, then [`launch_direct_stream`] once it is dropped.
+///
+/// Under the lock because a retire (`AnchorEntry::retire_pump`) and a removal
+/// both take that lock too: installing after it dropped could put back a feed
+/// that was retired in the gap, over the feed of the attach that replaced it.
+pub(crate) fn install_direct_feed(cell: &FeedCell, feed: DirectFeed) -> Arc<DirectFeed> {
+    let feed = Arc::new(feed);
+    cell.install(Arc::clone(&feed));
+    feed
+}
+
+/// Start a mux bind's stream: wake the consumer, spawn the watchdog.
 ///
 /// Called at the two places a mux bind gets its consumer side — the attach
 /// handler and `AnchorManager::prebind_anchor` — where every other transport
@@ -127,26 +174,12 @@ impl FeedCell {
 /// feed, and the frame is queued, so it cannot be lost to a race with the
 /// consumer's next poll. The consumer drops heartbeats before they reach the
 /// application.
-///
-/// Both callers start the feed after dropping the registry's shard lock, so a
-/// cancel can remove the entry in between; the entry's drop then withdraws a
-/// feed that is not installed yet. Checking the registry after the install
-/// closes that gap: either the install lands first and the removal withdraws
-/// it, or the check sees the entry gone and withdraws it here. Anchor ids are
-/// never reused, so a present entry is this anchor's.
-pub(crate) fn start_direct_stream(
-    cell: &FeedCell,
-    feed: DirectFeed,
+pub(crate) fn launch_direct_stream(
+    feed: Arc<DirectFeed>,
     frame_tx: flume::Sender<Vec<u8>>,
     ctx: crate::streaming::anchor::AnchorContext,
     watch: WatchdogContext,
 ) {
-    let feed = Arc::new(feed);
-    cell.install(Arc::clone(&feed));
-    if !ctx.registry.contains_key(&watch.local_id) {
-        cell.withdraw();
-        return;
-    }
     let _ = frame_tx.try_send(crate::streaming::sender::cached_heartbeat().clone());
     tokio::spawn(stream_watchdog(feed, frame_tx, ctx, watch));
 }
@@ -201,6 +234,13 @@ pub(crate) fn reap_unclaimed(
 /// Detection lands between `DETECTION_MULTIPLIER` and one more window after the
 /// last arrival: windows run on the watchdog's own clock, not from the last
 /// frame, because the watchdog never sees a frame.
+///
+/// A firing removes the anchor, which withdraws the feed, so records still in
+/// the slot buffer are not delivered: the consumer's next poll reads
+/// `SenderDropped`. The reader pump delivered them first. Keeping them would
+/// mean leaving the entry in place until the consumer drained, for records
+/// from a sender already judged dead on a stream that ends in an error either
+/// way.
 ///
 /// Exits when its token is cancelled, when the mux closes the bind's buffer
 /// (the stream ended, or an unclaimed bind was released — which it reaps on
@@ -264,11 +304,12 @@ pub(crate) async fn stream_watchdog(
                     }
                     tracing::warn!(
                         local_id,
-                        anchor_frame_tx_len = frame_tx.len(),
+                        slot_buffer_len = feed.rx.len(),
+                        arrivals = seen,
                         heartbeat_deadline_ms = heartbeat_deadline.as_millis() as u64,
                         detection_multiplier = DETECTION_MULTIPLIER,
-                        "stream_watchdog: no arrivals and an empty slot buffer for \
-                         the detection window, injecting Dropped"
+                        "stream_watchdog: nothing arrived from a sender holding credit \
+                         for the detection window, injecting Dropped"
                     );
                     let _ = frame_tx.try_send(crate::streaming::sender::cached_dropped().clone());
                     if let Some((_, entry)) = ctx.registry.remove(&local_id) {
@@ -308,6 +349,7 @@ mod tests {
             rx: flume::bounded(1).1,
             drain: Arc::new(DrainSignal::new(wake)),
             pump_token,
+            release: None,
         }
     }
 
@@ -318,46 +360,6 @@ mod tests {
     /// The entry that close would reap is the one the winning attach is about
     /// to reuse, so the cancelled token is what must stop the reap -- whichever
     /// of the consumer and the watchdog sees the close.
-    /// A feed started for an anchor that is no longer registered is withdrawn.
-    ///
-    /// The attach handler and `prebind_anchor` start the feed after they drop
-    /// the registry's shard lock. A cancel landing in that gap removes the
-    /// entry first, and the entry's drop withdraws a feed that is not there
-    /// yet; the install that follows would then leave the consumer reading a
-    /// cancelled stream's slot buffer. The pump this replaced was spawned with
-    /// the already-cancelled token and exited at once, so the feed has to check
-    /// the same thing.
-    #[tokio::test]
-    async fn a_feed_started_for_a_removed_anchor_is_withdrawn() {
-        let ctx = crate::streaming::anchor::AnchorContext {
-            registry: Arc::new(dashmap::DashMap::new()),
-            mpsc_registry: Arc::new(dashmap::DashMap::new()),
-            metrics: None,
-        };
-        let cell = FeedCell::default();
-        let (_tx, rx) = flume::bounded::<Vec<u8>>(4);
-        let (frame_tx, _frame_rx) = flume::bounded::<Vec<u8>>(4);
-        let (wake, _) = flume::unbounded();
-        start_direct_stream(
-            &cell,
-            DirectFeed {
-                rx,
-                drain: Arc::new(DrainSignal::new(wake)),
-                pump_token: CancellationToken::new(),
-            },
-            frame_tx,
-            ctx,
-            WatchdogContext {
-                local_id: 1,
-                heartbeat_deadline: Duration::from_secs(5),
-                prebound: Arc::new(AtomicBool::new(false)),
-            },
-        );
-        assert!(
-            cell.current().is_none(),
-            "anchor 1 is not registered, so its feed must not stay installed"
-        );
-    }
 
     #[test]
     fn a_retired_feed_does_not_reap_and_an_abandoned_one_reaps_once() {

@@ -1002,3 +1002,50 @@ async fn a_zero_credit_window_is_refused_at_build_time() {
 
 mod outcome;
 mod zero_rtt;
+
+/// A consumer that ends on a record it cannot decode releases its slot, on
+/// the ordinary attach path, while the application still holds the anchor.
+///
+/// The consumer reads the slot buffer through receiver clones it keeps in its
+/// feed. A decode error ends the stream on the consumer side only: the sender
+/// is alive and keeps sending. If ending the stream kept those clones, every
+/// later delivery would still find a receiver, the sender would fill its
+/// window and park, and the watchdog would leave a parked sender alone -- the
+/// slot and its peer batcher would never retire. A pre-bound anchor is closed
+/// by its `PreBind` when that drops; an ordinary attach has no `PreBind`, so
+/// the consumer has to close the slot itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_attached_consumer_that_ends_on_a_bad_record_releases_its_slot() {
+    let (consumer, producer) = pair(Some(mux_config()), Some(mux_config())).await;
+    let mut anchor = consumer.velo.create_anchor::<String>();
+    let handle = transfer(anchor.handle());
+    let sender = producer
+        .velo
+        .attach_anchor::<u32>(handle)
+        .await
+        .expect("attach over the mux");
+    sender.send(7).await.expect("send");
+
+    let ended = tokio::time::timeout(PATIENCE, anchor.next())
+        .await
+        .expect("timed out waiting for the bad record");
+    assert!(
+        matches!(
+            ended,
+            Some(Err(velo::streaming::StreamError::DeserializationError(_)))
+        ),
+        "a u32 is not a String, got {ended:?}"
+    );
+
+    // The sender is alive and keeps going; a send that parks is given up on.
+    for n in 0..32u32 {
+        if tokio::time::timeout(Duration::from_millis(100), sender.send(n))
+            .await
+            .map_or(true, |sent| sent.is_err())
+        {
+            break;
+        }
+    }
+    eventually(|| consumer.mux_live_slots() == 0.0).await;
+    drop(anchor);
+}

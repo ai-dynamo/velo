@@ -347,9 +347,9 @@ impl Batcher {
     /// still owed. A terminal behind starved predecessors therefore waits with
     /// them. What ends such a stream is the byte cap, if the producer keeps
     /// sending. If it does not, nothing does until the application drops the
-    /// anchor: the stream watchdog counts a window with records waiting unread
-    /// in the slot buffer as live, so it never fires on a consumer that stopped
-    /// draining.
+    /// anchor: a consumer that stopped draining leaves its sender without
+    /// credit, and the stream watchdog exempts a sender that holds none, so it
+    /// never fires on such a stream.
     pub(super) async fn release_withheld(&mut self, index: u32) {
         loop {
             let next = {

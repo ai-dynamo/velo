@@ -79,14 +79,15 @@ Read the channel depths:
 On a mux stream, the stream watchdog writes a different line:
 
 ```text
-stream_watchdog: no arrivals and an empty slot buffer for the detection window, injecting Dropped
+stream_watchdog: nothing arrived from a sender holding credit for the detection window, injecting Dropped
   local_id=...
-  anchor_frame_tx_len=...
+  slot_buffer_len=...
+  arrivals=...
   heartbeat_deadline_ms=5000
   detection_multiplier=3
 ```
 
-This watchdog fires only when nothing arrived for the slot and the slot buffer was empty for the whole detection window. A firing on a mux stream is therefore never a consumer that fell behind. The silence came from upstream: a producer crash, a network partition, or a backlog on the producer's egress or the peer link. On a mux peer link that carries thousands of streams, heartbeats wait in the same queue as data. A deep enough backlog there silences a live sender. In one measured UCX run, 1,722 streams on one congested peer were killed this way while their worker was healthy.
+This watchdog fires only when nothing arrived for the slot for the whole detection window while its sender still held data credit. Heartbeats spend data credit, so a sender that held credit could have sent one. A consumer that falls behind leaves its sender without credit, and the watchdog exempts such a sender, so a firing on a mux stream is never a consumer that fell behind. Records still in the slot buffer when it fires are not delivered: the consumer reads `SenderDropped` next. The silence came from upstream: a producer crash, a network partition, or a backlog on the producer's egress or the peer link. On a mux peer link that carries thousands of streams, heartbeats wait in the same queue as data. A deep enough backlog there silences a live sender. In one measured UCX run, 1,722 streams on one congested peer were killed this way while their worker was healthy.
 
 ### Mitigations
 
@@ -126,7 +127,7 @@ A queued terminal goes with the slot. A consumer that expected `Finalized` sees 
 
 This kill replaces the watchdog kill for muxed streams. It is deterministic, it names one slot, and it is metered as a drop, not as a liveness failure. `velo_streaming_heartbeat_watchdog_firings_total` remains the signal for a peer that went silent for another reason.
 
-The consumer reads the slot buffer itself, so credit returns only when it takes a record. A consumer that stops polling holds its sender to the credit window C. The stream watchdog counts a window with unread records as live. It never ends a stream whose consumer stopped polling. If the producer also stops sending, the anchor stays until the application drops it. `velo_streaming_reader_pump_backpressure_total` does not move for mux streams. Watch `velo_streaming_slot_credit_exhausted_total`, which the producer's node counts.
+The consumer reads the slot buffer itself, so credit returns only when it takes a record. A consumer that stops polling holds its sender to the credit window C. The stream watchdog exempts a sender that holds no credit, so it never ends a stream whose consumer stopped polling with its window full. If the producer dies while it still holds credit, the watchdog ends the stream on time, even with records unread. If it dies holding no credit, the watchdog ends the stream once the consumer reads enough to return credit to it. `velo_streaming_reader_pump_backpressure_total` does not move for mux streams. Watch `velo_streaming_slot_credit_exhausted_total`, which the producer's node counts.
 
 If the slot is fenced behind an unresolved `OpenSlot` or rendezvous admission, the consumer's `Dropped` waits for that admission. The producer is disconnected at once. If the admission fails, the failure is epoch death for the whole peer. The slot is retired without the deferred `Dropped`, and the consumer falls back on the heartbeat watchdog.
 

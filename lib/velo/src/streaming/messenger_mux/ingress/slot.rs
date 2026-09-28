@@ -386,9 +386,10 @@ fn fault_reason(fault: &DeliverFault) -> Applied {
 /// `DETECTION_MULTIPLIER` watches for, and it is the only thing a streaming beat
 /// still uniquely carries now that the Messenger detects process, host and
 /// connection death itself. The watchdog charges only a window with no
-/// arrivals *and* an empty slot buffer, so the saturation it sees is upstream
-/// of the consumer (the producer's egress or the peer link), not a consumer
-/// that has fallen behind.
+/// arrivals from a sender that still held data credit, so the saturation it
+/// sees is upstream of the consumer (the producer's egress or the peer link),
+/// not a consumer that has fallen behind: that consumer leaves its sender
+/// without credit, and the watchdog exempts it.
 pub(super) fn heartbeat_frame() -> Vec<u8> {
     cached_heartbeat().clone()
 }

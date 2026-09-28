@@ -2153,19 +2153,17 @@ async fn a_retired_pump_withdraws_its_feed() {
     drop(anchor);
 }
 
-/// A consumer that has ended retires its slot, even while the application
-/// still holds the anchor.
+/// A pre-bound consumer that has ended retires its slot, even while the
+/// application still holds the anchor.
 ///
 /// A record the consumer cannot decode ends the stream on the consumer side
-/// only: the sender is alive and keeps sending. The anchor still holds
-/// receiver clones of the slot buffer through its feed, so a delivery finding
-/// no receiver is not what retires the slot here. The terminal arm removes the
-/// anchor's entry and cancels its token, and that retires the slot. A change
-/// that kept the entry alive after a terminal error would leave a slot taking
-/// deliveries nobody reads, until the sender filled `C + 1` and parked for
-/// good; this pins that it does not.
-///
-/// The watchdog ending a silent stream retires the slot the same way.
+/// only: the sender is alive and keeps sending, and the consumer's feed holds
+/// receiver clones of the slot buffer. Ending the stream drops the feed and
+/// closes the slot through the mux (`SlotRelease`); on this pre-bound path the
+/// `PreBind` dropped with the entry closes it too. The ordinary attach path,
+/// which has no `PreBind`, is
+/// `an_attached_consumer_that_ends_on_a_bad_record_releases_its_slot` in the
+/// negotiation tests.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_ended_consumer_releases_its_slot_while_the_anchor_is_held() {
     let pair = mux_pair(test_config()).await;
@@ -2212,12 +2210,12 @@ async fn an_ended_consumer_releases_its_slot_while_the_anchor_is_held() {
     drop(anchor);
 }
 
-/// An anchor leaving the registry takes its feed with it.
+/// An anchor leaving the registry takes its feed out of the cell.
 ///
-/// The mux learns a consumer is gone when a delivery finds the slot buffer
-/// with no receiver left. The pump's receiver went with the pump, which every
-/// removal cancelled; the feed's receiver lives in the anchor entry, so the
-/// entry has to let go of it when it is removed.
+/// The cell is where a consumer that has not read yet would find the feed, so
+/// a removed entry has to clear it. This anchor never polls, so it proves the
+/// cell is cleared, not that a consumer's own receiver clones are let go of;
+/// that is the ended-consumer tests' job.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_removed_anchor_withdraws_its_feed() {
     let node = prebinding_node(test_config(), None).await;

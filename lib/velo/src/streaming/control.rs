@@ -43,7 +43,8 @@ use crate::streaming::handle::StreamAnchorHandle;
 ///   [`reader_pump`] for why.
 /// - The mux's stream watchdog (`feed::stream_watchdog`) never sees a frame. It wakes once
 ///   per window on its own clock and counts a window as dead when the ingress delivered
-///   nothing to the slot and the slot buffer is empty. Detection lands between
+///   nothing to the slot while its sender still held data credit, and so could have
+///   sent a heartbeat. Detection lands between
 ///   `DETECTION_MULTIPLIER` and `DETECTION_MULTIPLIER + 1` windows after the last arrival.
 ///
 /// Both the producer (`StreamSender`) heartbeat cadence and the consumer's per-window
@@ -331,7 +332,10 @@ mod pump;
 mod ticket;
 #[cfg(test)]
 pub(crate) use feed::stream_watchdog;
-pub(crate) use feed::{DirectFeed, FeedCell, WatchdogContext, reap_unclaimed, start_direct_stream};
+pub(crate) use feed::{
+    DirectFeed, FeedCell, SlotRelease, WatchdogContext, install_direct_feed, launch_direct_stream,
+    reap_unclaimed,
+};
 pub(crate) use pump::{PumpContext, note_timer_arm, note_timer_fire, reader_pump};
 #[cfg(test)]
 pub(crate) use pump::{TIMER_ARMS, TIMER_FIRES};
@@ -564,7 +568,6 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::messe
                             let pump_cancel = entry.cancel_token.child_token();
                             entry.active_pump_token = Some(pump_cancel.clone());
                             let pump_frame_tx = entry.frame_tx.clone();
-                            let feed = std::sync::Arc::clone(&entry.feed);
                             // Snapshot the negotiated heartbeat interval before dropping the lock.
                             let heartbeat_interval = entry.heartbeat_interval;
 
@@ -579,26 +582,39 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::messe
                                 );
                             }
 
+                            // Start the stream's consumer side. Only the mux
+                            // parks a drain signal, and only for the pair it
+                            // just bound: a mux bind's consumer reads the slot
+                            // buffer itself (see `control::feed`), and its feed
+                            // is installed before the shard lock drops, so a
+                            // retire or a removal cannot land in between. Every
+                            // other transport gets a reader pump.
+                            let (_, local_id) = req.handle.unpack();
+                            let direct = manager
+                                .take_mux_drain_signal(local_id, routing_session_id)
+                                .map(|drain| {
+                                    install_direct_feed(
+                                        &entry.feed,
+                                        DirectFeed {
+                                            rx: receiver.clone(),
+                                            drain,
+                                            pump_token: pump_cancel.clone(),
+                                            release: manager.mux_handle().map(|mux| SlotRelease {
+                                                mux,
+                                                anchor_id: local_id,
+                                                session_id: routing_session_id,
+                                            }),
+                                        },
+                                    )
+                                });
+
                             // Drop shard lock before spawning
                             drop(occ);
 
-                            // Start the stream's consumer side
-                            let (_, local_id) = req.handle.unpack();
-                            // Only the mux parks a drain signal, and only for
-                            // the pair it just bound: a mux bind's consumer
-                            // reads the slot buffer itself (see
-                            // `control::feed`); every other transport gets a
-                            // reader pump.
-                            if let Some(drain) =
-                                manager.take_mux_drain_signal(local_id, routing_session_id)
-                            {
-                                start_direct_stream(
-                                    &feed,
-                                    DirectFeed {
-                                        rx: receiver,
-                                        drain,
-                                        pump_token: pump_cancel,
-                                    },
+                            if let Some(feed) = direct {
+                                drop(receiver);
+                                launch_direct_stream(
+                                    feed,
                                     pump_frame_tx,
                                     manager.anchor_context(),
                                     WatchdogContext {

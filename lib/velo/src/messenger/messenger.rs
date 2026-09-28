@@ -480,6 +480,9 @@ impl Messenger {
 
     /// Wait for a specific handler to become available on a remote instance.
     ///
+    /// Not a reachability probe: once the handler is known, a later call does
+    /// not check that the peer is still there.
+    ///
     /// Returns at once when the peer's known handler list already names it:
     /// a registered handler does not go away while its instance lives, and a
     /// refresh is a `_hello` round trip through the peer. Callers that ask per

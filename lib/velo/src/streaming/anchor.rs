@@ -689,7 +689,20 @@ impl<T> StreamAnchor<T> {
     /// which withdraws its direct feed. Without it, those two arms would leave
     /// both the registry entry and that task running, with nothing telling
     /// either to stop.
-    fn retire(&self) {
+    /// End the stream on this side: remove the anchor, and let go of the slot
+    /// buffer this consumer reads.
+    ///
+    /// The feed's receiver clones would otherwise outlive the stream while the
+    /// application holds the anchor. When the stream ended on something other
+    /// than its sender's terminal, the sender may still be sending, so the slot
+    /// is also closed through the mux and the sender told (`SlotRelease`);
+    /// after a terminal the ingress has already retired it.
+    fn retire(&mut self, sender_may_be_live: bool) {
+        if let Some((feed, _)) = self.feed.take()
+            && sender_may_be_live
+        {
+            feed.release_slot();
+        }
         if let Some((_, entry)) = self.registry.remove(&self.local_id) {
             entry.cancel_token.cancel();
         }
@@ -790,7 +803,7 @@ impl<T: DeserializeOwned> Stream for StreamAnchor<T> {
                         Ok(StreamFrame::Finalized) => {
                             this.terminated = true;
                             // Anchor is permanently closed.
-                            this.retire();
+                            this.retire(false);
                             return Poll::Ready(Some(Ok(StreamFrame::Finalized)));
                         }
                         Ok(StreamFrame::Detached) => {
@@ -868,17 +881,17 @@ impl<T: DeserializeOwned> Stream for StreamAnchor<T> {
                         Ok(StreamFrame::Dropped) => {
                             this.terminated = true;
                             // Sender dropped without an explicit close.
-                            this.retire();
+                            this.retire(true);
                             return Poll::Ready(Some(Err(StreamError::SenderDropped)));
                         }
                         Ok(StreamFrame::TransportError(msg)) => {
                             this.terminated = true;
-                            this.retire();
+                            this.retire(true);
                             return Poll::Ready(Some(Err(StreamError::TransportError(msg))));
                         }
                         Err(e) => {
                             this.terminated = true;
-                            this.retire();
+                            this.retire(true);
                             return Poll::Ready(Some(Err(StreamError::DeserializationError(
                                 e.to_string(),
                             ))));
@@ -887,6 +900,7 @@ impl<T: DeserializeOwned> Stream for StreamAnchor<T> {
                 }
                 Poll::Ready(None) => {
                     this.terminated = true;
+                    this.retire(true);
                     return Poll::Ready(None);
                 }
                 Poll::Pending => return Poll::Pending,
@@ -1358,21 +1372,34 @@ impl AnchorManager {
                             mux: Arc::downgrade(mux),
                             prebound: Arc::clone(&prebound),
                         });
+                        // Installed under the shard lock, so a retire or a
+                        // removal cannot land between this and the install.
+                        let feed = crate::streaming::control::install_direct_feed(
+                            &entry.feed,
+                            crate::streaming::control::DirectFeed {
+                                rx: receiver.clone(),
+                                drain: Arc::clone(&drain),
+                                pump_token: pump_cancel,
+                                release: Some(crate::streaming::control::SlotRelease {
+                                    mux: Arc::downgrade(mux),
+                                    anchor_id: local_id,
+                                    session_id: routing_session_id,
+                                }),
+                            },
+                        );
                         Some((
                             ticket,
                             entry.frame_tx.clone(),
-                            pump_cancel,
                             entry.heartbeat_interval,
                             prebound,
-                            Arc::clone(&entry.feed),
+                            feed,
                         ))
                     }
                 }
             }
         };
 
-        let Some((ticket, frame_tx, pump_cancel, heartbeat_interval, prebound, feed)) = prepared
-        else {
+        let Some((ticket, frame_tx, heartbeat_interval, prebound, feed)) = prepared else {
             // Nothing took ownership of the bind, so give it straight back
             // rather than leaving the accept window to find it in a minute.
             mux.release_bind(local_id, routing_session_id);
@@ -1389,13 +1416,9 @@ impl AnchorManager {
             return None;
         };
 
-        crate::streaming::control::start_direct_stream(
-            &feed,
-            crate::streaming::control::DirectFeed {
-                rx: receiver,
-                drain,
-                pump_token: pump_cancel,
-            },
+        drop(receiver);
+        crate::streaming::control::launch_direct_stream(
+            feed,
             frame_tx,
             self.anchor_context(),
             crate::streaming::control::WatchdogContext {
@@ -1550,6 +1573,14 @@ impl AnchorManager {
     ///
     /// `None` for the legacy per-stream transports, which is the honest answer:
     /// they issue no credit over that seam, so there is nothing to return.
+    /// A weak handle to the installed mux, for a consumer that has to close
+    /// its own slot. Weak for the reason `PreBind` holds one.
+    pub(crate) fn mux_handle(
+        &self,
+    ) -> Option<std::sync::Weak<crate::streaming::messenger_mux::MessengerMuxTransport>> {
+        self.mux.get().map(Arc::downgrade)
+    }
+
     pub(crate) fn take_mux_drain_signal(
         &self,
         anchor_id: u64,
