@@ -76,29 +76,30 @@
 //!
 //! Credit comes back from three places. Two of them visit only slots that
 //! something named; the third is the whole-table backstop. A draining
-//! consumer's pump counts the record on that
-//! slot's [`ingress::DrainSignal`], puts the slot's index on its peer's dirty
-//! lane, and posts the peer. The **arrival path** then reconciles, on every
-//! inbound batch, the slots that batch delivered into together with the slots
-//! on that lane — so the credit a stream's tail waits on rides the peer's next
-//! batch, which arrives in tens of microseconds. The **doorbell** walks the
-//! same lane when the sweep task answers a wake, no more often than once per
+//! consumer (the `StreamAnchor` reading its slot buffer directly, or an MPSC
+//! anchor's pump) counts the record on that slot's [`ingress::DrainSignal`], lists the slot in its peer's
+//! [`ingress::DirtySlots`], and posts the peer if the listing is new. The
+//! **arrival path** then reconciles, on every inbound batch, the slots that
+//! batch delivered into together with the slots in that set — so the credit a
+//! stream's tail waits on rides the peer's next batch, which arrives in tens of
+//! microseconds. The **doorbell** takes the same set when the sweep task
+//! answers a wake, no more often than once per
 //! [`MuxConfig::drain_visit_floor`]; it is what covers a peer that has gone
 //! quiet. The **periodic tick** walks the whole table, for the slot nothing
-//! named — one parked with nothing arriving *and* nothing being taken out, or
-//! one whose drain found the lane full — and it carries batcher eviction.
+//! named — one parked with nothing arriving *and* nothing being taken out —
+//! and it carries batcher eviction.
 //!
-//! The lane is a doorbell, not a ledger: an entry names a slot and carries no
+//! The set is a doorbell, not a ledger: a listing names a slot and carries no
 //! quantity. The quantity is the count on that slot's own signal, and
 //! `IngressSlot::reconcile` taking it is the only thing that decides how much
 //! credit was freed. That is what lets the three paths run concurrently — a
 //! redundant visit finds a count of zero, where a delta would double-count.
 //!
-//! It still differs from `docs/src/concepts/batched-streaming.md`, which specifies an exact
-//! `credit.release(1)` per handoff. Releasing an amount from the pump is the
-//! part that was not adopted: releasing needs the peer's mutex, and taking it
-//! per record would trade a periodic cost for a worse per-record one. See the
-//! dated addenda at the end of that document.
+//! The first design released an exact `credit.release(1)` per handoff.
+//! Releasing an amount from the consumer is the part that was not adopted:
+//! releasing needs the peer's mutex, and taking it per record would trade a
+//! periodic cost for a worse per-record one. See "Credit return" in
+//! `docs/src/development/batched-streaming-design.md`.
 
 mod config;
 pub(crate) mod flow_control;
@@ -111,6 +112,7 @@ mod test_support;
 #[cfg(test)]
 mod tests;
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
@@ -173,12 +175,22 @@ const ACCEPT_TIMEOUT: Duration = Duration::from_secs(60);
 /// eviction sweeps inside one attach.
 const CONNECT_ATTEMPTS: usize = 3;
 
-/// Peer wakes the drain lane holds before it starts dropping them.
+/// The lane drain signals post their peer on and the sweep task answers.
 ///
-/// Wakes coalesce naturally — many slots of one peer post the same `WorkerId`,
-/// and one reconcile of that peer serves all of them — so this does not need to
-/// scale with slot count. It needs to absorb a burst across distinct peers.
-const DRAIN_WAKE_CAPACITY: usize = 1024;
+/// Unbounded, because a refused wake strands credit. Only the drain that newly
+/// lists a slot posts its peer; every later drain of that slot rides the
+/// listing and posts nothing, so a wake dropped here leaves the slot listed
+/// with no visit coming until a batch or the periodic tick arrives -- and a
+/// peer whose sender is parked out of credit sends no batch.
+///
+/// Occupancy is bounded without a capacity. A post needs the peer's `pending`
+/// flag to go from down to up, and only a visit to that peer or the periodic
+/// tick takes it down; each doorbell visit consumes the entry that summoned it,
+/// so the lane holds about one entry per peer, plus at most one more per peer
+/// per tick while the sweep task is behind.
+fn drain_wake_lane() -> (flume::Sender<WorkerId>, flume::Receiver<WorkerId>) {
+    flume::unbounded::<WorkerId>()
+}
 
 /// The `messenger-mux-v2` [`FrameTransport`].
 ///
@@ -211,12 +223,15 @@ struct MuxCore {
     /// batch of the new one as stale and discard it wholesale.
     epochs: Arc<AtomicU64>,
     cancel: CancellationToken,
+    /// The runtime the mux was built on, for work that has to spawn when the
+    /// caller has none: a slot close from an anchor dropped off-runtime.
+    runtime: Option<tokio::runtime::Handle>,
     /// Peers with credit to return, posted by draining consumers. See
     /// [`ingress::DrainSignal`].
     drain_tx: flume::Sender<WorkerId>,
     drain_rx: flume::Receiver<WorkerId>,
-    /// Drain signals waiting to be collected by the attach that will spawn the
-    /// pump holding them.
+    /// Drain signals waiting to be collected by the attach that will start the
+    /// feed and watchdog (or MPSC pump) holding them.
     ///
     /// `bind` cannot hand this back directly — `FrameTransport::bind` returns a
     /// receiver and nothing else, and widening that trait would be a breaking
@@ -225,6 +240,17 @@ struct MuxCore {
     /// `bind` returns. Take-once: whoever collects it owns it, and the bind
     /// expiry that already exists drops any that was never collected.
     drains: DashMap<(u64, u64), Arc<ingress::DrainSignal>>,
+    /// Accept-window deadlines, one per bind, oldest first.
+    ///
+    /// Every bind gets the same `ACCEPT_TIMEOUT`, so pushing at bind time keeps
+    /// the queue in deadline order and the sweep only ever pops its front. A
+    /// bind claimed or released early stays queued and costs a failed lookup
+    /// when its deadline comes; that is cheaper than finding and removing it.
+    /// It used to be one timer task per bind, which nothing but shutdown
+    /// cancelled: a claimed bind's task lived out the full minute, so a
+    /// frontend opening 2,000 streams a second carried about 120,000 idle
+    /// tasks.
+    bind_deadlines: std::sync::Mutex<VecDeque<(tokio::time::Instant, (u64, u64))>>,
     /// A barrier handed to every batcher this core spawns, installed by the
     /// tests that need one held mid-wake. See [`peer_batcher::test_hooks`].
     #[cfg(test)]
@@ -245,8 +271,8 @@ impl MessengerMuxTransport {
 
     /// Take the [`ingress::DrainSignal`] `bind` parked for this pair.
     ///
-    /// Called once by the attach path, between `bind` returning and the pump
-    /// being spawned. Returns `None` for a pair this transport did not bind,
+    /// Called once by the attach path, between `bind` returning and the
+    /// consumer side being started. Returns `None` for a pair this transport did not bind,
     /// which is the honest answer for the legacy per-stream transports — they
     /// have no mux credit to return.
     pub(crate) fn take_drain_signal(
@@ -295,11 +321,7 @@ impl MessengerMuxTransport {
             slot_byte_budget: limits.slot_byte_budget(),
             ..config
         };
-        // Bounded, and deliberately lossy on overflow: a wake is a hint that a
-        // peer has credit to return, and a dropped hint costs latency the
-        // periodic sweep still bounds. Sized so a burst across many peers does
-        // not discard wakes it could have kept.
-        let (drain_tx, drain_rx) = flume::bounded::<WorkerId>(DRAIN_WAKE_CAPACITY);
+        let (drain_tx, drain_rx) = drain_wake_lane();
         let core = Arc::new(MuxCore {
             messenger: Arc::clone(&messenger),
             config,
@@ -314,6 +336,8 @@ impl MessengerMuxTransport {
             drain_tx,
             drain_rx,
             drains: DashMap::new(),
+            runtime: tokio::runtime::Handle::try_current().ok(),
+            bind_deadlines: std::sync::Mutex::default(),
             #[cfg(test)]
             hooks: std::sync::OnceLock::new(),
         });
@@ -456,8 +480,7 @@ impl MuxCore {
     /// Reconcile every slot of one peer, on the periodic tick.
     ///
     /// The whole-table walk, and the only visitor of a slot nobody named — the
-    /// one parked with nothing arriving and nothing being taken out, and the
-    /// one whose drain found the peer's dirty lane full.
+    /// one parked with nothing arriving and nothing being taken out.
     fn sweep_peer(&self, peer: WorkerId) {
         // Taken down before the reconcile, not after: a record drained while
         // this visit is in progress must be able to post a fresh wake, or its
@@ -468,7 +491,7 @@ impl MuxCore {
 
     /// One doorbell-driven visit: reconcile the slots of the peer that rang.
     ///
-    /// Scoped to the slots a pump named on that peer's dirty lane, because a
+    /// Scoped to the slots listed in that peer's dirty set, because a
     /// wake means those slots drained and says nothing about the rest — and
     /// this walk holds the mutex the inbound batch path takes.
     ///
@@ -496,31 +519,43 @@ impl MuxCore {
     ///
     /// Two halves, and both are needed. The local retire is what returns
     /// `live_slots` to zero — nothing else does, because the sweep reads
-    /// only what the slot's own pump counted drained, and a pump whose
-    /// consumer is gone counts nothing; the next record to arrive would
+    /// only what the slot's own consumer counted drained, and a consumer that
+    /// is gone counts nothing; the next record to arrive would
     /// close the slot by finding its receiver gone, but an idle producer
     /// sends none. The reply is what that idle producer needs, since the
     /// fault that carries the same news to it otherwise rides on the next
     /// record it sends.
     fn close_claimed_slot(&self, peer: WorkerId, slot: protocol::SlotId, session_id: Option<u64>) {
-        // Checked before touching the ingress table, not after: this runs
-        // from a `Drop` that can land on a thread with no runtime under it
-        // (`StreamController::cancel` guards its own spawn the same way and
-        // for the same reason, `streaming/anchor.rs`), and resolving a
-        // batcher may need to spawn its task. Retiring the slot first and
-        // discovering only afterward that there is nowhere to post the reply
-        // would leave the peer worse off than doing nothing at all: the
-        // reactive `ConsumerGone` fault a live slot would otherwise raise on
-        // its next record can no longer find a slot to raise it on. With no
-        // runtime, do nothing -- the peer learns on its next record, exactly
-        // as if this path did not exist.
-        if tokio::runtime::Handle::try_current().is_err() {
-            tracing::debug!(
-                peer = %peer,
-                "messenger mux: no runtime to post a slot close on; the peer learns on its next record"
-            );
-            return;
-        }
+        // Resolving a batcher may spawn its task, and this runs from a `Drop`
+        // that can land on a thread with no runtime under it. Enter the runtime
+        // the mux was built on in that case: waiting for the slot's next record
+        // is no answer, because a dead or parked sender sends none. Checked
+        // before touching the ingress table, not after, so a mux with no
+        // runtime at all leaves the slot as it found it rather than retiring
+        // it with nowhere to post the reply.
+        let _entered = match tokio::runtime::Handle::try_current() {
+            Ok(_) => None,
+            // Only for a thread with no runtime. A destroyed thread-local (a
+            // drop from a TLS destructor) would make `enter` panic inside a
+            // `Drop`, so that case keeps the quiet return below.
+            Err(error) if !error.is_missing_context() => {
+                tracing::debug!(
+                    peer = %peer,
+                    "messenger mux: runtime context unavailable here; the peer learns on its next record"
+                );
+                return;
+            }
+            Err(_) => match self.runtime.as_ref() {
+                Some(runtime) => Some(runtime.enter()),
+                None => {
+                    tracing::debug!(
+                        peer = %peer,
+                        "messenger mux: no runtime to post a slot close on; the peer learns on its next record"
+                    );
+                    return;
+                }
+            },
+        };
         let Some(reply) =
             self.ingress
                 .close_consumer_gone(peer, slot, self.metrics.as_ref(), session_id)
@@ -532,6 +567,43 @@ impl MuxCore {
         }
         let batcher = self.batcher(peer);
         self.send_replies(&batcher, peer, &[reply]);
+    }
+
+    /// Close the accept window on every bind whose deadline has passed.
+    ///
+    /// Runs on the sweep tick, so a window closes up to one
+    /// `credit_sweep_interval` late -- 200 ms on a 60 s window by default.
+    fn expire_binds(&self, now: tokio::time::Instant) {
+        let due: Vec<(u64, u64)> = {
+            let mut deadlines = self
+                .bind_deadlines
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let ready = deadlines.partition_point(|(deadline, _)| *deadline <= now);
+            let due = deadlines.drain(..ready).map(|(_, key)| key).collect();
+            // A burst of binds leaves the queue's capacity behind it. Give it
+            // back only once the queue is nearly empty: the shrink copies what
+            // is left while holding the lock every bind takes, so shrinking a
+            // queue still tens of thousands deep would stall new streams.
+            if deadlines.len() <= 1024 && deadlines.capacity() > 8192 {
+                deadlines.shrink_to(2048);
+            }
+            due
+        };
+        for (anchor_id, session_id) in due {
+            // Whether or not the bind was still there, drop any drain signal
+            // no attach collected. Without this an attach that failed between
+            // `bind` and `take_drain_signal` would leak one entry per attempt
+            // for the process's life.
+            self.drains.remove(&(anchor_id, session_id));
+            if self.ingress.expire_bind(anchor_id, session_id) {
+                tracing::warn!(
+                    anchor_id,
+                    session_id,
+                    "messenger mux: no OpenSlot arrived before the accept window closed"
+                );
+            }
+        }
     }
 
     /// One sweep tick: return credit, then age out idle batchers.
@@ -582,9 +654,9 @@ impl Drop for MuxCore {
 /// The body [`FrameTransport::bind`] and
 /// [`MessengerMuxTransport::prebind`] share. `bind` is async because the trait
 /// is; **nothing in here awaits**, and that is what lets the zero-RTT path call
-/// it synchronously while registering a request. Anything a future accept-window
-/// change touches — the reaper this window is a candidate to become — is here,
-/// once, rather than in two places that would drift.
+/// it synchronously while registering a request. The accept window is a
+/// deadline the sweep expires (`MuxCore::expire_binds`), queued here, once,
+/// rather than in two places that would drift.
 fn open_bind(core: &Arc<MuxCore>, anchor_id: u64, session_id: u64) -> flume::Receiver<Vec<u8>> {
     // `C + 1`: `C` data credits plus the one reserved terminal credit.
     // Credit is issued against *this* buffer and never against the
@@ -596,34 +668,19 @@ fn open_bind(core: &Arc<MuxCore>, anchor_id: u64, session_id: u64) -> flume::Rec
     core.ingress
         .register_bind(anchor_id, session_id, frame_tx, drain);
 
-    // `Weak`, and cancellable. A strong handle here would pin the whole
-    // transport alive for the full accept window after the last owner
-    // dropped it — a minute of leaked slots, batcher tasks and ingress
-    // state per outstanding bind, and a `live_slots` gauge that only
-    // comes back to zero when the timers do.
-    let expiry = Arc::downgrade(core);
-    let cancel = core.cancel.clone();
-    tokio::spawn(async move {
-        tokio::select! {
-            () = cancel.cancelled() => return,
-            () = tokio::time::sleep(ACCEPT_TIMEOUT) => {}
-        }
-        let Some(core) = expiry.upgrade() else {
-            return;
-        };
-        // Whether or not the bind was still there, drop any drain
-        // signal no attach collected. Without this an attach that
-        // failed between `bind` and `take_drain_signal` would leak one
-        // entry per attempt for the process's life.
-        core.drains.remove(&(anchor_id, session_id));
-        if core.ingress.expire_bind(anchor_id, session_id) {
-            tracing::warn!(
-                anchor_id,
-                session_id,
-                "messenger mux: no OpenSlot arrived before the accept window closed"
-            );
-        }
-    });
+    // A deadline, not a task: the sweep expires it (`MuxCore::expire_binds`).
+    // Nothing here may pin the core either, which a task holding a strong
+    // handle would, for the full window after the last owner dropped it.
+    // The clock is read under the lock, so pushes land in deadline order.
+    let mut deadlines = core
+        .bind_deadlines
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    deadlines.push_back((
+        tokio::time::Instant::now() + ACCEPT_TIMEOUT,
+        (anchor_id, session_id),
+    ));
+    drop(deadlines);
 
     frame_rx
 }
@@ -730,6 +787,12 @@ impl MessengerMuxTransport {
     #[cfg(test)]
     pub(crate) fn close_claimed_slot(&self, peer: WorkerId, slot: protocol::SlotId) {
         self.core.close_claimed_slot(peer, slot, None);
+    }
+
+    /// Slot closes that went as far as taking a peer's ingress lock.
+    #[cfg(test)]
+    pub(crate) fn consumer_gone_calls(&self) -> usize {
+        self.core.ingress.consumer_gone_calls()
     }
 
     /// Binds registered and neither claimed nor released.

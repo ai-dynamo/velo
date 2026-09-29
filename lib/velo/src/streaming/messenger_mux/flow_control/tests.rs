@@ -85,7 +85,7 @@ fn records_classify_onto_the_right_reservation() {
     }
 
     // A heartbeat spends data credit and is therefore droppable under
-    // saturation. That drop *is* the per-slot saturation signal `reader_pump`'s
+    // saturation. That drop *is* the per-slot saturation signal the stream
     // watchdog fires on; a reserve here would delete it.
     assert_eq!(CreditClass::of(SlotHeartbeat, false), CreditClass::Data);
     assert_eq!(CreditClass::of(SlotHeartbeat, true), CreditClass::Data);

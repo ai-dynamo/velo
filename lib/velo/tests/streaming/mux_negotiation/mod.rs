@@ -42,9 +42,9 @@ const PATIENCE: Duration = Duration::from_secs(30);
 
 /// A window far smaller than the traffic every test pushes through it.
 ///
-/// Deliberate: this is the first stage in which `reader_pump` drains a mux slot
-/// buffer at all, so the credit the pump returns by reconciliation is newly
-/// load-bearing. At the default 256 the window never empties and none of that is
+/// Deliberate: the consumer drains the mux slot buffer (a mux-fed
+/// `StreamAnchor` reads it directly), so the credit it returns by
+/// reconciliation is load-bearing. At the default 256 the window never empties and none of that is
 /// exercised; at 8 it empties constantly and only the return path can refill it.
 fn mux_config() -> MuxConfig {
     mux_config_at(8)
@@ -588,6 +588,70 @@ async fn a_sender_without_a_mux_streams_over_the_legacy_path() {
     );
 }
 
+/// A mux stream that detached leaves no feed behind to misjudge the next
+/// sender's `Detached`.
+///
+/// A consumer reads a `Detached` off the anchor channel as an earlier stream's
+/// while a mux feed is installed: a mux stream detaches through its own slot.
+/// If the feed of a mux stream that detached stayed installed, the next
+/// sender to attach without the mux -- a peer without it, or one the per-node
+/// switch turned off -- would have its own `Detached` skipped. The anchor
+/// would then stay attached to nobody and refuse every later attach, with no
+/// timer left to reap it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_detached_mux_stream_leaves_no_feed_to_skip_a_later_detached() {
+    let (consumer, with_mux) = pair(Some(mux_config()), Some(mux_config())).await;
+    let without_mux = node(None).await;
+    consumer
+        .velo
+        .register_peer(without_mux.velo.peer_info())
+        .expect("register the second producer on the consumer");
+    without_mux
+        .velo
+        .register_peer(consumer.velo.peer_info())
+        .expect("register the consumer on the second producer");
+    ready(&without_mux, consumer.velo.instance_id(), "_anchor_attach").await;
+
+    let mut anchor = consumer.velo.create_anchor::<u32>();
+    let handle = transfer(anchor.handle());
+    let mut next = async || {
+        let frame = tokio::time::timeout(PATIENCE, anchor.next())
+            .await
+            .expect("timed out waiting for a frame")
+            .expect("stream ended early")
+            .expect("frame decodes");
+        format!("{frame:?}")
+    };
+
+    let sender = with_mux
+        .velo
+        .attach_anchor::<u32>(handle)
+        .await
+        .expect("mux attach");
+    sender.send(0).await.expect("send");
+    sender.detach().expect("detach");
+    assert_eq!(next().await, "Item(0)");
+    assert_eq!(next().await, "Detached");
+    assert_eq!(consumer.attaches_over(MUX_KEY), 1.0);
+
+    let sender = without_mux
+        .velo
+        .attach_anchor::<u32>(handle)
+        .await
+        .expect("attach without the mux after the mux stream detached");
+    sender.send(1).await.expect("send");
+    sender.detach().expect("detach");
+    assert_eq!(next().await, "Item(1)");
+    assert_eq!(next().await, "Detached");
+    assert_eq!(consumer.attaches_over(LEGACY_KEY), 1.0);
+
+    with_mux
+        .velo
+        .attach_anchor::<u32>(handle)
+        .await
+        .expect("both senders detached, so the anchor takes a third");
+}
+
 /// (d) A mux sender against a receiver without one: SPSC.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_mux_sender_falls_back_when_the_receiver_has_no_mux() {
@@ -1002,3 +1066,52 @@ async fn a_zero_credit_window_is_refused_at_build_time() {
 
 mod outcome;
 mod zero_rtt;
+
+/// A consumer that ends on a record it cannot decode releases its slot, on
+/// the ordinary attach path, while the application still holds the anchor.
+///
+/// The consumer reads the slot buffer through receiver clones it keeps in its
+/// feed. A decode error ends the stream on the consumer side only: the sender
+/// is alive and keeps sending. If ending the stream kept those clones, every
+/// later delivery would still find a receiver, the sender would fill its
+/// window and park, and the watchdog would leave a parked sender alone -- the
+/// slot and its peer batcher would never retire. A pre-bound anchor is closed
+/// by its `PreBind` when that drops; an ordinary attach has no `PreBind`, so
+/// the consumer has to close the slot itself, and tell the sender.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_attached_consumer_that_ends_on_a_bad_record_releases_its_slot() {
+    let (consumer, producer) = pair(Some(mux_config()), Some(mux_config())).await;
+    let mut anchor = consumer.velo.create_anchor::<String>();
+    let handle = transfer(anchor.handle());
+    let sender = producer
+        .velo
+        .attach_anchor::<u32>(handle)
+        .await
+        .expect("attach over the mux");
+    sender.send(7).await.expect("send");
+    // The stream rode the mux, not a fallback transport.
+    eventually(|| consumer.mux_live_slots() == 1.0).await;
+
+    let ended = tokio::time::timeout(PATIENCE, anchor.next())
+        .await
+        .expect("timed out waiting for the bad record");
+    assert!(
+        matches!(
+            ended,
+            Some(Err(velo::streaming::StreamError::DeserializationError(_)))
+        ),
+        "a u32 is not a String, got {ended:?}"
+    );
+
+    // The sender sends nothing more, so no later delivery can fail and retire
+    // the slot, and its first heartbeat is seconds away: the close has to come
+    // from the consumer, and it has to reach the sender.
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while consumer.mux_live_slots() != 0.0 || producer.mux_live_slots() != 0.0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the ended consumer must close its slot on both nodes");
+    drop((anchor, sender));
+}

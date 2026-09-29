@@ -49,8 +49,8 @@ The changes are listed in order of effect. Each one landed with a test that fail
 
 1. **One tokio runtime in the frontend.** This is the largest lever, and it is outside velo. The Dynamo frontend ran two 72-worker runtimes on 72 cores. The Python bridge built its own runtime lazily, because its initialization code sat in a branch that never ran. The velo node ran on the first runtime. The HTTP handlers and the per-stream reader pumps ran on the second. Every response record crossed between them through the injection-queue mutex of the second runtime. That lock took 2.4% of the cores plus 6.8% in lock contention. A worker blocked on that mutex does not service the time driver. Linger timers then stopped for seconds, and credit stopped. The 8,192 streams fell into a 6 to 8 s limit cycle. The fix initializes the bridge with Dynamo's runtime, a 24-line change. Thread count fell from 242 to 154.
 2. **Zero-RTT stream setup.** The worker sends without waiting for the attach round trip. The worker-ingress-to-first-token segment fell from 78 to 48 ms at p50.
-3. **Credit on the next batch for every drained slot.** The reader pump names the slot it drained, and the next inbound batch reconciles it. Before this change, each inbound batch walked every slot of its peer. At about 1,000 slots per peer and 11 slots touched per batch, `flume::Shared::len` alone took 2.1% of the frontend's 72 cores, about 0.5 ms per request.
-4. **One timer per stream in the reader pump.** The pump used to build a `tokio::time::timeout` per record. Each one took the time driver's lock twice. The `Sleep` subtree was 7.3% of the frontend's cores, plus 0.8% for the cancellation future. With one pinned timer, the timer subtree fell to 0.15%.
+3. **Credit on the next batch for every drained slot.** Each drain names the slot it drained, and the next inbound batch reconciles it. Before this change, each inbound batch walked every slot of its peer. At about 1,000 slots per peer and 11 slots touched per batch, `flume::Shared::len` alone took 2.1% of the frontend's 72 cores, about 0.5 ms per request.
+4. **One timer per stream in the reader pump.** The pump used to build a `tokio::time::timeout` per record. Each one took the time driver's lock twice. The `Sleep` subtree was 7.3% of the frontend's cores, plus 0.8% for the cancellation future. With one pinned timer, the timer subtree fell to 0.15%. The mux has since dropped the reader pump; its stream watchdog wakes once per window and does no timer work per record. See [The reader pump leaves the mux data path](#the-reader-pump-leaves-the-mux-data-path).
 5. **Reply linger.** Credit replies wait up to 1 ms to share a batch. With zero-RTT setup, the frontend's egress had carried one batch per credit reply: 1,027,872 outbound batches against 97,042 without zero-RTT. The linger cut frontend batches four to six times and saved 0.4 ms of CPU per request.
 6. **Control maps bounded by allocation.** A 4,096-entry control cap was sized for about 1,024 slots per peer. One mocker process held 4,000 to 6,700 live slots. The cap refused credit grants and closes, and with `async_open_ack` it refused the answer that lifts a slot's fence. A fenced slot then waited for the 15 s watchdog, and the client saw an HTTP 500.
 7. **Drain-driven credit return with a visit floor.** Measured on 2026-09-01 on an exclusive 144-core node with the in-process harness at 256 ingress peers, 42 interleaved runs:
@@ -79,7 +79,7 @@ These changes were measured or traced and did not help. They are recorded so tha
 | `async_open_ack` alone | TTFT p95 was worse in every rep (209, 176, 252 ms against 142, 119, 136). p50 did not improve. With zero-RTT setup it cut the response segment from 48 to 39 ms at p50, but p95 stayed worse. | Off by default. |
 | Reply linger as a first-token lever | The per-request segments did not move at equal load: 3.7 against 3.9–4.0 ms, 3.3 against 3.3–3.5 ms, 47.7 against 47.8–47.9 ms. | A batch and CPU fix only. The batch inflation was a symptom of contention, not its cause. |
 | Shard the frontend ingest lane | The lane's cost was the per-batch slot walk, which item 3 removed. The profile shows no core-bound lane stage. | Not built. |
-| Merge the reader pump into the anchor channel | Traced. The anchor channel has other writers, and credit is issued against the mux buffer's sole writer. | Forbidden by the credit invariant. |
+| Merge the reader pump into the anchor channel | Traced. The anchor channel has other writers, and credit is issued against the mux buffer's sole writer. | Forbidden by the credit invariant. The pump was later removed another way: the consumer reads the mux buffer itself. See [The reader pump leaves the mux data path](#the-reader-pump-leaves-the-mux-data-path). |
 | `SO_REUSEPORT` on the TCP path | Traced. The kernel demuxes TCP per connection, so the frontend already has one socket, queue and reader per peer. | Not applicable. A QUIC transport needs it, because one QUIC endpoint is one UDP socket. |
 | A 60 KiB against 64 KiB batch cap | Traced. Both planes write one `writev` per batch. | Equivalent. |
 | Flatten the MessagePack envelope | Profiled. Decode costs the same in both planes. | No lever. |
@@ -107,7 +107,7 @@ A per-subtree partition of a `perf` profile of both frontends, with one runtime 
 
 velo's anchor and adapter consumer (1.46) cost about what the comparison plane's reader and receiver cost (1.24). The excess is task hops. The reader pump is a channel-to-channel relay with no counterpart, and the lane, dispatch and transport are three stages where the comparison plane has one task. Each record also reaches the HTTP connection task as its own wake.
 
-After the inline receiver, a second profile put the velo-only buckets at 3.20 ms per request. The buckets were: reader pump 1.01, anchor 0.85, ingress 0.51, adapter 0.49, TCP 0.18, dispatch 0.14, batcher 0.01. The reader pump and the anchor channel are the remaining addressable surplus. The pump cannot merge into the anchor channel (see the table above). Each other hop-chain change is optional and needs a same-matrix tail check.
+After the inline receiver, a second profile put the velo-only buckets at 3.20 ms per request. The buckets were: reader pump 1.01, anchor 0.85, ingress 0.51, adapter 0.49, TCP 0.18, dispatch 0.14, batcher 0.01. The reader pump and the anchor channel are the remaining addressable surplus. The pump cannot merge into the anchor channel (see the table above). Each other hop-chain change is optional and needs a same-matrix tail check. These two profiles predate the direct feed, which takes the reader pump off the mux data path. See [The reader pump leaves the mux data path](#the-reader-pump-leaves-the-mux-data-path).
 
 Before the fixes above, these symbols appeared only in velo's profile, as a share of the 72 frontend cores:
 
@@ -115,15 +115,29 @@ Before the fixes above, these symbols appeared only in velo's profile, as a shar
 |---|---|---|---|
 | `flume::Shared<T>::len` | 2.09% | Per-batch walk of every slot, reading each channel length under its lock | Removed |
 | `parking_lot` lock slow paths | 1.58% | A `timeout` per received record in the reader pump | Removed |
-| `flume::Sender<T>::try_send` | 0.93% | Delivery of each record into its anchor channel | Inherent |
-| `set_active_anchor_gauge` | 0.49% | The gauge recounts the anchor registry on each create and retire | Open |
-| `CancellationToken::is_cancelled` | 0.43% | Per-record checks on the delivery path | Open |
+| `flume::Sender<T>::try_send` | 0.93% | Delivery of each record into its anchor channel | Removed for the mux: the consumer reads the slot buffer directly |
+| Active-anchor gauge updates | 0.49% | The gauge recounted the anchor registry on each create and retire | Removed: the gauge is computed when scraped |
+| `CancellationToken::is_cancelled` | 0.43% | Per-record checks on the delivery path | Removed for the mux with the reader pump; the producer's per-send check remains |
+
+Removed, measured on the rig rather than in a profile: each bind used to spawn one task that slept for the 60-second accept window, and a claim did not cancel it. A frontend at about 2,000 requests per second held 146,000 live tokio tasks against about 25,000 on the QUIC plane. The accept window is now a deadline in one queue that the credit sweep drains, so a bind owns no task and a window closes up to one sweep interval late. The test `a_finished_zero_rtt_stream_leaves_no_task_behind` holds the task count to its baseline after streams end.
 
 These costs are counted from source, not measured:
 
-- **Accept-window tasks.** Each bind spawns one task that sleeps for the 60-second accept window, and a claim does not cancel it. At 3,000 attaches per second, about 180,000 such tasks and timers are live. This is a memory and task-count cost, not a per-record one.
-- **The per-record copy.** Ingress copies each record body into a `Vec` (one allocation and one `memcpy`, estimated at 35 to 55 ns). Removing it needs `Bytes` from the slot buffer through the anchor channel.
-- **Wakes.** `flume` fires a waker only for a parked receiver, so k records for one slot in one batch already cost one wake. The cost that remains is the two-hop structure: slot buffer to reader pump, then anchor channel to consumer.
+- **The per-record copy.** Ingress copies each record body into a `Vec` (one allocation and one `memcpy`, estimated at 35 to 55 ns). Removing it needs `Bytes` from the slot buffer through to the consumer. On the microbenchmark below, `memcpy` was 0.5% of frontend CPU.
+- **Wakes.** `flume` fires a waker only for a parked receiver, so k records for one slot in one batch already cost one wake. With the direct feed, a record makes one hop, from the slot buffer to the consumer.
+
+### The reader pump leaves the mux data path
+
+Measured on 2026-09-26 with a two-process microbenchmark shaped like `response_plane_bench`, on one Grace node: frontend 32 threads, 2,048 streams, 918 records of 160 B, jemalloc. The figure is frontend CPU per record, median of 3 runs. Each pair of rows is its own A/B. The direct-feed baseline is a separate run of the dirty-set build, so the rows do not chain.
+
+| Change | Peers | Before, µs per record | After, µs per record | Change |
+|---|---|---|---|---|
+| Dirty set: a lock-free per-peer bitmap replaces the per-peer dirty lane and per-slot flag | 12 | 6.66 | 5.82 | −12.5% |
+| Dirty set | 48 | 8.60 | 8.11 | −5.6% |
+| Direct feed: the consumer reads the slot buffer, and no reader pump runs | 12 | 5.87 | 5.33 | −9.2% |
+| Direct feed | 48 | 7.71 | 7.38 | −4.3% |
+
+In the profiles before these changes, the reader pump was 28% of frontend CPU at 12 peers. In the dirty set, only the drain that newly lists a slot touches the peer's shared wake flag. The direct feed removes a task wake, a channel send and receive, and a hook allocation per record. These are microbenchmark numbers, not rig numbers.
 
 ## First-token mechanisms
 
@@ -144,6 +158,7 @@ These mechanisms were found:
 - **TTFT p50 followed the backlog draw.** Before the one-runtime fix, velo's p50 was 54 to 55 ms at one holder, 61 to 62 at two, 73 to 76 at three and 83 at five. The comparison plane stayed at 48 to 49 ms. After the fix, velo's p50 is 39 to 45 ms at one to three holders.
 - **The steady-state tail is the hot mocker process and HTTP ingress, in both planes.** In steady state, segment B contributes nothing to p99. Segment C adds 125 to 209 ms, and 59% to 89% of the p90-to-p99 band sits on one mocker process with 3,000 to 6,400 requests in flight. Segment A adds 39 to 112 ms. The raw p99 is the opening burst, described in [Benchmarking](benchmarking.md#steady-state-and-raw-percentiles).
 - **End-to-end and ITL tails measure one mocker process.** Arrivals are equal across the 8 mocker processes. In-flight counts are not: seven sit at 150 to 200 and one at 3,000 to 7,000 for the whole run, in every plane. By Little's law, a request on the hot process stays about 15 s against 0.43 s elsewhere. End-to-end p99 and ITL p99 therefore measure which process holds the backlog, not the plane.
+- **A handler wait cost a hello round trip per request.** The Dynamo adapter calls `Velo::wait_for_handler` before each request to make sure the worker can reach the frontend's `_stream_stop` handler. `wait_for_handler` refreshed the peer's handler list with a full `_hello` round trip every time, and under a saturated frontend that round trip waited in the frontend's messenger queues. It now returns at once when the handler list already names the handler. The test `test_wait_for_handler_reuses_cache_and_refreshes_missing_handlers` counts one handshake for repeated waits on a known handler, and a new one for a missing handler or a new instance. On the rig its effect on TTFT was within the rep-to-rep spread. A Dynamo adapter change also prepares each peer once instead of per request.
 - **velo's tail discipline is conditional.** Before pinning, velo appeared to keep a much shorter end-to-end tail. That was a starved frontend limiting how many streams ran at once. With the frontend on 48 cores and the load generator on 96, velo held 8.1 s end-to-end p99 at 3,008 req/s against the comparison plane's 25.2 s at 2,460. On a 72/72 split, both planes posted about 11.5 s.
 
 ## UCX transport instability
@@ -183,7 +198,7 @@ These alternatives were checked and refuted:
 - UCX scheduling is not unfair. The failed peer carried eight times the load of the others.
 - Spinning progress threads do not starve the CPU. There were 9 progress threads on 288 cores.
 
-No tuning setting reaches this mechanism. The fix has two parts. The UCX transport needs a backpressure edge (gate admission on in-flight operations or on a per-peer ring share). Liveness needs a heartbeat path that data cannot block, or a watchdog that can tell a starved stream from a dead one. The UCX inbound path records frames like every other transport. Version 0.14 adds the bounded admission edge. Saturation measurements must still check whether data backlog delays stream heartbeats beyond the watchdog. [RDMA performance](rdma-performance.md) covers the UCX transport outside the response plane.
+No tuning setting reaches this mechanism. The mux's stream watchdog, which replaced the reader pump's watchdog on single-sender streams, exempts a sender that holds no data credit, but here the senders held credit and their records were stuck upstream, so it would still have fired. The fix has two parts. The UCX transport needs a backpressure edge (gate admission on in-flight operations or on a per-peer ring share). Liveness needs a heartbeat path that data cannot block, or a watchdog that can tell a starved stream from a dead one. The UCX inbound path records frames like every other transport. Version 0.14 adds the bounded admission edge. Saturation measurements must still check whether data backlog delays stream heartbeats beyond the watchdog. [RDMA performance](rdma-performance.md) covers the UCX transport outside the response plane.
 
 ## Instrumentation cost
 

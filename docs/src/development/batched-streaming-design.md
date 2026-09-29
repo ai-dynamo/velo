@@ -82,6 +82,19 @@ The anchor's `frame_tx` has writers other than the mux: the same-worker attach p
 
 This ruling keeps the reader pump. Merging the pump into the anchor channel removes one task hop per record (about 1 ms of frontend CPU per request on the serving rig), but it breaks the credit proof. Removing the pump for mux streams also removes the heartbeat watchdog and `velo_streaming_reader_pump_backpressure_total`.
 
+**Addendum, 2026-09-26: the pump is off the mux data path, by another route.** The ruling against the merge stands, and so does its reason. What changed is who reads the mux buffer. The `StreamAnchor` now polls the slot buffer itself, ahead of its own `frame_tx`, and counts each record it takes on the slot's `DrainSignal` (`lib/velo/src/streaming/control/feed.rs`). The mux is still the buffer's only writer, so the credit proof is unchanged. The anchor channel carries only sentinels and the heartbeat that tells a parked consumer a new feed is installed.
+
+The watchdog is not lost. A stream watchdog, one task per mux stream that holds no data, keeps the pump's other duties: it reaps an unclaimed bind, injects `Dropped` after `DETECTION_MULTIPLIER` dead windows, and keeps the pre-bind exemption. It wakes once per window or when the mux closes the bind. A window is live if the ingress delivered to the slot, or if the sender holds no data credit with nothing waiting behind a sequence gap. The backpressure counter is lost for mux streams: nothing forwards into the anchor channel, so it no longer moves. `velo_streaming_slot_credit_exhausted_total`, counted on the producer's node, is the consumer-saturation signal there.
+
+What changes in behavior:
+
+- A consumer that stops polling holds its sender to the credit window C. The pump counted each move into the 256-deep anchor channel as a drain, so the sender could run C + 1 + 256 records ahead.
+- Detection lands between `DETECTION_MULTIPLIER` windows and one window more after the last arrival, because windows run on the watchdog's own clock. The pump detected exactly `DETECTION_MULTIPLIER` windows after the last forwarded frame.
+- A window is exempt only while the sender holds no data credit, as the consumer node's credit account sees it, and nothing waits in the reorder hold: credit spent into the hold behind a gap that never closes would otherwise exempt a stuck stream for good. Arrivals count deliveries, not records parked in the hold. An earlier version exempted any non-empty buffer; a dead sender behind a consumer that was connected but slow then kept its anchor, slot and peer batcher until the consumer drained. A sender that still holds credit can heartbeat, so its silence is its own whether or not records wait unread. The account also covers a sender starved by the byte budget, whose credit the consumer node withholds while the buffer holds that budget with fewer than C records in it.
+- Retiring a bind or removing the anchor withdraws the feed. The consumer drops a withdrawn feed before it reads that buffer again, so unread records in it are discarded.
+
+Measured on one Grace node with a two-process microbenchmark (frontend 32 threads, 2,048 streams, 918 records of 160 B, jemalloc, median of 3). Frontend CPU per record fell from 5.87 to 5.33 µs at 12 peers (−9.2%) and from 7.71 to 7.38 µs at 48 peers (−4.3%). In the profiles before these changes, the reader pump was 28% of frontend CPU at 12 peers. [Response plane performance](../operations/response-plane-performance.md#the-reader-pump-leaves-the-mux-data-path) has the setup and the dirty-set numbers.
+
 ### Generations and epochs
 
 Dense slot reuse without a generation delivers a stale record to the stream that now holds its index. A `u8` generation is enough because the epoch scopes the whole table: batches from an old epoch are discarded as a whole.
@@ -128,16 +141,17 @@ The price of `Manual` is also known. A per-pass flush caps a batch at that pass'
 
 The receiver answers `messenger-mux-v2` only when the sender named it. `resolve_transport` fails on an unknown key, so a receiver that chooses the mux on its own breaks every older sender. A node with the mux registers both keys. The wire version lives in the key, so incompatible versions never pair. A zero window with the mux key is refused, because a fallback connects to a transport where nothing listens.
 
-### Credit return: the pump posts, the reconcile decides
+### Credit return: the consumer posts, the reconcile decides
 
-The first design had the reader pump call `credit.release(1)` after each handoff. The landed design has the pump count on the slot's `DrainSignal`, list the slot on a per-peer dirty lane and post the peer. A reconcile then swaps the count and releases it.
+The first design had the reader pump call `credit.release(1)` after each handoff. The landed design has the drainer count on the slot's `DrainSignal`, list the slot in a per-peer dirty set and post the peer. A reconcile then swaps the count and releases it. For a mux stream the drainer is the consumer itself, which reads the slot buffer directly; for an MPSC anchor it is the MPSC pump.
 
-- **Why the pump does not release.** Releasing needs the peer mutex that the inbound batch path takes. Taking it per record trades a periodic cost for a worse per-record one. Two paths that each release an amount for one record also double-count, and the periodic sweep still exists. With the quantity on the slot, every visit is idempotent.
+- **Why the consumer does not release.** Releasing needs the peer mutex that the inbound batch path takes. Taking it per record trades a periodic cost for a worse per-record one. Two paths that each release an amount for one record also double-count, and the periodic sweep still exists. With the quantity on the slot, every visit is idempotent.
 - **Why wakes coalesce per peer.** Posting per record replaces a periodic cost with a per-record one. A per-slot record threshold withholds credit for the first T records of every slot. It also still posts once per slot per threshold, so it is worse on latency and on volume.
 - **Why the wake flag drops before the walk.** A drain that lands during a walk must post a fresh wake. The same property lets a fast consumer re-arm the flag at once, so the task walks back to back under the peer mutex. `drain_visit_floor` (2 ms, the old sweep interval) caps the visit rate per peer. A wake inside the floor is scheduled for when the peer comes due, and later drains coalesce into that visit.
-- **Why the arrival path reads the dirty lane.** Narrowing the per-batch reconcile to the slots a batch delivered into left every other slot to the doorbell and the sweep. Every stream on the serving rig sends about 4 records more than its 256-record window, so each stream's tail needs one grant. On the rig, sender credit exhaustion rose from 13 to about 20,500 per process. Doorbell visits fell to about one per peer per 12 ms. The frontend's lane wait rose from 0.36 ms to 1.4 s per batch. Throughput halved to 1,516 req/s and TTFT p50 rose from 55 to 331 ms. The grant must ride the peer's next inbound batch.
+- **Why the arrival path reads the dirty set.** Narrowing the per-batch reconcile to the slots a batch delivered into left every other slot to the doorbell and the sweep. Every stream on the serving rig sends about 4 records more than its 256-record window, so each stream's tail needs one grant. On the rig, sender credit exhaustion rose from 13 to about 20,500 per process. Doorbell visits fell to about one per peer per 12 ms. The frontend's lane wait rose from 0.36 ms to 1.4 s per batch. Throughput halved to 1,516 req/s and TTFT p50 rose from 55 to 331 ms. The grant must ride the peer's next inbound batch.
 - **Why the count replaces the occupancy estimate.** Reading `frame_tx.len()` takes the channel's lock. At about 1,000 slots per peer and 6 million batches per rep, that read was the largest velo-only cost on the frontend.
 - **Why the order is clear, then swap.** A drain that lands between the two steps finds the listing down and lists the slot again. The next pass then finds either a zero count or the new drain, never a count with nothing to fetch it.
+- **Why a bitmap, not a lane.** The dirty set was a bounded `flume` lane per peer plus a `listed` flag per slot. With about one record per stream per batch, nearly every drain found its slot unlisted and took the lane's mutex, which every consumer of the peer shares. It is now one lock-free bitmap per peer (`lib/velo/src/streaming/messenger_mux/ingress/dirty.rs`). Only the drain that newly lists a slot touches the peer's shared `pending` flag, and the drain wake lane is unbounded, so a wake is never refused. On the two-process microbenchmark, frontend CPU per record fell from 6.66 to 5.82 µs at 12 peers (−12.5%) and from 8.60 to 8.11 µs at 48 peers (−5.6%).
 
 The doorbell's deferral queue holds at most one entry per peer. An earlier version queued a second entry when a periodic tick cleared a peer's wake and a drain re-armed it inside the floor. The queue then grew by one entry per tick, permanently. The floor is also clamped to one hour, because `last + floor` overflows for an absurd `Duration`.
 
@@ -151,9 +165,9 @@ A grant threshold (grant only when half the window has drained) was built and me
 
 - **Rejected: bind on `OpenSlot`.** Minting a ticket and binding when the `OpenSlot` arrives has a simpler lifecycle. It inverts a layer (ingress resolves the anchor's channel from the registry) and it loses the meaning of the accept window.
 - **No protocol version bump.** The ticket rides the application's envelope as an optional field. A version bump breaks an old worker outright. An absent field makes the worker attach the ordinary way.
-- **The watchdog exemption is gated on `PumpContext::prebound`, not on the drain claim alone.** The mux parks a `DrainSignal` for every bind. The signal reads as unclaimed until the peer's `OpenSlot` arrives, which is after the attach response returned. `prebound` tells a real pre-bind (no sender yet) from an ordinary attach whose `OpenSlot` is still in flight. It is an `Arc<AtomicBool>` so that `PreBind::adopt` can clear it at once when a sender attaches the long way.
+- **The watchdog exemption is gated on `WatchdogContext::prebound`, not on the drain claim alone.** The mux parks a `DrainSignal` for every bind. The signal reads as unclaimed until the peer's `OpenSlot` arrives, which is after the attach response returned. `prebound` tells a real pre-bind (no sender yet) from an ordinary attach whose `OpenSlot` is still in flight. It is an `Arc<AtomicBool>` so that `PreBind::adopt` can clear it at once when a sender attaches the long way.
 - **The exemption lets the accept window be the true backstop.** Counting silence before a sender exists caps the wait at `DETECTION_MULTIPLIER × heartbeat_interval` (15 s at the default), whatever the application configured.
-- **Adoption does not restart the accept window.** An adopted attach inherits what is left of the 60 s. Whichever deadline comes first catches a sender that dies before its first record: the watchdog, measured from adoption, or the remaining accept window. With a heartbeat interval of 20 s or more, the accept window always wins.
+- **Adoption does not restart the accept window.** An adopted attach inherits what is left of the 60 s. Whichever deadline comes first catches a sender that dies before its first record: the watchdog, measured from adoption, or the remaining accept window. With a heartbeat interval of 20 s or more, the accept window wins; it closes up to one `credit_sweep_interval` late, so at exactly 20 s the two can land together.
 
 ### async_open_ack fences only when admission is pending
 
@@ -166,6 +180,8 @@ This skip applies to `OpenSlot` only. A rendezvous record always fences its slot
 A detached open and a later flush to the same peer are separate tasks, so their `batch_seq` values can reach the wire out of order. Per-slot order does not depend on `batch_seq`, so this inverts a counter, not a stream. The gap meter used `wrapping_sub`, and one inverted pair added 4,294,967,295 to `velo_streaming_mux_batch_seq_gaps_total`. The meter now keeps a high-water mark under RFC 1982 comparison. A batch behind the mark is not metered, so an inverted pair costs exactly one. A `batch_seq` per registration class removes that one. It is not built.
 
 ### One timer per stream in the reader pump
+
+This applies to `reader_pump`, which now serves only per-stream transports. The mux's stream watchdog has no per-record work at all: it wakes once per window on its own timer and reads the slot's arrival count.
 
 The pump arms one pinned `Sleep` for its stream. A received frame pushes the deadline only when the deadline is within half a window. When the timer fires, the pump re-arms from the last frame and counts a miss only if the last frame is older than the deadline.
 
@@ -183,7 +199,7 @@ A per-stream heartbeat task does not detect a hung producer, because it runs on 
 - **Phase alignment.** Each sender follows one peer-level tick (a `tokio::sync::watch` driven by one timer task) instead of its own `interval`. Heartbeats then coalesce into one batch instead of scattering across the interval.
 - **No per-sender task.** The batcher walks its live slots on each tick and emits `SlotHeartbeat` for the idle ones.
 
-N scattered heartbeats per interval become at most one batch, and N tasks become one. The receiver still sees a per-slot beat inside its per-slot deadline, so the reader pump and `DETECTION_MULTIPLIER` do not change. `SlotHeartbeat` must not join the reserved control class: a heartbeat dropped under saturation is the saturation signal. Today each sender still runs its own heartbeat task, and heartbeats travel as `Data` records.
+N scattered heartbeats per interval become at most one batch, and N tasks become one. The receiver still sees a per-slot beat inside its per-slot deadline, so the stream watchdog and `DETECTION_MULTIPLIER` do not change. `SlotHeartbeat` must not join the reserved control class: a heartbeat dropped under saturation is the saturation signal. Today each sender still runs its own heartbeat task, and heartbeats travel as `Data` records.
 
 ## Why the mux surface is not in velo-ext
 
@@ -242,10 +258,8 @@ Mutation testing showed that both original tests were blind: under a mutation th
 
 These properties of the current code are known and not yet changed:
 
-- **The sweep does not reclaim credit for a dead pump.** A dead pump counts no drains. The next record for its slot finds the receiver gone and closes the slot with `UnknownSlot`.
-- **Each bind spawns a 60-second accept-window task.** A claim does not cancel it. At 3,000 attaches per second, about 180,000 tasks are live. `expire_bind` is idempotent, so one reaper task with a monotonic deadline queue can replace them. It must keep the unconditional removal of the parked drain signal and the "no OpenSlot arrived" warning.
-- **The per-peer drain flag map never shrinks.** A pump holds its peer's flag as an `Arc` for the life of its stream. Removing the map entry while such a pump lives leaves it setting a flag that nothing reads. That peer's credit then falls back to the periodic sweep. Removal must happen under the same visibility that retires slots and binds.
-- **The drain listing uses two atomics.** On a weakly ordered target, a listing can be missed. The count stays, and the slot waits for the periodic walk. This was not observed on x86-64 or AArch64.
+- **The sweep does not reclaim credit for a consumer that is gone.** A consumer that is gone counts no drains, so its slot is closed instead. A consumer that ends its own stream, a watchdog firing and a cancel each close the slot and tell the sender. Every removal of a single-sender anchor goes through the entry's `Drop`, which closes the slot. An MPSC anchor keeps the older behavior: its slot waits for the next record, which finds the receiver gone and closes the slot with `UnknownSlot`.
+- **The per-peer drain flag map never shrinks.** A claimed slot's `DrainSignal` holds its peer's flag as an `Arc` for the life of its stream. Removing the map entry while such a stream lives leaves its consumer setting a flag that nothing reads. That peer's credit then falls back to the periodic sweep. Removal must happen under the same visibility that retires slots and binds.
 - **A fence lift can queue behind opens.** Under `async_open_ack`, the batcher polls the opens channel ahead of coalesced control. While opens for a peer are queued, the resolution that lifts a fence waits.
 - **`velo_streaming_mux_live_slots` counts a slot killed while fenced.** Its registry entry survives until the admission resolves, which can be the rest of the epoch.
 - **MPSC local `Drop` blocks.** See [A terminal send wedged the runtime](#a-terminal-send-wedged-the-runtime).

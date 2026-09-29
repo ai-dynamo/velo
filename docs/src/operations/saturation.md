@@ -43,10 +43,10 @@ All four counters have no labels. They register in the Prometheus registry that 
 
 | Metric | Meaning | How to read it |
 |---|---|---|
-| `velo_streaming_reader_pump_backpressure_total` | The 256-deep anchor channel was full, and the reader pump fell through to an awaited send. | Leading indicator. A sustained non-zero rate means that the consumer is at or near saturation. |
+| `velo_streaming_reader_pump_backpressure_total` | The 256-deep anchor channel was full, and the reader pump fell through to an awaited send. | Leading indicator. A sustained non-zero rate means that the consumer is at or near saturation. Per-stream path only: a mux stream has no reader pump, so this counter stays at zero there. |
 | `velo_streaming_server_pump_backpressure_total` | The 4,096-deep bind-side channel was full. | The cascade moved past the anchor channel. With reader-pump backpressure, this shows saturation. |
 | `velo_streaming_producer_send_backpressure_total` | `StreamSender::send` found its channel full. | The producer now waits in `send_async`. |
-| `velo_streaming_heartbeat_watchdog_firings_total` | A session was silent for `DETECTION_MULTIPLIER × heartbeat_interval`, and the reader pump ended it. | Lagging indicator. Any increase means that a session died. |
+| `velo_streaming_heartbeat_watchdog_firings_total` | A session was silent for `DETECTION_MULTIPLIER × heartbeat_interval`, and the reader pump ended it. Under the mux, the stream watchdog increments it too. | Lagging indicator. Any increase means that a session died. |
 
 A backpressure counter measures events, not latency, throughput or bytes. A high rate means that the system is at its capacity. A zero rate means that there is headroom.
 
@@ -54,13 +54,13 @@ A backpressure counter measures events, not latency, throughput or bytes. A high
 
 Build at least three panels:
 
-1. `rate(velo_streaming_reader_pump_backpressure_total[1m])`. A rising rate is the earliest warning.
+1. `rate(velo_streaming_reader_pump_backpressure_total[1m])`. A rising rate is the earliest warning on the per-stream path. For mux streams, use `rate(velo_streaming_slot_credit_exhausted_total[1m])` instead, which the producer's node counts.
 2. `rate(velo_streaming_server_pump_backpressure_total[1m])` and `rate(velo_streaming_producer_send_backpressure_total[1m])` beside the first panel. When these rise in sequence, the cascade is moving up.
 3. `increase(velo_streaming_heartbeat_watchdog_firings_total[5m])`. Any non-zero value is a dead session. If the rate panels rose first, the cause was saturation. If they stayed flat, the producer crashed or the network failed.
 
 ### The watchdog log line
 
-When the watchdog fires, the reader pump writes one `warn` line:
+When the watchdog fires on the per-stream path, the reader pump writes one `warn` line:
 
 ```text
 reader_pump: heartbeat watchdog fired, injecting Dropped (saturation indicator: see velo_streaming_*_backpressure_total)
@@ -74,7 +74,20 @@ reader_pump: heartbeat watchdog fired, injecting Dropped (saturation indicator: 
 Read the channel depths:
 
 - If `anchor_frame_tx_len` equals `anchor_frame_tx_cap`, the consumer side was saturated.
-- If both depths are near zero, the silence came from upstream of the consumer. The cause is a producer crash, a network partition, or a backlog on the producer's egress. On a mux peer link that carries thousands of streams, heartbeats wait in the same queue as data. A deep enough backlog there silences a live sender. In one measured UCX run, 1,722 streams on one congested peer were killed this way while their worker was healthy.
+- If both depths are near zero, the silence came from upstream of the consumer. The cause is a producer crash, a network partition, or a backlog on the producer's egress.
+
+On a single-sender mux stream, the stream watchdog writes a different line. An MPSC anchor's reader pump, on any transport, neither logs a firing nor counts it:
+
+```text
+stream_watchdog: nothing arrived from a sender holding credit for the detection window, injecting Dropped
+  local_id=...
+  slot_buffer_len=...
+  arrivals=...
+  heartbeat_deadline_ms=5000
+  detection_multiplier=3
+```
+
+This watchdog fires only when nothing was delivered to the slot for the whole detection window while its sender still held data credit or had records waiting behind a sequence gap. Heartbeats spend data credit, so a sender that held credit could have sent one. A consumer that falls behind leaves its sender without credit, and the watchdog exempts such a sender, so a firing on a mux stream is never a consumer that fell behind. Records still in the slot buffer when it fires are not delivered: the consumer reads `SenderDropped` next. The silence came from upstream: a producer crash, a network partition, or a backlog on the producer's egress or the peer link. On a mux peer link that carries thousands of streams, heartbeats wait in the same queue as data. A deep enough backlog there silences a live sender. In one measured UCX run, 1,722 streams on one congested peer were killed this way while their worker was healthy.
 
 ### Mitigations
 
@@ -97,9 +110,7 @@ flowchart TD
     I --> W[batcher: withheld queue, slot byte budget]
     W -->|credit available| B[_stream_batch on the peer connection]
     B --> S[consumer slot buffer, C+1]
-    S --> R[reader pump]
-    R --> A[anchor frame_tx, 256]
-    A --> Q[consumer]
+    S -->|read directly| Q[consumer: StreamAnchor::next]
     W -->|byte budget exceeded| K[slot closed: withheld_overflow, consumer sees Dropped]
 ```
 
@@ -115,6 +126,8 @@ When a producer runs past the byte budget on a slot that nobody drains, the mux 
 A queued terminal goes with the slot. A consumer that expected `Finalized` sees `Dropped`. The stream was already 1 MiB behind, so the terminal was late in any case.
 
 This kill replaces the watchdog kill for muxed streams. It is deterministic, it names one slot, and it is metered as a drop, not as a liveness failure. `velo_streaming_heartbeat_watchdog_firings_total` remains the signal for a peer that went silent for another reason.
+
+The consumer reads the slot buffer itself, so credit returns only when it takes a record. A consumer that stops polling holds its sender to the credit window C. The stream watchdog exempts a sender that holds no credit, so it never ends a stream whose consumer stopped polling with its window full. If the producer dies while it still holds credit, the watchdog ends the stream on time, even with records unread. If it dies holding no credit, the watchdog ends the stream once the consumer reads enough to return credit to it. `velo_streaming_reader_pump_backpressure_total` does not move for mux streams. Watch `velo_streaming_slot_credit_exhausted_total`, which the producer's node counts.
 
 If the slot is fenced behind an unresolved `OpenSlot` or rendezvous admission, the consumer's `Dropped` waits for that admission. The producer is disconnected at once. If the admission fails, the failure is epoch death for the whole peer. The slot is retired without the deferred `Dropped`, and the consumer falls back on the heartbeat watchdog.
 

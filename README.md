@@ -22,6 +22,8 @@ Typed streams support graceful stop, cancellation, and ordered finalization, inc
 
 Application authors depend on `velo` only. See [Workspace crates](docs/src/development/architecture.md) and [Versioning](docs/src/development/versioning.md).
 
+Streams to one peer can share its connection through the messenger mux. What the mux costs a serving frontend, and how that was measured, is in [Response-plane performance](docs/src/operations/response-plane-performance.md).
+
 ## Quick start
 
 ```bash
