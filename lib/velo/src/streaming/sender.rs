@@ -168,7 +168,7 @@ pub struct StreamSender<T> {
     /// [`negotiated_transport`](StreamSender::negotiated_transport).
     negotiated_transport: Option<velo_ext::TransportKey>,
     /// The runtime the sender was made on. A terminal that meets a full
-    /// channel waits in a task here, whichever thread sends it.
+    /// channel on a thread with no runtime waits in a task here.
     runtime: tokio::runtime::Handle,
     _phantom: std::marker::PhantomData<T>,
 }
@@ -440,17 +440,16 @@ impl<T: Serialize> StreamSender<T> {
 /// task otherwise. It carries work that must not become visible to anyone before
 /// the sentinel is in the channel.
 ///
-/// The task runs on the runtime the sender was made on, not on the caller's.
-/// A caller on a thread with no runtime (a sender moved to a language binding's
-/// thread, say) would otherwise have to block that thread, and under the mux a
-/// slot at its byte cap can keep the inlet full for as long as its consumer does
-/// not read.
+/// The task runs on the caller's runtime when the caller has one, and on the
+/// runtime the sender was made on when it does not. A caller on a thread with no
+/// runtime (a sender moved to a language binding's thread, say) would otherwise
+/// have to block that thread, and under the mux a slot at its byte cap can keep
+/// the inlet full for as long as its consumer does not read. The caller's
+/// runtime goes first because the sender can outlive the runtime it was made on.
 ///
-/// The one case where the record is still lost is a runtime shutting down before
-/// the task runs. Nothing is owed then — the receiver is being torn down by the
-/// same shutdown, so no consumer is left to tell `Finalized` from `Dropped` — and
-/// the sender clone dies with the task, so the inlet reaches EOF rather than
-/// hanging. [`tokio::task::block_in_place`] would avoid even that, at the price of
+/// The record is still lost when the runtime chosen is shutting down before the
+/// task runs. The sender clone dies with the task, so the inlet reaches EOF
+/// rather than hanging, and the consumer sees `Dropped`. [`tokio::task::block_in_place`] would avoid even that, at the price of
 /// panicking on a `current_thread` runtime, which is a worse failure than the one
 /// it fixes.
 fn send_terminal(
@@ -468,6 +467,7 @@ fn send_terminal(
         Err(flume::TrySendError::Full(bytes)) => bytes,
     };
 
+    let runtime = tokio::runtime::Handle::try_current().unwrap_or_else(|_| runtime.clone());
     let tx = tx.clone();
     runtime.spawn(async move {
         if tx.send_async(bytes).await.is_ok() {
@@ -681,6 +681,35 @@ mod tests {
             .expect("the terminal never arrived")
             .expect("channel closed before the terminal");
         assert!(matches!(decode::<u32>(&bytes), StreamFrame::Dropped));
+    }
+
+    /// A terminal sent after the sender's own runtime has ended still goes
+    /// out, on the caller's live runtime.
+    ///
+    /// The sender can outlive the runtime it was made on, while the batcher or
+    /// the consumer lives on another. There, a terminal that meets a full
+    /// channel must wait on the runtime that is still running, or the
+    /// consumer sees `Dropped` where it was owed `Finalized`.
+    #[test]
+    fn a_terminal_after_the_senders_runtime_ends_goes_out_on_the_callers() {
+        let (tx, rx) = flume::bounded::<Vec<u8>>(1);
+        let handle = StreamAnchorHandle::pack(velo_ext::WorkerId::from_u64(1), 1);
+        let first = tokio::runtime::Runtime::new().unwrap();
+        let (sender, _registry) =
+            first.block_on(async { make_sender_with_registry(tx.clone(), handle, 1) });
+        tx.send(b"filler".to_vec()).expect("fill the channel");
+        drop(first);
+
+        let second = tokio::runtime::Runtime::new().unwrap();
+        second.block_on(async move {
+            sender.finalize().expect("finalize");
+            assert_eq!(rx.recv_async().await.unwrap(), b"filler".to_vec());
+            let bytes = tokio::time::timeout(Duration::from_secs(5), rx.recv_async())
+                .await
+                .expect("the terminal never arrived")
+                .expect("channel closed before the terminal");
+            assert!(matches!(decode::<u32>(&bytes), StreamFrame::Finalized));
+        });
     }
 
     /// Helper: deserialize raw bytes into StreamFrame<T>.

@@ -187,6 +187,9 @@ pub(super) struct WithheldQueue {
 
 impl WithheldQueue {
     fn new(cap: u32) -> Self {
+        // Zero means "use the default" on the wire and is resolved before a
+        // slot exists. A zero cap here would pause the inlet forever.
+        debug_assert_ne!(cap, 0, "the slot byte cap must be resolved before use");
         Self {
             records: VecDeque::new(),
             bytes: 0,
@@ -497,7 +500,7 @@ impl EgressSlots {
 }
 
 /// What [`EgressSlots::close_all`] closed.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default)]
 pub(super) struct Closed {
     /// Slots closed.
     pub(super) slots: usize,
