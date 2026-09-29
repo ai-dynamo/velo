@@ -564,6 +564,20 @@ pub(crate) struct WorkerShared {
     /// is received late in the pass, well after the pass clock was read.
     #[cfg(test)]
     pub pre_progress_delay_ms: AtomicU64,
+    /// Test seam: while set, the progress loop waits at the top of its pass
+    /// and takes no command. Unlike `progress_stall_ms`, the wait lasts until
+    /// the test clears the flag, so a test that must act while the thread
+    /// cannot answer does not race a timer.
+    #[cfg(test)]
+    pub progress_hold: AtomicBool,
+    /// Test seam: `true` while the progress loop waits on `progress_hold`.
+    #[cfg(test)]
+    pub progress_held: AtomicBool,
+    /// Test seam: map replies delivered to a caller still waiting for them.
+    /// A test that needs the reply sent, not only the region mapped, waits on
+    /// this: the region exists a moment before its reply goes out.
+    #[cfg(test)]
+    pub map_replies_delivered: AtomicU64,
 }
 
 /// What the progress thread reports back once UCX is initialised.
@@ -1619,6 +1633,18 @@ fn take_test_delay(cell: &AtomicU64) {
     }
 }
 
+/// Test seam: wait while `progress_hold` is set; see its doc.
+#[cfg(test)]
+fn wait_while_held(shared: &WorkerShared) {
+    if shared.progress_hold.load(Ordering::Acquire) {
+        shared.progress_held.store(true, Ordering::Release);
+        while shared.progress_hold.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        shared.progress_held.store(false, Ordering::Release);
+    }
+}
+
 fn run_loop(mut state: WorkerState, ring_rx: flume::Receiver<Cmd>) {
     const DRAIN_BUDGET: usize = 64;
 
@@ -1637,6 +1663,8 @@ fn run_loop(mut state: WorkerState, ring_rx: flume::Receiver<Cmd>) {
         }
         #[cfg(test)]
         take_test_delay(&state.shared.progress_stall_ms);
+        #[cfg(test)]
+        wait_while_held(&state.shared);
         // The reaper's clock. It is read here, again after the progress loop,
         // and after each `ucp_ep_create`, and only moves forward. The two
         // per-pass reads run only with the reaper on. Every
@@ -1854,7 +1882,14 @@ impl WorkerState {
                 // which is the only signal that the caller's future was dropped.
                 // The region id died with it, so nobody can ever unmap this —
                 // roll it back here rather than pin the caller's memory forever.
-                if let Err(Ok(orphan)) = reply.send(self.map_region(ptr, len, region_id)) {
+                let sent = reply.send(self.map_region(ptr, len, region_id));
+                #[cfg(test)]
+                if sent.is_ok() {
+                    self.shared
+                        .map_replies_delivered
+                        .fetch_add(1, Ordering::Release);
+                }
+                if let Err(Ok(orphan)) = sent {
                     debug!(
                         "ucx: rolling back region {} (map_region caller went away)",
                         orphan.region_id
