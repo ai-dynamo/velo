@@ -6,7 +6,8 @@ This chapter records what the QUIC transport costs against TCP, the settings tha
 
 | Builder method | Default | Effect |
 |---|---|---|
-| `server_endpoints(n)` | 4 | Server sockets in the `SO_REUSEPORT` group (Linux). More sockets spread the receive load of many peers. |
+| `lanes(n)` | 1 | Connections to each peer, each from its own UDP socket. Order holds within a lane only. See [Lanes](#lanes). |
+| `server_endpoints(n)` | 4 | Server sockets in the `SO_REUSEPORT` group (Linux). More sockets spread the receive load of many peers and many lanes. |
 | `udp_buffer_sizes(recv, send)` | 8 MiB, 4 MiB | Requested socket buffers. The kernel clamps them to `net.core.rmem_max` and `net.core.wmem_max`, and the transport logs the clamp. |
 | `max_mtu(bytes)` | quinn's (1452) | Upper bound for path MTU discovery. Values above 6550 are lowered to 6550. |
 | `stream_receive_window(bytes)` | quinn's | Flow-control window for the stream. |
@@ -71,6 +72,31 @@ Measured on 2026-09-29 with the `throughput` example in its two-host mode. The s
 - Small messages cost about 25 µs more per round trip than on TCP, as on loopback. The network does not change this cost: it comes from the task hops inside quinn. With many messages in flight the gap closes, and pipelined QUIC matches TCP.
 - One QUIC connection tops out at about 0.8 GB/s, the same ceiling as on loopback on the same node type. So the limit is the CPU of the connection, not the network. A profile of the 64 KiB case put about 15% of the samples in AES-GCM. The rest was quinn's packet work, the kernel's UDP path, and task wakeups. TCP moves about 3.9 GB/s, because the kernel and the NIC offloads share that work.
 - A peer that needs more than about 0.8 GB/s needs more than one connection. The Dynamo response plane on the cluster carries far less than that per connection (see below).
+
+## Lanes
+
+A peer that needs more than about 0.8 GB/s needs more than one connection. `lanes(n)` gives each peer `n` connections, each dialed from its own UDP socket. Each connection then has its own quinn endpoint driver and connection driver, and the work runs on up to `n` cores.
+
+Measured on 2026-09-29 across the same two nodes as above, 64 KiB messages pipelined, 20,000 messages per cell, two reps. A prototype spread the messages round robin over the lanes, with the connection layout that `lanes(n)` builds. The receiving node had 32 server sockets.
+
+| Lanes | MB/s |
+|---|---|
+| 1 | 788–789 |
+| 2 | 1,552–1,558 |
+| 4 | 2,994–3,020 |
+| 8 | 5,773–5,850 |
+
+The UDP receive-buffer error count stayed below 50 in each run, so the gain comes from more cores, not from more socket buffers. 64 B pipelined messages do not change with the lane count.
+
+The receiving node needs many more server sockets than there are lanes. The kernel hashes each connection to one socket of the reuse-port group, and two lanes on one socket share its endpoint driver. With 8 lanes:
+
+| Server sockets on the receiving node | MB/s |
+|---|---|
+| 4 | 3,326–4,014 |
+| 8 | 2,628 or 6,579, as the hash fell |
+| 32 | 6,463–6,526 |
+
+The same prototype on TCP did not scale: 2.6–3.4 GB/s with 1 lane, and 2.9–3.8 GB/s with 2, 4 or 8 lanes. The limit for TCP is not the connection, so the TCP transport keeps one lane.
 
 ## Batched streaming over QUIC
 

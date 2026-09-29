@@ -53,10 +53,14 @@ const FAIL_REPORT_GRACE: Duration = Duration::from_millis(500);
 mod builder;
 pub use builder::QuicTransportBuilder;
 
+/// One connection per peer and lane. Lane 0 is the only lane unless the
+/// builder asked for more.
+type LaneKey = (crate::InstanceId, u16);
+
 /// QUIC messenger transport.
 ///
-/// One connection per peer, dialed lazily on the first send, with one
-/// bidirectional stream. See the module docs for the design.
+/// One connection per peer and lane, dialed lazily on the first send on that
+/// lane, with one bidirectional stream. See the module docs for the design.
 pub struct QuicTransport {
     key: TransportKey,
     bind_addr: SocketAddr,
@@ -65,7 +69,7 @@ pub struct QuicTransport {
     shrink_threshold: usize,
 
     peers: Arc<DashMap<crate::InstanceId, PeerEntry>>,
-    connections: Arc<DashMap<crate::InstanceId, ConnectionHandle>>,
+    connections: Arc<DashMap<LaneKey, ConnectionHandle>>,
 
     runtime: OnceLock<tokio::runtime::Handle>,
     cancel_token: CancellationToken,
@@ -81,12 +85,16 @@ pub struct QuicTransport {
     /// address is advertised. `start()` takes them to create the endpoints,
     /// which needs a runtime.
     server_sockets: Mutex<Option<Vec<std::net::UdpSocket>>>,
-    client_socket: Mutex<Option<std::net::UdpSocket>>,
+    /// One dial socket per lane, so each lane has its own quinn endpoint
+    /// driver and its own 4-tuple at the peer's reuse-port group.
+    client_sockets: Mutex<Option<Vec<std::net::UdpSocket>>>,
     server_config: quinn::ServerConfig,
     transport_config: Arc<quinn::TransportConfig>,
     endpoint_config: quinn::EndpointConfig,
     server_endpoints: OnceLock<Vec<quinn::Endpoint>>,
-    client_endpoint: OnceLock<quinn::Endpoint>,
+    /// Indexed by lane.
+    client_endpoints: OnceLock<Vec<quinn::Endpoint>>,
+    lanes: u16,
 
     local_interfaces: OnceLock<Vec<InterfaceEndpoint>>,
     numa_hint: Option<u32>,
@@ -139,7 +147,7 @@ impl QuicTransport {
         self.fingerprint
     }
 
-    fn reap_stale_connection(&self, instance_id: crate::InstanceId) {
+    fn reap_stale_connection(&self, instance_id: LaneKey) {
         if let Some((_, stale)) = self
             .connections
             .remove_if(&instance_id, |_, h| h.tx.is_disconnected())
@@ -149,7 +157,7 @@ impl QuicTransport {
         }
     }
 
-    fn get_or_create_connection(&self, instance_id: crate::InstanceId) -> Result<ConnectionHandle> {
+    fn get_or_create_connection(&self, instance_id: LaneKey) -> Result<ConnectionHandle> {
         if let Some(handle) = self.connections.get(&instance_id) {
             if !handle.tx.is_disconnected() {
                 return Ok(handle.clone());
@@ -166,7 +174,7 @@ impl QuicTransport {
     /// there if it is live, else a new one.
     fn install_connection(
         &self,
-        instance_id: crate::InstanceId,
+        instance_id: LaneKey,
         rt: &tokio::runtime::Handle,
     ) -> Result<ConnectionHandle> {
         let handle = match self.connections.entry(instance_id) {
@@ -195,9 +203,10 @@ impl QuicTransport {
 
     fn create_connection(
         &self,
-        instance_id: crate::InstanceId,
+        key: LaneKey,
         rt: &tokio::runtime::Handle,
     ) -> Result<ConnectionHandle> {
+        let (instance_id, lane) = key;
         let peer = self
             .peers
             .get(&instance_id)
@@ -205,8 +214,9 @@ impl QuicTransport {
             .value()
             .clone();
         let endpoint = self
-            .client_endpoint
+            .client_endpoints
             .get()
+            .and_then(|endpoints| endpoints.get(usize::from(lane)))
             .ok_or(TransportError::NotStarted)?
             .clone();
 
@@ -218,7 +228,7 @@ impl QuicTransport {
 
         self.writers.spawn_on(
             connection_writer_task(
-                instance_id,
+                key,
                 rx,
                 WriterTaskContext {
                     endpoint,
@@ -247,7 +257,7 @@ impl QuicTransport {
         }
     }
 
-    fn slow_path_send(&self, instance_id: crate::InstanceId, send_msg: SendTask) -> SendOutcome {
+    fn slow_path_send(&self, instance_id: LaneKey, send_msg: SendTask) -> SendOutcome {
         if self.runtime.get().is_none() {
             send_msg.on_error("Transport not started");
             return SendOutcome::Admitted;
@@ -284,8 +294,8 @@ impl QuicTransport {
             .expect("QUIC socket mutex poisoned")
             .take()
             .context("QUIC transport already started")?;
-        let client_socket = self
-            .client_socket
+        let client_sockets = self
+            .client_sockets
             .lock()
             .expect("QUIC socket mutex poisoned")
             .take()
@@ -306,10 +316,14 @@ impl QuicTransport {
         }
         // No default client config: every dial passes the peer's pinned one,
         // and a dial that does not fails instead of trusting anything.
-        let client =
-            quinn::Endpoint::new(self.endpoint_config.clone(), None, client_socket, runtime)
-                .context("failed to create the QUIC client endpoint")?;
-        let _ = self.client_endpoint.set(client);
+        let mut clients = Vec::with_capacity(client_sockets.len());
+        for socket in client_sockets {
+            clients.push(
+                quinn::Endpoint::new(self.endpoint_config.clone(), None, socket, runtime.clone())
+                    .context("failed to create a QUIC client endpoint")?,
+            );
+        }
+        let _ = self.client_endpoints.set(clients);
         Ok(servers)
     }
 }
@@ -366,6 +380,10 @@ impl Transport for QuicTransport {
     }
 
     #[inline]
+    fn lanes(&self, _target: crate::InstanceId) -> u16 {
+        self.lanes
+    }
+
     fn send_message(
         &self,
         instance_id: crate::InstanceId,
@@ -374,6 +392,19 @@ impl Transport for QuicTransport {
         message_type: MessageType,
         on_error: Arc<dyn TransportErrorHandler>,
     ) -> SendOutcome {
+        self.send_message_on_lane(instance_id, 0, header, payload, message_type, on_error)
+    }
+
+    fn send_message_on_lane(
+        &self,
+        instance_id: crate::InstanceId,
+        lane: u16,
+        header: Bytes,
+        payload: Bytes,
+        message_type: MessageType,
+        on_error: Arc<dyn TransportErrorHandler>,
+    ) -> SendOutcome {
+        let instance_id: LaneKey = (instance_id, lane % self.lanes);
         let send_msg = SendTask {
             msg_type: message_type,
             header,
@@ -457,9 +488,10 @@ impl Transport for QuicTransport {
         // of its last write; a writer parked on a peer's flow control is
         // closed by force at CLOSE_WAIT. `closed()` waits for that; this task
         // covers a caller that does not await it, as long as the runtime lives.
-        if let Some(endpoint) = self.client_endpoint.get().cloned() {
+        for endpoint in self.client_endpoints.get().into_iter().flatten() {
             match self.runtime.get() {
                 Some(rt) => {
+                    let endpoint = endpoint.clone();
                     rt.spawn(async move {
                         let _ = tokio::time::timeout(CLOSE_WAIT, endpoint.wait_idle()).await;
                         endpoint.close(quinn::VarInt::from_u32(0), b"shutdown");
@@ -484,7 +516,7 @@ impl Transport for QuicTransport {
             }
             let _ = tokio::time::timeout(CLOSE_WAIT, async {
                 self.writers.wait().await;
-                if let Some(endpoint) = self.client_endpoint.get() {
+                for endpoint in self.client_endpoints.get().into_iter().flatten() {
                     endpoint.wait_idle().await;
                 }
                 // `shutdown()` closed the server endpoints, but a close only
@@ -498,7 +530,7 @@ impl Transport for QuicTransport {
                 }
             })
             .await;
-            if let Some(endpoint) = self.client_endpoint.get() {
+            for endpoint in self.client_endpoints.get().into_iter().flatten() {
                 endpoint.close(quinn::VarInt::from_u32(0), b"shutdown");
             }
             // A writer still blocked on a peer that stopped reading fails its
@@ -522,13 +554,16 @@ impl Transport for QuicTransport {
         Box<dyn std::future::Future<Output = Result<(), HealthCheckError>> + Send + '_>,
     > {
         Box::pin(async move {
-            let connection_exists = self.connections.contains_key(&instance_id);
-            if let Some(handle) = self.connections.get(&instance_id) {
+            // Lane 0 stands for the peer. A lane that dies on its own is
+            // found by its next send, whose frames fail through `on_error`.
+            let lane_zero: LaneKey = (instance_id, 0);
+            let connection_exists = self.connections.contains_key(&lane_zero);
+            if let Some(handle) = self.connections.get(&lane_zero) {
                 if !handle.tx.is_disconnected() {
                     return Ok(());
                 }
                 drop(handle);
-                self.reap_stale_connection(instance_id);
+                self.reap_stale_connection(lane_zero);
             }
 
             let peer = self
@@ -538,8 +573,9 @@ impl Transport for QuicTransport {
                 .value()
                 .clone();
             let endpoint = self
-                .client_endpoint
+                .client_endpoints
                 .get()
+                .and_then(|endpoints| endpoints.first())
                 .ok_or(HealthCheckError::ConnectionFailed)?;
             let connecting = endpoint
                 .connect_with(peer.client_config, peer.addr, tls::SERVER_NAME)
@@ -563,7 +599,7 @@ impl Transport for QuicTransport {
 struct WriterTaskContext {
     endpoint: quinn::Endpoint,
     peer: PeerEntry,
-    connections: Arc<DashMap<crate::InstanceId, ConnectionHandle>>,
+    connections: Arc<DashMap<LaneKey, ConnectionHandle>>,
     cancel_token: CancellationToken,
     connect_timeout: Duration,
     reader_ctx: Option<DialedReaderContext>,
@@ -573,10 +609,11 @@ struct WriterTaskContext {
 /// Dial, then write frames until the channel closes, a write fails, or the
 /// peer ends the stream. Cleanup runs even if the dial fails.
 async fn connection_writer_task(
-    instance_id: crate::InstanceId,
+    key: LaneKey,
     rx: flume::Receiver<SendTask>,
     ctx: WriterTaskContext,
 ) {
+    let instance_id = key.0;
     let addr = ctx.peer.addr;
     let connections = Arc::clone(&ctx.connections);
     let metrics = ctx.metrics.clone();
@@ -592,7 +629,7 @@ async fn connection_writer_task(
         msg.on_error("Connection closed");
     }
     drop(rx);
-    if let Some((_, stale)) = connections.remove_if(&instance_id, |_, h| h.tx.is_disconnected()) {
+    if let Some((_, stale)) = connections.remove_if(&key, |_, h| h.tx.is_disconnected()) {
         stale.retire();
     }
     if let Some(metrics) = metrics.as_ref() {

@@ -10,6 +10,13 @@
 //! order of messages from one peer, which ordered handlers and batched
 //! streaming rely on.
 //!
+//! With `QuicTransportBuilder::lanes(n)`, the dialer keeps `n` connections to
+//! each peer, one per lane, each from its own UDP socket. `send_message` uses
+//! lane 0, so ordinary traffic keeps one ordered channel per peer. A caller
+//! that sends on other lanes gets order within each lane only. One connection
+//! is bound to about one core, so lanes are how one peer gets more than about
+//! 0.8 GB/s.
+//!
 //! TLS 1.3 uses a self-signed certificate per transport. Its SHA-256
 //! fingerprint travels in the `WorkerAddress` entry, and dialers accept only
 //! that certificate.

@@ -337,6 +337,45 @@ pub trait Transport: Send + Sync {
         on_error: Arc<dyn TransportErrorHandler>,
     ) -> SendOutcome;
 
+    /// How many ordered channels (lanes) this transport keeps to `target`.
+    ///
+    /// Frames sent on one `(target, lane)` through
+    /// [`send_message_on_lane`](Transport::send_message_on_lane) arrive in the
+    /// order they were sent. Nothing is promised across lanes. A transport
+    /// that carries a peer on one ordered channel keeps the default of 1.
+    ///
+    /// Lanes exist because one connection can be bound to one core: a QUIC
+    /// connection does its packet and crypto work on one task. A caller with
+    /// independent ordered flows to one peer puts them on different lanes to
+    /// use more cores.
+    fn lanes(&self, _target: InstanceId) -> u16 {
+        1
+    }
+
+    /// Send on `lane`, as [`send_message`](Transport::send_message) does on
+    /// lane 0.
+    ///
+    /// Every rule of `send_message` applies, per `(target, lane)`: one
+    /// admission gate per lane, and frames on one lane are written in the order
+    /// they were admitted. A lane never fails over to another lane's
+    /// connection, because that would reorder it. A lane at or past
+    /// [`lanes`](Transport::lanes) maps to `lane % lanes(target)`.
+    ///
+    /// The default ignores `lane` and calls `send_message`, which is correct
+    /// for a transport with one lane.
+    fn send_message_on_lane(
+        &self,
+        instance_id: InstanceId,
+        lane: u16,
+        header: Bytes,
+        payload: Bytes,
+        message_type: MessageType,
+        on_error: Arc<dyn TransportErrorHandler>,
+    ) -> SendOutcome {
+        let _ = lane;
+        self.send_message(instance_id, header, payload, message_type, on_error)
+    }
+
     /// Largest single message this transport will carry to `target`, in bytes.
     ///
     /// The number bounds `header.len() + payload.len()` for one
@@ -767,6 +806,83 @@ pub fn make_channels() -> (TransportAdapter, DataStreams) {
 mod tests {
     use super::*;
     use tokio::time::{sleep, timeout};
+
+    /// A transport that overrides nothing it does not have to, and records
+    /// what reached `send_message`.
+    #[derive(Default)]
+    struct OneLane {
+        sent: std::sync::Mutex<Vec<(InstanceId, Bytes)>>,
+    }
+
+    impl Transport for OneLane {
+        fn key(&self) -> TransportKey {
+            TransportKey::from("one-lane")
+        }
+        fn address(&self) -> WorkerAddress {
+            WorkerAddress::empty()
+        }
+        fn register(&self, _peer_info: PeerInfo) -> Result<(), TransportError> {
+            Ok(())
+        }
+        fn send_message(
+            &self,
+            instance_id: InstanceId,
+            _header: Bytes,
+            payload: Bytes,
+            _message_type: MessageType,
+            _on_error: Arc<dyn TransportErrorHandler>,
+        ) -> SendOutcome {
+            self.sent.lock().unwrap().push((instance_id, payload));
+            SendOutcome::Admitted
+        }
+        fn start(
+            &self,
+            _instance_id: InstanceId,
+            _channels: TransportAdapter,
+            _rt: tokio::runtime::Handle,
+        ) -> BoxFuture<'_, anyhow::Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn shutdown(&self) {}
+        fn check_health(
+            &self,
+            _instance_id: InstanceId,
+            _timeout: Duration,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), HealthCheckError>> + Send + '_>,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    struct Ignore;
+    impl TransportErrorHandler for Ignore {
+        fn on_error(&self, _header: Bytes, _payload: Bytes, _error: String) {}
+    }
+
+    /// An out-of-tree transport written before lanes existed has one lane,
+    /// and a send on any lane reaches its `send_message` unchanged.
+    #[test]
+    fn a_transport_without_lanes_has_one_and_ignores_the_lane() {
+        let transport = OneLane::default();
+        let target = InstanceId::new_v4();
+        assert_eq!(transport.lanes(target), 1);
+        for lane in [0u16, 1, 7] {
+            let outcome = transport.send_message_on_lane(
+                target,
+                lane,
+                Bytes::new(),
+                Bytes::from(vec![lane as u8]),
+                MessageType::Message,
+                Arc::new(Ignore),
+            );
+            assert!(outcome.is_admitted());
+        }
+        let sent = transport.sent.lock().unwrap();
+        let payloads: Vec<u8> = sent.iter().map(|(_, p)| p[0]).collect();
+        assert_eq!(payloads, vec![0, 1, 7]);
+        assert!(sent.iter().all(|(t, _)| *t == target));
+    }
 
     #[test]
     fn test_shutdown_state_initial() {

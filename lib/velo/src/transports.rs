@@ -313,6 +313,25 @@ impl VeloBackend {
         message_type: MessageType,
         on_error: Arc<dyn TransportErrorHandler>,
     ) -> anyhow::Result<SendOutcome> {
+        self.send_message_on_lane(target, 0, header, payload, message_type, on_error)
+    }
+
+    /// Send a message to a registered peer on one of its primary transport's
+    /// lanes.
+    ///
+    /// Frames sent on one `(target, lane)` arrive in order. See
+    /// [`Transport::send_message_on_lane`] for the contract, and
+    /// [`send_message`](Self::send_message) for everything else, which is the
+    /// same.
+    pub fn send_message_on_lane(
+        &self,
+        target: InstanceId,
+        lane: u16,
+        header: Bytes,
+        payload: Bytes,
+        message_type: MessageType,
+        on_error: Arc<dyn TransportErrorHandler>,
+    ) -> anyhow::Result<SendOutcome> {
         let transport = self
             .primary_transport
             .get(&target)
@@ -345,11 +364,25 @@ impl VeloBackend {
                 bytes
             );
             let _entered = span.enter();
-            transport.send_message(target, header, payload, message_type, error_handler)
+            transport.send_message_on_lane(
+                target,
+                lane,
+                header,
+                payload,
+                message_type,
+                error_handler,
+            )
         };
 
         #[cfg(not(feature = "distributed-tracing"))]
-        let outcome = transport.send_message(target, header, payload, message_type, error_handler);
+        let outcome = transport.send_message_on_lane(
+            target,
+            lane,
+            header,
+            payload,
+            message_type,
+            error_handler,
+        );
 
         Ok(finalize_send_outcome(outcome, report))
     }
