@@ -652,3 +652,76 @@ async fn prebound_slot_holds_c_credits_against_a_c_plus_one_buffer() {
         "credit came back some other way than the consumer draining"
     );
 }
+
+/// A producer faster than its consumer waits for it; the stream does not die.
+///
+/// The consumer here drains every record as soon as it arrives, so it is not a
+/// slow consumer in the sense the per-slot byte cap exists for. It is only
+/// slower than the producer, because credit comes back in windows of
+/// `initial_credit` records and the producer can fill a window faster than one
+/// round trip returns it. That describes any bulk stream.
+///
+/// Over a socket the producer's `send().await` waited when the socket buffer
+/// filled. Over the mux the slot's inlet is drained into the withheld queue
+/// whatever the credit, so `send().await` never waits. The producer runs ahead
+/// until the withheld queue passes the slot's byte cap (1 MiB by default), and
+/// then the batcher kills the slot: the producer sees `ChannelClosed` and the
+/// consumer sees `SenderDropped` part way through a stream it was reading.
+///
+/// The records are 1 KiB so that the run is ten times the cap and stays under
+/// the eager batch size, which keeps rendezvous out of the path.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "producer backpressure: the withheld-queue byte cap kills a slot whose producer outruns credit, even while the consumer drains"]
+async fn a_producer_that_outruns_a_draining_consumer_waits_for_credit() {
+    const RECORDS: u32 = 10_000;
+    const RECORD_BYTES: usize = 1024;
+
+    let consumer = node(MuxConfig::default()).await;
+    let producer = node(MuxConfig::default()).await;
+    introduce(&producer, &consumer).await;
+
+    let mut anchor = consumer.velo.create_anchor::<(u32, Vec<u8>)>();
+    let handle = transfer(anchor.handle());
+    let sender = producer
+        .velo
+        .attach_anchor::<(u32, Vec<u8>)>(handle)
+        .await
+        .expect("remote attach");
+
+    let writer = tokio::spawn(async move {
+        let body = vec![0u8; RECORD_BYTES];
+        for n in 0..RECORDS {
+            sender
+                .send((n, body.clone()))
+                .await
+                .map_err(|e| format!("send {n} failed: {e}"))?;
+        }
+        sender.finalize().map_err(|e| format!("finalize failed: {e}"))
+    });
+
+    let mut seen = 0u32;
+    loop {
+        match tokio::time::timeout(PATIENCE, anchor.next()).await {
+            Ok(Some(Ok(StreamFrame::Item((n, body))))) => {
+                assert_eq!(n, seen, "record out of order");
+                assert_eq!(body.len(), RECORD_BYTES);
+                seen += 1;
+            }
+            Ok(Some(Ok(StreamFrame::Finalized))) => break,
+            Ok(Some(Ok(other))) => {
+                panic!("the stream ended with {other:?} after {seen} of {RECORDS} records")
+            }
+            Ok(Some(Err(error))) => {
+                panic!("the stream failed with {error:?} after {seen} of {RECORDS} records")
+            }
+            Ok(None) => panic!("the anchor closed after {seen} of {RECORDS} records"),
+            Err(_) => panic!("stalled after {seen} of {RECORDS} records"),
+        }
+    }
+    assert_eq!(seen, RECORDS);
+    tokio::time::timeout(PATIENCE, writer)
+        .await
+        .expect("producer did not finish")
+        .expect("producer task panicked")
+        .expect("producer failed");
+}
