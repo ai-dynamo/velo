@@ -183,12 +183,23 @@ pub fn create_stream_cancel_handler(
 }
 
 /// Send a graceful stop through the identity established by attach.
+///
+/// A sender on `local_worker` is stopped through the local registry, as
+/// `StreamController::cancel` does: a same-worker attach registers it there,
+/// and an active message to the local worker is not guaranteed to resolve.
 pub(crate) fn request_sender_stop(
     handle: StreamCancelHandle,
+    local_worker: velo_ext::WorkerId,
     registry: &SenderRegistry,
     messenger: Option<&Arc<crate::messenger::Messenger>>,
 ) {
     let (worker, sender_stream_id) = handle.unpack();
+    if worker == local_worker {
+        if let Some(entry) = registry.senders.get(&sender_stream_id) {
+            entry.stop_token.cancel();
+        }
+        return;
+    }
     // Stream IDs are local to a worker. Do not cancel an unrelated local sender.
     if let Some(messenger) = messenger {
         // On the messenger's runtime, not the caller's: `request_stop` is
@@ -560,6 +571,8 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::messe
                             if entry.stop_requested {
                                 request_sender_stop(
                                     req.stream_cancel_handle,
+                                    // The anchor's worker is this worker.
+                                    req.handle.unpack().0,
                                     &manager.sender_registry,
                                     manager.messenger_lock.get(),
                                 );

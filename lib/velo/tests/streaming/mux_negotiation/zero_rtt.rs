@@ -103,6 +103,36 @@ async fn a_stop_requested_off_runtime_reaches_a_remote_sender() {
     }
 }
 
+/// A stop reaches a sender on the anchor's own worker.
+///
+/// A same-worker attach puts the sender in the local sender registry, the way
+/// `cancel` finds it. A stop sent as an active message has to resolve its own
+/// worker through the messenger instead, and that send's result is ignored.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_reaches_a_sender_on_the_same_worker() {
+    for early in [false, true] {
+        let node = node(Some(mux_config())).await;
+        let anchor = node.velo.create_anchor::<u32>();
+        let controller = anchor.controller();
+        if early {
+            controller.request_stop();
+        }
+        let sender = node
+            .velo
+            .attach_anchor::<u32>(anchor.handle())
+            .await
+            .expect("same-worker attach");
+        if !early {
+            controller.request_stop();
+        }
+        tokio::time::timeout(Duration::from_secs(5), sender.stop_token().cancelled())
+            .await
+            .unwrap_or_else(|_| panic!("early={early}: the same-worker sender never saw the stop"));
+        assert!(!sender.cancellation_token().is_cancelled());
+        drop(anchor);
+    }
+}
+
 /// An unused or claimed ticket must cancel without a subsequent producer send.
 #[tokio::test(flavor = "multi_thread")]
 async fn ticket_cancel_wakes_idle_producer() {
