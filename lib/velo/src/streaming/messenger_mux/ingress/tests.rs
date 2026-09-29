@@ -1026,7 +1026,7 @@ fn the_sweep_reconciles_every_slot() {
 /// This replaces a test whose premise was the defect. That test asserted a
 /// batch "says nothing about the slot it did not touch", and leaving those
 /// slots to the doorbell was measured on the tier-3 rig: every stream sends
-/// about four records more than its 256-record window, so the tail of every
+/// about four records more than its then-default 256-record window, so the tail of every
 /// stream waited on a per-peer, rate-limited walk instead of the peer's next
 /// inbound batch. Slot-credit exhaustion went from 13 to about 20,500 per
 /// worker process and throughput halved.

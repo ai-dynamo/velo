@@ -224,8 +224,8 @@ pub(crate) async fn reader_pump(
                     Ok(bytes) => {
                         // Forward to anchor's frame channel.
                         //
-                        // The per-anchor frame_tx is bounded(256) — the smallest
-                        // channel in the saturation cascade and the first to fill
+                        // The per-anchor frame_tx is bounded(256) — the first
+                        // channel in the saturation cascade to fill
                         // when the consumer can't keep up. We try_send first so we
                         // can record a leading-indicator counter on the slow path
                         // before falling through to the awaited send.
