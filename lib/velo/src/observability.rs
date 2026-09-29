@@ -1571,10 +1571,10 @@ impl VeloMetrics {
             registry,
             Counter::with_opts(Opts::new(
                 "velo_streaming_producer_send_backpressure_total",
-                "StreamSender::send calls that hit the connect-side channel's Full \
-                 branch (bounded(4096)) and fell through to send_async. Surfaces \
-                 producer-application visibility into the back-of-cascade backpressure \
-                 from a saturating consumer.",
+                "StreamSender::send calls that found the connect-side channel full \
+                 and waited in send_async. The channel is 4096 deep on the \
+                 per-stream path and C+1 deep under the mux, where it fills when \
+                 the slot reaches its byte cap or the batcher waits on admission.",
             ))?,
         )?;
         let streaming_heartbeat_watchdog_firings_total = register_collector(

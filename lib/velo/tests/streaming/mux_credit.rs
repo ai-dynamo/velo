@@ -662,11 +662,11 @@ async fn prebound_slot_holds_c_credits_against_a_c_plus_one_buffer() {
 /// round trip returns it. That describes any bulk stream.
 ///
 /// Over a socket the producer's `send().await` waited when the socket buffer
-/// filled. Over the mux the slot's inlet is drained into the withheld queue
-/// whatever the credit, so `send().await` never waits. The producer runs ahead
-/// until the withheld queue passes the slot's byte cap (1 MiB by default), and
-/// then the batcher kills the slot: the producer sees `ChannelClosed` and the
-/// consumer sees `SenderDropped` part way through a stream it was reading.
+/// filled. The mux first drained the slot's inlet into its withheld queue
+/// whatever the credit, so `send().await` never waited, and it killed the slot
+/// when the queue passed the byte cap (1 MiB by default). The consumer saw
+/// `SenderDropped` part way through a stream it was reading: 1,128 of 10,000
+/// records here. Now the slot pauses its inlet at the cap and `send` waits.
 ///
 /// The records are 1 KiB so that the run is ten times the cap and stays under
 /// the eager batch size, which keeps rendezvous out of the path.

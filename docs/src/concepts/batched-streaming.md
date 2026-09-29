@@ -212,7 +212,7 @@ Frame credit proves that no head-of-line blocking occurs. Byte credit bounds mem
 
 ### Egress: the withheld queue
 
-`finalize`, `detach` and `Drop` reach the slot inlet from synchronous code. The batcher therefore drains every inlet, whether or not the slot has credit. A slot with no credit keeps its records in a per-slot withheld queue, which the slot byte budget bounds. The queue is FIFO, so a terminal in it still waits for the records in front of it.
+The batcher pulls every slot's inlet, whether or not the slot has credit, up to the slot byte budget. A slot with no credit keeps its records in a per-slot withheld queue. The queue is FIFO, so a terminal in it still waits for the records in front of it. `finalize`, `detach` and `Drop` reach the inlet from synchronous code. When the inlet is full, the terminal waits in a task, so these calls do not block.
 
 A producer that runs a slot's byte cap ahead of its consumer waits. The batcher stops pulling from that slot's inlet, the inlet fills, and `StreamSender::send` waits until credit returns. Other slots continue. [Stream saturation](../operations/saturation.md) describes this backpressure from the operator side.
 
