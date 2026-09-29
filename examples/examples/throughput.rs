@@ -8,6 +8,8 @@
 //! - **Sequential**: one message in-flight at a time (baseline per-message cost)
 //! - **Concurrent**: N messages in-flight simultaneously (tests parallelism)
 //! - **Pipeline**: fire-and-forget with no per-message await (ceiling throughput)
+//! - **Stream**: the server streams items to anchors on the client, over the
+//!   messenger mux. Not run by default; select it with `--modes stream`.
 //!
 //! Results are printed as a table with latency percentiles (p50/p95/p99) for
 //! sequential and concurrent modes.
@@ -26,6 +28,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use bytes::Bytes;
 use clap::Parser;
+use futures::StreamExt;
 use hdrhistogram::Histogram;
 use tokio::task::JoinSet;
 use tokio::time::sleep;
@@ -51,6 +54,20 @@ struct Args {
     #[arg(long, value_delimiter = ',', default_values_t = [1usize, 10, 100])]
     concurrency: Vec<usize>,
 
+    /// Which send patterns to run (comma-separated).
+    #[arg(
+        long,
+        value_enum,
+        value_delimiter = ',',
+        default_values_t = [Mode::Sequential, Mode::Concurrent, Mode::Pipeline]
+    )]
+    modes: Vec<Mode>,
+
+    /// Streams open at once for stream mode (comma-separated). `--count`
+    /// items are split evenly across them.
+    #[arg(long, value_delimiter = ',', default_values_t = [1usize, 16])]
+    streams: Vec<usize>,
+
     /// Which half of the benchmark this process runs. `both` runs the server
     /// and the client in one process.
     #[arg(long, value_enum, default_value_t = Role::Both)]
@@ -60,6 +77,14 @@ struct Args {
     /// `--role server` and `--role client`.
     #[arg(long)]
     peer_file: Option<std::path::PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum Mode {
+    Sequential,
+    Concurrent,
+    Pipeline,
+    Stream,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -292,6 +317,99 @@ async fn run_pipeline(
 }
 
 // ---------------------------------------------------------------------------
+// Stream
+// ---------------------------------------------------------------------------
+
+/// What the client asks the server to stream to one anchor.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StreamRequest {
+    handle: u128,
+    items: u64,
+    item_bytes: usize,
+}
+
+/// Open `streams` anchors, have the server fill each with `items` items, and
+/// wait for every terminal.
+async fn stream_round(
+    velo: &Arc<Velo>,
+    target: InstanceId,
+    item_bytes: usize,
+    items: u64,
+    streams: usize,
+) -> Result<()> {
+    let mut drains = JoinSet::new();
+    for _ in 0..streams {
+        let mut anchor = velo.create_anchor::<Bytes>();
+        let request = StreamRequest {
+            handle: anchor.handle().as_u128(),
+            items,
+            item_bytes,
+        };
+        drains.spawn(async move {
+            let mut seen = 0u64;
+            while let Some(frame) = anchor.next().await {
+                match frame? {
+                    velo::streaming::StreamFrame::Item(item) => {
+                        anyhow::ensure!(item.len() == item_bytes, "item of {} bytes", item.len());
+                        seen += 1;
+                    }
+                    velo::streaming::StreamFrame::Finalized => break,
+                    other => anyhow::bail!("unexpected frame: {other:?}"),
+                }
+            }
+            anyhow::ensure!(seen == items, "saw {seen} of {items} items");
+            Ok(())
+        });
+        velo.unary("stream_to")?
+            .raw_payload(Bytes::from(rmp_serde::to_vec(&request)?))
+            .instance(target)
+            .send()
+            .await?;
+    }
+    while let Some(joined) = drains.join_next().await {
+        joined??;
+    }
+    Ok(())
+}
+
+async fn run_stream(
+    velo: &Arc<Velo>,
+    target: InstanceId,
+    item_bytes: usize,
+    count: u64,
+    streams: usize,
+) -> Result<CellResult> {
+    let streams = streams.max(1);
+    let items = (count / streams as u64).max(1);
+    let warmup = (items / 10).max(100);
+    stream_round(velo, target, item_bytes, warmup, streams)
+        .await
+        .map_err(|e| anyhow::anyhow!("stream warmup: {e}"))?;
+
+    let start = Instant::now();
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        stream_round(velo, target, item_bytes, items, streams),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("stream run timed out"))??;
+    let elapsed = start.elapsed().as_secs_f64();
+
+    let total = items * streams as u64;
+    Ok(CellResult {
+        mode: "stream",
+        payload_bytes: item_bytes,
+        concurrency: Some(streams),
+        msgs_per_sec: total as f64 / elapsed,
+        mb_per_sec: (total as f64 * item_bytes as f64) / elapsed / 1_048_576.0,
+        p50_us: None,
+        p95_us: None,
+        p99_us: None,
+        p99_9_us: None,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Display
 // ---------------------------------------------------------------------------
 
@@ -410,8 +528,8 @@ fn main() -> Result<()> {
     let args = Args::parse();
     println!("Using {:?} transport", args.tx.transport);
     println!(
-        "count={}, payload_sizes={:?}, concurrency={:?}, role={:?}",
-        args.count, args.payload_sizes, args.concurrency, args.role
+        "count={}, payload_sizes={:?}, concurrency={:?}, streams={:?}, modes={:?}, role={:?}",
+        args.count, args.payload_sizes, args.concurrency, args.streams, args.modes, args.role
     );
     match args.role {
         Role::Both => run_both(args),
@@ -546,7 +664,38 @@ async fn serve(transport_type: TransportType, done_tx: flume::Sender<()>) -> Res
         .build();
         velo.register_handler(count_done_handler)?;
     }
+    {
+        // A weak reference: the handler is owned by `velo`'s own registry.
+        let weak = Arc::downgrade(&velo);
+        let stream_to_handler = Handler::unary_handler("stream_to", move |ctx| {
+            let request: StreamRequest = rmp_serde::from_slice(&ctx.payload)
+                .map_err(|e| anyhow::anyhow!("deserialize: {e}"))?;
+            let velo = weak
+                .upgrade()
+                .ok_or_else(|| anyhow::anyhow!("server is shutting down"))?;
+            tokio::spawn(async move {
+                if let Err(e) = stream_items(&velo, request).await {
+                    eprintln!("stream_to failed: {e:#}");
+                }
+            });
+            Ok(Some(Bytes::new()))
+        })
+        .build();
+        velo.register_handler(stream_to_handler)?;
+    }
     Ok(velo)
+}
+
+/// Attach to the client's anchor and send it `items` items.
+async fn stream_items(velo: &Velo, request: StreamRequest) -> Result<()> {
+    let handle = velo::streaming::StreamAnchorHandle::from_u128(request.handle);
+    let sender = velo.attach_anchor::<Bytes>(handle).await?;
+    let item = Bytes::from(vec![0u8; request.item_bytes]);
+    for _ in 0..request.items {
+        sender.send(item.clone()).await?;
+    }
+    sender.finalize()?;
+    Ok(())
 }
 
 /// Read the peer file until the server it names answers an `echo`.
@@ -611,21 +760,36 @@ async fn run_client(args: &Args, peer: PeerSource, done: Done) -> Result<Vec<Cel
     for &size in &args.payload_sizes {
         let payload = Bytes::from(vec![0u8; size]);
 
-        println!("\nSequential, payload={}", format_payload(size));
-        all_results.push(run_sequential(&velo, target, payload.clone(), args.count).await?);
-
-        for &c in &args.concurrency {
-            println!(
-                "Concurrent concurrency={c}, payload={}",
-                format_payload(size)
-            );
-            all_results.push(
-                run_concurrent(Arc::clone(&velo), target, payload.clone(), args.count, c).await?,
-            );
+        if args.modes.contains(&Mode::Sequential) {
+            println!("\nSequential, payload={}", format_payload(size));
+            all_results.push(run_sequential(&velo, target, payload.clone(), args.count).await?);
         }
 
-        println!("Pipeline, payload={}", format_payload(size));
-        all_results.push(run_pipeline(&velo, target, payload.clone(), args.count, &done).await?);
+        if args.modes.contains(&Mode::Concurrent) {
+            for &c in &args.concurrency {
+                println!(
+                    "Concurrent concurrency={c}, payload={}",
+                    format_payload(size)
+                );
+                all_results.push(
+                    run_concurrent(Arc::clone(&velo), target, payload.clone(), args.count, c)
+                        .await?,
+                );
+            }
+        }
+
+        if args.modes.contains(&Mode::Pipeline) {
+            println!("Pipeline, payload={}", format_payload(size));
+            all_results
+                .push(run_pipeline(&velo, target, payload.clone(), args.count, &done).await?);
+        }
+
+        if args.modes.contains(&Mode::Stream) {
+            for &streams in &args.streams {
+                println!("Stream streams={streams}, payload={}", format_payload(size));
+                all_results.push(run_stream(&velo, target, size, args.count, streams).await?);
+            }
+        }
     }
 
     Ok(all_results)

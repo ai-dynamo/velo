@@ -19,7 +19,7 @@ quic = ["velo/quic"]
 velo = { path = "../lib/velo", features = ["test-helpers"] }
 
 anyhow = "1"
-bytes = "1"
+bytes = { version = "1", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
 flume = "0.12.0"
 futures = "0.3"
