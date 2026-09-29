@@ -47,7 +47,7 @@ pub enum TransportType {
 pub async fn new_transport(ty: TransportType, tag: &str) -> Result<Arc<dyn Transport>> {
     match ty {
         TransportType::Tcp => {
-            let listener = std::net::TcpListener::bind(format!("{}:0", bind_ip()))?;
+            let listener = std::net::TcpListener::bind(std::net::SocketAddr::new(bind_ip()?, 0))?;
             Ok(Arc::new(
                 velo::transports::tcp::TcpTransportBuilder::new()
                     .from_listener(listener)?
@@ -100,8 +100,13 @@ pub async fn new_transport(ty: TransportType, tag: &str) -> Result<Arc<dyn Trans
 /// `127.0.0.1`. A benchmark that runs its two halves on two hosts sets it to
 /// each host's address on the network under test, because the transports
 /// advertise the address they bind.
-pub fn bind_ip() -> String {
-    std::env::var("VELO_BIND_IP").unwrap_or_else(|_| "127.0.0.1".to_string())
+pub fn bind_ip() -> Result<std::net::IpAddr> {
+    match std::env::var("VELO_BIND_IP") {
+        Ok(v) => v
+            .parse()
+            .map_err(|_| anyhow::anyhow!("VELO_BIND_IP={v} is not an IP address")),
+        Err(_) => Ok(std::net::Ipv4Addr::LOCALHOST.into()),
+    }
 }
 
 /// Shared clap fragment: a single `--transport <backend>` flag.
@@ -141,7 +146,7 @@ pub fn quic_from_env() -> Result<velo::transports::quic::QuicTransportBuilder> {
         }
     }
     let mut builder = velo::transports::quic::QuicTransportBuilder::new()
-        .bind_addr(format!("{}:0", bind_ip()).parse()?);
+        .bind_addr(std::net::SocketAddr::new(bind_ip()?, 0));
     if let Some(v) = env("VELO_QUIC_MAX_MTU")? {
         builder = builder.max_mtu(v);
     }

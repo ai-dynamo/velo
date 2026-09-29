@@ -74,6 +74,15 @@ enum Role {
 /// In one process the server's `count` handler signals a channel. Across
 /// processes the client polls `count_done` once a millisecond, which is small
 /// against a pipeline run of seconds.
+/// Where the client finds the server.
+enum PeerSource {
+    /// Handed over in the same process.
+    Known(velo::PeerInfo),
+    /// Written by `--role server`. The file can be left over from an earlier
+    /// run, so the client reads it again until the server named in it answers.
+    File(std::path::PathBuf),
+}
+
 #[derive(Clone)]
 enum Done {
     Local(flume::Receiver<()>),
@@ -414,12 +423,21 @@ fn main() -> Result<()> {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
+            // An old file names a server that is gone; a client started
+            // before this one writes its own would read it.
+            let staged = path.with_extension("staged");
+            for old in [&path, &staged] {
+                match std::fs::remove_file(old) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
             runtime.block_on(async move {
                 let (done_tx, _done_rx) = flume::bounded::<()>(1);
                 let velo = serve(args.tx.transport, done_tx).await?;
                 // Written under another name and renamed, so a client never
                 // reads a half-written file.
-                let staged = path.with_extension("staged");
                 std::fs::write(&staged, rmp_serde::to_vec(&velo.peer_info())?)?;
                 std::fs::rename(&staged, &path)?;
                 println!("Server ready; peer info in {}", path.display());
@@ -432,21 +450,12 @@ fn main() -> Result<()> {
                 .peer_file
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("--role client needs --peer-file"))?;
-            let deadline = Instant::now() + Duration::from_secs(120);
-            let server_peer_info: velo::PeerInfo = loop {
-                if let Ok(bytes) = std::fs::read(&path) {
-                    break rmp_serde::from_slice(&bytes)?;
-                }
-                if Instant::now() > deadline {
-                    anyhow::bail!("no peer info at {} after 120 s", path.display());
-                }
-                std::thread::sleep(Duration::from_millis(200));
-            };
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
             let transport = args.tx.transport;
-            let results = runtime.block_on(run_client(&args, server_peer_info, Done::Remote))?;
+            let results =
+                runtime.block_on(run_client(&args, PeerSource::File(path), Done::Remote))?;
             print_table(&results, transport);
             Ok(())
         }
@@ -477,7 +486,11 @@ fn run_both(args: Args) -> Result<()> {
 
     let server_peer_info = peer_info_rx.recv().unwrap();
     let client_handle = std::thread::spawn(move || -> Result<Vec<CellResult>> {
-        runtime_client.block_on(run_client(&args, server_peer_info, Done::Local(done_rx)))
+        runtime_client.block_on(run_client(
+            &args,
+            PeerSource::Known(server_peer_info),
+            Done::Local(done_rx),
+        ))
     });
 
     let results = client_handle.join().unwrap()?;
@@ -536,26 +549,63 @@ async fn serve(transport_type: TransportType, done_tx: flume::Sender<()>) -> Res
     Ok(velo)
 }
 
+/// Read the peer file until the server it names answers an `echo`.
+///
+/// A file left over from an earlier run names a server that is gone, and the
+/// new server removes it only when it starts. So a failed `echo` means "read
+/// the file again", not "give up", until the deadline.
+async fn reach_server_from_file(velo: &Arc<Velo>, path: &std::path::Path) -> Result<InstanceId> {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut tried: Option<InstanceId> = None;
+    loop {
+        if let Ok(bytes) = std::fs::read(path)
+            && let Ok(info) = rmp_serde::from_slice::<velo::PeerInfo>(&bytes)
+            && tried != Some(info.instance_id())
+        {
+            let target = info.instance_id();
+            tried = Some(target);
+            velo.register_peer(info)?;
+            let echo = velo
+                .unary("echo")?
+                .raw_payload(Bytes::new())
+                .instance(target)
+                .send();
+            if let Ok(Ok(_)) = tokio::time::timeout(Duration::from_secs(5), echo).await {
+                return Ok(target);
+            }
+            println!(
+                "server in {} did not answer; waiting for a new one",
+                path.display()
+            );
+        }
+        if Instant::now() > deadline {
+            anyhow::bail!("no live server in {} after 120 s", path.display());
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+}
+
 /// Run every benchmark cell against the server.
-async fn run_client(
-    args: &Args,
-    server_peer_info: velo::PeerInfo,
-    done: Done,
-) -> Result<Vec<CellResult>> {
+async fn run_client(args: &Args, peer: PeerSource, done: Done) -> Result<Vec<CellResult>> {
     let transport = new_transport(args.tx.transport, "throughput").await?;
     let velo = Velo::builder().add_transport(transport).build().await?;
 
     sleep(Duration::from_millis(100)).await;
 
-    velo.register_peer(server_peer_info.clone())?;
-    let target = server_peer_info.instance_id();
-    sleep(Duration::from_millis(500)).await;
-
-    velo.unary("echo")?
-        .raw_payload(Bytes::new())
-        .instance(target)
-        .send()
-        .await?;
+    let target = match peer {
+        PeerSource::Known(server_peer_info) => {
+            velo.register_peer(server_peer_info.clone())?;
+            let target = server_peer_info.instance_id();
+            sleep(Duration::from_millis(500)).await;
+            velo.unary("echo")?
+                .raw_payload(Bytes::new())
+                .instance(target)
+                .send()
+                .await?;
+            target
+        }
+        PeerSource::File(path) => reach_server_from_file(&velo, &path).await?,
+    };
 
     let mut all_results = Vec::new();
     for &size in &args.payload_sizes {

@@ -34,7 +34,7 @@ VELO_BIND_IP=10.0.0.2 cargo run --release --example throughput --all-features --
   --role client --transport quic --peer-file /shared/peer --count 20000
 ```
 
-The server writes its peer info to the file and runs until it is stopped. The client prints the results table. `VELO_BIND_IP` applies to the `tcp` and `quic` transports of the examples, and the default is `127.0.0.1`.
+The server removes an old file, writes its peer info to the file, and runs until it is stopped. The client reads the file again until the server named in it answers, so a file left by an earlier run does no harm. Then it prints the results table. `VELO_BIND_IP` applies to the `tcp` and `quic` transports of the examples, and the default is `127.0.0.1`.
 
 ## Transport selection (`ping_pong`, `throughput`)
 
