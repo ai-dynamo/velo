@@ -150,7 +150,7 @@ Do not trust a configuration header that a program prints. The environment overr
 
 Two velo nodes can talk over UCX only if they use the same UCX wire version. Each node publishes that version in its UCX address, and `register()` refuses a peer on a different one.
 
-The current version is 2. Version 2 starts every frame header with the sender's 8-byte incarnation, so that the [endpoint idle reaper](../concepts/rendezvous.md#endpoint-idle-reaper) can tell which peer sent each frame. A version-1 node would misread those 8 bytes, so the two versions refuse each other instead.
+The current version is 2, from velo 0.15.0. Version 2 starts every frame header with the sender's 8-byte incarnation, so that the [endpoint idle reaper](../concepts/rendezvous.md#endpoint-idle-reaper) can tell which peer sent each frame. A version-1 node would misread those 8 bytes, so the two versions refuse each other instead.
 
 **Upgrade all UCX peers together.** During a rolling upgrade, an old node and a new node cannot reach each other over UCX. `register()` returns `InvalidEndpoint`, and the refusing node logs a warning: `ucx: rejecting peer blob: unsupported ucx blob version 1 (expected 2)`.
 
