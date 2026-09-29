@@ -31,7 +31,7 @@ The transport lowers `max_mtu` to 6550 and logs a warning. The test `large_frame
 
 ## Loopback measurements
 
-Measured on 2026-09-23 on one aarch64 workstation (20 cores, shared, load average near 8), over loopback, with the `throughput` example and 5,000 messages for each cell. Two reps for each configuration. These numbers show direction only. For the numbers on a cluster, see [Response plane on a cluster](#response-plane-on-a-cluster).
+Measured on 2026-09-23 on one aarch64 workstation (20 cores, shared, load average near 8), over loopback, with the `throughput` example and 5,000 messages for each cell. Two reps for each configuration. These numbers show direction only. For a network between two nodes, see [Two nodes](#two-nodes). For the response plane on a cluster, see [Response plane on a cluster](#response-plane-on-a-cluster).
 
 | Case | TCP | QUIC, default | QUIC, `max_mtu` 6550 |
 |---|---|---|---|
@@ -52,6 +52,25 @@ Measured on 2026-09-23 on one aarch64 workstation (20 cores, shared, load averag
 - **A larger initial congestion window.** 1 MiB instead of quinn's 14,720 bytes made no difference, at the default MTU or at 6550.
 - **Larger flow-control windows.** A 16 MiB stream window with a 64 MiB send window made no difference to one-at-a-time traffic, and was slower with 64 in flight (9,300 to 9,600 against 10,900 to 11,200 msg/s).
 - **Charging Tokio's task budget per batch of frames.** Dynamo's QUIC plane needed this because it polled quinn once per frame header and once per payload. The velo reader uses `FramedRead`, which decodes all buffered frames before it polls quinn again, and routes frames through `flume`, which does not charge the budget.
+- **LSE atomics.** Building with `-C target-feature=+lse` changed neither transport by more than 5%, on loopback on a 144-core Grace node.
+
+## Two nodes
+
+Measured on 2026-09-29 with the `throughput` example in its two-host mode. The server ran on one node and the client on another. Each node has 144 Grace aarch64 cores, and the process had 16 of them. The nodes connect through 200G Ethernet at MTU 1500, with `net.core.rmem_max` at 212,992. Each cell sent 20,000 messages. Three reps, with TCP and QUIC interleaved.
+
+| Case | TCP | QUIC | QUIC / TCP |
+|---|---|---|---|
+| 64 B, one at a time (msg/s) | 19,600–21,400 | 12,800–13,000 | 0.62 |
+| 64 B, one at a time, p50 (µs) | 51 | 76 | |
+| 64 B, 64 in flight (msg/s) | 261,000–339,000 | 210,000–270,000 | 0.80 |
+| 64 B, pipelined (msg/s) | 433,000–483,000 | 449,000–502,000 | 1.02 |
+| 64 KiB, one at a time (msg/s) | 6,400–8,100 | 2,300–2,600 | 0.33 |
+| 64 KiB, 64 in flight (MB/s, best rep) | 2,950 | 750 | 0.27 |
+| 64 KiB, pipelined (MB/s, best rep) | 3,920 | 840 | 0.23 |
+
+- Small messages cost about 25 µs more per round trip than on TCP, as on loopback. The network does not change this cost: it comes from the task hops inside quinn. With many messages in flight the gap closes, and pipelined QUIC matches TCP.
+- One QUIC connection tops out at about 0.8 GB/s, the same ceiling as on loopback on the same node type. So the limit is the CPU of the connection, not the network. A profile of the 64 KiB case put about 15% of the samples in AES-GCM. The rest was quinn's packet work, the kernel's UDP path, and task wakeups. TCP moves about 3.9 GB/s, because the kernel and the NIC offloads share that work.
+- A peer that needs more than about 0.8 GB/s needs more than one connection. The Dynamo response plane on the cluster carries far less than that per connection (see below).
 
 ## Batched streaming over QUIC
 
