@@ -70,6 +70,19 @@ Both have defaults, so out-of-tree transports keep compiling. `velo-ext` 0.5.3 t
 4. Mux lanes: rulings 8 to 14. Tests: per-lane order under load across many streams, lane selection (key hash and least-used), a lane failure fails only its slots, credit returns on the arrival lane, ticket round-trip with and without a lane, an old-format ticket decodes, N = 1 unchanged on the wire.
 5. Measure and write up: two-node stream cells at N = 1, 2, 4, 8 for QUIC (and TCP), 64 B no-regression, then the Dynamo mocker rig at the default. Book chapter update.
 
+## Stream baseline at one lane (2026-09-29)
+
+Two nodes, `throughput --modes stream` (branch `bench/throughput-stream` on #104), 200,000 items, 2 reps, 32 server sockets on the consumer:
+
+| Items | Streams | TCP MB/s | QUIC MB/s |
+|---|---|---|---|
+| 16 KiB | 16 | 2,158–2,191 | 533–738 |
+| 16 KiB | 64 | 2,658–2,783 | 485–709 |
+| 16 KiB | 256 | 2,256–2,885 | 487–684 |
+| 64 B | 256 | 790k–888k items/s | 752k–908k items/s |
+
+QUIC streams stop at the one-connection ceiling. TCP streams reach 2.2 to 2.9 GB/s through the same single batcher and ingress task, so the mux per peer is not the limit that lanes must lift. Ruling 12 stands. Data: `.research/perfwork/lanes/2node-stream/`.
+
 ## Measurement notes
 
 - Per-stream throughput is credit-bound, not transport-bound: 32 records per credit round trip. Loopback TCP, 64 B items, one stream: 14.7k items/s. Stream cells need many concurrent streams to reach the transport.
