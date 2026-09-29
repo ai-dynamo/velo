@@ -179,6 +179,11 @@ path = "tests/streaming/mux_credit.rs"
 required-features = ["test-helpers"]
 
 [[test]]
+name = "streaming_mux_kill_switch"
+# One test in a binary of its own: it sets a process-wide environment variable.
+path = "tests/streaming/mux_kill_switch.rs"
+
+[[test]]
 name = "streaming_mux_flush"
 path = "tests/streaming/mux_flush.rs"
 required-features = ["test-helpers"]

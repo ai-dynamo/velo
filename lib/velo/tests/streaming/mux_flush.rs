@@ -74,9 +74,13 @@ async fn node(mux: Option<MuxConfig>) -> Node {
         .add_transport(tcp_transport())
         .stream_bind_addr(std::net::Ipv4Addr::LOCALHOST.into())
         .metrics(metrics);
-    if let Some(config) = mux {
-        builder = builder.messenger_mux(config).expect("install mux");
-    }
+    // `None` is a node without the mux. The builder installs one by default,
+    // so a node without it has to say so.
+    let config = mux.unwrap_or(MuxConfig {
+        enabled: false,
+        ..MuxConfig::default()
+    });
+    builder = builder.messenger_mux(config).expect("configure mux");
     Node {
         velo: builder.build().await.expect("build velo"),
         registry,
