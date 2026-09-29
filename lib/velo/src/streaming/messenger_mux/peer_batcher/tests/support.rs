@@ -389,6 +389,19 @@ pub(super) fn item(n: u32) -> Vec<u8> {
     rmp_serde::to_vec(&crate::streaming::frame::StreamFrame::Item(n)).expect("encode item")
 }
 
+/// How many of `item(0)`, `item(1)`, ... a slot withholds before its queue
+/// reaches `cap` bytes and the inlet pauses. The record that reaches the cap is
+/// withheld too.
+pub(super) fn records_to_fill(cap: usize) -> usize {
+    let mut bytes = 0;
+    let mut n = 0;
+    while bytes < cap {
+        bytes += item(n).len();
+        n += 1;
+    }
+    n as usize
+}
+
 /// Wait until `predicate` holds, polling the batcher's observable state.
 pub(super) async fn eventually(mut predicate: impl FnMut() -> bool) {
     let deadline = tokio::time::Instant::now() + RECV_TIMEOUT;
@@ -541,14 +554,6 @@ impl StalledHarness {
     pub(super) fn staged(&self) -> f64 {
         self.snapshot()
             .gauge("velo_streaming_mux_staged_records", &[])
-    }
-
-    /// Records the producer ran past a starved slot's byte cap and lost.
-    pub(super) fn overflow_dropped(&self) -> f64 {
-        self.snapshot().counter(
-            "velo_streaming_mux_records_dropped_total",
-            &[("reason", "withheld_overflow")],
-        )
     }
 
     /// Wait until exactly `count` records are parked — for want of credit, or

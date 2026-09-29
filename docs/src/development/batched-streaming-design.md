@@ -61,7 +61,7 @@ The change of default has these effects that an operator can see:
 
 - A consumer with the mux mints zero-RTT tickets, and a producer without the mux cannot open them. Upgrade producers before the consumers that mint tickets.
 - `velo_streaming_producer_send_backpressure_total` changes meaning. See [Saturation](../operations/saturation.md).
-- A slow consumer is killed by the slot byte budget (`withheld_overflow`), not by the heartbeat watchdog after 15 seconds. See [Saturation](../operations/saturation.md).
+- A producer that runs the slot byte budget ahead of its consumer waits in `send`. The stream is not killed. See [Saturation](../operations/saturation.md).
 
 ## Rulings
 
@@ -111,11 +111,13 @@ Dense slot reuse without a generation delivers a stale record to the stream that
 
 When frame credit and the byte cap disagree, the receiver withholds the next grant. Refusing a record whose frame credit was already granted breaks a stream for a peer that obeyed every rule. The ingress hold is the one exception, because the alternative is unbounded growth behind a gap that can stay open.
 
-### Drain every inlet, and do not split control from data
+### Drain every inlet up to the byte budget, and do not split control from data
 
 The first design split the egress inlet into an unbounded control lane and a bounded data lane. `FrameTransport::connect` returns one `flume::Sender<Vec<u8>>`, and in that byte channel a terminal and a token look the same. A split needs a typed sink in the `velo-ext` trait, which is a breaking change to a published crate.
 
-The batcher instead drains every inlet, with or without credit, into a per-slot withheld queue that the slot byte budget bounds. A synchronous terminal send then never targets a channel that stays full. The cost is the per-slot kill: a producer that runs past the byte cap on a slot nobody drains loses that slot.
+The batcher instead drains every inlet, with or without credit, into a per-slot withheld queue that the slot byte budget bounds. At the budget, the batcher stops pulling from that inlet, and the producer's `send` waits. A synchronous terminal send on a full inlet waits in a task, so it does not block its caller.
+
+The first version killed the slot at the budget instead of pausing. That killed every producer faster than one credit round trip, including producers whose consumer was draining. A 10,000-record stream of 1 KiB records over loopback died after 1,128 records.
 
 ### Control is coalesced state, bounded by allocation
 

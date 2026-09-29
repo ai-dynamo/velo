@@ -820,9 +820,6 @@ pub(crate) enum MuxDropReason {
     ClosedSlot,
     /// An `OpenSlot` named a dense index a live slot still occupies.
     SlotCollision,
-    /// A producer ran past the byte cap on a slot that could not send, and the
-    /// slot was closed with everything it was holding.
-    WithheldOverflow,
     /// A singleton — a rendezvous transfer, or an `OpenSlot` under
     /// `MuxConfig::async_open_ack` — failed to resolve for a slot that had
     /// already closed.
@@ -839,7 +836,6 @@ impl MuxDropReason {
             Self::UnknownSlot => "unknown_slot",
             Self::ClosedSlot => "closed_slot",
             Self::SlotCollision => "slot_collision",
-            Self::WithheldOverflow => "withheld_overflow",
             Self::StaleSingleton => "stale_singleton",
             Self::Duplicate => "duplicate",
         }
@@ -1755,11 +1751,8 @@ impl VeloMetrics {
                  may not send yet — a slot out of credit, or fencing a \
                  singleton (a rendezvous transfer, or an OpenSlot under \
                  MuxConfig::async_open_ack) whose admission has not resolved. \
-                 The inlet is drained regardless of \
-                 whether the slot can send, because `finalize`, `detach` and \
-                 `Drop` reach it through a synchronous send that a full channel \
-                 would block forever; this gauge is where that backpressure \
-                 became visible instead. Bounded per slot by the slot byte cap.",
+                 Bounded per slot by the slot byte cap: at the cap the slot \
+                 stops pulling from its inlet, and the producer's send waits.",
             )?,
         )?;
         let streaming_mux_staged_records = register_collector(

@@ -223,14 +223,21 @@ async fn a_starved_slot_keeps_draining_so_a_synchronous_terminal_never_blocks() 
     assert_eq!(records[RECORDS as usize + 1].kind, RecordType::CloseSlot);
 }
 
-/// Run-ahead past the byte cap kills that slot, and only that slot.
+/// A starved slot stops pulling from its inlet at the byte cap, and only that
+/// slot does.
 ///
-/// This is the per-slot slow-consumer kill `docs/src/concepts/batched-streaming.md`
-/// prefers to the heartbeat watchdog: deterministic, scoped, and metered.
+/// The pause is the producer's backpressure. Records past the cap stay in the
+/// producer's channel, so once the channel is full its `send().await` waits.
+/// Nothing is dropped and the slot stays open. When credit comes, every record
+/// goes out in order. An earlier design killed the slot at the cap, and that
+/// also killed producers whose consumer was draining, only more slowly than
+/// the producer sent.
 #[tokio::test(flavor = "multi_thread")]
-async fn withheld_overflow_closes_the_starved_slot_and_leaves_the_others_alone() {
+async fn a_starved_slot_pauses_its_inlet_at_the_byte_cap_and_leaves_the_others_alone() {
+    const CAP: u32 = 256;
+    const RECORDS: u32 = 64;
     let harness = harness(MuxConfig {
-        slot_byte_budget: 256,
+        slot_byte_budget: CAP,
         ..MuxConfig::default()
     })
     .await;
@@ -239,41 +246,63 @@ async fn withheld_overflow_closes_the_starved_slot_and_leaves_the_others_alone()
     let (flowing_inlet, (flowing, _)) = harness.open_with_inlet(1, 2, 256).await;
     harness.grant(flowing, 64);
 
-    // Never granted, so everything piles into the withheld queue until the cap.
-    for n in 0..64u32 {
-        let _ = starved_inlet.send(item(n));
+    for n in 0..RECORDS {
+        starved_inlet.send(item(n)).expect("queue record");
     }
-    eventually(|| starved_inlet.is_disconnected()).await;
+    let parked = records_to_fill(CAP as usize);
+    assert!(parked < RECORDS as usize, "the run must pass the cap");
+    harness.await_withheld(parked).await;
+    // A negative fact needs time to turn false: a slot that did not pause
+    // would go on pulling from its inlet.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        harness.withheld(),
+        parked as f64,
+        "the inlet paused at the cap"
+    );
+    assert_eq!(
+        starved_inlet.len(),
+        RECORDS as usize - parked,
+        "the records past the cap wait in the producer's channel"
+    );
+    assert!(
+        !starved_inlet.is_disconnected(),
+        "a paused slot is not a killed one"
+    );
 
-    let mut closed = None;
-    let mut flowing_seen = 0;
     for n in 0..4u32 {
         flowing_inlet.send(item(100 + n)).expect("flowing send");
     }
-    while closed.is_none() || flowing_seen < 4 {
-        let batch = harness.next_batch().await;
-        for record in batch.records {
-            if record.slot == starved && record.kind == RecordType::CloseSlot {
-                closed = Some(record);
-            } else if record.slot == flowing {
+    let mut flowing_seen = 0;
+    while flowing_seen < 4 {
+        for record in harness.next_batch().await.records {
+            assert_ne!(
+                record.slot, starved,
+                "nothing leaves the starved slot without credit"
+            );
+            if record.slot == flowing {
                 flowing_seen += 1;
             }
         }
     }
-    assert!(
-        closed.is_some(),
-        "the consumer has to be told, or it waits out its heartbeat watchdog"
-    );
-    assert!(
-        !flowing_inlet.is_disconnected(),
-        "the peer's other slots are untouched"
-    );
-    assert!(
-        harness.snapshot().counter(
-            "velo_streaming_mux_records_dropped_total",
-            &[("reason", "withheld_overflow")]
-        ) > 0.0
-    );
+
+    // Credit resumes the inlet, and every record goes out in order.
+    harness.grant(starved, RECORDS);
+    let mut records = Vec::new();
+    while records.len() < RECORDS as usize {
+        records.extend(
+            harness
+                .next_batch()
+                .await
+                .records
+                .into_iter()
+                .filter(|record| record.slot == starved),
+        );
+    }
+    for (n, record) in records.iter().enumerate() {
+        assert_eq!(record.data, item(n as u32), "record {n} out of order");
+    }
+    assert_eq!(harness.withheld(), 0.0);
 }
 
 /// A producer that goes while records are still withheld owes them first.
@@ -382,10 +411,10 @@ async fn a_terminal_spends_the_reserve_when_data_credit_is_gone() {
 /// Pinned because it is the limit of what the reserve buys and it is easy to
 /// mistake for a bug. Letting the terminal past would reorder the stream — the
 /// consumer would see the end before records it is owed — so the terminal waits.
-/// The exit is the byte cap: a producer that keeps sending gets the per-slot
-/// kill. A producer that stops leaves the stream open until the application
-/// drops the anchor, because the stream watchdog exempts a sender that holds no
-/// credit (`docs/src/operations/saturation.md`).
+/// A producer that keeps sending is paused at the byte cap. Either way the
+/// stream stays open until the application drops the anchor, because the
+/// stream watchdog exempts a sender that holds no credit
+/// (`docs/src/operations/saturation.md`).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_terminal_behind_starved_predecessors_waits_for_them() {
     let harness = harness(MuxConfig::default()).await;

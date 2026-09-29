@@ -327,20 +327,19 @@ pub struct MuxConfig {
     /// slot's first record never depended on the control lane at all; with it,
     /// every congested-peer open now does.
     ///
-    /// **The fence this trades in is a second way to lose a stream.** On a
+    /// **The fence this trades in parks producers behind the peer.** On a
     /// peer whose admission is not already behind it, the fence goes up
     /// before the ack, unconditionally of credit, so the slot's first
     /// record — and every one behind it — withholds from record #1 whether or
     /// not the slot has room to spend. On a peer whose send queue is the
     /// congested one this flag exists to route around, a producer that starts
-    /// generating right away can fill the slot's byte cap before its own
-    /// `OpenSlot` is admitted, and the slow-consumer kill (`docs/src/operations/saturation.md`)
-    /// destroys the stream on that basis — a healthy consumer never entered
-    /// into it. Because `peer_byte_budget` bounds ingress only, nothing caps
-    /// how many slots may be open this way against one congested peer at once:
-    /// each can withhold up to `slot_byte_budget`, so the aggregate egress
-    /// buffer a stalled peer can hold grows with concurrent opens where the
-    /// awaited ack bounded it to one wait at a time.
+    /// generating right away fills the slot's byte cap before its own
+    /// `OpenSlot` is admitted, and then waits in `send` until the fence lifts.
+    /// Because `peer_byte_budget` bounds ingress only, nothing caps how many
+    /// slots may be open this way against one congested peer at once: each
+    /// can withhold up to `slot_byte_budget`, so the aggregate egress buffer a
+    /// stalled peer can hold grows with concurrent opens where the awaited ack
+    /// bounded it to one wait at a time.
     pub async_open_ack: bool,
     /// How long a pending credit reply may wait for a batch to form around it.
     ///

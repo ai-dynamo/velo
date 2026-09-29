@@ -670,11 +670,16 @@ async fn prebound_slot_holds_c_credits_against_a_c_plus_one_buffer() {
 ///
 /// The records are 1 KiB so that the run is ten times the cap and stays under
 /// the eager batch size, which keeps rendezvous out of the path.
+///
+/// Completing is not enough on its own: a batcher that neither paused nor
+/// killed would also complete, by buffering the whole run ahead of credit. So
+/// the consumer also samples the producer's withheld-record gauge as it reads,
+/// and the gauge must stay within the byte cap.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "producer backpressure: the withheld-queue byte cap kills a slot whose producer outruns credit, even while the consumer drains"]
 async fn a_producer_that_outruns_a_draining_consumer_waits_for_credit() {
     const RECORDS: u32 = 10_000;
     const RECORD_BYTES: usize = 1024;
+    const DEFAULT_SLOT_BYTE_BUDGET: usize = 1024 * 1024;
 
     let consumer = node(MuxConfig::default()).await;
     let producer = node(MuxConfig::default()).await;
@@ -696,9 +701,15 @@ async fn a_producer_that_outruns_a_draining_consumer_waits_for_credit() {
                 .await
                 .map_err(|e| format!("send {n} failed: {e}"))?;
         }
-        sender.finalize().map_err(|e| format!("finalize failed: {e}"))
+        sender
+            .finalize()
+            .map_err(|e| format!("finalize failed: {e}"))
     });
 
+    // Each record costs a little more than `RECORD_BYTES` on the wire, so this
+    // many fill the default 1 MiB cap, plus the one record that reaches it.
+    let max_withheld = (DEFAULT_SLOT_BYTE_BUDGET / RECORD_BYTES + 1) as f64;
+    let mut peak_withheld = 0.0f64;
     let mut seen = 0u32;
     loop {
         match tokio::time::timeout(PATIENCE, anchor.next()).await {
@@ -706,6 +717,13 @@ async fn a_producer_that_outruns_a_draining_consumer_waits_for_credit() {
                 assert_eq!(n, seen, "record out of order");
                 assert_eq!(body.len(), RECORD_BYTES);
                 seen += 1;
+                if seen.is_multiple_of(50) {
+                    peak_withheld = peak_withheld.max(
+                        producer
+                            .snapshot()
+                            .gauge("velo_streaming_mux_withheld_records", &[]),
+                    );
+                }
             }
             Ok(Some(Ok(StreamFrame::Finalized))) => break,
             Ok(Some(Ok(other))) => {
@@ -724,4 +742,10 @@ async fn a_producer_that_outruns_a_draining_consumer_waits_for_credit() {
         .expect("producer did not finish")
         .expect("producer task panicked")
         .expect("producer failed");
+    assert!(
+        peak_withheld <= max_withheld,
+        "the producer's node withheld {peak_withheld} records, past the {max_withheld} the \
+         byte cap allows: the batcher buffered the run ahead of credit instead of making \
+         the producer wait"
+    );
 }

@@ -116,9 +116,7 @@ Each slot buffer holds `initial_credit + 1` records. The byte budgets, not the r
 
 ## Change the byte budgets
 
-If producers legitimately run far ahead of slow consumers and lose streams to the withheld-overflow kill, increase `slot_byte_budget`. A larger cap gives a producer more run-ahead before the kill.
-
-To fail a wedged stream sooner, decrease `slot_byte_budget`.
+`slot_byte_budget` sets how far a producer can run ahead of its consumer before its `send` waits. A larger cap absorbs longer bursts, and costs that much memory per slot on the producer's node. A smaller cap makes the producer wait sooner.
 
 If one peer carries many slots with large records, increase `peer_byte_budget`. It bounds only the receive side.
 
@@ -138,7 +136,7 @@ If you set `reply_linger` to zero, each credit reply writes its own batch again.
 
 `async_open_ack` returns from a slot open before the transport admits the `OpenSlot`. At 512 workers and 8,192-way concurrency, it made first-token p95 worse in every rep and did not improve p50.
 
-It also adds a second way to lose a stream. On a congested peer, a producer can fill the slot byte cap before its own `OpenSlot` is admitted. The slot is then killed with a healthy consumer. Nothing caps how many slots can be open this way against one congested peer.
+It also parks producers behind a congested peer. On such a peer, a producer can fill the slot byte cap before its own `OpenSlot` is admitted, and then waits in `send` although its consumer is healthy. Nothing caps how many slots can wait this way against one congested peer, so egress memory grows with the number of opens.
 
 Do not enable it unless both of these conditions are true:
 

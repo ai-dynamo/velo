@@ -214,7 +214,7 @@ Frame credit proves that no head-of-line blocking occurs. Byte credit bounds mem
 
 `finalize`, `detach` and `Drop` reach the slot inlet from synchronous code. The batcher therefore drains every inlet, whether or not the slot has credit. A slot with no credit keeps its records in a per-slot withheld queue, which the slot byte budget bounds. The queue is FIFO, so a terminal in it still waits for the records in front of it.
 
-A producer that runs past the byte cap on a slot that nobody drains loses that slot. The producer's channel returns errors at once, the consumer receives `Dropped`, and `velo_streaming_mux_records_dropped_total{reason="withheld_overflow"}` increments. Other slots continue. [Stream saturation](../operations/saturation.md) describes this kill from the operator side.
+A producer that runs a slot's byte cap ahead of its consumer waits. The batcher stops pulling from that slot's inlet, the inlet fills, and `StreamSender::send` waits until credit returns. Other slots continue. [Stream saturation](../operations/saturation.md) describes this backpressure from the operator side.
 
 The batcher's own control inlet is coalesced state, not a queue. Credit returns accumulate into a `u32` per slot. A close supersedes the credit of its slot, and a failed singleton supersedes a successful one. The batcher is woken, never fed. A queue is unbounded exactly when a flush parks on admission, which is when the peer is busiest returning credit.
 
