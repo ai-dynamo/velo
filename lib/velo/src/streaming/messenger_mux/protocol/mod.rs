@@ -254,7 +254,8 @@ pub(crate) enum RecordType {
     CreditUpdate = 3,
     /// Per-slot liveness beat. No body.
     SlotHeartbeat = 4,
-    /// Graceful stop request, receiver to producer. No body.
+    /// Lifecycle request, receiver to producer: `[u64 session_id][u8 action]`,
+    /// where action 0 is a graceful stop and 1 is a cancel.
     LifecycleSlot = 5,
 }
 

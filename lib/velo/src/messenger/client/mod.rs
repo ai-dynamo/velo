@@ -247,6 +247,11 @@ impl ActiveMessageClient {
         self.peer_registry.has_handler_info(instance_id)
     }
 
+    /// Check the cached handler list for this exact peer instance.
+    pub(crate) fn has_cached_handler(&self, instance_id: InstanceId, handler: &str) -> bool {
+        self.peer_registry.handler_exists(instance_id, handler)
+    }
+
     /// Check if we can send a message directly (fast path)
     pub(crate) fn can_send_directly(&self, target: InstanceId, handler: &str) -> bool {
         // 1. Peer must be registered
@@ -397,12 +402,6 @@ impl ActiveMessageClient {
         self.peer_registry
             .get_handlers(instance_id)
             .ok_or_else(|| anyhow::anyhow!("Failed to get handlers for instance {}", instance_id))
-    }
-
-    /// Whether the peer's last known handler list names `handler`. No round
-    /// trip: `false` means unknown, not absent.
-    pub(crate) fn handler_known(&self, instance_id: InstanceId, handler: &str) -> bool {
-        self.peer_registry.handler_exists(instance_id, handler)
     }
 
     /// Refresh the handler list for a peer

@@ -454,6 +454,7 @@ impl StreamController {
         } else if let Some(handle) = entry.stream_cancel_handle {
             crate::streaming::control::request_sender_stop(
                 handle,
+                self.inner.worker_id,
                 &self.inner.sender_registry,
                 self.inner.messenger.as_ref(),
             );
@@ -1676,6 +1677,7 @@ impl AnchorManager {
                     if entry.stop_requested {
                         crate::streaming::control::request_sender_stop(
                             req.stream_cancel_handle,
+                            self.worker_id,
                             &self.sender_registry,
                             self.messenger_lock.get(),
                         );
