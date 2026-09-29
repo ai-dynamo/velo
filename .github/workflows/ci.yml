@@ -200,6 +200,11 @@ jobs:
       NATS_URL: nats://127.0.0.1:4222
       ETCD_URL: http://127.0.0.1:2379
       RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
+      # The instrumented build of every target filled the runner's disk: with
+      # incremental compilation on, each object file is written twice, into
+      # deps/ and into the incremental cache. sccache cannot cache incremental
+      # builds either.
+      CARGO_INCREMENTAL: "0"
     services:
       nats:
         image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/nats-jetstream:2.12.6v1
