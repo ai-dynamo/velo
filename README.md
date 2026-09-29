@@ -11,6 +11,8 @@ NOTE: Velo is experimental. Its design, development, and tests are still in prog
 
 **Documentation: [the Velo book](https://ai-dynamo.github.io/velo/)**. The source is in [`docs/src/`](docs/src/SUMMARY.md).
 
+Typed streams support graceful stop, cancellation, and ordered finalization, including prebound tickets. See [Stream lifecycle](docs/src/concepts/streaming.md).
+
 ## Crates
 
 | Crate | For | Contents |

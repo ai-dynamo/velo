@@ -865,7 +865,7 @@ impl BatcherWake {
     }
 }
 
-/// Collectors for the `messenger-mux-v1` streaming transport.
+/// Collectors for the `messenger-mux-v2` streaming transport.
 ///
 /// Bound once per mux transport via [`VeloMetrics::bind_mux`] so the hot paths
 /// (the per-peer batcher and the `_stream_batch` ingress lane) hold concrete

@@ -179,6 +179,7 @@ pub(crate) struct BatchOutcome {
     pub(crate) grants: Vec<(SlotId, u32)>,
     /// `CloseSlot`s addressed to slots *we* own, likewise.
     pub(crate) peer_closes: Vec<(SlotId, CloseReason)>,
+    pub(crate) peer_stops: Vec<(SlotId, u64, bool)>,
     /// Slots this batch created.
     pub(crate) opened: usize,
     /// Slots this batch retired.
@@ -211,6 +212,7 @@ impl IngressRegistry {
         peer: WorkerId,
         id: SlotId,
         metrics: Option<&MuxMetricsHandle>,
+        session_id: Option<u64>,
     ) -> Option<ReplyRecord> {
         let entry = self.peers.get(&peer)?;
         let mut state = lock(entry.value());
@@ -227,6 +229,10 @@ impl IngressRegistry {
         {
             return None;
         }
+        let live = state.slots[id.index() as usize].as_ref()?;
+        if session_id.is_some_and(|session| live.session_id != session) {
+            return None;
+        }
         let mut outcome = BatchOutcome::default();
         finish_close(
             &mut state,
@@ -235,9 +241,16 @@ impl IngressRegistry {
             metrics,
             &mut outcome,
         );
-        (outcome.closed > 0).then_some(ReplyRecord::CloseSlot {
-            slot: id,
-            reason: CloseReason::UnknownSlot,
+        (outcome.closed > 0).then_some(match session_id {
+            Some(session_id) => ReplyRecord::LifecycleSlot {
+                slot: id,
+                session_id,
+                cancel: true,
+            },
+            None => ReplyRecord::CloseSlot {
+                slot: id,
+                reason: CloseReason::UnknownSlot,
+            },
         })
     }
 
@@ -586,6 +599,9 @@ fn apply_record(
         RecordBody::CloseSlot { reason } => {
             close_slot(state, ctx, record.slot, record.frame_seq, reason, outcome);
         }
+        RecordBody::LifecycleSlot { session_id, cancel } => {
+            outcome.peer_stops.push((record.slot, session_id, cancel))
+        }
         RecordBody::Data(body) => deliver(state, ctx, record, body.to_vec(), outcome),
         RecordBody::SlotHeartbeat => deliver(state, ctx, record, heartbeat_frame(), outcome),
     }
@@ -680,14 +696,14 @@ fn open_slot(
     // The bind now has an owner, so its drain signal can start counting and
     // posting. Before this point it is inert: nothing has been delivered on
     // this slot, so nothing can have drained.
-    bind.drain.claimed_by(
+    let lifecycle = bind.drain.claimed_by(
         ctx.peer,
         id,
         ctx.registry.pending_wake(ctx.peer),
         state.drained_tx.clone(),
     );
 
-    let slot = IngressSlot::new(
+    let mut slot = IngressSlot::new(
         id,
         bind.frame_tx,
         Arc::clone(&bind.drain),
@@ -695,8 +711,23 @@ fn open_slot(
         ctx.config.slot_byte_budget,
         record.frame_seq.saturating_add(1),
     );
+    slot.session_id = session_id;
     state.slots[index] = Some(slot);
     outcome.opened += 1;
+    if lifecycle == 2 {
+        finish_close(state, id, CloseReason::UnknownSlot, ctx.metrics, outcome);
+        outcome.replies.push(ReplyRecord::LifecycleSlot {
+            slot: id,
+            session_id,
+            cancel: true,
+        });
+    } else if lifecycle == 1 {
+        outcome.replies.push(ReplyRecord::LifecycleSlot {
+            slot: id,
+            session_id,
+            cancel: false,
+        });
+    }
 }
 
 fn close_slot(

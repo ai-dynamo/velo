@@ -51,6 +51,7 @@ pub(super) enum Applied {
 
 /// One receive-side slot.
 pub(super) struct IngressSlot {
+    pub(super) session_id: u64,
     /// Index and generation this slot answers to.
     pub(super) id: SlotId,
     /// The mux-owned `C + 1`-deep buffer handed to the anchor by `bind`.
@@ -118,6 +119,7 @@ impl IngressSlot {
         first_seq: u32,
     ) -> Self {
         Self {
+            session_id: 0,
             id,
             frame_tx,
             drain,

@@ -115,7 +115,7 @@ Each rule below exists because a measurement without it was wrong.
 5. **Compare reps at a matched backlog draw.** On the external rig, one or more mocker processes fall behind during the opening burst and keep that backlog. The number of processes that hold the backlog (the "holders") sets throughput, ITL and end-to-end latency for every arm. Compare two arms only at the same holder count.
 6. **Do not fix the arm order.** A matrix that always ran the same arm second put that arm in a degraded band in every rep. Its request-level numbers measured run position, not the setting.
 7. **Change one setting per arm.** A pair that differed in two settings attributed a result to the wrong one.
-8. **Assert the transport per request.** Fail any request whose negotiated key is not `messenger-mux-v1`. A silent fallback measures the per-stream path under a mux label.
+8. **Assert the transport per request.** Fail any request whose negotiated key is not `messenger-mux-v2`. A silent fallback measures the per-stream path under a mux label.
 9. **Record the build.** Write the velo commit and its dirty state into each rep's metadata. If the installed build and the checkout differ, fail the rep.
 10. **Report latency beside throughput.** A change that adds latency can raise throughput by letting the consumer catch up. Watch TTFT in particular, because any windowed flush policy can make it worse.
 11. **Prove a regression test before you trust it.** Revert the fix and make sure that the test fails. A test that passes with the fix reverted proves nothing.

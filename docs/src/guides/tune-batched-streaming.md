@@ -24,7 +24,7 @@ let velo = Velo::builder()
     .await?;
 ```
 
-Enable the mux on both nodes of a pair. An attach uses the mux only when both sides advertise `messenger-mux-v1`. Every other pair uses the per-stream path.
+Enable the mux on both nodes of a pair. An attach uses the mux only when both sides advertise `messenger-mux-v2`. Every other pair uses the per-stream path.
 
 Call `messenger_mux` once per `Velo` instance. A second call returns an error.
 
@@ -86,7 +86,7 @@ All settings are fields of `MuxConfig`. Always build it with `..Default::default
 
 | Field | Default | What it controls |
 |---|---|---|
-| `enabled` | `false` | Installs the mux and advertises `messenger-mux-v1`. Setting it back to `false` is the rollback. |
+| `enabled` | `false` | Installs the mux and advertises `messenger-mux-v2`. Setting it back to `false` is the rollback. |
 | `max_batch_bytes` | 60 KiB | The configured cap on one batch. The eager budget and the 64 KiB coalescing threshold also clamp it. |
 | `initial_credit` | 256 | Data credit C per slot. Each slot buffer holds C+1 records. Zero is refused at build time. |
 | `slot_byte_budget` | 1 MiB | Bytes one slot can hold in flight, and the cap on its withheld queue. Zero means the default. |
@@ -165,7 +165,7 @@ let sender = match envelope.ticket {
 };
 ```
 
-A zero-RTT sender has no cancel handle, so its `cancellation_token` never fires. When the consumer drops the anchor, the producer's next `send` returns an error. An idle producer also receives a close from the consumer.
+A ticket sender observes `stop_token()` and `cancellation_token()` through the mux's slot lifecycle. Stop leaves the stream open for final output. Cancel or consumer drop wakes an idle producer and ends delivery; it does not need a later send.
 
 The ticket stays valid for the 60-second accept window. After the window, the consumer reaps the bind and sees `SenderDropped`.
 

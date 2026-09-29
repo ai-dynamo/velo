@@ -180,6 +180,7 @@ async fn reader_pump_unclaimed_bind_reap_increments_counter() {
             heartbeat_interval: std::time::Duration::from_secs(5),
             stream_cancel_handle: None,
             prebind: None,
+            stop_requested: false,
         },
     );
 
@@ -463,7 +464,7 @@ fn an_attach_request_round_trips_its_advertised_keys() {
         session_id: 3,
         stream_cancel_handle: StreamCancelHandle::pack(velo_ext::WorkerId::from_u64(4), 5),
         supported_transport_keys: vec![
-            velo_ext::TransportKey::new("messenger-mux-v1"),
+            velo_ext::TransportKey::new("messenger-mux-v2"),
             velo_ext::TransportKey::new("tcp-stream"),
         ],
     };
@@ -476,7 +477,7 @@ fn an_attach_request_round_trips_its_advertised_keys() {
             .iter()
             .map(velo_ext::TransportKey::as_str)
             .collect::<Vec<_>>(),
-        ["messenger-mux-v1", "tcp-stream"],
+        ["messenger-mux-v2", "tcp-stream"],
     );
 }
 
@@ -823,6 +824,7 @@ fn make_pump_test_infra() -> (
             heartbeat_interval: Duration::from_secs(5),
             stream_cancel_handle: None,
             prebind: None,
+            stop_requested: false,
         },
     );
 
@@ -912,6 +914,7 @@ fn make_prebind_pump_test_infra(
             heartbeat_interval: heartbeat_deadline,
             stream_cancel_handle: None,
             prebind: None,
+            stop_requested: false,
         },
     );
 
@@ -1494,6 +1497,7 @@ async fn reader_pump_does_not_count_a_blocked_forward_as_heartbeat_silence() {
             heartbeat_interval: deadline,
             stream_cancel_handle: None,
             prebind: None,
+            stop_requested: false,
         },
     );
     let ctx = crate::streaming::anchor::AnchorContext {
@@ -1703,6 +1707,7 @@ async fn test_child_token_reattach_pump_survives() {
             heartbeat_interval: Duration::from_secs(5),
             stream_cancel_handle: None,
             prebind: None,
+            stop_requested: false,
         },
     );
 
@@ -1883,7 +1888,7 @@ fn attach_response_golden_encoding_unchanged() {
         "handle": {"hi": 1, "lo": 2},
         "session_id": 3,
         "stream_cancel_handle": {"hi": 4, "lo": 5},
-        "supported_transport_keys": ["messenger-mux-v1"]
+        "supported_transport_keys": ["messenger-mux-v2"]
     }"#;
     let decoded: AnchorAttachRequest =
         serde_json::from_str(ticketless_request).expect("a ticketless request must deserialize");
@@ -1894,14 +1899,14 @@ fn attach_response_golden_encoding_unchanged() {
             .iter()
             .map(velo_ext::TransportKey::as_str)
             .collect::<Vec<_>>(),
-        ["messenger-mux-v1"]
+        ["messenger-mux-v2"]
     );
 
     // The response keeps its five fields and gains none. Compared as a value
     // rather than as bytes because the field *set* is the invariant; rmp-serde
     // writes named fields, so an added one would show up here as an extra key.
     let response = AnchorAttachResponse::Ok {
-        streaming_transport_key: velo_ext::TransportKey::new("messenger-mux-v1"),
+        streaming_transport_key: velo_ext::TransportKey::new("messenger-mux-v2"),
         heartbeat_interval_ms: 1234,
         routing_session_id: 42,
         initial_credit: 64,
@@ -1933,7 +1938,7 @@ fn attach_response_golden_encoding_unchanged() {
     // has no legacy sender to default for (see `StreamOpenTicket`'s own doc),
     // so `heartbeat_interval_ms` is set explicitly rather than left absent.
     let ticket: StreamOpenTicket = serde_json::from_str(
-        r#"{"streaming_transport_key":"messenger-mux-v1","heartbeat_interval_ms":1500,"routing_session_id":7,"initial_credit":8,"slot_byte_budget":0}"#,
+        r#"{"streaming_transport_key":"messenger-mux-v2","heartbeat_interval_ms":1500,"routing_session_id":7,"initial_credit":8,"slot_byte_budget":0}"#,
     )
     .expect("a fully-populated ticket must deserialize");
     assert_eq!(ticket.routing_session_id, 7);
@@ -1955,25 +1960,25 @@ fn attach_response_golden_encoding_unchanged() {
 /// -- all wrong answers reached without error.
 #[test]
 fn a_ticket_missing_a_minted_field_fails_rather_than_silently_defaulting() {
-    let missing_routing_session_id = r#"{"streaming_transport_key":"messenger-mux-v1","initial_credit":8,"slot_byte_budget":4096}"#;
+    let missing_routing_session_id = r#"{"streaming_transport_key":"messenger-mux-v2","initial_credit":8,"slot_byte_budget":4096}"#;
     assert!(
         serde_json::from_str::<StreamOpenTicket>(missing_routing_session_id).is_err(),
         "a ticket missing routing_session_id must not silently decode as session 0"
     );
 
-    let missing_initial_credit = r#"{"streaming_transport_key":"messenger-mux-v1","routing_session_id":7,"slot_byte_budget":4096}"#;
+    let missing_initial_credit = r#"{"streaming_transport_key":"messenger-mux-v2","routing_session_id":7,"slot_byte_budget":4096}"#;
     assert!(
         serde_json::from_str::<StreamOpenTicket>(missing_initial_credit).is_err(),
         "a ticket missing initial_credit must not silently decode as 'not offering the mux'"
     );
 
-    let missing_slot_byte_budget = r#"{"streaming_transport_key":"messenger-mux-v1","routing_session_id":7,"initial_credit":8}"#;
+    let missing_slot_byte_budget = r#"{"streaming_transport_key":"messenger-mux-v2","routing_session_id":7,"initial_credit":8}"#;
     assert!(
         serde_json::from_str::<StreamOpenTicket>(missing_slot_byte_budget).is_err(),
         "a ticket missing slot_byte_budget must not silently decode as 'use the default'"
     );
 
-    let missing_heartbeat = r#"{"streaming_transport_key":"messenger-mux-v1","routing_session_id":7,"initial_credit":8,"slot_byte_budget":4096}"#;
+    let missing_heartbeat = r#"{"streaming_transport_key":"messenger-mux-v2","routing_session_id":7,"initial_credit":8,"slot_byte_budget":4096}"#;
     assert!(
         serde_json::from_str::<StreamOpenTicket>(missing_heartbeat).is_err(),
         "a ticket missing heartbeat_interval_ms must not silently decode at 5000ms, which can \
