@@ -555,8 +555,8 @@ impl Transport for QuicTransport {
     > {
         Box::pin(async move {
             // Any live lane shows the peer is reachable. A lane that dies on
-            // its own is found by its next send, whose frames fail through
-            // `on_error`.
+            // its own fails the frames queued on it through `on_error`, and
+            // its next send dials it again.
             let mut connection_exists = false;
             for lane in 0..self.lanes {
                 let key: LaneKey = (instance_id, lane);

@@ -42,7 +42,7 @@ To let open streams finish, call `begin_drain`, wait until your streams end, and
 
 ## A refused request fails fast
 
-A transport that has a return path answers a refused request with a `MessageType::ShuttingDown` frame. The frame echoes the header of the rejected request, so the sender can find the waiting caller and fail it at once. Without the echo, the caller waits for its own timeout. The echo uses the request header, not a response header, so `ShuttingDown` frames have their own inbound lane.
+A transport that has a return path answers a refused request with a `MessageType::ShuttingDown` frame. The frame echoes the header of the rejected request, so the sender can find the waiting caller and fail it at once. Without the echo, the caller waits for its own timeout. The echo uses the request header, not a response header, so `ShuttingDown` frames have their own inbound stream.
 
 gRPC has no return path on its client-side read half. There, the transport records the rejection and drops the frame.
 

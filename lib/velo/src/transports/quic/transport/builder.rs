@@ -159,7 +159,8 @@ impl QuicTransportBuilder {
         self
     }
 
-    /// Connections to each peer, one per lane (default 1, at least 1).
+    /// Lanes to each peer: up to this many connections, one for each lane
+    /// used (default 1, at least 1).
     ///
     /// One QUIC connection does its packet and crypto work on one task, so it
     /// caps what one peer can carry at about one core's worth. Each lane is

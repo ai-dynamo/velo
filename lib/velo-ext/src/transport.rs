@@ -340,6 +340,7 @@ pub trait Transport: Send + Sync {
     ) -> SendOutcome;
 
     /// How many ordered channels (lanes) this transport keeps to `target`.
+    /// At least 1.
     ///
     /// Frames sent on one `(target, lane)` through
     /// [`send_message_on_lane`](Transport::send_message_on_lane) arrive in the
@@ -349,6 +350,10 @@ pub trait Transport: Send + Sync {
     /// The value must not change while the peer is registered: a caller maps
     /// its flows to lanes with it, and a different count would move a flow to
     /// another lane, which reorders it.
+    ///
+    /// A transport that returns more than 1 must also override
+    /// [`send_message_on_lane`](Transport::send_message_on_lane): the default
+    /// ignores the lane, and would put every lane on one channel.
     ///
     /// Lanes exist because one connection can be bound to one core: a QUIC
     /// connection does its packet and crypto work on one task. A caller with
@@ -362,8 +367,8 @@ pub trait Transport: Send + Sync {
     /// lane 0.
     ///
     /// Every rule of `send_message` applies, per `(target, lane)`: one
-    /// admission gate per lane, and frames on one lane are written in the order
-    /// they were admitted. A lane never fails over to another lane's
+    /// admission gate per lane, and frames on one lane arrive in the order they
+    /// were admitted. A lane never fails over to another lane's
     /// connection, because that would reorder it. A lane at or past
     /// [`lanes`](Transport::lanes) maps to `lane % lanes(target)`.
     ///

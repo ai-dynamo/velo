@@ -3,15 +3,17 @@
 
 //! QUIC messenger transport (feature `quic`).
 //!
-//! One QUIC connection per peer, lane and direction, like TCP with one lane. The dialer opens one
-//! bidirectional stream and writes velo frames on it with the shared
+//! One QUIC connection per peer, lane and direction. With the default of one
+//! lane, that is one connection per peer and direction, like TCP. The dialer
+//! opens one bidirectional stream and writes velo frames on it with the shared
 //! coalescing writer. The listener reads the stream with the TCP frame codec
-//! and writes back only `ShuttingDown` echoes. One stream per peer keeps the
-//! order of messages from one peer, which ordered handlers and batched
-//! streaming rely on.
+//! and writes back only `ShuttingDown` echoes. One stream per lane keeps the
+//! order of the messages on that lane, and ordered handlers and batched
+//! streaming rely on it.
 //!
-//! With `QuicTransportBuilder::lanes(n)`, the dialer keeps `n` connections to
-//! each peer, one per lane, each from its own UDP socket. `send_message` uses
+//! With `QuicTransportBuilder::lanes(n)`, the dialer keeps up to `n`
+//! connections to each peer, one for each lane it sends on, each from its own
+//! UDP socket. `send_message` uses
 //! lane 0, so ordinary traffic keeps one ordered channel per peer. A caller
 //! that sends on other lanes gets order within each lane only. One connection
 //! is bound to about one core, so lanes are how one peer gets more than about

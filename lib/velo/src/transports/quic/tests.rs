@@ -1049,8 +1049,16 @@ async fn a_listener_in_teardown_closes_the_connection_before_its_streams() {
 }
 
 /// A client with `lanes` lanes, registered with a fresh server.
-async fn laned_pair(lanes: u16) -> (Arc<QuicTransport>, QuicTransport, DataStreams, InstanceId) {
-    let (client, _client_streams, _) = started_with(QuicTransportBuilder::new().lanes(lanes)).await;
+async fn laned_pair(
+    lanes: u16,
+) -> (
+    Arc<QuicTransport>,
+    DataStreams,
+    QuicTransport,
+    DataStreams,
+    InstanceId,
+) {
+    let (client, client_streams, _) = started_with(QuicTransportBuilder::new().lanes(lanes)).await;
     let (server, server_streams, server_id) = started().await;
     client
         .register(peer_with_fingerprint(
@@ -1059,7 +1067,13 @@ async fn laned_pair(lanes: u16) -> (Arc<QuicTransport>, QuicTransport, DataStrea
             server.fingerprint(),
         ))
         .unwrap();
-    (Arc::new(client), server, server_streams, server_id)
+    (
+        Arc::new(client),
+        client_streams,
+        server,
+        server_streams,
+        server_id,
+    )
 }
 
 /// Each lane is its own connection from its own socket, and keeps its own
@@ -1074,7 +1088,7 @@ async fn laned_pair(lanes: u16) -> (Arc<QuicTransport>, QuicTransport, DataStrea
 async fn each_lane_is_its_own_connection_and_keeps_its_own_order() {
     const LANES: u16 = 4;
     const FRAMES: u32 = 10_000;
-    let (client, server, server_streams, server_id) = laned_pair(LANES).await;
+    let (client, _client_streams, server, server_streams, server_id) = laned_pair(LANES).await;
     assert_eq!(client.lanes(server_id), LANES);
 
     let errors = Arc::new(Errors::default());
@@ -1141,7 +1155,7 @@ async fn each_lane_is_its_own_connection_and_keeps_its_own_order() {
 /// it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn send_message_is_lane_zero_and_lanes_wrap() {
-    let (client, server, server_streams, server_id) = laned_pair(3).await;
+    let (client, _client_streams, server, server_streams, server_id) = laned_pair(3).await;
     let errors = Arc::new(Errors::default());
 
     let _ = client.send_message(
@@ -1188,25 +1202,26 @@ async fn send_message_is_lane_zero_and_lanes_wrap() {
     server.shutdown();
 }
 
-/// `closed()` waits for every lane: after it returns, no dial endpoint has a
+/// `closed()` covers every lane: after it returns, no dial endpoint has a
 /// connection open, and every frame sent on any lane was delivered or failed.
 ///
-/// Every lane is connected before the close: one frame on each has reached
-/// the server. The bulk then goes on lanes 1 and up only, so lane 0's endpoint
-/// is idle while the others drain, and a `closed()` that waited on lane 0
-/// alone would return with their connections still open.
+/// Every lane is connected before the close, and bulk frames are flowing on
+/// lanes 1 and up when it lands, so the close meets writers that are mid-stream
+/// on endpoints other than lane 0's. Each send is admitted at once (the bulk
+/// fits the send channel), so a frame is either on the wire or reported through
+/// `on_error`; none can be dropped in the gate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn closed_waits_for_every_lane() {
     const LANES: u16 = 4;
     const FRAMES: usize = 256;
     const PAYLOAD: usize = 64 * 1024;
-    let (client, server, server_streams, server_id) = laned_pair(LANES).await;
+    let (client, _client_streams, server, server_streams, server_id) = laned_pair(LANES).await;
     let errors = Arc::new(Errors::default());
 
     let send = |lane: u16, seq: usize, bytes: usize| {
         let mut header = lane.to_be_bytes().to_vec();
         header.extend_from_slice(&(seq as u32).to_be_bytes());
-        let _ = client.send_message_on_lane(
+        let outcome = client.send_message_on_lane(
             server_id,
             lane,
             Bytes::from(header),
@@ -1214,6 +1229,7 @@ async fn closed_waits_for_every_lane() {
             MessageType::Response,
             errors.clone(),
         );
+        assert!(outcome.is_admitted(), "the bulk must fit the send channel");
     };
     for lane in 0..LANES {
         send(lane, 0, 0);
@@ -1231,6 +1247,19 @@ async fn closed_waits_for_every_lane() {
     for i in 0..FRAMES {
         send(1 + (i % usize::from(LANES - 1)) as u16, i + 1, PAYLOAD);
     }
+    // Close only once every bulk lane has delivered a frame, so the close
+    // lands on writers that are streaming, not on writers yet to start.
+    let mut per_lane = vec![0usize; usize::from(LANES)];
+    let mut delivered = 0;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while per_lane[1..].contains(&0) {
+            let (header, _) = server_streams.response_stream.recv_async().await.unwrap();
+            per_lane[usize::from(u16::from_be_bytes([header[0], header[1]]))] += 1;
+            delivered += 1;
+        }
+    })
+    .await
+    .expect("every bulk lane delivers");
     client.shutdown();
     client.closed().await;
     for (lane, endpoint) in client.client_endpoints.get().unwrap().iter().enumerate() {
@@ -1241,8 +1270,6 @@ async fn closed_waits_for_every_lane() {
         );
     }
 
-    let mut delivered = 0;
-    let mut per_lane = vec![0usize; usize::from(LANES)];
     while let Ok(Ok((header, _))) = tokio::time::timeout(
         Duration::from_secs(3),
         server_streams.response_stream.recv_async(),
@@ -1258,10 +1285,6 @@ async fn closed_waits_for_every_lane() {
         FRAMES,
         "{delivered} delivered + {failed} failed != {FRAMES} sent"
     );
-    assert!(
-        per_lane[1..].iter().all(|&n| n > 0),
-        "every bulk lane delivered something: {per_lane:?}"
-    );
     server.shutdown();
 }
 
@@ -1272,7 +1295,7 @@ async fn closed_waits_for_every_lane() {
 /// throwaway probe and call such a peer `NeverConnected`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_peer_live_only_on_a_later_lane_is_healthy() {
-    let (client, server, server_streams, server_id) = laned_pair(3).await;
+    let (client, _client_streams, server, server_streams, server_id) = laned_pair(3).await;
     let errors = Arc::new(Errors::default());
     let _ = client.send_message_on_lane(
         server_id,
