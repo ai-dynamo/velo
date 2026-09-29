@@ -117,6 +117,16 @@ fn new_uds_transport() -> Arc<dyn Transport> {
     )
 }
 
+#[cfg(feature = "quic")]
+fn new_quic_transport() -> Arc<dyn Transport> {
+    Arc::new(
+        velo::transports::quic::QuicTransportBuilder::new()
+            .bind_addr("127.0.0.1:0".parse().unwrap())
+            .build()
+            .unwrap(),
+    )
+}
+
 /// A unary request to a peer that called `begin_drain` must fail fast with
 /// the drain rejection instead of hanging until the response timeout.
 async fn unary_to_draining_peer_fails_fast(make: fn() -> Arc<dyn Transport>) {
@@ -177,6 +187,12 @@ async fn tcp_unary_to_draining_peer_fails_fast() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn uds_unary_to_draining_peer_fails_fast() {
     unary_to_draining_peer_fails_fast(new_uds_transport).await;
+}
+
+#[cfg(feature = "quic")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quic_unary_to_draining_peer_fails_fast() {
+    unary_to_draining_peer_fails_fast(new_quic_transport).await;
 }
 
 /// Phase 2 of `graceful_shutdown` must wait for a handler invocation that is

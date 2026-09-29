@@ -330,9 +330,9 @@ pub(crate) trait WriterObserver {
     ///
     /// `records_egress`, `on_dequeue`, and `on_write` all default to asking
     /// this rather than each carrying its own copy of "do I have metrics" —
-    /// TCP and UDS answer all three identically (they hold the connection's
-    /// [`EgressMetrics`] and read it the same way), so overriding this one
-    /// accessor is all either transport needs. `None` is what buys an
+    /// TCP, UDS and QUIC answer all three identically (they hold the
+    /// connection's [`EgressMetrics`] and read it the same way), so overriding
+    /// this one accessor is all any of them needs. `None` is what buys an
     /// uninstrumented writer — a connection built with no observability
     /// handle, or the streaming egress pump, which has no `EgressMetrics` at
     /// all — out of every timestamp and every tally increment on the
@@ -374,11 +374,11 @@ pub(crate) trait WriterObserver {
 /// The egress-metrics half of a [`WriterObserver`], shared by every writer
 /// that drives [`run_coalescing_writer`].
 ///
-/// TCP and UDS answer `records_egress`, `on_dequeue`, and `on_write`
-/// identically — both hold the connection's pre-bound metrics handle and read
+/// TCP, UDS and QUIC answer `records_egress`, `on_dequeue`, and `on_write`
+/// identically — each holds the connection's pre-bound metrics handle and reads
 /// it the same way, and the only thing that actually varies per transport is
 /// `on_failure`'s log text, which stays on each transport's own
-/// `WriterObserver` impl. Both implement that shared answer by overriding
+/// `WriterObserver` impl. Each implements that shared answer by overriding
 /// [`WriterObserver::egress`] to return their handle, rather than each
 /// re-stating the three delegating method bodies, which keeps that one real
 /// difference visible instead of buried beside identical boilerplate.
@@ -389,10 +389,10 @@ pub(crate) trait WriterObserver {
 /// `set_observability` before `start()`. What differs is visibility — that
 /// callback runs on UCX's progress thread, which the runtime does not
 /// otherwise synchronize with, so it reads the slot per call rather than
-/// lean on the order (see `WorkerShared::metrics`). TCP and UDS have no such
-/// thread: the writer task (and its snapshot) does not exist until a
+/// lean on the order (see `WorkerShared::metrics`). TCP, UDS and QUIC have
+/// no such thread: the writer task (and its snapshot) does not exist until a
 /// connection is created after `start()` returns, on the runtime. A
-/// `TcpTransport`/`UdsTransport` used standalone, before `set_observability`,
+/// `TcpTransport`/`UdsTransport`/`QuicTransport` used standalone, before `set_observability`,
 /// records neither side of the accepted/written identity, so it stays 0-0
 /// rather than going stale.
 pub(crate) struct EgressMetrics {

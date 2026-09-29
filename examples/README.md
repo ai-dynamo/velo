@@ -23,10 +23,10 @@ cargo run --example mpsc_fanin --all-features -- --producers 4 --items 40
 
 ## Transport selection (`ping_pong`, `throughput`)
 
-`--transport {tcp,uds,zmq,nats,grpc}` (default: `tcp`).
+`--transport {tcp,uds,zmq,nats,grpc,quic,ucx}` (default: `tcp`).
 
-- `zmq` and `grpc` require building with `--features zmq` / `--features grpc`
-  (both enabled by `--all-features`).
+- `zmq`, `grpc`, `quic` and `ucx` require building with `--features zmq` / `--features grpc` /
+  `--features quic` / `--features ucx` (all enabled by `--all-features`; `ucx` is Linux only).
 - `nats` requires a local `nats-server` on `127.0.0.1:4222`
   (see repo root `docker-compose.yml` / `scripts/dev-up.sh`).
 
@@ -34,3 +34,4 @@ cargo run --example mpsc_fanin --all-features -- --producers 4 --items 40
 
 - `zmq` — enables the ZMQ transport option.
 - `grpc` — enables the gRPC transport option.
+- `quic` — enables the QUIC transport option.

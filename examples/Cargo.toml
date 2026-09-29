@@ -13,6 +13,7 @@ default = []
 zmq = ["velo/zmq"]
 ucx = ["velo/ucx"]
 grpc = ["velo/grpc"]
+quic = ["velo/quic"]
 
 [dependencies]
 velo = { path = "../lib/velo", features = ["test-helpers"] }

@@ -8,7 +8,7 @@
 | Anchor | The consumer end of a stream. It has a `u128` handle that a producer uses to attach. |
 | Attach | The `_anchor_attach` round trip that connects a producer to an anchor |
 | Batch | One messenger frame that carries records from many streams to one peer |
-| Coalescing writer | The TCP and UDS writer task. It writes small queued frames together, and a large frame as two writes. |
+| Coalescing writer | The TCP, UDS, and QUIC writer task. It writes small queued frames together, and a large frame as two writes. |
 | Credit | The number of records that a sender can send on a slot before the receiver grants more |
 | Drain | The second phase of graceful shutdown. Velo waits until no admitted request is in flight. |
 | Frame transport | A transport for stream frames when the mux is not used (TCP or gRPC) |
@@ -22,6 +22,7 @@
 | RDMA GET | A one-sided read by the NIC of the peer from registered memory on the owner |
 | Slot | The identity of one stream inside the mux, with its own order and credit |
 | Teardown | The third phase of graceful shutdown. Velo cancels tokens and stops the transports. |
+| Close | The fourth phase of graceful shutdown. Velo waits for `Transport::closed()` on each transport, so that what it wrote reaches the peer. |
 | Ticket | A `StreamOpenTicket`. It carries the terms of a pre-bound stream. |
 | `TransportKey` | The name of a transport in a `WorkerAddress`, for example `tcp` |
 | `WorkerAddress` | A MessagePack map from `TransportKey` to endpoint bytes |

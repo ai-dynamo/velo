@@ -39,7 +39,7 @@ The test for the boundary: `cargo tree -p velo-ext | grep -c prometheus` must pr
 | `velo::events` | The generational event system |
 | `velo::streaming` | Anchors, senders, frame transports, and the mux |
 | `velo::rendezvous` | Large-payload staging and the RDMA GET path |
-| `velo::transports` | TCP, UDS, NATS, gRPC, ZMQ, UCX, and the shared ingress and writer code |
+| `velo::transports` | TCP, UDS, QUIC, NATS, gRPC, ZMQ, UCX, and the shared ingress and writer code |
 | `velo::discovery` | Filesystem, NATS, and etcd backends |
 | `velo::queue` | Work queues |
 | `velo::observability` | `VeloMetrics` and the Prometheus families |

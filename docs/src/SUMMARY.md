@@ -29,6 +29,7 @@
 - [Benchmarking](operations/benchmarking.md)
 - [Response plane performance](operations/response-plane-performance.md)
 - [RDMA performance](operations/rdma-performance.md)
+- [QUIC performance](operations/quic-performance.md)
 
 # Development
 

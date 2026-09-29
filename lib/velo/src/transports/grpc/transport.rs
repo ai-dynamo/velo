@@ -40,7 +40,7 @@ use super::server::VeloStreamingService;
 ///
 /// Follows the same structural patterns as `TcpTransport`: lazy per-peer
 /// connections via `DashMap`, writer tasks fed through flume channels, and
-/// 3-phase graceful shutdown.
+/// the same graceful shutdown phases.
 pub struct GrpcTransport {
     /// Transport identity key (e.g. `"grpc"`).
     key: TransportKey,

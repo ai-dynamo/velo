@@ -18,6 +18,9 @@ struct MockTransport {
     started: AtomicBool,
     drained: AtomicBool,
     shut_down: AtomicBool,
+    /// Set by `closed()`, after a delay, so a test can tell whether graceful
+    /// shutdown waited for it.
+    closed: Arc<AtomicBool>,
     send_count: AtomicUsize,
     /// When true, `start` builds a one-slot channel that nobody drains and
     /// routes sends through a gate over it, so every send past the first
@@ -43,6 +46,7 @@ impl MockTransport {
             started: AtomicBool::new(false),
             drained: AtomicBool::new(false),
             shut_down: AtomicBool::new(false),
+            closed: Arc::new(AtomicBool::new(false)),
             send_count: AtomicUsize::new(0),
             saturating: false,
             queue: OnceLock::new(),
@@ -63,6 +67,7 @@ impl MockTransport {
             started: AtomicBool::new(false),
             drained: AtomicBool::new(false),
             shut_down: AtomicBool::new(false),
+            closed: Arc::new(AtomicBool::new(false)),
             send_count: AtomicUsize::new(0),
             saturating: true,
             queue: OnceLock::new(),
@@ -125,6 +130,13 @@ impl Transport for MockTransport {
     }
     fn shutdown(&self) {
         self.shut_down.store(true, Ordering::Relaxed);
+    }
+    fn closed(&self) -> futures::future::BoxFuture<'_, ()> {
+        let closed = self.closed.clone();
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            closed.store(true, Ordering::Relaxed);
+        })
     }
     fn begin_drain(&self) {
         self.drained.store(true, Ordering::Relaxed);
@@ -563,6 +575,16 @@ async fn test_graceful_shutdown_calls_all_transports() {
     assert!(t2.drained.load(Ordering::Relaxed));
     assert!(t1.shut_down.load(Ordering::Relaxed));
     assert!(t2.shut_down.load(Ordering::Relaxed));
+    // Graceful shutdown returns only after each transport's close finished on
+    // the wire; a QUIC transport relies on this to deliver its tail.
+    assert!(
+        t1.closed.load(Ordering::Relaxed),
+        "graceful_shutdown did not await closed()"
+    );
+    assert!(
+        t2.closed.load(Ordering::Relaxed),
+        "graceful_shutdown did not await closed()"
+    );
     assert!(backend.shutdown_state().is_draining());
     assert!(backend.shutdown_state().teardown_token().is_cancelled());
 }

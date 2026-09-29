@@ -108,10 +108,10 @@ async fn create_message_handler(
     // queued). Under `Timeout` it is what stops leftover queued work from
     // dispatching into an instance that has already declared itself dead.
     //
-    // It is not the only caller: the TCP, UDS, gRPC, and UCX
+    // It is not the only caller: the TCP, UDS, QUIC, gRPC, and UCX
     // `Transport::shutdown` impls cancel this same shared token (ZMQ, NATS,
     // and the simulation transport tear down only their own private
-    // machinery), so a direct `shutdown()` on one of those four on a live
+    // machinery), so a direct `shutdown()` on one of those five on a live
     // instance ends this task — backlog abandoned, guards released, every
     // later admission answered `Disconnected` — for *all* transports, with no
     // drain and no `ShuttingDown` correlations. That is documented on

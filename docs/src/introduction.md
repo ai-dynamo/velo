@@ -20,7 +20,7 @@ graph TD
     V --> M[Messenger]
     V --> A[AnchorManager]
     V --> R[RendezvousManager]
-    M --> T["Transports<br>TCP, UDS, NATS, gRPC, ZMQ, UCX"]
+    M --> T["Transports<br>TCP, UDS, QUIC, NATS, gRPC, ZMQ, UCX"]
     A --> FT["Frame transport or<br>batched streaming (mux)"]
     R --> M
     R --> RDMA["RDMA GET (UCX)"]

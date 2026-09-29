@@ -11,7 +11,7 @@ cargo machete
 bash scripts/check-semver.sh
 ```
 
-Always use `--all-features`. Without it, the code behind `zmq`, `grpc`, `nats-*`, `etcd`, `ucx`, and `simulation` does not compile, and its tests do not run.
+Always use `--all-features`. Without it, the code behind `zmq`, `grpc`, `quic`, `nats-*`, `etcd`, `ucx`, and `simulation` does not compile, and its tests do not run.
 
 Run one integration test by its name. The name is `<module>_<file>`. For example, `tests/transports/zmq_integration.rs` is `transports_zmq`:
 

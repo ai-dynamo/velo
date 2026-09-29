@@ -383,3 +383,82 @@ where
 
     handle_b.streams.shutdown_state.teardown_token().cancel();
 }
+
+/// Every frame handed to the transport before teardown either reaches the peer
+/// or comes back through `on_error`. Nothing may vanish between the two: a
+/// frame the writer counted as written that the peer never saw is a silent
+/// loss, and its caller waits out a response timeout instead of failing fast.
+///
+/// Large frames keep data in flight when teardown lands, which is the window
+/// this is about. The coalescing writer checks cancellation only between
+/// batches, so a batch it started is written in full; on TCP and UDS the
+/// kernel then delivers it after the socket closes, and whatever was still
+/// queued fails through `on_error`. A transport that closes its connection
+/// without waiting for the peer to acknowledge what it wrote loses the tail.
+///
+/// Limits: the frame count equals the default channel capacity, so no frame
+/// waits in the admission gate, and the test does not call `closed()`. The
+/// transports' own unit tests cover both.
+pub async fn every_frame_is_delivered_or_failed_across_teardown<C: ShutdownTestClient>()
+where
+    C::Transport: 'static,
+{
+    const FRAMES: usize = 256;
+    const PAYLOAD: usize = 64 * 1024;
+    let handle_a = C::new_handle().await.unwrap();
+    let handle_b = C::new_handle().await.unwrap();
+    handle_a.register_peer(&handle_b).unwrap();
+
+    for i in 0..FRAMES {
+        handle_a.send(
+            handle_b.instance_id,
+            (i as u32).to_be_bytes().to_vec(),
+            vec![0u8; PAYLOAD],
+            MessageType::Response,
+        );
+    }
+    // Tear down once frames are flowing, so it lands mid-stream.
+    let (first, _) = timeout(
+        Duration::from_secs(5),
+        handle_b.streams.response_stream.recv_async(),
+    )
+    .await
+    .expect("the first frame arrives")
+    .expect("recv");
+    let mut delivered = vec![first];
+    handle_a.streams.shutdown_state.teardown_token().cancel();
+    handle_a.transport.shutdown();
+
+    while let Ok(Ok((header, _))) = timeout(
+        Duration::from_secs(3),
+        handle_b.streams.response_stream.recv_async(),
+    )
+    .await
+    {
+        delivered.push(header);
+    }
+    let failed: Vec<_> = handle_a
+        .error_handler
+        .get_errors()
+        .into_iter()
+        .map(|(header, _, _)| header)
+        .collect();
+
+    // Each frame accounted for exactly once, by its header. Matching counts
+    // alone would let a frame reported twice (delivered and failed, or
+    // delivered twice) hide one that vanished.
+    let mut seen = vec![0usize; FRAMES];
+    for header in delivered.iter().chain(&failed) {
+        let index = u32::from_be_bytes(header[..].try_into().expect("a 4-byte header")) as usize;
+        seen[index] += 1;
+    }
+    let missing: Vec<_> = (0..FRAMES).filter(|&i| seen[i] == 0).collect();
+    let twice: Vec<_> = (0..FRAMES).filter(|&i| seen[i] > 1).collect();
+    assert!(
+        missing.is_empty() && twice.is_empty(),
+        "{} delivered, {} failed: frames {missing:?} vanished across teardown, frames {twice:?} were reported more than once",
+        delivered.len(),
+        failed.len()
+    );
+    handle_b.streams.shutdown_state.teardown_token().cancel();
+}
