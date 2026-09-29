@@ -39,14 +39,15 @@ pub enum TransportType {
     Quic,
 }
 
-/// Build a transport on loopback for an example.
+/// Build a transport for an example, on loopback unless `VELO_BIND_IP` names
+/// another local address (see [`bind_ip`]).
 ///
 /// `tag` is used for NATS cluster IDs and UDS socket filenames so different
 /// examples (or server/client pairs within one example) don't collide.
 pub async fn new_transport(ty: TransportType, tag: &str) -> Result<Arc<dyn Transport>> {
     match ty {
         TransportType::Tcp => {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let listener = std::net::TcpListener::bind(format!("{}:0", bind_ip()))?;
             Ok(Arc::new(
                 velo::transports::tcp::TcpTransportBuilder::new()
                     .from_listener(listener)?
@@ -78,9 +79,7 @@ pub async fn new_transport(ty: TransportType, tag: &str) -> Result<Arc<dyn Trans
         TransportType::Nats => {
             let client = velo::transports::nats::utils::connect("nats://127.0.0.1:4222")
                 .await
-                .map_err(|e| {
-                    anyhow::anyhow!("failed to connect to NATS at 127.0.0.1:4222: {e}")
-                })?;
+                .map_err(|e| anyhow::anyhow!("failed to connect to NATS at 127.0.0.1:4222: {e}"))?;
             Ok(Arc::new(
                 velo::transports::nats::NatsTransportBuilder::new(client, tag).build(),
             ))
@@ -95,6 +94,14 @@ pub async fn new_transport(ty: TransportType, tag: &str) -> Result<Arc<dyn Trans
             ))
         }
     }
+}
+
+/// The address TCP and QUIC transports bind to: `VELO_BIND_IP`, or
+/// `127.0.0.1`. A benchmark that runs its two halves on two hosts sets it to
+/// each host's address on the network under test, because the transports
+/// advertise the address they bind.
+pub fn bind_ip() -> String {
+    std::env::var("VELO_BIND_IP").unwrap_or_else(|_| "127.0.0.1".to_string())
 }
 
 /// Shared clap fragment: a single `--transport <backend>` flag.
@@ -116,7 +123,7 @@ pub fn init_tracing() {
     let _ = fmt().with_env_filter(filter).try_init();
 }
 
-/// A loopback QUIC builder, tuned by environment variables so a sweep can
+/// A QUIC builder bound to [`bind_ip`], tuned by environment variables so a sweep can
 /// vary the transport without new flags:
 ///
 /// - `VELO_QUIC_MAX_MTU` (bytes)
@@ -133,8 +140,8 @@ pub fn quic_from_env() -> Result<velo::transports::quic::QuicTransportBuilder> {
             Err(_) => Ok(None),
         }
     }
-    let mut builder =
-        velo::transports::quic::QuicTransportBuilder::new().bind_addr("127.0.0.1:0".parse()?);
+    let mut builder = velo::transports::quic::QuicTransportBuilder::new()
+        .bind_addr(format!("{}:0", bind_ip()).parse()?);
     if let Some(v) = env("VELO_QUIC_MAX_MTU")? {
         builder = builder.max_mtu(v);
     }

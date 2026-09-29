@@ -11,6 +11,11 @@
 //!
 //! Results are printed as a table with latency percentiles (p50/p95/p99) for
 //! sequential and concurrent modes.
+//!
+//! By default both halves run in one process, over loopback. To measure a
+//! network, run `--role server` on one host and `--role client` on another,
+//! with the same `--peer-file` on a shared filesystem and `VELO_BIND_IP` set to
+//! each host's address on the network under test.
 
 use std::sync::{
     Arc,
@@ -45,6 +50,34 @@ struct Args {
     /// Concurrency levels for concurrent mode (comma-separated).
     #[arg(long, value_delimiter = ',', default_values_t = [1usize, 10, 100])]
     concurrency: Vec<usize>,
+
+    /// Which half of the benchmark this process runs. `both` runs the server
+    /// and the client in one process.
+    #[arg(long, value_enum, default_value_t = Role::Both)]
+    role: Role,
+
+    /// Where the server writes its peer info and the client reads it, for
+    /// `--role server` and `--role client`.
+    #[arg(long)]
+    peer_file: Option<std::path::PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum Role {
+    Both,
+    Server,
+    Client,
+}
+
+/// How the client learns that the server counted every pipelined message.
+///
+/// In one process the server's `count` handler signals a channel. Across
+/// processes the client polls `count_done` once a millisecond, which is small
+/// against a pipeline run of seconds.
+#[derive(Clone)]
+enum Done {
+    Local(flume::Receiver<()>),
+    Remote,
 }
 
 struct CellResult {
@@ -206,7 +239,7 @@ async fn run_pipeline(
     target: InstanceId,
     payload: Bytes,
     count: u64,
-    done_rx: flume::Receiver<()>,
+    done: &Done,
 ) -> Result<CellResult> {
     let warmup = (count / 10).max(100);
 
@@ -218,10 +251,9 @@ async fn run_pipeline(
             .send()
             .await?;
     }
-    tokio::time::timeout(Duration::from_secs(30), done_rx.recv_async())
+    wait_done(velo, target, done, Duration::from_secs(30))
         .await
-        .map_err(|_| anyhow::anyhow!("pipeline warmup timed out"))?
-        .ok();
+        .map_err(|e| anyhow::anyhow!("pipeline warmup: {e}"))?;
 
     set_target(velo, target, count).await?;
     let start = Instant::now();
@@ -232,10 +264,9 @@ async fn run_pipeline(
             .send()
             .await?;
     }
-    tokio::time::timeout(Duration::from_secs(60), done_rx.recv_async())
+    wait_done(velo, target, done, Duration::from_secs(60))
         .await
-        .map_err(|_| anyhow::anyhow!("pipeline run did not complete: timed out"))?
-        .map_err(|e| anyhow::anyhow!("pipeline done channel error: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("pipeline run did not complete: {e}"))?;
 
     let elapsed = start.elapsed();
     Ok(CellResult {
@@ -255,6 +286,41 @@ async fn run_pipeline(
 // Display
 // ---------------------------------------------------------------------------
 
+async fn wait_done(
+    velo: &Arc<Velo>,
+    target: InstanceId,
+    done: &Done,
+    limit: Duration,
+) -> Result<()> {
+    match done {
+        Done::Local(rx) => {
+            tokio::time::timeout(limit, rx.recv_async())
+                .await
+                .map_err(|_| anyhow::anyhow!("timed out"))?
+                .map_err(|e| anyhow::anyhow!("done channel error: {e}"))?;
+        }
+        Done::Remote => {
+            let deadline = Instant::now() + limit;
+            loop {
+                let reply = velo
+                    .unary("count_done")?
+                    .raw_payload(Bytes::new())
+                    .instance(target)
+                    .send()
+                    .await?;
+                if reply.first() == Some(&1) {
+                    break;
+                }
+                if Instant::now() > deadline {
+                    anyhow::bail!("timed out");
+                }
+                sleep(Duration::from_millis(1)).await;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn format_payload(bytes: usize) -> String {
     if bytes == 0 {
         "0 B".to_string()
@@ -271,7 +337,14 @@ fn print_table(results: &[CellResult], transport: TransportType) {
     println!("\n=== Throughput Benchmark ({transport:?}) ===\n");
     println!(
         "{:<12} {:>8} {:>12} {:>14} {:>9} {:>8} {:>8} {:>8} {:>8}",
-        "Mode", "Payload", "Concurrency", "Msgs/sec", "MB/sec", "p50 µs", "p95 µs", "p99 µs",
+        "Mode",
+        "Payload",
+        "Concurrency",
+        "Msgs/sec",
+        "MB/sec",
+        "p50 µs",
+        "p95 µs",
+        "p99 µs",
         "p99.9 µs"
     );
     println!("{}", "-".repeat(95));
@@ -287,9 +360,18 @@ fn print_table(results: &[CellResult], transport: TransportType) {
             .concurrency
             .map(|c| c.to_string())
             .unwrap_or_else(|| "-".to_string());
-        let p50 = r.p50_us.map(|v| v.to_string()).unwrap_or_else(|| "-".into());
-        let p95 = r.p95_us.map(|v| v.to_string()).unwrap_or_else(|| "-".into());
-        let p99 = r.p99_us.map(|v| v.to_string()).unwrap_or_else(|| "-".into());
+        let p50 = r
+            .p50_us
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-".into());
+        let p95 = r
+            .p95_us
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-".into());
+        let p99 = r
+            .p99_us
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-".into());
         let p999 = r
             .p99_9_us
             .map(|v| v.to_string())
@@ -319,10 +401,60 @@ fn main() -> Result<()> {
     let args = Args::parse();
     println!("Using {:?} transport", args.tx.transport);
     println!(
-        "count={}, payload_sizes={:?}, concurrency={:?}",
-        args.count, args.payload_sizes, args.concurrency
+        "count={}, payload_sizes={:?}, concurrency={:?}, role={:?}",
+        args.count, args.payload_sizes, args.concurrency, args.role
     );
+    match args.role {
+        Role::Both => run_both(args),
+        Role::Server => {
+            let path = args
+                .peer_file
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("--role server needs --peer-file"))?;
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(async move {
+                let (done_tx, _done_rx) = flume::bounded::<()>(1);
+                let velo = serve(args.tx.transport, done_tx).await?;
+                // Written under another name and renamed, so a client never
+                // reads a half-written file.
+                let staged = path.with_extension("staged");
+                std::fs::write(&staged, rmp_serde::to_vec(&velo.peer_info())?)?;
+                std::fs::rename(&staged, &path)?;
+                println!("Server ready; peer info in {}", path.display());
+                std::future::pending::<()>().await;
+                Ok(())
+            })
+        }
+        Role::Client => {
+            let path = args
+                .peer_file
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("--role client needs --peer-file"))?;
+            let deadline = Instant::now() + Duration::from_secs(120);
+            let server_peer_info: velo::PeerInfo = loop {
+                if let Ok(bytes) = std::fs::read(&path) {
+                    break rmp_serde::from_slice(&bytes)?;
+                }
+                if Instant::now() > deadline {
+                    anyhow::bail!("no peer info at {} after 120 s", path.display());
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            };
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            let transport = args.tx.transport;
+            let results = runtime.block_on(run_client(&args, server_peer_info, Done::Remote))?;
+            print_table(&results, transport);
+            Ok(())
+        }
+    }
+}
 
+/// Both halves in one process, on two runtimes.
+fn run_both(args: Args) -> Result<()> {
     let runtime_server = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -336,53 +468,7 @@ fn main() -> Result<()> {
     let transport_type = args.tx.transport;
     let server_handle = std::thread::spawn(move || {
         runtime_server.block_on(async move {
-            let transport = new_transport(transport_type, "throughput")
-                .await
-                .expect("build server transport");
-            let velo = Velo::builder()
-                .add_transport(transport)
-                .build()
-                .await
-                .expect("build server velo");
-
-            sleep(Duration::from_millis(100)).await;
-
-            let echo_handler =
-                Handler::unary_handler("echo", |ctx| Ok(Some(ctx.payload.clone()))).build();
-            velo.register_handler(echo_handler).unwrap();
-
-            let counter = Arc::new(AtomicU64::new(0));
-            let target = Arc::new(AtomicU64::new(u64::MAX));
-            {
-                let counter_for_set = Arc::clone(&counter);
-                let target_for_set = Arc::clone(&target);
-                let set_target_handler = Handler::unary_handler("set_target", move |ctx| {
-                    let n: u64 = rmp_serde::from_slice(&ctx.payload)
-                        .map_err(|e| anyhow::anyhow!("deserialize: {e}"))?;
-                    counter_for_set.store(0, Ordering::SeqCst);
-                    target_for_set.store(n, Ordering::SeqCst);
-                    Ok(Some(Bytes::new()))
-                })
-                .build();
-                velo.register_handler(set_target_handler).unwrap();
-            }
-
-            {
-                let counter = Arc::clone(&counter);
-                let target = Arc::clone(&target);
-                let done_tx = done_tx.clone();
-                let count_handler = Handler::am_handler("count", move |_ctx| {
-                    let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
-                    let t = target.load(Ordering::SeqCst);
-                    if n >= t {
-                        let _ = done_tx.try_send(());
-                    }
-                    Ok(())
-                })
-                .build();
-                velo.register_handler(count_handler).unwrap();
-            }
-
+            let velo = serve(transport_type, done_tx).await.expect("build server");
             peer_info_tx.send(velo.peer_info()).unwrap();
             println!("Server ready");
             std::future::pending::<()>().await;
@@ -390,63 +476,107 @@ fn main() -> Result<()> {
     });
 
     let server_peer_info = peer_info_rx.recv().unwrap();
-    let transport_type = args.tx.transport;
-
     let client_handle = std::thread::spawn(move || -> Result<Vec<CellResult>> {
-        runtime_client.block_on(async move {
-            let transport = new_transport(transport_type, "throughput").await?;
-            let velo = Velo::builder().add_transport(transport).build().await?;
-
-            sleep(Duration::from_millis(100)).await;
-
-            velo.register_peer(server_peer_info.clone())?;
-            let target = server_peer_info.instance_id();
-            sleep(Duration::from_millis(500)).await;
-
-            velo.unary("echo")?
-                .raw_payload(Bytes::new())
-                .instance(target)
-                .send()
-                .await?;
-
-            let mut all_results = Vec::new();
-            for &size in &args.payload_sizes {
-                let payload = Bytes::from(vec![0u8; size]);
-
-                println!("\nSequential, payload={}", format_payload(size));
-                all_results
-                    .push(run_sequential(&velo, target, payload.clone(), args.count).await?);
-
-                for &c in &args.concurrency {
-                    println!(
-                        "Concurrent concurrency={c}, payload={}",
-                        format_payload(size)
-                    );
-                    all_results.push(
-                        run_concurrent(
-                            Arc::clone(&velo),
-                            target,
-                            payload.clone(),
-                            args.count,
-                            c,
-                        )
-                        .await?,
-                    );
-                }
-
-                println!("Pipeline, payload={}", format_payload(size));
-                all_results.push(
-                    run_pipeline(&velo, target, payload.clone(), args.count, done_rx.clone())
-                        .await?,
-                );
-            }
-
-            Ok(all_results)
-        })
+        runtime_client.block_on(run_client(&args, server_peer_info, Done::Local(done_rx)))
     });
 
     let results = client_handle.join().unwrap()?;
-    print_table(&results, args.tx.transport);
+    print_table(&results, transport_type);
     drop(server_handle);
     Ok(())
+}
+
+/// Build the server and register its handlers.
+async fn serve(transport_type: TransportType, done_tx: flume::Sender<()>) -> Result<Arc<Velo>> {
+    let transport = new_transport(transport_type, "throughput").await?;
+    let velo = Velo::builder().add_transport(transport).build().await?;
+
+    sleep(Duration::from_millis(100)).await;
+
+    let echo_handler = Handler::unary_handler("echo", |ctx| Ok(Some(ctx.payload.clone()))).build();
+    velo.register_handler(echo_handler)?;
+
+    let counter = Arc::new(AtomicU64::new(0));
+    let target = Arc::new(AtomicU64::new(u64::MAX));
+    {
+        let counter_for_set = Arc::clone(&counter);
+        let target_for_set = Arc::clone(&target);
+        let set_target_handler = Handler::unary_handler("set_target", move |ctx| {
+            let n: u64 = rmp_serde::from_slice(&ctx.payload)
+                .map_err(|e| anyhow::anyhow!("deserialize: {e}"))?;
+            counter_for_set.store(0, Ordering::SeqCst);
+            target_for_set.store(n, Ordering::SeqCst);
+            Ok(Some(Bytes::new()))
+        })
+        .build();
+        velo.register_handler(set_target_handler)?;
+    }
+    {
+        let counter = Arc::clone(&counter);
+        let target = Arc::clone(&target);
+        let count_handler = Handler::am_handler("count", move |_ctx| {
+            let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+            let t = target.load(Ordering::SeqCst);
+            if n >= t {
+                let _ = done_tx.try_send(());
+            }
+            Ok(())
+        })
+        .build();
+        velo.register_handler(count_handler)?;
+    }
+    {
+        let count_done_handler = Handler::unary_handler("count_done", move |_ctx| {
+            let reached = counter.load(Ordering::SeqCst) >= target.load(Ordering::SeqCst);
+            Ok(Some(Bytes::from(vec![u8::from(reached)])))
+        })
+        .build();
+        velo.register_handler(count_done_handler)?;
+    }
+    Ok(velo)
+}
+
+/// Run every benchmark cell against the server.
+async fn run_client(
+    args: &Args,
+    server_peer_info: velo::PeerInfo,
+    done: Done,
+) -> Result<Vec<CellResult>> {
+    let transport = new_transport(args.tx.transport, "throughput").await?;
+    let velo = Velo::builder().add_transport(transport).build().await?;
+
+    sleep(Duration::from_millis(100)).await;
+
+    velo.register_peer(server_peer_info.clone())?;
+    let target = server_peer_info.instance_id();
+    sleep(Duration::from_millis(500)).await;
+
+    velo.unary("echo")?
+        .raw_payload(Bytes::new())
+        .instance(target)
+        .send()
+        .await?;
+
+    let mut all_results = Vec::new();
+    for &size in &args.payload_sizes {
+        let payload = Bytes::from(vec![0u8; size]);
+
+        println!("\nSequential, payload={}", format_payload(size));
+        all_results.push(run_sequential(&velo, target, payload.clone(), args.count).await?);
+
+        for &c in &args.concurrency {
+            println!(
+                "Concurrent concurrency={c}, payload={}",
+                format_payload(size)
+            );
+            all_results.push(
+                run_concurrent(Arc::clone(&velo), target, payload.clone(), args.count, c).await?,
+            );
+        }
+
+        println!("Pipeline, payload={}", format_payload(size));
+        all_results.push(run_pipeline(&velo, target, payload.clone(), args.count, &done).await?);
+    }
+
+    Ok(all_results)
 }
