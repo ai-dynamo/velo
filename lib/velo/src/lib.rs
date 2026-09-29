@@ -28,6 +28,9 @@ pub mod transports;
 #[cfg(feature = "simulation")]
 pub mod simulation;
 
+#[cfg(test)]
+pub(crate) mod test_alloc;
+
 // ── Convenience re-exports for the most-used public types ──────────────────
 
 // Identity / address types live in velo-ext but are re-exported here so the
@@ -924,7 +927,15 @@ impl Velo {
     }
 
     /// Wait for a specific handler to become available on a remote instance.
-    /// Uses cached availability; refreshes only when the handler is not known.
+    ///
+    /// Returns at once, with no network I/O, when the handler list already
+    /// learned for `instance_id` names `handler_name`. Otherwise it refreshes
+    /// the list with a `_hello` round trip up to 10 times, 100 ms apart, and
+    /// returns a timeout error if the handler has not appeared. It is
+    /// therefore not a reachability probe: once a handler is known, a later
+    /// call does not check that the peer is still there. The cached list is
+    /// kept for the process's life, which is safe because an instance id names
+    /// one process, and a restarted peer has a new one.
     pub async fn wait_for_handler(
         &self,
         instance_id: InstanceId,
@@ -970,7 +981,7 @@ impl Velo {
         self.anchor_manager.attach_stream_anchor::<T>(handle).await
     }
 
-    /// Bind and pump a stream for an anchor now, so its sender never has to ask.
+    /// Bind a stream for an anchor now, so its sender never has to ask.
     ///
     /// Delegates to [`AnchorManager::prebind_anchor`](crate::streaming::AnchorManager::prebind_anchor).
     /// Carry the returned [`streaming::control::StreamOpenTicket`] to the worker
@@ -979,8 +990,8 @@ impl Velo {
     /// `None` means no ticket was minted and the worker should
     /// [`attach_anchor`](Velo::attach_anchor) the ordinary way.
     ///
-    /// Must be called from a runtime context: it spawns the reader pump and
-    /// the bind's accept-window task, exactly as the attach handler does.
+    /// Must be called from a runtime context: it spawns the stream watchdog,
+    /// exactly as the attach handler does for a mux bind.
     pub fn prebind_anchor(
         &self,
         handle: StreamAnchorHandle,

@@ -38,8 +38,9 @@ impl Batcher {
             return;
         };
         // Terminal-ness costs an `rmp_serde` decode attempt on anything that is
-        // not one of the three cached sentinels, so it is asked only where the
-        // answer changes what happens. On the fast path a record with data
+        // neither an `Item` (recognized by its first bytes) nor one of the
+        // cached sentinels, so it is asked only where the answer changes what
+        // happens. On the fast path a record with data
         // credit behind it is sent either way. On the starved path it decides
         // whether the reserve applies, and the whole reason the reserve exists
         // is that a terminal must not wait on credit a stalled consumer will
@@ -345,10 +346,11 @@ impl Batcher {
     /// The terminal reserve does **not** apply here, and that is deliberate: it
     /// buys a terminal past an *empty* queue, not past records the consumer is
     /// still owed. A terminal behind starved predecessors therefore waits with
-    /// them, and what ends such a stream is one of the two mechanisms that
-    /// already exist for a consumer that stopped draining — the byte cap, if the
-    /// producer keeps sending, or `reader_pump`'s heartbeat watchdog if it does
-    /// not.
+    /// them. What ends such a stream is the byte cap, if the producer keeps
+    /// sending. If it does not, nothing does until the application drops the
+    /// anchor: a consumer that stopped draining leaves its sender without
+    /// credit, and the stream watchdog exempts a sender that holds none, so it
+    /// never fires on such a stream.
     pub(super) async fn release_withheld(&mut self, index: u32) {
         loop {
             let next = {
