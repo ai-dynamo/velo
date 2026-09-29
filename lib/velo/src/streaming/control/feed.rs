@@ -69,29 +69,40 @@ pub(crate) struct SlotRelease {
     pub(crate) session_id: u64,
 }
 
-impl DirectFeed {
-    /// Close this feed's slot and tell its sender to abandon its end. A no-op
-    /// where there is nothing to close, including a stream that already ended
-    /// on its own terminal.
-    pub(crate) fn release_slot(&self) {
-        let Some(release) = &self.release else {
-            return;
-        };
+impl SlotRelease {
+    /// Close the slot `drain` belongs to and tell its sender to abandon its
+    /// end. A no-op where there is nothing to close, including a stream that
+    /// already ended on its own terminal.
+    ///
+    /// A consumer that stops reading must still end its sender this way. The
+    /// sender waits in `send` once its slot pauses at the byte cap, and only a
+    /// close of the slot, or credit that will not come, can wake it.
+    pub(crate) fn release(&self, drain: &DrainSignal) {
         // The ordinary end: the sender's terminal retired the slot already,
         // so there is nothing to close and no reason to take the peer's lock.
-        if self.drain.is_released() {
+        if drain.is_released() {
             return;
         }
-        let Some(mux) = release.mux.upgrade() else {
+        let Some(mux) = self.mux.upgrade() else {
             return;
         };
         // `cancel`, not `claimed`: it marks the bind cancelled under the lock
         // an `OpenSlot`'s claim takes, so a claim that lands after it finds
         // the mark and closes the slot itself (`open_slot`'s cancelled arm)
         // rather than opening one nobody reads.
-        match self.drain.cancel() {
-            Some((peer, slot)) => mux.cancel_claimed_session(peer, slot, release.session_id),
-            None => mux.release_bind(release.anchor_id, release.session_id),
+        match drain.cancel() {
+            Some((peer, slot)) => mux.cancel_claimed_session(peer, slot, self.session_id),
+            None => mux.release_bind(self.anchor_id, self.session_id),
+        }
+    }
+}
+
+impl DirectFeed {
+    /// Close this feed's slot and tell its sender to abandon its end. See
+    /// [`SlotRelease::release`].
+    pub(crate) fn release_slot(&self) {
+        if let Some(release) = &self.release {
+            release.release(&self.drain);
         }
     }
 }

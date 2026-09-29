@@ -425,9 +425,9 @@ impl<T: Serialize> StreamSender<T> {
 /// full. Under the messenger mux that channel is a per-slot inlet drained by one
 /// tokio task, so blocking a worker here starves the very task that would make
 /// room: a runtime with `W` workers wedges on `W` concurrent terminal sends, and a
-/// one-worker runtime on the first. Credit starvation is what fills the inlet, so
-/// this is reachable whenever a producer finalizes a stream whose consumer is
-/// behind — not an exotic state.
+/// one-worker runtime on the first. A slot paused at its byte cap fills the inlet,
+/// and so does a batcher parked on admission, so this is reachable whenever a
+/// producer finalizes a stream whose consumer is behind — not an exotic state.
 ///
 /// Dropping the record instead is not open to us: it is what tells the consumer
 /// `Finalized` from `Dropped`, and losing it strands a reader on the heartbeat
@@ -449,9 +449,10 @@ impl<T: Serialize> StreamSender<T> {
 ///
 /// The record is still lost when the runtime chosen is shutting down before the
 /// task runs. The sender clone dies with the task, so the inlet reaches EOF
-/// rather than hanging, and the consumer sees `Dropped`. [`tokio::task::block_in_place`] would avoid even that, at the price of
-/// panicking on a `current_thread` runtime, which is a worse failure than the one
-/// it fixes.
+/// rather than hanging, and the consumer sees `Dropped`.
+/// [`tokio::task::block_in_place`] would avoid even that, at the price of
+/// panicking on a `current_thread` runtime, which is a worse failure than the
+/// one it fixes.
 fn send_terminal(
     runtime: &tokio::runtime::Handle,
     tx: &flume::Sender<Vec<u8>>,

@@ -61,8 +61,8 @@
 //!   waits until credit drains the queue below the budget. So a producer runs
 //!   up to the byte budget ahead of its credit, not up to the channel depth.
 //! - **Terminals do not block.** `finalize`, `detach` and `Drop` reach the same
-//!   inlet synchronously. On a full inlet the terminal waits in a task on the
-//!   sender's runtime, so no caller thread blocks, and the terminal still goes
+//!   inlet synchronously. On a full inlet the terminal waits in a task (see
+//!   `send_terminal` for which runtime), so no caller thread blocks, and it goes
 //!   after the records ahead of it. `docs/src/operations/saturation.md`
 //!   describes the pause from the operator's side.
 //!

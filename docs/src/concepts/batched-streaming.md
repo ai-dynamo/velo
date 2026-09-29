@@ -259,7 +259,7 @@ Credit for a record returns when the consumer takes it, not when it enters the m
 
 A producer that ran out of credit sends no batches, so the arrival path does not run for its slots. It waits for the doorbell floor and then for the reply linger. Per record this costs `(drain_visit_floor + reply_linger) / initial_credit`. At the defaults (2 ms, 1 ms and 32) that is about 94 µs per record.
 
-The periodic walk does not reclaim credit for a slot whose consumer is gone, because a consumer that is gone counts no drains. The slot is closed instead: removing a single-sender anchor closes its slot and tells the sender, whichever way the stream ended. An MPSC anchor's slot still waits for the next record, which finds its receiver gone and closes the slot with `UnknownSlot`.
+The periodic walk does not reclaim credit for a slot whose consumer is gone, because a consumer that is gone counts no drains. The slot is closed instead: removing a single-sender anchor closes its slot and tells the sender, whichever way the stream ended. An MPSC anchor closes the slot of each sender when that sender's pump ends without a terminal, for example when the anchor is dropped. A sender parked at its byte cap then wakes with an error.
 
 ### Reply linger
 
@@ -283,7 +283,7 @@ On the per-stream path, the egress pump writes a terminal, discards anything que
 4. On the receive side, the terminal spends the reserved credit. Then `CloseSlot` drops the mux-side sender. The consumer reads the terminal and then sees the buffer close, the same as a receiver does when a socket closes, and the stream watchdog exits.
 5. A `CloseSlot` with any reason other than `TerminalSent`, and every epoch death, injects `Dropped` for a slot that has not delivered a terminal.
 
-`finalize`, `detach` and `Drop` hand the terminal to the inlet without blocking a runtime worker. They call `try_send` first. On a full channel, they hand the record to a task that awaits space. The task holds a clone of the sender, so the channel stays open until the sentinel is in it. With no runtime on the thread, they block, because no worker exists to starve. `detach` clears the attachment flag only after the sentinel is in the channel, so a re-attach cannot put records ahead of the `Detached` frame.
+`finalize`, `detach` and `Drop` hand the terminal to the inlet without blocking a runtime worker. They call `try_send` first. On a full channel, they hand the record to a task that awaits space. The task holds a clone of the sender, so the channel stays open until the sentinel is in it. The task runs on the caller's runtime, or on the sender's own runtime when the caller has none, so no caller thread blocks. `detach` clears the attachment flag only after the sentinel is in the channel, so a re-attach cannot put records ahead of the `Detached` frame.
 
 `velo_streaming_mux_live_slots` must return to zero at teardown. A leaked slot holds credit and byte budget for the rest of the epoch, and unlike a leaked socket it does not show in `lsof`.
 

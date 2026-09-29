@@ -749,3 +749,78 @@ async fn a_producer_that_outruns_a_draining_consumer_waits_for_credit() {
          the producer wait"
     );
 }
+
+/// An MPSC producer parked at the byte cap is released when its consumer drops
+/// the anchor, and its slot does not outlive the stream.
+///
+/// The consumer never reads. Its anchor fills, credit stops, the producer's
+/// slot withholds up to the byte cap and pauses, and the producer parks in
+/// `send`. Dropping the anchor is the consumer's way out, and it must reach the
+/// producer: `send` returns an error, and the producer's node closes the slot,
+/// so neither `live_slots` nor the withheld records stay behind for the rest of
+/// the peer's epoch. Before the pause existed, the byte-cap kill ended this
+/// case; with the pause, nothing else does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_producer_parked_on_a_dropped_mpsc_anchor_is_released() {
+    let config = MuxConfig {
+        initial_credit: 4,
+        slot_byte_budget: 4096,
+        ..MuxConfig::default()
+    };
+    let consumer = node(config.clone()).await;
+    let producer = node(config).await;
+    introduce(&producer, &consumer).await;
+
+    let anchor = consumer.velo.create_mpsc_anchor::<Vec<u8>>();
+    let handle = transfer(anchor.handle());
+    let sender = producer
+        .velo
+        .attach_mpsc_anchor::<Vec<u8>>(handle)
+        .await
+        .expect("remote mpsc attach");
+
+    let writer = tokio::spawn(async move {
+        let mut sent = 0u64;
+        while sender.send(vec![0u8; 256]).await.is_ok() {
+            sent += 1;
+        }
+        sent
+    });
+
+    // Parked: the slot holds records it may not send, and the producer has
+    // stopped finishing sends.
+    let withheld = || {
+        producer
+            .snapshot()
+            .gauge("velo_streaming_mux_withheld_records", &[])
+    };
+    let deadline = Instant::now() + PATIENCE;
+    while withheld() == 0.0 {
+        assert!(Instant::now() < deadline, "the producer never parked");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!writer.is_finished(), "the producer is parked in send");
+
+    drop(anchor);
+    tokio::time::timeout(PATIENCE, writer)
+        .await
+        .expect("send never returned after the consumer dropped the anchor")
+        .expect("producer task panicked");
+
+    let live = || {
+        producer
+            .snapshot()
+            .gauge("velo_streaming_mux_live_slots", &[])
+    };
+    let deadline = Instant::now() + PATIENCE;
+    while live() != 0.0 || withheld() != 0.0 {
+        assert!(
+            Instant::now() < deadline,
+            "the producer's slot outlived the stream: live_slots {}, withheld {}",
+            live(),
+            withheld()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
