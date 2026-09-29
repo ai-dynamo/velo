@@ -90,7 +90,7 @@ Measured on 2026-09-29 across the same two nodes as above, 64 KiB messages pipel
 
 The UDP receive-buffer error count stayed below 50 in each run, so the gain comes from more cores, not from more socket buffers. 64 B pipelined messages do not change with the lane count.
 
-The receiving node needs many more server sockets than there are lanes. The kernel hashes each connection to one socket of the reuse-port group, and two lanes on one socket share its endpoint driver. With 8 lanes:
+The receiving node needs many more server sockets than there are lanes. The kernel hashes each connection to one socket of the reuse-port group, and two lanes on one socket share its endpoint driver. With 8 lanes, in a separate job on another pair of nodes, so the 32-socket row differs from the table above by run-to-run spread:
 
 | Server sockets on the receiving node | MB/s |
 |---|---|

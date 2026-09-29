@@ -1210,6 +1210,12 @@ async fn send_message_is_lane_zero_and_lanes_wrap() {
 /// on endpoints other than lane 0's. Each send is admitted at once (the bulk
 /// fits the send channel), so a frame is either on the wire or reported through
 /// `on_error`; none can be dropped in the gate.
+///
+/// The accounting also needs the peer to acknowledge what the writers wrote
+/// within `FINISH_GRACE`, 1 s. Past that the writer warns that the stream end
+/// was not acknowledged and closes, and those frames are neither delivered nor
+/// failed. On loopback that is milliseconds of work, so a failure here next to
+/// that warning points at the grace, not at lanes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn closed_waits_for_every_lane() {
     const LANES: u16 = 4;
