@@ -94,7 +94,7 @@ pub struct QuicTransport {
     server_endpoints: OnceLock<Vec<quinn::Endpoint>>,
     /// Indexed by lane.
     client_endpoints: OnceLock<Vec<quinn::Endpoint>>,
-    lanes: u16,
+    lanes: std::num::NonZeroU16,
 
     local_interfaces: OnceLock<Vec<InterfaceEndpoint>>,
     numa_hint: Option<u32>,
@@ -379,7 +379,7 @@ impl Transport for QuicTransport {
         Ok(())
     }
 
-    fn lanes(&self, _target: crate::InstanceId) -> u16 {
+    fn lanes(&self, _target: crate::InstanceId) -> std::num::NonZeroU16 {
         self.lanes
     }
 
@@ -558,7 +558,7 @@ impl Transport for QuicTransport {
             // its own fails the frames queued on it through `on_error`, and
             // its next send dials it again.
             let mut connection_exists = false;
-            for lane in 0..self.lanes {
+            for lane in 0..self.lanes.get() {
                 let key: LaneKey = (instance_id, lane);
                 let Some(handle) = self.connections.get(&key) else {
                     continue;

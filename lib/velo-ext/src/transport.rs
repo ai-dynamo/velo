@@ -322,6 +322,10 @@ pub trait Transport: Send + Sync {
     ///   the channel closed). Delivery does **not** depend on the caller
     ///   polling it — dropping it is a legitimate fire-and-forget pattern.
     ///
+    /// On a transport whose [`lanes`](Transport::lanes) is more than 1,
+    /// `send_message` must be `send_message_on_lane(target, 0, ...)`: the same
+    /// gate and the same admission order as lane 0.
+    ///
     /// Implementations must route every send through one gate per target (per
     /// target and lane, on a transport with lanes) and keep no `try_send` path
     /// around it: an admission that can be overtaken by a later fast-path send
@@ -340,8 +344,9 @@ pub trait Transport: Send + Sync {
     ) -> SendOutcome;
 
     /// How many ordered channels (lanes) this transport keeps to `target`.
-    /// At least 1.
     ///
+    /// Non-zero by type, because a caller maps flows to lanes with
+    /// `flow % lanes(target)`.
     /// Frames sent on one `(target, lane)` through
     /// [`send_message_on_lane`](Transport::send_message_on_lane) arrive in the
     /// order they were admitted. Nothing is promised across lanes. A transport
@@ -359,8 +364,8 @@ pub trait Transport: Send + Sync {
     /// connection does its packet and crypto work on one task. A caller with
     /// independent ordered flows to one peer puts them on different lanes to
     /// use more cores.
-    fn lanes(&self, _target: InstanceId) -> u16 {
-        1
+    fn lanes(&self, _target: InstanceId) -> std::num::NonZeroU16 {
+        std::num::NonZeroU16::MIN
     }
 
     /// Send on `lane`, as [`send_message`](Transport::send_message) does on
@@ -373,7 +378,8 @@ pub trait Transport: Send + Sync {
     /// [`lanes`](Transport::lanes) maps to `lane % lanes(target)`.
     ///
     /// The default ignores `lane` and calls `send_message`, which is correct
-    /// for a transport with one lane.
+    /// for a transport with one lane. A transport whose `send_message` forwards
+    /// here must override this method too, or the two call each other.
     fn send_message_on_lane(
         &self,
         instance_id: InstanceId,
@@ -663,7 +669,7 @@ pub struct TransportAdapter {
     /// Each carries the rejected *request's* header, echoed back verbatim so
     /// the sender can correlate it, and an empty payload. The header is in
     /// the request format, not the response format — which is why these
-    /// frames have their own lane instead of sharing `response_stream`.
+    /// frames have their own stream instead of sharing `response_stream`.
     pub shutdown_stream: flume::Sender<(Bytes, Bytes)>,
     /// Shared shutdown coordinator for drain-aware routing.
     pub shutdown_state: ShutdownState,
@@ -738,7 +744,7 @@ impl TransportAdapter {
 /// Receiver-side handle for consuming inbound frames from all transports.
 ///
 /// Returned by [`make_channels`] alongside the corresponding [`TransportAdapter`].
-/// Higher layers pull [`InboundMessage`]s off the message lane and
+/// Higher layers pull [`InboundMessage`]s off the message stream and
 /// `(header, payload)` pairs off the other three.
 pub struct DataStreams {
     /// Receiver for inbound message frames.
@@ -877,7 +883,7 @@ mod tests {
     fn a_transport_without_lanes_has_one_and_ignores_the_lane() {
         let transport = OneLane::default();
         let target = InstanceId::new_v4();
-        assert_eq!(transport.lanes(target), 1);
+        assert_eq!(transport.lanes(target).get(), 1);
         for lane in [0u16, 1, 7] {
             let outcome = transport.send_message_on_lane(
                 target,

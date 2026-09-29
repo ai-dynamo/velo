@@ -42,7 +42,7 @@ pub struct QuicTransportBuilder {
     keep_alive_interval: Duration,
     idle_timeout: Duration,
     shrink_threshold: usize,
-    lanes: u16,
+    lanes: std::num::NonZeroU16,
 }
 
 impl QuicTransportBuilder {
@@ -65,7 +65,7 @@ impl QuicTransportBuilder {
             keep_alive_interval: Duration::from_secs(5),
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             shrink_threshold: DEFAULT_SHRINK_THRESHOLD,
-            lanes: 1,
+            lanes: std::num::NonZeroU16::MIN,
         }
     }
 
@@ -173,7 +173,7 @@ impl QuicTransportBuilder {
     /// Only the dialing side's count matters: the listener accepts however
     /// many connections a peer opens.
     pub fn lanes(mut self, lanes: u16) -> Self {
-        self.lanes = lanes.max(1);
+        self.lanes = std::num::NonZeroU16::new(lanes).unwrap_or(std::num::NonZeroU16::MIN);
         self
     }
 
@@ -196,7 +196,7 @@ impl QuicTransportBuilder {
         let server_sockets =
             bind_server_sockets(requested, self.server_endpoints, self.udp_buffers)?;
         let bind_addr = server_sockets[0].local_addr()?;
-        let client_sockets = (0..self.lanes)
+        let client_sockets = (0..self.lanes.get())
             .map(|_| bind_client_socket(bind_addr, self.udp_buffers))
             .collect::<Result<Vec<_>>>()?;
 

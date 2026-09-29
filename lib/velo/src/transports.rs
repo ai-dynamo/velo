@@ -321,7 +321,7 @@ impl VeloBackend {
     ///
     /// Returns [`VeloBackendError::InstanceNotRegistered`] if the peer has not
     /// been registered.
-    pub fn lanes(&self, target: InstanceId) -> anyhow::Result<u16> {
+    pub fn lanes(&self, target: InstanceId) -> anyhow::Result<std::num::NonZeroU16> {
         let transport = self
             .primary_transport
             .get(&target)

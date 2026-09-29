@@ -105,8 +105,8 @@ impl Transport for MockTransport {
             Err(TransportError::NoEndpoint)
         }
     }
-    fn lanes(&self, _target: InstanceId) -> u16 {
-        4
+    fn lanes(&self, _target: InstanceId) -> std::num::NonZeroU16 {
+        std::num::NonZeroU16::new(4).unwrap()
     }
     fn send_message_on_lane(
         &self,
@@ -300,7 +300,7 @@ async fn a_send_on_a_lane_reaches_the_transport_on_that_lane() {
     let peer_id = peer.instance_id();
     backend.register_peer(peer).unwrap();
 
-    assert_eq!(backend.lanes(peer_id).unwrap(), 4);
+    assert_eq!(backend.lanes(peer_id).unwrap().get(), 4);
     backend
         .send_message_on_lane(
             peer_id,
@@ -312,16 +312,22 @@ async fn a_send_on_a_lane_reaches_the_transport_on_that_lane() {
         )
         .unwrap();
     assert_eq!(t.last_lane.load(Ordering::Relaxed), 3);
-    backend
-        .send_message(
-            peer_id,
-            Bytes::from_static(&[1]),
-            Bytes::new(),
-            MessageType::Message,
-            Arc::new(NoopErrorHandler),
-        )
-        .unwrap();
-    assert_eq!(t.last_lane.load(Ordering::Relaxed), 0);
+    for _ in 0..3 {
+        backend
+            .send_message(
+                peer_id,
+                Bytes::from_static(&[1]),
+                Bytes::new(),
+                MessageType::Message,
+                Arc::new(NoopErrorHandler),
+            )
+            .unwrap();
+        assert_eq!(
+            t.last_lane.load(Ordering::Relaxed),
+            0,
+            "send_message is lane 0"
+        );
+    }
     assert!(backend.lanes(InstanceId::new_v4()).is_err());
 }
 

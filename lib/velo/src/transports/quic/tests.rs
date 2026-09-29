@@ -1089,7 +1089,7 @@ async fn each_lane_is_its_own_connection_and_keeps_its_own_order() {
     const LANES: u16 = 4;
     const FRAMES: u32 = 10_000;
     let (client, _client_streams, server, server_streams, server_id) = laned_pair(LANES).await;
-    assert_eq!(client.lanes(server_id), LANES);
+    assert_eq!(client.lanes(server_id).get(), LANES);
 
     let errors = Arc::new(Errors::default());
     let mut senders = Vec::new();
@@ -1158,21 +1158,27 @@ async fn send_message_is_lane_zero_and_lanes_wrap() {
     let (client, _client_streams, server, server_streams, server_id) = laned_pair(3).await;
     let errors = Arc::new(Errors::default());
 
-    let _ = client.send_message(
-        server_id,
-        Bytes::from_static(b"plain"),
-        Bytes::new(),
-        MessageType::Event,
-        errors.clone(),
-    );
-    let first = tokio::time::timeout(
-        Duration::from_secs(5),
-        server_streams.event_stream.recv_async(),
-    )
-    .await
-    .expect("the frame arrives")
-    .unwrap();
-    assert_eq!(first.0, Bytes::from_static(b"plain"));
+    // Several sends, so a send_message that rotated over lanes would open a
+    // second connection.
+    for _ in 0..3 {
+        let _ = client.send_message(
+            server_id,
+            Bytes::from_static(b"plain"),
+            Bytes::new(),
+            MessageType::Event,
+            errors.clone(),
+        );
+    }
+    for _ in 0..3 {
+        let frame = tokio::time::timeout(
+            Duration::from_secs(5),
+            server_streams.event_stream.recv_async(),
+        )
+        .await
+        .expect("the frame arrives")
+        .unwrap();
+        assert_eq!(frame.0, Bytes::from_static(b"plain"));
+    }
     assert_eq!(client.connections.len(), 1);
     assert!(client.connections.contains_key(&(server_id, 0)));
 
@@ -1324,4 +1330,61 @@ async fn a_peer_live_only_on_a_later_lane_is_healthy() {
     assert!(health.is_ok(), "{health:?}");
     client.shutdown();
     server.shutdown();
+}
+
+/// `closed()` force-closes a lane other than 0 whose peer stopped reading, and
+/// every frame on it is accounted for.
+///
+/// The laned form of `closed_accounts_for_every_frame_when_the_peer_stops_reading`.
+/// Its peer never reads, so the writer on lane 2 cannot finish its stream, and
+/// only a force close of its dial endpoint ends it. `shutdown()` schedules that
+/// close for every lane's endpoint, and `closed()` does it again after
+/// `CLOSE_WAIT`. If neither reached lane 2's endpoint, its writer would still be
+/// blocked, and its frames unreported, when `closed()` returns.
+///
+/// The test does not require the connection to be gone from its endpoint. A
+/// force-closed connection stays counted while it drains, on lane 0 too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closed_force_closes_a_stuck_lane_other_than_zero() {
+    let lane: u16 = 2;
+    const FRAMES: usize = 64;
+    const PAYLOAD: usize = 64 * 1024;
+    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+    let (peer, peer_id) = raw_server(
+        64 * 1024,
+        Duration::from_secs(30),
+        move |connection| async move {
+            let _stream = connection.accept_bi().await.unwrap();
+            let _ = accepted_tx.send(());
+            std::future::pending::<()>().await;
+        },
+    );
+    let (client, _client_streams, _) = started_with(QuicTransportBuilder::new().lanes(3)).await;
+    client.register(peer).unwrap();
+
+    let errors = Arc::new(Errors::default());
+    for i in 0..FRAMES {
+        let _ = client.send_message_on_lane(
+            peer_id,
+            lane,
+            Bytes::from((i as u32).to_be_bytes().to_vec()),
+            Bytes::from(vec![0u8; PAYLOAD]),
+            MessageType::Response,
+            errors.clone(),
+        );
+    }
+    tokio::time::timeout(Duration::from_secs(5), accepted_rx)
+        .await
+        .expect("the writer never reached the peer")
+        .unwrap();
+    assert!(client.connections.contains_key(&(peer_id, lane)));
+    assert_eq!(client.connections.len(), 1, "only lane {lane} was dialed");
+
+    client.shutdown();
+    client.closed().await;
+    let failed = errors.0.lock().unwrap().len();
+    assert_eq!(
+        failed, FRAMES,
+        "{failed} of {FRAMES} frames failed when closed() returned; the rest are unaccounted for"
+    );
 }

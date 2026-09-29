@@ -59,7 +59,7 @@ The old code set the sizes on the accepted socket, one task spawn after `accept`
 
 ## QUIC
 
-The QUIC transport uses [quinn](https://github.com/quinn-rs/quinn). It has the same shape as TCP: one connection for each peer and direction, dialed on the first send.
+The QUIC transport uses [quinn](https://github.com/quinn-rs/quinn). It has the same shape as TCP: one connection for each peer, lane and direction, dialed on the first send on that lane. With the default of one lane, that is one connection for each peer and direction, like TCP.
 
 ```mermaid
 graph LR

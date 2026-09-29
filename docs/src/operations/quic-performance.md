@@ -75,7 +75,7 @@ Measured on 2026-09-29 with the `throughput` example in its two-host mode. The s
 
 ## Lanes
 
-A peer that needs more than about 0.8 GB/s needs more than one connection. With `lanes(n)`, each peer gets up to `n` connections, one for each lane used, each dialed from its own UDP socket. Each connection then has its own quinn endpoint driver and connection driver, and the work runs on up to `n` cores.
+A peer that needs more than about 0.8 GB/s needs more than one connection. With `lanes(n)`, each peer gets up to `n` connections, one for each lane used, each dialed from its own UDP socket. Each lane has its own quinn endpoint driver, shared by every peer dialed on that lane, and each connection has its own connection driver. The work runs on up to `n` cores.
 
 The messenger sends its own traffic on lane 0. Only a caller that sends with `send_message_on_lane` uses the other lanes, so `lanes(n)` alone does not change the throughput of ordinary messages.
 
@@ -90,7 +90,7 @@ Measured on 2026-09-29 across the same two nodes as above, 64 KiB messages pipel
 
 The UDP receive-buffer error count stayed below 50 in each run, so the gain comes from more cores, not from more socket buffers. 64 B pipelined messages do not change with the lane count.
 
-The receiving node needs many more server sockets than there are lanes. The kernel hashes each connection to one socket of the reuse-port group, and two lanes on one socket share its endpoint driver. With 8 lanes, in a separate job on another pair of nodes, so the 32-socket row differs from the table above by run-to-run spread:
+The receiving node needs many more server sockets than there are lanes. The kernel hashes each connection to one socket of the reuse-port group, and two lanes on one socket share its endpoint driver. The table below used 8 lanes. It ran in a separate job on another pair of nodes, so its 32-socket row differs from the table above by run-to-run spread.
 
 | Server sockets on the receiving node | MB/s |
 |---|---|
