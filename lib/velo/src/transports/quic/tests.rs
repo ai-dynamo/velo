@@ -1141,7 +1141,7 @@ async fn each_lane_is_its_own_connection_and_keeps_its_own_order() {
 /// it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn send_message_is_lane_zero_and_lanes_wrap() {
-    let (client, server, server_streams, server_id) = laned_pair(2).await;
+    let (client, server, server_streams, server_id) = laned_pair(3).await;
     let errors = Arc::new(Errors::default());
 
     let _ = client.send_message(
@@ -1162,9 +1162,10 @@ async fn send_message_is_lane_zero_and_lanes_wrap() {
     assert_eq!(client.connections.len(), 1);
     assert!(client.connections.contains_key(&(server_id, 0)));
 
+    // Lane 4 of 3: modulo gives lane 1, where a clamp would give lane 2.
     let _ = client.send_message_on_lane(
         server_id,
-        5,
+        4,
         Bytes::from_static(b"wrapped"),
         Bytes::new(),
         MessageType::Event,
@@ -1179,7 +1180,7 @@ async fn send_message_is_lane_zero_and_lanes_wrap() {
     .unwrap();
     assert!(
         client.connections.contains_key(&(server_id, 1)),
-        "lane 5 of 2 is lane 1"
+        "lane 4 of 3 is lane 1"
     );
     assert_eq!(client.connections.len(), 2);
     assert!(errors.0.lock().unwrap().is_empty());
@@ -1189,6 +1190,11 @@ async fn send_message_is_lane_zero_and_lanes_wrap() {
 
 /// `closed()` waits for every lane: after it returns, no dial endpoint has a
 /// connection open, and every frame sent on any lane was delivered or failed.
+///
+/// Every lane is connected before the close: one frame on each has reached
+/// the server. The bulk then goes on lanes 1 and up only, so lane 0's endpoint
+/// is idle while the others drain, and a `closed()` that waited on lane 0
+/// alone would return with their connections still open.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn closed_waits_for_every_lane() {
     const LANES: u16 = 4;
@@ -1197,25 +1203,34 @@ async fn closed_waits_for_every_lane() {
     let (client, server, server_streams, server_id) = laned_pair(LANES).await;
     let errors = Arc::new(Errors::default());
 
-    for i in 0..FRAMES {
+    let send = |lane: u16, seq: usize, bytes: usize| {
+        let mut header = lane.to_be_bytes().to_vec();
+        header.extend_from_slice(&(seq as u32).to_be_bytes());
         let _ = client.send_message_on_lane(
             server_id,
-            (i % usize::from(LANES)) as u16,
-            Bytes::from((i as u32).to_be_bytes().to_vec()),
-            Bytes::from(vec![0u8; PAYLOAD]),
+            lane,
+            Bytes::from(header),
+            Bytes::from(vec![0u8; bytes]),
             MessageType::Response,
             errors.clone(),
         );
+    };
+    for lane in 0..LANES {
+        send(lane, 0, 0);
     }
-    // Every lane is dialed before the close, so the close lands mid-stream on
-    // all of them.
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while client.connections.len() < usize::from(LANES) {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("every lane dials");
+    for _ in 0..LANES {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            server_streams.response_stream.recv_async(),
+        )
+        .await
+        .expect("every lane connects")
+        .unwrap();
+    }
+
+    for i in 0..FRAMES {
+        send(1 + (i % usize::from(LANES - 1)) as u16, i + 1, PAYLOAD);
+    }
     client.shutdown();
     client.closed().await;
     for (lane, endpoint) in client.client_endpoints.get().unwrap().iter().enumerate() {
@@ -1227,12 +1242,14 @@ async fn closed_waits_for_every_lane() {
     }
 
     let mut delivered = 0;
-    while let Ok(Ok(_)) = tokio::time::timeout(
+    let mut per_lane = vec![0usize; usize::from(LANES)];
+    while let Ok(Ok((header, _))) = tokio::time::timeout(
         Duration::from_secs(3),
         server_streams.response_stream.recv_async(),
     )
     .await
     {
+        per_lane[usize::from(u16::from_be_bytes([header[0], header[1]]))] += 1;
         delivered += 1;
     }
     let failed = errors.0.lock().unwrap().len();
@@ -1241,5 +1258,41 @@ async fn closed_waits_for_every_lane() {
         FRAMES,
         "{delivered} delivered + {failed} failed != {FRAMES} sent"
     );
+    assert!(
+        per_lane[1..].iter().all(|&n| n > 0),
+        "every bulk lane delivered something: {per_lane:?}"
+    );
+    server.shutdown();
+}
+
+/// A peer reached only on a lane other than 0 is healthy.
+///
+/// The mux will put streams on any lane, so a peer can have live connections
+/// with none on lane 0. A health check that looked at lane 0 alone would dial a
+/// throwaway probe and call such a peer `NeverConnected`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peer_live_only_on_a_later_lane_is_healthy() {
+    let (client, server, server_streams, server_id) = laned_pair(3).await;
+    let errors = Arc::new(Errors::default());
+    let _ = client.send_message_on_lane(
+        server_id,
+        2,
+        Bytes::from_static(b"lane two"),
+        Bytes::new(),
+        MessageType::Event,
+        errors.clone(),
+    );
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        server_streams.event_stream.recv_async(),
+    )
+    .await
+    .expect("the frame arrives")
+    .unwrap();
+    assert!(!client.connections.contains_key(&(server_id, 0)));
+
+    let health = client.check_health(server_id, Duration::from_secs(1)).await;
+    assert!(health.is_ok(), "{health:?}");
+    client.shutdown();
     server.shutdown();
 }

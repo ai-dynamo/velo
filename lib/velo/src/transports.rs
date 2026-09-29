@@ -316,6 +316,19 @@ impl VeloBackend {
         self.send_message_on_lane(target, 0, header, payload, message_type, on_error)
     }
 
+    /// How many lanes the primary transport to `target` keeps. See
+    /// [`Transport::lanes`].
+    ///
+    /// Returns [`VeloBackendError::InstanceNotRegistered`] if the peer has not
+    /// been registered.
+    pub fn lanes(&self, target: InstanceId) -> anyhow::Result<u16> {
+        let transport = self
+            .primary_transport
+            .get(&target)
+            .ok_or(VeloBackendError::InstanceNotRegistered(target))?;
+        Ok(transport.value().lanes(target))
+    }
+
     /// Send a message to a registered peer on one of its primary transport's
     /// lanes.
     ///

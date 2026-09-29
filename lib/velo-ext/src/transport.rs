@@ -307,7 +307,8 @@ pub trait Transport: Send + Sync {
     ///
     /// The frame is taken unconditionally: implementations must not hand it
     /// back, and the caller has no way to retract it. What the return value
-    /// reports is *when* the frame reached the per-target send channel.
+    /// reports is *when* the frame reached the send channel for the target
+    /// (its lane 0, on a transport with [`lanes`](Transport::lanes)).
     ///
     /// - [`SendOutcome::Admitted`] — it is on the channel already. This is also
     ///   what a hard pre-wire failure returns, once `on_error` has been called
@@ -321,10 +322,11 @@ pub trait Transport: Send + Sync {
     ///   the channel closed). Delivery does **not** depend on the caller
     ///   polling it — dropping it is a legitimate fire-and-forget pattern.
     ///
-    /// Implementations must route every send through one gate per target and
-    /// keep no `try_send` path around it: an admission that can be overtaken by
-    /// a later fast-path send is the reordering hazard the gate exists to
-    /// remove (see the [`admission`](crate::admission) module docs).
+    /// Implementations must route every send through one gate per target (per
+    /// target and lane, on a transport with lanes) and keep no `try_send` path
+    /// around it: an admission that can be overtaken by a later fast-path send
+    /// is the reordering hazard the gate exists to remove (see the
+    /// [`admission`](crate::admission) module docs).
     ///
     /// Failures *after* admission — the write itself — continue to flow
     /// through `on_error`.
@@ -341,8 +343,12 @@ pub trait Transport: Send + Sync {
     ///
     /// Frames sent on one `(target, lane)` through
     /// [`send_message_on_lane`](Transport::send_message_on_lane) arrive in the
-    /// order they were sent. Nothing is promised across lanes. A transport
+    /// order they were admitted. Nothing is promised across lanes. A transport
     /// that carries a peer on one ordered channel keeps the default of 1.
+    ///
+    /// The value must not change while the peer is registered: a caller maps
+    /// its flows to lanes with it, and a different count would move a flow to
+    /// another lane, which reorders it.
     ///
     /// Lanes exist because one connection can be bound to one core: a QUIC
     /// connection does its packet and crypto work on one task. A caller with

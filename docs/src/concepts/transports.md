@@ -34,8 +34,8 @@ A `WorkerAddress` is a MessagePack map from `TransportKey` to endpoint bytes. Ea
 Every transport implements the `Transport` trait from `velo-ext`. The runtime relies on these rules:
 
 - **Sends do not wait for the wire.** `send_message` takes the frame and reports when it reached the send channel for the target. Failures after that point go to a `TransportErrorHandler` callback.
-- **Order holds per lane.** `lanes(target)` tells how many ordered channels the transport keeps to a peer. The default is 1. `send_message_on_lane` keeps order within one lane only, and `send_message` sends on lane 0. A lane never fails over to another lane's connection, because that would reorder it. QUIC implements lanes. The other transports keep one lane.
-- **Inbound frames go to four lanes**: message, response, event, and shutdown. The `TransportAdapter` routes each frame to its lane.
+- **Order holds per lane.** `lanes(target)` tells how many ordered channels the transport keeps to a peer. The default is 1. `send_message_on_lane` keeps order within one lane only, and `send_message` sends on lane 0. A lane never fails over to another lane's connection, because that would reorder it. The messenger sends its own traffic on lane 0, because ordered handlers need the messages of one peer on one lane. QUIC implements lanes. The other transports keep one lane.
+- **Inbound frames go to four streams**: message, response, event, and shutdown. The `TransportAdapter` routes each frame to its stream.
 - **Admission owns the in-flight count.** Each inbound `MessageType::Message` goes through `TransportAdapter::admit_message`. See [Shutdown and drain](shutdown.md) for why a transport must not check `is_draining()` itself.
 - **Metrics use one handle.** The runtime gives each transport an observability handle through `set_observability`. In-tree and out-of-tree transports write the same `velo_transport_*` series.
 
@@ -65,7 +65,7 @@ The QUIC transport uses [quinn](https://github.com/quinn-rs/quinn). It has the s
 graph LR
     subgraph Dialer
         W[Coalescing writer] --> S["Bidirectional stream<br>(send half)"]
-        R[Dialed reader] --> A1[Shutdown lane]
+        R[Dialed reader] --> A1[Shutdown stream]
     end
     subgraph Listener
         E["Server endpoints<br>(SO_REUSEPORT group)"] --> F[Stream reader]
@@ -76,12 +76,12 @@ graph LR
 ```
 
 - **One stream for each connection.** The dialer opens one bidirectional stream and writes velo frames on it with the TCP frame codec. One stream keeps the order of messages from one peer. Ordered handlers and batched streaming rely on that order. Several streams would remove head-of-line blocking after a packet loss, but they would also reorder messages from one peer.
-- **Shutdown waits for acknowledgement.** When a writer stops, even at teardown, it finishes its stream and waits up to 1 second for the peer to acknowledge what it wrote, and then closes its connection. A writer that is blocked because the peer stopped reading is closed by force at 2 seconds instead. The dial socket closes when every writer has finished, or at the latest after 2 seconds. A QUIC close discards unacknowledged data, which TCP would still deliver after a close. `Transport::closed()` waits for this, and `graceful_shutdown` waits for `closed()`, so a process can exit when `graceful_shutdown` returns.
+- **Shutdown waits for acknowledgement.** When a writer stops, even at teardown, it finishes its stream and waits up to 1 second for the peer to acknowledge what it wrote, and then closes its connection. A writer that is blocked because the peer stopped reading is closed by force at 2 seconds instead. The dial sockets close when every writer has finished, or at the latest after 2 seconds. A QUIC close discards unacknowledged data, which TCP would still deliver after a close. `Transport::closed()` waits for this, and `graceful_shutdown` waits for `closed()`, so a process can exit when `graceful_shutdown` returns.
 - **The reverse direction carries only drain echoes.** The listener writes a `ShuttingDown` frame back on the same stream when it refuses a request during drain. The dialer reads it with the same code as TCP.
 - **The certificate is pinned.** Each transport makes a self-signed certificate and puts its SHA-256 fingerprint in its `WorkerAddress` entry. A dialer accepts only that certificate and checks the TLS 1.3 handshake signature. A different listener on a reused port fails the handshake.
-- **Lanes are separate connections.** `lanes(n)` makes the dialer keep `n` connections to each peer, each from its own UDP socket. One QUIC connection does its packet and crypto work on one task, so it is bound to about one core. Lanes spread that work over more cores. `send_message` uses lane 0, so ordinary traffic keeps one ordered channel for each peer.
+- **Lanes are separate connections.** With `lanes(n)`, the dialer keeps up to `n` connections to each peer, one for each lane that it sends on, each from its own UDP socket. One QUIC connection does its packet and crypto work on one task, so it is bound to about one core. Lanes spread that work over more cores. `send_message` uses lane 0, so ordinary traffic keeps one ordered channel for each peer.
 - **Server sockets form a reuse-port group** (Linux). `server_endpoints(n)` binds `n` UDP sockets on one port. The kernel hashes each peer to one socket, so the receive queues and buffer ceilings add up. A node that many peers send to, such as a frontend, gains from more sockets. The default is 4. Each socket costs a quinn endpoint and its buffers.
-- **The dial socket is separate.** Dials use their own socket on an ephemeral port. A reply to a dial from a group member can hash to another member, which does not know the connection and drops the reply.
+- **Dial sockets are separate.** Dials use their own sockets on ephemeral ports, one for each lane. A reply to a dial from a group member can hash to another member, which does not know the connection and drops the reply.
 - **UDP buffers are checked.** The transport requests 8 MiB receive and 4 MiB send buffers on each socket, reads back what the kernel granted, and logs a warning when `net.core.rmem_max` or `net.core.wmem_max` clamped the request. A clamped UDP buffer shows up later as dropped datagrams, not as an error.
 - **Packets are at most 6550 bytes.** quinn sends up to 10 packets in one GSO batch, and a larger packet makes the batch exceed the UDP datagram limit. The batch is then lost with no error. `max_mtu` is lowered to 6550.
 - **quinn 0.11.12 is the minimum.** It pulls quinn-proto 0.11.18. Older quinn-proto can fail an ordered, lossless stream of many small chunks with `too many gaps in stream buffer`.

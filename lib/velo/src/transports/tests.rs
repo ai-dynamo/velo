@@ -22,6 +22,8 @@ struct MockTransport {
     /// shutdown waited for it.
     closed: Arc<AtomicBool>,
     send_count: AtomicUsize,
+    /// The lane of the last send, as the backend handed it over.
+    last_lane: AtomicUsize,
     /// When true, `start` builds a one-slot channel that nobody drains and
     /// routes sends through a gate over it, so every send past the first
     /// reports `Pending`. Lets tests exercise the backend's queued path.
@@ -48,6 +50,7 @@ impl MockTransport {
             shut_down: AtomicBool::new(false),
             closed: Arc::new(AtomicBool::new(false)),
             send_count: AtomicUsize::new(0),
+            last_lane: AtomicUsize::new(usize::MAX),
             saturating: false,
             queue: OnceLock::new(),
         })
@@ -69,6 +72,7 @@ impl MockTransport {
             shut_down: AtomicBool::new(false),
             closed: Arc::new(AtomicBool::new(false)),
             send_count: AtomicUsize::new(0),
+            last_lane: AtomicUsize::new(usize::MAX),
             saturating: true,
             queue: OnceLock::new(),
         })
@@ -100,6 +104,21 @@ impl Transport for MockTransport {
         } else {
             Err(TransportError::NoEndpoint)
         }
+    }
+    fn lanes(&self, _target: InstanceId) -> u16 {
+        4
+    }
+    fn send_message_on_lane(
+        &self,
+        instance_id: InstanceId,
+        lane: u16,
+        header: Bytes,
+        payload: Bytes,
+        message_type: MessageType,
+        on_error: Arc<dyn TransportErrorHandler>,
+    ) -> SendOutcome {
+        self.last_lane.store(usize::from(lane), Ordering::Relaxed);
+        self.send_message(instance_id, header, payload, message_type, on_error)
     }
     fn send_message(
         &self,
@@ -267,6 +286,43 @@ async fn test_register_peer_stores_worker_mapping() {
 
     let resolved = backend.try_translate_worker_id(worker_id).unwrap();
     assert_eq!(resolved, peer_id);
+}
+
+/// The backend reports the primary transport's lanes, and hands a send's
+/// lane to it. `send_message` is lane 0.
+#[tokio::test]
+async fn a_send_on_a_lane_reaches_the_transport_on_that_lane() {
+    let t = MockTransport::new("tcp", true);
+    let (backend, _streams) = VeloBackend::new(vec![t.clone() as Arc<dyn Transport>], None)
+        .await
+        .unwrap();
+    let peer = make_peer_info(&["tcp"]);
+    let peer_id = peer.instance_id();
+    backend.register_peer(peer).unwrap();
+
+    assert_eq!(backend.lanes(peer_id).unwrap(), 4);
+    backend
+        .send_message_on_lane(
+            peer_id,
+            3,
+            Bytes::from_static(&[1]),
+            Bytes::new(),
+            MessageType::Message,
+            Arc::new(NoopErrorHandler),
+        )
+        .unwrap();
+    assert_eq!(t.last_lane.load(Ordering::Relaxed), 3);
+    backend
+        .send_message(
+            peer_id,
+            Bytes::from_static(&[1]),
+            Bytes::new(),
+            MessageType::Message,
+            Arc::new(NoopErrorHandler),
+        )
+        .unwrap();
+    assert_eq!(t.last_lane.load(Ordering::Relaxed), 0);
+    assert!(backend.lanes(InstanceId::new_v4()).is_err());
 }
 
 #[tokio::test]

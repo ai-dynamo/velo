@@ -6,7 +6,7 @@ This chapter records what the QUIC transport costs against TCP, the settings tha
 
 | Builder method | Default | Effect |
 |---|---|---|
-| `lanes(n)` | 1 | Connections to each peer, each from its own UDP socket. Order holds within a lane only. See [Lanes](#lanes). |
+| `lanes(n)` | 1 | Up to `n` connections to each peer, one for each lane used, each from its own UDP socket. Order holds within a lane only. See [Lanes](#lanes). |
 | `server_endpoints(n)` | 4 | Server sockets in the `SO_REUSEPORT` group (Linux). More sockets spread the receive load of many peers and many lanes. |
 | `udp_buffer_sizes(recv, send)` | 8 MiB, 4 MiB | Requested socket buffers. The kernel clamps them to `net.core.rmem_max` and `net.core.wmem_max`, and the transport logs the clamp. |
 | `max_mtu(bytes)` | quinn's (1452) | Upper bound for path MTU discovery. Values above 6550 are lowered to 6550. |
@@ -75,9 +75,11 @@ Measured on 2026-09-29 with the `throughput` example in its two-host mode. The s
 
 ## Lanes
 
-A peer that needs more than about 0.8 GB/s needs more than one connection. `lanes(n)` gives each peer `n` connections, each dialed from its own UDP socket. Each connection then has its own quinn endpoint driver and connection driver, and the work runs on up to `n` cores.
+A peer that needs more than about 0.8 GB/s needs more than one connection. With `lanes(n)`, each peer gets up to `n` connections, one for each lane used, each dialed from its own UDP socket. Each connection then has its own quinn endpoint driver and connection driver, and the work runs on up to `n` cores.
 
-Measured on 2026-09-29 across the same two nodes as above, 64 KiB messages pipelined, 20,000 messages per cell, two reps. A prototype spread the messages round robin over the lanes, with the connection layout that `lanes(n)` builds. The receiving node had 32 server sockets.
+The messenger sends its own traffic on lane 0. Only a caller that sends with `send_message_on_lane` uses the other lanes, so `lanes(n)` alone does not change the throughput of ordinary messages.
+
+Measured on 2026-09-29 across the same two nodes as above, 64 KiB messages pipelined, 20,000 messages per cell, two reps. A prototype, which is not in the tree, spread the messages round robin over the lanes, with the connection layout that `lanes(n)` builds. The receiving node had 32 server sockets.
 
 | Lanes | MB/s |
 |---|---|

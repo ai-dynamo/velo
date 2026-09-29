@@ -36,17 +36,17 @@ use super::tls;
 /// bytes before it closes the connection, on every stop including teardown,
 /// unless the connection has already ended.
 /// Closing at once discards what the peer has not acknowledged, which TCP
-/// would still deliver after a close. The dial endpoint closes only after
+/// would still deliver after a close. The dial endpoints close only after
 /// the writers finish, or after CLOSE_WAIT.
 const FINISH_GRACE: Duration = Duration::from_secs(1);
 
 /// How long teardown waits for the writers to finish their streams and for
-/// the connections to close before it closes the dial endpoint by force.
+/// the connections to close before it closes the dial endpoints by force.
 /// Twice FINISH_GRACE, so a writer that was mid-write when teardown began
 /// still gets its full acknowledgement wait.
 const CLOSE_WAIT: Duration = FINISH_GRACE.saturating_mul(2);
 
-/// How long `closed()` waits, after it force-closes the dial endpoint, for the
+/// How long `closed()` waits, after it force-closes the dial endpoints, for the
 /// writers that were still blocked to report their frames as failed.
 const FAIL_REPORT_GRACE: Duration = Duration::from_millis(500);
 
@@ -147,49 +147,49 @@ impl QuicTransport {
         self.fingerprint
     }
 
-    fn reap_stale_connection(&self, instance_id: LaneKey) {
+    fn reap_stale_connection(&self, key: LaneKey) {
         if let Some((_, stale)) = self
             .connections
-            .remove_if(&instance_id, |_, h| h.tx.is_disconnected())
+            .remove_if(&key, |_, h| h.tx.is_disconnected())
         {
             stale.retire();
             self.update_connection_gauge();
         }
     }
 
-    fn get_or_create_connection(&self, instance_id: LaneKey) -> Result<ConnectionHandle> {
-        if let Some(handle) = self.connections.get(&instance_id) {
+    fn get_or_create_connection(&self, key: LaneKey) -> Result<ConnectionHandle> {
+        if let Some(handle) = self.connections.get(&key) {
             if !handle.tx.is_disconnected() {
                 return Ok(handle.clone());
             }
             drop(handle);
-            self.reap_stale_connection(instance_id);
+            self.reap_stale_connection(key);
         }
 
         let rt = self.runtime.get().ok_or(TransportError::NotStarted)?;
-        self.install_connection(instance_id, rt)
+        self.install_connection(key, rt)
     }
 
-    /// Put a live connection in the map for `instance_id`: the one already
+    /// Put a live connection in the map for `key`: the one already
     /// there if it is live, else a new one.
     fn install_connection(
         &self,
-        instance_id: LaneKey,
+        key: LaneKey,
         rt: &tokio::runtime::Handle,
     ) -> Result<ConnectionHandle> {
-        let handle = match self.connections.entry(instance_id) {
+        let handle = match self.connections.entry(key) {
             dashmap::mapref::entry::Entry::Occupied(mut entry) => {
                 if !entry.get().tx.is_disconnected() {
                     entry.get().clone()
                 } else {
                     entry.get().retire();
-                    let handle = self.create_connection(instance_id, rt)?;
+                    let handle = self.create_connection(key, rt)?;
                     entry.insert(handle.clone());
                     handle
                 }
             }
             dashmap::mapref::entry::Entry::Vacant(entry) => {
-                let handle = self.create_connection(instance_id, rt)?;
+                let handle = self.create_connection(key, rt)?;
                 entry.insert(handle.clone());
                 handle
             }
@@ -257,7 +257,7 @@ impl QuicTransport {
         }
     }
 
-    fn slow_path_send(&self, instance_id: LaneKey, send_msg: SendTask) -> SendOutcome {
+    fn slow_path_send(&self, key: LaneKey, send_msg: SendTask) -> SendOutcome {
         if self.runtime.get().is_none() {
             send_msg.on_error("Transport not started");
             return SendOutcome::Admitted;
@@ -266,7 +266,7 @@ impl QuicTransport {
             send_msg.on_error("Transport shut down");
             return SendOutcome::Admitted;
         }
-        match self.get_or_create_connection(instance_id) {
+        match self.get_or_create_connection(key) {
             Ok(handle) => self.admit(&handle, send_msg),
             Err(e) => {
                 send_msg.on_error(format!("Failed to create connection: {e:#}"));
@@ -379,7 +379,6 @@ impl Transport for QuicTransport {
         Ok(())
     }
 
-    #[inline]
     fn lanes(&self, _target: crate::InstanceId) -> u16 {
         self.lanes
     }
@@ -395,6 +394,7 @@ impl Transport for QuicTransport {
         self.send_message_on_lane(instance_id, 0, header, payload, message_type, on_error)
     }
 
+    #[inline]
     fn send_message_on_lane(
         &self,
         instance_id: crate::InstanceId,
@@ -404,7 +404,7 @@ impl Transport for QuicTransport {
         message_type: MessageType,
         on_error: Arc<dyn TransportErrorHandler>,
     ) -> SendOutcome {
-        let instance_id: LaneKey = (instance_id, lane % self.lanes);
+        let key: LaneKey = (instance_id, lane % self.lanes);
         let send_msg = SendTask {
             msg_type: message_type,
             header,
@@ -412,15 +412,15 @@ impl Transport for QuicTransport {
             on_error,
             queued_at: self.metrics.get().map(|_| Instant::now()),
         };
-        if let Some(handle) = self.connections.get(&instance_id) {
+        if let Some(handle) = self.connections.get(&key) {
             let live = (!handle.tx.is_disconnected()).then(|| handle.clone());
             drop(handle);
             match live {
                 Some(handle) => return self.admit(&handle, send_msg),
-                None => self.reap_stale_connection(instance_id),
+                None => self.reap_stale_connection(key),
             }
         }
-        self.slow_path_send(instance_id, send_msg)
+        self.slow_path_send(key, send_msg)
     }
 
     fn start(
@@ -482,7 +482,7 @@ impl Transport for QuicTransport {
         for endpoint in self.server_endpoints.get().into_iter().flatten() {
             endpoint.close(quinn::VarInt::from_u32(0), b"shutdown");
         }
-        // Not the dial endpoint yet: closing it now would discard what the
+        // Not the dial endpoints yet: closing them now would discard what the
         // writers wrote but the peers have not acknowledged. Each writer
         // finishes its stream and closes its connection within FINISH_GRACE
         // of its last write; a writer parked on a peer's flow control is
@@ -506,7 +506,7 @@ impl Transport for QuicTransport {
 
     /// Wait for every connection writer to finish its stream (each waits up
     /// to FINISH_GRACE for the peer's acknowledgement) and for every
-    /// endpoint's connections to close, then close the dial endpoint.
+    /// endpoint's connections to close, then close the dial endpoints.
     /// Bounded by CLOSE_WAIT plus FAIL_REPORT_GRACE. Returns at once if
     /// `shutdown()` has not run, because the writers are still live.
     fn closed(&self) -> futures::future::BoxFuture<'_, ()> {
@@ -554,16 +554,21 @@ impl Transport for QuicTransport {
         Box<dyn std::future::Future<Output = Result<(), HealthCheckError>> + Send + '_>,
     > {
         Box::pin(async move {
-            // Lane 0 stands for the peer. A lane that dies on its own is
-            // found by its next send, whose frames fail through `on_error`.
-            let lane_zero: LaneKey = (instance_id, 0);
-            let connection_exists = self.connections.contains_key(&lane_zero);
-            if let Some(handle) = self.connections.get(&lane_zero) {
+            // Any live lane shows the peer is reachable. A lane that dies on
+            // its own is found by its next send, whose frames fail through
+            // `on_error`.
+            let mut connection_exists = false;
+            for lane in 0..self.lanes {
+                let key: LaneKey = (instance_id, lane);
+                let Some(handle) = self.connections.get(&key) else {
+                    continue;
+                };
+                connection_exists = true;
                 if !handle.tx.is_disconnected() {
                     return Ok(());
                 }
                 drop(handle);
-                self.reap_stale_connection(lane_zero);
+                self.reap_stale_connection(key);
             }
 
             let peer = self
@@ -613,12 +618,13 @@ async fn connection_writer_task(
     rx: flume::Receiver<SendTask>,
     ctx: WriterTaskContext,
 ) {
-    let instance_id = key.0;
+    // Names the connection in logs: with lanes, one peer has several.
+    let peer = format!("{} lane {}", key.0, key.1);
     let addr = ctx.peer.addr;
     let connections = Arc::clone(&ctx.connections);
     let metrics = ctx.metrics.clone();
-    if let Err(e) = connection_writer_inner(instance_id, &rx, ctx).await {
-        warn!("QUIC: connection to {instance_id} ({addr}) failed: {e:#}");
+    if let Err(e) = connection_writer_inner(&peer, &rx, ctx).await {
+        warn!("QUIC: connection to {peer} ({addr}) failed: {e:#}");
     }
 
     // Drain queued messages and notify their error handlers. The same small
@@ -635,11 +641,11 @@ async fn connection_writer_task(
     if let Some(metrics) = metrics.as_ref() {
         metrics.set_active_connections(connections.len());
     }
-    debug!("QUIC connection to {instance_id} ({addr}) closed");
+    debug!("QUIC connection to {peer} ({addr}) closed");
 }
 
 async fn connection_writer_inner(
-    instance_id: crate::InstanceId,
+    peer_name: &str,
     rx: &flume::Receiver<SendTask>,
     ctx: WriterTaskContext,
 ) -> Result<()> {
@@ -666,7 +672,7 @@ async fn connection_writer_inner(
         .open_bi()
         .await
         .context("failed to open the QUIC stream")?;
-    debug!("QUIC connected to {instance_id} ({})", peer.addr);
+    debug!("QUIC connected to {peer_name} ({})", peer.addr);
 
     // The peer's listener writes `ShuttingDown` echoes back on this stream.
     // The reader routes them, and cancels `conn_cancel` when the peer ends
@@ -678,7 +684,7 @@ async fn connection_writer_inner(
             reader_ctx,
             metrics.clone(),
             conn_cancel.clone(),
-            format!("{instance_id} ({})", peer.addr),
+            format!("{peer_name} ({})", peer.addr),
         ))
     });
 
@@ -688,7 +694,7 @@ async fn connection_writer_inner(
         std::convert::identity,
         Some(&conn_cancel),
         &QuicWriterObserver {
-            instance_id,
+            peer: peer_name,
             addr: peer.addr,
             egress: metrics.map(EgressMetrics::new),
         },
@@ -708,14 +714,14 @@ async fn connection_writer_inner(
     // out) can leave written frames unread, so it is a warning.
     let loss = |why: String| {
         warn!(
-            "QUIC: {instance_id} ({}) did not acknowledge the stream end ({why}); \
+            "QUIC: {peer_name} ({}) did not acknowledge the stream end ({why}); \
              frames written but not acknowledged can be lost",
             peer.addr
         )
     };
     match connection.close_reason() {
         Some(quinn::ConnectionError::ApplicationClosed(reason)) => {
-            debug!("QUIC connection to {instance_id} closed by peer: {reason}");
+            debug!("QUIC connection to {peer_name} closed by peer: {reason}");
         }
         Some(quinn::ConnectionError::LocallyClosed) => {
             loss(format!("closed by force at shutdown, after {CLOSE_WAIT:?}"))
@@ -727,7 +733,7 @@ async fn connection_writer_inner(
                 Ok(Err(quinn::StoppedError::ConnectionLost(
                     quinn::ConnectionError::ApplicationClosed(reason),
                 ))) => {
-                    debug!("QUIC connection to {instance_id} closed by peer: {reason}");
+                    debug!("QUIC connection to {peer_name} closed by peer: {reason}");
                 }
                 Err(_) => loss(format!("no acknowledgement within {FINISH_GRACE:?}")),
                 Ok(outcome) => loss(format!("{outcome:?}")),
@@ -779,22 +785,23 @@ impl Coalescable for SendTask {
     }
 }
 
-struct QuicWriterObserver {
-    instance_id: crate::InstanceId,
+struct QuicWriterObserver<'a> {
+    /// The peer and lane, for logs.
+    peer: &'a str,
     addr: SocketAddr,
     egress: Option<EgressMetrics>,
 }
 
-impl WriterObserver for QuicWriterObserver {
+impl WriterObserver for QuicWriterObserver<'_> {
     fn on_failure(&self, kind: WriterFailure, err: &std::io::Error, frames: usize) {
         match kind {
             WriterFailure::Write => error!(
                 "QUIC write error to {} ({}): {err:#} ({frames} message(s) in batch)",
-                self.instance_id, self.addr
+                self.peer, self.addr
             ),
             WriterFailure::Encode => error!(
                 "QUIC encode error to {} ({}): {err:#}",
-                self.instance_id, self.addr
+                self.peer, self.addr
             ),
         }
     }

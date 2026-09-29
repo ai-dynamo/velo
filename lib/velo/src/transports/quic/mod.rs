@@ -3,7 +3,7 @@
 
 //! QUIC messenger transport (feature `quic`).
 //!
-//! One QUIC connection per peer and direction, like TCP. The dialer opens one
+//! One QUIC connection per peer, lane and direction, like TCP with one lane. The dialer opens one
 //! bidirectional stream and writes velo frames on it with the shared
 //! coalescing writer. The listener reads the stream with the TCP frame codec
 //! and writes back only `ShuttingDown` echoes. One stream per peer keeps the
