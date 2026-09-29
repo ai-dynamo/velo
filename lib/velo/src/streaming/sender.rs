@@ -65,7 +65,8 @@ pub(crate) fn cached_heartbeat() -> &'static Vec<u8> {
 }
 
 /// Cached serialized bytes for `StreamFrame::<()>::Dropped`.
-/// Used in Drop impl and reader_pump timeout path.
+/// Used in Drop impl and by the watchdogs (`reader_pump`, `stream_watchdog`)
+/// and the unclaimed-bind reap when they inject `Dropped`.
 pub(crate) fn cached_dropped() -> &'static Vec<u8> {
     static DROPPED: OnceLock<Vec<u8>> = OnceLock::new();
     DROPPED.get_or_init(|| {
@@ -89,6 +90,10 @@ pub(crate) fn cached_detached() -> &'static Vec<u8> {
     })
 }
 
+/// How `rmp_serde` encodes every `StreamFrame::Item`: a one-entry map (`0x81`)
+/// keyed by the fixstr `"Item"` (`0xa4` plus four bytes), then the payload.
+pub(crate) const ITEM_PREFIX: &[u8] = &[0x81, 0xa4, b'I', b't', b'e', b'm'];
+
 /// Whether these raw frame bytes are a terminal sentinel.
 ///
 /// Terminal means the stream ends here: `Dropped`, `Detached`, `Finalized` and
@@ -103,7 +108,15 @@ pub(crate) fn cached_detached() -> &'static Vec<u8> {
 /// costs a decode; that decode is also why an ordinary `Item` payload is not
 /// mistaken for one — a payload that happens to deserialize as `StreamFrame<()>`
 /// can only do so as a variant this function then rejects.
+///
+/// Both ends of the mux classify every data record, so an `Item` never reaches
+/// that decode: a frame keyed `"Item"` can only decode as `Item` or fail, never
+/// as `TransportError`, so [`ITEM_PREFIX`] decides it exactly. The failed decode
+/// it replaces formatted an error `String` per record.
 pub(crate) fn is_terminal_sentinel(bytes: &[u8]) -> bool {
+    if bytes.starts_with(ITEM_PREFIX) {
+        return false;
+    }
     if bytes == cached_dropped().as_slice()
         || bytes == cached_detached().as_slice()
         || bytes == cached_finalized().as_slice()
@@ -138,6 +151,7 @@ pub struct StreamSender<T> {
     registry: Arc<DashMap<u64, AnchorEntry>>,
     /// User-facing cancellation signal: fires when _stream_cancel is received.
     cancel_token: CancellationToken,
+    stop_token: CancellationToken,
     /// Key in the sender-side registry for cleanup and for the _stream_cancel handler.
     sender_stream_id: u64,
     /// Sender-side registry shared with the _stream_cancel handler.
@@ -172,7 +186,7 @@ impl<T: Serialize> StreamSender<T> {
     /// via non-blocking `try_send`. It is cancelled when the sender is finalized,
     /// detached, or dropped. `heartbeat_interval` is negotiated by the consumer
     /// via [`crate::streaming::control::AnchorAttachResponse::Ok::heartbeat_interval_ms`]
-    /// — both sides must agree so the consumer's reader pump deadline matches.
+    /// — both sides must agree so the consumer's watchdog deadline matches.
     ///
     /// `registry` is a shared reference to the anchor registry so that
     /// [`detach`](StreamSender::detach) can atomically clear the attachment flag.
@@ -196,6 +210,11 @@ impl<T: Serialize> StreamSender<T> {
             sender_registry,
             poison_tx,
         } = cancel;
+        let stop_token = sender_registry
+            .senders
+            .get(&sender_stream_id)
+            .map(|entry| entry.stop_token.clone())
+            .unwrap_or_else(|| cancel_token.child_token());
         let heartbeat_cancel = CancellationToken::new();
 
         // Spawn heartbeat background task
@@ -224,6 +243,7 @@ impl<T: Serialize> StreamSender<T> {
             tx,
             handle,
             heartbeat_cancel,
+            stop_token,
             sent_terminal: false,
             registry,
             cancel_token,
@@ -271,18 +291,15 @@ impl<T: Serialize> StreamSender<T> {
     /// # }
     /// ```
     ///
-    /// This fires only for a stream opened by attach. A sender built by
-    /// [`AnchorManager::open_anchor_stream`](crate::streaming::AnchorManager::open_anchor_stream)
-    /// (or [`Velo::open_anchor_stream`](crate::Velo::open_anchor_stream)) never
-    /// sent an attach, so the consumer never learned a `StreamCancelHandle` to
-    /// reach it by, and this token never cancels for it -- a dropped consumer
-    /// surfaces there as `SendError::ChannelClosed` on the next `send`
-    /// instead, posted promptly once the pre-bind's reclamation runs. The
-    /// `tokio::select!` above is still correct for that case: the token side
-    /// just never fires, so the loop exits through the `send` error the way
-    /// the corrected example above does.
+    /// Also fires for ticket opens, including an idle producer whose slot closes.
     pub fn cancellation_token(&self) -> CancellationToken {
         self.cancel_token.clone()
+    }
+
+    /// Fires when the consumer requests graceful stop or cancels the stream.
+    /// The producer can send buffered output and finalize after graceful stop.
+    pub fn stop_token(&self) -> CancellationToken {
+        self.stop_token.clone()
     }
 
     /// Send a typed item through the channel.
@@ -296,7 +313,7 @@ impl<T: Serialize> StreamSender<T> {
     /// - [`SendError::ChannelClosed`] if the receiver has been dropped.
     pub async fn send(&self, item: T) -> Result<(), SendError> {
         // Check if the poison channel has been disconnected (rx_closer dropped by _stream_cancel handler).
-        if self.poison_tx.is_disconnected() {
+        if self.cancel_token.is_cancelled() || self.poison_tx.is_disconnected() {
             return Err(SendError::ChannelClosed);
         }
         let bytes = rmp_serde::to_vec(&StreamFrame::Item(item))
@@ -311,10 +328,11 @@ impl<T: Serialize> StreamSender<T> {
                 if let Some(m) = self.metrics.as_ref() {
                     m.record_producer_send_backpressure();
                 }
-                self.tx
-                    .send_async(b)
-                    .await
-                    .map_err(|_| SendError::ChannelClosed)
+                tokio::select! {
+                    biased;
+                    _ = self.cancel_token.cancelled() => Err(SendError::ChannelClosed),
+                    result = self.tx.send_async(b) => result.map_err(|_| SendError::ChannelClosed),
+                }
             }
             Err(flume::TrySendError::Disconnected(_)) => Err(SendError::ChannelClosed),
         }
@@ -494,6 +512,63 @@ mod tests {
 
     use super::{StreamSender, StreamSenderCancelInfo};
 
+    /// Every variant, encoded the way a sender encodes it, gets the terminal
+    /// verdict the mux's credit classes depend on: exactly `Dropped`,
+    /// `Detached`, `Finalized` and `TransportError` spend the terminal reserve.
+    /// An `Item` whose payload is itself a sentinel's encoding stays data.
+    #[test]
+    fn terminal_classification_covers_every_variant() {
+        let enc = |f: &StreamFrame<String>| rmp_serde::to_vec(f).unwrap();
+        let cases = [
+            (StreamFrame::Item("x".to_string()), false),
+            (StreamFrame::Item("Finalized".to_string()), false),
+            (StreamFrame::SenderError("e".to_string()), false),
+            (StreamFrame::Heartbeat, false),
+            (StreamFrame::Dropped, true),
+            (StreamFrame::Detached, true),
+            (StreamFrame::Finalized, true),
+            (StreamFrame::TransportError("t".to_string()), true),
+        ];
+        for (frame, terminal) in cases {
+            assert_eq!(
+                super::is_terminal_sentinel(&enc(&frame)),
+                terminal,
+                "{frame:?}"
+            );
+        }
+        let nested =
+            rmp_serde::to_vec(&StreamFrame::Item(super::cached_finalized().clone())).unwrap();
+        assert!(!super::is_terminal_sentinel(&nested));
+    }
+
+    /// The fast path rests on the encoding: an `Item` is a one-entry map keyed
+    /// `"Item"`, whatever its payload.
+    #[test]
+    fn item_frames_start_with_the_item_prefix() {
+        for bytes in [
+            rmp_serde::to_vec(&StreamFrame::Item(())).unwrap(),
+            rmp_serde::to_vec(&StreamFrame::Item(vec![7u8; 300])).unwrap(),
+            rmp_serde::to_vec(&StreamFrame::Item(bytes::Bytes::from_static(b"data"))).unwrap(),
+        ] {
+            assert!(bytes.starts_with(super::ITEM_PREFIX), "{bytes:02x?}");
+        }
+    }
+
+    /// Every data record on both ends of the mux is classified, so the check
+    /// must not allocate. It used to decode each `Item` as `StreamFrame<()>`
+    /// to rule out `TransportError`, and the failed decode formatted an error
+    /// `String` per record.
+    #[test]
+    fn classifying_an_item_does_not_allocate() {
+        let bytes = rmp_serde::to_vec(&StreamFrame::Item(vec![1u8; 160])).unwrap();
+        // Warm the cached sentinels, which allocate once per process.
+        super::is_terminal_sentinel(&bytes);
+        let (terminal, allocations) =
+            crate::test_alloc::allocations_in(|| super::is_terminal_sentinel(&bytes));
+        assert!(!terminal);
+        assert_eq!(allocations, 0);
+    }
+
     /// Create an empty registry for use in unit tests (no real anchors needed).
     fn empty_registry() -> Arc<DashMap<u64, AnchorEntry>> {
         Arc::new(DashMap::new())
@@ -548,6 +623,7 @@ mod tests {
 
         // Insert the SenderEntry into the registry (simulating what attach_stream_anchor does)
         let entry = crate::streaming::control::SenderEntry {
+            stop_token: cancel_token.child_token(),
             cancel_token: cancel_token.clone(),
             rx_closer: std::sync::Mutex::new(Some(poison_rx)),
         };

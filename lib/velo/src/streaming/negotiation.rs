@@ -14,7 +14,7 @@
 //! 3. The sender decides what the answer obliges it to do ([`choose`]).
 //!
 //! Every asymmetry here exists to keep a mixed deployment working. The receiver
-//! prefers `messenger-mux-v1` **only** when the sender named it, because
+//! prefers `messenger-mux-v2` **only** when the sender named it, because
 //! `resolve_transport` hard-errors on a key it does not know and a receiver that
 //! answered the mux unilaterally would break every older sender. A node with the
 //! mux enabled therefore registers both it and the configured legacy transport,
@@ -131,7 +131,7 @@ pub(crate) enum Connect {
 ///
 /// The mux key with no window is the case that cannot be honoured. It is
 /// unreachable from any shipped peer: no version before this one answers
-/// `messenger-mux-v1`, and this one refuses to build a mux at zero credit. So it
+/// `messenger-mux-v2`, and this one refuses to build a mux at zero credit. So it
 /// means a peer that bound a mux receiver and then told us to ignore it, and
 /// there is no safe reading of that — connecting over any other transport would
 /// reach nothing the peer is listening on and hang until the anchor's watchdog

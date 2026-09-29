@@ -24,7 +24,7 @@ let velo = Velo::builder()
     .await?;
 ```
 
-Enable the mux on both nodes of a pair. An attach uses the mux only when both sides advertise `messenger-mux-v1`. Every other pair uses the per-stream path.
+Enable the mux on both nodes of a pair. An attach uses the mux only when both sides advertise `messenger-mux-v2`. Every other pair uses the per-stream path.
 
 Call `messenger_mux` once per `Velo` instance. A second call returns an error.
 
@@ -86,12 +86,12 @@ All settings are fields of `MuxConfig`. Always build it with `..Default::default
 
 | Field | Default | What it controls |
 |---|---|---|
-| `enabled` | `false` | Installs the mux and advertises `messenger-mux-v1`. Setting it back to `false` is the rollback. |
+| `enabled` | `false` | Installs the mux and advertises `messenger-mux-v2`. Setting it back to `false` is the rollback. |
 | `max_batch_bytes` | 60 KiB | The configured cap on one batch. The eager budget and the 64 KiB coalescing threshold also clamp it. |
 | `initial_credit` | 256 | Data credit C per slot. Each slot buffer holds C+1 records. Zero is refused at build time. |
 | `slot_byte_budget` | 1 MiB | Bytes one slot can hold in flight, and the cap on its withheld queue. Zero means the default. |
 | `peer_byte_budget` | 8 MiB | Bytes all slots of one peer can hold in flight on the receive side. |
-| `credit_sweep_interval` | 200 ms | Period of the whole-table credit walk and the batcher eviction check. Zero is refused at build time. |
+| `credit_sweep_interval` | 200 ms | Period of the whole-table credit walk, the batcher eviction check, and the check that closes expired accept windows. An unclaimed bind is reclaimed up to one interval after its 60 s window. Zero is refused at build time. |
 | `drain_visit_floor` | 2 ms | Shortest gap between two doorbell visits to the same peer. Zero turns the floor off. Values above 1 hour are clamped. |
 | `batcher_idle_ttl` | 60 s | How long a batcher with no slots stays alive before eviction. |
 | `flush_policy` | `Auto` with `on_admission: true` | When a batcher writes. See [Select a flush policy](#select-a-flush-policy). |
@@ -104,6 +104,7 @@ All settings are fields of `MuxConfig`. Always build it with `..Default::default
 
 - Keep the default of 256 for token streams.
 - A stream longer than the window needs grants. The consumer node returns credit as its consumer drains, usually when the next batch from the producer arrives. A live consumer therefore rarely stalls its producer.
+- The window is also how far a sender can run ahead of a consumer that stops polling. On a single-sender stream, credit returns only when the consumer takes a record from the slot buffer. An MPSC anchor's pump moves records into the anchor channel, so its senders can run further ahead.
 - Do not set a small window to save memory. A small window raises the credit-return latency per record. For a producer that ran out of credit, it is `(drain_visit_floor + reply_linger) / initial_credit`.
 - Do not set zero. Zero on the wire means "not offering the mux", and the build refuses it.
 
@@ -165,7 +166,7 @@ let sender = match envelope.ticket {
 };
 ```
 
-A zero-RTT sender has no cancel handle, so its `cancellation_token` never fires. When the consumer drops the anchor, the producer's next `send` returns an error. An idle producer also receives a close from the consumer.
+A ticket sender observes `stop_token()` and `cancellation_token()` through the mux's slot lifecycle. Stop leaves the stream open for final output. Cancel or consumer drop wakes an idle producer and ends delivery; it does not need a later send.
 
 The ticket stays valid for the 60-second accept window. After the window, the consumer reaps the bind and sees `SenderDropped`.
 

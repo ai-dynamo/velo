@@ -30,7 +30,7 @@ pub mod frame;
 #[cfg(feature = "grpc")]
 pub mod grpc_transport;
 pub mod handle;
-/// Batched, multiplexed streaming over the Messenger (`messenger-mux-v1`).
+/// Batched, multiplexed streaming over the Messenger (`messenger-mux-v2`).
 ///
 /// The transport itself is internal — it is opt-in and selected when a
 /// stream's terms are decided, at attach or at pre-bind for zero-RTT setup, so

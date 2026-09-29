@@ -3,17 +3,18 @@
 
 //! Where mux credit comes back from — the consumer draining, or the sweep.
 //!
-//! `docs/src/development/batched-streaming-design.md` specifies that credit is returned by `reader_pump`,
-//! which "gains an `Option<CreditReturn>` and calls `credit.release(1)` after
+//! The first design (`docs/src/development/batched-streaming-design.md` has
+//! the history) returned credit from `reader_pump`, which "gains an `Option<CreditReturn>` and calls `credit.release(1)` after
 //! each successful handoff to `frame_tx` — exact, O(1), and immediate", with a
 //! background sweep only reclaiming credit for slots whose pump died.
 //!
-//! What shipped instead had the pump ring a doorbell and a reconcile pass
-//! decide the amount — `reader_pump` counts the record on the slot's
-//! `DrainSignal` and names the slot on its peer's dirty lane, and the arrival
+//! What shipped instead has the drainer ring a doorbell and a reconcile pass
+//! decide the amount — the consumer counts the record on the slot's
+//! `DrainSignal` and lists the slot in its peer's dirty set, and the arrival
 //! path, the doorbell and the periodic sweep release what those counts say.
-//! Releasing from the pump itself is the part that was not adopted, because it
-//! needs the peer's mutex. Before any of that the sweep alone returned credit,
+//! A mux-fed `StreamAnchor` is that drainer: it reads the slot buffer itself,
+//! and no reader pump runs for a mux bind. Releasing from the drainer itself
+//! is the part that was not adopted, because it needs the peer's mutex. Before any of that the sweep alone returned credit,
 //! and the same document argues "the effect is the same and the sweep bounds
 //! the latency".
 //!
@@ -33,8 +34,9 @@
 //! returns credit by draining**, not by waiting for a timer.
 //!
 //! Every test here goes through the real `Velo` attach path rather than binding
-//! the transport directly, because that is the only path with a `reader_pump`
-//! in it — and `reader_pump` is where the drain is counted. A test that polls
+//! the transport directly, because that is the only path that installs the
+//! direct feed — and the `StreamAnchor` reading that feed is where the drain is
+//! counted. A test that polls
 //! the receiver `bind` returns drains nothing as far as the ledger knows, and
 //! its producer would park at the end of its first window.
 
@@ -406,7 +408,7 @@ async fn draining_and_sweeping_together_never_overspend_the_window() {
 /// hundreds to thousands of slots — a visit rate set by the traffic rather than
 /// by need is hot-path contention. Hence a floor: at most one doorbell visit
 /// per peer per `drain_visit_floor`. The walk was over every slot of the peer
-/// when the floor was added and is now over the peer's dirty lane alone, which
+/// when the floor was added and is now over the peer's dirty set alone, which
 /// shortens the visit without changing what its rate needs bounding for.
 ///
 /// The shape here makes the unfloored rate a structural number rather than a
@@ -628,7 +630,7 @@ async fn prebound_slot_holds_c_credits_against_a_c_plus_one_buffer() {
         .expect("zero-RTT open");
 
     // Many times the window, with the sweep unreachable: the run can only
-    // finish if the pre-bind's own reader pump returned credit by draining.
+    // finish if the pre-bind's consumer returned credit by draining.
     let send = tokio::spawn(async move {
         for n in 0..FRAMES {
             sender.send(n).await.expect("send item");
