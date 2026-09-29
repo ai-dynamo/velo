@@ -96,12 +96,8 @@ async fn reader_pump_watchdog_firing_increments_counter() {
         frame_tx,
         cancel,
         ctx,
-        PumpContext {
-            local_id: 999,
-            heartbeat_deadline: deadline,
-            drain: None,
-            prebound: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        },
+        999,
+        deadline,
     ));
 
     // 4× deadline of slack so timer scheduling jitter doesn't flake on busy CI.
@@ -145,15 +141,15 @@ async fn reader_pump_watchdog_firing_increments_counter() {
     );
 }
 
-/// The sibling reap the transport-closed arm does must also (1) increment
+/// The watchdog's reap of an unclaimed bind must also (1) increment
 /// `streaming_unclaimed_bind_reaped_total` and (2) inject a `Dropped`
-/// sentinel, the same two obligations the watchdog branch above proves --
+/// sentinel, the same two obligations the heartbeat branch above proves --
 /// otherwise an operator watching the watchdog counter alone would see
-/// nothing for every bind this arm reaps instead (a genuine pre-bind, an
-/// ordinary attach, or an adopted attach, whichever never got its `OpenSlot`
-/// before the accept window closed).
+/// nothing for every bind reaped this way (a genuine pre-bind, an ordinary
+/// attach, or an adopted attach, whichever never got its `OpenSlot` before
+/// the accept window closed).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reader_pump_unclaimed_bind_reap_increments_counter() {
+async fn stream_watchdog_unclaimed_bind_reap_increments_counter() {
     let registry = prometheus::Registry::new();
     let metrics = Arc::new(crate::observability::VeloMetrics::register(&registry).unwrap());
 
@@ -171,6 +167,7 @@ async fn reader_pump_unclaimed_bind_reap_increments_counter() {
     ctx.registry.insert(
         local_id,
         crate::streaming::anchor::AnchorEntry {
+            feed: Default::default(),
             frame_tx: frame_tx.clone(),
             cancel_token: cancel_token.clone(),
             active_pump_token: None,
@@ -180,6 +177,7 @@ async fn reader_pump_unclaimed_bind_reap_increments_counter() {
             heartbeat_interval: std::time::Duration::from_secs(5),
             stream_cancel_handle: None,
             prebind: None,
+            stop_requested: false,
         },
     );
 
@@ -189,27 +187,31 @@ async fn reader_pump_unclaimed_bind_reap_increments_counter() {
         wake_tx,
     ));
     let pump_cancel = cancel_token.child_token();
-    let pump = tokio::spawn(reader_pump(
-        transport_rx,
+    let pump = tokio::spawn(stream_watchdog(
+        Arc::new(super::DirectFeed {
+            rx: transport_rx,
+            drain: Arc::clone(&drain),
+            pump_token: pump_cancel,
+            release: None,
+        }),
         frame_tx,
-        pump_cancel,
         ctx,
-        PumpContext {
+        super::WatchdogContext {
             local_id,
             heartbeat_deadline: std::time::Duration::from_secs(5),
-            drain: Some(drain),
             prebound: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
     ));
 
-    // Simulate the accept window's `release_bind`/`expire_bind`: it drops
-    // the bind's `frame_tx`, the other end of this `transport_rx`. The
-    // drain above was never claimed, so this is the reap arm under test,
-    // not the watchdog (which would need 3 * 5s to fire).
+    // Simulate the accept window's `release_bind`/`expire_bind`: dropping the
+    // unclaimed `BindEntry` drops the bind's `frame_tx` and closes its drain
+    // signal. The drain was never claimed, so this is the reap under test,
+    // not the heartbeat branch (which would need 3 * 5s to fire).
     drop(transport_tx);
+    drain.close();
     tokio::time::timeout(std::time::Duration::from_millis(500), pump)
         .await
-        .expect("reader_pump must exit once its transport channel closes")
+        .expect("the watchdog must exit once its bind closes")
         .expect("pump task must not panic");
 
     let snap = registry.gather();
@@ -271,12 +273,8 @@ async fn reader_pump_watchdog_saturated_channel_drops_sentinel_silently() {
         frame_tx,
         cancel,
         ctx,
-        PumpContext {
-            local_id: 7777,
-            heartbeat_deadline: deadline,
-            drain: None,
-            prebound: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        },
+        7777,
+        deadline,
     ));
 
     let _ = tokio::time::timeout(std::time::Duration::from_millis(800), pump)
@@ -463,7 +461,7 @@ fn an_attach_request_round_trips_its_advertised_keys() {
         session_id: 3,
         stream_cancel_handle: StreamCancelHandle::pack(velo_ext::WorkerId::from_u64(4), 5),
         supported_transport_keys: vec![
-            velo_ext::TransportKey::new("messenger-mux-v1"),
+            velo_ext::TransportKey::new("messenger-mux-v2"),
             velo_ext::TransportKey::new("tcp-stream"),
         ],
     };
@@ -476,7 +474,7 @@ fn an_attach_request_round_trips_its_advertised_keys() {
             .iter()
             .map(velo_ext::TransportKey::as_str)
             .collect::<Vec<_>>(),
-        ["messenger-mux-v1", "tcp-stream"],
+        ["messenger-mux-v2", "tcp-stream"],
     );
 }
 
@@ -814,6 +812,7 @@ fn make_pump_test_infra() -> (
     registry.insert(
         local_id,
         crate::streaming::anchor::AnchorEntry {
+            feed: Default::default(),
             frame_tx: frame_tx.clone(),
             cancel_token: cancel_token.clone(),
             active_pump_token: None,
@@ -823,6 +822,7 @@ fn make_pump_test_infra() -> (
             heartbeat_interval: Duration::from_secs(5),
             stream_cancel_handle: None,
             prebind: None,
+            stop_requested: false,
         },
     );
 
@@ -838,18 +838,14 @@ fn make_pump_test_infra() -> (
         frame_tx,
         pump_cancel,
         ctx,
-        PumpContext {
-            local_id,
-            heartbeat_deadline: Duration::from_secs(5),
-            drain: None,
-            prebound: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        },
+        local_id,
+        Duration::from_secs(5),
     ));
 
     (transport_tx, frame_rx, cancel_token, registry, local_id)
 }
 
-/// Helper: reader_pump infra for a pump spawned over the mux, where a bare
+/// Helper: watchdog infra for a mux bind's direct feed, where a bare
 /// [`crate::streaming::messenger_mux::ingress::DrainSignal`] stands in for the
 /// mux's own -- `claimed()` is `None` until the test calls `claimed_by`,
 /// exactly like a bind no `OpenSlot` has opened yet.
@@ -859,7 +855,7 @@ fn make_pump_test_infra() -> (
 /// `false` is an ordinary mux attach whose peer just hasn't sent its
 /// `OpenSlot` yet. Both start with `drain: Some(unclaimed)` -- the mux parks
 /// a `DrainSignal` for every bind, not only a pre-bound one -- which is
-/// exactly the distinction `PumpContext::prebound` exists to carry explicitly
+/// exactly the distinction `WatchdogContext::prebound` exists to carry explicitly
 /// rather than infer from `drain.claimed()`.
 ///
 /// `attachment` is independent of `prebound`, not `!prebound`: adoption is
@@ -868,17 +864,17 @@ fn make_pump_test_infra() -> (
 /// same shard-lock hold, so a just-adopted pre-bind is never observed with
 /// both set. The pair comes from `attach_stream_anchor`'s co-located branch
 /// instead: it sets `attachment` and releases the `PreBind` without ever
-/// touching the shared `prebound` flag its now-cancelled pump still reads as
-/// `true`, and a fixture that tied the two together could never construct
-/// that pair to test it -- which is exactly why the reader pump's
-/// `!cancel_token.is_cancelled()` guard is load-bearing there.
+/// touching the shared `prebound` flag its now-cancelled watchdog still reads
+/// as `true`, and a fixture that tied the two together could never construct
+/// that pair to test it -- which is exactly why `reap_unclaimed`'s
+/// cancelled-token guard is load-bearing there.
 ///
 /// Returns `(transport_tx, drain, frame_rx, cancel_token, registry, local_id)`.
-/// `frame_rx` must be kept alive (even if unused) for as long as the pump
-/// should run: dropping it disconnects `frame_tx` and the pump exits, same as
-/// [`make_pump_test_infra`].
+/// `frame_rx` is where the watchdog's injected sentinel lands. Unlike
+/// [`make_pump_test_infra`]'s pump, the watchdog does not exit when it is
+/// dropped: it exits on its token, on `drain.close()`, or when it fires.
 #[allow(clippy::type_complexity)]
-fn make_prebind_pump_test_infra(
+fn make_watchdog_test_infra(
     heartbeat_deadline: Duration,
     prebound: bool,
     attachment: bool,
@@ -903,6 +899,7 @@ fn make_prebind_pump_test_infra(
     registry.insert(
         local_id,
         crate::streaming::anchor::AnchorEntry {
+            feed: Default::default(),
             frame_tx: frame_tx.clone(),
             cancel_token: cancel_token.clone(),
             active_pump_token: None,
@@ -912,13 +909,14 @@ fn make_prebind_pump_test_infra(
             heartbeat_interval: heartbeat_deadline,
             stream_cancel_handle: None,
             prebind: None,
+            stop_requested: false,
         },
     );
 
     // A child of the entry's token, as every real spawn site derives one
     // (`anchor.rs`'s `prebind_anchor`, `control.rs`'s attach handler): a
     // fixture that instead cloned the parent would make `cancel_token`'s own
-    // unconditional cancel-on-exit (`reader_pump`'s last line) indistinguishable
+    // unconditional cancel-on-exit (`stream_watchdog`'s last line) indistinguishable
     // from the entry's token being cancelled by a removal this test is trying
     // to observe.
     let pump_cancel = cancel_token.child_token();
@@ -927,15 +925,18 @@ fn make_prebind_pump_test_infra(
         mpsc_registry: std::sync::Arc::new(dashmap::DashMap::new()),
         metrics: None,
     };
-    tokio::spawn(reader_pump(
-        transport_rx,
+    tokio::spawn(stream_watchdog(
+        Arc::new(super::DirectFeed {
+            rx: transport_rx,
+            drain: Arc::clone(&drain),
+            pump_token: pump_cancel,
+            release: None,
+        }),
         frame_tx,
-        pump_cancel,
         ctx,
-        PumpContext {
+        super::WatchdogContext {
             local_id,
             heartbeat_deadline,
-            drain: Some(Arc::clone(&drain)),
             prebound: Arc::new(std::sync::atomic::AtomicBool::new(prebound)),
         },
     ));
@@ -959,11 +960,11 @@ fn make_prebind_pump_test_infra(
 /// A timeout with no claim is silence from a producer that does not exist,
 /// not proof one died, so it must not count toward the watchdog at all.
 #[tokio::test]
-async fn test_pump_does_not_reap_an_unclaimed_prebind_on_heartbeat_silence() {
+async fn test_watchdog_does_not_reap_an_unclaimed_prebind_on_heartbeat_silence() {
     tokio::time::pause();
     let heartbeat = Duration::from_millis(50);
     let (transport_tx, _drain, _frame_rx, _cancel, registry, local_id) =
-        make_prebind_pump_test_infra(heartbeat, true, false);
+        make_watchdog_test_infra(heartbeat, true, false);
 
     // Twice the window that reaps an already-claimed slot (see the sibling
     // test below) with nothing having claimed this one.
@@ -983,11 +984,11 @@ async fn test_pump_does_not_reap_an_unclaimed_prebind_on_heartbeat_silence() {
 /// has if that sender goes silent. Gating on the claim must delay detection,
 /// never defeat it.
 #[tokio::test]
-async fn test_pump_reaps_a_claimed_prebind_after_missed_heartbeats() {
+async fn test_watchdog_reaps_a_claimed_prebind_after_missed_heartbeats() {
     tokio::time::pause();
     let heartbeat = Duration::from_millis(50);
     let (transport_tx, drain, _frame_rx, _cancel, registry, local_id) =
-        make_prebind_pump_test_infra(heartbeat, true, false);
+        make_watchdog_test_infra(heartbeat, true, false);
 
     // What `open_slot` does to a bind's drain signal when an `OpenSlot`
     // claims it, without a mux in the loop.
@@ -997,7 +998,7 @@ async fn test_pump_reaps_a_claimed_prebind_after_missed_heartbeats() {
         peer,
         slot,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        flume::unbounded::<u32>().0,
+        std::sync::Arc::new(crate::streaming::messenger_mux::ingress::DirtySlots::new()),
     );
 
     // Same generous margin as the sibling test above and as
@@ -1022,13 +1023,16 @@ async fn test_pump_reaps_a_claimed_prebind_after_missed_heartbeats() {
 /// reaper an abandoned pre-bind has, so this exit must do the cleanup the
 /// watchdog-fired branch already does.
 #[tokio::test]
-async fn test_pump_reaps_an_unclaimed_prebind_when_its_bind_is_reclaimed() {
-    let (transport_tx, _drain, _frame_rx, cancel_token, registry, local_id) =
-        make_prebind_pump_test_infra(Duration::from_secs(5), true, false);
+async fn test_watchdog_reaps_an_unclaimed_prebind_when_its_bind_is_reclaimed() {
+    let (transport_tx, drain, _frame_rx, cancel_token, registry, local_id) =
+        make_watchdog_test_infra(Duration::from_secs(5), true, false);
 
     // Simulate the accept window's `release_bind`/`expire_bind`: it drops the
-    // `BindEntry`, and with it the `frame_tx` that feeds this `transport_rx`.
+    // `BindEntry`, and with it the `frame_tx` that feeds this `transport_rx`;
+    // `Drop for BindEntry` fires the drain signal's close, which is what the
+    // watchdog waits on.
     drop(transport_tx);
+    drain.close();
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -1046,18 +1050,18 @@ async fn test_pump_reaps_an_unclaimed_prebind_when_its_bind_is_reclaimed() {
 /// Finding: `drain.claimed().is_none()` is true of an ordinary mux attach's
 /// pump too, for as long as the peer's `OpenSlot` is still in flight -- which
 /// is always at least until after the attach response this pump was spawned
-/// from already returned (see `PumpContext::prebound`). Before gating on
+/// from already returned (see `WatchdogContext::prebound`). Before gating on
 /// `prebound` instead, this pump silently stopped counting heartbeat misses
 /// for the same window, so a sender that attached and then died before its
 /// first frame went undetected until the mux's 60 s accept-window timer
 /// reclaimed the bind, instead of the configured
 /// `DETECTION_MULTIPLIER * heartbeat_interval`.
 #[tokio::test]
-async fn test_pump_reaps_an_ordinary_attach_with_unclaimed_mux_drain_after_missed_heartbeats() {
+async fn test_watchdog_reaps_an_ordinary_attach_with_unclaimed_mux_drain_after_missed_heartbeats() {
     tokio::time::pause();
     let heartbeat = Duration::from_millis(50);
     let (transport_tx, _drain, _frame_rx, _cancel, registry, local_id) =
-        make_prebind_pump_test_infra(heartbeat, false, true);
+        make_watchdog_test_infra(heartbeat, false, true);
 
     // Same generous margin the claimed-prebind sibling test uses.
     tokio::time::sleep(heartbeat * (2 * DETECTION_MULTIPLIER as u32)).await;
@@ -1087,13 +1091,15 @@ async fn test_pump_reaps_an_ordinary_attach_with_unclaimed_mux_drain_after_misse
 /// this fix, closing first left the registry entry behind forever, with the
 /// consumer's `StreamAnchor` wedged on `Poll::Pending`.
 #[tokio::test]
-async fn test_pump_reaps_an_attached_entry_with_unclaimed_mux_drain_when_its_bind_is_reclaimed() {
-    let (transport_tx, _drain, frame_rx, cancel_token, registry, local_id) =
-        make_prebind_pump_test_infra(Duration::from_secs(5), false, true);
+async fn test_watchdog_reaps_an_attached_entry_with_unclaimed_mux_drain_when_its_bind_is_reclaimed()
+{
+    let (transport_tx, drain, frame_rx, cancel_token, registry, local_id) =
+        make_watchdog_test_infra(Duration::from_secs(5), false, true);
 
     // Simulate the peer never opening its slot: the bind's `frame_tx` --
     // the other end of this `transport_rx` -- goes away.
     drop(transport_tx);
+    drain.close();
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -1159,12 +1165,8 @@ async fn a_thousand_records_arm_the_heartbeat_timer_a_handful_of_times() {
             frame_tx,
             tokio_util::sync::CancellationToken::new(),
             ctx,
-            PumpContext {
-                local_id: 1,
-                heartbeat_deadline: Duration::from_secs(3600),
-                drain: None,
-                prebound: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            },
+            1,
+            Duration::from_secs(3600),
         ),
     ));
 
@@ -1268,12 +1270,8 @@ async fn a_stream_under_traffic_never_fires_its_heartbeat_timer() {
                 frame_tx,
                 tokio_util::sync::CancellationToken::new(),
                 ctx,
-                PumpContext {
-                    local_id: 1,
-                    heartbeat_deadline: deadline,
-                    drain: None,
-                    prebound: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                },
+                1,
+                deadline,
             ),
         ),
     ));
@@ -1371,12 +1369,8 @@ async fn a_stream_that_stops_is_caught_a_detection_window_after_its_last_record(
             frame_tx,
             tokio_util::sync::CancellationToken::new(),
             ctx,
-            PumpContext {
-                local_id: 1,
-                heartbeat_deadline: deadline,
-                drain: None,
-                prebound: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            },
+            1,
+            deadline,
         ),
     ));
 
@@ -1485,6 +1479,7 @@ async fn reader_pump_does_not_count_a_blocked_forward_as_heartbeat_silence() {
     registry.insert(
         local_id,
         crate::streaming::anchor::AnchorEntry {
+            feed: Default::default(),
             frame_tx: frame_tx.clone(),
             cancel_token: cancel_token.clone(),
             active_pump_token: None,
@@ -1494,6 +1489,7 @@ async fn reader_pump_does_not_count_a_blocked_forward_as_heartbeat_silence() {
             heartbeat_interval: deadline,
             stream_cancel_handle: None,
             prebind: None,
+            stop_requested: false,
         },
     );
     let ctx = crate::streaming::anchor::AnchorContext {
@@ -1506,12 +1502,8 @@ async fn reader_pump_does_not_count_a_blocked_forward_as_heartbeat_silence() {
         frame_tx,
         cancel_token,
         ctx,
-        PumpContext {
-            local_id,
-            heartbeat_deadline: deadline,
-            drain: None,
-            prebound: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        },
+        local_id,
+        deadline,
     ));
 
     let record = rmp_serde::to_vec(&crate::streaming::frame::StreamFrame::Item(1u32)).unwrap();
@@ -1694,6 +1686,7 @@ async fn test_child_token_reattach_pump_survives() {
     registry.insert(
         local_id,
         crate::streaming::anchor::AnchorEntry {
+            feed: Default::default(),
             frame_tx: frame_tx.clone(),
             cancel_token: parent.clone(),
             active_pump_token: Some(child1.clone()),
@@ -1703,6 +1696,7 @@ async fn test_child_token_reattach_pump_survives() {
             heartbeat_interval: Duration::from_secs(5),
             stream_cancel_handle: None,
             prebind: None,
+            stop_requested: false,
         },
     );
 
@@ -1719,12 +1713,8 @@ async fn test_child_token_reattach_pump_survives() {
         frame_tx.clone(),
         child1.clone(),
         ctx1,
-        PumpContext {
-            local_id,
-            heartbeat_deadline: Duration::from_secs(5),
-            drain: None,
-            prebound: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        },
+        local_id,
+        Duration::from_secs(5),
     ));
 
     // Send a frame -- pump should forward it
@@ -1767,12 +1757,8 @@ async fn test_child_token_reattach_pump_survives() {
         frame_tx.clone(),
         child2.clone(),
         ctx2,
-        PumpContext {
-            local_id,
-            heartbeat_deadline: Duration::from_secs(5),
-            drain: None,
-            prebound: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        },
+        local_id,
+        Duration::from_secs(5),
     ));
 
     // Send a frame through the new transport -- pump should forward it
@@ -1883,7 +1869,7 @@ fn attach_response_golden_encoding_unchanged() {
         "handle": {"hi": 1, "lo": 2},
         "session_id": 3,
         "stream_cancel_handle": {"hi": 4, "lo": 5},
-        "supported_transport_keys": ["messenger-mux-v1"]
+        "supported_transport_keys": ["messenger-mux-v2"]
     }"#;
     let decoded: AnchorAttachRequest =
         serde_json::from_str(ticketless_request).expect("a ticketless request must deserialize");
@@ -1894,14 +1880,14 @@ fn attach_response_golden_encoding_unchanged() {
             .iter()
             .map(velo_ext::TransportKey::as_str)
             .collect::<Vec<_>>(),
-        ["messenger-mux-v1"]
+        ["messenger-mux-v2"]
     );
 
     // The response keeps its five fields and gains none. Compared as a value
     // rather than as bytes because the field *set* is the invariant; rmp-serde
     // writes named fields, so an added one would show up here as an extra key.
     let response = AnchorAttachResponse::Ok {
-        streaming_transport_key: velo_ext::TransportKey::new("messenger-mux-v1"),
+        streaming_transport_key: velo_ext::TransportKey::new("messenger-mux-v2"),
         heartbeat_interval_ms: 1234,
         routing_session_id: 42,
         initial_credit: 64,
@@ -1933,7 +1919,7 @@ fn attach_response_golden_encoding_unchanged() {
     // has no legacy sender to default for (see `StreamOpenTicket`'s own doc),
     // so `heartbeat_interval_ms` is set explicitly rather than left absent.
     let ticket: StreamOpenTicket = serde_json::from_str(
-        r#"{"streaming_transport_key":"messenger-mux-v1","heartbeat_interval_ms":1500,"routing_session_id":7,"initial_credit":8,"slot_byte_budget":0}"#,
+        r#"{"streaming_transport_key":"messenger-mux-v2","heartbeat_interval_ms":1500,"routing_session_id":7,"initial_credit":8,"slot_byte_budget":0}"#,
     )
     .expect("a fully-populated ticket must deserialize");
     assert_eq!(ticket.routing_session_id, 7);
@@ -1955,25 +1941,25 @@ fn attach_response_golden_encoding_unchanged() {
 /// -- all wrong answers reached without error.
 #[test]
 fn a_ticket_missing_a_minted_field_fails_rather_than_silently_defaulting() {
-    let missing_routing_session_id = r#"{"streaming_transport_key":"messenger-mux-v1","initial_credit":8,"slot_byte_budget":4096}"#;
+    let missing_routing_session_id = r#"{"streaming_transport_key":"messenger-mux-v2","initial_credit":8,"slot_byte_budget":4096}"#;
     assert!(
         serde_json::from_str::<StreamOpenTicket>(missing_routing_session_id).is_err(),
         "a ticket missing routing_session_id must not silently decode as session 0"
     );
 
-    let missing_initial_credit = r#"{"streaming_transport_key":"messenger-mux-v1","routing_session_id":7,"slot_byte_budget":4096}"#;
+    let missing_initial_credit = r#"{"streaming_transport_key":"messenger-mux-v2","routing_session_id":7,"slot_byte_budget":4096}"#;
     assert!(
         serde_json::from_str::<StreamOpenTicket>(missing_initial_credit).is_err(),
         "a ticket missing initial_credit must not silently decode as 'not offering the mux'"
     );
 
-    let missing_slot_byte_budget = r#"{"streaming_transport_key":"messenger-mux-v1","routing_session_id":7,"initial_credit":8}"#;
+    let missing_slot_byte_budget = r#"{"streaming_transport_key":"messenger-mux-v2","routing_session_id":7,"initial_credit":8}"#;
     assert!(
         serde_json::from_str::<StreamOpenTicket>(missing_slot_byte_budget).is_err(),
         "a ticket missing slot_byte_budget must not silently decode as 'use the default'"
     );
 
-    let missing_heartbeat = r#"{"streaming_transport_key":"messenger-mux-v1","routing_session_id":7,"initial_credit":8,"slot_byte_budget":4096}"#;
+    let missing_heartbeat = r#"{"streaming_transport_key":"messenger-mux-v2","routing_session_id":7,"initial_credit":8,"slot_byte_budget":4096}"#;
     assert!(
         serde_json::from_str::<StreamOpenTicket>(missing_heartbeat).is_err(),
         "a ticket missing heartbeat_interval_ms must not silently decode at 5000ms, which can \

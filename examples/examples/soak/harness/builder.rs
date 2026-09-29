@@ -57,6 +57,12 @@ async fn build_side(
     let velo = Velo::builder()
         .add_transport(tx)
         .stream_config(stream_cfg)?
+        // Off, so the soak exercises the per-stream transport it selected;
+        // the builder installs the mux by default.
+        .messenger_mux(velo::streaming::MuxConfig {
+            enabled: false,
+            ..velo::streaming::MuxConfig::default()
+        })?
         .metrics(Arc::clone(&metrics))
         .build()
         .await?;

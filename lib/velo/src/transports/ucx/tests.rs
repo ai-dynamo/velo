@@ -24,7 +24,7 @@ use crate::transports::ucx::rma::{
     MAX_PACKED_RKEY, MappedRegion, RdmaEndpoint, RmaError, RmaGetRequest, SYS_DEV_UNKNOWN,
     preparse_packed_rkey,
 };
-use crate::transports::ucx::worker::Cmd;
+use crate::transports::ucx::worker::{Cmd, PARK_MS, SENDER_SLOTS, SenderSightings, ep_scan_period};
 use velo_ext::{InstanceId, MessageType, PeerInfo};
 
 struct CountingErrors {
@@ -399,6 +399,89 @@ async fn shutdown_fails_queued_sends() {
         }
     }
     b.transport.shutdown();
+}
+
+// A held command stands in for a UCX send that has not completed. This makes
+// pressure and cleanup deterministic without timing a network transfer.
+#[tokio::test]
+async fn send_budget_bounds_admission_and_releases_on_peer_retirement() {
+    use super::super::address::{AM_ID_BASE, BLOB_VERSION, UcxEndpoint};
+    let transport = UcxTransport::new(
+        "ucx".into(),
+        UcxConfig {
+            channel_capacity: 1,
+            ..Default::default()
+        },
+    );
+    transport
+        .runtime
+        .set(tokio::runtime::Handle::current())
+        .unwrap();
+    let peer = InstanceId::new_v4();
+    transport.shared.peers.insert(
+        peer,
+        UcxEndpoint {
+            v: BLOB_VERSION,
+            am_id_base: AM_ID_BASE,
+            eager_max: 1024,
+            incarnation: 1,
+            worker_addr: vec![],
+        },
+    );
+    let rx = transport.ring_rx.lock().unwrap().take().unwrap();
+    let errors = CountingErrors::new();
+    let send = || {
+        transport.send_message(
+            peer,
+            Bytes::new(),
+            Bytes::from_static(b"data"),
+            MessageType::Message,
+            errors.clone(),
+        )
+    };
+    assert!(send().is_admitted());
+    let held = tokio::time::timeout(T, rx.recv_async())
+        .await
+        .unwrap()
+        .unwrap();
+    // One command holds the permit, one may wait for it, and one fits in the
+    // channel. The following ticket must wait before admission.
+    let ticket = loop {
+        if let SendOutcome::Pending(ticket) = send() {
+            break ticket;
+        }
+    };
+    assert_eq!(
+        transport.connections.get(&peer).unwrap().gate.queued_len(),
+        1
+    );
+    send();
+    assert_eq!(errors.count(), 1, "excess queue entry must fail explicitly");
+    ticket.cancel();
+    assert_eq!(
+        transport.connections.get(&peer).unwrap().gate.queued_len(),
+        0
+    );
+    let next = send();
+    transport.shared.failed_peers.insert(peer, ());
+    transport.reap_failed_connection(peer);
+    if let SendOutcome::Pending(ticket) = next {
+        assert!(tokio::time::timeout(T, ticket).await.unwrap().is_err());
+    }
+    // Completion releases the outstanding permit and its retained buffers.
+    drop(held);
+    tokio::time::timeout(T, async {
+        while errors.count() < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(transport.connections.is_empty());
+    assert!(
+        rx.is_empty(),
+        "retired sends must not reach the progress thread"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1681,8 +1764,8 @@ async fn truncated_rkey_is_refused_before_ucx() {
 /// abandoned-operation path: measured, UCX completes the GET with
 /// `Endpoint timeout` rather than leaving it outstanding, so the reply comes
 /// from the normal completion route. `WorkerState::abandon_rma_ops` remains the
-/// backstop for a peer that stops progressing without closing — a state this
-/// harness cannot produce, and a hardware-checkpoint item.
+/// backstop for a peer that stops progressing without closing, which this
+/// test does not exercise.
 #[tokio::test(flavor = "multi_thread")]
 async fn peer_shutdown_during_get_answers_caller() {
     const LEN: usize = 64 * 1024 * 1024;
@@ -1775,9 +1858,11 @@ async fn ping_message_to(
 /// The builder raises a sub-floor idle timeout rather than honouring it.
 ///
 /// Asserted on its own because every other reaper test uses a value at or above
-/// the floor, so nothing else would notice the clamp disappearing — and what it
-/// guards against is a timeout shorter than endpoint wireup, which fails as lost
-/// sends rather than as anything the reaper reports.
+/// the floor, so nothing else would notice the clamp disappearing. What the
+/// floor guards against is a timeout shorter than endpoint wireup: endpoints
+/// then close between ordinary uses, each next use pays wireup again, and each
+/// close costs the peer its next Messages and pings to us, if it sends any
+/// before keepalive fails its endpoint. The reaper reports none of that.
 #[test]
 fn a_sub_floor_ep_idle_timeout_is_clamped() {
     let clamped = UcxTransportBuilder::new()
@@ -1808,82 +1893,174 @@ fn a_sub_floor_ep_idle_timeout_is_clamped() {
     );
 }
 
-/// **The load-bearing empirical fact.** For a peer we have an endpoint to, is
-/// the `reply_ep` UCX hands the recv callback the *same pointer* as the endpoint
-/// we created to that peer?
+/// Every kind of frame a peer sends us refreshes our endpoint to that peer, and
+/// a frame from a peer we hold no endpoint to refreshes nothing.
 ///
-/// The inbound freshness stamp is only possible if it is. Connection matching —
-/// which the reap-disruption finding establishes UCX does — is not the same
-/// claim: UCX could route the peer's frames over our connection while handing
-/// the callback a distinct `ucp_ep_h` wrapper, and then there would be nothing
-/// at this layer to stamp.
-///
-/// The two counters split the answer. `eps_stamped_inbound` rises only when a
-/// sighting matched an endpoint this worker owns; `eps_inbound_unmatched` rises
-/// when it matched nothing. Both are ordinary in general — a peer we have never
-/// sent to replies on an endpoint UCX made and we do not own — so what settles
-/// it is the *directional* case below: A sends to B (so A owns an endpoint to
-/// B), then B sends to A, and A's stamp count must move.
+/// The stamp keys on the sender's incarnation, which starts every frame
+/// header, not on UCX's `reply_ep`. UCX sets `reply_ep` only for frames sent
+/// with `UCP_AM_SEND_FLAG_REPLY` (Messages and pings), so a stamp keyed on it
+/// missed Responses, Events, Acks, Pongs and ShuttingDown echoes. This test
+/// sends one frame of each kind from B to A, waits for A's stamp count to move
+/// by one each time, and checks that none of them went unmatched. A pong is
+/// covered by A probing B. Then a third node C, which A has no endpoint to,
+/// sends A a Message: that must count as unmatched and stamp nothing.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_inbound_frame_refreshes_the_endpoint_it_arrived_on() {
+async fn an_inbound_frame_refreshes_the_endpoint_to_its_sender() {
     // The reaper gates the stamping work, so it has to be on — at a timeout far
     // longer than this test, since nothing here is about reaping.
     let a = start_node_with(|b| b.ep_idle_timeout(Some(Duration::from_secs(3600)))).await;
     let b = start_node().await;
+    let c = start_node().await;
     cross_register(&a, &b);
+    cross_register(&a, &c);
     let errs = CountingErrors::new();
+    let stamped = || {
+        a.transport
+            .shared
+            .eps_stamped_inbound
+            .load(Ordering::SeqCst)
+    };
+    let unmatched = || {
+        a.transport
+            .shared
+            .eps_inbound_unmatched
+            .load(Ordering::SeqCst)
+    };
 
-    // A now owns an endpoint to B.
+    // A now owns an endpoint to B, and none to C.
     ping_message(&a, &b, &errs).await;
     assert_eq!(eps_open(&a), 1);
-    let before = a
-        .transport
-        .shared
-        .eps_stamped_inbound
-        .load(Ordering::SeqCst);
+    let unmatched_before = unmatched();
 
-    // B sends to A. If the reply endpoint A's callback sees is the one A
-    // created, this stamps it.
-    ping_message(&b, &a, &errs).await;
-
-    let stamped = wait_until(T, || {
-        a.transport
-            .shared
-            .eps_stamped_inbound
-            .load(Ordering::SeqCst)
-            > before
-    })
-    .await;
-    let unmatched = a
-        .transport
-        .shared
-        .eps_inbound_unmatched
-        .load(Ordering::SeqCst);
-    println!(
-        "reply_ep identity: stamped={} unmatched={unmatched}",
-        a.transport
-            .shared
-            .eps_stamped_inbound
-            .load(Ordering::SeqCst)
-    );
+    for kind in [
+        MessageType::Message,
+        MessageType::Response,
+        MessageType::Event,
+        MessageType::Ack,
+        MessageType::ShuttingDown,
+    ] {
+        let before = stamped();
+        let out = b.transport.send_message(
+            a.instance_id,
+            Bytes::from_static(b"h"),
+            Bytes::from_static(b"p"),
+            kind,
+            errs.clone(),
+        );
+        assert!(matches!(out, SendOutcome::Admitted));
+        assert!(
+            wait_until(T, || stamped() > before).await,
+            "a {kind:?} frame from B did not refresh A's endpoint to B \
+             (unmatched: {})",
+            unmatched() - unmatched_before
+        );
+    }
+    // A pong: A probes B, and B's answer arrives at A.
+    let before = stamped();
+    assert!(a.transport.check_health(b.instance_id, T).await.is_ok());
     assert!(
-        stamped,
-        "an inbound frame from a peer we hold an endpoint to did not refresh it \
-         (unmatched sightings: {unmatched}). UCX is handing the recv callback a \
-         reply endpoint that is not the one `ucp_ep_create` gave us, so no inbound \
-         freshness stamp is possible at this layer — see the operator guidance on \
-         UcxTransportBuilder::ep_idle_timeout, which depends on this holding."
+        wait_until(T, || stamped() > before).await,
+        "a pong from B did not refresh A's endpoint to B"
     );
+    // A ping: B probes A.
+    let before = stamped();
+    assert!(b.transport.check_health(a.instance_id, T).await.is_ok());
+    assert!(
+        wait_until(T, || stamped() > before).await,
+        "a ping from B did not refresh A's endpoint to B"
+    );
+    assert_eq!(
+        unmatched(),
+        unmatched_before,
+        "a frame from B matched no endpoint, though A holds one to B"
+    );
+
+    // C's frame arrives, and matches nothing: A has no endpoint to C.
+    let before = stamped();
+    ping_message(&c, &a, &errs).await;
+    assert!(
+        wait_until(T, || unmatched() > unmatched_before).await,
+        "a frame from a peer A holds no endpoint to was not counted as unmatched"
+    );
+    assert_eq!(stamped(), before, "a frame from C stamped an endpoint");
+    assert_eq!(eps_open(&a), 1);
+    assert_eq!(errs.count(), 0);
 
     a.transport.shutdown();
     b.transport.shutdown();
+    c.transport.shutdown();
     assert_rma_balanced(&a);
     assert_rma_balanced(&b);
+    assert_rma_balanced(&c);
 }
 
-/// The consequence that matters operationally: a peer that only ever *sends* to
-/// us keeps its endpoint alive, instead of having it reaped and blackholed under
-/// its own traffic.
+/// A sender seen once in a pass is still seen when many frames from another
+/// sender follow it in the same pass.
+///
+/// The receive callback publishes each frame's sender into a fixed ring that
+/// the main loop drains once per pass. When one pass received more frames than
+/// the ring has slots, the newest overwrote the oldest. So a peer that sent
+/// one ping, followed in the same pass by a burst of Messages from a busy
+/// peer, lost its stamp. The pong answering that ping rides our endpoint to
+/// the pinger without a send count, so the reaper could close that endpoint
+/// in the same pass, under the pong. Eight frames from one peer in one pass is
+/// ordinary traffic.
+#[test]
+fn a_sighting_is_not_overwritten_by_a_burst_from_another_sender() {
+    const P: usize = 0x5051;
+    const Q: usize = 0x5152;
+    let ring = SenderSightings::new();
+    ring.record(P);
+    for _ in 0..8 {
+        ring.record(Q);
+    }
+    let (mut seen, mut out) = (0, Vec::new());
+    ring.drain_into(&mut seen, &mut out);
+    assert!(
+        out.contains(&P),
+        "P's sighting was overwritten by eight sightings of Q: {out:x?}"
+    );
+    assert!(out.contains(&Q));
+}
+
+/// More distinct senders in one pass than the ring holds is reported, not
+/// silently dropped: the main loop then stamps every endpoint, so none of
+/// the lost senders can be reaped under its own traffic.
+#[test]
+fn more_senders_in_one_pass_than_the_ring_holds_is_reported() {
+    let ring = SenderSightings::new();
+    let (mut seen, mut out) = (0, Vec::new());
+    for sender in 1..=SENDER_SLOTS {
+        ring.record(sender);
+    }
+    assert!(
+        !ring.drain_into(&mut seen, &mut out),
+        "a full ring is not an overflow"
+    );
+    assert_eq!(out.len(), SENDER_SLOTS);
+
+    out.clear();
+    for sender in 1..=SENDER_SLOTS + 1 {
+        ring.record(sender);
+    }
+    assert!(
+        ring.drain_into(&mut seen, &mut out),
+        "{} distinct senders fit in {SENDER_SLOTS} slots only by losing one, \
+         and the loss was not reported",
+        SENDER_SLOTS + 1
+    );
+
+    out.clear();
+    assert!(
+        !ring.drain_into(&mut seen, &mut out) && out.is_empty(),
+        "a drained ring reported sightings again"
+    );
+}
+
+/// The consequence that matters operationally: a peer that only ever *sends*
+/// us Messages keeps its endpoint alive, instead of having it reaped and
+/// blackholed under its own traffic. The Response and Event cases are pinned
+/// by the two tests after this one.
 ///
 /// This is the mutation target for the inbound stamp — remove it and the
 /// endpoint here is reaped on schedule, which the assertion catches.
@@ -1928,6 +2105,83 @@ async fn a_peer_that_keeps_sending_keeps_its_endpoint() {
     b.transport.shutdown();
     assert_rma_balanced(&a);
     assert_rma_balanced(&b);
+}
+
+/// A peer that answers us keeps its endpoint, the same as a peer that sends us
+/// Messages.
+///
+/// The common shape of traffic: A sends B one request, and B streams frames
+/// back for longer than the idle timeout while A sends nothing more. A must
+/// count B's frames as use of its endpoint to B. If A reaps that endpoint
+/// under the stream, the stream itself survives over the tcp lane: Responses
+/// and Events sent after the reap were measured to arrive. What the reap
+/// costs is B's next Message to A, which is lost without an error
+/// (`reaping_disrupts_the_peers_path_back`), or B's next ping, which gets no
+/// Pong, and the wireup A's next send pays. So the endpoint count is the assertion that fails here, not the
+/// arrival count.
+///
+/// `a_peer_that_keeps_sending_keeps_its_endpoint` is the control: the same
+/// schedule with Message frames passes. The frames here are collected after
+/// the stream ends, with a short bound, so a lost frame costs this test a
+/// second and not `T` per frame.
+async fn a_peer_that_keeps_answering_keeps_its_endpoint(kind: MessageType) {
+    let a = start_node_with(|b| b.ep_idle_timeout(Some(IDLE))).await;
+    let b = start_node().await;
+    cross_register(&a, &b);
+    let errs = CountingErrors::new();
+
+    // A owns an endpoint to B, and B's path back to A rides it. No frame goes
+    // from B to A before the stream: a Message would stamp A's endpoint and
+    // hide the defect.
+    ping_message(&a, &b, &errs).await;
+    assert_eq!(eps_open(&a), 1);
+
+    let stream = match kind {
+        MessageType::Response => &a.streams.response_stream,
+        MessageType::Event => &a.streams.event_stream,
+        other => panic!("no stream check for {other:?}"),
+    };
+    // One frame per quarter timeout, for two timeouts.
+    const FRAMES: usize = 8;
+    for i in 0..FRAMES {
+        let out = b.transport.send_message(
+            a.instance_id,
+            Bytes::from_static(b"h"),
+            Bytes::from(vec![i as u8]),
+            kind,
+            errs.clone(),
+        );
+        assert!(matches!(out, SendOutcome::Admitted));
+        tokio::time::sleep(IDLE / 4).await;
+    }
+    let closed = eps_closed_idle(&a);
+    let mut arrived = 0;
+    while arrived < FRAMES && recv(stream, Duration::from_secs(1)).await.is_some() {
+        arrived += 1;
+    }
+
+    assert_eq!(
+        closed, 0,
+        "A reaped its endpoint to B while B was sending {kind:?} frames to A \
+         ({arrived} of {FRAMES} arrived)"
+    );
+    assert_eq!(arrived, FRAMES, "{kind:?} frames from B were lost");
+    assert_eq!(errs.count(), 0);
+
+    a.transport.shutdown();
+    b.transport.shutdown();
+    assert_rma_balanced(&a);
+    assert_rma_balanced(&b);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_that_keeps_sending_responses_keeps_its_endpoint() {
+    a_peer_that_keeps_answering_keeps_its_endpoint(MessageType::Response).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_that_keeps_sending_events_keeps_its_endpoint() {
+    a_peer_that_keeps_answering_keeps_its_endpoint(MessageType::Event).await;
 }
 
 /// The default is off, and "off" has to mean *never*, not *rarely*.
@@ -2008,31 +2262,282 @@ async fn idle_endpoint_closes_and_the_next_send_wires_up_again() {
     assert_rma_balanced(&b);
 }
 
+/// The time `ucp_ep_create` takes is not idle time.
+///
+/// That call is not always fast. A worker's first `ucp_ep_create` took
+/// 110-150 ms on a GB200 node. Across 31 creates in one process during the
+/// parallel UCX tests, the median was 630 ms, longer than the 500 ms floor. The
+/// new endpoint was stamped from the loop clock read before the call, so it was
+/// already past the timeout when it was created, and the scan in the next loop
+/// pass (at most one `PARK_MS` later) closed it. That closed an eager endpoint
+/// microseconds after it was created, so `eager_wireup_and_the_reaper_compose`
+/// never saw it open. The delay seam makes the slow create happen here on
+/// demand.
+///
+/// The endpoint is eager, so no send is posted on it. A send in flight holds
+/// its endpoint open by itself, which would hide a stale create stamp.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_endpoint_create_does_not_age_the_new_endpoint() {
+    let a = start_node_with(|b| b.eager_endpoints(true).ep_idle_timeout(Some(IDLE))).await;
+    let b = start_node().await;
+    // Longer than IDLE, the way the measured 630 ms create was. Set before the
+    // registration, which is what creates the eager endpoint.
+    let delay = IDLE + IDLE / 2;
+    a.transport
+        .shared
+        .ep_create_delay_ms
+        .store(delay.as_millis() as u64, Ordering::Relaxed);
+    cross_register(&a, &b);
+
+    assert!(
+        wait_until(T, || eps_open(&a) == 1 || eps_closed_idle(&a) >= 1).await,
+        "eager wireup did not run"
+    );
+    // With a stale stamp the endpoint is closed by the scan in the same pass,
+    // when the create ran in the first drain (the clock is read again after
+    // the progress loop), or at the latest by the next pass's scan, at most one
+    // `PARK_MS` (100 ms) after the create plus scheduling delay.
+    // That broken side is the one that needs slack: a window of IDLE / 2
+    // (250 ms) gives it 150 ms. The correct side stays open a full IDLE, so it
+    // keeps 250 ms.
+    assert!(
+        !wait_until(IDLE / 2, || eps_closed_idle(&a) >= 1).await,
+        "the endpoint was closed right after it was created: the create time \
+         counted as idle time"
+    );
+
+    a.transport.shutdown();
+    b.transport.shutdown();
+    assert_rma_balanced(&a);
+    assert_rma_balanced(&b);
+}
+
+/// A frame received late in a long pass is stamped when the pass reaches it,
+/// not when the pass began.
+///
+/// The progress thread reads its clock at the top of each pass, then runs
+/// `ucp_worker_progress` to quiescence. Under load one progress loop took
+/// 526-573 ms. A frame received late in that loop was stamped with the time
+/// the pass began, so at the 500 ms floor it was already about a timeout old,
+/// and the next pass's scan closed the endpoint it had just used.
+///
+/// Two seams set this up. `progress_stall_ms` holds A's thread at the top of a
+/// pass while B sends, so the frame waits in A's socket. `pre_progress_delay_ms`
+/// then sleeps, in that same pass, after A reads its clock and before it runs
+/// `ucp_worker_progress`, for one and a half timeouts. The frame is therefore
+/// received 750 ms after the pass clock was read. With the stale stamp, the
+/// next scan closes the endpoint within one `PARK_MS` (100 ms) of the frame's
+/// arrival. With a stamp taken after the progress loop, it stays open a full
+/// timeout (500 ms). The window of IDLE / 2 (250 ms) leaves 150 ms on the
+/// broken side and 250 ms on the correct side.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_frame_received_late_in_a_long_pass_is_not_stamped_early() {
+    let a = start_node_with(|b| b.ep_idle_timeout(Some(IDLE))).await;
+    let b = start_node().await;
+    cross_register(&a, &b);
+    let errs = CountingErrors::new();
+
+    // A owns an endpoint to B, and B's path back is wired up, so B's next
+    // frame goes straight to A's socket and stamps A's endpoint on arrival.
+    ping_message(&a, &b, &errs).await;
+    ping_message(&b, &a, &errs).await;
+    assert_eq!(eps_open(&a), 1);
+
+    // Stall A, and wait until it is asleep in the stall: the seam clears its
+    // value just before it sleeps.
+    a.transport
+        .shared
+        .progress_stall_ms
+        .store(IDLE.as_millis() as u64, Ordering::Relaxed);
+    assert!(
+        wait_until(T, || a
+            .transport
+            .shared
+            .progress_stall_ms
+            .load(Ordering::Relaxed)
+            == 0)
+        .await,
+        "A never entered the stall"
+    );
+    // Same pass, after the clock read: the stand-in for a long progress loop.
+    a.transport
+        .shared
+        .pre_progress_delay_ms
+        .store((IDLE + IDLE / 2).as_millis() as u64, Ordering::Relaxed);
+    let out = b.transport.send_message(
+        a.instance_id,
+        Bytes::from_static(b"h"),
+        Bytes::from_static(b"p"),
+        MessageType::Message,
+        errs.clone(),
+    );
+    assert!(matches!(out, SendOutcome::Admitted));
+
+    assert!(
+        recv_message(&a.streams.message_stream, T).await.is_some(),
+        "B's frame never reached A"
+    );
+    assert_eq!(
+        a.transport
+            .shared
+            .pre_progress_delay_ms
+            .load(Ordering::Relaxed),
+        0,
+        "the frame arrived without the long pass it is meant to arrive in"
+    );
+    // One check for "already closed" and "closed soon after": with the stale
+    // stamp the close can land before this line runs, and either way the
+    // cause is the stamp.
+    assert!(
+        !wait_until(IDLE / 2, || eps_closed_idle(&a) >= 1).await,
+        "the endpoint was closed at or right after the moment a frame used it: \
+         the frame was stamped with the time its pass began"
+    );
+    assert_eq!(errs.count(), 0);
+
+    a.transport.shutdown();
+    b.transport.shutdown();
+    assert_rma_balanced(&a);
+    assert_rma_balanced(&b);
+}
+
+/// A send still in flight keeps its endpoint open, and its completion restarts
+/// the idle clock.
+///
+/// A first send between fresh workers waits while the peer sets up its own
+/// endpoint back, inside the peer's `ucp_worker_progress`. In parallel
+/// UCX-module runs the peer's progress loop that contained that step took
+/// 526-573 ms, so the reaper closed the endpoint with the send in flight: the
+/// send failed through `on_error` and the frame was lost. The seam stops the
+/// peer's progress thread for three timeouts, which holds the send in flight on
+/// demand.
+///
+/// The proof has two parts. `eps_closed_idle(&a) == 0` when the frame arrives
+/// shows the endpoint was not reaped under the send. That only means something
+/// if the send was in flight past the point where a reaper without the count
+/// would have closed it: the endpoint's creation plus one timeout, plus one
+/// scan period, plus one `PARK_MS`. The test measures the creation time and
+/// asserts that the stall outlasted that point. A slow `ucp_ep_create` then
+/// fails the test loudly instead of letting a broken reaper pass. The
+/// `arrived_at - sent_at` check only shows that the seam stalled the peer.
+///
+/// The second part checks the completion stamp. The timeout is 2 s, so the
+/// scan period is 1 s (half the timeout, capped at 1 s), and a due scan runs
+/// at most one `PARK_MS` (100 ms) late. If the admission stamp were the last
+/// use, the endpoint would be closed at the first scan after the send
+/// completed: within 1.1 s. With the completion stamp it stays open for a full
+/// 2 s. The bound is 1.5 s, which leaves 0.4 s on the broken side and 0.5 s on
+/// the correct side. These margins assume an idle worker, where a due scan runs
+/// at most one `PARK_MS` late (see `PARK_MS`).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_send_in_flight_keeps_its_endpoint_open() {
+    const TIMEOUT: Duration = Duration::from_secs(2);
+    const STALL: Duration = Duration::from_secs(6);
+    let park = Duration::from_millis(PARK_MS as u64);
+    let a = start_node_with(|b| b.ep_idle_timeout(Some(TIMEOUT))).await;
+    let b = start_node().await;
+    cross_register(&a, &b);
+    b.transport
+        .shared
+        .progress_stall_ms
+        .store(STALL.as_millis() as u64, Ordering::Relaxed);
+    let errs = CountingErrors::new();
+
+    let sent_at = std::time::Instant::now();
+    let out = a.transport.send_message(
+        b.instance_id,
+        Bytes::from_static(b"h"),
+        Bytes::from_static(b"p"),
+        MessageType::Message,
+        errs.clone(),
+    );
+    assert!(matches!(out, SendOutcome::Admitted));
+    assert!(
+        wait_until(T, || eps_open(&a) == 1).await,
+        "the send did not create an endpoint"
+    );
+    let created_at = std::time::Instant::now();
+    // Longer than the stall plus the reap window, so the arrival is waited for.
+    let arrived = recv_message(&b.streams.message_stream, STALL + T)
+        .await
+        .is_some();
+    let arrived_at = std::time::Instant::now();
+    assert_eq!(
+        errs.count(),
+        0,
+        "the send failed: its endpoint was closed while the send was in flight"
+    );
+    assert!(arrived, "the frame was lost while its send was in flight");
+    assert!(
+        arrived_at.duration_since(sent_at) >= TIMEOUT,
+        "the seam did not stall the peer"
+    );
+    let reap_due = TIMEOUT + ep_scan_period(TIMEOUT) + park;
+    let held = arrived_at.duration_since(created_at);
+    assert!(
+        held >= reap_due,
+        "the send was in flight for only {held:?} after its endpoint was created; \
+         it must outlast {reap_due:?} for this test to prove anything. Endpoint \
+         creation was too slow for the stall."
+    );
+    assert_eq!(
+        eps_closed_idle(&a),
+        0,
+        "the endpoint was closed while its send was in flight"
+    );
+
+    assert!(
+        wait_until(T, || eps_closed_idle(&a) >= 1).await,
+        "the endpoint was never closed after its send completed"
+    );
+    let quiet = arrived_at.elapsed();
+    assert!(
+        quiet >= TIMEOUT * 3 / 4,
+        "the endpoint was closed {quiet:?} after its send completed. Either it \
+         was reaped while the send was in flight, or completion did not restart \
+         the idle clock"
+    );
+
+    a.transport.shutdown();
+    b.transport.shutdown();
+    assert_rma_balanced(&a);
+    assert_rma_balanced(&b);
+}
+
 /// **Measured, and the reason the reaper is off by default.** Closing an idle
 /// endpoint disrupts the *peer's* path back to us.
 ///
 /// UCX pairs endpoints by remote worker: our REPLY-flagged Active Messages make
 /// UCX create a matching endpoint on the peer, and the peer's own
 /// `ucp_ep_create` back to us is then *matched onto that same connection* rather
-/// than building a fresh one. Closing our side — FORCE or flush, both were
-/// measured — leaves the peer holding an endpoint over a connection that no
-/// longer exists.
+/// than building a fresh one. After our side closes — FORCE or flush, both were
+/// measured — the peer's next REPLY-flagged frame to us is dropped. Why: per
+/// the UCX source, a REPLY-flagged frame carries an endpoint id for the reply
+/// path, and a frame whose endpoint id no longer resolves is dropped. That is
+/// inferred from the source and a measurement, not proven.
 ///
 /// Measured consequences, in order:
 ///
-/// 1. The peer's next frame to us is admitted and **silently lost**: no
-///    `on_error`, no arrival. Re-sending does not help, and neither does our
-///    side establishing a fresh endpoint of its own.
+/// 1. The peer's next Message (a REPLY-flagged frame, as this test sends) to us
+///    is admitted and **silently lost**: no `on_error`, no arrival. Re-sending
+///    does not help, and neither does our side establishing a fresh endpoint of
+///    its own (measured by hand; this test asserts only that the first frame
+///    does not arrive). By the same inferred mechanism, its next ping gets no
+///    Pong (not measured). Its Responses and Events still arrive
+///    (measured separately, not asserted here). Acks carry no REPLY flag
+///    either, so the same is expected, but it was not measured.
 /// 2. UCX keepalive (default interval ~20 s) eventually declares the peer's
 ///    endpoint failed, which fires its error handler and populates its
 ///    `failed_peers`.
 /// 3. The frame *after* that goes through velo's existing failed-connection
 ///    reaping onto a fresh endpoint and arrives normally.
 ///
-/// So it self-heals, at the cost of one lost frame and up to a keepalive
-/// interval of disruption per reap — which is a real price to pay for reclaiming
-/// an idle connection, and exactly the input D9's "connection-pool policy
-/// revisited later" was waiting for.
+/// So it self-heals, but until keepalive fails the peer's endpoint its Messages
+/// and pings to us are lost, silently; the first loss is a Message with no
+/// error, or (inferred) a ping that times out. That is up to a keepalive
+/// interval of disruption per reap — which is a real price to pay for
+/// reclaiming an idle connection, and exactly the input D9's "connection-pool
+/// policy revisited later" was waiting for.
 ///
 /// This test pins the finding rather than the design intent. The window is short
 /// because step 2 cannot happen inside it; if this ever *does* arrive, UCX or
@@ -2093,11 +2598,13 @@ async fn reaping_disrupts_the_peers_path_back() {
 /// would pass trivially whenever the transfer happened to finish first.
 ///
 /// *A sub-floor timeout, set on the config directly.* The reaper has to act
-/// faster than a 64 MiB transfer over the tcp lane, while the builder's floor is
-/// sized for the opposite concern — dominating endpoint wireup. Going under it
-/// isolates the exclusion from transfer timing, which is what is under test, and
-/// nothing here sends an Active Message, so the hazard the floor guards against
-/// is out of play entirely.
+/// faster than a 64 MiB transfer over the tcp lane, while the builder's floor
+/// is sized for the opposite concern — dominating endpoint wireup, so that
+/// endpoints do not close between ordinary uses and re-pay wireup each time,
+/// while the peer loses its Messages and pings to us until keepalive fails its
+/// endpoint. Going under it isolates the exclusion from transfer timing, which
+/// is what is under test. Nothing here sends an Active Message, and the idle
+/// peer's close is the point of the test, so those costs do not apply.
 ///
 /// *Eager wireup, no frames.* Both endpoints are established by registration
 /// alone, so neither depends on an AM completing.
@@ -2216,6 +2723,132 @@ async fn an_endpoint_with_an_inflight_get_is_not_reaped() {
     assert_rma_balanced(&idle_peer);
 }
 
+/// The completion of an RDMA GET restarts the idle clock, the same as the
+/// completion of a send.
+///
+/// An outstanding GET keeps its endpoint open (the test above). When the GET
+/// completes, its registry entry goes, and if nothing else stamped the
+/// endpoint, the last use on record is the moment the GET was posted. A GET
+/// slower than the timeout then leaves the endpoint closed at the first scan
+/// after it completes. No data is lost, but the next use pays a fresh wireup,
+/// and the peer loses its next Messages and pings to us, if it sends any
+/// before keepalive fails its endpoint.
+///
+/// Over the tcp lane a GET needs the owner's progress thread, so stalling that
+/// thread holds the GET. The timeout is 2 s, so the scan period is 1 s, and a
+/// due scan runs at most one `PARK_MS` (100 ms) late. Without a completion
+/// stamp the endpoint closes within 1.1 s of the completion. With it, the
+/// endpoint stays open a full 2 s. The bound is 1.5 s, as in
+/// `a_send_in_flight_keeps_its_endpoint_open`. The test also checks that the
+/// GET was held past the point where the post stamp alone would have let a
+/// scan close the endpoint. Without that check, a GET that did not wait on the
+/// owner would pass the test for no reason.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_rma_get_slower_than_the_timeout_restarts_the_idle_clock() {
+    const TIMEOUT: Duration = Duration::from_secs(2);
+    const STALL: Duration = Duration::from_secs(5);
+    const LEN: usize = 64 * 1024;
+    let park = Duration::from_millis(PARK_MS as u64);
+    let mut src = PageBuf::new(LEN);
+    let dst = PageBuf::new(LEN);
+    src.fill_pattern();
+
+    let puller = start_node_with(|b| b.ep_idle_timeout(Some(TIMEOUT))).await;
+    let owner = start_node().await;
+    cross_register(&puller, &owner);
+    let owner_rma = owner.transport.rdma_endpoint();
+    let puller_rma = puller.transport.rdma_endpoint();
+    let remote = owner_rma
+        .map_region(src.addr(), LEN)
+        .await
+        .expect("map src");
+    let local = puller_rma
+        .map_region(dst.addr(), LEN)
+        .await
+        .expect("map dst");
+    let req = RmaGetRequest {
+        peer: owner.instance_id,
+        remote_addr: src.addr() as u64,
+        packed_rkey: remote.packed_rkey.clone(),
+        local_region: local.region_id,
+        local_offset: 0,
+        len: LEN as u64,
+    };
+
+    // A warm GET wires the endpoint up, so the timed GET below waits only on
+    // the owner.
+    tokio::time::timeout(T, puller_rma.get(req.clone()))
+        .await
+        .expect("warm get must not hang")
+        .expect("warm get succeeds");
+    assert_eq!(eps_open(&puller), 1);
+    assert_eq!(eps_closed_idle(&puller), 0);
+
+    // Stall the owner, and wait until it is asleep in the stall: the seam
+    // clears its value just before it sleeps.
+    owner
+        .transport
+        .shared
+        .progress_stall_ms
+        .store(STALL.as_millis() as u64, Ordering::Relaxed);
+    assert!(
+        wait_until(T, || owner
+            .transport
+            .shared
+            .progress_stall_ms
+            .load(Ordering::Relaxed)
+            == 0)
+        .await,
+        "the owner never entered the stall"
+    );
+
+    let posted_at = std::time::Instant::now();
+    tokio::time::timeout(STALL + T, puller_rma.get(req))
+        .await
+        .expect("get must not hang")
+        .expect("get succeeds");
+    let done_at = std::time::Instant::now();
+    let reap_due = TIMEOUT + ep_scan_period(TIMEOUT) + park;
+    let held = done_at.duration_since(posted_at);
+    assert!(
+        held >= reap_due,
+        "the GET took only {held:?}; it must outlast {reap_due:?} for this test \
+         to prove anything. It did not wait on the owner's progress."
+    );
+    assert_eq!(
+        eps_closed_idle(&puller),
+        0,
+        "the endpoint was closed while the GET was outstanding"
+    );
+    assert_eq!(dst.as_slice(), src.as_slice(), "the GET must have landed");
+
+    assert!(
+        !wait_until(TIMEOUT * 3 / 4, || eps_closed_idle(&puller) >= 1).await,
+        "the endpoint was closed within {:?} of the GET completing: the \
+         completion did not restart the idle clock",
+        TIMEOUT * 3 / 4
+    );
+    // And it is closed later: the completion restarts the clock, it does not
+    // stop it.
+    assert!(
+        wait_until(T, || eps_closed_idle(&puller) >= 1).await,
+        "the endpoint was never closed after the GET completed"
+    );
+
+    puller_rma
+        .unmap_region(local.region_id)
+        .await
+        .expect("unmap dst");
+    owner_rma
+        .unmap_region(remote.region_id)
+        .await
+        .expect("unmap src");
+    puller.transport.shutdown();
+    owner.transport.shutdown();
+    assert_rma_balanced(&puller);
+    assert_rma_balanced(&owner);
+}
+
 /// Teardown racing an idle close: the close may still be parked in
 /// `pending_closes` when `shutdown()` arrives, and the endpoint must be
 /// accounted for exactly once either way.
@@ -2328,8 +2961,9 @@ async fn eager_wireup_follows_a_re_registration() {
 
 /// Eager wireup and the idle reaper together, which is the combination the
 /// builder docs promise composes: an endpoint established at registration and
-/// never used is reclaimed one timeout later, and a use after that wires up a
-/// new one. Intended behaviour, asserted so it stays intended.
+/// never used is reclaimed about one timeout later (see the close window), and
+/// a use after that wires up a new one. Intended behaviour, asserted so it
+/// stays intended.
 #[tokio::test(flavor = "multi_thread")]
 async fn eager_wireup_and_the_reaper_compose() {
     let a = start_node_with(|b| b.eager_endpoints(true).ep_idle_timeout(Some(IDLE))).await;
@@ -2525,4 +3159,92 @@ async fn bench_rma() {
     pair.owner.transport.shutdown();
     pair.puller.transport.shutdown();
     assert_pair_balanced(&pair);
+}
+
+/// Active Message send cost over the tcp lane, with the idle reaper off and on.
+///
+/// The reaper adds per-send bookkeeping, so the two rows are the price of that
+/// bookkeeping. Three measures: a one-way burst of Messages (the progress
+/// thread's per-send cost is on its critical path), the same burst of
+/// Responses, and a ping-pong round trip. Responses are measured apart because
+/// velo sends Messages with UCX's REPLY flag and Responses without it, and a
+/// change to what a frame carries shows only in the kind it changes. Run with
+/// `timeout 300 cargo test --release --features ucx -p velo --lib bench_am_send -- --ignored --nocapture --test-threads=1`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "benchmark: prints timings, asserts nothing"]
+async fn bench_am_send() {
+    const BURST: usize = 200_000;
+    const ROUND_TRIPS: usize = 20_000;
+    const WARMUP: usize = 2_000;
+    let header = Bytes::from(vec![7u8; 64]);
+    let payload = Bytes::from(vec![9u8; 64]);
+
+    for (label, timeout) in [
+        ("reaper off", None),
+        ("reaper on ", Some(Duration::from_secs(3600))),
+    ] {
+        let a = start_node_with(|b| b.ep_idle_timeout(timeout)).await;
+        let b = start_node_with(|b| b.ep_idle_timeout(timeout)).await;
+        cross_register(&a, &b);
+        let errs = CountingErrors::new();
+        let send_kind = |from: &Node, to: &Node, kind: MessageType| {
+            let _ = from.transport.send_message(
+                to.instance_id,
+                header.clone(),
+                payload.clone(),
+                kind,
+                errs.clone(),
+            );
+        };
+        let send = |from: &Node, to: &Node| send_kind(from, to, MessageType::Message);
+
+        for _ in 0..WARMUP {
+            send(&a, &b);
+            recv_message(&b.streams.message_stream, T).await.unwrap();
+            send(&b, &a);
+            recv_message(&a.streams.message_stream, T).await.unwrap();
+        }
+
+        let started = std::time::Instant::now();
+        for _ in 0..BURST {
+            send(&a, &b);
+        }
+        for _ in 0..BURST {
+            recv_message(&b.streams.message_stream, T).await.unwrap();
+        }
+        let burst = started.elapsed();
+
+        let started = std::time::Instant::now();
+        for _ in 0..BURST {
+            send_kind(&a, &b, MessageType::Response);
+        }
+        for _ in 0..BURST {
+            recv(&b.streams.response_stream, T).await.unwrap();
+        }
+        let resp_burst = started.elapsed();
+
+        let mut rtts = Vec::with_capacity(ROUND_TRIPS);
+        for _ in 0..ROUND_TRIPS {
+            let started = std::time::Instant::now();
+            send(&a, &b);
+            recv_message(&b.streams.message_stream, T).await.unwrap();
+            send(&b, &a);
+            recv_message(&a.streams.message_stream, T).await.unwrap();
+            rtts.push(started.elapsed());
+        }
+        rtts.sort();
+        println!(
+            "bench_am_send {label}: burst {:>7.1} ns/frame  resp burst {:>7.1} ns/frame  rtt p50 {:>9.3?} p99 {:>9.3?}  errors {}",
+            burst.as_nanos() as f64 / BURST as f64,
+            resp_burst.as_nanos() as f64 / BURST as f64,
+            rtts[ROUND_TRIPS / 2],
+            rtts[ROUND_TRIPS * 99 / 100],
+            errs.count()
+        );
+
+        a.transport.shutdown();
+        b.transport.shutdown();
+        assert_rma_balanced(&a);
+        assert_rma_balanced(&b);
+    }
 }

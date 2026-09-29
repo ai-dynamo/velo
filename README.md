@@ -11,6 +11,10 @@ NOTE: Velo is experimental. Its design, development, and tests are still in prog
 
 **Documentation: [the Velo book](https://ai-dynamo.github.io/velo/)**. The source is in [`docs/src/`](docs/src/SUMMARY.md).
 
+Typed streams support graceful stop, cancellation, and ordered finalization, including prebound tickets. See [Stream lifecycle](docs/src/concepts/streaming.md).
+
+Batched streams give each stream a window of 32 records in flight by default. A larger window lets a saturated consumer node queue a new stream's first record behind every other stream's backlog. See [Change the credit window](docs/src/guides/tune-batched-streaming.md#change-the-credit-window).
+
 ## Crates
 
 | Crate | For | Contents |
@@ -19,6 +23,8 @@ NOTE: Velo is experimental. Its design, development, and tests are still in prog
 | `velo-ext` | Authors of out-of-tree plugins | The stable trait surface: `Transport`, `FrameTransport`, `PeerDiscovery`, `ServiceDiscovery`, `TransportObservability`, and the types they use |
 
 Application authors depend on `velo` only. See [Workspace crates](docs/src/development/architecture.md) and [Versioning](docs/src/development/versioning.md).
+
+Streams to one peer can share its connection through the messenger mux. What the mux costs a serving frontend, and how that was measured, is in [Response-plane performance](docs/src/operations/response-plane-performance.md).
 
 ## Quick start
 

@@ -373,6 +373,21 @@ pub(crate) fn decode_response_id_from_request_header(header: &Bytes) -> Option<R
     Some(ResponseId::from_u128(u128::from_le_bytes(id_bytes)))
 }
 
+/// The handler name of a request header, read in place without decoding the
+/// rest. `None` for anything that is not a well-formed request header. Safe on
+/// arbitrary input: the drain gate calls it on raw inbound frames.
+pub(crate) fn handler_name_from_request_header(header: &[u8]) -> Option<&[u8]> {
+    // schema_version (1) + response_type (1) + response_id (16), then the name
+    // length, then the name.
+    const NAME_LEN_AT: usize = 18;
+    const NAME_AT: usize = NAME_LEN_AT + 2;
+    if header.len() < FIXED_HEADER_SIZE || header[0] != CURRENT_SCHEMA_VERSION {
+        return None;
+    }
+    let len = u16::from_le_bytes([header[NAME_LEN_AT], header[NAME_LEN_AT + 1]]) as usize;
+    header.get(NAME_AT..NAME_AT + len)
+}
+
 pub(crate) fn decode_active_message(
     header: Bytes,
     payload: Bytes,

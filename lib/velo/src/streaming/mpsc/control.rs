@@ -127,10 +127,6 @@ pub(crate) async fn mpsc_reader_pump(
         local_id,
         heartbeat_deadline,
         drain,
-        // MPSC has no zero-RTT pre-bind path (`AnchorManager::prebind_anchor`
-        // refuses `is_mpsc_stream()`), so every spawn here is an ordinary
-        // attach and there is nothing to gate on.
-        prebound: _,
     } = pump;
     let mut missed_heartbeats: u8 = 0;
     // One timer per sender, not one per record: see
@@ -418,9 +414,6 @@ pub fn create_mpsc_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::
                         local_id,
                         heartbeat_deadline: heartbeat_interval,
                         drain,
-                        // Always an ordinary attach; see the destructure in
-                        // `mpsc_reader_pump`.
-                        prebound: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     },
                 ));
 
@@ -499,7 +492,6 @@ pub fn create_mpsc_anchor_cancel_handler(manager: Arc<AnchorManager>) -> crate::
                         &manager.sender_registry,
                         manager.messenger_lock.get(),
                     );
-                    manager.update_active_anchor_gauge();
                 }
 
                 Ok(())
@@ -518,7 +510,7 @@ pub fn create_mpsc_anchor_cancel_handler(manager: Arc<AnchorManager>) -> crate::
 mod tests {
     use super::*;
     use crate::streaming::control::{PumpContext, TIMER_ARMS, TIMER_FIRES};
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
     use velo_ext::{TransportKey, WorkerId};
 
@@ -555,7 +547,6 @@ mod tests {
                     local_id: 1,
                     heartbeat_deadline: Duration::from_secs(3600),
                     drain: None,
-                    prebound: Arc::new(AtomicBool::new(false)),
                 },
             ),
         ));
@@ -632,7 +623,6 @@ mod tests {
                         local_id: 1,
                         heartbeat_deadline: deadline,
                         drain: None,
-                        prebound: Arc::new(AtomicBool::new(false)),
                     },
                 ),
             ),
@@ -715,7 +705,6 @@ mod tests {
                     local_id: 1,
                     heartbeat_deadline: deadline,
                     drain: None,
-                    prebound: Arc::new(AtomicBool::new(false)),
                 },
             ),
         ));
@@ -805,7 +794,6 @@ mod tests {
                 local_id: 1,
                 heartbeat_deadline: heartbeat,
                 drain: None,
-                prebound: Arc::new(AtomicBool::new(false)),
             },
         ));
 
@@ -859,7 +847,6 @@ mod tests {
                 local_id: 1,
                 heartbeat_deadline: heartbeat,
                 drain: None,
-                prebound: Arc::new(AtomicBool::new(false)),
             },
         ));
 
@@ -911,7 +898,6 @@ mod tests {
                 local_id: 1,
                 heartbeat_deadline: heartbeat,
                 drain: None,
-                prebound: Arc::new(AtomicBool::new(false)),
             },
         ));
 
@@ -995,7 +981,7 @@ mod tests {
             handle: StreamAnchorHandle::pack_mpsc(WorkerId::from_u64(1), 2),
             session_id: 3,
             stream_cancel_handle: StreamCancelHandle::pack(WorkerId::from_u64(4), 5),
-            supported_transport_keys: vec![TransportKey::new("messenger-mux-v1")],
+            supported_transport_keys: vec![TransportKey::new("messenger-mux-v2")],
         };
         let decoded: MpscAnchorAttachRequest =
             rmp_serde::from_slice(&rmp_serde::to_vec(&req).expect("encode")).expect("decode");
@@ -1005,11 +991,11 @@ mod tests {
                 .iter()
                 .map(TransportKey::as_str)
                 .collect::<Vec<_>>(),
-            ["messenger-mux-v1"],
+            ["messenger-mux-v2"],
         );
 
         let resp = MpscAnchorAttachResponse::Ok {
-            streaming_transport_key: TransportKey::new("messenger-mux-v1"),
+            streaming_transport_key: TransportKey::new("messenger-mux-v2"),
             heartbeat_interval_ms: 5000,
             sender_id: 7,
             routing_session_id: 8,

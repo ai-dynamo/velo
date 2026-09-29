@@ -36,12 +36,13 @@ use futures::StreamExt;
 use prometheus::Registry;
 use velo::observability::VeloMetrics;
 use velo::observability::test_helpers::MetricSnapshot;
-use velo::streaming::StreamFrame;
+use velo::streaming::{MuxConfig, StreamFrame};
 use velo::transports::tcp::TcpTransportBuilder;
 use velo::{StreamConfig, TcpConfig, Velo};
 
 /// Build a `Velo` node on TCP loopback with a TCP streaming data plane and its
-/// own Prometheus registry.
+/// own Prometheus registry. The mux is off: these tests measure the per-stream
+/// path, and with the mux on (the default) the streams would ride it instead.
 async fn make_node() -> (Arc<Velo>, Registry) {
     let registry = Registry::new();
     let metrics = Arc::new(VeloMetrics::register(&registry).expect("metrics"));
@@ -61,6 +62,11 @@ async fn make_node() -> (Arc<Velo>, Registry) {
             bind_addr: std::net::Ipv4Addr::LOCALHOST.into(),
         })))
         .expect("stream_config")
+        .messenger_mux(MuxConfig {
+            enabled: false,
+            ..MuxConfig::default()
+        })
+        .expect("messenger_mux")
         .metrics(Arc::clone(&metrics))
         .build()
         .await

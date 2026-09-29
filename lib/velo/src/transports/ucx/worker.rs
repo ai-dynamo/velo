@@ -124,76 +124,140 @@
 //! been observed empty. Running last also means it only ever sees endpoints the
 //! earlier passes decided to keep.
 //!
-//! **"In use" means idle in both directions, plus the RMA op registry.** An
-//! endpoint is a candidate when `now - last_used > timeout` *and* no entry in
-//! [`WorkerState::rma_ops`] names its peer. Two sites stamp `last_used`:
+//! **"In use" means idle in both directions, plus every operation in
+//! flight.** An endpoint is idle only when no send posted on it is in flight,
+//! no entry in [`WorkerState::rma_ops`] names its peer, and nothing has used it
+//! for the timeout. Four sites record a use:
 //!
 //! * [`WorkerState::ensure_ep`], for everything **we** initiate — frame sends,
-//!   ping probes, RMA GETs, eager wireup. Every outbound path resolves an
-//!   endpoint through it, so there is one place that can forget to record a use.
-//! * [`WorkerState::stamp_inbound_use`], for everything the **peer** initiates.
-//!   Without it "idle" would mean "we have not sent", and a peer that only ever
-//!   sends to us would have its endpoint reaped out from under its own traffic —
-//!   repeatedly, since each reap costs it a frame (see below). It rests on a
-//!   measured fact rather than an assumed one: the `reply_ep` UCX hands the recv
-//!   callback for a peer we hold an endpoint to is the *same pointer* as the
-//!   endpoint `ucp_ep_create` gave us.
-//!   `an_inbound_frame_refreshes_the_endpoint_it_arrived_on` asserts it, because
-//!   connection matching (which the disruption finding below establishes) is a
-//!   weaker claim than pointer identity and would not have been enough.
+//!   ping probes, RMA GETs, eager wireup. Every path that resolves an endpoint
+//!   by peer (`Send`, `Ping`, `EnsureEp`, `prepare_get`) goes through it, so
+//!   there is one place that can forget to record a use. Replies are the
+//!   exception: `PongTo` and `ShuttingDownTo` post on the endpoint the recv
+//!   callback handed us, with `ep_sends: None`, add no stamp, and rely on the
+//!   inbound stamp (see the reply paragraph below).
+//! * [`WorkerState::stamp_inbound_use`], for every frame the **peer** sends.
+//!   Each frame starts with the sender's incarnation (see [`SENDER_TAG_LEN`]),
+//!   and the stamp goes to the endpoint whose peer blob carries that
+//!   incarnation. Without it "idle" would mean "we have not sent", and a peer
+//!   that only ever sends to us would have its endpoint reaped out from under
+//!   its own traffic — repeatedly, since after each reap its Messages and
+//!   pings to us are lost, silently, until keepalive (~20 s) fails its
+//!   endpoint (see below). UCX's `reply_ep` cannot carry this: UCX sets it
+//!   only for frames sent with `UCP_AM_SEND_FLAG_REPLY`, which velo sets on
+//!   Messages and pings only, so a peer streaming Responses or Events back to
+//!   us would go unseen. The receive callback hands senders to the main loop through
+//!   [`SenderSightings`], which holds each sender once per pass; a pass with
+//!   more distinct senders than it holds stamps every endpoint rather than
+//!   lose one.
+//! * [`OpState::stamp_ep_drained`], called from `send_trampoline` when the
+//!   last send in flight on the endpoint completes. The endpoint's [`EpSends`]
+//!   counts sends posted on it and not yet completed, and the reaper skips an
+//!   endpoint while that count is not zero. The completion time then restarts
+//!   the idle clock. Without that, a send slower than the timeout would be
+//!   reaped the instant it completed.
+//! * [`WorkerState::drain_rma_completions`], when an RMA operation completes.
+//!   Its registry entry kept the endpoint open while it was outstanding, and
+//!   the completion restarts the idle clock, for the same reason as a send's.
 //!
 //! The registry check is deliberately conservative in one direction: an
 //! operation posted on a superseded endpoint still names its peer, so the
 //! reaper declines to close the replacement while it is outstanding.
 //!
-//! **What is still not tracked is an AM send in flight on a candidate
-//! endpoint**, and the gap is shrunk rather than closed. `last_used` records
-//! when a send was *admitted*, not when it completed, so a send admitted before
-//! the stamp aged out can still be on the wire at the close. The FORCE close
-//! then purges it with `UCS_ERR_CANCELED` into `send_trampoline`, which reports
-//! it through `on_error` with the original buffers — the identical contract
-//! `reap_failed_eps` has always had, so the failure is delivered rather
-//! than silent. Two residual terms remain, and both are real:
+//! **Why sends in flight are counted.** An admission stamp alone does not make
+//! an endpoint busy for as long as its send takes. A first send between fresh
+//! workers waits while the peer sets up its own endpoint back to us, inside the
+//! peer's `ucp_worker_progress`. With many UCX workers in one process (parallel
+//! UCX-module runs) the peer's progress loop that contained that step took
+//! 526-573 ms, past the 500 ms floor, and a reaper that read only the stamp
+//! FORCE-closed the endpoint under the send, losing the frame. The count
+//! follows `post_am`'s three exits: taken before the post, released on the
+//! inline and synchronous-failure exits, and released in `send_trampoline` for
+//! the asynchronous one. Only that last release reads the clock, and only when
+//! the count falls to zero. The count exists only with the reaper on, so with
+//! the reaper off (the default) a send pays only two `None` checks, plus one
+//! clock read per `ucp_ep_create`. A send that never completes holds its
+//! endpoint open until UCX fails the endpoint, which is the conservative
+//! direction.
 //!
-//! * **Congestion.** [`MIN_EP_IDLE_TIMEOUT`](super::transport) floors the
-//!   timeout at roughly thirty-five times measured endpoint wireup, which is the
-//!   slowest part of a first send — but a send that takes longer than the floor
-//!   under congestion or backpressure is still killable. The floor shrinks the
-//!   window; it does not eliminate it.
-//! * **Pass latency.** `last_used` is stamped from [`WorkerState::now`], sampled
-//!   once at the top of the loop pass, *before* the ring drain and the
-//!   progress-to-quiescence that follow it. A send admitted late in a long pass
-//!   is therefore stamped with a time already in the past, so the effective
-//!   budget is `timeout - Δ(pass)` rather than `timeout`.
+//! The per-send cost is below what can be measured. `bench_am_send` (in the
+//! tests) on a GB200 node, release build, 6 runs of each, alternating between
+//! the code without the count and with it: with the reaper on, the burst cost
+//! and the round-trip p50 and p99 moved +1.0% to +2.9%. With the reaper off,
+//! where the change adds only two `None` checks, the same runs moved -5.8% to
+//! -21.5%. The noise of this benchmark is therefore at least ±6%.
 //!
-//! Closing the gap exactly would mean a per-endpoint operation counter threaded
-//! through `post_am`'s three-exit reclaim discipline — sound, but priced above
-//! what it buys for a knob that is off by default and whose worst case is a
-//! correctly-reported send failure.
+//! Replies posted on a reply endpoint (`Cmd::PongTo`, `Cmd::ShuttingDownTo`)
+//! carry no count, because they do not go through `ensure_ep`. UCX can hand
+//! the receive callback the very endpoint we own to that peer (it did in every
+//! measurement over the tcp lane), so such a reply can ride an endpoint the
+//! reaper tracks without counting on it. The window is covered anyway: the
+//! inbound frame that caused the reply stamps our endpoint to its sender, by
+//! incarnation, in `stamp_inbound_use` in the same pass, before the scan, with
+//! the clock read after the progress loop. The reply is posted in the flush
+//! drain just after that read, so the endpoint cannot be closed until one
+//! timeout, less the length of that drain, after the reply is posted. If the
+//! reply endpoint is not one we own, the reaper never closes it. Either way
+//! nothing depends on which pointer UCX hands out.
+//!
+//! **Endpoint creation is not idle time.** `last_used` is stamped from
+//! [`WorkerState::now`], and `ensure_ep` advances that clock after
+//! `ucp_ep_create`. The call was measured at 630 ms (median of 31 creates in
+//! one process), past the floor. An endpoint with no send on it, such as an
+//! eager one, has only this stamp to keep it open.
+//!
+//! **When a use is stamped.** With the reaper on, [`WorkerState::now`] is read
+//! at the top of each loop pass, again after the progress loop, and after each
+//! `ucp_ep_create`. A command in either drain is stamped with the read taken
+//! before that drain began, or with a later read if a `ucp_ep_create` earlier
+//! in the same drain advanced the clock. Either way its stamp is early by at
+//! most the time the drain spent on earlier commands (at most `DRAIN_BUDGET`
+//! commands in the first drain, `channel_capacity + DRAIN_BUDGET` in the flush
+//! drain). An inbound frame, `EpSends::drained_at`, and an RMA completion that
+//! ran inside the progress loop are late, never early.
+//! The scan closes an endpoint when the scan clock is more than one timeout
+//! past [`EpEntry::last_activity`] (the later of the stamp and `drained_at`),
+//! no send is in flight on it, and no RMA operation names its peer. The scan
+//! runs once a scan period, and on an idle worker a due scan runs at most one
+//! [`PARK_MS`] late. A long pass on a busy worker delays it further.
 //!
 //! **FORCE, like every other close from the main loop.** `close_ep_raw` frees
 //! the leaked `ErrArg` the moment the close is issued, a discipline established
 //! for FORCE closes (UCX will not call the handler after a FORCE close is
 //! issued). A flush-mode close would need teardown Phase A's deferred free
 //! instead, and would hang on exactly the peer an idle endpoint is most likely
-//! to belong to — one that has gone away. A candidate has no outstanding RMA
-//! operation by construction, so FORCE has nothing to cancel.
+//! to belong to — one that has gone away. A candidate has no RMA operation and
+//! no counted send in flight; the one thing FORCE can still cancel is an
+//! uncounted reply (see the reply paragraph above).
 //!
-//! **What the peer pays, measured.** Closing an endpoint is not a local act.
-//! UCX pairs endpoints by remote worker, so velo's REPLY-flagged Active Messages
-//! cause a matching endpoint to exist on the peer, and the peer's own
-//! `ucp_ep_create` back to us is matched onto *that* connection rather than
-//! building a fresh one. After a reap the peer's next frame to us is admitted
-//! and silently lost; UCX keepalive (~20 s by default) then declares its
-//! endpoint failed, and the frame after that takes velo's existing
-//! failed-connection path and arrives. One lost frame and up to a keepalive
-//! interval of disruption, per reaped endpoint, self-healing. Both close modes
-//! were measured and behave identically, so FORCE is kept for the reasons below.
-//! `reaping_disrupts_the_peers_path_back` pins it and
-//! [`UcxTransportBuilder::ep_idle_timeout`](super::transport::UcxTransportBuilder::ep_idle_timeout)
-//! carries the operator-facing version. This is the concrete cost D9 deferred
-//! ("connection-pool policy revisited later") and the sharpest reason the knob
-//! is off.
+//! **What the peer pays.** Closing an endpoint is not a local act. UCX pairs
+//! endpoints by remote worker, so velo's REPLY-flagged Active Messages cause a
+//! matching endpoint to exist on the peer, and the peer's own `ucp_ep_create`
+//! back to us is matched onto *that* connection rather than building a fresh
+//! one. After a reap the peer's next REPLY-flagged frame to us is dropped. Its
+//! next Message is admitted and silently lost (measured). By the same inferred
+//! mechanism, its next ping gets no Pong, so its `check_health` returns
+//! `Timeout` (or `ConnectionFailed` if keepalive fails the endpoint while the
+//! probe is waiting). Its Responses and Events still arrive (measured: 8 of 8
+//! arrived in every recorded run). Acks carry no REPLY flag either, so the same
+//! is expected, but it was not measured. Why: per the UCX source, a
+//! REPLY-flagged frame carries an endpoint id for the reply path, and a frame
+//! whose endpoint id no longer resolves is dropped. That is inferred from the
+//! source and a measurement, not proven. UCX keepalive (~20 s by default) then
+//! declares the peer's endpoint failed, and the frame after that takes velo's
+//! existing failed-connection path and arrives. So after each reap the peer's
+//! Messages and pings to us are lost, silently, until keepalive (~20 s) fails
+//! its endpoint; the first loss is a Message with no error, or a ping that
+//! times out. Re-sending does not help (measured by hand;
+//! `reaping_disrupts_the_peers_path_back` asserts only that the first frame
+//! does not arrive). The disruption lasts up to a keepalive interval per reaped
+//! endpoint and heals itself. Both close modes were measured by hand and behave
+//! identically, so FORCE is kept for the reasons above.
+//! `reaping_disrupts_the_peers_path_back` pins the FORCE case. The
+//! operator-facing version is on
+//! [`UcxTransportBuilder::ep_idle_timeout`](super::transport::UcxTransportBuilder::ep_idle_timeout).
+//! This is the concrete cost D9 deferred ("connection-pool policy revisited
+//! later") and the sharpest reason the knob is off.
 //!
 //! Recreation on *our* side is transparent and needs no extra machinery: the peer stays in
 //! `WorkerShared::peers` with its incarnation intact, so the next `ensure_ep`
@@ -241,6 +305,7 @@ use super::transport::UcxConfig;
 /// One message staged for the progress thread.
 pub(crate) struct SendTask {
     pub peer: InstanceId,
+    pub permit: Option<tokio::sync::OwnedSemaphorePermit>,
     pub msg_type: MessageType,
     pub header: Bytes,
     pub payload: Bytes,
@@ -441,20 +506,12 @@ pub(crate) struct WorkerShared {
     /// thread; readable from anywhere as a gauge, and what the idle reaper's
     /// tests observe.
     pub eps_open: Arc<AtomicUsize>,
-    /// Inbound frames whose reply endpoint matched one this worker owns, so the
+    /// Inbound frames whose sender matched an endpoint this worker owns, so the
     /// idle reaper's freshness stamp was refreshed by traffic *from* the peer.
-    ///
-    /// Exists because the mechanism it counts rests on an empirical fact —
-    /// that UCX hands the recv callback the same `ucp_ep_h` we created to that
-    /// peer — which `an_inbound_frame_refreshes_the_endpoint_it_arrived_on`
-    /// asserts rather than assumes.
+    /// `an_inbound_frame_refreshes_the_endpoint_to_its_sender` reads it.
     pub eps_stamped_inbound: Arc<AtomicU64>,
-    /// Inbound reply endpoints that matched nothing this worker owns.
-    ///
-    /// The other half of the same evidence: routine for a peer we have never
-    /// sent to (UCX made that endpoint, we did not), and the number that would
-    /// be non-zero *instead of* `eps_stamped_inbound` if the pointer identity
-    /// the inbound stamp depends on did not hold.
+    /// Inbound frames whose sender matched no endpoint this worker owns:
+    /// routine for a peer we have never sent to.
     pub eps_inbound_unmatched: Arc<AtomicU64>,
     /// Endpoints closed by the idle reaper, cumulative.
     ///
@@ -470,9 +527,12 @@ pub(crate) struct WorkerShared {
     /// argument `VeloMetrics::set_rdma_live_regions` already makes for the
     /// unpacked-rkey count. So: a counter, a `debug!` per close, and no series.
     pub eps_closed_idle: Arc<AtomicU64>,
-    /// Reply endpoints observed by the AM recv trampoline, awaiting the main
-    /// loop's freshness stamps.
-    pub reply_eps: Arc<ReplyEpSightings>,
+    /// Sender incarnations observed by the AM recv trampoline, awaiting the
+    /// main loop's freshness stamps.
+    pub senders: Arc<SenderSightings>,
+    /// This worker's incarnation, as published in its blob. Every frame it
+    /// sends starts with it, so the receiver knows which endpoint to stamp.
+    pub incarnation: u64,
     /// Written once by `Transport::set_observability`, read by both the
     /// transport (any thread) and the AM receive callback.
     ///
@@ -486,6 +546,24 @@ pub(crate) struct WorkerShared {
     /// the runtime otherwise synchronizes with, so the callback reads the
     /// slot per frame rather than capture the handle once at `start()`.
     pub metrics: OnceLock<Arc<dyn velo_ext::TransportObservability>>,
+    /// Test seam: sleep this long after each `ucp_ep_create`, so a test can
+    /// make endpoint creation slower than the idle timeout on demand.
+    #[cfg(test)]
+    pub ep_create_delay_ms: AtomicU64,
+    /// Test seam: at the top of its next pass, the progress loop clears this
+    /// cell and then sleeps once for the value it held (see
+    /// [`take_test_delay`] for why the order matters). A peer that stops
+    /// progressing is what holds a first send in flight: the sender waits for
+    /// the peer's half of the wireup.
+    #[cfg(test)]
+    pub progress_stall_ms: AtomicU64,
+    /// Test seam: after the pass clock is read and before
+    /// `ucp_worker_progress`, the progress loop clears this cell and then
+    /// sleeps once for the value it held (see [`take_test_delay`]). It stands
+    /// in for a long progress loop: a frame that waits in the socket meanwhile
+    /// is received late in the pass, well after the pass clock was read.
+    #[cfg(test)]
+    pub pre_progress_delay_ms: AtomicU64,
 }
 
 /// What the progress thread reports back once UCX is initialised.
@@ -513,6 +591,7 @@ enum OpKind {
     /// A velo frame: failure reports through `on_error` with the original
     /// buffers, per the `Transport` contract.
     Frame {
+        _permit: Option<tokio::sync::OwnedSemaphorePermit>,
         header: Bytes,
         payload: Bytes,
         on_error: Arc<dyn TransportErrorHandler>,
@@ -525,15 +604,88 @@ enum OpKind {
 struct OpState {
     kind: OpKind,
     inflight: Arc<AtomicUsize>,
+    /// The send count of the endpoint this op was posted on, when the idle
+    /// reaper is on and the endpoint is one we own. `None` otherwise.
+    ep_sends: Option<Arc<EpSends>>,
+}
+
+/// Sends in flight on one endpoint, and when the last of them completed.
+///
+/// The idle reaper reads both. An endpoint with a send in flight is not idle,
+/// and the moment its last send completes asynchronously counts as a use. A
+/// send that completes inline, inside `post_am`, records no completion time:
+/// the `ensure_ep` stamp from the same drain stands in for it. Without the
+/// second part, a send slower than the timeout would be reaped the instant it
+/// completed.
+///
+/// Shared by the endpoint's [`EpEntry`] and each [`OpState`] posted on it,
+/// because a FORCE close drops the entry while its sends still complete. Only
+/// the progress thread touches it, so every access is `Relaxed`.
+struct EpSends {
+    /// Sends posted on the endpoint and not yet completed.
+    inflight: AtomicUsize,
+    /// When `inflight` last fell to zero from an asynchronous completion, as
+    /// nanoseconds after `born`. Zero means never.
+    drained_at_ns: AtomicU64,
+    born: Instant,
+}
+
+impl EpSends {
+    fn new(born: Instant) -> Self {
+        Self {
+            inflight: AtomicUsize::new(0),
+            drained_at_ns: AtomicU64::new(0),
+            born,
+        }
+    }
+
+    /// When the last send in flight completed, if one ever did asynchronously.
+    fn drained_at(&self) -> Option<Instant> {
+        match self.drained_at_ns.load(Ordering::Relaxed) {
+            0 => None,
+            ns => Some(self.born + Duration::from_nanos(ns)),
+        }
+    }
 }
 
 impl OpState {
+    /// Count this op against its endpoint. Called before the post.
+    fn begin_ep_send(&self) {
+        if let Some(sends) = &self.ep_sends {
+            sends.inflight.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Release the count taken by [`Self::begin_ep_send`]. Returns whether
+    /// that left the endpoint with no send in flight.
+    fn end_ep_send(&self) -> bool {
+        self.ep_sends
+            .as_ref()
+            .is_some_and(|sends| sends.inflight.fetch_sub(1, Ordering::Relaxed) == 1)
+    }
+
+    /// Record now as the time the endpoint's last send in flight completed.
+    ///
+    /// Only `send_trampoline` calls this. An op that completes inside `post_am`
+    /// skips it: `ensure_ep` stamped `last_used` in the same drain, at most
+    /// that drain's length earlier (see "When a use is stamped" in the module
+    /// docs), which is close enough that a clock read per inline completion is
+    /// not worth its cost.
+    fn stamp_ep_drained(&self) {
+        if let Some(sends) = &self.ep_sends {
+            // `max(1)`: zero means "never".
+            let ns = (sends.born.elapsed().as_nanos() as u64).max(1);
+            sends.drained_at_ns.store(ns, Ordering::Relaxed);
+        }
+    }
+
     fn complete(self: Arc<Self>, status: sys::ucs_status_t) {
         if status != sys::ucs_status_t_UCS_OK
             && let Some(state) = Arc::into_inner(self)
         {
             match state.kind {
                 OpKind::Frame {
+                    _permit,
                     header,
                     payload,
                     on_error,
@@ -568,6 +720,9 @@ unsafe extern "C" fn send_trampoline(
         // SAFETY: see contract above — exactly one reclaim per posted op.
         let state = unsafe { Arc::from_raw(user_data as *const OpState) };
         state.inflight.fetch_sub(1, Ordering::AcqRel);
+        if state.end_ep_send() {
+            state.stamp_ep_drained();
+        }
         state.complete(status);
     }));
     if !request.is_null() {
@@ -719,84 +874,114 @@ unsafe extern "C" fn rma_trampoline(
 /// Shared context for all AM recv handlers.
 struct RecvShared {
     adapter: TransportAdapter,
-    /// Whether to record reply-endpoint sightings at all — true only when the
+    /// Whether to record sender sightings at all — true only when the
     /// idle reaper is configured, which is the only reader of what they
     /// produce.
     ///
     /// Set once at worker start and never mutated, so this costs a predictable
     /// branch on a struct the callback has already dereferenced. Without it,
     /// every process that never enables the reaper would still pay two atomics
-    /// per inbound frame to fill a ring nothing drains.
+    /// per REPLY-flagged inbound frame to fill a ring nothing drains.
     stamp_inbound: bool,
     /// The state the transport side shares with the progress thread. The
-    /// callback reads `ring_tx`, `pending_pings`, `reply_eps` and `metrics`
+    /// callback reads `ring_tx`, `pending_pings`, `senders` and `metrics`
     /// through it, so there is one copy of each and nothing to keep in step.
     worker: Arc<WorkerShared>,
 }
 
-/// How many reply-endpoint sightings the recv trampoline can hand over between
-/// two passes of the main loop.
+/// Bytes at the front of every frame's header that carry the sender's
+/// incarnation.
 ///
-/// The loop drains this on every pass, so the window is one iteration of a loop
-/// that spins. Eight is far more than that window can fill under any traffic a
-/// single worker sustains, and losing a sighting costs nothing worse than a
-/// freshness stamp the *next* inbound frame from that peer sets anyway.
-const REPLY_EP_SLOTS: usize = 8;
+/// The idle reaper's inbound stamp needs to know which peer sent a frame, and
+/// UCX says so (through `reply_ep`) only for frames sent with
+/// `UCP_AM_SEND_FLAG_REPLY`. Velo's own headers do not say either: a
+/// Response's id names the requester. The incarnation is 8 bytes and already
+/// sits in every `EpEntry`, so matching it costs no lookup table.
+pub(crate) const SENDER_TAG_LEN: usize = 8;
 
-/// Reply endpoints seen by the AM recv trampoline, on their way to the main
+/// How many sender sightings the recv trampoline can hand over between two
+/// drains.
+///
+/// The loop drains this only in `stamp_inbound_use`, which runs in a pass that
+/// observed the command ring empty, and any number of frames can arrive
+/// between two such passes. So the ring holds each sender once (see [`SenderSightings::record`]),
+/// and a pass that saw more distinct senders than this reports the overflow
+/// instead of dropping sightings. Losing one is not harmless: it can be the
+/// last frame a peer sends before it goes quiet, or the ping whose pong rides
+/// our endpoint uncounted.
+pub(super) const SENDER_SLOTS: usize = 8;
+
+/// Sender incarnations seen by the AM recv trampoline, on their way to the main
 /// loop's [`EpEntry::last_used`] stamps.
 ///
 /// This is the [`WorkerState::rma_completions`] discipline in its cheapest form.
 /// A recv callback runs inside `ucp_worker_progress` and may not touch the ring
 /// or reach `WorkerState`, so what it can do is publish a value the loop picks
 /// up — and unlike an RMA completion, which happens once per transfer, this
-/// happens once per *inbound frame*. That rules out a mutex and a `Vec`: it is a
-/// fixed ring of atomics, one `fetch_add` and one `store` per frame, no
-/// allocation and no lock.
+/// happens once per *inbound frame*. That rules out a mutex and a `Vec`: it is
+/// a fixed ring of atomics, at most eight loads plus one `fetch_add` and one
+/// `store` per frame, no allocation and no lock.
 ///
-/// # These are integers, not pointers
-///
-/// A slot holds a `ucp_ep_h` **as `usize`**, and nothing ever dereferences it.
-/// The main loop compares the value against the endpoints it currently owns and
-/// stamps on equality. A sighting that outlives its endpoint therefore cannot be
-/// a use-after-free; the worst it can do is match an endpoint UCX later
-/// allocated at the same address, which refreshes a freshness stamp — the
-/// conservative direction, and the only direction this can err in.
-pub(crate) struct ReplyEpSightings {
-    slots: [AtomicUsize; REPLY_EP_SLOTS],
+/// A slot holds a sender's incarnation as `usize` (every target UCX builds on
+/// is 64-bit). The main loop compares it against the incarnation each endpoint
+/// was created from and stamps on equality. Incarnations are random, so a
+/// false match needs a 64-bit collision, and it would only refresh a stamp —
+/// the conservative direction.
+pub(crate) struct SenderSightings {
+    slots: [AtomicUsize; SENDER_SLOTS],
     /// Monotonic count of sightings recorded. The main loop compares it against
     /// what it last saw, so an idle worker pays one atomic load per pass instead
     /// of eight swaps.
     recorded: AtomicUsize,
 }
 
-impl ReplyEpSightings {
+impl SenderSightings {
     pub(crate) fn new() -> Self {
         Self {
-            slots: [const { AtomicUsize::new(0) }; REPLY_EP_SLOTS],
+            slots: [const { AtomicUsize::new(0) }; SENDER_SLOTS],
             recorded: AtomicUsize::new(0),
         }
     }
 
     /// Publish one sighting. Runs on the progress thread inside an AM callback.
-    fn record(&self, ep: usize) {
+    ///
+    /// A sender already in the ring is not recorded again. Without that, a
+    /// burst of frames from one peer in one pass overwrote every other peer's
+    /// sighting. With it, only more than [`SENDER_SLOTS`] *distinct* senders
+    /// in one pass can overflow the ring, and `drain_into` reports that.
+    pub(super) fn record(&self, sender: usize) {
+        // Relaxed is enough: the recorder and the drainer are the same thread
+        // (the progress thread), and the atomics exist only to make the ring
+        // shareable.
+        if self
+            .slots
+            .iter()
+            .any(|slot| slot.load(Ordering::Relaxed) == sender)
+        {
+            return;
+        }
         let seq = self.recorded.fetch_add(1, Ordering::Relaxed);
-        self.slots[seq % REPLY_EP_SLOTS].store(ep, Ordering::Release);
+        self.slots[seq % SENDER_SLOTS].store(sender, Ordering::Release);
     }
 
     /// Take everything published since the last call. Progress thread only.
-    fn drain_into(&self, seen: &mut usize, out: &mut Vec<usize>) {
+    ///
+    /// Returns `true` when more distinct senders were recorded than the ring
+    /// holds, so some sightings were overwritten and `out` is incomplete.
+    pub(super) fn drain_into(&self, seen: &mut usize, out: &mut Vec<usize>) -> bool {
         let recorded = self.recorded.load(Ordering::Acquire);
         if recorded == *seen {
-            return;
+            return false;
         }
+        let overflowed = recorded.wrapping_sub(*seen) > SENDER_SLOTS;
         *seen = recorded;
         for slot in &self.slots {
-            let ep = slot.swap(0, Ordering::AcqRel);
-            if ep != 0 {
-                out.push(ep);
+            let sender = slot.swap(0, Ordering::AcqRel);
+            if sender != 0 {
+                out.push(sender);
             }
         }
+        overflowed
     }
 }
 
@@ -830,14 +1015,6 @@ unsafe extern "C" fn recv_trampoline(
         // SAFETY: `param` is valid for the duration of the callback.
         let p = unsafe { &*param };
 
-        // Inbound traffic is use of an endpoint. Recorded here rather than in
-        // the per-kind arms below so that *every* frame from a peer counts —
-        // pings, responses, events, drain echoes — and so the hot path is one
-        // branch and two relaxed atomics regardless of what arrived.
-        if ra.shared.stamp_inbound && !p.reply_ep.is_null() {
-            ra.shared.worker.reply_eps.record(p.reply_ep as usize);
-        }
-
         if p.recv_attr & sys::ucp_am_recv_attr_t_UCP_AM_RECV_ATTR_FLAG_RNDV as u64 != 0 {
             // Protocol violation (velo pins EAGER). Refusing with an error
             // completes the sender's request with this status.
@@ -845,15 +1022,34 @@ unsafe extern "C" fn recv_trampoline(
             return sys::ucs_status_t_UCS_ERR_UNSUPPORTED;
         }
 
-        // SAFETY: header/data are valid for header_length/length bytes for
-        // the duration of the callback; we copy before returning.
-        let header = if header_length == 0 {
+        // Every velo frame starts with its sender's incarnation. A shorter
+        // header is not from velo (or is from a peer on another blob
+        // version, which `register` refuses), so it is dropped.
+        if header_length < SENDER_TAG_LEN {
+            warn!("ucx: dropping AM without a sender tag (kind {})", ra.kind);
+            return sys::ucs_status_t_UCS_OK;
+        }
+        // SAFETY: header is valid for header_length bytes for the duration of
+        // the callback; we copy before returning.
+        let raw_header = unsafe { std::slice::from_raw_parts(header as *const u8, header_length) };
+        let (tag, header) = raw_header.split_at(SENDER_TAG_LEN);
+
+        // Inbound traffic is use of an endpoint, whatever kind of frame it
+        // is. Recorded here rather than in the per-kind arms below so the hot
+        // path is one branch and two relaxed atomics regardless of what
+        // arrived.
+        if ra.shared.stamp_inbound {
+            let sender = u64::from_le_bytes(tag.try_into().unwrap());
+            ra.shared.worker.senders.record(sender as usize);
+        }
+
+        let header = if header.is_empty() {
             Bytes::new()
         } else {
-            Bytes::copy_from_slice(unsafe {
-                std::slice::from_raw_parts(header as *const u8, header_length)
-            })
+            Bytes::copy_from_slice(header)
         };
+        // SAFETY: data is valid for length bytes for the duration of the
+        // callback; we copy before returning.
         let payload = if length == 0 {
             Bytes::new()
         } else {
@@ -1015,14 +1211,40 @@ struct EpEntry {
     /// The peer incarnation this endpoint was created from; compared against
     /// the peers map after re-registrations.
     incarnation: u64,
-    /// When [`WorkerState::ensure_ep`] last handed this endpoint out.
+    /// When [`WorkerState::ensure_ep`] last handed this endpoint out, or
+    /// [`WorkerState::stamp_inbound_use`] last saw a frame from its peer, or
+    /// an RMA operation to that peer completed, whichever is latest.
     ///
     /// A plain `Instant`, not an atomic: `EpEntry` never leaves the progress
-    /// thread. It is sampled from [`WorkerState::now`] rather than read from the
-    /// clock, so stamping costs a copy and no syscall on the send path; the
-    /// resolution is one loop pass, which is four orders of magnitude finer than
-    /// any idle timeout worth configuring.
+    /// thread. It is sampled from [`WorkerState::now`] rather than read from
+    /// the clock, so stamping costs a copy and no syscall on the send path.
+    /// With the reaper on, that clock is read twice a pass plus once per
+    /// `ucp_ep_create`, so a stamp for a command can precede the command by up
+    /// to the length of the drain it ran in. The module docs ("When a use is
+    /// stamped") give the details.
     last_used: Instant,
+    /// Sends in flight on this endpoint. `Some` only with the idle reaper on,
+    /// which is the only reader, so with the reaper off (the default) a send
+    /// pays only two `None` checks, plus one clock read per `ucp_ep_create`.
+    sends: Option<Arc<EpSends>>,
+}
+
+impl EpEntry {
+    /// The latest use the reaper knows of: the last stamp, or the completion
+    /// of the last send in flight, whichever is later.
+    fn last_activity(&self) -> Instant {
+        match self.sends.as_ref().and_then(|s| s.drained_at()) {
+            Some(drained) => drained.max(self.last_used),
+            None => self.last_used,
+        }
+    }
+
+    /// Whether a send posted on this endpoint has not completed yet.
+    fn has_send_in_flight(&self) -> bool {
+        self.sends
+            .as_ref()
+            .is_some_and(|s| s.inflight.load(Ordering::Relaxed) != 0)
+    }
 }
 
 /// One `ucp_mem_map`ed region, owned by the progress thread.
@@ -1101,33 +1323,49 @@ struct WorkerState {
     /// being waited on with a nested `ucp_worker_progress` — see
     /// `close_ep_raw` for why that matters.
     pending_closes: Vec<sys::ucs_status_ptr_t>,
-    /// Coarse clock for the idle reaper, refreshed once per loop pass.
+    /// Coarse clock for the idle reaper. With the reaper on, it is read at the
+    /// top of each loop pass, again after the progress loop, and after each
+    /// endpoint creation. With the reaper off, only the creation read runs, so
+    /// the value is stale. `ensure_ep` still copies it into `last_used`, but
+    /// nothing uses it then.
     ///
-    /// One `Instant::now()` per pass instead of one per endpoint use: the send
+    /// Two `Instant::now()` per pass instead of one per endpoint use: the send
     /// path stamps [`EpEntry::last_used`] from this, and an idle timeout is a
     /// seconds-scale quantity that has nothing to gain from a per-command clock
-    /// read.
+    /// read. The read after the progress loop exists because one progress loop
+    /// (`ucp_worker_progress` run to quiescence) can outlast the timeout under
+    /// load. `ensure_ep` reads the clock again after `ucp_ep_create`, which can
+    /// take longer than the timeout itself.
     now: Instant,
     /// Earliest time [`WorkerState::reap_idle_eps`] will scan again. See
     /// [`ep_scan_period`].
     next_ep_scan: Instant,
-    /// Sightings already taken from [`WorkerShared::reply_eps`].
-    seen_reply_eps: usize,
+    /// Sightings already taken from [`WorkerShared::senders`].
+    seen_senders: usize,
     /// Reusable buffer for one pass's sightings, so draining them allocates
     /// nothing.
-    reply_ep_scratch: Vec<usize>,
+    sender_scratch: Vec<usize>,
+    /// Reused by `post_am` to build each frame's wire header.
+    am_header: Vec<u8>,
 }
 
 /// How often the idle reaper scans, given the configured timeout.
 ///
-/// Half the timeout, so an endpoint is closed between one and one and a half
-/// timeouts after its last use — the same shape (and the same reasoning) as the
-/// rendezvous lease reaper. The ceiling keeps a generous production timeout from
-/// costing more than one scan a second; the floor keeps a tiny test-sized
-/// timeout from turning the scan into a spin on every loop pass.
-fn ep_scan_period(timeout: Duration) -> Duration {
+/// Half the timeout, capped at one second, so an endpoint is closed between one
+/// timeout and one timeout plus one scan period after its last use (plus up to
+/// one [`PARK_MS`] on an idle worker) — the same shape (and the same reasoning)
+/// as the rendezvous lease reaper. The ceiling keeps a generous production
+/// timeout from costing more than one scan a second; the floor keeps a tiny
+/// test-sized timeout from turning the scan into a spin on every loop pass.
+pub(super) fn ep_scan_period(timeout: Duration) -> Duration {
     (timeout / 2).clamp(Duration::from_millis(10), Duration::from_secs(1))
 }
+
+/// Backstop park timeout: a lost doorbell costs at most this much latency.
+///
+/// It also bounds how late a due scan can run on an idle worker, which the
+/// reaper tests use to size their margins.
+pub(super) const PARK_MS: c_int = 100;
 
 /// Entry point of the dedicated progress thread.
 pub(crate) fn worker_main(args: WorkerArgs) {
@@ -1286,7 +1524,8 @@ unsafe fn init_ucx(
         let worker_addr =
             std::slice::from_raw_parts(attr.address as *const u8, attr.address_length).to_vec();
         sys::ucp_worker_release_address(worker, attr.address);
-        let max_am_header = attr.max_am_header;
+        // The sender tag rides in UCX's header, so velo's share is smaller.
+        let max_am_header = attr.max_am_header.saturating_sub(SENDER_TAG_LEN);
 
         let mut efd: c_int = -1;
         let st = sys::ucp_worker_get_efd(worker, &mut efd);
@@ -1317,8 +1556,9 @@ unsafe fn init_ucx(
                 pending_closes: Vec::new(),
                 now: Instant::now(),
                 next_ep_scan: Instant::now(),
-                seen_reply_eps: 0,
-                reply_ep_scratch: Vec::with_capacity(REPLY_EP_SLOTS),
+                seen_senders: 0,
+                sender_scratch: Vec::with_capacity(SENDER_SLOTS),
+                am_header: Vec::new(),
             },
             StartupOut {
                 worker_addr,
@@ -1361,12 +1601,31 @@ fn drain_ring(
     (false, true)
 }
 
+/// Test seam: clear `cell`, then sleep once for the milliseconds it held.
+///
+/// The order is load-bearing. A test that sees the cell read zero knows the
+/// progress thread has taken the value and is in, or entering, the sleep, with
+/// no progress call left before it.
+/// `a_frame_received_late_in_a_long_pass_is_not_stamped_early` relies on that
+/// to send while the thread is stalled.
+///
+/// A load first, so the benchmarks in the test build pay no read-modify-write
+/// per pass.
+#[cfg(test)]
+fn take_test_delay(cell: &AtomicU64) {
+    if cell.load(Ordering::Relaxed) != 0 {
+        let ms = cell.swap(0, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(ms));
+    }
+}
+
 fn run_loop(mut state: WorkerState, ring_rx: flume::Receiver<Cmd>) {
     const DRAIN_BUDGET: usize = 64;
-    /// Backstop park timeout: a lost doorbell costs at most this much latency.
-    const PARK_MS: c_int = 100;
 
     let spin_window = Duration::from_micros(state.config.spin_us);
+    // Only the idle reaper reads `state.now`, so a worker without it skips the
+    // two clock reads per pass.
+    let reaper_on = state.config.ep_idle_timeout.is_some();
     // Post-progress drain bound: enough to empty a full ring plus a burst of
     // racing submitters, without risking an unbounded loop under saturation.
     let flush_budget = state.config.channel_capacity + DRAIN_BUDGET;
@@ -1376,10 +1635,19 @@ fn run_loop(mut state: WorkerState, ring_rx: flume::Receiver<Cmd>) {
         if state.shared.shutdown_requested.load(Ordering::Acquire) {
             break 'outer;
         }
-        // The reaper's whole clock, sampled once. Every `EpEntry::last_used`
-        // stamp taken during this pass comes from here, so "used this pass"
-        // never reads as older than "scanned this pass".
-        state.now = Instant::now();
+        #[cfg(test)]
+        take_test_delay(&state.shared.progress_stall_ms);
+        // The reaper's clock. It is read here, again after the progress loop,
+        // and after each `ucp_ep_create`, and only moves forward. The two
+        // per-pass reads run only with the reaper on. Every
+        // `EpEntry::last_used` stamp comes from it, and the scan at the end of
+        // the pass reads it too. The one exception is `EpSends::drained_at`, a
+        // real clock read in `send_trampoline`, which can be later than this
+        // value. The scan's `saturating_duration_since` reads that as zero idle
+        // time, which is correct.
+        if reaper_on {
+            state.now = Instant::now();
+        }
 
         // -- drain the ring --------------------------------------------------
         let (_, keep_running) = drain_ring(&mut state, &ring_rx, DRAIN_BUDGET, &mut last_activity);
@@ -1387,21 +1655,33 @@ fn run_loop(mut state: WorkerState, ring_rx: flume::Receiver<Cmd>) {
             break 'outer;
         }
 
+        #[cfg(test)]
+        take_test_delay(&state.shared.pre_progress_delay_ms);
+
         // -- progress to quiescence -----------------------------------------
         // SAFETY: worker owned by this thread.
         while unsafe { sys::ucp_worker_progress(state.worker) } != 0 {
             last_activity = Instant::now();
+        }
+        // Read the clock again: one progress loop was measured at 526-573 ms
+        // under load. Without this, the flush drain and `stamp_inbound_use`
+        // below would stamp a frame received late in that loop with the time
+        // the pass began, and the next scan could close the endpoint the frame
+        // just used. The clock only moves forward, and a later stamp errs
+        // toward keeping an endpoint open.
+        if reaper_on {
+            state.now = Instant::now();
         }
 
         // -- flush, then reap -------------------------------------------------
         // ORDERING INVARIANT (use-after-free guard): `Cmd::PongTo` and
         // `Cmd::ShuttingDownTo` carry raw `ucp_ep_h` pointers captured by the
         // recv trampoline, i.e. they are enqueued ONLY from AM callbacks,
-        // which run ONLY inside `ucp_worker_progress` on this thread. The three
-        // paths that free endpoints (`revalidate_eps`, `reap_failed_eps`,
-        // `reap_idle_eps`) therefore run only (a) after the ring has been
-        // drained to empty
-        // following the progress call above, and (b) via FORCE closes that
+        // which run ONLY inside `ucp_worker_progress` on this thread. The four
+        // paths that free endpoints (`close_parked`, `revalidate_eps`,
+        // `reap_failed_eps`, `reap_idle_eps`) therefore run only (a) after the
+        // ring has been drained to empty following the progress call above,
+        // and (b) via FORCE closes that
         // never call `ucp_worker_progress` themselves (`close_ep_raw` defers
         // any close request to `poll_pending_closes`). Together these make
         // "a reply command exists for an endpoint that has been freed"
@@ -1417,7 +1697,8 @@ fn run_loop(mut state: WorkerState, ring_rx: flume::Receiver<Cmd>) {
         // invariants in the module docs.
         state.drain_rma_completions();
         if observed_empty {
-            // All four close endpoints; all are only safe here (see above).
+            // All four paths that free endpoints; all are only safe here (see
+            // above).
             state.close_parked();
             state.revalidate_eps();
             state.reap_failed_eps();
@@ -1480,7 +1761,7 @@ impl WorkerState {
         match cmd {
             Cmd::Send(task) => {
                 match self.ensure_ep(task.peer) {
-                    Ok(ep) => {
+                    Ok((ep, ep_sends)) => {
                         let kind = task.msg_type.as_u8();
                         // Message-type frames carry the REPLY flag so the
                         // receiver's drain gate can echo ShuttingDown without
@@ -1488,11 +1769,13 @@ impl WorkerState {
                         let reply = matches!(task.msg_type, MessageType::Message);
                         let op = Arc::new(OpState {
                             kind: OpKind::Frame {
+                                _permit: task.permit,
                                 header: task.header.clone(),
                                 payload: task.payload.clone(),
                                 on_error: task.on_error,
                             },
                             inflight: Arc::clone(&self.shared.inflight_ops),
+                            ep_sends,
                         });
                         self.post_am(ep, kind, task.header, task.payload, reply, op);
                     }
@@ -1501,13 +1784,14 @@ impl WorkerState {
             }
             Cmd::Ping { peer, token } => {
                 match self.ensure_ep(peer) {
-                    Ok(ep) => {
+                    Ok((ep, ep_sends)) => {
                         let header = Bytes::copy_from_slice(&token.to_le_bytes());
                         let op = Arc::new(OpState {
                             kind: OpKind::Control {
                                 _hold: header.clone(),
                             },
                             inflight: Arc::clone(&self.shared.inflight_ops),
+                            ep_sends,
                         });
                         self.post_am(ep, AM_KIND_PING, header, Bytes::new(), true, op);
                     }
@@ -1528,6 +1812,9 @@ impl WorkerState {
                         _hold: header.clone(),
                     },
                     inflight: Arc::clone(&self.shared.inflight_ops),
+                    // A reply endpoint UCX handed the recv callback. It is not
+                    // looked up in `eps`, so it carries no send count.
+                    ep_sends: None,
                 });
                 self.post_am(
                     reply_ep as sys::ucp_ep_h,
@@ -1544,6 +1831,9 @@ impl WorkerState {
                         _hold: header.clone(),
                     },
                     inflight: Arc::clone(&self.shared.inflight_ops),
+                    // A reply endpoint UCX handed the recv callback. It is not
+                    // looked up in `eps`, so it carries no send count.
+                    ep_sends: None,
                 });
                 self.post_am(
                     reply_ep as sys::ucp_ep_h,
@@ -1591,6 +1881,11 @@ impl WorkerState {
     }
 
     /// Post one AM. Consumes `op` per the three-exit discipline (module docs).
+    ///
+    /// The header on the wire is this worker's incarnation followed by
+    /// `header`. It is built in a reused buffer: `UCP_AM_SEND_FLAG_COPY_HEADER`
+    /// makes UCX copy the header before the call returns, so the buffer is
+    /// free again at once and no send allocates.
     fn post_am(
         &mut self,
         ep: sys::ucp_ep_h,
@@ -1601,6 +1896,7 @@ impl WorkerState {
         op: Arc<OpState>,
     ) {
         self.shared.inflight_ops.fetch_add(1, Ordering::AcqRel);
+        op.begin_ep_send();
         let user_data = Arc::into_raw(op) as *mut c_void;
 
         // SAFETY: header/payload are owned by the OpState referenced from
@@ -1619,13 +1915,18 @@ impl WorkerState {
         param.cb.send = Some(send_trampoline);
         param.user_data = user_data;
 
+        self.am_header.clear();
+        self.am_header
+            .extend_from_slice(&self.shared.incarnation.to_le_bytes());
+        self.am_header.extend_from_slice(&header);
+
         // SAFETY: ep is a live endpoint on this worker; buffers per above.
         let ptr = unsafe {
             sys::ucp_am_send_nbx(
                 ep,
                 (AM_ID_BASE as u32) + kind as u32,
-                header.as_ptr() as *const c_void,
-                header.len(),
+                self.am_header.as_ptr() as *const c_void,
+                self.am_header.len(),
                 payload.as_ptr() as *const c_void,
                 payload.len(),
                 &param,
@@ -1643,6 +1944,7 @@ impl WorkerState {
                 // touch user_data for an inline-completed op.
                 let state = unsafe { Arc::from_raw(user_data as *const OpState) };
                 state.inflight.fetch_sub(1, Ordering::AcqRel);
+                state.end_ep_send();
                 drop(state);
             }
             Err(status) => {
@@ -1651,6 +1953,7 @@ impl WorkerState {
                 // SAFETY: as above.
                 let state = unsafe { Arc::from_raw(user_data as *const OpState) };
                 state.inflight.fetch_sub(1, Ordering::AcqRel);
+                state.end_ep_send();
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     state.complete(status)
                 }));
@@ -1658,7 +1961,12 @@ impl WorkerState {
         }
     }
 
-    fn ensure_ep(&mut self, peer: InstanceId) -> anyhow::Result<sys::ucp_ep_h> {
+    /// The endpoint to `peer`, created if there is none, with its send count
+    /// (see [`EpSends`]) for an op about to be posted on it.
+    fn ensure_ep(
+        &mut self,
+        peer: InstanceId,
+    ) -> anyhow::Result<(sys::ucp_ep_h, Option<Arc<EpSends>>)> {
         let blob = self
             .shared
             .peers
@@ -1667,13 +1975,14 @@ impl WorkerState {
             .ok_or_else(|| anyhow::anyhow!("peer {peer} not registered"))?;
         if let Some(entry) = self.eps.get_mut(&peer) {
             if entry.incarnation == blob.incarnation {
-                // The single freshness stamp for the idle reaper. Every path
-                // that touches an endpoint — `Cmd::Send`, `Cmd::Ping`,
-                // `Cmd::EnsureEp`, and `prepare_get`'s RMA lookup — arrives
-                // here, so there is exactly one place that can forget to record
-                // a use.
+                // The freshness stamp for every path that resolves an
+                // endpoint by peer — `Cmd::Send`, `Cmd::Ping`, `Cmd::EnsureEp`,
+                // and `prepare_get`'s RMA lookup — so there is exactly one
+                // place that can forget to record a use. Replies
+                // (`Cmd::PongTo`, `Cmd::ShuttingDownTo`) do not come here; they
+                // rely on the inbound stamp (see the module docs).
                 entry.last_used = self.now;
-                return Ok(entry.ep);
+                return Ok((entry.ep, entry.sends.clone()));
             }
             // The peer was re-registered with a new incarnation. Sends must
             // switch to a fresh endpoint NOW (the old incarnation may still be
@@ -1718,8 +2027,31 @@ impl WorkerState {
             ep
         };
 
+        #[cfg(test)]
+        {
+            let ms = self.shared.ep_create_delay_ms.load(Ordering::Relaxed);
+            if ms != 0 {
+                std::thread::sleep(Duration::from_millis(ms));
+            }
+        }
+        // `ucp_ep_create` can outlast the idle timeout: across 31 creates in
+        // one process during the parallel UCX tests, the median was 630 ms. A
+        // stamp from the clock read before the call would make the endpoint
+        // older than the timeout at birth. A send in flight holds its endpoint
+        // open by itself, but an endpoint with no send on it, such as an eager
+        // one, has only this stamp. Advancing the pass clock, rather than
+        // stamping this entry alone, keeps every later stamp in the pass and
+        // the scan that ends it on one clock. It also makes endpoints stamped
+        // earlier in this pass read as older by the time the create took,
+        // which is their true age in wall-clock time.
+        self.now = Instant::now();
+
         self.shared.failed_peers.remove(&peer);
         self.shared.eps_open.fetch_add(1, Ordering::Relaxed);
+        let sends = self
+            .config
+            .ep_idle_timeout
+            .map(|_| Arc::new(EpSends::new(self.now)));
         self.eps.insert(
             peer,
             EpEntry {
@@ -1727,10 +2059,11 @@ impl WorkerState {
                 err_arg,
                 incarnation: blob.incarnation,
                 last_used: self.now,
+                sends: sends.clone(),
             },
         );
         debug!("ucx: created endpoint to {peer}");
-        Ok(ep)
+        Ok((ep, sends))
     }
 
     /// Close endpoints that `ensure_ep` replaced mid-drain.
@@ -1783,12 +2116,12 @@ impl WorkerState {
         }
     }
 
-    /// Refresh [`EpEntry::last_used`] for endpoints an inbound frame arrived on.
+    /// Refresh [`EpEntry::last_used`] for endpoints to peers an inbound frame
+    /// came from, matched by the sender's incarnation.
     ///
     /// The other half of "idle" — without it, idle would mean "we have not
     /// *sent*", and a peer that only ever sends to us would have its endpoint
-    /// reaped underneath its own traffic. See the module docs for why the
-    /// sighting is an integer comparison and never a dereference.
+    /// reaped underneath its own traffic.
     ///
     /// Runs only with the reaper configured: the stamps it writes are read by
     /// nothing else, and the match below is linear in the endpoints this worker
@@ -1798,27 +2131,37 @@ impl WorkerState {
         if self.config.ep_idle_timeout.is_none() {
             return;
         }
-        self.reply_ep_scratch.clear();
-        self.shared
-            .reply_eps
-            .drain_into(&mut self.seen_reply_eps, &mut self.reply_ep_scratch);
-        if self.reply_ep_scratch.is_empty() {
+        self.sender_scratch.clear();
+        let overflowed = self
+            .shared
+            .senders
+            .drain_into(&mut self.seen_senders, &mut self.sender_scratch);
+        let now = self.now;
+        if overflowed {
+            // More distinct peers sent to us in this pass than the ring holds,
+            // so some of their sightings are gone. Stamping every endpoint
+            // cannot miss one of them. It keeps an idle endpoint open one
+            // timeout longer, which only costs an idle endpoint's resources;
+            // missing a stamp can cost a peer a frame.
+            for entry in self.eps.values_mut() {
+                entry.last_used = now;
+            }
             return;
         }
-        let now = self.now;
+        if self.sender_scratch.is_empty() {
+            return;
+        }
         let (mut stamped, mut unmatched) = (0u64, 0u64);
-        for &seen in &self.reply_ep_scratch {
+        for &seen in &self.sender_scratch {
             let mut hit = false;
             for entry in self.eps.values_mut() {
-                if entry.ep as usize == seen {
+                if entry.incarnation as usize == seen {
                     entry.last_used = now;
                     hit = true;
                 }
             }
             // Unmatched is ordinary, not an anomaly: a peer we have never sent
-            // to replies on an endpoint UCX created, which we do not own and
-            // have nothing to stamp. It is counted so the *ratio* is evidence
-            // for whether the pointer identity this rests on holds at all.
+            // to has no endpoint here to stamp.
             if hit {
                 stamped += 1;
             } else {
@@ -1860,9 +2203,11 @@ impl WorkerState {
             .eps
             .iter()
             .filter(|(peer, entry)| {
-                self.now.saturating_duration_since(entry.last_used) > timeout
-                    // The in-flight exclusion. `rma_ops` holds every posted RMA
-                    // operation that has not completed, and
+                self.now.saturating_duration_since(entry.last_activity()) > timeout
+                    // A send in flight is a use: closing now would cancel it.
+                    && !entry.has_send_in_flight()
+                    // The in-flight exclusion for RMA. `rma_ops` holds every
+                    // posted RMA operation that has not completed, and
                     // `drain_rma_completions` has just run, so this is the
                     // freshest answer available on this thread. Scanning it is
                     // O(outstanding ops) — a handful — once per scan period.
@@ -1877,18 +2222,20 @@ impl WorkerState {
                 // NOTED RISK, for whoever changes close timing next. Every close
                 // that existed before this one was reactive — a peer failed, or
                 // was re-registered — so this is the first site that FORCE-closes
-                // the endpoint of a peer that is alive and well. The reply
-                // commands carrying raw `ucp_ep_h` values (`Cmd::PongTo`,
-                // `Cmd::ShuttingDownTo`) are covered by the ring-drain guard
-                // this block sits inside; the *other* window, a reply endpoint
-                // UCX itself hands out for an inbound AM, is covered only by the
-                // empirical result that it is the same pointer as ours and thus
-                // dies with it. That is measured
-                // (`an_inbound_frame_refreshes_the_endpoint_it_arrived_on`), not
-                // guaranteed by the ring drain. A future change that closes
-                // endpoints from anywhere else, or at any other point in the
-                // pass, must re-establish it rather than assume the drain guard
-                // covers it.
+                // the endpoint of a peer that is alive and well. Two things make
+                // that safe here. First, the reply commands carrying raw
+                // `ucp_ep_h` values (`Cmd::PongTo`, `Cmd::ShuttingDownTo`) are
+                // enqueued only from AM callbacks, and this block runs only
+                // after the ring has been observed empty, so no such command
+                // can name a closed endpoint. Second, a reply those commands
+                // posted may ride this very endpoint without a send count (UCX
+                // can hand the callback our own endpoint). The inbound frame
+                // that caused it stamped this endpoint by the sender's
+                // incarnation in `stamp_inbound_use`, earlier in this same
+                // pass, so the scan cannot pick it for another timeout. A
+                // future change that closes endpoints from anywhere else, or
+                // before `stamp_inbound_use` in the pass, must re-establish
+                // both rather than assume they still hold.
                 self.close_ep(entry, true);
                 self.shared.eps_closed_idle.fetch_add(1, Ordering::Relaxed);
             }
@@ -2221,7 +2568,7 @@ impl WorkerState {
         }
         validate_packed_rkey(&req.packed_rkey)?;
 
-        let ep = self
+        let (ep, _) = self
             .ensure_ep(req.peer)
             .map_err(|e| RmaError::EndpointUnavailable(e.to_string()))?;
 
@@ -2376,10 +2723,24 @@ impl WorkerState {
             }
             std::mem::take(&mut *guard)
         };
+        let reaper_on = self.config.ep_idle_timeout.is_some();
         for (region_id, op_id) in completed {
             // The operation has already answered its caller; teardown no longer
             // needs to know about it.
-            self.rma_ops.remove(&op_id);
+            let op = self.rma_ops.remove(&op_id);
+            // The completion is a use of the endpoint, as a send's is. While
+            // the operation was outstanding its registry entry kept the
+            // endpoint open; without this stamp the last use on record is the
+            // post, so a GET slower than the timeout would leave its endpoint
+            // to be closed at the next scan. `self.now` was read after the
+            // progress loop that ran the completion callback, so the stamp is
+            // not early.
+            if reaper_on
+                && let Some(op) = op
+                && let Some(entry) = self.eps.get_mut(&op.peer)
+            {
+                entry.last_used = self.now;
+            }
             let released = match self.regions.get_mut(&region_id) {
                 Some(entry) => {
                     entry.inflight = entry.inflight.saturating_sub(1);

@@ -11,33 +11,27 @@
 //! double-count.
 
 use super::super::peer_batcher::ReplyRecord;
+use super::PeerIngress;
 use super::slot::IngressSlot;
-use super::{MAX_INGRESS_SLOTS_PER_PEER, PeerIngress};
 
 /// Reconcile every slot of this peer. The periodic tick's walk, and the
-/// backstop for a slot whose drain could not reach [`collect_touched_grants`]
-/// because the dirty lane was full when its pump tried to list it.
+/// backstop for a slot nothing named.
 ///
 /// Unlike the other two visitors, this one does not route through
-/// [`list_drained_slots`], so it is the one that must drain the lane itself:
-/// every live slot below is reconciled and cleared unconditionally. Draining
-/// the lane first narrows this function's own race window rather than
-/// closing it — a drain landing after the drain loop below but before the
-/// walk reaches that slot still relists it, leaving one entry behind for the
-/// *next* call to discard. That entry is redundant, not harmful: its slot
-/// cannot be granted credit for it twice, because the quantity a reconcile
-/// reads lives in the slot's own [`DrainSignal`](super::DrainSignal), not in the lane, and the
-/// entry itself does not survive this function's next call, which drains the
-/// lane unconditionally before it reconciles again. Discarded rather than run
-/// through `mark_touched`: nothing downstream of this walk needs a
+/// [`list_drained_slots`], so it is the one that must take the dirty set
+/// itself: every live slot below is reconciled unconditionally, so the
+/// listings are discarded rather than walked. Taking the set first narrows
+/// this function's own race window rather than closing it — a drain landing
+/// after the take but before the walk reaches that slot lists it again,
+/// leaving one listing behind for the *next* pass. That listing is
+/// redundant, not harmful: its slot cannot be granted credit for it twice,
+/// because the quantity a reconcile reads lives in the slot's own
+/// [`DrainSignal`](super::DrainSignal), not in the set. Discarded rather than
+/// run through `mark_touched`: nothing downstream of this walk needs a
 /// touched-list entry, since every live slot is about to be visited
 /// regardless of what named it.
 pub(super) fn collect_grants(state: &mut PeerIngress, replies: &mut Vec<ReplyRecord>) {
-    for _ in 0..MAX_INGRESS_SLOTS_PER_PEER {
-        let Ok(_index) = state.drained_rx.try_recv() else {
-            break;
-        };
-    }
+    state.dirty.take(|_| {});
     #[cfg(test)]
     let visits = &mut state.reconcile_visits;
     for entry in &mut state.slots {
@@ -57,34 +51,31 @@ pub(super) fn collect_grants(state: &mut PeerIngress, replies: &mut Vec<ReplyRec
     }
 }
 
-/// Move the dirty lane's entries onto the pass's reconcile list.
-///
-/// Drained with `try_recv` and bounded by the lane's own capacity rather than
-/// by "until empty": a pump listing a slot while this runs would otherwise be
-/// able to hold the pass here, under the peer mutex the batch path needs. An
-/// entry that arrives after the bound is not lost — it is the next pass's, and
-/// the count that entitles it to credit lives in the slot's own signal.
+/// Move the dirty set's listings onto the pass's reconcile list.
 ///
 /// Dedup is [`IngressSlot::mark_touched`], the same flag the batch's own
 /// deliveries use, so a slot that both received and drained is visited once.
 ///
-/// An entry naming an index whose slot is gone lists nothing, and one naming an
-/// index a *different* slot has since taken costs that slot one visit that
+/// A listing naming an index whose slot is gone lists nothing, and one naming
+/// an index a *different* slot has since taken costs that slot one visit that
 /// reads that slot's own count, whatever it is. Neither can misplace credit:
-/// the lane carries an index and no quantity, and the quantity lives in the
+/// the set carries an index and no quantity, and the quantity lives in the
 /// [`DrainSignal`](super::DrainSignal) the slot itself holds.
 pub(super) fn list_drained_slots(state: &mut PeerIngress) {
-    for _ in 0..MAX_INGRESS_SLOTS_PER_PEER {
-        let Ok(index) = state.drained_rx.try_recv() else {
-            break;
-        };
-        let Some(slot) = state.slots.get_mut(index as usize).and_then(Option::as_mut) else {
-            continue;
+    let PeerIngress {
+        dirty,
+        slots,
+        touched,
+        ..
+    } = state;
+    dirty.take(|index| {
+        let Some(slot) = slots.get_mut(index as usize).and_then(Option::as_mut) else {
+            return;
         };
         if slot.mark_touched() {
-            state.touched.push(index);
+            touched.push(index);
         }
-    }
+    });
 }
 
 /// Reconcile the slots this pass listed, and clear the list it built.
@@ -101,7 +92,7 @@ pub(super) fn list_drained_slots(state: &mut PeerIngress) {
 /// replacement did not earn, because the count a reconcile reads belongs to
 /// the slot rather than to the index: `bind` makes one [`DrainSignal`](super::DrainSignal) per
 /// bind and `open_slot` claims it, so the replacement reads its own count —
-/// zero unless its own pump has already drained something, and either way
+/// zero unless its own consumer has already drained something, and either way
 /// its own credit, never the retired slot's. If the replacement is listed
 /// again later in the same pass, it is visited twice — the first visit takes
 /// the whole count and the pending grant with it, so the second finds zero of

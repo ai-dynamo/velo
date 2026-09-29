@@ -37,7 +37,9 @@
 //! whichever request it belongs to, and whether or not that request was in the
 //! batch a moment ago — rides in one `_stream_batch` active message.
 //!
-//! Running it every way is the whole argument. One developer machine, defaults:
+//! Running it every way is the whole argument. One developer machine, defaults
+//! at the time, with a credit window of 256 (`--initial-credit 256` reproduces
+//! it):
 //!
 //! ```text
 //! --legacy                    476 tokens, 476 per-stream egress flushes   1.00 : 1
@@ -130,7 +132,7 @@ use velo_examples::{TransportType, new_transport};
 /// requests-per-host, and `--max-batch` already moves it.
 const HOSTS: usize = 3;
 
-/// The streaming transport a node advertises only when the mux is switched on.
+/// The streaming transport a node advertises unless the mux is switched off.
 const MUX_KEY: &str = velo::streaming::MESSENGER_MUX_KEY;
 
 /// The streaming transport every node has: one TCP connection per stream.
@@ -180,6 +182,10 @@ struct Args {
     /// has no batcher to decide anything.
     #[arg(long = "flush-policy", value_enum, default_value_t = Flush::Manual)]
     flush_policy: Flush,
+
+    /// Per-stream credit window (`MuxConfig::initial_credit`).
+    #[arg(long = "initial-credit", default_value_t = MuxConfig::default().initial_credit)]
+    initial_credit: u32,
 }
 
 /// The two flush policies, as the example exposes them.
@@ -339,10 +345,10 @@ impl Node {
 
 /// Build a node on loopback with the mux either installed or rolled back.
 ///
-/// `enabled: false` is the documented rollback, and is the same node as never
-/// calling `messenger_mux` at all: nothing is registered, nothing is
-/// advertised, and every attach negotiates the legacy path.
-async fn node(mux_enabled: bool, flush: Flush) -> Result<Arc<Node>> {
+/// `enabled: false` is the documented rollback: nothing is registered, nothing
+/// is advertised, and every attach negotiates the per-stream path. The builder
+/// installs the mux by default, so the rollback has to be asked for.
+async fn node(mux_enabled: bool, flush: Flush, initial_credit: u32) -> Result<Arc<Node>> {
     // A registry per node. Two `VeloMetrics::register` calls against one
     // registry would collide on collector names, and per-node registries are
     // what let the summary attribute writes to the engine that made them.
@@ -356,6 +362,7 @@ async fn node(mux_enabled: bool, flush: Flush) -> Result<Arc<Node>> {
         .messenger_mux(MuxConfig {
             enabled: mux_enabled,
             flush_policy: flush.policy(),
+            initial_credit,
             ..MuxConfig::default()
         })?
         .build()
@@ -627,19 +634,19 @@ async fn main() -> Result<()> {
     };
     println!(
         "batched_streaming: {HOSTS} anchor hosts, {} engine(s), {} requests, \
-         max-batch {}, {expected_tokens} tokens, {}ms between passes\n\
+         max-batch {}, {expected_tokens} tokens, {}ms between passes, credit window {}\n\
          mode: {mode}",
-        args.engines, args.requests, args.max_batch, args.pass_delay_ms
+        args.engines, args.requests, args.max_batch, args.pass_delay_ms, args.initial_credit
     );
 
     // Build the deployment. Hosts own anchors; engines produce tokens.
     let mut hosts = Vec::with_capacity(HOSTS);
     for _ in 0..HOSTS {
-        hosts.push(node(mux, args.flush_policy).await?);
+        hosts.push(node(mux, args.flush_policy, args.initial_credit).await?);
     }
     let mut engines = Vec::with_capacity(args.engines);
     for _ in 0..args.engines {
-        engines.push(node(mux, args.flush_policy).await?);
+        engines.push(node(mux, args.flush_policy, args.initial_credit).await?);
     }
 
     // Engines and hosts know each other; hosts never stream to each other and

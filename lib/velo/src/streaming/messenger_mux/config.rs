@@ -126,19 +126,28 @@ impl FlushPolicy {
 
 /// Construction-time tuning for the mux, and the switch that installs one.
 ///
-/// Reached from the `Velo` builder as `.messenger_mux(MuxConfig { enabled: true,
-/// ..Default::default() })`. Defaults are chosen so `enabled` is the only
-/// decision an operator has to make.
+/// The `Velo` builder installs `MuxConfig::default()` unless
+/// `.messenger_mux(...)` passes another. Tune it with
+/// `.messenger_mux(MuxConfig { max_batch_bytes: ..., ..Default::default() })`,
+/// and turn it off with `.messenger_mux(MuxConfig { enabled: false,
+/// ..Default::default() })`. Defaults are chosen so that most deployments
+/// change nothing.
 #[derive(Debug, Clone)]
 pub struct MuxConfig {
     /// Whether to install the mux at all.
     ///
-    /// **Defaults to `false`, and stays that way** — the mux is opt-in, not the
-    /// default transport. This flag is also the rollback: set it back to
-    /// `false` and the node stops registering `messenger-mux-v1` and stops
-    /// advertising it on attach, so the next attach negotiates the legacy path
-    /// with no code change and no wire change. That is what makes a canary
-    /// safe, and why activation is config-only.
+    /// **Defaults to `true`.** The per-stream transport opens a connection for
+    /// each stream; at a few thousand new streams a second that exhausts the
+    /// local port range, and the mux carries the same streams over the
+    /// connection each peer already has. The mux still negotiates per attach,
+    /// so a peer that does not offer it is served on the per-stream transport.
+    ///
+    /// This flag is also the rollback: set it to `false` and the node stops
+    /// registering `messenger-mux-v2` and stops advertising it on attach, so
+    /// the next attach negotiates the per-stream path with no code change and
+    /// no wire change. `VELO_MESSENGER_MUX_DISABLE=1` does the same at
+    /// build time, for an application that does not expose this field; it
+    /// wins over `enabled: true` set in code.
     ///
     /// Complete on the node that mints zero-RTT tickets — with no mux there is
     /// no ticket, and every stream attaches the ordinary way — but not
@@ -155,6 +164,16 @@ pub struct MuxConfig {
     /// Data credit `C` granted to each new slot, and therefore the depth of the
     /// `C + 1` buffer `bind` hands the anchor.
     ///
+    /// It also bounds how much of the shared per-peer path one stream can fill,
+    /// and that is why the default is 32 rather than 256. When the consumer
+    /// node is the bottleneck, every stream runs at its window, and a new
+    /// stream's first record queues behind everything the others have in
+    /// flight. At 32 the surplus waits in each stream's own withheld queue on
+    /// the producer instead, where it delays only that stream; the cost is
+    /// more grants per stream. The measurements, and why not 16 or 64, are in
+    /// `docs/src/operations/response-plane-performance.md` ("The credit window
+    /// and a saturated frontend").
+    ///
     /// Advertised verbatim as the attach response's `initial_credit`, so it
     /// must never be zero: zero on the wire means *this peer is not offering
     /// the mux*. Building a mux refuses a zero rather than letting a node
@@ -170,11 +189,11 @@ pub struct MuxConfig {
     ///
     /// A backstop, not the primary mechanism. Credit comes back from the
     /// arrival path on every inbound batch — for the slots that batch
-    /// delivered into and the slots a draining pump named on the peer's dirty
-    /// lane — and from the doorbell over that same lane. This covers only what
-    /// neither reaches: a slot parked with nothing further arriving *and*
-    /// nothing being taken out, and one whose drain found the lane full. It
-    /// also carries batcher eviction, whose granularity it sets.
+    /// delivered into and the slots a draining consumer listed in the peer's
+    /// dirty set — and from the doorbell over that same set. This covers only
+    /// what neither reaches: a slot parked with nothing further arriving *and*
+    /// nothing being taken out. It also carries batcher eviction, whose
+    /// granularity it sets.
     ///
     /// It was 2 ms when the sweep was the only way credit came back, which is
     /// what made that interval load-bearing rather than a tuning choice. Every
@@ -187,6 +206,11 @@ pub struct MuxConfig {
     /// measured number: the figures first quoted here were taken on a shared
     /// login node and are retracted. See
     /// `docs/src/operations/response-plane-performance.md`.
+    ///
+    /// The same tick closes expired accept windows, so an unclaimed bind is
+    /// reclaimed up to one interval after its 60 s window: a long interval
+    /// delays the `SenderDropped` an abandoned ticket's anchor is owed by as
+    /// much.
     ///
     /// Must be non-zero. The sweep ticks on a `tokio::time::interval`, which
     /// has no zero period, so building a mux refuses a zero here the way it
@@ -206,7 +230,7 @@ pub struct MuxConfig {
     /// mutex the inbound batch path takes, so on the shape this mux exists for
     /// — one peer, hundreds to thousands of slots, a consumer that keeps up —
     /// the doorbell becomes hot-path contention. It walked every slot of the
-    /// peer when this floor was added; it now walks the dirty lane's slots
+    /// peer when this floor was added; it now walks the dirty set's slots
     /// alone, which shortens each visit but does not change what the rate needs
     /// bounding for.
     ///
@@ -220,13 +244,11 @@ pub struct MuxConfig {
     /// producer parked out of credit on a peer sending this side no further
     /// batch waits up to this long for the return its consumer's drain has
     /// already earned. Only that producer — any inbound batch from the peer
-    /// reconciles the slots its pumps named on the dirty lane, so a peer that
-    /// keeps sending never reaches this floor at all. A drain whose listing
-    /// found the lane full is not on the lane and so not on this path either;
-    /// `credit_sweep_interval` is what covers it. That is one wait per window,
-    /// so what it costs per record is `floor / initial_credit` — negligible at
-    /// the default 256-record window, and visible at the small windows the
-    /// credit tests use deliberately. It stacks with
+    /// reconciles the slots listed in its dirty set, so a peer that keeps
+    /// sending never reaches this floor at all. That is one wait per window,
+    /// so what it costs per record is `floor / initial_credit` — about 63 µs at
+    /// the default 2 ms floor and 32-record window, and more at the smaller
+    /// windows the credit tests use deliberately. It stacks with
     /// [`reply_linger`](Self::reply_linger) rather than replacing it: the
     /// return still has to cross the receiver's egress batcher once it is
     /// reconciled here.
@@ -368,8 +390,8 @@ pub struct MuxConfig {
     /// wins.
     ///
     /// The return a sender is owed is delayed by at most this long, once per
-    /// window, which per record is `reply_linger / initial_credit`: nothing at
-    /// the default 256-record window. On the drain-driven return path this
+    /// window, which per record is `reply_linger / initial_credit`: about 31 µs
+    /// at the default 1 ms linger and 32-record window. On the drain-driven return path this
     /// stacks with [`drain_visit_floor`](Self::drain_visit_floor) rather than
     /// replacing it — a producer parked out of credit can wait for both, in
     /// series.
@@ -384,9 +406,9 @@ pub struct MuxConfig {
 impl Default for MuxConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             max_batch_bytes: 60 * 1024,
-            initial_credit: 256,
+            initial_credit: 32,
             slot_byte_budget: DEFAULT_SLOT_BYTE_BUDGET,
             peer_byte_budget: DEFAULT_PEER_BYTE_BUDGET,
             credit_sweep_interval: Duration::from_millis(200),

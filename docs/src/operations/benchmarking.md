@@ -29,6 +29,7 @@ cargo run --release --all-features --example batched_streaming -- --engines 2 --
 | `--pass-delay-ms` | 1 | Gap between forward passes, standing in for GPU time. |
 | `--legacy` | off | Run the same workload on the per-stream path. |
 | `--flush-policy` | `manual` | `manual` calls `flush_batch()` once per pass. `auto` lets the batcher write at every wake. Ignored with `--legacy`. |
+| `--initial-credit` | 32, velo's default | Per-stream credit window, printed in the run header. The figures in this book that say "at a credit window of 256" need `--initial-credit 256`. |
 
 The example has three anchor hosts. It fails the run if any request misses a token, sees an unexpected frame, or if the batcher's `velo_streaming_mux_records_per_batch{direction="sent"}` does not account for every token.
 
@@ -37,9 +38,9 @@ Keep `--pass-delay-ms` above zero for a per-stream comparison. With no gap, the 
 To reproduce the flush-policy comparison in [Batched streaming](../concepts/batched-streaming.md#when-an-explicit-flush-helps), run each configuration five times with `--flush-policy auto` and `--flush-policy manual`:
 
 ```bash
-cargo run --release --all-features --example batched_streaming -- --engines 2 --requests 96 --max-batch 32 --tokens 40 --flush-policy auto
-cargo run --release --all-features --example batched_streaming -- --engines 2 --requests 96 --max-batch 32 --tokens 40 --flush-policy manual
-cargo run --release --all-features --example batched_streaming -- --engines 2 --requests 24 --max-batch 8 --tokens 40 --pass-delay-ms 0 --flush-policy auto
+cargo run --release --all-features --example batched_streaming -- --engines 2 --requests 96 --max-batch 32 --tokens 40 --flush-policy auto --initial-credit 256
+cargo run --release --all-features --example batched_streaming -- --engines 2 --requests 96 --max-batch 32 --tokens 40 --flush-policy manual --initial-credit 256
+cargo run --release --all-features --example batched_streaming -- --engines 2 --requests 24 --max-batch 8 --tokens 40 --pass-delay-ms 0 --flush-policy auto --initial-credit 256
 ```
 
 CI runs `batched_streaming` at the defaults with both flush policies.
@@ -63,6 +64,7 @@ cargo run --release --all-features --example response_plane_bench -- --anchor-ho
 | `--credit-sweep-interval-ms` | 2 | `MuxConfig::credit_sweep_interval`. |
 | `--legacy` | off | Run on the per-stream path. |
 | `--flush-policy` | `manual` | `manual` or `auto`, as in `batched_streaming`. |
+| `--initial-credit` | 32, velo's default | Per-stream credit window, as in `batched_streaming`. |
 | `--warmup-requests` | 0 | Leave the first N requests out of the latency histograms. |
 | `--json` | off | Print one line of JSON for scripts. |
 
@@ -72,7 +74,7 @@ The harness reports TTFT and ITL as HDR histograms (p50, p95, p99). It also repo
 
 Sweep `--engines`, not `--anchor-hosts`. The per-peer costs on a frontend scale with its ingress peers, and an anchor host's ingress peers are the engines that stream to it. `--anchor-hosts` moves the smaller side of the same product.
 
-The harness agrees with `batched_streaming`. At `--anchor-hosts 3 --engines 2 --requests 96 --max-batch 32 --tokens 40`, it reports 5.41 tokens per write where `batched_streaming` reports 5.38.
+The harness agrees with `batched_streaming`. At `--anchor-hosts 3 --engines 2 --requests 96 --max-batch 32 --tokens 40 --initial-credit 256`, it reports 5.41 tokens per write where `batched_streaming` reports 5.38, both at a credit window of 256.
 
 ### Limits of the in-process harness
 
@@ -84,7 +86,7 @@ The harness agrees with `batched_streaming`. At `--anchor-hosts 3 --engines 2 --
 
 ## The external serving rig
 
-The external rig runs velo as the response plane inside Dynamo's serving stack. It uses Dynamo's own HTTP frontend, its `mocker` engine and the `aiperf` load generator. The same rig runs Dynamo's own response planes, so only the response plane changes between arms. The rig scripts and the Dynamo adapter live outside this repository.
+The external rig runs velo as the response plane inside Dynamo's serving stack. It uses Dynamo's own HTTP frontend, its `mocker` engine and the `aiperf` load generator. The same rig runs Dynamo's own response planes, so only the response plane changes between arms. The rig scripts and the Dynamo adapter live outside this repository. The table below is the shape of the main comparison; other measurements state their own shape.
 
 | Item | Value |
 |---|---|
@@ -115,7 +117,10 @@ Each rule below exists because a measurement without it was wrong.
 5. **Compare reps at a matched backlog draw.** On the external rig, one or more mocker processes fall behind during the opening burst and keep that backlog. The number of processes that hold the backlog (the "holders") sets throughput, ITL and end-to-end latency for every arm. Compare two arms only at the same holder count.
 6. **Do not fix the arm order.** A matrix that always ran the same arm second put that arm in a degraded band in every rep. Its request-level numbers measured run position, not the setting.
 7. **Change one setting per arm.** A pair that differed in two settings attributed a result to the wrong one.
-8. **Assert the transport per request.** Fail any request whose negotiated key is not `messenger-mux-v1`. A silent fallback measures the per-stream path under a mux label.
+8. **Assert the transport per request.** Fail any request whose negotiated key is not `messenger-mux-v2`. A silent fallback measures the per-stream path under a mux label.
 9. **Record the build.** Write the velo commit and its dirty state into each rep's metadata. If the installed build and the checkout differ, fail the rep.
 10. **Report latency beside throughput.** A change that adds latency can raise throughput by letting the consumer catch up. Watch TTFT in particular, because any windowed flush policy can make it worse.
 11. **Prove a regression test before you trust it.** Revert the fix and make sure that the test fails. A test that passes with the fix reverted proves nothing.
+12. **Check that every process was scraped.** The rig gave worker process p the metrics port `base + p`. With 16 processes the range covered port 9100, which node_exporter holds on the compute nodes. Process 10 served traffic with no `/metrics`, and every summed worker metric missed a sixteenth of the fleet. An empty scrape file must fail the rep.
+13. **Time the first record at both ends before you blame a stage for TTFT.** Dynamo's worker `time_to_first_response` stops when the prologue is sent, not at the first token, so it cannot separate engine queueing from the response path. The rig adds histograms for the engine's first item and for its send on the worker, and for the prologue and the first data item on the frontend. With them, a 200 ms TTFT gap turned out to be the response path (the first token left the worker 10 ms after the request arrived) and not the mocker. See [The credit window and a saturated frontend](response-plane-performance.md#the-credit-window-and-a-saturated-frontend).
+14. **Sort reps by the environment before you compare arms.** On the 2-node rig, reps fall into two states that move every arm, the comparison plane included. In the bad state, frontend CPU per request rose from about 11 to 16–20 ms and irq and softirq time on node A rose from 5–9 to 13–16 cores. Network softirq runs on the frontend's own pinned cores: with the frontend on 24 cores, it took 5 to 7 of them, in both planes. Three reps that mix the states average two regimes and settle nothing.

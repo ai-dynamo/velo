@@ -28,6 +28,7 @@ use futures::StreamExt;
 use prometheus::Registry;
 use velo::observability::VeloMetrics;
 use velo::observability::test_helpers::MetricSnapshot;
+use velo::streaming::MuxConfig;
 use velo::transports::tcp::TcpTransportBuilder;
 use velo::*;
 
@@ -48,14 +49,27 @@ async fn make_pair() -> (Arc<Velo>, Registry, Arc<Velo>, Registry) {
     let consumer_reg = Registry::new();
     let consumer_metrics = Arc::new(VeloMetrics::register(&consumer_reg).unwrap());
 
+    // The mux is off on both nodes: this file covers the per-stream cascade
+    // (connect and bind channels, the server pump), and with the mux on (the
+    // default) the streams would ride it instead.
     let producer = Velo::builder()
         .add_transport(new_messenger_transport())
+        .messenger_mux(MuxConfig {
+            enabled: false,
+            ..MuxConfig::default()
+        })
+        .unwrap()
         .metrics(producer_metrics)
         .build()
         .await
         .unwrap();
     let consumer = Velo::builder()
         .add_transport(new_messenger_transport())
+        .messenger_mux(MuxConfig {
+            enabled: false,
+            ..MuxConfig::default()
+        })
+        .unwrap()
         .metrics(consumer_metrics)
         .build()
         .await
