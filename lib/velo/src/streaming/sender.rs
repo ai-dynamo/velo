@@ -356,10 +356,12 @@ impl<T: Serialize> StreamSender<T> {
         // only a String and its msgpack encoding is identical for any T.
         let bytes = rmp_serde::to_vec(&StreamFrame::<()>::SenderError(msg.to_string()))
             .expect("SenderError serializes infallibly");
-        self.tx
-            .send_async(bytes)
-            .await
-            .map_err(|_| SendError::ChannelClosed)
+        // Raced against the cancel for the same reason as `send`.
+        tokio::select! {
+            biased;
+            _ = self.cancel_token.cancelled() => Err(SendError::ChannelClosed),
+            result = self.tx.send_async(bytes) => result.map_err(|_| SendError::ChannelClosed),
+        }
     }
 
     /// Permanently close the stream by sending a `Finalized` sentinel.
@@ -446,6 +448,10 @@ impl<T: Serialize> StreamSender<T> {
 /// have to block that thread, and under the mux a slot at its byte cap can keep
 /// the inlet full for as long as its consumer does not read. The caller's
 /// runtime goes first because the sender can outlive the runtime it was made on.
+///
+/// A `current_thread` runtime that nobody drives never runs the task, so the
+/// terminal waits there with no end; that is the price of never blocking the
+/// caller's thread.
 ///
 /// The record is still lost when the runtime chosen is shutting down before the
 /// task runs. The sender clone dies with the task, so the inlet reaches EOF

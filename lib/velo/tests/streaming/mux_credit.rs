@@ -824,3 +824,68 @@ async fn a_producer_parked_on_a_dropped_mpsc_anchor_is_released() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
+
+/// Cancelling an MPSC anchor, while the consumer still holds it, releases a
+/// producer parked at the byte cap and closes its slot.
+///
+/// The twin of the test above, with a cancel instead of a drop. The anchor
+/// object stays alive, so its channel stays open and the consumer-side pump
+/// stays blocked forwarding a record into that full channel. The cancel has to
+/// reach the pump there, or the pump never ends and never closes the slot.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelling_a_held_mpsc_anchor_releases_its_parked_producer() {
+    let config = MuxConfig {
+        initial_credit: 4,
+        slot_byte_budget: 4096,
+        ..MuxConfig::default()
+    };
+    let consumer = node(config.clone()).await;
+    let producer = node(config).await;
+    introduce(&producer, &consumer).await;
+
+    let anchor = consumer.velo.create_mpsc_anchor::<Vec<u8>>();
+    let handle = transfer(anchor.handle());
+    let sender = producer
+        .velo
+        .attach_mpsc_anchor::<Vec<u8>>(handle)
+        .await
+        .expect("remote mpsc attach");
+
+    let writer = tokio::spawn(async move { while sender.send(vec![0u8; 256]).await.is_ok() {} });
+
+    let withheld = || {
+        producer
+            .snapshot()
+            .gauge("velo_streaming_mux_withheld_records", &[])
+    };
+    let deadline = Instant::now() + PATIENCE;
+    while withheld() == 0.0 {
+        assert!(Instant::now() < deadline, "the producer never parked");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!writer.is_finished(), "the producer is parked in send");
+
+    anchor.controller().cancel();
+    tokio::time::timeout(PATIENCE, writer)
+        .await
+        .expect("send never returned after the consumer cancelled the anchor")
+        .expect("producer task panicked");
+
+    let live = || {
+        producer
+            .snapshot()
+            .gauge("velo_streaming_mux_live_slots", &[])
+    };
+    let deadline = Instant::now() + PATIENCE;
+    while live() != 0.0 || withheld() != 0.0 {
+        assert!(
+            Instant::now() < deadline,
+            "the producer's slot outlived the cancel: live_slots {}, withheld {}",
+            live(),
+            withheld()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    drop(anchor);
+}

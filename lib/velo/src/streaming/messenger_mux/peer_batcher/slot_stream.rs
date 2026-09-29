@@ -499,7 +499,8 @@ impl EgressSlots {
     }
 }
 
-/// What [`EgressSlots::close_all`] closed.
+/// Slots closed together, and the withheld records discarded with them.
+/// [`EgressSlots::close_all`] returns one; a single close builds one too.
 #[derive(Debug, Default)]
 pub(super) struct Closed {
     /// Slots closed.

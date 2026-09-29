@@ -160,7 +160,16 @@ pub(crate) async fn mpsc_reader_pump(
                         let explicit_terminal = bytes == *crate::streaming::sender::cached_detached()
                             || bytes == *crate::streaming::sender::cached_dropped()
                             || bytes == *crate::streaming::sender::cached_finalized();
-                        if frame_tx.send_async((sender_id, bytes)).await.is_err() {
+                        // Raced against the cancel: over the mux a consumer
+                        // that stopped reading leaves this forward blocked on
+                        // a full anchor channel, and its cancel must still end
+                        // the pump, which closes the slot below.
+                        let forwarded = tokio::select! {
+                            biased;
+                            _ = &mut cancelled => false,
+                            sent = frame_tx.send_async((sender_id, bytes)) => sent.is_ok(),
+                        };
+                        if !forwarded {
                             break;
                         }
                         // Any frame proves liveness -- but only once it is
@@ -194,6 +203,12 @@ pub(crate) async fn mpsc_reader_pump(
                             drain.drained();
                         }
                         if explicit_terminal {
+                            // The terminal retires the slot on the mux side;
+                            // saying so here spares the release below its trip
+                            // to the peer's ingress lock.
+                            if let Some(drain) = drain.as_deref() {
+                                drain.mark_released();
+                            }
                             if let Some(slot) =
                                 super::anchor::remove_sender_slot(&mpsc_registry, local_id, sender_id)
                                 && let Some(pt) = slot.pump_token
@@ -205,7 +220,11 @@ pub(crate) async fn mpsc_reader_pump(
                     }
                     Err(_) => {
                         let dropped = crate::streaming::sender::cached_dropped().clone();
-                        let _ = frame_tx.send_async((sender_id, dropped)).await;
+                        tokio::select! {
+                            biased;
+                            _ = &mut cancelled => {}
+                            _ = frame_tx.send_async((sender_id, dropped)) => {}
+                        }
                         super::anchor::remove_sender_slot(
                             &mpsc_registry,
                             local_id,
@@ -233,7 +252,11 @@ pub(crate) async fn mpsc_reader_pump(
                 missed_heartbeats += 1;
                 if missed_heartbeats >= DETECTION_MULTIPLIER {
                     let dropped = crate::streaming::sender::cached_dropped().clone();
-                    let _ = frame_tx.send_async((sender_id, dropped)).await;
+                    tokio::select! {
+                        biased;
+                        _ = &mut cancelled => {}
+                        _ = frame_tx.send_async((sender_id, dropped)) => {}
+                    }
                     super::anchor::remove_sender_slot(&mpsc_registry, local_id, sender_id);
                     break;
                 }
