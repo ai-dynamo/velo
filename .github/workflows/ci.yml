@@ -205,6 +205,10 @@ jobs:
       # deps/ and into the incremental cache. sccache cannot cache incremental
       # builds either.
       CARGO_INCREMENTAL: "0"
+      # Full debug info was 80% of each test binary (317 of 395 MB), and the
+      # job builds about 30 of them. Source-based coverage reads LLVM's own
+      # coverage maps, not DWARF, so line tables are enough.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     services:
       nats:
         image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/nats-jetstream:2.12.6v1
