@@ -619,12 +619,12 @@ async fn connection_writer_task(
     ctx: WriterTaskContext,
 ) {
     // Names the connection in logs: with lanes, one peer has several.
-    let peer = format!("{} lane {}", key.0, key.1);
+    let peer_name = format!("{} lane {}", key.0, key.1);
     let addr = ctx.peer.addr;
     let connections = Arc::clone(&ctx.connections);
     let metrics = ctx.metrics.clone();
-    if let Err(e) = connection_writer_inner(&peer, &rx, ctx).await {
-        warn!("QUIC: connection to {peer} ({addr}) failed: {e:#}");
+    if let Err(e) = connection_writer_inner(&peer_name, &rx, ctx).await {
+        warn!("QUIC: connection to {peer_name} ({addr}) failed: {e:#}");
     }
 
     // Drain queued messages and notify their error handlers. The same small
@@ -641,7 +641,7 @@ async fn connection_writer_task(
     if let Some(metrics) = metrics.as_ref() {
         metrics.set_active_connections(connections.len());
     }
-    debug!("QUIC connection to {peer} ({addr}) closed");
+    debug!("QUIC connection to {peer_name} ({addr}) closed");
 }
 
 async fn connection_writer_inner(

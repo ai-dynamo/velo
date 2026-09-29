@@ -302,7 +302,8 @@ impl VeloBackend {
     /// been registered with [`register_peer`](Self::register_peer).
     ///
     /// The [`SendOutcome`] distinguishes synchronous admission
-    /// ([`SendOutcome::Admitted`]) from a saturated per-target channel
+    /// ([`SendOutcome::Admitted`]) from a saturated channel for the target's
+    /// lane 0
     /// ([`SendOutcome::Pending`]), where the frame is queued behind its
     /// predecessors and the contained [`SendAdmission`] reports when it lands.
     pub fn send_message(
@@ -332,7 +333,9 @@ impl VeloBackend {
     /// Send a message to a registered peer on one of its primary transport's
     /// lanes.
     ///
-    /// Frames sent on one `(target, lane)` arrive in order. See
+    /// Frames sent on one `(target, lane)` arrive in order, and nothing is
+    /// ordered across lanes. So `Message` frames for an ordered handler must
+    /// stay on one lane: the messenger's own traffic uses lane 0. See
     /// [`Transport::send_message_on_lane`] for the contract, and
     /// [`send_message`](Self::send_message) for everything else, which is the
     /// same.

@@ -188,8 +188,9 @@ pub enum OrderingKey {
     ///
     /// Messages from a single peer are handled in arrival order; messages from
     /// different peers run in parallel. This is the guarantee the transport
-    /// layer actually provides — one connection per peer, read sequentially —
-    /// so it is what [`AmHandlerBuilder::ordered`] selects.
+    /// layer actually provides — one lane per peer, read sequentially, and the
+    /// messenger sends on lane 0 — so it is what [`AmHandlerBuilder::ordered`]
+    /// selects.
     #[default]
     Sender,
     /// A single lane for the whole handler.

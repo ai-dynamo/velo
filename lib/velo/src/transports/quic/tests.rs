@@ -1379,6 +1379,12 @@ async fn closed_force_closes_a_stuck_lane_other_than_zero() {
         .unwrap();
     assert!(client.connections.contains_key(&(peer_id, lane)));
     assert_eq!(client.connections.len(), 1, "only lane {lane} was dialed");
+    // Otherwise every frame could have failed for another reason, and the
+    // force close under test would never have run.
+    assert!(
+        errors.0.lock().unwrap().is_empty(),
+        "a frame failed before shutdown"
+    );
 
     client.shutdown();
     client.closed().await;

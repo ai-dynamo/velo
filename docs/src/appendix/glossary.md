@@ -14,9 +14,9 @@
 | Frame transport | A transport for stream frames when the mux is not used (TCP or gRPC) |
 | Gate | The first phase of graceful shutdown. New inbound requests are refused. |
 | `InstanceId` | The identity of one `Velo` instance |
-| Lane | One ordered channel from a transport to a peer. Order holds within a lane only. QUIC can keep several lanes to a peer, each on its own connection. |
+| Lane | One ordered channel from a transport to a peer. Order holds within a lane only. QUIC can keep several lanes to a peer, each on its own connection. Not the same as an ordered lane. |
 | Mux | Batched streaming. Records from many streams share messenger frames to the same peer. |
-| Ordered lane | For an ordered handler, the queue and task for one sender (or for all senders with `ordered_global`) |
+| Ordered lane | For an ordered handler, the queue and task for one sender (or for all senders with `ordered_global`). Not the same as a transport lane. |
 | Pre-bind | `prebind_anchor`. The consumer makes a ticket, so the producer can open the stream with no attach round trip. |
 | Primary transport | The compatible transport with the highest priority for a peer |
 | Rendezvous | Transfer of a large payload by handle. The owner stages the bytes, and the peer pulls them. |

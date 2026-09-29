@@ -324,7 +324,9 @@ pub trait Transport: Send + Sync {
     ///
     /// On a transport whose [`lanes`](Transport::lanes) is more than 1,
     /// `send_message` must be `send_message_on_lane(target, 0, ...)`: the same
-    /// gate and the same admission order as lane 0.
+    /// gate and the same admission order as lane 0. Such a transport must then
+    /// override `send_message_on_lane` too, because its default calls
+    /// `send_message`, and the two would call each other.
     ///
     /// Implementations must route every send through one gate per target (per
     /// target and lane, on a transport with lanes) and keep no `try_send` path
