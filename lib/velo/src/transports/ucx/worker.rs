@@ -305,6 +305,7 @@ use super::transport::UcxConfig;
 /// One message staged for the progress thread.
 pub(crate) struct SendTask {
     pub peer: InstanceId,
+    pub permit: Option<tokio::sync::OwnedSemaphorePermit>,
     pub msg_type: MessageType,
     pub header: Bytes,
     pub payload: Bytes,
@@ -590,6 +591,7 @@ enum OpKind {
     /// A velo frame: failure reports through `on_error` with the original
     /// buffers, per the `Transport` contract.
     Frame {
+        _permit: Option<tokio::sync::OwnedSemaphorePermit>,
         header: Bytes,
         payload: Bytes,
         on_error: Arc<dyn TransportErrorHandler>,
@@ -683,6 +685,7 @@ impl OpState {
         {
             match state.kind {
                 OpKind::Frame {
+                    _permit,
                     header,
                     payload,
                     on_error,
@@ -1766,6 +1769,7 @@ impl WorkerState {
                         let reply = matches!(task.msg_type, MessageType::Message);
                         let op = Arc::new(OpState {
                             kind: OpKind::Frame {
+                                _permit: task.permit,
                                 header: task.header.clone(),
                                 payload: task.payload.clone(),
                                 on_error: task.on_error,

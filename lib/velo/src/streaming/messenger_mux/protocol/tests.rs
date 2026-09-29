@@ -609,20 +609,20 @@ fn an_unknown_record_type_is_rejected_with_its_offset() {
         encoder.push_heartbeat(slot(), 1).expect("push");
     });
     let second = BATCH_HEADER_LEN + RECORD_HEADER_LEN;
-    batch[second] = 5;
+    batch[second] = 6;
 
     assert_eq!(
         first_error(&batch),
         Some(DecodeError::UnknownRecordType {
             offset: second,
-            value: 5,
+            value: 6,
         })
     );
 
-    for value in 0..=4u8 {
+    for value in 0..=5u8 {
         assert!(RecordType::from_u8(value).is_some(), "type {value}");
     }
-    for value in 5..=u8::MAX {
+    for value in 6..=u8::MAX {
         assert_eq!(RecordType::from_u8(value), None, "type {value}");
     }
 }

@@ -250,6 +250,20 @@ impl VeloBackend {
             .map(|entry| entry.value().key())
     }
 
+    /// Probe the selected transport without changing its priority or fallback.
+    pub(crate) async fn check_peer_health(
+        &self,
+        target: InstanceId,
+        timeout: std::time::Duration,
+    ) -> Result<(), transport::HealthCheckError> {
+        let transport = self
+            .primary_transport
+            .get(&target)
+            .map(|entry| entry.value().clone())
+            .ok_or(transport::HealthCheckError::PeerNotRegistered)?;
+        transport.check_health(target, timeout).await
+    }
+
     /// Largest `header + payload` the peer's primary transport will carry to
     /// `target` in one send, or `None` when that cannot be established.
     ///

@@ -17,9 +17,7 @@ use futures::Stream;
 use serde::de::DeserializeOwned;
 use tokio_util::sync::CancellationToken;
 
-use crate::observability::VeloMetrics;
-
-use crate::streaming::anchor::{AnchorContext, AnchorEntry, set_active_anchor_gauge};
+use crate::streaming::anchor::AnchorContext;
 use crate::streaming::frame::{StreamError, StreamFrame};
 use crate::streaming::handle::StreamAnchorHandle;
 
@@ -68,11 +66,6 @@ pub(crate) struct MpscAnchorEntry {
     pub heartbeat_interval: Duration,
     /// Optional cap on concurrent attached senders.
     pub max_senders: Option<usize>,
-    /// Sibling SPSC registry + metrics snapshot captured at create time so
-    /// detach/timeout paths can update the shared active-anchors gauge
-    /// without round-tripping through `AnchorManager`.
-    pub spsc_registry: Arc<DashMap<u64, AnchorEntry>>,
-    pub metrics: Option<Arc<VeloMetrics>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -82,9 +75,6 @@ pub(crate) struct MpscAnchorEntry {
 struct MpscStreamControllerInner {
     local_id: u64,
     registry: Arc<DashMap<u64, MpscAnchorEntry>>,
-    /// Sibling SPSC registry — held for shared active-anchors gauge updates.
-    spsc_registry: Arc<DashMap<u64, AnchorEntry>>,
-    metrics: Option<Arc<VeloMetrics>>,
     sender_registry: Arc<crate::streaming::control::SenderRegistry>,
     messenger: Option<Arc<crate::messenger::Messenger>>,
     cancel_wake: flume::Sender<()>,
@@ -126,11 +116,6 @@ impl MpscStreamController {
         if let Some(ref tc) = entry.timeout_cancel {
             tc.cancel();
         }
-        set_active_anchor_gauge(
-            self.inner.metrics.as_ref(),
-            &self.inner.spsc_registry,
-            &self.inner.registry,
-        );
         let _ = self.inner.cancel_wake.try_send(());
 
         cancel_all_senders(
@@ -173,16 +158,13 @@ impl<T> MpscStreamAnchor<T> {
         messenger: Option<Arc<crate::messenger::Messenger>>,
     ) -> Self {
         let AnchorContext {
-            registry: spsc_registry,
             mpsc_registry: registry,
-            metrics,
+            ..
         } = ctx;
         let (cancel_wake, cancel_rx) = flume::bounded::<()>(1);
         let inner = Arc::new(MpscStreamControllerInner {
             local_id,
             registry: registry.clone(),
-            spsc_registry,
-            metrics,
             sender_registry,
             messenger,
             cancel_wake,
@@ -352,16 +334,7 @@ pub(crate) fn remove_sender_slot(
         && let Some(duration) = entry.unattached_timeout
     {
         let parent = entry.cancel_token.clone();
-        let spsc = entry.spsc_registry.clone();
-        let metrics = entry.metrics.clone();
-        let tc = spawn_mpsc_timeout_task_with_metrics(
-            registry.clone(),
-            Some(spsc),
-            metrics,
-            local_id,
-            duration,
-            &parent,
-        );
+        let tc = spawn_mpsc_timeout_task(registry.clone(), local_id, duration, &parent);
         entry.timeout_cancel = Some(tc);
     }
     Some(slot)
@@ -369,14 +342,8 @@ pub(crate) fn remove_sender_slot(
 
 /// Spawn a background task that removes the anchor after `timeout` elapses,
 /// cancelled by either explicit cancel or a new sender attaching.
-///
-/// Takes an optional SPSC registry + metrics snapshot so the timeout fire
-/// path can update the shared active-anchors gauge. Pass `None` only from
-/// call sites that genuinely have no metrics context.
-pub(crate) fn spawn_mpsc_timeout_task_with_metrics(
+pub(crate) fn spawn_mpsc_timeout_task(
     registry: Arc<DashMap<u64, MpscAnchorEntry>>,
-    spsc_registry: Option<Arc<DashMap<u64, AnchorEntry>>>,
-    metrics: Option<Arc<VeloMetrics>>,
     local_id: u64,
     timeout: Duration,
     parent_cancel: &CancellationToken,
@@ -389,9 +356,6 @@ pub(crate) fn spawn_mpsc_timeout_task_with_metrics(
             _ = tokio::time::sleep(timeout) => {
                 if let Some((_, entry)) = registry.remove(&local_id) {
                     entry.cancel_token.cancel();
-                    if let Some(spsc) = spsc_registry.as_ref() {
-                        set_active_anchor_gauge(metrics.as_ref(), spsc, &registry);
-                    }
                     // Dropping entry drops the stored frame_tx clone. Any remaining
                     // sender clones keep the receiver alive until they're dropped.
                 }
