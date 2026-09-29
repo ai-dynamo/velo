@@ -2146,14 +2146,24 @@ async fn a_sender_starved_by_the_byte_budget_is_not_reaped() {
         slot_byte_budget: 1024,
         ..test_config()
     };
-    let (pair, manager, mut anchor, local_id, tx) =
+    let (_pair, manager, mut anchor, local_id, tx) =
         watched_anchor::<Vec<u8>>(config, heartbeat, false).await;
     let big =
         |n: u32| rmp_serde::to_vec(&StreamFrame::Item(vec![n as u8; RECORD])).expect("encode item");
     for n in 0..CREDIT {
         tx.send_async(big(n)).await.expect("send item");
     }
-    eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 1).await;
+    // All of them, not just the slot: a read while the window is still
+    // arriving finds the buffer under the byte budget and grants credit back,
+    // and a sender that holds credit and sends nothing is rightly reaped.
+    eventually(|| {
+        manager
+            .registry
+            .get(&local_id)
+            .and_then(|entry| entry.feed.current())
+            .is_some_and(|feed| feed.drain.arrivals() == u64::from(CREDIT))
+    })
+    .await;
     // Read all but two. Two large records still hold the byte budget, so the
     // credit this read earns is withheld.
     for _ in 0..CREDIT - 2 {
