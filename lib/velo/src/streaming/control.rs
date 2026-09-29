@@ -191,20 +191,22 @@ pub(crate) fn request_sender_stop(
     let (worker, sender_stream_id) = handle.unpack();
     // Stream IDs are local to a worker. Do not cancel an unrelated local sender.
     if let Some(messenger) = messenger {
+        // On the messenger's runtime, not the caller's: `request_stop` is
+        // synchronous and can run on a thread with no runtime, where the stop
+        // would be dropped after the anchor had already recorded it.
+        let rt = messenger.runtime().clone();
         let messenger = Arc::clone(messenger);
-        if let Ok(rt) = tokio::runtime::Handle::try_current() {
-            rt.spawn(async move {
-                let payload = serde_json::to_vec(&StreamCancelRequest { sender_stream_id })
-                    .expect("stream identity");
-                let _ = messenger
-                    .am_send_streaming("_stream_stop")
-                    .expect("stream stop handler")
-                    .raw_payload(bytes::Bytes::from(payload))
-                    .worker(worker)
-                    .send()
-                    .await;
-            });
-        }
+        rt.spawn(async move {
+            let payload = serde_json::to_vec(&StreamCancelRequest { sender_stream_id })
+                .expect("stream identity");
+            let _ = messenger
+                .am_send_streaming("_stream_stop")
+                .expect("stream stop handler")
+                .raw_payload(bytes::Bytes::from(payload))
+                .worker(worker)
+                .send()
+                .await;
+        });
     } else if let Some(entry) = registry.senders.get(&sender_stream_id) {
         entry.stop_token.cancel();
     }
