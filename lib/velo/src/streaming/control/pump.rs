@@ -4,13 +4,14 @@
 //! The reader pump: bridges transport frames to an anchor's delivery channel.
 //!
 //! Split out of `control.rs` (the file's own `// --- Reader pump ---` banner
-//! marked the seam before the split): [`PumpContext`], [`bind_unclaimed`],
-//! [`awaiting_sender`] and [`reader_pump`] are one self-contained unit with a
-//! single external dependency, [`super::DETECTION_MULTIPLIER`]. Spawned from
-//! two call sites in `anchor.rs` (an ordinary or adopted attach) and one in
-//! `mpsc/control.rs` (`mpsc_reader_pump`, which reuses [`PumpContext`] rather
-//! than duplicating it) — none of them live here, which is why this stays a
-//! plain function rather than growing a home for its callers too.
+//! marked the seam before the split). [`reader_pump`] serves every
+//! per-stream transport and is spawned by the attach handler. A mux bind has
+//! no reader pump: its consumer reads the slot buffer itself, and
+//! [`super::feed`] holds what the pump did besides moving data.
+//! [`PumpContext`], [`bind_unclaimed`] and [`awaiting_sender`] live here for
+//! the two users that still need a bind's drain signal: that feed's watchdog,
+//! and `mpsc/control.rs`'s `mpsc_reader_pump`, which reuses [`PumpContext`]
+//! rather than duplicating it.
 
 use std::time::Duration;
 
@@ -18,14 +19,14 @@ use super::DETECTION_MULTIPLIER;
 
 #[cfg(test)]
 tokio::task_local! {
-    /// Counts how many times a pump has armed or re-armed its heartbeat
-    /// timer.
+    /// Counts how many times a pump or a stream watchdog has armed or
+    /// re-armed its heartbeat timer.
     ///
     /// A task-local rather than a field on [`PumpContext`]: the property it
-    /// exists to pin -- that a pump arms one timer for its stream instead of
-    /// one per record -- belongs to the pump's own loop, not to anything a
-    /// caller hands it, so a field would have had to be threaded through all
-    /// three production spawn sites to observe something none of them decide.
+    /// exists to pin -- that a task arms one timer for its stream instead of
+    /// one per record -- belongs to the task's own loop, not to anything a
+    /// caller hands it, so a field would have had to be threaded through every
+    /// production spawn site to observe something none of them decide.
     /// Scoping it per task also keeps each test's count its own while the
     /// suite runs them in parallel, which a process-wide counter could not.
     pub(crate) static TIMER_ARMS: std::sync::Arc<std::sync::atomic::AtomicU64>;
@@ -44,7 +45,8 @@ pub(crate) fn note_timer_arm() {}
 
 #[cfg(test)]
 tokio::task_local! {
-    /// Counts how many times a pump's heartbeat timer has actually elapsed.
+    /// Counts how many times a pump's or watchdog's heartbeat timer has
+    /// actually elapsed.
     ///
     /// A second counter rather than a flag on [`TIMER_ARMS`] because the two
     /// answer different questions and the receive-arm re-arm below moves them
@@ -66,7 +68,10 @@ pub(crate) fn note_timer_fire() {
 #[inline(always)]
 pub(crate) fn note_timer_fire() {}
 
-/// What a reader pump needs beyond its channels.
+/// What `mpsc_reader_pump` needs beyond its channels. The direct feed's
+/// [`stream_watchdog`](super::feed::stream_watchdog) takes a
+/// [`WatchdogContext`](super::feed::WatchdogContext) instead, and
+/// [`reader_pump`] reads no drain signal and takes neither.
 ///
 /// A struct rather than three more parameters: `mpsc_reader_pump` already
 /// carries a sender id and a registry, and adding the drain hook positionally
@@ -76,50 +81,32 @@ pub(crate) struct PumpContext {
     /// The anchor's local id, for registry removal on heartbeat loss.
     pub(crate) local_id: u64,
     /// The anchor's configured cadence, carried to the sender on the attach
-    /// response or the ticket. `DETECTION_MULTIPLIER` misses is a dead
-    /// stream -- except while [`awaiting_sender`] holds, which every window a
-    /// pre-bind spends with no sender yet does by construction.
+    /// response. `DETECTION_MULTIPLIER` misses is a dead stream. MPSC has no
+    /// pre-bind path, so unlike the stream watchdog there is no "no sender
+    /// yet" exemption to apply.
     pub(crate) heartbeat_deadline: Duration,
-    /// Told when a record leaves the buffer credit is issued against. `None`
-    /// for every transport that does not do flow control over this seam.
+    /// The mux bind's drain signal. `mpsc_reader_pump` tells it when a record
+    /// leaves the buffer credit is issued against. `None` for every transport
+    /// that does not do flow control over this seam.
     pub(crate) drain: Option<std::sync::Arc<crate::streaming::messenger_mux::ingress::DrainSignal>>,
-    /// Whether this pump's slot still has no sender, other than through its
-    /// own `OpenSlot`.
-    ///
-    /// `true` only at the one genuine pre-bind spawn site
-    /// (`AnchorManager::prebind_anchor`); every ordinary attach spawn passes
-    /// a fresh `Arc::new(AtomicBool::new(false))`. Shared with the
-    /// `PreBind` the pump was spawned for, and cleared by
-    /// [`PreBind::adopt`](crate::streaming::anchor::PreBind::adopt) the
-    /// moment a sender attaches the long way round instead of opening on its
-    /// ticket -- the one other door through which a sender can show up, and
-    /// the one transition an `Arc<AtomicBool>` exists to carry immediately
-    /// rather than the pump learning it only once that sender's own
-    /// `OpenSlot` lands.
-    ///
-    /// `drain.claimed().is_none()` is not a proxy for this on its own: the
-    /// mux parks a `DrainSignal` for *every* bind, including an ordinary
-    /// attach's, and that signal stays unclaimed until the peer's `OpenSlot`
-    /// arrives -- which is necessarily after the attach response already
-    /// returned. See [`awaiting_sender`] for the combined read the
-    /// heartbeat-exemption branch below needs; the transport-closed branch
-    /// needs only the claim, see [`bind_unclaimed`].
-    pub(crate) prebound: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
-/// Whether an `OpenSlot` has claimed the mux bind this pump reads from.
+/// Whether an `OpenSlot` has claimed the mux bind this task reads from.
 ///
 /// `None` (a transport with no `DrainSignal`) answers `false`: without a
 /// drain there is no accept window racing to reclaim the bind either, so a
 /// closed transport there has always meant a sender that genuinely departed,
-/// not one still on its way in. This is the condition the reap arm below
-/// gates on -- it does not care which of the two doors in [`awaiting_sender`]
-/// a sender was expected to come through, only whether one has.
-fn bind_unclaimed(drain: Option<&crate::streaming::messenger_mux::ingress::DrainSignal>) -> bool {
+/// not one still on its way in. This is the condition
+/// `feed::reap_unclaimed` gates on -- it does not care which of the two doors
+/// in [`awaiting_sender`] a sender was expected to come through, only whether
+/// one has.
+pub(super) fn bind_unclaimed(
+    drain: Option<&crate::streaming::messenger_mux::ingress::DrainSignal>,
+) -> bool {
     drain.is_some_and(|d| d.claimed().is_none())
 }
 
-/// Whether a pump's slot still has no sender -- the state that must not count
+/// Whether a mux bind still has no sender -- the state that must not count
 /// against the heartbeat watchdog.
 ///
 /// Two different doors let a sender show up, and this has to watch both:
@@ -129,10 +116,10 @@ fn bind_unclaimed(drain: Option<&crate::streaming::messenger_mux::ingress::Drain
 /// reassigns the slot to a sender that attached the ordinary way instead --
 /// `drain` alone cannot see that sender, since its own `OpenSlot` may still
 /// be seconds or minutes away. `prebound` alone is not enough either: an
-/// ordinary attach's pump starts with an unclaimed `drain` too, for as long
-/// as the peer's own `OpenSlot` is still in flight, and that pump is spawned
-/// with `prebound` already `false` for exactly that reason.
-fn awaiting_sender(
+/// ordinary attach's watchdog starts with an unclaimed `drain` too, for as
+/// long as the peer's own `OpenSlot` is still in flight, and that watchdog is
+/// spawned with `prebound` already `false` for exactly that reason.
+pub(super) fn awaiting_sender(
     prebound: &std::sync::atomic::AtomicBool,
     drain: Option<&crate::streaming::messenger_mux::ingress::DrainSignal>,
 ) -> bool {
@@ -141,14 +128,13 @@ fn awaiting_sender(
 
 /// Reader pump: bridges transport frames to the anchor's delivery channel.
 ///
-/// Spawned from one of two sites: the attach handler, after a sender has
-/// already asked for the stream, or
-/// [`AnchorManager::prebind_anchor`](crate::streaming::anchor::AnchorManager::prebind_anchor),
-/// before any sender has. Reads from the transport receiver, forwards to the
-/// anchor's frame_tx. Monitors for heartbeat loss with one timer for the
-/// whole stream: `DETECTION_MULTIPLIER * heartbeat_deadline` of silence
-/// triggers Dropped sentinel injection, registry removal (LIVE-02), and
-/// cleanup -- but only once a sender exists.
+/// Spawned by the attach handler for every per-stream transport. A mux bind
+/// does not get one: its consumer reads the slot buffer itself and
+/// [`stream_watchdog`](super::feed::stream_watchdog) keeps the lifecycle
+/// duties. Reads from the transport receiver, forwards to the anchor's
+/// frame_tx. Monitors for heartbeat loss with one timer for the whole stream:
+/// `DETECTION_MULTIPLIER * heartbeat_deadline` of silence triggers Dropped
+/// sentinel injection, registry removal (LIVE-02), and cleanup.
 ///
 /// That timer is armed once before the loop and moved by two rules. A
 /// received frame pushes it forward only when its deadline is already inside
@@ -168,39 +154,22 @@ fn awaiting_sender(
 /// `L + d`, where that first miss is counted instead. Either way the misses
 /// land at `L + d`, `L + 2d`, `L + 3d`, and the `DETECTION_MULTIPLIER`th at
 /// `L + DETECTION_MULTIPLIER * d`. The only fire that finds `L.elapsed() >= d`
-/// on its first look is one whose `L` predates the arm -- the arm at spawn,
-/// or the re-arm an [`awaiting_sender`] window takes -- and a per-record
-/// timeout restarted its window at exactly those points too.
+/// on its first look is one whose `L` predates the arm -- the arm at spawn
+/// -- and a per-record timeout restarted its window there too.
 ///
-/// While [`awaiting_sender`] holds, a pre-bind pump times out every window by
-/// construction (there is no producer yet to be silent), so the timer branch
-/// gates on it instead of counting those windows as misses. The
-/// transport-closed branch gates on the narrower
-/// [`bind_unclaimed`] instead: a bind nobody has claimed has no sender to
-/// speak of regardless of which door it was expecting one through, and the
-/// mux's accept window closing it is the only reaper such a bind has left,
-/// while a claimed bind's producer going silent is the watchdog's job. The
-/// deadline is the anchor's configured cadence, carried to the sender on
-/// `AnchorAttachResponse::heartbeat_interval_ms` for an attach or on
-/// `StreamOpenTicket::heartbeat_interval_ms` for a ticket -- either way it is
-/// `entry.heartbeat_interval` at the moment this pump was spawned.
+/// The deadline is the anchor's configured cadence, carried to the sender on
+/// `AnchorAttachResponse::heartbeat_interval_ms` -- `entry.heartbeat_interval`
+/// at the moment this pump was spawned.
 pub(crate) async fn reader_pump(
     transport_rx: flume::Receiver<Vec<u8>>,
     frame_tx: flume::Sender<Vec<u8>>,
     cancel_token: tokio_util::sync::CancellationToken,
     ctx: crate::streaming::anchor::AnchorContext,
-    pump: PumpContext,
+    local_id: u64,
+    heartbeat_deadline: Duration,
 ) {
-    let PumpContext {
-        local_id,
-        heartbeat_deadline,
-        drain,
-        prebound,
-    } = pump;
     let crate::streaming::anchor::AnchorContext {
-        registry,
-        mpsc_registry,
-        metrics,
+        registry, metrics, ..
     } = ctx;
     let mut missed_heartbeats: u8 = 0;
     // One timer for the stream, not one per record. `tokio::time::timeout`
@@ -255,8 +224,8 @@ pub(crate) async fn reader_pump(
                     Ok(bytes) => {
                         // Forward to anchor's frame channel.
                         //
-                        // The per-anchor frame_tx is bounded(256) — the smallest
-                        // channel in the saturation cascade and the first to fill
+                        // The per-anchor frame_tx is bounded(256) — the first
+                        // channel in the saturation cascade to fill
                         // when the consumer can't keep up. We try_send first so we
                         // can record a leading-indicator counter on the slow path
                         // before falling through to the awaited send.
@@ -301,88 +270,10 @@ pub(crate) async fn reader_pump(
                             sleep.as_mut().reset(armed_until);
                             note_timer_arm();
                         }
-                        // The record is out of the buffer the mux issues credit
-                        // against, so that credit is free. Telling the mux here
-                        // is what lets its sweep interval be a backstop rather
-                        // than the only way credit comes back — see
-                        // `messenger_mux::ingress::DrainSignal`. `None` for
-                        // every transport that does not do flow control over
-                        // this seam, which pays one `Option` check per frame.
-                        if let Some(drain) = drain.as_deref() {
-                            drain.drained();
-                        }
                     }
                     Err(_) => {
-                        // Transport channel closed -- the mux's accept window
-                        // reclaiming an unclaimed bind (`release_bind` /
-                        // `expire_bind` drop the bind's `frame_tx`, the other
-                        // end of this `transport_rx`), since a claimed bind's
-                        // channel does not otherwise close out from under a
-                        // live producer.
-                        //
-                        // Gated on `bind_unclaimed`, not `awaiting_sender`:
-                        // the accept window is a fixed 60 s from bind
-                        // creation and does not care which of the two doors
-                        // in `awaiting_sender` a sender was expected through,
-                        // only whether one has actually claimed the bind. A
-                        // real pre-bind and an ordinary or adopted attach
-                        // whose peer never sent its `OpenSlot` both leave the
-                        // registry entry with a live consumer and no other
-                        // reaper once this channel closes -- the heartbeat
-                        // watchdog only gets to run again if this arm defers
-                        // to it, and its next fire, restarting from whenever
-                        // `awaiting_sender` stopped exempting this pump, can
-                        // land after the accept window that just closed (see
-                        // `ACCEPT_TIMEOUT`'s doc on the residual window an
-                        // adopted attach inherits). Once claimed, this branch
-                        // never removes the entry -- something else already
-                        // owns telling the registry about a live stream going
-                        // away (finalize, cancel, or the watchdog).
-                        //
-                        // `!cancel_token.is_cancelled()` excludes the pump
-                        // being *retired* rather than abandoned: releasing an
-                        // unclaimed pre-bind (a mismatched-transport refusal,
-                        // say) cancels this same token before dropping the
-                        // bind, precisely so the entry it would otherwise
-                        // remove -- reused by whatever attach wins next -- is
-                        // never touched by a pump that no longer speaks for
-                        // it. The `biased` cancel branch above always wins a
-                        // poll where both it and this receive are ready, but
-                        // cancellation can still land in the gap after this
-                        // poll already committed to this arm's body, so the
-                        // check stays a state read rather than an ordering
-                        // assumption.
-                        if bind_unclaimed(drain.as_deref())
-                            && !cancel_token.is_cancelled()
-                            && let Some((_, entry)) = registry.remove(&local_id)
-                        {
-                            // The consumer must see `SenderDropped`, not a
-                            // bare channel close: a bind reclaimed unclaimed
-                            // means whatever sender it was minted for never
-                            // showed up. Best-effort, unlike the
-                            // watchdog-fired injection below only in that it
-                            // runs after `registry.remove` rather than
-                            // before -- there is nothing to race here, since
-                            // an entry a concurrent finalize or cancel
-                            // already removed makes `remove` return `None`
-                            // and this whole block does not run, so a
-                            // `Finalized` frame already in `frame_tx` never
-                            // gets a spurious `Dropped` appended after it. A
-                            // bind that was never claimed has forwarded no
-                            // data, so `frame_tx` cannot be full here either
-                            // way.
-                            if let Some(m) = metrics.as_ref() {
-                                m.record_unclaimed_bind_reaped();
-                            }
-                            let _ =
-                                frame_tx.try_send(crate::streaming::sender::cached_dropped().clone());
-                            entry.cancel_token.cancel();
-                            crate::streaming::anchor::set_active_anchor_gauge(
-                                metrics.as_ref(),
-                                &registry,
-                                &mpsc_registry,
-                            );
-                        }
+                        // The transport let go of the stream: the sender is
+                        // gone, and the consumer sees the channel close.
                         break;
                     }
                 }
@@ -391,17 +282,15 @@ pub(crate) async fn reader_pump(
                 note_timer_fire();
                 // Every path out of this arm re-arms the sleep first. A fired
                 // `Sleep` stays ready until it is reset, so a `continue` past
-                // one turns the pump into a hot loop instead of a wait --
-                // which is exactly what a pre-bind pump, exempt from the
-                // miss count below, would otherwise do on every window.
+                // one turns the pump into a hot loop instead of a wait on
+                // every window.
                 let idle = last_frame.elapsed();
                 if idle < heartbeat_deadline {
                     // A frame landed inside this window, so the deadline that
                     // frame implies has not arrived yet. Reached only when
-                    // the last frame fell in the first half of a window, or
-                    // when there is no sender yet -- the receive arm's push
-                    // keeps a stream carrying records out of this arm
-                    // entirely.
+                    // the last frame fell in the first half of a window --
+                    // the receive arm's push keeps a stream carrying records
+                    // out of this arm entirely.
                     armed_until = last_frame + heartbeat_deadline;
                     sleep.as_mut().reset(armed_until);
                     note_timer_arm();
@@ -410,21 +299,6 @@ pub(crate) async fn reader_pump(
                 armed_until = tokio::time::Instant::now() + heartbeat_deadline;
                 sleep.as_mut().reset(armed_until);
                 note_timer_arm();
-                // A slot still `awaiting_sender` times out on every
-                // window by construction -- there is no producer to
-                // be silent yet. Counting that as a miss is the bug:
-                // it arms this watchdog against a sender that has not
-                // shown up, capping how long a zero-RTT request may
-                // wait in a queue, or an adopted attach may wait for
-                // its own `OpenSlot`, at a bound nothing documents.
-                // Once a sender exists -- an `OpenSlot` claims the
-                // bind, or an attach adopts it -- every miss counts
-                // exactly as it always has, with the same
-                // `DETECTION_MULTIPLIER` margin the ordinary attach
-                // path has always given it.
-                if awaiting_sender(&prebound, drain.as_deref()) {
-                    continue;
-                }
                 missed_heartbeats += 1;
                 if missed_heartbeats >= DETECTION_MULTIPLIER {
                     if let Some(m) = metrics.as_ref() {
@@ -470,11 +344,6 @@ pub(crate) async fn reader_pump(
                     // so no stale entry remains (ANCR-04)
                     if let Some((_, entry)) = registry.remove(&local_id) {
                         entry.cancel_token.cancel();
-                        crate::streaming::anchor::set_active_anchor_gauge(
-                            metrics.as_ref(),
-                            &registry,
-                            &mpsc_registry,
-                        );
                     }
                     break;
                 }

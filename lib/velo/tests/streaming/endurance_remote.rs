@@ -10,7 +10,7 @@
 //! **raw TCP** (`TcpFrameTransport`).
 //!
 //! The messenger-backed variants that used to sit beside them went with the
-//! deleted `VeloFrameTransport`. Their replacement rides `messenger-mux-v1`,
+//! deleted `VeloFrameTransport`. Their replacement rides `messenger-mux-v2`,
 //! which is crate-internal until attach-time negotiation can select it, so the
 //! mux endurance scenarios land with that stage rather than here.
 //!

@@ -244,7 +244,7 @@ async fn test_velo_facade_mpsc_with_config() {
 
 /// `Velo::builder().add_transport(t).build()` — no `.stream_config()` and no
 /// `.messenger_mux()` call — must wire a TCP streaming transport under the
-/// `tcp-stream` key and the mux under `messenger-mux-v1`, and register both.
+/// `tcp-stream` key and the mux under `messenger-mux-v2`, and register both.
 /// The default-config path otherwise has zero coverage: every other test in
 /// this file calls `.stream_config(...)` explicitly, so a regression that
 /// swapped either builder default would slip through CI.

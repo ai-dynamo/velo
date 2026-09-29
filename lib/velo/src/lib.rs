@@ -28,6 +28,9 @@ pub mod transports;
 #[cfg(feature = "simulation")]
 pub mod simulation;
 
+#[cfg(test)]
+pub(crate) mod test_alloc;
+
 // ── Convenience re-exports for the most-used public types ──────────────────
 
 // Identity / address types live in velo-ext but are re-exported here so the
@@ -289,7 +292,7 @@ impl VeloBuilder {
     }
 
     /// Configure the batched, multiplexed streaming transport
-    /// (`messenger-mux-v1`), described in `docs/src/concepts/batched-streaming.md`.
+    /// (`messenger-mux-v2`), described in `docs/src/concepts/batched-streaming.md`.
     ///
     /// **The mux is on by default.** A builder that never calls this installs
     /// `MuxConfig::default()`, whose
@@ -301,7 +304,7 @@ impl VeloBuilder {
     /// node registers both, and each attach picks between them from what the
     /// peer advertised, so a peer without the mux is still served. **Rollback
     /// is the same flag**: set it to `false` and the node stops advertising
-    /// `messenger-mux-v1`, so the next attach negotiates the per-stream path.
+    /// `messenger-mux-v2`, so the next attach negotiates the per-stream path.
     /// No code change, no wire change, and no coordination with peers, because
     /// a key that is never advertised is never selected. An application that
     /// never calls this can still turn the mux off: set
@@ -414,7 +417,7 @@ impl VeloBuilder {
         // Step 5: Build the mux unless the caller switched it off (it is on by
         // default; see `messenger_mux`). It joins the registry *beside* the
         // per-stream transport rather than replacing it: negotiation answers
-        // `messenger-mux-v1` only to peers that advertised it, and every other
+        // `messenger-mux-v2` only to peers that advertised it, and every other
         // peer is still answered — and must still be served — on the
         // per-stream key.
         let mut config = self.mux_config.unwrap_or_default();
@@ -956,6 +959,15 @@ impl Velo {
     }
 
     /// Wait for a specific handler to become available on a remote instance.
+    ///
+    /// Returns at once, with no network I/O, when the handler list already
+    /// learned for `instance_id` names `handler_name`. Otherwise it refreshes
+    /// the list with a `_hello` round trip up to 10 times, 100 ms apart, and
+    /// returns a timeout error if the handler has not appeared. It is
+    /// therefore not a reachability probe: once a handler is known, a later
+    /// call does not check that the peer is still there. The cached list is
+    /// kept for the process's life, which is safe because an instance id names
+    /// one process, and a restarted peer has a new one.
     pub async fn wait_for_handler(
         &self,
         instance_id: InstanceId,
@@ -1001,7 +1013,7 @@ impl Velo {
         self.anchor_manager.attach_stream_anchor::<T>(handle).await
     }
 
-    /// Bind and pump a stream for an anchor now, so its sender never has to ask.
+    /// Bind a stream for an anchor now, so its sender never has to ask.
     ///
     /// Delegates to [`AnchorManager::prebind_anchor`](crate::streaming::AnchorManager::prebind_anchor).
     /// Carry the returned [`streaming::control::StreamOpenTicket`] to the worker
@@ -1010,8 +1022,8 @@ impl Velo {
     /// `None` means no ticket was minted and the worker should
     /// [`attach_anchor`](Velo::attach_anchor) the ordinary way.
     ///
-    /// Must be called from a runtime context: it spawns the reader pump and
-    /// the bind's accept-window task, exactly as the attach handler does.
+    /// Must be called from a runtime context: it spawns the stream watchdog,
+    /// exactly as the attach handler does for a mux bind.
     pub fn prebind_anchor(
         &self,
         handle: StreamAnchorHandle,
@@ -1026,9 +1038,8 @@ impl Velo {
     /// `_anchor_attach` round trip, because `ticket` already carries what one
     /// would have returned.
     ///
-    /// No attach means no `StreamCancelHandle`, so the returned sender's
-    /// `cancellation_token` never fires; a dropped consumer surfaces as a
-    /// send error instead.
+    /// The mux carries stop and cancel through the ticket's session and slot
+    /// identity. Both producer tokens work even before the first item is sent.
     pub async fn open_anchor_stream<T: serde::Serialize>(
         &self,
         handle: StreamAnchorHandle,

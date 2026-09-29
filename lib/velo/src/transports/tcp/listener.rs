@@ -24,6 +24,45 @@ use velo_ext::{MessageType, ShutdownState, TransportAdapter, TransportErrorHandl
 
 use super::framing::{TcpFrameCodec, maybe_shrink_read_buffer, parse_shrink_threshold};
 
+#[cfg(test)]
+tokio::task_local! {
+    /// Counts how many times a connection handler has built its teardown
+    /// future. The teardown token is node-wide, so every build registers a
+    /// waiter on one `Notify` that all connections share, and every drop
+    /// removes it again under that `Notify`'s lock.
+    static TEARDOWN_ARMS: std::sync::Arc<std::sync::atomic::AtomicU64>;
+}
+
+#[cfg(test)]
+fn note_teardown_arm() {
+    let _ = TEARDOWN_ARMS.try_with(|n| n.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+}
+
+/// Compiles away: the seam must cost the shipped listener nothing.
+#[cfg(not(test))]
+#[inline(always)]
+fn note_teardown_arm() {}
+
+/// The one place a connection builds its teardown future, so the count the
+/// test reads is the count of builds, not of a separate call that could drift
+/// from them.
+///
+/// On a child token, not the node-wide one. The loop polls this future on
+/// every frame, and each poll locks the token's tree node and, while waiting,
+/// its `Notify` waiter list. On the shared token both are shared by every
+/// connection on the node; a child token has its own of each, so the per-frame
+/// locks are uncontended. Cancelling the node-wide token still reaches every
+/// child.
+fn connection_teardown(
+    shutdown_state: &ShutdownState,
+) -> tokio_util::sync::WaitForCancellationFutureOwned {
+    note_teardown_arm();
+    shutdown_state
+        .teardown_token()
+        .child_token()
+        .cancelled_owned()
+}
+
 /// Per-connection configuration handed to [`TcpListener::handle_connection`].
 struct ConnectionContext {
     adapter: TransportAdapter,
@@ -262,7 +301,11 @@ impl TcpListener {
 
         // Create framed stream with zero-copy codec
         let mut framed = Framed::new(stream, TcpFrameCodec::new());
-        let teardown_token = shutdown_state.teardown_token().clone();
+        // Built once per connection: the token is node-wide, so a future
+        // rebuilt per frame would register and remove a waiter on one
+        // `Notify` shared by every connection, under its lock, per frame.
+        let teardown = connection_teardown(&shutdown_state);
+        tokio::pin!(teardown);
 
         debug!("Connection from {} ready for frames", peer_addr);
 
@@ -270,7 +313,7 @@ impl TcpListener {
             tokio::select! {
                 // Prioritize teardown so a saturated connection cannot starve shutdown.
                 biased;
-                _ = teardown_token.cancelled() => {
+                _ = &mut teardown => {
                     debug!("Connection handler for {} torn down", peer_addr);
                     break;
                 }
@@ -537,6 +580,65 @@ mod tests {
         fn on_error(&self, _header: Bytes, _payload: Bytes, error: String) {
             eprintln!("Test error handler: {}", error);
         }
+    }
+
+    /// A connection builds its teardown future once, not once per frame.
+    ///
+    /// The token is node-wide, so a future rebuilt per frame registers and
+    /// removes a waiter on one `Notify` shared by every connection -- about 5
+    /// percent of a frontend's CPU at small batches. Teardown must still end
+    /// the loop while frames are flowing, which is what the rebuilt future
+    /// bought, so the client here never stops sending: the cancel lands in the
+    /// middle of the stream.
+    #[tokio::test]
+    async fn a_connection_arms_its_teardown_once() {
+        let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+            // Until the listener side closes the connection.
+            while TcpFrameCodec::encode_frame(&mut s, MessageType::Response, b"h", b"p")
+                .await
+                .is_ok()
+            {}
+        });
+        let (stream, peer) = listener.accept().await.unwrap();
+        let (adapter, streams) = make_channels();
+        let shutdown_state = ShutdownState::new();
+        let ctx = ConnectionContext {
+            adapter,
+            error_handler: Arc::new(TestErrorHandler),
+            shutdown_state: shutdown_state.clone(),
+            transport_key: "tcp".to_string(),
+            metrics: None,
+            shrink_threshold: usize::MAX,
+        };
+        let arms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let handler = tokio::spawn(TEARDOWN_ARMS.scope(
+            arms.clone(),
+            TcpListener::handle_connection(stream, peer, ctx),
+        ));
+        for _ in 0..50 {
+            tokio::time::timeout(Duration::from_secs(5), streams.response_stream.recv_async())
+                .await
+                .expect("frame routed")
+                .unwrap();
+        }
+        // Keep taking what is routed, so a full channel is not what stops the
+        // loop; only teardown should.
+        let responses = streams.response_stream.clone();
+        let drainer = tokio::spawn(async move { while responses.recv_async().await.is_ok() {} });
+        assert!(!client.is_finished(), "the client must still be sending");
+        shutdown_state.teardown_token().cancel();
+        tokio::time::timeout(Duration::from_secs(5), handler)
+            .await
+            .expect("teardown ends the connection loop while frames are flowing")
+            .unwrap()
+            .unwrap();
+        assert_eq!(arms.load(std::sync::atomic::Ordering::Relaxed), 1);
+        drop(streams);
+        client.abort();
+        drainer.abort();
     }
 
     #[test]

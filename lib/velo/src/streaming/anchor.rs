@@ -34,28 +34,7 @@ use tokio_util::sync::CancellationToken;
 use crate::streaming::frame::{StreamError, StreamFrame};
 use crate::streaming::handle::StreamAnchorHandle;
 
-// ---------------------------------------------------------------------------
-// Shared gauge helper
-// ---------------------------------------------------------------------------
-
-/// Set the `streaming_active_anchors` Prometheus gauge to
-/// `spsc.len() + mpsc.len()`. No-op when `metrics` is `None`.
-///
-/// SPSC and MPSC anchors live in separate registries but share a single
-/// `next_local_id` counter and a single gauge, so every path that mutates
-/// either registry must report the sum. Use this helper rather than reading
-/// `registry.len()` directly — that's how the pre-MPSC code mis-counted.
-pub(crate) fn set_active_anchor_gauge(
-    metrics: Option<&Arc<VeloMetrics>>,
-    spsc: &Arc<DashMap<u64, AnchorEntry>>,
-    mpsc: &Arc<DashMap<u64, crate::streaming::mpsc::anchor::MpscAnchorEntry>>,
-) {
-    if let Some(m) = metrics {
-        m.set_streaming_active_anchors(spsc.len() + mpsc.len());
-    }
-}
-
-/// Grouped handles needed by anchor constructors and background pumps to
+/// Grouped handles needed by anchor constructors and background tasks to
 /// keep both registries and the metrics collector in a single parameter.
 /// Cheap to clone (all `Arc`s).
 #[derive(Clone)]
@@ -126,9 +105,9 @@ pub struct AnchorConfig {
     pub unattached_timeout: Option<Duration>,
 
     /// The heartbeat cadence the attached sender must emit at, and the
-    /// per-window deadline the consumer reader pump applies. Total tolerance
-    /// before `Dropped` injection is `crate::streaming::control::DETECTION_MULTIPLIER`
-    /// times this value.
+    /// per-window deadline the consumer side (reader pump or mux stream
+    /// watchdog) applies. Total tolerance before `Dropped` injection is about
+    /// `crate::streaming::control::DETECTION_MULTIPLIER` times this value.
     pub heartbeat_interval: Option<Duration>,
 }
 
@@ -143,11 +122,17 @@ pub struct AnchorConfig {
 ///
 /// The `attachment` flag indicates whether a sender is currently attached.
 /// The check-and-set is performed atomically via [`dashmap::mapref::entry::Entry`]
-/// to prevent TOCTOU races. The reader pump takes ownership of the transport
-/// receiver directly rather than storing it in the entry.
-// Fields are consumed by the control handlers and the data-path pump.
+/// to prevent TOCTOU races. A reader pump takes ownership of a per-stream
+/// transport's receiver rather than storing it in the entry; a mux bind's
+/// receiver sits in `feed`, where the consumer reads it.
+// Fields are consumed by the control handlers, the pump and the watchdog.
 #[allow(dead_code)]
 pub(crate) struct AnchorEntry {
+    /// The mux slot buffer this anchor's consumer reads directly, when a mux
+    /// bind is feeding it. Shared with the [`StreamAnchor<T>`]; see
+    /// [`FeedCell`](crate::streaming::control::FeedCell).
+    pub feed: Arc<crate::streaming::control::FeedCell>,
+
     /// Raw-bytes frame delivery channel to the [`StreamAnchor<T>`] consumer.
     ///
     /// Non-generic so `DashMap<u64, AnchorEntry>` requires no type parameters.
@@ -155,16 +140,20 @@ pub(crate) struct AnchorEntry {
 
     /// Anchor-lifetime parent token. Created at anchor creation; cancelled only
     /// by finalize/remove/cancel. Child tokens are derived for transient tasks
-    /// (reader pump, timeout) so that stopping a child never poisons the parent.
+    /// (reader pump or stream watchdog, timeout) so that stopping a child never
+    /// poisons the parent.
     pub cancel_token: CancellationToken,
 
-    /// Child token for the currently active reader pump (`None` when no sender
-    /// is attached). Created via `cancel_token.child_token()` on each attach.
-    /// Cancelling this stops the pump without affecting the parent.
+    /// Child token for the currently active reader pump or, for a mux bind,
+    /// stream watchdog (`None` when no sender is attached). Created via
+    /// `cancel_token.child_token()` on each attach or pre-bind. Cancelling it
+    /// stops that task without affecting the parent, but for a mux bind it no
+    /// longer cuts the data path: use [`AnchorEntry::retire_pump`], which also
+    /// withdraws `feed`.
     pub active_pump_token: Option<CancellationToken>,
 
-    /// `true` iff a sender is currently attached. The reader pump owns the
-    /// transport receiver separately (not stored here).
+    /// `true` iff a sender is currently attached. The transport receiver is
+    /// held by the reader pump, or by `feed` for a mux bind, not here.
     pub attachment: bool,
 
     /// Cancels the inactivity timeout task when a sender attaches.
@@ -176,9 +165,9 @@ pub(crate) struct AnchorEntry {
     /// `None` means the anchor never auto-removes while unattached.
     pub unattached_timeout: Option<Duration>,
 
-    /// The negotiated heartbeat cadence for this anchor. The reader pump uses
-    /// this as its per-window deadline; the producer's `StreamSender` uses it
-    /// as its emit interval. Resolved at create-time from per-anchor config or
+    /// The negotiated heartbeat cadence for this anchor. The reader pump or
+    /// stream watchdog uses this as its per-window deadline; the producer's
+    /// `StreamSender` uses it as its emit interval. Resolved at create-time from per-anchor config or
     /// the manager-level default and echoed to the sender via
     /// [`crate::streaming::control::AnchorAttachResponse::Ok::heartbeat_interval_ms`].
     pub heartbeat_interval: Duration,
@@ -189,24 +178,25 @@ pub(crate) struct AnchorEntry {
     /// `None` until a sender attaches.
     pub stream_cancel_handle: Option<crate::streaming::control::StreamCancelHandle>,
 
-    /// The mux slot bound and pumped for this anchor ahead of any sender, when
+    /// The mux slot bound and fed to this anchor ahead of any sender, when
     /// [`AnchorManager::prebind_anchor`] minted a ticket for it. `None` on the
     /// ordinary attach path, which is every anchor whose application sends no
     /// ticket.
     pub prebind: Option<PreBind>,
+    pub stop_requested: bool,
 }
 
 // ---------------------------------------------------------------------------
 // PreBind
 // ---------------------------------------------------------------------------
 
-/// A mux slot bound and pumped for an anchor before any sender asked for one.
+/// A mux slot bound and fed to an anchor before any sender asked for one.
 ///
 /// Zero-RTT stream setup does at request registration what the attach handler
 /// does on the round trip: allocate the routing session, bind the slot, take
-/// the drain signal, and spawn the reader pump. What is left over is this — the
-/// terms that were minted, the claim token that says whether anyone took them
-/// up, and the means to give the slot back.
+/// the drain signal, and start the direct feed and its watchdog. What is left
+/// over is this — the terms that were minted, the claim token that says whether
+/// anyone took them up, and the means to give the slot back.
 ///
 /// [`Drop`] is the whole reclamation story, and deliberately not a new call
 /// site: every path that kills an anchor already removes its registry entry, so
@@ -223,34 +213,23 @@ pub(crate) struct AnchorEntry {
 ///   learns a `StreamCancelHandle` either, and this is the only prompt path
 ///   left.
 ///
-/// Three races follow from `is_claimed` being an unlocked `OnceLock` read
-/// rather than something the registry's shard lock also covers, and none of
-/// them leak: an `OpenSlot` claiming between [`PreBind::drop`]'s read and its
-/// `release_bind` leaves a live slot with no close posted, discovered on the
-/// producer's next record or heartbeat; one claiming right after
-/// [`AnchorManager::adopt_prebind`] reads `is_claimed` for its verdict hands
-/// the attaching sender terms already in use, whose `OpenSlot` is then
-/// refused `UnknownSlot`; and one claiming between the co-located branch of
-/// [`AnchorManager::attach_stream_anchor`]'s guard read and its release below
-/// is evicted correctly rather than left as a second writer — that branch
-/// cancels this bind's pump before the release runs, so the claim has
-/// already lost its only route to the anchor's channel by the time
-/// [`PreBind::drop`] posts the close.
+/// Claim and lifecycle changes are serialized by `DrainSignal`. An early stop
+/// or cancel is therefore applied when OpenSlot claims the bind. Adoption still
+/// checks the claim before it transfers ownership; a competing open is refused.
 pub(crate) struct PreBind {
     /// The anchor this slot was bound for. Half of the bind's key; the other
     /// half is `ticket.routing_session_id`.
     anchor_id: u64,
     ticket: crate::streaming::control::StreamOpenTicket,
     drain: Arc<crate::streaming::messenger_mux::ingress::DrainSignal>,
-    /// `Weak` for the same reason the accept window's task holds one: a strong
-    /// handle inside a registry entry would keep the transport, its batchers
-    /// and its ingress state alive for as long as anything holds the anchor
-    /// registry.
+    /// `Weak` because a strong handle inside a registry entry would keep the
+    /// transport, its batchers and its ingress state alive for as long as
+    /// anything holds the anchor registry.
     ///
     /// It is also how [`PreBind::adopt`] defuses `Drop` — see there.
     mux: std::sync::Weak<crate::streaming::messenger_mux::MessengerMuxTransport>,
-    /// Shared with the [`PumpContext`](crate::streaming::control::PumpContext)
-    /// of the pump this bind feeds. `true` until [`PreBind::adopt`] clears
+    /// Shared with the [`WatchdogContext`](crate::streaming::control::WatchdogContext)
+    /// of this bind's stream watchdog. `true` until [`PreBind::adopt`] clears
     /// it — the one transition from "no sender yet" to "a sender exists"
     /// that a sender opening on its ticket the ordinary way (an `OpenSlot`
     /// claiming `drain` directly) never needs a writer for, because
@@ -274,31 +253,86 @@ impl PreBind {
     ///
     /// Clearing the transport handle is what defuses [`Drop`]: from here the
     /// slot is an ordinary attached stream, reclaimed by the paths that reclaim
-    /// those — the attach carried a `StreamCancelHandle`, so the anchor can
-    /// reach its producer directly and needs no close posted on its behalf.
+    /// those -- the anchor entry's own `Drop` closes the slot on removal, and
+    /// the attach carried a `StreamCancelHandle`, so the anchor can reach its
+    /// producer directly as well.
     ///
     /// The ticket is cloned rather than moved out because this type has a
     /// `Drop`; the clone is one `Arc<str>` bump on a path that runs once per
     /// adopted stream.
     fn adopt(mut self) -> crate::streaming::control::StreamOpenTicket {
         self.mux = std::sync::Weak::new();
-        // The pump this pre-bind feeds still reads `prebound` as `true` --
-        // it has no other way to learn a sender just showed up by this door
+        // This pre-bind's watchdog still reads `prebound` as `true` -- it
+        // has no other way to learn a sender just showed up by this door
         // rather than by its own `OpenSlot`, which may still be seconds or
         // minutes away. Clearing it here, in the same place that already
-        // defuses `Drop`, is what stops that pump from exempting a now-live
-        // stream from heartbeat detection. That is the only exemption it
-        // lifts: the pump's transport-closed arm gates on the claim alone
-        // (`bind_unclaimed`, never `prebound`), so an adopted attach whose
-        // `OpenSlot` never arrives is still reaped by the bind's accept
+        // defuses `Drop`, is what stops that watchdog from exempting a
+        // now-live stream from heartbeat detection. That is the only
+        // exemption it lifts: the unclaimed-bind reap gates on the claim
+        // alone (`bind_unclaimed`, never `prebound`), so an adopted attach
+        // whose `OpenSlot` never arrives is still reaped by the bind's accept
         // window, exactly as a pre-bind nobody adopted is -- see
-        // `control::reader_pump`.
+        // `control::reap_unclaimed`.
         self.prebound.store(false, Ordering::Relaxed);
         self.ticket.clone()
     }
 }
 
+impl Drop for AnchorEntry {
+    /// A removed entry closes its mux slot, tells the sender, and lets go of
+    /// its feed.
+    ///
+    /// Every way a stream leaves the registry passes through here: the
+    /// consumer's own terminal, a watchdog firing, a cancel through the
+    /// controller or the anchor's drop, the accept window. Waiting for a
+    /// delivery to find no receiver is not enough, because a sender that is
+    /// dead, or parked on its window, sends nothing to fail on; the slot and its
+    /// peer batcher would stay live. The close is idempotent and checks the
+    /// slot's generation and session, and a stream that ended on its sender's
+    /// terminal has no slot left to close.
+    fn drop(&mut self) {
+        // Withdrawn first, so a consumer still polling moves off the slot
+        // buffer before the close can inject `Dropped` into it and end the
+        // stream with an error instead of cleanly.
+        if let Some(feed) = self.feed.withdraw() {
+            feed.release_slot();
+        }
+    }
+}
+
 impl AnchorEntry {
+    /// Stop the pump or watchdog serving this anchor, and withdraw the direct
+    /// feed with it.
+    ///
+    /// For a per-stream transport the token is enough, because the pump is the
+    /// only route from a bind to the consumer. A mux bind's consumer reads the
+    /// slot buffer itself, so the feed has to come out as well: a bind retired
+    /// here can still be claimed and delivered into by a racing `OpenSlot`,
+    /// and the consumer must not read that as its own stream. The token is
+    /// returned for the caller that still needs it.
+    pub(crate) fn retire_pump(&mut self) -> Option<CancellationToken> {
+        self.feed.withdraw();
+        let token = self.active_pump_token.take();
+        if let Some(ref token) = token {
+            token.cancel();
+        }
+        token
+    }
+
+    /// Retire the pump if `feed` is still the installed one: a mux stream's
+    /// own `Detached` ended it. The watchdog stops with the feed, so it
+    /// cannot fire later on the entry a re-attach reuses. A newer feed is not
+    /// this stream's to stop.
+    pub(crate) fn retire_ended_feed(&mut self, feed: &Arc<crate::streaming::control::DirectFeed>) {
+        if self
+            .feed
+            .current()
+            .is_some_and(|current| Arc::ptr_eq(&current, feed))
+        {
+            self.retire_pump();
+        }
+    }
+
     /// Whether a pre-bound slot on this anchor already has a sender.
     ///
     /// `attachment` does not answer this. Nothing on the zero-RTT path sets it
@@ -314,11 +348,19 @@ impl AnchorEntry {
 
 impl Drop for PreBind {
     fn drop(&mut self) {
+        // The ordinary end of a zero-RTT stream: its terminal already retired
+        // the slot, so there is nothing to close and no reason to take the
+        // peer's ingress lock, once per request.
+        if self.drain.is_released() {
+            return;
+        }
         let Some(mux) = self.mux.upgrade() else {
             return;
         };
-        match self.drain.claimed() {
-            Some((peer, slot)) => mux.close_claimed_slot(peer, slot),
+        match self.drain.cancel() {
+            Some((peer, slot)) => {
+                mux.cancel_claimed_session(peer, slot, self.ticket.routing_session_id)
+            }
             None => mux.release_bind(self.anchor_id, self.ticket.routing_session_id),
         }
     }
@@ -336,7 +378,17 @@ struct SenderIdentity {
     sender_stream_id: u64,
     cancel_token: CancellationToken,
     poison_tx: flume::Sender<()>,
-    poison_rx: flume::Receiver<()>,
+    stop_token: CancellationToken,
+    registry: Arc<crate::streaming::control::SenderRegistry>,
+    armed: bool,
+}
+
+impl Drop for SenderIdentity {
+    fn drop(&mut self) {
+        if self.armed {
+            self.registry.senders.remove(&self.sender_stream_id);
+        }
+    }
 }
 
 /// What an incoming `_anchor_attach` may do with a pre-bound slot.
@@ -358,11 +410,9 @@ pub(crate) enum PrebindAdoption {
 /// Wrapped in `Arc` so `StreamController` can outlive `StreamAnchor` being
 /// moved into StreamExt combinators.
 struct StreamControllerInner {
+    worker_id: velo_ext::WorkerId,
     local_id: u64,
     registry: Arc<DashMap<u64, AnchorEntry>>,
-    /// Sibling MPSC registry — held so the shared gauge update includes MPSC
-    /// anchors alongside SPSC. Cheap `Arc` clone, no other use.
-    mpsc_registry: Arc<DashMap<u64, crate::streaming::mpsc::anchor::MpscAnchorEntry>>,
     metrics: Option<Arc<VeloMetrics>>,
     /// Sender-side registry: used to directly cancel the [`crate::streaming::control::SenderEntry`]
     /// when the anchor is cancelled (same-worker path without AM round-trip).
@@ -385,6 +435,32 @@ pub struct StreamController {
 }
 
 impl StreamController {
+    /// Request graceful stop without closing the response stream.
+    /// An early request is retained until a producer attaches or opens its ticket.
+    pub fn request_stop(&self) {
+        let Some(mut entry) = self.inner.registry.get_mut(&self.inner.local_id) else {
+            return;
+        };
+        if entry.stop_requested {
+            return;
+        }
+        entry.stop_requested = true;
+        if let Some(prebind) = &entry.prebind {
+            if let Some((peer, slot)) = prebind.drain.request_stop()
+                && let Some(mux) = prebind.mux.upgrade()
+            {
+                mux.request_stop(peer, slot, prebind.ticket.routing_session_id);
+            }
+        } else if let Some(handle) = entry.stream_cancel_handle {
+            crate::streaming::control::request_sender_stop(
+                handle,
+                self.inner.worker_id,
+                &self.inner.sender_registry,
+                self.inner.messenger.as_ref(),
+            );
+        }
+    }
+
     /// Cancel the stream: remove the anchor from the registry and send a
     /// `_stream_cancel` AM to the sender's worker (fire-and-forget).
     ///
@@ -412,11 +488,6 @@ impl StreamController {
                     entry.cancel_token.cancel();
                     entry.stream_cancel_handle
                 });
-        set_active_anchor_gauge(
-            self.inner.metrics.as_ref(),
-            &self.inner.registry,
-            &self.inner.mpsc_registry,
-        );
         if let Some(metrics) = self.inner.metrics.as_ref() {
             metrics.record_streaming_operation(
                 StreamingOp::Cancel,
@@ -432,7 +503,10 @@ impl StreamController {
         // the entry was already removed (e.g. finalize/detach ran first).
         if let Some(handle) = stream_cancel_handle {
             let (sender_worker_id, sender_stream_id) = handle.unpack();
-            if let Some((_, entry)) = self.inner.sender_registry.senders.remove(&sender_stream_id) {
+            if sender_worker_id == self.inner.worker_id
+                && let Some((_, entry)) =
+                    self.inner.sender_registry.senders.remove(&sender_stream_id)
+            {
                 drop(entry.rx_closer.lock().unwrap().take());
                 entry.cancel_token.cancel();
             }
@@ -512,17 +586,36 @@ pub struct StreamAnchor<T> {
     handle: StreamAnchorHandle,
     /// Async stream obtained from consuming the flume::Receiver via `into_stream()`.
     inner_stream: flume::r#async::RecvStream<'static, Vec<u8>>,
+    /// Where a mux bind installs its slot buffer for this consumer to read.
+    feed_cell: Arc<crate::streaming::control::FeedCell>,
+    /// The generation of `feed_cell` that `feed` was taken from.
+    feed_generation: u64,
+    /// The mux slot buffer being read, polled ahead of `inner_stream`. `None`
+    /// before a mux bind and after its buffer closes.
+    feed: Option<(
+        Arc<crate::streaming::control::DirectFeed>,
+        flume::r#async::RecvStream<'static, Vec<u8>>,
+    )>,
+    /// Whether the last frame `poll_frame` returned came from `feed` rather
+    /// than the anchor channel.
+    from_feed: bool,
+    /// Read the anchor channel before a newly installed feed. Anything already
+    /// there was sent before the new sender attached -- a co-located sender's
+    /// tail and its `Detached` -- and must not be overtaken.
+    channel_first: bool,
     /// Set to true after a terminal sentinel; prevents further polling.
     terminated: bool,
     /// The local ID of the anchor in the registry (for cancel).
     local_id: u64,
     /// Arc clone of the AnchorManager's registry (for cancel).
     registry: Arc<DashMap<u64, AnchorEntry>>,
-    /// Sibling MPSC registry — used when updating the shared active-anchors gauge.
-    mpsc_registry: Arc<DashMap<u64, crate::streaming::mpsc::anchor::MpscAnchorEntry>>,
     /// Shared cancel handle — also held by any [`StreamController`] clones.
     controller: StreamController,
     metrics: Option<Arc<VeloMetrics>>,
+    /// Runs after a frame is read and before it is handled, so a test can land
+    /// work in that gap on the same thread.
+    #[cfg(test)]
+    pub(crate) after_frame_hook: Option<Box<dyn FnMut() + Send>>,
     _phantom: std::marker::PhantomData<T>,
 }
 
@@ -530,6 +623,7 @@ impl<T> StreamAnchor<T> {
     pub(crate) fn new(
         handle: StreamAnchorHandle,
         rx: flume::Receiver<Vec<u8>>,
+        feed_cell: Arc<crate::streaming::control::FeedCell>,
         local_id: u64,
         ctx: AnchorContext,
         sender_registry: Arc<crate::streaming::control::SenderRegistry>,
@@ -537,13 +631,13 @@ impl<T> StreamAnchor<T> {
     ) -> Self {
         let AnchorContext {
             registry,
-            mpsc_registry,
+            mpsc_registry: _,
             metrics,
         } = ctx;
         let inner = Arc::new(StreamControllerInner {
+            worker_id: handle.unpack().0,
             local_id,
             registry: registry.clone(),
-            mpsc_registry: mpsc_registry.clone(),
             metrics: metrics.clone(),
             sender_registry,
             messenger,
@@ -553,12 +647,18 @@ impl<T> StreamAnchor<T> {
         Self {
             handle,
             inner_stream: rx.into_stream(),
+            feed_cell,
+            feed_generation: 0,
+            feed: None,
+            from_feed: false,
+            channel_first: false,
             terminated: false,
             local_id,
             registry,
-            mpsc_registry,
             controller,
             metrics,
+            #[cfg(test)]
+            after_frame_hook: None,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -575,25 +675,95 @@ impl<T> StreamAnchor<T> {
         self.controller.clone()
     }
 
-    /// Remove this anchor's registry entry, if it is still there.
+    /// The next raw frame: the mux slot buffer first, then the anchor channel.
+    ///
+    /// Data reaches a mux-fed anchor only through the slot buffer, which the
+    /// mux alone writes; the anchor channel carries sentinels injected by the
+    /// runtime (cancel, reap, watchdog) and the heartbeat that announces a new
+    /// feed. While a feed is installed the buffer is read first, so nothing on
+    /// the anchor channel jumps ahead of a record the consumer can still read.
+    /// A feed that is withdrawn (retire, entry removal) is dropped on the next
+    /// poll, before its buffer is read again: records still unread there are
+    /// discarded, not delivered. Every record taken from the buffer is counted
+    /// on its drain signal, because that count is the credit the sender gets
+    /// back.
+    fn poll_frame(&mut self, cx: &mut Context<'_>) -> Poll<Option<Vec<u8>>> {
+        loop {
+            let generation = self.feed_cell.generation();
+            if generation != self.feed_generation {
+                let (generation, feed) = self.feed_cell.snapshot();
+                self.feed_generation = generation;
+                self.channel_first = feed.is_some();
+                self.feed = feed.map(|feed| {
+                    let rx = feed.rx.clone().into_stream();
+                    (feed, rx)
+                });
+            }
+            if self.channel_first {
+                match Pin::new(&mut self.inner_stream).poll_next(cx) {
+                    Poll::Pending => self.channel_first = false,
+                    ready => {
+                        self.from_feed = false;
+                        return ready;
+                    }
+                }
+            }
+            if let Some((feed, rx)) = self.feed.as_mut() {
+                match Pin::new(rx).poll_next(cx) {
+                    Poll::Ready(Some(bytes)) => {
+                        // Withdrawn while this poll was reading it: the record
+                        // belongs to a stream this consumer has left -- a
+                        // `Dropped` a racing cancel's close injected, say --
+                        // so it is discarded like the rest of that buffer.
+                        if self.feed_cell.generation() != self.feed_generation {
+                            continue;
+                        }
+                        feed.drain.drained();
+                        self.from_feed = true;
+                        return Poll::Ready(Some(bytes));
+                    }
+                    Poll::Ready(None) => {
+                        // The stream ended, or its bind was released or
+                        // reaped; anything left to say is on the anchor
+                        // channel.
+                        let (feed, _) = self.feed.take().expect("matched Some above");
+                        crate::streaming::control::reap_unclaimed(
+                            &feed,
+                            self.local_id,
+                            &self.registry,
+                            self.metrics.as_deref(),
+                        );
+                        continue;
+                    }
+                    Poll::Pending => {}
+                }
+            }
+            self.from_feed = false;
+            return Pin::new(&mut self.inner_stream).poll_next(cx);
+        }
+    }
+
+    /// End the stream on this side: let go of the slot buffer this consumer
+    /// reads, close its slot, and remove the anchor's registry entry.
     ///
     /// Every terminal frame owes the registry this, and [`Drop`] cannot be the
     /// one to pay it: it short-circuits on `terminated`, which a terminal frame
     /// has just set. An entry left behind costs the frame channel, a permanent
-    /// reading in `velo_streaming_active_anchors`, and — under zero-RTT — the
-    /// [`PreBind`] whose own `Drop` is the only thing that gives the mux slot
-    /// back to its producer.
+    /// reading in `velo_streaming_active_anchors`, and the pump or watchdog
+    /// serving it, with nothing telling either to stop.
     ///
     /// Called from `poll_next` on every terminal arm, including
-    /// `TransportError` and a frame that fails to deserialize — not only
-    /// `Dropped` and `Finalized` — which cancels `entry.cancel_token` and so
-    /// kills the pump feeding this anchor. That reach is not zero-RTT-specific:
-    /// on every anchor, those two arms used to leave both the registry entry
-    /// and its pump running, with nothing telling either to stop.
-    fn retire(&self) {
+    /// `TransportError` and a frame that fails to deserialize. Removing the
+    /// entry closes the mux slot and tells the sender (`AnchorEntry`'s
+    /// `Drop`); the receiver clones this consumer holds are dropped here, or
+    /// they would outlive the stream while the application holds the
+    /// anchor.
+    fn retire(&mut self) {
+        // The entry's drop closes the slot; the receiver clones this consumer
+        // took for itself go here.
+        self.feed = None;
         if let Some((_, entry)) = self.registry.remove(&self.local_id) {
             entry.cancel_token.cancel();
-            set_active_anchor_gauge(self.metrics.as_ref(), &self.registry, &self.mpsc_registry);
         }
     }
 
@@ -631,15 +801,13 @@ impl<T> StreamAnchor<T> {
 
             // If unattached and a timeout is set, spawn a new timeout task.
             // A pre-bound anchor counts as spoken for: its slot is bound and
-            // pumped and a sender is on its way to it, so the timer that
+            // fed and a sender is on its way to it, so the timer that
             // measures "no sender attached" would be measuring nothing and
             // would remove a stream that is about to run.
             if !entry.attachment && entry.prebind.is_none() {
                 if let Some(duration) = timeout {
                     let tc = AnchorManager::spawn_timeout_task(
                         self.registry.clone(),
-                        self.mpsc_registry.clone(),
-                        self.metrics.clone(),
                         self.local_id,
                         duration,
                         &entry.cancel_token,
@@ -680,8 +848,12 @@ impl<T: DeserializeOwned> Stream for StreamAnchor<T> {
             return Poll::Ready(None);
         }
         loop {
-            match Pin::new(&mut this.inner_stream).poll_next(cx) {
+            match this.poll_frame(cx) {
                 Poll::Ready(Some(bytes)) => {
+                    #[cfg(test)]
+                    if let Some(hook) = this.after_frame_hook.as_mut() {
+                        hook();
+                    }
                     match rmp_serde::from_slice::<StreamFrame<T>>(&bytes) {
                         Ok(StreamFrame::Heartbeat) => continue, // filter heartbeats
                         Ok(StreamFrame::Item(data)) => {
@@ -693,6 +865,16 @@ impl<T: DeserializeOwned> Stream for StreamAnchor<T> {
                         }
                         Ok(StreamFrame::Finalized) => {
                             this.terminated = true;
+                            // A terminal read off the slot buffer was applied
+                            // in the same step that retires the slot, so there
+                            // is nothing left to close. Saying so now saves the
+                            // close its lock trip when the consumer gets here
+                            // before that step's release lands.
+                            if this.from_feed
+                                && let Some((feed, _)) = &this.feed
+                            {
+                                feed.drain.mark_released();
+                            }
                             // Anchor is permanently closed.
                             this.retire();
                             return Poll::Ready(Some(Ok(StreamFrame::Finalized)));
@@ -712,13 +894,13 @@ impl<T: DeserializeOwned> Stream for StreamAnchor<T> {
                             // the same "anchor is unattached again" signal
                             // Mismatch restores, for the same reason.
                             //
-                            // Unlike Mismatch, this does not cancel
-                            // `active_pump_token`, and that is safe only
-                            // because of an invariant this frame's arrival
-                            // guarantees: an unclaimed pre-bind has no
-                            // connected producer, so nothing could have put a
-                            // `Detached` frame in this anchor's `frame_tx` in
-                            // the first place -- the two writers of that
+                            // Unlike Mismatch, this does not call
+                            // `retire_pump`, and that is safe only because of
+                            // an invariant this frame's arrival guarantees: an
+                            // unclaimed pre-bind has no connected producer, so
+                            // nothing could have put a `Detached` frame in
+                            // this anchor's `frame_tx` or slot buffer in the
+                            // first place -- the two writers of that
                             // sentinel are `StreamSender::detach()`, reachable
                             // only once `open_anchor_stream` has actually
                             // opened the slot (which is what claims it), and
@@ -728,17 +910,24 @@ impl<T: DeserializeOwned> Stream for StreamAnchor<T> {
                             // `None` by the time it reaches here. So a
                             // `Some(prebind)` seen at this line is always
                             // claimed -- but `Detached` is a terminal
-                            // sentinel, and the ingress applies it through
-                            // `deliver()` -> `finish_close(TerminalSent)` in
-                            // the same critical section that puts these very
-                            // bytes into the bind's `frame_tx`, retiring the
-                            // slot before this poll arm can ever run.
-                            // `PreBind::drop`'s `close_claimed_slot` therefore
-                            // finds nothing there and is a no-op: there is
+                            // sentinel. Its sender puts it and its
+                            // `CloseSlot{TerminalSent}` in one batch, and the
+                            // ingress retires the slot on that close in the
+                            // same critical section that puts these very
+                            // bytes into the slot buffer the consumer reads.
+                            // The consumer can read them before that section
+                            // ends, but a close it posts takes the same lock
+                            // and so lands after the retire, and the slot's
+                            // generation and session checks make it find
+                            // nothing. `PreBind::drop`'s `close_claimed_slot`
+                            // is therefore a no-op here, and
+                            // the retiring slot closes the bind, which ends the
+                            // watchdog and the feed on their own: there is
                             // nothing left to cancel, not a stream still
                             // running -- unlike `adopt_prebind`'s Mismatch
-                            // arm, which does cancel a pump because its
-                            // pre-bind is genuinely still unclaimed.
+                            // arm, which does retire a watchdog and feed
+                            // because its pre-bind is genuinely still
+                            // unclaimed.
                             // Calling `spawn_timeout_task` under this shard
                             // guard (rather than hoisting it out the way
                             // `AnchorManager::detach`'s two-phase shape does)
@@ -746,8 +935,34 @@ impl<T: DeserializeOwned> Stream for StreamAnchor<T> {
                             // function: it never runs synchronously and never
                             // touches the registry itself, so there is
                             // nothing here for it to deadlock against.
-                            let released_prebind =
-                                this.registry.get_mut(&this.local_id).and_then(|mut entry| {
+                            // A `Detached` read off the anchor channel while a
+                            // mux feed is installed belongs to an earlier
+                            // stream: a mux stream detaches through its own
+                            // slot. The live stream's attachment and pre-bind
+                            // are not this frame's to clear. Judged under the
+                            // entry's guard, against the entry's own feed, not
+                            // what this consumer cached at the top of its
+                            // poll: a new sender can land in between.
+                            //
+                            // A mux stream's own `Detached` ends its feed, so
+                            // the feed and its watchdog retire with it. Left
+                            // there, the feed would make the next non-mux
+                            // sender's `Detached` read as stale, and the
+                            // anchor would stay attached to nobody.
+                            let from_feed = this.from_feed;
+                            let ended_feed = this
+                                .feed
+                                .as_ref()
+                                .filter(|_| from_feed)
+                                .map(|(feed, _)| Arc::clone(feed));
+                            let released_prebind = this
+                                .registry
+                                .get_mut(&this.local_id)
+                                .filter(|entry| from_feed || entry.feed.current().is_none())
+                                .and_then(|mut entry| {
+                                    if let Some(feed) = &ended_feed {
+                                        entry.retire_ended_feed(feed);
+                                    }
                                     entry.attachment = false;
                                     let released = entry.prebind.take();
                                     if released.is_some()
@@ -755,8 +970,6 @@ impl<T: DeserializeOwned> Stream for StreamAnchor<T> {
                                     {
                                         let tc = AnchorManager::spawn_timeout_task(
                                             Arc::clone(&this.registry),
-                                            Arc::clone(&this.mpsc_registry),
-                                            this.metrics.clone(),
                                             this.local_id,
                                             duration,
                                             &entry.cancel_token,
@@ -790,6 +1003,7 @@ impl<T: DeserializeOwned> Stream for StreamAnchor<T> {
                 }
                 Poll::Ready(None) => {
                     this.terminated = true;
+                    this.retire();
                     return Poll::Ready(None);
                 }
                 Poll::Pending => return Poll::Pending,
@@ -810,7 +1024,7 @@ impl<T: DeserializeOwned> Stream for StreamAnchor<T> {
 /// is the first valid local ID (i.e., IDs start at 1; 0 is reserved).
 ///
 /// The `registry` is wrapped in an `Arc` so that control handlers and the
-/// data-path pump can hold a cheap clone of the registry reference without
+/// consumer-side tasks can hold a cheap clone of the registry reference without
 /// holding a reference to the whole `AnchorManager`.
 ///
 /// Use [`AnchorManagerBuilder`] for optional configuration (e.g. `default_unattached_timeout`,
@@ -867,6 +1081,10 @@ pub struct AnchorManager {
     pub messenger: Option<Arc<crate::messenger::Messenger>>,
 
     /// Shared Prometheus collectors for streaming control-plane metrics.
+    ///
+    /// Set it through the builder. `build` registers this manager as a source
+    /// of `velo_streaming_active_anchors` with these collectors, so collectors
+    /// assigned to the field afterwards never see the gauge.
     #[builder(default)]
     pub metrics: Option<Arc<VeloMetrics>>,
 
@@ -895,7 +1113,7 @@ pub struct AnchorManager {
     #[builder(setter(skip), default = "std::sync::OnceLock::new()")]
     pub(crate) messenger_lock: std::sync::OnceLock<Arc<crate::messenger::Messenger>>,
 
-    /// The `messenger-mux-v1` transport, when one is installed.
+    /// The `messenger-mux-v2` transport, when one is installed.
     ///
     /// Held as its concrete type rather than only as a registry entry because
     /// negotiation needs things the `FrameTransport` trait does not carry: the
@@ -915,7 +1133,25 @@ pub struct AnchorManager {
 impl AnchorManagerBuilder {
     /// Build the [`AnchorManager`].
     pub fn build(self) -> Result<AnchorManager, AnchorManagerBuilderError> {
-        self.build_inner()
+        let manager = self.build_inner()?;
+        if let Some(metrics) = manager.metrics.as_ref() {
+            // Weak, so the metrics registry does not keep a dropped manager's
+            // anchors alive; a dropped manager counts zero.
+            let spsc = Arc::downgrade(&manager.registry);
+            let mpsc = Arc::downgrade(&manager.mpsc_registry);
+            // Each registry counts on its own: a `StreamAnchor` keeps the SPSC
+            // registry alive past the manager and the MPSC one does not, so
+            // the source is spent only once both are gone.
+            metrics.add_active_anchor_source(move || {
+                let spsc = spsc.upgrade();
+                let mpsc = mpsc.upgrade();
+                if spsc.is_none() && mpsc.is_none() {
+                    return None;
+                }
+                Some(spsc.map_or(0, |r| r.len()) + mpsc.map_or(0, |r| r.len()))
+            });
+        }
+        Ok(manager)
     }
 }
 
@@ -974,17 +1210,12 @@ impl AnchorManager {
         // Spawn timeout task if configured — derive child from the anchor's parent token
         // so that finalize/remove auto-cancels it.
         let timeout_cancel = unattached_timeout.map(|timeout| {
-            Self::spawn_timeout_task(
-                self.registry.clone(),
-                self.mpsc_registry.clone(),
-                self.metrics.clone(),
-                local_id,
-                timeout,
-                &cancel_token,
-            )
+            Self::spawn_timeout_task(self.registry.clone(), local_id, timeout, &cancel_token)
         });
 
+        let feed = Arc::new(crate::streaming::control::FeedCell::default());
         let entry = AnchorEntry {
+            feed: Arc::clone(&feed),
             frame_tx,
             cancel_token,
             active_pump_token: None,
@@ -994,15 +1225,16 @@ impl AnchorManager {
             heartbeat_interval,
             stream_cancel_handle: None, // populated on attach
             prebind: None,              // populated by `prebind_anchor`
+            stop_requested: false,
         };
 
         self.registry.insert(local_id, entry);
-        self.update_active_anchor_gauge();
 
         let handle = StreamAnchorHandle::pack(self.worker_id, local_id);
         StreamAnchor::new(
             handle,
             frame_rx,
+            feed,
             local_id,
             self.anchor_context(),
             self.sender_registry.clone(),
@@ -1028,8 +1260,6 @@ impl AnchorManager {
     /// in the middle of a consumer's poll.
     pub(crate) fn spawn_timeout_task(
         registry: Arc<DashMap<u64, AnchorEntry>>,
-        mpsc_registry: Arc<DashMap<u64, crate::streaming::mpsc::anchor::MpscAnchorEntry>>,
-        metrics: Option<Arc<VeloMetrics>>,
         local_id: u64,
         timeout: Duration,
         parent_cancel: &CancellationToken,
@@ -1052,7 +1282,6 @@ impl AnchorManager {
                     // Timeout expired -- remove anchor
                     if let Some((_, entry)) = registry.remove(&local_id) {
                         entry.cancel_token.cancel();
-                        set_active_anchor_gauge(metrics.as_ref(), &registry, &mpsc_registry);
                         // Dropping frame_tx closes the channel -> StreamAnchor yields None
                     }
                 }
@@ -1069,7 +1298,6 @@ impl AnchorManager {
     pub(crate) fn remove_anchor(&self, local_id: u64) -> Option<AnchorEntry> {
         self.registry.remove(&local_id).map(|(_, entry)| {
             entry.cancel_token.cancel();
-            self.update_active_anchor_gauge();
             entry
         })
     }
@@ -1100,7 +1328,7 @@ impl AnchorManager {
     ///
     /// Separate from the transport registry, which the mux also joins: the
     /// registry answers "can I `connect()` on this key", while this answers
-    /// "may I offer, and drive, `messenger-mux-v1`". Both are needed and they
+    /// "may I offer, and drive, `messenger-mux-v2`". Both are needed and they
     /// are set together by the builder.
     pub(crate) fn install_mux(
         &self,
@@ -1111,8 +1339,8 @@ impl AnchorManager {
             .map_err(|_| anyhow::anyhow!("a messenger mux is already installed on this manager"))
     }
 
-    /// Bind and pump a mux slot for `handle` now, so its sender never has to
-    /// ask for one.
+    /// Bind a mux slot for `handle` and start its feed now, so its sender
+    /// never has to ask for one.
     ///
     /// Returns the terms that sender must open on, to be carried to it in
     /// whatever envelope the application already sends — see
@@ -1135,8 +1363,8 @@ impl AnchorManager {
     /// unlike the rollback they are a caller mistake rather than a
     /// configuration.
     ///
-    /// Must be called from a runtime context: it spawns the reader pump and the
-    /// bind's accept-window task, exactly as the attach handler does.
+    /// Must be called from a runtime context: it spawns the stream watchdog,
+    /// exactly as the attach handler does for a mux bind.
     ///
     /// The ticket may sit in a request envelope for up to the mux's 60 s
     /// accept window before its worker opens it: heartbeat detection does not
@@ -1170,9 +1398,9 @@ impl AnchorManager {
         }
 
         // Fail fast on the common "not pre-bindable" case before minting a
-        // session id or registering a bind: `mux.prebind` spawns the 60 s
-        // accept-window task, and there is no reject path that can cancel it
-        // once running. This is a plain read, not a lock the mutate-and-check
+        // session id or registering a bind: `mux.prebind` queues a 60 s
+        // accept-window deadline, and a bind registered for nothing holds its
+        // buffer until that deadline passes. This is a plain read, not a lock the mutate-and-check
         // below still has to redo -- an entry can change between the two, and
         // that race is the same bounded one every other caller of this check
         // already accepts (see the `Entry::Occupied` arm below).
@@ -1233,8 +1461,8 @@ impl AnchorManager {
                             mux.advertised_limits(),
                         );
                         // A child of the anchor's token, as at attach: finalize,
-                        // cancel and detach stop the pump without poisoning the
-                        // parent.
+                        // cancel and detach stop the watchdog without poisoning
+                        // the parent.
                         let pump_cancel = entry.cancel_token.child_token();
                         entry.active_pump_token = Some(pump_cancel.clone());
                         // The unattached timer measures "no sender is coming".
@@ -1244,11 +1472,14 @@ impl AnchorManager {
                         if let Some(ref tc) = entry.timeout_cancel {
                             tc.cancel();
                         }
-                        // Shared with the pump spawned below and cleared by
+                        // Shared with the watchdog spawned below and cleared by
                         // `PreBind::adopt` the moment an attach hands this
                         // slot to a sender that used it instead of the
-                        // ticket -- see `PumpContext::prebound`.
+                        // ticket -- see `WatchdogContext::prebound`.
                         let prebound = Arc::new(AtomicBool::new(true));
+                        if entry.stop_requested {
+                            drain.request_stop();
+                        }
                         entry.prebind = Some(PreBind {
                             anchor_id: local_id,
                             ticket: ticket.clone(),
@@ -1256,19 +1487,36 @@ impl AnchorManager {
                             mux: Arc::downgrade(mux),
                             prebound: Arc::clone(&prebound),
                         });
+                        // Installed under the shard lock, so a retire or a
+                        // removal cannot land between this and the install.
+                        let (feed, replaced) = crate::streaming::control::install_direct_feed(
+                            entry,
+                            crate::streaming::control::DirectFeed {
+                                rx: receiver.clone(),
+                                drain: Arc::clone(&drain),
+                                pump_token: pump_cancel,
+                                release: Some(crate::streaming::control::SlotRelease {
+                                    mux: Arc::downgrade(mux),
+                                    anchor_id: local_id,
+                                    session_id: routing_session_id,
+                                }),
+                            },
+                        );
                         Some((
                             ticket,
                             entry.frame_tx.clone(),
-                            pump_cancel,
                             entry.heartbeat_interval,
                             prebound,
+                            feed,
+                            replaced,
                         ))
                     }
                 }
             }
         };
 
-        let Some((ticket, frame_tx, pump_cancel, heartbeat_interval, prebound)) = prepared else {
+        let Some((ticket, frame_tx, heartbeat_interval, prebound, feed, replaced)) = prepared
+        else {
             // Nothing took ownership of the bind, so give it straight back
             // rather than leaving the accept window to find it in a minute.
             mux.release_bind(local_id, routing_session_id);
@@ -1285,22 +1533,24 @@ impl AnchorManager {
             return None;
         };
 
-        tokio::spawn(crate::streaming::control::reader_pump(
-            receiver,
+        if let Some(replaced) = replaced {
+            replaced.release_slot();
+        }
+        drop(receiver);
+        crate::streaming::control::launch_direct_stream(
+            feed,
             frame_tx,
-            pump_cancel,
             self.anchor_context(),
-            crate::streaming::control::PumpContext {
+            crate::streaming::control::WatchdogContext {
                 local_id,
                 heartbeat_deadline: heartbeat_interval,
-                drain: Some(drain),
                 // The one genuine pre-bind spawn site: no sender has shown up
                 // yet. The `Arc` is the same cell stored in `PreBind` above,
                 // so `PreBind::adopt` can flip it the moment one does. See
-                // `PumpContext::prebound`.
+                // `WatchdogContext::prebound`.
                 prebound,
             },
-        ));
+        );
 
         self.record_streaming_operation(
             StreamingOp::Prebind,
@@ -1374,21 +1624,20 @@ impl AnchorManager {
                     // is being told the attach failed, so it will never send the
                     // `OpenSlot` that would claim it.
                     let released = entry.prebind.take();
-                    // The pump this prebind's own bind fed has to stop with it.
-                    // Left running, it would see its `transport_rx` close once
-                    // `released`'s `Drop` calls `release_bind` below and exit
-                    // through the reader pump's "transport channel closed" arm
-                    // -- which, for an *unclaimed* drain, now removes the
-                    // registry entry so an abandoned pre-bind is actually
-                    // reaped (see `reader_pump`). That entry is this one, still
-                    // very much alive for the next attach to use; without
-                    // cancelling the orphaned pump first, its late exit would
-                    // tear down whatever wins this race. Left `None` on
-                    // purpose, matching `_anchor_detach`: the next attach or
-                    // `prebind_anchor` creates its own.
-                    if let Some(pump_cancel) = entry.active_pump_token.take() {
-                        pump_cancel.cancel();
-                    }
+                    // The watchdog and feed this prebind's own bind started
+                    // have to stop with it. `released`'s `Drop` calls
+                    // `release_bind` below, which closes the unclaimed bind;
+                    // left running, the watchdog (on `DrainSignal::closed`) or
+                    // the consumer (on its feed's buffer closing) would run
+                    // `control::reap_unclaimed`, which for an *unclaimed* drain
+                    // removes the registry entry so an abandoned pre-bind is
+                    // actually reaped. That entry is this one, still very much
+                    // alive for the next attach to use. `retire_pump` cancels
+                    // the token, which the reap checks, and withdraws the
+                    // feed, so neither can tear down whatever wins this race.
+                    // Left `None` on purpose, matching `_anchor_detach`: the
+                    // next attach or `prebind_anchor` creates its own.
+                    entry.retire_pump();
                     // And the anchor is unattached again, so the timer that
                     // measures exactly that has to come back. `prebind_anchor`
                     // cancelled it because a pre-bind is a sender on its way;
@@ -1407,8 +1656,6 @@ impl AnchorManager {
                     if let Some(duration) = entry.unattached_timeout {
                         let tc = Self::spawn_timeout_task(
                             Arc::clone(&self.registry),
-                            Arc::clone(&self.mpsc_registry),
-                            self.metrics.clone(),
                             local_id,
                             duration,
                             &entry.cancel_token,
@@ -1427,12 +1674,28 @@ impl AnchorManager {
                     let prebind = entry.prebind.take().expect("the verdict says it is there");
                     entry.attachment = true;
                     entry.stream_cancel_handle = Some(req.stream_cancel_handle);
+                    if entry.stop_requested {
+                        crate::streaming::control::request_sender_stop(
+                            req.stream_cancel_handle,
+                            self.worker_id,
+                            &self.sender_registry,
+                            self.messenger_lock.get(),
+                        );
+                    }
                     (PrebindAdoption::Adopted(prebind.adopt()), None)
                 }
             }
         };
         drop(released);
         verdict
+    }
+
+    /// A weak handle to the installed mux, for a consumer that has to close
+    /// its own slot. Weak for the reason `PreBind` holds one.
+    pub(crate) fn mux_handle(
+        &self,
+    ) -> Option<std::sync::Weak<crate::streaming::messenger_mux::MessengerMuxTransport>> {
+        self.mux.get().map(Arc::downgrade)
     }
 
     /// Take the drain signal the mux parked for a bind, if the mux made it.
@@ -1488,13 +1751,15 @@ impl AnchorManager {
     /// `CreditUpdate` used to cost.
     async fn connect_streaming(
         &self,
-        key: &velo_ext::TransportKey,
+        ticket: &crate::streaming::control::StreamOpenTicket,
         peer: velo_ext::WorkerId,
         anchor_id: u64,
-        session_id: u64,
-        initial_credit: u32,
-        slot_byte_budget: u32,
+        lifecycle: Option<(CancellationToken, CancellationToken)>,
     ) -> Result<flume::Sender<Vec<u8>>, AttachError> {
+        let key = &ticket.streaming_transport_key;
+        let session_id = ticket.routing_session_id;
+        let initial_credit = ticket.initial_credit;
+        let slot_byte_budget = ticket.slot_byte_budget;
         match crate::streaming::negotiation::choose(key, initial_credit, slot_byte_budget) {
             Ok(crate::streaming::negotiation::Connect::Mux(limits)) => {
                 let mux = self.mux.get().ok_or_else(|| {
@@ -1504,7 +1769,7 @@ impl AnchorManager {
                     ))
                 })?;
                 Ok(mux
-                    .connect_negotiated(peer, anchor_id, session_id, limits)
+                    .connect_controlled(peer, anchor_id, session_id, limits, lifecycle)
                     .await?)
             }
             Ok(crate::streaming::negotiation::Connect::Legacy) => {
@@ -1545,7 +1810,7 @@ impl AnchorManager {
     ///
     /// Uses `DashMap::entry()` to perform the check-and-set atomically under
     /// the shard lock, preventing TOCTOU races between concurrent attach attempts.
-    /// The reader pump takes ownership of the transport receiver separately.
+    /// The reader pump or direct feed holds the transport receiver separately.
     ///
     /// If a timeout task is running, it is cancelled (paused) on successful attach.
     ///
@@ -1604,14 +1869,7 @@ impl AnchorManager {
             let parent = maybe_parent
                 .as_ref()
                 .expect("cancel_token present when unattached_timeout is");
-            let tc = Self::spawn_timeout_task(
-                self.registry.clone(),
-                self.mpsc_registry.clone(),
-                self.metrics.clone(),
-                local_id,
-                timeout,
-                parent,
-            );
+            let tc = Self::spawn_timeout_task(self.registry.clone(), local_id, timeout, parent);
             // Store the new cancellation token back in the entry
             if let Some(mut entry) = self.registry.get_mut(&local_id) {
                 entry.timeout_cancel = Some(tc);
@@ -1623,19 +1881,16 @@ impl AnchorManager {
 
     /// Returns the number of anchors currently registered.
     ///
-    /// Intended for testing and observability. The Prometheus
-    /// `velo_streaming_active_anchors` gauge reflects the same value.
+    /// Intended for testing and observability. Counts SPSC anchors only; the
+    /// Prometheus `velo_streaming_active_anchors` gauge counts SPSC and MPSC
+    /// anchors of every manager sharing the metrics registry.
     pub fn active_anchor_count(&self) -> usize {
         self.registry.len()
     }
 
-    pub(crate) fn update_active_anchor_gauge(&self) {
-        set_active_anchor_gauge(self.metrics.as_ref(), &self.registry, &self.mpsc_registry);
-    }
-
     /// Bundle the SPSC registry, MPSC registry, and metrics collector into
     /// a cheap `Arc`-cloneable context. Used to keep anchor constructors
-    /// and background pumps under clippy's argument threshold.
+    /// and background tasks under clippy's argument threshold.
     pub(crate) fn anchor_context(&self) -> AnchorContext {
         AnchorContext {
             registry: self.registry.clone(),
@@ -1752,6 +2007,12 @@ impl AnchorManager {
             &self.sender_registry,
         )))?;
 
+        messenger.register_streaming_handler(
+            crate::streaming::control::create_stream_stop_handler(Arc::clone(
+                &self.sender_registry,
+            )),
+        )?;
+
         // MPSC handlers — share the same SenderRegistry so `_stream_cancel`
         // covers both SPSC and MPSC senders uniformly.
         messenger.register_streaming_handler(
@@ -1778,7 +2039,8 @@ impl AnchorManager {
     /// Sends an `_anchor_attach` AM to the remote worker, receives the stream endpoint,
     /// calls `transport.connect()` to establish the write channel, and returns a
     /// [`StreamSender<T>`](crate::streaming::sender::StreamSender) that writes directly into the
-    /// transport bridge (which the remote reader_pump forwards to the anchor's frame channel).
+    /// transport bridge (which the remote reader pump forwards to the anchor's frame channel,
+    /// or which, over the mux, the remote consumer reads directly).
     ///
     /// # Errors
     /// - [`AttachError::TransportError`] if `messenger_lock` is not set (register_handlers not called)
@@ -1908,17 +2170,14 @@ impl AnchorManager {
     /// already released or has expired still returns `Ok` here and only
     /// surfaces later, as a send failure on the returned `StreamSender`.
     ///
-    /// No `_anchor_attach` means no `StreamCancelHandle` either, so the
-    /// returned sender's
-    /// [`cancellation_token`](crate::streaming::sender::StreamSender::cancellation_token)
-    /// never fires; a dropped consumer surfaces as a send error instead.
+    /// Slot lifecycle signals reach the producer even before its first send.
     ///
     /// # Errors
     /// - [`AttachError::TransportError`] if `handle` names this node's own
     ///   worker id (a ticket is for a *different* worker to open; a
     ///   same-worker sender should use
     ///   [`attach_stream_anchor`](Self::attach_stream_anchor) instead), if
-    ///   the ticket names `messenger-mux-v1` but this node has no mux
+    ///   the ticket names `messenger-mux-v2` but this node has no mux
     ///   installed, if the ticket names a transport key this node cannot
     ///   resolve, or if staging the local slot fails after retrying a
     ///   batcher that keeps retiring underneath it.
@@ -1970,11 +2229,24 @@ impl AnchorManager {
     /// Allocate the sender-side identity one stream is opened under.
     fn new_sender_identity(&self) -> SenderIdentity {
         let (poison_tx, poison_rx) = flume::bounded::<()>(1);
+        let sender_stream_id = self.next_sender_stream_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let cancel_token = CancellationToken::new();
+        let stop_token = cancel_token.child_token();
+        self.sender_registry.senders.insert(
+            sender_stream_id,
+            crate::streaming::control::SenderEntry {
+                cancel_token: cancel_token.clone(),
+                stop_token: stop_token.clone(),
+                rx_closer: std::sync::Mutex::new(Some(poison_rx)),
+            },
+        );
         SenderIdentity {
-            sender_stream_id: self.next_sender_stream_id.fetch_add(1, Ordering::Relaxed) + 1,
-            cancel_token: CancellationToken::new(),
+            sender_stream_id,
+            cancel_token,
+            stop_token,
             poison_tx,
-            poison_rx,
+            registry: self.sender_registry.clone(),
+            armed: true,
         }
     }
 
@@ -1989,7 +2261,7 @@ impl AnchorManager {
         &self,
         handle: StreamAnchorHandle,
         ticket: &crate::streaming::control::StreamOpenTicket,
-        identity: SenderIdentity,
+        mut identity: SenderIdentity,
     ) -> Result<crate::streaming::sender::StreamSender<T>, AttachError> {
         let started = Instant::now();
         let (handle_worker_id, local_id) = handle.unpack();
@@ -1998,12 +2270,10 @@ impl AnchorManager {
         // bound streaming transport, then connect by WorkerId.
         let frame_tx = match self
             .connect_streaming(
-                &ticket.streaming_transport_key,
+                ticket,
                 handle_worker_id,
                 local_id,
-                ticket.routing_session_id,
-                ticket.initial_credit,
-                ticket.slot_byte_budget,
+                Some((identity.cancel_token.clone(), identity.stop_token.clone())),
             )
             .await
         {
@@ -2019,21 +2289,10 @@ impl AnchorManager {
             }
         };
 
-        let SenderIdentity {
-            sender_stream_id,
-            cancel_token,
-            poison_tx,
-            poison_rx,
-        } = identity;
-
-        // Register SenderEntry for _stream_cancel routing
-        self.sender_registry.senders.insert(
-            sender_stream_id,
-            crate::streaming::control::SenderEntry {
-                cancel_token: cancel_token.clone(),
-                rx_closer: std::sync::Mutex::new(Some(poison_rx)),
-            },
-        );
+        let sender_stream_id = identity.sender_stream_id;
+        let cancel_token = identity.cancel_token.clone();
+        let poison_tx = identity.poison_tx.clone();
+        identity.armed = false;
 
         // Build StreamSender: frame_tx from the transport (not a local registry
         // frame_tx). No local AnchorEntry is created for the remote anchor.
@@ -2070,8 +2329,8 @@ impl AnchorManager {
     ///    [`StreamSender<T>`](crate::streaming::sender::StreamSender) for pushing typed frames.
     ///
     /// The StreamSender writes to the entry's `frame_tx` so items flow directly
-    /// to the [`StreamAnchor<T>`] consumer. The transport connection is used by the
-    /// reader pump for cross-worker flows.
+    /// to the [`StreamAnchor<T>`] consumer. The transport connection is used for
+    /// cross-worker flows.
     ///
     /// # Errors
     /// - [`AttachError::AnchorNotFound`] if the handle is not in the registry (local path)
@@ -2136,8 +2395,8 @@ impl AnchorManager {
                     // Snapshot the negotiated heartbeat cadence for the sender.
                     let heartbeat_interval = entry.heartbeat_interval;
 
-                    // Mark as attached (reader pump takes ownership of transport
-                    // receiver separately).
+                    // Mark as attached. The co-located sender needs no reader
+                    // pump or feed: it writes into `frame_tx` itself.
                     entry.attachment = true;
 
                     // Cancel the timeout task while attached (pause timer)
@@ -2157,32 +2416,37 @@ impl AnchorManager {
                     // writes from `open_slot`, under that peer's own mutex, not
                     // this registry's shard lock -- so a remote `OpenSlot` can
                     // still claim the bind in the gap between that read and the
-                    // release below. That is not a leak: the pump feeding this
-                    // slot is cancelled a few lines down, before the prebind is
-                    // taken, so a claim landing in the gap has already lost its
-                    // only route to `frame_tx` -- there is no second writer to
-                    // guard against. `PreBind::drop` sees the claim and posts
+                    // release below. That is not a leak: `retire_pump` a few
+                    // lines down, before the prebind is taken, cancels the
+                    // watchdog and withdraws the feed, so the consumer stops
+                    // reading that slot buffer on its next poll (the test
+                    // `a_retired_pump_withdraws_its_feed` pins this). A claim
+                    // landing in the gap can still have a record read by a
+                    // consumer poll that runs before the withdrawal; the
+                    // reader pump this replaced forwarded such records until
+                    // its own cancel landed, so the window is not new.
+                    // `PreBind::drop` sees the claim and posts
                     // `CloseSlot{UnknownSlot}` to that producer, which is the
-                    // true state of a stream whose pump just died, delivered
-                    // promptly rather than on the producer's next record. It is
-                    // returned out of this block and dropped once the shard
-                    // guard is gone -- `PreBind`'s drop reaches into mux state
-                    // (the ingress registry, a batcher), which is exactly what
+                    // true state of a stream whose consumer side just went
+                    // away, delivered promptly rather than on the producer's
+                    // next record. It is returned out of this block and
+                    // dropped once the shard guard is gone -- `PreBind`'s drop
+                    // reaches into mux state (the ingress registry, a
+                    // batcher), which is exactly what
                     // the two other call sites that release one from under this
                     // same lock (`_anchor_detach`, `adopt_prebind`'s `Mismatch`
                     // arm) exist to avoid doing while holding it.
                     //
-                    // Its pump has to stop with it, and this branch spawns no
-                    // replacement — the co-located sender writes straight into
-                    // `frame_tx` below, no transport in between. Left running,
-                    // the orphaned pump would see its `transport_rx` close once
-                    // the released prebind drops and exit through the reader
-                    // pump's "transport channel closed" arm, which for an
-                    // *unclaimed* drain now removes the registry entry this
-                    // co-located sender is about to become (see `reader_pump`).
-                    if let Some(pump_cancel) = entry.active_pump_token.take() {
-                        pump_cancel.cancel();
-                    }
+                    // Its watchdog and feed have to stop with it, and this
+                    // branch starts no replacement — the co-located sender
+                    // writes straight into `frame_tx` below, no transport in
+                    // between. Left running, the watchdog would see the bind
+                    // close once the released prebind drops, and
+                    // `control::reap_unclaimed` would remove, for an
+                    // *unclaimed* drain, the registry entry this co-located
+                    // sender is about to become. `retire_pump` cancels the
+                    // token the reap checks and withdraws the feed.
+                    entry.retire_pump();
                     let released_prebind = entry.prebind.take();
 
                     // Allocate sender_stream_id and build SenderEntry
@@ -2192,9 +2456,13 @@ impl AnchorManager {
                     let (poison_tx, poison_rx) = flume::bounded::<()>(1);
 
                     let sender_entry = crate::streaming::control::SenderEntry {
+                        stop_token: cancel_token.child_token(),
                         cancel_token: cancel_token.clone(),
                         rx_closer: std::sync::Mutex::new(Some(poison_rx)),
                     };
+                    if entry.stop_requested {
+                        sender_entry.stop_token.cancel();
+                    }
                     self.sender_registry
                         .senders
                         .insert(sender_stream_id, sender_entry);
@@ -2271,10 +2539,8 @@ impl AnchorManager {
             .unwrap_or(self.default_heartbeat_interval);
 
         let timeout_cancel = unattached_timeout.map(|timeout| {
-            crate::streaming::mpsc::anchor::spawn_mpsc_timeout_task_with_metrics(
+            crate::streaming::mpsc::anchor::spawn_mpsc_timeout_task(
                 self.mpsc_registry.clone(),
-                Some(self.registry.clone()),
-                self.metrics.clone(),
                 local_id,
                 timeout,
                 &cancel_token,
@@ -2290,12 +2556,9 @@ impl AnchorManager {
             timeout_cancel,
             heartbeat_interval,
             max_senders: config.max_senders,
-            spsc_registry: self.registry.clone(),
-            metrics: self.metrics.clone(),
         };
 
         self.mpsc_registry.insert(local_id, entry);
-        self.update_active_anchor_gauge();
 
         crate::streaming::mpsc::MpscStreamAnchor::new(
             handle,
@@ -2391,6 +2654,7 @@ impl AnchorManager {
 
         // Register SenderEntry outside the shard lock.
         let sender_entry = crate::streaming::control::SenderEntry {
+            stop_token: cancel_token.child_token(),
             cancel_token: cancel_token.clone(),
             rx_closer: std::sync::Mutex::new(Some(poison_rx)),
         };
@@ -2485,16 +2749,21 @@ impl AnchorManager {
                 };
                 let frame_tx = self
                     .connect_streaming(
-                        &streaming_transport_key,
+                        &crate::streaming::control::StreamOpenTicket {
+                            streaming_transport_key: streaming_transport_key.clone(),
+                            heartbeat_interval_ms,
+                            routing_session_id: connect_session_id,
+                            initial_credit,
+                            slot_byte_budget,
+                        },
                         handle_worker_id,
                         local_id,
-                        connect_session_id,
-                        initial_credit,
-                        slot_byte_budget,
+                        None,
                     )
                     .await?;
 
                 let sender_entry = crate::streaming::control::SenderEntry {
+                    stop_token: cancel_token.child_token(),
                     cancel_token: cancel_token.clone(),
                     rx_closer: std::sync::Mutex::new(Some(poison_rx)),
                 };
@@ -2569,6 +2838,112 @@ mod tests {
         ) -> BoxFuture<'_, AnyhowResult<flume::Sender<Vec<u8>>>> {
             Box::pin(async { Ok(flume::bounded::<Vec<u8>>(256).0) })
         }
+    }
+
+    /// `velo_streaming_active_anchors` reads the registries when scraped, so
+    /// it follows creates and retires without either touching the gauge.
+    #[tokio::test]
+    async fn the_active_anchor_gauge_follows_the_registries_when_scraped() {
+        let registry = prometheus::Registry::new();
+        let metrics = Arc::new(VeloMetrics::register(&registry).unwrap());
+        let mgr = AnchorManagerBuilder::default()
+            .worker_id(velo_ext::WorkerId::from_u64(1))
+            .transport(
+                Arc::new(MockTransport) as Arc<dyn crate::streaming::transport::FrameTransport>
+            )
+            .metrics(Some(metrics))
+            .build()
+            .unwrap();
+        let gauge = || {
+            crate::observability::test_helpers::MetricSnapshot::from_registry(&registry)
+                .gauge("velo_streaming_active_anchors", &[])
+        };
+        assert_eq!(gauge(), 0.0);
+        let spsc = mgr.create_anchor::<u32>();
+        let mpsc = mgr.create_mpsc_anchor::<u32>();
+        assert_eq!(gauge(), 2.0, "one SPSC and one MPSC anchor");
+        spsc.cancel();
+        assert_eq!(gauge(), 1.0);
+        drop(mpsc);
+        drop(mgr);
+        assert_eq!(gauge(), 0.0, "a dropped manager counts nothing");
+    }
+
+    /// The gauge counts each registry on its own.
+    ///
+    /// A `StreamAnchor` holds the SPSC registry and not the MPSC one, so the
+    /// manager can be gone while SPSC anchors still drain. A source that gave
+    /// up when either registry was gone would be pruned then, for good, and
+    /// the gauge would read zero with anchors alive.
+    #[tokio::test]
+    async fn the_active_anchor_gauge_outlives_one_registry() {
+        let registry = prometheus::Registry::new();
+        let metrics = Arc::new(VeloMetrics::register(&registry).unwrap());
+        let mgr = AnchorManagerBuilder::default()
+            .worker_id(velo_ext::WorkerId::from_u64(1))
+            .transport(
+                Arc::new(MockTransport) as Arc<dyn crate::streaming::transport::FrameTransport>
+            )
+            .metrics(Some(metrics))
+            .build()
+            .unwrap();
+        let gauge = || {
+            crate::observability::test_helpers::MetricSnapshot::from_registry(&registry)
+                .gauge("velo_streaming_active_anchors", &[])
+        };
+        let spsc = mgr.create_anchor::<u32>();
+        drop(mgr);
+        assert_eq!(
+            gauge(),
+            1.0,
+            "the MPSC registry went with the manager; the SPSC anchor still counts"
+        );
+        drop(spsc);
+        assert_eq!(gauge(), 0.0);
+    }
+
+    /// A consumer that reads its sender's `Finalized` off the slot buffer marks
+    /// the slot released.
+    ///
+    /// The ingress applied that terminal in the same step that retires the
+    /// slot, and its own release lands a moment after the consumer can read
+    /// the terminal. Marking it here is what keeps an ordinary end from taking
+    /// the ingress lock in that gap. The drain here belongs to no mux, so
+    /// nothing else ever marks it: only the consumer can.
+    #[tokio::test]
+    async fn reading_finalized_off_the_feed_marks_the_slot_released() {
+        let mgr = make_manager();
+        let mut anchor = mgr.create_anchor::<u32>();
+        let (_, local_id) = anchor.handle().unpack();
+        let (tx, rx) = flume::bounded::<Vec<u8>>(4);
+        let (wake, _wake_rx) = flume::unbounded();
+        let drain = Arc::new(crate::streaming::messenger_mux::ingress::DrainSignal::new(
+            wake,
+        ));
+        {
+            let mut entry = mgr.registry.get_mut(&local_id).expect("entry");
+            let _installed = crate::streaming::control::install_direct_feed(
+                &mut entry,
+                crate::streaming::control::DirectFeed {
+                    rx,
+                    drain: Arc::clone(&drain),
+                    pump_token: CancellationToken::new(),
+                    release: None,
+                },
+            );
+        }
+        tx.send(crate::streaming::sender::cached_finalized().clone())
+            .unwrap();
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), anchor.next())
+            .await
+            .expect("timed out waiting for Finalized")
+            .expect("stream ended early")
+            .expect("frame decodes");
+        assert!(matches!(frame, StreamFrame::Finalized));
+        assert!(
+            drain.is_released(),
+            "the consumer read the terminal off the buffer, so the slot is released"
+        );
     }
 
     fn make_manager() -> AnchorManager {
@@ -2952,7 +3327,7 @@ mod tests {
                 velo_ext::WorkerId::from_u64(7),
                 crate::streaming::messenger_mux::protocol::SlotId::from_raw(0),
                 Arc::new(AtomicBool::new(false)),
-                flume::unbounded::<u32>().0,
+                Arc::new(crate::streaming::messenger_mux::ingress::DirtySlots::new()),
             );
             let ticket = crate::streaming::control::StreamOpenTicket {
                 streaming_transport_key: velo_ext::TransportKey::new("mock-stream"),
