@@ -253,7 +253,7 @@ sequenceDiagram
 
 Credit for a record returns when the consumer takes it, not when it enters the mux buffer. A single-sender consumer that stops polling therefore holds its sender to the credit window C: no task moves records onward and returns credit for them. An MPSC anchor still has a pump that moves records into the anchor channel, so its senders can run ahead by that channel's depth as well.
 
-A producer that ran out of credit sends no batches, so the arrival path does not run for its slots. It waits for the doorbell floor and then for the reply linger. Per record this costs `(drain_visit_floor + reply_linger) / initial_credit`. At the defaults (2 ms, 1 ms and 256) that is under 12 µs per record.
+A producer that ran out of credit sends no batches, so the arrival path does not run for its slots. It waits for the doorbell floor and then for the reply linger. Per record this costs `(drain_visit_floor + reply_linger) / initial_credit`. At the defaults (2 ms, 1 ms and 32) that is about 94 µs per record.
 
 The periodic walk does not reclaim credit for a slot whose consumer is gone, because a consumer that is gone counts no drains. The slot is closed instead: removing a single-sender anchor closes its slot and tells the sender, whichever way the stream ended. An MPSC anchor's slot still waits for the next record, which finds its receiver gone and closes the slot with `UnknownSlot`.
 
@@ -351,7 +351,7 @@ The cost is latency, not memory, because the same clamps bound staged records. `
 
 A forward pass that sends to X streams with no `.await` between the sends puts them all in the shared egress queue. The default policy then sees all of them. A producer that awaits between sends (a tokenizer, a sampling callback, anything that yields) delivers each send to the batcher alone, and the ratio falls toward 1.0. Only an explicit flush groups sends that the runtime scheduled apart.
 
-The second reason is determinism. How many records share a batch under `Auto` depends on how the runtime scheduled the batcher against the producer. The `batched_streaming` example (three anchor hosts, two engines, loopback TCP, 20-core arm64 machine) shows the difference in tokens per wire write:
+The second reason is determinism. How many records share a batch under `Auto` depends on how the runtime scheduled the batcher against the producer. The `batched_streaming` example (three anchor hosts, two engines, loopback TCP, 20-core arm64 machine, credit window 256) shows the difference in tokens per wire write:
 
 | Configuration | Legacy per-stream | `Auto` (5 runs) | `Manual` (5 runs) |
 |---|---|---|---|

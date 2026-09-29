@@ -88,7 +88,7 @@ All settings are fields of `MuxConfig`. Always build it with `..Default::default
 |---|---|---|
 | `enabled` | `false` | Installs the mux and advertises `messenger-mux-v2`. Setting it back to `false` is the rollback. |
 | `max_batch_bytes` | 60 KiB | The configured cap on one batch. The eager budget and the 64 KiB coalescing threshold also clamp it. |
-| `initial_credit` | 256 | Data credit C per slot. Each slot buffer holds C+1 records. Zero is refused at build time. |
+| `initial_credit` | 32 | Data credit C per slot. Each slot buffer holds C+1 records. Zero is refused at build time. |
 | `slot_byte_budget` | 1 MiB | Bytes one slot can hold in flight, and the cap on its withheld queue. Zero means the default. |
 | `peer_byte_budget` | 8 MiB | Bytes all slots of one peer can hold in flight on the receive side. |
 | `credit_sweep_interval` | 200 ms | Period of the whole-table credit walk, the batcher eviction check, and the check that closes expired accept windows. An unclaimed bind is reclaimed up to one interval after its 60 s window. Zero is refused at build time. |
@@ -100,12 +100,13 @@ All settings are fields of `MuxConfig`. Always build it with `..Default::default
 
 ## Change the credit window
 
-`initial_credit` sets how many records a sender can send on one slot before it needs a grant.
+`initial_credit` sets how many records a sender can send on one slot before it needs a grant. The consumer node's value is the one that counts: it advertises its window when a stream attaches, and the sender uses that.
 
-- Keep the default of 256 for token streams.
+- Keep the default of 32 for token streams. A larger window lets every stream fill the shared path between a producer and a saturated consumer node, and a new stream's first record then waits behind all of it. See [The credit window and a saturated frontend](../operations/response-plane-performance.md#the-credit-window-and-a-saturated-frontend).
 - A stream longer than the window needs grants. The consumer node returns credit as its consumer drains, usually when the next batch from the producer arrives. A live consumer therefore rarely stalls its producer.
 - The window is also how far a sender can run ahead of a consumer that stops polling. On a single-sender stream, credit returns only when the consumer takes a record from the slot buffer. An MPSC anchor's pump moves records into the anchor channel, so its senders can run further ahead.
 - Do not set a small window to save memory. A small window raises the credit-return latency per record. For a producer that ran out of credit, it is `(drain_visit_floor + reply_linger) / initial_credit`.
+- Raise the window for a few high-rate streams to an otherwise idle consumer. With no other traffic from the producer, a starved stream gets its credit back only through the doorbell and the reply linger, so a small window caps its rate.
 - Do not set zero. Zero on the wire means "not offering the mux", and the build refuses it.
 
 Each slot buffer holds `initial_credit + 1` records. The byte budgets, not the record count, bound the memory.
@@ -185,7 +186,7 @@ Without zero-RTT setup, the order does not matter. Each new attach negotiates th
 
 These changes were measured and did not help. Do not try them again without a new reason:
 
-- A grant threshold of half a window. It cut credit traffic 19-fold, did not change CPU, and made inter-token p99 worse.
+- A grant threshold of half a window, measured at a window of 256. It cut credit traffic 19-fold, did not change CPU, and made inter-token p99 worse.
 - A 500 µs data linger on the producers (`Auto { max_linger }`). It saved about 1 ms of frontend CPU per request and added about 10 ms to the request path.
 - A shorter `credit_sweep_interval` for faster credit. The arrival path already returns credit on the next batch.
 - `async_open_ack`, as described above.

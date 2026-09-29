@@ -518,8 +518,8 @@ pub(crate) fn handle_batch(
     // The set is why this pass carries the drained slots too, and leaving them
     // to the doorbell was measured and is not an option: the doorbell is a
     // per-peer, rate-limited, single-task walk, and every stream in the serving
-    // shape sends about four records more than its initial window, so the tail
-    // of every stream waited on it. `docs/src/development/batched-streaming-design.md`
+    // shape sent about four records more than its then-default 256-record
+    // window, so the tail of every stream waited on it. `docs/src/development/batched-streaming-design.md`
     // has the numbers for why the arrival path also returns the credit of
     // every slot that drained. Credit still does not come back *from* the
     // consumer: releasing there means taking this peer's mutex per record.
