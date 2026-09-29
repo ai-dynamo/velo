@@ -1379,10 +1379,37 @@ async fn map_region_cancel_rolls_back() {
     // dropped, which is what a `select!` arm losing a race looks like. A timeout
     // would not do: tokio's timer granularity is a millisecond and the round
     // trip is microseconds, so the map would simply win.
+    //
+    // The progress thread is held asleep first. It is an OS thread of its own,
+    // so without the hold it can take the command and reply between the
+    // doorbell and the first poll, and the poll returns `Ready`. The seam
+    // clears its cell just before it sleeps.
+    node.transport
+        .shared
+        .progress_stall_ms
+        .store(200, Ordering::Relaxed);
+    assert!(
+        wait_until(T, || node
+            .transport
+            .shared
+            .progress_stall_ms
+            .load(Ordering::Relaxed)
+            == 0)
+        .await,
+        "the progress thread never entered the stall"
+    );
     let mut pending = Box::pin(rma.map_region(buf.addr(), LEN));
     assert!(
         futures::poll!(pending.as_mut()).is_pending(),
         "the first poll should submit and then await the reply"
+    );
+    // Then the worker maps the region and replies into the future's channel,
+    // which nobody reads. Dropping the future now is the cancel `MapRollback`
+    // exists for: the worker saw a successful reply, so only the future can
+    // give the region back.
+    assert!(
+        wait_until(T, || live() == 1).await,
+        "the worker never mapped the region"
     );
     drop(pending);
     assert!(
