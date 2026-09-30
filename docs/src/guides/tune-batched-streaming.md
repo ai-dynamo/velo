@@ -95,7 +95,7 @@ All settings are fields of `MuxConfig`. Always build it with `..Default::default
 | `slot_byte_budget` | 1 MiB | Bytes one slot can hold in flight, and the cap on its withheld queue. Zero means the default. |
 | `peer_byte_budget` | 8 MiB | Bytes all slots of one peer, on all its lanes, can hold in flight on the receive side. |
 | `credit_sweep_interval` | 200 ms | Period of the whole-table credit walk, the batcher eviction check, and the check that closes expired accept windows. An unclaimed bind is reclaimed up to one interval after its 60 s window. Zero is refused at build time. |
-| `drain_visit_floor` | 2 ms | Shortest gap between two doorbell visits to the same peer. Zero turns the floor off. Values above 1 hour are clamped. |
+| `drain_visit_floor` | 2 ms | Shortest gap between two doorbell visits to the same (peer, lane). Zero turns the floor off. Values above 1 hour are clamped. |
 | `batcher_idle_ttl` | 60 s | How long a batcher with no slots stays alive before eviction. |
 | `flush_policy` | `Auto` with `on_admission: true` | When a batcher writes. See [Select a flush policy](#select-a-flush-policy). |
 | `async_open_ack` | `false` | Whether a slot open returns before the transport admits its `OpenSlot`. |
@@ -127,7 +127,7 @@ Read [Stream saturation](../operations/saturation.md) before you change either b
 `credit_sweep_interval`, `drain_visit_floor` and `reply_linger` interact. Keep the defaults unless a measurement shows a reason.
 
 - The arrival path returns most credit on the next inbound batch. The periodic sweep is a backstop. A shorter sweep interval costs CPU in proportion to peers × slots and gains little.
-- `drain_visit_floor` limits contention on the per-peer ingress lock. Setting it to zero lets a fast consumer drive back-to-back walks under that lock.
+- `drain_visit_floor` limits contention on the ingress lock of each (peer, lane). Setting it to zero lets a fast consumer drive back-to-back walks under that lock.
 - `reply_linger` lets credit replies share batches. The measurement used a 512-worker rig at 8,192-way concurrency. The 1 ms default cut the frontend's outbound batches by 4.3 to 5.9 times against zero. It also cut the frontend's total write time from 13.5–14.3 s to 2.8–3.9 s per run.
 
 If you set `reply_linger` to zero, each credit reply writes its own batch again. Do this only to compare against the earlier behavior.

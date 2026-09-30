@@ -490,7 +490,7 @@ impl IngressRegistry {
     /// runs under the same mutex the inbound batch path takes, at up to one
     /// visit per
     /// [`MuxConfig::drain_visit_floor`](super::MuxConfig::drain_visit_floor)
-    /// per peer.
+    /// per (peer, lane).
     pub(crate) fn sweep_drained(&self, key: PeerLane) -> Vec<ReplyRecord> {
         let Some(entry) = self.peers.get(&key) else {
             return Vec::new();

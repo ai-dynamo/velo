@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The credit-return and eviction sweep task, and the per-peer floor on the
-//! doorbell-driven visits it answers.
+//! The credit-return and eviction sweep task, and the per-(peer, lane) floor on
+//! the doorbell-driven visits it answers.
 //!
 //! Split out of the transport module because it reaches [`MuxCore`] through
 //! two methods only, `sweep` and `visit_drained_peer`. Everything else here is
@@ -24,18 +24,20 @@ use super::{MuxCore, PeerLane};
 /// is a poor way to answer a misconfiguration.
 const MAX_DRAIN_VISIT_FLOOR: Duration = Duration::from_secs(3600);
 
-/// One peer's doorbell state.
+/// One (peer, lane)'s doorbell state.
 struct PeerVisits {
-    /// When the doorbell last walked this peer.
+    /// When the doorbell last walked this (peer, lane).
     last: tokio::time::Instant,
     /// Whether a deferred walk for it is already queued.
     ///
-    /// Exactly one entry per peer is ever in the queue, and this is what says
+    /// Exactly one entry per (peer, lane) is ever in the queue, and this is what says
     /// so. See [`DrainVisits`] for what a second one costs.
     queued: bool,
 }
 
-/// The per-peer floor on doorbell-driven visits, and the queue it defers into.
+/// The per-(peer, lane) floor on doorbell-driven visits, and the queue it
+/// defers into. "Peer" below means one (peer, lane): each lane has its own
+/// table, dirty set and wake, so each is floored on its own.
 ///
 /// Coalescing alone leaves the visit rate a property of the traffic: a visit
 /// takes the peer's wake down before it walks, so the next record drained arms

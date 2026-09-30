@@ -1853,13 +1853,13 @@ impl VeloMetrics {
             registry,
             Counter::with_opts(Opts::new(
                 "velo_streaming_mux_drain_visits_total",
-                "Per-peer credit reconciles the sweep task ran because a \
+                "Credit reconciles the sweep task ran on one (peer, lane) because a \
                  consumer drained, counted once per walk actually performed. \
                  Wakes deferred by MuxConfig::drain_visit_floor are not counted \
                  until the walk they coalesced into runs, and the periodic \
                  sweep's own walks are not counted at all, so this divided by \
-                 elapsed time is the doorbell's real per-peer visit rate and is \
-                 bounded above by 1/drain_visit_floor per peer.",
+                 elapsed time is the doorbell's real visit rate and is \
+                 bounded above by 1/drain_visit_floor per (peer, lane).",
             ))?,
         )?;
         let streaming_mux_records_sent_total = register_collector(
