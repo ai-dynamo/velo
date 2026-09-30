@@ -17,7 +17,7 @@ use futures::StreamExt;
 use velo_ext::WorkerId;
 
 use super::peer_batcher::test_hooks::TestHooks;
-use super::test_support::stalled_producer;
+use super::test_support::{lane0, stalled_producer};
 use super::*;
 use crate::observability::test_helpers::MetricSnapshot;
 use crate::streaming::sender::{cached_dropped, cached_finalized};
@@ -1382,10 +1382,10 @@ async fn a_close_posted_past_the_batchers_last_drain_still_reaches_the_producer(
             .consumer
             .core
             .batchers
-            .contains_key(&pair.producer_worker),
+            .contains_key(&lane0(pair.producer_worker)),
         "an admitted OpenSlot owes no reply, so no batcher exists yet"
     );
-    let batcher = pair.consumer.core.batcher(pair.producer_worker);
+    let batcher = pair.consumer.core.batcher(lane0(pair.producer_worker));
 
     // The sweep's eviction, by hand, in the window after its live-slot check
     // passed: claim under the registry lock, then post.
@@ -1394,7 +1394,9 @@ async fn a_close_posted_past_the_batchers_last_drain_still_reaches_the_producer(
         .consumer
         .core
         .batchers
-        .remove_if(&pair.producer_worker, |_, handle| handle.try_retire(0))
+        .remove_if(&lane0(pair.producer_worker), |_, handle| {
+            handle.try_retire(0)
+        })
         .expect("an idle batcher with no egress slots is evictable");
     evicted.retire();
     // Parked past the drain that carried `retire`, one step from exiting.
@@ -1402,7 +1404,7 @@ async fn a_close_posted_past_the_batchers_last_drain_still_reaches_the_producer(
 
     pair.consumer.core.send_replies(
         &batcher,
-        pair.producer_worker,
+        lane0(pair.producer_worker),
         &[peer_batcher::ReplyRecord::CloseSlot {
             slot,
             reason: protocol::CloseReason::UnknownSlot,
@@ -1440,19 +1442,21 @@ async fn a_close_refused_by_a_retired_batcher_reaches_the_producer_through_its_r
     // Resolved first, as `close_claimed_slot` resolves it, then evicted by
     // hand the way the sweep does it: claim under the registry lock, post
     // `retire`, and this time let the task run all the way out.
-    let batcher = pair.consumer.core.batcher(pair.producer_worker);
+    let batcher = pair.consumer.core.batcher(lane0(pair.producer_worker));
     let (_, evicted) = pair
         .consumer
         .core
         .batchers
-        .remove_if(&pair.producer_worker, |_, handle| handle.try_retire(0))
+        .remove_if(&lane0(pair.producer_worker), |_, handle| {
+            handle.try_retire(0)
+        })
         .expect("an idle batcher with no egress slots is evictable");
     evicted.retire();
     eventually(|| batcher.is_closed()).await;
 
     pair.consumer.core.send_replies(
         &batcher,
-        pair.producer_worker,
+        lane0(pair.producer_worker),
         &[peer_batcher::ReplyRecord::CloseSlot {
             slot,
             reason: protocol::CloseReason::UnknownSlot,
@@ -1465,7 +1469,7 @@ async fn a_close_refused_by_a_retired_batcher_reaches_the_producer_through_its_r
         .consumer
         .core
         .batchers
-        .get(&pair.producer_worker)
+        .get(&lane0(pair.producer_worker))
         .expect("the refused reply resolved a fresh batcher for the peer");
     assert!(
         !Arc::ptr_eq(replacement.value(), &batcher),

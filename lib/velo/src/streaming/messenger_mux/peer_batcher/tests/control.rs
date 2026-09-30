@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 use super::super::test_hooks::TestHooks;
 use super::super::*;
 use super::support::*;
+use crate::streaming::messenger_mux::LaneIndex;
 use crate::streaming::messenger_mux::protocol::RecordType;
 use crate::streaming::sender::cached_finalized;
 
@@ -413,13 +414,13 @@ async fn cancelling_the_transport_closes_every_producer_channel() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cancelled_batcher_is_unregistered_before_it_refuses_a_reply() {
     let (sender, capture, _batches) = capture_pair().await;
-    let peer = capture.instance_id().worker_id();
+    let key = PeerLane::new(capture.instance_id().worker_id(), LaneIndex::ZERO);
 
     for attempt in 0..64 {
         let cancel = CancellationToken::new();
         let batchers: Arc<BatcherMap> = Arc::new(DashMap::new());
         let handle = spawn(
-            peer,
+            key,
             BatcherContext {
                 messenger: Arc::clone(&sender),
                 config: MuxConfig::default(),
@@ -430,7 +431,7 @@ async fn a_cancelled_batcher_is_unregistered_before_it_refuses_a_reply() {
                 hooks: None,
             },
         );
-        batchers.insert(peer, Arc::clone(&handle));
+        batchers.insert(key, Arc::clone(&handle));
 
         let spinning = Arc::new(AtomicBool::new(false));
         let writer = {
@@ -453,7 +454,7 @@ async fn a_cancelled_batcher_is_unregistered_before_it_refuses_a_reply() {
                 }
                 // Refused. A re-resolve now must not hand this batcher back.
                 batchers
-                    .get(&peer)
+                    .get(&key)
                     .is_some_and(|entry| Arc::ptr_eq(entry.value(), &handle))
             })
         };

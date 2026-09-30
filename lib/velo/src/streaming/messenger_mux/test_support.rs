@@ -16,8 +16,13 @@ use std::time::Duration;
 use bytes::Bytes;
 use velo_ext::WorkerId;
 
-use super::{MessengerMuxTransport, MuxConfig};
+use super::{LaneIndex, MessengerMuxTransport, MuxConfig, PeerLane};
 use crate::messenger::Messenger;
+
+/// `peer` on lane 0, the only lane any stream uses today.
+pub(super) fn lane0(peer: WorkerId) -> PeerLane {
+    PeerLane::new(peer, LaneIndex::ZERO)
+}
 
 /// A transport whose per-target send channel this test owns.
 ///
@@ -144,7 +149,7 @@ impl velo_ext::Transport for StallingTransport {
 /// instead of waited for.
 pub(super) struct Stalled {
     producer: Arc<MessengerMuxTransport>,
-    peer: WorkerId,
+    key: PeerLane,
     pub(super) wire: flume::Receiver<(Bytes, Bytes)>,
     // Held so the messenger outlives the batchers it spawned.
     _messenger: Arc<Messenger>,
@@ -167,7 +172,7 @@ pub(super) async fn stalled_producer(config: MuxConfig) -> Stalled {
         MessengerMuxTransport::new(Arc::clone(&messenger), config, None).expect("producer mux");
     Stalled {
         producer,
-        peer: peer_instance.worker_id(),
+        key: lane0(peer_instance.worker_id()),
         wire,
         _messenger: messenger,
     }
@@ -183,7 +188,7 @@ impl Stalled {
         let limits = self.producer.advertised_limits();
         tokio::time::timeout(
             patience,
-            self.producer.connect_negotiated(self.peer, id, id, limits),
+            self.producer.connect_negotiated(self.key, id, id, limits),
         )
         .await
         .ok()

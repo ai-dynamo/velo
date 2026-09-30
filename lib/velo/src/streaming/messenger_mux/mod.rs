@@ -100,6 +100,7 @@
 mod config;
 pub(crate) mod flow_control;
 pub(crate) mod ingress;
+mod lane;
 pub(crate) mod peer_batcher;
 pub(crate) mod protocol;
 mod sweep;
@@ -129,6 +130,7 @@ use crate::observability::{MuxMetricsHandle, VeloMetrics};
 use crate::streaming::transport::FrameTransport;
 
 pub use self::config::{AutoFlush, FlushPolicy, MuxConfig};
+pub(crate) use self::lane::{LaneIndex, PeerLane};
 
 /// The streaming-transport key this mux answers to.
 ///
@@ -256,7 +258,7 @@ struct MuxCore {
 impl MessengerMuxTransport {
     pub(crate) fn request_stop(&self, peer: WorkerId, slot: protocol::SlotId, session_id: u64) {
         self.core.return_credit(
-            peer,
+            PeerLane::new(peer, LaneIndex::ZERO),
             vec![peer_batcher::ReplyRecord::LifecycleSlot {
                 slot,
                 session_id,
@@ -344,7 +346,9 @@ impl MessengerMuxTransport {
             let handler_core = handler_core.clone();
             async move {
                 if let Some(core) = handler_core.upgrade() {
-                    core.deliver_batch(ctx.sender_worker_id(), &ctx.payload);
+                    // The one batch handler is lane 0's.
+                    let key = PeerLane::new(ctx.sender_worker_id(), LaneIndex::ZERO);
+                    core.deliver_batch(key, &ctx.payload);
                 }
                 Ok(())
             }
@@ -367,17 +371,17 @@ impl MessengerMuxTransport {
 }
 
 impl MuxCore {
-    /// The batcher for `peer`, created on first use.
-    fn batcher(&self, peer: WorkerId) -> Arc<BatcherHandle> {
-        if let Some(existing) = self.batchers.get(&peer) {
+    /// The batcher for one (peer, lane), created on first use.
+    fn batcher(&self, key: PeerLane) -> Arc<BatcherHandle> {
+        if let Some(existing) = self.batchers.get(&key) {
             return Arc::clone(existing.value());
         }
         Arc::clone(
             self.batchers
-                .entry(peer)
+                .entry(key)
                 .or_insert_with(|| {
                     peer_batcher::spawn(
-                        peer,
+                        key,
                         BatcherContext {
                             messenger: Arc::clone(&self.messenger),
                             config: self.config.clone(),
@@ -395,12 +399,17 @@ impl MuxCore {
     }
 
     /// Hand one decoded batch to the ingress lane and act on what it produced.
-    fn deliver_batch(&self, peer: WorkerId, payload: &bytes::Bytes) {
+    ///
+    /// Everything the batch produced goes back through the batcher for the
+    /// lane it arrived on. Replies name the peer's slots on that lane, and
+    /// grants, closes and stops name this side's slots, whose ids are unique
+    /// only within that lane's batcher.
+    fn deliver_batch(&self, key: PeerLane, payload: &bytes::Bytes) {
         let outcome = ingress::handle_batch(
             &self.ingress,
             &self.config,
             self.metrics.as_ref(),
-            peer,
+            key.peer,
             payload,
         );
 
@@ -421,7 +430,7 @@ impl MuxCore {
             return;
         }
 
-        let batcher = self.batcher(peer);
+        let batcher = self.batcher(key);
         for (slot, session_id, cancel) in outcome.peer_stops {
             batcher.peer_stopped(slot, session_id, cancel);
         }
@@ -432,7 +441,7 @@ impl MuxCore {
             batcher.peer_closed(slot, reason);
         }
         if !outcome.replies.is_empty() {
-            self.send_replies(&batcher, peer, &outcome.replies);
+            self.send_replies(&batcher, key, &outcome.replies);
         }
     }
 
@@ -443,8 +452,8 @@ impl MuxCore {
         }
     }
 
-    /// Queue control records back to `peer`, re-resolving while the batcher
-    /// in hand has stopped reading.
+    /// Queue control records back to one (peer, lane), re-resolving while the
+    /// batcher in hand has stopped reading.
     ///
     /// Control is coalesced state rather than a queue, so nothing here can fail
     /// on the write — `reply`'s answer is what stands in for a `SendError`, and
@@ -466,13 +475,13 @@ impl MuxCore {
     fn send_replies(
         &self,
         batcher: &Arc<BatcherHandle>,
-        peer: WorkerId,
+        key: PeerLane,
         replies: &[peer_batcher::ReplyRecord],
     ) {
         if batcher.reply(replies) {
             return;
         }
-        while !self.batcher(peer).reply(replies) {}
+        while !self.batcher(key).reply(replies) {}
     }
 
     /// Reconcile every slot of one peer, on the periodic tick.
@@ -484,7 +493,10 @@ impl MuxCore {
         // this visit is in progress must be able to post a fresh wake, or its
         // credit waits for the periodic backstop.
         self.ingress.clear_pending_wake(peer);
-        self.return_credit(peer, self.ingress.sweep_credit(peer));
+        self.return_credit(
+            PeerLane::new(peer, LaneIndex::ZERO),
+            self.ingress.sweep_credit(peer),
+        );
     }
 
     /// One doorbell-driven visit: reconcile the slots of the peer that rang.
@@ -501,16 +513,20 @@ impl MuxCore {
             metrics.drain_visit();
         }
         self.ingress.clear_pending_wake(peer);
-        self.return_credit(peer, self.ingress.sweep_drained(peer));
+        self.return_credit(
+            PeerLane::new(peer, LaneIndex::ZERO),
+            self.ingress.sweep_drained(peer),
+        );
     }
 
-    /// Hand a reconcile pass's grants to the peer's batcher.
-    fn return_credit(&self, peer: WorkerId, replies: Vec<peer_batcher::ReplyRecord>) {
+    /// Hand a reconcile pass's grants to the batcher of the lane the slots
+    /// arrived on.
+    fn return_credit(&self, key: PeerLane, replies: Vec<peer_batcher::ReplyRecord>) {
         if replies.is_empty() {
             return;
         }
-        let batcher = self.batcher(peer);
-        self.send_replies(&batcher, peer, &replies);
+        let batcher = self.batcher(key);
+        self.send_replies(&batcher, key, &replies);
     }
 
     /// Retire a slot whose consumer has gone and tell its owner.
@@ -563,8 +579,9 @@ impl MuxCore {
         if let Some(metrics) = &self.metrics {
             metrics.slot_closed();
         }
-        let batcher = self.batcher(peer);
-        self.send_replies(&batcher, peer, &[reply]);
+        let key = PeerLane::new(peer, LaneIndex::ZERO);
+        let batcher = self.batcher(key);
+        self.send_replies(&batcher, key, &[reply]);
     }
 
     /// Close the accept window on every bind whose deadline has passed.
@@ -611,22 +628,23 @@ impl MuxCore {
         }
 
         let threshold = self.config.idle_ticks();
-        let peers: Vec<WorkerId> = self.batchers.iter().map(|entry| *entry.key()).collect();
-        for peer in peers {
-            let Some(handle) = self.batchers.get(&peer) else {
+        let keys: Vec<PeerLane> = self.batchers.iter().map(|entry| *entry.key()).collect();
+        for key in keys {
+            let Some(handle) = self.batchers.get(&key) else {
                 continue;
             };
             let idle = handle.tick_idle();
             drop(handle);
-            if idle < threshold || self.ingress.live_slots(peer) > 0 {
+            if idle < threshold || self.ingress.live_slots(key.peer) > 0 {
                 continue;
             }
             // The claim is made under the registry's shard lock, so a `connect`
-            // resolving the same peer either sees the entry gone and creates a
-            // fresh batcher, or gets this one and has its `OpenSlot` refused.
+            // resolving the same (peer, lane) either sees the entry gone and
+            // creates a fresh batcher, or gets this one and has its `OpenSlot`
+            // refused.
             if let Some((_, handle)) = self
                 .batchers
-                .remove_if(&peer, |_, handle| handle.try_retire(threshold))
+                .remove_if(&key, |_, handle| handle.try_retire(threshold))
             {
                 handle.retire();
             }
@@ -720,7 +738,9 @@ impl FrameTransport for MessengerMuxTransport {
         session_id: u64,
     ) -> BoxFuture<'_, Result<flume::Sender<Vec<u8>>>> {
         let limits = self.core.limits;
-        self.connect_negotiated(peer, anchor_id, session_id, limits)
+        // Lane 0: the bare trait has no attach response to carry a lane.
+        let key = PeerLane::new(peer, LaneIndex::ZERO);
+        self.connect_negotiated(key, anchor_id, session_id, limits)
     }
 }
 
@@ -852,17 +872,19 @@ impl MessengerMuxTransport {
     /// cost one round trip per stream open.
     pub(crate) fn connect_negotiated(
         &self,
-        peer: WorkerId,
+        key: PeerLane,
         anchor_id: u64,
         session_id: u64,
         limits: NegotiatedLimits,
     ) -> BoxFuture<'_, Result<flume::Sender<Vec<u8>>>> {
-        self.connect_controlled(peer, anchor_id, session_id, limits, None)
+        self.connect_controlled(key, anchor_id, session_id, limits, None)
     }
 
+    /// Open a slot on the batcher for `key`: the slot's lane is fixed here
+    /// for its whole life.
     pub(crate) fn connect_controlled(
         &self,
-        peer: WorkerId,
+        key: PeerLane,
         anchor_id: u64,
         session_id: u64,
         limits: NegotiatedLimits,
@@ -871,7 +893,7 @@ impl MessengerMuxTransport {
         let core = Arc::clone(&self.core);
         Box::pin(async move {
             for _ in 0..CONNECT_ATTEMPTS {
-                let batcher = core.batcher(peer);
+                let batcher = core.batcher(key);
                 // Sized to the credit window for symmetry with the receive
                 // buffer. A producer waits on it once its slot pauses at the
                 // byte cap, or while the batcher is parked on admission. See
@@ -902,7 +924,9 @@ impl MessengerMuxTransport {
                 }
             }
             Err(anyhow!(
-                "messenger mux: could not open a slot to peer {peer} after {CONNECT_ATTEMPTS} attempts"
+                "messenger mux: could not open a slot to peer {} on lane {} after {CONNECT_ATTEMPTS} attempts",
+                key.peer,
+                key.lane
             ))
         })
     }

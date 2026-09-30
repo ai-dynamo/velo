@@ -1768,8 +1768,11 @@ impl AnchorManager {
                          it can only have learned that key from an advertisement this node made"
                     ))
                 })?;
+                use crate::streaming::messenger_mux::{LaneIndex, PeerLane};
+                // Every stream rides lane 0 until the attach response names one.
+                let key = PeerLane::new(peer, LaneIndex::ZERO);
                 Ok(mux
-                    .connect_controlled(peer, anchor_id, session_id, limits, lifecycle)
+                    .connect_controlled(key, anchor_id, session_id, limits, lifecycle)
                     .await?)
             }
             Ok(crate::streaming::negotiation::Connect::Legacy) => {
