@@ -324,7 +324,7 @@ The baseline work for this design measured velo's existing transports and found 
 
 **Correction to the first analysis.** The first analysis applied the same options to an idle socket, saw an 18% cost, and called the buffer hypothesis refuted. That test removed the race, and the race is the mechanism.
 
-**Fix.** The listening socket sets the buffer sizes, and accepted sockets inherit them at handshake time. The dialing side still sets its own before the first write, which cannot race. The streaming TCP transport had the same fault and the same fix. On aarch64 loopback, 256 KiB x 64 went from 8.8 to 27.9 MB/s (8 of 8 runs collapsed) to 2,470 to 4,173 MB/s (8 of 8 healthy). Inherited sizes are also faster than no sizes at all, because autotuning starts cold.
+**Fix.** The listening socket sets the buffer sizes, and accepted sockets inherit them at handshake time. The dialing side still sets its own before the first write, which cannot race. The streaming TCP transport had the same fault and the same fix. On aarch64 loopback, 256 KiB x 64 went from 8.8 to 27.9 MB/s (8 of 8 runs collapsed) to 2,470 to 4,173 MB/s (8 of 8 healthy). For request and reply, inherited sizes are also faster than no sizes at all, because autotuning starts cold. For one-way bulk traffic across nodes, autotuning is faster, and the TCP messenger transport has an option for it. See [Transports](../concepts/transports.md#socket-buffers-are-set-before-data-flows).
 
 ### Three writes per large frame
 

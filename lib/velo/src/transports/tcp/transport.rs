@@ -90,6 +90,9 @@ pub struct TcpTransport {
     // Listener read-buffer shrink threshold (bytes). Plumbed into TcpListener
     // at start() time. Resolved from env or default in new().
     shrink_threshold: usize,
+    /// `SO_RCVBUF`/`SO_SNDBUF` for every TCP socket, or `None` for the
+    /// kernel's autotuning. See [`TcpTransportBuilder::socket_buffers`].
+    socket_buffers: Option<usize>,
 
     // Context for each dialed connection's read loop (the path that surfaces
     // the peer's ShuttingDown drain rejections). Set in start(), before
@@ -180,6 +183,7 @@ impl TcpTransport {
             numa_hint,
             metrics: OnceLock::new(),
             shrink_threshold: super::listener::default_shrink_threshold(),
+            socket_buffers: Some(super::listener::DEFAULT_SOCKET_BUFFERS),
             dialed_ctx: OnceLock::new(),
         }
     }
@@ -285,13 +289,7 @@ impl TcpTransport {
             addr,
             key,
             rx,
-            WriterTaskContext {
-                connections: Arc::clone(&self.connections),
-                cancel_token: self.cancel_token.clone(),
-                connect_timeout: self.connect_timeout,
-                reader_ctx: self.dialed_ctx.get().cloned(),
-                metrics: self.metrics.get().cloned(),
-            },
+            self.writer_context(),
         ));
 
         debug!(
@@ -299,6 +297,18 @@ impl TcpTransport {
             instance_id, lane, addr
         );
         Ok(handle)
+    }
+
+    /// What each connection writer gets from the transport.
+    fn writer_context(&self) -> WriterTaskContext {
+        WriterTaskContext {
+            connections: Arc::clone(&self.connections),
+            cancel_token: self.cancel_token.clone(),
+            connect_timeout: self.connect_timeout,
+            reader_ctx: self.dialed_ctx.get().cloned(),
+            metrics: self.metrics.get().cloned(),
+            socket_buffers: self.socket_buffers,
+        }
     }
 
     fn update_peer_gauge(&self) {
@@ -513,6 +523,7 @@ impl Transport for TcpTransport {
                 .transport_key(self.key.as_str())
                 .metrics(self.metrics.get().cloned())
                 .shrink_threshold(self.shrink_threshold)
+                .socket_buffers(self.socket_buffers)
                 .build()?;
 
             rt.spawn(async move {
@@ -613,6 +624,7 @@ struct WriterTaskContext {
     connect_timeout: Duration,
     reader_ctx: Option<DialedReaderContext>,
     metrics: Option<std::sync::Arc<dyn velo_ext::TransportObservability>>,
+    socket_buffers: Option<usize>,
 }
 
 /// Connection writer task
@@ -628,23 +640,12 @@ async fn connection_writer_task(
     rx: flume::Receiver<SendTask>,
     ctx: WriterTaskContext,
 ) -> Result<()> {
+    let result = connection_writer_inner(addr, key, &rx, &ctx).await;
     let WriterTaskContext {
         connections,
-        cancel_token,
-        connect_timeout,
-        reader_ctx,
         metrics,
+        ..
     } = ctx;
-    let result = connection_writer_inner(
-        addr,
-        key,
-        &rx,
-        &cancel_token,
-        connect_timeout,
-        reader_ctx,
-        metrics.clone(),
-    )
-    .await;
 
     // Always drain queued messages and notify their error handlers.
     //
@@ -682,22 +683,12 @@ async fn connection_writer_task(
     result
 }
 
-/// Inner loop: connect, configure the socket, and send frames until the channel
-/// closes, a write error occurs, or the reader sees the peer close the socket.
-async fn connection_writer_inner(
-    addr: SocketAddr,
-    (instance_id, lane): LaneKey,
-    rx: &flume::Receiver<SendTask>,
-    cancel_token: &CancellationToken,
-    connect_timeout: Duration,
-    reader_ctx: Option<DialedReaderContext>,
-    metrics: Option<std::sync::Arc<dyn velo_ext::TransportObservability>>,
-) -> Result<()> {
-    debug!("Connecting to {} lane {} ({})", instance_id, lane, addr);
-
+/// Connect to `addr` and set up the socket before its first write, or `None`
+/// when the transport is cancelled first.
+async fn dial(addr: SocketAddr, ctx: &WriterTaskContext) -> Result<Option<TcpStream>> {
     let stream = tokio::select! {
-        _ = cancel_token.cancelled() => return Ok(()),
-        res = tokio::time::timeout(connect_timeout, TcpStream::connect(addr)) => {
+        _ = ctx.cancel_token.cancelled() => return Ok(None),
+        res = tokio::time::timeout(ctx.connect_timeout, TcpStream::connect(addr)) => {
             res.context("connect timeout")?.context("connect failed")?
         },
     };
@@ -718,14 +709,25 @@ async fn connection_writer_inner(
     // Safe to size buffers here: this side dialed the connection and has not
     // written a byte yet, so unlike the accept path there is no in-flight data
     // to race (see the listener for why that race collapses the window).
-    if let Err(e) = sock.set_send_buffer_size(2_097_152) {
-        warn!("Failed to set send buffer size: {}", e);
-    }
+    super::listener::size_socket_buffers(&stream, ctx.socket_buffers);
+    Ok(Some(stream))
+}
 
-    if let Err(e) = sock.set_recv_buffer_size(2_097_152) {
-        warn!("Failed to set recv buffer size: {}", e);
-    }
-
+/// Inner loop: connect, configure the socket, and send frames until the channel
+/// closes, a write error occurs, or the reader sees the peer close the socket.
+async fn connection_writer_inner(
+    addr: SocketAddr,
+    (instance_id, lane): LaneKey,
+    rx: &flume::Receiver<SendTask>,
+    ctx: &WriterTaskContext,
+) -> Result<()> {
+    let cancel_token = &ctx.cancel_token;
+    let reader_ctx = ctx.reader_ctx.clone();
+    let metrics = ctx.metrics.clone();
+    debug!("Connecting to {} lane {} ({})", instance_id, lane, addr);
+    let Some(stream) = dial(addr, ctx).await? else {
+        return Ok(());
+    };
     debug!("Connected to {} lane {} ({})", instance_id, lane, addr);
 
     // The peer's listener replies on THIS socket when it rejects a Message

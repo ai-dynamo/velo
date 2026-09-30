@@ -482,6 +482,7 @@ async fn test_writer_task_cleans_up_on_write_error() {
             connect_timeout: Duration::from_secs(5),
             reader_ctx: None,
             metrics: None,
+            socket_buffers: None,
         },
     ));
 
@@ -628,6 +629,7 @@ async fn test_writer_task_drains_on_connect_failure() {
             connect_timeout: Duration::from_secs(5),
             reader_ctx: None,
             metrics: None,
+            socket_buffers: None,
         },
     ));
     let _ = writer.await;
@@ -715,6 +717,195 @@ async fn max_message_size_is_exactly_what_the_codec_will_encode() {
         TcpFrameCodec::build_preamble(MessageType::Message, header_len, payload_len + 1).is_err(),
         "one byte past the reported capacity must not",
     );
+}
+
+/// A size below the common `rmem_max` of 212,992 and far from the 2 MiB
+/// default, so a test that uses it tells the setting apart from the default.
+const SMALL_BUFFERS: usize = 98_304;
+
+/// What a new TCP socket reports for its receive and send buffers: the
+/// kernel's defaults, and the values once `bytes` is set on it. Linux doubles
+/// a set value for bookkeeping and clamps it, so the pairs differ on common
+/// hosts. On a host where one pair is equal, the tests that use this cannot
+/// tell a sized socket from an unsized one, so the helper fails there instead
+/// of letting them pass with no effect.
+struct BufferSizes {
+    default_recv: usize,
+    sized_recv: usize,
+    default_send: usize,
+    sized_send: usize,
+}
+
+fn buffer_sizes(bytes: usize) -> BufferSizes {
+    let fresh =
+        || socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+    let default = fresh();
+    let sized = fresh();
+    sized.set_recv_buffer_size(bytes).unwrap();
+    sized.set_send_buffer_size(bytes).unwrap();
+    let sizes = BufferSizes {
+        default_recv: default.recv_buffer_size().unwrap(),
+        sized_recv: sized.recv_buffer_size().unwrap(),
+        default_send: default.send_buffer_size().unwrap(),
+        sized_send: sized.send_buffer_size().unwrap(),
+    };
+    assert_ne!(
+        sizes.default_recv, sizes.sized_recv,
+        "a sized socket reads as the default on this host"
+    );
+    assert_ne!(
+        sizes.default_send, sizes.sized_send,
+        "a sized socket reads as the default on this host"
+    );
+    sizes
+}
+
+fn recv_and_send<'a>(sock: impl Into<socket2::SockRef<'a>>) -> (usize, usize) {
+    let sock = sock.into();
+    (
+        sock.recv_buffer_size().unwrap(),
+        sock.send_buffer_size().unwrap(),
+    )
+}
+
+fn listener_buffers(transport: &TcpTransport) -> (usize, usize) {
+    let guard = transport.listener.lock().unwrap();
+    recv_and_send(guard.as_ref().expect("the builder binds the listener"))
+}
+
+/// By default the listening socket is sized, as it always was, so accepted
+/// sockets inherit the size. With `socket_buffers(None)` it keeps the kernel's
+/// default, so accepted sockets autotune. Both ways of giving the builder a
+/// listener are covered: `bind_addr`, where the builder binds its own socket,
+/// and `from_listener`, which the examples use.
+///
+/// An explicit size turns autotuning off and is clamped to `rmem_max`; on
+/// hosts where that is 212,992 it caps one connection's window near 208 KiB.
+#[test]
+fn socket_buffers_sizes_the_listener_or_leaves_it_to_the_kernel() {
+    // The book and the builder doc state 2 MiB.
+    assert_eq!(
+        super::super::listener::DEFAULT_SOCKET_BUFFERS,
+        2 * 1024 * 1024
+    );
+    let default_sizes = buffer_sizes(super::super::listener::DEFAULT_SOCKET_BUFFERS);
+    let small = buffer_sizes(SMALL_BUFFERS);
+    let bound = |builder: TcpTransportBuilder| {
+        builder
+            .bind_addr("127.0.0.1:0".parse().unwrap())
+            .build()
+            .unwrap()
+    };
+    let given = |builder: TcpTransportBuilder| {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        builder.from_listener(listener).unwrap().build().unwrap()
+    };
+    for (name, build) in [
+        (
+            "bind_addr",
+            &bound as &dyn Fn(TcpTransportBuilder) -> TcpTransport,
+        ),
+        ("from_listener", &given),
+    ] {
+        let by_default = build(TcpTransportBuilder::new());
+        assert_eq!(
+            listener_buffers(&by_default),
+            (default_sizes.sized_recv, default_sizes.sized_send),
+            "{name}, default"
+        );
+        let small_transport = build(TcpTransportBuilder::new().socket_buffers(Some(SMALL_BUFFERS)));
+        assert_eq!(
+            listener_buffers(&small_transport),
+            (small.sized_recv, small.sized_send),
+            "{name}, {SMALL_BUFFERS}"
+        );
+        let autotuned = build(TcpTransportBuilder::new().socket_buffers(None));
+        assert_eq!(
+            listener_buffers(&autotuned),
+            (small.default_recv, small.default_send),
+            "{name}, None"
+        );
+    }
+}
+
+/// `start()` builds the listener that serves the socket, and that listener
+/// sizes a socket it is given once more. So `start()` must hand it the
+/// transport's setting, or `socket_buffers(None)` would turn into 2 MiB there
+/// and every accepted socket would lose autotuning. The listener is read
+/// through a clone once a frame has arrived, which proves that the accept loop
+/// (it runs after that second sizing) has started.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn start_keeps_the_listener_setting() {
+    let small = buffer_sizes(SMALL_BUFFERS);
+    for (setting, expected) in [
+        (Some(SMALL_BUFFERS), (small.sized_recv, small.sized_send)),
+        (None, (small.default_recv, small.default_send)),
+    ] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let probe = listener.try_clone().unwrap();
+        let server = TcpTransportBuilder::new()
+            .from_listener(listener)
+            .unwrap()
+            .socket_buffers(setting)
+            .build()
+            .unwrap();
+        let (adapter, streams) = crate::transports::make_channels();
+        let server_id = crate::InstanceId::new_v4();
+        server
+            .start(server_id, adapter, tokio::runtime::Handle::current())
+            .await
+            .unwrap();
+
+        let (client, _) = make_transport();
+        client
+            .register(PeerInfo::new(server_id, server.address()))
+            .unwrap();
+        let _ = client.send_message(
+            server_id,
+            Bytes::from_static(b"hdr"),
+            Bytes::from_static(b"pay"),
+            MessageType::Event,
+            Arc::new(NullErrorHandler),
+        );
+        tokio::time::timeout(Duration::from_secs(5), streams.event_stream.recv_async())
+            .await
+            .expect("the frame arrives")
+            .expect("event stream open");
+
+        assert_eq!(recv_and_send(&probe), expected, "{setting:?}");
+        client.shutdown();
+        server.shutdown();
+    }
+}
+
+/// A dialed socket follows the same setting. The transport builds each
+/// connection writer's context with `writer_context`, and `dial` is the step
+/// of the writer that connects and sets up the socket, so this reads the
+/// socket that the transport writes to. With `None`, the socket must read the
+/// same as one dialed with no setting at all.
+#[tokio::test]
+async fn dial_sizes_the_socket_or_leaves_it_to_the_kernel() {
+    let small = buffer_sizes(SMALL_BUFFERS);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (unsized_dial, _accepted) =
+        tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
+    let untouched = recv_and_send(&unsized_dial.unwrap());
+
+    for (setting, expected) in [
+        (Some(SMALL_BUFFERS), (small.sized_recv, small.sized_send)),
+        (None, untouched),
+    ] {
+        let transport = TcpTransportBuilder::new()
+            .bind_addr("127.0.0.1:0".parse().unwrap())
+            .socket_buffers(setting)
+            .build()
+            .unwrap();
+        let ctx = transport.writer_context();
+        let (dialed, _accepted) = tokio::join!(super::dial(addr, &ctx), listener.accept());
+        let dialed = dialed.unwrap().expect("not cancelled");
+        assert_eq!(recv_and_send(&dialed), expected, "{setting:?}");
+    }
 }
 
 /// Replacing a dead connection must not update the connection gauge while the

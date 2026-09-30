@@ -16,5 +16,5 @@ mod transport;
 mod writer;
 
 pub use framing::TcpFrameCodec;
-pub use listener::{RuntimeConfig, TcpListener, TcpListenerBuilder};
+pub use listener::{DEFAULT_SOCKET_BUFFERS, RuntimeConfig, TcpListener, TcpListenerBuilder};
 pub use transport::{TcpTransport, TcpTransportBuilder};

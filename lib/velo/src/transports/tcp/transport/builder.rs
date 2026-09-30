@@ -25,6 +25,7 @@ pub struct TcpTransportBuilder {
     interface_filter: InterfaceFilter,
     numa_hint: Option<u32>,
     shrink_threshold: Option<usize>,
+    socket_buffers: Option<usize>,
     lanes: NonZeroU16,
 }
 
@@ -40,6 +41,7 @@ impl TcpTransportBuilder {
             interface_filter: InterfaceFilter::default(),
             numa_hint: None,
             shrink_threshold: None,
+            socket_buffers: Some(super::super::listener::DEFAULT_SOCKET_BUFFERS),
             lanes: NonZeroU16::MIN,
         }
     }
@@ -93,15 +95,34 @@ impl TcpTransportBuilder {
         self
     }
 
+    /// `SO_RCVBUF` and `SO_SNDBUF` for every TCP socket of the transport, or
+    /// `None` to leave the buffers to the kernel's autotuning. The default is
+    /// 2 MiB.
+    ///
+    /// An explicit size turns autotuning off, and Linux clamps it to
+    /// `net.core.rmem_max`/`wmem_max`: with the common value of 212,992, 2 MiB
+    /// becomes a locked buffer that caps the TCP window at about 208 KiB.
+    /// Autotuning grows the buffers up to `net.ipv4.tcp_rmem`/`tcp_wmem`
+    /// instead. `None` is faster for one-way bulk traffic across nodes. The
+    /// default is faster for request and reply. The Transports chapter of the
+    /// book has the measurements.
+    ///
+    /// A listener that the caller sized before `from_listener` keeps its size:
+    /// `None` does not undo it.
+    pub fn socket_buffers(mut self, bytes: Option<usize>) -> Self {
+        self.socket_buffers = bytes;
+        self
+    }
+
     /// Lanes to each peer: up to this many connections, one for each lane
     /// used, dialed on the first send on that lane (default 1, at least 1).
     ///
     /// One connection is limited by its receiver: one reader task does the
-    /// whole receive copy, and fixed socket buffers cap the TCP window. Each
-    /// lane is its own connection, read by its own task, so N lanes spread
-    /// that work over up to N cores. Order holds
-    /// within a lane only, so a caller that uses lanes must keep each ordered
-    /// flow on one lane (see `Transport::send_message_on_lane`).
+    /// whole receive copy, and by default fixed socket buffers cap the TCP
+    /// window. Each lane is its own connection, read by its own task, so N
+    /// lanes spread that work over up to N cores. Order holds within a lane
+    /// only, so a caller that uses lanes must keep each ordered flow on one
+    /// lane (see `Transport::send_message_on_lane`).
     /// `send_message` uses lane 0.
     ///
     /// Only the dialing side's count matters: the listener accepts however
@@ -149,7 +170,7 @@ impl TcpTransportBuilder {
             // Caller-provided listener: it is already live, so this is best
             // effort — connections whose handshake completed before this point
             // keep kernel-default autotuned buffers, which is safe.
-            super::super::listener::size_listener_buffers(&listener);
+            super::super::listener::size_socket_buffers(&listener, self.socket_buffers);
             let addr = listener.local_addr()?;
             (addr, Some(listener))
         } else {
@@ -158,7 +179,7 @@ impl TcpTransportBuilder {
                 .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
             // Built by hand instead of std::net::TcpListener::bind so the
             // socket buffers are sized before listen() — accepted sockets
-            // inherit them at handshake time (see `size_listener_buffers`).
+            // inherit them at handshake time (see `size_socket_buffers`).
             let domain = if requested.is_ipv4() {
                 socket2::Domain::IPV4
             } else {
@@ -171,7 +192,7 @@ impl TcpTransportBuilder {
             socket
                 .set_reuse_address(true)
                 .context("Failed to set SO_REUSEADDR")?;
-            super::super::listener::size_listener_buffers(&socket);
+            super::super::listener::size_socket_buffers(&socket, self.socket_buffers);
             socket
                 .bind(&requested.into())
                 .context("Failed to pre-bind TCP listener")?;
@@ -219,6 +240,7 @@ impl TcpTransportBuilder {
         if let Some(t) = self.shrink_threshold {
             transport.shrink_threshold = t;
         }
+        transport.socket_buffers = self.socket_buffers;
         transport.lanes = self.lanes;
         Ok(transport)
     }

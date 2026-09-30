@@ -53,7 +53,22 @@ The writer publishes `velo_transport_frames_written_total`, `velo_transport_writ
 
 ## Socket buffers are set before data flows
 
-TCP sets `SO_RCVBUF` and `SO_SNDBUF` on the listening socket, so each accepted socket inherits the sizes at handshake time. The dial side sets them before its first write.
+TCP sets `SO_RCVBUF` and `SO_SNDBUF` on the listening socket, so each accepted socket inherits the sizes at handshake time. The dial side sets them before its first write. The size is 2 MiB by default.
+
+An explicit size turns off the kernel's autotuning, and Linux clamps it to `net.core.rmem_max` and `wmem_max`. With the common value of 212,992, 2 MiB becomes a locked buffer that reports 425,984 bytes (the kernel doubles the value for its own use). This caps the TCP window at about 208 KiB. `TcpTransportBuilder::socket_buffers(None)` sets no size, so the kernel autotunes the buffers up to `net.ipv4.tcp_rmem` and `tcp_wmem`. The choice is a trade-off.
+
+The table below was measured on 2026-09-30 with the `throughput` example in its two-host mode, over one connection. The nodes were of the same type as in the [two-node table](../operations/quic-performance.md#two-nodes): Grace aarch64, 200G Ethernet at MTU 1500, `rmem_max` at 212,992. Each process had a whole node and was not pinned. Each cell sent 20,000 messages. Three reps, with the two settings interleaved.
+
+| Traffic | Fixed 2 MiB (MiB/s) | Autotuned (MiB/s) |
+|---|---|---|
+| 64 KiB, pipelined one way | 2,411–2,506 | 2,618–2,660 |
+| 256 KiB, pipelined one way | 2,232–2,355 | 3,359–3,387 |
+| 64 KiB, request and reply, 64 in flight | 1,614–1,903 | 1,549–1,612 |
+| 256 KiB, request and reply, 64 in flight | 1,892–1,920, p50 8.0 ms | 1,639–1,674, p50 9.6 ms |
+
+The NUMA node that the processes run on also moves these numbers. The two-node table gives 3,920 MiB/s for one TCP connection, 64 KiB pipelined. In a separate run with both processes pinned to the NUMA node of the NIC, that case moved 3,220–3,910 MiB/s with the fixed size and 4,440–4,450 MiB/s with autotuning. Pinned to the other NUMA node, it moved 2,370–2,400 MiB/s with the fixed size.
+
+On loopback, autotuning lost 10% for 64 KiB pipelined, gained 10 to 30% for 256 KiB pipelined, and doubled the p99 for 256 KiB with 64 in flight. Autotuning suits one-way bulk traffic across nodes, and 256 KiB messages on loopback. The default suits request and reply. The option applies to the TCP messenger transport only: the per-stream TCP transport keeps a fixed 1 MiB. Every example that builds its transport with `new_transport` reads `VELO_TCP_SOCKET_BUFFERS`: `auto` for autotuning, or a size in bytes.
 
 The old code set the sizes on the accepted socket, one task spawn after `accept`. By then the peer was already sending. On Linux, `SO_RCVBUF` at that point turns off receive autotuning and clamps the buffer to `net.core.rmem_max`. The advertised window then collapses for the life of the connection. Throughput fell about 100 times, to 22.9 MB/s, and the fault was racy, so it showed up in some runs only. The `tx_budget` example measures this path and guards against the fault.
 
@@ -61,7 +76,7 @@ The old code set the sizes on the accepted socket, one task spawn after `accept`
 
 With `TcpTransportBuilder::lanes(n)`, the dialer keeps up to `n` connections to each peer, one for each lane that it sends on, dialed on the first send on that lane. The default is 1. `send_message` uses lane 0, so ordinary traffic keeps one ordered channel for each peer. Each lane has its own send channel and admission gate. If the connection of a lane closes, the next send on that lane dials a new one. A lane never uses the connection of another lane, because that can reorder its messages.
 
-- **One connection is limited by its receiver.** On the receiving side, one reader task does the whole receive copy for a connection, and the fixed socket buffers cap the TCP window. Lanes spread that work over more tasks and cores.
+- **One connection is limited by its receiver.** On the receiving side, one reader task does the whole receive copy for a connection, and by default the fixed socket buffers cap the TCP window (see [Socket buffers](#socket-buffers-are-set-before-data-flows)). Lanes spread that work over more tasks and cores.
 - **The listener needs no change.** The kernel gives each accepted connection its own socket, and the listener reads each connection on its own task. A peer can open as many lanes as it needs. Only the count on the dialing side matters.
 - **The health check counts any lane.** A caller can send on any lane, so a peer can have live connections with none on lane 0. `check_health` reports such a peer as healthy.
 
