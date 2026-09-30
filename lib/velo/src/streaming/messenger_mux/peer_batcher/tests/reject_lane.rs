@@ -40,7 +40,7 @@ fn a_bogus_open_slot_flood_reaches_control_as_a_bounded_reject() {
     // index is out of the ingress's own table range, so none of them can
     // ever become a held slot regardless of what this peer does next.
     const FLOOD: u32 = MAX_PENDING_REJECTS as u32 + 10_000;
-    let mut encoder = BatchEncoder::new(1, 0);
+    let mut encoder = BatchEncoder::new(1, 0, LaneIndex::ZERO);
     for i in 0..FLOOD {
         let id = SlotId::new(MAX_INGRESS_SLOTS_PER_PEER as u32 + i, 0).expect("index fits u24");
         encoder
@@ -49,7 +49,9 @@ fn a_bogus_open_slot_flood_reaches_control_as_a_bounded_reject() {
     }
     let payload = encoder.finish().freeze();
 
-    let outcome = handle_batch(&registry, &config, None, peer(), &payload);
+    let outcome = handle_batch(&registry, &config, None, peer(), &payload, || {
+        std::num::NonZeroU16::MIN
+    });
 
     assert_eq!(
         outcome.replies.len(),

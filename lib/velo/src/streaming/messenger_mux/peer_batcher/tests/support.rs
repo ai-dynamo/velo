@@ -16,12 +16,12 @@ use tokio_util::sync::CancellationToken;
 use super::super::*;
 use crate::messenger::{Context, Handler};
 use crate::observability::VeloMetrics;
+use crate::streaming::messenger_mux::LaneIndex;
 use crate::streaming::messenger_mux::flow_control::SlotCredit;
 use crate::streaming::messenger_mux::protocol::{
     BatchDecoder, BatchHeader, RecordBody, RecordType,
 };
 use crate::streaming::messenger_mux::test_support::{StallingTransport, stalling_address};
-use crate::streaming::messenger_mux::{LaneIndex, STREAM_BATCH_HANDLER};
 use crate::transports::tcp::TcpTransportBuilder;
 
 pub(super) const RECV_TIMEOUT: Duration = Duration::from_secs(5);
@@ -145,7 +145,7 @@ pub(super) async fn capture_pair() -> (Arc<Messenger>, Arc<Messenger>, flume::Re
         .expect("register sender");
 
     let (batch_tx, batches) = flume::unbounded::<Bytes>();
-    let handler = Handler::am_handler_async(STREAM_BATCH_HANDLER, move |ctx: Context| {
+    let handler = Handler::am_handler_async(LaneIndex::ZERO.handler_name(), move |ctx: Context| {
         let batch_tx = batch_tx.clone();
         async move {
             let _ = batch_tx.send(ctx.payload);

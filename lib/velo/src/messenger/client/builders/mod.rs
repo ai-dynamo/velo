@@ -74,6 +74,16 @@ impl AmSendBuilder {
         self
     }
 
+    /// Send on transport lane `lane` instead of lane 0.
+    ///
+    /// Frames on one lane to one peer arrive in order; nothing is ordered
+    /// across lanes. Crate-private because only the stream mux, which keeps
+    /// each stream on one lane, may give up per-peer order.
+    pub(crate) fn lane(mut self, lane: u16) -> Self {
+        self.inner = self.inner.lane(lane);
+        self
+    }
+
     /// Await a free response slot if the arena is at capacity (default:
     /// fail fast with `ResponseRegistrationError::Exhausted`). See
     /// [`MessageBuilder::await_capacity`] for rationale.
@@ -332,6 +342,9 @@ pub struct MessageBuilder {
     // down is `SendOutcome::Pending`: callers doing fan-out get bounded
     // in-flight backpressure for free.
     await_capacity: bool,
+    // The transport lane to send on. Only the stream mux sets it; other
+    // traffic stays on lane 0, the one ordered channel it had before lanes.
+    lane: u16,
 }
 
 /// Translate a synchronous fast-path `send_message` result into a
@@ -392,6 +405,7 @@ struct SlowPath {
     headers: Option<HashMap<String, String>>,
     response_id: ResponseId,
     message_type: MsgType,
+    lane: u16,
 }
 
 impl SlowPath {
@@ -451,7 +465,7 @@ impl SlowPath {
         };
         drive_send_outcome(
             &self.client,
-            self.client.send_message(target, message),
+            self.client.send_message(target, message, self.lane),
             self.response_id,
             "slow-path",
         )
@@ -494,6 +508,7 @@ impl MessageBuilder {
             target_worker: None,
             headers: None,
             await_capacity: false,
+            lane: 0,
         }
     }
 
@@ -521,6 +536,12 @@ impl MessageBuilder {
 
     pub fn headers(mut self, headers: HashMap<String, String>) -> Self {
         self.headers = Some(headers);
+        self
+    }
+
+    /// Send on transport lane `lane`. See [`AmSendBuilder::lane`].
+    pub(crate) fn lane(mut self, lane: u16) -> Self {
+        self.lane = lane;
         self
     }
 
@@ -614,6 +635,7 @@ impl MessageBuilder {
             headers: self.headers.clone(),
             response_id,
             message_type,
+            lane: self.lane,
         };
 
         tokio::spawn(async move {
@@ -651,7 +673,10 @@ impl MessageBuilder {
                     metadata,
                     payload: self.payload.unwrap_or_default(),
                 };
-                stage_from_send(self.client.send_message(target, message), awaiter)
+                stage_from_send(
+                    self.client.send_message(target, message, self.lane),
+                    awaiter,
+                )
             }
             Ok(target) => Dispatched::detached(
                 self.spawn_slow_path(SlowPathKind::Handshake(target), response_id, message_type),

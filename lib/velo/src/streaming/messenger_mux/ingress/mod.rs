@@ -1,10 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The `_stream_batch` handler body — the receive side of the mux.
+//! The batch handlers' body — the receive side of the mux.
 //!
-//! The handler is registered with **ordered per-sender dispatch**, so batches
-//! from one peer are handled on that peer's lane, by one task, in arrival order.
+//! Each lane's handler (`_stream_batch`, `_stream_batch.1`, ...) is registered
+//! with **ordered per-sender dispatch**, so batches from one peer on one mux
+//! lane are handled by one task, in arrival order.
 //! That is the guarantee the deleted `VeloFrameTransport` lacked: it layered a
 //! 4096-deep reorder buffer over a dispatcher that spawns a task per inbound
 //! message, and under cross-stream contention the window overflowed and
@@ -52,8 +53,8 @@ use super::protocol::{
 use super::{MuxConfig, PeerLane};
 use crate::observability::{MuxDirection, MuxDropReason, MuxMetricsHandle};
 
-/// Ceiling on the dense slot table one (peer, lane) may make this node
-/// allocate.
+/// Ceiling on the dense slot tables one peer may make this node allocate,
+/// summed over its lanes.
 ///
 /// A sender allocates from a free list starting at zero, so its indices stay
 /// within a small multiple of its live slot count; a jump past this is a
@@ -62,6 +63,11 @@ use crate::observability::{MuxDirection, MuxDropReason, MuxMetricsHandle};
 /// 1024 concurrent streams to one peer use indices 0..1024 — and keeps the
 /// worst case one `OpenSlot` can force to a few megabytes rather than a few
 /// hundred, which is the same amplification the batch decoder refuses.
+///
+/// Split evenly over the peer's lanes ([`table_slot_limit`]) rather than
+/// granted per table, so a peer with 16 lanes cannot force 16 times the
+/// memory. Each lane's batcher allocates its own indices from zero, so a
+/// lane's share (4 Ki at 16 lanes) is still far above its real fan-in.
 pub(crate) const MAX_INGRESS_SLOTS_PER_PEER: usize = 1 << 16;
 
 /// A `bind()` waiting for the `OpenSlot` that will claim it.
@@ -124,6 +130,9 @@ struct PeerIngress {
     epoch: Option<u64>,
     last_batch_seq: Option<u32>,
     slots: Vec<Option<IngressSlot>>,
+    /// Slot indices at or past this are refused: this table's share of
+    /// [`MAX_INGRESS_SLOTS_PER_PEER`].
+    slot_limit: usize,
     peer_bytes: ByteBudget,
     /// Slot indexes the pass being run must reconcile, in arrival order.
     ///
@@ -158,12 +167,13 @@ struct PeerIngress {
 }
 
 impl PeerIngress {
-    fn new(peer_byte_budget: u64) -> Self {
+    fn new(limits: TableLimits) -> Self {
         Self {
             epoch: None,
             last_batch_seq: None,
             slots: Vec::new(),
-            peer_bytes: ByteBudget::new(peer_byte_budget),
+            slot_limit: limits.slots,
+            peer_bytes: ByteBudget::new(limits.bytes),
             touched: Vec::new(),
             dirty: Arc::new(DirtySlots::new()),
             #[cfg(test)]
@@ -443,7 +453,17 @@ impl IngressRegistry {
     }
 }
 
-/// Handle one `_stream_batch` payload from one (peer, lane).
+/// Handle one batch from one (peer, lane).
+///
+/// `key.lane` is the lane of the handler the batch arrived on. A batch whose
+/// header names another lane is dropped whole: a sender stamps the lane it
+/// sends on, so a mismatch is a sender bug or a corrupt batch, and its slot
+/// ids belong to another lane's batcher, where applying them would retire or
+/// feed the wrong streams.
+///
+/// `lanes` is how many lanes this node keeps to the peer. It is read only when
+/// the (peer, lane) table is created, to split the per-peer limits over the
+/// tables, so the steady state does not pay for the lookup.
 ///
 /// Returns the replies to send back, the records addressed to our own egress
 /// slots, and the slot-count deltas the caller feeds the `live_slots` gauge.
@@ -454,6 +474,7 @@ pub(crate) fn handle_batch(
     metrics: Option<&MuxMetricsHandle>,
     key: PeerLane,
     payload: &Bytes,
+    lanes: impl FnOnce() -> NonZeroU16,
 ) -> BatchOutcome {
     let mut outcome = BatchOutcome::default();
 
@@ -470,13 +491,27 @@ pub(crate) fn handle_batch(
         }
     };
 
+    // Before the table lookup, so a batch on the wrong lane cannot create a
+    // table for a lane the peer never used.
+    if header.lane() != key.lane.get() {
+        tracing::warn!(
+            peer = %key.peer,
+            lane = %key.lane,
+            header_lane = header.lane(),
+            "messenger mux: batch header names another lane; dropped"
+        );
+        if let Some(metrics) = metrics {
+            metrics.records_dropped(MuxDropReason::LaneMismatch, u64::from(header.record_count));
+        }
+        return outcome;
+    }
+
     if !registry.peers.contains_key(&key) {
-        // One lane per peer until the transport reports more.
-        let budget = table_byte_budget(config.peer_byte_budget, NonZeroU16::MIN);
+        let limits = TableLimits::split(config, lanes());
         registry
             .peers
             .entry(key)
-            .or_insert_with(|| Mutex::new(PeerIngress::new(budget)));
+            .or_insert_with(|| Mutex::new(PeerIngress::new(limits)));
     }
     // A read guard, not `entry`'s write guard: the `Mutex` inside already
     // serialises writers, and holding the shard for writing would block the
@@ -548,13 +583,32 @@ pub(crate) fn handle_batch(
     outcome
 }
 
-/// One (peer, lane) table's share of `MuxConfig::peer_byte_budget`.
+/// One (peer, lane) table's share of the per-peer limits.
 ///
 /// Split evenly over the lanes this node keeps to the peer, so the per-peer
-/// bound holds with no state shared between tables. A budget smaller than the
-/// lane count leaves each table nothing to hold out-of-order records in.
-fn table_byte_budget(peer_byte_budget: u64, lanes: NonZeroU16) -> u64 {
-    peer_byte_budget / u64::from(lanes.get())
+/// bounds hold with no state shared between tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TableLimits {
+    /// Share of `MuxConfig::peer_byte_budget`.
+    bytes: u64,
+    /// Share of [`MAX_INGRESS_SLOTS_PER_PEER`].
+    slots: usize,
+}
+
+impl TableLimits {
+    /// The byte share never drops below one slot's `slot_byte_budget`: below
+    /// that, a single stream could not hold its full window on this table and
+    /// would close on an overflow the peer-wide budget never meant. So with
+    /// many lanes and a small peer budget the bound over all lanes is
+    /// `lanes x slot_byte_budget`, not `peer_byte_budget`.
+    fn split(config: &MuxConfig, lanes: NonZeroU16) -> Self {
+        let lanes = super::mux_lanes(lanes).get();
+        Self {
+            bytes: (config.peer_byte_budget / u64::from(lanes))
+                .max(u64::from(config.slot_byte_budget)),
+            slots: (MAX_INGRESS_SLOTS_PER_PEER / usize::from(lanes)).max(1),
+        }
+    }
 }
 
 /// Decide what to do with a batch's epoch. `false` means discard the batch.
@@ -659,7 +713,7 @@ fn open_slot(
 ) {
     let id = record.slot;
     let index = id.index() as usize;
-    if index >= MAX_INGRESS_SLOTS_PER_PEER {
+    if index >= state.slot_limit {
         // Never held and never will be: this index is out of the table's
         // range entirely, so the reject lane carries it, not `peers`.
         outcome.replies.push(ReplyRecord::RejectSlot {

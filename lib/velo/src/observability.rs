@@ -826,6 +826,9 @@ pub(crate) enum MuxDropReason {
     StaleSingleton,
     /// The record's `frame_seq` was behind the slot's next expected sequence.
     Duplicate,
+    /// The batch arrived on one mux lane's handler with another lane in its
+    /// header, so its slot ids could not be trusted to name this lane's slots.
+    LaneMismatch,
 }
 
 impl MuxDropReason {
@@ -838,6 +841,7 @@ impl MuxDropReason {
             Self::SlotCollision => "slot_collision",
             Self::StaleSingleton => "stale_singleton",
             Self::Duplicate => "duplicate",
+            Self::LaneMismatch => "lane_mismatch",
         }
     }
 }
@@ -2195,17 +2199,18 @@ impl VeloMetrics {
     /// Bind ordered-dispatch collectors for a specific handler label.
     ///
     /// Applies the same `_`-prefix filter as [`Self::bind_handler`], with one
-    /// exception: `_stream_batch`. That handler is the messenger mux's only
-    /// ingress lane, so filtering it out leaves the lane depth and wait series
-    /// dark on the single path carrying every streamed record — the one place
-    /// they are worth having, and the reason the series exist at all.
+    /// exception: the messenger mux's batch handlers, `_stream_batch` and
+    /// `_stream_batch.1` to `_stream_batch.15`, one per mux lane. They carry
+    /// every streamed record, so filtering them out leaves the lane depth and
+    /// wait series dark on the one path they are worth having for, and the
+    /// reason the series exist at all. Sixteen label values at most.
     ///
     /// The exception is scoped to ordered dispatch. Per-handler request,
     /// duration and byte series stay off for every `_` handler, because those
     /// are per-handler cardinality that system traffic should not add to.
     pub(crate) fn bind_ordered_dispatcher(&self, handler: &str) -> Option<OrderedMetricsHandle> {
         if !Self::should_track_handler(handler)
-            && handler != crate::streaming::messenger_mux::STREAM_BATCH_HANDLER
+            && !crate::streaming::messenger_mux::is_batch_handler(handler)
         {
             return None;
         }
@@ -3002,24 +3007,30 @@ mod tests {
         let metrics = VeloMetrics::register(&registry).expect("register metrics");
         assert!(metrics.bind_ordered_dispatcher("_internal").is_none());
         assert!(metrics.bind_ordered_dispatcher("user_handler").is_some());
-        // `_stream_batch` is the one exception to the `_` filter. It is the
-        // mux's only ingress lane, so with it excluded the lane depth and wait
-        // histograms are dark on the single path that carries every streamed
-        // record — the one place an operator needs them.
+        // The mux's batch handlers, one per mux lane, are the one exception
+        // to the `_` filter. They carry every streamed record, so with them
+        // excluded the lane depth and wait histograms are dark on the path
+        // an operator needs them for. Every lane's, not only lane 0's.
+        for lane in crate::streaming::messenger_mux::LaneIndex::all() {
+            assert!(
+                metrics
+                    .bind_ordered_dispatcher(lane.handler_name())
+                    .is_some(),
+                "mux lane {lane} must reach the ordered-dispatch collectors"
+            );
+            // The exception is scoped to ordered dispatch. Per-handler request,
+            // duration and byte series stay off for every `_` handler, so the
+            // allowlist must not widen that surface on its way past.
+            assert!(
+                metrics.bind_handler(lane.handler_name()).is_none(),
+                "the ordered-lane allowlist must not leak into the per-handler series"
+            );
+        }
+        // Only the batch handlers: a lookalike name is still filtered.
         assert!(
             metrics
-                .bind_ordered_dispatcher(crate::streaming::messenger_mux::STREAM_BATCH_HANDLER)
-                .is_some(),
-            "the mux ingress lane must reach the ordered-dispatch collectors"
-        );
-        // The exception is scoped to ordered dispatch. Per-handler request,
-        // duration and byte series stay off for every `_` handler, so the
-        // allowlist must not widen that surface on its way past.
-        assert!(
-            metrics
-                .bind_handler(crate::streaming::messenger_mux::STREAM_BATCH_HANDLER)
-                .is_none(),
-            "the ordered-lane allowlist must not leak into the per-handler series"
+                .bind_ordered_dispatcher("_stream_batch.16")
+                .is_none()
         );
     }
 

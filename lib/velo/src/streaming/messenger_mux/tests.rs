@@ -805,7 +805,7 @@ async fn the_ordered_lane_is_observed_once_per_batch_not_once_per_record() {
     let waits = || {
         snapshot().histogram_count(
             "velo_messenger_ordered_lane_wait_seconds",
-            &[("handler", STREAM_BATCH_HANDLER)],
+            &[("handler", LaneIndex::ZERO.handler_name())],
         )
     };
     let records = || {
@@ -850,7 +850,7 @@ async fn the_ordered_lane_is_observed_once_per_batch_not_once_per_record() {
     assert!(
         snapshot().gauge(
             "velo_messenger_ordered_lanes",
-            &[("handler", STREAM_BATCH_HANDLER)]
+            &[("handler", LaneIndex::ZERO.handler_name())]
         ) >= 1.0,
         "the sending peer's lane must be live while its stream is"
     );

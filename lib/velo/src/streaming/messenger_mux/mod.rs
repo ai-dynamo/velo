@@ -111,6 +111,7 @@ mod test_support;
 mod tests;
 
 use std::collections::VecDeque;
+use std::num::NonZeroU16;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
@@ -131,7 +132,7 @@ use crate::observability::{MuxMetricsHandle, VeloMetrics};
 use crate::streaming::transport::FrameTransport;
 
 pub use self::config::{AutoFlush, FlushPolicy, MuxConfig};
-pub(crate) use self::lane::{LaneIndex, PeerLane};
+pub(crate) use self::lane::{LaneIndex, PeerLane, is_batch_handler, mux_lanes};
 
 /// The streaming-transport key this mux answers to.
 ///
@@ -144,9 +145,6 @@ pub(crate) use self::lane::{LaneIndex, PeerLane};
 /// is compared against — a caller that had to spell the string itself would be
 /// re-deriving the one value negotiation is keyed on.
 pub const MESSENGER_MUX_KEY: &str = "messenger-mux-v2";
-
-/// The active-message handler every batch travels through.
-pub(crate) const STREAM_BATCH_HANDLER: &str = "_stream_batch";
 
 /// How long a bind waits for the `OpenSlot` that claims it.
 ///
@@ -288,7 +286,13 @@ impl MessengerMuxTransport {
             .map(|(_, signal)| signal)
     }
 
-    /// Build a mux over `messenger` and register its `_stream_batch` handler.
+    /// Build a mux over `messenger` and register its batch handlers, one per
+    /// lane up to [`MAX_LANES`](lane::MAX_LANES).
+    ///
+    /// All of them, whatever this node's transports keep, because the lane is
+    /// the consumer's choice clamped by the sender, and replies go back on the
+    /// arrival lane: a node must be able to take a batch on any lane a peer
+    /// could pick. A handler costs a map entry until its first batch.
     ///
     /// Registration is for the messenger's lifetime: there is no
     /// handler-deregistration hook. The messenger does not refuse a duplicate
@@ -345,25 +349,29 @@ impl MessengerMuxTransport {
             hooks: std::sync::OnceLock::new(),
         });
 
-        let handler_core = Arc::downgrade(&core);
-        let handler = Handler::am_handler_async(STREAM_BATCH_HANDLER, move |ctx: Context| {
-            let handler_core = handler_core.clone();
-            async move {
-                if let Some(core) = handler_core.upgrade() {
-                    // The one batch handler is lane 0's.
-                    let key = PeerLane::new(ctx.sender_worker_id(), LaneIndex::ZERO);
-                    core.deliver_batch(key, &ctx.payload);
+        for lane in LaneIndex::all() {
+            let handler_core = Arc::downgrade(&core);
+            let handler = Handler::am_handler_async(lane.handler_name(), move |ctx: Context| {
+                let handler_core = handler_core.clone();
+                async move {
+                    if let Some(core) = handler_core.upgrade() {
+                        // The lane is the handler's, never the header's: the
+                        // header only confirms it (see `handle_batch`).
+                        let key = PeerLane::new(ctx.sender_worker_id(), lane);
+                        core.deliver_batch(key, &ctx.payload);
+                    }
+                    Ok(())
                 }
-                Ok(())
-            }
-        })
-        // Ordered per sender. This is the whole reason the mux can drop the
-        // reorder window the deprecated AM transport needed: batches from one
-        // peer are handled on that peer's lane, by one task, in arrival order.
-        .ordered()
-        .build();
-        // Records and credit of open streams: see `register_drain_exempt_handler`.
-        messenger.register_drain_exempt_handler(handler)?;
+            })
+            // Ordered per sender. This is the whole reason the mux can drop the
+            // reorder window the deprecated AM transport needed: batches from
+            // one peer on one lane are handled by one task, in arrival order.
+            .ordered()
+            .build();
+            // Records and credit of open streams: see
+            // `register_drain_exempt_handler`.
+            messenger.register_drain_exempt_handler(handler)?;
+        }
 
         sweep::spawn_sweep(&core);
 
@@ -375,6 +383,19 @@ impl MessengerMuxTransport {
 }
 
 impl MuxCore {
+    /// How many lanes the messenger's transport keeps to `peer`.
+    ///
+    /// One for a peer the messenger cannot name yet: lane 0 serves every
+    /// stream, so under-counting costs spread, never correctness.
+    fn transport_lanes(&self, peer: WorkerId) -> NonZeroU16 {
+        let backend = self.messenger.backend();
+        backend
+            .try_translate_worker_id(peer)
+            .ok()
+            .and_then(|instance| backend.lanes(instance).ok())
+            .unwrap_or(NonZeroU16::MIN)
+    }
+
     /// The batcher for one (peer, lane), created on first use.
     fn batcher(&self, key: PeerLane) -> Arc<BatcherHandle> {
         if let Some(existing) = self.batchers.get(&key) {
@@ -415,6 +436,7 @@ impl MuxCore {
             self.metrics.as_ref(),
             key,
             payload,
+            || self.transport_lanes(key.peer),
         );
 
         if let Some(metrics) = &self.metrics {
