@@ -67,6 +67,23 @@ impl IngressRegistry {
             .map_or(0, |entry| lock(entry.value()).reconcile_visits)
     }
 
+    /// Live slots placed on `lane`, from `peer` or from every peer, counted by
+    /// walking every table: the exact answer the lane counts must match.
+    pub(crate) fn live_placed_on(&self, peer: Option<WorkerId>, lane: LaneIndex) -> usize {
+        self.peers
+            .iter()
+            .filter(|entry| peer.is_none_or(|peer| entry.key().peer == peer))
+            .map(|entry| {
+                lock(entry.value())
+                    .slots
+                    .iter()
+                    .flatten()
+                    .filter(|slot| slot.placed_lane() == lane)
+                    .count()
+            })
+            .sum()
+    }
+
     /// Run `f` while holding `key`'s table mutex, as the ordered batch
     /// handler does through a decode. `None` when `key` has no table.
     pub(crate) fn with_table_locked<R>(&self, key: PeerLane, f: impl FnOnce() -> R) -> Option<R> {
@@ -130,6 +147,16 @@ impl Consumer {
 
 /// Register a bind for `(ANCHOR, session)` and return its consumer side.
 fn register(registry: &IngressRegistry, config: &MuxConfig, session: u64) -> Consumer {
+    register_on(registry, config, session, LaneIndex::ZERO)
+}
+
+/// As [`register`], with the bind placed on `lane`.
+fn register_on(
+    registry: &IngressRegistry,
+    config: &MuxConfig,
+    session: u64,
+    lane: LaneIndex,
+) -> Consumer {
     let (tx, rx) = flume::bounded(
         crate::streaming::messenger_mux::flow_control::slot_buffer_depth(config.initial_credit),
     );
@@ -139,7 +166,7 @@ fn register(registry: &IngressRegistry, config: &MuxConfig, session: u64) -> Con
         session,
         tx,
         Arc::clone(&drain),
-        LaneReservation::uncounted(LaneIndex::ZERO),
+        LaneReservation::uncounted(lane),
     );
     Consumer { rx, drain }
 }
@@ -1846,23 +1873,34 @@ fn every_lane_table_takes_the_whole_slot_range() {
 }
 
 /// The node's live count per lane, and the count per (peer, lane), match the
-/// slots in its tables after every way a slot opens or leaves.
+/// slots in its tables, by the lane each slot was placed on, after every way a
+/// slot opens or leaves.
 ///
 /// Unkeyed pre-binds are placed by the first and unkeyed attaches by the
-/// second, both read without locking any table. Each slot holds its own count, so the two can drift only if a slot
-/// is kept somewhere after it leaves its table, or a count is taken with no
-/// slot behind it. The steps cover each exit (a duplicate open, a cancel that
+/// second, both read without locking any table. Each slot holds its own
+/// count, so the two can drift only if a slot is kept somewhere after it
+/// leaves its table, or a count is taken with no slot behind it.
+///
+/// A slot counts on the lane its bind was placed on, which is not always the
+/// lane its batches arrive on: a sender with fewer lanes sends lane k on k
+/// modulo its count. Here binds placed on lanes 5 and 6 arrive on lane 1, and
+/// one placed on lane 2 arrives on lane 0; a count taken on the arrival lane
+/// fails every step. The steps cover each exit (a duplicate open, a cancel that
 /// lands before the claim, a close from the consumer side, a new epoch, and
-/// shutdown) on two peers and two lanes.
+/// shutdown) on two peers and two arrival lanes.
 #[test]
 fn the_live_count_per_lane_matches_the_slot_tables() {
     let config = config();
     let registry = IngressRegistry::default();
-    let a0 = peer();
-    let a1 = PeerLane::new(a0.peer, LaneIndex::new(1));
-    let b1 = PeerLane::new(WorkerId::from_u64(PEER + 1), LaneIndex::new(1));
-    let consumers: Vec<Consumer> = (1..=6)
-        .map(|session| register(&registry, &config, session))
+    let a = WorkerId::from_u64(PEER);
+    let b = WorkerId::from_u64(PEER + 1);
+    let a0 = PeerLane::new(a, LaneIndex::ZERO);
+    let a1 = PeerLane::new(a, LaneIndex::new(1));
+    let b1 = PeerLane::new(b, LaneIndex::new(1));
+    // Session n's bind is placed on `placed[n - 1]`.
+    let placed = [0, 5, 1, 6, 2, 5].map(LaneIndex::new);
+    let consumers: Vec<Consumer> = (1..=6u64)
+        .map(|session| register_on(&registry, &config, session, placed[session as usize - 1]))
         .collect();
     let open_on = |key: PeerLane, epoch: u64, batch_seq: u32, id: SlotId, session: u64| {
         let payload = batch_on(key.lane, epoch, batch_seq, |encoder| {
@@ -1870,36 +1908,46 @@ fn the_live_count_per_lane_matches_the_slot_tables() {
         });
         handle_batch(&registry, &config, None, key, &payload)
     };
-    // Per lane, the node's count against the tables; and per (peer, lane),
-    // the count an unkeyed attach reads against that table.
-    let counts = || {
-        for key in [a0, a1, b1] {
+    // Every count against a walk of the tables, and the live slots per
+    // placed lane, 0 to 6, for the step to be checked against.
+    let counts = |step: &str| -> [usize; 7] {
+        LaneIndex::all().take(7).for_each(|lane| {
+            for peer in [a, b] {
+                assert_eq!(
+                    registry.live_count(PeerLane::new(peer, lane)),
+                    registry.live_placed_on(Some(peer), lane),
+                    "{step}: the count of ({peer:?}, {lane:?}) must match the tables"
+                );
+            }
             assert_eq!(
-                registry.live_count(key),
-                registry.live_slots(key),
-                "the (peer, lane) count of {key:?} must match its table"
+                registry.live_on_lane(lane),
+                registry.live_placed_on(None, lane),
+                "{step}: the node's count on {lane:?} must match the tables"
             );
-        }
-        [LaneIndex::ZERO, LaneIndex::new(1)].map(|lane| {
-            let in_tables: usize = [a0, a1, b1]
-                .into_iter()
-                .filter(|key| key.lane == lane)
-                .map(|key| registry.live_slots(key))
-                .sum();
-            (registry.live_on_lane(lane), in_tables)
-        })
+        });
+        std::array::from_fn(|lane| registry.live_on_lane(LaneIndex::new(lane as u16)))
     };
 
     open_on(a0, 1, 0, slot(0, 0), 1);
     open_on(a1, 5, 0, slot(0, 0), 2);
     open_on(b1, 7, 0, slot(0, 0), 3);
     open_on(b1, 7, 1, slot(1, 0), 4);
-    assert_eq!(counts(), [(1, 1), (3, 3)], "after the opens");
+    assert_eq!(counts("after the opens"), [1, 1, 0, 0, 0, 1, 1]);
+    assert_eq!(
+        (
+            registry.live_slots(a0),
+            registry.live_slots(a1),
+            registry.live_slots(b1)
+        ),
+        (1, 1, 2),
+        "the tables stay keyed by the lane batches arrive on"
+    );
 
-    // The same id opens again on a0: the incumbent retires, the new one opens.
+    // The same id opens again on a0: the incumbent retires, the new one opens
+    // placed on lane 2.
     let outcome = open_on(a0, 1, 1, slot(0, 0), 5);
     assert_eq!((outcome.opened, outcome.closed), (1, 1));
-    assert_eq!(counts(), [(1, 1), (3, 3)], "after a duplicate open");
+    assert_eq!(counts("after a duplicate open"), [0, 1, 1, 0, 0, 1, 1]);
 
     // The consumer cancels before the `OpenSlot` lands: the slot opens and
     // closes in one pass.
@@ -1907,9 +1955,8 @@ fn the_live_count_per_lane_matches_the_slot_tables() {
     let outcome = open_on(b1, 7, 2, slot(2, 0), 6);
     assert_eq!((outcome.opened, outcome.closed), (1, 1));
     assert_eq!(
-        counts(),
-        [(1, 1), (3, 3)],
-        "after a cancel before the claim"
+        counts("after a cancel before the claim"),
+        [0, 1, 1, 0, 0, 1, 1]
     );
 
     assert!(
@@ -1917,15 +1964,15 @@ fn the_live_count_per_lane_matches_the_slot_tables() {
             .close_consumer_gone(b1, slot(1, 0), None, None)
             .is_some()
     );
-    assert_eq!(counts(), [(1, 1), (2, 2)], "after a consumer-side close");
+    assert_eq!(counts("after a consumer-side close"), [0, 1, 1, 0, 0, 1, 0]);
 
     let payload = batch_on(a1.lane, 6, 0, |_| {});
     let outcome = handle_batch(&registry, &config, None, a1, &payload);
     assert_eq!(outcome.closed, 1);
-    assert_eq!(counts(), [(1, 1), (1, 1)], "after a new epoch on a1");
+    assert_eq!(counts("after a new epoch on a1"), [0, 1, 1, 0, 0, 0, 0]);
 
     assert_eq!(registry.shutdown(), 2);
-    assert_eq!(counts(), [(0, 0), (0, 0)], "after shutdown");
+    assert_eq!(counts("after shutdown"), [0; 7]);
 }
 
 /// One peer's lanes share one byte budget, so the per-peer bound is

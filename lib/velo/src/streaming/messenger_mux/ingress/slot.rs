@@ -53,17 +53,17 @@ pub(super) enum Applied {
     Fault(CloseReason),
 }
 
-/// A live slot's two lane counts.
+/// A live slot's two lane counts, on the lane the consumer placed it on.
 ///
 /// Held by the slot and never read, so whichever path retires it (a close, an
 /// epoch retired, shutdown) gives both back when it drops, and none can
 /// forget to.
 pub(super) struct LiveCounts {
-    /// On the slot's lane, summed over every peer. An unkeyed pre-bind reads
-    /// it, because it does not know its peer.
+    /// On the slot's placed lane, summed over every peer. An unkeyed pre-bind
+    /// reads it, because it does not know its peer.
     _node: LaneReservation,
-    /// On the slot's (peer, lane). An unkeyed attach from that peer reads it,
-    /// so the choice takes no slot table's mutex.
+    /// On the slot's (peer, placed lane). An unkeyed attach from that peer
+    /// reads it, so the choice takes no slot table's mutex.
     _peer: LaneReservation,
 }
 
@@ -173,6 +173,12 @@ impl IngressSlot {
             touched: false,
             pending_close: None,
         }
+    }
+
+    /// The lane the consumer placed this slot on, where its load counts.
+    #[cfg(test)]
+    pub(super) fn placed_lane(&self) -> super::super::LaneIndex {
+        self._live._node.lane()
     }
 
     /// Records currently parked ahead of sequence.

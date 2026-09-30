@@ -374,6 +374,53 @@ async fn unkeyed_attaches_from_one_peer_spread_over_the_lanes() {
         .expect("streams finished");
 }
 
+/// Unkeyed attaches spread over every lane of a producer that keeps fewer
+/// lanes than the consumer.
+///
+/// The consumer keeps 8 lanes and the producer 4, so a stream the consumer
+/// places on lane k arrives on lane k % 4. A stream's load must stay on the
+/// lane the consumer chose, from its bind until its slot retires. Counted on
+/// the lane it arrived on instead, lanes 4 to 7 hold no load once their binds
+/// are claimed: every attach after the fourth goes to lane 4 and rides the
+/// producer's lane 0, and nothing reports it. Each attach here waits for its
+/// stream's first record before the next one, so no bind is pending when the
+/// next attach chooses and only the live slots decide.
+#[tokio::test(flavor = "multi_thread")]
+async fn unkeyed_attaches_spread_over_a_producer_with_fewer_lanes() {
+    let (consumer, producer) = pair(8, 4).await;
+    let peer = producer.worker();
+    let consumer_mux = consumer.mux();
+    assert_eq!(
+        consumer_mux.core.transport_lanes(peer).get(),
+        8,
+        "the consumer must keep 8 lanes to the producer, or this proves nothing"
+    );
+
+    let mut streams = Vec::new();
+    for _ in 0..8 {
+        let (sender, anchor) = attach_all(&consumer, &producer, 1)
+            .await
+            .pop()
+            .expect("one stream");
+        sender.send(u32::MAX).await.expect("first send");
+        streams.push((sender, drain_first(anchor).await));
+    }
+    assert_eq!(
+        live_per_lane(&consumer_mux, peer, 8),
+        [2, 2, 2, 2, 0, 0, 0, 0],
+        "eight streams must arrive two on each of the producer's four lanes"
+    );
+
+    let finished = futures::future::join_all(
+        streams
+            .into_iter()
+            .map(|(sender, anchor)| async move { stream_through(sender, anchor).await }),
+    );
+    tokio::time::timeout(BOUND, finished)
+        .await
+        .expect("streams finished");
+}
+
 /// Read the `u32::MAX` a test sent to open the slot, and hand the anchor back.
 async fn drain_first(mut anchor: StreamAnchor<u32>) -> StreamAnchor<u32> {
     let first = tokio::time::timeout(BOUND, anchor.next())

@@ -132,6 +132,8 @@ The receiver chooses the lane once, when it binds the slot:
 
 Ties go to the lowest lane. `lanes` is the mux lane count of the transport to the sender. A pre-bind has no sender, so it uses the most lanes that any installed transport keeps. This is correct while `Transport::lanes()` gives one count for all peers, as every transport in velo does.
 
+A stream counts on the lane that the receiver chose, from the bind until its slot closes. That is not always the lane that its batches arrive on. A sender with fewer lanes sends lane k on lane k modulo its own count. If the load counted on the arrival lane, the lanes above the count of the sender would never get load, and every unkeyed stream would go to the first of them.
+
 A receiver whose transport keeps one lane names lane 0 for every stream, with a key or without one. A default deployment therefore sends the same bytes as before lanes.
 
 The new fields are last in each message, default to zero when absent, and are not sent when zero. A lane-0 ticket or attach message is therefore the same bytes as before lanes, in JSON and in MessagePack. A ticket that names another lane has one more field, which a worker from before lanes refuses under positional MessagePack. Upgrade the workers before the node that mints the tickets.

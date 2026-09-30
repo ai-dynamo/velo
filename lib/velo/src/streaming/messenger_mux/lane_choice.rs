@@ -11,10 +11,16 @@
 //!   streams with one key share a lane on every node and in every build.
 //! - Without a key, the lane is the one with the least load, ties to the
 //!   lowest index. On attach the peer is known and the load of lane k is that
-//!   peer's live slots on k plus its binds on k that no `OpenSlot` has claimed
-//!   yet. On pre-bind no peer is known and the load of lane k is this node's
-//!   live slots on k from every peer, plus the pre-binds on k that are not yet
-//!   claimed, released or expired.
+//!   peer's live slots placed on k plus its binds on k that no `OpenSlot` has
+//!   claimed yet. On pre-bind no peer is known and the load of lane k is this
+//!   node's live slots placed on k from every peer, plus the pre-binds on k
+//!   that are not yet claimed, released or expired.
+//!
+//! A stream counts on the lane chosen here from its bind until its slot
+//! retires, not on the lane its batches arrive on. A sender with fewer lanes
+//! sends lane k on k modulo its own count, so counted by arrival, the lanes
+//! past that count would hold no load once their binds were claimed, and every
+//! unkeyed choice would go to the first of them.
 //!
 //! Unclaimed binds count because an `OpenSlot` arrives only with the sender's
 //! first batch. Attaches answered before any of their senders sent would all

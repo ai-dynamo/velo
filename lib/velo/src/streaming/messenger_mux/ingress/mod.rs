@@ -35,7 +35,7 @@ mod tests;
 
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -83,8 +83,8 @@ struct BindEntry {
     drain: Arc<DrainSignal>,
     /// The lane the consumer placed this bind on, counted toward that lane's
     /// load until the bind leaves this table by any path. A claim hands the
-    /// count over to the slot's own, on the lane the `OpenSlot` arrived on.
-    _lane: LaneReservation,
+    /// count over to the slot's own, on this same lane.
+    lane: LaneReservation,
 }
 
 impl Drop for BindEntry {
@@ -127,17 +127,21 @@ pub(crate) struct IngressRegistry {
     drain_pending: DashMap<PeerLane, Arc<AtomicBool>>,
     /// Live slots per lane, summed over every peer.
     ///
-    /// Each [`IngressSlot`] holds one count on its arrival lane, so no retire
-    /// path can forget it. A pre-bind does not know its peer and reads this to
+    /// Each [`IngressSlot`] holds one count on the lane the consumer placed
+    /// it on, so no retire path can forget it. That is not always the lane its
+    /// batches arrive on: a sender with fewer lanes sends lane k on k modulo
+    /// its own count. A pre-bind does not know its peer and reads this to
     /// place its stream; summing the tables instead would lock every
     /// (peer, lane) table on a frontend's per-request path.
     live: LaneCounts,
-    /// Live slots per (peer, lane), held by each [`IngressSlot`] like `live`.
+    /// Live slots per (peer, lane placed on), held by each [`IngressSlot`]
+    /// like `live`.
     ///
     /// What an unkeyed attach reads to place its stream. Reading the tables
     /// instead would wait on the mutex the ordered batch handler holds through
-    /// a whole batch. [`live_slots`](Self::live_slots) stays the exact answer
-    /// for the one reader that needs it, batcher eviction.
+    /// a whole batch. [`live_slots`](Self::live_slots) stays the exact answer,
+    /// by the lane batches arrive on, for the one reader that needs it,
+    /// batcher eviction.
     live_per_peer: PeerLaneCounts,
     /// One byte budget per peer, shared by all of that peer's lane tables.
     ///
@@ -159,9 +163,6 @@ struct PeerIngress {
     slots: Vec<Option<IngressSlot>>,
     /// The peer's byte budget, shared with its other lanes' tables.
     peer_bytes: Arc<SharedByteBudget>,
-    /// This (peer, lane)'s live-slot count, taken once here so opening a
-    /// slot does not look it up in a map while this table's mutex is held.
-    live: Arc<AtomicUsize>,
     /// Slot indexes the pass being run must reconcile, in arrival order.
     ///
     /// Scratch, reused across passes so the steady state allocates nothing: a
@@ -195,13 +196,12 @@ struct PeerIngress {
 }
 
 impl PeerIngress {
-    fn new(peer_bytes: Arc<SharedByteBudget>, live: Arc<AtomicUsize>) -> Self {
+    fn new(peer_bytes: Arc<SharedByteBudget>) -> Self {
         Self {
             epoch: None,
             last_batch_seq: None,
             slots: Vec::new(),
             peer_bytes,
-            live,
             touched: Vec::new(),
             dirty: Arc::new(DirtySlots::new()),
             #[cfg(test)]
@@ -348,7 +348,7 @@ impl IngressRegistry {
             BindEntry {
                 frame_tx,
                 drain,
-                _lane: lane,
+                lane,
             },
         );
     }
@@ -377,16 +377,18 @@ impl IngressRegistry {
             .map_or(0, |entry| lock(entry.value()).live())
     }
 
-    /// Live receive-side slots on `lane`, from every peer.
+    /// Live receive-side slots placed on `lane`, from every peer.
     pub(crate) fn live_on_lane(&self, lane: LaneIndex) -> usize {
         self.live.get(lane)
     }
 
-    /// Live receive-side slots for one (peer, lane), read from an atomic and
-    /// taking no table's mutex.
+    /// Live receive-side slots from one peer placed on one lane, read from an
+    /// atomic and taking no table's mutex.
     ///
     /// A slot counts from the moment its `OpenSlot` is applied until it
     /// drops, so a reader racing a batch may see it a moment early or late.
+    /// It counts on the lane the consumer placed it on, which is not always
+    /// the table [`live_slots`](Self::live_slots) finds it in.
     pub(crate) fn live_count(&self, key: PeerLane) -> usize {
         self.live_per_peer.get(key)
     }
@@ -504,11 +506,10 @@ pub(crate) fn handle_batch(
 
     if !registry.peers.contains_key(&key) {
         let peer_bytes = registry.peer_budget(key.peer, config.peer_byte_budget);
-        let live = registry.live_per_peer.counter(key);
         registry
             .peers
             .entry(key)
-            .or_insert_with(|| Mutex::new(PeerIngress::new(peer_bytes, live)));
+            .or_insert_with(|| Mutex::new(PeerIngress::new(peer_bytes)));
     }
     // A read guard, not `entry`'s write guard: the `Mutex` inside already
     // serialises writers, and holding the shard for writing would block the
@@ -706,14 +707,21 @@ fn open_slot(
     );
 
     // Counted before `bind` drops at the end of this function, so the stream
-    // is counted twice for a moment rather than not at all. On the arrival
-    // lane, not the lane the bind was placed on: a sender with fewer lanes
-    // clamps, and the arrival lane is where the stream's load is.
+    // is counted twice for a moment rather than not at all. On the lane the
+    // bind was placed on, not the arrival lane: a sender with fewer lanes
+    // sends lane k on k modulo its count, and counted by arrival the lanes
+    // past that count would hold no load once claimed, so every unkeyed
+    // choice would land on the first of them. The per-(peer, lane) lookup
+    // takes a map shard under this table's mutex, which cannot deadlock:
+    // nothing holds that shard while it takes a table's mutex.
+    let placed = bind.lane.lane();
     let mut slot = IngressSlot::new(
         id,
         LiveCounts::new(
-            ctx.registry.live.take(ctx.key.lane),
-            LaneReservation::take(ctx.key.lane, Arc::clone(&state.live)),
+            ctx.registry.live.take(placed),
+            ctx.registry
+                .live_per_peer
+                .take(PeerLane::new(ctx.key.peer, placed)),
         ),
         bind.frame_tx.clone(),
         Arc::clone(&bind.drain),
