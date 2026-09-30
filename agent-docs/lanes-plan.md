@@ -87,3 +87,22 @@ QUIC streams stop at the one-connection ceiling. TCP streams reach 2.2 to 2.9 GB
 
 - Per-stream throughput is credit-bound, not transport-bound: 32 records per credit round trip. Loopback TCP, 64 B items, one stream: 14.7k items/s. Stream cells need many concurrent streams to reach the transport.
 - Stream items over 60 KiB ride rendezvous, so stream cells use 64 B and 16 KiB.
+
+## Addendum, 2026-09-29 (after #104, #105, #106)
+
+Base: `perf/lanes` merges #104 (`fix/mux-producer-backpressure`) and #106 (`perf/quic-lane-ports`, on #105). `velo` is 0.18.0 already; `velo-ext` 0.5.4. `Transport::lanes()` returns `NonZeroU16`. The messenger `.lane()` patch saved during #105 is at `/tmp/claude-2000518758/-lustre-fsw-core-dlfw-ci-ryan-velo/f0205b41-1ff7-4afc-aeff-edcfa2bad138/scratchpad/messenger-lane.patch`.
+
+Rulings that replace or refine ruling 12:
+
+18. **The mux follows the transport.** A peer's mux lane count is `transport.lanes(peer).get().min(MAX_LANES)`, with `MAX_LANES = 16`. No separate `MuxConfig` knob: a QUIC transport built with `lanes(8)` gives 8 mux lanes, and TCP stays at 1.
+19. **Mux lane k rides transport lane k.** The batcher for (peer, k) sends with `.lane(k)`, so each handler name stays on one ordered connection.
+20. **Every node registers `MAX_LANES` handlers at build.** Lane 0 is `_stream_batch`; lane k > 0 is `_stream_batch.k`. Each is ordered by sender and captures its lane. A node never receives a lane it did not register, because the sender's lane is at most the consumer's choice, and replies use the arrival lane.
+21. **Lane selection by the consumer**: `lane_key` given: `hash(lane_key) % lanes`; else the lane with the fewest live ingress slots for that peer (attach) or the fewest local binds (pre-bind, peer unknown). `lanes` is the consumer transport's `lanes(peer)` (attach) or `lanes(any)` (pre-bind).
+22. **The sender clamps**: its lane = `response.lane % own lanes(peer)`. A missing field is lane 0.
+23. **Header cross-check**: the batch header's reserved flags byte carries the lane; ingress drops (and meters) a batch whose header lane differs from its handler's lane.
+
+Stages:
+- A. Pure re-key: batchers, ingress tables, drain wake, doorbell, sweep, `SlotClaim`, reply routing keyed by (peer, lane), with lane 0 everywhere. No behaviour change; the whole existing suite passes.
+- B. Wire: handlers per lane, `.lane(k)` sends, header lane, lane in the attach response, ticket and requests, sender clamp; still choosing lane 0.
+- C. Selection: `attach_anchor_keyed`, `prebind_anchor_keyed`, least-used choice, MPSC attach.
+- D. Tests from the PR sequence list, examples knob `VELO_QUIC_LANES`, two-node stream measurement.
