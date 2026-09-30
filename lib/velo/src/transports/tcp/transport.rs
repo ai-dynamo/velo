@@ -285,12 +285,7 @@ impl TcpTransport {
             tx,
         };
 
-        rt.spawn(connection_writer_task(
-            addr,
-            key,
-            rx,
-            self.writer_context(),
-        ));
+        rt.spawn(connection_writer_task(addr, key, rx, self.writer_context()));
 
         debug!(
             "Created new connection to {} lane {} ({})",
