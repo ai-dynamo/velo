@@ -302,12 +302,47 @@ impl VeloBackend {
     /// been registered with [`register_peer`](Self::register_peer).
     ///
     /// The [`SendOutcome`] distinguishes synchronous admission
-    /// ([`SendOutcome::Admitted`]) from a saturated per-target channel
+    /// ([`SendOutcome::Admitted`]) from a saturated channel for the target's
+    /// lane 0
     /// ([`SendOutcome::Pending`]), where the frame is queued behind its
     /// predecessors and the contained [`SendAdmission`] reports when it lands.
     pub fn send_message(
         &self,
         target: InstanceId,
+        header: Bytes,
+        payload: Bytes,
+        message_type: MessageType,
+        on_error: Arc<dyn TransportErrorHandler>,
+    ) -> anyhow::Result<SendOutcome> {
+        self.send_message_on_lane(target, 0, header, payload, message_type, on_error)
+    }
+
+    /// How many lanes the primary transport to `target` keeps. See
+    /// [`Transport::lanes`].
+    ///
+    /// Returns [`VeloBackendError::InstanceNotRegistered`] if the peer has not
+    /// been registered.
+    pub fn lanes(&self, target: InstanceId) -> anyhow::Result<std::num::NonZeroU16> {
+        let transport = self
+            .primary_transport
+            .get(&target)
+            .ok_or(VeloBackendError::InstanceNotRegistered(target))?;
+        Ok(transport.value().lanes(target))
+    }
+
+    /// Send a message to a registered peer on one of its primary transport's
+    /// lanes.
+    ///
+    /// Frames sent on one `(target, lane)` arrive in order, and nothing is
+    /// ordered across lanes. So `Message` frames for an ordered handler must
+    /// stay on one lane: the messenger's own traffic uses lane 0. See
+    /// [`Transport::send_message_on_lane`] for the contract, and
+    /// [`send_message`](Self::send_message) for everything else, which is the
+    /// same.
+    pub fn send_message_on_lane(
+        &self,
+        target: InstanceId,
+        lane: u16,
         header: Bytes,
         payload: Bytes,
         message_type: MessageType,
@@ -345,11 +380,25 @@ impl VeloBackend {
                 bytes
             );
             let _entered = span.enter();
-            transport.send_message(target, header, payload, message_type, error_handler)
+            transport.send_message_on_lane(
+                target,
+                lane,
+                header,
+                payload,
+                message_type,
+                error_handler,
+            )
         };
 
         #[cfg(not(feature = "distributed-tracing"))]
-        let outcome = transport.send_message(target, header, payload, message_type, error_handler);
+        let outcome = transport.send_message_on_lane(
+            target,
+            lane,
+            header,
+            payload,
+            message_type,
+            error_handler,
+        );
 
         Ok(finalize_send_outcome(outcome, report))
     }

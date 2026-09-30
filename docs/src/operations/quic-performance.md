@@ -6,7 +6,8 @@ This chapter records what the QUIC transport costs against TCP, the settings tha
 
 | Builder method | Default | Effect |
 |---|---|---|
-| `server_endpoints(n)` | 4 | Server sockets in the `SO_REUSEPORT` group (Linux). More sockets spread the receive load of many peers. |
+| `lanes(n)` | 1 | Up to `n` connections to each peer, one for each lane used, each from its own UDP socket. Order holds within a lane only. See [Lanes](#lanes). |
+| `server_endpoints(n)` | 4 | Server sockets, each on its own port. A dialer spreads its lanes over them, so use at least as many as the peers' lanes. |
 | `udp_buffer_sizes(recv, send)` | 8 MiB, 4 MiB | Requested socket buffers. The kernel clamps them to `net.core.rmem_max` and `net.core.wmem_max`, and the transport logs the clamp. |
 | `max_mtu(bytes)` | quinn's (1452) | Upper bound for path MTU discovery. Values above 6550 are lowered to 6550. |
 | `stream_receive_window(bytes)` | quinn's | Flow-control window for the stream. |
@@ -70,7 +71,36 @@ Measured on 2026-09-29 with the `throughput` example in its two-host mode. The s
 
 - Small messages cost about 25 µs more per round trip than on TCP, as on loopback. The network does not change this cost: it comes from the task hops inside quinn. With many messages in flight the gap closes, and pipelined QUIC matches TCP.
 - One QUIC connection tops out at about 0.8 GB/s, the same ceiling as on loopback on the same node type. So the limit is the CPU of the connection, not the network. A profile of the 64 KiB case put about 15% of the samples in AES-GCM. The rest was quinn's packet work, the kernel's UDP path, and task wakeups. TCP moves about 3.9 GB/s, because the kernel and the NIC offloads share that work.
-- A peer that needs more than about 0.8 GB/s needs more than one connection. The Dynamo response plane on the cluster carries far less than that per connection (see below).
+- A peer that needs more than about 0.8 GB/s needs more than one connection; see [Lanes](#lanes). The Dynamo response plane on the cluster carries far less than that per connection (see below).
+
+## Lanes
+
+With `lanes(n)`, each peer gets up to `n` connections, one for each lane used, each dialed from its own UDP socket. Each lane has its own quinn endpoint driver, shared by every peer dialed on that lane, and each connection has its own connection driver. The work runs on up to `n` cores.
+
+The messenger sends its own traffic on lane 0. Only a caller that sends with `send_message_on_lane` uses the other lanes, so `lanes(n)` alone does not change the throughput of ordinary messages.
+
+Measured on 2026-09-29 across the same two nodes as above, 64 KiB messages pipelined, 20,000 messages per cell, two reps. A prototype, which is not in the tree, spread the messages round robin over the lanes, with the connection layout that `lanes(n)` builds. The receiving node had 32 server sockets.
+
+| Lanes | MB/s |
+|---|---|
+| 1 | 788–789 |
+| 2 | 1,552–1,558 |
+| 4 | 2,994–3,020 |
+| 8 | 5,773–5,850 |
+
+The UDP receive-buffer error count stayed below 50 in each run, so the gain comes from more cores, not from more socket buffers. 64 B pipelined messages do not change with the lane count.
+
+Two lanes on one server socket share its endpoint driver. So each server socket has its own port, and a dialer sends each lane to a different socket. The prototype instead put all server sockets on one port in a `SO_REUSEPORT` group, where the kernel hashes each connection to a socket at random. The table below shows what that cost with 8 lanes. It ran in a separate job on another pair of nodes, so its 32-socket row differs from the table above by run-to-run spread.
+
+| Server sockets in the reuse-port group | MB/s |
+|---|---|
+| 4 | 3,326–4,014 |
+| 8 | 2,628 or 6,579, as the hash fell |
+| 32 | 6,463–6,526 |
+
+With one port for each socket, 8 lanes need 8 server sockets on the receiving node, not 32.
+
+The same prototype on TCP did not scale: 2.6–3.4 GB/s with 1 lane, and 2.9–3.8 GB/s with 2, 4 or 8 lanes. The limit for TCP is not the connection, so the TCP transport keeps one lane.
 
 ## Batched streaming over QUIC
 

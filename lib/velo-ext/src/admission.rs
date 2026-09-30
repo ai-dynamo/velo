@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Ordered per-target send admission.
+//! Ordered send admission, per target (and lane).
 //!
 //! ## The hazard this exists to fix
 //!
@@ -114,7 +114,8 @@ pub enum AdmissionError {
 }
 
 /// Outcome of [`AdmissionGate::send`], and of
-/// [`Transport::send_message`](crate::transport::Transport::send_message).
+/// [`Transport::send_message`](crate::transport::Transport::send_message) and
+/// [`Transport::send_message_on_lane`](crate::transport::Transport::send_message_on_lane).
 ///
 /// Dropping this is a legitimate fire-and-forget pattern — the frame is already
 /// owned by the gate and will be delivered either way — so it is deliberately

@@ -222,7 +222,7 @@ Each control map is bounded by what the batcher allocated, not by a size cap. On
 
 ### Admission
 
-Transports expose an ordered per-target admission gate as `SendOutcome::{Admitted, Pending(SendAdmission)}`. A batcher learns at the send site, in order, that its peer is congested, and parks itself instead of a runtime worker. A batcher parked on admission stops draining its inlets. The producer then waits on a full inlet. This wait is bounded by the progress of the transport, which is the same position a socket was always in.
+Transports expose an ordered admission gate, per target and lane, as `SendOutcome::{Admitted, Pending(SendAdmission)}`. A batcher learns at the send site, in order, that its peer is congested, and parks itself instead of a runtime worker. A batcher parked on admission stops draining its inlets. The producer then waits on a full inlet. This wait is bounded by the progress of the transport, which is the same position a socket was always in.
 
 ### Credit return
 

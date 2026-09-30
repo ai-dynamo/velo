@@ -465,7 +465,7 @@ async fn replacing_a_dead_connection_does_not_deadlock() {
     let (tx, rx) = flume::bounded(1);
     drop(rx);
     client.connections.insert(
-        server_id,
+        (server_id, 0),
         ConnectionHandle {
             gate: crate::transports::transport::AdmissionGate::new(tx.clone(), rt.clone()),
             tx,
@@ -477,7 +477,7 @@ async fn replacing_a_dead_connection_does_not_deadlock() {
     std::thread::spawn({
         let client = client.clone();
         move || {
-            let installed = client.install_connection(server_id, &rt).is_ok();
+            let installed = client.install_connection((server_id, 0), &rt).is_ok();
             let _ = done_tx.send(installed);
         }
     });
@@ -488,7 +488,7 @@ async fn replacing_a_dead_connection_does_not_deadlock() {
     assert!(
         !client
             .connections
-            .get(&server_id)
+            .get(&(server_id, 0))
             .unwrap()
             .tx
             .is_disconnected()
@@ -608,6 +608,7 @@ where
         )
         .unwrap(),
         fingerprint: identity.fingerprint,
+        ports: vec![],
     };
     let mut builder = WorkerAddressBuilder::new();
     builder.add_entry("quic", info.encode().unwrap()).unwrap();
@@ -663,7 +664,7 @@ fn the_senders_exit_closes_its_connection() {
         client.shutdown();
         client.closed().await;
         assert_eq!(
-            client.client_endpoint.get().unwrap().open_connections(),
+            client.client_endpoints.get().unwrap()[0].open_connections(),
             0,
             "closed() returned with a dialed connection still open"
         );
@@ -1046,4 +1047,427 @@ async fn a_listener_in_teardown_closes_the_connection_before_its_streams() {
         "the listener stopped the stream before it closed the connection: {outcome:?}"
     );
     server.shutdown();
+}
+
+/// A client with `lanes` lanes, registered with a fresh server.
+async fn laned_pair(
+    lanes: u16,
+) -> (
+    Arc<QuicTransport>,
+    DataStreams,
+    QuicTransport,
+    DataStreams,
+    InstanceId,
+) {
+    let (client, client_streams, _) = started_with(QuicTransportBuilder::new().lanes(lanes)).await;
+    let (server, server_streams, server_id) = started().await;
+    client
+        .register(peer_with_fingerprint(
+            &server,
+            server_id,
+            server.fingerprint(),
+        ))
+        .unwrap();
+    (
+        Arc::new(client),
+        client_streams,
+        server,
+        server_streams,
+        server_id,
+    )
+}
+
+/// Each lane is its own connection from its own socket, and keeps its own
+/// order under load from concurrent senders.
+///
+/// The header carries `(lane, seq)`. The receiver sees the lanes interleaved,
+/// which is allowed, and each lane's sequence in order, which is the contract.
+/// A lane that shared a connection with another would still pass the order
+/// check, so the test also counts connections per dial endpoint: one lane, one
+/// socket, one connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_lane_is_its_own_connection_and_keeps_its_own_order() {
+    const LANES: u16 = 4;
+    const FRAMES: u32 = 10_000;
+    let (client, _client_streams, server, server_streams, server_id) = laned_pair(LANES).await;
+    assert_eq!(client.lanes(server_id).get(), LANES);
+
+    let errors = Arc::new(Errors::default());
+    let mut senders = Vec::new();
+    for lane in 0..LANES {
+        let client = client.clone();
+        let errors = errors.clone();
+        senders.push(tokio::spawn(async move {
+            for seq in 0..FRAMES {
+                let mut header = lane.to_le_bytes().to_vec();
+                header.extend_from_slice(&seq.to_le_bytes());
+                let outcome = client.send_message_on_lane(
+                    server_id,
+                    lane,
+                    Bytes::from(header),
+                    Bytes::from_static(b"token"),
+                    MessageType::Event,
+                    errors.clone(),
+                );
+                if let velo_ext::SendOutcome::Pending(admission) = outcome {
+                    admission.await.unwrap();
+                }
+            }
+        }));
+    }
+
+    let mut next = vec![0u32; usize::from(LANES)];
+    tokio::time::timeout(Duration::from_secs(60), async {
+        for _ in 0..FRAMES * u32::from(LANES) {
+            let (header, _) = server_streams.event_stream.recv_async().await.unwrap();
+            let lane = u16::from_le_bytes(header[..2].try_into().unwrap());
+            let seq = u32::from_le_bytes(header[2..6].try_into().unwrap());
+            assert_eq!(seq, next[usize::from(lane)], "lane {lane} out of order");
+            next[usize::from(lane)] += 1;
+        }
+    })
+    .await
+    .expect("every frame arrives");
+    for sender in senders {
+        sender.await.unwrap();
+    }
+    assert!(errors.0.lock().unwrap().is_empty());
+
+    for lane in 0..LANES {
+        assert!(client.connections.contains_key(&(server_id, lane)));
+    }
+    let endpoints = client.client_endpoints.get().unwrap();
+    assert_eq!(endpoints.len(), usize::from(LANES));
+    for (lane, endpoint) in endpoints.iter().enumerate() {
+        assert_eq!(
+            endpoint.open_connections(),
+            1,
+            "lane {lane} dials from its own socket"
+        );
+    }
+    client.shutdown();
+    server.shutdown();
+}
+
+/// `send_message` is lane 0, and a lane at or past the count wraps.
+///
+/// Ordinary traffic must keep the one ordered channel it had before lanes, so
+/// a transport built with several lanes must not open a second connection for
+/// it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_message_is_lane_zero_and_lanes_wrap() {
+    let (client, _client_streams, server, server_streams, server_id) = laned_pair(3).await;
+    let errors = Arc::new(Errors::default());
+
+    // Several sends, so a send_message that rotated over lanes would open a
+    // second connection.
+    for _ in 0..3 {
+        let _ = client.send_message(
+            server_id,
+            Bytes::from_static(b"plain"),
+            Bytes::new(),
+            MessageType::Event,
+            errors.clone(),
+        );
+    }
+    for _ in 0..3 {
+        let frame = tokio::time::timeout(
+            Duration::from_secs(5),
+            server_streams.event_stream.recv_async(),
+        )
+        .await
+        .expect("the frame arrives")
+        .unwrap();
+        assert_eq!(frame.0, Bytes::from_static(b"plain"));
+    }
+    assert_eq!(client.connections.len(), 1);
+    assert!(client.connections.contains_key(&(server_id, 0)));
+
+    // Lane 4 of 3: modulo gives lane 1, where a clamp would give lane 2.
+    let _ = client.send_message_on_lane(
+        server_id,
+        4,
+        Bytes::from_static(b"wrapped"),
+        Bytes::new(),
+        MessageType::Event,
+        errors.clone(),
+    );
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        server_streams.event_stream.recv_async(),
+    )
+    .await
+    .expect("the frame arrives")
+    .unwrap();
+    assert!(
+        client.connections.contains_key(&(server_id, 1)),
+        "lane 4 of 3 is lane 1"
+    );
+    assert_eq!(client.connections.len(), 2);
+    assert!(errors.0.lock().unwrap().is_empty());
+    client.shutdown();
+    server.shutdown();
+}
+
+/// `closed()` covers every lane: after it returns, no dial endpoint has a
+/// connection open, and every frame sent on any lane was delivered or failed.
+///
+/// Every lane is connected before the close, and bulk frames are flowing on
+/// lanes 1 and up when it lands, so the close meets writers that are mid-stream
+/// on endpoints other than lane 0's. Each send is admitted at once (the bulk
+/// fits the send channel), so a frame is either on the wire or reported through
+/// `on_error`; none can be dropped in the gate.
+///
+/// This pins the state after `closed()` returns; the force close of a stuck
+/// lane other than 0 is what `closed_force_closes_a_stuck_lane_other_than_zero`
+/// covers. The endpoint check needs every connection to finish draining within
+/// `CLOSE_WAIT`, 2 s.
+///
+/// The accounting also needs the peer to acknowledge what the writers wrote
+/// within `FINISH_GRACE`, 1 s. Past that the writer warns that the stream end
+/// was not acknowledged and closes, and those frames are neither delivered nor
+/// failed. On loopback that is milliseconds of work, so a failure here next to
+/// that warning points at the grace, not at lanes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closed_waits_for_every_lane() {
+    const LANES: u16 = 4;
+    const FRAMES: usize = 256;
+    const PAYLOAD: usize = 64 * 1024;
+    let (client, _client_streams, server, server_streams, server_id) = laned_pair(LANES).await;
+    let errors = Arc::new(Errors::default());
+
+    let send = |lane: u16, seq: usize, bytes: usize| {
+        let mut header = lane.to_be_bytes().to_vec();
+        header.extend_from_slice(&(seq as u32).to_be_bytes());
+        let outcome = client.send_message_on_lane(
+            server_id,
+            lane,
+            Bytes::from(header),
+            Bytes::from(vec![0u8; bytes]),
+            MessageType::Response,
+            errors.clone(),
+        );
+        assert!(outcome.is_admitted(), "the bulk must fit the send channel");
+    };
+    for lane in 0..LANES {
+        send(lane, 0, 0);
+    }
+    for _ in 0..LANES {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            server_streams.response_stream.recv_async(),
+        )
+        .await
+        .expect("every lane connects")
+        .unwrap();
+    }
+
+    for i in 0..FRAMES {
+        send(1 + (i % usize::from(LANES - 1)) as u16, i + 1, PAYLOAD);
+    }
+    // Close only once every bulk lane has delivered a frame, so the close
+    // lands on writers that are streaming, not on writers yet to start.
+    let mut per_lane = vec![0usize; usize::from(LANES)];
+    let mut delivered = 0;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while per_lane[1..].contains(&0) {
+            let (header, _) = server_streams.response_stream.recv_async().await.unwrap();
+            per_lane[usize::from(u16::from_be_bytes([header[0], header[1]]))] += 1;
+            delivered += 1;
+        }
+    })
+    .await
+    .expect("every bulk lane delivers");
+    client.shutdown();
+    client.closed().await;
+    for (lane, endpoint) in client.client_endpoints.get().unwrap().iter().enumerate() {
+        assert_eq!(
+            endpoint.open_connections(),
+            0,
+            "closed() returned with lane {lane}'s connection still open"
+        );
+    }
+
+    while let Ok(Ok((header, _))) = tokio::time::timeout(
+        Duration::from_secs(3),
+        server_streams.response_stream.recv_async(),
+    )
+    .await
+    {
+        per_lane[usize::from(u16::from_be_bytes([header[0], header[1]]))] += 1;
+        delivered += 1;
+    }
+    let failed = errors.0.lock().unwrap().len();
+    assert_eq!(
+        delivered + failed,
+        FRAMES,
+        "{delivered} delivered + {failed} failed != {FRAMES} sent"
+    );
+    server.shutdown();
+}
+
+/// A peer reached only on a lane other than 0 is healthy.
+///
+/// The mux will put streams on any lane, so a peer can have live connections
+/// with none on lane 0. A health check that looked at lane 0 alone would dial a
+/// throwaway probe and call such a peer `NeverConnected`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peer_live_only_on_a_later_lane_is_healthy() {
+    let (client, _client_streams, server, server_streams, server_id) = laned_pair(3).await;
+    let errors = Arc::new(Errors::default());
+    let _ = client.send_message_on_lane(
+        server_id,
+        2,
+        Bytes::from_static(b"lane two"),
+        Bytes::new(),
+        MessageType::Event,
+        errors.clone(),
+    );
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        server_streams.event_stream.recv_async(),
+    )
+    .await
+    .expect("the frame arrives")
+    .unwrap();
+    assert!(!client.connections.contains_key(&(server_id, 0)));
+
+    let health = client.check_health(server_id, Duration::from_secs(1)).await;
+    assert!(health.is_ok(), "{health:?}");
+    client.shutdown();
+    server.shutdown();
+}
+
+/// `closed()` force-closes a lane other than 0 whose peer stopped reading, and
+/// every frame on it is accounted for.
+///
+/// The laned form of `closed_accounts_for_every_frame_when_the_peer_stops_reading`.
+/// Its peer never reads, so the writer on lane 2 cannot finish its stream, and
+/// only a force close of its dial endpoint ends it. `shutdown()` schedules that
+/// close for every lane's endpoint, and `closed()` does it again after
+/// `CLOSE_WAIT`. If neither reached lane 2's endpoint, its writer would still be
+/// blocked, and its frames unreported, when `closed()` returns.
+///
+/// The test does not require the connection to be gone from its endpoint. A
+/// force-closed connection stays counted while it drains, on lane 0 too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closed_force_closes_a_stuck_lane_other_than_zero() {
+    let lane: u16 = 2;
+    const FRAMES: usize = 64;
+    const PAYLOAD: usize = 64 * 1024;
+    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+    let (peer, peer_id) = raw_server(
+        64 * 1024,
+        Duration::from_secs(30),
+        move |connection| async move {
+            let _stream = connection.accept_bi().await.unwrap();
+            let _ = accepted_tx.send(());
+            std::future::pending::<()>().await;
+        },
+    );
+    let (client, _client_streams, _) = started_with(QuicTransportBuilder::new().lanes(3)).await;
+    client.register(peer).unwrap();
+
+    let errors = Arc::new(Errors::default());
+    for i in 0..FRAMES {
+        let _ = client.send_message_on_lane(
+            peer_id,
+            lane,
+            Bytes::from((i as u32).to_be_bytes().to_vec()),
+            Bytes::from(vec![0u8; PAYLOAD]),
+            MessageType::Response,
+            errors.clone(),
+        );
+    }
+    tokio::time::timeout(Duration::from_secs(5), accepted_rx)
+        .await
+        .expect("the writer never reached the peer")
+        .unwrap();
+    assert!(client.connections.contains_key(&(peer_id, lane)));
+    assert_eq!(client.connections.len(), 1, "only lane {lane} was dialed");
+    // Otherwise every frame could have failed for another reason, and the
+    // force close under test would never have run.
+    assert!(
+        errors.0.lock().unwrap().is_empty(),
+        "a frame failed before shutdown"
+    );
+
+    client.shutdown();
+    client.closed().await;
+    let failed = errors.0.lock().unwrap().len();
+    assert_eq!(
+        failed, FRAMES,
+        "{failed} of {FRAMES} frames failed when closed() returned; the rest are unaccounted for"
+    );
+}
+
+/// The lanes of one dialer land on different server sockets of the peer.
+///
+/// Each server socket has its own port and its own endpoint driver, and the
+/// dialer spreads its lanes over the ports. Two lanes on one socket would
+/// share one driver, which is the limit lanes exist to lift.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_lane_lands_on_its_own_server_socket() {
+    const LANES: u16 = 4;
+    let (client, _client_streams, server, server_streams, server_id) = laned_pair(LANES).await;
+    let servers = server.server_endpoints.get().unwrap();
+    assert_eq!(
+        servers.len(),
+        usize::from(LANES),
+        "the default is one socket per lane here"
+    );
+
+    let errors = Arc::new(Errors::default());
+    for lane in 0..LANES {
+        let _ = client.send_message_on_lane(
+            server_id,
+            lane,
+            Bytes::from(lane.to_le_bytes().to_vec()),
+            Bytes::new(),
+            MessageType::Event,
+            errors.clone(),
+        );
+    }
+    for _ in 0..LANES {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            server_streams.event_stream.recv_async(),
+        )
+        .await
+        .expect("every lane delivers")
+        .unwrap();
+    }
+    for (index, endpoint) in servers.iter().enumerate() {
+        assert_eq!(
+            endpoint.open_connections(),
+            1,
+            "server socket {index} holds exactly one lane"
+        );
+    }
+    assert!(errors.0.lock().unwrap().is_empty());
+    client.shutdown();
+    server.shutdown();
+}
+
+/// A lane's address: socket `(offset + lane) % n` of the peer, or the one
+/// advertised address for a peer that lists no ports.
+#[test]
+fn lane_addresses_spread_over_the_peers_sockets() {
+    let client_config = super::tls::pinned_client_config([0; 32]).unwrap();
+    let addr: std::net::SocketAddr = "10.0.0.1:5000".parse().unwrap();
+    let peer = super::PeerEntry {
+        addr,
+        ports: vec![5000, 5001, 5002, 5003],
+        client_config: client_config.clone(),
+    };
+    let ports: Vec<u16> = (0..4).map(|lane| peer.lane_addr(lane, 6).port()).collect();
+    assert_eq!(ports, vec![5002, 5003, 5000, 5001]);
+    assert!((0..4).all(|lane| peer.lane_addr(lane, 6).ip() == addr.ip()));
+
+    let before_lanes = super::PeerEntry {
+        addr,
+        ports: vec![],
+        client_config,
+    };
+    assert!((0..4).all(|lane| before_lanes.lane_addr(lane, 6) == addr));
 }

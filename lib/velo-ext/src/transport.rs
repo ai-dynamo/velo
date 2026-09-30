@@ -307,24 +307,32 @@ pub trait Transport: Send + Sync {
     ///
     /// The frame is taken unconditionally: implementations must not hand it
     /// back, and the caller has no way to retract it. What the return value
-    /// reports is *when* the frame reached the per-target send channel.
+    /// reports is *when* the frame reached the send channel for the target
+    /// (its lane 0, on a transport with [`lanes`](Transport::lanes)).
     ///
     /// - [`SendOutcome::Admitted`] — it is on the channel already. This is also
     ///   what a hard pre-wire failure returns, once `on_error` has been called
     ///   for it (peer unregistered, transport not started, oversized frame):
     ///   there is nothing left for the caller to wait on either way.
     /// - [`SendOutcome::Pending`] — the channel was saturated, so the frame is
-    ///   queued in the target's [`AdmissionGate`](crate::admission::AdmissionGate)
-    ///   behind its predecessors. The returned
+    ///   queued in the [`AdmissionGate`](crate::admission::AdmissionGate) of the
+    ///   target's lane (lane 0 here) behind its predecessors. The returned
     ///   [`SendAdmission`](crate::admission::SendAdmission) resolves `Ok(())` when the frame is
     ///   enqueued and `Err` when it never will be (the connection epoch died,
     ///   the channel closed). Delivery does **not** depend on the caller
     ///   polling it — dropping it is a legitimate fire-and-forget pattern.
     ///
-    /// Implementations must route every send through one gate per target and
-    /// keep no `try_send` path around it: an admission that can be overtaken by
-    /// a later fast-path send is the reordering hazard the gate exists to
-    /// remove (see the [`admission`](crate::admission) module docs).
+    /// On a transport whose [`lanes`](Transport::lanes) is more than 1,
+    /// `send_message` must be `send_message_on_lane(target, 0, ...)`: the same
+    /// gate and the same admission order as lane 0. Such a transport must then
+    /// override `send_message_on_lane` too, because its default calls
+    /// `send_message`, and the two would call each other.
+    ///
+    /// Implementations must route every send through one gate per target (per
+    /// target and lane, on a transport with lanes) and keep no `try_send` path
+    /// around it: an admission that can be overtaken by a later fast-path send
+    /// is the reordering hazard the gate exists to remove (see the
+    /// [`admission`](crate::admission) module docs).
     ///
     /// Failures *after* admission — the write itself — continue to flow
     /// through `on_error`.
@@ -337,10 +345,60 @@ pub trait Transport: Send + Sync {
         on_error: Arc<dyn TransportErrorHandler>,
     ) -> SendOutcome;
 
+    /// How many ordered channels (lanes) this transport keeps to `target`.
+    ///
+    /// Non-zero by type, because a caller maps flows to lanes with
+    /// `flow % lanes(target)`.
+    /// Frames sent on one `(target, lane)` through
+    /// [`send_message_on_lane`](Transport::send_message_on_lane) arrive in the
+    /// order they were admitted. Nothing is promised across lanes. A transport
+    /// that carries a peer on one ordered channel keeps the default of 1.
+    ///
+    /// The value must not change while the peer is registered: a caller maps
+    /// its flows to lanes with it, and a different count would move a flow to
+    /// another lane, which reorders it.
+    ///
+    /// A transport that returns more than 1 must also override
+    /// [`send_message_on_lane`](Transport::send_message_on_lane): the default
+    /// ignores the lane, and would put every lane on one channel.
+    ///
+    /// Lanes exist because one connection can be bound to one core: a QUIC
+    /// connection does its packet and crypto work on one task. A caller with
+    /// independent ordered flows to one peer puts them on different lanes to
+    /// use more cores.
+    fn lanes(&self, _target: InstanceId) -> std::num::NonZeroU16 {
+        std::num::NonZeroU16::MIN
+    }
+
+    /// Send on `lane`, as [`send_message`](Transport::send_message) does on
+    /// lane 0.
+    ///
+    /// Every rule of `send_message` applies, per `(target, lane)`: one
+    /// admission gate per lane, and frames on one lane arrive in the order they
+    /// were admitted. A lane never fails over to another lane's
+    /// connection, because that would reorder it. A lane at or past
+    /// [`lanes`](Transport::lanes) maps to `lane % lanes(target)`.
+    ///
+    /// The default ignores `lane` and calls `send_message`, which is correct
+    /// for a transport with one lane. A transport whose `send_message` forwards
+    /// here must override this method too, or the two call each other.
+    fn send_message_on_lane(
+        &self,
+        instance_id: InstanceId,
+        lane: u16,
+        header: Bytes,
+        payload: Bytes,
+        message_type: MessageType,
+        on_error: Arc<dyn TransportErrorHandler>,
+    ) -> SendOutcome {
+        let _ = lane;
+        self.send_message(instance_id, header, payload, message_type, on_error)
+    }
+
     /// Largest single message this transport will carry to `target`, in bytes.
     ///
-    /// The number bounds `header.len() + payload.len()` for one
-    /// [`send_message`](Transport::send_message) — the *combined* frame
+    /// The number bounds `header.len() + payload.len()` for one send on any
+    /// lane — the *combined* frame
     /// content, not the payload alone. A caller that prepends its own envelope
     /// to the payload subtracts that envelope from this number; there is no
     /// second allowance hiding behind it.
@@ -445,7 +503,8 @@ pub trait Transport: Send + Sync {
 
     /// Check if a registered peer is reachable and healthy.
     ///
-    /// Returns `Ok(())` if the peer responds within the timeout. Different
+    /// Returns `Ok(())` if the peer responds within the timeout. On a
+    /// transport with lanes, a peer with any live lane is healthy. Different
     /// transports implement this differently:
     /// - NATS: request/reply to health subject
     /// - TCP: check existing connection or attempt new connection
@@ -613,7 +672,7 @@ pub struct TransportAdapter {
     /// Each carries the rejected *request's* header, echoed back verbatim so
     /// the sender can correlate it, and an empty payload. The header is in
     /// the request format, not the response format — which is why these
-    /// frames have their own lane instead of sharing `response_stream`.
+    /// frames have their own stream instead of sharing `response_stream`.
     pub shutdown_stream: flume::Sender<(Bytes, Bytes)>,
     /// Shared shutdown coordinator for drain-aware routing.
     pub shutdown_state: ShutdownState,
@@ -688,7 +747,7 @@ impl TransportAdapter {
 /// Receiver-side handle for consuming inbound frames from all transports.
 ///
 /// Returned by [`make_channels`] alongside the corresponding [`TransportAdapter`].
-/// Higher layers pull [`InboundMessage`]s off the message lane and
+/// Higher layers pull [`InboundMessage`]s off the message stream and
 /// `(header, payload)` pairs off the other three.
 pub struct DataStreams {
     /// Receiver for inbound message frames.
@@ -767,6 +826,83 @@ pub fn make_channels() -> (TransportAdapter, DataStreams) {
 mod tests {
     use super::*;
     use tokio::time::{sleep, timeout};
+
+    /// A transport that overrides nothing it does not have to, and records
+    /// what reached `send_message`.
+    #[derive(Default)]
+    struct OneLane {
+        sent: std::sync::Mutex<Vec<(InstanceId, Bytes)>>,
+    }
+
+    impl Transport for OneLane {
+        fn key(&self) -> TransportKey {
+            TransportKey::from("one-lane")
+        }
+        fn address(&self) -> WorkerAddress {
+            WorkerAddress::empty()
+        }
+        fn register(&self, _peer_info: PeerInfo) -> Result<(), TransportError> {
+            Ok(())
+        }
+        fn send_message(
+            &self,
+            instance_id: InstanceId,
+            _header: Bytes,
+            payload: Bytes,
+            _message_type: MessageType,
+            _on_error: Arc<dyn TransportErrorHandler>,
+        ) -> SendOutcome {
+            self.sent.lock().unwrap().push((instance_id, payload));
+            SendOutcome::Admitted
+        }
+        fn start(
+            &self,
+            _instance_id: InstanceId,
+            _channels: TransportAdapter,
+            _rt: tokio::runtime::Handle,
+        ) -> BoxFuture<'_, anyhow::Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn shutdown(&self) {}
+        fn check_health(
+            &self,
+            _instance_id: InstanceId,
+            _timeout: Duration,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), HealthCheckError>> + Send + '_>,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    struct Ignore;
+    impl TransportErrorHandler for Ignore {
+        fn on_error(&self, _header: Bytes, _payload: Bytes, _error: String) {}
+    }
+
+    /// An out-of-tree transport written before lanes existed has one lane,
+    /// and a send on any lane reaches its `send_message` unchanged.
+    #[test]
+    fn a_transport_without_lanes_has_one_and_ignores_the_lane() {
+        let transport = OneLane::default();
+        let target = InstanceId::new_v4();
+        assert_eq!(transport.lanes(target).get(), 1);
+        for lane in [0u16, 1, 7] {
+            let outcome = transport.send_message_on_lane(
+                target,
+                lane,
+                Bytes::new(),
+                Bytes::from(vec![lane as u8]),
+                MessageType::Message,
+                Arc::new(Ignore),
+            );
+            assert!(outcome.is_admitted());
+        }
+        let sent = transport.sent.lock().unwrap();
+        let payloads: Vec<u8> = sent.iter().map(|(_, p)| p[0]).collect();
+        assert_eq!(payloads, vec![0, 1, 7]);
+        assert!(sent.iter().all(|(t, _)| *t == target));
+    }
 
     #[test]
     fn test_shutdown_state_initial() {
