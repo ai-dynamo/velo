@@ -154,6 +154,23 @@ impl<T: Serialize> MpscStreamSender<T> {
         self.cancel_token.clone()
     }
 
+    /// Await `send`, giving up when the consumer cancels the stream.
+    ///
+    /// Over the mux the channel stays full for as long as the slot is paused
+    /// at its byte cap, which lasts as long as the consumer does not read. A
+    /// consumer that cancels, or drops its anchor, must still wake a sender
+    /// parked here. Mirrors `StreamSender::send`.
+    async fn until_cancelled<E>(
+        &self,
+        send: impl std::future::Future<Output = Result<(), E>>,
+    ) -> Result<(), SendError> {
+        tokio::select! {
+            biased;
+            _ = self.cancel_token.cancelled() => Err(SendError::ChannelClosed),
+            result = send => result.map_err(|_| SendError::ChannelClosed),
+        }
+    }
+
     /// Send a typed item through the channel.
     pub async fn send(&self, item: T) -> Result<(), SendError> {
         if self.poison_tx.is_disconnected() {
@@ -170,7 +187,7 @@ impl<T: Serialize> MpscStreamSender<T> {
                     if let Some(m) = self.metrics.as_ref() {
                         m.record_producer_send_backpressure();
                     }
-                    tx.send_async(b).await.map_err(|_| SendError::ChannelClosed)
+                    self.until_cancelled(tx.send_async(b)).await
                 }
                 Err(flume::TrySendError::Disconnected(_)) => Err(SendError::ChannelClosed),
             },
@@ -180,7 +197,7 @@ impl<T: Serialize> MpscStreamSender<T> {
                     if let Some(m) = self.metrics.as_ref() {
                         m.record_producer_send_backpressure();
                     }
-                    tx.send_async(b).await.map_err(|_| SendError::ChannelClosed)
+                    self.until_cancelled(tx.send_async(b)).await
                 }
                 Err(flume::TrySendError::Disconnected(_)) => Err(SendError::ChannelClosed),
             },
@@ -195,14 +212,11 @@ impl<T: Serialize> MpscStreamSender<T> {
         let bytes = rmp_serde::to_vec(&StreamFrame::<()>::SenderError(msg.to_string()))
             .expect("SenderError serializes infallibly");
         match &self.channel {
-            SenderChannel::Local(tx) => tx
-                .send_async((self.sender_id.0, bytes))
-                .await
-                .map_err(|_| SendError::ChannelClosed),
-            SenderChannel::Remote(tx) => tx
-                .send_async(bytes)
-                .await
-                .map_err(|_| SendError::ChannelClosed),
+            SenderChannel::Local(tx) => {
+                self.until_cancelled(tx.send_async((self.sender_id.0, bytes)))
+                    .await
+            }
+            SenderChannel::Remote(tx) => self.until_cancelled(tx.send_async(bytes)).await,
         }
     }
 
@@ -215,14 +229,11 @@ impl<T: Serialize> MpscStreamSender<T> {
         self.sent_terminal = true;
         let bytes = cached_detached().clone();
         let result = match &self.channel {
-            SenderChannel::Local(tx) => tx
-                .send_async((self.sender_id.0, bytes))
-                .await
-                .map_err(|_| SendError::ChannelClosed),
-            SenderChannel::Remote(tx) => tx
-                .send_async(bytes)
-                .await
-                .map_err(|_| SendError::ChannelClosed),
+            SenderChannel::Local(tx) => {
+                self.until_cancelled(tx.send_async((self.sender_id.0, bytes)))
+                    .await
+            }
+            SenderChannel::Remote(tx) => self.until_cancelled(tx.send_async(bytes)).await,
         };
 
         // Same-worker: remove the slot locally so reattach can reuse capacity

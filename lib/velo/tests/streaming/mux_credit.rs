@@ -652,3 +652,253 @@ async fn prebound_slot_holds_c_credits_against_a_c_plus_one_buffer() {
         "credit came back some other way than the consumer draining"
     );
 }
+
+/// A producer faster than its consumer waits for it; the stream does not die.
+///
+/// The consumer here drains every record as soon as it arrives, so it is not a
+/// slow consumer in the sense the per-slot byte cap exists for. It is only
+/// slower than the producer, because credit comes back in windows of
+/// `initial_credit` records and the producer can fill a window faster than one
+/// round trip returns it. That describes any bulk stream.
+///
+/// Over a socket the producer's `send().await` waited when the socket buffer
+/// filled. The mux first drained the slot's inlet into its withheld queue
+/// whatever the credit, so `send().await` never waited, and it killed the slot
+/// when the queue passed the byte cap (1 MiB by default). The consumer saw
+/// `SenderDropped` part way through a stream it was reading: 1,128 of 10,000
+/// records here. Now the slot pauses its inlet at the cap and `send` waits.
+///
+/// The records are 1 KiB so that the run is ten times the cap and stays under
+/// the eager batch size, which keeps rendezvous out of the path.
+///
+/// Completing is not enough on its own: a batcher that neither paused nor
+/// killed would also complete, by buffering the whole run ahead of credit. So
+/// the consumer also samples the producer's withheld-record gauge as it reads,
+/// and the gauge must stay within the byte cap.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_producer_that_outruns_a_draining_consumer_waits_for_credit() {
+    const RECORDS: u32 = 10_000;
+    const RECORD_BYTES: usize = 1024;
+    const DEFAULT_SLOT_BYTE_BUDGET: usize = 1024 * 1024;
+
+    let consumer = node(MuxConfig::default()).await;
+    let producer = node(MuxConfig::default()).await;
+    introduce(&producer, &consumer).await;
+
+    let mut anchor = consumer.velo.create_anchor::<(u32, Vec<u8>)>();
+    let handle = transfer(anchor.handle());
+    let sender = producer
+        .velo
+        .attach_anchor::<(u32, Vec<u8>)>(handle)
+        .await
+        .expect("remote attach");
+
+    let writer = tokio::spawn(async move {
+        let body = vec![0u8; RECORD_BYTES];
+        for n in 0..RECORDS {
+            sender
+                .send((n, body.clone()))
+                .await
+                .map_err(|e| format!("send {n} failed: {e}"))?;
+        }
+        sender
+            .finalize()
+            .map_err(|e| format!("finalize failed: {e}"))
+    });
+
+    // Each record costs a little more than `RECORD_BYTES` on the wire, so this
+    // many fill the default 1 MiB cap, plus the one record that reaches it.
+    let max_withheld = (DEFAULT_SLOT_BYTE_BUDGET / RECORD_BYTES + 1) as f64;
+    let mut peak_withheld = 0.0f64;
+    let mut seen = 0u32;
+    loop {
+        match tokio::time::timeout(PATIENCE, anchor.next()).await {
+            Ok(Some(Ok(StreamFrame::Item((n, body))))) => {
+                assert_eq!(n, seen, "record out of order");
+                assert_eq!(body.len(), RECORD_BYTES);
+                seen += 1;
+                if seen.is_multiple_of(50) {
+                    peak_withheld = peak_withheld.max(
+                        producer
+                            .snapshot()
+                            .gauge("velo_streaming_mux_withheld_records", &[]),
+                    );
+                }
+            }
+            Ok(Some(Ok(StreamFrame::Finalized))) => break,
+            Ok(Some(Ok(other))) => {
+                panic!("the stream ended with {other:?} after {seen} of {RECORDS} records")
+            }
+            Ok(Some(Err(error))) => {
+                panic!("the stream failed with {error:?} after {seen} of {RECORDS} records")
+            }
+            Ok(None) => panic!("the anchor closed after {seen} of {RECORDS} records"),
+            Err(_) => panic!("stalled after {seen} of {RECORDS} records"),
+        }
+    }
+    assert_eq!(seen, RECORDS);
+    tokio::time::timeout(PATIENCE, writer)
+        .await
+        .expect("producer did not finish")
+        .expect("producer task panicked")
+        .expect("producer failed");
+    assert!(
+        peak_withheld <= max_withheld,
+        "the producer's node withheld {peak_withheld} records, past the {max_withheld} the \
+         byte cap allows: the batcher buffered the run ahead of credit instead of making \
+         the producer wait"
+    );
+}
+
+/// An MPSC producer parked at the byte cap is released when its consumer drops
+/// the anchor, and its slot does not outlive the stream.
+///
+/// The consumer never reads. Its anchor fills, credit stops, the producer's
+/// slot withholds up to the byte cap and pauses, and the producer parks in
+/// `send`. Dropping the anchor is the consumer's way out, and it must reach the
+/// producer: `send` returns an error, and the producer's node closes the slot,
+/// so neither `live_slots` nor the withheld records stay behind for the rest of
+/// the peer's epoch. The sender's cancel wakes `send`; only the release of the
+/// slot frees what it holds on the producer's node. Before the pause existed,
+/// the byte-cap kill ended this case.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_producer_parked_on_a_dropped_mpsc_anchor_is_released() {
+    let config = MuxConfig {
+        initial_credit: 4,
+        slot_byte_budget: 4096,
+        ..MuxConfig::default()
+    };
+    let consumer = node(config.clone()).await;
+    let producer = node(config).await;
+    introduce(&producer, &consumer).await;
+
+    let anchor = consumer.velo.create_mpsc_anchor::<Vec<u8>>();
+    let handle = transfer(anchor.handle());
+    let sender = producer
+        .velo
+        .attach_mpsc_anchor::<Vec<u8>>(handle)
+        .await
+        .expect("remote mpsc attach");
+
+    let writer = tokio::spawn(async move {
+        let mut sent = 0u64;
+        while sender.send(vec![0u8; 256]).await.is_ok() {
+            sent += 1;
+        }
+        sent
+    });
+
+    let withheld = || {
+        producer
+            .snapshot()
+            .gauge("velo_streaming_mux_withheld_records", &[])
+    };
+    // Parked: the slot paused at the byte cap and the producer's inlet filled,
+    // which is when its send falls through to waiting.
+    let waited = || {
+        producer
+            .snapshot()
+            .counter("velo_streaming_producer_send_backpressure_total", &[])
+    };
+    let deadline = Instant::now() + PATIENCE;
+    while withheld() == 0.0 || waited() == 0.0 {
+        assert!(Instant::now() < deadline, "the producer never parked");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!writer.is_finished(), "the producer is parked in send");
+
+    drop(anchor);
+    tokio::time::timeout(PATIENCE, writer)
+        .await
+        .expect("send never returned after the consumer dropped the anchor")
+        .expect("producer task panicked");
+
+    let live = || {
+        producer
+            .snapshot()
+            .gauge("velo_streaming_mux_live_slots", &[])
+    };
+    let deadline = Instant::now() + PATIENCE;
+    while live() != 0.0 || withheld() != 0.0 {
+        assert!(
+            Instant::now() < deadline,
+            "the producer's slot outlived the stream: live_slots {}, withheld {}",
+            live(),
+            withheld()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Cancelling an MPSC anchor, while the consumer still holds it, releases a
+/// producer parked at the byte cap and closes its slot.
+///
+/// The twin of the test above, with a cancel instead of a drop. The anchor
+/// object stays alive, so its channel stays open and the consumer-side pump
+/// stays blocked forwarding a record into that full channel. The cancel has to
+/// reach the pump there, or the pump never ends and never closes the slot.
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelling_a_held_mpsc_anchor_releases_its_parked_producer() {
+    let config = MuxConfig {
+        initial_credit: 4,
+        slot_byte_budget: 4096,
+        ..MuxConfig::default()
+    };
+    let consumer = node(config.clone()).await;
+    let producer = node(config).await;
+    introduce(&producer, &consumer).await;
+
+    let anchor = consumer.velo.create_mpsc_anchor::<Vec<u8>>();
+    let handle = transfer(anchor.handle());
+    let sender = producer
+        .velo
+        .attach_mpsc_anchor::<Vec<u8>>(handle)
+        .await
+        .expect("remote mpsc attach");
+
+    let writer = tokio::spawn(async move { while sender.send(vec![0u8; 256]).await.is_ok() {} });
+
+    let withheld = || {
+        producer
+            .snapshot()
+            .gauge("velo_streaming_mux_withheld_records", &[])
+    };
+    // Parked: the slot paused at the byte cap and the producer's inlet filled,
+    // which is when its send falls through to waiting.
+    let waited = || {
+        producer
+            .snapshot()
+            .counter("velo_streaming_producer_send_backpressure_total", &[])
+    };
+    let deadline = Instant::now() + PATIENCE;
+    while withheld() == 0.0 || waited() == 0.0 {
+        assert!(Instant::now() < deadline, "the producer never parked");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!writer.is_finished(), "the producer is parked in send");
+
+    anchor.controller().cancel();
+    tokio::time::timeout(PATIENCE, writer)
+        .await
+        .expect("send never returned after the consumer cancelled the anchor")
+        .expect("producer task panicked");
+
+    let live = || {
+        producer
+            .snapshot()
+            .gauge("velo_streaming_mux_live_slots", &[])
+    };
+    let deadline = Instant::now() + PATIENCE;
+    while live() != 0.0 || withheld() != 0.0 {
+        assert!(
+            Instant::now() < deadline,
+            "the producer's slot outlived the cancel: live_slots {}, withheld {}",
+            live(),
+            withheld()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    drop(anchor);
+}

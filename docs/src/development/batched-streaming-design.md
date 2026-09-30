@@ -61,7 +61,7 @@ The change of default has these effects that an operator can see:
 
 - A consumer with the mux mints zero-RTT tickets, and a producer without the mux cannot open them. Upgrade producers before the consumers that mint tickets.
 - `velo_streaming_producer_send_backpressure_total` changes meaning. See [Saturation](../operations/saturation.md).
-- A slow consumer is killed by the slot byte budget (`withheld_overflow`), not by the heartbeat watchdog after 15 seconds. See [Saturation](../operations/saturation.md).
+- A producer that runs the slot byte budget ahead of its consumer waits in `send`. The stream is not killed. See [Saturation](../operations/saturation.md).
 
 ## Rulings
 
@@ -111,11 +111,13 @@ Dense slot reuse without a generation delivers a stale record to the stream that
 
 When frame credit and the byte cap disagree, the receiver withholds the next grant. Refusing a record whose frame credit was already granted breaks a stream for a peer that obeyed every rule. The ingress hold is the one exception, because the alternative is unbounded growth behind a gap that can stay open.
 
-### Drain every inlet, and do not split control from data
+### Drain every inlet up to the byte budget, and do not split control from data
 
 The first design split the egress inlet into an unbounded control lane and a bounded data lane. `FrameTransport::connect` returns one `flume::Sender<Vec<u8>>`, and in that byte channel a terminal and a token look the same. A split needs a typed sink in the `velo-ext` trait, which is a breaking change to a published crate.
 
-The batcher instead drains every inlet, with or without credit, into a per-slot withheld queue that the slot byte budget bounds. A synchronous terminal send then never targets a channel that stays full. The cost is the per-slot kill: a producer that runs past the byte cap on a slot nobody drains loses that slot.
+The batcher instead drains every inlet, with or without credit, into a per-slot withheld queue that the slot byte budget bounds. At the budget, the batcher stops pulling from that inlet, and the producer's `send` waits. A synchronous terminal send on a full inlet waits in a task, so it does not block its caller.
+
+The first version killed the slot at the budget instead of pausing. That killed every producer faster than one credit round trip, including producers whose consumer was draining. A 10,000-record stream of 1 KiB records over loopback died after 1,128 records.
 
 ### Control is coalesced state, bounded by allocation
 
@@ -235,7 +237,7 @@ The first hypothesis was half right. It named the right call site (`finalize`, `
 
 The real mechanism: `std::thread::available_parallelism()` returned 1 on that host (while `nproc` reported 128), so the test runtime had one worker. The synchronous send blocked that worker. The batcher, the only task that can make room, did not run again, and runtime shutdown waited on the blocked worker. With W workers, W concurrent blocking terminal sends wedge the runtime. A decode engine that finalizes many starved streams at once is that case.
 
-The fix is `send_terminal`. It calls `try_send`. On a full channel it hands the record to a task that awaits space. The task holds a sender clone, so the receiver cannot see end-of-stream before the sentinel. With no runtime on the thread, it blocks. The invariant is structural: no terminal send blocks a runtime-owned thread, at any credit, stream count or runtime size. `tokio::task::block_in_place` was rejected because it panics on a `current_thread` runtime.
+The fix is `send_terminal`. It calls `try_send`. On a full channel it hands the record to a task that awaits space. The task holds a sender clone, so the receiver cannot see end-of-stream before the sentinel. With no runtime on the thread, the task runs on the runtime the sender was made on. The invariant is structural: no terminal send blocks a runtime-owned thread, at any credit, stream count or runtime size. `tokio::task::block_in_place` was rejected because it panics on a `current_thread` runtime.
 
 `detach` clears the attachment flag only after the sentinel is in the channel. Otherwise a sender that re-attaches in the gap puts its records ahead of the `Detached` frame.
 
@@ -266,8 +268,8 @@ Mutation testing showed that both original tests were blind: under a mutation th
 
 These properties of the current code are known and not yet changed:
 
-- **The sweep does not reclaim credit for a consumer that is gone.** A consumer that is gone counts no drains, so its slot is closed instead. A consumer that ends its own stream, a watchdog firing and a cancel each close the slot and tell the sender. Every removal of a single-sender anchor goes through the entry's `Drop`, which closes the slot. An MPSC anchor keeps the older behavior: its slot waits for the next record, which finds the receiver gone and closes the slot with `UnknownSlot`.
+- **The sweep does not reclaim credit for a consumer that is gone.** A consumer that is gone counts no drains, so its slot is closed instead. A consumer that ends its own stream, a watchdog firing and a cancel each close the slot and tell the sender. Every removal of a single-sender anchor goes through the entry's `Drop`, which closes the slot. An MPSC anchor closes each sender's slot when that sender's pump ends without a terminal, including when the anchor is cancelled while the pump waits on a full anchor channel.
 - **The per-peer drain flag map never shrinks.** A claimed slot's `DrainSignal` holds its peer's flag as an `Arc` for the life of its stream. Removing the map entry while such a stream lives leaves its consumer setting a flag that nothing reads. That peer's credit then falls back to the periodic sweep. Removal must happen under the same visibility that retires slots and binds.
 - **A fence lift can queue behind opens.** Under `async_open_ack`, the batcher polls the opens channel ahead of coalesced control. While opens for a peer are queued, the resolution that lifts a fence waits.
-- **`velo_streaming_mux_live_slots` counts a slot killed while fenced.** Its registry entry survives until the admission resolves, which can be the rest of the epoch.
+- **`velo_streaming_mux_live_slots` counts a slot whose producer left while it was fenced.** Its registry entry survives until the admission resolves, which can be the rest of the epoch.
 - **MPSC local `Drop` blocks.** See [A terminal send wedged the runtime](#a-terminal-send-wedged-the-runtime).

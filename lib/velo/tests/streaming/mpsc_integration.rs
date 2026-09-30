@@ -534,3 +534,39 @@ async fn test_mpsc_controller_cancel_idempotent() {
     c2.cancel(); // second call must not panic or double-remove
     drop(anchor);
 }
+
+/// A local MPSC sender parked on a full anchor channel wakes with an error when
+/// the consumer cancels, even though the consumer still holds the anchor.
+///
+/// Holding the anchor keeps its channel open, so only the cancel can end the
+/// wait. The task hands the sender back rather than dropping it: a local MPSC
+/// sender's `Drop` blocks while the channel is full, which is a separate, known
+/// limit, and the anchor is dropped first so that `Drop` finds it closed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_local_sender_parked_on_a_full_channel_wakes_on_cancel() {
+    let mgr = make_manager();
+    let anchor = mgr.create_mpsc_anchor_with_config::<u32>(velo::streaming::MpscAnchorConfig {
+        channel_capacity: Some(1),
+        ..Default::default()
+    });
+    let sender = mgr
+        .attach_mpsc_stream_anchor::<u32>(anchor.handle())
+        .await
+        .expect("attach");
+    sender.send(0).await.expect("fill the channel");
+    let parked = tokio::spawn(async move {
+        let result = sender.send(1).await;
+        (result, sender)
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(!parked.is_finished(), "the channel is full, so send waits");
+
+    anchor.controller().cancel();
+    let (result, sender) = tokio::time::timeout(std::time::Duration::from_secs(5), parked)
+        .await
+        .expect("send never returned after the cancel")
+        .expect("sender task panicked");
+    assert!(result.is_err(), "a cancelled stream refuses the send");
+    drop(anchor);
+    drop(sender);
+}
