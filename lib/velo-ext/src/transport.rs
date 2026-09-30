@@ -315,8 +315,8 @@ pub trait Transport: Send + Sync {
     ///   for it (peer unregistered, transport not started, oversized frame):
     ///   there is nothing left for the caller to wait on either way.
     /// - [`SendOutcome::Pending`] — the channel was saturated, so the frame is
-    ///   queued in the target's [`AdmissionGate`](crate::admission::AdmissionGate)
-    ///   behind its predecessors. The returned
+    ///   queued in the [`AdmissionGate`](crate::admission::AdmissionGate) of the
+    ///   target's lane (lane 0 here) behind its predecessors. The returned
     ///   [`SendAdmission`](crate::admission::SendAdmission) resolves `Ok(())` when the frame is
     ///   enqueued and `Err` when it never will be (the connection epoch died,
     ///   the channel closed). Delivery does **not** depend on the caller
@@ -397,8 +397,8 @@ pub trait Transport: Send + Sync {
 
     /// Largest single message this transport will carry to `target`, in bytes.
     ///
-    /// The number bounds `header.len() + payload.len()` for one
-    /// [`send_message`](Transport::send_message) — the *combined* frame
+    /// The number bounds `header.len() + payload.len()` for one send on any
+    /// lane — the *combined* frame
     /// content, not the payload alone. A caller that prepends its own envelope
     /// to the payload subtracts that envelope from this number; there is no
     /// second allowance hiding behind it.
@@ -503,7 +503,8 @@ pub trait Transport: Send + Sync {
 
     /// Check if a registered peer is reachable and healthy.
     ///
-    /// Returns `Ok(())` if the peer responds within the timeout. Different
+    /// Returns `Ok(())` if the peer responds within the timeout. On a
+    /// transport with lanes, a peer with any live lane is healthy. Different
     /// transports implement this differently:
     /// - NATS: request/reply to health subject
     /// - TCP: check existing connection or attempt new connection

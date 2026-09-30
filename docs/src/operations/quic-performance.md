@@ -71,11 +71,11 @@ Measured on 2026-09-29 with the `throughput` example in its two-host mode. The s
 
 - Small messages cost about 25 µs more per round trip than on TCP, as on loopback. The network does not change this cost: it comes from the task hops inside quinn. With many messages in flight the gap closes, and pipelined QUIC matches TCP.
 - One QUIC connection tops out at about 0.8 GB/s, the same ceiling as on loopback on the same node type. So the limit is the CPU of the connection, not the network. A profile of the 64 KiB case put about 15% of the samples in AES-GCM. The rest was quinn's packet work, the kernel's UDP path, and task wakeups. TCP moves about 3.9 GB/s, because the kernel and the NIC offloads share that work.
-- A peer that needs more than about 0.8 GB/s needs more than one connection. The Dynamo response plane on the cluster carries far less than that per connection (see below).
+- A peer that needs more than about 0.8 GB/s needs more than one connection; see [Lanes](#lanes). The Dynamo response plane on the cluster carries far less than that per connection (see below).
 
 ## Lanes
 
-A peer that needs more than about 0.8 GB/s needs more than one connection. With `lanes(n)`, each peer gets up to `n` connections, one for each lane used, each dialed from its own UDP socket. Each lane has its own quinn endpoint driver, shared by every peer dialed on that lane, and each connection has its own connection driver. The work runs on up to `n` cores.
+With `lanes(n)`, each peer gets up to `n` connections, one for each lane used, each dialed from its own UDP socket. Each lane has its own quinn endpoint driver, shared by every peer dialed on that lane, and each connection has its own connection driver. The work runs on up to `n` cores.
 
 The messenger sends its own traffic on lane 0. Only a caller that sends with `send_message_on_lane` uses the other lanes, so `lanes(n)` alone does not change the throughput of ordinary messages.
 

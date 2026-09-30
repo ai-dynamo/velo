@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Ordered per-target send admission.
+//! Ordered send admission, per target (and lane).
 //!
 //! ## The hazard this exists to fix
 //!

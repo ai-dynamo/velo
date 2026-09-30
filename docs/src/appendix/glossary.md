@@ -4,7 +4,7 @@
 |---|---|
 | Active message | A message that names a handler on the remote instance. The handler runs when the message arrives. |
 | Admission | The step where a transport puts an inbound request on the queue with `TransportAdapter::admit_message`. Admission takes the in-flight guard. |
-| Admission gate | The per-target queue that holds sends while the bounded send channel is full |
+| Admission gate | The queue for one target (and lane) that holds sends while the bounded send channel is full |
 | Anchor | The consumer end of a stream. It has a `u128` handle that a producer uses to attach. |
 | Attach | The `_anchor_attach` round trip that connects a producer to an anchor |
 | Batch | One messenger frame that carries records from many streams to one peer |

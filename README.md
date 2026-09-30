@@ -26,6 +26,8 @@ Application authors depend on `velo` only. See [Workspace crates](docs/src/devel
 
 Streams to one peer can share its connection through the messenger mux. What the mux costs a serving frontend, and how that was measured, is in [Response-plane performance](docs/src/operations/response-plane-performance.md).
 
+QUIC can keep several lanes, each its own connection, to one peer. See [Lanes](docs/src/operations/quic-performance.md#lanes).
+
 ## Quick start
 
 ```bash
