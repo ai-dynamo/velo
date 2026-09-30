@@ -250,8 +250,19 @@ async fn a_singleton_failing_after_its_slot_closed_does_not_fail_the_epoch() {
         .send(cached_finalized().clone())
         .expect("queue terminal");
     eventually(|| inlet.is_disconnected()).await;
-    // Drain the terminal's batch so the next assertions read a quiet wire.
-    while harness.try_next_batch().is_some() {}
+    // Wait for the terminal's own batch, so the reopen below reads its own
+    // `OpenSlot`. The inlet reads as closed as soon as the batcher closes the
+    // slot, but the batch still has to cross the loopback messenger pair. A
+    // non-blocking drain here lost that race under a loaded CI runner, and
+    // the late batch (data and close, two records) failed the reopen's
+    // "OpenSlot is flushed on its own" check.
+    while !harness
+        .next_batch()
+        .await
+        .records
+        .iter()
+        .any(|r| r.kind == RecordType::CloseSlot && r.slot == stale)
+    {}
 
     // The index comes back under a new generation.
     let (reopened_inlet, reopened) = harness.open(1, 2).await;
