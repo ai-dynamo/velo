@@ -98,11 +98,14 @@ impl TcpTransportBuilder {
     ///
     /// An explicit size turns autotuning off, and Linux clamps it to
     /// `net.core.rmem_max`/`wmem_max`: with the common value of 212,992, 2 MiB
-    /// becomes a locked 416 KB, which caps the TCP window near 256 KB.
+    /// becomes a locked buffer that caps the TCP window at about 208 KiB.
     /// Autotuning grows the buffers up to `net.ipv4.tcp_rmem`/`tcp_wmem`
-    /// instead. `None` is faster for one-way bulk and streaming traffic. The
+    /// instead. `None` is faster for one-way bulk traffic across nodes. The
     /// default is faster for request and reply. The Transports chapter of the
     /// book has the measurements.
+    ///
+    /// A listener that the caller sized before `from_listener` keeps its size:
+    /// `None` does not undo it.
     pub fn socket_buffers(mut self, bytes: Option<usize>) -> Self {
         self.socket_buffers = bytes;
         self

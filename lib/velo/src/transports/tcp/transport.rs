@@ -262,18 +262,23 @@ impl TcpTransport {
             addr,
             instance_id,
             rx,
-            WriterTaskContext {
-                connections: Arc::clone(&self.connections),
-                cancel_token: self.cancel_token.clone(),
-                connect_timeout: self.connect_timeout,
-                reader_ctx: self.dialed_ctx.get().cloned(),
-                metrics: self.metrics.get().cloned(),
-                socket_buffers: self.socket_buffers,
-            },
+            self.writer_context(),
         ));
 
         debug!("Created new connection to {} ({})", instance_id, addr);
         Ok(handle)
+    }
+
+    /// What each connection writer gets from the transport.
+    fn writer_context(&self) -> WriterTaskContext {
+        WriterTaskContext {
+            connections: Arc::clone(&self.connections),
+            cancel_token: self.cancel_token.clone(),
+            connect_timeout: self.connect_timeout,
+            reader_ctx: self.dialed_ctx.get().cloned(),
+            metrics: self.metrics.get().cloned(),
+            socket_buffers: self.socket_buffers,
+        }
     }
 
     fn update_peer_gauge(&self) {
@@ -620,21 +625,12 @@ async fn connection_writer_task(
     result
 }
 
-/// Inner loop: connect, configure the socket, and send frames until the channel
-/// closes, a write error occurs, or the reader sees the peer close the socket.
-async fn connection_writer_inner(
-    addr: SocketAddr,
-    instance_id: crate::InstanceId,
-    rx: &flume::Receiver<SendTask>,
-    ctx: &WriterTaskContext,
-) -> Result<()> {
-    let cancel_token = &ctx.cancel_token;
-    let reader_ctx = ctx.reader_ctx.clone();
-    let metrics = ctx.metrics.clone();
+/// Connect to `addr` and set up the socket before its first write, or `None`
+/// when the transport is cancelled first.
+async fn dial(addr: SocketAddr, ctx: &WriterTaskContext) -> Result<Option<TcpStream>> {
     debug!("Connecting to {}", addr);
-
     let stream = tokio::select! {
-        _ = cancel_token.cancelled() => return Ok(()),
+        _ = ctx.cancel_token.cancelled() => return Ok(None),
         res = tokio::time::timeout(ctx.connect_timeout, TcpStream::connect(addr)) => {
             res.context("connect timeout")?.context("connect failed")?
         },
@@ -659,6 +655,23 @@ async fn connection_writer_inner(
     super::listener::size_socket_buffers(&stream, ctx.socket_buffers);
 
     debug!("Connected to {}", addr);
+    Ok(Some(stream))
+}
+
+/// Inner loop: connect, configure the socket, and send frames until the channel
+/// closes, a write error occurs, or the reader sees the peer close the socket.
+async fn connection_writer_inner(
+    addr: SocketAddr,
+    instance_id: crate::InstanceId,
+    rx: &flume::Receiver<SendTask>,
+    ctx: &WriterTaskContext,
+) -> Result<()> {
+    let cancel_token = &ctx.cancel_token;
+    let reader_ctx = ctx.reader_ctx.clone();
+    let metrics = ctx.metrics.clone();
+    let Some(stream) = dial(addr, ctx).await? else {
+        return Ok(());
+    };
 
     // The peer's listener replies on THIS socket when it rejects a Message
     // during drain (a ShuttingDown frame echoing the header). Split the
