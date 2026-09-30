@@ -53,6 +53,13 @@ const FAIL_REPORT_GRACE: Duration = Duration::from_millis(500);
 mod builder;
 pub use builder::QuicTransportBuilder;
 
+/// This dialer's offset into a peer's server sockets, taken from its own
+/// certificate fingerprint. The fingerprint is random per transport, so dialers
+/// spread over a peer's sockets without coordinating.
+pub(super) fn lane_offset(fingerprint: &tls::Fingerprint) -> u16 {
+    u16::from_le_bytes([fingerprint[0], fingerprint[1]])
+}
+
 /// One connection per peer and lane. Lane 0 is the only lane unless the
 /// builder asked for more.
 type LaneKey = (crate::InstanceId, u16);
@@ -92,8 +99,6 @@ pub struct QuicTransport {
     transport_config: Arc<quinn::TransportConfig>,
     endpoint_config: quinn::EndpointConfig,
     server_endpoints: OnceLock<Vec<quinn::Endpoint>>,
-    /// The port of each server socket, as advertised.
-    server_ports: Vec<u16>,
     /// Indexed by lane.
     client_endpoints: OnceLock<Vec<quinn::Endpoint>>,
     lanes: std::num::NonZeroU16,
@@ -111,11 +116,10 @@ pub struct QuicTransport {
 
 /// A registered peer: where to dial, and the TLS config that pins its
 /// certificate.
-#[derive(Clone)]
 struct PeerEntry {
     addr: SocketAddr,
-    /// The port of each of the peer's server sockets. Empty for a peer that
-    /// predates per-socket ports, whose every lane dials `addr`.
+    /// The port of each of the peer's server sockets; never empty. A peer that
+    /// predates per-socket ports advertises none, and gets the port of `addr`.
     ports: Vec<u16>,
     client_config: quinn::ClientConfig,
 }
@@ -127,11 +131,10 @@ impl PeerEntry {
     /// different sockets, and the lane 0 of many dialers does not pile onto
     /// socket 0.
     fn lane_addr(&self, lane: u16, offset: u16) -> SocketAddr {
-        if self.ports.is_empty() {
-            return self.addr;
-        }
         let index = (usize::from(offset) + usize::from(lane)) % self.ports.len();
-        SocketAddr::new(self.addr.ip(), self.ports[index])
+        let mut addr = self.addr;
+        addr.set_port(self.ports[index]);
+        addr
     }
 }
 
@@ -396,7 +399,11 @@ impl Transport for QuicTransport {
             peer_info.instance_id(),
             PeerEntry {
                 addr,
-                ports: info.ports,
+                ports: if info.ports.is_empty() {
+                    vec![addr.port()]
+                } else {
+                    info.ports
+                },
                 client_config,
             },
         );
@@ -493,9 +500,17 @@ impl Transport for QuicTransport {
             let _ = self.server_endpoints.set(servers);
             self.runtime.set(rt).ok();
 
+            let ports: Vec<u16> = self
+                .server_endpoints
+                .get()
+                .into_iter()
+                .flatten()
+                .filter_map(|endpoint| endpoint.local_addr().ok())
+                .map(|addr| addr.port())
+                .collect();
             info!(
-                "QUIC transport started on {} (server ports {:?})",
-                self.bind_addr, self.server_ports
+                "QUIC transport started on {} (server ports {ports:?})",
+                self.bind_addr
             );
             Ok(())
         })
@@ -604,25 +619,25 @@ impl Transport for QuicTransport {
                 self.reap_stale_connection(key);
             }
 
-            let peer = self
-                .peers
-                .get(&instance_id)
-                .ok_or(HealthCheckError::PeerNotRegistered)?
-                .value()
-                .clone();
+            // The socket this dialer's lane 0 uses, so the probe and the lane
+            // agree on what is reachable.
+            let (addr, client_config) = {
+                let peer = self
+                    .peers
+                    .get(&instance_id)
+                    .ok_or(HealthCheckError::PeerNotRegistered)?;
+                (
+                    peer.lane_addr(0, self.lane_offset),
+                    peer.client_config.clone(),
+                )
+            };
             let endpoint = self
                 .client_endpoints
                 .get()
                 .and_then(|endpoints| endpoints.first())
                 .ok_or(HealthCheckError::ConnectionFailed)?;
-            // The socket this dialer's lane 0 uses, so the probe and the lane
-            // agree on what is reachable.
             let connecting = endpoint
-                .connect_with(
-                    peer.client_config.clone(),
-                    peer.lane_addr(0, self.lane_offset),
-                    tls::SERVER_NAME,
-                )
+                .connect_with(client_config, addr, tls::SERVER_NAME)
                 .map_err(|_| HealthCheckError::ConnectionFailed)?;
             match tokio::time::timeout(timeout, connecting).await {
                 Ok(Ok(connection)) => {
