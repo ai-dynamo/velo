@@ -54,9 +54,10 @@ pub(super) struct BufferSizes {
 ///
 /// With a fixed requested port `P`, the sockets bind `P` to `P + count - 1`, so
 /// an operator who opens the ports in a firewall knows which ones to open.
-/// With port 0, each socket takes an ephemeral port. All bind the same IP. The peer learns every port from [`QuicEndpointInfo::ports`] and
-/// dials lane `k` on socket `(offset + k) % count`, where `offset` is fixed per
-/// dialer. So the lanes of one dialer land on different sockets, each with its
+/// With port 0, each socket takes an ephemeral port. All bind the same IP.
+///
+/// The peer learns every port from [`QuicEndpointInfo::ports`] and dials lane
+/// `k` on socket `(offset + k) % count`, where `offset` is fixed per dialer. So the lanes of one dialer land on different sockets, each with its
 /// own quinn endpoint driver and receive buffer.
 ///
 /// An earlier design put every socket on one port in a `SO_REUSEPORT` group.
@@ -69,27 +70,36 @@ pub(super) fn bind_server_sockets(
     buffers: BufferSizes,
 ) -> Result<Vec<std::net::UdpSocket>> {
     let count = count.max(1);
+    // All ports are worked out before any socket binds, so a range past 65535
+    // fails without leaving sockets behind.
+    let ports: Vec<u16> = if requested.port() == 0 {
+        vec![0; count]
+    } else {
+        let last = u16::try_from(count - 1)
+            .ok()
+            .and_then(|extra| requested.port().checked_add(extra))
+            .with_context(|| {
+                format!(
+                    "QUIC server_endpoints({count}) needs ports {} to {} + {}, past 65535",
+                    requested.port(),
+                    requested.port(),
+                    count - 1
+                )
+            })?;
+        (requested.port()..=last).collect()
+    };
     let mut sockets = Vec::with_capacity(count);
-    for index in 0..count {
-        let port = if requested.port() == 0 {
-            0
-        } else {
-            u16::try_from(index)
-                .ok()
-                .and_then(|offset| requested.port().checked_add(offset))
-                .with_context(|| {
-                    format!(
-                        "QUIC server socket {index} needs port {} + {index}, past 65535",
-                        requested.port()
-                    )
-                })?
-        };
-        let addr = SocketAddr::new(requested.ip(), port);
+    for (index, port) in ports.into_iter().enumerate() {
+        // `set_port` keeps an IPv6 scope id and flow info.
+        let mut addr = requested;
+        addr.set_port(port);
         let socket = new_udp_socket(addr)?;
         size_buffers(&socket, buffers);
-        socket
-            .bind(&addr.into())
-            .with_context(|| format!("failed to bind QUIC server socket {index} on {addr}"))?;
+        socket.bind(&addr.into()).with_context(|| {
+            format!(
+                "failed to bind QUIC server socket {index} of server_endpoints({count}) on {addr}"
+            )
+        })?;
         sockets.push(socket.into());
     }
     Ok(sockets)
@@ -181,14 +191,6 @@ mod tests {
         assert_eq!(ports.len(), 4, "every socket is reachable on its own port");
     }
 
-    #[test]
-    fn the_client_socket_is_not_in_the_server_group() {
-        let server = bind_server_sockets("127.0.0.1:0".parse().unwrap(), 2, SMALL).unwrap();
-        let server_addr = server[0].local_addr().unwrap();
-        let client = bind_client_socket(server_addr, SMALL).unwrap();
-        assert_ne!(client.local_addr().unwrap().port(), server_addr.port());
-    }
-
     /// A fixed port opens consecutive ports, so an operator knows what to
     /// allow through a firewall.
     #[test]
@@ -224,6 +226,8 @@ mod tests {
         assert!(bind_server_sockets(requested, 2, SMALL).is_err());
     }
 
+    /// No other socket can bind a server port. A server socket with
+    /// `SO_REUSEADDR` or `SO_REUSEPORT` would let any process take one.
     #[test]
     fn an_unrelated_bind_cannot_take_a_server_port() {
         let server = bind_server_sockets("127.0.0.1:0".parse().unwrap(), 2, SMALL).unwrap();
@@ -259,6 +263,23 @@ mod tests {
         let decoded = QuicEndpointInfo::decode(&info.encode().unwrap()).unwrap();
         assert_eq!(decoded.fingerprint, [7; 32]);
         assert_eq!(decoded.ports, vec![5000, 5001]);
+    }
+
+    /// A peer that predates per-socket ports decodes an entry that has them:
+    /// the unknown field is skipped.
+    #[test]
+    fn an_old_peer_decodes_an_entry_with_ports() {
+        #[derive(Deserialize)]
+        struct Before {
+            fingerprint: Fingerprint,
+        }
+        let info = QuicEndpointInfo {
+            endpoints: vec![],
+            fingerprint: [5; 32],
+            ports: vec![5000, 5001],
+        };
+        let old: Before = rmp_serde::from_slice(&info.encode().unwrap()).unwrap();
+        assert_eq!(old.fingerprint, [5; 32]);
     }
 
     /// An entry from a peer that predates per-socket ports has no `ports`, and still

@@ -73,7 +73,9 @@ impl QuicTransportBuilder {
     ///
     /// With a fixed port `P`, the transport binds one server socket per
     /// [`server_endpoints`](Self::server_endpoints), on ports `P` to
-    /// `P + n - 1`. Open all of them in a firewall; a peer dials each of them.
+    /// `P + n - 1`. Open all of them in a firewall: peers spread over them,
+    /// ordinary traffic included. Transports on one host need fixed ports at
+    /// least `n` apart.
     pub fn bind_addr(mut self, addr: SocketAddr) -> Self {
         self.bind_addr = Some(addr);
         self
@@ -118,7 +120,7 @@ impl QuicTransportBuilder {
     /// the sockets too. Each socket costs a port, a quinn endpoint and its
     /// receive buffers.
     pub fn server_endpoints(mut self, count: usize) -> Self {
-        self.server_endpoints = count.max(1);
+        self.server_endpoints = count;
         self
     }
 
@@ -249,7 +251,7 @@ impl QuicTransportBuilder {
         let info = QuicEndpointInfo {
             endpoints,
             fingerprint: identity.fingerprint,
-            ports: ports.clone(),
+            ports,
         };
         let mut addr_builder = crate::transports::address::WorkerAddressBuilder::new();
         addr_builder.add_entry(key.clone(), info.encode()?)?;
@@ -278,7 +280,6 @@ impl QuicTransportBuilder {
             client_endpoints: OnceLock::new(),
             lanes: self.lanes,
             lane_offset: u16::from_le_bytes([identity.fingerprint[0], identity.fingerprint[1]]),
-            server_ports: ports,
             local_interfaces: OnceLock::new(),
             numa_hint: self.numa_hint,
             metrics: OnceLock::new(),

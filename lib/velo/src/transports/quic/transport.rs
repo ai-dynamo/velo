@@ -92,8 +92,6 @@ pub struct QuicTransport {
     transport_config: Arc<quinn::TransportConfig>,
     endpoint_config: quinn::EndpointConfig,
     server_endpoints: OnceLock<Vec<quinn::Endpoint>>,
-    /// The port of each server socket, as advertised.
-    server_ports: Vec<u16>,
     /// Indexed by lane.
     client_endpoints: OnceLock<Vec<quinn::Endpoint>>,
     lanes: std::num::NonZeroU16,
@@ -493,9 +491,17 @@ impl Transport for QuicTransport {
             let _ = self.server_endpoints.set(servers);
             self.runtime.set(rt).ok();
 
+            let ports: Vec<u16> = self
+                .server_endpoints
+                .get()
+                .into_iter()
+                .flatten()
+                .filter_map(|endpoint| endpoint.local_addr().ok())
+                .map(|addr| addr.port())
+                .collect();
             info!(
-                "QUIC transport started on {} (server ports {:?})",
-                self.bind_addr, self.server_ports
+                "QUIC transport started on {} (server ports {ports:?})",
+                self.bind_addr
             );
             Ok(())
         })
@@ -604,25 +610,25 @@ impl Transport for QuicTransport {
                 self.reap_stale_connection(key);
             }
 
-            let peer = self
-                .peers
-                .get(&instance_id)
-                .ok_or(HealthCheckError::PeerNotRegistered)?
-                .value()
-                .clone();
+            // The socket this dialer's lane 0 uses, so the probe and the lane
+            // agree on what is reachable.
+            let (addr, client_config) = {
+                let peer = self
+                    .peers
+                    .get(&instance_id)
+                    .ok_or(HealthCheckError::PeerNotRegistered)?;
+                (
+                    peer.lane_addr(0, self.lane_offset),
+                    peer.client_config.clone(),
+                )
+            };
             let endpoint = self
                 .client_endpoints
                 .get()
                 .and_then(|endpoints| endpoints.first())
                 .ok_or(HealthCheckError::ConnectionFailed)?;
-            // The socket this dialer's lane 0 uses, so the probe and the lane
-            // agree on what is reachable.
             let connecting = endpoint
-                .connect_with(
-                    peer.client_config.clone(),
-                    peer.lane_addr(0, self.lane_offset),
-                    tls::SERVER_NAME,
-                )
+                .connect_with(client_config, addr, tls::SERVER_NAME)
                 .map_err(|_| HealthCheckError::ConnectionFailed)?;
             match tokio::time::timeout(timeout, connecting).await {
                 Ok(Ok(connection)) => {

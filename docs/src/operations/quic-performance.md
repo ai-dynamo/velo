@@ -90,7 +90,7 @@ Measured on 2026-09-29 across the same two nodes as above, 64 KiB messages pipel
 
 The UDP receive-buffer error count stayed below 50 in each run, so the gain comes from more cores, not from more socket buffers. 64 B pipelined messages do not change with the lane count.
 
-Two lanes on one server socket share its endpoint driver. So each server socket has its own port, and a dialer sends each lane to a different socket. The prototype instead put all server sockets on one port in a `SO_REUSEPORT` group, where the kernel hashes each connection to a socket at random. The table below shows what that cost with 8 lanes. It ran in a separate job on another pair of nodes, so its 32-socket row differs from the table above by run-to-run spread.
+Two lanes on one server socket share its endpoint driver. So each server socket has its own port, and a dialer sends lane `k` to socket `(offset + k) % n`. With at least as many sockets as lanes, each lane of a dialer has its own socket. The prototype instead put all server sockets on one port in a `SO_REUSEPORT` group, where the kernel hashes each connection to a socket at random. The table below shows what that cost with 8 lanes. It ran in a separate job on another pair of nodes, so its 32-socket row differs from the table above by run-to-run spread.
 
 | Server sockets in the reuse-port group | MB/s |
 |---|---|
@@ -100,9 +100,9 @@ Two lanes on one server socket share its endpoint driver. So each server socket 
 
 With one port for each socket, 8 lanes should need only 8 server sockets on the receiving node. That follows from the design and is not measured yet.
 
-A fixed `bind_addr` port `P` binds ports `P` to `P + n - 1`, one for each server socket. Open all of them in a firewall.
+A fixed `bind_addr` port `P` binds ports `P` to `P + n - 1`, one for each server socket. Peers spread over all of them, ordinary traffic included, so open all of them in a firewall. Transports on one host need fixed ports at least `n` apart.
 
-During a rolling upgrade, a peer without per-socket ports dials only the first port, so all such peers share one server socket. Upgrade the dialers before the receivers.
+During a rolling upgrade both directions work. A peer without per-socket ports dials only the first port of a new node, so until it upgrades it shares that socket with the other old peers.
 
 The same prototype on TCP did not scale: 2.6–3.4 GB/s with 1 lane, and 2.9–3.8 GB/s with 2, 4 or 8 lanes. The limit for TCP is not the connection, so the TCP transport keeps one lane.
 

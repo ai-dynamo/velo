@@ -1478,10 +1478,10 @@ fn lane_addresses_spread_over_the_peers_sockets() {
     assert_eq!(ports, vec![5002, 5003, 5000, 5001]);
     assert!((0..4).all(|lane| peer.lane_addr(lane, 6).ip() == addr.ip()));
 
-    let before_lanes = super::PeerEntry {
+    let no_ports = super::PeerEntry {
         addr,
         ports: vec![],
         client_config,
     };
-    assert!((0..4).all(|lane| before_lanes.lane_addr(lane, 6) == addr));
+    assert!((0..4).all(|lane| no_ports.lane_addr(lane, 6) == addr));
 }
