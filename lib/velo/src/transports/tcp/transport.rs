@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use dashmap::DashMap;
 use std::net::SocketAddr;
+use std::num::NonZeroU16;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
@@ -32,11 +33,21 @@ use super::writer::TcpWriterObserver;
 use crate::transports::coalesce::{EgressMetrics, run_coalescing_writer};
 use crate::transports::ingress::{DialedReaderContext, run_dialed_reader};
 
+mod builder;
+pub use builder::TcpTransportBuilder;
+
+/// One connection per peer and lane. Lane 0 is the only lane unless the
+/// builder asked for more.
+type LaneKey = (crate::InstanceId, u16);
+
 /// High-performance TCP transport with lock-free concurrent access
 ///
 /// This transport uses `DashMap` for lock-free concurrent access to connection state.
 /// Tasks are spawned using `tokio::spawn` for compatibility with the `Transport` trait.
 /// For single-threaded performance, run the entire transport in a `LocalSet` context.
+///
+/// It keeps up to [`TcpTransportBuilder::lanes`] connections to each peer, one
+/// for each lane used.
 pub struct TcpTransport {
     // Identity (immutable, no wrapper needed)
     key: TransportKey,
@@ -45,7 +56,11 @@ pub struct TcpTransport {
 
     // Shared mutable state with DashMap (lock-free)
     peers: Arc<DashMap<crate::InstanceId, SocketAddr>>,
-    connections: Arc<DashMap<crate::InstanceId, ConnectionHandle>>,
+    connections: Arc<DashMap<LaneKey, ConnectionHandle>>,
+
+    // Ordered channels to each peer, each its own connection, dialed on the
+    // first send on that lane. Set by the builder; `new()` gives 1.
+    lanes: NonZeroU16,
 
     // Runtime handle for spawning tasks
     runtime: OnceLock<tokio::runtime::Handle>,
@@ -75,6 +90,9 @@ pub struct TcpTransport {
     // Listener read-buffer shrink threshold (bytes). Plumbed into TcpListener
     // at start() time. Resolved from env or default in new().
     shrink_threshold: usize,
+    /// `SO_RCVBUF`/`SO_SNDBUF` for every TCP socket, or `None` for the
+    /// kernel's autotuning. See [`TcpTransportBuilder::socket_buffers`].
+    socket_buffers: Option<usize>,
 
     // Context for each dialed connection's read loop (the path that surfaces
     // the peer's ShuttingDown drain rejections). Set in start(), before
@@ -154,6 +172,7 @@ impl TcpTransport {
             local_address,
             peers: Arc::new(DashMap::new()),
             connections: Arc::new(DashMap::new()),
+            lanes: NonZeroU16::MIN,
             runtime: OnceLock::new(),
             cancel_token: CancellationToken::new(),
             shutdown_state: OnceLock::new(),
@@ -164,6 +183,7 @@ impl TcpTransport {
             numa_hint,
             metrics: OnceLock::new(),
             shrink_threshold: super::listener::default_shrink_threshold(),
+            socket_buffers: Some(super::listener::DEFAULT_SOCKET_BUFFERS),
             dialed_ctx: OnceLock::new(),
         }
     }
@@ -171,9 +191,10 @@ impl TcpTransport {
     /// Optional: Pre-establish connection after registration
     ///
     /// This can be called after `register()` to eagerly establish the TCP connection
-    /// instead of waiting for the first `send_message()` call.
+    /// instead of waiting for the first `send_message()` call. It connects
+    /// lane 0, the lane `send_message()` uses.
     pub fn ensure_connected(&self, instance_id: crate::InstanceId) -> Result<()> {
-        self.get_or_create_connection(instance_id)?;
+        self.get_or_create_connection((instance_id, 0))?;
         Ok(())
     }
 
@@ -182,32 +203,42 @@ impl TcpTransport {
     /// The predicate keeps us from evicting a successor that another task
     /// installed in the meantime; retiring before the entry disappears is what
     /// guarantees the old epoch's queued frames fail rather than linger.
-    fn reap_stale_connection(&self, instance_id: crate::InstanceId) {
+    fn reap_stale_connection(&self, key: LaneKey) {
         if let Some((_, stale)) = self
             .connections
-            .remove_if(&instance_id, |_, h| h.tx.is_disconnected())
+            .remove_if(&key, |_, h| h.tx.is_disconnected())
         {
             stale.retire();
             self.update_connection_gauge();
         }
     }
 
-    /// Get or create a connection to a peer (lazy initialization)
-    fn get_or_create_connection(&self, instance_id: crate::InstanceId) -> Result<ConnectionHandle> {
+    /// Get or create the connection for one peer and lane (lazy
+    /// initialization)
+    fn get_or_create_connection(&self, key: LaneKey) -> Result<ConnectionHandle> {
         // Fast path: connection already exists and is alive
-        if let Some(handle) = self.connections.get(&instance_id) {
+        if let Some(handle) = self.connections.get(&key) {
             if !handle.tx.is_disconnected() {
                 return Ok(handle.clone());
             }
             // Stale — drop guard before mutating the map
             drop(handle);
-            self.reap_stale_connection(instance_id);
+            self.reap_stale_connection(key);
         }
 
         let rt = self.runtime.get().ok_or(TransportError::NotStarted)?;
+        self.install_connection(key, rt)
+    }
 
+    /// Put a live connection in the map for `key`: the one already there if
+    /// it is live, else a new one.
+    fn install_connection(
+        &self,
+        key: LaneKey,
+        rt: &tokio::runtime::Handle,
+    ) -> Result<ConnectionHandle> {
         // Atomic check-and-insert via entry API
-        let handle = match self.connections.entry(instance_id) {
+        let handle = match self.connections.entry(key) {
             dashmap::mapref::entry::Entry::Occupied(mut entry) => {
                 if !entry.get().tx.is_disconnected() {
                     entry.get().clone()
@@ -216,29 +247,32 @@ impl TcpTransport {
                     // is installed, so no frame from the old connection can be
                     // observed as pending on the new one.
                     entry.get().retire();
-                    let handle = self.create_connection(instance_id, rt)?;
+                    let handle = self.create_connection(key, rt)?;
                     entry.insert(handle.clone());
-                    self.update_connection_gauge();
                     handle
                 }
             }
             dashmap::mapref::entry::Entry::Vacant(entry) => {
-                let handle = self.create_connection(instance_id, rt)?;
+                let handle = self.create_connection(key, rt)?;
                 entry.insert(handle.clone());
-                self.update_connection_gauge();
                 handle
             }
         };
-
+        // After the match, not inside it: the gauge reads `len()`, which
+        // read-locks every shard, and an occupied entry still holds its
+        // shard's write lock, which is not reentrant. The thread then waits
+        // on itself.
+        self.update_connection_gauge();
         Ok(handle)
     }
 
     /// Create a new connection handle and spawn the writer task.
     fn create_connection(
         &self,
-        instance_id: crate::InstanceId,
+        key: LaneKey,
         rt: &tokio::runtime::Handle,
     ) -> Result<ConnectionHandle> {
+        let (instance_id, lane) = key;
         let addr = *self
             .peers
             .get(&instance_id)
@@ -251,21 +285,25 @@ impl TcpTransport {
             tx,
         };
 
-        rt.spawn(connection_writer_task(
-            addr,
-            instance_id,
-            rx,
-            WriterTaskContext {
-                connections: Arc::clone(&self.connections),
-                cancel_token: self.cancel_token.clone(),
-                connect_timeout: self.connect_timeout,
-                reader_ctx: self.dialed_ctx.get().cloned(),
-                metrics: self.metrics.get().cloned(),
-            },
-        ));
+        rt.spawn(connection_writer_task(addr, key, rx, self.writer_context()));
 
-        debug!("Created new connection to {} ({})", instance_id, addr);
+        debug!(
+            "Created new connection to {} lane {} ({})",
+            instance_id, lane, addr
+        );
         Ok(handle)
+    }
+
+    /// What each connection writer gets from the transport.
+    fn writer_context(&self) -> WriterTaskContext {
+        WriterTaskContext {
+            connections: Arc::clone(&self.connections),
+            cancel_token: self.cancel_token.clone(),
+            connect_timeout: self.connect_timeout,
+            reader_ctx: self.dialed_ctx.get().cloned(),
+            metrics: self.metrics.get().cloned(),
+            socket_buffers: self.socket_buffers,
+        }
     }
 
     fn update_peer_gauge(&self) {
@@ -286,12 +324,12 @@ impl TcpTransport {
     /// A failure here is terminal for the frame, so it is reported through
     /// `on_error` and the send reports [`SendOutcome::Admitted`] — there is
     /// nothing for the caller to wait on.
-    fn slow_path_send(&self, instance_id: crate::InstanceId, send_msg: SendTask) -> SendOutcome {
+    fn slow_path_send(&self, key: LaneKey, send_msg: SendTask) -> SendOutcome {
         if self.runtime.get().is_none() {
             send_msg.on_error("Transport not started");
             return SendOutcome::Admitted;
         }
-        let handle = match self.get_or_create_connection(instance_id) {
+        let handle = match self.get_or_create_connection(key) {
             Ok(h) => h,
             Err(e) => {
                 send_msg.on_error(format!("Failed to create connection: {}", e));
@@ -367,6 +405,10 @@ impl Transport for TcpTransport {
         Ok(())
     }
 
+    fn lanes(&self, _target: crate::InstanceId) -> NonZeroU16 {
+        self.lanes
+    }
+
     #[inline]
     fn send_message(
         &self,
@@ -376,6 +418,26 @@ impl Transport for TcpTransport {
         message_type: MessageType,
         on_error: std::sync::Arc<dyn TransportErrorHandler>,
     ) -> SendOutcome {
+        self.send_message_on_lane(instance_id, 0, header, payload, message_type, on_error)
+    }
+
+    /// Each lane is its own connection with its own gate. If the connection
+    /// of a lane is dead, the next send on that lane dials a new one. A lane
+    /// never uses the connection of another lane, because that can reorder
+    /// it.
+    #[inline]
+    fn send_message_on_lane(
+        &self,
+        instance_id: crate::InstanceId,
+        lane: u16,
+        header: Bytes,
+        payload: Bytes,
+        message_type: MessageType,
+        on_error: std::sync::Arc<dyn TransportErrorHandler>,
+    ) -> SendOutcome {
+        // Modulo, not a clamp: a caller that maps flows with `flow % lanes`
+        // and one that passes a raw flow number land on the same lane.
+        let key: LaneKey = (instance_id, lane % self.lanes);
         let send_msg = SendTask {
             msg_type: message_type,
             header,
@@ -389,17 +451,17 @@ impl Transport for TcpTransport {
         // because a dead epoch's gate would swallow the frame; the gate itself
         // then decides admitted-vs-queued, so there is no `try_send` here that
         // could overtake a frame already queued behind it.
-        if let Some(handle) = self.connections.get(&instance_id) {
+        if let Some(handle) = self.connections.get(&key) {
             let live = (!handle.tx.is_disconnected()).then(|| handle.clone());
             // Release the shard guard before either admitting (which may spawn
             // a driver) or mutating the map.
             drop(handle);
             match live {
                 Some(handle) => return self.admit(&handle, send_msg),
-                None => self.reap_stale_connection(instance_id),
+                None => self.reap_stale_connection(key),
             }
         }
-        self.slow_path_send(instance_id, send_msg)
+        self.slow_path_send(key, send_msg)
     }
 
     fn start(
@@ -456,6 +518,7 @@ impl Transport for TcpTransport {
                 .transport_key(self.key.as_str())
                 .metrics(self.metrics.get().cloned())
                 .shrink_threshold(self.shrink_threshold)
+                .socket_buffers(self.socket_buffers)
                 .build()?;
 
             rt.spawn(async move {
@@ -505,18 +568,22 @@ impl Transport for TcpTransport {
         Box<dyn std::future::Future<Output = Result<(), HealthCheckError>> + Send + '_>,
     > {
         Box::pin(async move {
-            // Check if we have an existing connection
-            let connection_exists = self.connections.contains_key(&instance_id);
-
-            if let Some(handle) = self.connections.get(&instance_id) {
-                // Check if the channel is still connected (socket is still live)
-                // If the writer task has exited (socket closed), the channel will be disconnected
+            // Any live lane shows that the peer is reachable. A caller can
+            // send on any lane, so a peer can have no connection on lane 0.
+            // A lane whose writer has exited (socket closed) has a
+            // disconnected channel. Reap it: its next send dials it again.
+            let mut connection_exists = false;
+            for lane in 0..self.lanes.get() {
+                let key: LaneKey = (instance_id, lane);
+                let Some(handle) = self.connections.get(&key) else {
+                    continue;
+                };
+                connection_exists = true;
                 if !handle.tx.is_disconnected() {
-                    return Ok(()); // Connection is alive and healthy
+                    return Ok(());
                 }
-                // Channel is disconnected — drop guard and remove stale entry
                 drop(handle);
-                self.reap_stale_connection(instance_id);
+                self.reap_stale_connection(key);
             }
 
             // No existing connection or connection is dead - verify peer is reachable
@@ -547,11 +614,12 @@ impl Transport for TcpTransport {
 
 /// Per-connection configuration handed to [`connection_writer_task`].
 struct WriterTaskContext {
-    connections: Arc<DashMap<crate::InstanceId, ConnectionHandle>>,
+    connections: Arc<DashMap<LaneKey, ConnectionHandle>>,
     cancel_token: CancellationToken,
     connect_timeout: Duration,
     reader_ctx: Option<DialedReaderContext>,
     metrics: Option<std::sync::Arc<dyn velo_ext::TransportObservability>>,
+    socket_buffers: Option<usize>,
 }
 
 /// Connection writer task
@@ -563,27 +631,16 @@ struct WriterTaskContext {
 /// even if the initial TCP connect fails.
 async fn connection_writer_task(
     addr: SocketAddr,
-    instance_id: crate::InstanceId,
+    key: LaneKey,
     rx: flume::Receiver<SendTask>,
     ctx: WriterTaskContext,
 ) -> Result<()> {
+    let result = connection_writer_inner(addr, key, &rx, &ctx).await;
     let WriterTaskContext {
         connections,
-        cancel_token,
-        connect_timeout,
-        reader_ctx,
         metrics,
+        ..
     } = ctx;
-    let result = connection_writer_inner(
-        addr,
-        instance_id,
-        &rx,
-        &cancel_token,
-        connect_timeout,
-        reader_ctx,
-        metrics.clone(),
-    )
-    .await;
 
     // Always drain queued messages and notify their error handlers.
     //
@@ -609,34 +666,24 @@ async fn connection_writer_task(
     // successor's gate is a different one and the old gate's frames take the
     // closed-channel route instead.
     drop(rx);
-    if let Some((_, stale)) = connections.remove_if(&instance_id, |_, h| h.tx.is_disconnected()) {
+    if let Some((_, stale)) = connections.remove_if(&key, |_, h| h.tx.is_disconnected()) {
         stale.retire();
     }
     if let Some(metrics) = metrics.as_ref() {
         metrics.set_active_connections(connections.len());
     }
 
-    debug!("Connection to {} ({}) closed", instance_id, addr);
+    debug!("Connection to {} lane {} ({}) closed", key.0, key.1, addr);
 
     result
 }
 
-/// Inner loop: connect, configure the socket, and send frames until the channel
-/// closes, a write error occurs, or the reader sees the peer close the socket.
-async fn connection_writer_inner(
-    addr: SocketAddr,
-    instance_id: crate::InstanceId,
-    rx: &flume::Receiver<SendTask>,
-    cancel_token: &CancellationToken,
-    connect_timeout: Duration,
-    reader_ctx: Option<DialedReaderContext>,
-    metrics: Option<std::sync::Arc<dyn velo_ext::TransportObservability>>,
-) -> Result<()> {
-    debug!("Connecting to {}", addr);
-
+/// Connect to `addr` and set up the socket before its first write, or `None`
+/// when the transport is cancelled first.
+async fn dial(addr: SocketAddr, ctx: &WriterTaskContext) -> Result<Option<TcpStream>> {
     let stream = tokio::select! {
-        _ = cancel_token.cancelled() => return Ok(()),
-        res = tokio::time::timeout(connect_timeout, TcpStream::connect(addr)) => {
+        _ = ctx.cancel_token.cancelled() => return Ok(None),
+        res = tokio::time::timeout(ctx.connect_timeout, TcpStream::connect(addr)) => {
             res.context("connect timeout")?.context("connect failed")?
         },
     };
@@ -657,15 +704,26 @@ async fn connection_writer_inner(
     // Safe to size buffers here: this side dialed the connection and has not
     // written a byte yet, so unlike the accept path there is no in-flight data
     // to race (see the listener for why that race collapses the window).
-    if let Err(e) = sock.set_send_buffer_size(2_097_152) {
-        warn!("Failed to set send buffer size: {}", e);
-    }
+    super::listener::size_socket_buffers(&stream, ctx.socket_buffers);
+    Ok(Some(stream))
+}
 
-    if let Err(e) = sock.set_recv_buffer_size(2_097_152) {
-        warn!("Failed to set recv buffer size: {}", e);
-    }
-
-    debug!("Connected to {}", addr);
+/// Inner loop: connect, configure the socket, and send frames until the channel
+/// closes, a write error occurs, or the reader sees the peer close the socket.
+async fn connection_writer_inner(
+    addr: SocketAddr,
+    (instance_id, lane): LaneKey,
+    rx: &flume::Receiver<SendTask>,
+    ctx: &WriterTaskContext,
+) -> Result<()> {
+    let cancel_token = &ctx.cancel_token;
+    let reader_ctx = ctx.reader_ctx.clone();
+    let metrics = ctx.metrics.clone();
+    debug!("Connecting to {} lane {} ({})", instance_id, lane, addr);
+    let Some(stream) = dial(addr, ctx).await? else {
+        return Ok(());
+    };
+    debug!("Connected to {} lane {} ({})", instance_id, lane, addr);
 
     // The peer's listener replies on THIS socket when it rejects a Message
     // during drain (a ShuttingDown frame echoing the header). Split the
@@ -682,7 +740,7 @@ async fn connection_writer_inner(
             ctx,
             metrics.clone(),
             conn_cancel.clone(),
-            format!("{} ({})", instance_id, addr),
+            format!("{} lane {} ({})", instance_id, lane, addr),
         ))
     });
 
@@ -699,6 +757,7 @@ async fn connection_writer_inner(
         Some(&conn_cancel),
         &TcpWriterObserver {
             instance_id,
+            lane,
             addr,
             egress: metrics.map(EgressMetrics::new),
         },
@@ -745,195 +804,8 @@ fn parse_tcp_endpoint(endpoint: &[u8]) -> Result<SocketAddr> {
         .ok_or_else(|| anyhow::anyhow!("no addresses resolved"))
 }
 
-/// Builder for TcpTransport
-pub struct TcpTransportBuilder {
-    bind_addr: Option<SocketAddr>,
-    key: Option<TransportKey>,
-    channel_capacity: usize,
-    connect_timeout: Duration,
-    listener: Option<std::net::TcpListener>,
-    interface_filter: InterfaceFilter,
-    numa_hint: Option<u32>,
-    shrink_threshold: Option<usize>,
-}
-
-impl TcpTransportBuilder {
-    /// Create a new builder
-    pub fn new() -> Self {
-        Self {
-            bind_addr: None,
-            key: None,
-            channel_capacity: 256,
-            connect_timeout: Duration::from_secs(5),
-            listener: None,
-            interface_filter: InterfaceFilter::default(),
-            numa_hint: None,
-            shrink_threshold: None,
-        }
-    }
-
-    /// Set the bind address
-    pub fn bind_addr(mut self, addr: SocketAddr) -> Self {
-        self.bind_addr = Some(addr);
-        self
-    }
-
-    /// Set the transport key
-    pub fn key(mut self, key: TransportKey) -> Self {
-        self.key = Some(key);
-        self
-    }
-
-    /// Set the channel capacity for backpressure (default: 256)
-    pub fn channel_capacity(mut self, capacity: usize) -> Self {
-        self.channel_capacity = capacity;
-        self
-    }
-
-    /// Set the connect timeout for outbound connections (default: 5s)
-    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
-        self.connect_timeout = timeout;
-        self
-    }
-
-    /// Set the interface selection filter for multi-NIC environments.
-    pub fn interface_filter(mut self, filter: InterfaceFilter) -> Self {
-        self.interface_filter = filter;
-        self
-    }
-
-    /// Set the NUMA node hint for topology-aware NIC selection.
-    ///
-    /// Callers typically resolve this via `dynamo_memory::numa::get_device_numa_node(gpu_id)`.
-    pub fn numa_hint(mut self, node: u32) -> Self {
-        self.numa_hint = Some(node);
-        self
-    }
-
-    /// Override the per-connection read-buffer shrink threshold (bytes).
-    ///
-    /// If a single oversized inbound frame causes the listener's `BytesMut`
-    /// read buffer to grow past this many bytes, the buffer will be reset back
-    /// to a small capacity the next time it fully drains. Defaults to 8 MB,
-    /// overridable at process start via `VELO_TCP_SHRINK_THRESHOLD`.
-    pub fn shrink_threshold(mut self, bytes: usize) -> Self {
-        self.shrink_threshold = Some(bytes);
-        self
-    }
-
-    /// Use a pre-bound TcpListener instead of binding to a specific address
-    ///
-    /// This is useful for tests where you want to bind to port 0 and get an OS-assigned
-    /// port without creating a race condition between binding and starting the transport.
-    ///
-    /// Note: This is mutually exclusive with `bind_addr()`. Using both will result in an error.
-    pub fn from_listener(mut self, listener: std::net::TcpListener) -> Result<Self> {
-        // Validate mutual exclusivity: can't use both bind_addr() and from_listener()
-        if self.bind_addr.is_some() {
-            anyhow::bail!(
-                "Cannot use both bind_addr() and from_listener() - they are mutually exclusive"
-            );
-        }
-
-        let addr = listener
-            .local_addr()
-            .context("Failed to get local address from listener")?;
-        self.bind_addr = Some(addr);
-        self.listener = Some(listener);
-        Ok(self)
-    }
-
-    /// Build the TcpTransport
-    pub fn build(self) -> Result<TcpTransport> {
-        let key = self.key.unwrap_or_else(|| TransportKey::from("tcp"));
-
-        // If we have a listener, use its address; otherwise pre-bind to resolve port 0.
-        let (bind_addr, listener) = if let Some(listener) = self.listener {
-            // Caller-provided listener: it is already live, so this is best
-            // effort — connections whose handshake completed before this point
-            // keep kernel-default autotuned buffers, which is safe.
-            super::listener::size_listener_buffers(&listener);
-            let addr = listener.local_addr()?;
-            (addr, Some(listener))
-        } else {
-            let requested = self
-                .bind_addr
-                .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
-            // Built by hand instead of std::net::TcpListener::bind so the
-            // socket buffers are sized before listen() — accepted sockets
-            // inherit them at handshake time (see `size_listener_buffers`).
-            let domain = if requested.is_ipv4() {
-                socket2::Domain::IPV4
-            } else {
-                socket2::Domain::IPV6
-            };
-            let socket =
-                socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
-                    .context("Failed to create TCP listener socket")?;
-            // std::net::TcpListener::bind sets SO_REUSEADDR on Unix; keep that.
-            socket
-                .set_reuse_address(true)
-                .context("Failed to set SO_REUSEADDR")?;
-            super::listener::size_listener_buffers(&socket);
-            socket
-                .bind(&requested.into())
-                .context("Failed to pre-bind TCP listener")?;
-            // 128 matches std::net::TcpListener::bind's backlog.
-            socket.listen(128).context("Failed to listen")?;
-            let std_listener: std::net::TcpListener = socket.into();
-            let actual = std_listener.local_addr()?;
-            (actual, Some(std_listener))
-        };
-
-        // Resolve advertise endpoints (multi-interface discovery)
-        let endpoints = resolve_advertise_endpoints(bind_addr, &self.interface_filter)?;
-
-        // Warn if NUMA hint conflicts with interface filter
-        if let (Some(numa), InterfaceFilter::ByName(name)) =
-            (self.numa_hint, &self.interface_filter)
-        {
-            for ep in &endpoints {
-                if let Some(ep_numa) = ep.numa_node
-                    && ep_numa != numa as i32
-                {
-                    warn!(
-                        "NIC {} is on NUMA node {} but GPU NUMA hint is {}",
-                        name, ep_numa, numa
-                    );
-                }
-            }
-        }
-
-        let encoded =
-            rmp_serde::to_vec(&endpoints).context("Failed to encode interface endpoints")?;
-        let mut addr_builder = crate::transports::address::WorkerAddressBuilder::new();
-        addr_builder.add_entry(key.clone(), encoded)?;
-        let local_address = addr_builder.build()?;
-
-        let mut transport = TcpTransport::new(
-            bind_addr,
-            key,
-            local_address,
-            self.channel_capacity,
-            self.connect_timeout,
-            listener,
-            self.numa_hint,
-        );
-        if let Some(t) = self.shrink_threshold {
-            transport.shrink_threshold = t;
-        }
-        Ok(transport)
-    }
-}
-
-impl Default for TcpTransportBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// `#[path]` keeps the tests beside their siblings as `tcp/tests.rs`; the
-// default resolution would bury them in a one-file `tcp/transport/` directory.
+// `#[path]` keeps the tests beside their siblings as `tcp/tests.rs`, not
+// beside the builder in `tcp/transport/`.
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;

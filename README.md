@@ -26,7 +26,7 @@ Application authors depend on `velo` only. See [Workspace crates](docs/src/devel
 
 Streams to one peer can share its connection through the messenger mux. What the mux costs a serving frontend, and how that was measured, is in [Response-plane performance](docs/src/operations/response-plane-performance.md).
 
-QUIC can keep several lanes, each its own connection, to one peer. See [Lanes](docs/src/operations/quic-performance.md#lanes).
+QUIC and TCP can keep several lanes, each its own connection, to one peer. See [TCP lanes](docs/src/concepts/transports.md#tcp-lanes) and [QUIC lanes](docs/src/operations/quic-performance.md#lanes).
 
 Streams through the mux spread over those lanes, and each stream stays on one lane. If the caller gives a key (`attach_anchor_keyed`, `prebind_anchor_keyed`), the receiver places the stream by that key, so streams with one key share a lane. Without a key, the receiver uses the lane with the least load. See [Lanes](docs/src/concepts/batched-streaming.md#lanes).
 

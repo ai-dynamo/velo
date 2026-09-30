@@ -172,3 +172,72 @@ fn max_message_size_is_unknown() {
         None
     );
 }
+
+/// Replacing a dead connection must not update the connection gauge while the
+/// map entry is held. The gauge reads `len()`, which read-locks every shard,
+/// and the shard that the entry holds for writing is not reentrant: the
+/// thread waits on itself, and every later operation on that shard waits
+/// behind it. The dead entry is seeded directly because in normal use it only
+/// appears in a race between `reap_stale_connection` and `entry()`. TCP and
+/// UDS have the same test.
+///
+/// The test owns its runtime. With the fault, the writer task that
+/// `install_connection` spawns blocks a runtime worker when it removes its map
+/// entry, and dropping a `#[tokio::test]` runtime then waits for that worker
+/// forever. Here the runtime is dropped in the background, so the test fails
+/// instead of hanging the run.
+#[test]
+fn replacing_a_dead_connection_does_not_deadlock() {
+    use crate::observability::VeloMetrics;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let registry = prometheus::Registry::new();
+    let metrics = VeloMetrics::register(&registry).expect("register metrics");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let transport = GrpcTransportBuilder::new()
+        .from_listener(listener)
+        .unwrap()
+        .build()
+        .unwrap();
+    transport.runtime.set(rt.handle().clone()).ok();
+    // Observed, so the gauge update runs.
+    transport.set_observability(Arc::new(metrics.bind_transport("grpc")));
+
+    let peer_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let peer = make_grpc_peer(peer_listener.local_addr().unwrap());
+    let iid = peer.instance_id();
+    transport.register(peer).unwrap();
+    // A dead entry: its receiver is dropped at once.
+    let (tx, _) = flume::bounded::<SendTask>(1);
+    transport.connections.insert(
+        iid,
+        ConnectionHandle {
+            gate: AdmissionGate::new(tx.clone(), rt.handle().clone()),
+            tx,
+        },
+    );
+
+    let transport = Arc::new(transport);
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn({
+        let transport = transport.clone();
+        let handle = rt.handle().clone();
+        move || {
+            let installed = transport.install_connection(iid, &handle).is_ok();
+            let _ = done_tx.send(installed);
+        }
+    });
+    let Ok(installed) = done_rx.recv_timeout(Duration::from_secs(5)) else {
+        rt.shutdown_background();
+        panic!("install_connection deadlocked replacing a dead connection");
+    };
+    // No liveness check on the new entry, unlike TCP and UDS: the peer is not a
+    // gRPC server, so the writer can fail its connect and drop the receiver
+    // before the check runs. `Ok` from the dead-entry arm is the replacement.
+    assert!(installed);
+    transport.shutdown();
+}
