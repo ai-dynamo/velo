@@ -114,6 +114,40 @@ async fn the_configured_cap_bounds_every_batch() {
     assert_eq!(delivered, 12);
 }
 
+/// A new eager budget can make a record oversized after a full batch was
+/// admitted. The empty retry batch must not leave a sequence gap before it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_smaller_retry_budget_keeps_batch_sequences_contiguous() {
+    let harness = stalled_harness(MuxConfig {
+        max_batch_bytes: 1024,
+        ..MuxConfig::default()
+    })
+    .await;
+    let (inlet, ack) = harness.open(1, 1, 4).await;
+    ack.await.unwrap().unwrap();
+    let frame =
+        rmp_serde::to_vec(&crate::streaming::frame::StreamFrame::Item("x".repeat(800))).unwrap();
+    // Both records are queued before this single-threaded runtime can poll
+    // the batcher. The second cuts a batch and parks behind the unread open.
+    inlet.send(frame.clone()).unwrap();
+    inlet.send(frame.clone()).unwrap();
+    eventually(|| harness.transport.stalled() == 1).await;
+    harness.transport.report_next_message_limit(512);
+
+    let open = harness.next_wire_batch().await;
+    let first = harness.next_wire_batch().await;
+    let second = harness.next_wire_batch().await;
+    assert_eq!(open.header.batch_seq, 0);
+    assert_eq!(first.header.batch_seq, 1);
+    assert_eq!(second.header.batch_seq, 2);
+    assert_eq!(first.records.len(), 1);
+    assert_eq!(second.records.len(), 1);
+    assert_eq!(first.records[0].data, frame);
+    assert_eq!(second.records[0].data, frame);
+    assert_eq!(first.records[0].frame_seq, 1);
+    assert_eq!(second.records[0].frame_seq, 2);
+}
+
 /// A caller may batch beyond TCP's coalescing threshold without losing records.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_configured_cap_can_exceed_the_tcp_coalescing_threshold() {
