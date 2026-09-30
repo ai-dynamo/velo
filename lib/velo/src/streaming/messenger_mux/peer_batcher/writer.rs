@@ -4,7 +4,7 @@
 //! Batch assembly and the send that ends it.
 //!
 //! Everything between "there is a record to put on the wire" and "the messenger
-//! has it" lives here: the staging buffer, the three clamps that decide how big
+//! has it" lives here: the staging buffer, the two clamps that decide how big
 //! a batch may get, the sequence numbering, and the two ways a batch leaves — a
 //! packed flush that parks on admission, and a singleton that does not.
 //!
@@ -23,7 +23,6 @@ use super::super::protocol::{BATCH_HEADER_LEN, BatchEncoder, EncodeError, MAX_RE
 use crate::messenger::{FireResult, Messenger};
 use crate::observability::MuxMetricsHandle;
 use crate::streaming::messenger_mux::STREAM_BATCH_HANDLER;
-use crate::transports::tcp::framing::COALESCE_THRESHOLD;
 
 /// Smallest batch a clamp may produce: the header plus one empty record.
 ///
@@ -34,32 +33,19 @@ use crate::transports::tcp::framing::COALESCE_THRESHOLD;
 /// answer for them.
 pub(super) const MIN_BATCH_CAP: usize = BATCH_HEADER_LEN + 13;
 
-/// `min(configured cap, effective eager budget, COALESCE_THRESHOLD)`, floored
-/// at [`MIN_BATCH_CAP`].
+/// `min(configured cap, effective eager budget)`, floored at [`MIN_BATCH_CAP`].
 ///
-/// The threshold is the packing *target*: the shared coalescing writer stages a
-/// frame into one buffered `write_all` only while it fits, so a batch above it
-/// gives back what batching bought. The eager budget is the ceiling above it —
-/// exceed it and the batch quietly becomes a rendezvous transfer, paying a round
-/// trip on behalf of every slot packed into it.
-///
-/// Split out from the caller because the eager term is the one an in-process
-/// pair cannot make bind: every messenger transport's budget is the 256 KiB
-/// rendezvous threshold or its own smaller limit, both far above the 64 KiB
-/// coalescing threshold, so end to end the other two terms always win. The
-/// arithmetic is where that arm is reachable.
+/// The eager budget prevents a packed batch from becoming a rendezvous
+/// transfer. TCP's coalescing threshold is not a message limit: larger frames
+/// use its direct write path. Let the caller choose that tradeoff, also for
+/// transports that do not use TCP's coalescing writer.
 pub(super) const fn batch_cap(configured: usize, eager: usize) -> usize {
     let clamped = if configured < eager {
         configured
     } else {
         eager
     };
-    let clamped = if clamped < COALESCE_THRESHOLD {
-        clamped
-    } else {
-        COALESCE_THRESHOLD
-    };
-    // Not `clamp`: the floor is applied *after* the three ceilings, and a
+    // Not `clamp`: the floor is applied *after* the two ceilings, and a
     // configured cap below the floor is a legitimate (if useless) setting rather
     // than the panic `clamp` would give it.
     if clamped > MIN_BATCH_CAP {

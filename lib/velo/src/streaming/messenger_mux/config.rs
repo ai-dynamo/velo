@@ -157,9 +157,9 @@ pub struct MuxConfig {
     /// the sender no longer offers. Roll the minting side back first, or both
     /// together; see `docs/src/development/batched-streaming-design.md` for the whole argument.
     pub enabled: bool,
-    /// Configured ceiling on one batch. Further clamped at flush time by the
-    /// effective eager budget and by `COALESCE_THRESHOLD`, whichever binds
-    /// first.
+    /// Configured ceiling on one batch, further clamped by the effective eager
+    /// budget. The default is 60 KiB. Larger TCP batches use the direct write
+    /// path above the transport's coalescing threshold.
     pub max_batch_bytes: usize,
     /// Data credit `C` granted to each new slot, and therefore the depth of the
     /// `C + 1` buffer `bind` hands the anchor.
