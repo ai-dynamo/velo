@@ -9,7 +9,7 @@ Runnable examples for the `velo` facade crate. This is a standalone crate
 | Name         | What it shows                                                                |
 |--------------|------------------------------------------------------------------------------|
 | `ping_pong`  | Round-trip latency for unary messages between two `Velo` instances.          |
-| `throughput` | msgs/sec + MB/sec + p50/p95/p99 across sequential, concurrent, and pipeline. |
+| `throughput` | msgs/sec + MiB/s + p50/p95/p99 across sequential, concurrent, pipeline, and stream. |
 | `mpsc_fanin` | MPSC streaming: many producers fan into one consumer via `LoopbackTransport`.|
 
 ## Run
@@ -33,6 +33,8 @@ VELO_BIND_IP=10.0.0.1 cargo run --release --example throughput --all-features --
 VELO_BIND_IP=10.0.0.2 cargo run --release --example throughput --all-features -- \
   --role client --transport quic --peer-file /shared/peer --count 20000
 ```
+
+`--modes` picks the send patterns: `sequential`, `concurrent` and `pipeline` run by default. `--modes stream` has the client create anchors and ask the server to attach and stream `--count` items to them, split over `--streams` streams (for example `--streams 16,64,256`). Stream items go over the batched-streaming mux, so the client is the consumer. Items over about 60 KiB go by rendezvous, so use smaller `--payload-sizes` for stream cells. With `--transport quic`, `VELO_QUIC_LANES=n` on both hosts gives each peer `n` lanes, and the mux spreads the streams over them.
 
 The server removes an old file, writes its peer info to the file, and runs until it is stopped. The client reads the file again until the server named in it answers, so a file left by an earlier run does no harm. Then it prints the results table. `VELO_BIND_IP` applies to the `tcp` and `quic` transports of the examples, and the default is `127.0.0.1`.
 

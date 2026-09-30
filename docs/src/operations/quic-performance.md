@@ -15,7 +15,7 @@ This chapter records what the QUIC transport costs against TCP, the settings tha
 | `idle_timeout(d)` | 15 s | A connection that receives nothing for this long is closed. This is how a peer that died without closing is found. quinn's own default is 30 s. |
 | `shrink_threshold(bytes)` | The TCP transport's | Read-buffer size above which a reader gives memory back after a frame. |
 
-The examples read `VELO_QUIC_MAX_MTU`, `VELO_QUIC_STREAM_WINDOW`, and `VELO_QUIC_SERVER_ENDPOINTS`, so a sweep can change them without new flags.
+The examples read `VELO_QUIC_LANES`, `VELO_QUIC_MAX_MTU`, `VELO_QUIC_STREAM_WINDOW`, and `VELO_QUIC_SERVER_ENDPOINTS`, so a sweep can change them without new flags.
 
 ## Packets above 6550 bytes are lost
 

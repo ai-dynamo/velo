@@ -131,6 +131,8 @@ pub fn init_tracing() {
 /// A QUIC builder bound to [`bind_ip`], tuned by environment variables so a sweep can
 /// vary the transport without new flags:
 ///
+/// - `VELO_QUIC_LANES` (count). The mux places streams over the lanes; other
+///   messenger traffic stays on lane 0.
 /// - `VELO_QUIC_MAX_MTU` (bytes)
 /// - `VELO_QUIC_STREAM_WINDOW` (bytes)
 /// - `VELO_QUIC_SERVER_ENDPOINTS` (count)
@@ -155,6 +157,9 @@ pub fn quic_from_env() -> Result<velo::transports::quic::QuicTransportBuilder> {
     }
     if let Some(v) = env("VELO_QUIC_SERVER_ENDPOINTS")? {
         builder = builder.server_endpoints(v);
+    }
+    if let Some(v) = env("VELO_QUIC_LANES")? {
+        builder = builder.lanes(v);
     }
     Ok(builder)
 }
