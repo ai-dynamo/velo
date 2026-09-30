@@ -717,3 +717,55 @@ async fn the_egress_queue_wait_spans_the_admission_gate() {
         "and all three reached the writer"
     );
 }
+
+/// Replacing a dead connection must not update the connection gauge while the
+/// map entry is held. The gauge reads `len()`, which read-locks every shard,
+/// and the shard that the entry holds for writing is not reentrant: the
+/// thread waits on itself, and every later operation on that shard waits
+/// behind it. The dead entry is seeded directly because in normal use it only
+/// appears in a race between `reap_stale_connection` and `entry()`. TCP has
+/// the same test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replacing_a_dead_connection_does_not_deadlock() {
+    use crate::observability::VeloMetrics;
+
+    let registry = prometheus::Registry::new();
+    let metrics = VeloMetrics::register(&registry).expect("register metrics");
+    let (transport, _socket_path) = make_transport();
+    // Observed, so the gauge update runs.
+    transport.set_observability(Arc::new(metrics.bind_transport("uds")));
+
+    let dir = std::env::temp_dir().join(format!("uds-peer-{}", crate::InstanceId::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let peer_socket = dir.join("peer.sock");
+    let _peer_listener = tokio::net::UnixListener::bind(&peer_socket).unwrap();
+    let peer = make_uds_peer(&peer_socket);
+    let iid = peer.instance_id();
+    transport.register(peer).unwrap();
+    insert_stale_handle(&transport, iid);
+
+    let transport = Arc::new(transport);
+    let rt = tokio::runtime::Handle::current();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn({
+        let transport = transport.clone();
+        move || {
+            let installed = transport.install_connection(iid, &rt).is_ok();
+            let _ = done_tx.send(installed);
+        }
+    });
+    let installed = done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("install_connection deadlocked replacing a dead connection");
+    assert!(installed);
+    assert!(
+        !transport
+            .connections
+            .get(&iid)
+            .unwrap()
+            .tx
+            .is_disconnected()
+    );
+    transport.shutdown();
+    std::fs::remove_dir_all(&dir).ok();
+}
