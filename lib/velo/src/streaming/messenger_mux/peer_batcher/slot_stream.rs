@@ -48,13 +48,13 @@ use futures::task::AtomicWaker;
 use super::super::protocol::{MAX_SLOT_INDEX, SlotId};
 use crate::streaming::messenger_mux::flow_control::{CreditClass, SlotCredit};
 
-/// Close signalling for one slot's inlet, shared between the batcher task and
-/// the stream it polls.
+/// Close and pause signalling for one slot's inlet, shared between the
+/// batcher task and the stream it polls.
 ///
-/// One flag, because there is only one thing to say: draining stops when the
-/// gate closes, whether that is the slot ending or `EgressSlot::disconnect`
-/// cutting the producer off ahead of a deferred close — the two are the same
-/// signal to a stream that only ever sees its gate close once.
+/// Closed ends the stream for good. Paused stops pulls until the withheld
+/// queue drops below the byte cap. Both are set and read on the batcher's own
+/// task; the atomics are there because the stream is polled through a shared
+/// `Arc`.
 pub(super) struct SlotGate {
     closed: AtomicBool,
     /// The withheld queue is at the byte cap: pull nothing more until it
@@ -79,8 +79,11 @@ impl SlotGate {
     }
 
     /// Pull from the inlet again, waking the stream if it was paused.
+    ///
+    /// Reads before it writes: this runs once per released record, and most
+    /// slots never pause.
     fn resume(&self) {
-        if self.paused.swap(false, Ordering::AcqRel) {
+        if self.paused.load(Ordering::Acquire) && self.paused.swap(false, Ordering::AcqRel) {
             self.waker.wake();
         }
     }
@@ -184,6 +187,9 @@ pub(super) struct WithheldQueue {
 
 impl WithheldQueue {
     fn new(cap: u32) -> Self {
+        // Zero means "use the default" on the wire and is resolved before a
+        // slot exists. A zero cap here would pause the inlet forever.
+        debug_assert_ne!(cap, 0, "the slot byte cap must be resolved before use");
         Self {
             records: VecDeque::new(),
             bytes: 0,
@@ -196,6 +202,11 @@ impl WithheldQueue {
     /// stream.
     pub(super) fn is_empty(&self) -> bool {
         self.records.is_empty()
+    }
+
+    /// Records waiting.
+    fn len(&self) -> usize {
+        self.records.len()
     }
 
     /// Park a record.
@@ -455,30 +466,45 @@ impl EgressSlots {
 
     /// Close the slot at `index`, ending its stream and bumping its generation.
     ///
-    /// Returns `true` when a slot was actually there, so the caller can keep the
-    /// `live_slots` gauge honest without double-counting a repeated close.
-    pub(super) fn close(&mut self, index: u32) -> bool {
-        let Some(slot) = self.entries.get_mut(index as usize).and_then(Option::take) else {
-            return false;
-        };
+    /// Returns how many withheld records the slot still held, which are
+    /// discarded with it, or `None` when no slot was there. The caller keeps
+    /// the `live_slots` and withheld gauges honest from the answer, without
+    /// double-counting a repeated close.
+    pub(super) fn close(&mut self, index: u32) -> Option<usize> {
+        let slot = self
+            .entries
+            .get_mut(index as usize)
+            .and_then(Option::take)?;
         slot.disconnect();
         self.generations[index as usize] = slot.id.generation().wrapping_add(1);
         self.free.push(index);
         self.live -= 1;
-        true
+        Some(slot.withheld.len())
     }
 
-    /// Close every live slot, returning how many there were.
+    /// Close every live slot.
     ///
     /// Used by epoch death, where "exactly one failure per live slot" is the
     /// property being preserved: slots do not survive an epoch, so this runs
     /// once and the table is empty afterwards.
-    pub(super) fn close_all(&mut self) -> usize {
-        let closed = self.live;
+    pub(super) fn close_all(&mut self) -> Closed {
+        let mut closed = Closed::default();
         for index in 0..self.entries.len() {
-            let index = index as u32;
-            self.close(index);
+            if let Some(withheld) = self.close(index as u32) {
+                closed.slots += 1;
+                closed.withheld += withheld;
+            }
         }
         closed
     }
+}
+
+/// Slots closed together, and the withheld records discarded with them.
+/// [`EgressSlots::close_all`] returns one; a single close builds one too.
+#[derive(Debug, Default)]
+pub(super) struct Closed {
+    /// Slots closed.
+    pub(super) slots: usize,
+    /// Withheld records discarded with them.
+    pub(super) withheld: usize,
 }

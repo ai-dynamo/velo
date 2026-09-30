@@ -89,6 +89,10 @@ pub(crate) struct PumpContext {
     /// leaves the buffer credit is issued against. `None` for every transport
     /// that does not do flow control over this seam.
     pub(crate) drain: Option<std::sync::Arc<crate::streaming::messenger_mux::ingress::DrainSignal>>,
+    /// How to close the mux slot when the pump ends before the sender's
+    /// terminal: the anchor was dropped or cancelled, or the sender went
+    /// silent. Present exactly when `drain` is.
+    pub(crate) release: Option<super::SlotRelease>,
 }
 
 /// Whether an `OpenSlot` has claimed the mux bind this task reads from.

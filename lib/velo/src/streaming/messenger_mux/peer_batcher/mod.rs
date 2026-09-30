@@ -985,12 +985,23 @@ impl Batcher {
     // -----------------------------------------------------------------------
 
     fn close_local(&mut self, index: u32) {
-        if self.slots.close(index) {
-            if let Some(metrics) = &self.metrics {
+        if let Some(withheld) = self.slots.close(index) {
+            self.account_closed(slot_stream::Closed { slots: 1, withheld });
+        }
+    }
+
+    /// Account for closed slots: one from `close_local`, or all of them from
+    /// epoch death or teardown.
+    fn account_closed(&self, closed: slot_stream::Closed) {
+        if let Some(metrics) = &self.metrics {
+            for _ in 0..closed.slots {
                 metrics.slot_closed();
             }
-            self.publish_live_slots();
+            if closed.withheld > 0 {
+                metrics.withheld_records_delta(-(closed.withheld as i64));
+            }
         }
+        self.publish_live_slots();
     }
 
     fn publish_live_slots(&self) {
@@ -1010,11 +1021,8 @@ impl Batcher {
         self.streams = SelectAll::new();
         if let Some(metrics) = &self.metrics {
             metrics.epoch_death();
-            for _ in 0..closed {
-                metrics.slot_closed();
-            }
         }
-        self.publish_live_slots();
+        self.account_closed(closed);
         // The staged batch goes with the epoch, so the gate must forget it too.
         // Otherwise the staged gauge — the one signal a forgotten flush shows up
         // in — drifts up by a batch per epoch death and cries wolf. The credit
@@ -1112,11 +1120,6 @@ impl Batcher {
         self.gate.discarded();
         let closed = self.slots.close_all();
         self.streams = SelectAll::new();
-        if let Some(metrics) = &self.metrics {
-            for _ in 0..closed {
-                metrics.slot_closed();
-            }
-        }
-        self.publish_live_slots();
+        self.account_closed(closed);
     }
 }
