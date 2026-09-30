@@ -73,16 +73,8 @@ pub(crate) fn advertised_keys(
 pub(crate) struct Selection {
     /// What [`bind`](Self::bind) binds on.
     target: Target,
-    /// The key to answer with, which the sender resolves on its side.
-    pub(crate) key: TransportKey,
-    /// Data credit granted to each mux slot. Zero unless the mux was selected —
-    /// the wire encoding of *not offering the mux*.
-    pub(crate) initial_credit: u32,
-    /// Bytes one mux slot may hold. Zero unless the mux was selected, and zero
-    /// on the wire means *use the default*, so the two never collide.
-    pub(crate) slot_byte_budget: u32,
-    /// The mux lane the slot is placed on. Zero unless the mux was selected.
-    pub(crate) lane: u16,
+    /// What the attach response answers once the bind is made.
+    pub(crate) terms: Terms,
 }
 
 /// The transport a [`Selection`] binds on.
@@ -100,25 +92,25 @@ impl Selection {
         anchor_id: u64,
         session_id: u64,
     ) -> anyhow::Result<(flume::Receiver<Vec<u8>>, Terms)> {
-        let terms = Terms {
-            key: self.key,
-            initial_credit: self.initial_credit,
-            slot_byte_budget: self.slot_byte_budget,
-            lane: self.lane,
-        };
         let receiver = match self.target {
             Target::Mux(mux, lane) => mux.bind_on_lane(anchor_id, session_id, lane),
             Target::Other(transport) => transport.bind(anchor_id, session_id).await?,
         };
-        Ok((receiver, terms))
+        Ok((receiver, self.terms))
     }
 }
 
 /// What a bound [`Selection`] answers the sender with.
 pub(crate) struct Terms {
+    /// The key to answer with, which the sender resolves on its side.
     pub(crate) key: TransportKey,
+    /// Data credit granted to each mux slot. Zero unless the mux was selected —
+    /// the wire encoding of *not offering the mux*.
     pub(crate) initial_credit: u32,
+    /// Bytes one mux slot may hold. Zero unless the mux was selected, and zero
+    /// on the wire means *use the default*, so the two never collide.
     pub(crate) slot_byte_budget: u32,
+    /// The mux lane the slot is placed on. Zero unless the mux was selected.
     pub(crate) lane: u16,
 }
 
@@ -145,19 +137,23 @@ pub(crate) fn select(
         let limits = mux.advertised_limits();
         let lane = mux.choose_lane(Some(peer), lane_key);
         return Selection {
-            key: TransportKey::new(MESSENGER_MUX_KEY),
-            initial_credit: limits.initial_credit(),
-            slot_byte_budget: limits.slot_byte_budget(),
-            lane: lane.lane().get(),
+            terms: Terms {
+                key: TransportKey::new(MESSENGER_MUX_KEY),
+                initial_credit: limits.initial_credit(),
+                slot_byte_budget: limits.slot_byte_budget(),
+                lane: lane.lane().get(),
+            },
             target: Target::Mux(Arc::clone(mux), lane),
         };
     }
     Selection {
         target: Target::Other(Arc::clone(default_transport)),
-        key: default_transport.key(),
-        initial_credit: 0,
-        slot_byte_budget: 0,
-        lane: 0,
+        terms: Terms {
+            key: default_transport.key(),
+            initial_credit: 0,
+            slot_byte_budget: 0,
+            lane: 0,
+        },
     }
 }
 
