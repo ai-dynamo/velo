@@ -2069,6 +2069,41 @@ fn a_ticket_carries_its_lane_and_an_old_one_reads_as_lane_zero() {
     }
 }
 
+/// A worker from before lanes refuses a ticket on another lane when the
+/// application carries tickets in positional MessagePack, and reads it
+/// (ignoring the lane) in JSON and named MessagePack.
+///
+/// This is why workers must be upgraded before the node that mints tickets
+/// turns on lanes. Positional MessagePack encodes a struct as an array and
+/// the old type expects five elements; a lane adds a sixth. If this ever
+/// decodes, the upgrade-order warning in the ticket's docs and in the book is
+/// wrong.
+#[test]
+fn a_worker_before_lanes_refuses_a_ticket_on_another_lane_in_positional_msgpack() {
+    let lane_three = rmp_serde::to_vec(&ticket_on(3)).expect("rmp");
+    assert!(
+        rmp_serde::from_slice::<TicketBeforeLanes>(&lane_three).is_err(),
+        "positional msgpack: an old worker must refuse a sixth element"
+    );
+    // Control: the lane-0 ticket, same encoding, decodes.
+    let lane_zero = rmp_serde::to_vec(&ticket_on(0)).expect("rmp");
+    assert_eq!(
+        rmp_serde::from_slice::<TicketBeforeLanes>(&lane_zero).expect("lane 0 decodes"),
+        ticket_before_lanes()
+    );
+    // Control: the encodings with field names skip the unknown field.
+    let json = serde_json::to_vec(&ticket_on(3)).expect("json");
+    assert_eq!(
+        serde_json::from_slice::<TicketBeforeLanes>(&json).expect("json decodes"),
+        ticket_before_lanes()
+    );
+    let named = rmp_serde::to_vec_named(&ticket_on(3)).expect("rmp named");
+    assert_eq!(
+        rmp_serde::from_slice::<TicketBeforeLanes>(&named).expect("named rmp decodes"),
+        ticket_before_lanes()
+    );
+}
+
 /// An attach response from a receiver before lanes decodes as lane 0 in
 /// positional MessagePack too, where only a trailing field may be missing;
 /// and a request with no lane key is the same bytes as one from before lanes.

@@ -864,3 +864,188 @@ async fn an_attach_that_fails_after_its_bind_gives_its_lane_back() {
         "a failed MPSC attach must give back its lane count, its bind and its drain signal"
     );
 }
+
+/// A transport that refuses admission on one lane once told to, and passes
+/// everything else to QUIC.
+///
+/// A refused admission is how a transport reports a lane's connection gone
+/// (`ChannelClosed`, `ConnectionReplaced`), and it is the only failure the
+/// mux batcher treats as epoch death.
+struct LaneFailing {
+    inner: Arc<QuicTransport>,
+    /// The lane to refuse, or `u16::MAX` for none.
+    failed: std::sync::atomic::AtomicU16,
+    /// A gate over a channel with no receiver: every send is refused.
+    dead: velo_ext::AdmissionGate<()>,
+}
+
+impl LaneFailing {
+    fn new(inner: Arc<QuicTransport>) -> Self {
+        let (tx, rx) = flume::bounded(1);
+        drop(rx);
+        Self {
+            inner,
+            failed: std::sync::atomic::AtomicU16::new(u16::MAX),
+            dead: velo_ext::AdmissionGate::new(tx, tokio::runtime::Handle::current()),
+        }
+    }
+
+    fn fail(&self, lane: u16) {
+        self.failed
+            .store(lane, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl velo_ext::Transport for LaneFailing {
+    fn key(&self) -> velo_ext::TransportKey {
+        self.inner.key()
+    }
+
+    fn address(&self) -> velo_ext::WorkerAddress {
+        self.inner.address()
+    }
+
+    fn register(&self, peer_info: velo_ext::PeerInfo) -> Result<(), velo_ext::TransportError> {
+        self.inner.register(peer_info)
+    }
+
+    fn send_message(
+        &self,
+        instance_id: velo_ext::InstanceId,
+        header: bytes::Bytes,
+        payload: bytes::Bytes,
+        message_type: velo_ext::MessageType,
+        on_error: Arc<dyn velo_ext::TransportErrorHandler>,
+    ) -> velo_ext::SendOutcome {
+        self.send_message_on_lane(instance_id, 0, header, payload, message_type, on_error)
+    }
+
+    fn lanes(&self, target: velo_ext::InstanceId) -> std::num::NonZeroU16 {
+        self.inner.lanes(target)
+    }
+
+    fn send_message_on_lane(
+        &self,
+        instance_id: velo_ext::InstanceId,
+        lane: u16,
+        header: bytes::Bytes,
+        payload: bytes::Bytes,
+        message_type: velo_ext::MessageType,
+        on_error: Arc<dyn velo_ext::TransportErrorHandler>,
+    ) -> velo_ext::SendOutcome {
+        if lane == self.failed.load(std::sync::atomic::Ordering::Acquire) {
+            return self.dead.send(());
+        }
+        self.inner
+            .send_message_on_lane(instance_id, lane, header, payload, message_type, on_error)
+    }
+
+    fn max_message_size(&self, target: velo_ext::InstanceId) -> Option<usize> {
+        self.inner.max_message_size(target)
+    }
+
+    fn start(
+        &self,
+        instance_id: velo_ext::InstanceId,
+        channels: velo_ext::TransportAdapter,
+        rt: tokio::runtime::Handle,
+    ) -> futures::future::BoxFuture<'_, anyhow::Result<()>> {
+        self.inner.start(instance_id, channels, rt)
+    }
+
+    fn shutdown(&self) {
+        self.inner.shutdown();
+    }
+
+    fn closed(&self) -> futures::future::BoxFuture<'_, ()> {
+        self.inner.closed()
+    }
+
+    fn set_observability(&self, observability: Arc<dyn velo_ext::TransportObservability>) {
+        self.inner.set_observability(observability);
+    }
+
+    fn begin_drain(&self) {
+        self.inner.begin_drain();
+    }
+
+    fn check_health(
+        &self,
+        instance_id: velo_ext::InstanceId,
+        timeout: Duration,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), velo_ext::HealthCheckError>> + Send + '_>,
+    > {
+        self.inner.check_health(instance_id, timeout)
+    }
+}
+
+/// A lane whose transport refuses admission fails the streams on that lane
+/// and no others.
+///
+/// Each lane has its own batcher and its own epoch, so a refused batch kills
+/// only the slots of its (peer, lane). This drives the mux over real QUIC
+/// lanes and injects the failure at the transport's admission, on the
+/// producer's lane 2 only; it does not close a QUIC connection, which the
+/// transport redials on the next send without refusing admission.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lane_that_refuses_admission_fails_only_its_own_streams() {
+    let consumer = Node::new(4).await;
+    let quic = Arc::new(
+        QuicTransportBuilder::new()
+            .bind_addr("127.0.0.1:0".parse().expect("loopback"))
+            .lanes(4)
+            .build()
+            .expect("quic transport"),
+    );
+    let failing = Arc::new(LaneFailing::new(Arc::clone(&quic)));
+    let velo = Velo::builder()
+        .add_transport(Arc::clone(&failing) as Arc<dyn crate::Transport>)
+        .stream_bind_addr(std::net::Ipv4Addr::LOCALHOST.into())
+        .build()
+        .await
+        .expect("build velo");
+    let producer = Node { velo, quic };
+    connect(&consumer, &producer).await;
+    let peer = producer.worker();
+    let consumer_mux = consumer.mux();
+
+    let mut streams = Vec::new();
+    for lane in 0..4 {
+        let anchor = consumer.velo.create_anchor::<u32>();
+        let sender = producer
+            .velo
+            .attach_anchor_keyed::<u32>(transfer(anchor.handle()), key_for(lane, 4))
+            .await
+            .expect("remote attach");
+        sender.send(u32::MAX).await.expect("first send");
+        streams.push((sender, drain_first(anchor).await));
+    }
+    assert_eq!(
+        live_per_lane(&consumer_mux, peer, 4),
+        [1, 1, 1, 1],
+        "one stream per lane, or a failure on lane 2 proves nothing about the others"
+    );
+
+    const FAILED: u16 = 2;
+    failing.fail(FAILED);
+    let (failed_sender, _failed_anchor) = streams.remove(usize::from(FAILED));
+    tokio::time::timeout(BOUND, async {
+        let mut n = 0u32;
+        while failed_sender.send(n).await.is_ok() {
+            n += 1;
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the stream on the refusing lane must fail");
+
+    let finished = futures::future::join_all(
+        streams
+            .into_iter()
+            .map(|(sender, anchor)| async move { stream_through(sender, anchor).await }),
+    );
+    tokio::time::timeout(BOUND, finished)
+        .await
+        .expect("the streams on the other lanes finish in order");
+}
