@@ -24,6 +24,11 @@
 //! within milliseconds and their streams then live for seconds. Counting only
 //! unclaimed pre-binds would show every lane empty at almost every choice, and
 //! nearly every stream would go to lane 0.
+//!
+//! Every count is an atomic that the bind or the slot itself holds, so an
+//! unkeyed choice reads no slot table. The ordered batch handler holds its
+//! table's mutex through a whole batch, and a choice that locked tables would
+//! wait behind that batch.
 
 use std::num::NonZeroU16;
 use std::sync::Arc;
@@ -73,9 +78,8 @@ fn least_loaded(lanes: NonZeroU16, load: impl Fn(LaneIndex) -> usize) -> LaneInd
 /// claimed by an `OpenSlot`, released by its owner, expired by the accept
 /// window, cleared at shutdown; a slot closed, retired with its epoch, or torn
 /// down) gives the count back through `Drop`, and none can forget to. `Drop`
-/// only decrements an atomic. Binds and slots are dropped while a slot
-/// table's mutex is held, and the attach choice reads slot tables, so taking a
-/// lock here could deadlock against it.
+/// only decrements an atomic: binds and slots are dropped while a slot
+/// table's mutex is held, so taking any lock here risks a lock-order deadlock.
 #[derive(Debug)]
 pub(crate) struct LaneReservation {
     lane: LaneIndex,
@@ -94,7 +98,7 @@ impl LaneReservation {
         Self::take(lane, Arc::new(AtomicUsize::new(0)))
     }
 
-    fn take(lane: LaneIndex, count: Arc<AtomicUsize>) -> Self {
+    pub(crate) fn take(lane: LaneIndex, count: Arc<AtomicUsize>) -> Self {
         count.fetch_add(1, Ordering::Relaxed);
         Self { lane, count }
     }
@@ -122,26 +126,55 @@ impl LaneCounts {
     }
 }
 
+/// A count per (peer, lane), shared with the reservations taken on it.
+///
+/// Grows with distinct (peer, lane)s and is never pruned, like the ingress
+/// registry's own per-(peer, lane) state: a reservation holds its counter, so
+/// removing an entry while one is out would split the count in two.
+#[derive(Default)]
+pub(crate) struct PeerLaneCounts(DashMap<PeerLane, Arc<AtomicUsize>>);
+
+impl PeerLaneCounts {
+    /// The counter for `key`, created on first use.
+    pub(crate) fn counter(&self, key: PeerLane) -> Arc<AtomicUsize> {
+        if let Some(count) = self.0.get(&key) {
+            return Arc::clone(count.value());
+        }
+        Arc::clone(self.0.entry(key).or_default().value())
+    }
+
+    /// Count one more on `key` until the returned reservation drops.
+    pub(crate) fn take(&self, key: PeerLane) -> LaneReservation {
+        LaneReservation::take(key.lane, self.counter(key))
+    }
+
+    /// The reservations on `key` not yet dropped.
+    pub(crate) fn get(&self, key: PeerLane) -> usize {
+        self.0
+            .get(&key)
+            .map_or(0, |count| count.load(Ordering::Relaxed))
+    }
+}
+
 /// Unclaimed binds per lane, the part of lane load that no slot table shows.
 #[derive(Default)]
 pub(crate) struct LaneLoad {
     /// Attach binds not yet claimed, per (peer, lane).
-    ///
-    /// Grows with distinct (peer, lane)s and is never pruned, like the ingress
-    /// registry's own per-(peer, lane) state: a reservation holds its counter,
-    /// so removing an entry while a bind is pending would split the count in
-    /// two.
-    attach: DashMap<PeerLane, Arc<AtomicUsize>>,
+    attach: PeerLaneCounts,
     /// Binds with no peer (pre-binds, and binds through the bare
     /// `FrameTransport::bind`) not yet claimed, released or expired, per lane.
     local: LaneCounts,
-    /// Makes reading the loads and taking a reservation one step for attach
-    /// binds, so two chosen at once cannot both read the same lane as least
-    /// loaded. Never taken in `LaneReservation::drop`.
-    choosing_attach: Mutex<()>,
-    /// The same for binds with no peer. Apart from `choosing_attach` because
-    /// an attach choice holds its lock while it reads slot tables, and a
-    /// pre-bind is on a frontend's per-request path and reads only atomics.
+    /// Makes reading the loads and taking a reservation one step for the
+    /// attach binds of one peer, so two chosen at once cannot both read the
+    /// same lane as least loaded. Without it, attaches from one peer answered
+    /// together all land on one lane. Per peer, because an attach reads only
+    /// its own peer's counts, so attaches from different peers have nothing to
+    /// race over. Never taken in `LaneReservation::drop`.
+    ///
+    /// Grows with distinct peers and is never pruned, as `attach` above.
+    choosing_attach: DashMap<WorkerId, Arc<Mutex<()>>>,
+    /// The same for binds with no peer. One for the node, because every
+    /// pre-bind reads the same node-wide counts.
     choosing_local: Mutex<()>,
 }
 
@@ -163,11 +196,11 @@ impl LaneLoad {
         if let Some(key) = key {
             return self.reserve_on(peer, keyed_lane(key, lanes));
         }
-        let choosing = if peer.is_some() {
-            &self.choosing_attach
-        } else {
-            &self.choosing_local
-        };
+        // Cloned out of the map before it is locked, so the map's shard lock
+        // is not held through the choice.
+        let per_peer =
+            peer.map(|peer| Arc::clone(self.choosing_attach.entry(peer).or_default().value()));
+        let choosing = per_peer.as_deref().unwrap_or(&self.choosing_local);
         let _choosing = choosing
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -178,15 +211,7 @@ impl LaneLoad {
     /// Count one bind on a lane already decided.
     pub(crate) fn reserve_on(&self, peer: Option<WorkerId>, lane: LaneIndex) -> LaneReservation {
         match peer {
-            Some(peer) => LaneReservation::take(
-                lane,
-                Arc::clone(
-                    self.attach
-                        .entry(PeerLane::new(peer, lane))
-                        .or_default()
-                        .value(),
-                ),
-            ),
+            Some(peer) => self.attach.take(PeerLane::new(peer, lane)),
             None => self.local.take(lane),
         }
     }
@@ -195,10 +220,7 @@ impl LaneLoad {
     /// expired, for `peer` (attach) or with no peer (pre-bind).
     pub(crate) fn pending(&self, peer: Option<WorkerId>, lane: LaneIndex) -> usize {
         match peer {
-            Some(peer) => self
-                .attach
-                .get(&PeerLane::new(peer, lane))
-                .map_or(0, |count| count.load(Ordering::Relaxed)),
+            Some(peer) => self.attach.get(PeerLane::new(peer, lane)),
             None => self.local.get(lane),
         }
     }

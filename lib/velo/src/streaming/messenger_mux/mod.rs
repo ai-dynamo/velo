@@ -825,7 +825,7 @@ impl MessengerMuxTransport {
         self.core
             .lane_load
             .reserve(peer, key, lanes, |peer, lane| match peer {
-                Some(peer) => ingress.live_slots(PeerLane::new(peer, lane)),
+                Some(peer) => ingress.live_count(PeerLane::new(peer, lane)),
                 None => ingress.live_on_lane(lane),
             })
     }

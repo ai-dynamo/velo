@@ -741,3 +741,66 @@ async fn a_one_lane_producer_opens_past_a_sixteenth_of_the_slot_ceiling() {
         "slot indices {sixteenth} and {last} on lane 0 must open"
     );
 }
+
+/// An unkeyed attach chooses its lane without taking any ingress table's
+/// mutex.
+///
+/// The ordered batch handler holds its table's mutex through a whole batch's
+/// decode. A choice that read live slots by locking each table would wait
+/// behind that batch, and every unkeyed attach on the node would wait behind
+/// the choice. Here another thread holds the (producer, 0) table's mutex, and
+/// the choice must finish anyway. The table must exist: with none, reading its
+/// live slots takes no lock and the test would pass for nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unkeyed_attach_choice_takes_no_ingress_table_lock() {
+    let (consumer, producer) = pair(4, 4).await;
+    let peer = producer.worker();
+    let on_zero = PeerLane::new(peer, LaneIndex::ZERO);
+    let anchor = consumer.velo.create_anchor::<u32>();
+    let sender = producer
+        .velo
+        .attach_anchor_keyed::<u32>(transfer(anchor.handle()), key_for(0, 4))
+        .await
+        .expect("remote attach");
+    sender.send(u32::MAX).await.expect("first send");
+    let mux = consumer.mux();
+    eventually("the slot to open on lane 0", || {
+        mux.live_ingress_slots(on_zero) == 1
+    })
+    .await;
+
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = {
+        let mux = Arc::clone(&mux);
+        std::thread::spawn(move || {
+            mux.core
+                .ingress
+                .with_table_locked(on_zero, || {
+                    locked_tx.send(()).expect("test thread waits");
+                    let _ = release_rx.recv();
+                })
+                .expect("the (producer, 0) table exists");
+        })
+    };
+    locked_rx
+        .recv_timeout(BOUND)
+        .expect("the holder took the table's mutex");
+    let (chosen_tx, chosen_rx) = std::sync::mpsc::channel();
+    let chooser = {
+        let mux = Arc::clone(&mux);
+        std::thread::spawn(move || {
+            let _ = chosen_tx.send(mux.choose_lane(Some(peer), None).lane());
+        })
+    };
+    let chosen = chosen_rx.recv_timeout(Duration::from_secs(2));
+    // Release before asserting, so a failure here ends as a failure and not
+    // as a hung test.
+    let _ = release_tx.send(());
+    holder.join().expect("holder thread");
+    chooser.join().expect("chooser thread");
+    let lane = chosen.expect("an unkeyed attach choice must not wait on an ingress table's mutex");
+    assert_ne!(lane, LaneIndex::ZERO, "lane 0 holds a live slot");
+
+    stream_through(sender, drain_first(anchor).await).await;
+}

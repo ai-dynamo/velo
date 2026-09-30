@@ -1780,11 +1780,11 @@ fn every_lane_table_takes_the_whole_slot_range() {
     );
 }
 
-/// The node's live count per lane matches the slots in its tables after every
-/// way a slot opens or leaves.
+/// The node's live count per lane, and the count per (peer, lane), match the
+/// slots in its tables after every way a slot opens or leaves.
 ///
-/// Unkeyed pre-binds are placed by this count, read without locking any
-/// table. Each slot holds its own count, so the two can drift only if a slot
+/// Unkeyed pre-binds are placed by the first and unkeyed attaches by the
+/// second, both read without locking any table. Each slot holds its own count, so the two can drift only if a slot
 /// is kept somewhere after it leaves its table, or a count is taken with no
 /// slot behind it. The steps cover each exit (a duplicate open, a cancel that
 /// lands before the claim, a close from the consumer side, a new epoch, and
@@ -1805,7 +1805,16 @@ fn the_live_count_per_lane_matches_the_slot_tables() {
         });
         handle_batch(&registry, &config, None, key, &payload)
     };
+    // Per lane, the node's count against the tables; and per (peer, lane),
+    // the count an unkeyed attach reads against that table.
     let counts = || {
+        for key in [a0, a1, b1] {
+            assert_eq!(
+                registry.live_count(key),
+                registry.live_slots(key),
+                "the (peer, lane) count of {key:?} must match its table"
+            );
+        }
         [LaneIndex::ZERO, LaneIndex::new(1)].map(|lane| {
             let in_tables: usize = [a0, a1, b1]
                 .into_iter()

@@ -53,14 +53,36 @@ pub(super) enum Applied {
     Fault(CloseReason),
 }
 
+/// A live slot's two lane counts.
+///
+/// Held by the slot and never read, so whichever path retires it (a close, an
+/// epoch retired, shutdown) gives both back when it drops, and none can
+/// forget to.
+pub(super) struct LiveCounts {
+    /// On the slot's lane, summed over every peer. An unkeyed pre-bind reads
+    /// it, because it does not know its peer.
+    _node: LaneReservation,
+    /// On the slot's (peer, lane). An unkeyed attach from that peer reads it,
+    /// so the choice takes no slot table's mutex.
+    _peer: LaneReservation,
+}
+
+impl LiveCounts {
+    pub(super) fn new(node: LaneReservation, peer: LaneReservation) -> Self {
+        Self {
+            _node: node,
+            _peer: peer,
+        }
+    }
+}
+
 /// One receive-side slot.
 pub(super) struct IngressSlot {
     pub(super) session_id: u64,
     /// Index and generation this slot answers to.
     pub(super) id: SlotId,
-    /// This slot's count on its lane, for placing unkeyed pre-binds. Given
-    /// back when the slot drops, by whichever path retires it.
-    _lane: LaneReservation,
+    /// This slot's counts on its lane, for placing unkeyed streams.
+    _live: LiveCounts,
     /// The mux-owned `C + 1`-deep buffer handed to the anchor by `bind`.
     frame_tx: flume::Sender<Vec<u8>>,
     /// The signal this slot's consumer counts its drains on (the
@@ -128,7 +150,7 @@ impl IngressSlot {
     /// Open a slot against the buffer `bind` created, granting `initial_credit`.
     pub(super) fn new(
         id: SlotId,
-        lane: LaneReservation,
+        live: LiveCounts,
         frame_tx: flume::Sender<Vec<u8>>,
         drain: Arc<DrainSignal>,
         initial_credit: u32,
@@ -138,7 +160,7 @@ impl IngressSlot {
         Self {
             session_id: 0,
             id,
-            _lane: lane,
+            _live: live,
             frame_tx,
             drain,
             account: SlotCreditAccount::new(initial_credit),

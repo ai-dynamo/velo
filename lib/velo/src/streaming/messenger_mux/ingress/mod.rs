@@ -34,7 +34,7 @@ mod tests;
 
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -43,9 +43,9 @@ use velo_ext::WorkerId;
 pub(crate) use self::dirty::DirtySlots;
 pub(crate) use self::drain::DrainSignal;
 use self::reconcile::{collect_grants, collect_touched_grants, list_drained_slots};
-use self::slot::{Applied, IngressSlot, heartbeat_frame};
+use self::slot::{Applied, IngressSlot, LiveCounts, heartbeat_frame};
 use super::flow_control::SharedByteBudget;
-use super::lane_choice::{LaneCounts, LaneReservation};
+use super::lane_choice::{LaneCounts, LaneReservation, PeerLaneCounts};
 use super::peer_batcher::ReplyRecord;
 use super::protocol::{
     BatchDecoder, BatchHeader, CloseReason, Record, RecordBody, SlotId, batch_seq_gap,
@@ -133,6 +133,13 @@ pub(crate) struct IngressRegistry {
     /// place its stream; summing the tables instead would lock every
     /// (peer, lane) table on a frontend's per-request path.
     live: LaneCounts,
+    /// Live slots per (peer, lane), held by each [`IngressSlot`] like `live`.
+    ///
+    /// What an unkeyed attach reads to place its stream. Reading the tables
+    /// instead would wait on the mutex the ordered batch handler holds through
+    /// a whole batch. [`live_slots`](Self::live_slots) stays the exact answer
+    /// for the one reader that needs it, batcher eviction.
+    live_per_peer: PeerLaneCounts,
     /// One byte budget per peer, shared by all of that peer's lane tables.
     ///
     /// Shared rather than split, so the peer's bound is `peer_byte_budget`
@@ -153,6 +160,9 @@ struct PeerIngress {
     slots: Vec<Option<IngressSlot>>,
     /// The peer's byte budget, shared with its other lanes' tables.
     peer_bytes: Arc<SharedByteBudget>,
+    /// This (peer, lane)'s live-slot count, taken once here so opening a
+    /// slot does not look it up in a map while this table's mutex is held.
+    live: Arc<AtomicUsize>,
     /// Slot indexes the pass being run must reconcile, in arrival order.
     ///
     /// Scratch, reused across passes so the steady state allocates nothing: a
@@ -186,12 +196,13 @@ struct PeerIngress {
 }
 
 impl PeerIngress {
-    fn new(peer_bytes: Arc<SharedByteBudget>) -> Self {
+    fn new(peer_bytes: Arc<SharedByteBudget>, live: Arc<AtomicUsize>) -> Self {
         Self {
             epoch: None,
             last_batch_seq: None,
             slots: Vec::new(),
             peer_bytes,
+            live,
             touched: Vec::new(),
             dirty: Arc::new(DirtySlots::new()),
             #[cfg(test)]
@@ -411,7 +422,18 @@ impl IngressRegistry {
             .map_or(0, |entry| lock(entry.value()).reconcile_visits)
     }
 
-    /// Live receive-side slots for one (peer, lane).
+    /// Run `f` while holding `key`'s table mutex, as the ordered batch
+    /// handler does through a decode. `None` when `key` has no table.
+    #[cfg(test)]
+    pub(crate) fn with_table_locked<R>(&self, key: PeerLane, f: impl FnOnce() -> R) -> Option<R> {
+        let entry = self.peers.get(&key)?;
+        let _state = lock(entry.value());
+        Some(f())
+    }
+
+    /// Live receive-side slots for one (peer, lane), counted by walking its
+    /// table under the table's mutex. Exact, and it waits behind a batch in
+    /// the ordered handler; [`live_count`](Self::live_count) does neither.
     pub(crate) fn live_slots(&self, key: PeerLane) -> usize {
         self.peers
             .get(&key)
@@ -421,6 +443,15 @@ impl IngressRegistry {
     /// Live receive-side slots on `lane`, from every peer.
     pub(crate) fn live_on_lane(&self, lane: LaneIndex) -> usize {
         self.live.get(lane)
+    }
+
+    /// Live receive-side slots for one (peer, lane), read from an atomic and
+    /// taking no table's mutex.
+    ///
+    /// A slot counts from the moment its `OpenSlot` is applied until it
+    /// drops, so a reader racing a batch may see it a moment early or late.
+    pub(crate) fn live_count(&self, key: PeerLane) -> usize {
+        self.live_per_peer.get(key)
     }
 
     /// Every (peer, lane) with receive-side state, for the credit sweep.
@@ -543,10 +574,11 @@ pub(crate) fn handle_batch(
 
     if !registry.peers.contains_key(&key) {
         let peer_bytes = registry.peer_budget(key.peer, config.peer_byte_budget);
+        let live = registry.live_per_peer.counter(key);
         registry
             .peers
             .entry(key)
-            .or_insert_with(|| Mutex::new(PeerIngress::new(peer_bytes)));
+            .or_insert_with(|| Mutex::new(PeerIngress::new(peer_bytes, live)));
     }
     // A read guard, not `entry`'s write guard: the `Mutex` inside already
     // serialises writers, and holding the shard for writing would block the
@@ -812,7 +844,10 @@ fn open_slot(
     // clamps, and the arrival lane is where the stream's load is.
     let mut slot = IngressSlot::new(
         id,
-        ctx.registry.live.take(ctx.key.lane),
+        LiveCounts::new(
+            ctx.registry.live.take(ctx.key.lane),
+            LaneReservation::take(ctx.key.lane, Arc::clone(&state.live)),
+        ),
         bind.frame_tx.clone(),
         Arc::clone(&bind.drain),
         ctx.config.initial_credit,
