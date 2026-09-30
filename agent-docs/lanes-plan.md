@@ -106,3 +106,11 @@ Stages:
 - B. Wire: handlers per lane, `.lane(k)` sends, header lane, lane in the attach response, ticket and requests, sender clamp; still choosing lane 0.
 - C. Selection: `attach_anchor_keyed`, `prebind_anchor_keyed`, least-used choice, MPSC attach.
 - D. Tests from the PR sequence list, examples knob `VELO_QUIC_LANES`, two-node stream measurement.
+
+## Progress, 2026-09-29: Stage A done
+
+Commits `6bc76f2` (batchers keyed by (peer, lane)) and `bc902a2` (ingress, drain wake, doorbell, sweep, `SlotClaim` keyed by (peer, lane)). Types: `LaneIndex(u16)` and `PeerLane { peer, lane }` in `messenger_mux/lane.rs`. Gate on compute: fmt 0, clippy 0, lib 1138 passed (2 new ingress tests: lanes keep separate tables; a claim and its wake name the arrival lane), all ten streaming integration suites pass.
+
+Where lane 0 enters today (grep `LaneIndex::ZERO`): the `_stream_batch` handler in `MessengerMuxTransport::new`; `FrameTransport::connect` (stays lane 0: the bare trait carries no lane); `AnchorManager::connect_streaming` (Stage B takes the lane from the ticket or attach response); test helpers. Everything else takes its lane from a key or from `SlotClaim`.
+
+For Stage B: `writer.rs` names `STREAM_BATCH_HANDLER` twice, in the send and in `compute_cap`'s `effective_eager_payload`, so the per-lane handler name must reach both. `table_byte_budget` in `ingress/mod.rs` is called with one lane; pass the receiver's lane count there, and note a budget below the lane count rounds to 0. `MAX_INGRESS_SLOTS_PER_PEER` is now per table, so the per-peer bound is that times the lane count. The health probe (`peer_is_alive`) runs per batcher, so once per lane.
