@@ -118,7 +118,7 @@ A lane is one ordered channel of batches from a sender to a peer. Order holds pe
 
 The mux keeps up to 16 lanes to a peer, and mux lane k rides transport lane k. The count follows the transport: `Transport::lanes(peer)`, capped at 16. A QUIC transport built with `lanes(8)` gives 8 mux lanes. TCP keeps one lane, which is the behavior from before lanes.
 
-Each lane has its own batch handler, ordered per sender. Lane 0 keeps the name `_stream_batch`, so a peer from before lanes sends and receives on it. Lanes 1 to 15 use `_stream_batch.1` to `_stream_batch.15`. Every node registers all 16 handlers, whatever its transport keeps, because a peer can send on any lane that the peer keeps.
+Each lane has its own batch handler, ordered per sender. Lane 0 keeps the name `_stream_batch`, so a peer from before lanes sends and receives on it. Lanes 1 to 15 use `_stream_batch.1` to `_stream_batch.15`. Every node registers all 16 handlers when it is built. At that time the lane counts of its peers are not known, and they can be different for each peer and each transport.
 
 Everything that depends on order is kept per (peer, lane): the batcher on the sender, and the epoch, `batch_seq` and slot table on the receiver. Slot ids are unique only within one batcher, so a table shared by two lanes would let one lane retire the slots of the other. Replies (credit, closes, stops) go back on the lane that the batch arrived on.
 

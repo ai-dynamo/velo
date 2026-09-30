@@ -296,10 +296,10 @@ impl MessengerMuxTransport {
     /// Build a mux over `messenger` and register its batch handlers, one per
     /// lane up to [`MAX_LANES`](lane::MAX_LANES).
     ///
-    /// All of them, whatever this node's transports keep, because the lane is
-    /// the consumer's choice clamped by the sender, and replies go back on the
-    /// arrival lane: a node must be able to take a batch on any lane a peer
-    /// could pick. A handler costs a map entry until its first batch.
+    /// All of them, whatever this node's transports keep: registration
+    /// happens here, at build, before any peer's lane count is known, and the
+    /// count can differ per peer and per transport. A handler costs a map
+    /// entry until its first batch.
     ///
     /// Registration is for the messenger's lifetime: there is no
     /// handler-deregistration hook. The messenger does not refuse a duplicate

@@ -264,3 +264,30 @@ async fn a_one_lane_producer_clamps_a_named_lane_to_zero() {
     assert!(matches!(first, StreamFrame::Item(u32::MAX)));
     stream_through(sender, anchor).await;
 }
+
+/// An MPSC sender opens on the lane the consumer's attach response names.
+///
+/// The MPSC attach builds its own ticket from the response, apart from the
+/// SPSC path, so a lane dropped there would silently put the sender on lane 0.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_mpsc_sender_opens_on_the_lane_its_attach_names() {
+    let (consumer, producer) = pair(4, 4).await;
+    let on_lane = PeerLane::new(producer.worker(), LaneIndex::new(LANE));
+    let on_zero = PeerLane::new(producer.worker(), LaneIndex::ZERO);
+
+    let anchor = consumer.velo.create_mpsc_anchor::<u32>();
+    let sender = producer
+        .velo
+        .attach_mpsc_anchor::<u32>(transfer(anchor.handle()))
+        .await
+        .expect("remote mpsc attach");
+    sender.send(7).await.expect("send");
+    let consumer_mux = consumer.mux();
+    eventually("the mpsc slot to open on lane 3", || {
+        consumer_mux.live_ingress_slots(on_lane) == 1
+    })
+    .await;
+    assert_eq!(consumer_mux.live_ingress_slots(on_zero), 0);
+    drop(sender);
+    drop(anchor);
+}
