@@ -3,7 +3,7 @@
 
 //! Throughput benchmark for the Velo messaging facade.
 //!
-//! Measures messages/sec and bytes/sec across three send patterns:
+//! Measures messages/sec and bytes/sec across four send patterns:
 //!
 //! - **Sequential**: one message in-flight at a time (baseline per-message cost)
 //! - **Concurrent**: N messages in-flight simultaneously (tests parallelism)

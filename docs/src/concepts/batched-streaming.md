@@ -170,7 +170,7 @@ The epoch scopes the whole table above the generation. A generation survives slo
 
 ### Ordering is per slot
 
-The mux registers `_stream_batch` with ordered per-sender dispatch. One task handles the batches from one peer, in arrival order. The general reordering problem does not arise, and no reorder window is necessary.
+The mux registers each lane's batch handler (`_stream_batch`, `_stream_batch.1`, ...) with ordered per-sender dispatch. One task handles the batches from one peer on one lane, in arrival order. The general reordering problem does not arise, and no reorder window is necessary.
 
 One exception exists. A rendezvous payload resolves in a detached task before dispatch, so an oversized record is not ordered against the eager batches around it. Two mechanisms bound this:
 
@@ -189,7 +189,7 @@ By default, `connect` returns after the transport admits the `OpenSlot`. `MuxCon
 
 ### Zero-RTT stream setup
 
-The receiver chooses every field of the attach response without input from the sender. It can therefore bind a slot before any sender asks. `AnchorManager::prebind_anchor` does the work of the attach handler at request registration. It binds the slot, allocates the routing session, takes the drain signal, installs the direct feed and spawns the stream watchdog. It returns a `StreamOpenTicket` with the five values an attach response carries. The application puts the ticket in the request envelope that it already sends to the worker.
+The receiver chooses every field of the attach response without input from the sender. It can therefore bind a slot before any sender asks. `AnchorManager::prebind_anchor` does the work of the attach handler at request registration. It binds the slot, allocates the routing session, takes the drain signal, installs the direct feed and spawns the stream watchdog. It returns a `StreamOpenTicket` with the six values an attach response carries. The application puts the ticket in the request envelope that it already sends to the worker.
 
 The worker calls `AnchorManager::open_anchor_stream` with the ticket. Its first batch carries an `OpenSlot`, which claims the pre-bound slot the same way an attached sender's does. No `_anchor_attach` crosses the wire. The wire format does not change: `StreamOpenTicket` is a separate type in the application's envelope. When no mux is installed, `prebind_anchor` returns `None` and the stream attaches the ordinary way.
 
@@ -215,9 +215,11 @@ Loss of Messenger connectivity, peer eviction and batcher eviction all end in ep
 
 Any failed admission of a batch is also epoch death. A batch that never reached the wire leaves a `frame_seq` gap in every slot it carried. The mux does not retransmit, so those slots cannot make progress again.
 
+Each lane has its own batcher and its own epoch, so epoch death on one lane fails only the slots on that lane. Streams to the same peer on other lanes continue.
+
 ## Flow control
 
-The shared resource is the ordering lane of the peer. A `_stream_batch` handler that awaits holds that lane, and every slot from the peer stalls behind it. Lane channels are unbounded, so a blocking handler turns backpressure into unbounded memory growth. With a blocking handler, one saturated anchor stalls every stream from that peer and fires all of their heartbeat watchdogs at once. For inference, one slow HTTP client then throttles the GPU. Ingress is therefore bounded and nonblocking, on per-slot credit.
+The shared resource is the ordering lane of one (peer, lane). A batch handler that awaits holds that lane, and every slot from the peer on that lane stalls behind it. Lane channels are unbounded, so a blocking handler turns backpressure into unbounded memory growth. With a blocking handler, one saturated anchor stalls every stream from that peer on its lane and fires all of their heartbeat watchdogs at once. For inference, one slow HTTP client then throttles the GPU. Ingress is therefore bounded and nonblocking, on per-slot credit.
 
 ### Credit against a mux-owned buffer
 

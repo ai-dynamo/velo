@@ -1374,8 +1374,9 @@ impl AnchorManager {
     /// worker that may be queued longer than that needs a longer-lived
     /// rendezvous than this call provides.
     ///
-    /// The ticket names the mux lane with the fewest pre-binds not yet claimed,
-    /// released or expired; [`prebind_anchor_keyed`](Self::prebind_anchor_keyed)
+    /// The ticket names the mux lane with the least load on this node: its
+    /// live slots from every peer, plus its pre-binds not yet claimed,
+    /// released or expired. [`prebind_anchor_keyed`](Self::prebind_anchor_keyed)
     /// places it by a key instead.
     pub fn prebind_anchor(
         &self,

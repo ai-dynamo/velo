@@ -171,7 +171,7 @@ A grant threshold (grant only when half the window has drained) was built and me
 
 ### Zero-RTT: pre-bind is the synchronous twin of bind
 
-`MessengerMuxTransport::prebind` calls the same `open_bind` body as `FrameTransport::bind`. `bind` is async only because the trait is. One body keeps the two paths from drifting.
+`MessengerMuxTransport::bind_on_lane` calls the same `open_bind` body as `FrameTransport::bind`. `bind` is async only because the trait is. One body keeps the two paths from drifting.
 
 - **Rejected: bind on `OpenSlot`.** Minting a ticket and binding when the `OpenSlot` arrives has a simpler lifecycle. It inverts a layer (ingress resolves the anchor's channel from the registry) and it loses the meaning of the accept window.
 - **No protocol version bump.** The ticket rides the application's envelope as an optional field. A version bump breaks an old worker outright. An absent field makes the worker attach the ordinary way.

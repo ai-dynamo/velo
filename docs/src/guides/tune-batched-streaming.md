@@ -10,7 +10,7 @@ A `Velo` builder installs the mux with `MuxConfig::default()`. The per-stream tr
 
 To turn the mux off without a code change, set `VELO_MESSENGER_MUX_DISABLE=1` and restart the process. Only `1`, `true`, `yes` and `on` (any case) count. Velo reads the variable once, when it builds the node. The variable wins over `enabled: true` set in code, so a benchmark that must measure the mux must not inherit it.
 
-A node with the mux runs one sweep task, which wakes five times a second, and registers 16 batch handlers (`_stream_batch` and one for each other lane), even if it never streams. A handler costs a map entry until its first batch.
+A node with the mux runs one sweep task, which wakes five times a second, and registers 16 batch handlers (`_stream_batch` for lane 0 and `_stream_batch.1` to `_stream_batch.15`), even if it never streams. A handler costs a map entry until its first batch.
 
 Call `messenger_mux` to change a setting, or to turn the mux off:
 

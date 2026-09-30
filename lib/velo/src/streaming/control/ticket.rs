@@ -30,7 +30,7 @@ use std::time::Duration;
 /// nothing. [`super::AnchorAttachRequest`] and [`super::AnchorAttachResponse`]
 /// gain and lose no field for any of this. `#[non_exhaustive]` is what keeps
 /// the divergence free: fields stay `pub` for reading, but a type this
-/// permissive would otherwise make adding a sixth field a breaking change for
+/// permissive would otherwise make adding a field a breaking change for
 /// any out-of-tree struct literal, exactly as it would be on the response.
 /// The one way a ticket is meant to be built off this node is by decoding one
 /// off the wire (`Deserialize` is generated inside this crate, so
