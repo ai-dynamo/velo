@@ -714,3 +714,64 @@ async fn max_message_size_is_exactly_what_the_codec_will_encode() {
         "one byte past the reported capacity must not",
     );
 }
+
+/// Replacing a dead connection must not update the connection gauge while the
+/// map entry is held. The gauge reads `len()`, which read-locks every shard,
+/// and the shard that the entry holds for writing is not reentrant: the
+/// thread waits on itself, and every later operation on that shard waits
+/// behind it. The dead entry is seeded directly because in normal use it only
+/// appears in a race between `reap_stale_connection` and `entry()`.
+///
+/// The test owns its runtime and drops it in the background on a timeout, so
+/// the fault fails the test instead of hanging the run. With the fault, a
+/// task that later touches the map blocks a runtime worker on the held shard,
+/// and dropping a `#[tokio::test]` runtime would then wait for it forever.
+#[test]
+fn replacing_a_dead_connection_does_not_deadlock() {
+    use crate::observability::VeloMetrics;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let guard = rt.enter();
+
+    let registry = prometheus::Registry::new();
+    let metrics = VeloMetrics::register(&registry).expect("register metrics");
+    let (transport, _addr) = make_transport();
+    // Observed, so the gauge update runs.
+    transport.set_observability(Arc::new(metrics.bind_transport("tcp")));
+
+    let peer_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let peer = make_tcp_peer(peer_listener.local_addr().unwrap());
+    let iid = peer.instance_id();
+    transport.register(peer).unwrap();
+    insert_stale_handle(&transport, iid);
+
+    let transport = Arc::new(transport);
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn({
+        let transport = transport.clone();
+        let handle = rt.handle().clone();
+        move || {
+            let installed = transport.install_connection(iid, &handle).is_ok();
+            let _ = done_tx.send(installed);
+        }
+    });
+    let Ok(installed) = done_rx.recv_timeout(Duration::from_secs(5)) else {
+        drop(guard);
+        rt.shutdown_background();
+        panic!("install_connection deadlocked replacing a dead connection");
+    };
+    assert!(installed);
+    assert!(
+        !transport
+            .connections
+            .get(&iid)
+            .unwrap()
+            .tx
+            .is_disconnected()
+    );
+    transport.shutdown();
+}
