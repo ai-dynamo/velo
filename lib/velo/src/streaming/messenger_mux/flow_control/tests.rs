@@ -56,7 +56,10 @@ fn advertised_limits_pass_through_unchanged() {
 fn the_documented_defaults_are_what_batching_md_says() {
     assert_eq!(DEFAULT_PEER_BYTE_BUDGET, 8 * 1024 * 1024);
     assert_eq!(DEFAULT_SLOT_BYTE_BUDGET, 1024 * 1024);
-    assert_eq!(ByteBudget::per_peer().limit(), DEFAULT_PEER_BYTE_BUDGET);
+    assert_eq!(
+        SharedByteBudget::per_peer().limit(),
+        DEFAULT_PEER_BYTE_BUDGET
+    );
     assert_eq!(
         ByteBudget::per_slot(&limits(1)).limit(),
         u64::from(limits(1).slot_byte_budget())
@@ -435,6 +438,55 @@ fn a_reservation_larger_than_the_budget_is_permanent() {
 }
 
 #[test]
+fn a_shared_budget_refuses_what_does_not_fit_and_takes_it_after_a_release() {
+    let budget = SharedByteBudget::new(100);
+    assert_eq!(budget.try_reserve(80), Ok(()));
+    assert_eq!(
+        budget.try_reserve(30),
+        Err(ByteBudgetError::Exhausted {
+            requested: 30,
+            available: 20,
+            limit: 100,
+        })
+    );
+    assert_eq!(
+        budget.try_reserve(101),
+        Err(ByteBudgetError::ExceedsBudget {
+            requested: 101,
+            limit: 100,
+        })
+    );
+    assert_eq!(budget.used(), 80, "a refused reservation costs nothing");
+    budget.release(80);
+    assert_eq!(budget.try_reserve(30), Ok(()));
+    assert_eq!(budget.available(), 70);
+}
+
+/// Tables of one peer reserve from their own threads; together they never
+/// take more than the budget, and they take all of it.
+#[test]
+fn concurrent_reservations_never_pass_a_shared_budget() {
+    let budget = std::sync::Arc::new(SharedByteBudget::new(10_000));
+    let admitted: u64 = (0..8)
+        .map(|_| {
+            let budget = std::sync::Arc::clone(&budget);
+            std::thread::spawn(move || {
+                let mut admitted = 0;
+                while budget.try_reserve(100).is_ok() {
+                    admitted += 100;
+                }
+                admitted
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|thread| thread.join().expect("thread"))
+        .sum();
+    assert_eq!(admitted, 10_000);
+    assert_eq!(budget.used(), 10_000);
+}
+
+#[test]
 fn an_over_release_cannot_drive_usage_negative() {
     let mut budget = ByteBudget::new(100);
     assert_eq!(budget.try_reserve(10), Ok(()));
@@ -445,11 +497,11 @@ fn an_over_release_cannot_drive_usage_negative() {
 
 #[test]
 fn a_paired_reservation_rolls_the_slot_back_when_the_peer_refuses() {
-    let mut peer = ByteBudget::new(64);
+    let peer = SharedByteBudget::new(64);
     let mut slot = ByteBudget::new(128);
-    assert_eq!(try_reserve_pair(&mut peer, &mut slot, 50), Ok(()));
+    assert_eq!(try_reserve_pair(&peer, &mut slot, 50), Ok(()));
 
-    let err = try_reserve_pair(&mut peer, &mut slot, 30).expect_err("peer is full");
+    let err = try_reserve_pair(&peer, &mut slot, 30).expect_err("peer is full");
     assert!(err.is_transient());
     // The leak this guards against: a slot reservation outliving a failed peer
     // reservation, invisible to the live-slots gauge for the life of the epoch.
@@ -459,10 +511,10 @@ fn a_paired_reservation_rolls_the_slot_back_when_the_peer_refuses() {
 
 #[test]
 fn a_paired_reservation_refused_by_the_slot_leaves_the_peer_alone() {
-    let mut peer = ByteBudget::new(1_024);
+    let peer = SharedByteBudget::new(1_024);
     let mut slot = ByteBudget::new(64);
 
-    let err = try_reserve_pair(&mut peer, &mut slot, 65).expect_err("over the slot cap");
+    let err = try_reserve_pair(&peer, &mut slot, 65).expect_err("over the slot cap");
     assert!(!err.is_transient());
     assert_eq!(peer.used(), 0);
     assert_eq!(slot.used(), 0);
@@ -470,13 +522,13 @@ fn a_paired_reservation_refused_by_the_slot_leaves_the_peer_alone() {
 
 #[test]
 fn releasing_a_pair_returns_both_scopes() {
-    let mut peer = ByteBudget::per_peer();
+    let peer = SharedByteBudget::per_peer();
     let mut slot = ByteBudget::per_slot(&limits(4));
 
-    assert_eq!(try_reserve_pair(&mut peer, &mut slot, 2_048), Ok(()));
+    assert_eq!(try_reserve_pair(&peer, &mut slot, 2_048), Ok(()));
     assert_eq!((peer.used(), slot.used()), (2_048, 2_048));
 
-    release_pair(&mut peer, &mut slot, 2_048);
+    release_pair(&peer, &mut slot, 2_048);
     assert_eq!((peer.used(), slot.used()), (0, 0));
     assert_eq!(peer.available(), DEFAULT_PEER_BYTE_BUDGET);
 }
@@ -485,12 +537,12 @@ fn releasing_a_pair_returns_both_scopes() {
 fn many_slots_cannot_together_exceed_the_peer_budget() {
     // Frame credit alone bounds memory at `slots x C x max frame size`; this
     // is the number that makes it finite.
-    let mut peer = ByteBudget::new(1_000);
+    let peer = SharedByteBudget::new(1_000);
     let mut slots: Vec<ByteBudget> = (0..10).map(|_| ByteBudget::new(500)).collect();
 
     let mut admitted = 0u64;
     for slot in &mut slots {
-        while try_reserve_pair(&mut peer, slot, 100).is_ok() {
+        while try_reserve_pair(&peer, slot, 100).is_ok() {
             admitted += 100;
         }
     }

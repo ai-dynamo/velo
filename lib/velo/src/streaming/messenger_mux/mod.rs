@@ -136,7 +136,7 @@ use crate::observability::{MuxMetricsHandle, VeloMetrics};
 use crate::streaming::transport::FrameTransport;
 
 pub use self::config::{AutoFlush, FlushPolicy, MuxConfig};
-pub(crate) use self::lane::{LaneIndex, PeerLane, is_batch_handler, mux_lanes};
+pub(crate) use self::lane::{LaneIndex, PeerLane, is_batch_handler};
 pub(crate) use self::lane_choice::LaneReservation;
 
 /// The streaming-transport key this mux answers to.
@@ -455,7 +455,6 @@ impl MuxCore {
             self.metrics.as_ref(),
             key,
             payload,
-            || self.transport_lanes(key.peer),
         );
 
         if let Some(metrics) = &self.metrics {

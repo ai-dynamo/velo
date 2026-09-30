@@ -49,9 +49,7 @@ fn a_bogus_open_slot_flood_reaches_control_as_a_bounded_reject() {
     }
     let payload = encoder.finish().freeze();
 
-    let outcome = handle_batch(&registry, &config, None, peer(), &payload, || {
-        std::num::NonZeroU16::MIN
-    });
+    let outcome = handle_batch(&registry, &config, None, peer(), &payload);
 
     assert_eq!(
         outcome.replies.len(),

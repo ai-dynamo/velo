@@ -118,12 +118,6 @@ fn batch_on(
     encoder.finish().freeze()
 }
 
-/// The lane count of a node with one transport lane to the peer, which is
-/// every test here that does not split the per-peer limits.
-fn one_lane() -> NonZeroU16 {
-    NonZeroU16::MIN
-}
-
 fn item(n: u8) -> Vec<u8> {
     rmp_serde::to_vec(&crate::streaming::frame::StreamFrame::Item(n)).expect("encode item")
 }
@@ -141,7 +135,7 @@ fn open(registry: &IngressRegistry, config: &MuxConfig, id: SlotId, epoch: u64) 
     let payload = batch(epoch, 0, |encoder| {
         encoder.push_open_slot(id, 0, ANCHOR, SESSION).unwrap();
     });
-    handle_batch(registry, config, None, peer(), &payload, one_lane)
+    handle_batch(registry, config, None, peer(), &payload)
 }
 
 /// Take everything the consumer can see, without counting it on a drain
@@ -187,7 +181,7 @@ fn open_slot_for_an_unregistered_anchor_rejects_that_slot_only() {
         // A pair nobody bound.
         encoder.push_open_slot(id, 0, 999, 999).unwrap();
     });
-    let outcome = handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    let outcome = handle_batch(&registry, &config, None, peer(), &payload);
 
     assert_eq!(outcome.opened, 0);
     assert_eq!(
@@ -214,7 +208,7 @@ fn an_out_of_range_open_slot_is_rejected_without_touching_the_table() {
     let payload = batch(1, 0, |encoder| {
         encoder.push_open_slot(id, 0, ANCHOR, SESSION).unwrap();
     });
-    let outcome = handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    let outcome = handle_batch(&registry, &config, None, peer(), &payload);
 
     assert_eq!(outcome.opened, 0);
     assert_eq!(
@@ -269,8 +263,8 @@ fn a_colliding_open_slot_is_rejected_and_the_incumbent_survives() {
     let payload = batch(1, 1, |encoder| {
         encoder.push_data(incumbent, 2, &item(2)).unwrap();
     });
-    handle_batch(&registry, &config, None, peer(), &payload, one_lane);
-    let held_bytes = registry.peer_bytes_used(peer());
+    handle_batch(&registry, &config, None, peer(), &payload);
+    let held_bytes = registry.peer_bytes_used(peer().peer);
     assert!(
         held_bytes > 0,
         "the hold has to be charged for this to test anything"
@@ -283,7 +277,7 @@ fn a_colliding_open_slot_is_rejected_and_the_incumbent_survives() {
             .push_open_slot(collider, 0, ANCHOR, SESSION + 1)
             .unwrap();
     });
-    let outcome = handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    let outcome = handle_batch(&registry, &config, None, peer(), &payload);
 
     assert_eq!(outcome.opened, 0);
     assert_eq!(outcome.closed, 0, "the incumbent must not be retired");
@@ -303,7 +297,7 @@ fn a_colliding_open_slot_is_rejected_and_the_incumbent_survives() {
         "the incumbent's consumer must not see its channel end"
     );
     assert_eq!(
-        registry.peer_bytes_used(peer()),
+        registry.peer_bytes_used(peer().peer),
         held_bytes,
         "the incumbent's hold must still be charged to the peer budget — a \
          silent eviction would have leaked it for the life of the epoch"
@@ -314,7 +308,7 @@ fn a_colliding_open_slot_is_rejected_and_the_incumbent_survives() {
     let payload = batch(1, 3, |encoder| {
         encoder.push_data(incumbent, 1, &item(1)).unwrap();
     });
-    handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    handle_batch(&registry, &config, None, peer(), &payload);
     assert_eq!(drain(&incumbent_rx), vec![item(1), item(2)]);
 
     // The rejected open did not consume the bind it named, so the opener that
@@ -325,12 +319,12 @@ fn a_colliding_open_slot_is_rejected_and_the_incumbent_survives() {
             .push_open_slot(rightful, 0, ANCHOR, SESSION + 1)
             .unwrap();
     });
-    let outcome = handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    let outcome = handle_batch(&registry, &config, None, peer(), &payload);
     assert_eq!(outcome.opened, 1);
     let payload = batch(1, 5, |encoder| {
         encoder.push_data(rightful, 1, &item(9)).unwrap();
     });
-    handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    handle_batch(&registry, &config, None, peer(), &payload);
     assert_eq!(drain(&rival_rx), vec![item(9)]);
 }
 
@@ -372,14 +366,14 @@ fn a_duplicate_open_retires_the_incumbent_through_the_ordinary_close() {
     let payload = batch(1, 1, |encoder| {
         encoder.push_data(id, 2, &item(2)).unwrap();
     });
-    handle_batch(&registry, &config, None, peer(), &payload, one_lane);
-    assert!(registry.peer_bytes_used(peer()) > 0);
+    handle_batch(&registry, &config, None, peer(), &payload);
+    assert!(registry.peer_bytes_used(peer().peer) > 0);
 
     // The same slot id opens again, against a different bind.
     let payload = batch(1, 2, |encoder| {
         encoder.push_open_slot(id, 0, ANCHOR, SESSION + 1).unwrap();
     });
-    let outcome = handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    let outcome = handle_batch(&registry, &config, None, peer(), &payload);
 
     assert_eq!(outcome.opened, 1);
     assert_eq!(
@@ -387,7 +381,7 @@ fn a_duplicate_open_retires_the_incumbent_through_the_ordinary_close() {
         "the incumbent was retired, not dropped on the floor"
     );
     assert_eq!(
-        registry.peer_bytes_used(peer()),
+        registry.peer_bytes_used(peer().peer),
         0,
         "the incumbent's held bytes go back to the peer budget"
     );
@@ -401,7 +395,7 @@ fn a_duplicate_open_retires_the_incumbent_through_the_ordinary_close() {
     let payload = batch(1, 3, |encoder| {
         encoder.push_data(id, 1, &item(9)).unwrap();
     });
-    handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    handle_batch(&registry, &config, None, peer(), &payload);
     assert_eq!(drain(&second_rx), vec![item(9)]);
     assert_eq!(registry.live_slots(peer()), 1);
 }
@@ -433,7 +427,7 @@ fn a_same_id_duplicate_with_no_bind_is_rejected_without_disturbing_the_incumbent
     let payload = batch(1, 1, |encoder| {
         encoder.push_open_slot(id, 0, 999, 999).unwrap();
     });
-    let outcome = handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    let outcome = handle_batch(&registry, &config, None, peer(), &payload);
 
     assert_eq!(outcome.opened, 0);
     assert_eq!(outcome.closed, 0, "the incumbent must not be retired");
@@ -457,7 +451,7 @@ fn a_same_id_duplicate_with_no_bind_is_rejected_without_disturbing_the_incumbent
     let payload = batch(1, 2, |encoder| {
         encoder.push_data(id, 1, &item(1)).unwrap();
     });
-    handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    handle_batch(&registry, &config, None, peer(), &payload);
     assert_eq!(consumer.pump(), vec![item(1)]);
 }
 
@@ -468,7 +462,7 @@ fn records_for_a_slot_that_never_opened_are_dropped() {
     let payload = batch(1, 0, |encoder| {
         encoder.push_data(slot(5, 0), 0, &item(1)).unwrap();
     });
-    let outcome = handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    let outcome = handle_batch(&registry, &config, None, peer(), &payload);
 
     assert!(outcome.replies.is_empty());
     assert!(consumer.pump().is_empty());
@@ -491,7 +485,7 @@ fn data_applies_in_frame_seq_order() {
                 .expect("push data");
         }
     });
-    handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    handle_batch(&registry, &config, None, peer(), &payload);
 
     let frames = consumer.pump();
     assert_eq!(frames.len(), 4);
@@ -512,7 +506,7 @@ fn ahead_of_sequence_records_are_held_until_the_gap_closes() {
         encoder.push_data(id, 2, &item(2)).unwrap();
         encoder.push_data(id, 3, &item(3)).unwrap();
     });
-    handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    handle_batch(&registry, &config, None, peer(), &payload);
     assert!(
         consumer.pump().is_empty(),
         "nothing may be delivered while the gap is open"
@@ -521,7 +515,7 @@ fn ahead_of_sequence_records_are_held_until_the_gap_closes() {
     let payload = batch(1, 2, |encoder| {
         encoder.push_data(id, 1, &item(1)).unwrap();
     });
-    handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    handle_batch(&registry, &config, None, peer(), &payload);
 
     let frames = consumer.pump();
     assert_eq!(frames, vec![item(1), item(2), item(3)]);
@@ -551,7 +545,7 @@ fn records_held_behind_a_gap_do_not_keep_the_stream_alive() {
             encoder.push_data(id, seq, &item(seq as u8)).unwrap();
         }
     });
-    handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    handle_batch(&registry, &config, None, peer(), &payload);
     assert!(
         consumer.pump().is_empty(),
         "the gap is open, so nothing is delivered"
@@ -578,7 +572,7 @@ fn a_window_delivered_in_order_parks_the_sender() {
             encoder.push_data(id, seq, &item(seq as u8)).unwrap();
         }
     });
-    handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    handle_batch(&registry, &config, None, peer(), &payload);
     assert!(consumer.drain.arrivals() > 0);
     assert!(
         consumer.drain.sender_parked(),
@@ -596,7 +590,7 @@ fn records_behind_the_sequence_are_dropped_as_duplicates() {
         encoder.push_data(id, 1, &item(1)).unwrap();
         encoder.push_data(id, 1, &item(9)).unwrap();
     });
-    handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    handle_batch(&registry, &config, None, peer(), &payload);
 
     assert_eq!(consumer.pump(), vec![item(1)]);
     assert_eq!(registry.live_slots(peer()), 1, "a duplicate is not a fault");
@@ -631,7 +625,7 @@ fn hold_overflow_closes_that_slot_and_leaves_the_others_alone() {
         encoder.push_open_slot(a, 0, ANCHOR, SESSION).unwrap();
         encoder.push_open_slot(b, 0, ANCHOR, SESSION + 1).unwrap();
     });
-    handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    handle_batch(&registry, &config, None, peer(), &payload);
     assert_eq!(registry.live_slots(peer()), 2);
 
     // Slot A holds more than its `C` credits ahead of sequence: seq 1 never
@@ -642,7 +636,7 @@ fn hold_overflow_closes_that_slot_and_leaves_the_others_alone() {
         }
         encoder.push_data(b, 1, &item(42)).unwrap();
     });
-    let outcome = handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    let outcome = handle_batch(&registry, &config, None, peer(), &payload);
 
     assert_eq!(registry.live_slots(peer()), 1, "only slot A may close");
     assert!(
@@ -676,28 +670,14 @@ fn a_record_at_the_wrong_generation_is_dropped_and_metered() {
     let payload = batch(1, 0, |encoder| {
         encoder.push_open_slot(id, 0, ANCHOR, SESSION).unwrap();
     });
-    handle_batch(
-        &registry,
-        &config,
-        Some(&mux_metrics),
-        peer(),
-        &payload,
-        one_lane,
-    );
+    handle_batch(&registry, &config, Some(&mux_metrics), peer(), &payload);
 
     // The same index at the previous generation: a record still in flight for a
     // slot that has since been recycled.
     let payload = batch(1, 1, |encoder| {
         encoder.push_data(slot(0, 2), 1, &item(1)).unwrap();
     });
-    handle_batch(
-        &registry,
-        &config,
-        Some(&mux_metrics),
-        peer(),
-        &payload,
-        one_lane,
-    );
+    handle_batch(&registry, &config, Some(&mux_metrics), peer(), &payload);
 
     assert!(
         consumer.pump().is_empty(),
@@ -725,14 +705,7 @@ fn a_stale_epoch_batch_is_discarded_wholesale() {
         encoder.push_data(id, 1, &item(1)).unwrap();
         encoder.push_data(id, 2, &item(2)).unwrap();
     });
-    handle_batch(
-        &registry,
-        &config,
-        Some(&mux_metrics),
-        peer(),
-        &payload,
-        one_lane,
-    );
+    handle_batch(&registry, &config, Some(&mux_metrics), peer(), &payload);
 
     assert!(consumer.pump().is_empty());
     let snapshot =
@@ -756,14 +729,14 @@ fn a_newer_epoch_retires_the_old_slots_with_exactly_one_dropped() {
     let payload = batch(1, 1, |encoder| {
         encoder.push_data(id, 1, &item(1)).unwrap();
     });
-    handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    handle_batch(&registry, &config, None, peer(), &payload);
 
     // The sender reconnected. Its first batch under the new epoch is what tells
     // this side; nothing else can.
     let payload = batch(2, 0, |encoder| {
         encoder.push_data(slot(0, 0), 0, &item(2)).unwrap();
     });
-    let outcome = handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    let outcome = handle_batch(&registry, &config, None, peer(), &payload);
 
     assert_eq!(outcome.closed, 1);
     assert_eq!(
@@ -796,28 +769,14 @@ fn a_batch_arriving_after_its_successor_is_not_metered_as_a_gap() {
     let payload = batch(1, 0, |encoder| {
         encoder.push_open_slot(id, 0, ANCHOR, SESSION).unwrap();
     });
-    handle_batch(
-        &registry,
-        &config,
-        Some(&mux_metrics),
-        peer(),
-        &payload,
-        one_lane,
-    );
+    handle_batch(&registry, &config, Some(&mux_metrics), peer(), &payload);
 
     // Batch 2 lands before batch 1. As far as the meter can tell here, one
     // batch is missing, and that is the one count it may make for the pair.
     let payload = batch(1, 2, |encoder| {
         encoder.push_data(id, 2, &item(2)).unwrap();
     });
-    handle_batch(
-        &registry,
-        &config,
-        Some(&mux_metrics),
-        peer(),
-        &payload,
-        one_lane,
-    );
+    handle_batch(&registry, &config, Some(&mux_metrics), peer(), &payload);
     assert_eq!(
         gaps(),
         1.0,
@@ -828,14 +787,7 @@ fn a_batch_arriving_after_its_successor_is_not_metered_as_a_gap() {
     let payload = batch(1, 1, |encoder| {
         encoder.push_data(id, 1, &item(1)).unwrap();
     });
-    handle_batch(
-        &registry,
-        &config,
-        Some(&mux_metrics),
-        peer(),
-        &payload,
-        one_lane,
-    );
+    handle_batch(&registry, &config, Some(&mux_metrics), peer(), &payload);
     assert_eq!(
         gaps(),
         1.0,
@@ -846,14 +798,7 @@ fn a_batch_arriving_after_its_successor_is_not_metered_as_a_gap() {
     let payload = batch(1, 3, |encoder| {
         encoder.push_data(id, 3, &item(3)).unwrap();
     });
-    handle_batch(
-        &registry,
-        &config,
-        Some(&mux_metrics),
-        peer(),
-        &payload,
-        one_lane,
-    );
+    handle_batch(&registry, &config, Some(&mux_metrics), peer(), &payload);
     assert_eq!(
         gaps(),
         1.0,
@@ -881,7 +826,7 @@ fn terminal_then_close_delivers_the_terminal_and_injects_nothing() {
             .push_close_slot(id, 2, CloseReason::TerminalSent)
             .unwrap();
     });
-    let outcome = handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    let outcome = handle_batch(&registry, &config, None, peer(), &payload);
 
     assert_eq!(outcome.closed, 1);
     assert_eq!(registry.live_slots(peer()), 0);
@@ -918,7 +863,7 @@ fn a_terminal_gets_through_after_the_data_credit_is_spent() {
             .push_close_slot(id, 3, CloseReason::TerminalSent)
             .unwrap();
     });
-    let outcome = handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    let outcome = handle_batch(&registry, &config, None, peer(), &payload);
 
     assert_eq!(outcome.closed, 1);
     assert_eq!(
@@ -943,14 +888,14 @@ fn a_terminal_close_defers_behind_records_still_in_the_hold() {
             .push_close_slot(id, 3, CloseReason::TerminalSent)
             .unwrap();
     });
-    let outcome = handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    let outcome = handle_batch(&registry, &config, None, peer(), &payload);
     assert_eq!(outcome.closed, 0, "the close waits for the gap to close");
     assert_eq!(registry.live_slots(peer()), 1);
 
     let payload = batch(1, 2, |encoder| {
         encoder.push_data(id, 1, &item(1)).unwrap();
     });
-    handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    handle_batch(&registry, &config, None, peer(), &payload);
 
     assert_eq!(
         consumer.pump(),
@@ -971,7 +916,7 @@ fn a_non_terminal_close_from_the_receiver_is_routed_to_the_batcher() {
             .push_close_slot(id, 0, CloseReason::UnknownSlot)
             .unwrap();
     });
-    let outcome = handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    let outcome = handle_batch(&registry, &config, None, peer(), &payload);
 
     assert_eq!(
         outcome.peer_closes,
@@ -1000,7 +945,7 @@ fn credit_is_returned_as_the_consumer_drains() {
             encoder.push_data(id, seq, &item(seq as u8)).unwrap();
         }
     });
-    let outcome = handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    let outcome = handle_batch(&registry, &config, None, peer(), &payload);
     assert!(
         outcome.replies.is_empty(),
         "nothing has drained yet, so there is nothing to grant back"
@@ -1034,7 +979,7 @@ fn credit_is_withheld_while_the_slot_is_over_its_byte_watermark() {
             encoder.push_data(id, seq, &item(seq as u8)).unwrap();
         }
     });
-    handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    handle_batch(&registry, &config, None, peer(), &payload);
     assert_eq!(consumer.pump().len(), 2);
 
     // Occupancy is back to zero, so the watermark no longer binds and the
@@ -1072,7 +1017,7 @@ fn open_many(registry: &IngressRegistry, config: &MuxConfig, count: u32) -> Vec<
                 .unwrap();
         }
     });
-    handle_batch(registry, config, None, peer(), &payload, one_lane);
+    handle_batch(registry, config, None, peer(), &payload);
     assert_eq!(registry.live_slots(peer()), count as usize);
     consumers
 }
@@ -1095,7 +1040,7 @@ fn a_batch_reconciles_the_slots_it_delivered_into_and_no_others_when_nothing_dra
     let payload = batch(1, 1, |encoder| {
         encoder.push_data(slot(7, 0), 1, &item(1)).unwrap();
     });
-    handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    handle_batch(&registry, &config, None, peer(), &payload);
     let visits = registry.reconcile_visits(peer()) - before;
 
     assert_eq!(
@@ -1153,7 +1098,7 @@ fn a_batch_returns_the_credit_of_every_slot_that_drained() {
             encoder.push_data(b, seq, &item(seq as u8)).unwrap();
         }
     });
-    let outcome = handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    let outcome = handle_batch(&registry, &config, None, peer(), &payload);
     assert!(outcome.replies.is_empty(), "nothing has drained yet");
 
     // Only B's consumer drains. A's records are still in its buffer, so A has
@@ -1164,7 +1109,7 @@ fn a_batch_returns_the_credit_of_every_slot_that_drained() {
     let payload = batch(1, 2, |encoder| {
         encoder.push_data(a, 3, &item(3)).unwrap();
     });
-    let outcome = handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    let outcome = handle_batch(&registry, &config, None, peer(), &payload);
     assert_eq!(
         outcome.replies,
         vec![ReplyRecord::CreditUpdate { slot: b, delta: 2 }],
@@ -1184,7 +1129,7 @@ fn a_batch_returns_the_credit_of_every_slot_that_drained() {
     let payload = batch(1, 3, |encoder| {
         encoder.push_data(b, 3, &item(3)).unwrap();
     });
-    let outcome = handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    let outcome = handle_batch(&registry, &config, None, peer(), &payload);
     assert_eq!(
         outcome.replies,
         vec![ReplyRecord::CreditUpdate { slot: a, delta: 3 }],
@@ -1207,7 +1152,7 @@ fn a_doorbell_visit_reconciles_only_the_slots_that_drained() {
     let payload = batch(1, 1, |encoder| {
         encoder.push_data(id, 1, &item(1)).unwrap();
     });
-    handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    handle_batch(&registry, &config, None, peer(), &payload);
     assert_eq!(consumers[7].pump().len(), 1);
 
     let before = registry.reconcile_visits(peer());
@@ -1261,7 +1206,7 @@ fn the_grant_is_what_the_pump_counted_not_what_the_channel_holds() {
             encoder.push_data(id, seq, &item(seq as u8)).unwrap();
         }
     });
-    handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    handle_batch(&registry, &config, None, peer(), &payload);
     assert_eq!(consumer.pump_n(2).len(), 2);
 
     // A fourth record the mux never admitted. The buffer now holds two, and
@@ -1312,7 +1257,7 @@ fn the_periodic_walk_takes_the_dirty_set_and_the_next_drain_lists_again() {
             encoder.push_data(id, seq, &item(seq as u8)).unwrap();
         }
     });
-    handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    handle_batch(&registry, &config, None, peer(), &payload);
     assert_eq!(consumer.pump().len(), 2);
 
     let dirty = registry.dirty_slots(peer());
@@ -1328,7 +1273,7 @@ fn the_periodic_walk_takes_the_dirty_set_and_the_next_drain_lists_again() {
     let payload = batch(1, 2, |encoder| {
         encoder.push_data(id, 3, &item(3)).unwrap();
     });
-    handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    handle_batch(&registry, &config, None, peer(), &payload);
     assert_eq!(consumer.pump().len(), 1);
     let mut listed = Vec::new();
     dirty.take(|index| listed.push(index));
@@ -1352,7 +1297,7 @@ fn a_held_record_earns_its_credit_only_when_the_consumer_takes_it() {
     let payload = batch(1, 1, |encoder| {
         encoder.push_data(id, 2, &item(2)).unwrap();
     });
-    handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    handle_batch(&registry, &config, None, peer(), &payload);
     assert!(
         registry.sweep_credit(peer()).is_empty(),
         "a record in the hold has been taken out of nothing"
@@ -1363,7 +1308,7 @@ fn a_held_record_earns_its_credit_only_when_the_consumer_takes_it() {
     let payload = batch(1, 2, |encoder| {
         encoder.push_data(id, 1, &item(1)).unwrap();
     });
-    handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    handle_batch(&registry, &config, None, peer(), &payload);
     assert!(
         registry.sweep_credit(peer()).is_empty(),
         "in the buffer is not drained either"
@@ -1402,7 +1347,7 @@ fn no_grant_is_lost_or_double_counted_when_a_batch_touches_one_of_two_slots() {
             encoder.push_data(b, seq, &item(seq as u8)).unwrap();
         }
     });
-    handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    handle_batch(&registry, &config, None, peer(), &payload);
     assert_eq!(consumers[0].pump().len(), 2);
     assert_eq!(consumers[1].pump().len(), 2);
 
@@ -1420,7 +1365,7 @@ fn no_grant_is_lost_or_double_counted_when_a_batch_touches_one_of_two_slots() {
             }
         }
     };
-    tally(handle_batch(&registry, &config, None, peer(), &payload, one_lane).replies);
+    tally(handle_batch(&registry, &config, None, peer(), &payload).replies);
     tally(registry.sweep_credit(peer()));
     tally(registry.sweep_credit(peer()));
 
@@ -1447,7 +1392,7 @@ fn a_held_record_marks_its_slot_and_its_release_is_reconciled_in_the_same_batch(
     let payload = batch(1, 1, |encoder| {
         encoder.push_data(id, 2, &item(2)).unwrap();
     });
-    handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    handle_batch(&registry, &config, None, peer(), &payload);
     let visits = registry.reconcile_visits(peer()) - before;
     assert_eq!(
         visits, 1,
@@ -1461,7 +1406,7 @@ fn a_held_record_marks_its_slot_and_its_release_is_reconciled_in_the_same_batch(
     let payload = batch(1, 2, |encoder| {
         encoder.push_data(id, 1, &item(1)).unwrap();
     });
-    handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    handle_batch(&registry, &config, None, peer(), &payload);
     let visits = registry.reconcile_visits(peer()) - before;
     assert_eq!(visits, 1, "the releasing batch visits its slot: {visits}");
     assert_eq!(
@@ -1473,7 +1418,7 @@ fn a_held_record_marks_its_slot_and_its_release_is_reconciled_in_the_same_batch(
     let payload = batch(1, 3, |encoder| {
         encoder.push_data(id, 3, &item(3)).unwrap();
     });
-    let outcome = handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    let outcome = handle_batch(&registry, &config, None, peer(), &payload);
     assert_eq!(
         outcome.replies,
         vec![ReplyRecord::CreditUpdate { slot: id, delta: 2 }],
@@ -1499,7 +1444,7 @@ fn a_reused_index_reconciles_its_replacement_and_grants_it_nothing() {
     let payload = batch(1, 1, |encoder| {
         encoder.push_data(id, 1, &item(1)).unwrap();
     });
-    handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    handle_batch(&registry, &config, None, peer(), &payload);
     assert_eq!(
         consumer.pump(),
         vec![item(1)],
@@ -1520,7 +1465,7 @@ fn a_reused_index_reconciles_its_replacement_and_grants_it_nothing() {
             .push_open_slot(new_id, 0, ANCHOR, SESSION + 1)
             .unwrap();
     });
-    let outcome = handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    let outcome = handle_batch(&registry, &config, None, peer(), &payload);
     let visits = registry.reconcile_visits(peer()) - before;
 
     assert_eq!(outcome.closed, 1);
@@ -1570,7 +1515,7 @@ fn a_heartbeat_record_reaches_the_consumer_as_a_heartbeat_frame() {
     let payload = batch(1, 1, |encoder| {
         encoder.push_heartbeat(id, 1).unwrap();
     });
-    handle_batch(&registry, &config, None, peer(), &payload, one_lane);
+    handle_batch(&registry, &config, None, peer(), &payload);
 
     assert_eq!(
         consumer.pump(),
@@ -1678,14 +1623,14 @@ fn lanes_of_one_peer_keep_separate_tables() {
     let payload = batch(5, 0, |encoder| {
         encoder.push_open_slot(id, 0, ANCHOR, SESSION).unwrap();
     });
-    let outcome = handle_batch(&registry, &config, None, zero, &payload, one_lane);
+    let outcome = handle_batch(&registry, &config, None, zero, &payload);
     assert_eq!(outcome.opened, 1);
 
     // The same slot id on lane 1, under that lane's own epoch.
     let payload = batch_on(one.lane, 9, 0, |encoder| {
         encoder.push_open_slot(id, 0, ANCHOR, SESSION + 1).unwrap();
     });
-    let outcome = handle_batch(&registry, &config, None, one, &payload, one_lane);
+    let outcome = handle_batch(&registry, &config, None, one, &payload);
     assert_eq!(outcome.opened, 1);
     assert!(
         outcome.replies.is_empty(),
@@ -1698,13 +1643,13 @@ fn lanes_of_one_peer_keep_separate_tables() {
     let payload = batch_on(one.lane, 9, 1, |encoder| {
         encoder.push_data(id, 1, &item(1)).unwrap();
     });
-    handle_batch(&registry, &config, None, one, &payload, one_lane);
+    handle_batch(&registry, &config, None, one, &payload);
     assert_eq!(on_one.pump(), vec![item(1)]);
     assert!(on_zero.pump().is_empty());
 
     // A new epoch on lane 1 retires lane 1's slot and nothing on lane 0.
     let payload = batch_on(one.lane, 10, 0, |_| {});
-    let outcome = handle_batch(&registry, &config, None, one, &payload, one_lane);
+    let outcome = handle_batch(&registry, &config, None, one, &payload);
     assert_eq!(outcome.closed, 1);
     assert_eq!(registry.live_slots(one), 0);
     assert_eq!(
@@ -1745,7 +1690,7 @@ fn a_claim_and_its_wake_name_the_arrival_lane() {
         encoder.push_open_slot(id, 0, ANCHOR, SESSION).unwrap();
         encoder.push_data(id, 1, &item(7)).unwrap();
     });
-    handle_batch(&registry, &config, None, one, &payload, one_lane);
+    handle_batch(&registry, &config, None, one, &payload);
 
     assert_eq!(consumer.drain.claimed(), Some((one, id)));
     assert_eq!(consumer.pump(), vec![item(7)]);
@@ -1778,14 +1723,7 @@ fn a_batch_on_the_wrong_lane_is_dropped_and_metered() {
 
     // Stamped lane 0, arriving on lane 3's handler.
     let payload = batch(1, 0, open_slot);
-    let outcome = handle_batch(
-        &registry,
-        &config,
-        Some(&mux_metrics),
-        three,
-        &payload,
-        one_lane,
-    );
+    let outcome = handle_batch(&registry, &config, Some(&mux_metrics), three, &payload);
     assert_eq!(outcome.opened, 0);
     assert!(outcome.replies.is_empty());
     assert!(
@@ -1804,96 +1742,42 @@ fn a_batch_on_the_wrong_lane_is_dropped_and_metered() {
 
     // The control: stamped with the handler's lane, the same batch opens.
     let payload = batch_on(three.lane, 1, 0, open_slot);
-    let outcome = handle_batch(
-        &registry,
-        &config,
-        Some(&mux_metrics),
-        three,
-        &payload,
-        one_lane,
-    );
+    let outcome = handle_batch(&registry, &config, Some(&mux_metrics), three, &payload);
     assert_eq!(outcome.opened, 1);
     assert_eq!(registry.live_slots(three), 1);
 }
 
-/// The per-peer limits are split over the peer's lanes, so the peer-wide
-/// bounds hold with no state shared between tables; the byte share never
-/// drops below one slot's full window.
-#[test]
-fn per_peer_limits_split_over_the_lanes() {
-    let config = config();
-    let four = NonZeroU16::new(4).unwrap();
-    assert_eq!(
-        TableLimits::split(&config, NonZeroU16::MIN),
-        TableLimits {
-            bytes: config.peer_byte_budget,
-            slots: MAX_INGRESS_SLOTS_PER_PEER,
-        }
-    );
-    assert_eq!(
-        TableLimits::split(&config, four),
-        TableLimits {
-            bytes: config.peer_byte_budget / 4,
-            slots: MAX_INGRESS_SLOTS_PER_PEER / 4,
-        }
-    );
-    // A quarter of 512 bytes is below one slot's 256-byte window, so the
-    // floor decides.
-    let tight = MuxConfig {
-        peer_byte_budget: 512,
-        ..config
-    };
-    assert_eq!(
-        TableLimits::split(&tight, four).bytes,
-        u64::from(tight.slot_byte_budget),
-        "one slot must always fit its full window on its table"
-    );
-    // A transport with more lanes than the mux keeps splits by the mux's.
-    let many = NonZeroU16::new(64).unwrap();
-    assert_eq!(
-        TableLimits::split(&config, many).slots,
-        MAX_INGRESS_SLOTS_PER_PEER / usize::from(crate::streaming::messenger_mux::lane::MAX_LANES)
-    );
-}
-
-/// A table refuses slot indices past its share of the per-peer slot ceiling.
+/// Every lane's table takes the whole slot index range.
 ///
-/// The index just below the share opens; the share itself is rejected on a
-/// four-lane peer and would open on a one-lane peer.
+/// The sender picks the lane a stream rides, clamped to its own lane count,
+/// so one lane's table may hold all of a peer's streams. A range split over
+/// this node's lanes refused `OpenSlot`s a one-lane sender had every right to
+/// send.
 #[test]
-fn a_table_refuses_slots_past_its_lane_share() {
-    let four = || NonZeroU16::new(4).unwrap();
-    let share = (MAX_INGRESS_SLOTS_PER_PEER / 4) as u32;
-
+fn every_lane_table_takes_the_whole_slot_range() {
     let (registry, _consumer, config) = bound();
-    let id = slot(share, 0);
-    let payload = batch(1, 0, |encoder| {
-        encoder.push_open_slot(id, 0, ANCHOR, SESSION).unwrap();
+    let last = PeerLane::new(peer().peer, LaneIndex::new(15));
+    let top = slot(MAX_INGRESS_SLOTS_PER_PEER as u32 - 1, 0);
+    let payload = batch_on(last.lane, 1, 0, |encoder| {
+        encoder.push_open_slot(top, 0, ANCHOR, SESSION).unwrap();
     });
-    let outcome = handle_batch(&registry, &config, None, peer(), &payload, four);
-    assert_eq!(outcome.opened, 0);
+    let outcome = handle_batch(&registry, &config, None, last, &payload);
+    assert_eq!(outcome.opened, 1);
+    assert!(outcome.replies.is_empty());
+
+    // The ceiling itself is still refused.
+    let past = slot(MAX_INGRESS_SLOTS_PER_PEER as u32, 0);
+    let payload = batch_on(last.lane, 1, 1, |encoder| {
+        encoder.push_open_slot(past, 0, ANCHOR, SESSION).unwrap();
+    });
+    let outcome = handle_batch(&registry, &config, None, last, &payload);
     assert_eq!(
         outcome.replies,
         vec![ReplyRecord::RejectSlot {
-            slot: id,
+            slot: past,
             reason: CloseReason::ProtocolError
         }]
     );
-
-    // Control: the same index on a one-lane peer's table opens.
-    let (registry, _consumer, config) = bound();
-    let outcome = handle_batch(&registry, &config, None, peer(), &payload, one_lane);
-    assert_eq!(outcome.opened, 1);
-
-    // And the index below the share opens on the four-lane table.
-    let (registry, _consumer, config) = bound();
-    let payload = batch(1, 0, |encoder| {
-        encoder
-            .push_open_slot(slot(share - 1, 0), 0, ANCHOR, SESSION)
-            .unwrap();
-    });
-    let outcome = handle_batch(&registry, &config, None, peer(), &payload, four);
-    assert_eq!(outcome.opened, 1);
 }
 
 /// The node's live count per lane matches the slots in its tables after every
@@ -1919,7 +1803,7 @@ fn the_live_count_per_lane_matches_the_slot_tables() {
         let payload = batch_on(key.lane, epoch, batch_seq, |encoder| {
             encoder.push_open_slot(id, 0, ANCHOR, session).unwrap();
         });
-        handle_batch(&registry, &config, None, key, &payload, one_lane)
+        handle_batch(&registry, &config, None, key, &payload)
     };
     let counts = || {
         [LaneIndex::ZERO, LaneIndex::new(1)].map(|lane| {
@@ -1962,10 +1846,90 @@ fn the_live_count_per_lane_matches_the_slot_tables() {
     assert_eq!(counts(), [(1, 1), (2, 2)], "after a consumer-side close");
 
     let payload = batch_on(a1.lane, 6, 0, |_| {});
-    let outcome = handle_batch(&registry, &config, None, a1, &payload, one_lane);
+    let outcome = handle_batch(&registry, &config, None, a1, &payload);
     assert_eq!(outcome.closed, 1);
     assert_eq!(counts(), [(1, 1), (1, 1)], "after a new epoch on a1");
 
     assert_eq!(registry.shutdown(), 2);
     assert_eq!(counts(), [(0, 0), (0, 0)], "after shutdown");
+}
+
+/// One peer's lanes share one byte budget, so the per-peer bound is
+/// `peer_byte_budget` whatever lane count either side keeps.
+///
+/// Each lane's table used to take its own share of the budget, sized from the
+/// lane count this node read when the table was made. A count read as 1 (the
+/// peer not yet known to discovery) gave a table the whole budget, and later
+/// lanes a share each, so the peer could hold more than the budget. Here each
+/// table is made while the count reads 1, and a second lane's hold must still
+/// be refused once the first lane's hold has taken most of the budget.
+///
+/// The budget is below two slots' windows, so the shared bound is what bites,
+/// not a slot's own cap. After a new epoch retires lane 0's slot, its bytes
+/// come back to the shared budget and lane 1 can hold again.
+#[test]
+fn the_lanes_of_one_peer_share_one_byte_budget() {
+    let config = MuxConfig {
+        peer_byte_budget: 300,
+        ..config()
+    };
+    assert!(config.peer_byte_budget < 2 * u64::from(config.slot_byte_budget));
+    let registry = IngressRegistry::default();
+    let _consumers: Vec<Consumer> = (1..=3)
+        .map(|session| register(&registry, &config, session))
+        .collect();
+    let a0 = peer();
+    let a1 = PeerLane::new(a0.peer, LaneIndex::new(1));
+    let big = |n: u8| {
+        rmp_serde::to_vec(&crate::streaming::frame::StreamFrame::Item(vec![n; 180]))
+            .expect("encode item")
+    };
+    let id = slot(0, 0);
+    let run = |key: PeerLane, epoch: u64, batch_seq: u32, build: &dyn Fn(&mut BatchEncoder)| {
+        let payload = batch_on(key.lane, epoch, batch_seq, |encoder| build(encoder));
+        handle_batch(&registry, &config, None, key, &payload)
+    };
+
+    run(a0, 1, 0, &|encoder| {
+        encoder.push_open_slot(id, 0, ANCHOR, 1).unwrap();
+    });
+    run(a1, 1, 0, &|encoder| {
+        encoder.push_open_slot(id, 0, ANCHOR, 2).unwrap();
+    });
+    // Ahead of sequence (the next is 1), so each record is held and charged.
+    let outcome = run(a0, 1, 1, &|encoder| {
+        encoder.push_data(id, 2, &big(1)).unwrap();
+    });
+    assert!(outcome.replies.is_empty(), "lane 0's hold fits the budget");
+    let outcome = run(a1, 1, 1, &|encoder| {
+        encoder.push_data(id, 2, &big(2)).unwrap();
+    });
+    assert_eq!(
+        outcome.replies,
+        vec![ReplyRecord::CloseSlot {
+            slot: id,
+            reason: CloseReason::ProtocolError
+        }],
+        "lane 1's hold must be refused: with lane 0's it would pass the peer's budget"
+    );
+    let held = registry.peer_bytes_used(a0.peer);
+    assert!(
+        (150..=config.peer_byte_budget).contains(&held),
+        "lane 0's hold alone is charged to the peer: {held}"
+    );
+
+    // A new epoch on lane 0 retires its slot and gives its bytes back.
+    let outcome = run(a0, 2, 0, &|_| {});
+    assert_eq!(outcome.closed, 1);
+    assert_eq!(registry.peer_bytes_used(a0.peer), 0);
+    run(a1, 1, 2, &|encoder| {
+        encoder.push_open_slot(slot(1, 0), 0, ANCHOR, 3).unwrap();
+    });
+    let outcome = run(a1, 1, 3, &|encoder| {
+        encoder.push_data(slot(1, 0), 2, &big(3)).unwrap();
+    });
+    assert!(
+        outcome.replies.is_empty(),
+        "a retired epoch's holds must go back to the shared budget"
+    );
 }

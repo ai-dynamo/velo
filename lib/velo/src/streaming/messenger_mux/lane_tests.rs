@@ -694,3 +694,50 @@ async fn a_one_lane_consumer_places_every_stream_on_lane_zero() {
     assert_eq!(live_per_lane(&consumer_mux, peer, 4), [1, 0, 0, 0]);
     stream_through(sender, drain_first(anchor).await).await;
 }
+
+/// A one-lane producer puts every stream on lane 0 of a 16-lane consumer, so
+/// that one table must take slot indices past 65,536 / 16.
+///
+/// The sender picks the lane it rides, clamped to its own lane count, so the
+/// consumer cannot size a table's slot range from its own lane count: that
+/// gave (producer, 0) 4,096 indices here, and a producer with more live
+/// streams than that had its `OpenSlot`s refused as protocol errors. The
+/// `OpenSlot` is built by hand and fed to the consumer's receive path, because
+/// opening 4,097 real streams would test the same thing slower.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_one_lane_producer_opens_past_a_sixteenth_of_the_slot_ceiling() {
+    use super::protocol::{BatchEncoder, SlotId};
+
+    let (consumer, producer) = pair(16, 1).await;
+    let mux = consumer.mux();
+    let peer = producer.worker();
+    assert_eq!(
+        mux.core.transport_lanes(peer).get(),
+        16,
+        "the consumer must keep 16 lanes to the producer, or this proves nothing"
+    );
+    let key = PeerLane::new(peer, LaneIndex::ZERO);
+    let sixteenth = super::ingress::MAX_INGRESS_SLOTS_PER_PEER / 16;
+    let last = super::ingress::MAX_INGRESS_SLOTS_PER_PEER - 1;
+    let mut receivers = Vec::new();
+    for (session, index) in [(1u64, sixteenth), (2, last)] {
+        let anchor_id = u64::MAX - session;
+        let lane = mux.core.lane_load.reserve_on(Some(peer), LaneIndex::ZERO);
+        receivers.push(mux.bind_on_lane(anchor_id, session, lane));
+        let mut encoder = BatchEncoder::new(1, session as u32, LaneIndex::ZERO);
+        encoder
+            .push_open_slot(
+                SlotId::new(index as u32, 0).expect("index fits u24"),
+                0,
+                anchor_id,
+                session,
+            )
+            .expect("encode");
+        mux.core.deliver_batch(key, &encoder.finish().freeze());
+    }
+    assert_eq!(
+        mux.live_ingress_slots(key),
+        2,
+        "slot indices {sixteenth} and {last} on lane 0 must open"
+    );
+}

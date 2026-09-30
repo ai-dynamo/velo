@@ -26,7 +26,9 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
-use super::super::flow_control::{ByteBudget, CreditClass, SlotCreditAccount, try_reserve_pair};
+use super::super::flow_control::{
+    ByteBudget, CreditClass, SharedByteBudget, SlotCreditAccount, try_reserve_pair,
+};
 use super::super::lane_choice::LaneReservation;
 use super::super::protocol::{CloseReason, RecordType, SlotId};
 use super::DrainSignal;
@@ -188,7 +190,7 @@ impl IngressSlot {
         &mut self,
         frame_seq: u32,
         body: Vec<u8>,
-        peer_bytes: &mut ByteBudget,
+        peer_bytes: &SharedByteBudget,
     ) -> Applied {
         if frame_seq < self.next_seq {
             return Applied::Duplicate;
@@ -316,7 +318,7 @@ impl IngressSlot {
         self.hold_bytes.used()
     }
 
-    fn park(&mut self, frame_seq: u32, body: Vec<u8>, peer_bytes: &mut ByteBudget) -> Applied {
+    fn park(&mut self, frame_seq: u32, body: Vec<u8>, peer_bytes: &SharedByteBudget) -> Applied {
         let class = classify(&body);
         if let Err(fault) = self.admit(class) {
             return fault_reason(&fault);
@@ -329,7 +331,7 @@ impl IngressSlot {
         Applied::Held
     }
 
-    fn release_hold(&mut self, peer_bytes: &mut ByteBudget) -> Applied {
+    fn release_hold(&mut self, peer_bytes: &SharedByteBudget) -> Applied {
         while let Some(body) = self.hold.remove(&self.next_seq) {
             let len = body.len();
             if let Err(fault) = self.deliver(body) {

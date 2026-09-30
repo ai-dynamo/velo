@@ -140,7 +140,7 @@ The batch header repeats the lane. Ingress drops a batch whose header lane is no
 
 Across two nodes over QUIC, 64 streams of 16 KiB items moved about 750 MiB/s on 1 lane and 5,300 MiB/s on 8 lanes. The setup and the full table are in [QUIC performance](../operations/quic-performance.md#streams-over-lanes).
 
-The per-peer limits are split evenly over the lanes of the peer: each table gets `peer_byte_budget / lanes` bytes and 65,536 / lanes slot indices. The byte share never goes below one `slot_byte_budget`, so one stream can always hold its full window.
+Each (peer, lane) table takes the whole range of 65,536 slot indices. The sender picks the lane that a stream rides, so one table can hold every stream of a peer: a sender with one lane puts all its streams on lane 0. All the tables of one peer share one byte budget, `peer_byte_budget`. The bound for each peer is therefore the same at any lane count on either side, and it does not depend on when each table was made.
 
 ### The batch size cap
 
@@ -236,7 +236,7 @@ Each slot reserves one credit that only a terminal sentinel can spend. Data spen
 Frame credit alone bounds memory at slots × C × the maximum frame size, which is not a useful bound. The per-stream socket enforced about 1 MiB per stream for free. The mux shares one connection, so it enforces its own limits:
 
 - `MuxConfig::slot_byte_budget`, 1 MiB per slot by default.
-- `MuxConfig::peer_byte_budget`, 8 MiB per peer by default.
+- `MuxConfig::peer_byte_budget`, 8 MiB per peer by default. All the lanes of a peer share it.
 
 Frame credit proves that no head-of-line blocking occurs. Byte credit bounds memory. The two grants can disagree, for example C records of 1 MiB each against a 1 MiB slot cap. The byte side wins by withholding the next grant while the slot is over its byte watermark. It does not refuse a record whose frame credit was already granted. The ingress hold is the one place where a byte reservation refuses a record, because the alternative is unbounded growth behind a gap.
 
