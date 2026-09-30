@@ -23,6 +23,7 @@ use super::super::protocol::{BATCH_HEADER_LEN, BatchEncoder, EncodeError, MAX_RE
 use crate::messenger::{FireResult, Messenger};
 use crate::observability::MuxMetricsHandle;
 use crate::streaming::messenger_mux::STREAM_BATCH_HANDLER;
+use crate::transports::tcp::framing::COALESCE_THRESHOLD;
 
 /// Smallest batch a clamp may produce: the header plus one empty record.
 ///
@@ -161,7 +162,7 @@ impl BatchWriter {
     /// will inject. An unresolved peer costs the conservative clamp rather than
     /// a failed flush.
     fn compute_cap(&mut self) -> usize {
-        let eager = self.peer_instance().map_or(usize::MAX, |instance| {
+        let eager = self.peer_instance().map_or(COALESCE_THRESHOLD, |instance| {
             self.messenger
                 .effective_eager_payload(instance, STREAM_BATCH_HANDLER, None)
         });
