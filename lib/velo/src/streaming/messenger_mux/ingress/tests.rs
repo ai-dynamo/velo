@@ -1884,9 +1884,11 @@ fn every_lane_table_takes_the_whole_slot_range() {
 /// A slot counts on the lane its bind was placed on, which is not always the
 /// lane its batches arrive on: a sender with fewer lanes sends lane k on k
 /// modulo its count. Here binds placed on lanes 5 and 6 arrive on lane 1, and
-/// one placed on lane 2 arrives on lane 0; a count taken on the arrival lane
-/// fails every step. The steps cover each exit (a duplicate open, a cancel that
-/// lands before the claim, a close from the consumer side, a new epoch, and
+/// one placed on lane 2 arrives on lane 0. The table walk reads each slot's
+/// lane from the slot's own count, so it agrees with a count taken on the wrong
+/// lane; the expected per-lane counts after each step are what catch that, so
+/// keep them. The steps cover each exit (a duplicate open, a cancel that lands
+/// before the claim, a close from the consumer side, a new epoch, and
 /// shutdown) on two peers and two arrival lanes.
 #[test]
 fn the_live_count_per_lane_matches_the_slot_tables() {
