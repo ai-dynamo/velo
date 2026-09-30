@@ -608,6 +608,7 @@ where
         )
         .unwrap(),
         fingerprint: identity.fingerprint,
+        ports: vec![],
     };
     let mut builder = WorkerAddressBuilder::new();
     builder.add_entry("quic", info.encode().unwrap()).unwrap();
@@ -1398,4 +1399,101 @@ async fn closed_force_closes_a_stuck_lane_other_than_zero() {
         failed, FRAMES,
         "{failed} of {FRAMES} frames failed when closed() returned; the rest are unaccounted for"
     );
+}
+
+/// Dial `lanes` lanes into a server with `sockets` server sockets, one frame
+/// per lane, and return how many connections each server socket holds.
+async fn connections_per_server_socket(lanes: u16, sockets: usize) -> Vec<usize> {
+    let (client, _client_streams, _) = started_with(QuicTransportBuilder::new().lanes(lanes)).await;
+    let (server, server_streams, server_id) =
+        started_with(QuicTransportBuilder::new().server_endpoints(sockets)).await;
+    client
+        .register(peer_with_fingerprint(
+            &server,
+            server_id,
+            server.fingerprint(),
+        ))
+        .unwrap();
+    let errors = Arc::new(Errors::default());
+    for lane in 0..lanes {
+        let _ = client.send_message_on_lane(
+            server_id,
+            lane,
+            Bytes::from(lane.to_le_bytes().to_vec()),
+            Bytes::new(),
+            MessageType::Event,
+            errors.clone(),
+        );
+    }
+    for _ in 0..lanes {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            server_streams.event_stream.recv_async(),
+        )
+        .await
+        .expect("every lane delivers")
+        .unwrap();
+    }
+    assert!(errors.0.lock().unwrap().is_empty());
+    let counts = server
+        .server_endpoints
+        .get()
+        .unwrap()
+        .iter()
+        .map(|endpoint| endpoint.open_connections())
+        .collect();
+    client.shutdown();
+    server.shutdown();
+    counts
+}
+
+/// The lanes of one dialer land on different server sockets of the peer.
+///
+/// Each server socket has its own port and its own endpoint driver, and the
+/// dialer spreads its lanes over the ports. Two lanes on one socket would
+/// share one driver, which is the limit lanes exist to lift.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_lane_lands_on_its_own_server_socket() {
+    assert_eq!(connections_per_server_socket(4, 4).await, vec![1, 1, 1, 1]);
+}
+
+/// With more lanes than server sockets, the lanes wrap and spread evenly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn more_lanes_than_sockets_spread_evenly() {
+    assert_eq!(connections_per_server_socket(4, 2).await, vec![2, 2]);
+}
+
+/// A lane's address: socket `(offset + lane) % n` of the peer, or the one
+/// advertised address for a peer that lists no ports.
+#[test]
+fn lane_addresses_spread_over_the_peers_sockets() {
+    let client_config = super::tls::pinned_client_config([0; 32]).unwrap();
+    let addr: std::net::SocketAddr = "10.0.0.1:5000".parse().unwrap();
+    let peer = super::PeerEntry {
+        addr,
+        ports: vec![5000, 5001, 5002, 5003],
+        client_config: client_config.clone(),
+    };
+    let ports: Vec<u16> = (0..4).map(|lane| peer.lane_addr(lane, 6).port()).collect();
+    assert_eq!(ports, vec![5002, 5003, 5000, 5001]);
+    assert!((0..4).all(|lane| peer.lane_addr(lane, 6).ip() == addr.ip()));
+
+    let one_port = super::PeerEntry {
+        addr,
+        ports: vec![addr.port()],
+        client_config,
+    };
+    assert!((0..4).all(|lane| one_port.lane_addr(lane, 6) == addr));
+}
+
+/// The dial offset comes from the certificate fingerprint, so two transports
+/// with different certificates start their lanes on different sockets.
+#[test]
+fn the_lane_offset_follows_the_fingerprint() {
+    let mut fingerprint = [0u8; 32];
+    fingerprint[0] = 0x34;
+    fingerprint[1] = 0x12;
+    assert_eq!(super::lane_offset(&fingerprint), 0x1234);
+    fingerprint[0] = 0x35;
+    assert_ne!(super::lane_offset(&fingerprint), 0x1234);
 }

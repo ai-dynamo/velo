@@ -80,7 +80,7 @@ graph LR
         R[Dialed reader] --> A1[Shutdown stream]
     end
     subgraph Listener
-        E["Server endpoints<br>(SO_REUSEPORT group)"] --> F[Stream reader]
+        E["Server endpoints<br>(one port each)"] --> F[Stream reader]
         F --> AD[admit_message and route_frame]
         F -. "ShuttingDown echo" .-> R
     end
@@ -92,8 +92,8 @@ graph LR
 - **The reverse direction carries only drain echoes.** The listener writes a `ShuttingDown` frame back on the same stream when it refuses a request during drain. The dialer reads it with the same code as TCP.
 - **The certificate is pinned.** Each transport makes a self-signed certificate and puts its SHA-256 fingerprint in its `WorkerAddress` entry. A dialer accepts only that certificate and checks the TLS 1.3 handshake signature. A different listener on a reused port fails the handshake.
 - **Lanes are separate connections.** With `lanes(n)`, the dialer keeps up to `n` connections to each peer, one for each lane that it sends on, each from its own UDP socket. One QUIC connection does its packet and crypto work on one task, so it is bound to about one core. Lanes spread that work over more cores. `send_message` uses lane 0, so ordinary traffic keeps one ordered channel for each peer.
-- **Server sockets form a reuse-port group** (Linux). `server_endpoints(n)` binds `n` UDP sockets on one port. The kernel hashes each peer to one socket, so the receive queues and buffer ceilings add up. A node that many peers send to, such as a frontend, gains from more sockets. The default is 4. Each socket costs a quinn endpoint and its buffers.
-- **Dial sockets are separate.** Dials use their own sockets on ephemeral ports, one for each lane. A reply to a dial from a group member can hash to another member, which does not know the connection and drops the reply.
+- **Each server socket has its own port.** `server_endpoints(n)` binds `n` UDP sockets, each on its own port, and the `WorkerAddress` entry lists the ports. A dialer sends lane `k` to socket `(offset + k) % n`, where `offset` comes from the dialer's own certificate. So the lanes of one dialer land on different sockets, and the peers are spread over the sockets too. Each socket has its own quinn endpoint driver, receive queue and buffer ceiling. The lanes of a dialer are spread evenly, so a socket can carry two lanes: 8 lanes into 4 sockets moved as much as into 8. The default is 4. Each socket costs a port, a quinn endpoint and its buffers. A peer that does not list ports is dialed on its one advertised port for every lane.
+- **Dial sockets are separate.** Dials use their own sockets on ephemeral ports, one for each lane, so each lane has its own endpoint driver for its replies.
 - **UDP buffers are checked.** The transport requests 8 MiB receive and 4 MiB send buffers on each socket, reads back what the kernel granted, and logs a warning when `net.core.rmem_max` or `net.core.wmem_max` clamped the request. A clamped UDP buffer shows up later as dropped datagrams, not as an error.
 - **Packets are at most 6550 bytes.** quinn sends up to 10 packets in one GSO batch, and a larger packet makes the batch exceed the UDP datagram limit. The batch is then lost with no error. `max_mtu` is lowered to 6550.
 - **quinn 0.11.12 is the minimum.** It pulls quinn-proto 0.11.18. Older quinn-proto can fail an ordered, lossless stream of many small chunks with `too many gaps in stream buffer`.

@@ -22,6 +22,12 @@ pub struct QuicEndpointInfo {
     pub endpoints: Vec<InterfaceEndpoint>,
     /// SHA-256 of the listener's certificate.
     pub fingerprint: Fingerprint,
+    /// The port of each server socket. The first is the port in
+    /// [`endpoints`](Self::endpoints). A dialer spreads its lanes over these.
+    /// Empty in an entry from a peer that predates per-socket ports: dial the
+    /// port in `endpoints` for every lane.
+    #[serde(default)]
+    pub ports: Vec<u16>,
 }
 
 impl QuicEndpointInfo {
@@ -44,54 +50,57 @@ pub(super) struct BufferSizes {
     pub(super) send: usize,
 }
 
-/// Bind the server sockets: `count` sockets on one port.
+/// Bind the server sockets: `count` sockets, each on its own port.
 ///
-/// With `count > 1` (Linux only), the sockets form a `SO_REUSEPORT` group.
-/// The kernel hashes each client 4-tuple to one socket, so one connection
-/// always lands on the same endpoint, and the receive queues and buffer
-/// ceilings of all sockets add up. A single socket is capped by
-/// `net.core.rmem_max`, which drops datagrams under a burst from many peers.
+/// With a fixed requested port `P`, the sockets bind `P` to `P + count - 1`, so
+/// an operator who opens the ports in a firewall knows which ones to open.
+/// With port 0, each socket takes an ephemeral port. All bind the same IP.
 ///
-/// The first socket binds without `SO_REUSEPORT` and joins after the bind.
-/// With a requested port of 0, this stops the kernel from picking a port
-/// that an unrelated reuse-port group already holds.
+/// The peer learns every port from [`QuicEndpointInfo::ports`] and dials lane
+/// `k` on socket `(offset + k) % count`, where `offset` is fixed per dialer.
+/// So the lanes of one dialer spread evenly over the sockets, each with its own
+/// quinn endpoint driver and receive buffer.
+///
+/// An earlier design put every socket on one port in a `SO_REUSEPORT` group.
+/// The kernel then hashed each connection to a socket at random, and several
+/// lanes of one peer often landed on one socket: with 8 lanes into a group of
+/// 8 sockets, one run moved 2.6 GB/s and another 6.6 GB/s, as the hash fell.
 pub(super) fn bind_server_sockets(
     requested: SocketAddr,
     count: usize,
     buffers: BufferSizes,
 ) -> Result<Vec<std::net::UdpSocket>> {
-    let count = if cfg!(target_os = "linux") {
-        count.max(1)
+    let count = count.max(1);
+    // Checked arithmetic, so a range past 65535 is an error rather than a
+    // port that wraps to a low number.
+    let ports: Vec<u16> = if requested.port() == 0 {
+        vec![0; count]
     } else {
-        1
+        let last = u16::try_from(count - 1)
+            .ok()
+            .and_then(|extra| requested.port().checked_add(extra))
+            .with_context(|| {
+                format!(
+                    "QUIC server_endpoints({count}) needs ports {} to {} + {}, past 65535",
+                    requested.port(),
+                    requested.port(),
+                    count - 1
+                )
+            })?;
+        (requested.port()..=last).collect()
     };
-    let first = new_udp_socket(requested)?;
-    size_buffers(&first, buffers);
-    first
-        .bind(&requested.into())
-        .with_context(|| format!("failed to bind QUIC socket on {requested}"))?;
-    // SO_REUSEPORT alone forms the group. SO_REUSEADDR is left off: on Linux
-    // two UDP sockets that both set it skip the port conflict check, so any
-    // process could bind the group's port.
-    #[cfg(target_os = "linux")]
-    if count > 1 {
-        first.set_reuse_port(true)?;
-    }
-    let bound: SocketAddr = first
-        .local_addr()?
-        .as_socket()
-        .context("QUIC socket has no IP address")?;
-
     let mut sockets = Vec::with_capacity(count);
-    sockets.push(first.into());
-    for index in 1..count {
-        let socket = new_udp_socket(bound)?;
+    for (index, port) in ports.into_iter().enumerate() {
+        // `set_port` keeps an IPv6 scope id and flow info.
+        let mut addr = requested;
+        addr.set_port(port);
+        let socket = new_udp_socket(addr)?;
         size_buffers(&socket, buffers);
-        #[cfg(target_os = "linux")]
-        socket.set_reuse_port(true)?;
-        socket
-            .bind(&bound.into())
-            .with_context(|| format!("failed to bind QUIC reuse-port socket {index} on {bound}"))?;
+        socket.bind(&addr.into()).with_context(|| {
+            format!(
+                "failed to bind QUIC server socket {index} of server_endpoints({count}) on {addr}"
+            )
+        })?;
         sockets.push(socket.into());
     }
     Ok(sockets)
@@ -99,9 +108,8 @@ pub(super) fn bind_server_sockets(
 
 /// Bind one socket that dials peers. The transport binds one for each lane.
 ///
-/// It is separate from the server sockets and has its own ephemeral port. A
-/// dial from a reuse-port member would get its replies hashed to any member
-/// of the group, and a member that does not own the connection drops them.
+/// It is separate from the server sockets and has its own ephemeral port, so
+/// each lane has its own quinn endpoint driver for the replies it receives.
 pub(super) fn bind_client_socket(
     server: SocketAddr,
     buffers: BufferSizes,
@@ -148,7 +156,7 @@ pub(super) fn size_buffers(socket: &Socket, requested: BufferSizes) -> BufferSiz
             requested = requested.recv,
             effective = effective.recv,
             "QUIC: the kernel clamped the UDP receive buffer; raise net.core.rmem_max \
-             or add reuse-port endpoints, or expect datagram drops under load"
+             or add server endpoints, or expect datagram drops under load"
         );
     }
     if effective.send < requested.send {
@@ -171,41 +179,80 @@ mod tests {
     };
 
     #[test]
-    fn server_sockets_share_one_port() {
+    fn server_sockets_each_have_their_own_port() {
         let sockets = bind_server_sockets("127.0.0.1:0".parse().unwrap(), 4, SMALL).unwrap();
-        let expected = if cfg!(target_os = "linux") { 4 } else { 1 };
-        assert_eq!(sockets.len(), expected);
-        let port = sockets[0].local_addr().unwrap().port();
-        assert_ne!(port, 0);
-        for socket in &sockets {
-            assert_eq!(socket.local_addr().unwrap().port(), port);
+        assert_eq!(sockets.len(), 4);
+        let mut ports: Vec<u16> = sockets
+            .iter()
+            .map(|socket| socket.local_addr().unwrap().port())
+            .collect();
+        assert!(ports.iter().all(|&port| port != 0));
+        ports.sort_unstable();
+        ports.dedup();
+        assert_eq!(ports.len(), 4, "every socket is reachable on its own port");
+    }
+
+    /// A fixed port opens consecutive ports, so an operator knows what to
+    /// allow through a firewall.
+    #[test]
+    fn a_fixed_port_binds_consecutive_ports() {
+        // A free base port can be taken by another process between the probe
+        // and the bind, so try a few.
+        for _ in 0..10 {
+            let base = std::net::UdpSocket::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            if base > u16::MAX - 3 {
+                continue;
+            }
+            let requested = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), base);
+            let Ok(sockets) = bind_server_sockets(requested, 3, SMALL) else {
+                continue;
+            };
+            let ports: Vec<u16> = sockets
+                .iter()
+                .map(|socket| socket.local_addr().unwrap().port())
+                .collect();
+            assert_eq!(ports, vec![base, base + 1, base + 2]);
+            return;
         }
+        panic!("no free run of three ports in ten tries");
     }
 
     #[test]
-    fn the_client_socket_is_not_in_the_server_group() {
-        let server = bind_server_sockets("127.0.0.1:0".parse().unwrap(), 2, SMALL).unwrap();
-        let server_addr = server[0].local_addr().unwrap();
-        let client = bind_client_socket(server_addr, SMALL).unwrap();
-        assert_ne!(client.local_addr().unwrap().port(), server_addr.port());
+    fn a_fixed_port_past_the_range_is_refused() {
+        let requested = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), u16::MAX);
+        let error = bind_server_sockets(requested, 2, SMALL).unwrap_err();
+        assert!(format!("{error:#}").contains("past 65535"), "{error:#}");
     }
 
+    /// No other socket can bind a server port. A server socket with
+    /// `SO_REUSEADDR` or `SO_REUSEPORT` would let another process of the same
+    /// user take one and read its datagrams.
     #[test]
-    fn an_unrelated_bind_cannot_join_the_group() {
-        // The first socket joins the group only after its own bind, so a
-        // second plain bind to the same port still fails.
+    fn an_unrelated_bind_cannot_take_a_server_port() {
         let server = bind_server_sockets("127.0.0.1:0".parse().unwrap(), 2, SMALL).unwrap();
-        let addr = server[0].local_addr().unwrap();
-        assert!(std::net::UdpSocket::bind(addr).is_err());
-        // Nor may a socket with SO_REUSEADDR alone. On Linux two UDP sockets
-        // that both set SO_REUSEADDR skip the port conflict check, so if the
-        // group set it, any process could bind the group's port.
-        let reuse_addr_only = new_udp_socket(addr).unwrap();
-        reuse_addr_only.set_reuse_address(true).unwrap();
-        assert!(
-            reuse_addr_only.bind(&addr.into()).is_err(),
-            "a socket with SO_REUSEADDR alone bound the group's port"
-        );
+        for socket in &server {
+            let addr = socket.local_addr().unwrap();
+            assert!(std::net::UdpSocket::bind(addr).is_err());
+            let reuse_addr_only = new_udp_socket(addr).unwrap();
+            reuse_addr_only.set_reuse_address(true).unwrap();
+            assert!(
+                reuse_addr_only.bind(&addr.into()).is_err(),
+                "a socket with SO_REUSEADDR alone bound a server port"
+            );
+            #[cfg(target_os = "linux")]
+            {
+                let reuse_port = new_udp_socket(addr).unwrap();
+                reuse_port.set_reuse_port(true).unwrap();
+                assert!(
+                    reuse_port.bind(&addr.into()).is_err(),
+                    "a socket with SO_REUSEPORT bound a server port"
+                );
+            }
+        }
     }
 
     #[test]
@@ -223,8 +270,48 @@ mod tests {
         let info = QuicEndpointInfo {
             endpoints: vec![],
             fingerprint: [7; 32],
+            ports: vec![5000, 5001],
         };
         let decoded = QuicEndpointInfo::decode(&info.encode().unwrap()).unwrap();
         assert_eq!(decoded.fingerprint, [7; 32]);
+        assert_eq!(decoded.ports, vec![5000, 5001]);
+    }
+
+    /// A peer that predates per-socket ports decodes an entry that has them:
+    /// the unknown field is skipped.
+    #[test]
+    fn an_old_peer_decodes_an_entry_with_ports() {
+        #[derive(Deserialize)]
+        struct Before {
+            endpoints: Vec<InterfaceEndpoint>,
+            fingerprint: Fingerprint,
+        }
+        let info = QuicEndpointInfo {
+            endpoints: vec![],
+            fingerprint: [5; 32],
+            ports: vec![5000, 5001],
+        };
+        let old: Before = rmp_serde::from_slice(&info.encode().unwrap()).unwrap();
+        assert!(old.endpoints.is_empty());
+        assert_eq!(old.fingerprint, [5; 32]);
+    }
+
+    /// An entry from a peer that predates per-socket ports has no `ports`, and still
+    /// decodes: the dialer then uses the port in `endpoints` for every lane.
+    #[test]
+    fn an_entry_without_ports_decodes() {
+        #[derive(Serialize)]
+        struct Before {
+            endpoints: Vec<InterfaceEndpoint>,
+            fingerprint: Fingerprint,
+        }
+        let raw = rmp_serde::to_vec_named(&Before {
+            endpoints: vec![],
+            fingerprint: [3; 32],
+        })
+        .unwrap();
+        let decoded = QuicEndpointInfo::decode(&raw).unwrap();
+        assert_eq!(decoded.fingerprint, [3; 32]);
+        assert!(decoded.ports.is_empty());
     }
 }
