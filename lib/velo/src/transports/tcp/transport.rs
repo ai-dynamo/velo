@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use dashmap::DashMap;
 use std::net::SocketAddr;
+use std::num::NonZeroU16;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
@@ -32,11 +33,18 @@ use super::writer::TcpWriterObserver;
 use crate::transports::coalesce::{EgressMetrics, run_coalescing_writer};
 use crate::transports::ingress::{DialedReaderContext, run_dialed_reader};
 
+/// One connection per peer and lane. Lane 0 is the only lane unless the
+/// builder asked for more.
+type LaneKey = (crate::InstanceId, u16);
+
 /// High-performance TCP transport with lock-free concurrent access
 ///
 /// This transport uses `DashMap` for lock-free concurrent access to connection state.
 /// Tasks are spawned using `tokio::spawn` for compatibility with the `Transport` trait.
 /// For single-threaded performance, run the entire transport in a `LocalSet` context.
+///
+/// It keeps up to [`TcpTransportBuilder::lanes`] connections to each peer, one
+/// for each lane used.
 pub struct TcpTransport {
     // Identity (immutable, no wrapper needed)
     key: TransportKey,
@@ -45,7 +53,11 @@ pub struct TcpTransport {
 
     // Shared mutable state with DashMap (lock-free)
     peers: Arc<DashMap<crate::InstanceId, SocketAddr>>,
-    connections: Arc<DashMap<crate::InstanceId, ConnectionHandle>>,
+    connections: Arc<DashMap<LaneKey, ConnectionHandle>>,
+
+    // Ordered channels to each peer, each its own connection, dialed on the
+    // first send on that lane. Set by the builder; `new()` gives 1.
+    lanes: NonZeroU16,
 
     // Runtime handle for spawning tasks
     runtime: OnceLock<tokio::runtime::Handle>,
@@ -154,6 +166,7 @@ impl TcpTransport {
             local_address,
             peers: Arc::new(DashMap::new()),
             connections: Arc::new(DashMap::new()),
+            lanes: NonZeroU16::MIN,
             runtime: OnceLock::new(),
             cancel_token: CancellationToken::new(),
             shutdown_state: OnceLock::new(),
@@ -171,9 +184,10 @@ impl TcpTransport {
     /// Optional: Pre-establish connection after registration
     ///
     /// This can be called after `register()` to eagerly establish the TCP connection
-    /// instead of waiting for the first `send_message()` call.
+    /// instead of waiting for the first `send_message()` call. It connects
+    /// lane 0, the lane `send_message()` uses.
     pub fn ensure_connected(&self, instance_id: crate::InstanceId) -> Result<()> {
-        self.get_or_create_connection(instance_id)?;
+        self.get_or_create_connection((instance_id, 0))?;
         Ok(())
     }
 
@@ -182,41 +196,42 @@ impl TcpTransport {
     /// The predicate keeps us from evicting a successor that another task
     /// installed in the meantime; retiring before the entry disappears is what
     /// guarantees the old epoch's queued frames fail rather than linger.
-    fn reap_stale_connection(&self, instance_id: crate::InstanceId) {
+    fn reap_stale_connection(&self, key: LaneKey) {
         if let Some((_, stale)) = self
             .connections
-            .remove_if(&instance_id, |_, h| h.tx.is_disconnected())
+            .remove_if(&key, |_, h| h.tx.is_disconnected())
         {
             stale.retire();
             self.update_connection_gauge();
         }
     }
 
-    /// Get or create a connection to a peer (lazy initialization)
-    fn get_or_create_connection(&self, instance_id: crate::InstanceId) -> Result<ConnectionHandle> {
+    /// Get or create the connection for one peer and lane (lazy
+    /// initialization)
+    fn get_or_create_connection(&self, key: LaneKey) -> Result<ConnectionHandle> {
         // Fast path: connection already exists and is alive
-        if let Some(handle) = self.connections.get(&instance_id) {
+        if let Some(handle) = self.connections.get(&key) {
             if !handle.tx.is_disconnected() {
                 return Ok(handle.clone());
             }
             // Stale — drop guard before mutating the map
             drop(handle);
-            self.reap_stale_connection(instance_id);
+            self.reap_stale_connection(key);
         }
 
         let rt = self.runtime.get().ok_or(TransportError::NotStarted)?;
-        self.install_connection(instance_id, rt)
+        self.install_connection(key, rt)
     }
 
-    /// Put a live connection in the map for `instance_id`: the one already
-    /// there if it is live, else a new one.
+    /// Put a live connection in the map for `key`: the one already there if
+    /// it is live, else a new one.
     fn install_connection(
         &self,
-        instance_id: crate::InstanceId,
+        key: LaneKey,
         rt: &tokio::runtime::Handle,
     ) -> Result<ConnectionHandle> {
         // Atomic check-and-insert via entry API
-        let handle = match self.connections.entry(instance_id) {
+        let handle = match self.connections.entry(key) {
             dashmap::mapref::entry::Entry::Occupied(mut entry) => {
                 if !entry.get().tx.is_disconnected() {
                     entry.get().clone()
@@ -225,13 +240,13 @@ impl TcpTransport {
                     // is installed, so no frame from the old connection can be
                     // observed as pending on the new one.
                     entry.get().retire();
-                    let handle = self.create_connection(instance_id, rt)?;
+                    let handle = self.create_connection(key, rt)?;
                     entry.insert(handle.clone());
                     handle
                 }
             }
             dashmap::mapref::entry::Entry::Vacant(entry) => {
-                let handle = self.create_connection(instance_id, rt)?;
+                let handle = self.create_connection(key, rt)?;
                 entry.insert(handle.clone());
                 handle
             }
@@ -247,9 +262,10 @@ impl TcpTransport {
     /// Create a new connection handle and spawn the writer task.
     fn create_connection(
         &self,
-        instance_id: crate::InstanceId,
+        key: LaneKey,
         rt: &tokio::runtime::Handle,
     ) -> Result<ConnectionHandle> {
+        let (instance_id, lane) = key;
         let addr = *self
             .peers
             .get(&instance_id)
@@ -264,7 +280,7 @@ impl TcpTransport {
 
         rt.spawn(connection_writer_task(
             addr,
-            instance_id,
+            key,
             rx,
             WriterTaskContext {
                 connections: Arc::clone(&self.connections),
@@ -275,7 +291,10 @@ impl TcpTransport {
             },
         ));
 
-        debug!("Created new connection to {} ({})", instance_id, addr);
+        debug!(
+            "Created new connection to {} lane {} ({})",
+            instance_id, lane, addr
+        );
         Ok(handle)
     }
 
@@ -297,12 +316,12 @@ impl TcpTransport {
     /// A failure here is terminal for the frame, so it is reported through
     /// `on_error` and the send reports [`SendOutcome::Admitted`] — there is
     /// nothing for the caller to wait on.
-    fn slow_path_send(&self, instance_id: crate::InstanceId, send_msg: SendTask) -> SendOutcome {
+    fn slow_path_send(&self, key: LaneKey, send_msg: SendTask) -> SendOutcome {
         if self.runtime.get().is_none() {
             send_msg.on_error("Transport not started");
             return SendOutcome::Admitted;
         }
-        let handle = match self.get_or_create_connection(instance_id) {
+        let handle = match self.get_or_create_connection(key) {
             Ok(h) => h,
             Err(e) => {
                 send_msg.on_error(format!("Failed to create connection: {}", e));
@@ -378,6 +397,10 @@ impl Transport for TcpTransport {
         Ok(())
     }
 
+    fn lanes(&self, _target: crate::InstanceId) -> NonZeroU16 {
+        self.lanes
+    }
+
     #[inline]
     fn send_message(
         &self,
@@ -387,6 +410,26 @@ impl Transport for TcpTransport {
         message_type: MessageType,
         on_error: std::sync::Arc<dyn TransportErrorHandler>,
     ) -> SendOutcome {
+        self.send_message_on_lane(instance_id, 0, header, payload, message_type, on_error)
+    }
+
+    /// Each lane is its own connection with its own gate. If the connection
+    /// of a lane is dead, the next send on that lane dials a new one. A lane
+    /// never uses the connection of another lane, because that can reorder
+    /// it.
+    #[inline]
+    fn send_message_on_lane(
+        &self,
+        instance_id: crate::InstanceId,
+        lane: u16,
+        header: Bytes,
+        payload: Bytes,
+        message_type: MessageType,
+        on_error: std::sync::Arc<dyn TransportErrorHandler>,
+    ) -> SendOutcome {
+        // Modulo, not a clamp: a caller that maps flows with `flow % lanes`
+        // and one that passes a raw flow number land on the same lane.
+        let key: LaneKey = (instance_id, lane % self.lanes);
         let send_msg = SendTask {
             msg_type: message_type,
             header,
@@ -400,17 +443,17 @@ impl Transport for TcpTransport {
         // because a dead epoch's gate would swallow the frame; the gate itself
         // then decides admitted-vs-queued, so there is no `try_send` here that
         // could overtake a frame already queued behind it.
-        if let Some(handle) = self.connections.get(&instance_id) {
+        if let Some(handle) = self.connections.get(&key) {
             let live = (!handle.tx.is_disconnected()).then(|| handle.clone());
             // Release the shard guard before either admitting (which may spawn
             // a driver) or mutating the map.
             drop(handle);
             match live {
                 Some(handle) => return self.admit(&handle, send_msg),
-                None => self.reap_stale_connection(instance_id),
+                None => self.reap_stale_connection(key),
             }
         }
-        self.slow_path_send(instance_id, send_msg)
+        self.slow_path_send(key, send_msg)
     }
 
     fn start(
@@ -516,18 +559,22 @@ impl Transport for TcpTransport {
         Box<dyn std::future::Future<Output = Result<(), HealthCheckError>> + Send + '_>,
     > {
         Box::pin(async move {
-            // Check if we have an existing connection
-            let connection_exists = self.connections.contains_key(&instance_id);
-
-            if let Some(handle) = self.connections.get(&instance_id) {
-                // Check if the channel is still connected (socket is still live)
-                // If the writer task has exited (socket closed), the channel will be disconnected
+            // Any live lane shows that the peer is reachable. A caller can
+            // send on any lane, so a peer can have no connection on lane 0.
+            // A lane whose writer has exited (socket closed) has a
+            // disconnected channel. Reap it: its next send dials it again.
+            let mut connection_exists = false;
+            for lane in 0..self.lanes.get() {
+                let key: LaneKey = (instance_id, lane);
+                let Some(handle) = self.connections.get(&key) else {
+                    continue;
+                };
+                connection_exists = true;
                 if !handle.tx.is_disconnected() {
-                    return Ok(()); // Connection is alive and healthy
+                    return Ok(());
                 }
-                // Channel is disconnected — drop guard and remove stale entry
                 drop(handle);
-                self.reap_stale_connection(instance_id);
+                self.reap_stale_connection(key);
             }
 
             // No existing connection or connection is dead - verify peer is reachable
@@ -558,7 +605,7 @@ impl Transport for TcpTransport {
 
 /// Per-connection configuration handed to [`connection_writer_task`].
 struct WriterTaskContext {
-    connections: Arc<DashMap<crate::InstanceId, ConnectionHandle>>,
+    connections: Arc<DashMap<LaneKey, ConnectionHandle>>,
     cancel_token: CancellationToken,
     connect_timeout: Duration,
     reader_ctx: Option<DialedReaderContext>,
@@ -574,7 +621,7 @@ struct WriterTaskContext {
 /// even if the initial TCP connect fails.
 async fn connection_writer_task(
     addr: SocketAddr,
-    instance_id: crate::InstanceId,
+    key: LaneKey,
     rx: flume::Receiver<SendTask>,
     ctx: WriterTaskContext,
 ) -> Result<()> {
@@ -587,7 +634,7 @@ async fn connection_writer_task(
     } = ctx;
     let result = connection_writer_inner(
         addr,
-        instance_id,
+        key,
         &rx,
         &cancel_token,
         connect_timeout,
@@ -620,14 +667,14 @@ async fn connection_writer_task(
     // successor's gate is a different one and the old gate's frames take the
     // closed-channel route instead.
     drop(rx);
-    if let Some((_, stale)) = connections.remove_if(&instance_id, |_, h| h.tx.is_disconnected()) {
+    if let Some((_, stale)) = connections.remove_if(&key, |_, h| h.tx.is_disconnected()) {
         stale.retire();
     }
     if let Some(metrics) = metrics.as_ref() {
         metrics.set_active_connections(connections.len());
     }
 
-    debug!("Connection to {} ({}) closed", instance_id, addr);
+    debug!("Connection to {} lane {} ({}) closed", key.0, key.1, addr);
 
     result
 }
@@ -636,14 +683,14 @@ async fn connection_writer_task(
 /// closes, a write error occurs, or the reader sees the peer close the socket.
 async fn connection_writer_inner(
     addr: SocketAddr,
-    instance_id: crate::InstanceId,
+    (instance_id, lane): LaneKey,
     rx: &flume::Receiver<SendTask>,
     cancel_token: &CancellationToken,
     connect_timeout: Duration,
     reader_ctx: Option<DialedReaderContext>,
     metrics: Option<std::sync::Arc<dyn velo_ext::TransportObservability>>,
 ) -> Result<()> {
-    debug!("Connecting to {}", addr);
+    debug!("Connecting to {} lane {} ({})", instance_id, lane, addr);
 
     let stream = tokio::select! {
         _ = cancel_token.cancelled() => return Ok(()),
@@ -676,7 +723,7 @@ async fn connection_writer_inner(
         warn!("Failed to set recv buffer size: {}", e);
     }
 
-    debug!("Connected to {}", addr);
+    debug!("Connected to {} lane {} ({})", instance_id, lane, addr);
 
     // The peer's listener replies on THIS socket when it rejects a Message
     // during drain (a ShuttingDown frame echoing the header). Split the
@@ -693,7 +740,7 @@ async fn connection_writer_inner(
             ctx,
             metrics.clone(),
             conn_cancel.clone(),
-            format!("{} ({})", instance_id, addr),
+            format!("{} lane {} ({})", instance_id, lane, addr),
         ))
     });
 
@@ -710,6 +757,7 @@ async fn connection_writer_inner(
         Some(&conn_cancel),
         &TcpWriterObserver {
             instance_id,
+            lane,
             addr,
             egress: metrics.map(EgressMetrics::new),
         },
@@ -766,6 +814,7 @@ pub struct TcpTransportBuilder {
     interface_filter: InterfaceFilter,
     numa_hint: Option<u32>,
     shrink_threshold: Option<usize>,
+    lanes: NonZeroU16,
 }
 
 impl TcpTransportBuilder {
@@ -780,6 +829,7 @@ impl TcpTransportBuilder {
             interface_filter: InterfaceFilter::default(),
             numa_hint: None,
             shrink_threshold: None,
+            lanes: NonZeroU16::MIN,
         }
     }
 
@@ -829,6 +879,24 @@ impl TcpTransportBuilder {
     /// overridable at process start via `VELO_TCP_SHRINK_THRESHOLD`.
     pub fn shrink_threshold(mut self, bytes: usize) -> Self {
         self.shrink_threshold = Some(bytes);
+        self
+    }
+
+    /// Lanes to each peer: up to this many connections, one for each lane
+    /// used, dialed on the first send on that lane (default 1, at least 1).
+    ///
+    /// One connection is limited by its receiver: one reader task does the
+    /// whole receive copy, and fixed socket buffers cap the TCP window. Each
+    /// lane is its own connection, read by its own task, so N lanes spread
+    /// that work over up to N cores. Order holds
+    /// within a lane only, so a caller that uses lanes must keep each ordered
+    /// flow on one lane (see `Transport::send_message_on_lane`).
+    /// `send_message` uses lane 0.
+    ///
+    /// Only the dialing side's count matters: the listener accepts however
+    /// many connections a peer opens, and reads each on its own task.
+    pub fn lanes(mut self, lanes: u16) -> Self {
+        self.lanes = NonZeroU16::new(lanes).unwrap_or(NonZeroU16::MIN);
         self
     }
 
@@ -933,6 +1001,7 @@ impl TcpTransportBuilder {
         if let Some(t) = self.shrink_threshold {
             transport.shrink_threshold = t;
         }
+        transport.lanes = self.lanes;
         Ok(transport)
     }
 }

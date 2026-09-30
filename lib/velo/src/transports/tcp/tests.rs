@@ -91,7 +91,7 @@ fn make_handle(capacity: usize) -> (ConnectionHandle, flume::Receiver<SendTask>)
 fn insert_stale_handle(transport: &TcpTransport, instance_id: crate::InstanceId) {
     let (handle, _rx) = make_handle(1);
     // Drop _rx immediately so tx.is_disconnected() == true
-    transport.connections.insert(instance_id, handle);
+    transport.connections.insert((instance_id, 0), handle);
 }
 
 /// A `SendTask` whose error handler is the given one.
@@ -144,6 +144,7 @@ async fn writer_observer_publishes_egress_into_the_bound_handle() {
         None,
         &TcpWriterObserver {
             instance_id: crate::InstanceId::new_v4(),
+            lane: 0,
             addr: "127.0.0.1:1".parse().unwrap(),
             egress: Some(EgressMetrics::new(handle)),
         },
@@ -208,7 +209,7 @@ async fn the_egress_queue_wait_spans_the_admission_gate() {
     // and everything after it queues behind the gate.
     let instance_id = crate::InstanceId::new_v4();
     let (conn, rx) = make_handle(1);
-    transport.connections.insert(instance_id, conn);
+    transport.connections.insert((instance_id, 0), conn);
 
     let outcomes: Vec<SendOutcome> = (0..3)
         .map(|_| {
@@ -249,6 +250,7 @@ async fn the_egress_queue_wait_spans_the_admission_gate() {
                 Some(&cancel),
                 &TcpWriterObserver {
                     instance_id,
+                    lane: 0,
                     addr: "127.0.0.1:1".parse().unwrap(),
                     egress: Some(EgressMetrics::new(handle)),
                 },
@@ -411,18 +413,18 @@ async fn test_get_or_create_connection_replaces_stale_handle() {
     assert!(
         transport
             .connections
-            .get(&iid)
+            .get(&(iid, 0))
             .unwrap()
             .tx
             .is_disconnected()
     );
 
     // get_or_create_connection should replace the stale handle with a live one
-    let handle = transport.get_or_create_connection(iid).unwrap();
+    let handle = transport.get_or_create_connection((iid, 0)).unwrap();
     assert!(!handle.tx.is_disconnected());
 
     // The map entry should also be live
-    let entry = transport.connections.get(&iid).unwrap();
+    let entry = transport.connections.get(&(iid, 0)).unwrap();
     assert!(!entry.tx.is_disconnected());
 }
 
@@ -440,13 +442,13 @@ async fn test_check_health_removes_stale_entry() {
 
     // Insert stale handle — simulates a dead writer task
     insert_stale_handle(&transport, iid);
-    assert!(transport.connections.contains_key(&iid));
+    assert!(transport.connections.contains_key(&(iid, 0)));
 
     // check_health should remove the stale entry and verify the peer is reachable
     let result = transport.check_health(iid, Duration::from_secs(2)).await;
 
     // Stale entry should be gone
-    assert!(!transport.connections.contains_key(&iid));
+    assert!(!transport.connections.contains_key(&(iid, 0)));
 
     // Since there WAS a previous connection entry, check_health returns Ok
     // (the peer is reachable via our test listener)
@@ -463,8 +465,8 @@ async fn test_writer_task_cleans_up_on_write_error() {
     let (handle, rx) = make_handle(8);
     let tx = handle.tx.clone();
 
-    let connections: Arc<DashMap<crate::InstanceId, ConnectionHandle>> = Arc::new(DashMap::new());
-    connections.insert(iid, handle);
+    let connections: Arc<DashMap<LaneKey, ConnectionHandle>> = Arc::new(DashMap::new());
+    connections.insert((iid, 0), handle);
 
     let conns = Arc::clone(&connections);
     let cancel = CancellationToken::new();
@@ -472,7 +474,7 @@ async fn test_writer_task_cleans_up_on_write_error() {
     // Spawn the writer task
     let writer = tokio::spawn(connection_writer_task(
         addr,
-        iid,
+        (iid, 0),
         rx,
         WriterTaskContext {
             connections: conns,
@@ -521,7 +523,7 @@ async fn test_writer_task_cleans_up_on_write_error() {
 
     // The writer should have removed the stale entry from the map
     assert!(
-        !connections.contains_key(&iid),
+        !connections.contains_key(&(iid, 0)),
         "writer task should clean up its DashMap entry on write error"
     );
 }
@@ -579,7 +581,7 @@ async fn test_send_message_does_not_fail_on_stale_handle() {
     );
 
     // The connections map should now contain a live handle
-    let entry = transport.connections.get(&iid).unwrap();
+    let entry = transport.connections.get(&(iid, 0)).unwrap();
     assert!(
         !entry.tx.is_disconnected(),
         "stale handle should have been replaced with a live one"
@@ -598,8 +600,8 @@ async fn test_writer_task_drains_on_connect_failure() {
     let (handle, rx) = make_handle(8);
     let tx = handle.tx.clone();
 
-    let connections: Arc<DashMap<crate::InstanceId, ConnectionHandle>> = Arc::new(DashMap::new());
-    connections.insert(iid, handle);
+    let connections: Arc<DashMap<LaneKey, ConnectionHandle>> = Arc::new(DashMap::new());
+    connections.insert((iid, 0), handle);
 
     // Queue a message *before* the writer task even starts — this simulates
     // the race between create_connection returning and connect completing.
@@ -618,7 +620,7 @@ async fn test_writer_task_drains_on_connect_failure() {
 
     let writer = tokio::spawn(connection_writer_task(
         addr,
-        iid,
+        (iid, 0),
         rx,
         WriterTaskContext {
             connections: conns,
@@ -637,7 +639,7 @@ async fn test_writer_task_drains_on_connect_failure() {
     );
 
     assert!(
-        !connections.contains_key(&iid),
+        !connections.contains_key(&(iid, 0)),
         "writer task should clean up its DashMap entry on connect failure"
     );
 }
@@ -659,7 +661,7 @@ async fn stale_replacement_fails_the_old_epoch_and_admits_on_the_successor() {
 
     // A live one-slot connection, filled and then queued behind.
     let (handle, rx) = make_handle(1);
-    transport.connections.insert(iid, handle.clone());
+    transport.connections.insert((iid, 0), handle.clone());
     let errors = Arc::new(TrackingErrorHandler::new());
     assert!(handle.gate.send(task(errors.clone())).is_admitted());
     let queued = match handle.gate.send(task(errors.clone())) {
@@ -672,7 +674,7 @@ async fn stale_replacement_fails_the_old_epoch_and_admits_on_the_successor() {
     // in the gate and `fail_all` resolves it synchronously.
     drop(rx);
     assert!(handle.tx.is_disconnected());
-    let fresh = transport.get_or_create_connection(iid).unwrap();
+    let fresh = transport.get_or_create_connection((iid, 0)).unwrap();
 
     assert_eq!(
         queued.state(),
@@ -743,7 +745,7 @@ async fn replacing_a_dead_connection_does_not_deadlock() {
     std::thread::spawn({
         let transport = transport.clone();
         move || {
-            let installed = transport.install_connection(iid, &rt).is_ok();
+            let installed = transport.install_connection((iid, 0), &rt).is_ok();
             let _ = done_tx.send(installed);
         }
     });
@@ -754,10 +756,314 @@ async fn replacing_a_dead_connection_does_not_deadlock() {
     assert!(
         !transport
             .connections
-            .get(&iid)
+            .get(&(iid, 0))
             .unwrap()
             .tx
             .is_disconnected()
     );
     transport.shutdown();
+}
+
+/// A frame as a raw peer saw it: the index of the connection it came on, in
+/// accept order, and the frame, or `None` when that connection ended.
+type RawFrame = (usize, Option<(MessageType, Bytes, Bytes)>);
+
+/// A plain TCP listener standing in for the peer, so a test can see which
+/// connection each frame came on. The listener of the transport routes the
+/// frames of every connection into one stream, which hides that.
+struct RawPeer {
+    info: PeerInfo,
+    frames: flume::Receiver<RawFrame>,
+    accepted: Arc<AtomicUsize>,
+}
+
+impl RawPeer {
+    async fn start() -> Self {
+        use futures::StreamExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let info = make_tcp_peer(listener.local_addr().unwrap());
+        let (tx, frames) = flume::unbounded();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let count = accepted.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let index = count.fetch_add(1, Ordering::SeqCst);
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let mut decoded =
+                        tokio_util::codec::FramedRead::new(stream, TcpFrameCodec::new());
+                    while let Some(Ok(frame)) = decoded.next().await {
+                        let _ = tx.send((index, Some(frame)));
+                    }
+                    let _ = tx.send((index, None));
+                });
+            }
+        });
+        Self {
+            info,
+            frames,
+            accepted,
+        }
+    }
+
+    /// The next frame, which must arrive within 5 s.
+    async fn next(&self) -> RawFrame {
+        tokio::time::timeout(Duration::from_secs(5), self.frames.recv_async())
+            .await
+            .expect("the frame arrives")
+            .unwrap()
+    }
+}
+
+/// A started-enough transport with `lanes` lanes, registered with a raw peer.
+async fn laned_pair(lanes: u16) -> (Arc<TcpTransport>, RawPeer, crate::InstanceId) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let transport = TcpTransportBuilder::new()
+        .from_listener(listener)
+        .unwrap()
+        .lanes(lanes)
+        .build()
+        .unwrap();
+    transport
+        .runtime
+        .set(tokio::runtime::Handle::current())
+        .ok();
+    let peer = RawPeer::start().await;
+    let peer_id = peer.info.instance_id();
+    transport.register(peer.info.clone()).unwrap();
+    (Arc::new(transport), peer, peer_id)
+}
+
+#[test]
+fn the_builder_keeps_at_least_one_lane() {
+    let id = crate::InstanceId::new_v4();
+    let lanes = |builder: TcpTransportBuilder| builder.build().unwrap().lanes(id).get();
+    assert_eq!(lanes(TcpTransportBuilder::new()), 1, "the default");
+    assert_eq!(lanes(TcpTransportBuilder::new().lanes(0)), 1, "0 means 1");
+    assert_eq!(lanes(TcpTransportBuilder::new().lanes(4)), 4);
+}
+
+/// Each lane is its own TCP connection, and keeps its own order under load
+/// from concurrent senders.
+///
+/// The header carries `(lane, seq)`. The peer sees the lanes interleaved,
+/// which is allowed, and each lane's sequence in order, which is the contract.
+/// Lanes that share one connection also pass the order check, so the test
+/// also checks that the frames of each lane all came on one connection, and
+/// that no two lanes shared one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_lane_is_its_own_connection_and_keeps_its_own_order() {
+    const LANES: u16 = 4;
+    const FRAMES: u32 = 5_000;
+    let (transport, peer, peer_id) = laned_pair(LANES).await;
+    assert_eq!(transport.lanes(peer_id).get(), LANES);
+
+    let errors = Arc::new(TrackingErrorHandler::new());
+    let mut senders = Vec::new();
+    for lane in 0..LANES {
+        let transport = transport.clone();
+        let errors = errors.clone();
+        senders.push(tokio::spawn(async move {
+            for seq in 0..FRAMES {
+                let mut header = lane.to_le_bytes().to_vec();
+                header.extend_from_slice(&seq.to_le_bytes());
+                let outcome = transport.send_message_on_lane(
+                    peer_id,
+                    lane,
+                    Bytes::from(header),
+                    Bytes::from_static(b"token"),
+                    MessageType::Event,
+                    errors.clone(),
+                );
+                if let SendOutcome::Pending(admission) = outcome {
+                    admission.await.unwrap();
+                }
+            }
+        }));
+    }
+
+    let mut next = vec![0u32; usize::from(LANES)];
+    let mut connection_of: Vec<Option<usize>> = vec![None; usize::from(LANES)];
+    for _ in 0..FRAMES * u32::from(LANES) {
+        let (connection, frame) = peer.next().await;
+        let (_, header, _) = frame.expect("no connection ends while the lanes send");
+        let lane = usize::from(u16::from_le_bytes(header[..2].try_into().unwrap()));
+        let seq = u32::from_le_bytes(header[2..6].try_into().unwrap());
+        assert_eq!(seq, next[lane], "lane {lane} out of order");
+        next[lane] += 1;
+        let first = *connection_of[lane].get_or_insert(connection);
+        assert_eq!(first, connection, "lane {lane} moved to another connection");
+    }
+    for sender in senders {
+        sender.await.unwrap();
+    }
+    assert_eq!(errors.error_count(), 0);
+
+    let mut distinct: Vec<usize> = connection_of.iter().map(|c| c.unwrap()).collect();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(
+        distinct.len(),
+        usize::from(LANES),
+        "each lane has its own connection: {connection_of:?}"
+    );
+    assert_eq!(peer.accepted.load(Ordering::SeqCst), usize::from(LANES));
+    for lane in 0..LANES {
+        assert!(transport.connections.contains_key(&(peer_id, lane)));
+    }
+    transport.shutdown();
+}
+
+/// `send_message` is lane 0, and a lane at or past the count wraps.
+///
+/// Ordinary traffic must keep one ordered channel, so a transport built with
+/// several lanes must not open a second connection for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_message_is_lane_zero_and_lanes_wrap() {
+    let (transport, peer, peer_id) = laned_pair(3).await;
+    let errors = Arc::new(TrackingErrorHandler::new());
+
+    // Several sends, so that a send_message that rotates over lanes opens a
+    // second connection.
+    for _ in 0..3 {
+        let _ = transport.send_message(
+            peer_id,
+            Bytes::from_static(b"plain"),
+            Bytes::new(),
+            MessageType::Event,
+            errors.clone(),
+        );
+    }
+    let mut plain_connection = None;
+    for _ in 0..3 {
+        let (connection, frame) = peer.next().await;
+        assert_eq!(frame.unwrap().1, Bytes::from_static(b"plain"));
+        assert_eq!(*plain_connection.get_or_insert(connection), connection);
+    }
+    assert_eq!(peer.accepted.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.connections.len(), 1);
+    assert!(transport.connections.contains_key(&(peer_id, 0)));
+
+    // Lane 4 of 3: modulo gives lane 1, where a clamp would give lane 2.
+    let _ = transport.send_message_on_lane(
+        peer_id,
+        4,
+        Bytes::from_static(b"wrapped"),
+        Bytes::new(),
+        MessageType::Event,
+        errors.clone(),
+    );
+    let (connection, frame) = peer.next().await;
+    assert_eq!(frame.unwrap().1, Bytes::from_static(b"wrapped"));
+    assert_ne!(Some(connection), plain_connection, "lane 1 is not lane 0");
+    assert!(
+        transport.connections.contains_key(&(peer_id, 1)),
+        "lane 4 of 3 is lane 1"
+    );
+    assert_eq!(transport.connections.len(), 2);
+    assert_eq!(errors.error_count(), 0);
+    transport.shutdown();
+}
+
+/// A peer reached only on a lane other than 0 is healthy.
+///
+/// A caller can put a flow on any lane, so a peer can have live connections
+/// with none on lane 0. A health check that looks at lane 0 alone dials a
+/// throwaway probe and calls such a peer `NeverConnected`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peer_live_only_on_a_later_lane_is_healthy() {
+    let (transport, peer, peer_id) = laned_pair(3).await;
+    let errors = Arc::new(TrackingErrorHandler::new());
+    let _ = transport.send_message_on_lane(
+        peer_id,
+        2,
+        Bytes::from_static(b"lane two"),
+        Bytes::new(),
+        MessageType::Event,
+        errors.clone(),
+    );
+    assert!(peer.next().await.1.is_some());
+    assert!(!transport.connections.contains_key(&(peer_id, 0)));
+
+    let health = transport
+        .check_health(peer_id, Duration::from_secs(1))
+        .await;
+    assert!(health.is_ok(), "{health:?}");
+    assert_eq!(errors.error_count(), 0);
+    transport.shutdown();
+}
+
+/// `shutdown()` closes every lane's connection, and every frame sent on any
+/// lane is delivered or failed.
+///
+/// Every lane is connected before the bulk, and the bulk is flowing on every
+/// lane when shutdown lands, so it meets writers that are mid-stream on lanes
+/// other than 0. Each send is admitted at once (the bulk fits the send
+/// channel), so a frame is either on the wire or reported through `on_error`.
+/// None can be dropped in the gate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_closes_every_lane() {
+    const LANES: u16 = 4;
+    const FRAMES: usize = 128;
+    const PAYLOAD: usize = 64 * 1024;
+    let (transport, peer, peer_id) = laned_pair(LANES).await;
+    let errors = Arc::new(TrackingErrorHandler::new());
+
+    let send = |lane: u16, bytes: usize| {
+        let outcome = transport.send_message_on_lane(
+            peer_id,
+            lane,
+            Bytes::copy_from_slice(&lane.to_be_bytes()),
+            Bytes::from(vec![0u8; bytes]),
+            MessageType::Response,
+            errors.clone(),
+        );
+        assert!(outcome.is_admitted(), "the bulk must fit the send channel");
+    };
+    for lane in 0..LANES {
+        send(lane, 0);
+    }
+    for _ in 0..LANES {
+        assert!(peer.next().await.1.is_some(), "every lane connects");
+    }
+    assert_eq!(peer.accepted.load(Ordering::SeqCst), usize::from(LANES));
+
+    for i in 0..FRAMES {
+        send((i % usize::from(LANES)) as u16, PAYLOAD);
+    }
+    // Shut down only once every lane has delivered a bulk frame, so shutdown
+    // lands on writers that are streaming, not on writers yet to start.
+    let mut per_lane = vec![0usize; usize::from(LANES)];
+    let mut ended = 0;
+    while per_lane.contains(&0) {
+        let (_, frame) = peer.next().await;
+        let (_, header, _) = frame.expect("no connection ends before shutdown");
+        per_lane[usize::from(u16::from_be_bytes([header[0], header[1]]))] += 1;
+    }
+    transport.shutdown();
+
+    while ended < usize::from(LANES) {
+        match peer.next().await {
+            (_, Some((_, header, _))) => {
+                per_lane[usize::from(u16::from_be_bytes([header[0], header[1]]))] += 1;
+            }
+            (_, None) => ended += 1,
+        }
+    }
+    assert!(transport.connections.is_empty());
+
+    // A writer reports the frames it did not write after its socket closes, so
+    // the count can trail the last end of stream by a moment.
+    let delivered: usize = per_lane.iter().sum();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while delivered + errors.error_count() < FRAMES && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let failed = errors.error_count();
+    assert_eq!(
+        delivered + failed,
+        FRAMES,
+        "{delivered} delivered + {failed} failed != {FRAMES} sent"
+    );
 }

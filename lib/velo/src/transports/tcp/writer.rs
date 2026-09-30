@@ -69,6 +69,7 @@ impl Coalescable for SendTask {
 /// visibility this type needs.
 pub(super) struct TcpWriterObserver {
     pub(super) instance_id: crate::InstanceId,
+    pub(super) lane: u16,
     pub(super) addr: SocketAddr,
     pub(super) egress: Option<EgressMetrics>,
 }
@@ -77,12 +78,12 @@ impl WriterObserver for TcpWriterObserver {
     fn on_failure(&self, kind: WriterFailure, err: &std::io::Error, frames: usize) {
         match kind {
             WriterFailure::Write => error!(
-                "Write error to {} ({}): {} ({} message(s) in batch)",
-                self.instance_id, self.addr, err, frames
+                "Write error to {} lane {} ({}): {} ({} message(s) in batch)",
+                self.instance_id, self.lane, self.addr, err, frames
             ),
             WriterFailure::Encode => error!(
-                "Encode error to {} ({}): {}",
-                self.instance_id, self.addr, err
+                "Encode error to {} lane {} ({}): {}",
+                self.instance_id, self.lane, self.addr, err
             ),
         }
     }
