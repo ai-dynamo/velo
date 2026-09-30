@@ -86,7 +86,7 @@ pub struct QuicTransport {
     /// which needs a runtime.
     server_sockets: Mutex<Option<Vec<std::net::UdpSocket>>>,
     /// One dial socket per lane, so each lane has its own quinn endpoint
-    /// driver and its own 4-tuple at the peer's reuse-port group.
+    /// driver.
     client_sockets: Mutex<Option<Vec<std::net::UdpSocket>>>,
     server_config: quinn::ServerConfig,
     transport_config: Arc<quinn::TransportConfig>,
@@ -108,7 +108,25 @@ pub struct QuicTransport {
 #[derive(Clone)]
 struct PeerEntry {
     addr: SocketAddr,
+    /// The port of each of the peer's server sockets. Empty for a peer that
+    /// predates lanes, whose every lane dials `addr`.
+    ports: Vec<u16>,
     client_config: quinn::ClientConfig,
+}
+
+impl PeerEntry {
+    /// Where `lane` dials: the peer's server socket `(offset + lane) % n`.
+    ///
+    /// `offset` is fixed per dialer, so the lanes of one dialer land on
+    /// different sockets, and the lane 0 of many dialers does not pile onto
+    /// socket 0.
+    fn lane_addr(&self, lane: u16, offset: usize) -> SocketAddr {
+        if self.ports.is_empty() {
+            return self.addr;
+        }
+        let index = (offset + usize::from(lane)) % self.ports.len();
+        SocketAddr::new(self.addr.ip(), self.ports[index])
+    }
 }
 
 /// Handle to one connection's writer task. One handle is one connection
@@ -207,12 +225,13 @@ impl QuicTransport {
         rt: &tokio::runtime::Handle,
     ) -> Result<ConnectionHandle> {
         let (instance_id, lane) = key;
-        let peer = self
+        let mut peer = self
             .peers
             .get(&instance_id)
             .ok_or(TransportError::PeerNotRegistered(instance_id))?
             .value()
             .clone();
+        peer.addr = peer.lane_addr(lane, self.lane_offset());
         let endpoint = self
             .client_endpoints
             .get()
@@ -243,6 +262,15 @@ impl QuicTransport {
             rt,
         );
         Ok(handle)
+    }
+
+    /// This dialer's offset into a peer's server sockets. Taken from the
+    /// certificate fingerprint, which is random per transport, so dialers
+    /// spread over a peer's sockets without coordinating.
+    fn lane_offset(&self) -> usize {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&self.fingerprint[..8]);
+        u64::from_le_bytes(bytes) as usize
     }
 
     fn update_peer_gauge(&self) {
@@ -367,6 +395,7 @@ impl Transport for QuicTransport {
             peer_info.instance_id(),
             PeerEntry {
                 addr,
+                ports: info.ports,
                 client_config,
             },
         );

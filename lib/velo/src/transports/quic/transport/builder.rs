@@ -105,12 +105,14 @@ impl QuicTransportBuilder {
         self
     }
 
-    /// Number of server sockets in the `SO_REUSEPORT` group (Linux only;
-    /// default 4, ignored elsewhere).
+    /// Number of server sockets, each on its own port (default 4).
     ///
-    /// A node that many peers send to at once (a frontend) gains from more:
-    /// each socket has its own receive queue and buffer ceiling. Each socket
-    /// also costs a quinn endpoint and its receive buffers.
+    /// Each socket has its own quinn endpoint driver, receive queue and buffer
+    /// ceiling. A peer spreads its lanes over the sockets, so a receiving node
+    /// needs at least as many sockets as its peers use lanes, or two lanes
+    /// share one endpoint driver. Peers with one lane each are spread over
+    /// the sockets too. Each socket costs a port, a quinn endpoint and its
+    /// receive buffers.
     pub fn server_endpoints(mut self, count: usize) -> Self {
         self.server_endpoints = count.max(1);
         self
@@ -236,9 +238,14 @@ impl QuicTransportBuilder {
         server_config.transport_config(transport_config.clone());
 
         let endpoints = resolve_advertise_endpoints(bind_addr, &self.interface_filter)?;
+        let ports = server_sockets
+            .iter()
+            .map(|socket| socket.local_addr().map(|addr| addr.port()))
+            .collect::<std::io::Result<Vec<u16>>>()?;
         let info = QuicEndpointInfo {
             endpoints,
             fingerprint: identity.fingerprint,
+            ports,
         };
         let mut addr_builder = crate::transports::address::WorkerAddressBuilder::new();
         addr_builder.add_entry(key.clone(), info.encode()?)?;
@@ -280,7 +287,7 @@ impl Default for QuicTransportBuilder {
     }
 }
 
-/// Server sockets in the reuse-port group by default. Dynamo's QUIC plane
+/// Server sockets by default. Dynamo's QUIC plane
 /// measured 8 and 32 on a frontend; 32 cost about 50 MiB of RSS. A frontend
 /// sets a higher count with [`QuicTransportBuilder::server_endpoints`].
 const DEFAULT_SERVER_ENDPOINTS: usize = 4;

@@ -7,7 +7,7 @@ This chapter records what the QUIC transport costs against TCP, the settings tha
 | Builder method | Default | Effect |
 |---|---|---|
 | `lanes(n)` | 1 | Up to `n` connections to each peer, one for each lane used, each from its own UDP socket. Order holds within a lane only. See [Lanes](#lanes). |
-| `server_endpoints(n)` | 4 | Server sockets in the `SO_REUSEPORT` group (Linux). More sockets spread the receive load of many peers and many lanes. |
+| `server_endpoints(n)` | 4 | Server sockets, each on its own port. A dialer spreads its lanes over them, so use at least as many as the peers' lanes. |
 | `udp_buffer_sizes(recv, send)` | 8 MiB, 4 MiB | Requested socket buffers. The kernel clamps them to `net.core.rmem_max` and `net.core.wmem_max`, and the transport logs the clamp. |
 | `max_mtu(bytes)` | quinn's (1452) | Upper bound for path MTU discovery. Values above 6550 are lowered to 6550. |
 | `stream_receive_window(bytes)` | quinn's | Flow-control window for the stream. |
@@ -90,13 +90,15 @@ Measured on 2026-09-29 across the same two nodes as above, 64 KiB messages pipel
 
 The UDP receive-buffer error count stayed below 50 in each run, so the gain comes from more cores, not from more socket buffers. 64 B pipelined messages do not change with the lane count.
 
-The receiving node needs many more server sockets than there are lanes. The kernel hashes each connection to one socket of the reuse-port group, and two lanes on one socket share its endpoint driver. The table below used 8 lanes. It ran in a separate job on another pair of nodes, so its 32-socket row differs from the table above by run-to-run spread.
+Two lanes on one server socket share its endpoint driver. So each server socket has its own port, and a dialer sends each lane to a different socket. The prototype instead put all server sockets on one port in a `SO_REUSEPORT` group, where the kernel hashes each connection to a socket at random. The table below shows what that cost with 8 lanes. It ran in a separate job on another pair of nodes, so its 32-socket row differs from the table above by run-to-run spread.
 
-| Server sockets on the receiving node | MB/s |
+| Server sockets in the reuse-port group | MB/s |
 |---|---|
 | 4 | 3,326–4,014 |
 | 8 | 2,628 or 6,579, as the hash fell |
 | 32 | 6,463–6,526 |
+
+With one port for each socket, 8 lanes need 8 server sockets on the receiving node, not 32.
 
 The same prototype on TCP did not scale: 2.6–3.4 GB/s with 1 lane, and 2.9–3.8 GB/s with 2, 4 or 8 lanes. The limit for TCP is not the connection, so the TCP transport keeps one lane.
 

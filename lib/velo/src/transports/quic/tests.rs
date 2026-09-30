@@ -608,6 +608,7 @@ where
         )
         .unwrap(),
         fingerprint: identity.fingerprint,
+        ports: vec![],
     };
     let mut builder = WorkerAddressBuilder::new();
     builder.add_entry("quic", info.encode().unwrap()).unwrap();
@@ -1398,4 +1399,75 @@ async fn closed_force_closes_a_stuck_lane_other_than_zero() {
         failed, FRAMES,
         "{failed} of {FRAMES} frames failed when closed() returned; the rest are unaccounted for"
     );
+}
+
+/// The lanes of one dialer land on different server sockets of the peer.
+///
+/// Each server socket has its own port and its own endpoint driver, and the
+/// dialer spreads its lanes over the ports. Two lanes on one socket would
+/// share one driver, which is the limit lanes exist to lift.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_lane_lands_on_its_own_server_socket() {
+    const LANES: u16 = 4;
+    let (client, _client_streams, server, server_streams, server_id) = laned_pair(LANES).await;
+    let servers = server.server_endpoints.get().unwrap();
+    assert_eq!(
+        servers.len(),
+        usize::from(LANES),
+        "the default is one socket per lane here"
+    );
+
+    let errors = Arc::new(Errors::default());
+    for lane in 0..LANES {
+        let _ = client.send_message_on_lane(
+            server_id,
+            lane,
+            Bytes::from(lane.to_le_bytes().to_vec()),
+            Bytes::new(),
+            MessageType::Event,
+            errors.clone(),
+        );
+    }
+    for _ in 0..LANES {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            server_streams.event_stream.recv_async(),
+        )
+        .await
+        .expect("every lane delivers")
+        .unwrap();
+    }
+    for (index, endpoint) in servers.iter().enumerate() {
+        assert_eq!(
+            endpoint.open_connections(),
+            1,
+            "server socket {index} holds exactly one lane"
+        );
+    }
+    assert!(errors.0.lock().unwrap().is_empty());
+    client.shutdown();
+    server.shutdown();
+}
+
+/// A lane's address: socket `(offset + lane) % n` of the peer, or the one
+/// advertised address for a peer that lists no ports.
+#[test]
+fn lane_addresses_spread_over_the_peers_sockets() {
+    let client_config = super::tls::pinned_client_config([0; 32]).unwrap();
+    let addr: std::net::SocketAddr = "10.0.0.1:5000".parse().unwrap();
+    let peer = super::PeerEntry {
+        addr,
+        ports: vec![5000, 5001, 5002, 5003],
+        client_config: client_config.clone(),
+    };
+    let ports: Vec<u16> = (0..4).map(|lane| peer.lane_addr(lane, 6).port()).collect();
+    assert_eq!(ports, vec![5002, 5003, 5000, 5001]);
+    assert!((0..4).all(|lane| peer.lane_addr(lane, 6).ip() == addr.ip()));
+
+    let before_lanes = super::PeerEntry {
+        addr,
+        ports: vec![],
+        client_config,
+    };
+    assert!((0..4).all(|lane| before_lanes.lane_addr(lane, 6) == addr));
 }
