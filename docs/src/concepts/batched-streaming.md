@@ -74,7 +74,7 @@ flowchart LR
 
 `MessengerMuxTransport` implements the streaming `FrameTransport` contract. It has no dial, no listener, no acceptor and no connection manager. The sender's identity arrives in the active-message envelope, so credit has a return route without a handshake.
 
-Egress is one `PeerBatcher` per remote instance. The batcher is created on the first send to that peer and evicted when it is idle with no live slots. A node that talks to Y peers holds Y batchers, whatever its stream count. The per-stream design is O(X) in tasks and sockets. With the mux, sockets and batchers are O(Y). Each stream still has its own stream watchdog on the consumer and heartbeat task on the producer, so tasks stay O(X). The watchdog wakes once per heartbeat window, not once per record.
+Egress is one `PeerBatcher` per remote instance and [lane](#lanes). The batcher is created on the first send to that peer on that lane, and evicted when it is idle with no live slots. A node that talks to Y peers on one lane holds Y batchers, whatever its stream count. The per-stream design is O(X) in tasks and sockets. With the mux, sockets and batchers are O(Y). Each stream still has its own stream watchdog on the consumer and heartbeat task on the producer, so tasks stay O(X). The watchdog wakes once per heartbeat window, not once per record.
 
 The cost of this design is that streaming no longer owns its wire. It shares queues, framing and backpressure with control traffic. Stream order is no longer a TCP guarantee. It is a protocol obligation, and every record carries a per-slot sequence number for this reason.
 
@@ -95,7 +95,7 @@ record:
 record_type: 0 = Data, 1 = OpenSlot, 2 = CloseSlot, 3 = CreditUpdate, 4 = SlotHeartbeat, 5 = LifecycleSlot
 ```
 
-Every multi-byte field is big-endian, in the header and in each record. Senders write `flags` as zero, and receivers ignore unknown bits.
+Every multi-byte field is big-endian, in the header and in each record. The low four bits of `flags` carry the [lane](#lanes) of the batch. The high four bits are reserved and are zero. A lane-0 batch writes `flags` as zero, as senders did before lanes, and a receiver from before lanes ignores the byte.
 
 The sender bumps `peer_epoch` each time it re-establishes its view of the peer. `batch_seq` advances within an epoch and is compared modulo 2^32. Together they let ingress discard a stale epoch's batches by header inspection, and they meter gaps. `frame_seq` is per slot and is the authority on stream order.
 
@@ -111,6 +111,24 @@ Record bodies:
 - **`SlotHeartbeat`** has no body. The decoder accepts it, but no sender emits it. See [Heartbeats](#heartbeats).
 
 `CloseSlot` travels in both directions and has no direction bit. The reason carries the direction. `TerminalSent` and `PeerGone` travel from slot owner to receiver. `UnknownSlot` and `ProtocolError` travel from receiver to slot owner. Both sides can hold a slot at the same dense index, and the reason tells them apart.
+
+### Lanes
+
+A lane is one ordered channel of batches from a sender to a peer. Order holds per (peer, lane), not per peer. Each slot stays on one lane for its whole life, so the order of each stream holds.
+
+The mux keeps up to 16 lanes to a peer, and mux lane k rides transport lane k. The count follows the transport: `Transport::lanes(peer)`, capped at 16. A QUIC transport built with `lanes(8)` gives 8 mux lanes. TCP keeps one lane, which is the behavior from before lanes.
+
+Each lane has its own batch handler, ordered per sender. Lane 0 keeps the name `_stream_batch`, so a peer from before lanes sends and receives on it. Lanes 1 to 15 use `_stream_batch.1` to `_stream_batch.15`. Every node registers all 16 handlers, whatever its transport keeps, because a peer can send on any lane that the peer keeps.
+
+Everything that depends on order is kept per (peer, lane): the batcher on the sender, and the epoch, `batch_seq` and slot table on the receiver. Slot ids are unique only within one batcher, so a table shared by two lanes would let one lane retire the slots of the other. Replies (credit, closes, stops) go back on the lane that the batch arrived on.
+
+The receiver of a stream names its lane, in the attach response or in the `StreamOpenTicket`. The sender uses that lane modulo the lanes its own transport keeps to the receiver. A sender with one lane always uses lane 0. Any lane is correct for any stream, because every node takes batches on every lane. Only the spread changes. Today the receiver names lane 0 for every stream.
+
+The new fields are last in each message, default to zero when absent, and are not sent when zero. A lane-0 ticket or attach message is therefore the same bytes as before lanes, in JSON and in MessagePack. A ticket that names another lane has one more field, which a worker from before lanes refuses under positional MessagePack. Upgrade the workers before the node that mints the tickets.
+
+The batch header repeats the lane. Ingress drops a batch whose header lane is not the lane of its handler, and counts its records as `lane_mismatch` in `velo_streaming_mux_records_dropped_total`. The slot ids of such a batch belong to another batcher, so applying them could feed or retire the wrong streams.
+
+The per-peer limits are split evenly over the lanes of the peer: each table gets `peer_byte_budget / lanes` bytes and 65,536 / lanes slot indices. The byte share never goes below one `slot_byte_budget`, so one stream can always hold its full window.
 
 ### The batch size cap
 
@@ -147,7 +165,7 @@ One exception exists. A rendezvous payload resolves in a detached task before di
 1. **The egress fence.** A slot has at most one fenced singleton outstanding. While the fence is up, the batcher withholds the later records of that slot until the staged send is admitted. This includes the slot's `CloseSlot`, because a close must not overtake the record in front of it. Only the resolution of that singleton lifts its own fence. A rendezvous record always fences its slot, even when the transport admits it synchronously, because the receiver resolves it outside the ordered lane.
 2. **The ingress hold.** Ingress keeps a record that arrives ahead of its `frame_seq` in a per-slot hold, and applies it when the gap closes. Credit admission and the slot and peer byte budgets bound the hold. An overflow closes that slot with `ProtocolError` and meters `velo_streaming_mux_hold_overflow_total`. The consumer sees `Dropped`. Other slots and the lane continue.
 
-Batches from one peer must not be reordered. The worker writes each `OpenSlot` in its own batch. A `Data` batch that overtakes it finds no slot and is dropped as `closed_slot`. The slot then opens with its sequence past the lost record, which silently truncates the head of the stream.
+Batches from one peer on one lane must not be reordered. The worker writes each `OpenSlot` in its own batch. A `Data` batch that overtakes it finds no slot and is dropped as `closed_slot`. The slot then opens with its sequence past the lost record, which silently truncates the head of the stream.
 
 ### Opening a slot
 
@@ -389,7 +407,7 @@ The mux series all start with `velo_streaming_mux_`. The most important ones:
 - `velo_streaming_mux_live_slots` returns to zero at teardown.
 - `velo_streaming_mux_reader_stall_total` and `velo_streaming_mux_credit_lost_total` must stay at zero.
 - `velo_streaming_slot_credit_exhausted_total` counts credit starvation on the sender.
-- `velo_messenger_ordered_lane_wait_seconds{handler="_stream_batch"}` shows the ingress lane wait, one sample per batch.
+- `velo_messenger_ordered_lane_wait_seconds{handler="_stream_batch"}` shows the ingress lane wait, one sample per batch. Lanes other than 0 report under their own handler names, `_stream_batch.1` to `_stream_batch.15`.
 
 The [Metrics reference](../appendix/metrics.md) lists every series. [Stream saturation](../operations/saturation.md) explains how to read them under load.
 
