@@ -42,10 +42,10 @@ Measured on 2026-09-23 on one aarch64 workstation (20 cores, shared, load averag
 | 64 B, pipelined (msg/s) | 482,000–486,000 | 465,000–574,000 | 486,000–562,000 |
 | 64 KiB, one at a time (msg/s) | 9,600–11,900 | 2,500–2,600 | 3,200–3,300 |
 | 64 KiB, 64 in flight (msg/s) | 16,700–19,900 | 8,400–8,800 | 10,900–11,200 |
-| 64 KiB, pipelined (MB/s) | 2,800–4,400 | 580–620 | 770–790 |
+| 64 KiB, pipelined (MiB/s) | 2,800–4,400 | 580–620 | 770–790 |
 
 - Small messages cost about twice the latency of TCP. Each direction passes through quinn's connection and endpoint driver tasks, so one message takes more task hops than on TCP.
-- Large messages reach about 600 to 800 MB/s on one connection. One quinn task does the packet work and the encryption for a connection. TCP moves 64 KiB segments on loopback, and the kernel does that work.
+- Large messages reach about 600 to 800 MiB/s on one connection. One quinn task does the packet work and the encryption for a connection. TCP moves 64 KiB segments on loopback, and the kernel does that work.
 - `max_mtu` 6550 gives 25% to 30% more for large messages when the path carries it. It does not help small messages.
 
 ### Settings that did not help
@@ -66,8 +66,8 @@ Measured on 2026-09-29 with the `throughput` example in its two-host mode. The s
 | 64 B, 64 in flight (msg/s) | 261,000–339,000 | 210,000–270,000 | 0.80 |
 | 64 B, pipelined (msg/s) | 433,000–483,000 | 449,000–502,000 | 1.02 |
 | 64 KiB, one at a time (msg/s) | 6,400–8,100 | 2,300–2,600 | 0.33 |
-| 64 KiB, 64 in flight (MB/s, best rep) | 2,950 | 750 | 0.27 |
-| 64 KiB, pipelined (MB/s, best rep) | 3,920 | 840 | 0.23 |
+| 64 KiB, 64 in flight (MiB/s, best rep) | 2,950 | 750 | 0.27 |
+| 64 KiB, pipelined (MiB/s, best rep) | 3,920 | 840 | 0.23 |
 
 - Small messages cost about 25 µs more per round trip than on TCP, as on loopback. The network does not change this cost: it comes from the task hops inside quinn. With many messages in flight the gap closes, and pipelined QUIC matches TCP.
 - One QUIC connection tops out at about 0.8 GB/s, the same ceiling as on loopback on the same node type. So the limit is the CPU of the connection, not the network. A profile of the 64 KiB case put about 15% of the samples in AES-GCM. The rest was quinn's packet work, the kernel's UDP path, and task wakeups. TCP moves about 3.9 GB/s, because the kernel and the NIC offloads share that work.
@@ -81,7 +81,7 @@ The messenger sends its own traffic on lane 0. Only a caller that sends with `se
 
 Measured on 2026-09-29 across the same two nodes as above, 64 KiB messages pipelined, 20,000 messages per cell, two reps. A prototype, which is not in the tree, spread the messages round robin over the lanes, with the connection layout that `lanes(n)` builds. The receiving node had 32 server sockets.
 
-| Lanes | MB/s |
+| Lanes | MiB/s |
 |---|---|
 | 1 | 788–789 |
 | 2 | 1,552–1,558 |
@@ -92,13 +92,13 @@ The UDP receive-buffer error count stayed below 50 in each run, so the gain come
 
 The receiving node needs many more server sockets than there are lanes. The kernel hashes each connection to one socket of the reuse-port group, and two lanes on one socket share its endpoint driver. The table below used 8 lanes. It ran in a separate job on another pair of nodes, so its 32-socket row differs from the table above by run-to-run spread.
 
-| Server sockets on the receiving node | MB/s |
+| Server sockets on the receiving node | MiB/s |
 |---|---|
 | 4 | 3,326–4,014 |
 | 8 | 2,628 or 6,579, as the hash fell |
 | 32 | 6,463–6,526 |
 
-The same prototype on TCP did not scale: 2.6–3.4 GB/s with 1 lane, and 2.9–3.8 GB/s with 2, 4 or 8 lanes. The limit for TCP is not the connection, so the TCP transport keeps one lane.
+A TCP prototype with the same layout, one connection per lane, scaled too: 2.5, 4.6, 8.1 and 13.1 GB/s (10^9 bytes per second) with 1, 2, 4 and 8 lanes. One TCP connection is limited by its receiver: one reader task does the `recvmsg` copy, and the transport's fixed socket buffers cap the TCP window. The TCP transport does not implement lanes yet.
 
 ## Batched streaming over QUIC
 
