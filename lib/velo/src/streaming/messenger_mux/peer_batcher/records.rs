@@ -7,16 +7,14 @@
 //! inside, for the same reason [`control`](super::control) and
 //! [`writer`](super::writer) are: the file was full. What is here is one
 //! coherent question — *this record arrived on this slot's inlet; where does it
-//! go?* — and the four answers to it:
+//! go?* — and the three answers to it:
 //!
 //! - into the staged batch, when the slot has credit and the record fits;
-//! - into the slot's withheld queue, when it does not have credit, which is
-//!   what lets the inlet be drained unconditionally so a synchronous `finalize`,
-//!   `detach` or `Drop` can never block on a full channel;
+//! - into the slot's withheld queue, when it does not have credit or is
+//!   fenced. At the slot's byte cap the queue pauses the inlet, and that pause
+//!   is what makes a producer that outruns its credit wait;
 //! - out alone through rendezvous, when it is larger than any eager batch to
-//!   this peer, fencing its slot until the admission resolves;
-//! - or nowhere, when the producer outran the byte cap on a slot nobody is
-//!   draining and the slot is closed under it.
+//!   this peer, fencing its slot until the admission resolves.
 //!
 //! The `CloseSlot` that ends a slot with no terminal behind it queues by the
 //! same two rules as a data record — after anything withheld, and after the
@@ -61,76 +59,18 @@ impl Batcher {
             }
 
             let starved = slot.credit.data_available() == 0;
-            match slot.withheld.push(bytes) {
-                Ok(()) => {
-                    if let Some(metrics) = &self.metrics {
-                        metrics.withheld_records_delta(1);
-                        if starved && slot.note_starved() {
-                            metrics.credit_exhausted();
-                        }
-                    }
+            slot.withhold(bytes);
+            if let Some(metrics) = &self.metrics {
+                metrics.withheld_records_delta(1);
+                if starved && slot.note_starved() {
+                    metrics.credit_exhausted();
                 }
-                Err(error) => self.overflow_kill(index, error).await,
             }
             return;
         }
 
         let terminal = is_terminal_sentinel(&bytes);
         self.emit_data(index, bytes, terminal).await;
-    }
-
-    /// The producer ran past the byte cap on a slot that cannot send.
-    ///
-    /// This is the per-slot slow-consumer kill, and it is deliberately *not* the
-    /// heartbeat watchdog: the slot dies and its consumer sees `Dropped` through
-    /// a `CloseSlot{PeerGone}` — written here, or by `release_withheld` if the
-    /// slot is fenced (see below) — and the peer's other slots never notice.
-    /// Anything withheld goes with it — including a queued terminal, so a
-    /// consumer that would have seen `Finalized` sees `Dropped` instead. That is
-    /// the cost of not blocking the producer's synchronous terminal send, and it
-    /// is bounded by a megabyte of run-ahead on a stream nobody is draining.
-    ///
-    /// The kill runs here; the record it owes may go later. Cutting the producer
-    /// off is what the kill *is*, so it happens on the spot whatever the slot is
-    /// waiting for; only the `CloseSlot` can wait, because a fenced slot has a
-    /// record of its own outstanding and the close is the record after it. The
-    /// slot itself outlives the kill in that case — its entry stays in the
-    /// table, disconnected but not retired, until the fence lifts.
-    async fn overflow_kill(&mut self, index: u32, error: slot_stream::WithheldOverflow) {
-        let Some(slot) = self.slots.get_mut(index) else {
-            return;
-        };
-        let id = slot.id;
-        let discarded = slot.withheld.len();
-        slot.withheld.clear();
-        slot.close_owed = true;
-        // Deferring the close must not defer this. Ending the inlet is the only
-        // signal the producer gets — the `CloseSlot` travels the other way — and
-        // a producer left connected keeps running ahead into a slot whose
-        // records are already being discarded, learning nothing until the peer
-        // un-parks, which on the congested peer a fence is about may be a very
-        // long time. It is also what keeps the deferred close last: no frame can
-        // arrive for the slot after its stream has ended.
-        slot.disconnect();
-        let fenced = slot.is_fenced();
-        tracing::warn!(
-            slot = ?id,
-            %error,
-            discarded,
-            "messenger mux: producer outran a starved slot's byte cap; closing the slot"
-        );
-        if let Some(metrics) = &self.metrics {
-            metrics.records_dropped(MuxDropReason::WithheldOverflow, discarded as u64 + 1);
-            metrics.withheld_records_delta(-(discarded as i64));
-        }
-        if fenced {
-            // The kill is a decision about the slot, not a licence to jump the
-            // queue: a fenced slot has a record of its own outstanding whose
-            // admission has not answered, and the `CloseSlot` is the next record
-            // after it. `release_withheld` writes it when the fence lifts.
-            return;
-        }
-        self.finish_close(index).await;
     }
 
     /// Append a `CloseSlot` for a slot this side owns, cutting the batch first
@@ -196,10 +136,9 @@ impl Batcher {
 
     /// Emit the `CloseSlot{PeerGone}` a dying slot owes its consumer.
     ///
-    /// Shared by the two ways a slot dies without a terminal — its producer went
-    /// (`on_inlet_closed`), or it ran past its byte cap (`overflow_kill`) — and
-    /// by the deferred arm of both, so the record is written in one place
-    /// whether it goes now or after a fence lifts.
+    /// Shared by `on_inlet_closed` and by its deferred arm in
+    /// `release_withheld`, so the record is written in one place whether it
+    /// goes now or after a fence lifts.
     async fn finish_close(&mut self, index: u32) {
         let Some(slot) = self.slots.get_mut(index) else {
             return;
@@ -346,11 +285,11 @@ impl Batcher {
     /// The terminal reserve does **not** apply here, and that is deliberate: it
     /// buys a terminal past an *empty* queue, not past records the consumer is
     /// still owed. A terminal behind starved predecessors therefore waits with
-    /// them. What ends such a stream is the byte cap, if the producer keeps
-    /// sending. If it does not, nothing does until the application drops the
+    /// them. Nothing ends such a stream until the application drops the
     /// anchor: a consumer that stopped draining leaves its sender without
-    /// credit, and the stream watchdog exempts a sender that holds none, so it
-    /// never fires on such a stream.
+    /// credit, the paused inlet parks the producer, and the stream watchdog
+    /// exempts a sender that holds no credit, so it never fires on such a
+    /// stream.
     pub(super) async fn release_withheld(&mut self, index: u32) {
         loop {
             let next = {
@@ -371,7 +310,7 @@ impl Batcher {
                         if !slot.credit.can_spend(class) {
                             return;
                         }
-                        let popped = slot.withheld.pop();
+                        let popped = slot.release_one();
                         if popped.is_some()
                             && let Some(metrics) = &self.metrics
                         {

@@ -100,38 +100,33 @@ Apply these in order, from the smallest change to the largest:
 
 ## Saturation under the mux
 
-A muxed stream has no socket of its own. It has credit. A consumer that stops draining stops returning credit, and the stream's egress parks. The kill is different, and the difference is visible to users.
+A muxed stream has no socket of its own. It has credit. A consumer that stops draining stops returning credit, and the stream's egress parks. The producer then waits, as it waited on a full socket buffer.
 
-Parked egress must not park the producer. `finalize`, `detach` and `Drop` reach the slot inlet from synchronous code, and credit can park a slot for as long as the consumer is stopped. The batcher therefore drains every inlet into a per-slot withheld queue. The slot byte budget (1 MiB by default) bounds that queue.
+The batcher pulls each slot's records from the slot inlet into a per-slot withheld queue, whether or not the slot has credit. The slot byte budget (1 MiB by default) bounds that queue. When the queue reaches the budget, the batcher stops pulling from that slot's inlet. The inlet (C+1 records deep) then fills, and `StreamSender::send` waits. When credit returns and the queue drops below the budget, the batcher pulls again.
 
 ```mermaid
 flowchart TD
     P[producer: StreamSender::send] --> I[slot inlet, C+1]
-    I --> W[batcher: withheld queue, slot byte budget]
+    I -->|until the byte budget| W[batcher: withheld queue, slot byte budget]
     W -->|credit available| B[_stream_batch on the peer connection]
     B --> S[consumer slot buffer, C+1]
     S -->|read directly| Q[consumer: StreamAnchor::next]
-    W -->|byte budget exceeded| K[slot closed: withheld_overflow, consumer sees Dropped]
+    W -.->|budget reached: inlet paused| I
 ```
 
-### The per-slot kill
+### Producer backpressure
 
-When a producer runs past the byte budget on a slot that nobody drains, the mux closes that slot:
+A producer faster than its consumer waits in `send`. The stream stays open, and nothing is dropped. This holds for a consumer that drains more slowly than the producer sends, and for a consumer that stopped draining.
 
-- The producer's channel returns errors at once.
-- The consumer receives `Dropped`.
-- `velo_streaming_mux_records_dropped_total{reason="withheld_overflow"}` increments.
-- The peer's other slots continue.
+`finalize`, `detach` and `Drop` are synchronous. When the inlet is full, the terminal waits in a task, so these calls do not block. The terminal then goes out after the records ahead of it.
 
-A queued terminal goes with the slot. A consumer that expected `Finalized` sees `Dropped`. The stream was already 1 MiB behind, so the terminal was late in any case.
+An earlier design closed the slot when the queue passed the budget. That design also closed streams whose consumer was draining, because any producer faster than one credit round trip reached the budget within milliseconds.
 
-This kill replaces the watchdog kill for muxed streams. It is deterministic, it names one slot, and it is metered as a drop, not as a liveness failure. `velo_streaming_heartbeat_watchdog_firings_total` remains the signal for a peer that went silent for another reason.
+The consumer reads the slot buffer itself, so credit returns only when it takes a record. A consumer that stops polling holds its sender to the credit window C, and then to the byte budget. The stream watchdog exempts a sender that holds no credit, so it never ends a stream whose consumer stopped polling with its window full. Such a stream stays open until the application drops the anchor. If the producer dies while it still holds credit, the watchdog ends the stream on time, even with records unread. If it dies holding no credit, the watchdog ends the stream once the consumer reads enough to return credit to it. `velo_streaming_reader_pump_backpressure_total` does not move for mux streams. Watch `velo_streaming_slot_credit_exhausted_total`, which the producer's node counts.
 
-The consumer reads the slot buffer itself, so credit returns only when it takes a record. A consumer that stops polling holds its sender to the credit window C. The stream watchdog exempts a sender that holds no credit, so it never ends a stream whose consumer stopped polling with its window full. If the producer dies while it still holds credit, the watchdog ends the stream on time, even with records unread. If it dies holding no credit, the watchdog ends the stream once the consumer reads enough to return credit to it. `velo_streaming_reader_pump_backpressure_total` does not move for mux streams. Watch `velo_streaming_slot_credit_exhausted_total`, which the producer's node counts.
+If the slot is fenced behind an unresolved `OpenSlot` or rendezvous admission, its records wait for that admission, and the producer waits at the byte budget. If a producer leaves while its slot is fenced, the consumer's `Dropped` waits for the admission too. If the admission fails, the failure is epoch death for the whole peer. The slot is retired without the deferred `Dropped`, and the consumer falls back on the heartbeat watchdog.
 
-If the slot is fenced behind an unresolved `OpenSlot` or rendezvous admission, the consumer's `Dropped` waits for that admission. The producer is disconnected at once. If the admission fails, the failure is epoch death for the whole peer. The slot is retired without the deferred `Dropped`, and the consumer falls back on the heartbeat watchdog.
-
-The knob is `MuxConfig::slot_byte_budget`. A larger budget gives a slow consumer more run-ahead before the kill. A smaller budget fails a wedged stream sooner.
+The knob is `MuxConfig::slot_byte_budget`. A larger budget lets a producer run further ahead of its consumer, and costs that much memory per slot on the producer's node.
 
 ### Mux counters
 
@@ -139,8 +134,7 @@ The knob is `MuxConfig::slot_byte_budget`. A larger budget gives a slow consumer
 |---|---|
 | `velo_streaming_slot_credit_exhausted_total` | A slot on the sender ran out of credit. This is the mux equivalent of consumer backpressure. |
 | `velo_streaming_mux_withheld_records` | Gauge of records waiting in withheld queues on this node. |
-| `velo_streaming_mux_records_dropped_total{reason="withheld_overflow"}` | Records dropped by the per-slot kill. |
-| `velo_streaming_producer_send_backpressure_total` | The slot inlet (C+1 deep) was full. Under the mux, the batcher drains inlets whether or not a slot has credit. A full inlet therefore means that the batcher is parked on transport admission, not that the slot ran out of credit. |
+| `velo_streaming_producer_send_backpressure_total` | The slot inlet (C+1 deep) was full. Under the mux, a full inlet means that the slot's withheld queue reached the byte budget, or that the batcher is parked on transport admission. |
 | `velo_transport_send_backpressure_total` | The transport's admission gate returned `Pending`. The peer connection is congested. |
 | `velo_streaming_mux_reader_stall_total` | Must be zero. A non-zero value is a bug in the credit invariant. |
 | `velo_streaming_mux_live_slots` | Gauge of open slots. It must return to zero at teardown. |
@@ -149,13 +143,9 @@ The knob is `MuxConfig::slot_byte_budget`. A larger budget gives a slow consumer
 
 ### The async_open_ack exposure
 
-With `MuxConfig::async_open_ack` enabled, a healthy consumer is not necessary for the per-slot kill. The `OpenSlot` fence withholds a slot's records from the first record, with or without credit. A producer that starts generating into a peer whose send queue is congested can fill the byte budget before its own `OpenSlot` is admitted. The slot dies the same way and shows the same metrics, but the cause is sender-side congestion.
+With `MuxConfig::async_open_ack` enabled, the `OpenSlot` fence withholds a slot's records from the first record, with or without credit. A producer that starts generating into a peer whose send queue is congested fills the byte budget before its own `OpenSlot` is admitted, and then waits in `send`. The cause is sender-side congestion, not the consumer.
 
-This exposure does not compose the way the ordinary kill does. `peer_byte_budget` bounds the receive side only. N concurrent opens into a stalled peer can hold N times the slot byte budget in egress memory. The default awaited open serializes new opens behind the same admission and bounds this to one wait at a time.
-
-No signal separates this kill from the ordinary one. Both report `withheld_overflow`. `velo_streaming_mux_withheld_records` has no label, and the `overflow_kill` log line does not say whether the slot was fenced. If `async_open_ack` is disabled, the fenced cause cannot occur, so the kill is the ordinary one. If it is enabled, the metrics cannot tell the two causes apart. You need other evidence, such as the send queue depth of the peer when the slot died.
-
-A slot killed while fenced stays in `velo_streaming_mux_live_slots`. Its deferred `CloseSlot` must not overtake its `OpenSlot`, so the registry entry survives the kill until the admission resolves. If the admission never resolves, the entry, its index, its withheld bytes and its `live_slots` count stay for the rest of the peer's epoch. `batcher_idle_ttl` evicts only a batcher with zero live slots, so it does not bound this.
+`peer_byte_budget` bounds the receive side only. N concurrent opens into a stalled peer can hold N times the slot byte budget in egress memory. The default awaited open serializes new opens behind the same admission and bounds this to one wait at a time.
 
 ## Write coalescing ratio
 

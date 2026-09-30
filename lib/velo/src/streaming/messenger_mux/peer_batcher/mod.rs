@@ -46,11 +46,10 @@
 //! ## Draining X channels from one task
 //!
 //! [`slot_stream`] explains the `SelectAll` arrangement and why every inlet is
-//! drained unconditionally, credit or no credit: a slot parked on credit would
-//! otherwise leave its producer's terminal waiting on a channel that never makes
-//! room. The batcher's half of that contract is the per-slot withheld queue —
-//! where a record waits when the slot cannot send it — and the byte cap on that
-//! queue, which is what bounds the memory the arrangement costs.
+//! drained whether or not its slot has credit, up to the slot's byte cap. The
+//! batcher's half of that contract is the per-slot withheld queue — where a
+//! record waits when the slot cannot send it. At the byte cap the slot pauses
+//! its inlet, which bounds the memory and makes the producer wait.
 
 mod control;
 mod flush_gate;
@@ -986,12 +985,23 @@ impl Batcher {
     // -----------------------------------------------------------------------
 
     fn close_local(&mut self, index: u32) {
-        if self.slots.close(index) {
-            if let Some(metrics) = &self.metrics {
+        if let Some(withheld) = self.slots.close(index) {
+            self.account_closed(slot_stream::Closed { slots: 1, withheld });
+        }
+    }
+
+    /// Account for closed slots: one from `close_local`, or all of them from
+    /// epoch death or teardown.
+    fn account_closed(&self, closed: slot_stream::Closed) {
+        if let Some(metrics) = &self.metrics {
+            for _ in 0..closed.slots {
                 metrics.slot_closed();
             }
-            self.publish_live_slots();
+            if closed.withheld > 0 {
+                metrics.withheld_records_delta(-(closed.withheld as i64));
+            }
         }
+        self.publish_live_slots();
     }
 
     fn publish_live_slots(&self) {
@@ -1011,11 +1021,8 @@ impl Batcher {
         self.streams = SelectAll::new();
         if let Some(metrics) = &self.metrics {
             metrics.epoch_death();
-            for _ in 0..closed {
-                metrics.slot_closed();
-            }
         }
-        self.publish_live_slots();
+        self.account_closed(closed);
         // The staged batch goes with the epoch, so the gate must forget it too.
         // Otherwise the staged gauge — the one signal a forgotten flush shows up
         // in — drifts up by a batch per epoch death and cries wolf. The credit
@@ -1113,11 +1120,6 @@ impl Batcher {
         self.gate.discarded();
         let closed = self.slots.close_all();
         self.streams = SelectAll::new();
-        if let Some(metrics) = &self.metrics {
-            for _ in 0..closed {
-                metrics.slot_closed();
-            }
-        }
-        self.publish_live_slots();
+        self.account_closed(closed);
     }
 }
