@@ -714,3 +714,50 @@ async fn max_message_size_is_exactly_what_the_codec_will_encode() {
         "one byte past the reported capacity must not",
     );
 }
+
+/// Replacing a dead connection must not update the connection gauge while the
+/// map entry is held. The gauge reads `len()`, which read-locks every shard,
+/// and the shard that the entry holds for writing is not reentrant: the
+/// thread waits on itself, and every later operation on that shard waits
+/// behind it. The dead entry is seeded directly because in normal use it only
+/// appears in a race between `reap_stale_connection` and `entry()`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replacing_a_dead_connection_does_not_deadlock() {
+    use crate::observability::VeloMetrics;
+
+    let registry = prometheus::Registry::new();
+    let metrics = VeloMetrics::register(&registry).expect("register metrics");
+    let (transport, _addr) = make_transport();
+    // Observed, so the gauge update runs.
+    transport.set_observability(Arc::new(metrics.bind_transport("tcp")));
+
+    let peer_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let peer = make_tcp_peer(peer_listener.local_addr().unwrap());
+    let iid = peer.instance_id();
+    transport.register(peer).unwrap();
+    insert_stale_handle(&transport, iid);
+
+    let transport = Arc::new(transport);
+    let rt = tokio::runtime::Handle::current();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn({
+        let transport = transport.clone();
+        move || {
+            let installed = transport.install_connection(iid, &rt).is_ok();
+            let _ = done_tx.send(installed);
+        }
+    });
+    let installed = done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("install_connection deadlocked replacing a dead connection");
+    assert!(installed);
+    assert!(
+        !transport
+            .connections
+            .get(&iid)
+            .unwrap()
+            .tx
+            .is_disconnected()
+    );
+    transport.shutdown();
+}
