@@ -70,6 +70,10 @@ impl QuicTransportBuilder {
     }
 
     /// The UDP address to bind (default `0.0.0.0:0`).
+    ///
+    /// With a fixed port `P`, the transport binds one server socket per
+    /// [`server_endpoints`](Self::server_endpoints), on ports `P` to
+    /// `P + n - 1`. Open all of them in a firewall; a peer dials each of them.
     pub fn bind_addr(mut self, addr: SocketAddr) -> Self {
         self.bind_addr = Some(addr);
         self
@@ -245,7 +249,7 @@ impl QuicTransportBuilder {
         let info = QuicEndpointInfo {
             endpoints,
             fingerprint: identity.fingerprint,
-            ports,
+            ports: ports.clone(),
         };
         let mut addr_builder = crate::transports::address::WorkerAddressBuilder::new();
         addr_builder.add_entry(key.clone(), info.encode()?)?;
@@ -273,6 +277,8 @@ impl QuicTransportBuilder {
             server_endpoints: OnceLock::new(),
             client_endpoints: OnceLock::new(),
             lanes: self.lanes,
+            lane_offset: u16::from_le_bytes([identity.fingerprint[0], identity.fingerprint[1]]),
+            server_ports: ports,
             local_interfaces: OnceLock::new(),
             numa_hint: self.numa_hint,
             metrics: OnceLock::new(),
@@ -287,9 +293,10 @@ impl Default for QuicTransportBuilder {
     }
 }
 
-/// Server sockets by default. Dynamo's QUIC plane
-/// measured 8 and 32 on a frontend; 32 cost about 50 MiB of RSS. A frontend
-/// sets a higher count with [`QuicTransportBuilder::server_endpoints`].
+/// Server sockets, each on its own port, by default. Dynamo's QUIC plane
+/// measured reuse-port groups of 8 and 32 on a frontend; 32 cost about 50 MiB
+/// of RSS. A frontend sets a higher count with
+/// [`QuicTransportBuilder::server_endpoints`].
 const DEFAULT_SERVER_ENDPOINTS: usize = 4;
 /// Largest packet size at which quinn's send batches still fit in one UDP
 /// datagram: 65507 bytes of UDP payload over quinn's 10-packet batch.

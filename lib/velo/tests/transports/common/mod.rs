@@ -327,8 +327,8 @@ impl TestTransportHandle<QuicTransport> {
     }
 }
 
-/// Loopback QUIC transport with the reuse-port group enabled, so every test
-/// runs across more than one server socket.
+/// Loopback QUIC transport with two server sockets, each on its own port, so
+/// the tests exercise a peer that advertises several ports.
 #[cfg(feature = "quic")]
 fn quic_builder() -> anyhow::Result<QuicTransport> {
     QuicTransportBuilder::new()

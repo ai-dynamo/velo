@@ -80,7 +80,7 @@ These changes were measured or traced and did not help. They are recorded so tha
 | Reply linger as a first-token lever | The per-request segments did not move at equal load: 3.7 against 3.9–4.0 ms, 3.3 against 3.3–3.5 ms, 47.7 against 47.8–47.9 ms. | A batch and CPU fix only. The batch inflation was a symptom of contention, not its cause. |
 | Shard the frontend ingest lane | The lane's cost was the per-batch slot walk, which item 3 removed. The profile shows no core-bound lane stage. | Not built. |
 | Merge the reader pump into the anchor channel | Traced. The anchor channel has other writers, and credit is issued against the mux buffer's sole writer. | Forbidden by the credit invariant. The pump was later removed another way: the consumer reads the mux buffer itself. See [The reader pump leaves the mux data path](#the-reader-pump-leaves-the-mux-data-path). |
-| `SO_REUSEPORT` on the TCP path | Traced. The kernel demuxes TCP per connection, so the frontend already has one socket, queue and reader per peer. | Not applicable. A QUIC transport needs it, because one QUIC endpoint is one UDP socket. |
+| `SO_REUSEPORT` on the TCP path | Traced. The kernel demuxes TCP per connection, so the frontend already has one socket, queue and reader per peer. | Not applicable. One QUIC endpoint is one UDP socket, so the QUIC transport binds several server sockets, one port each. See [QUIC performance](quic-performance.md#lanes). |
 | A 60 KiB against 64 KiB batch cap | Traced. Both planes write one `writev` per batch. | Equivalent. |
 | Flatten the MessagePack envelope | Profiled. Decode costs the same in both planes. | No lever. |
 | A connection pool per peer, a different record header | Traced. Neither is on the measured path. | Not built. |
