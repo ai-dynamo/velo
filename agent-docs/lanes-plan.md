@@ -168,3 +168,48 @@ For Stage D:
 - The unkeyed choice takes a mutex: one for attaches (held while it reads up to 16 slot tables) and a separate one for pre-binds (atomics only), so frontend pre-binds do not wait behind attach scans.
 - `max_lanes()` assumes `lanes()` ignores its target. If TCP lanes (other worktree) make `lanes()` per peer, pre-bind needs a different count.
 - `VELO_QUIC_LANES` in the examples only needs the transport builder's `lanes(n)`; the mux follows it. `throughput.rs` on `perf/lanes` has no stream mode yet (it is on `bench/throughput-stream`). Every example streams through unkeyed `attach_anchor`, so the measurement exercises the least-used choice on attach, not pre-bind.
+
+## Progress, 2026-09-30: Stage D done
+
+Branch state: `perf/lanes` merged #106's last head `9dec9e2` (one conflict, `streaming/control/feed.rs`, only `key` against `peer` in a variable name; kept the lane-keyed side), then `git merge -s ours origin/main` (538679c), after checking `origin/main^{tree}` equals `9dec9e2^{tree}` (both `7ae16d7`). The diff to `origin/main` is only the mux-lanes work. Gate after the merge: fmt 0, clippy 0, lib 1166, all 13 suites pass.
+
+Commits:
+- `3455039` fix: unkeyed pre-binds count the node's live slots per lane. Each `IngressSlot` holds a `LaneReservation` on `IngressRegistry.live` (a `LaneCounts`, one atomic per lane, summed over peers), taken on the arrival lane before the claimed bind drops. The pre-bind choice reads `live_on_lane(k) + pending pre-binds on k` under `choosing_local`, atomics only. `LaneLoad::reserve` now takes `live(Option<WorkerId>, LaneIndex)`.
+- `9edcaca` book: the pre-bind rule.
+- `dd94509` cherry-pick of the stream mode (`ad2d4ed` from `bench/throughput-stream`), no conflicts.
+- `3a8320d` `VELO_QUIC_LANES` in `quic_from_env`, examples README and book examples page describe the stream mode. No TCP knob: #108's review fixes removed `tcp_from_env`/`VELO_TCP_LANES` from the examples, so that is left to #108.
+- `84f0099` book: stream numbers in `quic-performance.md` (Streams over lanes) and one line in the batched-streaming Lanes section.
+
+Tests: `claimed_pre_binds_keep_their_lane_counted_while_their_streams_live` (two producers, 8 pre-bound streams each claimed and live before the next ticket; red on the old code with `[8, 0, 0, 0]` against `[2, 2, 2, 2]`, log `.research/perfwork/gate-last-velo-lanes-impl/D-red.log`), `the_live_count_per_lane_matches_the_slot_tables` (ingress invariant through duplicate open, cancel before claim, consumer-side close, new epoch, shutdown), `pre_binds_count_the_nodes_live_slots_and_unclaimed_pre_binds` (unit). The Stage C test is renamed `pre_binds_spread_and_give_their_lane_back_on_release_and_expiry`: a claim no longer frees the lane, so its claim step now expects lane 0 (all four lanes at one).
+
+Mutation checks (`.research/perfwork/lanes-D-fix.sh`, `lanes-D-mut2.sh`), all red: pre-bind live term dropped (2 tests), slot count taken on a throwaway counter (e2e and invariant), slot count on lane 0 instead of the arrival lane (invariant), live term dropped in `reserve` (unit), attach pending term dropped (Stage C's attach test still guards it). The Stage C script `lanes-mutate-C.sh` no longer applies its `pendingterm` sed (the line changed); `attach-no-pending` here replaces it.
+
+Final gate: fmt 0, clippy 0, lib 1169 passed, all 13 suites pass with Stage B counts.
+
+### Two-node stream measurement
+
+Setup: `throughput --modes stream`, server (producer, attaches) on node A, client (consumer, places lanes) on node B, 200G Ethernet, `VELO_QUIC_LANES=n` both sides, default 4 server sockets, 200,000 items per cell, 2 reps. Script `.research/perfwork/lanesD-2node.sh`, binary built by `lanesD-build.sh` (build stops before copying on failure; loopback smoke: QUIC 64 streams 16 KiB 690 MiB/s at 1 lane, 3,200 at 4).
+
+QUIC, 16 KiB, MiB/s (job 2926332, ptyche0217/0218, data `.research/perfwork/lanesD/quic/`):
+
+| Lanes | 16 streams | 64 | 256 |
+|---|---|---|---|
+| 1 | 730–776 | 732–756 | 493–677 |
+| 2 | 1,499–1,505 | 1,440–1,441 | 1,472–1,506 |
+| 4 | 2,561–2,874 | 2,445–2,829 | 2,784–2,814 |
+| 8 | 3,660–3,704 | 5,290–5,300 | 5,282–5,365 |
+| TCP 1 conn | 1,722–1,776 | 2,098–2,125 | 1,916–2,056 |
+
+64 B, items/s: QUIC 1 lane 174k–178k (16 streams), 736k–927k (256); QUIC 8 lanes 159k–161k, 1.75M–1.93M; TCP 1 conn 183k–186k, 851k–856k.
+
+Lane-use evidence (job 2926584, `.research/perfwork/lanesD/quic-socks/socks.txt`): the consumer process had 5, 8 and 12 UDP sockets at 1, 4 and 8 lanes = 4 server sockets + one dial socket per lane it returned credit on, so streams sat on every lane. The same job gave 533–735 MiB/s at 1 lane and 3,721–5,150 at 8 (other node pair). The server-side sample read a stale server: `kill $S` on the srun does not stop the remote server, and `pgrep` without `-n` picked the oldest; the idle leftovers do not carry traffic.
+
+TCP lanes, measured on a throwaway branch `tmp/lanesD-tcp` (worktree `velo-lanesD-tcp`: `perf/lanes` + `perf/tcp-lanes` at 020e310 + a local `VELO_TCP_LANES` knob; not gated), job 2926582, ptyche0157/0161, data `.research/perfwork/lanesD/tcp/`. 16 KiB MiB/s: 1 lane 2,361–2,390 / 2,779–2,990 / 2,880–3,158 (16/64/256 streams); 2 lanes 4,270–4,424 / 4,605–5,401 / 5,170–5,287; 4 lanes 3,960–4,015 / 8,876–9,701 / 7,739–8,716; 8 lanes 3,047–3,123 / 10,272–11,008 / 13,497–15,686. 64 B: 1 lane 179k–182k / 790k–807k; 8 lanes 162k–163k / 2.04M–2.20M. The consumer had 2 established TCP connections per lane (its dial for credit plus the producer's), 2/4/8/16 at 1/2/4/8 lanes.
+
+What the PR reviewer must know:
+- Few streams of small items lose about 9% at 8 lanes (QUIC and TCP alike: 16 streams of 64 B). Many streams gain 2x (64 B) to 7x (16 KiB, QUIC). Not profiled; the likely cause is fewer records per lane batch.
+- 16 streams cannot fill 8 lanes: per-stream rate is credit-bound (32 records per round trip). TCP at 8 lanes with 16 streams (3,047–3,123) is below 2 lanes (4,270–4,424) for the same reason plus spread.
+- The pre-bind choice now counts every peer's live slots, but not other peers' pending attach binds (they live for milliseconds and counting them needs a scan or a second counter).
+- The live count is per arrival lane, not per chosen lane; a clamping sender's stream counts where it actually rides.
+- `c196911` (an earlier merge on this branch) has no `Signed-off-by`; DCO will flag it when the PR opens. Not rewritten.
+- The Dynamo rig run at the default is still open (ruling 24's rerun with lanes on TCP and QUIC).
