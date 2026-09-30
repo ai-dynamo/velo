@@ -65,9 +65,16 @@ With `TcpTransportBuilder::lanes(n)`, the dialer keeps up to `n` connections to 
 - **The listener needs no change.** The kernel gives each accepted connection its own socket, and the listener reads each connection on its own task. A peer can open as many lanes as it needs. Only the count on the dialing side matters.
 - **The health check counts any lane.** A caller can send on any lane, so a peer can have live connections with none on lane 0. `check_health` reports such a peer as healthy.
 
-A prototype with one connection per lane measured 2.5, 4.6, 8.1 and 13.1 GB/s (10^9 bytes per second) with 1, 2, 4 and 8 lanes, with 64 KiB messages pipelined between two nodes. See [Lanes](../operations/quic-performance.md#lanes) for the setup.
+A prototype with one connection per lane sent 64 KiB messages, pipelined, between two nodes. It used the `throughput` example on nodes of the same type as the [two-node table](../operations/quic-performance.md#two-nodes), and sent each message on the next lane in turn. Each cell has two reps. The NUMA node that the two processes run on changes the result by 1.3 to 1.6 times:
 
-The examples read `VELO_TCP_LANES`. Only a caller that sends with `send_message_on_lane` uses lanes other than 0.
+| Lanes | Pinned to the NUMA node of the NIC (MiB/s) | Pinned to the other NUMA node (MiB/s) | Not pinned (MiB/s) |
+|---|---|---|---|
+| 1 | 3,220–3,910 | 2,370–2,400 | 2,410–2,430 |
+| 2 | | | 4,370–4,500 |
+| 4 | 10,510–10,690 | 7,760–7,890 | 7,710–7,790 |
+| 8 | 16,830 (one rep) | | 12,420–12,520 |
+
+The 3,920 MiB/s for one TCP connection in the two-node table is in the range for processes on the NUMA node of the NIC.
 
 ## QUIC
 

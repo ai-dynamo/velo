@@ -844,8 +844,8 @@ fn the_builder_keeps_at_least_one_lane() {
     assert_eq!(lanes(TcpTransportBuilder::new().lanes(4)), 4);
 }
 
-/// Each lane is its own TCP connection, and keeps its own order under load
-/// from concurrent senders.
+/// Each lane is its own TCP connection, and keeps its own order while frames
+/// queue in its admission gate.
 ///
 /// The header carries `(lane, seq)`. The peer sees the lanes interleaved,
 /// which is allowed, and each lane's sequence in order, which is the contract.
@@ -865,6 +865,14 @@ async fn each_lane_is_its_own_connection_and_keeps_its_own_order() {
         let transport = transport.clone();
         let errors = errors.clone();
         senders.push(tokio::spawn(async move {
+            // Send everything before awaiting any admission, so most frames
+            // queue in the gate behind a full channel, and the order check
+            // below covers the gate's queue as well as the channel. It does
+            // not catch a send that skips the gate: flume hands a waiting
+            // sender's frame into the channel as soon as a slot frees, so a
+            // skipping send almost never finds room (measured: a `try_send`
+            // ahead of the gate passed this test 5 of 5 times).
+            let mut pending = Vec::new();
             for seq in 0..FRAMES {
                 let mut header = lane.to_le_bytes().to_vec();
                 header.extend_from_slice(&seq.to_le_bytes());
@@ -877,8 +885,12 @@ async fn each_lane_is_its_own_connection_and_keeps_its_own_order() {
                     errors.clone(),
                 );
                 if let SendOutcome::Pending(admission) = outcome {
-                    admission.await.unwrap();
+                    pending.push(admission);
                 }
+            }
+            assert!(!pending.is_empty(), "no send queued in the gate");
+            for admission in pending {
+                admission.await.unwrap();
             }
         }));
     }
@@ -997,11 +1009,15 @@ async fn a_peer_live_only_on_a_later_lane_is_healthy() {
 /// `shutdown()` closes every lane's connection, and every frame sent on any
 /// lane is delivered or failed.
 ///
-/// Every lane is connected before the bulk, and the bulk is flowing on every
-/// lane when shutdown lands, so it meets writers that are mid-stream on lanes
-/// other than 0. Each send is admitted at once (the bulk fits the send
-/// channel), so a frame is either on the wire or reported through `on_error`.
-/// None can be dropped in the gate.
+/// Every lane is connected, and has delivered a bulk frame, before shutdown
+/// lands. On loopback the rest of the bulk often arrives before the writers
+/// see the cancel, so the test does not count on any frame failing. It proves
+/// that every lane closes and that no frame is lost or counted twice. Each
+/// send is admitted at once (the bulk fits the send channel), so a frame is
+/// either on the wire or reported through `on_error`. None can be dropped in
+/// the gate. The writer's drain of unsent frames has its own tests:
+/// `test_writer_task_cleans_up_on_write_error` and
+/// `test_writer_task_drains_on_connect_failure`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shutdown_closes_every_lane() {
     const LANES: u16 = 4;
