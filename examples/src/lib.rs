@@ -46,14 +46,7 @@ pub enum TransportType {
 /// examples (or server/client pairs within one example) don't collide.
 pub async fn new_transport(ty: TransportType, tag: &str) -> Result<Arc<dyn Transport>> {
     match ty {
-        TransportType::Tcp => {
-            let listener = std::net::TcpListener::bind(std::net::SocketAddr::new(bind_ip()?, 0))?;
-            Ok(Arc::new(
-                velo::transports::tcp::TcpTransportBuilder::new()
-                    .from_listener(listener)?
-                    .build()?,
-            ))
-        }
+        TransportType::Tcp => Ok(Arc::new(tcp_from_env()?.build()?)),
         #[cfg(unix)]
         TransportType::Uds => {
             let socket_path =
@@ -128,6 +121,31 @@ pub fn init_tracing() {
     let _ = fmt().with_env_filter(filter).try_init();
 }
 
+/// A numeric setting from the environment, or `None` when it is not set.
+fn env<T: std::str::FromStr>(name: &str) -> Result<Option<T>> {
+    match std::env::var(name) {
+        Ok(v) => v
+            .parse()
+            .map(Some)
+            .map_err(|_| anyhow::anyhow!("{name}={v} is not a number")),
+        Err(_) => Ok(None),
+    }
+}
+
+/// A TCP builder bound to [`bind_ip`], tuned by environment variables so a
+/// sweep can vary the transport without new flags:
+///
+/// - `VELO_TCP_LANES` (count). Only a caller that sends with
+///   `send_message_on_lane` uses lanes other than 0.
+pub fn tcp_from_env() -> Result<velo::transports::tcp::TcpTransportBuilder> {
+    let listener = std::net::TcpListener::bind(std::net::SocketAddr::new(bind_ip()?, 0))?;
+    let mut builder = velo::transports::tcp::TcpTransportBuilder::new().from_listener(listener)?;
+    if let Some(v) = env("VELO_TCP_LANES")? {
+        builder = builder.lanes(v);
+    }
+    Ok(builder)
+}
+
 /// A QUIC builder bound to [`bind_ip`], tuned by environment variables so a sweep can
 /// vary the transport without new flags:
 ///
@@ -136,15 +154,6 @@ pub fn init_tracing() {
 /// - `VELO_QUIC_SERVER_ENDPOINTS` (count)
 #[cfg(feature = "quic")]
 pub fn quic_from_env() -> Result<velo::transports::quic::QuicTransportBuilder> {
-    fn env<T: std::str::FromStr>(name: &str) -> Result<Option<T>> {
-        match std::env::var(name) {
-            Ok(v) => v
-                .parse()
-                .map(Some)
-                .map_err(|_| anyhow::anyhow!("{name}={v} is not a number")),
-            Err(_) => Ok(None),
-        }
-    }
     let mut builder = velo::transports::quic::QuicTransportBuilder::new()
         .bind_addr(std::net::SocketAddr::new(bind_ip()?, 0));
     if let Some(v) = env("VELO_QUIC_MAX_MTU")? {
