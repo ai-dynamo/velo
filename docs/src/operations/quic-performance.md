@@ -79,7 +79,7 @@ With `lanes(n)`, each peer gets up to `n` connections, one for each lane used, e
 
 The messenger sends its own traffic on lane 0. Only a caller that sends with `send_message_on_lane` uses the other lanes, so `lanes(n)` alone does not change the throughput of ordinary messages.
 
-Measured on 2026-09-29 across the same two nodes as above, 64 KiB messages pipelined, 20,000 messages per cell, two reps. A prototype, which is not in the tree, spread the messages round robin over the lanes, with the connection layout that `lanes(n)` builds. The receiving node had 32 server sockets.
+Measured on 2026-09-29 across the same two nodes as above, 64 KiB messages pipelined, 20,000 messages per cell, two reps. A prototype, which is not in the tree, spread the messages round robin over the lanes, with one connection per lane, each from its own UDP socket. The receiving node had 32 server sockets in one `SO_REUSEPORT` group.
 
 | Lanes | MB/s |
 |---|---|
@@ -98,7 +98,11 @@ Two lanes on one server socket share its endpoint driver. So each server socket 
 | 8 | 2,628 or 6,579, as the hash fell |
 | 32 | 6,463–6,526 |
 
-With one port for each socket, 8 lanes need 8 server sockets on the receiving node, not 32.
+With one port for each socket, 8 lanes should need only 8 server sockets on the receiving node. That follows from the design and is not measured yet.
+
+A fixed `bind_addr` port `P` binds ports `P` to `P + n - 1`, one for each server socket. Open all of them in a firewall.
+
+During a rolling upgrade, a peer without per-socket ports dials only the first port, so all such peers share one server socket. Upgrade the dialers before the receivers.
 
 The same prototype on TCP did not scale: 2.6–3.4 GB/s with 1 lane, and 2.9–3.8 GB/s with 2, 4 or 8 lanes. The limit for TCP is not the connection, so the TCP transport keeps one lane.
 

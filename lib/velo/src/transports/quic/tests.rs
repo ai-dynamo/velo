@@ -1401,24 +1401,21 @@ async fn closed_force_closes_a_stuck_lane_other_than_zero() {
     );
 }
 
-/// The lanes of one dialer land on different server sockets of the peer.
-///
-/// Each server socket has its own port and its own endpoint driver, and the
-/// dialer spreads its lanes over the ports. Two lanes on one socket would
-/// share one driver, which is the limit lanes exist to lift.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn each_lane_lands_on_its_own_server_socket() {
-    const LANES: u16 = 4;
-    let (client, _client_streams, server, server_streams, server_id) = laned_pair(LANES).await;
-    let servers = server.server_endpoints.get().unwrap();
-    assert_eq!(
-        servers.len(),
-        usize::from(LANES),
-        "the default is one socket per lane here"
-    );
-
+/// Dial `lanes` lanes into a server with `sockets` server sockets, one frame
+/// per lane, and return how many connections each server socket holds.
+async fn connections_per_server_socket(lanes: u16, sockets: usize) -> Vec<usize> {
+    let (client, _client_streams, _) = started_with(QuicTransportBuilder::new().lanes(lanes)).await;
+    let (server, server_streams, server_id) =
+        started_with(QuicTransportBuilder::new().server_endpoints(sockets)).await;
+    client
+        .register(peer_with_fingerprint(
+            &server,
+            server_id,
+            server.fingerprint(),
+        ))
+        .unwrap();
     let errors = Arc::new(Errors::default());
-    for lane in 0..LANES {
+    for lane in 0..lanes {
         let _ = client.send_message_on_lane(
             server_id,
             lane,
@@ -1428,7 +1425,7 @@ async fn each_lane_lands_on_its_own_server_socket() {
             errors.clone(),
         );
     }
-    for _ in 0..LANES {
+    for _ in 0..lanes {
         tokio::time::timeout(
             Duration::from_secs(5),
             server_streams.event_stream.recv_async(),
@@ -1437,16 +1434,33 @@ async fn each_lane_lands_on_its_own_server_socket() {
         .expect("every lane delivers")
         .unwrap();
     }
-    for (index, endpoint) in servers.iter().enumerate() {
-        assert_eq!(
-            endpoint.open_connections(),
-            1,
-            "server socket {index} holds exactly one lane"
-        );
-    }
     assert!(errors.0.lock().unwrap().is_empty());
+    let counts = server
+        .server_endpoints
+        .get()
+        .unwrap()
+        .iter()
+        .map(|endpoint| endpoint.open_connections())
+        .collect();
     client.shutdown();
     server.shutdown();
+    counts
+}
+
+/// The lanes of one dialer land on different server sockets of the peer.
+///
+/// Each server socket has its own port and its own endpoint driver, and the
+/// dialer spreads its lanes over the ports. Two lanes on one socket would
+/// share one driver, which is the limit lanes exist to lift.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_lane_lands_on_its_own_server_socket() {
+    assert_eq!(connections_per_server_socket(4, 4).await, vec![1, 1, 1, 1]);
+}
+
+/// With more lanes than server sockets, the lanes wrap and spread evenly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn more_lanes_than_sockets_spread_evenly() {
+    assert_eq!(connections_per_server_socket(4, 2).await, vec![2, 2]);
 }
 
 /// A lane's address: socket `(offset + lane) % n` of the peer, or the one

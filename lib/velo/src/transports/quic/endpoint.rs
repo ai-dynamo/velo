@@ -24,8 +24,8 @@ pub struct QuicEndpointInfo {
     pub fingerprint: Fingerprint,
     /// The port of each server socket. The first is the port in
     /// [`endpoints`](Self::endpoints). A dialer spreads its lanes over these.
-    /// Empty in an entry from a peer that predates lanes: dial the port in
-    /// `endpoints` for every lane.
+    /// Empty in an entry from a peer that predates per-socket ports: dial the
+    /// port in `endpoints` for every lane.
     #[serde(default)]
     pub ports: Vec<u16>,
 }
@@ -52,16 +52,17 @@ pub(super) struct BufferSizes {
 
 /// Bind the server sockets: `count` sockets, each on its own port.
 ///
-/// The first socket binds `requested`, and the others bind ephemeral ports on
-/// the same IP. The peer learns every port from [`QuicEndpointInfo::ports`] and
+/// With a fixed requested port `P`, the sockets bind `P` to `P + count - 1`, so
+/// an operator who opens the ports in a firewall knows which ones to open.
+/// With port 0, each socket takes an ephemeral port. All bind the same IP. The peer learns every port from [`QuicEndpointInfo::ports`] and
 /// dials lane `k` on socket `(offset + k) % count`, where `offset` is fixed per
 /// dialer. So the lanes of one dialer land on different sockets, each with its
 /// own quinn endpoint driver and receive buffer.
 ///
 /// An earlier design put every socket on one port in a `SO_REUSEPORT` group.
 /// The kernel then hashed each connection to a socket at random, and two lanes
-/// of one peer often shared a socket: with 8 lanes into 4 sockets, one run moved
-/// 3.3 GB/s where distinct sockets moved 6.5 GB/s.
+/// of one peer often shared a socket: with 8 lanes, a group of 4 sockets moved
+/// 3.3 GB/s where a group of 32 moved 6.5 GB/s.
 pub(super) fn bind_server_sockets(
     requested: SocketAddr,
     count: usize,
@@ -70,11 +71,20 @@ pub(super) fn bind_server_sockets(
     let count = count.max(1);
     let mut sockets = Vec::with_capacity(count);
     for index in 0..count {
-        let addr = if index == 0 {
-            requested
+        let port = if requested.port() == 0 {
+            0
         } else {
-            SocketAddr::new(requested.ip(), 0)
+            u16::try_from(index)
+                .ok()
+                .and_then(|offset| requested.port().checked_add(offset))
+                .with_context(|| {
+                    format!(
+                        "QUIC server socket {index} needs port {} + {index}, past 65535",
+                        requested.port()
+                    )
+                })?
         };
+        let addr = SocketAddr::new(requested.ip(), port);
         let socket = new_udp_socket(addr)?;
         size_buffers(&socket, buffers);
         socket
@@ -179,6 +189,41 @@ mod tests {
         assert_ne!(client.local_addr().unwrap().port(), server_addr.port());
     }
 
+    /// A fixed port opens consecutive ports, so an operator knows what to
+    /// allow through a firewall.
+    #[test]
+    fn a_fixed_port_binds_consecutive_ports() {
+        // A free base port can be taken by another process between the probe
+        // and the bind, so try a few.
+        for _ in 0..10 {
+            let base = std::net::UdpSocket::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            if base > u16::MAX - 3 {
+                continue;
+            }
+            let requested = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), base);
+            let Ok(sockets) = bind_server_sockets(requested, 3, SMALL) else {
+                continue;
+            };
+            let ports: Vec<u16> = sockets
+                .iter()
+                .map(|socket| socket.local_addr().unwrap().port())
+                .collect();
+            assert_eq!(ports, vec![base, base + 1, base + 2]);
+            return;
+        }
+        panic!("no free run of three ports in ten tries");
+    }
+
+    #[test]
+    fn a_fixed_port_past_the_range_is_refused() {
+        let requested = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), u16::MAX);
+        assert!(bind_server_sockets(requested, 2, SMALL).is_err());
+    }
+
     #[test]
     fn an_unrelated_bind_cannot_take_a_server_port() {
         let server = bind_server_sockets("127.0.0.1:0".parse().unwrap(), 2, SMALL).unwrap();
@@ -216,7 +261,7 @@ mod tests {
         assert_eq!(decoded.ports, vec![5000, 5001]);
     }
 
-    /// An entry from a peer that predates lanes has no `ports`, and still
+    /// An entry from a peer that predates per-socket ports has no `ports`, and still
     /// decodes: the dialer then uses the port in `endpoints` for every lane.
     #[test]
     fn an_entry_without_ports_decodes() {

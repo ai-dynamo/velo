@@ -92,9 +92,15 @@ pub struct QuicTransport {
     transport_config: Arc<quinn::TransportConfig>,
     endpoint_config: quinn::EndpointConfig,
     server_endpoints: OnceLock<Vec<quinn::Endpoint>>,
+    /// The port of each server socket, as advertised.
+    server_ports: Vec<u16>,
     /// Indexed by lane.
     client_endpoints: OnceLock<Vec<quinn::Endpoint>>,
     lanes: std::num::NonZeroU16,
+    /// This dialer's offset into a peer's server sockets. Taken from the
+    /// certificate fingerprint, which is random per transport, so dialers
+    /// spread over a peer's sockets without coordinating.
+    lane_offset: u16,
 
     local_interfaces: OnceLock<Vec<InterfaceEndpoint>>,
     numa_hint: Option<u32>,
@@ -109,7 +115,7 @@ pub struct QuicTransport {
 struct PeerEntry {
     addr: SocketAddr,
     /// The port of each of the peer's server sockets. Empty for a peer that
-    /// predates lanes, whose every lane dials `addr`.
+    /// predates per-socket ports, whose every lane dials `addr`.
     ports: Vec<u16>,
     client_config: quinn::ClientConfig,
 }
@@ -120,11 +126,11 @@ impl PeerEntry {
     /// `offset` is fixed per dialer, so the lanes of one dialer land on
     /// different sockets, and the lane 0 of many dialers does not pile onto
     /// socket 0.
-    fn lane_addr(&self, lane: u16, offset: usize) -> SocketAddr {
+    fn lane_addr(&self, lane: u16, offset: u16) -> SocketAddr {
         if self.ports.is_empty() {
             return self.addr;
         }
-        let index = (offset + usize::from(lane)) % self.ports.len();
+        let index = (usize::from(offset) + usize::from(lane)) % self.ports.len();
         SocketAddr::new(self.addr.ip(), self.ports[index])
     }
 }
@@ -225,13 +231,16 @@ impl QuicTransport {
         rt: &tokio::runtime::Handle,
     ) -> Result<ConnectionHandle> {
         let (instance_id, lane) = key;
-        let mut peer = self
-            .peers
-            .get(&instance_id)
-            .ok_or(TransportError::PeerNotRegistered(instance_id))?
-            .value()
-            .clone();
-        peer.addr = peer.lane_addr(lane, self.lane_offset());
+        let (addr, client_config) = {
+            let peer = self
+                .peers
+                .get(&instance_id)
+                .ok_or(TransportError::PeerNotRegistered(instance_id))?;
+            (
+                peer.lane_addr(lane, self.lane_offset),
+                peer.client_config.clone(),
+            )
+        };
         let endpoint = self
             .client_endpoints
             .get()
@@ -251,7 +260,8 @@ impl QuicTransport {
                 rx,
                 WriterTaskContext {
                     endpoint,
-                    peer,
+                    addr,
+                    client_config,
                     connections: Arc::clone(&self.connections),
                     cancel_token: self.cancel_token.clone(),
                     connect_timeout: self.connect_timeout,
@@ -262,15 +272,6 @@ impl QuicTransport {
             rt,
         );
         Ok(handle)
-    }
-
-    /// This dialer's offset into a peer's server sockets. Taken from the
-    /// certificate fingerprint, which is random per transport, so dialers
-    /// spread over a peer's sockets without coordinating.
-    fn lane_offset(&self) -> usize {
-        let mut bytes = [0u8; 8];
-        bytes.copy_from_slice(&self.fingerprint[..8]);
-        u64::from_le_bytes(bytes) as usize
     }
 
     fn update_peer_gauge(&self) {
@@ -492,7 +493,10 @@ impl Transport for QuicTransport {
             let _ = self.server_endpoints.set(servers);
             self.runtime.set(rt).ok();
 
-            info!("QUIC transport started on {}", self.bind_addr);
+            info!(
+                "QUIC transport started on {} (server ports {:?})",
+                self.bind_addr, self.server_ports
+            );
             Ok(())
         })
     }
@@ -611,8 +615,14 @@ impl Transport for QuicTransport {
                 .get()
                 .and_then(|endpoints| endpoints.first())
                 .ok_or(HealthCheckError::ConnectionFailed)?;
+            // The socket this dialer's lane 0 uses, so the probe and the lane
+            // agree on what is reachable.
             let connecting = endpoint
-                .connect_with(peer.client_config, peer.addr, tls::SERVER_NAME)
+                .connect_with(
+                    peer.client_config.clone(),
+                    peer.lane_addr(0, self.lane_offset),
+                    tls::SERVER_NAME,
+                )
                 .map_err(|_| HealthCheckError::ConnectionFailed)?;
             match tokio::time::timeout(timeout, connecting).await {
                 Ok(Ok(connection)) => {
@@ -632,7 +642,9 @@ impl Transport for QuicTransport {
 
 struct WriterTaskContext {
     endpoint: quinn::Endpoint,
-    peer: PeerEntry,
+    /// The peer's server socket for this lane.
+    addr: SocketAddr,
+    client_config: quinn::ClientConfig,
     connections: Arc<DashMap<LaneKey, ConnectionHandle>>,
     cancel_token: CancellationToken,
     connect_timeout: Duration,
@@ -649,7 +661,7 @@ async fn connection_writer_task(
 ) {
     // Names the connection in logs: with lanes, one peer has several.
     let peer_name = format!("{} lane {}", key.0, key.1);
-    let addr = ctx.peer.addr;
+    let addr = ctx.addr;
     let connections = Arc::clone(&ctx.connections);
     let metrics = ctx.metrics.clone();
     if let Err(e) = connection_writer_inner(&peer_name, &rx, ctx).await {
@@ -680,7 +692,8 @@ async fn connection_writer_inner(
 ) -> Result<()> {
     let WriterTaskContext {
         endpoint,
-        peer,
+        addr,
+        client_config,
         cancel_token,
         connect_timeout,
         reader_ctx,
@@ -689,7 +702,7 @@ async fn connection_writer_inner(
     } = ctx;
 
     let connecting = endpoint
-        .connect_with(peer.client_config, peer.addr, tls::SERVER_NAME)
+        .connect_with(client_config, addr, tls::SERVER_NAME)
         .context("failed to start the QUIC handshake")?;
     let connection = tokio::select! {
         _ = cancel_token.cancelled() => return Ok(()),
@@ -701,7 +714,7 @@ async fn connection_writer_inner(
         .open_bi()
         .await
         .context("failed to open the QUIC stream")?;
-    debug!("QUIC connected to {peer_name} ({})", peer.addr);
+    debug!("QUIC connected to {peer_name} ({})", addr);
 
     // The peer's listener writes `ShuttingDown` echoes back on this stream.
     // The reader routes them, and cancels `conn_cancel` when the peer ends
@@ -713,7 +726,7 @@ async fn connection_writer_inner(
             reader_ctx,
             metrics.clone(),
             conn_cancel.clone(),
-            format!("{peer_name} ({})", peer.addr),
+            format!("{peer_name} ({})", addr),
         ))
     });
 
@@ -724,7 +737,7 @@ async fn connection_writer_inner(
         Some(&conn_cancel),
         &QuicWriterObserver {
             peer: peer_name,
-            addr: peer.addr,
+            addr,
             egress: metrics.map(EgressMetrics::new),
         },
     )
@@ -745,7 +758,7 @@ async fn connection_writer_inner(
         warn!(
             "QUIC: {peer_name} ({}) did not acknowledge the stream end ({why}); \
              frames written but not acknowledged can be lost",
-            peer.addr
+            addr
         )
     };
     match connection.close_reason() {
