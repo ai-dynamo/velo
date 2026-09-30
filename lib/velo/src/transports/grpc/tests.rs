@@ -235,6 +235,9 @@ fn replacing_a_dead_connection_does_not_deadlock() {
         rt.shutdown_background();
         panic!("install_connection deadlocked replacing a dead connection");
     };
+    // No liveness check on the new entry, unlike TCP and UDS: the peer is not a
+    // gRPC server, so the writer can fail its connect and drop the receiver
+    // before the check runs. `Ok` from the dead-entry arm is the replacement.
     assert!(installed);
     transport.shutdown();
 }

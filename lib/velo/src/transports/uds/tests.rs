@@ -725,9 +725,21 @@ async fn the_egress_queue_wait_spans_the_admission_gate() {
 /// behind it. The dead entry is seeded directly because in normal use it only
 /// appears in a race between `reap_stale_connection` and `entry()`. TCP has
 /// the same test.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn replacing_a_dead_connection_does_not_deadlock() {
+///
+/// The test owns its runtime and drops it in the background on a timeout, so
+/// the fault fails the test instead of hanging the run. With the fault, a
+/// task that later touches the map blocks a runtime worker on the held shard,
+/// and dropping a `#[tokio::test]` runtime would then wait for it forever.
+#[test]
+fn replacing_a_dead_connection_does_not_deadlock() {
     use crate::observability::VeloMetrics;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let guard = rt.enter();
 
     let registry = prometheus::Registry::new();
     let metrics = VeloMetrics::register(&registry).expect("register metrics");
@@ -745,18 +757,20 @@ async fn replacing_a_dead_connection_does_not_deadlock() {
     insert_stale_handle(&transport, iid);
 
     let transport = Arc::new(transport);
-    let rt = tokio::runtime::Handle::current();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     std::thread::spawn({
         let transport = transport.clone();
+        let handle = rt.handle().clone();
         move || {
-            let installed = transport.install_connection(iid, &rt).is_ok();
+            let installed = transport.install_connection(iid, &handle).is_ok();
             let _ = done_tx.send(installed);
         }
     });
-    let installed = done_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("install_connection deadlocked replacing a dead connection");
+    let Ok(installed) = done_rx.recv_timeout(Duration::from_secs(5)) else {
+        drop(guard);
+        rt.shutdown_background();
+        panic!("install_connection deadlocked replacing a dead connection");
+    };
     assert!(installed);
     assert!(
         !transport
