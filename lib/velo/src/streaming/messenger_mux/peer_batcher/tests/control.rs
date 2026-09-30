@@ -252,8 +252,9 @@ async fn a_singleton_failing_after_its_slot_closed_does_not_fail_the_epoch() {
     eventually(|| inlet.is_disconnected()).await;
     // Wait for the terminal's own batch, so the reopen below reads its own
     // `OpenSlot`. The inlet reads as closed as soon as the batcher closes the
-    // slot, but the batch still has to cross the loopback messenger pair. A
-    // non-blocking drain here lost that race under a loaded CI runner, and
+    // slot, which is before the batcher flushes the batch, and the batch then
+    // has to cross the loopback messenger pair. A non-blocking drain here
+    // lost that race under a loaded CI runner, and
     // the late batch (data and close, two records) failed the reopen's
     // "OpenSlot is flushed on its own" check.
     while !harness
