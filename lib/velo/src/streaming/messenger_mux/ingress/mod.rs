@@ -45,6 +45,7 @@ pub(crate) use self::drain::DrainSignal;
 use self::reconcile::{collect_grants, collect_touched_grants, list_drained_slots};
 use self::slot::{Applied, IngressSlot, heartbeat_frame};
 use super::flow_control::ByteBudget;
+use super::lane_choice::LaneReservation;
 use super::peer_batcher::ReplyRecord;
 use super::protocol::{
     BatchDecoder, BatchHeader, CloseReason, Record, RecordBody, SlotId, batch_seq_gap,
@@ -78,6 +79,9 @@ struct BindEntry {
     /// `mpsc_reader_pump` for an MPSC anchor); told which peer it belongs to
     /// here, when an `OpenSlot` claims this bind.
     drain: Arc<DrainSignal>,
+    /// The lane the consumer placed this bind on, counted toward that lane's
+    /// load until the bind leaves this table by any path.
+    _lane: LaneReservation,
 }
 
 impl Drop for BindEntry {
@@ -336,16 +340,24 @@ impl IngressRegistry {
         }
     }
 
-    /// Register the buffer a `bind()` created, keyed by `(anchor, session)`.
+    /// Register the buffer a `bind()` created, keyed by `(anchor, session)`,
+    /// with the lane the consumer placed it on.
     pub(crate) fn register_bind(
         &self,
         anchor_id: u64,
         session_id: u64,
         frame_tx: flume::Sender<Vec<u8>>,
         drain: Arc<DrainSignal>,
+        lane: LaneReservation,
     ) {
-        self.binds
-            .insert((anchor_id, session_id), BindEntry { frame_tx, drain });
+        self.binds.insert(
+            (anchor_id, session_id),
+            BindEntry {
+                frame_tx,
+                drain,
+                _lane: lane,
+            },
+        );
     }
 
     /// Calls into `close_consumer_gone` so far.

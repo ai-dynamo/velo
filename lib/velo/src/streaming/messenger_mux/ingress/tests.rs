@@ -69,7 +69,13 @@ fn register(registry: &IngressRegistry, config: &MuxConfig, session: u64) -> Con
         crate::streaming::messenger_mux::flow_control::slot_buffer_depth(config.initial_credit),
     );
     let drain = test_drain();
-    registry.register_bind(ANCHOR, session, tx, Arc::clone(&drain));
+    registry.register_bind(
+        ANCHOR,
+        session,
+        tx,
+        Arc::clone(&drain),
+        LaneReservation::uncounted(LaneIndex::ZERO),
+    );
     Consumer { rx, drain }
 }
 
@@ -238,10 +244,22 @@ fn a_colliding_open_slot_is_rejected_and_the_incumbent_survives() {
     let depth =
         crate::streaming::messenger_mux::flow_control::slot_buffer_depth(config.initial_credit);
     let (incumbent_tx, incumbent_rx) = flume::bounded(depth);
-    registry.register_bind(ANCHOR, SESSION, incumbent_tx, test_drain());
+    registry.register_bind(
+        ANCHOR,
+        SESSION,
+        incumbent_tx,
+        test_drain(),
+        LaneReservation::uncounted(LaneIndex::ZERO),
+    );
     // A second bind, for the collider to try to claim.
     let (rival_tx, rival_rx) = flume::bounded(depth);
-    registry.register_bind(ANCHOR, SESSION + 1, rival_tx, test_drain());
+    registry.register_bind(
+        ANCHOR,
+        SESSION + 1,
+        rival_tx,
+        test_drain(),
+        LaneReservation::uncounted(LaneIndex::ZERO),
+    );
 
     let incumbent = slot(0, 0);
     open(&registry, &config, incumbent, 1);
@@ -331,8 +349,20 @@ fn a_duplicate_open_retires_the_incumbent_through_the_ordinary_close() {
         crate::streaming::messenger_mux::flow_control::slot_buffer_depth(config.initial_credit);
     let (first_tx, first_rx) = flume::bounded(depth);
     let (second_tx, second_rx) = flume::bounded(depth);
-    registry.register_bind(ANCHOR, SESSION, first_tx, test_drain());
-    registry.register_bind(ANCHOR, SESSION + 1, second_tx, test_drain());
+    registry.register_bind(
+        ANCHOR,
+        SESSION,
+        first_tx,
+        test_drain(),
+        LaneReservation::uncounted(LaneIndex::ZERO),
+    );
+    registry.register_bind(
+        ANCHOR,
+        SESSION + 1,
+        second_tx,
+        test_drain(),
+        LaneReservation::uncounted(LaneIndex::ZERO),
+    );
 
     let id = slot(0, 0);
     open(&registry, &config, id, 1);
@@ -580,8 +610,20 @@ fn hold_overflow_closes_that_slot_and_leaves_the_others_alone() {
         crate::streaming::messenger_mux::flow_control::slot_buffer_depth(config.initial_credit);
     let (tx_a, rx_a) = flume::bounded(depth);
     let (tx_b, rx_b) = flume::bounded(depth);
-    registry.register_bind(ANCHOR, SESSION, tx_a, test_drain());
-    registry.register_bind(ANCHOR, SESSION + 1, tx_b, test_drain());
+    registry.register_bind(
+        ANCHOR,
+        SESSION,
+        tx_a,
+        test_drain(),
+        LaneReservation::uncounted(LaneIndex::ZERO),
+    );
+    registry.register_bind(
+        ANCHOR,
+        SESSION + 1,
+        tx_b,
+        test_drain(),
+        LaneReservation::uncounted(LaneIndex::ZERO),
+    );
 
     let a = slot(0, 0);
     let b = slot(1, 0);
@@ -1202,7 +1244,13 @@ fn the_grant_is_what_the_pump_counted_not_what_the_channel_holds() {
         crate::streaming::messenger_mux::flow_control::slot_buffer_depth(config.initial_credit),
     );
     let drain = test_drain();
-    registry.register_bind(ANCHOR, SESSION, tx.clone(), Arc::clone(&drain));
+    registry.register_bind(
+        ANCHOR,
+        SESSION,
+        tx.clone(),
+        Arc::clone(&drain),
+        LaneReservation::uncounted(LaneIndex::ZERO),
+    );
     let consumer = Consumer { rx, drain };
     let id = slot(0, 0);
     open(&registry, &config, id, 1);
@@ -1682,7 +1730,13 @@ fn a_claim_and_its_wake_name_the_arrival_lane() {
         crate::streaming::messenger_mux::flow_control::slot_buffer_depth(config.initial_credit),
     );
     let drain = Arc::new(DrainSignal::new(wake_tx));
-    registry.register_bind(ANCHOR, SESSION, tx, Arc::clone(&drain));
+    registry.register_bind(
+        ANCHOR,
+        SESSION,
+        tx,
+        Arc::clone(&drain),
+        LaneReservation::uncounted(LaneIndex::ZERO),
+    );
     let consumer = Consumer { rx, drain };
     let one = PeerLane::new(peer().peer, LaneIndex::new(1));
     let id = slot(4, 2);

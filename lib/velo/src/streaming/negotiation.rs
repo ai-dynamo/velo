@@ -28,10 +28,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use velo_ext::TransportKey;
+use velo_ext::{TransportKey, WorkerId};
 
 use super::messenger_mux::flow_control::{NegotiatedLimits, NegotiationError};
-use super::messenger_mux::{MESSENGER_MUX_KEY, MessengerMuxTransport};
+use super::messenger_mux::{LaneReservation, MESSENGER_MUX_KEY, MessengerMuxTransport};
 use super::transport::FrameTransport;
 
 /// The streaming-transport registry an [`AnchorManager`] resolves keys against.
@@ -71,8 +71,8 @@ pub(crate) fn advertised_keys(
 
 /// What the receiver picked for one attach, and what it owes the sender.
 pub(crate) struct Selection {
-    /// The transport to `bind()` on.
-    pub(crate) transport: Arc<dyn FrameTransport>,
+    /// What [`bind`](Self::bind) binds on.
+    target: Target,
     /// The key to answer with, which the sender resolves on its side.
     pub(crate) key: TransportKey,
     /// Data credit granted to each mux slot. Zero unless the mux was selected —
@@ -85,31 +85,75 @@ pub(crate) struct Selection {
     pub(crate) lane: u16,
 }
 
+/// The transport a [`Selection`] binds on.
+enum Target {
+    /// The mux, with the lane it placed the stream on. The reservation goes
+    /// into the bind, so the lane counts this stream from now on.
+    Mux(Arc<MessengerMuxTransport>, LaneReservation),
+    Other(Arc<dyn FrameTransport>),
+}
+
+impl Selection {
+    /// Bind the receive side of the stream on the selected transport.
+    pub(crate) async fn bind(
+        self,
+        anchor_id: u64,
+        session_id: u64,
+    ) -> anyhow::Result<(flume::Receiver<Vec<u8>>, Terms)> {
+        let terms = Terms {
+            key: self.key,
+            initial_credit: self.initial_credit,
+            slot_byte_budget: self.slot_byte_budget,
+            lane: self.lane,
+        };
+        let receiver = match self.target {
+            Target::Mux(mux, lane) => mux.bind_on_lane(anchor_id, session_id, lane),
+            Target::Other(transport) => transport.bind(anchor_id, session_id).await?,
+        };
+        Ok((receiver, terms))
+    }
+}
+
+/// What a bound [`Selection`] answers the sender with.
+pub(crate) struct Terms {
+    pub(crate) key: TransportKey,
+    pub(crate) initial_credit: u32,
+    pub(crate) slot_byte_budget: u32,
+    pub(crate) lane: u16,
+}
+
 /// Intersect the sender's advertisement with what is installed here.
 ///
 /// The mux wins only when both sides named it; everything else falls through to
 /// the behaviour that shipped before negotiation — answer with the local default
 /// transport's key. An empty `offered` (an older sender, which omits the field
 /// entirely) cannot intersect, so such a sender always takes that path.
+///
+/// When the mux wins, the stream is placed on a lane for `peer`, the sender
+/// that asked, by `lane_key` if it gave one
+/// ([`MessengerMuxTransport::choose_lane`]).
 pub(crate) fn select(
     offered: &[TransportKey],
     mux: Option<&Arc<MessengerMuxTransport>>,
     default_transport: &Arc<dyn FrameTransport>,
+    peer: WorkerId,
+    lane_key: Option<u64>,
 ) -> Selection {
     if let Some(mux) = mux
         && offered.iter().any(|key| key.as_str() == MESSENGER_MUX_KEY)
     {
         let limits = mux.advertised_limits();
+        let lane = mux.choose_lane(Some(peer), lane_key);
         return Selection {
-            transport: Arc::clone(mux) as Arc<dyn FrameTransport>,
             key: TransportKey::new(MESSENGER_MUX_KEY),
             initial_credit: limits.initial_credit(),
             slot_byte_budget: limits.slot_byte_budget(),
-            lane: mux.choose_lane().get(),
+            lane: lane.lane().get(),
+            target: Target::Mux(Arc::clone(mux), lane),
         };
     }
     Selection {
-        transport: Arc::clone(default_transport),
+        target: Target::Other(Arc::clone(default_transport)),
         key: default_transport.key(),
         initial_credit: 0,
         slot_byte_budget: 0,

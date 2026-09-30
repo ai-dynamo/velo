@@ -280,11 +280,12 @@ pub struct AnchorAttachRequest {
     #[serde(default)]
     pub supported_transport_keys: Vec<velo_ext::TransportKey>,
     /// A key for the receiver to place the stream's mux lane by, so streams
-    /// with one key share a lane. `None` lets the receiver choose.
+    /// with one key share a lane. `None` lets the receiver choose the lane
+    /// with the fewest streams from this sender.
     ///
     /// Left out when `None`, so a request without a key is the same bytes as
-    /// one from before lanes. The receiver does not read it yet: every stream
-    /// is placed on lane 0.
+    /// one from before lanes. A receiver from before lanes ignores it and
+    /// places every stream on lane 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lane_key: Option<u64>,
 }
@@ -420,6 +421,9 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::messe
             let manager = manager.clone();
             async move {
                 let started = Instant::now();
+                // The worker whose batches will carry this stream: the lane is placed
+                // against its load. From the envelope, not from the request body.
+                let sender = ctx.sender_worker_id();
                 let req = ctx.input;
 
                 // Defence-in-depth: reject MPSC handles at the SPSC attach
@@ -534,9 +538,13 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::messe
                 // the sender advertised: `messenger-mux-v2` when both sides
                 // named it, and otherwise exactly the local default this
                 // handler answered with before negotiation existed.
-                let selection = manager.select_streaming_transport(&req.supported_transport_keys);
-                let receiver = match selection.transport.bind(local_id, routing_session_id).await {
-                    Ok(rx) => rx,
+                let selection = manager.select_streaming_transport(
+                    &req.supported_transport_keys,
+                    sender,
+                    req.lane_key,
+                );
+                let (receiver, terms) = match selection.bind(local_id, routing_session_id).await {
+                    Ok(bound) => bound,
                     Err(e) => {
                         manager.record_streaming_operation(
                             StreamingOp::Attach,
@@ -549,7 +557,7 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::messe
                         });
                     }
                 };
-                let streaming_transport_key = selection.key;
+                let streaming_transport_key = terms.key;
 
                 // Step 3: Atomically set attachment under shard lock
                 use dashmap::mapref::entry::Entry;
@@ -696,9 +704,9 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::messe
                                 streaming_transport_key,
                                 heartbeat_interval_ms: heartbeat_interval.as_millis() as u64,
                                 routing_session_id,
-                                initial_credit: selection.initial_credit,
-                                slot_byte_budget: selection.slot_byte_budget,
-                                lane: selection.lane,
+                                initial_credit: terms.initial_credit,
+                                slot_byte_budget: terms.slot_byte_budget,
+                                lane: terms.lane,
                             })
                         }
                     }

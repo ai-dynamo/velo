@@ -1373,9 +1373,36 @@ impl AnchorManager {
     /// — it stays paused for the whole pre-bind phase, same as at attach. A
     /// worker that may be queued longer than that needs a longer-lived
     /// rendezvous than this call provides.
+    ///
+    /// The ticket names the mux lane with the fewest pre-binds not yet claimed,
+    /// released or expired; [`prebind_anchor_keyed`](Self::prebind_anchor_keyed)
+    /// places it by a key instead.
     pub fn prebind_anchor(
         &self,
         handle: StreamAnchorHandle,
+    ) -> Option<crate::streaming::control::StreamOpenTicket> {
+        self.prebind_anchor_on(handle, None)
+    }
+
+    /// As [`prebind_anchor`](Self::prebind_anchor), with the stream placed on
+    /// the mux lane `key` hashes to.
+    ///
+    /// Streams pre-bound with one key share a lane, so their records stay in
+    /// one ordered channel to the worker. The hash is fixed across builds and
+    /// processes. With one lane (the default transport setup) every key is on
+    /// lane 0.
+    pub fn prebind_anchor_keyed(
+        &self,
+        handle: StreamAnchorHandle,
+        key: u64,
+    ) -> Option<crate::streaming::control::StreamOpenTicket> {
+        self.prebind_anchor_on(handle, Some(key))
+    }
+
+    fn prebind_anchor_on(
+        &self,
+        handle: StreamAnchorHandle,
+        lane_key: Option<u64>,
     ) -> Option<crate::streaming::control::StreamOpenTicket> {
         // The rollback, and the only `None` that is not a mistake -- zero-RTT
         // is simply off, so there is no operation to record.
@@ -1398,7 +1425,7 @@ impl AnchorManager {
         }
 
         // Fail fast on the common "not pre-bindable" case before minting a
-        // session id or registering a bind: `mux.prebind` queues a 60 s
+        // session id or registering a bind: `mux.bind_on_lane` queues a 60 s
         // accept-window deadline, and a bind registered for nothing holds its
         // buffer until that deadline passes. This is a plain read, not a lock the mutate-and-check
         // below still has to redo -- an entry can change between the two, and
@@ -1435,7 +1462,11 @@ impl AnchorManager {
         // two senders reusing their own local counters would collide on the
         // transport's `(anchor_id, session_id)` routing key.
         let routing_session_id = self.next_routing_session_id.fetch_add(1, Ordering::Relaxed) + 1;
-        let receiver = mux.prebind(local_id, routing_session_id);
+        // No sender is known yet, so the lane is placed against this node's
+        // own pre-binds. Chosen before the bind so the bind is counted on it.
+        let lane = mux.choose_lane(None, lane_key);
+        let lane_index = lane.lane();
+        let receiver = mux.bind_on_lane(local_id, routing_session_id, lane);
         let drain = mux
             .take_drain_signal(local_id, routing_session_id)
             .expect("prebind parks a drain signal for the pair it just registered");
@@ -1459,7 +1490,7 @@ impl AnchorManager {
                             entry.heartbeat_interval,
                             routing_session_id,
                             mux.advertised_limits(),
-                            mux.choose_lane(),
+                            lane_index,
                         );
                         // A child of the anchor's token, as at attach: finalize,
                         // cancel and detach stop the watchdog without poisoning
@@ -1733,15 +1764,24 @@ impl AnchorManager {
         )
     }
 
-    /// Pick the transport to bind for an incoming attach.
+    /// Pick the transport to bind for an incoming attach from `peer`, and
+    /// the mux lane, by `lane_key` if the sender gave one.
     ///
     /// Called by both attach handlers, which differ only in the response type
     /// they pour the answer into.
     pub(crate) fn select_streaming_transport(
         &self,
         offered: &[velo_ext::TransportKey],
+        peer: velo_ext::WorkerId,
+        lane_key: Option<u64>,
     ) -> crate::streaming::negotiation::Selection {
-        crate::streaming::negotiation::select(offered, self.mux.get(), &self.transport)
+        crate::streaming::negotiation::select(
+            offered,
+            self.mux.get(),
+            &self.transport,
+            peer,
+            lane_key,
+        )
     }
 
     /// Connect the transport the receiver's attach response named.
@@ -2053,6 +2093,7 @@ impl AnchorManager {
     async fn attach_remote<T: serde::Serialize>(
         &self,
         handle: StreamAnchorHandle,
+        lane_key: Option<u64>,
     ) -> Result<crate::streaming::sender::StreamSender<T>, AttachError> {
         let (handle_worker_id, _) = handle.unpack();
 
@@ -2079,7 +2120,7 @@ impl AnchorManager {
             session_id: identity.sender_stream_id,
             stream_cancel_handle,
             supported_transport_keys: self.supported_transport_keys(),
-            lane_key: None,
+            lane_key,
         };
 
         // Send _anchor_attach AM to the remote worker (typed request-response).
@@ -2345,9 +2386,38 @@ impl AnchorManager {
     ///   includes a pre-bound slot an `OpenSlot` has already claimed (local path)
     /// - [`AttachError::TransportError`] for all remote path errors (messenger unavailable,
     ///   AM send failed, remote error response)
+    ///
+    /// Over the mux, the consumer places the stream on the lane with the
+    /// fewest streams from this worker;
+    /// [`attach_stream_anchor_keyed`](Self::attach_stream_anchor_keyed) places
+    /// it by a key instead.
     pub async fn attach_stream_anchor<T: serde::Serialize>(
         &self,
         handle: StreamAnchorHandle,
+    ) -> Result<crate::streaming::sender::StreamSender<T>, AttachError> {
+        self.attach_stream_anchor_on(handle, None).await
+    }
+
+    /// As [`attach_stream_anchor`](Self::attach_stream_anchor), with the
+    /// stream placed on the mux lane `key` hashes to.
+    ///
+    /// Streams attached with one key to one consumer share a lane, so their
+    /// records stay in one ordered channel. The consumer hashes the key, with a
+    /// hash fixed across builds and processes, over the lanes its transport
+    /// keeps to this worker; with one lane every key is on lane 0. A local
+    /// anchor has no lane and ignores the key.
+    pub async fn attach_stream_anchor_keyed<T: serde::Serialize>(
+        &self,
+        handle: StreamAnchorHandle,
+        key: u64,
+    ) -> Result<crate::streaming::sender::StreamSender<T>, AttachError> {
+        self.attach_stream_anchor_on(handle, Some(key)).await
+    }
+
+    async fn attach_stream_anchor_on<T: serde::Serialize>(
+        &self,
+        handle: StreamAnchorHandle,
+        lane_key: Option<u64>,
     ) -> Result<crate::streaming::sender::StreamSender<T>, AttachError> {
         // Fail fast if the caller passed an MPSC handle: the SPSC registry
         // will never contain it, and the remote path would waste an AM
@@ -2363,7 +2433,7 @@ impl AnchorManager {
 
         // Remote path: handle belongs to a different worker — send _anchor_attach AM
         if handle_worker_id != self.worker_id {
-            return self.attach_remote::<T>(handle).await;
+            return self.attach_remote::<T>(handle, lane_key).await;
         }
 
         // Step 1: Quick check anchor exists and is unattached (drop ref before async)
@@ -2580,9 +2650,33 @@ impl AnchorManager {
     /// Attach a sender to an MPSC anchor. Like [`Self::attach_stream_anchor`] but
     /// targets the MPSC registry: multiple senders may attach concurrently,
     /// and each attach allocates a fresh [`crate::streaming::mpsc::SenderId`].
+    ///
+    /// Over the mux, the consumer places the sender on the lane with the fewest
+    /// streams from this worker;
+    /// [`attach_mpsc_stream_anchor_keyed`](Self::attach_mpsc_stream_anchor_keyed)
+    /// places it by a key instead.
     pub async fn attach_mpsc_stream_anchor<T: serde::Serialize>(
         &self,
         handle: StreamAnchorHandle,
+    ) -> Result<crate::streaming::mpsc::MpscStreamSender<T>, AttachError> {
+        self.attach_mpsc_stream_anchor_on(handle, None).await
+    }
+
+    /// As [`attach_mpsc_stream_anchor`](Self::attach_mpsc_stream_anchor), with
+    /// the sender placed on the mux lane `key` hashes to. See
+    /// [`attach_stream_anchor_keyed`](Self::attach_stream_anchor_keyed).
+    pub async fn attach_mpsc_stream_anchor_keyed<T: serde::Serialize>(
+        &self,
+        handle: StreamAnchorHandle,
+        key: u64,
+    ) -> Result<crate::streaming::mpsc::MpscStreamSender<T>, AttachError> {
+        self.attach_mpsc_stream_anchor_on(handle, Some(key)).await
+    }
+
+    async fn attach_mpsc_stream_anchor_on<T: serde::Serialize>(
+        &self,
+        handle: StreamAnchorHandle,
+        lane_key: Option<u64>,
     ) -> Result<crate::streaming::mpsc::MpscStreamSender<T>, AttachError> {
         // Fail fast if the caller passed an SPSC handle.
         if handle.is_spsc_stream() {
@@ -2595,7 +2689,7 @@ impl AnchorManager {
         let (handle_worker_id, local_id) = handle.unpack();
 
         if handle_worker_id != self.worker_id {
-            return self.attach_mpsc_remote::<T>(handle).await;
+            return self.attach_mpsc_remote::<T>(handle, lane_key).await;
         }
 
         // Local path: reserve a slot under the shard lock, then construct
@@ -2688,6 +2782,7 @@ impl AnchorManager {
     async fn attach_mpsc_remote<T: serde::Serialize>(
         &self,
         handle: StreamAnchorHandle,
+        lane_key: Option<u64>,
     ) -> Result<crate::streaming::mpsc::MpscStreamSender<T>, AttachError> {
         let (handle_worker_id, _) = handle.unpack();
 
@@ -2708,7 +2803,7 @@ impl AnchorManager {
             session_id: sender_stream_id,
             stream_cancel_handle,
             supported_transport_keys: self.supported_transport_keys(),
-            lane_key: None,
+            lane_key,
         };
 
         // Same bracket as the SPSC path above, through the same helper: the

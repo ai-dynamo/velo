@@ -15,6 +15,11 @@ use velo_ext::{TransportKey, WorkerAddress, WorkerId};
 use super::*;
 use crate::streaming::messenger_mux::MuxConfig;
 
+/// The sender of every attach in these tests.
+fn peer() -> WorkerId {
+    WorkerId::from_u64(9)
+}
+
 /// A stand-in for whichever legacy transport a node is configured with.
 struct LegacyTransport(&'static str);
 
@@ -145,9 +150,10 @@ async fn the_mux_is_selected_only_when_both_sides_named_it() {
         &keys(&[MESSENGER_MUX_KEY, "tcp-stream"]),
         Some(&mux),
         &legacy(),
+        peer(),
+        None,
     );
     assert_eq!(selected.key.as_str(), MESSENGER_MUX_KEY);
-    assert_eq!(selected.transport.key().as_str(), MESSENGER_MUX_KEY);
     assert_eq!(selected.initial_credit, 64);
     assert_eq!(selected.slot_byte_budget, 4096);
 }
@@ -155,7 +161,7 @@ async fn the_mux_is_selected_only_when_both_sides_named_it() {
 #[tokio::test]
 async fn a_sender_that_did_not_name_the_mux_gets_the_legacy_transport() {
     let mux = mux(MuxConfig::default()).await;
-    let selected = select(&keys(&["tcp-stream"]), Some(&mux), &legacy());
+    let selected = select(&keys(&["tcp-stream"]), Some(&mux), &legacy(), peer(), None);
     assert_eq!(selected.key.as_str(), "tcp-stream");
     assert_eq!(selected.initial_credit, 0);
 }
@@ -166,7 +172,7 @@ async fn a_sender_from_before_negotiation_gets_the_legacy_transport() {
     // field, `#[serde(default)]` makes that an empty list, and an empty list
     // cannot intersect.
     let mux = mux(MuxConfig::default()).await;
-    let selected = select(&[], Some(&mux), &legacy());
+    let selected = select(&[], Some(&mux), &legacy(), peer(), None);
     assert_eq!(selected.key.as_str(), "tcp-stream");
     assert_eq!(selected.initial_credit, 0);
     assert_eq!(selected.slot_byte_budget, 0);
@@ -174,7 +180,7 @@ async fn a_sender_from_before_negotiation_gets_the_legacy_transport() {
 
 #[test]
 fn a_receiver_without_a_mux_never_answers_with_one() {
-    let selected = select(&keys(&[MESSENGER_MUX_KEY]), None, &legacy());
+    let selected = select(&keys(&[MESSENGER_MUX_KEY]), None, &legacy(), peer(), None);
     assert_eq!(
         selected.key.as_str(),
         "tcp-stream",

@@ -102,6 +102,7 @@ mod config;
 pub(crate) mod flow_control;
 pub(crate) mod ingress;
 mod lane;
+mod lane_choice;
 #[cfg(all(test, feature = "quic"))]
 mod lane_tests;
 pub(crate) mod peer_batcher;
@@ -126,6 +127,7 @@ use velo_ext::{TransportKey, WorkerAddress, WorkerId};
 
 use self::flow_control::NegotiatedLimits;
 use self::ingress::IngressRegistry;
+use self::lane_choice::LaneLoad;
 use self::peer_batcher::{
     BatcherContext, BatcherHandle, BatcherMap, OpenRejected, OpenSlotRequest,
 };
@@ -135,6 +137,7 @@ use crate::streaming::transport::FrameTransport;
 
 pub use self::config::{AutoFlush, FlushPolicy, MuxConfig};
 pub(crate) use self::lane::{LaneIndex, PeerLane, is_batch_handler, mux_lanes};
+pub(crate) use self::lane_choice::LaneReservation;
 
 /// The streaming-transport key this mux answers to.
 ///
@@ -152,21 +155,21 @@ pub const MESSENGER_MUX_KEY: &str = "messenger-mux-v2";
 ///
 /// Deliberately the same 60 s the TCP transport gives a pending session, and
 /// deliberately measuring the same thing: "time until a batch bearing this
-/// `OpenSlot` arrives". That sentence holds without qualification for
-/// `FrameTransport::bind`'s attach-path caller: a sender has already asked by
+/// `OpenSlot` arrives". That sentence holds without qualification for the
+/// attach path's bind: a sender has already asked by
 /// the time the bind exists, so the window is one response leg plus one batch
 /// leg, and `OpenSlot` is eager precisely so it cannot quietly become "time
 /// until the producer produces its first token" there.
 ///
-/// It does not hold for `MessengerMuxTransport::prebind`'s zero-RTT caller,
+/// It does not hold for the zero-RTT pre-bind (`AnchorManager::prebind_anchor`),
 /// where the same clock starts before any sender has asked at all: the window
 /// there is envelope transit plus however long the ticket sits in a request
 /// envelope before its worker calls `open_anchor_stream`, which can be exactly
 /// the producer-side wait the paragraph above rules out for `bind`. See
 /// `AnchorManager::prebind_anchor`'s doc for that bound. An attach that adopts
 /// an existing pre-bind does not restart this timer either way — adoption
-/// takes over the bind `prebind` already registered rather than calling
-/// `bind` again, so it inherits whatever is left of the 60 s, not a fresh one.
+/// takes over the bind the pre-bind already registered rather than binding
+/// again, so it inherits whatever is left of the 60 s, not a fresh one.
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Attempts `connect` makes before giving up on a batcher that keeps retiring
@@ -255,11 +258,9 @@ struct MuxCore {
     /// tests that need one held mid-wake. See [`peer_batcher::test_hooks`].
     #[cfg(test)]
     hooks: std::sync::OnceLock<Arc<peer_batcher::test_hooks::TestHooks>>,
-    /// A lane every stream bound here is placed on, installed by the tests
-    /// that drive a lane other than 0 end to end. Per mux rather than a
-    /// static, so it cannot move another test's streams.
-    #[cfg(test)]
-    forced_lane: std::sync::OnceLock<LaneIndex>,
+    /// Binds per lane that no `OpenSlot` has claimed yet, read when the next
+    /// stream is placed ([`MessengerMuxTransport::choose_lane`]).
+    lane_load: LaneLoad,
 }
 
 impl MessengerMuxTransport {
@@ -354,8 +355,7 @@ impl MessengerMuxTransport {
             bind_deadlines: std::sync::Mutex::default(),
             #[cfg(test)]
             hooks: std::sync::OnceLock::new(),
-            #[cfg(test)]
-            forced_lane: std::sync::OnceLock::new(),
+            lane_load: LaneLoad::default(),
         });
 
         for lane in LaneIndex::all() {
@@ -403,6 +403,16 @@ impl MuxCore {
             .ok()
             .and_then(|instance| backend.lanes(instance).ok())
             .unwrap_or(NonZeroU16::MIN)
+    }
+
+    /// How many lanes this node's transports keep to a peer not yet known.
+    ///
+    /// The most any installed transport keeps. Every in-tree transport answers
+    /// `lanes()` without looking at its target, so this is what the peer's
+    /// transport will keep too if it is the one with lanes; a peer reached over
+    /// one with fewer clamps the lane on its side, which is always correct.
+    fn local_lanes(&self) -> NonZeroU16 {
+        self.messenger.backend().max_lanes()
     }
 
     /// The batcher for one (peer, lane), created on first use.
@@ -699,12 +709,17 @@ impl Drop for MuxCore {
 /// accept window on it.
 ///
 /// The body [`FrameTransport::bind`] and
-/// [`MessengerMuxTransport::prebind`] share. `bind` is async because the trait
+/// [`MessengerMuxTransport::bind_on_lane`] share. `bind` is async because the trait
 /// is; **nothing in here awaits**, and that is what lets the zero-RTT path call
 /// it synchronously while registering a request. The accept window is a
 /// deadline the sweep expires (`MuxCore::expire_binds`), queued here, once,
 /// rather than in two places that would drift.
-fn open_bind(core: &Arc<MuxCore>, anchor_id: u64, session_id: u64) -> flume::Receiver<Vec<u8>> {
+fn open_bind(
+    core: &Arc<MuxCore>,
+    anchor_id: u64,
+    session_id: u64,
+    lane: LaneReservation,
+) -> flume::Receiver<Vec<u8>> {
     // `C + 1`: `C` data credits plus the one reserved terminal credit.
     // Credit is issued against *this* buffer and never against the
     // anchor's `frame_tx`, which has writers other than the mux.
@@ -713,7 +728,7 @@ fn open_bind(core: &Arc<MuxCore>, anchor_id: u64, session_id: u64) -> flume::Rec
     core.drains
         .insert((anchor_id, session_id), Arc::clone(&drain));
     core.ingress
-        .register_bind(anchor_id, session_id, frame_tx, drain);
+        .register_bind(anchor_id, session_id, frame_tx, drain, lane);
 
     // A deadline, not a task: the sweep expires it (`MuxCore::expire_binds`).
     // Nothing here may pin the core either, which a task holding a strong
@@ -750,7 +765,10 @@ impl FrameTransport for MessengerMuxTransport {
         session_id: u64,
     ) -> BoxFuture<'_, Result<flume::Receiver<Vec<u8>>>> {
         let core = Arc::clone(&self.core);
-        Box::pin(async move { Ok(open_bind(&core, anchor_id, session_id)) })
+        // Lane 0, as `connect` below: the bare trait names no peer and carries
+        // no lane to the sender. Counted, so the next choice sees it.
+        let lane = core.lane_load.reserve_on(None, LaneIndex::ZERO);
+        Box::pin(async move { Ok(open_bind(&core, anchor_id, session_id, lane)) })
     }
 
     /// Opens a slot at *this node's* limits.
@@ -781,27 +799,46 @@ impl MessengerMuxTransport {
         self.core.limits
     }
 
-    /// The lane a stream bound on this node is placed on, as answered in the
-    /// attach response or quoted in the ticket.
+    /// Place the next stream bound on this node on a lane, and count it there
+    /// until its bind is claimed, released or expired.
     ///
-    /// Lane 0 for every stream for now. The sender follows whatever this
-    /// answers, clamped to its own lanes ([`Self::sender_lane`]).
-    pub(crate) fn choose_lane(&self) -> LaneIndex {
-        #[cfg(test)]
-        if let Some(lane) = self.core.forced_lane.get() {
-            return *lane;
-        }
-        LaneIndex::ZERO
+    /// The lane is answered in the attach response or quoted in the ticket,
+    /// and the sender follows it, clamped to its own lanes
+    /// ([`Self::sender_lane`]). `peer` is the sender an attach came from, and
+    /// `None` for a pre-bind, whose sender is not known yet. `key` is the
+    /// caller's lane key; see [`lane_choice`] for how each case is placed.
+    ///
+    /// The lane count is the mux lanes of the transport to `peer`, or for a
+    /// pre-bind the most any transport here keeps. With one lane every stream
+    /// is on lane 0, which keeps a default deployment's attach answers and
+    /// tickets the same bytes as before lanes: a ticket naming another lane
+    /// cannot be read by a worker built before lanes.
+    ///
+    /// The returned reservation goes to [`Self::bind_on_lane`]; dropping it
+    /// gives the count back.
+    pub(crate) fn choose_lane(&self, peer: Option<WorkerId>, key: Option<u64>) -> LaneReservation {
+        let lanes = peer.map_or_else(
+            || self.core.local_lanes(),
+            |peer| self.core.transport_lanes(peer),
+        );
+        let ingress = &self.core.ingress;
+        self.core
+            .lane_load
+            .reserve(peer, key, lanes, |key| ingress.live_slots(key))
     }
 
-    /// Place every stream bound on this node on `lane`, for the tests that
-    /// drive a lane other than 0 end to end.
+    /// Binds on `lane` not yet claimed, released or expired: from `peer`'s
+    /// attaches, or with `None` from pre-binds.
     #[cfg(test)]
-    pub(crate) fn force_lane(&self, lane: LaneIndex) {
+    pub(crate) fn pending_binds_on(&self, peer: Option<WorkerId>, lane: LaneIndex) -> usize {
+        self.core.lane_load.pending(peer, lane)
+    }
+
+    /// Close the accept window on every bind as if it had run out.
+    #[cfg(test)]
+    pub(crate) fn expire_all_binds(&self) {
         self.core
-            .forced_lane
-            .set(lane)
-            .expect("the forced lane is set once");
+            .expire_binds(tokio::time::Instant::now() + ACCEPT_TIMEOUT + Duration::from_secs(1));
     }
 
     /// The (peer, lane) a stream that `peer` placed on `lane` is sent on from
@@ -818,20 +855,26 @@ impl MessengerMuxTransport {
         )
     }
 
-    /// Bind a slot before any sender has asked for one.
+    /// Bind a slot on the lane [`choose_lane`](Self::choose_lane) placed it on.
     ///
-    /// The synchronous twin of [`FrameTransport::bind`], and identical to it:
-    /// the trait's `bind` is async only because the trait is, and its body has
-    /// no await in it. Zero-RTT setup needs the receiver *now*, while
-    /// registering a request, so it takes this door instead of paying a future
-    /// for nothing.
+    /// The synchronous, lane-aware twin of [`FrameTransport::bind`], which is
+    /// async only because the trait is and has no await in its body. The
+    /// attach handlers take this door once they have chosen the mux, so the
+    /// bind is counted on its lane. Zero-RTT setup takes it because it needs
+    /// the receiver *now*, while registering a request, and has no sender yet
+    /// to ask.
     ///
     /// Nothing about the resulting bind is special. A peer's `OpenSlot` claims
     /// it by the same `(anchor_id, session_id)` lookup, the accept window runs
     /// the same 60 s, and [`release_bind`](Self::release_bind) is what an owner
     /// that gives up before then calls.
-    pub(crate) fn prebind(&self, anchor_id: u64, session_id: u64) -> flume::Receiver<Vec<u8>> {
-        open_bind(&self.core, anchor_id, session_id)
+    pub(crate) fn bind_on_lane(
+        &self,
+        anchor_id: u64,
+        session_id: u64,
+        lane: LaneReservation,
+    ) -> flume::Receiver<Vec<u8>> {
+        open_bind(&self.core, anchor_id, session_id, lane)
     }
 
     /// Give back a bind nobody claimed, along with the drain signal parked with
