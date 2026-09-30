@@ -111,7 +111,7 @@ With 8 lanes, 4 sockets carry two lanes each and reach the same rate as 8 socket
 
 A fixed `bind_addr` port `P` binds ports `P` to `P + n - 1`, one for each server socket. Peers spread over all of them, ordinary traffic included, so open all of them in a firewall. Transports on one host need fixed ports at least `n` apart.
 
-During a rolling upgrade both directions work. A peer without per-socket ports dials only the first port of a new node, so until it upgrades it shares that socket with the other old peers.
+During a rolling upgrade, an old peer can dial a new node, and a new peer can dial an old node. A peer without per-socket ports dials only the first port of a new node, so until it upgrades it shares that socket with the other old peers.
 
 The same prototype on TCP did not scale: 2.6–3.4 GB/s with 1 lane, and 2.9–3.8 GB/s with 2, 4 or 8 lanes. The limit for TCP is not the connection, so the TCP transport keeps one lane.
 

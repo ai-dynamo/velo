@@ -1478,10 +1478,22 @@ fn lane_addresses_spread_over_the_peers_sockets() {
     assert_eq!(ports, vec![5002, 5003, 5000, 5001]);
     assert!((0..4).all(|lane| peer.lane_addr(lane, 6).ip() == addr.ip()));
 
-    let no_ports = super::PeerEntry {
+    let one_port = super::PeerEntry {
         addr,
-        ports: vec![],
+        ports: vec![addr.port()],
         client_config,
     };
-    assert!((0..4).all(|lane| no_ports.lane_addr(lane, 6) == addr));
+    assert!((0..4).all(|lane| one_port.lane_addr(lane, 6) == addr));
+}
+
+/// The dial offset comes from the certificate fingerprint, so two transports
+/// with different certificates start their lanes on different sockets.
+#[test]
+fn the_lane_offset_follows_the_fingerprint() {
+    let mut fingerprint = [0u8; 32];
+    fingerprint[0] = 0x34;
+    fingerprint[1] = 0x12;
+    assert_eq!(super::lane_offset(&fingerprint), 0x1234);
+    fingerprint[0] = 0x35;
+    assert_ne!(super::lane_offset(&fingerprint), 0x1234);
 }

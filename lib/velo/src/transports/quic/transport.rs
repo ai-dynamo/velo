@@ -53,6 +53,13 @@ const FAIL_REPORT_GRACE: Duration = Duration::from_millis(500);
 mod builder;
 pub use builder::QuicTransportBuilder;
 
+/// This dialer's offset into a peer's server sockets, taken from its own
+/// certificate fingerprint. The fingerprint is random per transport, so dialers
+/// spread over a peer's sockets without coordinating.
+pub(super) fn lane_offset(fingerprint: &tls::Fingerprint) -> u16 {
+    u16::from_le_bytes([fingerprint[0], fingerprint[1]])
+}
+
 /// One connection per peer and lane. Lane 0 is the only lane unless the
 /// builder asked for more.
 type LaneKey = (crate::InstanceId, u16);
@@ -109,11 +116,10 @@ pub struct QuicTransport {
 
 /// A registered peer: where to dial, and the TLS config that pins its
 /// certificate.
-#[derive(Clone)]
 struct PeerEntry {
     addr: SocketAddr,
-    /// The port of each of the peer's server sockets. Empty for a peer that
-    /// predates per-socket ports, whose every lane dials `addr`.
+    /// The port of each of the peer's server sockets; never empty. A peer that
+    /// predates per-socket ports advertises none, and gets the port of `addr`.
     ports: Vec<u16>,
     client_config: quinn::ClientConfig,
 }
@@ -125,11 +131,10 @@ impl PeerEntry {
     /// different sockets, and the lane 0 of many dialers does not pile onto
     /// socket 0.
     fn lane_addr(&self, lane: u16, offset: u16) -> SocketAddr {
-        if self.ports.is_empty() {
-            return self.addr;
-        }
         let index = (usize::from(offset) + usize::from(lane)) % self.ports.len();
-        SocketAddr::new(self.addr.ip(), self.ports[index])
+        let mut addr = self.addr;
+        addr.set_port(self.ports[index]);
+        addr
     }
 }
 
@@ -394,7 +399,11 @@ impl Transport for QuicTransport {
             peer_info.instance_id(),
             PeerEntry {
                 addr,
-                ports: info.ports,
+                ports: if info.ports.is_empty() {
+                    vec![addr.port()]
+                } else {
+                    info.ports
+                },
                 client_config,
             },
         );

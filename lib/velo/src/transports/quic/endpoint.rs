@@ -57,21 +57,22 @@ pub(super) struct BufferSizes {
 /// With port 0, each socket takes an ephemeral port. All bind the same IP.
 ///
 /// The peer learns every port from [`QuicEndpointInfo::ports`] and dials lane
-/// `k` on socket `(offset + k) % count`, where `offset` is fixed per dialer. So the lanes of one dialer land on different sockets, each with its
-/// own quinn endpoint driver and receive buffer.
+/// `k` on socket `(offset + k) % count`, where `offset` is fixed per dialer.
+/// So the lanes of one dialer spread evenly over the sockets, each with its own
+/// quinn endpoint driver and receive buffer.
 ///
 /// An earlier design put every socket on one port in a `SO_REUSEPORT` group.
-/// The kernel then hashed each connection to a socket at random, and two lanes
-/// of one peer often shared a socket: with 8 lanes, a group of 4 sockets moved
-/// 3.3 GB/s where a group of 32 moved 6.5 GB/s.
+/// The kernel then hashed each connection to a socket at random, and several
+/// lanes of one peer often landed on one socket: with 8 lanes into a group of
+/// 8 sockets, one run moved 2.6 GB/s and another 6.6 GB/s, as the hash fell.
 pub(super) fn bind_server_sockets(
     requested: SocketAddr,
     count: usize,
     buffers: BufferSizes,
 ) -> Result<Vec<std::net::UdpSocket>> {
     let count = count.max(1);
-    // All ports are worked out before any socket binds, so a range past 65535
-    // fails without leaving sockets behind.
+    // Checked arithmetic, so a range past 65535 is an error rather than a
+    // port that wraps to a low number.
     let ports: Vec<u16> = if requested.port() == 0 {
         vec![0; count]
     } else {
@@ -223,11 +224,13 @@ mod tests {
     #[test]
     fn a_fixed_port_past_the_range_is_refused() {
         let requested = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), u16::MAX);
-        assert!(bind_server_sockets(requested, 2, SMALL).is_err());
+        let error = bind_server_sockets(requested, 2, SMALL).unwrap_err();
+        assert!(format!("{error:#}").contains("past 65535"), "{error:#}");
     }
 
     /// No other socket can bind a server port. A server socket with
-    /// `SO_REUSEADDR` or `SO_REUSEPORT` would let any process take one.
+    /// `SO_REUSEADDR` or `SO_REUSEPORT` would let another process of the same
+    /// user take one and read its datagrams.
     #[test]
     fn an_unrelated_bind_cannot_take_a_server_port() {
         let server = bind_server_sockets("127.0.0.1:0".parse().unwrap(), 2, SMALL).unwrap();
@@ -240,6 +243,15 @@ mod tests {
                 reuse_addr_only.bind(&addr.into()).is_err(),
                 "a socket with SO_REUSEADDR alone bound a server port"
             );
+            #[cfg(target_os = "linux")]
+            {
+                let reuse_port = new_udp_socket(addr).unwrap();
+                reuse_port.set_reuse_port(true).unwrap();
+                assert!(
+                    reuse_port.bind(&addr.into()).is_err(),
+                    "a socket with SO_REUSEPORT bound a server port"
+                );
+            }
         }
     }
 
@@ -271,6 +283,7 @@ mod tests {
     fn an_old_peer_decodes_an_entry_with_ports() {
         #[derive(Deserialize)]
         struct Before {
+            endpoints: Vec<InterfaceEndpoint>,
             fingerprint: Fingerprint,
         }
         let info = QuicEndpointInfo {
@@ -279,6 +292,7 @@ mod tests {
             ports: vec![5000, 5001],
         };
         let old: Before = rmp_serde::from_slice(&info.encode().unwrap()).unwrap();
+        assert!(old.endpoints.is_empty());
         assert_eq!(old.fingerprint, [5; 32]);
     }
 
