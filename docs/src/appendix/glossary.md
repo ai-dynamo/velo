@@ -14,7 +14,6 @@
 | Frame transport | A transport for stream frames when the mux is not used (TCP or gRPC) |
 | Gate | The first phase of graceful shutdown. New inbound requests are refused. |
 | `InstanceId` | The identity of one `Velo` instance |
-| Lane | One ordered channel from a transport to a peer. Order holds within a lane only. QUIC can keep several lanes to a peer, each on its own connection. Not the same as an ordered lane. |
 | Mux | Batched streaming. Records from many streams share messenger frames to the same peer. |
 | Ordered lane | For an ordered handler, the queue and task for one sender (or for all senders with `ordered_global`). Not the same as a transport lane. |
 | Pre-bind | `prebind_anchor`. The consumer makes a ticket, so the producer can open the stream with no attach round trip. |
@@ -25,6 +24,7 @@
 | Teardown | The third phase of graceful shutdown. Velo cancels tokens and stops the transports. |
 | Close | The fourth phase of graceful shutdown. Velo waits for `Transport::closed()` on each transport, so that what it wrote reaches the peer. |
 | Ticket | A `StreamOpenTicket`. It carries the terms of a pre-bound stream. |
+| Transport lane | One ordered channel from a transport to a peer. Order holds within a lane only. QUIC can keep several lanes to a peer, each on its own connection. Not the same as an ordered lane. |
 | `TransportKey` | The name of a transport in a `WorkerAddress`, for example `tcp` |
 | `WorkerAddress` | A MessagePack map from `TransportKey` to endpoint bytes |
 | `WorkerId` | The identity of a worker. A `StreamAnchorHandle` encodes it. |

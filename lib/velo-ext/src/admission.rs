@@ -114,7 +114,8 @@ pub enum AdmissionError {
 }
 
 /// Outcome of [`AdmissionGate::send`], and of
-/// [`Transport::send_message`](crate::transport::Transport::send_message).
+/// [`Transport::send_message`](crate::transport::Transport::send_message) and
+/// [`Transport::send_message_on_lane`](crate::transport::Transport::send_message_on_lane).
 ///
 /// Dropping this is a legitimate fire-and-forget pattern — the frame is already
 /// owned by the gate and will be delivered either way — so it is deliberately

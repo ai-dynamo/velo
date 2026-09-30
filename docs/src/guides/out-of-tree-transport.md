@@ -52,4 +52,4 @@ impl Transport for MyTransport {
 
 New trait methods in `velo-ext` always have a default implementation, so a new release does not break your implementation. A change to an existing signature is a breaking release. See [Versioning](../development/versioning.md).
 
-A transport with one ordered channel to each peer keeps the defaults of `lanes` and `send_message_on_lane`. Override both only if your transport keeps several ordered channels to one peer.
+A transport with one ordered channel to each peer keeps the defaults of `lanes` and `send_message_on_lane`. Override both only if your transport keeps several ordered channels to one peer. The two methods need `velo-ext = "0.5.4"` or later.

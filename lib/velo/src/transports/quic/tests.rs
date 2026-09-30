@@ -1217,6 +1217,11 @@ async fn send_message_is_lane_zero_and_lanes_wrap() {
 /// fits the send channel), so a frame is either on the wire or reported through
 /// `on_error`; none can be dropped in the gate.
 ///
+/// This pins the state after `closed()` returns; the force close of a stuck
+/// lane other than 0 is what `closed_force_closes_a_stuck_lane_other_than_zero`
+/// covers. The endpoint check needs every connection to finish draining within
+/// `CLOSE_WAIT`, 2 s.
+///
 /// The accounting also needs the peer to acknowledge what the writers wrote
 /// within `FINISH_GRACE`, 1 s. Past that the writer warns that the stream end
 /// was not acknowledged and closes, and those frames are neither delivered nor
