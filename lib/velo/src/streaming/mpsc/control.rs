@@ -400,7 +400,14 @@ pub fn create_mpsc_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::
                 use dashmap::mapref::entry::Entry;
                 let (frame_tx, pump_cancel, sender_id) = match manager.mpsc_registry.entry(local_id)
                 {
+                    // The two arms that fail after the bind give it back at
+                    // once rather than to the accept window.
                     Entry::Vacant(_) => {
+                        manager.release_unused_bind(
+                            &streaming_transport_key,
+                            local_id,
+                            routing_session_id,
+                        );
                         manager.record_streaming_operation(
                             StreamingOp::Attach,
                             HandlerOutcome::Error,
@@ -416,6 +423,11 @@ pub fn create_mpsc_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::
                         if let Some(limit) = entry.max_senders
                             && entry.senders.len() >= limit
                         {
+                            manager.release_unused_bind(
+                                &streaming_transport_key,
+                                local_id,
+                                routing_session_id,
+                            );
                             manager.record_streaming_operation(
                                 StreamingOp::Attach,
                                 HandlerOutcome::Error,

@@ -562,7 +562,14 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::messe
                 // Step 3: Atomically set attachment under shard lock
                 use dashmap::mapref::entry::Entry;
                 match manager.registry.entry(local_id) {
+                    // The three arms that fail after the bind give it back
+                    // at once rather than to the accept window.
                     Entry::Vacant(_) => {
+                        manager.release_unused_bind(
+                            &streaming_transport_key,
+                            local_id,
+                            routing_session_id,
+                        );
                         manager.record_streaming_operation(
                             StreamingOp::Attach,
                             HandlerOutcome::Error,
@@ -576,6 +583,11 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::messe
                     Entry::Occupied(mut occ) => {
                         let entry = occ.get_mut();
                         if entry.attachment {
+                            manager.release_unused_bind(
+                                &streaming_transport_key,
+                                local_id,
+                                routing_session_id,
+                            );
                             manager.record_streaming_operation(
                                 StreamingOp::Attach,
                                 HandlerOutcome::Error,
@@ -594,9 +606,12 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::messe
                             // it would leave two tasks serving one anchor
                             // and two live routing sessions, with
                             // `active_pump_token` naming only the newer, so
-                            // nothing could ever cancel the older. The bind just
-                            // made is left to the accept window, as it is on the
-                            // two arms above.
+                            // nothing could ever cancel the older.
+                            manager.release_unused_bind(
+                                &streaming_transport_key,
+                                local_id,
+                                routing_session_id,
+                            );
                             manager.record_streaming_operation(
                                 StreamingOp::Attach,
                                 HandlerOutcome::Error,

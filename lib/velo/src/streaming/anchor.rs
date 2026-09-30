@@ -1784,6 +1784,27 @@ impl AnchorManager {
         )
     }
 
+    /// Give back a bind an attach handler made and then could not commit.
+    ///
+    /// For the mux only: its bind counts on the lane it was placed on, and
+    /// left to the 60 s accept window it would skew every unkeyed choice for
+    /// that peer meanwhile. The same release `prebind_anchor` makes when
+    /// nothing took its bind. It touches only the mux's own maps, so a caller
+    /// may hold an anchor registry entry. Other transports' binds keep their
+    /// own accept windows.
+    pub(crate) fn release_unused_bind(
+        &self,
+        key: &velo_ext::TransportKey,
+        anchor_id: u64,
+        session_id: u64,
+    ) {
+        if key.as_str() == crate::streaming::messenger_mux::MESSENGER_MUX_KEY
+            && let Some(mux) = self.mux.get()
+        {
+            mux.release_bind(anchor_id, session_id);
+        }
+    }
+
     /// Connect the transport the receiver's attach response named.
     ///
     /// The mux arm is why this is not just `resolve_transport(...).connect(...)`:

@@ -804,3 +804,63 @@ async fn an_unkeyed_attach_choice_takes_no_ingress_table_lock() {
 
     stream_through(sender, drain_first(anchor).await).await;
 }
+
+/// An attach that fails after its bind gives the bind and its lane back at
+/// once, on both attach handlers.
+///
+/// The failure arms after the bind (the anchor removed, attached, or
+/// pre-bound while the handler bound) are races: the mux bind does not await,
+/// so another thread must land in between. The bind hook plays that thread
+/// and removes the anchor. Left to the accept window, the bind would count on
+/// its lane for 60 s and skew every unkeyed choice for that peer meanwhile.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_attach_that_fails_after_its_bind_gives_its_lane_back() {
+    let (consumer, producer) = pair(4, 4).await;
+    let mux = consumer.mux();
+    let peer = producer.worker();
+    let manager = consumer.velo.anchor_manager();
+    let spsc = Arc::clone(&manager.registry);
+    let mpsc = Arc::clone(&manager.mpsc_registry);
+    assert!(
+        mux.core
+            .bind_hook
+            .set(Box::new(move |anchor_id| {
+                spsc.remove(&anchor_id);
+                mpsc.remove(&anchor_id);
+            }))
+            .is_ok()
+    );
+    let counted = || {
+        (
+            (0..4)
+                .map(|lane| mux.pending_binds_on(Some(peer), LaneIndex::new(lane)))
+                .sum::<usize>(),
+            mux.pending_binds(),
+            mux.parked_drains(),
+        )
+    };
+
+    let anchor = consumer.velo.create_anchor::<u32>();
+    let attached = producer
+        .velo
+        .attach_anchor::<u32>(transfer(anchor.handle()))
+        .await;
+    assert!(attached.is_err(), "the anchor was removed during the bind");
+    assert_eq!(
+        counted(),
+        (0, 0, 0),
+        "a failed SPSC attach must give back its lane count, its bind and its drain signal"
+    );
+
+    let anchor = consumer.velo.create_mpsc_anchor::<u32>();
+    let attached = producer
+        .velo
+        .attach_mpsc_anchor::<u32>(transfer(anchor.handle()))
+        .await;
+    assert!(attached.is_err(), "the anchor was removed during the bind");
+    assert_eq!(
+        counted(),
+        (0, 0, 0),
+        "a failed MPSC attach must give back its lane count, its bind and its drain signal"
+    );
+}

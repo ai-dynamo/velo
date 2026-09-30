@@ -258,6 +258,11 @@ struct MuxCore {
     /// tests that need one held mid-wake. See [`peer_batcher::test_hooks`].
     #[cfg(test)]
     hooks: std::sync::OnceLock<Arc<peer_batcher::test_hooks::TestHooks>>,
+    /// Runs at the end of [`MessengerMuxTransport::bind_on_lane`] with the
+    /// anchor id, so a test can land work between an attach handler's bind
+    /// and its commit. The mux bind does not await, so nothing else can.
+    #[cfg(test)]
+    bind_hook: std::sync::OnceLock<Box<dyn Fn(u64) + Send + Sync>>,
     /// Binds per lane that no `OpenSlot` has claimed yet, read when the next
     /// stream is placed ([`MessengerMuxTransport::choose_lane`]).
     lane_load: LaneLoad,
@@ -355,6 +360,8 @@ impl MessengerMuxTransport {
             bind_deadlines: std::sync::Mutex::default(),
             #[cfg(test)]
             hooks: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            bind_hook: std::sync::OnceLock::new(),
             lane_load: LaneLoad::default(),
         });
 
@@ -877,7 +884,12 @@ impl MessengerMuxTransport {
         session_id: u64,
         lane: LaneReservation,
     ) -> flume::Receiver<Vec<u8>> {
-        open_bind(&self.core, anchor_id, session_id, lane)
+        let receiver = open_bind(&self.core, anchor_id, session_id, lane);
+        #[cfg(test)]
+        if let Some(hook) = self.core.bind_hook.get() {
+            hook(anchor_id);
+        }
+        receiver
     }
 
     /// Give back a bind nobody claimed, along with the drain signal parked with
