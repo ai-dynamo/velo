@@ -106,6 +106,10 @@ impl TcpTransportBuilder {
     ///
     /// Only the dialing side's count matters: the listener accepts however
     /// many connections a peer opens, and reads each on its own task.
+    ///
+    /// Each lane costs a socket at each end, a reader task on the listening
+    /// side, and the send and receive buffers of one connection. `lanes(8)`
+    /// to 200 peers is 1,600 connections.
     pub fn lanes(mut self, lanes: u16) -> Self {
         self.lanes = NonZeroU16::new(lanes).unwrap_or(NonZeroU16::MIN);
         self

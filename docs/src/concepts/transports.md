@@ -65,7 +65,7 @@ With `TcpTransportBuilder::lanes(n)`, the dialer keeps up to `n` connections to 
 - **The listener needs no change.** The kernel gives each accepted connection its own socket, and the listener reads each connection on its own task. A peer can open as many lanes as it needs. Only the count on the dialing side matters.
 - **The health check counts any lane.** A caller can send on any lane, so a peer can have live connections with none on lane 0. `check_health` reports such a peer as healthy.
 
-A prototype with one connection per lane sent 64 KiB messages, pipelined, between two nodes. It used the `throughput` example on nodes of the same type as the [two-node table](../operations/quic-performance.md#two-nodes), and sent each message on the next lane in turn. Each cell has two reps. The NUMA node that the two processes run on changes the result by 1.3 to 1.6 times:
+A prototype with one connection per lane sent 64 KiB messages, pipelined, between two nodes. It used the `throughput` example on nodes of the same type as the [two-node table](../operations/quic-performance.md#two-nodes), and sent each message on the next lane in turn. The prototype was a patched build, not the code in the tree. The `throughput` example in the tree sends through the messenger, which uses lane 0 only, so it cannot repeat this measurement. Each cell has two reps. The NUMA node that the two processes run on changes the result by 1.3 to 1.6 times:
 
 | Lanes | Pinned to the NUMA node of the NIC (MiB/s) | Pinned to the other NUMA node (MiB/s) | Not pinned (MiB/s) |
 |---|---|---|---|
