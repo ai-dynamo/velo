@@ -70,6 +70,12 @@ impl QuicTransportBuilder {
     }
 
     /// The UDP address to bind (default `0.0.0.0:0`).
+    ///
+    /// With a fixed port `P`, the transport binds one server socket per
+    /// [`server_endpoints`](Self::server_endpoints), on ports `P` to
+    /// `P + n - 1`. Open all of them in a firewall: peers spread over them,
+    /// ordinary traffic included. Transports on one host need fixed ports at
+    /// least `n` apart.
     pub fn bind_addr(mut self, addr: SocketAddr) -> Self {
         self.bind_addr = Some(addr);
         self
@@ -105,14 +111,15 @@ impl QuicTransportBuilder {
         self
     }
 
-    /// Number of server sockets in the `SO_REUSEPORT` group (Linux only;
-    /// default 4, ignored elsewhere).
+    /// Number of server sockets, each on its own port (default 4, at least 1).
     ///
-    /// A node that many peers send to at once (a frontend) gains from more:
-    /// each socket has its own receive queue and buffer ceiling. Each socket
-    /// also costs a quinn endpoint and its receive buffers.
+    /// Each socket has its own quinn endpoint driver, receive queue and buffer
+    /// ceiling. A peer spreads its lanes evenly over the sockets. Measured with
+    /// 8 lanes, 4 sockets (two lanes each) moved as much as 8. Peers with one
+    /// lane each are spread over the sockets too. Each socket costs a port, a
+    /// quinn endpoint and its receive buffers.
     pub fn server_endpoints(mut self, count: usize) -> Self {
-        self.server_endpoints = count.max(1);
+        self.server_endpoints = count;
         self
     }
 
@@ -236,9 +243,14 @@ impl QuicTransportBuilder {
         server_config.transport_config(transport_config.clone());
 
         let endpoints = resolve_advertise_endpoints(bind_addr, &self.interface_filter)?;
+        let ports = server_sockets
+            .iter()
+            .map(|socket| socket.local_addr().map(|addr| addr.port()))
+            .collect::<std::io::Result<Vec<u16>>>()?;
         let info = QuicEndpointInfo {
             endpoints,
             fingerprint: identity.fingerprint,
+            ports,
         };
         let mut addr_builder = crate::transports::address::WorkerAddressBuilder::new();
         addr_builder.add_entry(key.clone(), info.encode()?)?;
@@ -266,6 +278,7 @@ impl QuicTransportBuilder {
             server_endpoints: OnceLock::new(),
             client_endpoints: OnceLock::new(),
             lanes: self.lanes,
+            lane_offset: super::lane_offset(&identity.fingerprint),
             local_interfaces: OnceLock::new(),
             numa_hint: self.numa_hint,
             metrics: OnceLock::new(),
@@ -280,9 +293,11 @@ impl Default for QuicTransportBuilder {
     }
 }
 
-/// Server sockets in the reuse-port group by default. Dynamo's QUIC plane
-/// measured 8 and 32 on a frontend; 32 cost about 50 MiB of RSS. A frontend
-/// sets a higher count with [`QuicTransportBuilder::server_endpoints`].
+/// Server sockets, each on its own port, by default. Measured across two nodes,
+/// 4 sockets carried 8 lanes of one peer at full rate. Each socket costs
+/// memory: Dynamo's QUIC plane measured about 50 MiB of RSS for 32. A node
+/// that many peers send to sets a higher count with
+/// [`QuicTransportBuilder::server_endpoints`].
 const DEFAULT_SERVER_ENDPOINTS: usize = 4;
 /// Largest packet size at which quinn's send batches still fit in one UDP
 /// datagram: 65507 bytes of UDP payload over quinn's 10-packet batch.

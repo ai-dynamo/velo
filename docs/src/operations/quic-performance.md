@@ -7,7 +7,7 @@ This chapter records what the QUIC transport costs against TCP, the settings tha
 | Builder method | Default | Effect |
 |---|---|---|
 | `lanes(n)` | 1 | Up to `n` connections to each peer, one for each lane used, each from its own UDP socket. Order holds within a lane only. See [Lanes](#lanes). |
-| `server_endpoints(n)` | 4 | Server sockets in the `SO_REUSEPORT` group (Linux). More sockets spread the receive load of many peers and many lanes. |
+| `server_endpoints(n)` | 4 | Server sockets, each on its own port. A dialer spreads its lanes evenly over them. See [Lanes](#lanes). |
 | `udp_buffer_sizes(recv, send)` | 8 MiB, 4 MiB | Requested socket buffers. The kernel clamps them to `net.core.rmem_max` and `net.core.wmem_max`, and the transport logs the clamp. |
 | `max_mtu(bytes)` | quinn's (1452) | Upper bound for path MTU discovery. Values above 6550 are lowered to 6550. |
 | `stream_receive_window(bytes)` | quinn's | Flow-control window for the stream. |
@@ -79,7 +79,7 @@ With `lanes(n)`, each peer gets up to `n` connections, one for each lane used, e
 
 The messenger sends its own traffic on lane 0. Only a caller that sends with `send_message_on_lane` uses the other lanes, so `lanes(n)` alone does not change the throughput of ordinary messages.
 
-Measured on 2026-09-29 across the same two nodes as above, 64 KiB messages pipelined, 20,000 messages per cell, two reps. A prototype, which is not in the tree, spread the messages round robin over the lanes, with the connection layout that `lanes(n)` builds. The receiving node had 32 server sockets.
+Measured on 2026-09-29 across the same two nodes as above, 64 KiB messages pipelined, 20,000 messages per cell, two reps. A prototype, which is not in the tree, spread the messages round robin over the lanes, with one connection per lane, each from its own UDP socket. The receiving node had 32 server sockets in one `SO_REUSEPORT` group.
 
 | Lanes | MiB/s |
 |---|---|
@@ -90,13 +90,28 @@ Measured on 2026-09-29 across the same two nodes as above, 64 KiB messages pipel
 
 The UDP receive-buffer error count stayed below 50 in each run, so the gain comes from more cores, not from more socket buffers. 64 B pipelined messages do not change with the lane count.
 
-The receiving node needs many more server sockets than there are lanes. The kernel hashes each connection to one socket of the reuse-port group, and two lanes on one socket share its endpoint driver. The table below used 8 lanes. It ran in a separate job on another pair of nodes, so its 32-socket row differs from the table above by run-to-run spread.
+Lanes on one server socket share its endpoint driver. So each server socket has its own port, and a dialer sends lane `k` to socket `(offset + k) % n`, which spreads its lanes evenly. The prototype instead put all server sockets on one port in a `SO_REUSEPORT` group, where the kernel hashes each connection to a socket at random, so some sockets carried three or four lanes and others none. The table below shows what that cost with 8 lanes. It ran in a separate job on another pair of nodes, so its 32-socket row differs from the table above by run-to-run spread.
 
-| Server sockets on the receiving node | MiB/s |
+| Server sockets in the reuse-port group | MiB/s |
 |---|---|
 | 4 | 3,326–4,014 |
 | 8 | 2,628 or 6,579, as the hash fell |
 | 32 | 6,463–6,526 |
+
+With one port for each socket, the lanes of one dialer are placed evenly, so fewer sockets do. Measured on 2026-09-29 across two nodes, 64 KiB messages pipelined, 20,000 messages per cell, two reps, with messages spread round robin over the lanes by a measurement build:
+
+| Lanes | Server sockets, one port each | MiB/s |
+|---|---|---|
+| 1 | 4 | 781–788 |
+| 4 | 4 | 2,984–3,055 |
+| 8 | 4 | 5,788–5,800 |
+| 8 | 8 | 5,542–5,878 |
+
+With 8 lanes, 4 sockets carry two lanes each and reach the same rate as 8 sockets. One lane is unchanged.
+
+A fixed `bind_addr` port `P` binds ports `P` to `P + n - 1`, one for each server socket. Peers spread over all of them, ordinary traffic included, so open all of them in a firewall. Transports on one host need fixed ports at least `n` apart.
+
+During a rolling upgrade, an old peer can dial a new node, and a new peer can dial an old node. A peer without per-socket ports dials only the first port of a new node, so until it upgrades it shares that socket with the other old peers.
 
 A TCP prototype with the same layout, one connection per lane, scaled too: 2.5, 4.6, 8.1 and 13.1 GB/s (10^9 bytes per second) with 1, 2, 4 and 8 lanes. One TCP connection is limited by its receiver: one reader task does the `recvmsg` copy, and the transport's fixed socket buffers cap the TCP window. The TCP transport does not implement lanes yet.
 
