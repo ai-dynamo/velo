@@ -111,10 +111,14 @@ pub(crate) struct LaneLoad {
     /// Binds with no peer (pre-binds, and binds through the bare
     /// `FrameTransport::bind`) not yet claimed, released or expired, per lane.
     local: [Arc<AtomicUsize>; MAX_LANES as usize],
-    /// Makes reading the loads and taking a reservation one step, so two
-    /// binds chosen at once cannot both read the same lane as least loaded.
-    /// Never taken in `LaneReservation::drop`.
-    choosing: Mutex<()>,
+    /// Makes reading the loads and taking a reservation one step for attach
+    /// binds, so two chosen at once cannot both read the same lane as least
+    /// loaded. Never taken in `LaneReservation::drop`.
+    choosing_attach: Mutex<()>,
+    /// The same for binds with no peer. Apart from `choosing_attach` because
+    /// an attach choice holds its lock while it reads slot tables, and a
+    /// pre-bind is on a frontend's per-request path and reads only atomics.
+    choosing_local: Mutex<()>,
 }
 
 impl LaneLoad {
@@ -134,8 +138,12 @@ impl LaneLoad {
         if let Some(key) = key {
             return self.reserve_on(peer, keyed_lane(key, lanes));
         }
-        let _choosing = self
-            .choosing
+        let choosing = if peer.is_some() {
+            &self.choosing_attach
+        } else {
+            &self.choosing_local
+        };
+        let _choosing = choosing
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let lane = least_loaded(lanes, |lane| match peer {
