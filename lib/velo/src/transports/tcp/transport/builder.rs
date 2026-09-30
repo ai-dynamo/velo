@@ -4,6 +4,7 @@
 //! [`TcpTransportBuilder`]: the transport's options and their defaults.
 
 use std::net::SocketAddr;
+use std::num::NonZeroU16;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -25,6 +26,7 @@ pub struct TcpTransportBuilder {
     numa_hint: Option<u32>,
     shrink_threshold: Option<usize>,
     socket_buffers: Option<usize>,
+    lanes: NonZeroU16,
 }
 
 impl TcpTransportBuilder {
@@ -40,6 +42,7 @@ impl TcpTransportBuilder {
             numa_hint: None,
             shrink_threshold: None,
             socket_buffers: Some(super::super::listener::DEFAULT_SOCKET_BUFFERS),
+            lanes: NonZeroU16::MIN,
         }
     }
 
@@ -108,6 +111,31 @@ impl TcpTransportBuilder {
     /// `None` does not undo it.
     pub fn socket_buffers(mut self, bytes: Option<usize>) -> Self {
         self.socket_buffers = bytes;
+        self
+    }
+
+    /// Lanes to each peer: up to this many connections, one for each lane
+    /// used, dialed on the first send on that lane (default 1, at least 1).
+    ///
+    /// One connection is limited by its receiver: one reader task does the
+    /// whole receive copy, and by default fixed socket buffers cap the TCP
+    /// window. Each lane is its own connection, read by its own task, so N
+    /// lanes spread that work over up to N cores. Order holds within a lane
+    /// only, so a caller that uses lanes must keep each ordered flow on one
+    /// lane (see `Transport::send_message_on_lane`).
+    /// `send_message` uses lane 0.
+    ///
+    /// Only the dialing side's count matters: the listener accepts however
+    /// many connections a peer opens, and reads each on its own task.
+    ///
+    /// Each lane costs a socket at each end, a writer task and a reader task
+    /// on the dialing side, a reader task on the listening side, and the send
+    /// and receive buffers of one connection. `channel_capacity` applies to
+    /// each lane. A lane stays open until its socket dies or `shutdown()`:
+    /// unlike QUIC, TCP has no idle close. `lanes(8)` to 200 peers is up to
+    /// 1,600 connections for the life of the transport.
+    pub fn lanes(mut self, lanes: u16) -> Self {
+        self.lanes = NonZeroU16::new(lanes).unwrap_or(NonZeroU16::MIN);
         self
     }
 
@@ -213,6 +241,7 @@ impl TcpTransportBuilder {
             transport.shrink_threshold = t;
         }
         transport.socket_buffers = self.socket_buffers;
+        transport.lanes = self.lanes;
         Ok(transport)
     }
 }

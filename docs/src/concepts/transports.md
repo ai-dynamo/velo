@@ -34,7 +34,7 @@ A `WorkerAddress` is a MessagePack map from `TransportKey` to endpoint bytes. Ea
 Every transport implements the `Transport` trait from `velo-ext`. The runtime relies on these rules:
 
 - **Sends do not wait for the wire.** `send_message` takes the frame and reports when it reached the send channel for the target. Failures after that point go to a `TransportErrorHandler` callback.
-- **Order holds per lane.** `lanes(target)` tells how many ordered channels the transport keeps to a peer. The default is 1. `send_message_on_lane` keeps order within one lane only, and `send_message` sends on lane 0. A lane never fails over to another lane's connection, because that would reorder it. The messenger sends its own traffic on lane 0, because ordered handlers need the messages of one peer on one lane. QUIC implements lanes. The other transports keep one lane.
+- **Order holds per lane.** `lanes(target)` tells how many ordered channels the transport keeps to a peer. The default is 1. `send_message_on_lane` keeps order within one lane only, and `send_message` sends on lane 0. A lane never fails over to another lane's connection, because that would reorder it. The messenger sends its own traffic on lane 0, because ordered handlers need the messages of one peer on one lane. QUIC and TCP implement lanes. The other transports keep one lane.
 - **Inbound frames go to four streams**: message, response, event, and shutdown. The `TransportAdapter` routes each frame to its stream.
 - **Admission owns the in-flight count.** Each inbound `MessageType::Message` goes through `TransportAdapter::admit_message`. See [Shutdown and drain](shutdown.md) for why a transport must not check `is_draining()` itself.
 - **Metrics use one handle.** The runtime gives each transport an observability handle through `set_observability`. In-tree and out-of-tree transports write the same `velo_transport_*` series.
@@ -72,9 +72,28 @@ On loopback, autotuning lost 10% for 64 KiB pipelined, gained 10 to 30% for 256 
 
 The old code set the sizes on the accepted socket, one task spawn after `accept`. By then the peer was already sending. On Linux, `SO_RCVBUF` at that point turns off receive autotuning and clamps the buffer to `net.core.rmem_max`. The advertised window then collapses for the life of the connection. Throughput fell about 100 times, to 22.9 MB/s, and the fault was racy, so it showed up in some runs only. The `tx_budget` example measures this path and guards against the fault.
 
+## TCP lanes
+
+With `TcpTransportBuilder::lanes(n)`, the dialer keeps up to `n` connections to each peer, one for each lane that it sends on, dialed on the first send on that lane. The default is 1. `send_message` uses lane 0, so ordinary traffic keeps one ordered channel for each peer. Each lane has its own send channel and admission gate. If the connection of a lane closes, the next send on that lane dials a new one. A lane never uses the connection of another lane, because that can reorder its messages.
+
+- **One connection is limited by its receiver.** On the receiving side, one reader task does the whole receive copy for a connection, and by default the fixed socket buffers cap the TCP window (see [Socket buffers](#socket-buffers-are-set-before-data-flows)). Lanes spread that work over more tasks and cores.
+- **The listener needs no change.** The kernel gives each accepted connection its own socket, and the listener reads each connection on its own task. A peer can open as many lanes as it needs. Only the count on the dialing side matters.
+- **The health check counts any lane.** A caller can send on any lane, so a peer can have live connections with none on lane 0. `check_health` reports such a peer as healthy.
+
+A prototype with one connection per lane sent 64 KiB messages, pipelined, between two nodes. It used the `throughput` example on nodes of the same type as the [two-node table](../operations/quic-performance.md#two-nodes), and sent each message on the next lane in turn. The prototype was a patched build, not the code in the tree. The `throughput` example in the tree sends through the messenger, which uses lane 0 only, so it cannot repeat this measurement. Each cell has two reps. The NUMA node that the two processes run on changes the result by 1.3 to 1.6 times:
+
+| Lanes | Pinned to the NUMA node of the NIC (MiB/s) | Pinned to the other NUMA node (MiB/s) | Not pinned (MiB/s) |
+|---|---|---|---|
+| 1 | 3,220–3,910 | 2,370–2,400 | 2,410–2,430 |
+| 2 | | | 4,370–4,500 |
+| 4 | 10,510–10,690 | 7,760–7,890 | 7,710–7,790 |
+| 8 | 16,830 (one rep) | | 12,420–12,520 |
+
+The 3,920 MiB/s for one TCP connection in the two-node table is at the top of the range for processes on the NUMA node of the NIC.
+
 ## QUIC
 
-The QUIC transport uses [quinn](https://github.com/quinn-rs/quinn). It has the same shape as TCP: one connection for each peer, lane and direction, dialed on the first send on that lane. With the default of one lane, that is one connection for each peer and direction, like TCP.
+The QUIC transport uses [quinn](https://github.com/quinn-rs/quinn). It has the same shape as TCP: one connection for each peer, lane and direction, dialed on the first send on that lane. With the default of one lane, that is one connection for each peer and direction.
 
 ```mermaid
 graph LR

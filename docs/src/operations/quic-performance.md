@@ -113,7 +113,7 @@ A fixed `bind_addr` port `P` binds ports `P` to `P + n - 1`, one for each server
 
 During a rolling upgrade, an old peer can dial a new node, and a new peer can dial an old node. A peer without per-socket ports dials only the first port of a new node, so until it upgrades it shares that socket with the other old peers.
 
-A TCP prototype with the same layout, one connection per lane, scaled too: 2.5, 4.6, 8.1 and 13.1 GB/s (10^9 bytes per second) with 1, 2, 4 and 8 lanes. One TCP connection is limited by its receiver: one reader task does the `recvmsg` copy, and by default the transport's fixed socket buffers cap the TCP window (see [Socket buffers](../concepts/transports.md#socket-buffers-are-set-before-data-flows)). The TCP transport does not implement lanes yet.
+A TCP prototype with the same layout, one connection per lane, scaled too: 2.5, 4.6, 8.1 and 13.1 GB/s (10^9 bytes per second) with 1, 2, 4 and 8 lanes. One TCP connection is limited by its receiver: one reader task does the `recvmsg` copy, and by default the transport's fixed socket buffers cap the TCP window (see [Socket buffers](../concepts/transports.md#socket-buffers-are-set-before-data-flows)). `TcpTransportBuilder::lanes(n)` builds the same layout. See [TCP lanes](../concepts/transports.md#tcp-lanes). These TCP numbers came from the prototype, not from that code.
 
 ## Batched streaming over QUIC
 
