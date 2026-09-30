@@ -916,10 +916,11 @@ async fn an_attach_that_fails_after_its_bind_gives_its_lane_back() {
 /// everything else to QUIC.
 ///
 /// A refused admission is the only send failure the mux batcher sees, and it
-/// fails the epoch of that (peer, lane). A connection that closes after
-/// admission is not reported to the batcher: QUIC and TCP dial the lane again
-/// on the next send, and the slots that lost records end through their
-/// stream watchdogs. So a refusal is the failure to inject here.
+/// fails the epoch of that (peer, lane). A connection close refuses only the
+/// batches still waiting for admission (`ConnectionReplaced`). It is not
+/// reported for batches already admitted: QUIC and TCP dial the lane again on
+/// the next send, and the slots that lost records end through their stream
+/// watchdogs. So a refusal is the failure to inject here.
 struct LaneFailing {
     inner: Arc<QuicTransport>,
     /// The lane to refuse, or `u16::MAX` for none.
