@@ -138,6 +138,8 @@ The new fields are last in each message, default to zero when absent, and are no
 
 The batch header repeats the lane. Ingress drops a batch whose header lane is not the lane of its handler, and counts its records as `lane_mismatch` in `velo_streaming_mux_records_dropped_total`. The slot ids of such a batch belong to another batcher, so applying them could feed or retire the wrong streams.
 
+Across two nodes over QUIC, 64 streams of 16 KiB items moved about 750 MiB/s on 1 lane and 5,300 MiB/s on 8 lanes. The setup and the full table are in [QUIC performance](../operations/quic-performance.md#streams-over-lanes).
+
 The per-peer limits are split evenly over the lanes of the peer: each table gets `peer_byte_budget / lanes` bytes and 65,536 / lanes slot indices. The byte share never goes below one `slot_byte_budget`, so one stream can always hold its full window.
 
 ### The batch size cap
