@@ -24,6 +24,7 @@ pub struct TcpTransportBuilder {
     interface_filter: InterfaceFilter,
     numa_hint: Option<u32>,
     shrink_threshold: Option<usize>,
+    socket_buffers: Option<usize>,
 }
 
 impl TcpTransportBuilder {
@@ -38,6 +39,7 @@ impl TcpTransportBuilder {
             interface_filter: InterfaceFilter::default(),
             numa_hint: None,
             shrink_threshold: None,
+            socket_buffers: Some(super::super::listener::DEFAULT_SOCKET_BUFFERS),
         }
     }
 
@@ -90,6 +92,25 @@ impl TcpTransportBuilder {
         self
     }
 
+    /// `SO_RCVBUF` and `SO_SNDBUF` for every TCP socket of the transport, or
+    /// `None` to leave the buffers to the kernel's autotuning. The default is
+    /// 2 MiB.
+    ///
+    /// An explicit size turns autotuning off, and Linux clamps it to
+    /// `net.core.rmem_max`/`wmem_max`: with the common value of 212,992, 2 MiB
+    /// becomes a locked buffer that caps the TCP window at about 208 KiB.
+    /// Autotuning grows the buffers up to `net.ipv4.tcp_rmem`/`tcp_wmem`
+    /// instead. `None` is faster for one-way bulk traffic across nodes. The
+    /// default is faster for request and reply. The Transports chapter of the
+    /// book has the measurements.
+    ///
+    /// A listener that the caller sized before `from_listener` keeps its size:
+    /// `None` does not undo it.
+    pub fn socket_buffers(mut self, bytes: Option<usize>) -> Self {
+        self.socket_buffers = bytes;
+        self
+    }
+
     /// Use a pre-bound TcpListener instead of binding to a specific address
     ///
     /// This is useful for tests where you want to bind to port 0 and get an OS-assigned
@@ -121,7 +142,7 @@ impl TcpTransportBuilder {
             // Caller-provided listener: it is already live, so this is best
             // effort — connections whose handshake completed before this point
             // keep kernel-default autotuned buffers, which is safe.
-            super::super::listener::size_listener_buffers(&listener);
+            super::super::listener::size_socket_buffers(&listener, self.socket_buffers);
             let addr = listener.local_addr()?;
             (addr, Some(listener))
         } else {
@@ -130,7 +151,7 @@ impl TcpTransportBuilder {
                 .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
             // Built by hand instead of std::net::TcpListener::bind so the
             // socket buffers are sized before listen() — accepted sockets
-            // inherit them at handshake time (see `size_listener_buffers`).
+            // inherit them at handshake time (see `size_socket_buffers`).
             let domain = if requested.is_ipv4() {
                 socket2::Domain::IPV4
             } else {
@@ -143,7 +164,7 @@ impl TcpTransportBuilder {
             socket
                 .set_reuse_address(true)
                 .context("Failed to set SO_REUSEADDR")?;
-            super::super::listener::size_listener_buffers(&socket);
+            super::super::listener::size_socket_buffers(&socket, self.socket_buffers);
             socket
                 .bind(&requested.into())
                 .context("Failed to pre-bind TCP listener")?;
@@ -191,6 +212,7 @@ impl TcpTransportBuilder {
         if let Some(t) = self.shrink_threshold {
             transport.shrink_threshold = t;
         }
+        transport.socket_buffers = self.socket_buffers;
         Ok(transport)
     }
 }
