@@ -45,13 +45,13 @@ pub(crate) use self::drain::DrainSignal;
 use self::reconcile::{collect_grants, collect_touched_grants, list_drained_slots};
 use self::slot::{Applied, IngressSlot, heartbeat_frame};
 use super::flow_control::ByteBudget;
-use super::lane_choice::LaneReservation;
+use super::lane_choice::{LaneCounts, LaneReservation};
 use super::peer_batcher::ReplyRecord;
 use super::protocol::{
     BatchDecoder, BatchHeader, CloseReason, Record, RecordBody, SlotId, batch_seq_gap,
     batch_seq_is_newer,
 };
-use super::{MuxConfig, PeerLane};
+use super::{LaneIndex, MuxConfig, PeerLane};
 use crate::observability::{MuxDirection, MuxDropReason, MuxMetricsHandle};
 
 /// Ceiling on the dense slot tables one peer may make this node allocate,
@@ -80,7 +80,8 @@ struct BindEntry {
     /// here, when an `OpenSlot` claims this bind.
     drain: Arc<DrainSignal>,
     /// The lane the consumer placed this bind on, counted toward that lane's
-    /// load until the bind leaves this table by any path.
+    /// load until the bind leaves this table by any path. A claim hands the
+    /// count over to the slot's own, on the lane the `OpenSlot` arrived on.
     _lane: LaneReservation,
 }
 
@@ -122,6 +123,13 @@ pub(crate) struct IngressRegistry {
     /// only be removed under the same visibility that retires slots and binds,
     /// and until that is worth building, unbounded-but-tiny is the honest trade.
     drain_pending: DashMap<PeerLane, Arc<AtomicBool>>,
+    /// Live slots per lane, summed over every peer.
+    ///
+    /// Each [`IngressSlot`] holds one count on its arrival lane, so no retire
+    /// path can forget it. A pre-bind does not know its peer and reads this to
+    /// place its stream; summing the tables instead would lock every
+    /// (peer, lane) table on a frontend's per-request path.
+    live: LaneCounts,
 }
 
 /// Receive-side state for one (peer, lane).
@@ -393,6 +401,11 @@ impl IngressRegistry {
         self.peers
             .get(&key)
             .map_or(0, |entry| lock(entry.value()).live())
+    }
+
+    /// Live receive-side slots on `lane`, from every peer.
+    pub(crate) fn live_on_lane(&self, lane: LaneIndex) -> usize {
+        self.live.get(lane)
     }
 
     /// Every (peer, lane) with receive-side state, for the credit sweep.
@@ -811,8 +824,13 @@ fn open_slot(
         Arc::clone(&state.dirty),
     );
 
+    // Counted before `bind` drops at the end of this function, so the stream
+    // is counted twice for a moment rather than not at all. On the arrival
+    // lane, not the lane the bind was placed on: a sender with fewer lanes
+    // clamps, and the arrival lane is where the stream's load is.
     let mut slot = IngressSlot::new(
         id,
+        ctx.registry.live.take(ctx.key.lane),
         bind.frame_tx.clone(),
         Arc::clone(&bind.drain),
         ctx.config.initial_credit,

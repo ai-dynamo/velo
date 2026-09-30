@@ -1895,3 +1895,77 @@ fn a_table_refuses_slots_past_its_lane_share() {
     let outcome = handle_batch(&registry, &config, None, peer(), &payload, four);
     assert_eq!(outcome.opened, 1);
 }
+
+/// The node's live count per lane matches the slots in its tables after every
+/// way a slot opens or leaves.
+///
+/// Unkeyed pre-binds are placed by this count, read without locking any
+/// table. Each slot holds its own count, so the two can drift only if a slot
+/// is kept somewhere after it leaves its table, or a count is taken with no
+/// slot behind it. The steps cover each exit (a duplicate open, a cancel that
+/// lands before the claim, a close from the consumer side, a new epoch, and
+/// shutdown) on two peers and two lanes.
+#[test]
+fn the_live_count_per_lane_matches_the_slot_tables() {
+    let config = config();
+    let registry = IngressRegistry::default();
+    let a0 = peer();
+    let a1 = PeerLane::new(a0.peer, LaneIndex::new(1));
+    let b1 = PeerLane::new(WorkerId::from_u64(PEER + 1), LaneIndex::new(1));
+    let consumers: Vec<Consumer> = (1..=6)
+        .map(|session| register(&registry, &config, session))
+        .collect();
+    let open_on = |key: PeerLane, epoch: u64, batch_seq: u32, id: SlotId, session: u64| {
+        let payload = batch_on(key.lane, epoch, batch_seq, |encoder| {
+            encoder.push_open_slot(id, 0, ANCHOR, session).unwrap();
+        });
+        handle_batch(&registry, &config, None, key, &payload, one_lane)
+    };
+    let counts = || {
+        [LaneIndex::ZERO, LaneIndex::new(1)].map(|lane| {
+            let in_tables: usize = [a0, a1, b1]
+                .into_iter()
+                .filter(|key| key.lane == lane)
+                .map(|key| registry.live_slots(key))
+                .sum();
+            (registry.live_on_lane(lane), in_tables)
+        })
+    };
+
+    open_on(a0, 1, 0, slot(0, 0), 1);
+    open_on(a1, 5, 0, slot(0, 0), 2);
+    open_on(b1, 7, 0, slot(0, 0), 3);
+    open_on(b1, 7, 1, slot(1, 0), 4);
+    assert_eq!(counts(), [(1, 1), (3, 3)], "after the opens");
+
+    // The same id opens again on a0: the incumbent retires, the new one opens.
+    let outcome = open_on(a0, 1, 1, slot(0, 0), 5);
+    assert_eq!((outcome.opened, outcome.closed), (1, 1));
+    assert_eq!(counts(), [(1, 1), (3, 3)], "after a duplicate open");
+
+    // The consumer cancels before the `OpenSlot` lands: the slot opens and
+    // closes in one pass.
+    assert_eq!(consumers[5].drain.cancel(), None);
+    let outcome = open_on(b1, 7, 2, slot(2, 0), 6);
+    assert_eq!((outcome.opened, outcome.closed), (1, 1));
+    assert_eq!(
+        counts(),
+        [(1, 1), (3, 3)],
+        "after a cancel before the claim"
+    );
+
+    assert!(
+        registry
+            .close_consumer_gone(b1, slot(1, 0), None, None)
+            .is_some()
+    );
+    assert_eq!(counts(), [(1, 1), (2, 2)], "after a consumer-side close");
+
+    let payload = batch_on(a1.lane, 6, 0, |_| {});
+    let outcome = handle_batch(&registry, &config, None, a1, &payload, one_lane);
+    assert_eq!(outcome.closed, 1);
+    assert_eq!(counts(), [(1, 1), (1, 1)], "after a new epoch on a1");
+
+    assert_eq!(registry.shutdown(), 2);
+    assert_eq!(counts(), [(0, 0), (0, 0)], "after shutdown");
+}

@@ -89,24 +89,24 @@ fn live_per_lane(mux: &MessengerMuxTransport, peer: velo_ext::WorkerId, lanes: u
 async fn pair(consumer_lanes: u16, producer_lanes: u16) -> (Node, Node) {
     let consumer = Node::new(consumer_lanes).await;
     let producer = Node::new(producer_lanes).await;
-    consumer
-        .velo
-        .register_peer(producer.velo.peer_info())
-        .expect("register producer on consumer");
-    producer
-        .velo
-        .register_peer(consumer.velo.peer_info())
-        .expect("register consumer on producer");
-    for (node, peer) in [
-        (&producer, consumer.velo.instance_id()),
-        (&consumer, producer.velo.instance_id()),
-    ] {
+    connect(&consumer, &producer).await;
+    (consumer, producer)
+}
+
+/// Make `a` and `b` peers of each other and wait for their control planes.
+async fn connect(a: &Node, b: &Node) {
+    a.velo
+        .register_peer(b.velo.peer_info())
+        .expect("register b on a");
+    b.velo
+        .register_peer(a.velo.peer_info())
+        .expect("register a on b");
+    for (node, peer) in [(b, a.velo.instance_id()), (a, b.velo.instance_id())] {
         tokio::time::timeout(BOUND, node.velo.wait_for_handler(peer, "_anchor_attach"))
             .await
             .expect("timed out waiting for the peer's control plane")
             .expect("peer never advertised the handler");
     }
-    (consumer, producer)
 }
 
 fn transfer(handle: StreamAnchorHandle) -> StreamAnchorHandle {
@@ -436,14 +436,15 @@ async fn a_finished_stream_frees_its_lane_for_the_next_attach() {
     }
 }
 
-/// Pre-binds spread by this node's own unclaimed pre-binds, and a lane's
-/// count falls when its bind is claimed, released or expired.
+/// Pre-binds spread by this node's unclaimed pre-binds and live slots. A
+/// claim moves a stream's count from pending to its live slot, and a release
+/// or an expiry gives the count back.
 ///
-/// No peer is known at pre-bind, so the count is the only input. Each step
-/// frees one lane while the others stay held, so the next pre-bind landing
-/// there proves that exit gave the count back.
+/// No peer is known at pre-bind, so these counts are the only input. The
+/// release step frees one lane while the others stay held, so the next
+/// pre-bind landing there proves the release gave the count back.
 #[tokio::test(flavor = "multi_thread")]
-async fn pre_binds_spread_and_give_their_lane_back_on_claim_release_and_expiry() {
+async fn pre_binds_spread_and_give_their_lane_back_on_release_and_expiry() {
     let (consumer, producer) = pair(4, 4).await;
     let consumer_mux = consumer.mux();
     let pending = |lane: u16| consumer_mux.pending_binds_on(None, LaneIndex::new(lane));
@@ -477,13 +478,19 @@ async fn pre_binds_spread_and_give_their_lane_back_on_claim_release_and_expiry()
         consumer_mux.live_ingress_slots(PeerLane::new(producer.worker(), LaneIndex::new(2))) == 1
     })
     .await;
-    assert_eq!(pending(2), 0, "a claimed pre-bind must stop counting");
+    assert_eq!(
+        pending(2),
+        0,
+        "a claimed pre-bind must stop counting as pending"
+    );
+    // Lane 2 is still counted by its live slot, so all four lanes hold one
+    // and the tie goes to lane 0.
     let after_claim = consumer.velo.create_anchor::<u32>();
     let ticket = consumer
         .velo
         .prebind_anchor(after_claim.handle())
         .expect("ticket");
-    assert_eq!(ticket.lane, 2);
+    assert_eq!(ticket.lane, 0, "a live slot must keep its lane counted");
     anchors.push(after_claim);
 
     // Release: the anchor pre-bound on lane 1 is dropped before any sender
@@ -499,11 +506,95 @@ async fn pre_binds_spread_and_give_their_lane_back_on_claim_release_and_expiry()
     anchors.push(after_release);
 
     // Expiry: the accept window closes on every unclaimed pre-bind.
-    assert_eq!((0..4).map(pending).collect::<Vec<_>>(), [1, 1, 1, 1]);
+    assert_eq!((0..4).map(pending).collect::<Vec<_>>(), [2, 1, 0, 1]);
     consumer_mux.expire_all_binds();
     assert_eq!((0..4).map(pending).collect::<Vec<_>>(), [0, 0, 0, 0]);
 
     stream_through(sender, drain_first(claimed).await).await;
+}
+
+/// Pre-bound streams that are claimed and still live keep their lane counted,
+/// so later unkeyed pre-binds go to other lanes.
+///
+/// This is the frontend's pattern: it mints a ticket per request, a worker
+/// opens it within milliseconds, and the stream then lives for seconds. A
+/// count that fell at the claim would show every lane empty at almost every
+/// pre-bind, and nearly all streams would pile onto lane 0. Here each ticket
+/// is opened and its slot is live before the next is minted, so no pre-bind is
+/// ever pending when the next one chooses.
+///
+/// The tickets are opened by two producers in turn. A pre-bind does not know
+/// which peer will open it, so the count is the node's live slots on the lane
+/// from every peer, not one peer's.
+#[tokio::test(flavor = "multi_thread")]
+async fn claimed_pre_binds_keep_their_lane_counted_while_their_streams_live() {
+    let consumer = Node::new(4).await;
+    let producers = [Node::new(4).await, Node::new(4).await];
+    for producer in &producers {
+        connect(&consumer, producer).await;
+    }
+    let consumer_mux = consumer.mux();
+    let live_on_node = || -> Vec<usize> {
+        (0..4)
+            .map(|lane| {
+                producers
+                    .iter()
+                    .map(|producer| {
+                        consumer_mux.live_ingress_slots(PeerLane::new(
+                            producer.worker(),
+                            LaneIndex::new(lane),
+                        ))
+                    })
+                    .sum()
+            })
+            .collect()
+    };
+
+    let mut streams = Vec::new();
+    for n in 0..8 {
+        let anchor = consumer.velo.create_anchor::<u32>();
+        let ticket = consumer
+            .velo
+            .prebind_anchor(anchor.handle())
+            .expect("ticket");
+        let lane = ticket.lane;
+        let sender = producers[n % 2]
+            .velo
+            .open_anchor_stream::<u32>(transfer(anchor.handle()), ticket)
+            .await
+            .expect("open from ticket");
+        sender.send(u32::MAX).await.expect("first send");
+        eventually("the ticket's slot to open", || {
+            live_on_node().iter().sum::<usize>() == n + 1
+        })
+        .await;
+        streams.push((lane, sender, anchor));
+    }
+    assert_eq!(
+        live_on_node(),
+        [2, 2, 2, 2],
+        "pre-binds must spread by the node's live slots, not only its pending pre-binds"
+    );
+
+    // A finished stream gives its lane back: the next pre-bind takes it.
+    let finished = streams
+        .iter()
+        .position(|(lane, _, _)| *lane == 2)
+        .expect("a stream on lane 2");
+    let (_, sender, anchor) = streams.remove(finished);
+    stream_through(sender, drain_first(anchor).await).await;
+    eventually("lane 2's slot to retire", || live_on_node() == [2, 2, 1, 2]).await;
+    let next = consumer.velo.create_anchor::<u32>();
+    let ticket = consumer.velo.prebind_anchor(next.handle()).expect("ticket");
+    assert_eq!(ticket.lane, 2);
+
+    let finished =
+        futures::future::join_all(streams.into_iter().map(|(_, sender, anchor)| async move {
+            stream_through(sender, drain_first(anchor).await).await
+        }));
+    tokio::time::timeout(BOUND, finished)
+        .await
+        .expect("streams finished");
 }
 
 /// Streams with one key share a lane; streams with keys on different lanes

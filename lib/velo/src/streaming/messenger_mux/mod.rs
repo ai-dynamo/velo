@@ -800,7 +800,8 @@ impl MessengerMuxTransport {
     }
 
     /// Place the next stream bound on this node on a lane, and count it there
-    /// until its bind is claimed, released or expired.
+    /// until its bind is claimed, released or expired. Once claimed, the
+    /// stream counts on its lane as a live slot until the slot retires.
     ///
     /// The lane is answered in the attach response or quoted in the ticket,
     /// and the sender follows it, clamped to its own lanes
@@ -824,7 +825,10 @@ impl MessengerMuxTransport {
         let ingress = &self.core.ingress;
         self.core
             .lane_load
-            .reserve(peer, key, lanes, |key| ingress.live_slots(key))
+            .reserve(peer, key, lanes, |peer, lane| match peer {
+                Some(peer) => ingress.live_slots(PeerLane::new(peer, lane)),
+                None => ingress.live_on_lane(lane),
+            })
     }
 
     /// Binds on `lane` not yet claimed, released or expired: from `peer`'s

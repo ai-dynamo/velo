@@ -27,6 +27,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
 use super::super::flow_control::{ByteBudget, CreditClass, SlotCreditAccount, try_reserve_pair};
+use super::super::lane_choice::LaneReservation;
 use super::super::protocol::{CloseReason, RecordType, SlotId};
 use super::DrainSignal;
 use crate::streaming::sender::{cached_dropped, cached_heartbeat, is_terminal_sentinel};
@@ -55,6 +56,9 @@ pub(super) struct IngressSlot {
     pub(super) session_id: u64,
     /// Index and generation this slot answers to.
     pub(super) id: SlotId,
+    /// This slot's count on its lane, for placing unkeyed pre-binds. Given
+    /// back when the slot drops, by whichever path retires it.
+    _lane: LaneReservation,
     /// The mux-owned `C + 1`-deep buffer handed to the anchor by `bind`.
     frame_tx: flume::Sender<Vec<u8>>,
     /// The signal this slot's consumer counts its drains on (the
@@ -122,6 +126,7 @@ impl IngressSlot {
     /// Open a slot against the buffer `bind` created, granting `initial_credit`.
     pub(super) fn new(
         id: SlotId,
+        lane: LaneReservation,
         frame_tx: flume::Sender<Vec<u8>>,
         drain: Arc<DrainSignal>,
         initial_credit: u32,
@@ -131,6 +136,7 @@ impl IngressSlot {
         Self {
             session_id: 0,
             id,
+            _lane: lane,
             frame_tx,
             drain,
             account: SlotCreditAccount::new(initial_credit),

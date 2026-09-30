@@ -12,12 +12,18 @@
 //! - Without a key, the lane is the one with the least load, ties to the
 //!   lowest index. On attach the peer is known and the load of lane k is that
 //!   peer's live slots on k plus its binds on k that no `OpenSlot` has claimed
-//!   yet. On pre-bind no peer is known and the load of lane k is the pre-binds
-//!   on k that are not yet claimed, released or expired.
+//!   yet. On pre-bind no peer is known and the load of lane k is this node's
+//!   live slots on k from every peer, plus the pre-binds on k that are not yet
+//!   claimed, released or expired.
 //!
 //! Unclaimed binds count because an `OpenSlot` arrives only with the sender's
 //! first batch. Attaches answered before any of their senders sent would all
 //! see zero live slots and all land on lane 0.
+//!
+//! Live slots count for pre-binds because a frontend's tickets are claimed
+//! within milliseconds and their streams then live for seconds. Counting only
+//! unclaimed pre-binds would show every lane empty at almost every choice, and
+//! nearly every stream would go to lane 0.
 
 use std::num::NonZeroU16;
 use std::sync::Arc;
@@ -60,13 +66,15 @@ fn least_loaded(lanes: NonZeroU16, load: impl Fn(LaneIndex) -> usize) -> LaneInd
         .unwrap_or(LaneIndex::ZERO)
 }
 
-/// One bind's claim on a lane, counted until the bind leaves the table.
+/// One bind's or one live slot's claim on a lane, counted until its holder
+/// goes.
 ///
-/// Held by the bind itself, so every way a bind can leave (claimed by an
-/// `OpenSlot`, released by its owner, expired by the accept window, cleared at
-/// shutdown) gives the count back through `Drop`, and none can forget to.
-/// `Drop` only decrements an atomic. The claim path drops a bind while it
-/// holds a slot table's mutex, and the choice reads slot tables, so taking a
+/// Held by the bind or the slot itself, so every way it can leave (a bind
+/// claimed by an `OpenSlot`, released by its owner, expired by the accept
+/// window, cleared at shutdown; a slot closed, retired with its epoch, or torn
+/// down) gives the count back through `Drop`, and none can forget to. `Drop`
+/// only decrements an atomic. Binds and slots are dropped while a slot
+/// table's mutex is held, and the attach choice reads slot tables, so taking a
 /// lock here could deadlock against it.
 #[derive(Debug)]
 pub(crate) struct LaneReservation {
@@ -98,6 +106,22 @@ impl Drop for LaneReservation {
     }
 }
 
+/// A count per lane, shared with the reservations taken on it.
+#[derive(Default)]
+pub(crate) struct LaneCounts([Arc<AtomicUsize>; MAX_LANES as usize]);
+
+impl LaneCounts {
+    /// Count one more on `lane` until the returned reservation drops.
+    pub(crate) fn take(&self, lane: LaneIndex) -> LaneReservation {
+        LaneReservation::take(lane, Arc::clone(&self.0[usize::from(lane.get())]))
+    }
+
+    /// The reservations on `lane` not yet dropped.
+    pub(crate) fn get(&self, lane: LaneIndex) -> usize {
+        self.0[usize::from(lane.get())].load(Ordering::Relaxed)
+    }
+}
+
 /// Unclaimed binds per lane, the part of lane load that no slot table shows.
 #[derive(Default)]
 pub(crate) struct LaneLoad {
@@ -110,7 +134,7 @@ pub(crate) struct LaneLoad {
     attach: DashMap<PeerLane, Arc<AtomicUsize>>,
     /// Binds with no peer (pre-binds, and binds through the bare
     /// `FrameTransport::bind`) not yet claimed, released or expired, per lane.
-    local: [Arc<AtomicUsize>; MAX_LANES as usize],
+    local: LaneCounts,
     /// Makes reading the loads and taking a reservation one step for attach
     /// binds, so two chosen at once cannot both read the same lane as least
     /// loaded. Never taken in `LaneReservation::drop`.
@@ -126,14 +150,15 @@ impl LaneLoad {
     ///
     /// `peer` is the sender when an attach names it, `None` for a pre-bind.
     /// `lanes` is how many mux lanes this node keeps to `peer` (or to any peer,
-    /// for a pre-bind). `live` is `peer`'s live slots on a lane; it is not
-    /// read for a keyed bind or when `peer` is `None`.
+    /// for a pre-bind). `live(peer, lane)` is the live slots on `lane` from
+    /// `peer`, or from every peer when `peer` is `None`; it is not read for a
+    /// keyed bind.
     pub(crate) fn reserve(
         &self,
         peer: Option<WorkerId>,
         key: Option<u64>,
         lanes: NonZeroU16,
-        live: impl Fn(PeerLane) -> usize,
+        live: impl Fn(Option<WorkerId>, LaneIndex) -> usize,
     ) -> LaneReservation {
         if let Some(key) = key {
             return self.reserve_on(peer, keyed_lane(key, lanes));
@@ -146,19 +171,24 @@ impl LaneLoad {
         let _choosing = choosing
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let lane = least_loaded(lanes, |lane| match peer {
-            Some(peer) => {
-                let key = PeerLane::new(peer, lane);
-                live(key) + self.pending(Some(peer), lane)
-            }
-            None => self.pending(None, lane),
-        });
-        LaneReservation::take(lane, self.counter(peer, lane))
+        let lane = least_loaded(lanes, |lane| live(peer, lane) + self.pending(peer, lane));
+        self.reserve_on(peer, lane)
     }
 
     /// Count one bind on a lane already decided.
     pub(crate) fn reserve_on(&self, peer: Option<WorkerId>, lane: LaneIndex) -> LaneReservation {
-        LaneReservation::take(lane, self.counter(peer, lane))
+        match peer {
+            Some(peer) => LaneReservation::take(
+                lane,
+                Arc::clone(
+                    self.attach
+                        .entry(PeerLane::new(peer, lane))
+                        .or_default()
+                        .value(),
+                ),
+            ),
+            None => self.local.take(lane),
+        }
     }
 
     /// Binds on `lane` that are counted and not yet claimed, released or
@@ -169,19 +199,7 @@ impl LaneLoad {
                 .attach
                 .get(&PeerLane::new(peer, lane))
                 .map_or(0, |count| count.load(Ordering::Relaxed)),
-            None => self.local[usize::from(lane.get())].load(Ordering::Relaxed),
-        }
-    }
-
-    fn counter(&self, peer: Option<WorkerId>, lane: LaneIndex) -> Arc<AtomicUsize> {
-        match peer {
-            Some(peer) => Arc::clone(
-                self.attach
-                    .entry(PeerLane::new(peer, lane))
-                    .or_default()
-                    .value(),
-            ),
-            None => Arc::clone(&self.local[usize::from(lane.get())]),
+            None => self.local.get(lane),
         }
     }
 }
@@ -231,7 +249,7 @@ mod tests {
         }
         let load = LaneLoad::default();
         let held: Vec<_> = (0..8)
-            .map(|_| load.reserve(None, None, lanes(1), |_| 0))
+            .map(|_| load.reserve(None, None, lanes(1), |_, _| 0))
             .collect();
         assert!(held.iter().all(|r| r.lane() == LaneIndex::ZERO));
     }
@@ -241,7 +259,7 @@ mod tests {
     fn pre_binds_go_to_the_least_loaded_lane_and_give_it_back_on_drop() {
         let load = LaneLoad::default();
         let mut held: Vec<_> = (0..8)
-            .map(|_| load.reserve(None, None, lanes(4), |_| 0))
+            .map(|_| load.reserve(None, None, lanes(4), |_, _| 0))
             .collect();
         let placed: Vec<u16> = held.iter().map(|r| r.lane().get()).collect();
         assert_eq!(placed, [0, 1, 2, 3, 0, 1, 2, 3]);
@@ -249,7 +267,7 @@ mod tests {
         // Give back one on lane 2.
         drop(held.remove(2));
         assert_eq!(load.pending(None, LaneIndex::new(2)), 1);
-        let next = load.reserve(None, None, lanes(4), |_| 0);
+        let next = load.reserve(None, None, lanes(4), |_, _| 0);
         assert_eq!(next.lane(), LaneIndex::new(2));
 
         drop(held);
@@ -266,7 +284,9 @@ mod tests {
         let peer = WorkerId::from_u64(7);
         let other = WorkerId::from_u64(8);
         // Lane 0 has two live slots from `peer`.
-        let live = |key: PeerLane| usize::from(key.peer == peer && key.lane == LaneIndex::ZERO) * 2;
+        let live = |from: Option<WorkerId>, lane: LaneIndex| {
+            usize::from(from == Some(peer) && lane == LaneIndex::ZERO) * 2
+        };
         // Another peer's binds do not move this peer's choice.
         let _others: Vec<_> = (0..4)
             .map(|_| load.reserve(Some(other), Some(3), lanes(4), live))
@@ -282,13 +302,37 @@ mod tests {
         );
     }
 
+    /// On pre-bind, the node's live slots on a lane and its unclaimed
+    /// pre-binds both count.
+    ///
+    /// A claimed pre-bind stops counting as pending, and its stream counts as
+    /// a live slot instead for as long as it lives. Without the live term a
+    /// node whose pre-binds are all claimed would read every lane as empty.
+    #[test]
+    fn pre_binds_count_the_nodes_live_slots_and_unclaimed_pre_binds() {
+        let load = LaneLoad::default();
+        // Live slots on the node, from any peer: lanes 0 and 1 hold two each,
+        // lane 2 holds one.
+        let live = |from: Option<WorkerId>, lane: LaneIndex| {
+            assert_eq!(from, None, "a pre-bind reads the node's count");
+            [2, 2, 1, 0][usize::from(lane.get())]
+        };
+        let first = load.reserve(None, None, lanes(4), live);
+        let second = load.reserve(None, None, lanes(4), live);
+        let third = load.reserve(None, None, lanes(4), live);
+        assert_eq!(
+            [first.lane(), second.lane(), third.lane()].map(LaneIndex::get),
+            [3, 2, 3]
+        );
+    }
+
     /// A keyed bind is counted too, so unkeyed binds route around it.
     #[test]
     fn a_keyed_bind_counts_toward_its_lane() {
         let load = LaneLoad::default();
-        let keyed = load.reserve(None, Some(3), lanes(4), |_| 0);
+        let keyed = load.reserve(None, Some(3), lanes(4), |_, _| 0);
         assert_eq!(keyed.lane(), keyed_lane(3, lanes(4)));
-        let unkeyed = load.reserve(None, None, lanes(4), |_| 0);
+        let unkeyed = load.reserve(None, None, lanes(4), |_, _| 0);
         assert_ne!(unkeyed.lane(), keyed.lane());
     }
 }
