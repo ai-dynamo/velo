@@ -221,32 +221,14 @@ impl BatchWriter {
     /// caller fences the one slot involved and watches the admission from a
     /// detached task.
     ///
-    /// Both ways out without a send give the reserved sequence back, so this
-    /// call's own reservation never leaks — whatever a caller does with the
-    /// `Option<FireResult>` it gets back. That does not, by itself, keep the
-    /// wire contiguous against a *separate* reservation a caller holds open
-    /// across this call: `emit_data`'s clamp-retry path calls `ensure_batch`
-    /// (reserving a sequence for a fresh, still-empty encoder) and can in
-    /// principle fall through to this method without flushing it first, which
-    /// would leave that encoder's sequence to be refunded later out of order
-    /// and read at the receiver as a hole followed by a duplicate. It cannot
-    /// today: that fallthrough needs [`Self::compute_cap`] to shrink between
-    /// the two `ensure_batch` calls in one `emit_data` invocation, and
-    /// [`batch_cap`]'s own doc records that the eager term never binds
-    /// end-to-end for any transport in this workspace. So this is a caller
-    /// discipline the writer cannot enforce by itself — held today by that
-    /// arithmetic fact about `emit_data`, not by construction here.
+    /// Both ways out without a send give this call's reserved sequence back.
+    /// Callers must flush any staged batch first, including an empty batch
+    /// opened before a refreshed eager budget routes a record here. Otherwise
+    /// its reserved sequence would become a gap ahead of this singleton.
     ///
-    /// Every caller flushes immediately before reaching here, so `self.buffer`
-    /// is free capacity the last flush handed back — take it the way
-    /// `ensure_batch` does, rather than allocating a fresh `BytesMut`, so the
-    /// path this flag adds costs no more per open than the awaited one did.
-    /// The one caller that does not arrive with `self.buffer` free is
-    /// `emit_data`'s clamp-retry arm, which re-opens an encoder (and so
-    /// re-takes the buffer into it) before learning the record still does not
-    /// fit; a staged `self.encoder` is how that case is told apart, and it
-    /// falls back to a fresh allocation because the buffer is already spoken
-    /// for.
+    /// The previous flush returns spare buffer capacity for this write. The
+    /// fallback allocation keeps this helper from taking a live encoder's
+    /// buffer if another internal caller is added later.
     pub(super) fn dispatch_singleton(
         &mut self,
         write: impl FnOnce(&mut BatchEncoder) -> Result<(), EncodeError>,
