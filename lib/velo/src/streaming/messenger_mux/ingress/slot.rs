@@ -425,13 +425,14 @@ fn fault_reason(fault: &DeliverFault) -> Applied {
 ///
 /// A heartbeat is a `Data`-class record on purpose: dropping one under
 /// saturation *is* the per-slot saturation signal the stream watchdog's
-/// `DETECTION_MULTIPLIER` watches for, and it is the only thing a streaming beat
-/// still uniquely carries now that the Messenger detects process, host and
-/// connection death itself. The watchdog charges only a window with no
-/// arrivals from a sender that still held data credit, so the saturation it
-/// sees is upstream of the consumer (the producer's egress or the peer link),
-/// not a consumer that has fallen behind: that consumer leaves its sender
-/// without credit, and the watchdog exempts it.
+/// `DETECTION_MULTIPLIER` watches for, and the batcher's peer health check
+/// cannot see it. The watchdog also ends a slot behind a batch that a
+/// connection close lost after admission, which nothing reports to the mux:
+/// the records after the gap wait in the hold. The watchdog charges only a
+/// window with no arrivals from a sender that still held data credit, so the
+/// saturation it sees is upstream of the consumer (the producer's egress or
+/// the peer link), not a consumer that has fallen behind: that consumer leaves
+/// its sender without credit, and the watchdog exempts it.
 pub(super) fn heartbeat_frame() -> Vec<u8> {
     cached_heartbeat().clone()
 }

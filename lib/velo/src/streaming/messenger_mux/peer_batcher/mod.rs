@@ -555,16 +555,15 @@ impl Batcher {
     /// a singleton's resolution carries the `SlotId` it was sent under, and a
     /// close-then-reopen recycles that dense index under a new generation while
     /// the resolution is still in flight. Acting on a stale failure would fail
-    /// the epoch — every live slot on the peer — over a stream that ended
+    /// the epoch — every live slot on the (peer, lane) — over a stream that ended
     /// cleanly before the answer arrived.
     async fn on_owned_control(&mut self, slot: SlotId, entry: OwnedControl) {
         if self.slots.get_mut_checked(slot).is_none() {
             // The slot is gone, so there is no `frame_seq` gap left to protect:
             // its records are nobody's problem and its consumer has already
-            // been told. If the admission failed for a connection-level reason
-            // rather than a slot-level one, the very next batch to this peer
-            // meets the same failure and fails the epoch then — deferring to
-            // that signal costs a batch and loses nothing.
+            // been told. A lane that refuses everything refuses the next batch
+            // too and fails the epoch then, and a lane the transport dialed
+            // again takes it. Either way deferring costs a batch, loses nothing.
             if entry.singleton == Some(false)
                 && let Some(metrics) = &self.metrics
             {
@@ -964,12 +963,12 @@ impl Batcher {
     async fn flush(&mut self) {
         self.gate.cleared();
         // Whatever credit this batch carries goes with the write either way.
-        // Admitted, it is the peer's. Refused, it dies with the epoch the
-        // refusal kills, and deliberately: a transport that refused this
-        // batch will not take the one a re-post rebuilds either, so re-posting
-        // here is an unbounded retry at the reply window's cadence rather than
-        // a recovery. `epoch_death` therefore finds nothing to hand back on
-        // this path, and everything to hand back on its other two.
+        // Admitted, it is the peer's. If a connection close loses it after
+        // admission, nothing reports that here, and this node's stream
+        // watchdogs end its slots. Refused, it dies with the refused epoch on
+        // purpose: a re-post would be refused too, a retry and not a recovery.
+        // `epoch_death` therefore finds nothing to hand back on this path, and
+        // everything to hand back on its other two.
         self.staged_credit.clear();
         if let Err(writer::FlushFailed(error)) = self.writer.flush().await {
             tracing::warn!(

@@ -213,11 +213,15 @@ The rollout has the same asymmetry in reverse. The mux is on by default, so a co
 
 ### Peer loss
 
-Loss of Messenger connectivity, peer eviction and batcher eviction all end in epoch death. Every live slot in the dying epoch that has not seen a terminal receives an injected `StreamFrame::Dropped`. The consumer sees `StreamError::SenderDropped`, the same as on the per-stream path. `TransportError` stays reserved for protocol violations. A reconnect bumps the epoch, and slots do not survive it. As a result, each failed live slot gets exactly one `Dropped`.
+While a batcher has live slots, it checks the health of its peer every 5 s. A failed health check, peer eviction and batcher eviction end in epoch death. A failed admission of a batch is also epoch death. The transport refused the batch, so it never reached the wire and left a `frame_seq` gap in every slot that it carried. The mux does not retransmit, so those slots cannot make progress again.
 
-Any failed admission of a batch is also epoch death. A batch that never reached the wire leaves a `frame_seq` gap in every slot it carried. The mux does not retransmit, so those slots cannot make progress again.
+At epoch death the batcher closes every live slot of its (peer, lane) and starts a new epoch. The receiver retires the slots of the old epoch when the first batch of the new epoch arrives on that lane. Every retired slot that has not seen a terminal receives an injected `StreamFrame::Dropped`. The consumer sees `StreamError::SenderDropped`, the same as on the per-stream path. `TransportError` stays reserved for protocol violations. If no batch of the new epoch arrives, for example because the lane still refuses, the stream watchdog ends each slot.
 
-Each lane has its own batcher and its own epoch, so epoch death on one lane fails only the slots on that lane. Streams to the same peer on other lanes continue.
+A connection that closes after the transport admitted a batch is not epoch death. The mux does not wait for a response to a batch: the send drops its response awaiter at admission. A later failure of the send goes only to the process-wide error handler of the Messenger, which logs it. QUIC and TCP dial the lane again on the next send, and the batcher keeps its epoch. The receiver sees the lost batches as a gap in `batch_seq`, and as a gap in `frame_seq` in each slot that they carried.
+
+A slot with a gap cannot make progress. Its stream watchdog ends it after `DETECTION_MULTIPLIER` heartbeat windows, 15 to 20 s at the defaults. A slot whose `OpenSlot` was lost never opens, and its consumer waits until the 60 s accept window closes the bind. Slots that lost nothing continue.
+
+Each lane has its own batcher, connection and epoch. A failure on one lane therefore touches only the slots of that lane. Streams to the same peer on other lanes continue, unless the peer fails its health check.
 
 ## Flow control
 
@@ -331,7 +335,7 @@ A sender that still holds credit can heartbeat, so its silence counts even with 
 
 On the per-stream path, the reader pump detects silence. It arms one pinned timer per stream. On each received frame, it stamps the time after the forward completes. It moves the deadline only when the deadline is within half a window. Under steady traffic the timer never fires and moves at most twice per deadline. When the timer fires with no frame inside the window, the pump counts a miss. After `DETECTION_MULTIPLIER` misses, exactly that many windows after the last frame, it injects `Dropped` and increments the same counter.
 
-A per-stream heartbeat does not detect a hung producer, because it runs on a separate task. It detects process or host death, connection death and sustained saturation. Saturation shows because a full channel drops heartbeats. Under the mux, the Messenger already detects process, host and connection death, and the mux learns of it through epoch death. The one signal a stream heartbeat still carries is per-slot saturation upstream of the consumer, such as a backlog on the producer's egress. For this reason heartbeats are not in the reserved control class. A consumer that has fallen behind is not this signal: it leaves its sender without credit, and the watchdog exempts a sender that holds none.
+A per-stream heartbeat does not detect a hung producer, because it runs on a separate task. It detects process or host death, connection death and sustained saturation. Saturation shows because a full channel drops heartbeats. Under the mux, the health check of the batcher detects a dead peer, and the mux learns of it through epoch death. A connection that closes after admission is different: nothing reports it to the mux, and the stream watchdog ends the slots that lost records (see [Peer loss](#peer-loss)). The other signal that a stream heartbeat carries is per-slot saturation upstream of the consumer, such as a backlog on the producer's egress. For this reason heartbeats are not in the reserved control class. A consumer that has fallen behind is not this signal: it leaves its sender without credit, and the watchdog exempts a sender that holds none.
 
 The wire reserves `SlotHeartbeat` (record type 4) for a cheaper heartbeat. In that design, the batcher emits it only for idle slots, on one peer-level tick. Ingress decodes and applies it, but no sender emits it yet. The [Batched streaming design](../development/batched-streaming-design.md) chapter records that design.
 

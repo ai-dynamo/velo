@@ -177,9 +177,8 @@ impl CreditClass {
     /// a `Data` record can carry one.
     ///
     /// `SlotHeartbeat` is deliberately **not** control. A heartbeat dropped
-    /// under saturation *is* the per-slot saturation signal — the one thing a
-    /// streaming beat still uniquely carries now that the Messenger detects
-    /// process, host and connection death itself. Give it a reserve and the
+    /// under saturation *is* the per-slot saturation signal, which the
+    /// batcher's peer health check cannot see. Give it a reserve and the
     /// stream watchdog's `DETECTION_MULTIPLIER` stops firing on a saturated
     /// slot.
     pub(crate) const fn of(record_type: RecordType, is_terminal: bool) -> Self {

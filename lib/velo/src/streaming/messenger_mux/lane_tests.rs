@@ -915,9 +915,11 @@ async fn an_attach_that_fails_after_its_bind_gives_its_lane_back() {
 /// A transport that refuses admission on one lane once told to, and passes
 /// everything else to QUIC.
 ///
-/// A refused admission is how a transport reports a lane's connection gone
-/// (`ChannelClosed`, `ConnectionReplaced`), and it is the only failure the
-/// mux batcher treats as epoch death.
+/// A refused admission is the only send failure the mux batcher sees, and it
+/// fails the epoch of that (peer, lane). A connection that closes after
+/// admission is not reported to the batcher: QUIC and TCP dial the lane again
+/// on the next send, and the slots that lost records end through their
+/// stream watchdogs. So a refusal is the failure to inject here.
 struct LaneFailing {
     inner: Arc<QuicTransport>,
     /// The lane to refuse, or `u16::MAX` for none.
@@ -1027,14 +1029,25 @@ impl velo_ext::Transport for LaneFailing {
     }
 }
 
+/// The heartbeat window of the stream on the refusing lane, short so its
+/// consumer's watchdog fires within the test's bound.
+const FAILED_HEARTBEAT: Duration = Duration::from_secs(1);
+
 /// A lane whose transport refuses admission fails the streams on that lane
 /// and no others.
 ///
 /// Each lane has its own batcher and its own epoch, so a refused batch kills
-/// only the slots of its (peer, lane). This drives the mux over real QUIC
-/// lanes and injects the failure at the transport's admission, on the
-/// producer's lane 2 only; it does not close a QUIC connection, which the
+/// only the slots of its (peer, lane) on the producer. This drives the mux over
+/// real QUIC lanes and injects the failure at the transport's admission, on
+/// the producer's lane 2 only; it does not close a QUIC connection, which the
 /// transport redials on the next send without refusing admission.
+///
+/// The consumer of the failed stream sees `SenderDropped`, but not from the
+/// epoch death: that happens on the producer, and the refusing lane carries
+/// nothing more to the consumer. Its stream watchdog ends the stream once
+/// `DETECTION_MULTIPLIER` heartbeat windows pass with no arrival, so the
+/// `Dropped` comes at least a window after the failure. Its anchor uses a short
+/// window so that wait fits the test's bound.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_lane_that_refuses_admission_fails_only_its_own_streams() {
     let consumer = Node::new(4).await;
@@ -1057,9 +1070,20 @@ async fn a_lane_that_refuses_admission_fails_only_its_own_streams() {
     let peer = producer.worker();
     let consumer_mux = consumer.mux();
 
+    const FAILED: u16 = 2;
     let mut streams = Vec::new();
     for lane in 0..4 {
-        let anchor = consumer.velo.create_anchor::<u32>();
+        let anchor = if lane == FAILED {
+            consumer
+                .velo
+                .anchor_manager()
+                .create_anchor_with_config::<u32>(crate::streaming::AnchorConfig {
+                    heartbeat_interval: Some(FAILED_HEARTBEAT),
+                    ..Default::default()
+                })
+        } else {
+            consumer.velo.create_anchor::<u32>()
+        };
         let sender = producer
             .velo
             .attach_anchor_keyed::<u32>(transfer(anchor.handle()), key_for(lane, 4))
@@ -1074,9 +1098,9 @@ async fn a_lane_that_refuses_admission_fails_only_its_own_streams() {
         "one stream per lane, or a failure on lane 2 proves nothing about the others"
     );
 
-    const FAILED: u16 = 2;
     failing.fail(FAILED);
-    let (failed_sender, _failed_anchor) = streams.remove(usize::from(FAILED));
+    let failed_at = tokio::time::Instant::now();
+    let (failed_sender, mut failed_anchor) = streams.remove(usize::from(FAILED));
     tokio::time::timeout(BOUND, async {
         let mut n = 0u32;
         while failed_sender.send(n).await.is_ok() {
@@ -1086,6 +1110,27 @@ async fn a_lane_that_refuses_admission_fails_only_its_own_streams() {
     })
     .await
     .expect("the stream on the refusing lane must fail");
+
+    let end = tokio::time::timeout(BOUND, async {
+        loop {
+            match failed_anchor.next().await {
+                Some(Ok(StreamFrame::Item(_))) => continue,
+                other => return other,
+            }
+        }
+    })
+    .await
+    .expect("the consumer on the refusing lane must see its stream end");
+    assert!(
+        matches!(end, Some(Err(crate::streaming::StreamError::SenderDropped))),
+        "the consumer on the refusing lane must see SenderDropped, got {end:?}"
+    );
+    assert!(
+        failed_at.elapsed() >= FAILED_HEARTBEAT,
+        "the Dropped must come from the stream watchdog, a window or more after \
+         the failure, not from the lane: {:?}",
+        failed_at.elapsed()
+    );
 
     let finished = futures::future::join_all(
         streams
