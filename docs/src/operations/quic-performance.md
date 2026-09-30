@@ -138,11 +138,11 @@ Measured on 2026-09-30 across two nodes of the same type as above, with the `thr
 | TCP, 1 connection | 183,000–186,000 | 851,000–856,000 |
 
 - **Streams scale with lanes as messages do.** One lane stays at the one-connection limit, 500 to 780 MiB/s. Each doubling of lanes nearly doubles the rate, up to about 5,300 MiB/s at 8 lanes, which is 2.5 times TCP on one connection.
-- **16 streams cannot fill 8 lanes.** Each stream waits for credit every 32 records, so a stream's rate is bound by the round trip, not by the transport. Two streams on each lane reach about 3,700 MiB/s.
+- **16 streams do not fill 8 lanes.** With two streams on each lane, 8 lanes reach about 3,700 MiB/s. Each stream waits for credit every 32 records, which limits the rate of one stream. This was not profiled.
 - **Small items lose a little at few streams.** 16 streams of 64 B are about 9% slower at 8 lanes than at 1. The likely cause is that each lane's batch then carries the records of only two streams. This was not profiled. At 256 streams, 8 lanes move twice as many items as 1.
-- **The streams did use all lanes.** The consumer dials lane `k` of a peer only to return credit for a stream on lane `k`. In a second job, sampled during the cells, its process had 4 server sockets plus 1, 4 and 8 dial sockets at 1, 4 and 8 lanes.
+- **The streams used the lanes.** One lane carries at most about 790 MiB/s, so 5,300 MiB/s at 8 lanes needs data on at least 7 lanes. The lane tests check the placement directly.
 
-That second job, on another pair of nodes, gave 533 to 735 MiB/s at 1 lane and 3,721 to 5,150 MiB/s at 8 lanes, so the spread between node pairs is larger than between reps.
+A second job on another pair of nodes gave 533 to 735 MiB/s at 1 lane and 3,721 to 5,150 MiB/s at 8 lanes, so the spread between node pairs is larger than between reps.
 
 ## Batched streaming over QUIC
 
