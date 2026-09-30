@@ -551,26 +551,6 @@ impl Transport for TcpTransport {
     }
 }
 
-/// How to dial and set up one outbound connection.
-struct DialOptions {
-    connect_timeout: Duration,
-    /// `SO_RCVBUF`/`SO_SNDBUF`, or `None` for the kernel's autotuning.
-    socket_buffers: Option<usize>,
-}
-
-/// Size a dialed socket's buffers, or leave them to the kernel for `None`.
-pub(super) fn size_dialed_buffers(sock: &socket2::SockRef<'_>, bytes: Option<usize>) {
-    let Some(bytes) = bytes else {
-        return;
-    };
-    if let Err(e) = sock.set_send_buffer_size(bytes) {
-        warn!("Failed to set send buffer size: {}", e);
-    }
-    if let Err(e) = sock.set_recv_buffer_size(bytes) {
-        warn!("Failed to set recv buffer size: {}", e);
-    }
-}
-
 /// Per-connection configuration handed to [`connection_writer_task`].
 struct WriterTaskContext {
     connections: Arc<DashMap<crate::InstanceId, ConnectionHandle>>,
@@ -594,27 +574,12 @@ async fn connection_writer_task(
     rx: flume::Receiver<SendTask>,
     ctx: WriterTaskContext,
 ) -> Result<()> {
+    let result = connection_writer_inner(addr, instance_id, &rx, &ctx).await;
     let WriterTaskContext {
         connections,
-        cancel_token,
-        connect_timeout,
-        reader_ctx,
         metrics,
-        socket_buffers,
+        ..
     } = ctx;
-    let result = connection_writer_inner(
-        addr,
-        instance_id,
-        &rx,
-        &cancel_token,
-        DialOptions {
-            connect_timeout,
-            socket_buffers,
-        },
-        reader_ctx,
-        metrics.clone(),
-    )
-    .await;
 
     // Always drain queued messages and notify their error handlers.
     //
@@ -658,20 +623,16 @@ async fn connection_writer_inner(
     addr: SocketAddr,
     instance_id: crate::InstanceId,
     rx: &flume::Receiver<SendTask>,
-    cancel_token: &CancellationToken,
-    dial: DialOptions,
-    reader_ctx: Option<DialedReaderContext>,
-    metrics: Option<std::sync::Arc<dyn velo_ext::TransportObservability>>,
+    ctx: &WriterTaskContext,
 ) -> Result<()> {
-    let DialOptions {
-        connect_timeout,
-        socket_buffers,
-    } = dial;
+    let cancel_token = &ctx.cancel_token;
+    let reader_ctx = ctx.reader_ctx.clone();
+    let metrics = ctx.metrics.clone();
     debug!("Connecting to {}", addr);
 
     let stream = tokio::select! {
         _ = cancel_token.cancelled() => return Ok(()),
-        res = tokio::time::timeout(connect_timeout, TcpStream::connect(addr)) => {
+        res = tokio::time::timeout(ctx.connect_timeout, TcpStream::connect(addr)) => {
             res.context("connect timeout")?.context("connect failed")?
         },
     };
@@ -692,7 +653,7 @@ async fn connection_writer_inner(
     // Safe to size buffers here: this side dialed the connection and has not
     // written a byte yet, so unlike the accept path there is no in-flight data
     // to race (see the listener for why that race collapses the window).
-    size_dialed_buffers(&sock, socket_buffers);
+    super::listener::size_socket_buffers(&stream, ctx.socket_buffers);
 
     debug!("Connected to {}", addr);
 
@@ -857,13 +818,12 @@ impl TcpTransportBuilder {
     /// 2 MiB.
     ///
     /// An explicit size turns autotuning off, and Linux clamps it to
-    /// `net.core.rmem_max`/`wmem_max`: with the common 212,992, 2 MiB becomes a
-    /// locked 416 KB, which caps the TCP window near 256 KB. Autotuning grows
-    /// the buffers up to `net.ipv4.tcp_rmem`/`tcp_wmem` instead. Measured
-    /// across two nodes, autotuning moved 6% more for 64 KiB messages
-    /// pipelined one way and 45% more for 256 KiB, but 5 to 15% less for
-    /// request and reply with 64 in flight, with a higher median latency. Use
-    /// `None` for one-way bulk and streaming traffic.
+    /// `net.core.rmem_max`/`wmem_max`: with the common value of 212,992, 2 MiB
+    /// becomes a locked 416 KB, which caps the TCP window near 256 KB.
+    /// Autotuning grows the buffers up to `net.ipv4.tcp_rmem`/`tcp_wmem`
+    /// instead. `None` is faster for one-way bulk and streaming traffic. The
+    /// default is faster for request and reply. The Transports chapter of the
+    /// book has the measurements.
     pub fn socket_buffers(mut self, bytes: Option<usize>) -> Self {
         self.socket_buffers = bytes;
         self
@@ -900,7 +860,7 @@ impl TcpTransportBuilder {
             // Caller-provided listener: it is already live, so this is best
             // effort — connections whose handshake completed before this point
             // keep kernel-default autotuned buffers, which is safe.
-            super::listener::size_listener_buffers(&listener, self.socket_buffers);
+            super::listener::size_socket_buffers(&listener, self.socket_buffers);
             let addr = listener.local_addr()?;
             (addr, Some(listener))
         } else {
@@ -909,7 +869,7 @@ impl TcpTransportBuilder {
                 .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
             // Built by hand instead of std::net::TcpListener::bind so the
             // socket buffers are sized before listen() — accepted sockets
-            // inherit them at handshake time (see `size_listener_buffers`).
+            // inherit them at handshake time (see `size_socket_buffers`).
             let domain = if requested.is_ipv4() {
                 socket2::Domain::IPV4
             } else {
@@ -922,7 +882,7 @@ impl TcpTransportBuilder {
             socket
                 .set_reuse_address(true)
                 .context("Failed to set SO_REUSEADDR")?;
-            super::listener::size_listener_buffers(&socket, self.socket_buffers);
+            super::listener::size_socket_buffers(&socket, self.socket_buffers);
             socket
                 .bind(&requested.into())
                 .context("Failed to pre-bind TCP listener")?;

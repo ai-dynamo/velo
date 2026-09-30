@@ -718,15 +718,23 @@ async fn max_message_size_is_exactly_what_the_codec_will_encode() {
 }
 
 /// The kernel's default receive buffer for a new TCP socket, and what it
-/// reports once `bytes` is set on one. The two differ on every host, because
-/// Linux doubles a set value for bookkeeping and clamps it to `rmem_max`.
+/// reports once `bytes` is set on one. Linux doubles a set value for
+/// bookkeeping and clamps it to `rmem_max`, so the two differ on common hosts.
+/// On a host where they are equal, the tests that use this cannot tell a sized
+/// socket from an unsized one, so the helper fails there instead of letting
+/// them pass with no effect.
 fn recv_buffer_default_and_sized(bytes: usize) -> (usize, usize) {
     let fresh =
         || socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
     let default = fresh().recv_buffer_size().unwrap();
     let sized = fresh();
     sized.set_recv_buffer_size(bytes).unwrap();
-    (default, sized.recv_buffer_size().unwrap())
+    let sized = sized.recv_buffer_size().unwrap();
+    assert_ne!(
+        default, sized,
+        "a sized socket reads as the default on this host"
+    );
+    (default, sized)
 }
 
 fn listener_recv_buffer(transport: &TcpTransport) -> usize {
@@ -776,7 +784,7 @@ async fn socket_buffers_sizes_a_dialed_socket_or_leaves_it_to_the_kernel() {
         let dialed = dialed.unwrap();
         let sock = socket2::SockRef::from(&dialed);
         let untouched = sock.recv_buffer_size().unwrap();
-        super::size_dialed_buffers(&sock, setting);
+        super::super::listener::size_socket_buffers(&dialed, setting);
         let expected = if setting.is_some() { sized } else { untouched };
         assert_eq!(sock.recv_buffer_size().unwrap(), expected, "{setting:?}");
     }
