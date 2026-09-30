@@ -144,6 +144,19 @@ Measured on 2026-09-30 across two nodes of the same type as above, with the `thr
 
 A second job on another pair of nodes gave 533 to 735 MiB/s at 1 lane and 3,721 to 5,150 MiB/s at 8 lanes, so the spread between node pairs is larger than between reps.
 
+Later runs on three more pairs of nodes gave 3,237 to 5,402 MiB/s at 8 lanes and 64 streams (median 5,198, 11 reps), and 3,655 to 5,326 MiB/s at 256 streams (median 4,948). The first rep of a job is often the low one. A diagnostic build counted the bytes that each lane's batch handler received: over 8 lanes, the busiest lane carried at most 1.09 times the mean, at 64 and at 256 streams.
+
+The same stream mode over TCP lanes (`VELO_TCP_LANES`), on one pair of nodes, 2 reps, 16 KiB items, MiB/s:
+
+| TCP lanes | 16 streams | 64 streams | 256 streams |
+|---|---|---|---|
+| 1 | 1,712–1,773 | 2,083–2,090 | 2,005–2,087 |
+| 2 | 2,986–3,314 | 3,809–3,847 | 3,796–3,894 |
+| 4 | 3,917–4,046 | 6,583–6,720 | 6,882–6,943 |
+| 8 | 3,046–3,098 | 9,921–10,734 | 10,448–10,709 |
+
+With 64 B items at 256 streams, TCP moved 783,000 to 857,000 items/s at 1 lane and 2,120,000 to 2,219,000 at 8 lanes. At 16 streams, 8 lanes were slower than 4, for both item sizes.
+
 ## Batched streaming over QUIC
 
 Measured on the same workstation with `response_plane_bench` (2 anchor hosts, 64 engines, 2,000 requests, 200 warm-up requests, `--flush-policy auto`), three reps.
