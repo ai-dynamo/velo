@@ -67,8 +67,8 @@ pub(crate) fn is_batch_handler(name: &str) -> bool {
 
 /// Which mux lane to a peer.
 ///
-/// Always below [`MAX_LANES`], so indexing the handler table cannot go out of
-/// range.
+/// Always below [`MAX_LANES`]: the only way to make one from a number is
+/// [`LaneIndex::clamped`], so indexing the handler table cannot go out of range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct LaneIndex(u16);
 
@@ -76,6 +76,17 @@ impl LaneIndex {
     /// The lane of every stream whose consumer did not choose another, and of
     /// every peer that predates lanes.
     pub(crate) const ZERO: Self = Self(0);
+
+    /// `lane % lanes`, with `lanes` itself capped at [`MAX_LANES`].
+    ///
+    /// How a sender takes the lane its consumer named: the consumer may name a
+    /// lane this node does not keep to it, and the stream then rides the lane
+    /// it maps to. Any lane is correct for any stream, because the consumer
+    /// registers a handler for every lane and replies on the arrival lane;
+    /// only the spread changes.
+    pub(crate) fn clamped(lane: u16, lanes: NonZeroU16) -> Self {
+        Self(lane % mux_lanes(lanes).get())
+    }
 
     /// Every lane, in order. One batch handler is registered per entry.
     pub(crate) fn all() -> impl Iterator<Item = Self> {
@@ -133,5 +144,19 @@ mod tests {
         for lane in LaneIndex::all().skip(1) {
             assert_eq!(lane.handler_name(), format!("_stream_batch.{lane}"));
         }
+    }
+
+    #[test]
+    fn a_lane_clamps_to_the_lanes_this_node_keeps() {
+        let one = NonZeroU16::MIN;
+        let four = NonZeroU16::new(4).unwrap();
+        let many = NonZeroU16::new(64).unwrap();
+        assert_eq!(LaneIndex::clamped(3, one), LaneIndex::ZERO);
+        assert_eq!(LaneIndex::clamped(3, four), LaneIndex::new(3));
+        assert_eq!(LaneIndex::clamped(6, four), LaneIndex::new(2));
+        // A transport with more lanes than the mux keeps still maps into the
+        // handler table.
+        assert_eq!(LaneIndex::clamped(17, many), LaneIndex::new(1));
+        assert_eq!(mux_lanes(many).get(), MAX_LANES);
     }
 }

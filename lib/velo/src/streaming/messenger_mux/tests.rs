@@ -1585,6 +1585,7 @@ async fn a_refused_prebind_gives_the_unattached_timer_back() {
         supported_transport_keys: vec![velo_ext::TransportKey::new(
             crate::streaming::tcp_transport::TCP_STREAM_KEY,
         )],
+        lane_key: None,
     };
     assert!(
         matches!(
@@ -1637,6 +1638,7 @@ async fn an_adopted_prebind_is_reaped_on_heartbeat_silence_before_its_open_slot(
             1,
         ),
         supported_transport_keys: vec![velo_ext::TransportKey::new(MESSENGER_MUX_KEY)],
+        lane_key: None,
     };
     assert!(
         matches!(
@@ -1690,6 +1692,7 @@ async fn an_adopted_prebind_with_a_slow_heartbeat_is_reaped_by_the_accept_window
             1,
         ),
         supported_transport_keys: vec![velo_ext::TransportKey::new(MESSENGER_MUX_KEY)],
+        lane_key: None,
     };
     assert!(
         matches!(
@@ -2057,6 +2060,7 @@ async fn watched_anchor<T: serde::de::DeserializeOwned>(
                 1,
             ),
             supported_transport_keys: vec![velo_ext::TransportKey::new(MESSENGER_MUX_KEY)],
+            lane_key: None,
         };
         assert!(
             matches!(
@@ -2607,6 +2611,7 @@ async fn dropping_an_anchor_before_its_sender_opens_releases_the_bind() {
             1,
         ),
         supported_transport_keys: vec![velo_ext::TransportKey::new(MESSENGER_MUX_KEY)],
+        lane_key: None,
     };
     assert!(matches!(
         manager.adopt_prebind(local_id, &request),

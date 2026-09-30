@@ -1459,6 +1459,7 @@ impl AnchorManager {
                             entry.heartbeat_interval,
                             routing_session_id,
                             mux.advertised_limits(),
+                            mux.choose_lane(),
                         );
                         // A child of the anchor's token, as at attach: finalize,
                         // cancel and detach stop the watchdog without poisoning
@@ -1768,9 +1769,9 @@ impl AnchorManager {
                          it can only have learned that key from an advertisement this node made"
                     ))
                 })?;
-                use crate::streaming::messenger_mux::{LaneIndex, PeerLane};
-                // Every stream rides lane 0 until the attach response names one.
-                let key = PeerLane::new(peer, LaneIndex::ZERO);
+                // The lane the receiver named, clamped to the lanes this node
+                // keeps to it. A receiver from before lanes names none: lane 0.
+                let key = mux.sender_lane(peer, ticket.lane);
                 Ok(mux
                     .connect_controlled(key, anchor_id, session_id, limits, lifecycle)
                     .await?)
@@ -2078,6 +2079,7 @@ impl AnchorManager {
             session_id: identity.sender_stream_id,
             stream_cancel_handle,
             supported_transport_keys: self.supported_transport_keys(),
+            lane_key: None,
         };
 
         // Send _anchor_attach AM to the remote worker (typed request-response).
@@ -2109,6 +2111,7 @@ impl AnchorManager {
                 routing_session_id,
                 initial_credit,
                 slot_byte_budget,
+                lane,
             } => {
                 self.record_attach_rtt(
                     started,
@@ -2131,7 +2134,7 @@ impl AnchorManager {
                 } else {
                     identity.sender_stream_id
                 };
-                // The response's five fields *are* the terms a stream opens on,
+                // The response's six fields *are* the terms a stream opens on,
                 // which is what a ticket carries, so the shared tail below takes
                 // one shape rather than two. The credit fields are whatever the
                 // peer answered, including the legacy zeros — `negotiation::choose`
@@ -2142,6 +2145,7 @@ impl AnchorManager {
                     routing_session_id,
                     initial_credit,
                     slot_byte_budget,
+                    lane,
                 };
                 self.open_stream_sender::<T>(handle, &ticket, identity)
                     .await
@@ -2704,6 +2708,7 @@ impl AnchorManager {
             session_id: sender_stream_id,
             stream_cancel_handle,
             supported_transport_keys: self.supported_transport_keys(),
+            lane_key: None,
         };
 
         // Same bracket as the SPSC path above, through the same helper: the
@@ -2733,6 +2738,7 @@ impl AnchorManager {
                 routing_session_id,
                 initial_credit,
                 slot_byte_budget,
+                lane,
             } => {
                 self.record_attach_rtt(
                     started,
@@ -2758,6 +2764,7 @@ impl AnchorManager {
                             routing_session_id: connect_session_id,
                             initial_credit,
                             slot_byte_budget,
+                            lane,
                         },
                         handle_worker_id,
                         local_id,
@@ -3341,6 +3348,7 @@ mod tests {
                 routing_session_id: 1,
                 initial_credit: 1,
                 slot_byte_budget: 1,
+                lane: 0,
             };
             let prebind = PreBind {
                 anchor_id: local_id,

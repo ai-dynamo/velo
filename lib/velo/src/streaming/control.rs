@@ -279,6 +279,20 @@ pub struct AnchorAttachRequest {
     /// of falling through to that default.
     #[serde(default)]
     pub supported_transport_keys: Vec<velo_ext::TransportKey>,
+    /// A key for the receiver to place the stream's mux lane by, so streams
+    /// with one key share a lane. `None` lets the receiver choose.
+    ///
+    /// Left out when `None`, so a request without a key is the same bytes as
+    /// one from before lanes. The receiver does not read it yet: every stream
+    /// is placed on lane 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane_key: Option<u64>,
+}
+
+/// Whether a lane on the wire is lane 0, which is left out of what is sent so
+/// that lane-0 terms are the same bytes they were before lanes.
+pub(crate) fn is_zero_lane(lane: &u16) -> bool {
+    *lane == 0
 }
 
 /// Response from the attach handler.
@@ -335,6 +349,14 @@ pub enum AnchorAttachResponse {
         /// is encoded.
         #[serde(default)]
         slot_byte_budget: u32,
+        /// The mux lane the receiver put the slot on. The sender opens the
+        /// slot on `lane % (lanes it keeps to the receiver)`.
+        ///
+        /// An older receiver sends no lane, which reads as lane 0, the one lane
+        /// it has. Left out when zero, so a lane-0 answer is the same bytes as
+        /// before lanes. Always zero for a transport other than the mux.
+        #[serde(default, skip_serializing_if = "is_zero_lane")]
+        lane: u16,
     },
     /// Attach failed; `reason` describes why.
     Err { reason: String },
@@ -448,6 +470,10 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::messe
                             routing_session_id: ticket.routing_session_id,
                             initial_credit: ticket.initial_credit,
                             slot_byte_budget: ticket.slot_byte_budget,
+                            // The lane the pre-bind was minted on: the
+                            // adopting sender must open where the ticket
+                            // would have.
+                            lane: ticket.lane,
                         });
                     }
                     crate::streaming::anchor::PrebindAdoption::Refused(reason) => {
@@ -672,6 +698,7 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::messe
                                 routing_session_id,
                                 initial_credit: selection.initial_credit,
                                 slot_byte_budget: selection.slot_byte_budget,
+                                lane: selection.lane,
                             })
                         }
                     }

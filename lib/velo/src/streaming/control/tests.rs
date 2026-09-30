@@ -350,6 +350,7 @@ fn test_anchor_attach_response_serde_ok() {
         routing_session_id: 7,
         initial_credit: 0,
         slot_byte_budget: 0,
+        lane: 0,
     };
     let json = serde_json::to_string(&resp).expect("serialize Ok");
     let decoded: AnchorAttachResponse = serde_json::from_str(&json).expect("deserialize Ok");
@@ -378,6 +379,7 @@ fn test_anchor_attach_response_rmp_round_trip_non_default_heartbeat() {
         routing_session_id: 42,
         initial_credit: 64,
         slot_byte_budget: 4096,
+        lane: 3,
     };
     let bytes = rmp_serde::to_vec(&resp).expect("rmp serialize Ok");
     let decoded: AnchorAttachResponse = rmp_serde::from_slice(&bytes).expect("rmp deserialize Ok");
@@ -388,12 +390,14 @@ fn test_anchor_attach_response_rmp_round_trip_non_default_heartbeat() {
             routing_session_id,
             initial_credit,
             slot_byte_budget,
+            lane,
         } => {
             assert_eq!(streaming_transport_key.as_str(), "tcp-stream");
             assert_eq!(heartbeat_interval_ms, 1234);
             assert_eq!(routing_session_id, 42);
             assert_eq!(initial_credit, 64);
             assert_eq!(slot_byte_budget, 4096);
+            assert_eq!(lane, 3, "a non-zero lane survives positional msgpack");
         }
         other => panic!("expected Ok, got {:?}", other),
     }
@@ -412,6 +416,7 @@ fn test_anchor_attach_response_serde_ok_default_heartbeat() {
             routing_session_id,
             initial_credit,
             slot_byte_budget,
+            lane,
         } => {
             assert_eq!(streaming_transport_key.as_str(), "mock-stream");
             assert_eq!(
@@ -429,6 +434,10 @@ fn test_anchor_attach_response_serde_ok_default_heartbeat() {
             assert_eq!(
                 slot_byte_budget, 0,
                 "an absent byte cap means the default, resolved by NegotiatedLimits"
+            );
+            assert_eq!(
+                lane, 0,
+                "a receiver from before lanes names none, and has only lane 0"
             );
         }
         other => panic!("expected Ok, got {:?}", other),
@@ -464,6 +473,7 @@ fn an_attach_request_round_trips_its_advertised_keys() {
             velo_ext::TransportKey::new("messenger-mux-v2"),
             velo_ext::TransportKey::new("tcp-stream"),
         ],
+        lane_key: None,
     };
     let bytes = rmp_serde::to_vec(&req).expect("rmp serialize request");
     let decoded: AnchorAttachRequest =
@@ -529,6 +539,7 @@ async fn test_anchor_attach_handler() {
                     routing_session_id: 1,
                     initial_credit: 0,
                     slot_byte_budget: 0,
+                    lane: 0,
                 }
             }
         }
@@ -593,6 +604,7 @@ async fn test_anchor_attach_already_attached() {
                     routing_session_id: 1,
                     initial_credit: 0,
                     slot_byte_budget: 0,
+                    lane: 0,
                 }
             }
         }
@@ -1886,15 +1898,17 @@ fn attach_response_golden_encoding_unchanged() {
         ["messenger-mux-v2"]
     );
 
-    // The response keeps its five fields and gains none. Compared as a value
-    // rather than as bytes because the field *set* is the invariant; rmp-serde
-    // writes named fields, so an added one would show up here as an extra key.
+    // A lane-0 response keeps its five fields and gains none: the lane is
+    // left out when zero. Compared as a value rather than as bytes because
+    // the field *set* is the invariant; an added one would show up here as an
+    // extra key.
     let response = AnchorAttachResponse::Ok {
         streaming_transport_key: velo_ext::TransportKey::new("messenger-mux-v2"),
         heartbeat_interval_ms: 1234,
         routing_session_id: 42,
         initial_credit: 64,
         slot_byte_budget: 4096,
+        lane: 0,
     };
     let json: serde_json::Value =
         serde_json::from_str(&serde_json::to_string(&response).expect("serialize"))
@@ -1968,4 +1982,160 @@ fn a_ticket_missing_a_minted_field_fails_rather_than_silently_defaulting() {
         "a ticket missing heartbeat_interval_ms must not silently decode at 5000ms, which can \
          cross a short-heartbeat anchor's watchdog and tear down a live stream"
     );
+}
+
+/// The shape `StreamOpenTicket` had before lanes, field for field.
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+struct TicketBeforeLanes {
+    streaming_transport_key: velo_ext::TransportKey,
+    heartbeat_interval_ms: u64,
+    routing_session_id: u64,
+    initial_credit: u32,
+    slot_byte_budget: u32,
+}
+
+fn ticket_on(lane: u16) -> StreamOpenTicket {
+    StreamOpenTicket {
+        streaming_transport_key: velo_ext::TransportKey::new("messenger-mux-v2"),
+        heartbeat_interval_ms: 1500,
+        routing_session_id: 7,
+        initial_credit: 32,
+        slot_byte_budget: 1 << 20,
+        lane,
+    }
+}
+
+fn ticket_before_lanes() -> TicketBeforeLanes {
+    TicketBeforeLanes {
+        streaming_transport_key: velo_ext::TransportKey::new("messenger-mux-v2"),
+        heartbeat_interval_ms: 1500,
+        routing_session_id: 7,
+        initial_credit: 32,
+        slot_byte_budget: 1 << 20,
+    }
+}
+
+/// Every encoding an application may carry a ticket in: JSON, positional
+/// MessagePack (`rmp_serde::to_vec`) and named MessagePack.
+type Encode<T> = fn(&T) -> Vec<u8>;
+fn encodings<T: serde::Serialize>() -> [(&'static str, Encode<T>); 3] {
+    [
+        ("json", |value| serde_json::to_vec(value).expect("json")),
+        ("rmp", |value| rmp_serde::to_vec(value).expect("rmp")),
+        ("rmp named", |value| {
+            rmp_serde::to_vec_named(value).expect("rmp named")
+        }),
+    ]
+}
+
+fn decode<T: serde::de::DeserializeOwned>(name: &str, bytes: &[u8]) -> T {
+    if name == "json" {
+        serde_json::from_slice(bytes).expect("json decode")
+    } else {
+        rmp_serde::from_slice(bytes).expect("rmp decode")
+    }
+}
+
+/// A lane-0 ticket is the same bytes as a ticket from before lanes, so a
+/// worker from before lanes still reads every ticket a default node mints,
+/// even under positional MessagePack, which refuses an extra element.
+#[test]
+fn a_lane_zero_ticket_encodes_as_before_lanes() {
+    for ((name, new), (_, old)) in encodings::<StreamOpenTicket>()
+        .into_iter()
+        .zip(encodings::<TicketBeforeLanes>())
+    {
+        assert_eq!(
+            new(&ticket_on(0)),
+            old(&ticket_before_lanes()),
+            "{name}: a lane-0 ticket must encode as before lanes"
+        );
+    }
+}
+
+/// A ticket on another lane carries it through every encoding, and a ticket
+/// from before lanes decodes as lane 0.
+#[test]
+fn a_ticket_carries_its_lane_and_an_old_one_reads_as_lane_zero() {
+    for (name, encode) in encodings::<StreamOpenTicket>() {
+        let decoded: StreamOpenTicket = decode(name, &encode(&ticket_on(3)));
+        assert_eq!(decoded.lane, 3, "{name}: lane 3 must round-trip");
+        assert_eq!(decoded.routing_session_id, 7);
+    }
+    for (name, encode) in encodings::<TicketBeforeLanes>() {
+        let decoded: StreamOpenTicket = decode(name, &encode(&ticket_before_lanes()));
+        assert_eq!(decoded.lane, 0, "{name}: an old ticket is lane 0");
+        assert_eq!(decoded.slot_byte_budget, 1 << 20);
+    }
+}
+
+/// An attach response from a receiver before lanes decodes as lane 0 in
+/// positional MessagePack too, where only a trailing field may be missing;
+/// and a request with no lane key is the same bytes as one from before lanes.
+#[test]
+fn attach_messages_from_before_lanes_read_as_lane_zero() {
+    #[derive(serde::Serialize)]
+    enum ResponseBeforeLanes {
+        Ok {
+            streaming_transport_key: velo_ext::TransportKey,
+            heartbeat_interval_ms: u64,
+            routing_session_id: u64,
+            initial_credit: u32,
+            slot_byte_budget: u32,
+        },
+    }
+    let old = ResponseBeforeLanes::Ok {
+        streaming_transport_key: velo_ext::TransportKey::new("messenger-mux-v2"),
+        heartbeat_interval_ms: 1500,
+        routing_session_id: 7,
+        initial_credit: 32,
+        slot_byte_budget: 4096,
+    };
+    for (name, encode) in encodings::<ResponseBeforeLanes>() {
+        match decode::<AnchorAttachResponse>(name, &encode(&old)) {
+            AnchorAttachResponse::Ok {
+                lane,
+                initial_credit,
+                ..
+            } => {
+                assert_eq!(lane, 0, "{name}: an old response is lane 0");
+                assert_eq!(initial_credit, 32);
+            }
+            other => panic!("{name}: expected Ok, got {other:?}"),
+        }
+    }
+
+    #[derive(serde::Serialize)]
+    struct RequestBeforeLanes {
+        handle: StreamAnchorHandle,
+        session_id: u64,
+        stream_cancel_handle: StreamCancelHandle,
+        supported_transport_keys: Vec<velo_ext::TransportKey>,
+    }
+    let handle = StreamAnchorHandle::pack(velo_ext::WorkerId::from_u64(1), 2);
+    let cancel = StreamCancelHandle::pack(velo_ext::WorkerId::from_u64(4), 5);
+    let keys = vec![velo_ext::TransportKey::new("messenger-mux-v2")];
+    let old = RequestBeforeLanes {
+        handle,
+        session_id: 3,
+        stream_cancel_handle: cancel,
+        supported_transport_keys: keys.clone(),
+    };
+    let new = AnchorAttachRequest {
+        handle,
+        session_id: 3,
+        stream_cancel_handle: cancel,
+        supported_transport_keys: keys,
+        lane_key: None,
+    };
+    for ((name, new_encode), (_, old_encode)) in encodings::<AnchorAttachRequest>()
+        .into_iter()
+        .zip(encodings::<RequestBeforeLanes>())
+    {
+        assert_eq!(
+            new_encode(&new),
+            old_encode(&old),
+            "{name}: a request with no lane key must encode as before lanes"
+        );
+    }
 }

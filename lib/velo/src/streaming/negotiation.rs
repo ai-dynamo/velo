@@ -81,6 +81,8 @@ pub(crate) struct Selection {
     /// Bytes one mux slot may hold. Zero unless the mux was selected, and zero
     /// on the wire means *use the default*, so the two never collide.
     pub(crate) slot_byte_budget: u32,
+    /// The mux lane the slot is placed on. Zero unless the mux was selected.
+    pub(crate) lane: u16,
 }
 
 /// Intersect the sender's advertisement with what is installed here.
@@ -103,6 +105,7 @@ pub(crate) fn select(
             key: TransportKey::new(MESSENGER_MUX_KEY),
             initial_credit: limits.initial_credit(),
             slot_byte_budget: limits.slot_byte_budget(),
+            lane: mux.choose_lane().get(),
         };
     }
     Selection {
@@ -110,6 +113,7 @@ pub(crate) fn select(
         key: default_transport.key(),
         initial_credit: 0,
         slot_byte_budget: 0,
+        lane: 0,
     }
 }
 

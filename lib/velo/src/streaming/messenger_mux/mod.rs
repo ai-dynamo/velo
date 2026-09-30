@@ -102,6 +102,8 @@ mod config;
 pub(crate) mod flow_control;
 pub(crate) mod ingress;
 mod lane;
+#[cfg(all(test, feature = "quic"))]
+mod lane_tests;
 pub(crate) mod peer_batcher;
 pub(crate) mod protocol;
 mod sweep;
@@ -253,6 +255,11 @@ struct MuxCore {
     /// tests that need one held mid-wake. See [`peer_batcher::test_hooks`].
     #[cfg(test)]
     hooks: std::sync::OnceLock<Arc<peer_batcher::test_hooks::TestHooks>>,
+    /// A lane every stream bound here is placed on, installed by the tests
+    /// that drive a lane other than 0 end to end. Per mux rather than a
+    /// static, so it cannot move another test's streams.
+    #[cfg(test)]
+    forced_lane: std::sync::OnceLock<LaneIndex>,
 }
 
 impl MessengerMuxTransport {
@@ -347,6 +354,8 @@ impl MessengerMuxTransport {
             bind_deadlines: std::sync::Mutex::default(),
             #[cfg(test)]
             hooks: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            forced_lane: std::sync::OnceLock::new(),
         });
 
         for lane in LaneIndex::all() {
@@ -770,6 +779,43 @@ impl MessengerMuxTransport {
     /// The window this node advertises to a peer negotiating an attach.
     pub(crate) fn advertised_limits(&self) -> NegotiatedLimits {
         self.core.limits
+    }
+
+    /// The lane a stream bound on this node is placed on, as answered in the
+    /// attach response or quoted in the ticket.
+    ///
+    /// Lane 0 for every stream for now. The sender follows whatever this
+    /// answers, clamped to its own lanes ([`Self::sender_lane`]).
+    pub(crate) fn choose_lane(&self) -> LaneIndex {
+        #[cfg(test)]
+        if let Some(lane) = self.core.forced_lane.get() {
+            return *lane;
+        }
+        LaneIndex::ZERO
+    }
+
+    /// Place every stream bound on this node on `lane`, for the tests that
+    /// drive a lane other than 0 end to end.
+    #[cfg(test)]
+    pub(crate) fn force_lane(&self, lane: LaneIndex) {
+        self.core
+            .forced_lane
+            .set(lane)
+            .expect("the forced lane is set once");
+    }
+
+    /// The (peer, lane) a stream that `peer` placed on `lane` is sent on from
+    /// this node.
+    ///
+    /// `lane` modulo the lanes this node's transport keeps to `peer`. The peer
+    /// chose the lane from its own transport's count, which may be larger;
+    /// any lane is correct for any stream, because every node takes batches on
+    /// every lane and replies on the lane a batch arrived on.
+    pub(crate) fn sender_lane(&self, peer: WorkerId, lane: u16) -> PeerLane {
+        PeerLane::new(
+            peer,
+            LaneIndex::clamped(lane, self.core.transport_lanes(peer)),
+        )
     }
 
     /// Bind a slot before any sender has asked for one.

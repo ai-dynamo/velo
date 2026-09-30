@@ -49,6 +49,9 @@ pub struct MpscAnchorAttachRequest {
     /// does not.
     #[serde(default)]
     pub supported_transport_keys: Vec<velo_ext::TransportKey>,
+    /// See [`crate::streaming::control::AnchorAttachRequest::lane_key`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane_key: Option<u64>,
 }
 
 /// Response from the MPSC attach handler.
@@ -73,6 +76,13 @@ pub enum MpscAnchorAttachResponse {
         /// Mux per-slot byte cap; zero means *use the default*.
         #[serde(default)]
         slot_byte_budget: u32,
+        /// The mux lane of this sender's slot; see
+        /// [`crate::streaming::control::AnchorAttachResponse::Ok`].
+        #[serde(
+            default,
+            skip_serializing_if = "crate::streaming::control::is_zero_lane"
+        )]
+        lane: u16,
     },
     Err {
         reason: String,
@@ -471,6 +481,7 @@ pub fn create_mpsc_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::
                     routing_session_id,
                     initial_credit: selection.initial_credit,
                     slot_byte_budget: selection.slot_byte_budget,
+                    lane: selection.lane,
                 })
             }
         },
@@ -1028,6 +1039,7 @@ mod tests {
             session_id: 3,
             stream_cancel_handle: StreamCancelHandle::pack(WorkerId::from_u64(4), 5),
             supported_transport_keys: vec![TransportKey::new("messenger-mux-v2")],
+            lane_key: None,
         };
         let decoded: MpscAnchorAttachRequest =
             rmp_serde::from_slice(&rmp_serde::to_vec(&req).expect("encode")).expect("decode");
@@ -1047,6 +1059,7 @@ mod tests {
             routing_session_id: 8,
             initial_credit: 256,
             slot_byte_budget: 1024,
+            lane: 0,
         };
         let decoded: MpscAnchorAttachResponse =
             rmp_serde::from_slice(&rmp_serde::to_vec(&resp).expect("encode")).expect("decode");
