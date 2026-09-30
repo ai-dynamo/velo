@@ -54,26 +54,21 @@
 //! channel is transient. The mux behaves differently and it is worth stating
 //! where a reader will meet it:
 //!
-//! - **`send` does not become the backpressure point.** The batcher drains a
-//!   slot's inlet whether or not the slot may send — it has to, because
-//!   `finalize`, `detach` and `Drop` reach that same channel through a
-//!   *synchronous* send, and a slot parked on credit would block one of them
-//!   forever. Records the slot cannot send wait in a mux-owned withheld queue
-//!   instead.
-//! - **The bound is bytes, and overrunning it ends the stream.** That queue is
-//!   capped at the per-slot byte budget (1 MiB by default). A producer that runs
-//!   further ahead than that on a slot nobody is draining has its slot closed:
-//!   the producer's channel starts erroring at once, the consumer receives
-//!   `Dropped` (deferred behind an outstanding singleton's admission if the
-//!   slot is fenced — see the fence paragraph in `docs/src/concepts/batched-streaming.md`), and the
-//!   peer's other slots are untouched. `docs/src/operations/saturation.md` describes it from the
-//!   operator's side.
+//! - **`send` waits at the byte cap, not at the credit window.** The batcher
+//!   pulls a slot's inlet whether or not the slot may send, into a mux-owned
+//!   withheld queue, until that queue holds the per-slot byte budget (1 MiB by
+//!   default). Then the slot pauses its inlet, the inlet fills, and `send`
+//!   waits until credit drains the queue below the budget. So a producer runs
+//!   up to the byte budget ahead of its credit, not up to the channel depth.
+//! - **Terminals do not block.** `finalize`, `detach` and `Drop` reach the same
+//!   inlet synchronously. On a full inlet the terminal waits in a task (see
+//!   `send_terminal` for which runtime), so no caller thread blocks, and it goes
+//!   after the records ahead of it. `docs/src/operations/saturation.md`
+//!   describes the pause from the operator's side.
 //!
-//! The exception is a batcher parked on *admission* rather than on credit. That
-//! suspends the task, inlet drain included — but it is bounded by the
-//! transport's own progress, which is the position a socket was always in. It is
-//! credit starvation, which nothing but the consumer can end, that the withheld
-//! queue exists for.
+//! A batcher parked on *admission* rather than on credit suspends the whole
+//! task, inlet pulls included. That is bounded by the transport's own
+//! progress, which is the position a socket was always in.
 //!
 //! Credit comes back from three places. Two of them visit only slots that
 //! something named; the third is the whole-table backstop. A draining
@@ -878,11 +873,8 @@ impl MessengerMuxTransport {
             for _ in 0..CONNECT_ATTEMPTS {
                 let batcher = core.batcher(peer);
                 // Sized to the credit window for symmetry with the receive
-                // buffer. It is *not* where credit starvation backpressures a
-                // producer — the batcher drains this channel whether or not the
-                // slot may send — but it **is** where a batcher parked on
-                // admission does, because that park suspends the whole task,
-                // inlet drain included. See
+                // buffer. A producer waits on it once its slot pauses at the
+                // byte cap, or while the batcher is parked on admission. See
                 // [the producer contract](self#the-producers-contract-under-the-mux).
                 let (inlet_tx, inlet_rx) = flume::bounded::<Vec<u8>>(limits.slot_buffer_depth());
                 let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();

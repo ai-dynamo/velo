@@ -167,6 +167,9 @@ pub struct StreamSender<T> {
     /// attach never negotiated one. See
     /// [`negotiated_transport`](StreamSender::negotiated_transport).
     negotiated_transport: Option<velo_ext::TransportKey>,
+    /// The runtime the sender was made on. A terminal that meets a full
+    /// channel on a thread with no runtime waits in a task here.
+    runtime: tokio::runtime::Handle,
     _phantom: std::marker::PhantomData<T>,
 }
 
@@ -242,6 +245,7 @@ impl<T: Serialize> StreamSender<T> {
         Self {
             tx,
             handle,
+            runtime: tokio::runtime::Handle::current(),
             heartbeat_cancel,
             stop_token,
             sent_terminal: false,
@@ -319,9 +323,8 @@ impl<T: Serialize> StreamSender<T> {
         let bytes = rmp_serde::to_vec(&StreamFrame::Item(item))
             .map_err(|e| SendError::SerializationError(e.to_string()))?;
         // Try non-blocking first so we can record producer-side backpressure
-        // before falling through to the awaited send. The connect-side flume
-        // is bounded(4096) — by the time it's full the consumer has already
-        // saturated the per-anchor channel and the cascade is in flight.
+        // before falling through to the awaited send. The connect-side channel
+        // is 4096 deep on the per-stream path and C+1 deep under the mux.
         match self.tx.try_send(bytes) {
             Ok(()) => Ok(()),
             Err(flume::TrySendError::Full(b)) => {
@@ -353,10 +356,12 @@ impl<T: Serialize> StreamSender<T> {
         // only a String and its msgpack encoding is identical for any T.
         let bytes = rmp_serde::to_vec(&StreamFrame::<()>::SenderError(msg.to_string()))
             .expect("SenderError serializes infallibly");
-        self.tx
-            .send_async(bytes)
-            .await
-            .map_err(|_| SendError::ChannelClosed)
+        // Raced against the cancel for the same reason as `send`.
+        tokio::select! {
+            biased;
+            _ = self.cancel_token.cancelled() => Err(SendError::ChannelClosed),
+            result = self.tx.send_async(bytes) => result.map_err(|_| SendError::ChannelClosed),
+        }
     }
 
     /// Permanently close the stream by sending a `Finalized` sentinel.
@@ -378,7 +383,7 @@ impl<T: Serialize> StreamSender<T> {
         self.sent_terminal = true;
         // Clean up sender registry entry before returning
         self.sender_registry.senders.remove(&self.sender_stream_id);
-        send_terminal(&self.tx, bytes, || {})
+        send_terminal(&self.runtime, &self.tx, bytes, || {})
     }
 
     /// Detach the sender from the anchor by sending a `Detached` sentinel.
@@ -405,7 +410,7 @@ impl<T: Serialize> StreamSender<T> {
         self.sent_terminal = true;
         let registry = Arc::clone(&self.registry);
         let (_, local_id) = self.handle.unpack();
-        send_terminal(&self.tx, bytes, move || {
+        send_terminal(&self.runtime, &self.tx, bytes, move || {
             if let Some(mut entry) = registry.get_mut(&local_id) {
                 entry.attachment = false;
             }
@@ -422,9 +427,9 @@ impl<T: Serialize> StreamSender<T> {
 /// full. Under the messenger mux that channel is a per-slot inlet drained by one
 /// tokio task, so blocking a worker here starves the very task that would make
 /// room: a runtime with `W` workers wedges on `W` concurrent terminal sends, and a
-/// one-worker runtime on the first. Credit starvation is what fills the inlet, so
-/// this is reachable whenever a producer finalizes a stream whose consumer is
-/// behind — not an exotic state.
+/// one-worker runtime on the first. A slot paused at its byte cap fills the inlet,
+/// and so does a batcher parked on admission, so this is reachable whenever a
+/// producer finalizes a stream whose consumer is behind — not an exotic state.
 ///
 /// Dropping the record instead is not open to us: it is what tells the consumer
 /// `Finalized` from `Dropped`, and losing it strands a reader on the heartbeat
@@ -437,14 +442,27 @@ impl<T: Serialize> StreamSender<T> {
 /// task otherwise. It carries work that must not become visible to anyone before
 /// the sentinel is in the channel.
 ///
-/// The one case where the record is still lost is a runtime shutting down before
-/// the task runs. Nothing is owed then — the receiver is being torn down by the
-/// same shutdown, so no consumer is left to tell `Finalized` from `Dropped` — and
-/// the sender clone dies with the task, so the inlet reaches EOF rather than
-/// hanging. [`tokio::task::block_in_place`] would avoid even that, at the price of
-/// panicking on a `current_thread` runtime, which is a worse failure than the one
-/// it fixes.
+/// The task runs on the caller's runtime when the caller has one, and on the
+/// runtime the sender was made on when it does not. A caller on a thread with no
+/// runtime (a sender moved to a language binding's thread, say) would otherwise
+/// have to block that thread, and under the mux a slot at its byte cap can keep
+/// the inlet full for as long as its consumer does not read. The caller's
+/// runtime goes first because the sender can outlive the runtime it was made on.
+///
+/// A `current_thread` runtime that nobody drives never runs the task, so the
+/// terminal waits there with no end: the task's sender clone keeps the inlet
+/// open, and the consumer sees neither `Finalized` nor `Dropped` until that
+/// runtime runs. That is the price of never blocking the caller's thread.
+///
+/// The record is still lost when the runtime chosen is shutting down before or
+/// during the wait, and for `detach` the attachment flag then stays set. The
+/// sender clone dies with the task, so the inlet reaches EOF rather than
+/// hanging, and the consumer sees `Dropped`.
+/// [`tokio::task::block_in_place`] would avoid even that, at the price of
+/// panicking on a `current_thread` runtime, which is a worse failure than the
+/// one it fixes.
 fn send_terminal(
+    runtime: &tokio::runtime::Handle,
     tx: &flume::Sender<Vec<u8>>,
     bytes: Vec<u8>,
     on_delivered: impl FnOnce() + Send + 'static,
@@ -458,14 +476,7 @@ fn send_terminal(
         Err(flume::TrySendError::Full(bytes)) => bytes,
     };
 
-    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-        // No runtime under this thread, so there is no worker for the send to
-        // starve and blocking is exactly what the caller asked for.
-        tx.send(bytes).map_err(|_| SendError::ChannelClosed)?;
-        on_delivered();
-        return Ok(());
-    };
-
+    let runtime = tokio::runtime::Handle::try_current().unwrap_or_else(|_| runtime.clone());
     let tx = tx.clone();
     runtime.spawn(async move {
         if tx.send_async(bytes).await.is_ok() {
@@ -490,7 +501,7 @@ impl<T> Drop for StreamSender<T> {
             // Never blocks — see `send_terminal`. A `Drop` that parks a runtime
             // worker is the one thing this path may not do. Errors ignored: the
             // channel may already be closed if the receiver was dropped first.
-            let _ = send_terminal(&self.tx, bytes, || {});
+            let _ = send_terminal(&self.runtime, &self.tx, bytes, || {});
         }
     }
 }
@@ -644,6 +655,71 @@ mod tests {
             None,
         );
         (sender, sender_registry)
+    }
+
+    /// A terminal sent from a thread with no runtime does not block that
+    /// thread on a full channel.
+    ///
+    /// Under the mux a slot at its byte cap stops pulling from its inlet, and
+    /// the inlet stays full for as long as the consumer does not read. A sender
+    /// moved to a plain thread, a language binding's thread for one, and dropped
+    /// there must not hang that thread until the consumer reads. The terminal
+    /// waits in a task on the runtime the sender was made on instead, and
+    /// arrives, in order, once there is room.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_terminal_from_a_thread_without_a_runtime_does_not_block_it() {
+        let (tx, rx) = flume::bounded::<Vec<u8>>(1);
+        let handle = StreamAnchorHandle::pack(velo_ext::WorkerId::from_u64(1), 1);
+        let (sender, _registry) = make_sender_with_registry(tx.clone(), handle, 1);
+        tx.send(b"filler".to_vec()).expect("fill the channel");
+
+        let dropper = std::thread::spawn(move || drop(sender));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !dropper.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "dropping the sender blocked its thread on the full channel"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        dropper.join().expect("dropping thread panicked");
+
+        assert_eq!(rx.recv_async().await.unwrap(), b"filler".to_vec());
+        let bytes = tokio::time::timeout(Duration::from_secs(5), rx.recv_async())
+            .await
+            .expect("the terminal never arrived")
+            .expect("channel closed before the terminal");
+        assert!(matches!(decode::<u32>(&bytes), StreamFrame::Dropped));
+    }
+
+    /// A terminal sent after the sender's own runtime has ended still goes
+    /// out, on the caller's live runtime.
+    ///
+    /// The sender can outlive the runtime it was made on, while the batcher or
+    /// the consumer lives on another. There, a terminal that meets a full
+    /// channel must wait on the runtime that is still running, or the
+    /// consumer sees `Dropped` where it was owed `Finalized`. This pins that
+    /// the caller's runtime goes first, ahead of the one the sender stores.
+    #[test]
+    fn a_terminal_after_the_senders_runtime_ends_goes_out_on_the_callers() {
+        let (tx, rx) = flume::bounded::<Vec<u8>>(1);
+        let handle = StreamAnchorHandle::pack(velo_ext::WorkerId::from_u64(1), 1);
+        let first = tokio::runtime::Runtime::new().unwrap();
+        let (sender, _registry) =
+            first.block_on(async { make_sender_with_registry(tx.clone(), handle, 1) });
+        tx.send(b"filler".to_vec()).expect("fill the channel");
+        drop(first);
+
+        let second = tokio::runtime::Runtime::new().unwrap();
+        second.block_on(async move {
+            sender.finalize().expect("finalize");
+            assert_eq!(rx.recv_async().await.unwrap(), b"filler".to_vec());
+            let bytes = tokio::time::timeout(Duration::from_secs(5), rx.recv_async())
+                .await
+                .expect("the terminal never arrived")
+                .expect("channel closed before the terminal");
+            assert!(matches!(decode::<u32>(&bytes), StreamFrame::Finalized));
+        });
     }
 
     /// Helper: deserialize raw bytes into StreamFrame<T>.

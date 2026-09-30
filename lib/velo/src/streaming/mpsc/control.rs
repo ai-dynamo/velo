@@ -127,6 +127,7 @@ pub(crate) async fn mpsc_reader_pump(
         local_id,
         heartbeat_deadline,
         drain,
+        release,
     } = pump;
     let mut missed_heartbeats: u8 = 0;
     // One timer per sender, not one per record: see
@@ -159,7 +160,16 @@ pub(crate) async fn mpsc_reader_pump(
                         let explicit_terminal = bytes == *crate::streaming::sender::cached_detached()
                             || bytes == *crate::streaming::sender::cached_dropped()
                             || bytes == *crate::streaming::sender::cached_finalized();
-                        if frame_tx.send_async((sender_id, bytes)).await.is_err() {
+                        // Raced against the cancel: over the mux a consumer
+                        // that stopped reading leaves this forward blocked on
+                        // a full anchor channel, and its cancel must still end
+                        // the pump, which closes the slot below.
+                        let forwarded = tokio::select! {
+                            biased;
+                            _ = &mut cancelled => false,
+                            sent = frame_tx.send_async((sender_id, bytes)) => sent.is_ok(),
+                        };
+                        if !forwarded {
                             break;
                         }
                         // Any frame proves liveness -- but only once it is
@@ -193,6 +203,12 @@ pub(crate) async fn mpsc_reader_pump(
                             drain.drained();
                         }
                         if explicit_terminal {
+                            // The terminal retires the slot on the mux side;
+                            // saying so here spares the release below its trip
+                            // to the peer's ingress lock.
+                            if let Some(drain) = drain.as_deref() {
+                                drain.mark_released();
+                            }
                             if let Some(slot) =
                                 super::anchor::remove_sender_slot(&mpsc_registry, local_id, sender_id)
                                 && let Some(pt) = slot.pump_token
@@ -204,7 +220,11 @@ pub(crate) async fn mpsc_reader_pump(
                     }
                     Err(_) => {
                         let dropped = crate::streaming::sender::cached_dropped().clone();
-                        let _ = frame_tx.send_async((sender_id, dropped)).await;
+                        tokio::select! {
+                            biased;
+                            _ = &mut cancelled => {}
+                            _ = frame_tx.send_async((sender_id, dropped)) => {}
+                        }
                         super::anchor::remove_sender_slot(
                             &mpsc_registry,
                             local_id,
@@ -232,12 +252,24 @@ pub(crate) async fn mpsc_reader_pump(
                 missed_heartbeats += 1;
                 if missed_heartbeats >= DETECTION_MULTIPLIER {
                     let dropped = crate::streaming::sender::cached_dropped().clone();
-                    let _ = frame_tx.send_async((sender_id, dropped)).await;
+                    tokio::select! {
+                        biased;
+                        _ = &mut cancelled => {}
+                        _ = frame_tx.send_async((sender_id, dropped)) => {}
+                    }
                     super::anchor::remove_sender_slot(&mpsc_registry, local_id, sender_id);
                     break;
                 }
             }
         }
+    }
+    // Every way out but the sender's own terminal leaves the mux slot open: the
+    // anchor was dropped or cancelled, or the sender went silent. A sender
+    // parked at its slot's byte cap would then wait forever, and its slot
+    // would hold its withheld records until the peer's epoch ends. After a
+    // terminal, `release` finds the slot retired and does nothing.
+    if let (Some(drain), Some(release)) = (drain.as_deref(), release.as_ref()) {
+        release.release(drain);
     }
     cancel_token.cancel();
 }
@@ -404,6 +436,13 @@ pub fn create_mpsc_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::
                 // Spawn the per-sender pump outside the shard lock.
                 let pump_registry = manager.mpsc_registry.clone();
                 let drain = manager.take_mux_drain_signal(local_id, routing_session_id);
+                let release = drain.as_ref().and(manager.mux_handle()).map(|mux| {
+                    crate::streaming::control::SlotRelease {
+                        mux,
+                        anchor_id: local_id,
+                        session_id: routing_session_id,
+                    }
+                });
                 tokio::spawn(mpsc_reader_pump(
                     sender_id,
                     transport_rx,
@@ -414,6 +453,7 @@ pub fn create_mpsc_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::
                         local_id,
                         heartbeat_deadline: heartbeat_interval,
                         drain,
+                        release,
                     },
                 ));
 
@@ -547,6 +587,7 @@ mod tests {
                     local_id: 1,
                     heartbeat_deadline: Duration::from_secs(3600),
                     drain: None,
+                    release: None,
                 },
             ),
         ));
@@ -623,6 +664,7 @@ mod tests {
                         local_id: 1,
                         heartbeat_deadline: deadline,
                         drain: None,
+                        release: None,
                     },
                 ),
             ),
@@ -705,6 +747,7 @@ mod tests {
                     local_id: 1,
                     heartbeat_deadline: deadline,
                     drain: None,
+                    release: None,
                 },
             ),
         ));
@@ -794,6 +837,7 @@ mod tests {
                 local_id: 1,
                 heartbeat_deadline: heartbeat,
                 drain: None,
+                release: None,
             },
         ));
 
@@ -847,6 +891,7 @@ mod tests {
                 local_id: 1,
                 heartbeat_deadline: heartbeat,
                 drain: None,
+                release: None,
             },
         ));
 
@@ -898,6 +943,7 @@ mod tests {
                 local_id: 1,
                 heartbeat_deadline: heartbeat,
                 drain: None,
+                release: None,
             },
         ));
 

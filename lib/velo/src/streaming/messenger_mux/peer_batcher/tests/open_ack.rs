@@ -13,13 +13,12 @@
 //! - a failed admission must still be epoch death. The ack already said `Ok`
 //!   and the producer already holds its inlet, so nothing else is left to tell
 //!   it the stream can never make progress;
-//! - a `CloseSlot` owed while the fence is up waits for it, and the slow-consumer
-//!   kill that writes one still disconnects its producer on the spot. Deferring
-//!   the *record* must not defer the *kill* — this one is not a property of the
-//!   new gate: `send_singleton` fences any over-budget non-terminal record, so
-//!   the shipped default reaches the same deferral through a different door,
-//!   which is why the arms at the bottom of this file run
-//!   [`MuxConfig::default`];
+//! - a `CloseSlot` owed while the fence is up waits for it, and a producer
+//!   that fills the byte cap behind the fence is paused, not killed. Neither
+//!   is a property of the new gate alone: `send_singleton` fences any
+//!   over-budget non-terminal record, so the shipped default reaches the same
+//!   fence through a different door, which is why the arms at the bottom of
+//!   this file run [`MuxConfig::default`];
 //! - the admission's answer reaches the batcher whatever else is pending or
 //!   refused. It is the only thing that lifts the fence, so it lives in its
 //!   own `resolutions` lane rather than sharing `mine` with ordinary grants,
@@ -463,80 +462,72 @@ async fn a_departed_producer_s_close_waits_for_the_open_slot_admission() {
     assert_the_close_follows_its_open(&harness).await;
 }
 
-/// The slow-consumer kill's `CloseSlot` waits for the `OpenSlot` admission too.
+/// A slot fenced behind its `OpenSlot` admission pauses at the byte cap.
 ///
-/// `overflow_kill` reaches the wire by a second door — the producer ran past the
-/// byte cap rather than went away — and it discards the withheld queue on its
-/// way, so the queue that defers a departed producer's close is empty by the
-/// time this one is written. The fence has to be consulted directly.
+/// Fenced, every record withholds however much credit the slot holds, so what
+/// this producer meets is the byte cap, not the ledger. The slot pauses its
+/// inlet there and is not closed. Once the admission lifts the fence, the
+/// withheld records and then the rest of the producer's channel go out behind
+/// the `OpenSlot`, in order.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_overflow_kill_waits_for_the_open_slot_admission() {
+async fn a_fenced_slot_pauses_at_the_byte_cap_until_its_open_is_admitted() {
+    const CAP: u32 = 256;
+    const RECORDS: u32 = 64;
     let harness = stalled_harness(MuxConfig {
-        slot_byte_budget: 256,
+        slot_byte_budget: CAP,
         ..async_open_ack()
     })
     .await;
     let (_filler_inlet, inlet) = open_behind_a_full_gate(&harness).await;
 
-    // Fenced, so every record is withheld however much credit the slot holds:
-    // what this producer meets is the byte cap, not the ledger.
-    for n in 0..64u32 {
-        let _ = inlet.send(item(n));
+    for n in 0..RECORDS {
+        inlet.send(item(n)).expect("queue record");
     }
-    // The kill has run — the positive fact this arm turns on, since the close it
-    // writes is emitted in the same call.
-    eventually(|| harness.overflow_dropped() > 0.0).await;
+    let parked = records_to_fill(CAP as usize);
+    harness.await_withheld(parked).await;
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(
+        inlet.len(),
+        RECORDS as usize - parked,
+        "the inlet paused at the cap, so the rest wait in the producer's channel"
+    );
+    assert!(
+        !inlet.is_disconnected(),
+        "a paused slot is not a killed one"
+    );
+    assert_eq!(live_slots(&harness), 2.0, "the filler and the paused slot");
 
-    let _prober_inlet = open_answered_while_the_gate_is_full(&harness).await;
-    assert_the_close_follows_its_open(&harness).await;
+    let first = harness.next_wire_batch().await;
+    assert_eq!(first.records[0].kind, RecordType::OpenSlot);
+    let opened = harness.next_wire_batch().await;
+    assert_eq!(opened.records[0].kind, RecordType::OpenSlot);
+    assert_the_records_follow(&harness, opened.records[0].slot, 1, RECORDS).await;
 }
 
-/// The kill disconnects its producer at once; only the record waits.
-///
-/// `overflow_kill` is the per-slot slow-consumer kill, and what it is *for* is
-/// cutting a producer off from a stream nobody is draining. The `CloseSlot` it
-/// writes tells the far side; ending the inlet tells the near side, and that is
-/// the half a fence must not postpone — a producer left connected keeps running
-/// ahead into a slot whose records are already being thrown away, and learns
-/// nothing until the peer un-parks, which on the congested peer this fence is
-/// about may be a very long time.
-///
-/// The disconnect costs one turn of the batcher's drain loop rather than being
-/// synchronous: closing the gate ends the slot's stream, `SelectAll` drops it on
-/// the next poll, and dropping it is what drops the `flume::Receiver` the
-/// producer's `Sender` is paired with. `close_local` has exactly the same lag,
-/// so an unfenced kill's timing is unchanged.
-///
-/// `live_slots` is what separates "the close was deferred" from "the close was
-/// written and is merely queued", and it is the only thing that does: a close
-/// written while the fence is up would leave on the wire behind the `OpenSlot`
-/// anyway and would carry the same `frame_seq`, so neither order nor sequence
-/// tells the two apart. The gauge does, because `close_local` runs synchronously
-/// inside `finish_close`.
-#[tokio::test(flavor = "multi_thread")]
-async fn an_overflow_kill_disconnects_its_producer_before_the_fence_lifts() {
-    let harness = stalled_harness(MuxConfig {
-        slot_byte_budget: 256,
-        ..async_open_ack()
-    })
-    .await;
-    let (_filler_inlet, inlet) = open_behind_a_full_gate(&harness).await;
-
-    for n in 0..64u32 {
-        let _ = inlet.send(item(n));
+/// Drain the wire until `count` data records of `slot` have gone, and assert
+/// they are `item(0)..` in order, starting at `first_seq`.
+async fn assert_the_records_follow(
+    harness: &StalledHarness,
+    slot: SlotId,
+    first_seq: u32,
+    count: u32,
+) {
+    let mut records = Vec::new();
+    while records.len() < count as usize {
+        records.extend(
+            harness
+                .next_wire_batch()
+                .await
+                .records
+                .into_iter()
+                .filter(|record| record.slot == slot),
+        );
     }
-    eventually(|| harness.overflow_dropped() > 0.0).await;
-
-    eventually(|| inlet.is_disconnected()).await;
-
-    let _prober_inlet = open_answered_while_the_gate_is_full(&harness).await;
-    assert_eq!(
-        live_slots(&harness),
-        3.0,
-        "the killed slot still owes its consumer a `CloseSlot`, so it is still \
-         live: the filler, the killed slot, and the prober"
-    );
-    assert_the_close_follows_its_open(&harness).await;
+    for (n, record) in records.iter().enumerate() {
+        assert_eq!(record.kind, RecordType::Data);
+        assert_eq!(record.data, item(n as u32), "record {n} out of order");
+        assert_eq!(record.frame_seq, first_seq + n as u32);
+    }
 }
 
 /// Control: with the awaited ack the slot is never fenced, so nothing waits.
@@ -674,32 +665,43 @@ async fn the_default_defers_a_departed_producer_s_close_behind_a_fence() {
     assert_the_close_follows_the_singleton(&harness).await;
 }
 
-/// Gate off: the kill disconnects its producer at once and defers only the
-/// record.
+/// Gate off: a slot fenced behind a rendezvous singleton pauses at the byte
+/// cap.
 ///
-/// The overrun arm of the same default configuration. `overflow_kill` discards
-/// the withheld queue on its way, so the queue that defers a departed producer's
-/// close is empty here and the fence is the only thing left holding it — while
-/// the producer, which is the party the kill exists to stop, must be cut off
-/// immediately.
+/// The default configuration fences a slot through any over-budget record, so
+/// this is the pause a shipped mux reaches. The records behind the singleton go
+/// out after it, in order, once its admission answers.
 #[tokio::test(flavor = "multi_thread")]
-async fn the_default_disconnects_an_overflow_kill_s_producer_behind_a_fence() {
-    let harness = stalled_harness(tight_batches()).await;
+async fn the_default_pauses_a_fenced_slot_at_the_byte_cap() {
+    const RECORDS: u32 = 64;
+    let config = tight_batches();
+    let harness = stalled_harness(config.clone()).await;
     let inlet = fence_through_an_over_budget_record(&harness).await;
 
-    // Fenced, so every record after the singleton is withheld however much
-    // credit the slot holds, until the byte cap refuses one.
-    for n in 0..64u32 {
-        let _ = inlet.send(item(n));
+    for n in 0..RECORDS {
+        inlet.send(item(n)).expect("queue record");
     }
-    eventually(|| harness.overflow_dropped() > 0.0).await;
-
-    eventually(|| inlet.is_disconnected()).await;
+    let parked = records_to_fill(config.slot_byte_budget as usize);
+    harness.await_withheld(parked).await;
+    tokio::time::sleep(SETTLE).await;
     assert_eq!(
-        live_slots(&harness),
-        1.0,
-        "the wire close still waits for the singleton it is ordered behind"
+        inlet.len(),
+        RECORDS as usize - parked,
+        "the inlet paused at the cap, so the rest wait in the producer's channel"
     );
+    assert!(
+        !inlet.is_disconnected(),
+        "a paused slot is not a killed one"
+    );
+    assert_eq!(live_slots(&harness), 1.0);
 
-    assert_the_close_follows_the_singleton(&harness).await;
+    let open = harness.next_wire_batch().await;
+    assert_eq!(open.records[0].kind, RecordType::OpenSlot);
+    let singleton = harness.next_wire_batch().await;
+    assert_eq!(
+        singleton.records.len(),
+        1,
+        "an over-budget record goes alone"
+    );
+    assert_the_records_follow(&harness, singleton.records[0].slot, 2, RECORDS).await;
 }
