@@ -42,6 +42,7 @@ pub struct QuicTransportBuilder {
     keep_alive_interval: Duration,
     idle_timeout: Duration,
     shrink_threshold: usize,
+    lanes: std::num::NonZeroU16,
 }
 
 impl QuicTransportBuilder {
@@ -64,6 +65,7 @@ impl QuicTransportBuilder {
             keep_alive_interval: Duration::from_secs(5),
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             shrink_threshold: DEFAULT_SHRINK_THRESHOLD,
+            lanes: std::num::NonZeroU16::MIN,
         }
     }
 
@@ -157,6 +159,24 @@ impl QuicTransportBuilder {
         self
     }
 
+    /// Lanes to each peer: up to this many connections, one for each lane
+    /// used (default 1, at least 1).
+    ///
+    /// One QUIC connection does its packet and crypto work on one task, so it
+    /// caps what one peer can carry at about one core's worth. Each lane is
+    /// its own connection, dialed from its own UDP socket, so N lanes spread
+    /// that work over up to N cores. Order holds within a lane only, so a
+    /// caller that uses lanes must keep each ordered flow on one lane (see
+    /// `Transport::send_message_on_lane`). Each lane costs a socket, a quinn
+    /// endpoint and its buffers.
+    ///
+    /// Only the dialing side's count matters: the listener accepts however
+    /// many connections a peer opens.
+    pub fn lanes(mut self, lanes: u16) -> Self {
+        self.lanes = std::num::NonZeroU16::new(lanes).unwrap_or(std::num::NonZeroU16::MIN);
+        self
+    }
+
     /// Read-buffer size above which a reader gives the excess back after a
     /// frame (default: the TCP transport's). The codec reserves the whole
     /// frame length, so without this one large frame pins that much memory
@@ -176,7 +196,9 @@ impl QuicTransportBuilder {
         let server_sockets =
             bind_server_sockets(requested, self.server_endpoints, self.udp_buffers)?;
         let bind_addr = server_sockets[0].local_addr()?;
-        let client_socket = bind_client_socket(bind_addr, self.udp_buffers)?;
+        let client_sockets = (0..self.lanes.get())
+            .map(|_| bind_client_socket(bind_addr, self.udp_buffers))
+            .collect::<Result<Vec<_>>>()?;
 
         let mut transport_config = quinn::TransportConfig::default();
         // One bidirectional stream per connection. Datagrams and
@@ -237,12 +259,13 @@ impl QuicTransportBuilder {
             channel_capacity: self.channel_capacity,
             connect_timeout: self.connect_timeout,
             server_sockets: Mutex::new(Some(server_sockets)),
-            client_socket: Mutex::new(Some(client_socket)),
+            client_sockets: Mutex::new(Some(client_sockets)),
             server_config,
             transport_config,
             endpoint_config,
             server_endpoints: OnceLock::new(),
-            client_endpoint: OnceLock::new(),
+            client_endpoints: OnceLock::new(),
+            lanes: self.lanes,
             local_interfaces: OnceLock::new(),
             numa_hint: self.numa_hint,
             metrics: OnceLock::new(),

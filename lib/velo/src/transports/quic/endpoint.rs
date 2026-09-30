@@ -97,7 +97,7 @@ pub(super) fn bind_server_sockets(
     Ok(sockets)
 }
 
-/// Bind the socket that dials peers.
+/// Bind one socket that dials peers. The transport binds one for each lane.
 ///
 /// It is separate from the server sockets and has its own ephemeral port. A
 /// dial from a reuse-port member would get its replies hashed to any member

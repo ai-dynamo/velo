@@ -4,7 +4,7 @@
 |---|---|
 | Active message | A message that names a handler on the remote instance. The handler runs when the message arrives. |
 | Admission | The step where a transport puts an inbound request on the queue with `TransportAdapter::admit_message`. Admission takes the in-flight guard. |
-| Admission gate | The per-target queue that holds sends while the bounded send channel is full |
+| Admission gate | The queue for one target (and lane) that holds sends while the bounded send channel is full |
 | Anchor | The consumer end of a stream. It has a `u128` handle that a producer uses to attach. |
 | Attach | The `_anchor_attach` round trip that connects a producer to an anchor |
 | Batch | One messenger frame that carries records from many streams to one peer |
@@ -15,7 +15,7 @@
 | Gate | The first phase of graceful shutdown. New inbound requests are refused. |
 | `InstanceId` | The identity of one `Velo` instance |
 | Mux | Batched streaming. Records from many streams share messenger frames to the same peer. |
-| Ordered lane | For an ordered handler, the queue and task for one sender (or for all senders with `ordered_global`) |
+| Ordered lane | For an ordered handler, the queue and task for one sender (or for all senders with `ordered_global`). Not the same as a transport lane. |
 | Pre-bind | `prebind_anchor`. The consumer makes a ticket, so the producer can open the stream with no attach round trip. |
 | Primary transport | The compatible transport with the highest priority for a peer |
 | Rendezvous | Transfer of a large payload by handle. The owner stages the bytes, and the peer pulls them. |
@@ -24,6 +24,7 @@
 | Teardown | The third phase of graceful shutdown. Velo cancels tokens and stops the transports. |
 | Close | The fourth phase of graceful shutdown. Velo waits for `Transport::closed()` on each transport, so that what it wrote reaches the peer. |
 | Ticket | A `StreamOpenTicket`. It carries the terms of a pre-bound stream. |
+| Transport lane | One ordered channel from a transport to a peer. Order holds within a lane only. QUIC can keep several lanes to a peer, each on its own connection. Not the same as an ordered lane. |
 | `TransportKey` | The name of a transport in a `WorkerAddress`, for example `tcp` |
 | `WorkerAddress` | A MessagePack map from `TransportKey` to endpoint bytes |
 | `WorkerId` | The identity of a worker. A `StreamAnchorHandle` encodes it. |

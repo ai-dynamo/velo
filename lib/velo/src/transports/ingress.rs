@@ -130,7 +130,7 @@ pub(crate) async fn route_frame(
         MessageType::ShuttingDown => {
             // A remote peer rejected our request during its drain. The frame
             // carries our request header echoed back, so higher layers can
-            // correlate it; it gets its own lane because that header is
+            // correlate it; it gets its own stream because that header is
             // request-format, not response-format.
             &adapter.shutdown_stream
         }

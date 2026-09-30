@@ -23,7 +23,7 @@ velo-ext = "0.5"
 2. Send each inbound `MessageType::Message` frame through `TransportAdapter::admit_message`. Do not check `ShutdownState::is_draining()` first. See [Shutdown and drain](../concepts/shutdown.md).
 3. If `admit_message` returns `AdmitOutcome::Draining` and your transport has a return path, send a `MessageType::ShuttingDown` frame with the header of the rejected request. If there is no return path, record the rejection and drop the frame.
 4. If `admit_message` returns `AdmitOutcome::Disconnected`, the runtime has stopped. Record `TransportRejection::RouteFailed` through the observability handle and drop the frame.
-5. Route the other inbound types (`Response`, `Ack`, `Event`, `ShuttingDown`) to their lanes on the adapter.
+5. Route the other inbound types to their streams on the adapter: `Response` to the response stream, `Ack` and `Event` to the event stream, and `ShuttingDown` to the shutdown stream.
 6. Store the handle that `set_observability` gives you. Record each inbound frame as you route it.
 7. On the `Admitted` arm, and only there, record the frame as inbound `message`.
 
@@ -51,3 +51,5 @@ impl Transport for MyTransport {
 ## Stability of `velo-ext`
 
 New trait methods in `velo-ext` always have a default implementation, so a new release does not break your implementation. A change to an existing signature is a breaking release. See [Versioning](../development/versioning.md).
+
+A transport with one ordered channel to each peer keeps the defaults of `lanes` and `send_message_on_lane`. Override both only if your transport keeps several ordered channels to one peer. The two methods need `velo-ext = "0.5.4"` or later.
