@@ -480,6 +480,7 @@ async fn test_writer_task_cleans_up_on_write_error() {
             connect_timeout: Duration::from_secs(5),
             reader_ctx: None,
             metrics: None,
+            socket_buffers: None,
         },
     ));
 
@@ -626,6 +627,7 @@ async fn test_writer_task_drains_on_connect_failure() {
             connect_timeout: Duration::from_secs(5),
             reader_ctx: None,
             metrics: None,
+            socket_buffers: None,
         },
     ));
     let _ = writer.await;
@@ -713,4 +715,69 @@ async fn max_message_size_is_exactly_what_the_codec_will_encode() {
         TcpFrameCodec::build_preamble(MessageType::Message, header_len, payload_len + 1).is_err(),
         "one byte past the reported capacity must not",
     );
+}
+
+/// The kernel's default receive buffer for a new TCP socket, and what it
+/// reports once `bytes` is set on one. The two differ on every host, because
+/// Linux doubles a set value for bookkeeping and clamps it to `rmem_max`.
+fn recv_buffer_default_and_sized(bytes: usize) -> (usize, usize) {
+    let fresh =
+        || socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+    let default = fresh().recv_buffer_size().unwrap();
+    let sized = fresh();
+    sized.set_recv_buffer_size(bytes).unwrap();
+    (default, sized.recv_buffer_size().unwrap())
+}
+
+fn listener_recv_buffer(transport: &TcpTransport) -> usize {
+    let guard = transport.listener.lock().unwrap();
+    let listener = guard.as_ref().expect("the builder binds the listener");
+    socket2::SockRef::from(listener).recv_buffer_size().unwrap()
+}
+
+/// By default the listening socket is sized, as it always was, so accepted
+/// sockets inherit the size. With `socket_buffers(None)` it keeps the kernel's
+/// default, so accepted sockets autotune.
+///
+/// An explicit size turns autotuning off and is clamped to `rmem_max`; on
+/// hosts where that is 212,992 it caps one connection's window near 256 KB.
+#[test]
+fn socket_buffers_sizes_the_listener_or_leaves_it_to_the_kernel() {
+    let (default, sized) =
+        recv_buffer_default_and_sized(super::super::listener::DEFAULT_SOCKET_BUFFERS);
+    let build = |builder: TcpTransportBuilder| {
+        builder
+            .bind_addr("127.0.0.1:0".parse().unwrap())
+            .build()
+            .unwrap()
+    };
+    let sized_transport = build(TcpTransportBuilder::new());
+    assert_eq!(listener_recv_buffer(&sized_transport), sized);
+    let autotuned = build(TcpTransportBuilder::new().socket_buffers(None));
+    assert_eq!(listener_recv_buffer(&autotuned), default);
+    // The dial path reads the transport's copy of the setting.
+    assert_eq!(
+        sized_transport.socket_buffers,
+        Some(super::super::listener::DEFAULT_SOCKET_BUFFERS)
+    );
+    assert_eq!(autotuned.socket_buffers, None);
+}
+
+/// A dialed socket follows the same setting.
+#[tokio::test]
+async fn socket_buffers_sizes_a_dialed_socket_or_leaves_it_to_the_kernel() {
+    let bytes = super::super::listener::DEFAULT_SOCKET_BUFFERS;
+    let (_, sized) = recv_buffer_default_and_sized(bytes);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    for setting in [Some(bytes), None] {
+        let (dialed, _accepted) =
+            tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
+        let dialed = dialed.unwrap();
+        let sock = socket2::SockRef::from(&dialed);
+        let untouched = sock.recv_buffer_size().unwrap();
+        super::size_dialed_buffers(&sock, setting);
+        let expected = if setting.is_some() { sized } else { untouched };
+        assert_eq!(sock.recv_buffer_size().unwrap(), expected, "{setting:?}");
+    }
 }

@@ -39,6 +39,20 @@ pub enum TransportType {
     Quic,
 }
 
+/// TCP socket buffers from `VELO_TCP_SOCKET_BUFFERS`: `auto` for the
+/// kernel's autotuning, a number of bytes for a fixed size, unset for the
+/// transport's default.
+pub fn tcp_socket_buffers_from_env() -> Result<Option<usize>> {
+    match std::env::var("VELO_TCP_SOCKET_BUFFERS") {
+        Err(_) => Ok(Some(velo::transports::tcp::DEFAULT_SOCKET_BUFFERS)),
+        Ok(v) if v == "auto" => Ok(None),
+        Ok(v) => v
+            .parse()
+            .map(Some)
+            .map_err(|_| anyhow::anyhow!("VELO_TCP_SOCKET_BUFFERS={v} is not `auto` or a number")),
+    }
+}
+
 /// Build a transport for an example, on loopback unless `VELO_BIND_IP` names
 /// another local address (see [`bind_ip`]).
 ///
@@ -51,6 +65,7 @@ pub async fn new_transport(ty: TransportType, tag: &str) -> Result<Arc<dyn Trans
             Ok(Arc::new(
                 velo::transports::tcp::TcpTransportBuilder::new()
                     .from_listener(listener)?
+                    .socket_buffers(tcp_socket_buffers_from_env()?)
                     .build()?,
             ))
         }

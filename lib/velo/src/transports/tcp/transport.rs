@@ -75,6 +75,9 @@ pub struct TcpTransport {
     // Listener read-buffer shrink threshold (bytes). Plumbed into TcpListener
     // at start() time. Resolved from env or default in new().
     shrink_threshold: usize,
+    /// `SO_RCVBUF`/`SO_SNDBUF` for every TCP socket, or `None` for the
+    /// kernel's autotuning. See [`TcpTransportBuilder::socket_buffers`].
+    socket_buffers: Option<usize>,
 
     // Context for each dialed connection's read loop (the path that surfaces
     // the peer's ShuttingDown drain rejections). Set in start(), before
@@ -164,6 +167,7 @@ impl TcpTransport {
             numa_hint,
             metrics: OnceLock::new(),
             shrink_threshold: super::listener::default_shrink_threshold(),
+            socket_buffers: Some(super::listener::DEFAULT_SOCKET_BUFFERS),
             dialed_ctx: OnceLock::new(),
         }
     }
@@ -261,6 +265,7 @@ impl TcpTransport {
                 connect_timeout: self.connect_timeout,
                 reader_ctx: self.dialed_ctx.get().cloned(),
                 metrics: self.metrics.get().cloned(),
+                socket_buffers: self.socket_buffers,
             },
         ));
 
@@ -456,6 +461,7 @@ impl Transport for TcpTransport {
                 .transport_key(self.key.as_str())
                 .metrics(self.metrics.get().cloned())
                 .shrink_threshold(self.shrink_threshold)
+                .socket_buffers(self.socket_buffers)
                 .build()?;
 
             rt.spawn(async move {
@@ -545,6 +551,26 @@ impl Transport for TcpTransport {
     }
 }
 
+/// How to dial and set up one outbound connection.
+struct DialOptions {
+    connect_timeout: Duration,
+    /// `SO_RCVBUF`/`SO_SNDBUF`, or `None` for the kernel's autotuning.
+    socket_buffers: Option<usize>,
+}
+
+/// Size a dialed socket's buffers, or leave them to the kernel for `None`.
+pub(super) fn size_dialed_buffers(sock: &socket2::SockRef<'_>, bytes: Option<usize>) {
+    let Some(bytes) = bytes else {
+        return;
+    };
+    if let Err(e) = sock.set_send_buffer_size(bytes) {
+        warn!("Failed to set send buffer size: {}", e);
+    }
+    if let Err(e) = sock.set_recv_buffer_size(bytes) {
+        warn!("Failed to set recv buffer size: {}", e);
+    }
+}
+
 /// Per-connection configuration handed to [`connection_writer_task`].
 struct WriterTaskContext {
     connections: Arc<DashMap<crate::InstanceId, ConnectionHandle>>,
@@ -552,6 +578,7 @@ struct WriterTaskContext {
     connect_timeout: Duration,
     reader_ctx: Option<DialedReaderContext>,
     metrics: Option<std::sync::Arc<dyn velo_ext::TransportObservability>>,
+    socket_buffers: Option<usize>,
 }
 
 /// Connection writer task
@@ -573,13 +600,17 @@ async fn connection_writer_task(
         connect_timeout,
         reader_ctx,
         metrics,
+        socket_buffers,
     } = ctx;
     let result = connection_writer_inner(
         addr,
         instance_id,
         &rx,
         &cancel_token,
-        connect_timeout,
+        DialOptions {
+            connect_timeout,
+            socket_buffers,
+        },
         reader_ctx,
         metrics.clone(),
     )
@@ -628,10 +659,14 @@ async fn connection_writer_inner(
     instance_id: crate::InstanceId,
     rx: &flume::Receiver<SendTask>,
     cancel_token: &CancellationToken,
-    connect_timeout: Duration,
+    dial: DialOptions,
     reader_ctx: Option<DialedReaderContext>,
     metrics: Option<std::sync::Arc<dyn velo_ext::TransportObservability>>,
 ) -> Result<()> {
+    let DialOptions {
+        connect_timeout,
+        socket_buffers,
+    } = dial;
     debug!("Connecting to {}", addr);
 
     let stream = tokio::select! {
@@ -657,13 +692,7 @@ async fn connection_writer_inner(
     // Safe to size buffers here: this side dialed the connection and has not
     // written a byte yet, so unlike the accept path there is no in-flight data
     // to race (see the listener for why that race collapses the window).
-    if let Err(e) = sock.set_send_buffer_size(2_097_152) {
-        warn!("Failed to set send buffer size: {}", e);
-    }
-
-    if let Err(e) = sock.set_recv_buffer_size(2_097_152) {
-        warn!("Failed to set recv buffer size: {}", e);
-    }
+    size_dialed_buffers(&sock, socket_buffers);
 
     debug!("Connected to {}", addr);
 
@@ -755,6 +784,7 @@ pub struct TcpTransportBuilder {
     interface_filter: InterfaceFilter,
     numa_hint: Option<u32>,
     shrink_threshold: Option<usize>,
+    socket_buffers: Option<usize>,
 }
 
 impl TcpTransportBuilder {
@@ -769,6 +799,7 @@ impl TcpTransportBuilder {
             interface_filter: InterfaceFilter::default(),
             numa_hint: None,
             shrink_threshold: None,
+            socket_buffers: Some(super::listener::DEFAULT_SOCKET_BUFFERS),
         }
     }
 
@@ -821,6 +852,23 @@ impl TcpTransportBuilder {
         self
     }
 
+    /// `SO_RCVBUF` and `SO_SNDBUF` for every TCP socket of the transport, or
+    /// `None` to leave the buffers to the kernel's autotuning. The default is
+    /// 2 MiB.
+    ///
+    /// An explicit size turns autotuning off, and Linux clamps it to
+    /// `net.core.rmem_max`/`wmem_max`: with the common 212,992, 2 MiB becomes a
+    /// locked 416 KB, which caps the TCP window near 256 KB. Autotuning grows
+    /// the buffers up to `net.ipv4.tcp_rmem`/`tcp_wmem` instead. Measured
+    /// across two nodes, autotuning moved 6% more for 64 KiB messages
+    /// pipelined one way and 45% more for 256 KiB, but 5 to 15% less for
+    /// request and reply with 64 in flight, with a higher median latency. Use
+    /// `None` for one-way bulk and streaming traffic.
+    pub fn socket_buffers(mut self, bytes: Option<usize>) -> Self {
+        self.socket_buffers = bytes;
+        self
+    }
+
     /// Use a pre-bound TcpListener instead of binding to a specific address
     ///
     /// This is useful for tests where you want to bind to port 0 and get an OS-assigned
@@ -852,7 +900,7 @@ impl TcpTransportBuilder {
             // Caller-provided listener: it is already live, so this is best
             // effort — connections whose handshake completed before this point
             // keep kernel-default autotuned buffers, which is safe.
-            super::listener::size_listener_buffers(&listener);
+            super::listener::size_listener_buffers(&listener, self.socket_buffers);
             let addr = listener.local_addr()?;
             (addr, Some(listener))
         } else {
@@ -874,7 +922,7 @@ impl TcpTransportBuilder {
             socket
                 .set_reuse_address(true)
                 .context("Failed to set SO_REUSEADDR")?;
-            super::listener::size_listener_buffers(&socket);
+            super::listener::size_listener_buffers(&socket, self.socket_buffers);
             socket
                 .bind(&requested.into())
                 .context("Failed to pre-bind TCP listener")?;
@@ -922,6 +970,7 @@ impl TcpTransportBuilder {
         if let Some(t) = self.shrink_threshold {
             transport.shrink_threshold = t;
         }
+        transport.socket_buffers = self.socket_buffers;
         Ok(transport)
     }
 }

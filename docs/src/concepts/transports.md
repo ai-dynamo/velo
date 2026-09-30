@@ -53,7 +53,18 @@ The writer publishes `velo_transport_frames_written_total`, `velo_transport_writ
 
 ## Socket buffers are set before data flows
 
-TCP sets `SO_RCVBUF` and `SO_SNDBUF` on the listening socket, so each accepted socket inherits the sizes at handshake time. The dial side sets them before its first write.
+TCP sets `SO_RCVBUF` and `SO_SNDBUF` on the listening socket, so each accepted socket inherits the sizes at handshake time. The dial side sets them before its first write. The size is 2 MiB by default.
+
+An explicit size turns off the kernel's autotuning, and Linux clamps it to `net.core.rmem_max` and `wmem_max`. With the common 212,992, 2 MiB becomes a locked 416 KB buffer, which caps the TCP window near 256 KB. `TcpTransportBuilder::socket_buffers(None)` sets no size, so the kernel autotunes the buffers up to `net.ipv4.tcp_rmem` and `tcp_wmem`. It is a trade-off. Measured on 2026-09-30 across two nodes, three reps, one connection:
+
+| Traffic | Size of 2 MiB (MiB/s) | Autotuned (MiB/s) |
+|---|---|---|
+| 64 KiB, pipelined one way | 2,411–2,506 | 2,618–2,660 |
+| 256 KiB, pipelined one way | 2,232–2,355 | 3,359–3,387 |
+| 64 KiB, request and reply, 64 in flight | 1,614–1,903 | 1,549–1,612 |
+| 256 KiB, request and reply, 64 in flight | 1,892–1,920, p50 8.0 ms | 1,639–1,674, p50 9.6 ms |
+
+On loopback, autotuning lost 10% for 64 KiB pipelined, gained 10 to 30% for 256 KiB pipelined, and doubled the p99 for 256 KiB with 64 in flight. Autotuning suits one-way bulk and streaming traffic. The default suits request and reply. The examples read `VELO_TCP_SOCKET_BUFFERS`: `auto` for autotuning, or a size in bytes.
 
 The old code set the sizes on the accepted socket, one task spawn after `accept`. By then the peer was already sending. On Linux, `SO_RCVBUF` at that point turns off receive autotuning and clamps the buffer to `net.core.rmem_max`. The advertised window then collapses for the life of the connection. Throughput fell about 100 times, to 22.9 MB/s, and the fault was racy, so it showed up in some runs only. The `tx_budget` example measures this path and guards against the fault.
 
