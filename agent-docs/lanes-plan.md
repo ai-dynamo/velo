@@ -136,3 +136,9 @@ For Stage C:
 - Zero-RTT: if the worker cannot translate the minting node's worker id when it opens a ticket, `transport_lanes` falls back to 1 and the stream rides lane 0. Correct, but loses the spread.
 - `MAX_INGRESS_SLOTS_PER_PEER / 16 = 4096` indices per lane. A keyed hash that piles many streams on one lane hits that before the peer-wide 65,536.
 - Old-worker hazard (ruling 13) is now live code: a minting node that names a non-zero lane breaks old workers under positional rmp. Stage C turns on non-zero lanes only where the transport keeps more than one lane (QUIC with `lanes(n)`), so a default deployment stays lane 0.
+
+## Correction, 2026-09-29: ruling 17 is withdrawn
+
+The TCP lanes numbers behind ruling 17 came from a stale binary: the TCP-lanes prototype build failed (a `missing_docs` error) and the build script copied the old QUIC-only binary. With a working build, across two nodes, 64 KiB pipelined (GB/s = 10^9 B/s): TCP 1, 2, 4 and 8 lanes gave 2.5, 4.6, 8.1 and 13.1 GB/s with the process on NUMA node 1, and 17.6 GB/s at 8 lanes with both sides on the NIC's NUMA node 0. One TCP connection is limited by its receiver: one reader task spends about 0.85 core in `recvmsg`, runs on the NUMA node away from the NIC, and velo's 2 MiB `SO_RCVBUF` request is clamped to 416 KB and locked, which turns off autotuning. Data: `.research/perfwork/tcpprof/`.
+
+New ruling 24: TCP implements lanes too, keyed (peer, lane) like QUIC. TCP needs no per-lane port: the kernel gives each accepted connection its own socket, and the listener reads each on its own task. Ryan (2026-09-29): rerun the Dynamo harness with lanes on TCP and on QUIC once the mux lanes land, pinned to velo main or a release.
