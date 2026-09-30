@@ -27,6 +27,7 @@
 
 mod dirty;
 mod drain;
+mod epoch;
 mod reconcile;
 mod slot;
 #[cfg(test)]
@@ -42,15 +43,13 @@ use velo_ext::WorkerId;
 
 pub(crate) use self::dirty::DirtySlots;
 pub(crate) use self::drain::DrainSignal;
+use self::epoch::{accept_epoch, note_batch_seq, retire_epoch};
 use self::reconcile::{collect_grants, collect_touched_grants, list_drained_slots};
 use self::slot::{Applied, IngressSlot, LiveCounts, heartbeat_frame};
 use super::flow_control::SharedByteBudget;
 use super::lane_choice::{LaneCounts, LaneReservation, PeerLaneCounts};
 use super::peer_batcher::ReplyRecord;
-use super::protocol::{
-    BatchDecoder, BatchHeader, CloseReason, Record, RecordBody, SlotId, batch_seq_gap,
-    batch_seq_is_newer,
-};
+use super::protocol::{BatchDecoder, BatchHeader, CloseReason, Record, RecordBody, SlotId};
 use super::{LaneIndex, MuxConfig, PeerLane};
 use crate::observability::{MuxDirection, MuxDropReason, MuxMetricsHandle};
 
@@ -303,37 +302,6 @@ impl IngressRegistry {
         })
     }
 
-    /// Binds registered and neither claimed nor released.
-    #[cfg(test)]
-    pub(crate) fn bind_count(&self) -> usize {
-        self.binds.len()
-    }
-
-    /// The window one of `key`'s live slots opened holding.
-    #[cfg(test)]
-    pub(crate) fn slot_open_terms(&self, key: PeerLane, id: SlotId) -> Option<(u32, u64)> {
-        let entry = self.peers.get(&key)?;
-        let state = lock(entry.value());
-        state
-            .slots
-            .get(id.index() as usize)
-            .and_then(Option::as_ref)
-            .filter(|slot| slot.id == id)
-            .map(|slot| slot.open_terms())
-    }
-
-    /// The ids of `key`'s live slots.
-    #[cfg(test)]
-    pub(crate) fn live_slot_ids(&self, key: PeerLane) -> Vec<SlotId> {
-        self.peers.get(&key).map_or_else(Vec::new, |entry| {
-            lock(entry.value())
-                .slots
-                .iter()
-                .filter_map(|slot| slot.as_ref().map(|slot| slot.id))
-                .collect()
-        })
-    }
-
     /// This (peer, lane)'s pending-wake flag, created on first use.
     ///
     /// Lives on the registry rather than in `PeerIngress` so a draining consumer
@@ -385,23 +353,9 @@ impl IngressRegistry {
         );
     }
 
-    /// Calls into `close_consumer_gone` so far.
-    #[cfg(test)]
-    pub(crate) fn consumer_gone_calls(&self) -> usize {
-        self.consumer_gone_calls
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
     /// Drop an unclaimed bind, reporting whether one was there.
     pub(crate) fn expire_bind(&self, anchor_id: u64, session_id: u64) -> bool {
         self.binds.remove(&(anchor_id, session_id)).is_some()
-    }
-
-    /// Bytes `peer`'s ahead-of-sequence holds have reserved between them, on
-    /// every lane.
-    #[cfg(test)]
-    pub(crate) fn peer_bytes_used(&self, peer: WorkerId) -> u64 {
-        self.peer_bytes.get(&peer).map_or(0, |budget| budget.used())
     }
 
     /// `peer`'s byte budget, created at `limit` on first use.
@@ -412,23 +366,6 @@ impl IngressRegistry {
                 .or_insert_with(|| Arc::new(SharedByteBudget::new(limit)))
                 .value(),
         )
-    }
-
-    /// Reconcile visits `key`'s slots have taken since its table opened.
-    #[cfg(test)]
-    pub(crate) fn reconcile_visits(&self, key: PeerLane) -> u64 {
-        self.peers
-            .get(&key)
-            .map_or(0, |entry| lock(entry.value()).reconcile_visits)
-    }
-
-    /// Run `f` while holding `key`'s table mutex, as the ordered batch
-    /// handler does through a decode. `None` when `key` has no table.
-    #[cfg(test)]
-    pub(crate) fn with_table_locked<R>(&self, key: PeerLane, f: impl FnOnce() -> R) -> Option<R> {
-        let entry = self.peers.get(&key)?;
-        let _state = lock(entry.value());
-        Some(f())
     }
 
     /// Live receive-side slots for one (peer, lane), counted by walking its
@@ -500,13 +437,6 @@ impl IngressRegistry {
         list_drained_slots(&mut state);
         collect_touched_grants(&mut state, &mut replies);
         replies
-    }
-
-    /// `key`'s dirty-slot set, for the tests that inspect it.
-    #[cfg(test)]
-    pub(crate) fn dirty_slots(&self, key: PeerLane) -> Arc<DirtySlots> {
-        let entry = self.peers.get(&key).expect("peer has a slot table");
-        Arc::clone(&lock(entry.value()).dirty)
     }
 
     /// Tear down every slot of every peer, injecting `Dropped` into each.
@@ -648,69 +578,6 @@ pub(crate) fn handle_batch(
     list_drained_slots(&mut state);
     collect_touched_grants(&mut state, &mut outcome.replies);
     outcome
-}
-
-/// Decide what to do with a batch's epoch. `false` means discard the batch.
-fn accept_epoch(
-    state: &mut PeerIngress,
-    header: &BatchHeader,
-    metrics: Option<&MuxMetricsHandle>,
-    outcome: &mut BatchOutcome,
-) -> bool {
-    match state.epoch {
-        // First batch from this peer: adopt whatever epoch it names.
-        None => state.epoch = Some(header.peer_epoch),
-        Some(current) if header.peer_epoch < current => {
-            // Discarded wholesale by header inspection rather than drained
-            // record by record against state that has moved on.
-            if let Some(metrics) = metrics {
-                metrics.records_dropped(MuxDropReason::StaleEpoch, u64::from(header.record_count));
-            }
-            return false;
-        }
-        Some(current) if header.peer_epoch > current => {
-            // The reconnect, seen from the receive side. Egress learns of epoch
-            // death from a failed admission; the receiver's only signal is this
-            // header, and without acting on it the old epoch's slots leak for
-            // the life of the process and `live_slots` never returns to zero.
-            outcome.closed += retire_epoch(state, metrics);
-            state.epoch = Some(header.peer_epoch);
-            state.last_batch_seq = None;
-        }
-        Some(_) => {}
-    }
-    true
-}
-
-/// Meter the batch's sequence against the newest one seen from this peer.
-///
-/// The mark only moves forward. A batch behind it — a duplicate, or one that
-/// arrived after its successor — is not a gap and does not move the mark.
-/// Metering it would add the wrapped difference, near `u32::MAX`, to a counter
-/// that means "batches missing", and moving the mark back would count its
-/// successor's gap a second time when the sequence resumes past it. A detached
-/// open under `MuxConfig::async_open_ack` can invert a pair this way (see
-/// `Batcher::open_detached` in `peer_batcher`); what the meter reports for
-/// one is the single batch its later half looked like when it arrived first,
-/// and nothing more.
-fn note_batch_seq(
-    state: &mut PeerIngress,
-    header: &BatchHeader,
-    metrics: Option<&MuxMetricsHandle>,
-) {
-    let received = header.batch_seq;
-    if let Some(last) = state.last_batch_seq {
-        if !batch_seq_is_newer(received, last) {
-            return;
-        }
-        let gap = batch_seq_gap(last.wrapping_add(1), received);
-        if gap > 0
-            && let Some(metrics) = metrics
-        {
-            metrics.batch_seq_gap(gap);
-        }
-    }
-    state.last_batch_seq = Some(received);
 }
 
 /// Apply one record to the peer's slot table.
@@ -1038,49 +905,6 @@ fn checked_slot<'a>(
             None
         }
     }
-}
-
-/// Retire every slot of a dying epoch, injecting exactly one `Dropped` each.
-fn retire_epoch(state: &mut PeerIngress, metrics: Option<&MuxMetricsHandle>) -> usize {
-    let mut closed = 0;
-    for index in 0..state.slots.len() {
-        if let Some(mut slot) = state.slots[index].take() {
-            // Only this slot's holds go back: the budget is shared with the
-            // peer's other lanes, whose epochs live on.
-            state.peer_bytes.release(slot.hold_bytes_used() as usize);
-            if let Some(metrics) = metrics
-                && slot.held() > 0
-            {
-                metrics.held_records_delta(-(slot.held() as i64));
-            }
-            slot.inject_dropped();
-            closed += 1;
-        }
-    }
-    state.slots.clear();
-    // The entries here name slots of the epoch being retired. On the ordinary
-    // path the list is already empty at this point — the epoch check runs
-    // before any record is applied, and `shutdown` runs with no batch in
-    // flight — so this clears the poison path `touched`'s own doc names (a
-    // panic between a push and the drain), plus any future caller that
-    // retires mid-batch. The table is cleared and regrows from index zero, so
-    // a left-behind entry would send the next pass to whatever slot takes that
-    // index back — a reconcile of a slot neither the batch nor a consumer named.
-    // Clearing keeps every entry meaning what the pass assumes it means.
-    //
-    // The dirty set gets no matching clear. A retired index's own consumer can
-    // still list it — draining what was already in the C + 1 buffer at
-    // close — and that listing outlives this function with nothing here to
-    // name it. Left alone, it costs whatever visits the index next one empty visit
-    // (nothing, if the index stays closed) or one spurious visit of a
-    // replacement (harmless per `collect_touched_grants`'s doc: the visit
-    // reads the replacement's own count, whatever its own consumer has drained
-    // since, and that count is always its own — `bind` makes one
-    // `DrainSignal` per bind and `open_slot` claims it, so it can never be the
-    // retired slot's). `collect_grants`'s periodic walk also takes the whole
-    // set, so such a listing cannot outlive one tick.
-    state.touched.clear();
-    closed
 }
 
 /// Take a lock, ignoring poisoning.

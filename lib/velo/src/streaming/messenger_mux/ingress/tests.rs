@@ -17,6 +17,71 @@ use crate::streaming::messenger_mux::LaneIndex;
 use crate::streaming::messenger_mux::protocol::{BatchEncoder, RecordType, SlotId};
 use crate::streaming::sender::{cached_dropped, cached_finalized};
 
+/// Test-only views into the registry. Here rather than beside the registry,
+/// so the receive path's file holds only the receive path.
+impl IngressRegistry {
+    /// Binds registered and neither claimed nor released.
+    pub(crate) fn bind_count(&self) -> usize {
+        self.binds.len()
+    }
+
+    /// The window one of `key`'s live slots opened holding.
+    pub(crate) fn slot_open_terms(&self, key: PeerLane, id: SlotId) -> Option<(u32, u64)> {
+        let entry = self.peers.get(&key)?;
+        let state = lock(entry.value());
+        state
+            .slots
+            .get(id.index() as usize)
+            .and_then(Option::as_ref)
+            .filter(|slot| slot.id == id)
+            .map(|slot| slot.open_terms())
+    }
+
+    /// The ids of `key`'s live slots.
+    pub(crate) fn live_slot_ids(&self, key: PeerLane) -> Vec<SlotId> {
+        self.peers.get(&key).map_or_else(Vec::new, |entry| {
+            lock(entry.value())
+                .slots
+                .iter()
+                .filter_map(|slot| slot.as_ref().map(|slot| slot.id))
+                .collect()
+        })
+    }
+
+    /// Calls into `close_consumer_gone` so far.
+    pub(crate) fn consumer_gone_calls(&self) -> usize {
+        self.consumer_gone_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Bytes `peer`'s ahead-of-sequence holds have reserved between them, on
+    /// every lane.
+    pub(crate) fn peer_bytes_used(&self, peer: WorkerId) -> u64 {
+        self.peer_bytes.get(&peer).map_or(0, |budget| budget.used())
+    }
+
+    /// Reconcile visits `key`'s slots have taken since its table opened.
+    pub(crate) fn reconcile_visits(&self, key: PeerLane) -> u64 {
+        self.peers
+            .get(&key)
+            .map_or(0, |entry| lock(entry.value()).reconcile_visits)
+    }
+
+    /// Run `f` while holding `key`'s table mutex, as the ordered batch
+    /// handler does through a decode. `None` when `key` has no table.
+    pub(crate) fn with_table_locked<R>(&self, key: PeerLane, f: impl FnOnce() -> R) -> Option<R> {
+        let entry = self.peers.get(&key)?;
+        let _state = lock(entry.value());
+        Some(f())
+    }
+
+    /// `key`'s dirty-slot set, for the tests that inspect it.
+    pub(crate) fn dirty_slots(&self, key: PeerLane) -> Arc<DirtySlots> {
+        let entry = self.peers.get(&key).expect("peer has a slot table");
+        Arc::clone(&lock(entry.value()).dirty)
+    }
+}
+
 /// A drain signal whose wakes go nowhere, for tests that drive the registry
 /// directly. The claim path still runs, so `open_slot` naming the peer, the
 /// slot index and the dirty set is covered; nothing consumes the wake lane

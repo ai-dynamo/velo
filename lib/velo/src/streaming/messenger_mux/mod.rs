@@ -114,7 +114,6 @@ mod test_support;
 mod tests;
 
 use std::collections::VecDeque;
-use std::num::NonZeroU16;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
@@ -399,29 +398,6 @@ impl MessengerMuxTransport {
 }
 
 impl MuxCore {
-    /// How many lanes the messenger's transport keeps to `peer`.
-    ///
-    /// One for a peer the messenger cannot name yet: lane 0 serves every
-    /// stream, so under-counting costs spread, never correctness.
-    fn transport_lanes(&self, peer: WorkerId) -> NonZeroU16 {
-        let backend = self.messenger.backend();
-        backend
-            .try_translate_worker_id(peer)
-            .ok()
-            .and_then(|instance| backend.lanes(instance).ok())
-            .unwrap_or(NonZeroU16::MIN)
-    }
-
-    /// How many lanes this node's transports keep to a peer not yet known.
-    ///
-    /// The most any installed transport keeps. Every in-tree transport answers
-    /// `lanes()` without looking at its target, so this is what the peer's
-    /// transport will keep too if it is the one with lanes; a peer reached over
-    /// one with fewer clamps the lane on its side, which is always correct.
-    fn local_lanes(&self) -> NonZeroU16 {
-        self.messenger.backend().max_lanes()
-    }
-
     /// The batcher for one (peer, lane), created on first use.
     fn batcher(&self, key: PeerLane) -> Arc<BatcherHandle> {
         if let Some(existing) = self.batchers.get(&key) {
@@ -803,66 +779,6 @@ impl MessengerMuxTransport {
     /// The window this node advertises to a peer negotiating an attach.
     pub(crate) fn advertised_limits(&self) -> NegotiatedLimits {
         self.core.limits
-    }
-
-    /// Place the next stream bound on this node on a lane, and count it there
-    /// until its bind is claimed, released or expired. Once claimed, the
-    /// stream counts on its lane as a live slot until the slot retires.
-    ///
-    /// The lane is answered in the attach response or quoted in the ticket,
-    /// and the sender follows it, clamped to its own lanes
-    /// ([`Self::sender_lane`]). `peer` is the sender an attach came from, and
-    /// `None` for a pre-bind, whose sender is not known yet. `key` is the
-    /// caller's lane key; see [`lane_choice`] for how each case is placed.
-    ///
-    /// The lane count is the mux lanes of the transport to `peer`, or for a
-    /// pre-bind the most any transport here keeps. With one lane every stream
-    /// is on lane 0, which keeps a default deployment's attach answers and
-    /// tickets the same bytes as before lanes: a ticket naming another lane
-    /// cannot be read by a worker built before lanes.
-    ///
-    /// The returned reservation goes to [`Self::bind_on_lane`]; dropping it
-    /// gives the count back.
-    pub(crate) fn choose_lane(&self, peer: Option<WorkerId>, key: Option<u64>) -> LaneReservation {
-        let lanes = peer.map_or_else(
-            || self.core.local_lanes(),
-            |peer| self.core.transport_lanes(peer),
-        );
-        let ingress = &self.core.ingress;
-        self.core
-            .lane_load
-            .reserve(peer, key, lanes, |peer, lane| match peer {
-                Some(peer) => ingress.live_count(PeerLane::new(peer, lane)),
-                None => ingress.live_on_lane(lane),
-            })
-    }
-
-    /// Binds on `lane` not yet claimed, released or expired: from `peer`'s
-    /// attaches, or with `None` from pre-binds.
-    #[cfg(test)]
-    pub(crate) fn pending_binds_on(&self, peer: Option<WorkerId>, lane: LaneIndex) -> usize {
-        self.core.lane_load.pending(peer, lane)
-    }
-
-    /// Close the accept window on every bind as if it had run out.
-    #[cfg(test)]
-    pub(crate) fn expire_all_binds(&self) {
-        self.core
-            .expire_binds(tokio::time::Instant::now() + ACCEPT_TIMEOUT + Duration::from_secs(1));
-    }
-
-    /// The (peer, lane) a stream that `peer` placed on `lane` is sent on from
-    /// this node.
-    ///
-    /// `lane` modulo the lanes this node's transport keeps to `peer`. The peer
-    /// chose the lane from its own transport's count, which may be larger;
-    /// any lane is correct for any stream, because every node takes batches on
-    /// every lane and replies on the lane a batch arrived on.
-    pub(crate) fn sender_lane(&self, peer: WorkerId, lane: u16) -> PeerLane {
-        PeerLane::new(
-            peer,
-            LaneIndex::clamped(lane, self.core.transport_lanes(peer)),
-        )
     }
 
     /// Bind a slot on the lane [`choose_lane`](Self::choose_lane) placed it on.
