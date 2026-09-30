@@ -1021,8 +1021,9 @@ impl Velo {
     /// hashes to.
     ///
     /// Delegates to [`AnchorManager::attach_stream_anchor_keyed`](crate::streaming::AnchorManager::attach_stream_anchor_keyed).
-    /// Streams with one key to one consumer share a lane and so stay in one
-    /// ordered channel. [`attach_anchor`](Velo::attach_anchor) lets the
+    /// The key is a placement hint, not an ordering guarantee: streams with
+    /// one key to one consumer share a lane, but the mux never orders records
+    /// across streams. [`attach_anchor`](Velo::attach_anchor) lets the
     /// consumer pick the least-used lane instead.
     pub async fn attach_anchor_keyed<T: serde::Serialize>(
         &self,

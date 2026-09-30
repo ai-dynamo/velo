@@ -8,7 +8,9 @@
 //! to the lanes it keeps itself.
 //!
 //! - With a key from the caller, the lane is `stable_hash(key) % lanes`, so
-//!   streams with one key share a lane on every node and in every build.
+//!   one key gives one lane index on every node with the same lane count, in
+//!   every build. It is a placement hint: the mux never orders records across
+//!   streams.
 //! - Without a key, the lane is the one with the least load, ties to the
 //!   lowest index. On attach the peer is known and the load of lane k is that
 //!   peer's live slots placed on k plus its binds on k that no `OpenSlot` has

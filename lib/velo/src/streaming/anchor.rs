@@ -1388,10 +1388,11 @@ impl AnchorManager {
     /// As [`prebind_anchor`](Self::prebind_anchor), with the stream placed on
     /// the mux lane `key` hashes to.
     ///
-    /// Streams pre-bound with one key share a lane, so their records stay in
-    /// one ordered channel to the worker. The hash is fixed across builds and
-    /// processes. With one lane (the default transport setup) every key is on
-    /// lane 0.
+    /// The hash is fixed across builds and processes, so one key gives the
+    /// same lane index on every node that keeps the same lane count. With one
+    /// lane (the default transport setup) every key is on lane 0. The key is a
+    /// placement hint, not an ordering guarantee: the mux never orders records
+    /// across streams, even on one lane.
     pub fn prebind_anchor_keyed(
         &self,
         handle: StreamAnchorHandle,
@@ -2423,11 +2424,13 @@ impl AnchorManager {
     /// As [`attach_stream_anchor`](Self::attach_stream_anchor), with the
     /// stream placed on the mux lane `key` hashes to.
     ///
-    /// Streams attached with one key to one consumer share a lane, so their
-    /// records stay in one ordered channel. The consumer hashes the key, with a
-    /// hash fixed across builds and processes, over the lanes its transport
-    /// keeps to this worker; with one lane every key is on lane 0. A local
-    /// anchor has no lane and ignores the key.
+    /// The consumer hashes the key, with a hash fixed across builds and
+    /// processes, over the lanes its transport keeps to this worker. One key
+    /// therefore gives the same lane index on every consumer that keeps the
+    /// same lane count, and with one lane every key is on lane 0. The key is a
+    /// placement hint, not an ordering guarantee: the mux never orders records
+    /// across streams, even on one lane. A local anchor has no lane and
+    /// ignores the key.
     pub async fn attach_stream_anchor_keyed<T: serde::Serialize>(
         &self,
         handle: StreamAnchorHandle,
