@@ -182,7 +182,7 @@ async fn stream_watchdog_unclaimed_bind_reap_increments_counter() {
     );
 
     let (transport_tx, transport_rx) = flume::bounded::<Vec<u8>>(4);
-    let (wake_tx, _wake_rx) = flume::bounded::<velo_ext::WorkerId>(16);
+    let (wake_tx, _wake_rx) = flume::bounded::<crate::streaming::messenger_mux::PeerLane>(16);
     let drain = Arc::new(crate::streaming::messenger_mux::ingress::DrainSignal::new(
         wake_tx,
     ));
@@ -891,7 +891,7 @@ fn make_watchdog_test_infra(
     let cancel_token = tokio_util::sync::CancellationToken::new();
     let registry = std::sync::Arc::new(dashmap::DashMap::new());
     let local_id = 1u64;
-    let (wake_tx, _wake_rx) = flume::bounded::<velo_ext::WorkerId>(16);
+    let (wake_tx, _wake_rx) = flume::bounded::<crate::streaming::messenger_mux::PeerLane>(16);
     let drain = Arc::new(crate::streaming::messenger_mux::ingress::DrainSignal::new(
         wake_tx,
     ));
@@ -992,7 +992,10 @@ async fn test_watchdog_reaps_a_claimed_prebind_after_missed_heartbeats() {
 
     // What `open_slot` does to a bind's drain signal when an `OpenSlot`
     // claims it, without a mux in the loop.
-    let peer = velo_ext::WorkerId::from_u64(0xABCD);
+    let peer = crate::streaming::messenger_mux::PeerLane::new(
+        velo_ext::WorkerId::from_u64(0xABCD),
+        crate::streaming::messenger_mux::LaneIndex::ZERO,
+    );
     let slot = crate::streaming::messenger_mux::protocol::SlotId::new(0, 0).expect("slot id");
     drain.claimed_by(
         peer,

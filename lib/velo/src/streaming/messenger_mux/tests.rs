@@ -943,15 +943,17 @@ async fn gate_off_reproduces_the_awaited_ack() {
 /// each side of the floor, that a deferred peer is handed back exactly once,
 /// and that the re-check inside `due` cannot spin.
 mod drain_visit_floor {
+    use super::super::PeerLane;
     use super::super::sweep::DrainVisits;
+    use super::super::test_support::lane0;
     use std::time::Duration;
     use tokio::time::Instant;
     use velo_ext::WorkerId;
 
     const FLOOR: Duration = Duration::from_millis(2);
 
-    fn peer(id: u64) -> WorkerId {
-        WorkerId::from_u64(id)
+    fn peer(id: u64) -> PeerLane {
+        lane0(WorkerId::from_u64(id))
     }
 
     #[test]
@@ -1291,7 +1293,7 @@ async fn unclaimed_bind_is_reclaimed_on_anchor_death_without_the_timer() {
     );
     assert_eq!(mux.parked_drains(), 0);
     assert_eq!(
-        mux.live_ingress_slots(messenger.instance_id().worker_id()),
+        mux.live_ingress_slots(lane0(messenger.instance_id().worker_id())),
         0
     );
 }
@@ -1310,7 +1312,7 @@ async fn close_claimed_slot_is_idempotent() {
 
     // A slot this side never opened: nothing to close, and nothing to say.
     pair.consumer
-        .close_claimed_slot(pair.producer_worker, protocol::SlotId::from_raw(0));
+        .close_claimed_slot(lane0(pair.producer_worker), protocol::SlotId::from_raw(0));
 
     let rx = pair.consumer.bind(1, 1).await.expect("bind");
     let tx = pair
@@ -1321,13 +1323,15 @@ async fn close_claimed_slot_is_idempotent() {
     tx.send_async(item(0)).await.expect("send item");
     assert_eq!(recv(&rx).await, item(0));
 
-    let ids = pair.consumer.live_slot_ids(pair.producer_worker);
+    let ids = pair.consumer.live_slot_ids(lane0(pair.producer_worker));
     assert_eq!(ids.len(), 1, "one stream, one receive-side slot");
     let slot = ids[0];
 
-    pair.consumer.close_claimed_slot(pair.producer_worker, slot);
+    pair.consumer
+        .close_claimed_slot(lane0(pair.producer_worker), slot);
     assert_eq!(
-        pair.consumer.live_ingress_slots(pair.producer_worker),
+        pair.consumer
+            .live_ingress_slots(lane0(pair.producer_worker)),
         0,
         "the close must retire the slot here, not only tell the peer"
     );
@@ -1336,8 +1340,13 @@ async fn close_claimed_slot_is_idempotent() {
     eventually(|| tx.is_disconnected()).await;
 
     // Second close: same slot, already gone.
-    pair.consumer.close_claimed_slot(pair.producer_worker, slot);
-    assert_eq!(pair.consumer.live_ingress_slots(pair.producer_worker), 0);
+    pair.consumer
+        .close_claimed_slot(lane0(pair.producer_worker), slot);
+    assert_eq!(
+        pair.consumer
+            .live_ingress_slots(lane0(pair.producer_worker)),
+        0
+    );
 }
 
 /// The prompt close survives its peer's batcher retiring underneath it.
@@ -1370,8 +1379,13 @@ async fn a_close_posted_past_the_batchers_last_drain_still_reaches_the_producer(
         .connect(pair.consumer_worker, 1, 1)
         .await
         .expect("connect");
-    eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 1).await;
-    let slot = pair.consumer.live_slot_ids(pair.producer_worker)[0];
+    eventually(|| {
+        pair.consumer
+            .live_ingress_slots(lane0(pair.producer_worker))
+            == 1
+    })
+    .await;
+    let slot = pair.consumer.live_slot_ids(lane0(pair.producer_worker))[0];
 
     // Resolved first, as `close_claimed_slot` resolves it. Nothing has been
     // drained, so no credit is owed and the batcher is idle from birth — which
@@ -1436,8 +1450,13 @@ async fn a_close_refused_by_a_retired_batcher_reaches_the_producer_through_its_r
         .connect(pair.consumer_worker, 1, 1)
         .await
         .expect("connect");
-    eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 1).await;
-    let slot = pair.consumer.live_slot_ids(pair.producer_worker)[0];
+    eventually(|| {
+        pair.consumer
+            .live_ingress_slots(lane0(pair.producer_worker))
+            == 1
+    })
+    .await;
+    let slot = pair.consumer.live_slot_ids(lane0(pair.producer_worker))[0];
 
     // Resolved first, as `close_claimed_slot` resolves it, then evicted by
     // hand the way the sweep does it: claim under the registry lock, post
@@ -1503,18 +1522,22 @@ async fn close_claimed_slot_off_runtime_closes_through_the_mux_runtime() {
     tx.send_async(item(0)).await.expect("send item");
     assert_eq!(recv(&rx).await, item(0));
 
-    let ids = pair.consumer.live_slot_ids(pair.producer_worker);
+    let ids = pair.consumer.live_slot_ids(lane0(pair.producer_worker));
     assert_eq!(ids.len(), 1, "one stream, one receive-side slot");
     let slot = ids[0];
 
     let consumer = Arc::clone(&pair.consumer);
-    let peer = pair.producer_worker;
+    let peer = lane0(pair.producer_worker);
     // A bare OS thread carries no tokio context.
     std::thread::spawn(move || consumer.close_claimed_slot(peer, slot))
         .join()
         .expect("close_claimed_slot must not panic off a runtime");
 
-    assert_eq!(pair.consumer.live_ingress_slots(pair.producer_worker), 0);
+    assert_eq!(
+        pair.consumer
+            .live_ingress_slots(lane0(pair.producer_worker)),
+        0
+    );
     // The producer's inlet closes once its slot retires on the close.
     tokio::time::timeout(RECV_TIMEOUT, async {
         while !tx.is_disconnected() {
@@ -1820,12 +1843,17 @@ async fn a_prebound_slot_opens_on_the_terms_its_ticket_quotes() {
         .await
         .expect("connect");
     tx.send_async(item(0)).await.expect("send item");
-    eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 1).await;
+    eventually(|| {
+        pair.consumer
+            .live_ingress_slots(lane0(pair.producer_worker))
+            == 1
+    })
+    .await;
 
-    let id = pair.consumer.live_slot_ids(pair.producer_worker)[0];
+    let id = pair.consumer.live_slot_ids(lane0(pair.producer_worker))[0];
     let (credit, byte_budget) = pair
         .consumer
-        .slot_open_terms(pair.producer_worker, id)
+        .slot_open_terms(lane0(pair.producer_worker), id)
         .expect("the claimed slot is live");
     assert_eq!(
         ticket.initial_credit, credit,
@@ -1902,7 +1930,7 @@ fn the_drain_wake_lane_never_refuses_a_wake() {
     let (tx, _rx) = drain_wake_lane();
     for peer in 0..100_000u64 {
         assert!(
-            tx.try_send(WorkerId::from_u64(peer)).is_ok(),
+            tx.try_send(lane0(WorkerId::from_u64(peer))).is_ok(),
             "wake {peer} refused"
         );
     }
@@ -2069,7 +2097,12 @@ async fn the_watchdog_does_not_fire_while_its_sender_is_parked() {
     for n in 0..CREDIT {
         tx.send_async(item(n)).await.expect("send item");
     }
-    eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 1).await;
+    eventually(|| {
+        pair.consumer
+            .live_ingress_slots(lane0(pair.producer_worker))
+            == 1
+    })
+    .await;
 
     // Twenty windows of silence, with the whole window unread.
     tokio::time::sleep(heartbeat * 20).await;
@@ -2107,7 +2140,12 @@ async fn a_silent_sender_with_credit_is_reaped_while_records_wait_unread() {
     for n in 0..3 {
         tx.send_async(item(n)).await.expect("send item");
     }
-    eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 1).await;
+    eventually(|| {
+        pair.consumer
+            .live_ingress_slots(lane0(pair.producer_worker))
+            == 1
+    })
+    .await;
 
     // Nobody reads. Detection is three windows, plus one of clock skew.
     tokio::time::timeout(heartbeat * 20, async {
@@ -2271,7 +2309,12 @@ async fn an_ended_consumer_releases_its_slot_while_the_anchor_is_held() {
         "expected DeserializationError, got {ended:?}"
     );
 
-    eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 0).await;
+    eventually(|| {
+        pair.consumer
+            .live_ingress_slots(lane0(pair.producer_worker))
+            == 0
+    })
+    .await;
     drop((anchor, tx));
 }
 
@@ -2290,9 +2333,19 @@ async fn a_watchdog_firing_closes_its_slot() {
     for n in 0..3 {
         tx.send_async(item(n)).await.expect("send item");
     }
-    eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 1).await;
+    eventually(|| {
+        pair.consumer
+            .live_ingress_slots(lane0(pair.producer_worker))
+            == 1
+    })
+    .await;
     eventually(|| !manager.registry.contains_key(&local_id)).await;
-    eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 0).await;
+    eventually(|| {
+        pair.consumer
+            .live_ingress_slots(lane0(pair.producer_worker))
+            == 0
+    })
+    .await;
     drop((anchor, tx));
 }
 
@@ -2309,10 +2362,20 @@ async fn cancelling_a_stream_closes_its_slot() {
     let (pair, _manager, anchor, _local_id, tx) =
         watched_anchor::<u32>(test_config(), heartbeat, true).await;
     tx.send_async(item(0)).await.expect("send item");
-    eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 1).await;
+    eventually(|| {
+        pair.consumer
+            .live_ingress_slots(lane0(pair.producer_worker))
+            == 1
+    })
+    .await;
 
     anchor.controller().cancel();
-    eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 0).await;
+    eventually(|| {
+        pair.consumer
+            .live_ingress_slots(lane0(pair.producer_worker))
+            == 0
+    })
+    .await;
     drop((anchor, tx));
 }
 
@@ -2329,12 +2392,22 @@ async fn an_anchor_dropped_off_runtime_still_closes_its_slot() {
     let (pair, _manager, anchor, _local_id, tx) =
         watched_anchor::<u32>(test_config(), heartbeat, true).await;
     tx.send_async(item(0)).await.expect("send item");
-    eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 1).await;
+    eventually(|| {
+        pair.consumer
+            .live_ingress_slots(lane0(pair.producer_worker))
+            == 1
+    })
+    .await;
 
     std::thread::spawn(move || drop(anchor))
         .join()
         .expect("drop on a plain thread");
-    eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 0).await;
+    eventually(|| {
+        pair.consumer
+            .live_ingress_slots(lane0(pair.producer_worker))
+            == 0
+    })
+    .await;
     drop(tx);
 }
 
@@ -2414,7 +2487,12 @@ async fn a_reattach_over_the_mux_does_not_overtake_the_detached_tail() {
         .await
         .expect("connect");
     tx.send_async(item(100)).await.expect("send");
-    eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 1).await;
+    eventually(|| {
+        pair.consumer
+            .live_ingress_slots(lane0(pair.producer_worker))
+            == 1
+    })
+    .await;
 
     let mut seen = Vec::new();
     for _ in 0..4 {

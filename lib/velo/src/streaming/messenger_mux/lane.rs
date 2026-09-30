@@ -22,6 +22,11 @@ pub(crate) struct LaneIndex(u16);
 impl LaneIndex {
     /// The lane every stream uses until lanes are chosen per stream.
     pub(crate) const ZERO: Self = Self(0);
+
+    #[cfg(test)]
+    pub(crate) const fn new(index: u16) -> Self {
+        Self(index)
+    }
 }
 
 impl std::fmt::Display for LaneIndex {

@@ -15,16 +15,16 @@
 
 use velo_ext::WorkerId;
 
-use crate::streaming::messenger_mux::MuxConfig;
 use crate::streaming::messenger_mux::ingress::{
     IngressRegistry, MAX_INGRESS_SLOTS_PER_PEER, handle_batch,
 };
 use crate::streaming::messenger_mux::peer_batcher::ReplyRecord;
 use crate::streaming::messenger_mux::peer_batcher::control::{ControlInbox, MAX_PENDING_REJECTS};
 use crate::streaming::messenger_mux::protocol::{BatchEncoder, SlotId};
+use crate::streaming::messenger_mux::{LaneIndex, MuxConfig, PeerLane};
 
-fn peer() -> WorkerId {
-    WorkerId::from_u64(0xF00D)
+fn peer() -> PeerLane {
+    PeerLane::new(WorkerId::from_u64(0xF00D), LaneIndex::ZERO)
 }
 
 /// A flood of out-of-range `OpenSlot`s in one batch produces `RejectSlot`

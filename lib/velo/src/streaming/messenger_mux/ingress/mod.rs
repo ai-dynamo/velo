@@ -31,28 +31,29 @@ mod slot;
 #[cfg(test)]
 mod tests;
 
+use std::num::NonZeroU16;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
 use dashmap::DashMap;
-use velo_ext::WorkerId;
 
 pub(crate) use self::dirty::DirtySlots;
 pub(crate) use self::drain::DrainSignal;
 use self::reconcile::{collect_grants, collect_touched_grants, list_drained_slots};
 use self::slot::{Applied, IngressSlot, heartbeat_frame};
-use super::MuxConfig;
 use super::flow_control::ByteBudget;
 use super::peer_batcher::ReplyRecord;
 use super::protocol::{
     BatchDecoder, BatchHeader, CloseReason, Record, RecordBody, SlotId, batch_seq_gap,
     batch_seq_is_newer,
 };
+use super::{MuxConfig, PeerLane};
 use crate::observability::{MuxDirection, MuxDropReason, MuxMetricsHandle};
 
-/// Ceiling on the dense slot table one peer may make this node allocate.
+/// Ceiling on the dense slot table one (peer, lane) may make this node
+/// allocate.
 ///
 /// A sender allocates from a free list starting at zero, so its indices stay
 /// within a small multiple of its live slot count; a jump past this is a
@@ -89,19 +90,20 @@ impl Drop for BindEntry {
 pub(crate) struct IngressRegistry {
     /// `(anchor_id, session_id)` → the buffer a matching `OpenSlot` claims.
     binds: DashMap<(u64, u64), BindEntry>,
-    /// Per-peer slot tables. One `Mutex` per peer, uncontended in steady state
-    /// because the peer's ordering lane is its only writer; the credit sweep is
-    /// the sole other visitor.
-    peers: DashMap<WorkerId, Mutex<PeerIngress>>,
+    /// Slot tables, one per (peer, lane). One `Mutex` per table, uncontended
+    /// in steady state because the lane's ordered handler is its only writer;
+    /// the credit sweep is the sole other visitor.
+    peers: DashMap<PeerLane, Mutex<PeerIngress>>,
     /// Calls into `close_consumer_gone`, each of which takes a peer's lock.
     #[cfg(test)]
     consumer_gone_calls: std::sync::atomic::AtomicUsize,
-    /// Per-peer "a credit-return visit is already queued" flags, read and set by
-    /// draining consumers without taking the peer mutex. See [`DrainSignal`].
+    /// Per-table "a credit-return visit is already queued" flags, read and set
+    /// by draining consumers without taking the table's mutex. See
+    /// [`DrainSignal`].
     ///
-    /// **Grows with distinct peers and is never pruned**, which mirrors `peers`
-    /// above and costs a pointer and a bool per peer this node has ever received
-    /// a slot from. Removing an entry is not a matter of picking a moment: a
+    /// **Grows with distinct (peer, lane)s and is never pruned**, which mirrors
+    /// `peers` above and costs a pointer and a bool per (peer, lane) this node
+    /// has ever received a slot on. Removing an entry is not a matter of picking a moment: a
     /// claimed [`DrainSignal`] holds its peer's flag as an `Arc` for the life of
     /// its stream, so a removal while any such stream lives leaves its consumer
     /// setting a flag nothing reads — permanently true, permanently
@@ -109,10 +111,14 @@ pub(crate) struct IngressRegistry {
     /// the rest of the stream. So it may
     /// only be removed under the same visibility that retires slots and binds,
     /// and until that is worth building, unbounded-but-tiny is the honest trade.
-    drain_pending: DashMap<WorkerId, Arc<AtomicBool>>,
+    drain_pending: DashMap<PeerLane, Arc<AtomicBool>>,
 }
 
-/// Receive-side state for one peer.
+/// Receive-side state for one (peer, lane).
+///
+/// Per lane, not per peer, because everything here depends on order and order
+/// holds only within a lane: the epoch and `batch_seq` a lane's batcher
+/// stamps, and slot ids, which are unique only within one batcher.
 struct PeerIngress {
     /// The sender epoch this table belongs to. `None` until the first batch.
     epoch: Option<u64>,
@@ -191,9 +197,10 @@ struct ApplyCtx<'a> {
     registry: &'a IngressRegistry,
     config: &'a MuxConfig,
     metrics: Option<&'a MuxMetricsHandle>,
-    /// Whose batch this is. Carried so `open_slot` can tell the bind's
-    /// [`DrainSignal`] which peer it turned out to belong to.
-    peer: WorkerId,
+    /// Whose batch this is, and on which lane. Carried so `open_slot` can
+    /// tell the bind's [`DrainSignal`] which (peer, lane) it turned out to
+    /// belong to.
+    key: PeerLane,
 }
 
 impl IngressRegistry {
@@ -209,7 +216,7 @@ impl IngressRegistry {
     /// a second call finds the table entry gone and asks for nothing.
     pub(crate) fn close_consumer_gone(
         &self,
-        peer: WorkerId,
+        key: PeerLane,
         id: SlotId,
         metrics: Option<&MuxMetricsHandle>,
         session_id: Option<u64>,
@@ -217,7 +224,7 @@ impl IngressRegistry {
         #[cfg(test)]
         self.consumer_gone_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let entry = self.peers.get(&peer)?;
+        let entry = self.peers.get(&key)?;
         let mut state = lock(entry.value());
         // Generation-checked, because `finish_close` is not: it takes the slot
         // by dense index alone, and the peer may have recycled this one under a
@@ -263,10 +270,10 @@ impl IngressRegistry {
         self.binds.len()
     }
 
-    /// The window one of `peer`'s live slots opened holding.
+    /// The window one of `key`'s live slots opened holding.
     #[cfg(test)]
-    pub(crate) fn slot_open_terms(&self, peer: WorkerId, id: SlotId) -> Option<(u32, u64)> {
-        let entry = self.peers.get(&peer)?;
+    pub(crate) fn slot_open_terms(&self, key: PeerLane, id: SlotId) -> Option<(u32, u64)> {
+        let entry = self.peers.get(&key)?;
         let state = lock(entry.value());
         state
             .slots
@@ -276,10 +283,10 @@ impl IngressRegistry {
             .map(|slot| slot.open_terms())
     }
 
-    /// The ids of `peer`'s live slots.
+    /// The ids of `key`'s live slots.
     #[cfg(test)]
-    pub(crate) fn live_slot_ids(&self, peer: WorkerId) -> Vec<SlotId> {
-        self.peers.get(&peer).map_or_else(Vec::new, |entry| {
+    pub(crate) fn live_slot_ids(&self, key: PeerLane) -> Vec<SlotId> {
+        self.peers.get(&key).map_or_else(Vec::new, |entry| {
             lock(entry.value())
                 .slots
                 .iter()
@@ -288,15 +295,15 @@ impl IngressRegistry {
         })
     }
 
-    /// This peer's pending-wake flag, created on first use.
+    /// This (peer, lane)'s pending-wake flag, created on first use.
     ///
     /// Lives on the registry rather than in `PeerIngress` so a draining consumer
-    /// can reach it without taking the peer mutex — taking that mutex per
+    /// can reach it without taking the table's mutex — taking that mutex per
     /// record is the cost this whole change exists to avoid.
-    pub(crate) fn pending_wake(&self, peer: WorkerId) -> Arc<AtomicBool> {
+    pub(crate) fn pending_wake(&self, key: PeerLane) -> Arc<AtomicBool> {
         Arc::clone(
             self.drain_pending
-                .entry(peer)
+                .entry(key)
                 .or_insert_with(|| Arc::new(AtomicBool::new(false)))
                 .value(),
         )
@@ -313,8 +320,8 @@ impl IngressRegistry {
     /// the clear either comes before the drain's set, and the drain posts a
     /// wake, or after it and acquires it, and then the take below sees the
     /// listing.
-    pub(crate) fn clear_pending_wake(&self, peer: WorkerId) {
-        if let Some(flag) = self.drain_pending.get(&peer) {
+    pub(crate) fn clear_pending_wake(&self, key: PeerLane) {
+        if let Some(flag) = self.drain_pending.get(&key) {
             flag.swap(false, Ordering::AcqRel);
         }
     }
@@ -343,35 +350,35 @@ impl IngressRegistry {
         self.binds.remove(&(anchor_id, session_id)).is_some()
     }
 
-    /// Bytes `peer`'s ahead-of-sequence holds have reserved between them.
+    /// Bytes `key`'s ahead-of-sequence holds have reserved between them.
     #[cfg(test)]
-    pub(crate) fn peer_bytes_used(&self, peer: WorkerId) -> u64 {
+    pub(crate) fn peer_bytes_used(&self, key: PeerLane) -> u64 {
         self.peers
-            .get(&peer)
+            .get(&key)
             .map_or(0, |entry| lock(entry.value()).peer_bytes.used())
     }
 
-    /// Reconcile visits `peer`'s slots have taken since its table opened.
+    /// Reconcile visits `key`'s slots have taken since its table opened.
     #[cfg(test)]
-    pub(crate) fn reconcile_visits(&self, peer: WorkerId) -> u64 {
+    pub(crate) fn reconcile_visits(&self, key: PeerLane) -> u64 {
         self.peers
-            .get(&peer)
+            .get(&key)
             .map_or(0, |entry| lock(entry.value()).reconcile_visits)
     }
 
-    /// Live receive-side slots for `peer`.
-    pub(crate) fn live_slots(&self, peer: WorkerId) -> usize {
+    /// Live receive-side slots for one (peer, lane).
+    pub(crate) fn live_slots(&self, key: PeerLane) -> usize {
         self.peers
-            .get(&peer)
+            .get(&key)
             .map_or(0, |entry| lock(entry.value()).live())
     }
 
-    /// Every peer with receive-side state, for the credit sweep.
-    pub(crate) fn peers(&self) -> Vec<WorkerId> {
+    /// Every (peer, lane) with receive-side state, for the credit sweep.
+    pub(crate) fn peers(&self) -> Vec<PeerLane> {
         self.peers.iter().map(|entry| *entry.key()).collect()
     }
 
-    /// Reconcile every slot of `peer` and collect the credit now returnable.
+    /// Reconcile every slot of `key` and collect the credit now returnable.
     ///
     /// The periodic sweep's walk, and the only path that visits a slot nobody
     /// named. It is load-bearing rather than a backstop for one case: a peer
@@ -384,8 +391,8 @@ impl IngressRegistry {
     /// read, so what this walk costs is bounded by the tick's own interval.
     ///
     /// [`sweep_drained`]: Self::sweep_drained
-    pub(crate) fn sweep_credit(&self, peer: WorkerId) -> Vec<ReplyRecord> {
-        let Some(entry) = self.peers.get(&peer) else {
+    pub(crate) fn sweep_credit(&self, key: PeerLane) -> Vec<ReplyRecord> {
+        let Some(entry) = self.peers.get(&key) else {
             return Vec::new();
         };
         let mut state = lock(entry.value());
@@ -394,7 +401,7 @@ impl IngressRegistry {
         replies
     }
 
-    /// Reconcile the slots of `peer` that a consumer listed in the dirty set.
+    /// Reconcile the slots of `key` that a consumer listed in the dirty set.
     ///
     /// The drain doorbell's visit. It answers a wake, and a wake means some
     /// slot of this peer drained — the set says which, so the walk is over
@@ -403,8 +410,8 @@ impl IngressRegistry {
     /// visit per
     /// [`MuxConfig::drain_visit_floor`](super::MuxConfig::drain_visit_floor)
     /// per peer.
-    pub(crate) fn sweep_drained(&self, peer: WorkerId) -> Vec<ReplyRecord> {
-        let Some(entry) = self.peers.get(&peer) else {
+    pub(crate) fn sweep_drained(&self, key: PeerLane) -> Vec<ReplyRecord> {
+        let Some(entry) = self.peers.get(&key) else {
             return Vec::new();
         };
         let mut state = lock(entry.value());
@@ -414,10 +421,10 @@ impl IngressRegistry {
         replies
     }
 
-    /// `peer`'s dirty-slot set, for the tests that inspect it.
+    /// `key`'s dirty-slot set, for the tests that inspect it.
     #[cfg(test)]
-    pub(crate) fn dirty_slots(&self, peer: WorkerId) -> Arc<DirtySlots> {
-        let entry = self.peers.get(&peer).expect("peer has a slot table");
+    pub(crate) fn dirty_slots(&self, key: PeerLane) -> Arc<DirtySlots> {
+        let entry = self.peers.get(&key).expect("peer has a slot table");
         Arc::clone(&lock(entry.value()).dirty)
     }
 
@@ -436,7 +443,7 @@ impl IngressRegistry {
     }
 }
 
-/// Handle one `_stream_batch` payload from `peer`.
+/// Handle one `_stream_batch` payload from one (peer, lane).
 ///
 /// Returns the replies to send back, the records addressed to our own egress
 /// slots, and the slot-count deltas the caller feeds the `live_slots` gauge.
@@ -445,7 +452,7 @@ pub(crate) fn handle_batch(
     registry: &IngressRegistry,
     config: &MuxConfig,
     metrics: Option<&MuxMetricsHandle>,
-    peer: WorkerId,
+    key: PeerLane,
     payload: &Bytes,
 ) -> BatchOutcome {
     let mut outcome = BatchOutcome::default();
@@ -453,21 +460,28 @@ pub(crate) fn handle_batch(
     let header = match BatchHeader::decode(payload) {
         Ok(header) => header,
         Err(error) => {
-            tracing::warn!(peer = %peer, %error, "messenger mux: undecodable batch header");
+            tracing::warn!(
+                peer = %key.peer,
+                lane = %key.lane,
+                %error,
+                "messenger mux: undecodable batch header"
+            );
             return outcome;
         }
     };
 
-    if !registry.peers.contains_key(&peer) {
+    if !registry.peers.contains_key(&key) {
+        // One lane per peer until the transport reports more.
+        let budget = table_byte_budget(config.peer_byte_budget, NonZeroU16::MIN);
         registry
             .peers
-            .entry(peer)
-            .or_insert_with(|| Mutex::new(PeerIngress::new(config.peer_byte_budget)));
+            .entry(key)
+            .or_insert_with(|| Mutex::new(PeerIngress::new(budget)));
     }
     // A read guard, not `entry`'s write guard: the `Mutex` inside already
     // serialises writers, and holding the shard for writing would block the
     // credit sweep on an unrelated peer in the same shard.
-    let Some(entry) = registry.peers.get(&peer) else {
+    let Some(entry) = registry.peers.get(&key) else {
         return outcome;
     };
     let mut state = lock(entry.value());
@@ -480,7 +494,12 @@ pub(crate) fn handle_batch(
     let decoder = match BatchDecoder::new(payload) {
         Ok(decoder) => decoder,
         Err(error) => {
-            tracing::warn!(peer = %peer, %error, "messenger mux: undecodable batch");
+            tracing::warn!(
+                peer = %key.peer,
+                lane = %key.lane,
+                %error,
+                "messenger mux: undecodable batch"
+            );
             return outcome;
         }
     };
@@ -492,14 +511,15 @@ pub(crate) fn handle_batch(
         registry,
         config,
         metrics,
-        peer,
+        key,
     };
     for decoded in decoder {
         match decoded {
             Ok(record) => apply_record(&mut state, &ctx, &record, &mut outcome),
             Err(error) => {
                 tracing::warn!(
-                    peer = %peer,
+                    peer = %key.peer,
+                    lane = %key.lane,
                     %error,
                     "messenger mux: malformed record; the rest of the batch is skipped"
                 );
@@ -526,6 +546,15 @@ pub(crate) fn handle_batch(
     list_drained_slots(&mut state);
     collect_touched_grants(&mut state, &mut outcome.replies);
     outcome
+}
+
+/// One (peer, lane) table's share of `MuxConfig::peer_byte_budget`.
+///
+/// Split evenly over the lanes this node keeps to the peer, so the per-peer
+/// bound holds with no state shared between tables. A budget smaller than the
+/// lane count leaves each table nothing to hold out-of-order records in.
+fn table_byte_budget(peer_byte_budget: u64, lanes: NonZeroU16) -> u64 {
+    peer_byte_budget / u64::from(lanes.get())
 }
 
 /// Decide what to do with a batch's epoch. `false` means discard the batch.
@@ -710,9 +739,9 @@ fn open_slot(
     // posting. Before this point it is inert: nothing has been delivered on
     // this slot, so nothing can have drained.
     let lifecycle = bind.drain.claimed_by(
-        ctx.peer,
+        ctx.key,
         id,
-        ctx.registry.pending_wake(ctx.peer),
+        ctx.registry.pending_wake(ctx.key),
         Arc::clone(&state.dirty),
     );
 

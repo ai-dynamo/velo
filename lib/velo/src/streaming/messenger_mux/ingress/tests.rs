@@ -13,6 +13,7 @@ use bytes::Bytes;
 use velo_ext::WorkerId;
 
 use super::*;
+use crate::streaming::messenger_mux::LaneIndex;
 use crate::streaming::messenger_mux::protocol::{BatchEncoder, RecordType, SlotId};
 use crate::streaming::sender::{cached_dropped, cached_finalized};
 
@@ -76,8 +77,9 @@ const PEER: u64 = 0xABCD;
 const ANCHOR: u64 = 7;
 const SESSION: u64 = 11;
 
-fn peer() -> WorkerId {
-    WorkerId::from_u64(PEER)
+/// The peer's lane 0, where every test here runs unless it names a lane.
+fn peer() -> PeerLane {
+    PeerLane::new(WorkerId::from_u64(PEER), LaneIndex::ZERO)
 }
 
 fn config() -> MuxConfig {
@@ -1521,7 +1523,7 @@ fn drain_signal_claim_stays_write_once() {
 
     let first = SlotId::new(3, 0).expect("slot id");
     let second = SlotId::new(9, 1).expect("slot id");
-    let other_peer = WorkerId::from_u64(PEER + 1);
+    let other_peer = PeerLane::new(WorkerId::from_u64(PEER + 1), LaneIndex::ZERO);
 
     let dirty = Arc::new(DirtySlots::new());
     drain.claimed_by(
@@ -1537,4 +1539,101 @@ fn drain_signal_claim_stays_write_once() {
         Some((peer(), first)),
         "the second claim must be dropped, not applied"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Lanes
+// ---------------------------------------------------------------------------
+
+/// Two lanes of one peer keep separate tables.
+///
+/// Slot ids are unique only within one sender batcher, and each lane has its
+/// own batcher, so the same id may be live on two lanes at once. A table
+/// shared by the lanes would read the second `OpenSlot` as a collision and
+/// reject it, and a new epoch on one lane would retire the other lane's
+/// streams. Every other test here runs on lane 0 alone and cannot see either.
+#[test]
+fn lanes_of_one_peer_keep_separate_tables() {
+    let config = config();
+    let registry = IngressRegistry::default();
+    let on_zero = register(&registry, &config, SESSION);
+    let on_one = register(&registry, &config, SESSION + 1);
+    let zero = peer();
+    let one = PeerLane::new(zero.peer, LaneIndex::new(1));
+    let id = slot(0, 0);
+
+    let payload = batch(5, 0, |encoder| {
+        encoder.push_open_slot(id, 0, ANCHOR, SESSION).unwrap();
+    });
+    let outcome = handle_batch(&registry, &config, None, zero, &payload);
+    assert_eq!(outcome.opened, 1);
+
+    // The same slot id on lane 1, under that lane's own epoch.
+    let payload = batch(9, 0, |encoder| {
+        encoder.push_open_slot(id, 0, ANCHOR, SESSION + 1).unwrap();
+    });
+    let outcome = handle_batch(&registry, &config, None, one, &payload);
+    assert_eq!(outcome.opened, 1);
+    assert!(
+        outcome.replies.is_empty(),
+        "the same id on another lane is not a collision"
+    );
+    assert_eq!(registry.live_slots(zero), 1);
+    assert_eq!(registry.live_slots(one), 1);
+
+    // Records reach the stream of the lane they arrived on.
+    let payload = batch(9, 1, |encoder| {
+        encoder.push_data(id, 1, &item(1)).unwrap();
+    });
+    handle_batch(&registry, &config, None, one, &payload);
+    assert_eq!(on_one.pump(), vec![item(1)]);
+    assert!(on_zero.pump().is_empty());
+
+    // A new epoch on lane 1 retires lane 1's slot and nothing on lane 0.
+    let payload = batch(10, 0, |_| {});
+    let outcome = handle_batch(&registry, &config, None, one, &payload);
+    assert_eq!(outcome.closed, 1);
+    assert_eq!(registry.live_slots(one), 0);
+    assert_eq!(
+        registry.live_slots(zero),
+        1,
+        "an epoch change on one lane must leave the other lane's streams alone"
+    );
+}
+
+/// A claim names the lane its `OpenSlot` arrived on, and so does the wake its
+/// drains post.
+///
+/// Stop, cancel and close of a claimed slot go through the batcher the claim
+/// names, and credit comes back through the lane the wake names. Either one
+/// landing on another lane would reach a batcher whose slot ids mean other
+/// streams.
+#[test]
+fn a_claim_and_its_wake_name_the_arrival_lane() {
+    let config = config();
+    let registry = IngressRegistry::default();
+    let (wake_tx, wake_rx) = flume::unbounded();
+    let (tx, rx) = flume::bounded(
+        crate::streaming::messenger_mux::flow_control::slot_buffer_depth(config.initial_credit),
+    );
+    let drain = Arc::new(DrainSignal::new(wake_tx));
+    registry.register_bind(ANCHOR, SESSION, tx, Arc::clone(&drain));
+    let consumer = Consumer { rx, drain };
+    let one = PeerLane::new(peer().peer, LaneIndex::new(1));
+    let id = slot(4, 2);
+
+    let payload = batch(3, 0, |encoder| {
+        encoder.push_open_slot(id, 0, ANCHOR, SESSION).unwrap();
+        encoder.push_data(id, 1, &item(7)).unwrap();
+    });
+    handle_batch(&registry, &config, None, one, &payload);
+
+    assert_eq!(consumer.drain.claimed(), Some((one, id)));
+    assert_eq!(consumer.pump(), vec![item(7)]);
+    assert_eq!(
+        wake_rx.try_recv(),
+        Ok(one),
+        "the wake names the arrival lane"
+    );
+    assert_eq!(consumer.drain.cancel(), Some((one, id)));
 }

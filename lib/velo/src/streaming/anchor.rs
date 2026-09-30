@@ -358,8 +358,8 @@ impl Drop for PreBind {
             return;
         };
         match self.drain.cancel() {
-            Some((peer, slot)) => {
-                mux.cancel_claimed_session(peer, slot, self.ticket.routing_session_id)
+            Some((key, slot)) => {
+                mux.cancel_claimed_session(key, slot, self.ticket.routing_session_id)
             }
             None => mux.release_bind(self.anchor_id, self.ticket.routing_session_id),
         }
@@ -446,10 +446,10 @@ impl StreamController {
         }
         entry.stop_requested = true;
         if let Some(prebind) = &entry.prebind {
-            if let Some((peer, slot)) = prebind.drain.request_stop()
+            if let Some((key, slot)) = prebind.drain.request_stop()
                 && let Some(mux) = prebind.mux.upgrade()
             {
-                mux.request_stop(peer, slot, prebind.ticket.routing_session_id);
+                mux.request_stop(key, slot, prebind.ticket.routing_session_id);
             }
         } else if let Some(handle) = entry.stream_cancel_handle {
             crate::streaming::control::request_sender_stop(
@@ -3327,7 +3327,10 @@ mod tests {
                 wake_tx,
             ));
             drain.claimed_by(
-                velo_ext::WorkerId::from_u64(7),
+                crate::streaming::messenger_mux::PeerLane::new(
+                    velo_ext::WorkerId::from_u64(7),
+                    crate::streaming::messenger_mux::LaneIndex::ZERO,
+                ),
                 crate::streaming::messenger_mux::protocol::SlotId::from_raw(0),
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(crate::streaming::messenger_mux::ingress::DirtySlots::new()),

@@ -13,9 +13,7 @@ use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
-use velo_ext::WorkerId;
-
-use super::MuxCore;
+use super::{MuxCore, PeerLane};
 
 /// Ceiling on an operator's [`MuxConfig::drain_visit_floor`](super::MuxConfig::drain_visit_floor).
 ///
@@ -61,9 +59,10 @@ struct PeerVisits {
 /// saw 59 floor-spaced walks continue after the traffic had provably stopped.
 pub(super) struct DrainVisits {
     floor: Duration,
-    peers: HashMap<WorkerId, PeerVisits>,
-    /// Deferred walks, ordered by when they come due, at most one per peer.
-    deferred: BinaryHeap<Reverse<(tokio::time::Instant, WorkerId)>>,
+    /// Keyed by (peer, lane): each lane has its own table, dirty set and wake.
+    peers: HashMap<PeerLane, PeerVisits>,
+    /// Deferred walks, ordered by when they come due, at most one per key.
+    deferred: BinaryHeap<Reverse<(tokio::time::Instant, PeerLane)>>,
 }
 
 impl DrainVisits {
@@ -99,7 +98,7 @@ impl DrainVisits {
     /// returns has already been counted as visited*, so two wakes for one peer
     /// cannot both be admitted, and the interval the floor measures is
     /// walk-start to walk-start — which is what the rate it bounds means.
-    pub(super) fn admit(&mut self, peer: WorkerId, now: tokio::time::Instant) -> Option<WorkerId> {
+    pub(super) fn admit(&mut self, peer: PeerLane, now: tokio::time::Instant) -> Option<PeerLane> {
         let Some(state) = self.peers.get_mut(&peer) else {
             self.peers.insert(
                 peer,
@@ -127,7 +126,7 @@ impl DrainVisits {
     }
 
     /// Peers whose deferred walk has come due.
-    pub(super) fn due(&mut self, now: tokio::time::Instant) -> Vec<WorkerId> {
+    pub(super) fn due(&mut self, now: tokio::time::Instant) -> Vec<PeerLane> {
         let mut ready = Vec::new();
         while self.next_due().is_some_and(|due| due <= now) {
             let Reverse((_, peer)) = self.deferred.pop().expect("peeked a moment ago");
@@ -208,7 +207,7 @@ pub(super) fn spawn_sweep(core: &Arc<MuxCore>) {
     tokio::spawn(async move {
         enum Wake {
             Tick,
-            Peer(WorkerId),
+            Peer(PeerLane),
             Due,
         }
         // Non-zero by construction: `interval` panics on a zero period, and
