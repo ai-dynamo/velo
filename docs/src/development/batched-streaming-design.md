@@ -203,7 +203,7 @@ The `select!` is `biased` toward the receive arm. `tokio::time::timeout`, which 
 
 ### Heartbeats: the consolidation that is specified, not built
 
-A per-stream heartbeat task does not detect a hung producer, because it runs on its own task. Under the mux, the health check of the batcher detects a dead peer, and the mux learns of it through epoch death. A connection that closes after admission is not reported to the mux, and the stream watchdog ends the slots that lost records with it. The other signal that a stream heartbeat carries is per-slot saturation. The design keeps the heartbeat per slot and makes it cheap:
+A per-stream heartbeat task does not detect a hung producer, because it runs on its own task. Under the mux, the health check of the batcher detects a dead peer on the sending side, and the mux learns of it through epoch death. On a node that only receives, a dead producer is still the stream watchdog's job. A connection that closes after admission is not reported to the mux, and the stream watchdog ends the slots that lost records with it. The other signal that a stream heartbeat carries is per-slot saturation. The design keeps the heartbeat per slot and makes it cheap:
 
 - **Suppression.** A per-slot "last send" tick (one relaxed `AtomicU64` store per frame). A slot that sent anything in the interval skips its heartbeat.
 - **Phase alignment.** Each sender follows one peer-level tick (a `tokio::sync::watch` driven by one timer task) instead of its own `interval`. Heartbeats then coalesce into one batch instead of scattering across the interval.
