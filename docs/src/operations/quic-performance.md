@@ -98,7 +98,7 @@ The receiving node needs many more server sockets than there are lanes. The kern
 | 8 | 2,628 or 6,579, as the hash fell |
 | 32 | 6,463–6,526 |
 
-A TCP prototype with the same layout, one connection per lane, scaled too: 2.5, 4.6, 8.1 and 13.1 GB/s (10^9 bytes per second) with 1, 2, 4 and 8 lanes. One TCP connection is limited by its receiver: one reader task does the `recvmsg` copy, and the transport's fixed socket buffers cap the TCP window. The TCP transport does not implement lanes yet.
+A TCP prototype with the same layout, one connection per lane, scaled too: 2.5, 4.6, 8.1 and 13.1 GB/s (10^9 bytes per second) with 1, 2, 4 and 8 lanes. One TCP connection is limited by its receiver: one reader task does the `recvmsg` copy, and the transport's fixed socket buffers cap the TCP window. `TcpTransportBuilder::lanes(n)` builds the same layout. See [TCP lanes](../concepts/transports.md#tcp-lanes). These TCP numbers came from the prototype, not from that code.
 
 ## Batched streaming over QUIC
 
