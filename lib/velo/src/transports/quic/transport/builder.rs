@@ -114,9 +114,8 @@ impl QuicTransportBuilder {
     /// Number of server sockets, each on its own port (default 4).
     ///
     /// Each socket has its own quinn endpoint driver, receive queue and buffer
-    /// ceiling. A peer spreads its lanes over the sockets, so a receiving node
-    /// needs at least as many sockets as its peers use lanes, or two lanes
-    /// share one endpoint driver. Peers with one lane each are spread over
+    /// ceiling. A peer spreads its lanes evenly over the sockets. Measured with
+    /// 8 lanes, 4 sockets (two lanes each) moved as much as 8. Peers with one lane each are spread over
     /// the sockets too. Each socket costs a port, a quinn endpoint and its
     /// receive buffers.
     pub fn server_endpoints(mut self, count: usize) -> Self {

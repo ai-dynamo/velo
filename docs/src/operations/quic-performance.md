@@ -7,7 +7,7 @@ This chapter records what the QUIC transport costs against TCP, the settings tha
 | Builder method | Default | Effect |
 |---|---|---|
 | `lanes(n)` | 1 | Up to `n` connections to each peer, one for each lane used, each from its own UDP socket. Order holds within a lane only. See [Lanes](#lanes). |
-| `server_endpoints(n)` | 4 | Server sockets, each on its own port. A dialer spreads its lanes over them, so use at least as many as the peers' lanes. |
+| `server_endpoints(n)` | 4 | Server sockets, each on its own port. A dialer spreads its lanes evenly over them. See [Lanes](#lanes). |
 | `udp_buffer_sizes(recv, send)` | 8 MiB, 4 MiB | Requested socket buffers. The kernel clamps them to `net.core.rmem_max` and `net.core.wmem_max`, and the transport logs the clamp. |
 | `max_mtu(bytes)` | quinn's (1452) | Upper bound for path MTU discovery. Values above 6550 are lowered to 6550. |
 | `stream_receive_window(bytes)` | quinn's | Flow-control window for the stream. |
@@ -90,7 +90,7 @@ Measured on 2026-09-29 across the same two nodes as above, 64 KiB messages pipel
 
 The UDP receive-buffer error count stayed below 50 in each run, so the gain comes from more cores, not from more socket buffers. 64 B pipelined messages do not change with the lane count.
 
-Two lanes on one server socket share its endpoint driver. So each server socket has its own port, and a dialer sends lane `k` to socket `(offset + k) % n`. With at least as many sockets as lanes, each lane of a dialer has its own socket. The prototype instead put all server sockets on one port in a `SO_REUSEPORT` group, where the kernel hashes each connection to a socket at random. The table below shows what that cost with 8 lanes. It ran in a separate job on another pair of nodes, so its 32-socket row differs from the table above by run-to-run spread.
+Lanes on one server socket share its endpoint driver. So each server socket has its own port, and a dialer sends lane `k` to socket `(offset + k) % n`, which spreads its lanes evenly. The prototype instead put all server sockets on one port in a `SO_REUSEPORT` group, where the kernel hashes each connection to a socket at random, so some sockets carried three or four lanes and others none. The table below shows what that cost with 8 lanes. It ran in a separate job on another pair of nodes, so its 32-socket row differs from the table above by run-to-run spread.
 
 | Server sockets in the reuse-port group | MB/s |
 |---|---|
@@ -98,7 +98,16 @@ Two lanes on one server socket share its endpoint driver. So each server socket 
 | 8 | 2,628 or 6,579, as the hash fell |
 | 32 | 6,463–6,526 |
 
-With one port for each socket, 8 lanes should need only 8 server sockets on the receiving node. That follows from the design and is not measured yet.
+With one port for each socket, the lanes of one dialer are placed evenly, so fewer sockets do. Measured on 2026-09-29 across two nodes, 64 KiB messages pipelined, 20,000 messages per cell, two reps, with messages spread round robin over the lanes by a measurement build:
+
+| Lanes | Server sockets, one port each | MB/s |
+|---|---|---|
+| 1 | 4 | 781–788 |
+| 4 | 4 | 2,984–3,055 |
+| 8 | 4 | 5,788–5,800 |
+| 8 | 8 | 5,542–5,878 |
+
+With 8 lanes, 4 sockets carry two lanes each and reach the same rate as 8 sockets. One lane is unchanged.
 
 A fixed `bind_addr` port `P` binds ports `P` to `P + n - 1`, one for each server socket. Peers spread over all of them, ordinary traffic included, so open all of them in a firewall. Transports on one host need fixed ports at least `n` apart.
 
