@@ -122,7 +122,17 @@ Each lane has its own batch handler, ordered per sender. Lane 0 keeps the name `
 
 Everything that depends on order is kept per (peer, lane): the batcher on the sender, and the epoch, `batch_seq` and slot table on the receiver. Slot ids are unique only within one batcher, so a table shared by two lanes would let one lane retire the slots of the other. Replies (credit, closes, stops) go back on the lane that the batch arrived on.
 
-The receiver of a stream names its lane, in the attach response or in the `StreamOpenTicket`. The sender uses that lane modulo the lanes its own transport keeps to the receiver. A sender with one lane always uses lane 0. Any lane is correct for any stream, because every node takes batches on every lane. Only the spread changes. Today the receiver names lane 0 for every stream.
+The receiver of a stream names its lane, in the attach response or in the `StreamOpenTicket`. The sender uses that lane modulo the lanes its own transport keeps to the receiver. A sender with one lane always uses lane 0. Any lane is correct for any stream, because every node takes batches on every lane. Only the spread changes.
+
+The receiver chooses the lane once, when it binds the slot:
+
+- **With a key.** `Velo::attach_anchor_keyed(handle, key)`, `Velo::attach_mpsc_anchor_keyed(handle, key)` and `Velo::prebind_anchor_keyed(handle, key)` take a `u64` key. The receiver puts the stream on lane `hash(key) % lanes`. The hash is splitmix64, fixed in the code, so one key gives one lane on every node and in every build. Streams with one key share a lane and stay in one ordered channel.
+- **Without a key, on attach.** `attach_anchor` and `attach_mpsc_anchor` put the stream on the lane with the least load from that sender. The load of a lane is its live slots plus the binds that the receiver answered and no `OpenSlot` has claimed yet. The unclaimed binds count because an `OpenSlot` arrives only with the first batch of the sender. Without them, attaches answered at the same time all go to lane 0.
+- **Without a key, on pre-bind.** `prebind_anchor` does not know the sender. It puts the stream on the lane with the fewest pre-binds that are not yet claimed, released or expired.
+
+Ties go to the lowest lane. `lanes` is the mux lane count of the transport to the sender. A pre-bind has no sender, so it uses the most lanes that any installed transport keeps. This is correct while `Transport::lanes()` gives one count for all peers, as every transport in velo does.
+
+A receiver whose transport keeps one lane names lane 0 for every stream, with a key or without one. A default deployment therefore sends the same bytes as before lanes.
 
 The new fields are last in each message, default to zero when absent, and are not sent when zero. A lane-0 ticket or attach message is therefore the same bytes as before lanes, in JSON and in MessagePack. A ticket that names another lane has one more field, which a worker from before lanes refuses under positional MessagePack. Upgrade the workers before the node that mints the tickets.
 
