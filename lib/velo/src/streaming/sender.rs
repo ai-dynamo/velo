@@ -455,8 +455,9 @@ impl<T: Serialize> StreamSender<T> {
 /// runtime runs. That is the price of never blocking the caller's thread.
 ///
 /// The record is still lost when the runtime chosen is shutting down before or
-/// during the wait, and for `detach` the attachment flag then stays set. The sender clone dies with the task, so the inlet reaches EOF
-/// rather than hanging, and the consumer sees `Dropped`.
+/// during the wait, and for `detach` the attachment flag then stays set. The
+/// sender clone dies with the task, so the inlet reaches EOF rather than
+/// hanging, and the consumer sees `Dropped`.
 /// [`tokio::task::block_in_place`] would avoid even that, at the price of
 /// panicking on a `current_thread` runtime, which is a worse failure than the
 /// one it fixes.
