@@ -74,7 +74,7 @@ A prototype with one connection per lane sent 64 KiB messages, pipelined, betwee
 | 4 | 10,510–10,690 | 7,760–7,890 | 7,710–7,790 |
 | 8 | 16,830 (one rep) | | 12,420–12,520 |
 
-The 3,920 MiB/s for one TCP connection in the two-node table is in the range for processes on the NUMA node of the NIC.
+The 3,920 MiB/s for one TCP connection in the two-node table is at the top of the range for processes on the NUMA node of the NIC.
 
 ## QUIC
 

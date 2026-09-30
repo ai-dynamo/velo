@@ -107,9 +107,12 @@ impl TcpTransportBuilder {
     /// Only the dialing side's count matters: the listener accepts however
     /// many connections a peer opens, and reads each on its own task.
     ///
-    /// Each lane costs a socket at each end, a reader task on the listening
-    /// side, and the send and receive buffers of one connection. `lanes(8)`
-    /// to 200 peers is 1,600 connections.
+    /// Each lane costs a socket at each end, a writer task and a reader task
+    /// on the dialing side, a reader task on the listening side, and the send
+    /// and receive buffers of one connection. `channel_capacity` applies to
+    /// each lane. A lane stays open until its socket dies or `shutdown()`:
+    /// unlike QUIC, TCP has no idle close. `lanes(8)` to 200 peers is up to
+    /// 1,600 connections for the life of the transport.
     pub fn lanes(mut self, lanes: u16) -> Self {
         self.lanes = NonZeroU16::new(lanes).unwrap_or(NonZeroU16::MIN);
         self
