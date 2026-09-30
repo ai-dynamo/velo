@@ -450,11 +450,12 @@ impl<T: Serialize> StreamSender<T> {
 /// runtime goes first because the sender can outlive the runtime it was made on.
 ///
 /// A `current_thread` runtime that nobody drives never runs the task, so the
-/// terminal waits there with no end; that is the price of never blocking the
-/// caller's thread.
+/// terminal waits there with no end: the task's sender clone keeps the inlet
+/// open, and the consumer sees neither `Finalized` nor `Dropped` until that
+/// runtime runs. That is the price of never blocking the caller's thread.
 ///
-/// The record is still lost when the runtime chosen is shutting down before the
-/// task runs. The sender clone dies with the task, so the inlet reaches EOF
+/// The record is still lost when the runtime chosen is shutting down before or
+/// during the wait, and for `detach` the attachment flag then stays set. The sender clone dies with the task, so the inlet reaches EOF
 /// rather than hanging, and the consumer sees `Dropped`.
 /// [`tokio::task::block_in_place`] would avoid even that, at the price of
 /// panicking on a `current_thread` runtime, which is a worse failure than the
@@ -696,7 +697,8 @@ mod tests {
     /// The sender can outlive the runtime it was made on, while the batcher or
     /// the consumer lives on another. There, a terminal that meets a full
     /// channel must wait on the runtime that is still running, or the
-    /// consumer sees `Dropped` where it was owed `Finalized`.
+    /// consumer sees `Dropped` where it was owed `Finalized`. This pins that
+    /// the caller's runtime goes first, ahead of the one the sender stores.
     #[test]
     fn a_terminal_after_the_senders_runtime_ends_goes_out_on_the_callers() {
         let (tx, rx) = flume::bounded::<Vec<u8>>(1);

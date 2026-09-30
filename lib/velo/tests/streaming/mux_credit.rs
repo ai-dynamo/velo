@@ -758,8 +758,9 @@ async fn a_producer_that_outruns_a_draining_consumer_waits_for_credit() {
 /// `send`. Dropping the anchor is the consumer's way out, and it must reach the
 /// producer: `send` returns an error, and the producer's node closes the slot,
 /// so neither `live_slots` nor the withheld records stay behind for the rest of
-/// the peer's epoch. Before the pause existed, the byte-cap kill ended this
-/// case; with the pause, nothing else does.
+/// the peer's epoch. The sender's cancel wakes `send`; only the release of the
+/// slot frees what it holds on the producer's node. Before the pause existed,
+/// the byte-cap kill ended this case.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_producer_parked_on_a_dropped_mpsc_anchor_is_released() {
     let config = MuxConfig {
@@ -787,15 +788,20 @@ async fn a_producer_parked_on_a_dropped_mpsc_anchor_is_released() {
         sent
     });
 
-    // Parked: the slot holds records it may not send, and the producer has
-    // stopped finishing sends.
     let withheld = || {
         producer
             .snapshot()
             .gauge("velo_streaming_mux_withheld_records", &[])
     };
+    // Parked: the slot paused at the byte cap and the producer's inlet filled,
+    // which is when its send falls through to waiting.
+    let waited = || {
+        producer
+            .snapshot()
+            .counter("velo_streaming_producer_send_backpressure_total", &[])
+    };
     let deadline = Instant::now() + PATIENCE;
-    while withheld() == 0.0 {
+    while withheld() == 0.0 || waited() == 0.0 {
         assert!(Instant::now() < deadline, "the producer never parked");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -858,8 +864,15 @@ async fn cancelling_a_held_mpsc_anchor_releases_its_parked_producer() {
             .snapshot()
             .gauge("velo_streaming_mux_withheld_records", &[])
     };
+    // Parked: the slot paused at the byte cap and the producer's inlet filled,
+    // which is when its send falls through to waiting.
+    let waited = || {
+        producer
+            .snapshot()
+            .counter("velo_streaming_producer_send_backpressure_total", &[])
+    };
     let deadline = Instant::now() + PATIENCE;
-    while withheld() == 0.0 {
+    while withheld() == 0.0 || waited() == 0.0 {
         assert!(Instant::now() < deadline, "the producer never parked");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }

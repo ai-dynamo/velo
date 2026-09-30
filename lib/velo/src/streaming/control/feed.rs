@@ -74,9 +74,10 @@ impl SlotRelease {
     /// end. A no-op where there is nothing to close, including a stream that
     /// already ended on its own terminal.
     ///
-    /// A consumer that stops reading must still end its sender this way. The
-    /// sender waits in `send` once its slot pauses at the byte cap, and only a
-    /// close of the slot, or credit that will not come, can wake it.
+    /// A consumer that stops reading must still close its slot this way. The
+    /// cancel that reaches the sender wakes a `send` parked at the byte cap,
+    /// but only a close of the slot frees the slot, and the records it holds,
+    /// on the sender's node.
     pub(crate) fn release(&self, drain: &DrainSignal) {
         // The ordinary end: the sender's terminal retired the slot already,
         // so there is nothing to close and no reason to take the peer's lock.
