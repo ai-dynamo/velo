@@ -79,9 +79,8 @@ out="" url=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -o) out="$2"; shift 2 ;;
-        -w) shift 2 ;;
-        -*) shift ;;
-        *) url="$1"; shift ;;
+        "${SEMVER_INDEX_URL}"/*) url="$1"; shift ;;
+        *) shift ;;
     esac
 done
 if [[ "${INDEX_FAIL:-0}" == "1" ]]; then
@@ -431,6 +430,7 @@ out=$(cat "$TMP_ROOT/l.out")
 ok=1
 if [[ "$(cat "$TMP_ROOT/l.exit")" == "1" ]] \
     && echo "$out" | grep -qF 'Checking velo against 0.10.0' \
+    && echo "$out" | grep -qF 'version on this change:   0.10.0' \
     && ! echo "$out" | grep -qF 'Checking velo-ext'; then
     ok=0
 fi
