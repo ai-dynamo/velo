@@ -169,7 +169,7 @@ index_path() {
 latest_published_version() {
     local crate_name="$1" body status
     body=$(mktemp)
-    status=$(curl -sS -o "$body" -w '%{http_code}' "${SEMVER_INDEX_URL}/$(index_path "$crate_name")") || {
+    status=$(curl -sS --max-time 30 --retry 2 -o "$body" -w '%{http_code}' "${SEMVER_INDEX_URL}/$(index_path "$crate_name")") || {
         rm -f "$body"
         echo "::error::Could not reach ${SEMVER_INDEX_URL} for ${crate_name}" >&2
         exit 1
@@ -189,10 +189,12 @@ latest_published_version() {
         exit 1
     fi
     local latest
-    # A pre-release is not a baseline, as in cargo-semver-checks' own choice.
-    # The `-` test runs on the version before any `+build` metadata.
+    # A pre-release is not a baseline. cargo-semver-checks also prefers a
+    # non-pre-release baseline; where it would fall back to a pre-release,
+    # this gate fails instead. The `-` test runs on the version before any
+    # `+build` metadata, which may itself contain a `-`.
     latest=$(grep -F '"yanked":false' "$body" | sed -n 's/.*"vers":"\([^"]*\)".*/\1/p' \
-        | awk '{ split($0, core, "+"); if (core[1] !~ /-/) print }' | sort -V | tail -1)
+        | awk '{ split($0, core, "+"); if (core[1] !~ /-/) print }' | sort -V | tail -1) || latest=""
     rm -f "$body"
     if [[ -z "$latest" ]]; then
         echo "::error::every published version of ${crate_name} is yanked or a pre-release; there is no baseline to check against" >&2
@@ -252,7 +254,7 @@ for crate_name in "${changed_crates[@]}"; do
         --baseline-version "$published" 2>&1) || crate_exit=$?
 
     if [[ $crate_exit -eq 0 ]]; then
-        echo "  ${crate_name}: no breaking changes"
+        echo "  ${crate_name}: ok, cargo-semver-checks accepts ${pr_version} against ${base_version}"
         continue
     fi
 

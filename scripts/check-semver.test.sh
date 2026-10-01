@@ -444,8 +444,8 @@ CARGO_SEMVER_EXIT=0 run_case m 0.10.0 0.5.0 0.10.0 0.5.1
 out=$(cat "$TMP_ROOT/m.out")
 ok=1
 if [[ "$(cat "$TMP_ROOT/m.exit")" == "0" ]] \
-    && echo "$out" | grep -qF 'velo: no breaking changes' \
-    && echo "$out" | grep -qF 'velo-ext: no breaking changes'; then
+    && echo "$out" | grep -qF 'velo: ok, cargo-semver-checks accepts 0.10.0 against 0.10.0' \
+    && echo "$out" | grep -qF 'velo-ext: ok, cargo-semver-checks accepts 0.5.1 against 0.5.0'; then
     ok=0
 fi
 report "(m) a change with no breaking change passes" "$ok" "$out"
@@ -460,16 +460,18 @@ INLINE_WS=1 run_case n 0.11.0 0.5.0 0.10.0 0.5.0 base
 out=$(cat "$TMP_ROOT/n.out")
 ok=1
 if [[ "$(cat "$TMP_ROOT/n.exit")" == "1" ]] \
-    && echo "$out" | grep -qF 'Checking velo against 0.10.0'; then
+    && echo "$out" | grep -qF 'Checking velo against 0.10.0' \
+    && echo "$out" | grep -qF 'version on this change:   0.10.0'; then
     ok=0
 fi
 report "(n) a root-manifest change selects a crate written with \`version = { workspace = true }\`" "$ok" "$out"
 
 # ── (o) a pre-release is not the baseline ────────────────────────────────────
 # sort -V ranks 0.11.0-rc.1 above 0.10.0, and a pre-release baseline would
-# fail the parse check on every change to the crate.
+# fail the parse check on every change to the crate. The baseline here has
+# build metadata with a `-` in it, which is not a pre-release.
 reset_index
-publish velo 0.10.0 0.11.0-rc.1
+publish velo 0.10.0+build-1 0.11.0-rc.1
 publish velo-ext 0.5.0
 run_case o 0.10.0 0.6.0 0.11.0 0.6.0
 out=$(cat "$TMP_ROOT/o.out")
