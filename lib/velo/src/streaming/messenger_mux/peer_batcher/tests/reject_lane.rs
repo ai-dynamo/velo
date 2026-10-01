@@ -15,16 +15,16 @@
 
 use velo_ext::WorkerId;
 
-use crate::streaming::messenger_mux::MuxConfig;
 use crate::streaming::messenger_mux::ingress::{
     IngressRegistry, MAX_INGRESS_SLOTS_PER_PEER, handle_batch,
 };
 use crate::streaming::messenger_mux::peer_batcher::ReplyRecord;
 use crate::streaming::messenger_mux::peer_batcher::control::{ControlInbox, MAX_PENDING_REJECTS};
 use crate::streaming::messenger_mux::protocol::{BatchEncoder, SlotId};
+use crate::streaming::messenger_mux::{LaneIndex, MuxConfig, PeerLane};
 
-fn peer() -> WorkerId {
-    WorkerId::from_u64(0xF00D)
+fn peer() -> PeerLane {
+    PeerLane::new(WorkerId::from_u64(0xF00D), LaneIndex::ZERO)
 }
 
 /// A flood of out-of-range `OpenSlot`s in one batch produces `RejectSlot`
@@ -40,7 +40,7 @@ fn a_bogus_open_slot_flood_reaches_control_as_a_bounded_reject() {
     // index is out of the ingress's own table range, so none of them can
     // ever become a held slot regardless of what this peer does next.
     const FLOOD: u32 = MAX_PENDING_REJECTS as u32 + 10_000;
-    let mut encoder = BatchEncoder::new(1, 0);
+    let mut encoder = BatchEncoder::new(1, 0, LaneIndex::ZERO);
     for i in 0..FLOOD {
         let id = SlotId::new(MAX_INGRESS_SLOTS_PER_PEER as u32 + i, 0).expect("index fits u24");
         encoder

@@ -215,6 +215,7 @@ async fn attach_advertising(
             .iter()
             .map(|key| velo_ext::TransportKey::new(*key))
             .collect(),
+        lane_key: None,
     };
     producer
         .velo
@@ -228,7 +229,7 @@ async fn attach_advertising(
         .expect("attach round trip")
 }
 
-/// The five fields of an `Ok` response, as the terms a sender opens on.
+/// The six fields of an `Ok` response, as the terms a sender opens on.
 ///
 /// Built by decoding rather than a struct literal: `StreamOpenTicket` is
 /// `#[non_exhaustive]`, so from outside `velo` (this integration test is its
@@ -242,14 +243,16 @@ fn terms(response: AnchorAttachResponse) -> StreamOpenTicket {
             routing_session_id,
             initial_credit,
             slot_byte_budget,
+            lane,
         } => serde_json::from_value(serde_json::json!({
             "streaming_transport_key": streaming_transport_key,
             "heartbeat_interval_ms": heartbeat_interval_ms,
             "routing_session_id": routing_session_id,
             "initial_credit": initial_credit,
             "slot_byte_budget": slot_byte_budget,
+            "lane": lane,
         }))
-        .expect("the five fields of an Ok response decode as a StreamOpenTicket"),
+        .expect("the six fields of an Ok response decode as a StreamOpenTicket"),
         AnchorAttachResponse::Err { reason } => panic!("attach rejected: {reason}"),
     }
 }

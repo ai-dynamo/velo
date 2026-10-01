@@ -141,6 +141,7 @@ impl ActiveMessageClient {
         &self,
         target: InstanceId,
         mut message: ActiveMessage,
+        lane: u16,
     ) -> Result<SendOutcome> {
         // Transparent large payload staging: if payload exceeds threshold,
         // stage it via rendezvous and replace with a handle in the headers.
@@ -170,8 +171,9 @@ impl ActiveMessageClient {
                 bytes = header.len() + payload.len()
             );
             let _entered = span.enter();
-            self.backend.send_message(
+            self.backend.send_message_on_lane(
                 target,
+                lane,
                 header,
                 payload,
                 message_type,
@@ -180,8 +182,9 @@ impl ActiveMessageClient {
         }
 
         #[cfg(not(feature = "distributed-tracing"))]
-        self.backend.send_message(
+        self.backend.send_message_on_lane(
             target,
+            lane,
             header,
             payload,
             message_type,
@@ -303,7 +306,7 @@ impl ActiveMessageClient {
             payload: bytes::Bytes::from(payload),
         };
 
-        let send_outcome = self.send_message(target, message)?;
+        let send_outcome = self.send_message(target, message, 0)?;
 
         // Share a single handshake_timeout budget across both the admission
         // wait (if the frame was queued) and the response receive. A failed

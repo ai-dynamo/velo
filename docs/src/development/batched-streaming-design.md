@@ -157,7 +157,7 @@ The first design had the reader pump call `credit.release(1)` after each handoff
 
 - **Why the consumer does not release.** Releasing needs the peer mutex that the inbound batch path takes. Taking it per record trades a periodic cost for a worse per-record one. Two paths that each release an amount for one record also double-count, and the periodic sweep still exists. With the quantity on the slot, every visit is idempotent.
 - **Why wakes coalesce per peer.** Posting per record replaces a periodic cost with a per-record one. A per-slot record threshold withholds credit for the first T records of every slot. It also still posts once per slot per threshold, so it is worse on latency and on volume.
-- **Why the wake flag drops before the walk.** A drain that lands during a walk must post a fresh wake. The same property lets a fast consumer re-arm the flag at once, so the task walks back to back under the peer mutex. `drain_visit_floor` (2 ms, the old sweep interval) caps the visit rate per peer. A wake inside the floor is scheduled for when the peer comes due, and later drains coalesce into that visit.
+- **Why the wake flag drops before the walk.** A drain that lands during a walk must post a fresh wake. The same property lets a fast consumer re-arm the flag at once, so the task walks back to back under the peer mutex. `drain_visit_floor` (2 ms, the old sweep interval) caps the visit rate per (peer, lane). A wake inside the floor is scheduled for when the peer comes due, and later drains coalesce into that visit.
 - **Why the arrival path reads the dirty set.** Narrowing the per-batch reconcile to the slots a batch delivered into left every other slot to the doorbell and the sweep. Every stream on the serving rig sends about 4 records more than its then-default 256-record window, so each stream's tail needs one grant. On the rig, sender credit exhaustion rose from 13 to about 20,500 per process. Doorbell visits fell to about one per peer per 12 ms. The frontend's lane wait rose from 0.36 ms to 1.4 s per batch. Throughput halved to 1,516 req/s and TTFT p50 rose from 55 to 331 ms. The grant must ride the peer's next inbound batch.
 - **Why the count replaces the occupancy estimate.** Reading `frame_tx.len()` takes the channel's lock. At about 1,000 slots per peer and 6 million batches per rep, that read was the largest velo-only cost on the frontend.
 - **Why the order is clear, then swap.** A drain that lands between the two steps finds the listing down and lists the slot again. The next pass then finds either a zero count or the new drain, never a count with nothing to fetch it.
@@ -171,7 +171,7 @@ A grant threshold (grant only when half the window has drained) was built and me
 
 ### Zero-RTT: pre-bind is the synchronous twin of bind
 
-`MessengerMuxTransport::prebind` calls the same `open_bind` body as `FrameTransport::bind`. `bind` is async only because the trait is. One body keeps the two paths from drifting.
+`MessengerMuxTransport::bind_on_lane` calls the same `open_bind` body as `FrameTransport::bind`. `bind` is async only because the trait is. One body keeps the two paths from drifting.
 
 - **Rejected: bind on `OpenSlot`.** Minting a ticket and binding when the `OpenSlot` arrives has a simpler lifecycle. It inverts a layer (ingress resolves the anchor's channel from the registry) and it loses the meaning of the accept window.
 - **No protocol version bump.** The ticket rides the application's envelope as an optional field. A version bump breaks an old worker outright. An absent field makes the worker attach the ordinary way.
@@ -203,7 +203,7 @@ The `select!` is `biased` toward the receive arm. `tokio::time::timeout`, which 
 
 ### Heartbeats: the consolidation that is specified, not built
 
-A per-stream heartbeat task does not detect a hung producer, because it runs on its own task. Under the mux, the Messenger detects process, host and connection death, and the mux learns of it through epoch death. The one signal a stream heartbeat still carries is per-slot saturation. The design keeps the heartbeat per slot and makes it cheap:
+A per-stream heartbeat task does not detect a hung producer, because it runs on its own task. Under the mux, the health check of the batcher detects a dead peer on the sending side, and the mux learns of it through epoch death. On a node that only receives, a dead producer is still the stream watchdog's job. A connection that closes after admission is not reported to the mux, and the stream watchdog ends the slots that lost records with it. The other signal that a stream heartbeat carries is per-slot saturation. The design keeps the heartbeat per slot and makes it cheap:
 
 - **Suppression.** A per-slot "last send" tick (one relaxed `AtomicU64` store per frame). A slot that sent anything in the interval skips its heartbeat.
 - **Phase alignment.** Each sender follows one peer-level tick (a `tokio::sync::watch` driven by one timer task) instead of its own `interval`. Heartbeats then coalesce into one batch instead of scattering across the interval.

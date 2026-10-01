@@ -73,8 +73,9 @@
 //! Credit comes back from three places. Two of them visit only slots that
 //! something named; the third is the whole-table backstop. A draining
 //! consumer (the `StreamAnchor` reading its slot buffer directly, or an MPSC
-//! anchor's pump) counts the record on that slot's [`ingress::DrainSignal`], lists the slot in its peer's
-//! [`ingress::DirtySlots`], and posts the peer if the listing is new. The
+//! anchor's pump) counts the record on that slot's [`ingress::DrainSignal`],
+//! lists the slot in its (peer, lane)'s [`ingress::DirtySlots`], and posts
+//! that (peer, lane) if the listing is new. The
 //! **arrival path** then reconciles, on every inbound batch, the slots that
 //! batch delivered into together with the slots in that set — so the credit a
 //! stream's tail waits on rides the peer's next batch, which arrives in tens of
@@ -100,6 +101,10 @@
 mod config;
 pub(crate) mod flow_control;
 pub(crate) mod ingress;
+mod lane;
+mod lane_choice;
+#[cfg(all(test, feature = "quic"))]
+mod lane_tests;
 pub(crate) mod peer_batcher;
 pub(crate) mod protocol;
 mod sweep;
@@ -121,6 +126,7 @@ use velo_ext::{TransportKey, WorkerAddress, WorkerId};
 
 use self::flow_control::NegotiatedLimits;
 use self::ingress::IngressRegistry;
+use self::lane_choice::LaneLoad;
 use self::peer_batcher::{
     BatcherContext, BatcherHandle, BatcherMap, OpenRejected, OpenSlotRequest,
 };
@@ -129,6 +135,8 @@ use crate::observability::{MuxMetricsHandle, VeloMetrics};
 use crate::streaming::transport::FrameTransport;
 
 pub use self::config::{AutoFlush, FlushPolicy, MuxConfig};
+pub(crate) use self::lane::{LaneIndex, PeerLane, is_batch_handler};
+pub(crate) use self::lane_choice::LaneReservation;
 
 /// The streaming-transport key this mux answers to.
 ///
@@ -142,28 +150,25 @@ pub use self::config::{AutoFlush, FlushPolicy, MuxConfig};
 /// re-deriving the one value negotiation is keyed on.
 pub const MESSENGER_MUX_KEY: &str = "messenger-mux-v2";
 
-/// The active-message handler every batch travels through.
-pub(crate) const STREAM_BATCH_HANDLER: &str = "_stream_batch";
-
 /// How long a bind waits for the `OpenSlot` that claims it.
 ///
 /// Deliberately the same 60 s the TCP transport gives a pending session, and
 /// deliberately measuring the same thing: "time until a batch bearing this
-/// `OpenSlot` arrives". That sentence holds without qualification for
-/// `FrameTransport::bind`'s attach-path caller: a sender has already asked by
+/// `OpenSlot` arrives". That sentence holds without qualification for the
+/// attach path's bind: a sender has already asked by
 /// the time the bind exists, so the window is one response leg plus one batch
 /// leg, and `OpenSlot` is eager precisely so it cannot quietly become "time
 /// until the producer produces its first token" there.
 ///
-/// It does not hold for `MessengerMuxTransport::prebind`'s zero-RTT caller,
+/// It does not hold for the zero-RTT pre-bind (`AnchorManager::prebind_anchor`),
 /// where the same clock starts before any sender has asked at all: the window
 /// there is envelope transit plus however long the ticket sits in a request
 /// envelope before its worker calls `open_anchor_stream`, which can be exactly
 /// the producer-side wait the paragraph above rules out for `bind`. See
 /// `AnchorManager::prebind_anchor`'s doc for that bound. An attach that adopts
 /// an existing pre-bind does not restart this timer either way — adoption
-/// takes over the bind `prebind` already registered rather than calling
-/// `bind` again, so it inherits whatever is left of the 60 s, not a fresh one.
+/// takes over the bind the pre-bind already registered rather than binding
+/// again, so it inherits whatever is left of the 60 s, not a fresh one.
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Attempts `connect` makes before giving up on a batcher that keeps retiring
@@ -171,7 +176,8 @@ const ACCEPT_TIMEOUT: Duration = Duration::from_secs(60);
 /// eviction sweeps inside one attach.
 const CONNECT_ATTEMPTS: usize = 3;
 
-/// The lane drain signals post their peer on and the sweep task answers.
+/// The lane drain signals post their (peer, lane) on and the sweep task
+/// answers.
 ///
 /// Unbounded, because a refused wake strands credit. Only the drain that newly
 /// lists a slot posts its peer; every later drain of that slot rides the
@@ -184,8 +190,8 @@ const CONNECT_ATTEMPTS: usize = 3;
 /// tick takes it down; each doorbell visit consumes the entry that summoned it,
 /// so the lane holds about one entry per peer, plus at most one more per peer
 /// per tick while the sweep task is behind.
-fn drain_wake_lane() -> (flume::Sender<WorkerId>, flume::Receiver<WorkerId>) {
-    flume::unbounded::<WorkerId>()
+fn drain_wake_lane() -> (flume::Sender<PeerLane>, flume::Receiver<PeerLane>) {
+    flume::unbounded::<PeerLane>()
 }
 
 /// The `messenger-mux-v2` [`FrameTransport`].
@@ -224,8 +230,8 @@ struct MuxCore {
     runtime: Option<tokio::runtime::Handle>,
     /// Peers with credit to return, posted by draining consumers. See
     /// [`ingress::DrainSignal`].
-    drain_tx: flume::Sender<WorkerId>,
-    drain_rx: flume::Receiver<WorkerId>,
+    drain_tx: flume::Sender<PeerLane>,
+    drain_rx: flume::Receiver<PeerLane>,
     /// Drain signals waiting to be collected by the attach that will start the
     /// feed and watchdog (or MPSC pump) holding them.
     ///
@@ -251,12 +257,22 @@ struct MuxCore {
     /// tests that need one held mid-wake. See [`peer_batcher::test_hooks`].
     #[cfg(test)]
     hooks: std::sync::OnceLock<Arc<peer_batcher::test_hooks::TestHooks>>,
+    /// Runs at the end of [`MessengerMuxTransport::bind_on_lane`] with the
+    /// anchor id, so a test can land work between an attach handler's bind
+    /// and its commit. The mux bind does not await, so nothing else can.
+    #[cfg(test)]
+    bind_hook: std::sync::OnceLock<Box<dyn Fn(u64) + Send + Sync>>,
+    /// Binds per lane that no `OpenSlot` has claimed yet, read when the next
+    /// stream is placed ([`MessengerMuxTransport::choose_lane`]).
+    lane_load: LaneLoad,
 }
 
 impl MessengerMuxTransport {
-    pub(crate) fn request_stop(&self, peer: WorkerId, slot: protocol::SlotId, session_id: u64) {
+    /// Ask the sender of a claimed slot to stop, through the batcher of the
+    /// lane its `OpenSlot` arrived on.
+    pub(crate) fn request_stop(&self, key: PeerLane, slot: protocol::SlotId, session_id: u64) {
         self.core.return_credit(
-            peer,
+            key,
             vec![peer_batcher::ReplyRecord::LifecycleSlot {
                 slot,
                 session_id,
@@ -282,7 +298,13 @@ impl MessengerMuxTransport {
             .map(|(_, signal)| signal)
     }
 
-    /// Build a mux over `messenger` and register its `_stream_batch` handler.
+    /// Build a mux over `messenger` and register its batch handlers, one per
+    /// lane up to [`MAX_LANES`](lane::MAX_LANES).
+    ///
+    /// All of them, whatever this node's transports keep: registration
+    /// happens here, at build, before any peer's lane count is known, and the
+    /// count can differ per peer and per transport. A handler costs a map
+    /// entry until its first batch.
     ///
     /// Registration is for the messenger's lifetime: there is no
     /// handler-deregistration hook. The messenger does not refuse a duplicate
@@ -337,25 +359,34 @@ impl MessengerMuxTransport {
             bind_deadlines: std::sync::Mutex::default(),
             #[cfg(test)]
             hooks: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            bind_hook: std::sync::OnceLock::new(),
+            lane_load: LaneLoad::default(),
         });
 
-        let handler_core = Arc::downgrade(&core);
-        let handler = Handler::am_handler_async(STREAM_BATCH_HANDLER, move |ctx: Context| {
-            let handler_core = handler_core.clone();
-            async move {
-                if let Some(core) = handler_core.upgrade() {
-                    core.deliver_batch(ctx.sender_worker_id(), &ctx.payload);
+        for lane in LaneIndex::all() {
+            let handler_core = Arc::downgrade(&core);
+            let handler = Handler::am_handler_async(lane.handler_name(), move |ctx: Context| {
+                let handler_core = handler_core.clone();
+                async move {
+                    if let Some(core) = handler_core.upgrade() {
+                        // The lane is the handler's, never the header's: the
+                        // header only confirms it (see `handle_batch`).
+                        let key = PeerLane::new(ctx.sender_worker_id(), lane);
+                        core.deliver_batch(key, &ctx.payload);
+                    }
+                    Ok(())
                 }
-                Ok(())
-            }
-        })
-        // Ordered per sender. This is the whole reason the mux can drop the
-        // reorder window the deprecated AM transport needed: batches from one
-        // peer are handled on that peer's lane, by one task, in arrival order.
-        .ordered()
-        .build();
-        // Records and credit of open streams: see `register_drain_exempt_handler`.
-        messenger.register_drain_exempt_handler(handler)?;
+            })
+            // Ordered per sender. This is the whole reason the mux can drop the
+            // reorder window the deprecated AM transport needed: batches from
+            // one peer on one lane are handled by one task, in arrival order.
+            .ordered()
+            .build();
+            // Records and credit of open streams: see
+            // `register_drain_exempt_handler`.
+            messenger.register_drain_exempt_handler(handler)?;
+        }
 
         sweep::spawn_sweep(&core);
 
@@ -367,17 +398,17 @@ impl MessengerMuxTransport {
 }
 
 impl MuxCore {
-    /// The batcher for `peer`, created on first use.
-    fn batcher(&self, peer: WorkerId) -> Arc<BatcherHandle> {
-        if let Some(existing) = self.batchers.get(&peer) {
+    /// The batcher for one (peer, lane), created on first use.
+    fn batcher(&self, key: PeerLane) -> Arc<BatcherHandle> {
+        if let Some(existing) = self.batchers.get(&key) {
             return Arc::clone(existing.value());
         }
         Arc::clone(
             self.batchers
-                .entry(peer)
+                .entry(key)
                 .or_insert_with(|| {
                     peer_batcher::spawn(
-                        peer,
+                        key,
                         BatcherContext {
                             messenger: Arc::clone(&self.messenger),
                             config: self.config.clone(),
@@ -395,12 +426,17 @@ impl MuxCore {
     }
 
     /// Hand one decoded batch to the ingress lane and act on what it produced.
-    fn deliver_batch(&self, peer: WorkerId, payload: &bytes::Bytes) {
+    ///
+    /// Everything the batch produced goes back through the batcher for the
+    /// lane it arrived on. Replies name the peer's slots on that lane, and
+    /// grants, closes and stops name this side's slots, whose ids are unique
+    /// only within that lane's batcher.
+    fn deliver_batch(&self, key: PeerLane, payload: &bytes::Bytes) {
         let outcome = ingress::handle_batch(
             &self.ingress,
             &self.config,
             self.metrics.as_ref(),
-            peer,
+            key,
             payload,
         );
 
@@ -421,7 +457,7 @@ impl MuxCore {
             return;
         }
 
-        let batcher = self.batcher(peer);
+        let batcher = self.batcher(key);
         for (slot, session_id, cancel) in outcome.peer_stops {
             batcher.peer_stopped(slot, session_id, cancel);
         }
@@ -432,7 +468,7 @@ impl MuxCore {
             batcher.peer_closed(slot, reason);
         }
         if !outcome.replies.is_empty() {
-            self.send_replies(&batcher, peer, &outcome.replies);
+            self.send_replies(&batcher, key, &outcome.replies);
         }
     }
 
@@ -443,8 +479,8 @@ impl MuxCore {
         }
     }
 
-    /// Queue control records back to `peer`, re-resolving while the batcher
-    /// in hand has stopped reading.
+    /// Queue control records back to one (peer, lane), re-resolving while the
+    /// batcher in hand has stopped reading.
     ///
     /// Control is coalesced state rather than a queue, so nothing here can fail
     /// on the write — `reply`'s answer is what stands in for a `SendError`, and
@@ -466,28 +502,29 @@ impl MuxCore {
     fn send_replies(
         &self,
         batcher: &Arc<BatcherHandle>,
-        peer: WorkerId,
+        key: PeerLane,
         replies: &[peer_batcher::ReplyRecord],
     ) {
         if batcher.reply(replies) {
             return;
         }
-        while !self.batcher(peer).reply(replies) {}
+        while !self.batcher(key).reply(replies) {}
     }
 
-    /// Reconcile every slot of one peer, on the periodic tick.
+    /// Reconcile every slot of one (peer, lane), on the periodic tick.
     ///
     /// The whole-table walk, and the only visitor of a slot nobody named — the
     /// one parked with nothing arriving and nothing being taken out.
-    fn sweep_peer(&self, peer: WorkerId) {
+    fn sweep_peer(&self, key: PeerLane) {
         // Taken down before the reconcile, not after: a record drained while
         // this visit is in progress must be able to post a fresh wake, or its
         // credit waits for the periodic backstop.
-        self.ingress.clear_pending_wake(peer);
-        self.return_credit(peer, self.ingress.sweep_credit(peer));
+        self.ingress.clear_pending_wake(key);
+        self.return_credit(key, self.ingress.sweep_credit(key));
     }
 
-    /// One doorbell-driven visit: reconcile the slots of the peer that rang.
+    /// One doorbell-driven visit: reconcile the slots of the (peer, lane) that
+    /// rang.
     ///
     /// Scoped to the slots listed in that peer's dirty set, because a
     /// wake means those slots drained and says nothing about the rest — and
@@ -496,21 +533,22 @@ impl MuxCore {
     /// Counted here rather than where the wake is received, so the series
     /// measures walks and not wakes — a wake the floor deferred is counted once,
     /// on the visit it coalesced into.
-    fn visit_drained_peer(&self, peer: WorkerId) {
+    fn visit_drained_peer(&self, key: PeerLane) {
         if let Some(metrics) = &self.metrics {
             metrics.drain_visit();
         }
-        self.ingress.clear_pending_wake(peer);
-        self.return_credit(peer, self.ingress.sweep_drained(peer));
+        self.ingress.clear_pending_wake(key);
+        self.return_credit(key, self.ingress.sweep_drained(key));
     }
 
-    /// Hand a reconcile pass's grants to the peer's batcher.
-    fn return_credit(&self, peer: WorkerId, replies: Vec<peer_batcher::ReplyRecord>) {
+    /// Hand a reconcile pass's grants to the batcher of the lane the slots
+    /// arrived on.
+    fn return_credit(&self, key: PeerLane, replies: Vec<peer_batcher::ReplyRecord>) {
         if replies.is_empty() {
             return;
         }
-        let batcher = self.batcher(peer);
-        self.send_replies(&batcher, peer, &replies);
+        let batcher = self.batcher(key);
+        self.send_replies(&batcher, key, &replies);
     }
 
     /// Retire a slot whose consumer has gone and tell its owner.
@@ -523,7 +561,7 @@ impl MuxCore {
     /// sends none. The reply is what that idle producer needs, since the
     /// fault that carries the same news to it otherwise rides on the next
     /// record it sends.
-    fn close_claimed_slot(&self, peer: WorkerId, slot: protocol::SlotId, session_id: Option<u64>) {
+    fn close_claimed_slot(&self, key: PeerLane, slot: protocol::SlotId, session_id: Option<u64>) {
         // Resolving a batcher may spawn its task, and this runs from a `Drop`
         // that can land on a thread with no runtime under it. Enter the runtime
         // the mux was built on in that case: waiting for the slot's next record
@@ -538,7 +576,8 @@ impl MuxCore {
             // `Drop`, so that case keeps the quiet return below.
             Err(error) if !error.is_missing_context() => {
                 tracing::debug!(
-                    peer = %peer,
+                    peer = %key.peer,
+                    lane = %key.lane,
                     "messenger mux: runtime context unavailable here; the peer learns on its next record"
                 );
                 return;
@@ -547,7 +586,8 @@ impl MuxCore {
                 Some(runtime) => Some(runtime.enter()),
                 None => {
                     tracing::debug!(
-                        peer = %peer,
+                        peer = %key.peer,
+                        lane = %key.lane,
                         "messenger mux: no runtime to post a slot close on; the peer learns on its next record"
                     );
                     return;
@@ -556,15 +596,15 @@ impl MuxCore {
         };
         let Some(reply) =
             self.ingress
-                .close_consumer_gone(peer, slot, self.metrics.as_ref(), session_id)
+                .close_consumer_gone(key, slot, self.metrics.as_ref(), session_id)
         else {
             return;
         };
         if let Some(metrics) = &self.metrics {
             metrics.slot_closed();
         }
-        let batcher = self.batcher(peer);
-        self.send_replies(&batcher, peer, &[reply]);
+        let batcher = self.batcher(key);
+        self.send_replies(&batcher, key, &[reply]);
     }
 
     /// Close the accept window on every bind whose deadline has passed.
@@ -606,27 +646,28 @@ impl MuxCore {
 
     /// One sweep tick: return credit, then age out idle batchers.
     fn sweep(&self) {
-        for peer in self.ingress.peers() {
-            self.sweep_peer(peer);
+        for key in self.ingress.peers() {
+            self.sweep_peer(key);
         }
 
         let threshold = self.config.idle_ticks();
-        let peers: Vec<WorkerId> = self.batchers.iter().map(|entry| *entry.key()).collect();
-        for peer in peers {
-            let Some(handle) = self.batchers.get(&peer) else {
+        let keys: Vec<PeerLane> = self.batchers.iter().map(|entry| *entry.key()).collect();
+        for key in keys {
+            let Some(handle) = self.batchers.get(&key) else {
                 continue;
             };
             let idle = handle.tick_idle();
             drop(handle);
-            if idle < threshold || self.ingress.live_slots(peer) > 0 {
+            if idle < threshold || self.ingress.live_slots(key) > 0 {
                 continue;
             }
             // The claim is made under the registry's shard lock, so a `connect`
-            // resolving the same peer either sees the entry gone and creates a
-            // fresh batcher, or gets this one and has its `OpenSlot` refused.
+            // resolving the same (peer, lane) either sees the entry gone and
+            // creates a fresh batcher, or gets this one and has its `OpenSlot`
+            // refused.
             if let Some((_, handle)) = self
                 .batchers
-                .remove_if(&peer, |_, handle| handle.try_retire(threshold))
+                .remove_if(&key, |_, handle| handle.try_retire(threshold))
             {
                 handle.retire();
             }
@@ -650,12 +691,17 @@ impl Drop for MuxCore {
 /// accept window on it.
 ///
 /// The body [`FrameTransport::bind`] and
-/// [`MessengerMuxTransport::prebind`] share. `bind` is async because the trait
+/// [`MessengerMuxTransport::bind_on_lane`] share. `bind` is async because the trait
 /// is; **nothing in here awaits**, and that is what lets the zero-RTT path call
 /// it synchronously while registering a request. The accept window is a
 /// deadline the sweep expires (`MuxCore::expire_binds`), queued here, once,
 /// rather than in two places that would drift.
-fn open_bind(core: &Arc<MuxCore>, anchor_id: u64, session_id: u64) -> flume::Receiver<Vec<u8>> {
+fn open_bind(
+    core: &Arc<MuxCore>,
+    anchor_id: u64,
+    session_id: u64,
+    lane: LaneReservation,
+) -> flume::Receiver<Vec<u8>> {
     // `C + 1`: `C` data credits plus the one reserved terminal credit.
     // Credit is issued against *this* buffer and never against the
     // anchor's `frame_tx`, which has writers other than the mux.
@@ -664,7 +710,7 @@ fn open_bind(core: &Arc<MuxCore>, anchor_id: u64, session_id: u64) -> flume::Rec
     core.drains
         .insert((anchor_id, session_id), Arc::clone(&drain));
     core.ingress
-        .register_bind(anchor_id, session_id, frame_tx, drain);
+        .register_bind(anchor_id, session_id, frame_tx, drain, lane);
 
     // A deadline, not a task: the sweep expires it (`MuxCore::expire_binds`).
     // Nothing here may pin the core either, which a task holding a strong
@@ -701,7 +747,10 @@ impl FrameTransport for MessengerMuxTransport {
         session_id: u64,
     ) -> BoxFuture<'_, Result<flume::Receiver<Vec<u8>>>> {
         let core = Arc::clone(&self.core);
-        Box::pin(async move { Ok(open_bind(&core, anchor_id, session_id)) })
+        // Lane 0, as `connect` below: the bare trait names no peer and carries
+        // no lane to the sender. Counted, so the next choice sees it.
+        let lane = core.lane_load.reserve_on(None, LaneIndex::ZERO);
+        Box::pin(async move { Ok(open_bind(&core, anchor_id, session_id, lane)) })
     }
 
     /// Opens a slot at *this node's* limits.
@@ -720,7 +769,9 @@ impl FrameTransport for MessengerMuxTransport {
         session_id: u64,
     ) -> BoxFuture<'_, Result<flume::Sender<Vec<u8>>>> {
         let limits = self.core.limits;
-        self.connect_negotiated(peer, anchor_id, session_id, limits)
+        // Lane 0: the bare trait has no attach response to carry a lane.
+        let key = PeerLane::new(peer, LaneIndex::ZERO);
+        self.connect_negotiated(key, anchor_id, session_id, limits)
     }
 }
 
@@ -730,20 +781,31 @@ impl MessengerMuxTransport {
         self.core.limits
     }
 
-    /// Bind a slot before any sender has asked for one.
+    /// Bind a slot on the lane [`choose_lane`](Self::choose_lane) placed it on.
     ///
-    /// The synchronous twin of [`FrameTransport::bind`], and identical to it:
-    /// the trait's `bind` is async only because the trait is, and its body has
-    /// no await in it. Zero-RTT setup needs the receiver *now*, while
-    /// registering a request, so it takes this door instead of paying a future
-    /// for nothing.
+    /// The synchronous, lane-aware twin of [`FrameTransport::bind`], which is
+    /// async only because the trait is and has no await in its body. The
+    /// attach handlers take this door once they have chosen the mux, so the
+    /// bind is counted on its lane. Zero-RTT setup takes it because it needs
+    /// the receiver *now*, while registering a request, and has no sender yet
+    /// to ask.
     ///
     /// Nothing about the resulting bind is special. A peer's `OpenSlot` claims
     /// it by the same `(anchor_id, session_id)` lookup, the accept window runs
     /// the same 60 s, and [`release_bind`](Self::release_bind) is what an owner
     /// that gives up before then calls.
-    pub(crate) fn prebind(&self, anchor_id: u64, session_id: u64) -> flume::Receiver<Vec<u8>> {
-        open_bind(&self.core, anchor_id, session_id)
+    pub(crate) fn bind_on_lane(
+        &self,
+        anchor_id: u64,
+        session_id: u64,
+        lane: LaneReservation,
+    ) -> flume::Receiver<Vec<u8>> {
+        let receiver = open_bind(&self.core, anchor_id, session_id, lane);
+        #[cfg(test)]
+        if let Some(hook) = self.core.bind_hook.get() {
+            hook(anchor_id);
+        }
+        receiver
     }
 
     /// Give back a bind nobody claimed, along with the drain signal parked with
@@ -775,16 +837,16 @@ impl MessengerMuxTransport {
     /// a stream costs no extra record on the wire.
     pub(crate) fn cancel_claimed_session(
         &self,
-        peer: WorkerId,
+        key: PeerLane,
         slot: protocol::SlotId,
         session_id: u64,
     ) {
-        self.core.close_claimed_slot(peer, slot, Some(session_id));
+        self.core.close_claimed_slot(key, slot, Some(session_id));
     }
 
     #[cfg(test)]
-    pub(crate) fn close_claimed_slot(&self, peer: WorkerId, slot: protocol::SlotId) {
-        self.core.close_claimed_slot(peer, slot, None);
+    pub(crate) fn close_claimed_slot(&self, key: PeerLane, slot: protocol::SlotId) {
+        self.core.close_claimed_slot(key, slot, None);
     }
 
     /// Slot closes that went as far as taking a peer's ingress lock.
@@ -805,30 +867,30 @@ impl MessengerMuxTransport {
         self.core.drains.len()
     }
 
-    /// Live receive-side slots for `peer`.
+    /// Live receive-side slots for one (peer, lane).
     #[cfg(test)]
-    pub(crate) fn live_ingress_slots(&self, peer: WorkerId) -> usize {
-        self.core.ingress.live_slots(peer)
+    pub(crate) fn live_ingress_slots(&self, key: PeerLane) -> usize {
+        self.core.ingress.live_slots(key)
     }
 
-    /// The ids of `peer`'s live receive-side slots.
+    /// The ids of `key`'s live receive-side slots.
     ///
     /// A test that has to name a slot would otherwise have to re-derive the
     /// sender's allocation order, which is the allocator's business and not the
     /// test's.
     #[cfg(test)]
-    pub(crate) fn live_slot_ids(&self, peer: WorkerId) -> Vec<protocol::SlotId> {
-        self.core.ingress.live_slot_ids(peer)
+    pub(crate) fn live_slot_ids(&self, key: PeerLane) -> Vec<protocol::SlotId> {
+        self.core.ingress.live_slot_ids(key)
     }
 
-    /// The window one of `peer`'s live receive-side slots opened holding.
+    /// The window one of `key`'s live receive-side slots opened holding.
     #[cfg(test)]
     pub(crate) fn slot_open_terms(
         &self,
-        peer: WorkerId,
+        key: PeerLane,
         id: protocol::SlotId,
     ) -> Option<(u32, u64)> {
-        self.core.ingress.slot_open_terms(peer, id)
+        self.core.ingress.slot_open_terms(key, id)
     }
 
     /// Write what every batcher has staged, to every peer.
@@ -852,17 +914,19 @@ impl MessengerMuxTransport {
     /// cost one round trip per stream open.
     pub(crate) fn connect_negotiated(
         &self,
-        peer: WorkerId,
+        key: PeerLane,
         anchor_id: u64,
         session_id: u64,
         limits: NegotiatedLimits,
     ) -> BoxFuture<'_, Result<flume::Sender<Vec<u8>>>> {
-        self.connect_controlled(peer, anchor_id, session_id, limits, None)
+        self.connect_controlled(key, anchor_id, session_id, limits, None)
     }
 
+    /// Open a slot on the batcher for `key`: the slot's lane is fixed here
+    /// for its whole life.
     pub(crate) fn connect_controlled(
         &self,
-        peer: WorkerId,
+        key: PeerLane,
         anchor_id: u64,
         session_id: u64,
         limits: NegotiatedLimits,
@@ -871,7 +935,7 @@ impl MessengerMuxTransport {
         let core = Arc::clone(&self.core);
         Box::pin(async move {
             for _ in 0..CONNECT_ATTEMPTS {
-                let batcher = core.batcher(peer);
+                let batcher = core.batcher(key);
                 // Sized to the credit window for symmetry with the receive
                 // buffer. A producer waits on it once its slot pauses at the
                 // byte cap, or while the batcher is parked on admission. See
@@ -902,7 +966,9 @@ impl MessengerMuxTransport {
                 }
             }
             Err(anyhow!(
-                "messenger mux: could not open a slot to peer {peer} after {CONNECT_ATTEMPTS} attempts"
+                "messenger mux: could not open a slot to peer {} on lane {} after {CONNECT_ATTEMPTS} attempts",
+                key.peer,
+                key.lane
             ))
         })
     }

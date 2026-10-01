@@ -1017,6 +1017,24 @@ impl Velo {
         self.anchor_manager.attach_stream_anchor::<T>(handle).await
     }
 
+    /// Attach a sender to an anchor, placing the stream on the mux lane `key`
+    /// hashes to.
+    ///
+    /// Delegates to [`AnchorManager::attach_stream_anchor_keyed`](crate::streaming::AnchorManager::attach_stream_anchor_keyed).
+    /// The key is a placement hint, not an ordering guarantee: streams with
+    /// one key to one consumer share a lane, but the mux never orders records
+    /// across streams. [`attach_anchor`](Velo::attach_anchor) lets the
+    /// consumer pick the least-used lane instead.
+    pub async fn attach_anchor_keyed<T: serde::Serialize>(
+        &self,
+        handle: StreamAnchorHandle,
+        key: u64,
+    ) -> Result<StreamSender<T>, AttachError> {
+        self.anchor_manager
+            .attach_stream_anchor_keyed::<T>(handle, key)
+            .await
+    }
+
     /// Bind a stream for an anchor now, so its sender never has to ask.
     ///
     /// Delegates to [`AnchorManager::prebind_anchor`](crate::streaming::AnchorManager::prebind_anchor).
@@ -1033,6 +1051,18 @@ impl Velo {
         handle: StreamAnchorHandle,
     ) -> Option<streaming::control::StreamOpenTicket> {
         self.anchor_manager.prebind_anchor(handle)
+    }
+
+    /// As [`prebind_anchor`](Velo::prebind_anchor), placing the stream on the
+    /// mux lane `key` hashes to.
+    ///
+    /// Delegates to [`AnchorManager::prebind_anchor_keyed`](crate::streaming::AnchorManager::prebind_anchor_keyed).
+    pub fn prebind_anchor_keyed(
+        &self,
+        handle: StreamAnchorHandle,
+        key: u64,
+    ) -> Option<streaming::control::StreamOpenTicket> {
+        self.anchor_manager.prebind_anchor_keyed(handle, key)
     }
 
     /// Open a sender for an anchor whose slot the consumer already bound.
@@ -1093,6 +1123,20 @@ impl Velo {
     ) -> Result<streaming::mpsc::MpscStreamSender<T>, AttachError> {
         self.anchor_manager
             .attach_mpsc_stream_anchor::<T>(handle)
+            .await
+    }
+
+    /// As [`attach_mpsc_anchor`](Velo::attach_mpsc_anchor), placing the sender
+    /// on the mux lane `key` hashes to.
+    ///
+    /// Delegates to [`AnchorManager::attach_mpsc_stream_anchor_keyed`](crate::streaming::AnchorManager::attach_mpsc_stream_anchor_keyed).
+    pub async fn attach_mpsc_anchor_keyed<T: serde::Serialize>(
+        &self,
+        handle: StreamAnchorHandle,
+        key: u64,
+    ) -> Result<streaming::mpsc::MpscStreamSender<T>, AttachError> {
+        self.anchor_manager
+            .attach_mpsc_stream_anchor_keyed::<T>(handle, key)
             .await
     }
 

@@ -1,9 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The per-peer egress batcher — one task, one peer, every stream to it.
+//! The egress batcher — one task, one (peer, lane), every stream on it.
 //!
-//! A node talking to Y peers holds Y of these however many streams it holds,
+//! A node talking to Y peers over one lane each holds Y of these however many
+//! streams it holds,
 //! which is the whole O(X) → O(Y) argument in `docs/src/concepts/batched-streaming.md`
 //! § "Riding the Messenger" made concrete. The batcher owns the slot table for its peer, packs
 //! records from every slot into `_stream_batch` active messages, and is the one
@@ -70,7 +71,6 @@ use futures::future::FutureExt;
 use futures::stream::{SelectAll, StreamExt};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
-use velo_ext::WorkerId;
 
 use self::control::{ControlInbox, DrainedControl, OwnedControl, PeerControl};
 use self::flush_gate::{FlushGate, linger_until};
@@ -79,20 +79,21 @@ use self::slot_stream::{EgressSlots, SlotItem, SlotStream};
 #[cfg(test)]
 use self::test_hooks::TestHooks;
 use self::writer::BatchWriter;
-use super::MuxConfig;
 use super::protocol::{
     BATCH_HEADER_LEN, BatchEncoder, CloseReason, EncodeError, RecordType, SlotId,
     record_encoded_len,
 };
+use super::{MuxConfig, PeerLane};
 use crate::messenger::Messenger;
 use crate::observability::{BatcherWake, MuxDropReason, MuxMetricsHandle};
 use crate::streaming::messenger_mux::flow_control::{CreditClass, SlotCredit};
 use crate::streaming::sender::is_terminal_sentinel;
 use crate::transports::AdmissionState;
 
-/// The per-peer batcher registry, keyed by the batching key from
-/// `docs/src/concepts/batched-streaming.md` § "Why bucketing by destination is free".
-pub(crate) type BatcherMap = DashMap<WorkerId, Arc<BatcherHandle>>;
+/// The batcher registry, keyed by the batching key from
+/// `docs/src/concepts/batched-streaming.md` § "Why bucketing by destination is free",
+/// one batcher per (peer, lane). Slot ids are unique only within one batcher.
+pub(crate) type BatcherMap = DashMap<PeerLane, Arc<BatcherHandle>>;
 
 /// Attach requests queued for a batcher.
 ///
@@ -288,8 +289,8 @@ pub(crate) struct BatcherContext {
     pub(crate) hooks: Option<Arc<TestHooks>>,
 }
 
-/// Spawn a batcher for `peer` and return its registry handle.
-pub(crate) fn spawn(peer: WorkerId, ctx: BatcherContext) -> Arc<BatcherHandle> {
+/// Spawn the batcher for one (peer, lane) and return its registry handle.
+pub(crate) fn spawn(key: PeerLane, ctx: BatcherContext) -> Arc<BatcherHandle> {
     let (opens, open_rx) = flume::bounded(OPEN_QUEUE_DEPTH);
     let control = Arc::new(ControlInbox::new(ctx.metrics.clone()));
     let handle = Arc::new(BatcherHandle {
@@ -308,13 +309,13 @@ pub(crate) fn spawn(peer: WorkerId, ctx: BatcherContext) -> Arc<BatcherHandle> {
     let async_open_ack = ctx.config.async_open_ack;
     let writer = BatchWriter::new(
         Arc::clone(&ctx.messenger),
-        peer,
+        key,
         ctx.config,
         ctx.metrics.clone(),
         epoch,
     );
     let batcher = Batcher {
-        peer,
+        key,
         metrics: ctx.metrics,
         handle: Arc::clone(&handle),
         epochs: ctx.epochs,
@@ -360,7 +361,8 @@ enum FenceSkip {
 }
 
 struct Batcher {
-    peer: WorkerId,
+    /// The (peer, lane) this batcher serves, and its key in the registry.
+    key: PeerLane,
     metrics: Option<MuxMetricsHandle>,
     handle: Arc<BatcherHandle>,
     epochs: Arc<AtomicU64>,
@@ -553,16 +555,15 @@ impl Batcher {
     /// a singleton's resolution carries the `SlotId` it was sent under, and a
     /// close-then-reopen recycles that dense index under a new generation while
     /// the resolution is still in flight. Acting on a stale failure would fail
-    /// the epoch — every live slot on the peer — over a stream that ended
+    /// the epoch — every live slot on the (peer, lane) — over a stream that ended
     /// cleanly before the answer arrived.
     async fn on_owned_control(&mut self, slot: SlotId, entry: OwnedControl) {
         if self.slots.get_mut_checked(slot).is_none() {
             // The slot is gone, so there is no `frame_seq` gap left to protect:
             // its records are nobody's problem and its consumer has already
-            // been told. If the admission failed for a connection-level reason
-            // rather than a slot-level one, the very next batch to this peer
-            // meets the same failure and fails the epoch then — deferring to
-            // that signal costs a batch and loses nothing.
+            // been told. A lane that refuses everything refuses the next batch
+            // too and fails the epoch then, and a lane the transport dialed
+            // again takes it. Either way deferring costs a batch, loses nothing.
             if entry.singleton == Some(false)
                 && let Some(metrics) = &self.metrics
             {
@@ -927,7 +928,7 @@ impl Batcher {
         // A `connect()` won the race with the sweep: its `OpenSlot` was queued
         // before the eviction claim and processed after it. Take the registry
         // entry back rather than serve a peer nobody can find.
-        match self.batchers.entry(self.peer) {
+        match self.batchers.entry(self.key) {
             dashmap::mapref::entry::Entry::Vacant(vacant) => {
                 self.handle.retired.store(false, Ordering::Release);
                 self.handle.mark_active();
@@ -962,16 +963,17 @@ impl Batcher {
     async fn flush(&mut self) {
         self.gate.cleared();
         // Whatever credit this batch carries goes with the write either way.
-        // Admitted, it is the peer's. Refused, it dies with the epoch the
-        // refusal kills, and deliberately: a transport that refused this
-        // batch will not take the one a re-post rebuilds either, so re-posting
-        // here is an unbounded retry at the reply window's cadence rather than
-        // a recovery. `epoch_death` therefore finds nothing to hand back on
-        // this path, and everything to hand back on its other two.
+        // Admitted, it is the peer's. If a connection close loses it after
+        // admission, nothing reports that here, and this node's stream
+        // watchdogs end its slots. Refused, it dies with the refused epoch on
+        // purpose: a re-post would be refused too, a retry and not a recovery.
+        // `epoch_death` therefore finds nothing to hand back on this path, and
+        // everything to hand back on its other two.
         self.staged_credit.clear();
         if let Err(writer::FlushFailed(error)) = self.writer.flush().await {
             tracing::warn!(
-                peer = %self.peer,
+                peer = %self.key.peer,
+                lane = %self.key.lane,
                 epoch = self.writer.epoch(),
                 %error,
                 "messenger mux: batch was never admitted; failing the peer epoch"
@@ -1082,7 +1084,7 @@ impl Batcher {
     /// Cloned out rather than used through the guard: holding a `DashMap` shard
     /// lock across `reply`'s own mutex buys nothing and orders two locks.
     fn replacement(&self) -> Option<Arc<BatcherHandle>> {
-        let entry = self.batchers.get(&self.peer)?;
+        let entry = self.batchers.get(&self.key)?;
         (!Arc::ptr_eq(entry.value(), &self.handle)).then(|| Arc::clone(entry.value()))
     }
 
@@ -1099,7 +1101,7 @@ impl Batcher {
         if unregister {
             let handle = Arc::clone(&self.handle);
             self.batchers
-                .remove_if(&self.peer, |_, entry| Arc::ptr_eq(entry, &handle));
+                .remove_if(&self.key, |_, entry| Arc::ptr_eq(entry, &handle));
         }
         // Already closed on the retirement path, where what it handed back
         // rode the final flush. On cancellation whatever is still pending

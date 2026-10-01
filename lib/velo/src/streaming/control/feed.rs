@@ -92,7 +92,7 @@ impl SlotRelease {
         // the mark and closes the slot itself (`open_slot`'s cancelled arm)
         // rather than opening one nobody reads.
         match drain.cancel() {
-            Some((peer, slot)) => mux.cancel_claimed_session(peer, slot, self.session_id),
+            Some((key, slot)) => mux.cancel_claimed_session(key, slot, self.session_id),
             None => mux.release_bind(self.anchor_id, self.session_id),
         }
     }

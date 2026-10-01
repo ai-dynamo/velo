@@ -869,5 +869,15 @@ impl WriterObserver for QuicWriterObserver<'_> {
 }
 
 #[cfg(test)]
+impl QuicTransport {
+    /// Whether this transport holds a dialed connection to `target` on
+    /// `lane`, for tests outside this module that prove which lane carried
+    /// their traffic.
+    pub(crate) fn has_lane_connection(&self, target: crate::InstanceId, lane: u16) -> bool {
+        self.connections.contains_key(&(target, lane))
+    }
+}
+
+#[cfg(test)]
 #[path = "tests.rs"]
 mod tests;

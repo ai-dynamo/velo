@@ -17,7 +17,7 @@ use futures::StreamExt;
 use velo_ext::WorkerId;
 
 use super::peer_batcher::test_hooks::TestHooks;
-use super::test_support::stalled_producer;
+use super::test_support::{lane0, stalled_producer};
 use super::*;
 use crate::observability::test_helpers::MetricSnapshot;
 use crate::streaming::sender::{cached_dropped, cached_finalized};
@@ -805,7 +805,7 @@ async fn the_ordered_lane_is_observed_once_per_batch_not_once_per_record() {
     let waits = || {
         snapshot().histogram_count(
             "velo_messenger_ordered_lane_wait_seconds",
-            &[("handler", STREAM_BATCH_HANDLER)],
+            &[("handler", LaneIndex::ZERO.handler_name())],
         )
     };
     let records = || {
@@ -850,7 +850,7 @@ async fn the_ordered_lane_is_observed_once_per_batch_not_once_per_record() {
     assert!(
         snapshot().gauge(
             "velo_messenger_ordered_lanes",
-            &[("handler", STREAM_BATCH_HANDLER)]
+            &[("handler", LaneIndex::ZERO.handler_name())]
         ) >= 1.0,
         "the sending peer's lane must be live while its stream is"
     );
@@ -943,15 +943,17 @@ async fn gate_off_reproduces_the_awaited_ack() {
 /// each side of the floor, that a deferred peer is handed back exactly once,
 /// and that the re-check inside `due` cannot spin.
 mod drain_visit_floor {
+    use super::super::PeerLane;
     use super::super::sweep::DrainVisits;
+    use super::super::test_support::lane0;
     use std::time::Duration;
     use tokio::time::Instant;
     use velo_ext::WorkerId;
 
     const FLOOR: Duration = Duration::from_millis(2);
 
-    fn peer(id: u64) -> WorkerId {
-        WorkerId::from_u64(id)
+    fn peer(id: u64) -> PeerLane {
+        lane0(WorkerId::from_u64(id))
     }
 
     #[test]
@@ -1291,7 +1293,7 @@ async fn unclaimed_bind_is_reclaimed_on_anchor_death_without_the_timer() {
     );
     assert_eq!(mux.parked_drains(), 0);
     assert_eq!(
-        mux.live_ingress_slots(messenger.instance_id().worker_id()),
+        mux.live_ingress_slots(lane0(messenger.instance_id().worker_id())),
         0
     );
 }
@@ -1310,7 +1312,7 @@ async fn close_claimed_slot_is_idempotent() {
 
     // A slot this side never opened: nothing to close, and nothing to say.
     pair.consumer
-        .close_claimed_slot(pair.producer_worker, protocol::SlotId::from_raw(0));
+        .close_claimed_slot(lane0(pair.producer_worker), protocol::SlotId::from_raw(0));
 
     let rx = pair.consumer.bind(1, 1).await.expect("bind");
     let tx = pair
@@ -1321,13 +1323,15 @@ async fn close_claimed_slot_is_idempotent() {
     tx.send_async(item(0)).await.expect("send item");
     assert_eq!(recv(&rx).await, item(0));
 
-    let ids = pair.consumer.live_slot_ids(pair.producer_worker);
+    let ids = pair.consumer.live_slot_ids(lane0(pair.producer_worker));
     assert_eq!(ids.len(), 1, "one stream, one receive-side slot");
     let slot = ids[0];
 
-    pair.consumer.close_claimed_slot(pair.producer_worker, slot);
+    pair.consumer
+        .close_claimed_slot(lane0(pair.producer_worker), slot);
     assert_eq!(
-        pair.consumer.live_ingress_slots(pair.producer_worker),
+        pair.consumer
+            .live_ingress_slots(lane0(pair.producer_worker)),
         0,
         "the close must retire the slot here, not only tell the peer"
     );
@@ -1336,8 +1340,13 @@ async fn close_claimed_slot_is_idempotent() {
     eventually(|| tx.is_disconnected()).await;
 
     // Second close: same slot, already gone.
-    pair.consumer.close_claimed_slot(pair.producer_worker, slot);
-    assert_eq!(pair.consumer.live_ingress_slots(pair.producer_worker), 0);
+    pair.consumer
+        .close_claimed_slot(lane0(pair.producer_worker), slot);
+    assert_eq!(
+        pair.consumer
+            .live_ingress_slots(lane0(pair.producer_worker)),
+        0
+    );
 }
 
 /// The prompt close survives its peer's batcher retiring underneath it.
@@ -1370,8 +1379,13 @@ async fn a_close_posted_past_the_batchers_last_drain_still_reaches_the_producer(
         .connect(pair.consumer_worker, 1, 1)
         .await
         .expect("connect");
-    eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 1).await;
-    let slot = pair.consumer.live_slot_ids(pair.producer_worker)[0];
+    eventually(|| {
+        pair.consumer
+            .live_ingress_slots(lane0(pair.producer_worker))
+            == 1
+    })
+    .await;
+    let slot = pair.consumer.live_slot_ids(lane0(pair.producer_worker))[0];
 
     // Resolved first, as `close_claimed_slot` resolves it. Nothing has been
     // drained, so no credit is owed and the batcher is idle from birth — which
@@ -1382,10 +1396,10 @@ async fn a_close_posted_past_the_batchers_last_drain_still_reaches_the_producer(
             .consumer
             .core
             .batchers
-            .contains_key(&pair.producer_worker),
+            .contains_key(&lane0(pair.producer_worker)),
         "an admitted OpenSlot owes no reply, so no batcher exists yet"
     );
-    let batcher = pair.consumer.core.batcher(pair.producer_worker);
+    let batcher = pair.consumer.core.batcher(lane0(pair.producer_worker));
 
     // The sweep's eviction, by hand, in the window after its live-slot check
     // passed: claim under the registry lock, then post.
@@ -1394,7 +1408,9 @@ async fn a_close_posted_past_the_batchers_last_drain_still_reaches_the_producer(
         .consumer
         .core
         .batchers
-        .remove_if(&pair.producer_worker, |_, handle| handle.try_retire(0))
+        .remove_if(&lane0(pair.producer_worker), |_, handle| {
+            handle.try_retire(0)
+        })
         .expect("an idle batcher with no egress slots is evictable");
     evicted.retire();
     // Parked past the drain that carried `retire`, one step from exiting.
@@ -1402,7 +1418,7 @@ async fn a_close_posted_past_the_batchers_last_drain_still_reaches_the_producer(
 
     pair.consumer.core.send_replies(
         &batcher,
-        pair.producer_worker,
+        lane0(pair.producer_worker),
         &[peer_batcher::ReplyRecord::CloseSlot {
             slot,
             reason: protocol::CloseReason::UnknownSlot,
@@ -1434,25 +1450,32 @@ async fn a_close_refused_by_a_retired_batcher_reaches_the_producer_through_its_r
         .connect(pair.consumer_worker, 1, 1)
         .await
         .expect("connect");
-    eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 1).await;
-    let slot = pair.consumer.live_slot_ids(pair.producer_worker)[0];
+    eventually(|| {
+        pair.consumer
+            .live_ingress_slots(lane0(pair.producer_worker))
+            == 1
+    })
+    .await;
+    let slot = pair.consumer.live_slot_ids(lane0(pair.producer_worker))[0];
 
     // Resolved first, as `close_claimed_slot` resolves it, then evicted by
     // hand the way the sweep does it: claim under the registry lock, post
     // `retire`, and this time let the task run all the way out.
-    let batcher = pair.consumer.core.batcher(pair.producer_worker);
+    let batcher = pair.consumer.core.batcher(lane0(pair.producer_worker));
     let (_, evicted) = pair
         .consumer
         .core
         .batchers
-        .remove_if(&pair.producer_worker, |_, handle| handle.try_retire(0))
+        .remove_if(&lane0(pair.producer_worker), |_, handle| {
+            handle.try_retire(0)
+        })
         .expect("an idle batcher with no egress slots is evictable");
     evicted.retire();
     eventually(|| batcher.is_closed()).await;
 
     pair.consumer.core.send_replies(
         &batcher,
-        pair.producer_worker,
+        lane0(pair.producer_worker),
         &[peer_batcher::ReplyRecord::CloseSlot {
             slot,
             reason: protocol::CloseReason::UnknownSlot,
@@ -1465,7 +1488,7 @@ async fn a_close_refused_by_a_retired_batcher_reaches_the_producer_through_its_r
         .consumer
         .core
         .batchers
-        .get(&pair.producer_worker)
+        .get(&lane0(pair.producer_worker))
         .expect("the refused reply resolved a fresh batcher for the peer");
     assert!(
         !Arc::ptr_eq(replacement.value(), &batcher),
@@ -1499,18 +1522,22 @@ async fn close_claimed_slot_off_runtime_closes_through_the_mux_runtime() {
     tx.send_async(item(0)).await.expect("send item");
     assert_eq!(recv(&rx).await, item(0));
 
-    let ids = pair.consumer.live_slot_ids(pair.producer_worker);
+    let ids = pair.consumer.live_slot_ids(lane0(pair.producer_worker));
     assert_eq!(ids.len(), 1, "one stream, one receive-side slot");
     let slot = ids[0];
 
     let consumer = Arc::clone(&pair.consumer);
-    let peer = pair.producer_worker;
+    let peer = lane0(pair.producer_worker);
     // A bare OS thread carries no tokio context.
     std::thread::spawn(move || consumer.close_claimed_slot(peer, slot))
         .join()
         .expect("close_claimed_slot must not panic off a runtime");
 
-    assert_eq!(pair.consumer.live_ingress_slots(pair.producer_worker), 0);
+    assert_eq!(
+        pair.consumer
+            .live_ingress_slots(lane0(pair.producer_worker)),
+        0
+    );
     // The producer's inlet closes once its slot retires on the close.
     tokio::time::timeout(RECV_TIMEOUT, async {
         while !tx.is_disconnected() {
@@ -1558,6 +1585,7 @@ async fn a_refused_prebind_gives_the_unattached_timer_back() {
         supported_transport_keys: vec![velo_ext::TransportKey::new(
             crate::streaming::tcp_transport::TCP_STREAM_KEY,
         )],
+        lane_key: None,
     };
     assert!(
         matches!(
@@ -1610,6 +1638,7 @@ async fn an_adopted_prebind_is_reaped_on_heartbeat_silence_before_its_open_slot(
             1,
         ),
         supported_transport_keys: vec![velo_ext::TransportKey::new(MESSENGER_MUX_KEY)],
+        lane_key: None,
     };
     assert!(
         matches!(
@@ -1663,6 +1692,7 @@ async fn an_adopted_prebind_with_a_slow_heartbeat_is_reaped_by_the_accept_window
             1,
         ),
         supported_transport_keys: vec![velo_ext::TransportKey::new(MESSENGER_MUX_KEY)],
+        lane_key: None,
     };
     assert!(
         matches!(
@@ -1816,12 +1846,17 @@ async fn a_prebound_slot_opens_on_the_terms_its_ticket_quotes() {
         .await
         .expect("connect");
     tx.send_async(item(0)).await.expect("send item");
-    eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 1).await;
+    eventually(|| {
+        pair.consumer
+            .live_ingress_slots(lane0(pair.producer_worker))
+            == 1
+    })
+    .await;
 
-    let id = pair.consumer.live_slot_ids(pair.producer_worker)[0];
+    let id = pair.consumer.live_slot_ids(lane0(pair.producer_worker))[0];
     let (credit, byte_budget) = pair
         .consumer
-        .slot_open_terms(pair.producer_worker, id)
+        .slot_open_terms(lane0(pair.producer_worker), id)
         .expect("the claimed slot is live");
     assert_eq!(
         ticket.initial_credit, credit,
@@ -1898,7 +1933,7 @@ fn the_drain_wake_lane_never_refuses_a_wake() {
     let (tx, _rx) = drain_wake_lane();
     for peer in 0..100_000u64 {
         assert!(
-            tx.try_send(WorkerId::from_u64(peer)).is_ok(),
+            tx.try_send(lane0(WorkerId::from_u64(peer))).is_ok(),
             "wake {peer} refused"
         );
     }
@@ -2025,6 +2060,7 @@ async fn watched_anchor<T: serde::de::DeserializeOwned>(
                 1,
             ),
             supported_transport_keys: vec![velo_ext::TransportKey::new(MESSENGER_MUX_KEY)],
+            lane_key: None,
         };
         assert!(
             matches!(
@@ -2065,7 +2101,12 @@ async fn the_watchdog_does_not_fire_while_its_sender_is_parked() {
     for n in 0..CREDIT {
         tx.send_async(item(n)).await.expect("send item");
     }
-    eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 1).await;
+    eventually(|| {
+        pair.consumer
+            .live_ingress_slots(lane0(pair.producer_worker))
+            == 1
+    })
+    .await;
 
     // Twenty windows of silence, with the whole window unread.
     tokio::time::sleep(heartbeat * 20).await;
@@ -2103,7 +2144,12 @@ async fn a_silent_sender_with_credit_is_reaped_while_records_wait_unread() {
     for n in 0..3 {
         tx.send_async(item(n)).await.expect("send item");
     }
-    eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 1).await;
+    eventually(|| {
+        pair.consumer
+            .live_ingress_slots(lane0(pair.producer_worker))
+            == 1
+    })
+    .await;
 
     // Nobody reads. Detection is three windows, plus one of clock skew.
     tokio::time::timeout(heartbeat * 20, async {
@@ -2267,7 +2313,12 @@ async fn an_ended_consumer_releases_its_slot_while_the_anchor_is_held() {
         "expected DeserializationError, got {ended:?}"
     );
 
-    eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 0).await;
+    eventually(|| {
+        pair.consumer
+            .live_ingress_slots(lane0(pair.producer_worker))
+            == 0
+    })
+    .await;
     drop((anchor, tx));
 }
 
@@ -2286,9 +2337,19 @@ async fn a_watchdog_firing_closes_its_slot() {
     for n in 0..3 {
         tx.send_async(item(n)).await.expect("send item");
     }
-    eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 1).await;
+    eventually(|| {
+        pair.consumer
+            .live_ingress_slots(lane0(pair.producer_worker))
+            == 1
+    })
+    .await;
     eventually(|| !manager.registry.contains_key(&local_id)).await;
-    eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 0).await;
+    eventually(|| {
+        pair.consumer
+            .live_ingress_slots(lane0(pair.producer_worker))
+            == 0
+    })
+    .await;
     drop((anchor, tx));
 }
 
@@ -2305,10 +2366,20 @@ async fn cancelling_a_stream_closes_its_slot() {
     let (pair, _manager, anchor, _local_id, tx) =
         watched_anchor::<u32>(test_config(), heartbeat, true).await;
     tx.send_async(item(0)).await.expect("send item");
-    eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 1).await;
+    eventually(|| {
+        pair.consumer
+            .live_ingress_slots(lane0(pair.producer_worker))
+            == 1
+    })
+    .await;
 
     anchor.controller().cancel();
-    eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 0).await;
+    eventually(|| {
+        pair.consumer
+            .live_ingress_slots(lane0(pair.producer_worker))
+            == 0
+    })
+    .await;
     drop((anchor, tx));
 }
 
@@ -2325,12 +2396,22 @@ async fn an_anchor_dropped_off_runtime_still_closes_its_slot() {
     let (pair, _manager, anchor, _local_id, tx) =
         watched_anchor::<u32>(test_config(), heartbeat, true).await;
     tx.send_async(item(0)).await.expect("send item");
-    eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 1).await;
+    eventually(|| {
+        pair.consumer
+            .live_ingress_slots(lane0(pair.producer_worker))
+            == 1
+    })
+    .await;
 
     std::thread::spawn(move || drop(anchor))
         .join()
         .expect("drop on a plain thread");
-    eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 0).await;
+    eventually(|| {
+        pair.consumer
+            .live_ingress_slots(lane0(pair.producer_worker))
+            == 0
+    })
+    .await;
     drop(tx);
 }
 
@@ -2410,7 +2491,12 @@ async fn a_reattach_over_the_mux_does_not_overtake_the_detached_tail() {
         .await
         .expect("connect");
     tx.send_async(item(100)).await.expect("send");
-    eventually(|| pair.consumer.live_ingress_slots(pair.producer_worker) == 1).await;
+    eventually(|| {
+        pair.consumer
+            .live_ingress_slots(lane0(pair.producer_worker))
+            == 1
+    })
+    .await;
 
     let mut seen = Vec::new();
     for _ in 0..4 {
@@ -2525,6 +2611,7 @@ async fn dropping_an_anchor_before_its_sender_opens_releases_the_bind() {
             1,
         ),
         supported_transport_keys: vec![velo_ext::TransportKey::new(MESSENGER_MUX_KEY)],
+        lane_key: None,
     };
     assert!(matches!(
         manager.adopt_prebind(local_id, &request),

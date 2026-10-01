@@ -15,7 +15,7 @@ This chapter records what the QUIC transport costs against TCP, the settings tha
 | `idle_timeout(d)` | 15 s | A connection that receives nothing for this long is closed. This is how a peer that died without closing is found. quinn's own default is 30 s. |
 | `shrink_threshold(bytes)` | The TCP transport's | Read-buffer size above which a reader gives memory back after a frame. |
 
-The examples read `VELO_QUIC_MAX_MTU`, `VELO_QUIC_STREAM_WINDOW`, and `VELO_QUIC_SERVER_ENDPOINTS`, so a sweep can change them without new flags.
+The examples read `VELO_QUIC_LANES`, `VELO_QUIC_MAX_MTU`, `VELO_QUIC_STREAM_WINDOW`, and `VELO_QUIC_SERVER_ENDPOINTS`, so a sweep can change them without new flags.
 
 ## Packets above 6550 bytes are lost
 
@@ -77,7 +77,7 @@ Measured on 2026-09-29 with the `throughput` example in its two-host mode. The s
 
 With `lanes(n)`, each peer gets up to `n` connections, one for each lane used, each dialed from its own UDP socket. Each lane has its own quinn endpoint driver, shared by every peer dialed on that lane, and each connection has its own connection driver. The work runs on up to `n` cores.
 
-The messenger sends its own traffic on lane 0. Only a caller that sends with `send_message_on_lane` uses the other lanes, so `lanes(n)` alone does not change the throughput of ordinary messages.
+The messenger sends its own traffic on lane 0, so `lanes(n)` does not change the throughput of ordinary messages. The batched-streaming mux places streams over the lanes (see [Lanes](../concepts/batched-streaming.md#lanes)), so streams do get faster. A caller can also send on a lane with `send_message_on_lane`.
 
 Measured on 2026-09-29 across the same two nodes as above, 64 KiB messages pipelined, 20,000 messages per cell, two reps. A prototype, which is not in the tree, spread the messages round robin over the lanes, with one connection per lane, each from its own UDP socket. The receiving node had 32 server sockets in one `SO_REUSEPORT` group.
 
@@ -114,6 +114,48 @@ A fixed `bind_addr` port `P` binds ports `P` to `P + n - 1`, one for each server
 During a rolling upgrade, an old peer can dial a new node, and a new peer can dial an old node. A peer without per-socket ports dials only the first port of a new node, so until it upgrades it shares that socket with the other old peers.
 
 A TCP prototype with the same layout, one connection per lane, scaled too: 2.5, 4.6, 8.1 and 13.1 GB/s (10^9 bytes per second) with 1, 2, 4 and 8 lanes. One TCP connection is limited by its receiver: one reader task does the `recvmsg` copy, and by default the transport's fixed socket buffers cap the TCP window (see [Socket buffers](../concepts/transports.md#socket-buffers-are-set-before-data-flows)). `TcpTransportBuilder::lanes(n)` builds the same layout. See [TCP lanes](../concepts/transports.md#tcp-lanes). These TCP numbers came from the prototype, not from that code.
+
+### Streams over lanes
+
+Measured on 2026-09-30 across two nodes of the same type as above, with the `throughput` example in its stream mode (`--modes stream`). The client creates the anchors, and the server attaches to them and streams to them, so the client is the consumer and places the streams on lanes. Both sides set `VELO_QUIC_LANES` to the lane count and keep the default of 4 server sockets. Each cell sends 200,000 items in total, split evenly over the streams, after a warm-up round. Two reps. The TCP row is one connection in the same job, for reference.
+
+16 KiB items, MiB/s:
+
+| Transport | 16 streams | 64 streams | 256 streams |
+|---|---|---|---|
+| QUIC, 1 lane | 730–776 | 732–756 | 493–677 |
+| QUIC, 2 lanes | 1,499–1,505 | 1,440–1,441 | 1,472–1,506 |
+| QUIC, 4 lanes | 2,561–2,874 | 2,445–2,829 | 2,784–2,814 |
+| QUIC, 8 lanes | 3,660–3,704 | 5,290–5,300 | 5,282–5,365 |
+| TCP, 1 connection | 1,722–1,776 | 2,098–2,125 | 1,916–2,056 |
+
+64 B items, items per second:
+
+| Transport | 16 streams | 256 streams |
+|---|---|---|
+| QUIC, 1 lane | 174,000–178,000 | 736,000–927,000 |
+| QUIC, 8 lanes | 159,000–161,000 | 1,755,000–1,933,000 |
+| TCP, 1 connection | 183,000–186,000 | 851,000–856,000 |
+
+- **Streams scale with lanes as messages do.** One lane stays at the one-connection limit, 500 to 780 MiB/s. Each doubling of lanes nearly doubles the rate, up to about 5,300 MiB/s at 8 lanes, which is 2.5 times TCP on one connection.
+- **16 streams do not fill 8 lanes.** With two streams on each lane, 8 lanes reach about 3,700 MiB/s. Each stream waits for credit every 32 records, which limits the rate of one stream. This was not profiled.
+- **Small items lose a little at few streams.** 16 streams of 64 B are about 9% slower at 8 lanes than at 1. The likely cause is that each lane's batch then carries the records of only two streams. This was not profiled. At 256 streams, 8 lanes move twice as many items as 1.
+- **The streams used the lanes.** One lane carries at most about 790 MiB/s, so 5,300 MiB/s at 8 lanes needs data on at least 7 lanes. The lane tests check the placement directly.
+
+A second job on another pair of nodes gave 533 to 735 MiB/s at 1 lane and 3,721 to 5,150 MiB/s at 8 lanes, so the spread between node pairs is larger than between reps.
+
+Later runs on three more pairs of nodes gave 3,237 to 5,402 MiB/s at 8 lanes and 64 streams (median 5,198, 11 reps), and 3,655 to 5,326 MiB/s at 256 streams (median 4,948). The first rep of a job is often the low one. A diagnostic build counted the bytes that each lane's batch handler received: over 8 lanes, the busiest lane carried at most 1.09 times the mean, at 64 and at 256 streams.
+
+The same stream mode over TCP lanes (`VELO_TCP_LANES`), on one pair of nodes, 2 reps, 16 KiB items, MiB/s:
+
+| TCP lanes | 16 streams | 64 streams | 256 streams |
+|---|---|---|---|
+| 1 | 1,712–1,773 | 2,083–2,090 | 2,005–2,087 |
+| 2 | 2,986–3,314 | 3,809–3,847 | 3,796–3,894 |
+| 4 | 3,917–4,046 | 6,583–6,720 | 6,882–6,943 |
+| 8 | 3,046–3,098 | 9,921–10,734 | 10,448–10,709 |
+
+With 64 B items at 256 streams, TCP moved 783,000 to 857,000 items/s at 1 lane and 2,120,000 to 2,219,000 at 8 lanes. At 16 streams, 8 lanes were slower than 4, for both item sizes.
 
 ## Batched streaming over QUIC
 

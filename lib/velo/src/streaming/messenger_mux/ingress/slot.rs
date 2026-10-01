@@ -26,7 +26,10 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
-use super::super::flow_control::{ByteBudget, CreditClass, SlotCreditAccount, try_reserve_pair};
+use super::super::flow_control::{
+    ByteBudget, CreditClass, SharedByteBudget, SlotCreditAccount, try_reserve_pair,
+};
+use super::super::lane_choice::LaneReservation;
 use super::super::protocol::{CloseReason, RecordType, SlotId};
 use super::DrainSignal;
 use crate::streaming::sender::{cached_dropped, cached_heartbeat, is_terminal_sentinel};
@@ -50,11 +53,36 @@ pub(super) enum Applied {
     Fault(CloseReason),
 }
 
+/// A live slot's two lane counts, on the lane the consumer placed it on.
+///
+/// Held by the slot and never read, so whichever path retires it (a close, an
+/// epoch retired, shutdown) gives both back when it drops, and none can
+/// forget to.
+pub(super) struct LiveCounts {
+    /// On the slot's placed lane, summed over every peer. An unkeyed pre-bind
+    /// reads it, because it does not know its peer.
+    _node: LaneReservation,
+    /// On the slot's (peer, placed lane). An unkeyed attach from that peer
+    /// reads it, so the choice takes no slot table's mutex.
+    _peer: LaneReservation,
+}
+
+impl LiveCounts {
+    pub(super) fn new(node: LaneReservation, peer: LaneReservation) -> Self {
+        Self {
+            _node: node,
+            _peer: peer,
+        }
+    }
+}
+
 /// One receive-side slot.
 pub(super) struct IngressSlot {
     pub(super) session_id: u64,
     /// Index and generation this slot answers to.
     pub(super) id: SlotId,
+    /// This slot's counts on its lane, for placing unkeyed streams.
+    _live: LiveCounts,
     /// The mux-owned `C + 1`-deep buffer handed to the anchor by `bind`.
     frame_tx: flume::Sender<Vec<u8>>,
     /// The signal this slot's consumer counts its drains on (the
@@ -122,6 +150,7 @@ impl IngressSlot {
     /// Open a slot against the buffer `bind` created, granting `initial_credit`.
     pub(super) fn new(
         id: SlotId,
+        live: LiveCounts,
         frame_tx: flume::Sender<Vec<u8>>,
         drain: Arc<DrainSignal>,
         initial_credit: u32,
@@ -131,6 +160,7 @@ impl IngressSlot {
         Self {
             session_id: 0,
             id,
+            _live: live,
             frame_tx,
             drain,
             account: SlotCreditAccount::new(initial_credit),
@@ -143,6 +173,12 @@ impl IngressSlot {
             touched: false,
             pending_close: None,
         }
+    }
+
+    /// The lane the consumer placed this slot on, where its load counts.
+    #[cfg(test)]
+    pub(super) fn placed_lane(&self) -> super::super::LaneIndex {
+        self._live._node.lane()
     }
 
     /// Records currently parked ahead of sequence.
@@ -182,7 +218,7 @@ impl IngressSlot {
         &mut self,
         frame_seq: u32,
         body: Vec<u8>,
-        peer_bytes: &mut ByteBudget,
+        peer_bytes: &SharedByteBudget,
     ) -> Applied {
         if frame_seq < self.next_seq {
             return Applied::Duplicate;
@@ -310,7 +346,7 @@ impl IngressSlot {
         self.hold_bytes.used()
     }
 
-    fn park(&mut self, frame_seq: u32, body: Vec<u8>, peer_bytes: &mut ByteBudget) -> Applied {
+    fn park(&mut self, frame_seq: u32, body: Vec<u8>, peer_bytes: &SharedByteBudget) -> Applied {
         let class = classify(&body);
         if let Err(fault) = self.admit(class) {
             return fault_reason(&fault);
@@ -323,7 +359,7 @@ impl IngressSlot {
         Applied::Held
     }
 
-    fn release_hold(&mut self, peer_bytes: &mut ByteBudget) -> Applied {
+    fn release_hold(&mut self, peer_bytes: &SharedByteBudget) -> Applied {
         while let Some(body) = self.hold.remove(&self.next_seq) {
             let len = body.len();
             if let Err(fault) = self.deliver(body) {
@@ -389,13 +425,14 @@ fn fault_reason(fault: &DeliverFault) -> Applied {
 ///
 /// A heartbeat is a `Data`-class record on purpose: dropping one under
 /// saturation *is* the per-slot saturation signal the stream watchdog's
-/// `DETECTION_MULTIPLIER` watches for, and it is the only thing a streaming beat
-/// still uniquely carries now that the Messenger detects process, host and
-/// connection death itself. The watchdog charges only a window with no
-/// arrivals from a sender that still held data credit, so the saturation it
-/// sees is upstream of the consumer (the producer's egress or the peer link),
-/// not a consumer that has fallen behind: that consumer leaves its sender
-/// without credit, and the watchdog exempts it.
+/// `DETECTION_MULTIPLIER` watches for, and the batcher's peer health check
+/// cannot see it. The watchdog also ends a slot behind a batch that a
+/// connection close lost after admission, which nothing reports to the mux:
+/// the records after the gap wait in the hold. The watchdog charges only a
+/// window with no arrivals from a sender that still held data credit, so the
+/// saturation it sees is upstream of the consumer (the producer's egress or
+/// the peer link), not a consumer that has fallen behind: that consumer leaves
+/// its sender without credit, and the watchdog exempts it.
 pub(super) fn heartbeat_frame() -> Vec<u8> {
     cached_heartbeat().clone()
 }
