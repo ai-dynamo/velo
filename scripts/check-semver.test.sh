@@ -64,7 +64,9 @@ chmod +x "$STUB_BIN/cargo"
 
 # The curl stub serves "$INDEX_DIR/<index path>" for any URL under
 # $SEMVER_INDEX_URL, and answers 404 for a crate the fixture index lacks, as
-# the sparse index does. INDEX_FAIL=1 makes it fail like an unreachable host.
+# the sparse index does. INDEX_FAIL=1 makes it fail like an unreachable host,
+# INDEX_STATUS answers that HTTP status, and INDEX_BODY answers 200 with that
+# body for every crate.
 cat > "$STUB_BIN/curl" <<'STUB'
 #!/usr/bin/env bash
 out="" url=""
@@ -79,6 +81,16 @@ done
 if [[ "${INDEX_FAIL:-0}" == "1" ]]; then
     echo "curl: (6) Could not resolve host" >&2
     exit 6
+fi
+if [[ -n "${INDEX_STATUS:-}" ]]; then
+    echo "error" > "$out"
+    printf '%s' "$INDEX_STATUS"
+    exit 0
+fi
+if [[ -n "${INDEX_BODY:-}" ]]; then
+    printf '%s\n' "$INDEX_BODY" > "$out"
+    printf 200
+    exit 0
 fi
 path="${url#"${SEMVER_INDEX_URL}"/}"
 if [[ -f "$INDEX_DIR/$path" ]]; then
@@ -171,9 +183,13 @@ EOF
 
 # Builds a fixture repo with a base commit and a change commit, and runs the
 # gate on the change. $1: case name, $2/$3: base versions (root, literal),
-# $4/$5: change versions. Leaves $TMP_ROOT/<case>.out and .exit.
+# $4/$5: change versions, $6: optional source marker for the change commit.
+# Leaves $TMP_ROOT/<case>.out and .exit.
 run_case() {
     local name="$1" base_root="$2" base_lit="$3" pr_root="$4" pr_lit="$5"
+    # A 6th argument keeps the crates' sources unchanged, so the change
+    # touches only the manifests.
+    local change_marker="${6:-change}"
     local repo="$TMP_ROOT/repo-$name"
     mkdir -p "$repo"
     (
@@ -182,7 +198,7 @@ run_case() {
         write_fixture_commit "$base_root" "$base_lit" "base" "base"
         local base_sha
         base_sha=$(git rev-parse HEAD)
-        write_fixture_commit "$pr_root" "$pr_lit" "change" "change"
+        write_fixture_commit "$pr_root" "$pr_lit" "change" "$change_marker"
         set +e
         BASE_REF="$base_sha" bash "$CHECK_SEMVER" > "$TMP_ROOT/$name.out" 2>&1
         echo $? > "$TMP_ROOT/$name.exit"
@@ -332,6 +348,81 @@ if [[ "$(cat "$TMP_ROOT/g.exit")" == "1" ]] \
     ok=0
 fi
 report "(g) an unreachable index fails the gate instead of skipping the check" "$ok" "$out"
+
+
+# ── (h) an HTTP 200 that is not an index fails ───────────────────────────────
+# A proxy or a captive portal can answer 200 with a page. Reading that as
+# "never published" would skip every check and pass.
+reset_index
+INDEX_BODY='<html>sign in</html>' run_case h 0.10.0 0.5.0 0.10.0 0.5.0
+out=$(cat "$TMP_ROOT/h.out")
+ok=1
+if [[ "$(cat "$TMP_ROOT/h.exit")" == "1" ]] \
+    && echo "$out" | grep -qF '::error::' \
+    && ! echo "$out" | grep -qF 'never published'; then
+    ok=0
+fi
+report "(h) an HTTP 200 whose body is not an index fails the gate" "$ok" "$out"
+
+# ── (i) a crate whose every version is yanked fails ──────────────────────────
+# There is no baseline to check against, and that needs a person's decision.
+reset_index
+publish velo 0.10.0! 0.11.0!
+publish velo-ext 0.5.0
+run_case i 0.11.0 0.5.0 0.11.0 0.5.0
+out=$(cat "$TMP_ROOT/i.out")
+ok=1
+if [[ "$(cat "$TMP_ROOT/i.exit")" == "1" ]] \
+    && echo "$out" | grep -qF 'every published version' \
+    && ! echo "$out" | grep -qF 'never published'; then
+    ok=0
+fi
+report "(i) a crate with every version yanked fails the gate" "$ok" "$out"
+
+# ── (j) an index error status fails ──────────────────────────────────────────
+reset_index
+INDEX_STATUS=500 run_case j 0.10.0 0.5.0 0.10.0 0.5.0
+out=$(cat "$TMP_ROOT/j.out")
+ok=1
+if [[ "$(cat "$TMP_ROOT/j.exit")" == "1" ]] \
+    && echo "$out" | grep -qF 'answered HTTP 500' \
+    && ! echo "$out" | grep -qF 'never published'; then
+    ok=0
+fi
+report "(j) an index error status other than 404 fails the gate" "$ok" "$out"
+
+# ── (k) a version below the published one fails ─────────────────────────────
+# cargo-semver-checks treats any minor change before 1.0 as allowed to break,
+# in either direction, so it passes 0.9.0 against a published 0.10.0. A bad
+# merge that lowers the version must not pass.
+reset_index
+publish velo 0.10.0
+publish velo-ext 0.5.0
+run_case k 0.10.0 0.5.0 0.9.0 0.5.0
+out=$(cat "$TMP_ROOT/k.out")
+ok=1
+if [[ "$(cat "$TMP_ROOT/k.exit")" == "1" ]] \
+    && echo "$out" | grep -qF 'is below its latest published version 0.10.0'; then
+    ok=0
+fi
+report "(k) a version below the latest published version fails the gate" "$ok" "$out"
+
+# ── (l) a change to the root manifest selects the crates that inherit it ─────
+# velo takes its version from [workspace.package] in the root Cargo.toml. A
+# change that touches only that file can change velo's version, so velo must
+# be checked.
+reset_index
+publish velo 0.10.0
+publish velo-ext 0.5.0
+run_case l 0.11.0 0.5.0 0.10.0 0.5.0 base
+out=$(cat "$TMP_ROOT/l.out")
+ok=1
+if [[ "$(cat "$TMP_ROOT/l.exit")" == "1" ]] \
+    && echo "$out" | grep -qF 'Checking velo against 0.10.0' \
+    && ! echo "$out" | grep -qF 'Checking velo-ext'; then
+    ok=0
+fi
+report "(l) a root-manifest change selects the crates that inherit its version" "$ok" "$out"
 
 echo ""
 

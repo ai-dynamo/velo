@@ -37,7 +37,11 @@ for crate_dir in lib/*/ crates/*/; do
     crate_name=$(basename "$crate_dir")
     # Any file in the crate can change its public surface (src/, build.rs,
     # Cargo.toml features/deps) — match the whole crate directory.
-    if echo "$changed_files" | grep -qE "^${crate_dir}/"; then
+    # A crate whose version is `version.workspace = true` takes it from the
+    # root manifest, so a change to the root manifest alone can change it.
+    if echo "$changed_files" | grep -qE "^${crate_dir}/" \
+        || { echo "$changed_files" | grep -qx 'Cargo.toml' \
+            && grep -qE '^version\.workspace[[:space:]]*=[[:space:]]*true' "${crate_dir}/Cargo.toml" 2>/dev/null; }; then
         changed_crates+=("$crate_name")
         crate_dirs["$crate_name"]="$crate_dir"
     fi
@@ -173,8 +177,19 @@ latest_published_version() {
         echo "::error::${SEMVER_INDEX_URL} answered HTTP ${status} for ${crate_name}" >&2
         exit 1
     fi
-    grep -F '"yanked":false' "$body" | sed -n 's/.*"vers":"\([^"]*\)".*/\1/p' | sort -V | tail -1
+    if ! grep -qF '"vers":"' "$body"; then
+        rm -f "$body"
+        echo "::error::${SEMVER_INDEX_URL} answered 200 for ${crate_name} with a body that is not an index entry" >&2
+        exit 1
+    fi
+    local latest
+    latest=$(grep -F '"yanked":false' "$body" | sed -n 's/.*"vers":"\([^"]*\)".*/\1/p' | sort -V | tail -1) || true
     rm -f "$body"
+    if [[ -z "$latest" ]]; then
+        echo "::error::every published version of ${crate_name} is yanked; there is no baseline to check against" >&2
+        exit 1
+    fi
+    echo "$latest"
 }
 
 failures=()
@@ -188,25 +203,6 @@ for crate_name in "${changed_crates[@]}"; do
 
     echo "Checking ${crate_name} against ${published}, its latest published version..."
 
-    crate_output=""
-    crate_exit=0
-    crate_output=$(cargo semver-checks check-release \
-        --package "$crate_name" \
-        --baseline-version "$published" 2>&1) || crate_exit=$?
-
-    if [[ $crate_exit -eq 0 ]]; then
-        echo "  ${crate_name}: no breaking changes"
-        continue
-    fi
-
-    # Distinguish tool errors from actual semver violations
-    if ! echo "$crate_output" | grep -qiE '(BREAKING|--- failure|semver requires)'; then
-        echo "::error::cargo-semver-checks failed for ${crate_name} (not a semver violation — likely a build error):"
-        echo "$crate_output"
-        exit 1
-    fi
-
-    # Breaking changes detected — check version bump
     base_version="$published"
     pr_version=$(extract_crate_version "$crate_name")
 
@@ -224,6 +220,33 @@ for crate_name in "${changed_crates[@]}"; do
     # closed, rather than reaching `-gt` and aborting the shell mid-run.
     if [[ ! "$base_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || [[ ! "$pr_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         echo "::error::Could not parse version for ${crate_name} (base='${base_version}' pr='${pr_version}')"
+        exit 1
+    fi
+
+    # Before 1.0, cargo-semver-checks allows any change across a minor
+    # version in either direction, so it would pass a version below the
+    # published one. A lower version is a bad merge, not a release.
+    lowest=$(printf '%s\n%s\n' "$pr_version" "$base_version" | sort -V | head -1)
+    if [[ "$pr_version" != "$base_version" && "$lowest" == "$pr_version" ]]; then
+        echo "::error::${crate_name} ${pr_version} is below its latest published version ${base_version}"
+        exit 1
+    fi
+
+    crate_output=""
+    crate_exit=0
+    crate_output=$(cargo semver-checks check-release \
+        --package "$crate_name" \
+        --baseline-version "$published" 2>&1) || crate_exit=$?
+
+    if [[ $crate_exit -eq 0 ]]; then
+        echo "  ${crate_name}: no breaking changes"
+        continue
+    fi
+
+    # Distinguish tool errors from actual semver violations
+    if ! echo "$crate_output" | grep -qiE '(BREAKING|--- failure|semver requires)'; then
+        echo "::error::cargo-semver-checks failed for ${crate_name} (not a semver violation — likely a build error):"
+        echo "$crate_output"
         exit 1
     fi
 
