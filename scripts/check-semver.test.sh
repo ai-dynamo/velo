@@ -41,6 +41,8 @@ report() {
 # check its installed version) and `cargo semver-checks check-release`
 # separately. Stub both, so the test controls whether a "breaking change" is
 # reported without one existing in the fixture crate's source.
+# CARGO_SEMVER_EXIT=0 makes the stub report no breaking change, as the real
+# tool does for a pre-1.0 change across a minor version in either direction.
 STUB_BIN="$TMP_ROOT/bin"
 mkdir -p "$STUB_BIN"
 
@@ -54,6 +56,10 @@ cat > "$STUB_BIN/cargo" <<'STUB'
 #!/usr/bin/env bash
 echo "$*" >> "$CARGO_ARGS_LOG"
 if [[ "$1" == "semver-checks" ]]; then
+    if [[ "${CARGO_SEMVER_EXIT:-1}" == "0" ]]; then
+        echo "Summary no semver update required"
+        exit 0
+    fi
     echo "--- failure some_lint: fixture-forced breaking change ---"
     exit 1
 fi
@@ -161,12 +167,16 @@ edition = "2024"
 EOF
 
     mkdir -p lib/velo/src lib/velo-ext/src
-    cat > lib/velo/Cargo.toml <<'EOF'
+    if [[ "${INLINE_WS:-0}" == "1" ]]; then
+        printf '[package]\nname = "velo"\nversion = { workspace = true }\nedition.workspace = true\n' > lib/velo/Cargo.toml
+    else
+        cat > lib/velo/Cargo.toml <<'EOF'
 [package]
 name = "velo"
 version.workspace = true
 edition.workspace = true
 EOF
+    fi
     echo "pub fn touch() {} // ${marker}" > lib/velo/src/lib.rs
 
     cat > lib/velo-ext/Cargo.toml <<EOF
@@ -314,11 +324,12 @@ out=$(cat "$TMP_ROOT/e.out")
 ok=1
 if [[ "$(cat "$TMP_ROOT/e.exit")" == "0" ]] \
     && echo "$out" | grep -qF 'breaking changes, but version bumped' \
+    && grep -qF -- '--package ucx-rs --baseline-version 0.1.0+ucx.1.22.0' "$CARGO_ARGS_LOG" \
     && ! echo "$out" | grep -qi 'Could not parse version' \
     && ! echo "$out" | grep -qi 'invalid arithmetic operator'; then
     ok=0
 fi
-report "(e) ucx-rs's +build metadata compares on the semver core; a correct bump passes" "$ok" "$out"
+report "(e) ucx-rs's +build metadata compares on the semver core, and the baseline keeps it; a correct bump passes" "$ok" "$out"
 
 # ── (f) a crate that was never published is skipped ─────────────────────────
 # The index answers 404 for it, so there is no baseline to break.
@@ -358,7 +369,7 @@ INDEX_BODY='<html>sign in</html>' run_case h 0.10.0 0.5.0 0.10.0 0.5.0
 out=$(cat "$TMP_ROOT/h.out")
 ok=1
 if [[ "$(cat "$TMP_ROOT/h.exit")" == "1" ]] \
-    && echo "$out" | grep -qF '::error::' \
+    && echo "$out" | grep -qF 'with a body that is not an index entry' \
     && ! echo "$out" | grep -qF 'never published'; then
     ok=0
 fi
@@ -393,12 +404,13 @@ report "(j) an index error status other than 404 fails the gate" "$ok" "$out"
 
 # ── (k) a version below the published one fails ─────────────────────────────
 # cargo-semver-checks treats any minor change before 1.0 as allowed to break,
-# in either direction, so it passes 0.9.0 against a published 0.10.0. A bad
-# merge that lowers the version must not pass.
+# in either direction, so it passes 0.9.0 against a published 0.10.0. The
+# stub reports no breaking change here, as the real tool would. A bad merge
+# that lowers the version must still fail.
 reset_index
 publish velo 0.10.0
 publish velo-ext 0.5.0
-run_case k 0.10.0 0.5.0 0.9.0 0.5.0
+CARGO_SEMVER_EXIT=0 run_case k 0.10.0 0.5.0 0.9.0 0.5.0
 out=$(cat "$TMP_ROOT/k.out")
 ok=1
 if [[ "$(cat "$TMP_ROOT/k.exit")" == "1" ]] \
@@ -423,6 +435,50 @@ if [[ "$(cat "$TMP_ROOT/l.exit")" == "1" ]] \
     ok=0
 fi
 report "(l) a root-manifest change selects the crates that inherit its version" "$ok" "$out"
+
+# ── (m) a change with no breaking change passes ──────────────────────────────
+reset_index
+publish velo 0.10.0
+publish velo-ext 0.5.0
+CARGO_SEMVER_EXIT=0 run_case m 0.10.0 0.5.0 0.10.0 0.5.1
+out=$(cat "$TMP_ROOT/m.out")
+ok=1
+if [[ "$(cat "$TMP_ROOT/m.exit")" == "0" ]] \
+    && echo "$out" | grep -qF 'velo: no breaking changes' \
+    && echo "$out" | grep -qF 'velo-ext: no breaking changes'; then
+    ok=0
+fi
+report "(m) a change with no breaking change passes" "$ok" "$out"
+
+# ── (n) the inline form of an inherited version is selected too ─────────────
+# Cargo accepts `version = { workspace = true }` as well as
+# `version.workspace = true`; a root-only change must select either.
+reset_index
+publish velo 0.10.0
+publish velo-ext 0.5.0
+INLINE_WS=1 run_case n 0.11.0 0.5.0 0.10.0 0.5.0 base
+out=$(cat "$TMP_ROOT/n.out")
+ok=1
+if [[ "$(cat "$TMP_ROOT/n.exit")" == "1" ]] \
+    && echo "$out" | grep -qF 'Checking velo against 0.10.0'; then
+    ok=0
+fi
+report "(n) a root-manifest change selects a crate written with \`version = { workspace = true }\`" "$ok" "$out"
+
+# ── (o) a pre-release is not the baseline ────────────────────────────────────
+# sort -V ranks 0.11.0-rc.1 above 0.10.0, and a pre-release baseline would
+# fail the parse check on every change to the crate.
+reset_index
+publish velo 0.10.0 0.11.0-rc.1
+publish velo-ext 0.5.0
+run_case o 0.10.0 0.6.0 0.11.0 0.6.0
+out=$(cat "$TMP_ROOT/o.out")
+ok=1
+if [[ "$(cat "$TMP_ROOT/o.exit")" == "0" ]] \
+    && echo "$out" | grep -qF 'version bumped 0.10.0 -> 0.11.0'; then
+    ok=0
+fi
+report "(o) a pre-release is not the baseline" "$ok" "$out"
 
 echo ""
 

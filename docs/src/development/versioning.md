@@ -14,7 +14,7 @@
 
 ## The CI gate
 
-The `Semver Check` job runs `scripts/check-semver.sh`. For each crate that the change touches, the script reads the latest version of the crate from the crates.io index and runs `cargo semver-checks check-release` against it. It fails when a breaking change is not covered by the version bump over that published version. It skips a crate that was never published, and it fails if it cannot reach the index. A change to the root `Cargo.toml` also selects every crate that takes its version from it. The check is cumulative, so a breaking change that reached `main` without a bump fails the next change that touches that crate. The `semver:skip` PR label exists for emergencies. Use it only when a reviewer agrees.
+The `Semver Check` job runs `scripts/check-semver.sh`. For each crate that the change touches, the script reads the latest version of the crate from the crates.io index and runs `cargo semver-checks check-release` against it. It fails when a breaking change is not covered by the version bump over that published version. It skips a crate that was never published (the index answers 404). Any other answer from the index fails the gate: no connection, an error status, a page that is not an index entry, or a crate whose every version is yanked or a pre-release. A change to the root `Cargo.toml` also selects every crate that takes its version from it. The check is cumulative, so a breaking change that reached `main` without a bump fails the next change that touches that crate. The `semver:skip` PR label exists for emergencies. Use it only when a reviewer agrees.
 
 To run the gate locally:
 

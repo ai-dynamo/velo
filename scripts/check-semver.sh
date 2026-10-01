@@ -29,6 +29,13 @@ fi
 
 # Publishable crates live under lib/ (velo, velo-ext) and crates/ (ucx-rs).
 # Track each crate's directory so the baseline lookups below do not assume lib/.
+# Whether a crate takes its version from [workspace.package], in either
+# spelling cargo accepts: `version.workspace = true` or
+# `version = { workspace = true }`.
+inherits_workspace_version() {
+    grep -m1 '^version' "$1/Cargo.toml" 2>/dev/null | grep -q 'workspace[[:space:]]*=[[:space:]]*true'
+}
+
 changed_crates=()
 declare -A crate_dirs=()
 for crate_dir in lib/*/ crates/*/; do
@@ -40,8 +47,7 @@ for crate_dir in lib/*/ crates/*/; do
     # A crate whose version is `version.workspace = true` takes it from the
     # root manifest, so a change to the root manifest alone can change it.
     if echo "$changed_files" | grep -qE "^${crate_dir}/" \
-        || { echo "$changed_files" | grep -qx 'Cargo.toml' \
-            && grep -qE '^version\.workspace[[:space:]]*=[[:space:]]*true' "${crate_dir}/Cargo.toml" 2>/dev/null; }; then
+        || { echo "$changed_files" | grep -qx 'Cargo.toml' && inherits_workspace_version "$crate_dir"; }; then
         changed_crates+=("$crate_name")
         crate_dirs["$crate_name"]="$crate_dir"
     fi
@@ -90,7 +96,7 @@ extract_crate_version() {
     crate_manifest=$(cat "${crate_dir}/Cargo.toml" 2>/dev/null) || crate_manifest=""
     raw=$(printf '%s\n' "$crate_manifest" | grep -m1 '^version') || raw=""
 
-    if printf '%s' "$raw" | grep -q 'workspace[[:space:]]*=[[:space:]]*true'; then
+    if inherits_workspace_version "$crate_dir"; then
         # Inherited version: the real value lives in [workspace.package] in
         # the root manifest.
         local root_manifest
@@ -183,10 +189,13 @@ latest_published_version() {
         exit 1
     fi
     local latest
-    latest=$(grep -F '"yanked":false' "$body" | sed -n 's/.*"vers":"\([^"]*\)".*/\1/p' | sort -V | tail -1) || true
+    # A pre-release is not a baseline, as in cargo-semver-checks' own choice.
+    # The `-` test runs on the version before any `+build` metadata.
+    latest=$(grep -F '"yanked":false' "$body" | sed -n 's/.*"vers":"\([^"]*\)".*/\1/p' \
+        | awk '{ split($0, core, "+"); if (core[1] !~ /-/) print }' | sort -V | tail -1)
     rm -f "$body"
     if [[ -z "$latest" ]]; then
-        echo "::error::every published version of ${crate_name} is yanked; there is no baseline to check against" >&2
+        echo "::error::every published version of ${crate_name} is yanked or a pre-release; there is no baseline to check against" >&2
         exit 1
     fi
     echo "$latest"
@@ -234,6 +243,10 @@ for crate_name in "${changed_crates[@]}"; do
 
     crate_output=""
     crate_exit=0
+    # The unstripped version, `+build` metadata included: cargo-semver-checks
+    # finds the baseline in the index by exact version equality, and semver
+    # equality counts build metadata. `0.1.0` would not find ucx-rs's
+    # `0.1.0+ucx.1.22.0`.
     crate_output=$(cargo semver-checks check-release \
         --package "$crate_name" \
         --baseline-version "$published" 2>&1) || crate_exit=$?
