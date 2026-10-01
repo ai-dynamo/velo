@@ -4,7 +4,14 @@
 
 set -euo pipefail
 
+# BASE_REF only selects which crates this change touches. The baseline that
+# a crate is checked against is its latest version on crates.io: only
+# published versions take part in Cargo's resolution, so a version on `main`
+# that was never published needs no bump of its own. Several breaking
+# changes between two publishes all ride on the one bump `main` carries over
+# the published version (pre-1.0: one minor bump).
 BASE_REF="${BASE_REF:-origin/main}"
+SEMVER_INDEX_URL="${SEMVER_INDEX_URL:-https://index.crates.io}"
 
 # ── Escape hatch: semver:skip label ──────────────────────────────────────────
 if [[ "${SEMVER_SKIP:-false}" == "true" ]]; then
@@ -70,33 +77,20 @@ extract_workspace_version() {
     '
 }
 
+# The version of a crate in the working tree.
 extract_crate_version() {
     local crate_name="$1"
-    local source="$2"
     local crate_dir="${crate_dirs[$crate_name]}"
     local crate_manifest raw
 
-    if [[ "$source" == "HEAD" ]]; then
-        crate_manifest=$(cat "${crate_dir}/Cargo.toml" 2>/dev/null) || crate_manifest=""
-    else
-        crate_manifest=$(git show "${source}:${crate_dir}/Cargo.toml" 2>/dev/null) || crate_manifest=""
-    fi
-
+    crate_manifest=$(cat "${crate_dir}/Cargo.toml" 2>/dev/null) || crate_manifest=""
     raw=$(printf '%s\n' "$crate_manifest" | grep -m1 '^version') || raw=""
 
     if printf '%s' "$raw" | grep -q 'workspace[[:space:]]*=[[:space:]]*true'; then
         # Inherited version: the real value lives in [workspace.package] in
-        # the ROOT manifest. Read that root manifest from the SAME source
-        # (HEAD vs BASE_REF) as the crate manifest above — reading the
-        # baseline crate's inherited version out of the worktree's root
-        # Cargo.toml would compare the PR's own baseline version against
-        # itself instead of against what BASE_REF actually pinned.
+        # the root manifest.
         local root_manifest
-        if [[ "$source" == "HEAD" ]]; then
-            root_manifest=$(cat Cargo.toml 2>/dev/null) || root_manifest=""
-        else
-            root_manifest=$(git show "${source}:Cargo.toml" 2>/dev/null) || root_manifest=""
-        fi
+        root_manifest=$(cat Cargo.toml 2>/dev/null) || root_manifest=""
         raw=$(extract_workspace_version "$root_manifest") || raw=""
     fi
 
@@ -147,22 +141,58 @@ required_bump_label() {
     fi
 }
 
+# The sparse-index path of a crate (https://doc.rust-lang.org/cargo/reference/registry-index.html).
+index_path() {
+    local name="${1,,}"
+    case ${#name} in
+        1) echo "1/${name}" ;;
+        2) echo "2/${name}" ;;
+        3) echo "3/${name:0:1}/${name}" ;;
+        *) echo "${name:0:2}/${name:2:2}/${name}" ;;
+    esac
+}
+
+# Prints the crate's highest non-yanked version on the registry, or nothing
+# if the registry has never seen the crate (HTTP 404). Any other failure
+# exits: a network error must not read as "unpublished", which would skip
+# the check.
+latest_published_version() {
+    local crate_name="$1" body status
+    body=$(mktemp)
+    status=$(curl -sS -o "$body" -w '%{http_code}' "${SEMVER_INDEX_URL}/$(index_path "$crate_name")") || {
+        rm -f "$body"
+        echo "::error::Could not reach ${SEMVER_INDEX_URL} for ${crate_name}" >&2
+        exit 1
+    }
+    if [[ "$status" == "404" ]]; then
+        rm -f "$body"
+        return 0
+    fi
+    if [[ "$status" != "200" ]]; then
+        rm -f "$body"
+        echo "::error::${SEMVER_INDEX_URL} answered HTTP ${status} for ${crate_name}" >&2
+        exit 1
+    fi
+    grep -F '"yanked":false' "$body" | sed -n 's/.*"vers":"\([^"]*\)".*/\1/p' | sort -V | tail -1
+    rm -f "$body"
+}
+
 failures=()
 
 for crate_name in "${changed_crates[@]}"; do
-    # New crates that don't exist on the base branch — skip semver check
-    if ! git show "${BASE_REF}:${crate_dirs[$crate_name]}/Cargo.toml" &>/dev/null; then
-        echo "  ${crate_name}: new crate, skipping semver check"
+    published=$(latest_published_version "$crate_name")
+    if [[ -z "$published" ]]; then
+        echo "  ${crate_name}: never published, skipping semver check"
         continue
     fi
 
-    echo "Checking ${crate_name}..."
+    echo "Checking ${crate_name} against ${published}, its latest published version..."
 
     crate_output=""
     crate_exit=0
     crate_output=$(cargo semver-checks check-release \
         --package "$crate_name" \
-        --baseline-rev "${BASE_REF}" 2>&1) || crate_exit=$?
+        --baseline-version "$published" 2>&1) || crate_exit=$?
 
     if [[ $crate_exit -eq 0 ]]; then
         echo "  ${crate_name}: no breaking changes"
@@ -177,8 +207,8 @@ for crate_name in "${changed_crates[@]}"; do
     fi
 
     # Breaking changes detected — check version bump
-    base_version=$(extract_crate_version "$crate_name" "${BASE_REF}")
-    pr_version=$(extract_crate_version "$crate_name" "HEAD")
+    base_version="$published"
+    pr_version=$(extract_crate_version "$crate_name")
 
     # crates/ucx-rs pins "0.1.0+ucx.1.22.0". Build metadata records which UCX
     # release is vendored and takes no part in precedence (semver 2.0 s10), so
@@ -225,8 +255,8 @@ for entry in "${failures[@]}"; do
     IFS='|' read -r name base_ver pr_ver <<< "$entry"
     required=$(required_bump_label "$base_ver")
     echo "    ${name}"
-    echo "      version on ${BASE_REF}: ${base_ver}"
-    echo "      version on PR:          ${pr_ver}"
+    echo "      latest published version: ${base_ver}"
+    echo "      version on this change:   ${pr_ver}"
     echo "      required: at least ${required}"
     echo ""
 done
