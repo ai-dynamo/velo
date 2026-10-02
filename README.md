@@ -13,7 +13,7 @@ NOTE: Velo is experimental. Its design, development, and tests are still in prog
 
 Typed streams support graceful stop, cancellation, and ordered finalization, including prebound tickets. See [Stream lifecycle](docs/src/concepts/streaming.md).
 
-Velo 0.19 removes the `.inline()` dispatch option and the sender poison channel. See [Migrate dispatch and cancellation](docs/src/guides/migrate-dispatch-and-cancellation.md).
+Velo 0.19 gives Velo and Messenger explicit drop lifetimes, removes value-level Messenger cloning, and removes duplicate dispatch and cancellation APIs. See [Migrate ownership, dispatch, and cancellation](docs/src/guides/migrate-dispatch-and-cancellation.md).
 
 Use `Velo::shutdown(policy)` to close an instance while Tokio keeps running. Accepted requests remain counted until their replies are submitted, including error replies. See [Shutdown and drain](docs/src/concepts/shutdown.md).
 

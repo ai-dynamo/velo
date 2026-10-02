@@ -19,7 +19,7 @@ use lru::LruCache;
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use tokio_util::task::TaskTracker;
 use tracing::warn;
 
@@ -53,7 +53,7 @@ pub struct VeloEvents {
     system_id: u64,
     instance_id: InstanceId,
     backend: Arc<VeloBackend>,
-    messenger: RwLock<Option<Arc<Messenger>>>,
+    messenger: RwLock<Weak<Messenger>>,
     remote_events: DashMap<RemoteEventKey, Arc<RemoteEvent>>,
     completed_cache: Arc<Mutex<LruCache<RemoteEventKey, CompletedEventInfo>>>,
     owner_subscribers: DashMap<RemoteEventKey, DashMap<InstanceId, u32>>,
@@ -100,7 +100,7 @@ impl VeloEvents {
             system_id,
             instance_id,
             backend,
-            messenger: RwLock::new(None),
+            messenger: RwLock::new(Weak::new()),
             remote_events: DashMap::new(),
             completed_cache: Arc::new(Mutex::new(LruCache::new(
                 NonZeroUsize::new(DEFAULT_COMPLETED_CACHE_SIZE).unwrap(),
@@ -186,7 +186,15 @@ impl VeloEvents {
     }
 
     pub(crate) fn set_messenger(&self, messenger: Arc<Messenger>) {
-        *self.messenger.write() = Some(messenger);
+        *self.messenger.write() = Arc::downgrade(&messenger);
+    }
+
+    /// Borrow the owner only for synchronous setup, never across a network wait.
+    fn messenger(&self) -> Result<Arc<Messenger>> {
+        self.messenger
+            .read()
+            .upgrade()
+            .ok_or_else(|| anyhow!("Event messenger is unavailable"))
     }
 
     // ── Fire-and-forget remote operations (for EventBackend trait) ──
@@ -238,13 +246,7 @@ impl VeloEvents {
         }
 
         // Slow path: use messenger's discovery to resolve worker_id -> peer_info
-        let messenger = self
-            .messenger
-            .read()
-            .clone()
-            .ok_or_else(|| anyhow!("Event messenger is unavailable"))?;
-
-        let discovery = messenger.discovery().ok_or_else(|| {
+        let discovery = self.messenger()?.discovery().ok_or_else(|| {
             anyhow!(
                 "No discovery backend configured. Cannot resolve worker {}",
                 worker_id
@@ -255,7 +257,7 @@ impl VeloEvents {
         let instance_id = peer_info.instance_id();
 
         // Auto-register discovered peer for future fast-path lookups
-        messenger.register_peer(peer_info)?;
+        self.messenger()?.register_peer(peer_info)?;
 
         Ok(instance_id)
     }
@@ -833,18 +835,9 @@ impl VeloEvents {
         handler: &str,
         payload: T,
     ) -> Result<()> {
-        let messenger = self
-            .messenger
-            .read()
-            .clone()
-            .ok_or_else(|| anyhow!("Event messenger is unavailable"))?;
         let bytes = Bytes::from(serde_json::to_vec(&payload)?);
-        messenger
-            .message_builder_unchecked(handler)
-            .raw_payload(bytes)
-            .instance(target)
-            .fire()
-            .await
+        let message = self.messenger()?.message_builder_unchecked(handler);
+        message.raw_payload(bytes).instance(target).fire().await
     }
 
     // ── LRU cache management ────────────────────────────────────────
@@ -1254,6 +1247,68 @@ mod tests {
         assert!(events.poll(waiting).is_err());
         assert!(events.trigger(triggering).await.is_err());
         assert!(events.poison(poisoning, "after shutdown").await.is_err());
+        local.trigger().unwrap();
+        local_waiter.await.unwrap();
+        owner
+            .graceful_shutdown(crate::ShutdownPolicy::WaitForever)
+            .await;
+        owner.closed().await;
+    }
+
+    #[tokio::test]
+    async fn messenger_drop_finishes_event_tasks_and_remote_waits() {
+        struct PendingDiscovery(tokio::sync::Notify);
+        impl crate::PeerDiscovery for PendingDiscovery {
+            fn discover_by_worker_id(
+                &self,
+                _: velo_ext::WorkerId,
+            ) -> futures::future::BoxFuture<'_, anyhow::Result<velo_ext::PeerInfo>> {
+                Box::pin(async move {
+                    self.0.notify_one();
+                    std::future::pending().await
+                })
+            }
+
+            fn discover_by_instance_id(
+                &self,
+                _: velo_ext::InstanceId,
+            ) -> futures::future::BoxFuture<'_, anyhow::Result<velo_ext::PeerInfo>> {
+                Box::pin(std::future::pending())
+            }
+        }
+
+        let owner = Messenger::builder().build().await.unwrap();
+        let discovery = Arc::new(PendingDiscovery(tokio::sync::Notify::new()));
+        let subscriber = Messenger::builder()
+            .discovery(discovery.clone())
+            .build()
+            .await
+            .unwrap();
+        let events = Arc::clone(subscriber.events());
+        let messenger = Arc::downgrade(&subscriber);
+        let tracker = subscriber.tracker().clone();
+        let waiting = owner.events().new_event().unwrap().into_handle();
+        let waiter = events.awaiter(waiting).unwrap();
+        let local = events.new_event().unwrap();
+        let local_waiter = local.awaiter().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), discovery.0.notified())
+            .await
+            .expect("remote subscription did not start discovery");
+
+        drop(subscriber);
+        let error = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("final Messenger drop left its remote event pending")
+            .unwrap_err();
+        assert!(error.to_string().contains("Event runtime shut down"));
+        tokio::time::timeout(Duration::from_secs(2), events.closed())
+            .await
+            .expect("final Messenger drop left its event watcher parked");
+        tracker.close();
+        tokio::time::timeout(Duration::from_secs(2), tracker.wait())
+            .await
+            .expect("final Messenger drop retained receive loops");
+        assert!(messenger.upgrade().is_none());
         local.trigger().unwrap();
         local_waiter.await.unwrap();
         owner

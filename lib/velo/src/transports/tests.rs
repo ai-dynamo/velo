@@ -166,7 +166,10 @@ impl Transport for MockTransport {
     fn shutdown(&self) {
         assert!(self.start_completed.load(Ordering::Relaxed));
         assert!(self.drained.load(Ordering::Relaxed));
-        self.shut_down.store(true, Ordering::Relaxed);
+        assert!(
+            !self.shut_down.swap(true, Ordering::Relaxed),
+            "transport shutdown called twice"
+        );
     }
     fn closed(&self) -> futures::future::BoxFuture<'_, ()> {
         assert!(self.start_completed.load(Ordering::Relaxed));
@@ -710,6 +713,36 @@ async fn test_graceful_shutdown_calls_all_transports() {
     );
     assert!(backend.shutdown_state().is_draining());
     assert!(backend.shutdown_state().teardown_token().is_cancelled());
+}
+
+#[tokio::test]
+async fn final_messenger_drop_stops_transports_once_after_any_teardown_path() {
+    for prior_shutdown in ["none", "graceful", "token"] {
+        let transport = MockTransport::new("mock", true);
+        let messenger = crate::Messenger::builder()
+            .add_transport(transport.clone())
+            .build()
+            .await
+            .unwrap();
+        match prior_shutdown {
+            "graceful" => {
+                messenger
+                    .graceful_shutdown(ShutdownPolicy::WaitForever)
+                    .await
+            }
+            "token" => messenger
+                .backend()
+                .shutdown_state()
+                .teardown_token()
+                .cancel(),
+            _ => {}
+        }
+        drop(messenger);
+        assert!(
+            transport.shut_down.load(Ordering::Relaxed),
+            "{prior_shutdown}"
+        );
+    }
 }
 
 #[tokio::test]
