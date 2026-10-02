@@ -405,7 +405,7 @@ At serving depth, `Manual` is both higher and repeatable. A batcher that writes 
 
 ## Negotiation and compatibility
 
-The attach selects the mux. No wire magic exists. `AnchorAttachRequest` and `MpscAnchorAttachRequest` carry `supported_transport_keys` (with `#[serde(default)]`, so an older sender deserializes as advertising nothing). The attach handler intersects the sender's keys with its installed transports. It picks `messenger-mux-v2` only when both sides name it. Otherwise it answers with its default key.
+The attach selects the mux. No wire magic exists. `AnchorAttachRequest` and `MpscAnchorAttachRequest` carry `supported_transport_keys` (with `#[serde(default)]`, so an older sender deserializes as advertising nothing). The attach handler intersects the sender's keys with its installed transports. It picks `messenger-mux-v2` only when both sides name it. Otherwise it selects the per-stream default if the sender offers that key, or sends an attach error. An empty offer from an older sender retains the legacy default selection.
 
 The sender reads the answer:
 
@@ -413,11 +413,11 @@ The sender reads the answer:
 - `messenger-mux-v2` with a window opens a slot that already holds that window.
 - `messenger-mux-v2` with no window (`initial_credit` zero) is refused. No shipped receiver answers this, and a node with a mux cannot advertise a zero window. A fallback to another transport reaches nothing that listens, and the stream hangs until the watchdog fires.
 
-A node with the mux enabled registers both `messenger-mux-v2` and its configured per-stream transport, so it still serves older peers. `resolve_transport` fails on an unknown key in a non-empty registry, so a receiver that answers the mux on its own breaks every older sender. SPSC and MPSC anchors both negotiate the mux.
+By default, a node with the mux enabled registers both `messenger-mux-v2` and its configured per-stream transport, so it still serves older peers. A node built with `.mux_only()` installs no per-stream listener and refuses peers that need one. `resolve_transport` fails on an unknown key in a non-empty registry, so a receiver that answers the mux on its own breaks every older sender. SPSC and MPSC anchors both negotiate the mux.
 
 `StreamSender::negotiated_transport()` returns the key that the attach settled on. It returns `None` for a same-worker attach, which uses no transport. Compare it with the public constant `MESSENGER_MUX_KEY`.
 
-`MuxConfig::enabled = false`, or `VELO_MESSENGER_MUX_DISABLE=1` at startup, is the rollback. The node stops advertising `messenger-mux-v2`, and the next attach negotiates the per-stream path with no code or wire change. See [Zero-RTT stream setup](#zero-rtt-stream-setup) for the order when tickets are in use.
+For a node with a per-stream listener, `MuxConfig::enabled = false`, or `VELO_MESSENGER_MUX_DISABLE=1` at startup, is the rollback. The node stops advertising `messenger-mux-v2`, and the next attach negotiates the per-stream path with no code or wire change. For mux-only nodes, either setting makes startup fail. Remove `.mux_only()` to restore the listener before using this rollback. See [Zero-RTT stream setup](#zero-rtt-stream-setup) for the order when tickets are in use.
 
 ## Observability
 

@@ -931,6 +931,9 @@ pub struct AnchorManager {
     #[builder(default = "Arc::new(DashMap::new())")]
     pub(crate) mpsc_registry: Arc<DashMap<u64, crate::streaming::mpsc::anchor::MpscAnchorEntry>>,
 
+    /// Default transport for local setup and legacy negotiation. This is the
+    /// mux in `VeloBuilder::mux_only()` mode; otherwise it is the configured
+    /// per-stream transport. The registry lists every installed transport.
     pub transport: Arc<dyn crate::streaming::transport::FrameTransport>,
 
     /// Transport registry: maps scheme (e.g., "tcp", "velo") to the FrameTransport
@@ -1666,7 +1669,7 @@ impl AnchorManager {
         offered: &[velo_ext::TransportKey],
         peer: velo_ext::WorkerId,
         lane_key: Option<u64>,
-    ) -> crate::streaming::negotiation::Selection {
+    ) -> anyhow::Result<crate::streaming::negotiation::Selection> {
         crate::streaming::negotiation::select(
             offered,
             self.mux.get(),
@@ -1905,6 +1908,9 @@ impl AnchorManager {
         // Everything but the attaches serves a stream already open, so the
         // drain gate lets it through; an attach opens a new stream.
         messenger.register_drain_exempt_handler(anchor_detach_handler(manager.clone()))?;
+        messenger.register_drain_exempt_handler(
+            crate::streaming::control::create_anchor_abort_attach_handler(manager.clone()),
+        )?;
         messenger.register_drain_exempt_handler(anchor_finalize_handler(manager.clone()))?;
         messenger.register_drain_exempt_handler(anchor_cancel_handler(manager.clone()))?;
         messenger.register_drain_exempt_handler(create_stream_cancel_handler(Arc::clone(
@@ -2048,8 +2054,21 @@ impl AnchorManager {
                     slot_byte_budget,
                     lane,
                 };
-                self.open_stream_sender::<T>(handle, &ticket, identity)
-                    .await
+                let result = self
+                    .open_stream_sender::<T>(handle, &ticket, identity)
+                    .await;
+                if result.is_err() {
+                    self.rollback_remote_attach(
+                        handle,
+                        "_anchor_abort_attach",
+                        &crate::streaming::control::AnchorAbortAttachRequest {
+                            handle,
+                            stream_cancel_handle,
+                        },
+                    )
+                    .await;
+                }
+                result
             }
             crate::streaming::control::AnchorAttachResponse::Err { reason } => {
                 // A refusal is still a round trip the caller waited on, so it
@@ -2057,6 +2076,35 @@ impl AnchorManager {
                 self.record_attach_rtt(started, HandlerOutcome::Error, "unknown");
                 Err(AttachError::TransportError(anyhow::anyhow!("{}", reason)))
             }
+        }
+    }
+
+    /// A rejected or timed-out cleanup must not hide the original connect error.
+    /// Older peers may not have the identity-aware SPSC handler; never fall back
+    /// to unqualified detach, which could remove a replacement sender.
+    async fn rollback_remote_attach(
+        &self,
+        handle: StreamAnchorHandle,
+        handler: &str,
+        request: &impl serde::Serialize,
+    ) {
+        let Some(messenger) = self.messenger_lock.get() else {
+            return;
+        };
+        let cleanup = async {
+            messenger
+                .typed_unary_streaming::<()>(handler)
+                .payload(request)?
+                .worker(handle.unpack().0)
+                .send()
+                .await
+        };
+        match tokio::time::timeout(Duration::from_secs(1), cleanup).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(%handle, %handler, %error, "failed to roll back stream attach")
+            }
+            Err(_) => tracing::warn!(%handle, %handler, "stream attach rollback timed out"),
         }
     }
 
@@ -2674,7 +2722,7 @@ impl AnchorManager {
                 } else {
                     sender_stream_id
                 };
-                let frame_tx = self
+                let frame_tx = match self
                     .connect_streaming(
                         &crate::streaming::control::StreamOpenTicket {
                             streaming_transport_key: streaming_transport_key.clone(),
@@ -2688,7 +2736,22 @@ impl AnchorManager {
                         local_id,
                         Some((identity.cancel_token.clone(), identity.stop_token.clone())),
                     )
-                    .await?;
+                    .await
+                {
+                    Ok(frame_tx) => frame_tx,
+                    Err(error) => {
+                        self.rollback_remote_attach(
+                            handle,
+                            "_mpsc_anchor_detach",
+                            &crate::streaming::mpsc::control::MpscAnchorDetachRequest {
+                                handle,
+                                sender_id,
+                            },
+                        )
+                        .await;
+                        return Err(error);
+                    }
+                };
 
                 identity.armed = false;
                 Ok(crate::streaming::mpsc::MpscStreamSender::new(
@@ -4358,6 +4421,141 @@ mod tests {
         )
     }
 
+    /// A failed connect releases only its own accepted attach. An older peer
+    /// without the new handler keeps its existing timeout behavior.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_connect_rolls_back_its_identity_and_preserves_legacy_errors() {
+        use crate::streaming::control::{AnchorAbortAttachRequest, StreamCancelHandle};
+        for upgraded in [true, false] {
+            let consumer = crate::messenger::Messenger::builder()
+                .add_transport(tcp_messenger_transport())
+                .build()
+                .await
+                .unwrap();
+            let producer = crate::messenger::Messenger::builder()
+                .add_transport(tcp_messenger_transport())
+                .build()
+                .await
+                .unwrap();
+            consumer.register_peer(producer.peer_info()).unwrap();
+            producer.register_peer(consumer.peer_info()).unwrap();
+            let receiver_transport =
+                crate::streaming::TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into())
+                    .await
+                    .unwrap();
+            let sender_transport =
+                crate::streaming::TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into())
+                    .await
+                    .unwrap();
+            let make =
+                |messenger: &Arc<crate::messenger::Messenger>,
+                 transport: Arc<dyn crate::streaming::FrameTransport>| {
+                    Arc::new(
+                        AnchorManagerBuilder::default()
+                            .worker_id(messenger.instance_id().worker_id())
+                            .transport(transport)
+                            .messenger(Some(messenger.clone()))
+                            .build()
+                            .unwrap(),
+                    )
+                };
+            let receiver = make(&consumer, receiver_transport.clone());
+            let sender = make(&producer, sender_transport.clone());
+            sender.register_handlers(producer.clone()).unwrap();
+            if upgraded {
+                receiver.register_handlers(consumer.clone()).unwrap();
+            } else {
+                consumer
+                    .register_streaming_handler(
+                        crate::streaming::control::create_anchor_attach_handler(receiver.clone()),
+                    )
+                    .unwrap();
+                // If rollback ever falls back to the old unqualified detach,
+                // this real handler would clear the attachment below.
+                consumer
+                    .register_streaming_handler(
+                        crate::streaming::control::create_anchor_detach_handler(receiver.clone()),
+                    )
+                    .unwrap();
+            }
+            let mut anchor = receiver.create_anchor::<u32>();
+            let handle = anchor.handle();
+            // Control peers are registered; the producer's frame transport is
+            // deliberately missing the peer, so only post-OK connect fails.
+            let error = tokio::time::timeout(
+                Duration::from_secs(3),
+                sender.attach_stream_anchor::<u32>(handle),
+            )
+            .await
+            .expect("rollback must have a bounded wait")
+            .unwrap_err();
+            assert!(error.to_string().contains("not registered"), "{error}");
+            assert!(sender.sender_registry.senders.is_empty());
+            assert_eq!(
+                receiver
+                    .registry
+                    .get(&handle.unpack().1)
+                    .unwrap()
+                    .attachment,
+                !upgraded
+            );
+            if upgraded {
+                let replacement = receiver.attach_stream_anchor::<u32>(handle).await.unwrap();
+                consumer.begin_drain();
+                let stale = AnchorAbortAttachRequest {
+                    handle,
+                    stream_cancel_handle: StreamCancelHandle::pack(
+                        producer.instance_id().worker_id(),
+                        1,
+                    ),
+                };
+                // Rollback serves an existing attach and must pass the drain gate.
+                tokio::time::timeout(
+                    Duration::from_secs(3),
+                    producer
+                        .typed_unary_streaming::<()>("_anchor_abort_attach")
+                        .payload(&stale)
+                        .unwrap()
+                        .worker(consumer.instance_id().worker_id())
+                        .send(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert!(
+                    receiver
+                        .registry
+                        .get(&handle.unpack().1)
+                        .unwrap()
+                        .attachment
+                );
+                replacement.send(7).await.unwrap();
+                replacement.finalize().unwrap();
+                assert!(matches!(
+                    anchor.next().await,
+                    Some(Ok(StreamFrame::Item(7)))
+                ));
+                assert!(matches!(
+                    anchor.next().await,
+                    Some(Ok(StreamFrame::Finalized))
+                ));
+            }
+            drop(anchor);
+            receiver.shutdown().await;
+            sender.shutdown().await;
+            receiver_transport.shutdown().await;
+            sender_transport.shutdown().await;
+            consumer
+                .graceful_shutdown(crate::ShutdownPolicy::WaitForever)
+                .await;
+            producer
+                .graceful_shutdown(crate::ShutdownPolicy::WaitForever)
+                .await;
+            consumer.closed().await;
+            producer.closed().await;
+        }
+    }
+
     /// The `transport_scheme` label never carries a string the peer chose.
     ///
     /// The key in an attach response comes off the wire, and the sender records
@@ -4367,14 +4565,8 @@ mod tests {
     /// value a peer can pick is unbounded cardinality: one histogram child per
     /// distinct string, each alive for the life of the process.
     ///
-    /// The disagreement is the ordinary mixed-deployment one, not a contrived
-    /// hostile peer: `negotiation::select` falls through to the *receiver's*
-    /// own default transport key whenever the sender did not advertise the mux,
-    /// so a receiver configured with a different streaming transport answers
-    /// with a key this sender never named. Here the sender's registry is empty,
-    /// which is the documented convenience path where `resolve_transport` falls
-    /// back to the default transport — so the attach also succeeds, and the
-    /// label is recorded on the success arm rather than an error one.
+    /// Use an untrusted handler that answers with a key outside the offer.
+    /// Normal receivers reject that mismatch before binding a stream.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_peer_chosen_transport_key_never_becomes_a_label_value() {
         use crate::observability::test_helpers::MetricSnapshot;
@@ -4429,6 +4621,28 @@ mod tests {
         am_producer
             .register_handlers(Arc::clone(&m_producer))
             .expect("producer handlers");
+
+        m_consumer
+            .register_streaming_handler(
+                crate::messenger::Handler::typed_unary_async(
+                    "_anchor_attach",
+                    |_ctx: crate::messenger::TypedContext<
+                        crate::streaming::control::AnchorAttachRequest,
+                    >| async {
+                        Ok(crate::streaming::control::AnchorAttachResponse::Ok {
+                            streaming_transport_key: velo_ext::TransportKey::new(PEER_CHOSEN),
+                            heartbeat_interval_ms: 5000,
+                            routing_session_id: 1,
+                            initial_credit: 0,
+                            slot_byte_budget: 0,
+                            lane: 0,
+                        })
+                    },
+                )
+                .spawn()
+                .build(),
+            )
+            .unwrap();
 
         let anchor = am_consumer.create_anchor::<u32>();
         let handle = anchor.handle();

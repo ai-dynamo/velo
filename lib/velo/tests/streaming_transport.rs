@@ -303,7 +303,7 @@ async fn test_velo_builder_default_stream_config_is_tcp() {
 /// not registered" — a silent production breakage for any caller using a
 /// PeerDiscovery backend (etcd / NATS / filesystem).
 ///
-/// The test wires two Velos through a `FilesystemPeerDiscovery`, registers
+/// The test wires two Velos through an in-memory PeerDiscovery, registers
 /// each with discovery, has worker B resolve worker A via
 /// `discover_and_register_peer`, and then drives a full attach + send cycle
 /// across the streaming transport. A pre-fix Velo fails at the attach step.
@@ -311,34 +311,53 @@ async fn test_velo_builder_default_stream_config_is_tcp() {
 async fn test_discover_and_register_peer_fans_out_to_streaming() {
     use futures::StreamExt;
     use velo::PeerDiscovery;
-    use velo::discovery::FilesystemPeerDiscovery;
     use velo::streaming::StreamFrame;
 
-    let tmp = tempfile::tempdir().unwrap();
-    let discovery = Arc::new(FilesystemPeerDiscovery::new(tmp.path().join("peers.json")).unwrap());
-
-    let mk = || async {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let transport = Arc::new(
-            velo::transports::tcp::TcpTransportBuilder::new()
-                .from_listener(listener)
-                .unwrap()
-                .build()
-                .unwrap(),
-        );
-        // The mux is off: the mux never consults the per-stream peer table,
-        // so under it the fan-out this test guards would go unexercised.
-        velo::Velo::builder()
-            .add_transport(transport)
-            .discovery(discovery.clone() as Arc<dyn PeerDiscovery>)
-            .messenger_mux(velo::streaming::MuxConfig {
-                enabled: false,
-                ..velo::streaming::MuxConfig::default()
+    #[derive(Default)]
+    struct MemoryDiscovery(std::sync::Mutex<Vec<velo::PeerInfo>>);
+    impl PeerDiscovery for MemoryDiscovery {
+        fn discover_by_worker_id(
+            &self,
+            id: velo::WorkerId,
+        ) -> futures::future::BoxFuture<'_, anyhow::Result<velo::PeerInfo>> {
+            Box::pin(async move {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|peer| peer.worker_id() == id)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("unknown worker"))
             })
-            .unwrap()
-            .build()
-            .await
-            .unwrap()
+        }
+        fn discover_by_instance_id(
+            &self,
+            id: velo::InstanceId,
+        ) -> futures::future::BoxFuture<'_, anyhow::Result<velo::PeerInfo>> {
+            Box::pin(async move {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|peer| peer.instance_id == id)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("unknown instance"))
+            })
+        }
+    }
+    let discovery = Arc::new(MemoryDiscovery::default());
+    let mk = || async {
+        // Disable the mux to exercise the per-stream peer-registration path.
+        tcp_node(
+            velo::Velo::builder()
+                .discovery(discovery.clone() as Arc<dyn PeerDiscovery>)
+                .messenger_mux(velo::streaming::MuxConfig {
+                    enabled: false,
+                    ..Default::default()
+                })
+                .unwrap(),
+        )
+        .await
     };
     let a = mk().await;
     let b = mk().await;
@@ -346,8 +365,11 @@ async fn test_discover_and_register_peer_fans_out_to_streaming() {
     // Both register themselves into discovery using the *merged* address
     // (messenger + streaming), so the streaming entry is visible to the
     // discovering side. Velo doesn't auto-publish — that's the caller's job.
-    let _guard_a = discovery.register_peer_info(&a.peer_info()).await.unwrap();
-    let _guard_b = discovery.register_peer_info(&b.peer_info()).await.unwrap();
+    discovery
+        .0
+        .lock()
+        .unwrap()
+        .extend([a.peer_info(), b.peer_info()]);
 
     // A discovers B through PeerDiscovery. The streaming transport on A must
     // see B via this call — otherwise the attach below fails.
@@ -392,19 +414,11 @@ async fn default_pair(
     mux: Option<velo::streaming::MuxConfig>,
 ) -> (Arc<velo::Velo>, Arc<velo::Velo>) {
     let mk = || async {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let transport = Arc::new(
-            velo::transports::tcp::TcpTransportBuilder::new()
-                .from_listener(listener)
-                .unwrap()
-                .build()
-                .unwrap(),
-        );
-        let mut builder = velo::Velo::builder().add_transport(transport);
+        let mut builder = velo::Velo::builder();
         if let Some(config) = mux.clone() {
             builder = builder.messenger_mux(config).unwrap();
         }
-        builder.build().await.unwrap()
+        tcp_node(builder).await
     };
     let a = mk().await;
     let b = mk().await;
@@ -461,4 +475,193 @@ async fn turning_the_mux_off_falls_back_to_the_per_stream_transport() {
         ..velo::streaming::MuxConfig::default()
     };
     assert_eq!(negotiated_key(Some(off)).await, "tcp-stream");
+}
+
+async fn tcp_node(builder: velo::VeloBuilder) -> Arc<velo::Velo> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let transport = velo::transports::tcp::TcpTransportBuilder::new()
+        .from_listener(listener)
+        .unwrap()
+        .build()
+        .unwrap();
+    builder
+        .add_transport(Arc::new(transport))
+        .build()
+        .await
+        .unwrap()
+}
+
+/// All stream forms and transparent large-message transfers work without an
+/// extra stream listener, including when the services feature is absent.
+#[tokio::test(flavor = "multi_thread")]
+async fn mux_only_carries_streams_and_large_messages() {
+    use bytes::Bytes;
+    use futures::StreamExt;
+    use velo::streaming::{MESSENGER_MUX_KEY, StreamFrame, mpsc::MpscFrame};
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let producer = tcp_node(velo::Velo::builder().mux_only()).await;
+        let consumer = tcp_node(velo::Velo::builder().mux_only()).await;
+        producer.register_peer(consumer.peer_info()).unwrap();
+        consumer.register_peer(producer.peer_info()).unwrap();
+        for node in [&producer, &consumer] {
+            let registry = &node.anchor_manager().transport_registry;
+            assert_eq!(registry.len(), 1);
+            assert!(registry.contains_key(MESSENGER_MUX_KEY));
+            assert!(
+                node.peer_info()
+                    .worker_address
+                    .get_entry("tcp-stream")
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        let payloads = [vec![1, 2, 3], vec![7; 512 * 1024]];
+        for prebound in [false, true] {
+            let mut anchor = consumer.create_anchor::<Vec<u8>>();
+            let sender = if prebound {
+                let ticket = consumer.prebind_anchor(anchor.handle()).unwrap();
+                producer
+                    .open_anchor_stream(anchor.handle(), ticket)
+                    .await
+                    .unwrap()
+            } else {
+                producer.attach_anchor(anchor.handle()).await.unwrap()
+            };
+            for payload in &payloads {
+                sender.send(payload.clone()).await.unwrap();
+            }
+            sender.finalize().unwrap();
+            let mut received = Vec::new();
+            while let Some(frame) = anchor.next().await {
+                if let StreamFrame::Item(payload) = frame.unwrap() {
+                    received.push(payload);
+                }
+            }
+            assert_eq!(received, payloads);
+        }
+
+        let mut anchor = consumer.create_mpsc_anchor::<u32>();
+        let s1 = producer
+            .attach_mpsc_anchor::<u32>(anchor.handle())
+            .await
+            .unwrap();
+        let s2 = producer
+            .attach_mpsc_anchor::<u32>(anchor.handle())
+            .await
+            .unwrap();
+        s1.send(10).await.unwrap();
+        s2.send(20).await.unwrap();
+        let mut received = Vec::new();
+        while received.len() < 2 {
+            if let (id, MpscFrame::Item(value)) = anchor.next().await.unwrap().unwrap() {
+                received.push((id, value));
+            }
+        }
+        assert!(received.contains(&(s1.sender_id(), 10)));
+        assert!(received.contains(&(s2.sender_id(), 20)));
+        anchor.cancel();
+        drop((s1, s2));
+
+        consumer
+            .register_handler(
+                velo::Handler::unary_handler("echo", |ctx| Ok(Some(ctx.payload))).build(),
+            )
+            .unwrap();
+        let large = Bytes::from(payloads[1].clone());
+        let response = producer
+            .unary("echo")
+            .unwrap()
+            .raw_payload(large.clone())
+            .instance(consumer.instance_id())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response, large);
+        producer.shutdown(velo::ShutdownPolicy::WaitForever).await;
+        consumer.shutdown(velo::ShutdownPolicy::WaitForever).await;
+    })
+    .await
+    .expect("mux-only operations must finish");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mux_only_rejects_peers_that_need_a_stream_listener() {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mux = tcp_node(velo::Velo::builder().mux_only()).await;
+        let legacy = tcp_node(
+            velo::Velo::builder()
+                .messenger_mux(velo::streaming::MuxConfig {
+                    enabled: false,
+                    ..Default::default()
+                })
+                .unwrap(),
+        )
+        .await;
+        mux.register_peer(legacy.peer_info()).unwrap();
+        legacy.register_peer(mux.peer_info()).unwrap();
+        let anchor = mux.create_anchor::<u32>();
+        let error = legacy
+            .attach_anchor::<u32>(anchor.handle())
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not support the messenger mux"),
+            "{error}"
+        );
+        let mpsc = mux.create_mpsc_anchor::<u32>();
+        let error = legacy
+            .attach_mpsc_anchor::<u32>(mpsc.handle())
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not support the messenger mux"),
+            "{error}"
+        );
+        let legacy_anchor = legacy.create_anchor::<u32>();
+        let error = mux
+            .attach_anchor::<u32>(legacy_anchor.handle())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("no common streaming transport"),
+            "{error}"
+        );
+        drop((anchor, mpsc, legacy_anchor));
+        mux.shutdown(velo::ShutdownPolicy::WaitForever).await;
+        legacy.shutdown(velo::ShutdownPolicy::WaitForever).await;
+    })
+    .await
+    .expect("incompatible peers must fail promptly");
+}
+
+#[tokio::test]
+async fn mux_only_rejects_conflicting_configuration_before_startup() {
+    for builder in [
+        velo::Velo::builder()
+            .mux_only()
+            .stream_config(velo::StreamConfig::Tcp(None))
+            .unwrap(),
+        velo::Velo::builder()
+            .stream_bind_addr("127.0.0.1".parse().unwrap())
+            .mux_only(),
+        velo::Velo::builder()
+            .mux_only()
+            .messenger_mux(velo::streaming::MuxConfig {
+                enabled: false,
+                ..Default::default()
+            })
+            .unwrap(),
+    ] {
+        let error = match builder.build().await {
+            Ok(_) => panic!("conflicting mux-only configuration was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("mux_only"), "{error}");
+    }
 }

@@ -386,8 +386,11 @@ pub(crate) fn mpsc_anchor_attach_handler(manager: AnchorManagerRef) -> crate::me
                     sender,
                     req.lane_key,
                 );
-                let (transport_rx, terms) = match selection.bind(local_id, routing_session_id).await
-                {
+                let bound = match selection {
+                    Ok(selection) => selection.bind(local_id, routing_session_id).await,
+                    Err(error) => Err(error),
+                };
+                let (transport_rx, terms) = match bound {
                     Ok(bound) => bound,
                     Err(e) => {
                         manager.record_streaming_operation(
@@ -518,9 +521,9 @@ pub(crate) fn mpsc_anchor_attach_handler(manager: AnchorManagerRef) -> crate::me
 
 /// Build the `_mpsc_anchor_detach` handler.
 ///
-/// Removes one sender slot from the entry and cancels its pump. Anchor
-/// remains in the registry; the consumer will eventually see a `Detached`
-/// frame for this sender_id via the pump forwarding or via slot removal.
+/// Removes one sender slot and cancels its pump. The anchor remains in the
+/// registry, with its unattached timeout rearmed if the last sender left.
+/// This handler emits no terminal frame, so it can also undo a failed attach.
 pub fn create_mpsc_anchor_detach_handler(manager: Arc<AnchorManager>) -> crate::messenger::Handler {
     mpsc_anchor_detach_handler(AnchorManagerRef::Strong(manager))
 }

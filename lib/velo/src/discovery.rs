@@ -5,10 +5,14 @@
 //! are re-exported here for backwards compatibility while the workspace
 //! migrates to the two-crate (`velo` + `velo-ext`) layout.
 
+#[cfg(feature = "services")]
 pub mod filesystem;
+#[cfg(feature = "services")]
 pub use filesystem::{FilesystemPeerDiscovery, FilesystemRegistrationGuard};
 
+#[cfg(feature = "services")]
 pub mod filesystem_service;
+#[cfg(feature = "services")]
 pub use filesystem_service::{FilesystemServiceDiscovery, FilesystemServiceRegistrationGuard};
 
 #[cfg(feature = "nats-discovery")]

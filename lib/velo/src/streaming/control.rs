@@ -586,14 +586,18 @@ pub(crate) fn anchor_attach_handler(manager: AnchorManagerRef) -> crate::messeng
                     + 1;
                 // Which transport this attach rides is decided here, from what
                 // the sender advertised: `messenger-mux-v2` when both sides
-                // named it, and otherwise exactly the local default this
-                // handler answered with before negotiation existed.
+                // named it. Otherwise use the per-stream default, or reject
+                // the peer if this instance is mux-only.
                 let selection = manager.select_streaming_transport(
                     &req.supported_transport_keys,
                     sender,
                     req.lane_key,
                 );
-                let (receiver, terms) = match selection.bind(local_id, routing_session_id).await {
+                let bound = match selection {
+                    Ok(selection) => selection.bind(local_id, routing_session_id).await,
+                    Err(error) => Err(error),
+                };
+                let (receiver, terms) = match bound {
                     Ok(bound) => bound,
                     Err(e) => {
                         manager.record_streaming_operation(
@@ -896,6 +900,59 @@ pub(crate) fn anchor_detach_handler(manager: AnchorManagerRef) -> crate::messeng
                     );
                 }
 
+                Ok(())
+            }
+        },
+    )
+    .spawn()
+    .build()
+}
+
+/// A failed connect may undo only the attachment established by this identity.
+/// Keep this separate from the legacy, unqualified detach request.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct AnchorAbortAttachRequest {
+    pub handle: StreamAnchorHandle,
+    pub stream_cancel_handle: StreamCancelHandle,
+}
+
+pub(crate) fn create_anchor_abort_attach_handler(
+    manager: AnchorManagerRef,
+) -> crate::messenger::Handler {
+    crate::messenger::Handler::typed_unary_async(
+        "_anchor_abort_attach",
+        move |ctx: crate::messenger::TypedContext<AnchorAbortAttachRequest>| {
+            let manager = manager.upgrade();
+            async move {
+                let manager = manager?;
+                let req = ctx.input;
+                let (worker, local_id) = req.handle.unpack();
+                if worker != ctx.msg.instance_id().worker_id() || req.handle.is_mpsc_stream() {
+                    anyhow::bail!("abort attach requires a local SPSC anchor");
+                }
+                let (feed, prebind) = {
+                    let Some(mut entry) = manager.registry.get_mut(&local_id) else {
+                        return Ok(());
+                    };
+                    if !entry.attachment
+                        || entry.stream_cancel_handle != Some(req.stream_cancel_handle)
+                    {
+                        return Ok(());
+                    }
+                    entry.attachment = false;
+                    entry.stream_cancel_handle = None;
+                    let feed = entry.feed.current();
+                    entry.retire_pump();
+                    let prebind = entry.prebind.take();
+                    entry.restart_unattached_timeout(&manager.registry, local_id);
+                    (feed, prebind)
+                };
+                // Mux release enters other locks. Release the anchor guard first.
+                drop(prebind);
+                if let Some(feed) = feed {
+                    feed.release_slot();
+                }
+                // No sender was returned, so there is no Detached event to emit.
                 Ok(())
             }
         },

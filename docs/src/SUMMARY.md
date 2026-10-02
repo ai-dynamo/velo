@@ -17,6 +17,7 @@
 
 # Guides
 
+- [Services and mux-only mode](guides/migrate-services.md)
 - [Migrate ownership, dispatch, and cancellation to 0.19](guides/migrate-dispatch-and-cancellation.md)
 - [Write an out-of-tree transport](guides/out-of-tree-transport.md)
 - [Tune batched streaming](guides/tune-batched-streaming.md)

@@ -4,17 +4,21 @@
 //! Messenger - the core active messaging system.
 
 use anyhow::Result;
+#[cfg(feature = "services")]
 use std::num::NonZero;
 use std::sync::Arc;
 
+#[cfg(feature = "services")]
 use crate::events::{DistributedEventFactory, EventHandle};
 use crate::observability::VeloMetrics;
 use crate::transports::{Transport, VeloBackend};
 use velo_ext::{InstanceId, PeerInfo};
 
 use crate::PeerDiscovery;
+#[cfg(feature = "services")]
 use crate::messenger::VeloEvents;
 use crate::messenger::client::ActiveMessageClient;
+#[cfg(feature = "services")]
 use crate::messenger::client::builders::MessageBuilder;
 use crate::messenger::handlers::{Handler, HandlerManager};
 use crate::messenger::server::ActiveMessageServer;
@@ -27,6 +31,7 @@ pub struct Messenger {
     server: Arc<ActiveMessageServer>,
     handlers: HandlerManager,
     discovery: Option<Arc<dyn PeerDiscovery>>,
+    #[cfg(feature = "services")]
     events: Arc<VeloEvents>,
     observability: Option<Arc<VeloMetrics>>,
     runtime: tokio::runtime::Handle,
@@ -153,17 +158,19 @@ impl Messenger {
         let runtime = tokio::runtime::Handle::current();
         let tracker = tokio_util::task::TaskTracker::new();
 
-        // 2. Create distributed event system
-        let system_id = NonZero::new(worker_id.as_u64())
-            .expect("worker_id must be non-zero for distributed events");
-        let factory = DistributedEventFactory::new(system_id);
-        let local_base = factory.system().clone();
-        let events = VeloEvents::new(
-            instance_id,
-            local_base,
-            backend.clone(),
-            response_manager.clone(),
-        );
+        #[cfg(feature = "services")]
+        let events = {
+            let system_id = NonZero::new(worker_id.as_u64())
+                .expect("worker_id must be non-zero for distributed events");
+            let factory = DistributedEventFactory::new(system_id);
+            let local_base = factory.system().clone();
+            VeloEvents::new(
+                instance_id,
+                local_base,
+                backend.clone(),
+                response_manager.clone(),
+            )
+        };
 
         // 3. Create shared OnceLock for large payload resolver (receiver side)
         let large_payload_resolver: Arc<
@@ -231,6 +238,7 @@ impl Messenger {
             server: server.clone(),
             handlers,
             discovery,
+            #[cfg(feature = "services")]
             events: events.clone(),
             observability: metrics,
             runtime,
@@ -243,11 +251,14 @@ impl Messenger {
         //    handler. Direct DashMap insertion (via HandlerManager) means the
         //    handlers are in the map as soon as these calls return — no async
         //    task needs to be scheduled first.
-        events.set_messenger(system.clone());
-        crate::messenger::events::handlers::register_event_handlers(
-            |handler| system.register_drain_exempt_handler(handler),
-            events,
-        )?;
+        #[cfg(feature = "services")]
+        {
+            events.set_messenger(system.clone());
+            crate::messenger::events::handlers::register_event_handlers(
+                |handler| system.register_drain_exempt_handler(handler),
+                events,
+            )?;
+        }
         crate::messenger::server::register_system_handlers(&system.handlers)?;
 
         // 8. Initialize hub's system reference. This unblocks wait_for_system()
@@ -282,11 +293,13 @@ impl Messenger {
     }
 
     /// Get the distributed event system.
+    #[cfg(feature = "services")]
     pub fn events(&self) -> &Arc<VeloEvents> {
         &self.events
     }
 
     /// Convenience: create an EventManager wired with the distributed backend.
+    #[cfg(feature = "services")]
     pub fn event_manager(&self) -> crate::events::EventManager {
         self.events.event_manager()
     }
@@ -528,6 +541,7 @@ impl Messenger {
     }
 
     /// Check whether a specific instance has subscribed to a locally-owned event.
+    #[cfg(feature = "services")]
     pub fn has_event_subscriber(&self, handle: EventHandle, subscriber: InstanceId) -> bool {
         self.events.has_subscriber(handle, subscriber)
     }
@@ -666,10 +680,12 @@ impl Messenger {
 
     pub(crate) async fn closed(&self) {
         self.server.closed().await;
+        #[cfg(feature = "services")]
         self.events.closed().await;
     }
 
     /// Internal: create an unchecked message builder (for system messages)
+    #[cfg(feature = "services")]
     pub(crate) fn message_builder_unchecked(&self, handler: &str) -> MessageBuilder {
         MessageBuilder::new_unchecked(self.client.clone(), handler)
     }
@@ -1019,7 +1035,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_system_and_event_handlers_are_available_immediately_after_startup() {
+    async fn test_enabled_system_handlers_are_available_immediately_after_startup() {
         let (transport_a, transport_b) = make_transport_pair();
         let a = Messenger::builder()
             .add_transport(transport_a)
@@ -1045,9 +1061,10 @@ mod tests {
             handlers.iter().any(|handler| handler == "_list_handlers"),
             "expected _list_handlers to be available immediately after startup"
         );
-        assert!(
+        assert_eq!(
             handlers.iter().any(|handler| handler == "_event_subscribe"),
-            "expected _event_subscribe to be available immediately after startup"
+            cfg!(feature = "services"),
+            "event handlers must follow the services feature"
         );
     }
 
