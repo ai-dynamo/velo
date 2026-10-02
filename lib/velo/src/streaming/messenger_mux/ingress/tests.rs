@@ -86,6 +86,7 @@ impl IngressRegistry {
 
     /// Run `f` while holding `key`'s table mutex, as the ordered batch
     /// handler does through a decode. `None` when `key` has no table.
+    #[cfg(feature = "quic")]
     pub(crate) fn with_table_locked<R>(&self, key: PeerLane, f: impl FnOnce() -> R) -> Option<R> {
         let entry = self.peers.get(&key)?;
         let _state = lock(entry.value());
