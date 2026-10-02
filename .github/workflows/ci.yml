@@ -168,7 +168,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        features: [test-helpers, "ucx,test-helpers"]
+        include:
+        - features: test-helpers
+          production-features: ""
+        - features: "ucx,test-helpers"
+          production-features: ucx
     env:
       UCX_TLS: tcp
       CARGO_INCREMENTAL: "0"
@@ -182,6 +186,8 @@ jobs:
       uses: ./.github/actions/sccache-setup
       with:
         bucket: ${{ secrets.SCCACHE_S3_BUCKET }}
+    - name: Check production library without dev-dependency features
+      run: cargo check --locked -p velo --lib --no-default-features --features '${{ matrix.production-features }}'
     - name: Test without default features
       run: timeout 900 cargo test --locked -p velo --no-default-features --features '${{ matrix.features }}' --all-targets
 
