@@ -922,9 +922,11 @@ pub(crate) fn create_anchor_abort_attach_handler(
     crate::messenger::Handler::typed_unary_async(
         "_anchor_abort_attach",
         move |ctx: crate::messenger::TypedContext<AnchorAbortAttachRequest>| {
-            let manager = manager.upgrade();
+            let manager = manager.clone();
             async move {
-                let manager = manager?;
+                let manager = manager
+                    .upgrade()
+                    .ok_or_else(|| anyhow::anyhow!("anchor manager shut down"))?;
                 let req = ctx.input;
                 let (worker, local_id) = req.handle.unpack();
                 if worker != ctx.msg.instance_id().worker_id() || req.handle.is_mpsc_stream() {
