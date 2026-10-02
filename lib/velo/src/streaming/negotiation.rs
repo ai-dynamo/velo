@@ -17,8 +17,8 @@
 //! prefers `messenger-mux-v2` **only** when the sender named it, because
 //! `resolve_transport` hard-errors on a key it does not know and a receiver that
 //! answered the mux unilaterally would break every older sender. A node with the
-//! mux enabled therefore registers both it and the configured per-stream
-//! transport, and keeps serving peers without the mux unchanged.
+//! default builder registers both the mux and a per-stream transport to serve
+//! older peers. An explicit mux-only builder rejects peers without mux support.
 //!
 //! The credit fields carry the rest of the agreement, and their two zeros mean
 //! different things: no window means *not offering the mux*, no byte cap means
@@ -116,10 +116,10 @@ pub(crate) struct Terms {
 
 /// Intersect the sender's advertisement with what is installed here.
 ///
-/// The mux wins only when both sides named it; everything else falls through to
-/// the behaviour that shipped before negotiation — answer with the local default
-/// transport's key. An empty `offered` (an older sender, which omits the field
-/// entirely) cannot intersect, so such a sender always takes that path.
+/// The mux wins when both sides named it. Otherwise the sender must support
+/// the local default transport. An empty offer comes from an older sender,
+/// which did not negotiate: preserve that peer's default-transport behavior.
+/// A mux-only instance has no per-stream transport and rejects that sender.
 ///
 /// When the mux wins, the stream is placed on a lane for `peer`, the sender
 /// that asked, by `lane_key` if it gave one
@@ -130,13 +130,13 @@ pub(crate) fn select(
     default_transport: &Arc<dyn FrameTransport>,
     peer: WorkerId,
     lane_key: Option<u64>,
-) -> Selection {
+) -> anyhow::Result<Selection> {
     if let Some(mux) = mux
         && offered.iter().any(|key| key.as_str() == MESSENGER_MUX_KEY)
     {
         let limits = mux.advertised_limits();
         let lane = mux.choose_lane(Some(peer), lane_key);
-        return Selection {
+        return Ok(Selection {
             terms: Terms {
                 key: TransportKey::new(MESSENGER_MUX_KEY),
                 initial_credit: limits.initial_credit(),
@@ -144,9 +144,18 @@ pub(crate) fn select(
                 lane: lane.lane().get(),
             },
             target: Target::Mux(Arc::clone(mux), lane),
-        };
+        });
     }
-    Selection {
+    anyhow::ensure!(
+        default_transport.key().as_str() != MESSENGER_MUX_KEY,
+        "peer does not support the messenger mux required by this instance"
+    );
+    anyhow::ensure!(
+        offered.is_empty() || offered.contains(&default_transport.key()),
+        "no common streaming transport: peer does not support {}",
+        default_transport.key()
+    );
+    Ok(Selection {
         target: Target::Other(Arc::clone(default_transport)),
         terms: Terms {
             key: default_transport.key(),
@@ -154,7 +163,7 @@ pub(crate) fn select(
             slot_byte_budget: 0,
             lane: 0,
         },
-    }
+    })
 }
 
 /// How the sender must honour the key the receiver answered with.

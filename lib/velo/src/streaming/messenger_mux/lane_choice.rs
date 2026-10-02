@@ -295,13 +295,13 @@ impl MessengerMuxTransport {
 
     /// Binds on `lane` not yet claimed, released or expired: from `peer`'s
     /// attaches, or with `None` from pre-binds.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "quic"))]
     pub(crate) fn pending_binds_on(&self, peer: Option<WorkerId>, lane: LaneIndex) -> usize {
         self.core.lane_load.pending(peer, lane)
     }
 
     /// Close the accept window on every bind as if it had run out.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "quic"))]
     pub(crate) fn expire_all_binds(&self) {
         self.core.expire_binds(
             tokio::time::Instant::now() + super::ACCEPT_TIMEOUT + std::time::Duration::from_secs(1),
