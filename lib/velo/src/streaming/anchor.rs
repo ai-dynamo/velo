@@ -141,7 +141,7 @@ pub(crate) struct AnchorEntry {
     /// Anchor-lifetime parent token. Created at anchor creation; cancelled only
     /// by finalize/remove/cancel. Child tokens are derived for transient tasks
     /// (reader pump or stream watchdog, timeout) so that stopping a child never
-    /// poisons the parent.
+    /// cancels the parent.
     pub cancel_token: CancellationToken,
 
     /// Child token for the currently active reader pump or, for a mux bind,
@@ -392,7 +392,6 @@ impl Drop for PreBind {
 struct SenderIdentity {
     sender_stream_id: u64,
     cancel_token: CancellationToken,
-    poison_tx: flume::Sender<()>,
     stop_token: CancellationToken,
     registry: Arc<crate::streaming::control::SenderRegistry>,
     armed: bool,
@@ -1387,7 +1386,7 @@ impl AnchorManager {
                             lane_index,
                         );
                         // A child of the anchor's token, as at attach: finalize,
-                        // cancel and detach stop the watchdog without poisoning
+                        // cancel and detach stop the watchdog without cancelling
                         // the parent.
                         let pump_cancel = entry.cancel_token.child_token();
                         entry.active_pump_token = Some(pump_cancel.clone());
@@ -2110,7 +2109,6 @@ impl AnchorManager {
 
     /// Allocate the sender-side identity one stream is opened under.
     fn new_sender_identity(&self) -> SenderIdentity {
-        let (poison_tx, poison_rx) = flume::bounded::<()>(1);
         let sender_stream_id = self.next_sender_stream_id.fetch_add(1, Ordering::Relaxed) + 1;
         let cancel_token = CancellationToken::new();
         let stop_token = cancel_token.child_token();
@@ -2119,14 +2117,12 @@ impl AnchorManager {
             crate::streaming::control::SenderEntry {
                 cancel_token: cancel_token.clone(),
                 stop_token: stop_token.clone(),
-                rx_closer: std::sync::Mutex::new(Some(poison_rx)),
             },
         );
         SenderIdentity {
             sender_stream_id,
             cancel_token,
             stop_token,
-            poison_tx,
             registry: self.sender_registry.clone(),
             armed: true,
         }
@@ -2173,7 +2169,6 @@ impl AnchorManager {
 
         let sender_stream_id = identity.sender_stream_id;
         let cancel_token = identity.cancel_token.clone();
-        let poison_tx = identity.poison_tx.clone();
         identity.armed = false;
 
         // Build StreamSender: frame_tx from the transport (not a local registry
@@ -2186,7 +2181,6 @@ impl AnchorManager {
                 cancel_token,
                 sender_stream_id,
                 sender_registry: self.sender_registry.clone(),
-                poison_tx,
             },
             Duration::from_millis(ticket.heartbeat_interval_ms),
             self.metrics.clone(),
@@ -2366,12 +2360,10 @@ impl AnchorManager {
                     let sender_stream_id =
                         self.next_sender_stream_id.fetch_add(1, Ordering::Relaxed) + 1;
                     let cancel_token = tokio_util::sync::CancellationToken::new();
-                    let (poison_tx, poison_rx) = flume::bounded::<()>(1);
 
                     let sender_entry = crate::streaming::control::SenderEntry {
                         stop_token: cancel_token.child_token(),
                         cancel_token: cancel_token.clone(),
-                        rx_closer: std::sync::Mutex::new(Some(poison_rx)),
                     };
                     if entry.stop_requested {
                         sender_entry.stop_token.cancel();
@@ -2396,7 +2388,6 @@ impl AnchorManager {
                             cancel_token,
                             sender_stream_id,
                             sender_registry: self.sender_registry.clone(),
-                            poison_tx,
                         },
                         heartbeat_interval,
                         self.metrics.clone(),
@@ -2579,7 +2570,6 @@ impl AnchorManager {
                 cancel_token: identity.cancel_token.clone(),
                 sender_stream_id: identity.sender_stream_id,
                 sender_registry: self.sender_registry.clone(),
-                poison_tx: identity.poison_tx.clone(),
             },
             heartbeat_interval,
             self.metrics.clone(),
@@ -2683,7 +2673,6 @@ impl AnchorManager {
                         cancel_token: identity.cancel_token.clone(),
                         sender_stream_id,
                         sender_registry: self.sender_registry.clone(),
-                        poison_tx: identity.poison_tx.clone(),
                     },
                     Duration::from_millis(heartbeat_interval_ms),
                     self.metrics.clone(),

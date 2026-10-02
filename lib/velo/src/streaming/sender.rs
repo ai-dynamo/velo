@@ -34,10 +34,10 @@ use crate::streaming::anchor::AnchorEntry;
 use crate::streaming::frame::{SendError, StreamFrame};
 use crate::streaming::handle::StreamAnchorHandle;
 
-/// Cancel/poison plumbing for a [`StreamSender`].
+/// Cancellation state for a [`StreamSender`].
 ///
 /// Bundled to keep [`StreamSender::new`] under the argument-count threshold
-/// while still keeping the call sites readable. All four fields are required
+/// while still keeping the call sites readable. All fields are required
 /// — there are no defaults.
 pub(crate) struct StreamSenderCancelInfo {
     /// User-facing cancellation signal: fires when `_stream_cancel` is received.
@@ -46,9 +46,6 @@ pub(crate) struct StreamSenderCancelInfo {
     pub sender_stream_id: u64,
     /// Sender-side registry shared with `_stream_cancel`.
     pub sender_registry: Arc<crate::streaming::control::SenderRegistry>,
-    /// Poison channel sender: when its receiver is dropped (by `_stream_cancel`),
-    /// `send()` returns `ChannelClosed` because the channel is disconnected.
-    pub poison_tx: flume::Sender<()>,
 }
 
 // ---------------------------------------------------------------------------
@@ -156,9 +153,6 @@ pub struct StreamSender<T> {
     sender_stream_id: u64,
     /// Sender-side registry shared with the _stream_cancel handler.
     sender_registry: Arc<crate::streaming::control::SenderRegistry>,
-    /// Poison channel sender: when rx_closer (the receiver) is dropped by _stream_cancel handler,
-    /// this becomes disconnected and send() returns ChannelClosed.
-    poison_tx: flume::Sender<()>,
     /// Optional metrics handle for producer-side backpressure observability.
     /// `None` for in-process AnchorManager constructions that skip metrics
     /// (test fixtures and direct AnchorManagerBuilder users).
@@ -211,7 +205,6 @@ impl<T: Serialize> StreamSender<T> {
             cancel_token,
             sender_stream_id,
             sender_registry,
-            poison_tx,
         } = cancel;
         let stop_token = sender_registry
             .senders
@@ -253,7 +246,6 @@ impl<T: Serialize> StreamSender<T> {
             cancel_token,
             sender_stream_id,
             sender_registry,
-            poison_tx,
             metrics,
             negotiated_transport,
             _phantom: std::marker::PhantomData,
@@ -316,8 +308,7 @@ impl<T: Serialize> StreamSender<T> {
     /// - [`SendError::SerializationError`] if `rmp_serde::to_vec` fails.
     /// - [`SendError::ChannelClosed`] if the receiver has been dropped.
     pub async fn send(&self, item: T) -> Result<(), SendError> {
-        // Check if the poison channel has been disconnected (rx_closer dropped by _stream_cancel handler).
-        if self.cancel_token.is_cancelled() || self.poison_tx.is_disconnected() {
+        if self.cancel_token.is_cancelled() {
             return Err(SendError::ChannelClosed);
         }
         let bytes = rmp_serde::to_vec(&StreamFrame::Item(item))
@@ -593,21 +584,12 @@ mod tests {
     }
 
     /// Create a test sender with a bounded(256) channel and a dummy handle.
-    ///
-    /// Returns `(sender, frame_rx, _poison_rx)`.
-    /// The `_poison_rx` must be kept alive for the lifetime of the sender —
-    /// dropping it simulates `_stream_cancel` and causes `send()` to return `ChannelClosed`.
-    fn make_sender() -> (
-        StreamSender<u32>,
-        flume::Receiver<Vec<u8>>,
-        flume::Receiver<()>,
-    ) {
+    fn make_sender() -> (StreamSender<u32>, flume::Receiver<Vec<u8>>) {
         let (tx, rx) = flume::bounded::<Vec<u8>>(256);
         let handle = StreamAnchorHandle::pack(velo_ext::WorkerId::from_u64(1), 1);
         let cancel_token = tokio_util::sync::CancellationToken::new();
         let sender_registry =
             std::sync::Arc::new(crate::streaming::control::SenderRegistry::default());
-        let (poison_tx, poison_rx) = flume::bounded::<()>(1);
         let sender = StreamSender::new(
             tx,
             handle,
@@ -616,13 +598,12 @@ mod tests {
                 cancel_token,
                 sender_stream_id: 1,
                 sender_registry,
-                poison_tx,
             },
             Duration::from_secs(5),
             None,
             None,
         );
-        (sender, rx, poison_rx)
+        (sender, rx)
     }
 
     /// Create a sender entry and insert it into a registry. Returns (registry, sender_stream_id).
@@ -637,13 +618,11 @@ mod tests {
         let cancel_token = tokio_util::sync::CancellationToken::new();
         let sender_registry =
             std::sync::Arc::new(crate::streaming::control::SenderRegistry::default());
-        let (poison_tx, poison_rx) = flume::bounded::<()>(1);
 
         // Insert the SenderEntry into the registry (simulating what attach_stream_anchor does)
         let entry = crate::streaming::control::SenderEntry {
             stop_token: cancel_token.child_token(),
             cancel_token: cancel_token.clone(),
-            rx_closer: std::sync::Mutex::new(Some(poison_rx)),
         };
         sender_registry.senders.insert(sender_stream_id, entry);
 
@@ -655,7 +634,6 @@ mod tests {
                 cancel_token,
                 sender_stream_id,
                 sender_registry: sender_registry.clone(),
-                poison_tx,
             },
             Duration::from_secs(5),
             None,
@@ -742,7 +720,7 @@ mod tests {
     async fn test_heartbeat_emits() {
         tokio::time::pause();
 
-        let (sender, rx, _poison_rx) = make_sender();
+        let (sender, rx) = make_sender();
 
         // Advance time past one heartbeat interval (5 seconds).
         // Use sleep rather than advance+yield so the interval task gets polled.
@@ -766,7 +744,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_item() {
-        let (sender, rx, _poison_rx) = make_sender();
+        let (sender, rx) = make_sender();
 
         sender.send(42u32).await.expect("send should succeed");
 
@@ -786,7 +764,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_err() {
-        let (sender, rx, _poison_rx) = make_sender();
+        let (sender, rx) = make_sender();
 
         sender
             .send_err("something went wrong")
@@ -809,7 +787,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_finalize() {
-        let (sender, rx, _poison_rx) = make_sender();
+        let (sender, rx) = make_sender();
 
         sender.finalize().expect("finalize should succeed");
 
@@ -837,7 +815,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_detach() {
-        let (sender, rx, _poison_rx) = make_sender();
+        let (sender, rx) = make_sender();
         let expected_handle = StreamAnchorHandle::pack(velo_ext::WorkerId::from_u64(1), 1);
 
         let returned_handle = sender.detach().expect("detach should succeed");
@@ -867,7 +845,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_drop_sends_dropped() {
-        let (sender, rx, _poison_rx) = make_sender();
+        let (sender, rx) = make_sender();
 
         // Drop without finalize or detach
         drop(sender);
@@ -896,7 +874,6 @@ mod tests {
         let cancel_token = tokio_util::sync::CancellationToken::new();
         let sender_registry =
             std::sync::Arc::new(crate::streaming::control::SenderRegistry::default());
-        let (poison_tx, _poison_rx) = flume::bounded::<()>(1);
         let sender = StreamSender::new(
             tx,
             handle,
@@ -905,7 +882,6 @@ mod tests {
                 cancel_token,
                 sender_stream_id: 1,
                 sender_registry,
-                poison_tx,
             },
             Duration::from_secs(5),
             None,
@@ -940,7 +916,6 @@ mod tests {
         let cancel_token = tokio_util::sync::CancellationToken::new();
         let sender_registry =
             std::sync::Arc::new(crate::streaming::control::SenderRegistry::default());
-        let (poison_tx, _poison_rx) = flume::bounded::<()>(1);
         let sender = StreamSender::new(
             tx,
             handle,
@@ -949,7 +924,6 @@ mod tests {
                 cancel_token,
                 sender_stream_id: 1,
                 sender_registry,
-                poison_tx,
             },
             Duration::from_secs(5),
             None,
@@ -977,7 +951,7 @@ mod tests {
     async fn test_heartbeat_stops_after_cancel() {
         tokio::time::pause();
 
-        let (sender, rx, _poison_rx) = make_sender();
+        let (sender, rx) = make_sender();
 
         // Finalize cancels the heartbeat
         sender.finalize().expect("finalize should succeed");
@@ -1004,7 +978,7 @@ mod tests {
     fn test_cancellation_token() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let (sender, _rx, _poison_rx) = make_sender();
+            let (sender, _rx) = make_sender();
             let token = sender.cancellation_token();
             // Token should not be cancelled yet
             assert!(!token.is_cancelled(), "token should not start cancelled");
@@ -1025,47 +999,44 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 11: send() returns ChannelClosed after poison_tx disconnected
+    // Test 11: cancellation rejects sends while the receiver remains open
     // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_send_after_cancel() {
-        let (frame_tx, _frame_rx) = flume::bounded::<Vec<u8>>(256);
-        let handle = StreamAnchorHandle::pack(velo_ext::WorkerId::from_u64(1), 2);
+        let (sender, rx) = make_sender();
+        sender.cancellation_token().cancel();
+        assert!(matches!(
+            sender.send(42).await,
+            Err(SendError::ChannelClosed)
+        ));
+        assert!(matches!(
+            sender.send_err("late error").await,
+            Err(SendError::ChannelClosed)
+        ));
+        assert!(rx.is_empty());
+    }
 
-        // Create a poison channel and keep track of the receiver
-        let cancel_token = tokio_util::sync::CancellationToken::new();
-        let sender_registry =
-            std::sync::Arc::new(crate::streaming::control::SenderRegistry::default());
-        let (poison_tx, poison_rx) = flume::bounded::<()>(1);
+    #[tokio::test]
+    async fn cancellation_wakes_item_and_error_sends_on_a_full_channel() {
+        let (sender, rx) = make_sender();
+        for _ in 0..rx.capacity().unwrap() {
+            sender.send(0).await.unwrap();
+        }
+        let item = sender.send(42);
+        let error = sender.send_err("late error");
+        tokio::pin!(item, error);
+        assert!(futures::poll!(&mut item).is_pending());
+        assert!(futures::poll!(&mut error).is_pending());
 
-        let sender = StreamSender::<u32>::new(
-            frame_tx,
-            handle,
-            empty_registry(),
-            StreamSenderCancelInfo {
-                cancel_token,
-                sender_stream_id: 2,
-                sender_registry,
-                poison_tx,
-            },
-            Duration::from_secs(5),
-            None,
-            None,
-        );
-
-        // Drop the receiver (simulating rx_closer drop in _stream_cancel handler)
-        drop(poison_rx);
-
-        // send() should now return ChannelClosed
-        let result = sender.send(42u32).await;
-        assert!(
-            matches!(result, Err(SendError::ChannelClosed)),
-            "expected ChannelClosed after poison_rx drop, got {:?}",
-            result
-        );
-
-        drop(sender);
+        sender.cancellation_token().cancel();
+        let (item, error) =
+            tokio::time::timeout(Duration::from_secs(1), async { (item.await, error.await) })
+                .await
+                .expect("blocked sends did not wake after cancellation");
+        assert!(matches!(item, Err(SendError::ChannelClosed)));
+        assert!(matches!(error, Err(SendError::ChannelClosed)));
+        assert!(rx.is_full(), "the receiver stayed open and did not drain");
     }
 
     // -----------------------------------------------------------------------

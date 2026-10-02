@@ -44,12 +44,11 @@ use crate::messenger::common::events::{EventType, Outcome, encode_event_header};
 use crate::messenger::common::messages::ResponseType;
 use crate::messenger::common::responses::{ResponseId, encode_response_header};
 use crate::messenger::server::dispatcher::{
-    ActiveMessageDispatcher, ActiveMessageHandler, HandlerContext, InlineDispatcher,
-    OrderedDispatcher, SpawnedDispatcher,
+    ActiveMessageDispatcher, ActiveMessageHandler, HandlerContext, OrderedDispatcher,
+    SpawnedDispatcher,
 };
 use crate::transports::{MessageType, SendOutcome, VeloBackend};
 use derive_getters::Dissolve;
-use tokio_util::task::TaskTracker;
 
 /// Wait for a queued frame to reach the send channel.
 ///
@@ -163,14 +162,7 @@ pub type UnifiedResponse = Result<Option<Bytes>>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DispatchMode {
-    /// Spawn the handler on a detached task that is *not* registered with
-    /// the messenger's task tracker.
-    ///
-    /// Despite the name this does not run on the dispatcher task. It is
-    /// [`Spawn`](Self::Spawn) minus trackability, so a future graceful
-    /// shutdown cannot wait for these handlers.
-    Inline,
-    /// Spawn handler on separate task (default, safer)
+    /// Run each message on its own task (default).
     Spawn,
     /// Queue onto an ordering lane drained by a single task, so messages
     /// sharing a lane key are handled in arrival order.
@@ -1144,14 +1136,6 @@ macro_rules! impl_dispatch_mode_setters {
                 self
             }
 
-            /// Run the handler on a task not registered with the messenger's
-            /// tracker.
-            pub fn inline(mut self) -> Self {
-                self.dispatch_mode = DispatchMode::Inline;
-                self.ordered = None;
-                self
-            }
-
             /// Handle messages from each sending instance in arrival order,
             /// with different senders running in parallel.
             ///
@@ -1217,11 +1201,10 @@ fn make_dispatcher<H: ActiveMessageHandler + 'static>(
     ordered: Option<OrderedConfig>,
 ) -> Arc<dyn ActiveMessageDispatcher> {
     match mode {
-        DispatchMode::Inline => Arc::new(InlineDispatcher::new(adapter)),
         DispatchMode::Ordered => {
             Arc::new(OrderedDispatcher::new(adapter, ordered.unwrap_or_default()))
         }
-        DispatchMode::Spawn => Arc::new(SpawnedDispatcher::new(adapter, TaskTracker::new())),
+        DispatchMode::Spawn => Arc::new(SpawnedDispatcher::new(adapter)),
     }
 }
 
@@ -1420,9 +1403,6 @@ mod tests {
         let handler = am_handler("test_am", |_ctx| Ok(())).build();
         assert_eq!(handler.name(), "test_am");
 
-        let handler = am_handler("test_am_inline", |_ctx| Ok(())).inline().build();
-        assert_eq!(handler.name(), "test_am_inline");
-
         let handler = am_handler("test_am_spawn", |_ctx| Ok(())).spawn().build();
         assert_eq!(handler.name(), "test_am_spawn");
     }
@@ -1431,22 +1411,12 @@ mod tests {
     fn test_am_handler_async_builder() {
         let handler = am_handler_async("test_am_async", |_ctx| async move { Ok(()) }).build();
         assert_eq!(handler.name(), "test_am_async");
-
-        let handler = am_handler_async("test_am_async_inline", |_ctx| async move { Ok(()) })
-            .inline()
-            .build();
-        assert_eq!(handler.name(), "test_am_async_inline");
     }
 
     #[test]
     fn test_unary_handler_builder() {
         let handler = unary_handler("test_unary", |_ctx| Ok(None)).build();
         assert_eq!(handler.name(), "test_unary");
-
-        let handler = unary_handler("test_unary_inline", |_ctx| Ok(None))
-            .inline()
-            .build();
-        assert_eq!(handler.name(), "test_unary_inline");
     }
 
     #[test]
@@ -1465,15 +1435,6 @@ mod tests {
         })
         .build();
         assert_eq!(handler.name(), "test_typed");
-
-        let handler = typed_unary("test_typed_inline", |ctx: TypedContext<PingRequest>| {
-            Ok(PingResponse {
-                echo: ctx.input.message,
-            })
-        })
-        .inline()
-        .build();
-        assert_eq!(handler.name(), "test_typed_inline");
     }
 
     #[test]
@@ -1555,10 +1516,6 @@ mod tests {
             .max_concurrent(8)
             .spawn();
         assert_eq!(builder.dispatch_mode, DispatchMode::Spawn);
-        assert!(builder.ordered.is_none());
-
-        let builder = am_handler("c", |_ctx| Ok(())).ordered().inline();
-        assert_eq!(builder.dispatch_mode, DispatchMode::Inline);
         assert!(builder.ordered.is_none());
     }
 
