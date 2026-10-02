@@ -24,7 +24,7 @@
 | Teardown | The third phase of graceful shutdown. Velo cancels tokens and stops the transports. |
 | Close | The fourth phase of graceful shutdown. Velo waits for `Transport::closed()` on each transport, so that what it wrote reaches the peer. |
 | Ticket | A `StreamOpenTicket`. It carries the terms of a pre-bound stream. |
-| Transport lane | One ordered channel from a transport to a peer. Order holds within a lane only. QUIC can keep several lanes to a peer, each on its own connection. Not the same as an ordered lane. |
+| Transport lane | One ordered channel from a transport to a peer. Order holds within a lane only. QUIC and TCP can keep several lanes to a peer, each on its own connection. Not the same as an ordered lane. |
 | `TransportKey` | The name of a transport in a `WorkerAddress`, for example `tcp` |
 | `WorkerAddress` | A MessagePack map from `TransportKey` to endpoint bytes |
 | `WorkerId` | The identity of a worker. A `StreamAnchorHandle` encodes it. |

@@ -13,8 +13,91 @@ use bytes::Bytes;
 use velo_ext::WorkerId;
 
 use super::*;
+use crate::streaming::messenger_mux::LaneIndex;
 use crate::streaming::messenger_mux::protocol::{BatchEncoder, RecordType, SlotId};
 use crate::streaming::sender::{cached_dropped, cached_finalized};
+
+/// Test-only views into the registry. Here rather than beside the registry,
+/// so the receive path's file holds only the receive path.
+impl IngressRegistry {
+    /// Binds registered and neither claimed nor released.
+    pub(crate) fn bind_count(&self) -> usize {
+        self.binds.len()
+    }
+
+    /// The window one of `key`'s live slots opened holding.
+    pub(crate) fn slot_open_terms(&self, key: PeerLane, id: SlotId) -> Option<(u32, u64)> {
+        let entry = self.peers.get(&key)?;
+        let state = lock(entry.value());
+        state
+            .slots
+            .get(id.index() as usize)
+            .and_then(Option::as_ref)
+            .filter(|slot| slot.id == id)
+            .map(|slot| slot.open_terms())
+    }
+
+    /// The ids of `key`'s live slots.
+    pub(crate) fn live_slot_ids(&self, key: PeerLane) -> Vec<SlotId> {
+        self.peers.get(&key).map_or_else(Vec::new, |entry| {
+            lock(entry.value())
+                .slots
+                .iter()
+                .filter_map(|slot| slot.as_ref().map(|slot| slot.id))
+                .collect()
+        })
+    }
+
+    /// Calls into `close_consumer_gone` so far.
+    pub(crate) fn consumer_gone_calls(&self) -> usize {
+        self.consumer_gone_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Bytes `peer`'s ahead-of-sequence holds have reserved between them, on
+    /// every lane.
+    pub(crate) fn peer_bytes_used(&self, peer: WorkerId) -> u64 {
+        self.peer_bytes.get(&peer).map_or(0, |budget| budget.used())
+    }
+
+    /// Reconcile visits `key`'s slots have taken since its table opened.
+    pub(crate) fn reconcile_visits(&self, key: PeerLane) -> u64 {
+        self.peers
+            .get(&key)
+            .map_or(0, |entry| lock(entry.value()).reconcile_visits)
+    }
+
+    /// Live slots placed on `lane`, from `peer` or from every peer, counted by
+    /// walking every table: the exact answer the lane counts must match.
+    pub(crate) fn live_placed_on(&self, peer: Option<WorkerId>, lane: LaneIndex) -> usize {
+        self.peers
+            .iter()
+            .filter(|entry| peer.is_none_or(|peer| entry.key().peer == peer))
+            .map(|entry| {
+                lock(entry.value())
+                    .slots
+                    .iter()
+                    .flatten()
+                    .filter(|slot| slot.placed_lane() == lane)
+                    .count()
+            })
+            .sum()
+    }
+
+    /// Run `f` while holding `key`'s table mutex, as the ordered batch
+    /// handler does through a decode. `None` when `key` has no table.
+    pub(crate) fn with_table_locked<R>(&self, key: PeerLane, f: impl FnOnce() -> R) -> Option<R> {
+        let entry = self.peers.get(&key)?;
+        let _state = lock(entry.value());
+        Some(f())
+    }
+
+    /// `key`'s dirty-slot set, for the tests that inspect it.
+    pub(crate) fn dirty_slots(&self, key: PeerLane) -> Arc<DirtySlots> {
+        let entry = self.peers.get(&key).expect("peer has a slot table");
+        Arc::clone(&lock(entry.value()).dirty)
+    }
+}
 
 /// A drain signal whose wakes go nowhere, for tests that drive the registry
 /// directly. The claim path still runs, so `open_slot` naming the peer, the
@@ -64,11 +147,27 @@ impl Consumer {
 
 /// Register a bind for `(ANCHOR, session)` and return its consumer side.
 fn register(registry: &IngressRegistry, config: &MuxConfig, session: u64) -> Consumer {
+    register_on(registry, config, session, LaneIndex::ZERO)
+}
+
+/// As [`register`], with the bind placed on `lane`.
+fn register_on(
+    registry: &IngressRegistry,
+    config: &MuxConfig,
+    session: u64,
+    lane: LaneIndex,
+) -> Consumer {
     let (tx, rx) = flume::bounded(
         crate::streaming::messenger_mux::flow_control::slot_buffer_depth(config.initial_credit),
     );
     let drain = test_drain();
-    registry.register_bind(ANCHOR, session, tx, Arc::clone(&drain));
+    registry.register_bind(
+        ANCHOR,
+        session,
+        tx,
+        Arc::clone(&drain),
+        LaneReservation::uncounted(lane),
+    );
     Consumer { rx, drain }
 }
 
@@ -76,8 +175,9 @@ const PEER: u64 = 0xABCD;
 const ANCHOR: u64 = 7;
 const SESSION: u64 = 11;
 
-fn peer() -> WorkerId {
-    WorkerId::from_u64(PEER)
+/// The peer's lane 0, where every test here runs unless it names a lane.
+fn peer() -> PeerLane {
+    PeerLane::new(WorkerId::from_u64(PEER), LaneIndex::ZERO)
 }
 
 fn config() -> MuxConfig {
@@ -93,9 +193,19 @@ fn slot(index: u32, generation: u8) -> SlotId {
     SlotId::new(index, generation).expect("index fits u24")
 }
 
-/// Build a batch payload from a closure that pushes its records.
+/// Build a lane-0 batch payload from a closure that pushes its records.
 fn batch(epoch: u64, batch_seq: u32, build: impl FnOnce(&mut BatchEncoder)) -> Bytes {
-    let mut encoder = BatchEncoder::new(epoch, batch_seq);
+    batch_on(LaneIndex::ZERO, epoch, batch_seq, build)
+}
+
+/// As [`batch`], stamped with `lane`.
+fn batch_on(
+    lane: LaneIndex,
+    epoch: u64,
+    batch_seq: u32,
+    build: impl FnOnce(&mut BatchEncoder),
+) -> Bytes {
+    let mut encoder = BatchEncoder::new(epoch, batch_seq, lane);
     build(&mut encoder);
     encoder.finish().freeze()
 }
@@ -220,10 +330,22 @@ fn a_colliding_open_slot_is_rejected_and_the_incumbent_survives() {
     let depth =
         crate::streaming::messenger_mux::flow_control::slot_buffer_depth(config.initial_credit);
     let (incumbent_tx, incumbent_rx) = flume::bounded(depth);
-    registry.register_bind(ANCHOR, SESSION, incumbent_tx, test_drain());
+    registry.register_bind(
+        ANCHOR,
+        SESSION,
+        incumbent_tx,
+        test_drain(),
+        LaneReservation::uncounted(LaneIndex::ZERO),
+    );
     // A second bind, for the collider to try to claim.
     let (rival_tx, rival_rx) = flume::bounded(depth);
-    registry.register_bind(ANCHOR, SESSION + 1, rival_tx, test_drain());
+    registry.register_bind(
+        ANCHOR,
+        SESSION + 1,
+        rival_tx,
+        test_drain(),
+        LaneReservation::uncounted(LaneIndex::ZERO),
+    );
 
     let incumbent = slot(0, 0);
     open(&registry, &config, incumbent, 1);
@@ -234,7 +356,7 @@ fn a_colliding_open_slot_is_rejected_and_the_incumbent_survives() {
         encoder.push_data(incumbent, 2, &item(2)).unwrap();
     });
     handle_batch(&registry, &config, None, peer(), &payload);
-    let held_bytes = registry.peer_bytes_used(peer());
+    let held_bytes = registry.peer_bytes_used(peer().peer);
     assert!(
         held_bytes > 0,
         "the hold has to be charged for this to test anything"
@@ -267,7 +389,7 @@ fn a_colliding_open_slot_is_rejected_and_the_incumbent_survives() {
         "the incumbent's consumer must not see its channel end"
     );
     assert_eq!(
-        registry.peer_bytes_used(peer()),
+        registry.peer_bytes_used(peer().peer),
         held_bytes,
         "the incumbent's hold must still be charged to the peer budget — a \
          silent eviction would have leaked it for the life of the epoch"
@@ -313,8 +435,20 @@ fn a_duplicate_open_retires_the_incumbent_through_the_ordinary_close() {
         crate::streaming::messenger_mux::flow_control::slot_buffer_depth(config.initial_credit);
     let (first_tx, first_rx) = flume::bounded(depth);
     let (second_tx, second_rx) = flume::bounded(depth);
-    registry.register_bind(ANCHOR, SESSION, first_tx, test_drain());
-    registry.register_bind(ANCHOR, SESSION + 1, second_tx, test_drain());
+    registry.register_bind(
+        ANCHOR,
+        SESSION,
+        first_tx,
+        test_drain(),
+        LaneReservation::uncounted(LaneIndex::ZERO),
+    );
+    registry.register_bind(
+        ANCHOR,
+        SESSION + 1,
+        second_tx,
+        test_drain(),
+        LaneReservation::uncounted(LaneIndex::ZERO),
+    );
 
     let id = slot(0, 0);
     open(&registry, &config, id, 1);
@@ -325,7 +459,7 @@ fn a_duplicate_open_retires_the_incumbent_through_the_ordinary_close() {
         encoder.push_data(id, 2, &item(2)).unwrap();
     });
     handle_batch(&registry, &config, None, peer(), &payload);
-    assert!(registry.peer_bytes_used(peer()) > 0);
+    assert!(registry.peer_bytes_used(peer().peer) > 0);
 
     // The same slot id opens again, against a different bind.
     let payload = batch(1, 2, |encoder| {
@@ -339,7 +473,7 @@ fn a_duplicate_open_retires_the_incumbent_through_the_ordinary_close() {
         "the incumbent was retired, not dropped on the floor"
     );
     assert_eq!(
-        registry.peer_bytes_used(peer()),
+        registry.peer_bytes_used(peer().peer),
         0,
         "the incumbent's held bytes go back to the peer budget"
     );
@@ -562,8 +696,20 @@ fn hold_overflow_closes_that_slot_and_leaves_the_others_alone() {
         crate::streaming::messenger_mux::flow_control::slot_buffer_depth(config.initial_credit);
     let (tx_a, rx_a) = flume::bounded(depth);
     let (tx_b, rx_b) = flume::bounded(depth);
-    registry.register_bind(ANCHOR, SESSION, tx_a, test_drain());
-    registry.register_bind(ANCHOR, SESSION + 1, tx_b, test_drain());
+    registry.register_bind(
+        ANCHOR,
+        SESSION,
+        tx_a,
+        test_drain(),
+        LaneReservation::uncounted(LaneIndex::ZERO),
+    );
+    registry.register_bind(
+        ANCHOR,
+        SESSION + 1,
+        tx_b,
+        test_drain(),
+        LaneReservation::uncounted(LaneIndex::ZERO),
+    );
 
     let a = slot(0, 0);
     let b = slot(1, 0);
@@ -1135,7 +1281,13 @@ fn the_grant_is_what_the_pump_counted_not_what_the_channel_holds() {
         crate::streaming::messenger_mux::flow_control::slot_buffer_depth(config.initial_credit),
     );
     let drain = test_drain();
-    registry.register_bind(ANCHOR, SESSION, tx.clone(), Arc::clone(&drain));
+    registry.register_bind(
+        ANCHOR,
+        SESSION,
+        tx.clone(),
+        Arc::clone(&drain),
+        LaneReservation::uncounted(LaneIndex::ZERO),
+    );
     let consumer = Consumer { rx, drain };
     let id = slot(0, 0);
     open(&registry, &config, id, 1);
@@ -1521,7 +1673,7 @@ fn drain_signal_claim_stays_write_once() {
 
     let first = SlotId::new(3, 0).expect("slot id");
     let second = SlotId::new(9, 1).expect("slot id");
-    let other_peer = WorkerId::from_u64(PEER + 1);
+    let other_peer = PeerLane::new(WorkerId::from_u64(PEER + 1), LaneIndex::ZERO);
 
     let dirty = Arc::new(DirtySlots::new());
     drain.claimed_by(
@@ -1536,5 +1688,371 @@ fn drain_signal_claim_stays_write_once() {
         drain.claimed(),
         Some((peer(), first)),
         "the second claim must be dropped, not applied"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Lanes
+// ---------------------------------------------------------------------------
+
+/// Two lanes of one peer keep separate tables.
+///
+/// Slot ids are unique only within one sender batcher, and each lane has its
+/// own batcher, so the same id may be live on two lanes at once. A table
+/// shared by the lanes would read the second `OpenSlot` as a collision and
+/// reject it, and a new epoch on one lane would retire the other lane's
+/// streams. Every other test here runs on lane 0 alone and cannot see either.
+#[test]
+fn lanes_of_one_peer_keep_separate_tables() {
+    let config = config();
+    let registry = IngressRegistry::default();
+    let on_zero = register(&registry, &config, SESSION);
+    let on_one = register(&registry, &config, SESSION + 1);
+    let zero = peer();
+    let one = PeerLane::new(zero.peer, LaneIndex::new(1));
+    let id = slot(0, 0);
+
+    let payload = batch(5, 0, |encoder| {
+        encoder.push_open_slot(id, 0, ANCHOR, SESSION).unwrap();
+    });
+    let outcome = handle_batch(&registry, &config, None, zero, &payload);
+    assert_eq!(outcome.opened, 1);
+
+    // The same slot id on lane 1, under that lane's own epoch.
+    let payload = batch_on(one.lane, 9, 0, |encoder| {
+        encoder.push_open_slot(id, 0, ANCHOR, SESSION + 1).unwrap();
+    });
+    let outcome = handle_batch(&registry, &config, None, one, &payload);
+    assert_eq!(outcome.opened, 1);
+    assert!(
+        outcome.replies.is_empty(),
+        "the same id on another lane is not a collision"
+    );
+    assert_eq!(registry.live_slots(zero), 1);
+    assert_eq!(registry.live_slots(one), 1);
+
+    // Records reach the stream of the lane they arrived on.
+    let payload = batch_on(one.lane, 9, 1, |encoder| {
+        encoder.push_data(id, 1, &item(1)).unwrap();
+    });
+    handle_batch(&registry, &config, None, one, &payload);
+    assert_eq!(on_one.pump(), vec![item(1)]);
+    assert!(on_zero.pump().is_empty());
+
+    // A new epoch on lane 1 retires lane 1's slot and nothing on lane 0.
+    let payload = batch_on(one.lane, 10, 0, |_| {});
+    let outcome = handle_batch(&registry, &config, None, one, &payload);
+    assert_eq!(outcome.closed, 1);
+    assert_eq!(registry.live_slots(one), 0);
+    assert_eq!(
+        registry.live_slots(zero),
+        1,
+        "an epoch change on one lane must leave the other lane's streams alone"
+    );
+}
+
+/// A claim names the lane its `OpenSlot` arrived on, and so does the wake its
+/// drains post.
+///
+/// Stop, cancel and close of a claimed slot go through the batcher the claim
+/// names, and credit comes back through the lane the wake names. Either one
+/// landing on another lane would reach a batcher whose slot ids mean other
+/// streams.
+#[test]
+fn a_claim_and_its_wake_name_the_arrival_lane() {
+    let config = config();
+    let registry = IngressRegistry::default();
+    let (wake_tx, wake_rx) = flume::unbounded();
+    let (tx, rx) = flume::bounded(
+        crate::streaming::messenger_mux::flow_control::slot_buffer_depth(config.initial_credit),
+    );
+    let drain = Arc::new(DrainSignal::new(wake_tx));
+    registry.register_bind(
+        ANCHOR,
+        SESSION,
+        tx,
+        Arc::clone(&drain),
+        LaneReservation::uncounted(LaneIndex::ZERO),
+    );
+    let consumer = Consumer { rx, drain };
+    let one = PeerLane::new(peer().peer, LaneIndex::new(1));
+    let id = slot(4, 2);
+
+    let payload = batch_on(one.lane, 3, 0, |encoder| {
+        encoder.push_open_slot(id, 0, ANCHOR, SESSION).unwrap();
+        encoder.push_data(id, 1, &item(7)).unwrap();
+    });
+    handle_batch(&registry, &config, None, one, &payload);
+
+    assert_eq!(consumer.drain.claimed(), Some((one, id)));
+    assert_eq!(consumer.pump(), vec![item(7)]);
+    assert_eq!(
+        wake_rx.try_recv(),
+        Ok(one),
+        "the wake names the arrival lane"
+    );
+    assert_eq!(consumer.drain.cancel(), Some((one, id)));
+}
+
+/// A batch whose header names another lane than its handler's is dropped
+/// whole and metered, and creates no table.
+///
+/// The control is the same batch stamped with the handler's lane, which
+/// opens its slot; without the check the mismatched one would too, on a table
+/// for a lane its slot ids do not belong to.
+#[test]
+fn a_batch_on_the_wrong_lane_is_dropped_and_metered() {
+    let registry_metrics = prometheus::Registry::new();
+    let metrics = crate::observability::VeloMetrics::register(&registry_metrics).unwrap();
+    let mux_metrics = metrics.bind_mux();
+    let (registry, _consumer, config) = bound();
+    let three = PeerLane::new(peer().peer, LaneIndex::new(3));
+    let open_slot = |encoder: &mut BatchEncoder| {
+        encoder
+            .push_open_slot(slot(0, 0), 0, ANCHOR, SESSION)
+            .unwrap();
+    };
+
+    // Stamped lane 0, arriving on lane 3's handler.
+    let payload = batch(1, 0, open_slot);
+    let outcome = handle_batch(&registry, &config, Some(&mux_metrics), three, &payload);
+    assert_eq!(outcome.opened, 0);
+    assert!(outcome.replies.is_empty());
+    assert!(
+        !registry.peers().contains(&three),
+        "a dropped batch must not create a table"
+    );
+    let snapshot =
+        crate::observability::test_helpers::MetricSnapshot::from_registry(&registry_metrics);
+    assert_eq!(
+        snapshot.counter(
+            "velo_streaming_mux_records_dropped_total",
+            &[("reason", "lane_mismatch")]
+        ),
+        1.0
+    );
+
+    // The control: stamped with the handler's lane, the same batch opens.
+    let payload = batch_on(three.lane, 1, 0, open_slot);
+    let outcome = handle_batch(&registry, &config, Some(&mux_metrics), three, &payload);
+    assert_eq!(outcome.opened, 1);
+    assert_eq!(registry.live_slots(three), 1);
+}
+
+/// Every lane's table takes the whole slot index range.
+///
+/// The sender picks the lane a stream rides, clamped to its own lane count,
+/// so one lane's table may hold all of a peer's streams. A range split over
+/// this node's lanes refused `OpenSlot`s a one-lane sender had every right to
+/// send.
+#[test]
+fn every_lane_table_takes_the_whole_slot_range() {
+    let (registry, _consumer, config) = bound();
+    let last = PeerLane::new(peer().peer, LaneIndex::new(15));
+    let top = slot(MAX_INGRESS_SLOTS_PER_PEER as u32 - 1, 0);
+    let payload = batch_on(last.lane, 1, 0, |encoder| {
+        encoder.push_open_slot(top, 0, ANCHOR, SESSION).unwrap();
+    });
+    let outcome = handle_batch(&registry, &config, None, last, &payload);
+    assert_eq!(outcome.opened, 1);
+    assert!(outcome.replies.is_empty());
+
+    // The ceiling itself is still refused.
+    let past = slot(MAX_INGRESS_SLOTS_PER_PEER as u32, 0);
+    let payload = batch_on(last.lane, 1, 1, |encoder| {
+        encoder.push_open_slot(past, 0, ANCHOR, SESSION).unwrap();
+    });
+    let outcome = handle_batch(&registry, &config, None, last, &payload);
+    assert_eq!(
+        outcome.replies,
+        vec![ReplyRecord::RejectSlot {
+            slot: past,
+            reason: CloseReason::ProtocolError
+        }]
+    );
+}
+
+/// The node's live count per lane, and the count per (peer, lane), match the
+/// slots in its tables, by the lane each slot was placed on, after every way a
+/// slot opens or leaves.
+///
+/// Unkeyed pre-binds are placed by the first and unkeyed attaches by the
+/// second, both read without locking any table. Each slot holds its own
+/// count, so the two can drift only if a slot is kept somewhere after it
+/// leaves its table, or a count is taken with no slot behind it.
+///
+/// A slot counts on the lane its bind was placed on, which is not always the
+/// lane its batches arrive on: a sender with fewer lanes sends lane k on k
+/// modulo its count. Here binds placed on lanes 5 and 6 arrive on lane 1, and
+/// one placed on lane 2 arrives on lane 0. The table walk reads each slot's
+/// lane from the slot's own count, so it agrees with a count taken on the wrong
+/// lane; the expected per-lane counts after each step are what catch that, so
+/// keep them. The steps cover each exit (a duplicate open, a cancel that lands
+/// before the claim, a close from the consumer side, a new epoch, and
+/// shutdown) on two peers and two arrival lanes.
+#[test]
+fn the_live_count_per_lane_matches_the_slot_tables() {
+    let config = config();
+    let registry = IngressRegistry::default();
+    let a = WorkerId::from_u64(PEER);
+    let b = WorkerId::from_u64(PEER + 1);
+    let a0 = PeerLane::new(a, LaneIndex::ZERO);
+    let a1 = PeerLane::new(a, LaneIndex::new(1));
+    let b1 = PeerLane::new(b, LaneIndex::new(1));
+    // Session n's bind is placed on `placed[n - 1]`.
+    let placed = [0, 5, 1, 6, 2, 5].map(LaneIndex::new);
+    let consumers: Vec<Consumer> = (1..=6u64)
+        .map(|session| register_on(&registry, &config, session, placed[session as usize - 1]))
+        .collect();
+    let open_on = |key: PeerLane, epoch: u64, batch_seq: u32, id: SlotId, session: u64| {
+        let payload = batch_on(key.lane, epoch, batch_seq, |encoder| {
+            encoder.push_open_slot(id, 0, ANCHOR, session).unwrap();
+        });
+        handle_batch(&registry, &config, None, key, &payload)
+    };
+    // Every count against a walk of the tables, and the live slots per
+    // placed lane, 0 to 6, for the step to be checked against.
+    let counts = |step: &str| -> [usize; 7] {
+        LaneIndex::all().take(7).for_each(|lane| {
+            for peer in [a, b] {
+                assert_eq!(
+                    registry.live_count(PeerLane::new(peer, lane)),
+                    registry.live_placed_on(Some(peer), lane),
+                    "{step}: the count of ({peer:?}, {lane:?}) must match the tables"
+                );
+            }
+            assert_eq!(
+                registry.live_on_lane(lane),
+                registry.live_placed_on(None, lane),
+                "{step}: the node's count on {lane:?} must match the tables"
+            );
+        });
+        std::array::from_fn(|lane| registry.live_on_lane(LaneIndex::new(lane as u16)))
+    };
+
+    open_on(a0, 1, 0, slot(0, 0), 1);
+    open_on(a1, 5, 0, slot(0, 0), 2);
+    open_on(b1, 7, 0, slot(0, 0), 3);
+    open_on(b1, 7, 1, slot(1, 0), 4);
+    assert_eq!(counts("after the opens"), [1, 1, 0, 0, 0, 1, 1]);
+    assert_eq!(
+        (
+            registry.live_slots(a0),
+            registry.live_slots(a1),
+            registry.live_slots(b1)
+        ),
+        (1, 1, 2),
+        "the tables stay keyed by the lane batches arrive on"
+    );
+
+    // The same id opens again on a0: the incumbent retires, the new one opens
+    // placed on lane 2.
+    let outcome = open_on(a0, 1, 1, slot(0, 0), 5);
+    assert_eq!((outcome.opened, outcome.closed), (1, 1));
+    assert_eq!(counts("after a duplicate open"), [0, 1, 1, 0, 0, 1, 1]);
+
+    // The consumer cancels before the `OpenSlot` lands: the slot opens and
+    // closes in one pass.
+    assert_eq!(consumers[5].drain.cancel(), None);
+    let outcome = open_on(b1, 7, 2, slot(2, 0), 6);
+    assert_eq!((outcome.opened, outcome.closed), (1, 1));
+    assert_eq!(
+        counts("after a cancel before the claim"),
+        [0, 1, 1, 0, 0, 1, 1]
+    );
+
+    assert!(
+        registry
+            .close_consumer_gone(b1, slot(1, 0), None, None)
+            .is_some()
+    );
+    assert_eq!(counts("after a consumer-side close"), [0, 1, 1, 0, 0, 1, 0]);
+
+    let payload = batch_on(a1.lane, 6, 0, |_| {});
+    let outcome = handle_batch(&registry, &config, None, a1, &payload);
+    assert_eq!(outcome.closed, 1);
+    assert_eq!(counts("after a new epoch on a1"), [0, 1, 1, 0, 0, 0, 0]);
+
+    assert_eq!(registry.shutdown(), 2);
+    assert_eq!(counts("after shutdown"), [0; 7]);
+}
+
+/// One peer's lanes share one byte budget, so the per-peer bound is
+/// `peer_byte_budget` whatever lane count either side keeps.
+///
+/// Each lane's table used to take its own share of the budget, sized from the
+/// lane count this node read when the table was made. A count read as 1 (the
+/// peer not yet known to discovery) gave a table the whole budget, and later
+/// lanes a share each, so the peer could hold more than the budget. Here each
+/// table is made while the count reads 1, and a second lane's hold must still
+/// be refused once the first lane's hold has taken most of the budget.
+///
+/// The budget is below two slots' windows, so the shared bound is what bites,
+/// not a slot's own cap. After a new epoch retires lane 0's slot, its bytes
+/// come back to the shared budget and lane 1 can hold again.
+#[test]
+fn the_lanes_of_one_peer_share_one_byte_budget() {
+    let config = MuxConfig {
+        peer_byte_budget: 300,
+        ..config()
+    };
+    assert!(config.peer_byte_budget < 2 * u64::from(config.slot_byte_budget));
+    let registry = IngressRegistry::default();
+    let _consumers: Vec<Consumer> = (1..=3)
+        .map(|session| register(&registry, &config, session))
+        .collect();
+    let a0 = peer();
+    let a1 = PeerLane::new(a0.peer, LaneIndex::new(1));
+    let big = |n: u8| {
+        rmp_serde::to_vec(&crate::streaming::frame::StreamFrame::Item(vec![n; 180]))
+            .expect("encode item")
+    };
+    let id = slot(0, 0);
+    let run = |key: PeerLane, epoch: u64, batch_seq: u32, build: &dyn Fn(&mut BatchEncoder)| {
+        let payload = batch_on(key.lane, epoch, batch_seq, |encoder| build(encoder));
+        handle_batch(&registry, &config, None, key, &payload)
+    };
+
+    run(a0, 1, 0, &|encoder| {
+        encoder.push_open_slot(id, 0, ANCHOR, 1).unwrap();
+    });
+    run(a1, 1, 0, &|encoder| {
+        encoder.push_open_slot(id, 0, ANCHOR, 2).unwrap();
+    });
+    // Ahead of sequence (the next is 1), so each record is held and charged.
+    let outcome = run(a0, 1, 1, &|encoder| {
+        encoder.push_data(id, 2, &big(1)).unwrap();
+    });
+    assert!(outcome.replies.is_empty(), "lane 0's hold fits the budget");
+    let outcome = run(a1, 1, 1, &|encoder| {
+        encoder.push_data(id, 2, &big(2)).unwrap();
+    });
+    assert_eq!(
+        outcome.replies,
+        vec![ReplyRecord::CloseSlot {
+            slot: id,
+            reason: CloseReason::ProtocolError
+        }],
+        "lane 1's hold must be refused: with lane 0's it would pass the peer's budget"
+    );
+    let held = registry.peer_bytes_used(a0.peer);
+    assert!(
+        (150..=config.peer_byte_budget).contains(&held),
+        "lane 0's hold alone is charged to the peer: {held}"
+    );
+
+    // A new epoch on lane 0 retires its slot and gives its bytes back.
+    let outcome = run(a0, 2, 0, &|_| {});
+    assert_eq!(outcome.closed, 1);
+    assert_eq!(registry.peer_bytes_used(a0.peer), 0);
+    run(a1, 1, 2, &|encoder| {
+        encoder.push_open_slot(slot(1, 0), 0, ANCHOR, 3).unwrap();
+    });
+    let outcome = run(a1, 1, 3, &|encoder| {
+        encoder.push_data(slot(1, 0), 2, &big(3)).unwrap();
+    });
+    assert!(
+        outcome.replies.is_empty(),
+        "a retired epoch's holds must go back to the shared budget"
     );
 }

@@ -330,6 +330,21 @@ impl VeloBackend {
         Ok(transport.value().lanes(target))
     }
 
+    /// The most lanes any installed transport keeps, for a choice made before
+    /// the peer is known.
+    ///
+    /// Asks each transport about this node's own instance, because there is
+    /// no peer to name. That is right only while `lanes()` ignores its target,
+    /// which every in-tree transport does today; one that answered per peer
+    /// would need a peer here.
+    pub(crate) fn max_lanes(&self) -> std::num::NonZeroU16 {
+        self.transports
+            .values()
+            .map(|transport| transport.lanes(self.instance_id))
+            .max()
+            .unwrap_or(std::num::NonZeroU16::MIN)
+    }
+
     /// Send a message to a registered peer on one of its primary transport's
     /// lanes.
     ///

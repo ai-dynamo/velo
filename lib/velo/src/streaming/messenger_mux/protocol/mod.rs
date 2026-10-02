@@ -11,7 +11,10 @@
 //! [16 B batch header][record_count × record]
 //!
 //! batch header:
-//!   [u8 mux_version = 1][u8 flags][u16 record_count][u64 peer_epoch][u32 batch_seq]
+//!   [u8 mux_version = 2][u8 flags][u16 record_count][u64 peer_epoch][u32 batch_seq]
+//!
+//! flags:
+//!   low 4 bits: the mux lane the batch was sent on; high 4 bits: reserved, 0
 //!
 //! record:
 //!   [u8 record_type][u32 slot][u32 frame_seq][u32 len][len bytes body]
@@ -31,6 +34,8 @@ use std::fmt;
 use std::iter::FusedIterator;
 use std::ops::Range;
 
+use super::lane::{LaneIndex, MAX_LANES};
+
 /// Mux wire version carried in every batch header.
 ///
 /// Bumped only for a change that an older peer cannot skip past. Negotiation
@@ -40,6 +45,15 @@ pub(crate) const MUX_VERSION: u8 = 2;
 
 /// Encoded size of a batch header.
 pub(crate) const BATCH_HEADER_LEN: usize = 16;
+
+/// The bits of the header's flags byte that carry the lane.
+///
+/// Four bits hold every lane below `MAX_LANES`. The high four stay reserved,
+/// so a future flag there must not read as a different lane: the lane is
+/// always read through this mask.
+pub(crate) const LANE_FLAGS: u8 = 0x0F;
+
+const _: () = assert!(MAX_LANES <= LANE_FLAGS as u16 + 1);
 
 /// Encoded size of a record header, body excluded.
 ///
@@ -100,8 +114,11 @@ fn read_u64(src: &[u8], at: usize) -> Option<u64> {
 pub(crate) struct BatchHeader {
     /// Wire version; [`MUX_VERSION`] for anything this build produces.
     pub(crate) mux_version: u8,
-    /// Reserved for future per-batch bits. Senders write `0`; receivers ignore
-    /// unknown bits rather than failing the peer.
+    /// The lane in the low four bits ([`LANE_FLAGS`]); the rest reserved.
+    ///
+    /// A lane-0 batch writes `0`, the byte every sender wrote before lanes, and
+    /// a receiver that predates lanes ignores the whole byte. A receiver with
+    /// lanes checks the lane against the handler the batch arrived on.
     pub(crate) flags: u8,
     /// Records that follow. Written by [`BatchEncoder::finish`], not at open.
     pub(crate) record_count: u16,
@@ -112,15 +129,21 @@ pub(crate) struct BatchHeader {
 }
 
 impl BatchHeader {
-    /// A header for the current wire version with no flags and no records yet.
-    pub(crate) const fn new(peer_epoch: u64, batch_seq: u32) -> Self {
+    /// A header for the current wire version, on `lane`, with no records yet.
+    pub(crate) const fn new(peer_epoch: u64, batch_seq: u32, lane: LaneIndex) -> Self {
         Self {
             mux_version: MUX_VERSION,
-            flags: 0,
+            // Below `MAX_LANES`, so it fits in `LANE_FLAGS` (asserted above).
+            flags: lane.get() as u8,
             record_count: 0,
             peer_epoch,
             batch_seq,
         }
+    }
+
+    /// The lane the sender stamped, read through [`LANE_FLAGS`].
+    pub(crate) const fn lane(&self) -> u16 {
+        (self.flags & LANE_FLAGS) as u16
     }
 
     /// Whether this build can interpret the records behind this header.
@@ -532,18 +555,23 @@ impl BatchEncoder {
         })
     }
 
-    /// Opens a batch in a fresh buffer.
-    pub(crate) fn new(peer_epoch: u64, batch_seq: u32) -> Self {
-        Self::with_buffer(BytesMut::new(), peer_epoch, batch_seq)
+    /// Opens a batch on `lane` in a fresh buffer.
+    pub(crate) fn new(peer_epoch: u64, batch_seq: u32, lane: LaneIndex) -> Self {
+        Self::with_buffer(BytesMut::new(), peer_epoch, batch_seq, lane)
     }
 
     /// Opens a batch in a caller-supplied buffer, clearing it first.
     ///
     /// The batcher hands back its staging buffer this way so a steady-state
     /// flush allocates nothing.
-    pub(crate) fn with_buffer(mut buf: BytesMut, peer_epoch: u64, batch_seq: u32) -> Self {
+    pub(crate) fn with_buffer(
+        mut buf: BytesMut,
+        peer_epoch: u64,
+        batch_seq: u32,
+        lane: LaneIndex,
+    ) -> Self {
         buf.clear();
-        BatchHeader::new(peer_epoch, batch_seq).encode_into(&mut buf);
+        BatchHeader::new(peer_epoch, batch_seq, lane).encode_into(&mut buf);
         Self {
             buf,
             record_count: 0,

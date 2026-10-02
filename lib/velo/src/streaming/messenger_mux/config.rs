@@ -219,8 +219,16 @@ pub struct MuxConfig {
     /// [`reply_linger`](Self::reply_linger), where `Duration::ZERO` is a
     /// valid "off".
     pub credit_sweep_interval: Duration,
-    /// Shortest gap between two doorbell-driven reconciles of the *same* peer —
-    /// so a ceiling of `1 / drain_visit_floor` visits per second per peer.
+    /// Shortest gap between two doorbell-driven reconciles of the *same*
+    /// (peer, lane) — so a ceiling of `1 / drain_visit_floor` visits per second
+    /// per (peer, lane).
+    ///
+    /// Per lane, not per peer, because each lane has its own slot table, dirty
+    /// set and wake, and a visit walks and locks one lane's table only. The
+    /// contention the floor bounds is one table's mutex, so the bound is per
+    /// table too. A peer with N lanes can therefore take up to
+    /// `N / drain_visit_floor` visits per second in total, spread over N
+    /// mutexes.
     ///
     /// Coalescing alone does not bound this. A visit takes the peer's wake down
     /// before it walks, because a drain landing mid-walk must be able to post a
@@ -255,7 +263,7 @@ pub struct MuxConfig {
     ///
     /// Defaults to 2 ms, which is the interval the sweep itself ran at while it
     /// was the only way credit came back. That cadence was enough to keep every
-    /// peer's credit moving then, so it is enough as a per-peer floor now, and
+    /// peer's credit moving then, so it is enough as a per-lane floor now, and
     /// it is a shipped number rather than a fresh guess. `Duration::ZERO` turns
     /// the floor off: every wake is walked, which is the behaviour this field
     /// was added to bound. At the other end it is clamped to an hour, past which

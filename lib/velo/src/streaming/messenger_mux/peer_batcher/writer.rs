@@ -16,13 +16,12 @@
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
-use velo_ext::{InstanceId, WorkerId};
+use velo_ext::InstanceId;
 
-use super::super::MuxConfig;
 use super::super::protocol::{BATCH_HEADER_LEN, BatchEncoder, EncodeError, MAX_RECORDS_PER_BATCH};
+use super::super::{MuxConfig, PeerLane};
 use crate::messenger::{FireResult, Messenger};
 use crate::observability::MuxMetricsHandle;
-use crate::streaming::messenger_mux::STREAM_BATCH_HANDLER;
 use crate::transports::tcp::framing::COALESCE_THRESHOLD;
 
 /// Smallest batch a clamp may produce: the header plus one empty record.
@@ -64,10 +63,13 @@ pub(super) const fn batch_cap(configured: usize, eager: usize) -> usize {
 #[derive(Debug)]
 pub(super) struct FlushFailed(pub(super) anyhow::Error);
 
-/// Staging and dispatch for one peer's batches.
+/// Staging and dispatch for one (peer, lane)'s batches.
 pub(super) struct BatchWriter {
     messenger: Arc<Messenger>,
-    peer: WorkerId,
+    /// Where batches go: to `key.peer`, through the lane's own batch handler,
+    /// on the transport lane of the same index. One handler on one ordered
+    /// connection is what keeps the lane's batches in order.
+    key: PeerLane,
     peer_instance: Option<InstanceId>,
     config: MuxConfig,
     metrics: Option<MuxMetricsHandle>,
@@ -81,14 +83,14 @@ pub(super) struct BatchWriter {
 impl BatchWriter {
     pub(super) fn new(
         messenger: Arc<Messenger>,
-        peer: WorkerId,
+        key: PeerLane,
         config: MuxConfig,
         metrics: Option<MuxMetricsHandle>,
         epoch: u64,
     ) -> Self {
         Self {
             messenger,
-            peer,
+            key,
             peer_instance: None,
             config,
             metrics,
@@ -135,7 +137,12 @@ impl BatchWriter {
             self.cap = self.compute_cap();
             let batch_seq = self.take_batch_seq();
             let buffer = std::mem::take(&mut self.buffer);
-            self.encoder = Some(BatchEncoder::with_buffer(buffer, self.epoch, batch_seq));
+            self.encoder = Some(BatchEncoder::with_buffer(
+                buffer,
+                self.epoch,
+                batch_seq,
+                self.key.lane,
+            ));
         }
         self.cap
     }
@@ -164,7 +171,7 @@ impl BatchWriter {
     fn compute_cap(&mut self) -> usize {
         let eager = self.peer_instance().map_or(COALESCE_THRESHOLD, |instance| {
             self.messenger
-                .effective_eager_payload(instance, STREAM_BATCH_HANDLER, None)
+                .effective_eager_payload(instance, self.key.lane.handler_name(), None)
         });
         batch_cap(self.config.max_batch_bytes, eager)
     }
@@ -174,7 +181,7 @@ impl BatchWriter {
             self.peer_instance = self
                 .messenger
                 .backend()
-                .try_translate_worker_id(self.peer)
+                .try_translate_worker_id(self.key.peer)
                 .ok();
         }
         self.peer_instance
@@ -235,9 +242,14 @@ impl BatchWriter {
     ) -> Option<FireResult> {
         let batch_seq = self.take_batch_seq();
         let mut encoder = if self.encoder.is_none() {
-            BatchEncoder::with_buffer(std::mem::take(&mut self.buffer), self.epoch, batch_seq)
+            BatchEncoder::with_buffer(
+                std::mem::take(&mut self.buffer),
+                self.epoch,
+                batch_seq,
+                self.key.lane,
+            )
         } else {
-            BatchEncoder::new(self.epoch, batch_seq)
+            BatchEncoder::new(self.epoch, batch_seq, self.key.lane)
         };
         if let Err(error) = write(&mut encoder) {
             tracing::error!(%error, "messenger mux: dropping unencodable singleton");
@@ -254,12 +266,21 @@ impl BatchWriter {
         let payload = finished.split().freeze();
         self.buffer = finished;
 
-        match self.messenger.am_send_streaming(STREAM_BATCH_HANDLER) {
+        match self
+            .messenger
+            .am_send_streaming(self.key.lane.handler_name())
+        {
             Ok(builder) => {
                 if let Some(metrics) = &self.metrics {
                     metrics.batch_sent(by_type);
                 }
-                Some(builder.raw_payload(payload).worker(self.peer).send())
+                Some(
+                    builder
+                        .raw_payload(payload)
+                        .worker(self.key.peer)
+                        .lane(self.key.lane.get())
+                        .send(),
+                )
             }
             Err(error) => {
                 tracing::error!(%error, "messenger mux: could not build a singleton send");
@@ -284,9 +305,10 @@ impl BatchWriter {
 
     async fn dispatch(&self, payload: Bytes) -> anyhow::Result<()> {
         self.messenger
-            .am_send_streaming(STREAM_BATCH_HANDLER)?
+            .am_send_streaming(self.key.lane.handler_name())?
             .raw_payload(payload)
-            .worker(self.peer)
+            .worker(self.key.peer)
+            .lane(self.key.lane.get())
             .send()
             .await
     }

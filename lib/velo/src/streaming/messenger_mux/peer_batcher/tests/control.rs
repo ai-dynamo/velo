@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 use super::super::test_hooks::TestHooks;
 use super::super::*;
 use super::support::*;
+use crate::streaming::messenger_mux::LaneIndex;
 use crate::streaming::messenger_mux::protocol::RecordType;
 use crate::streaming::sender::cached_finalized;
 
@@ -250,8 +251,20 @@ async fn a_singleton_failing_after_its_slot_closed_does_not_fail_the_epoch() {
         .send(cached_finalized().clone())
         .expect("queue terminal");
     eventually(|| inlet.is_disconnected()).await;
-    // Drain the terminal's batch so the next assertions read a quiet wire.
-    while harness.try_next_batch().is_some() {}
+    // Wait for the terminal's own batch, so the reopen below reads its own
+    // `OpenSlot`. The inlet reads as closed as soon as the batcher closes the
+    // slot, which is before the batcher flushes the batch, and the batch then
+    // has to cross the loopback messenger pair. A non-blocking drain here
+    // lost that race under a loaded CI runner, and
+    // the late batch (data and close, two records) failed the reopen's
+    // "OpenSlot is flushed on its own" check.
+    while !harness
+        .next_batch()
+        .await
+        .records
+        .iter()
+        .any(|r| r.kind == RecordType::CloseSlot && r.slot == stale)
+    {}
 
     // The index comes back under a new generation.
     let (reopened_inlet, reopened) = harness.open(1, 2).await;
@@ -413,13 +426,13 @@ async fn cancelling_the_transport_closes_every_producer_channel() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cancelled_batcher_is_unregistered_before_it_refuses_a_reply() {
     let (sender, capture, _batches) = capture_pair().await;
-    let peer = capture.instance_id().worker_id();
+    let key = PeerLane::new(capture.instance_id().worker_id(), LaneIndex::ZERO);
 
     for attempt in 0..64 {
         let cancel = CancellationToken::new();
         let batchers: Arc<BatcherMap> = Arc::new(DashMap::new());
         let handle = spawn(
-            peer,
+            key,
             BatcherContext {
                 messenger: Arc::clone(&sender),
                 config: MuxConfig::default(),
@@ -430,7 +443,7 @@ async fn a_cancelled_batcher_is_unregistered_before_it_refuses_a_reply() {
                 hooks: None,
             },
         );
-        batchers.insert(peer, Arc::clone(&handle));
+        batchers.insert(key, Arc::clone(&handle));
 
         let spinning = Arc::new(AtomicBool::new(false));
         let writer = {
@@ -453,7 +466,7 @@ async fn a_cancelled_batcher_is_unregistered_before_it_refuses_a_reply() {
                 }
                 // Refused. A re-resolve now must not hand this batcher back.
                 batchers
-                    .get(&peer)
+                    .get(&key)
                     .is_some_and(|entry| Arc::ptr_eq(entry.value(), &handle))
             })
         };

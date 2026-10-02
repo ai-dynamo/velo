@@ -23,8 +23,8 @@ use super::super::writer::BatchWriter;
 use super::support::{OwnedBatch, RECV_TIMEOUT, capture_pair};
 use crate::observability::VeloMetrics;
 use crate::observability::test_helpers::MetricSnapshot;
-use crate::streaming::messenger_mux::MuxConfig;
 use crate::streaming::messenger_mux::protocol::{EncodeError, RecordType, SlotId};
+use crate::streaming::messenger_mux::{LaneIndex, MuxConfig, PeerLane};
 
 /// The epoch every batch here is stamped with. Any value; it only has to be
 /// stable, so a batch from another test cannot be mistaken for one of these.
@@ -50,12 +50,12 @@ const OPENS: u32 = 1000;
 #[tokio::test(flavor = "multi_thread")]
 async fn open_slot_batch_seq_stays_contiguous_across_failures() {
     let (sender, capture, batches) = capture_pair().await;
-    let peer = capture.instance_id().worker_id();
+    let key = PeerLane::new(capture.instance_id().worker_id(), LaneIndex::ZERO);
     let registry = prometheus::Registry::new();
     let metrics = VeloMetrics::register(&registry).expect("register metrics");
     let mut writer = BatchWriter::new(
         Arc::clone(&sender),
-        peer,
+        key,
         MuxConfig::default(),
         Some(metrics.bind_mux()),
         EPOCH,

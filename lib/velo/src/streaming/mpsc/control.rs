@@ -49,6 +49,9 @@ pub struct MpscAnchorAttachRequest {
     /// does not.
     #[serde(default)]
     pub supported_transport_keys: Vec<velo_ext::TransportKey>,
+    /// See [`crate::streaming::control::AnchorAttachRequest::lane_key`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane_key: Option<u64>,
 }
 
 /// Response from the MPSC attach handler.
@@ -73,6 +76,13 @@ pub enum MpscAnchorAttachResponse {
         /// Mux per-slot byte cap; zero means *use the default*.
         #[serde(default)]
         slot_byte_budget: u32,
+        /// The mux lane of this sender's slot; see
+        /// [`crate::streaming::control::AnchorAttachResponse::Ok`].
+        #[serde(
+            default,
+            skip_serializing_if = "crate::streaming::control::is_zero_lane"
+        )]
+        lane: u16,
     },
     Err {
         reason: String,
@@ -291,6 +301,9 @@ pub fn create_mpsc_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::
             let manager = manager.clone();
             async move {
                 let started = Instant::now();
+                // The worker whose batches will carry this stream: the lane is placed
+                // against its load. From the envelope, not from the request body.
+                let sender = ctx.sender_worker_id();
                 let req = ctx.input;
 
                 // Defence-in-depth: reject SPSC handles at the MPSC attach
@@ -361,29 +374,40 @@ pub fn create_mpsc_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::
                     + 1;
                 // Same intersection the SPSC handler makes; MPSC negotiates in
                 // the same version so there is no half-migrated state.
-                let selection = manager.select_streaming_transport(&req.supported_transport_keys);
-                let transport_rx =
-                    match selection.transport.bind(local_id, routing_session_id).await {
-                        Ok(rx) => rx,
-                        Err(e) => {
-                            manager.record_streaming_operation(
-                                StreamingOp::Attach,
-                                HandlerOutcome::Error,
-                                "unknown",
-                                started,
-                            );
-                            return Ok(MpscAnchorAttachResponse::Err {
-                                reason: format!("transport error: {}", e),
-                            });
-                        }
-                    };
-                let streaming_transport_key = selection.key;
+                let selection = manager.select_streaming_transport(
+                    &req.supported_transport_keys,
+                    sender,
+                    req.lane_key,
+                );
+                let (transport_rx, terms) = match selection.bind(local_id, routing_session_id).await
+                {
+                    Ok(bound) => bound,
+                    Err(e) => {
+                        manager.record_streaming_operation(
+                            StreamingOp::Attach,
+                            HandlerOutcome::Error,
+                            "unknown",
+                            started,
+                        );
+                        return Ok(MpscAnchorAttachResponse::Err {
+                            reason: format!("transport error: {}", e),
+                        });
+                    }
+                };
+                let streaming_transport_key = terms.key;
 
                 // Step 3: atomic slot insertion.
                 use dashmap::mapref::entry::Entry;
                 let (frame_tx, pump_cancel, sender_id) = match manager.mpsc_registry.entry(local_id)
                 {
+                    // The two arms that fail after the bind give it back at
+                    // once rather than to the accept window.
                     Entry::Vacant(_) => {
+                        manager.release_unused_bind(
+                            &streaming_transport_key,
+                            local_id,
+                            routing_session_id,
+                        );
                         manager.record_streaming_operation(
                             StreamingOp::Attach,
                             HandlerOutcome::Error,
@@ -399,6 +423,11 @@ pub fn create_mpsc_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::
                         if let Some(limit) = entry.max_senders
                             && entry.senders.len() >= limit
                         {
+                            manager.release_unused_bind(
+                                &streaming_transport_key,
+                                local_id,
+                                routing_session_id,
+                            );
                             manager.record_streaming_operation(
                                 StreamingOp::Attach,
                                 HandlerOutcome::Error,
@@ -469,8 +498,9 @@ pub fn create_mpsc_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::
                     heartbeat_interval_ms: heartbeat_interval.as_millis() as u64,
                     sender_id,
                     routing_session_id,
-                    initial_credit: selection.initial_credit,
-                    slot_byte_budget: selection.slot_byte_budget,
+                    initial_credit: terms.initial_credit,
+                    slot_byte_budget: terms.slot_byte_budget,
+                    lane: terms.lane,
                 })
             }
         },
@@ -1028,6 +1058,7 @@ mod tests {
             session_id: 3,
             stream_cancel_handle: StreamCancelHandle::pack(WorkerId::from_u64(4), 5),
             supported_transport_keys: vec![TransportKey::new("messenger-mux-v2")],
+            lane_key: None,
         };
         let decoded: MpscAnchorAttachRequest =
             rmp_serde::from_slice(&rmp_serde::to_vec(&req).expect("encode")).expect("decode");
@@ -1047,6 +1078,7 @@ mod tests {
             routing_session_id: 8,
             initial_credit: 256,
             slot_byte_budget: 1024,
+            lane: 0,
         };
         let decoded: MpscAnchorAttachResponse =
             rmp_serde::from_slice(&rmp_serde::to_vec(&resp).expect("encode")).expect("decode");

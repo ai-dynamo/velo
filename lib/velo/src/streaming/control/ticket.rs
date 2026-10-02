@@ -14,7 +14,7 @@ use std::time::Duration;
 
 /// The terms a stream opens on, carried to the sender instead of asked for.
 ///
-/// Exactly the five fields of [`super::AnchorAttachResponse::Ok`], because it
+/// Exactly the six fields of [`super::AnchorAttachResponse::Ok`], because it
 /// is the same answer arriving by a different road: the receiver decides them
 /// all without needing anything from the sender, so nothing obliges it to
 /// wait to be asked. An application that already sends the worker a request
@@ -30,7 +30,7 @@ use std::time::Duration;
 /// nothing. [`super::AnchorAttachRequest`] and [`super::AnchorAttachResponse`]
 /// gain and lose no field for any of this. `#[non_exhaustive]` is what keeps
 /// the divergence free: fields stay `pub` for reading, but a type this
-/// permissive would otherwise make adding a sixth field a breaking change for
+/// permissive would otherwise make adding a field a breaking change for
 /// any out-of-tree struct literal, exactly as it would be on the response.
 /// The one way a ticket is meant to be built off this node is by decoding one
 /// off the wire (`Deserialize` is generated inside this crate, so
@@ -87,6 +87,18 @@ pub struct StreamOpenTicket {
     ///
     /// No `#[serde(default)]`, for the same reason as `routing_session_id`.
     pub slot_byte_budget: u32,
+    /// The mux lane the receiver put the slot on, as
+    /// [`super::AnchorAttachResponse::Ok::lane`]. The sender clamps it to the
+    /// lanes it keeps to the receiver.
+    ///
+    /// Last, defaulted, and left out when zero, so a lane-0 ticket encodes to
+    /// the same bytes as a ticket from before lanes, and a ticket without it
+    /// decodes as lane 0 -- in JSON and in positional MessagePack alike, where
+    /// only a trailing element may be missing. A non-zero lane adds an
+    /// element, which a worker from before lanes refuses under positional
+    /// MessagePack, so workers must be upgraded before the node that mints.
+    #[serde(default, skip_serializing_if = "super::is_zero_lane")]
+    pub lane: u16,
 }
 
 impl StreamOpenTicket {
@@ -96,6 +108,7 @@ impl StreamOpenTicket {
         heartbeat_interval: Duration,
         routing_session_id: u64,
         limits: crate::streaming::messenger_mux::flow_control::NegotiatedLimits,
+        lane: crate::streaming::messenger_mux::LaneIndex,
     ) -> Self {
         Self {
             streaming_transport_key,
@@ -103,6 +116,7 @@ impl StreamOpenTicket {
             routing_session_id,
             initial_credit: limits.initial_credit(),
             slot_byte_budget: limits.slot_byte_budget(),
+            lane: lane.get(),
         }
     }
 }

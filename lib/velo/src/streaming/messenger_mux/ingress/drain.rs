@@ -9,8 +9,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use velo_ext::WorkerId;
-
+use super::super::PeerLane;
 use super::super::protocol::SlotId;
 use super::dirty::DirtySlots;
 
@@ -70,12 +69,15 @@ pub(crate) struct DrainSignal {
     /// the way a receiver does; this is how it learns in time to reap an
     /// unclaimed bind before its consumer notices anything.
     closed: tokio_util::sync::CancellationToken,
-    wake: flume::Sender<WorkerId>,
+    wake: flume::Sender<PeerLane>,
 }
 
 /// What an `OpenSlot` tells a bind's [`DrainSignal`] when it claims it.
 struct SlotClaim {
-    peer: WorkerId,
+    /// The (peer, lane) the `OpenSlot` arrived on. A stop, cancel or close of
+    /// this slot goes back through that lane's batcher and no other: slot ids
+    /// are unique only within one lane.
+    key: PeerLane,
     /// The peer's "a credit-return visit is already queued" flag.
     pending: Arc<AtomicBool>,
     /// The slot this bind became, whose index names it in the dirty set.
@@ -85,7 +87,7 @@ struct SlotClaim {
 }
 
 impl DrainSignal {
-    pub(crate) fn new(wake: flume::Sender<WorkerId>) -> Self {
+    pub(crate) fn new(wake: flume::Sender<PeerLane>) -> Self {
         Self {
             claim: OnceLock::new(),
             lifecycle: std::sync::Mutex::new(0),
@@ -98,19 +100,19 @@ impl DrainSignal {
         }
     }
 
-    /// Name the peer this bind turned out to belong to, its slot index, that
-    /// peer's dirty-slot set and its pending-wake flag. Called once, when an
-    /// `OpenSlot` claims the bind.
+    /// Name the (peer, lane) this bind turned out to belong to, its slot
+    /// index, that table's dirty-slot set and its pending-wake flag. Called
+    /// once, when an `OpenSlot` claims the bind.
     pub(crate) fn claimed_by(
         &self,
-        peer: WorkerId,
+        key: PeerLane,
         slot: SlotId,
         pending: Arc<AtomicBool>,
         dirty: Arc<DirtySlots>,
     ) -> u8 {
         let lifecycle = self.lifecycle.lock().unwrap();
         let _ = self.claim.set(SlotClaim {
-            peer,
+            key,
             slot,
             pending,
             dirty,
@@ -118,7 +120,7 @@ impl DrainSignal {
         *lifecycle
     }
 
-    pub(crate) fn request_stop(&self) -> Option<(WorkerId, SlotId)> {
+    pub(crate) fn request_stop(&self) -> Option<(PeerLane, SlotId)> {
         let mut state = self.lifecycle.lock().unwrap();
         if *state != 0 {
             return None;
@@ -127,17 +129,17 @@ impl DrainSignal {
         self.claimed()
     }
 
-    pub(crate) fn cancel(&self) -> Option<(WorkerId, SlotId)> {
+    pub(crate) fn cancel(&self) -> Option<(PeerLane, SlotId)> {
         *self.lifecycle.lock().unwrap() = 2;
         self.claimed()
     }
 
-    /// The peer and slot that claimed this bind, once one has.
+    /// The (peer, lane) and slot that claimed this bind, once one has.
     ///
     /// `None` is "no `OpenSlot` has arrived", which is what tells a pre-bind's
     /// owner that giving up means releasing a bind rather than closing a slot.
-    pub(crate) fn claimed(&self) -> Option<(WorkerId, SlotId)> {
-        self.claim.get().map(|claim| (claim.peer, claim.slot))
+    pub(crate) fn claimed(&self) -> Option<(PeerLane, SlotId)> {
+        self.claim.get().map(|claim| (claim.key, claim.slot))
     }
 
     /// One record left the buffer: count it, name the slot, ring the doorbell.
@@ -199,7 +201,7 @@ impl DrainSignal {
         if claim.pending.swap(true, Ordering::AcqRel) {
             return; // a wake for this peer is already outstanding
         }
-        if self.wake.try_send(claim.peer).is_err() {
+        if self.wake.try_send(claim.key).is_err() {
             // The sweep task is gone; nobody will take the flag down.
             claim.pending.store(false, Ordering::Release);
         }

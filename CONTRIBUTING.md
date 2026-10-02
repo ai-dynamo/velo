@@ -90,10 +90,10 @@ pre-commit run --all-files
 When changing `lib/velo-ext/`:
 
 1. **New trait methods MUST land with default implementations.** Adding a bare method is a breaking change for every external impl — and a major-version bump while we are pre-1.0 means a coordinated `velo` release. A defaulted addition is the compatible case and takes the patch position (`0.5.0` → `0.5.1`): cargo reads `0.y` as the breaking position while we are pre-1.0, so `0.y.z` is where additions go, and `cargo semver-checks` accepts it on that basis.
-2. **Signature, bound, or parameter changes to existing trait methods are breaking** (minor bump pre-1.0). They require a `velo` bump in the same PR so the runtime's exact `=` pin tracks.
+2. **Signature, bound, or parameter changes to existing trait methods are breaking** (minor bump pre-1.0). `velo` must then carry a bump over its latest published version too, and the runtime's exact `=` pin must track `velo-ext`.
 3. **Removing a trait, type, or public item is breaking** and requires a major bump.
 4. **`velo`'s dep on `velo-ext` is an exact `=` pin in `[workspace.dependencies]`.** Bumping `velo-ext` without bumping the pin will break the workspace lockfile.
-5. **The CI `semver:` job is the enforcement gate** — it runs `cargo semver-checks` per changed crate against `origin/main` and fails the build if a breaking change is not paired with a sufficient version bump. Use the `semver:skip` PR label only with explicit reviewer agreement.
+5. **The CI `semver:` job is the enforcement gate** — it runs `cargo semver-checks` for each changed crate against that crate's latest version on crates.io, and fails the build if a breaking change is not covered by the version bump over that published version. A bump is measured against the latest published version, so several breaking PRs between two publishes share one bump. Use the `semver:skip` PR label only with explicit reviewer agreement.
 
 Any other workspace crate is marked `publish = false` and is internal to this repository — `crates/ucx-rs` is the one documented exception, versioned independently as a leaf FFI crate (see `CLAUDE.md`, *Workspace layout*). External consumers can only depend on `velo` and `velo-ext`, so internal API changes do not require version coordination.
 

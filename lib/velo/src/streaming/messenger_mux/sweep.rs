@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The credit-return and eviction sweep task, and the per-peer floor on the
-//! doorbell-driven visits it answers.
+//! The credit-return and eviction sweep task, and the per-(peer, lane) floor on
+//! the doorbell-driven visits it answers.
 //!
 //! Split out of the transport module because it reaches [`MuxCore`] through
 //! two methods only, `sweep` and `visit_drained_peer`. Everything else here is
@@ -13,9 +13,7 @@ use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
-use velo_ext::WorkerId;
-
-use super::MuxCore;
+use super::{MuxCore, PeerLane};
 
 /// Ceiling on an operator's [`MuxConfig::drain_visit_floor`](super::MuxConfig::drain_visit_floor).
 ///
@@ -26,18 +24,20 @@ use super::MuxCore;
 /// is a poor way to answer a misconfiguration.
 const MAX_DRAIN_VISIT_FLOOR: Duration = Duration::from_secs(3600);
 
-/// One peer's doorbell state.
+/// One (peer, lane)'s doorbell state.
 struct PeerVisits {
-    /// When the doorbell last walked this peer.
+    /// When the doorbell last walked this (peer, lane).
     last: tokio::time::Instant,
     /// Whether a deferred walk for it is already queued.
     ///
-    /// Exactly one entry per peer is ever in the queue, and this is what says
+    /// Exactly one entry per (peer, lane) is ever in the queue, and this is what says
     /// so. See [`DrainVisits`] for what a second one costs.
     queued: bool,
 }
 
-/// The per-peer floor on doorbell-driven visits, and the queue it defers into.
+/// The per-(peer, lane) floor on doorbell-driven visits, and the queue it
+/// defers into. "Peer" below means one (peer, lane): each lane has its own
+/// table, dirty set and wake, so each is floored on its own.
 ///
 /// Coalescing alone leaves the visit rate a property of the traffic: a visit
 /// takes the peer's wake down before it walks, so the next record drained arms
@@ -61,9 +61,10 @@ struct PeerVisits {
 /// saw 59 floor-spaced walks continue after the traffic had provably stopped.
 pub(super) struct DrainVisits {
     floor: Duration,
-    peers: HashMap<WorkerId, PeerVisits>,
-    /// Deferred walks, ordered by when they come due, at most one per peer.
-    deferred: BinaryHeap<Reverse<(tokio::time::Instant, WorkerId)>>,
+    /// Keyed by (peer, lane): each lane has its own table, dirty set and wake.
+    peers: HashMap<PeerLane, PeerVisits>,
+    /// Deferred walks, ordered by when they come due, at most one per key.
+    deferred: BinaryHeap<Reverse<(tokio::time::Instant, PeerLane)>>,
 }
 
 impl DrainVisits {
@@ -99,7 +100,7 @@ impl DrainVisits {
     /// returns has already been counted as visited*, so two wakes for one peer
     /// cannot both be admitted, and the interval the floor measures is
     /// walk-start to walk-start — which is what the rate it bounds means.
-    pub(super) fn admit(&mut self, peer: WorkerId, now: tokio::time::Instant) -> Option<WorkerId> {
+    pub(super) fn admit(&mut self, peer: PeerLane, now: tokio::time::Instant) -> Option<PeerLane> {
         let Some(state) = self.peers.get_mut(&peer) else {
             self.peers.insert(
                 peer,
@@ -127,7 +128,7 @@ impl DrainVisits {
     }
 
     /// Peers whose deferred walk has come due.
-    pub(super) fn due(&mut self, now: tokio::time::Instant) -> Vec<WorkerId> {
+    pub(super) fn due(&mut self, now: tokio::time::Instant) -> Vec<PeerLane> {
         let mut ready = Vec::new();
         while self.next_due().is_some_and(|due| due <= now) {
             let Reverse((_, peer)) = self.deferred.pop().expect("peeked a moment ago");
@@ -208,7 +209,7 @@ pub(super) fn spawn_sweep(core: &Arc<MuxCore>) {
     tokio::spawn(async move {
         enum Wake {
             Tick,
-            Peer(WorkerId),
+            Peer(PeerLane),
             Due,
         }
         // Non-zero by construction: `interval` panics on a zero period, and

@@ -100,6 +100,9 @@ pub struct TcpListener {
     /// [`SHRINK_RESET_CAPACITY`] once it next empties. Bounds long-lived memory
     /// after a single oversized frame.
     shrink_threshold: usize,
+    /// `SO_RCVBUF`/`SO_SNDBUF` for the listening socket, or `None` for the
+    /// kernel's autotuning. See [`size_socket_buffers`].
+    socket_buffers: Option<usize>,
 }
 
 impl TcpListener {
@@ -190,8 +193,8 @@ impl TcpListener {
             // live, so connections that completed their handshake before this
             // point keep kernel-default autotuned buffers (safe). Listeners
             // the transport builds itself are sized before listen() instead —
-            // see `size_listener_buffers`.
-            size_listener_buffers(&std_listener);
+            // see `size_socket_buffers`.
+            size_socket_buffers(&std_listener, self.socket_buffers);
 
             // Set non-blocking for tokio conversion
             std_listener
@@ -210,7 +213,7 @@ impl TcpListener {
                 .set_reuseaddr(true)
                 .context("Failed to set SO_REUSEADDR")?;
             // Before listen(), so every accepted socket inherits the sizes.
-            size_listener_buffers(&socket);
+            size_socket_buffers(&socket, self.socket_buffers);
             socket
                 .bind(self.bind_addr)
                 .context(format!("Failed to bind TCP listener to {}", self.bind_addr))?;
@@ -401,6 +404,7 @@ pub struct TcpListenerBuilder {
     transport_key: Option<String>,
     metrics: Option<std::sync::Arc<dyn velo_ext::TransportObservability>>,
     shrink_threshold: Option<usize>,
+    socket_buffers: Option<usize>,
 }
 
 impl TcpListenerBuilder {
@@ -416,6 +420,7 @@ impl TcpListenerBuilder {
             transport_key: None,
             metrics: None,
             shrink_threshold: None,
+            socket_buffers: Some(DEFAULT_SOCKET_BUFFERS),
         }
     }
 
@@ -495,6 +500,14 @@ impl TcpListenerBuilder {
         self
     }
 
+    /// Socket buffer size for accepted connections, or `None` for the
+    /// kernel's autotuning (default: [`DEFAULT_SOCKET_BUFFERS`]). See
+    /// `TcpTransportBuilder::socket_buffers` for the trade-off.
+    pub fn socket_buffers(mut self, bytes: Option<usize>) -> Self {
+        self.socket_buffers = bytes;
+        self
+    }
+
     /// Build the TcpListener
     pub fn build(self) -> Result<TcpListener> {
         let bind_addr = self
@@ -523,6 +536,7 @@ impl TcpListenerBuilder {
             shrink_threshold: self
                 .shrink_threshold
                 .unwrap_or_else(default_shrink_threshold),
+            socket_buffers: self.socket_buffers,
         })
     }
 }
@@ -534,7 +548,8 @@ pub(super) fn default_shrink_threshold() -> usize {
     parse_shrink_threshold(std::env::var("VELO_TCP_SHRINK_THRESHOLD").ok().as_deref())
 }
 
-/// Size the socket buffers on a *listening* socket, never on an accepted one.
+/// Size a socket's buffers: a listening socket before `listen()`, a dialed
+/// socket before its first write, and never an accepted socket.
 ///
 /// The kernel snapshots the listener's buffer sizes into each child socket
 /// when it creates the child during the TCP handshake, so sizing the listener
@@ -550,16 +565,22 @@ pub(super) fn default_shrink_threshold() -> usize {
 /// the 2 MB request to ~416 KB).
 ///
 /// Best effort: failure to size is logged, never fatal — kernel-default
-/// autotuned buffers are safe.
-pub(super) fn size_listener_buffers<'a>(sock: impl Into<socket2::SockRef<'a>>) {
+/// autotuned buffers are safe. `None` leaves the buffers to the kernel.
+pub(super) fn size_socket_buffers<'a>(sock: impl Into<socket2::SockRef<'a>>, bytes: Option<usize>) {
+    let Some(bytes) = bytes else {
+        return;
+    };
     let sock = sock.into();
-    if let Err(e) = sock.set_recv_buffer_size(2_097_152) {
-        warn!("Failed to set listener recv buffer size: {}", e);
+    if let Err(e) = sock.set_recv_buffer_size(bytes) {
+        warn!("Failed to set socket recv buffer size: {}", e);
     }
-    if let Err(e) = sock.set_send_buffer_size(2_097_152) {
-        warn!("Failed to set listener send buffer size: {}", e);
+    if let Err(e) = sock.set_send_buffer_size(bytes) {
+        warn!("Failed to set socket send buffer size: {}", e);
     }
 }
+
+/// The socket buffer size TCP sets unless a caller chooses otherwise.
+pub const DEFAULT_SOCKET_BUFFERS: usize = 2 * 1024 * 1024;
 
 impl Default for TcpListenerBuilder {
     fn default() -> Self {

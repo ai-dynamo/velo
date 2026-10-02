@@ -39,6 +39,31 @@ pub enum TransportType {
     Quic,
 }
 
+/// TCP socket buffers from `VELO_TCP_SOCKET_BUFFERS`: `auto` for the
+/// kernel's autotuning, a number of bytes for a fixed size, unset for the
+/// transport's default.
+pub fn tcp_socket_buffers_from_env() -> Result<Option<usize>> {
+    match std::env::var("VELO_TCP_SOCKET_BUFFERS") {
+        Err(_) => Ok(Some(velo::transports::tcp::DEFAULT_SOCKET_BUFFERS)),
+        Ok(v) if v == "auto" => Ok(None),
+        Ok(v) => v
+            .parse()
+            .map(Some)
+            .map_err(|_| anyhow::anyhow!("VELO_TCP_SOCKET_BUFFERS={v} is not `auto` or a number")),
+    }
+}
+
+/// TCP lanes from `VELO_TCP_LANES` (count, default 1). The mux places streams
+/// over the lanes; other messenger traffic stays on lane 0.
+pub fn tcp_lanes_from_env() -> Result<u16> {
+    match std::env::var("VELO_TCP_LANES") {
+        Err(_) => Ok(1),
+        Ok(v) => v
+            .parse()
+            .map_err(|_| anyhow::anyhow!("VELO_TCP_LANES={v} is not a number")),
+    }
+}
+
 /// Build a transport for an example, on loopback unless `VELO_BIND_IP` names
 /// another local address (see [`bind_ip`]).
 ///
@@ -51,6 +76,8 @@ pub async fn new_transport(ty: TransportType, tag: &str) -> Result<Arc<dyn Trans
             Ok(Arc::new(
                 velo::transports::tcp::TcpTransportBuilder::new()
                     .from_listener(listener)?
+                    .socket_buffers(tcp_socket_buffers_from_env()?)
+                    .lanes(tcp_lanes_from_env()?)
                     .build()?,
             ))
         }
@@ -131,6 +158,8 @@ pub fn init_tracing() {
 /// A QUIC builder bound to [`bind_ip`], tuned by environment variables so a sweep can
 /// vary the transport without new flags:
 ///
+/// - `VELO_QUIC_LANES` (count). The mux places streams over the lanes; other
+///   messenger traffic stays on lane 0.
 /// - `VELO_QUIC_MAX_MTU` (bytes)
 /// - `VELO_QUIC_STREAM_WINDOW` (bytes)
 /// - `VELO_QUIC_SERVER_ENDPOINTS` (count)
@@ -155,6 +184,9 @@ pub fn quic_from_env() -> Result<velo::transports::quic::QuicTransportBuilder> {
     }
     if let Some(v) = env("VELO_QUIC_SERVER_ENDPOINTS")? {
         builder = builder.server_endpoints(v);
+    }
+    if let Some(v) = env("VELO_QUIC_LANES")? {
+        builder = builder.lanes(v);
     }
     Ok(builder)
 }

@@ -21,7 +21,7 @@ fn encode_batch<F>(peer_epoch: u64, batch_seq: u32, fill: F) -> BytesMut
 where
     F: FnOnce(&mut BatchEncoder),
 {
-    let mut encoder = BatchEncoder::new(peer_epoch, batch_seq);
+    let mut encoder = BatchEncoder::new(peer_epoch, batch_seq, LaneIndex::ZERO);
     fill(&mut encoder);
     encoder.finish()
 }
@@ -333,7 +333,7 @@ fn a_reused_buffer_starts_a_clean_batch() {
         encoder.push_data(slot(), 0, b"stale").expect("push");
     });
 
-    let mut encoder = BatchEncoder::with_buffer(first, 2, 2);
+    let mut encoder = BatchEncoder::with_buffer(first, 2, 2, LaneIndex::ZERO);
     assert!(encoder.is_empty());
     assert_eq!(encoder.encoded_len(), BATCH_HEADER_LEN);
     encoder.push_heartbeat(slot(), 0).expect("push");
@@ -347,7 +347,7 @@ fn a_reused_buffer_starts_a_clean_batch() {
 
 #[test]
 fn encoded_len_tracks_the_record_arithmetic() {
-    let mut encoder = BatchEncoder::new(0, 0);
+    let mut encoder = BatchEncoder::new(0, 0, LaneIndex::ZERO);
     assert_eq!(encoder.encoded_len(), BATCH_HEADER_LEN);
 
     encoder.push_data(slot(), 0, &[0; 40]).expect("push");
@@ -366,7 +366,7 @@ fn encoded_len_tracks_the_record_arithmetic() {
 
 #[test]
 fn the_batch_fills_at_the_record_count_ceiling() {
-    let mut encoder = BatchEncoder::new(0, 0);
+    let mut encoder = BatchEncoder::new(0, 0, LaneIndex::ZERO);
     for seq in 0..u32::from(MAX_RECORDS_PER_BATCH) {
         encoder.push_heartbeat(slot(), seq).expect("push");
     }
@@ -461,7 +461,7 @@ fn decodable_record_type_has_in_range_unique_count_index() {
 #[test]
 fn a_short_header_never_decodes() {
     let mut buf = BytesMut::new();
-    BatchHeader::new(1, 1).encode_into(&mut buf);
+    BatchHeader::new(1, 1, LaneIndex::ZERO).encode_into(&mut buf);
 
     for len in 0..BATCH_HEADER_LEN {
         assert_eq!(
@@ -508,6 +508,30 @@ fn flags_are_carried_verbatim_and_do_not_fail_the_peer() {
     let (header, records) = decode_all(&batch);
     assert_eq!(header.flags, 0b1111_1111);
     assert_eq!(records.len(), 1);
+}
+
+/// The lane rides the low four bits of the flags byte, and lane 0 writes the
+/// zero byte every sender wrote before lanes, so a lane-0 batch is
+/// byte-identical to one from a peer that predates lanes.
+#[test]
+fn the_lane_rides_the_low_bits_of_the_flags_byte() {
+    let lane0 = BatchEncoder::new(9, 4, LaneIndex::ZERO).finish();
+    assert_eq!(lane0[1], 0, "lane 0 must keep the flags byte at zero");
+
+    let lane = LaneIndex::new(MAX_LANES - 1);
+    let batch = BatchEncoder::new(9, 4, lane).finish();
+    let header = BatchHeader::decode(&batch).expect("header decodes");
+    assert_eq!(header.flags, 0x0F);
+    assert_eq!(header.lane(), MAX_LANES - 1);
+    // Everything but the flags byte is as lane 0 wrote it.
+    assert_eq!(batch[..1], lane0[..1]);
+    assert_eq!(batch[2..], lane0[2..]);
+
+    // A future flag in the reserved bits does not read as another lane.
+    let mut flagged = batch.clone();
+    flagged[1] |= 0xF0;
+    let header = BatchHeader::decode(&flagged).expect("header decodes");
+    assert_eq!(header.lane(), MAX_LANES - 1);
 }
 
 #[test]

@@ -32,9 +32,11 @@
 //! `buffered` field is the occupancy it bounds — a `#[cfg(test)]` accessor
 //! reads it back for the tests that pin the bound, so it is not a link here.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use super::protocol::RecordType;
 
-/// Per-peer byte budget across all of that peer's slots.
+/// Per-peer byte budget across all of that peer's slots, on every lane.
 ///
 /// Frame-count credit alone bounds memory at `slots × C × max frame size` — a
 /// meaningless number. Today the kernel socket enforces a real ~1 MiB-per-stream
@@ -175,9 +177,8 @@ impl CreditClass {
     /// a `Data` record can carry one.
     ///
     /// `SlotHeartbeat` is deliberately **not** control. A heartbeat dropped
-    /// under saturation *is* the per-slot saturation signal — the one thing a
-    /// streaming beat still uniquely carries now that the Messenger detects
-    /// process, host and connection death itself. Give it a reserve and the
+    /// under saturation *is* the per-slot saturation signal, which the
+    /// batcher's peer health check cannot see. Give it a reserve and the
     /// stream watchdog's `DETECTION_MULTIPLIER` stops firing on a saturated
     /// slot.
     pub(crate) const fn of(record_type: RecordType, is_terminal: bool) -> Self {
@@ -481,11 +482,11 @@ impl ByteBudgetError {
     }
 }
 
-/// A saturating byte reservation counter.
+/// A saturating byte reservation counter, for one slot's hold.
 ///
-/// One type serves both scopes: per peer at [`DEFAULT_PEER_BYTE_BUDGET`] and
-/// per slot at the negotiated [`NegotiatedLimits::slot_byte_budget`]. Usage
-/// never exceeds the limit by construction, so `available` cannot underflow.
+/// Per slot at the negotiated [`NegotiatedLimits::slot_byte_budget`]. The
+/// per-peer scope is a [`SharedByteBudget`]. Usage never exceeds the limit by
+/// construction, so `available` cannot underflow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ByteBudget {
     limit: u64,
@@ -498,12 +499,6 @@ impl ByteBudget {
         Self { limit, used: 0 }
     }
 
-    /// The per-peer budget across all of that peer's slots.
-    #[cfg(test)]
-    pub(crate) const fn per_peer() -> Self {
-        Self::new(DEFAULT_PEER_BYTE_BUDGET)
-    }
-
     /// The per-slot cap at the negotiated budget.
     #[cfg(test)]
     pub(crate) const fn per_slot(limits: &NegotiatedLimits) -> Self {
@@ -511,6 +506,7 @@ impl ByteBudget {
     }
 
     /// The ceiling.
+    #[cfg(test)]
     pub(crate) const fn limit(&self) -> u64 {
         self.limit
     }
@@ -555,6 +551,101 @@ impl ByteBudget {
     }
 }
 
+/// A byte budget that several slot tables reserve from at once.
+///
+/// One per peer on the receive side, held by every (peer, lane) table of that
+/// peer, so the peer's bound is the configured `peer_byte_budget` whatever lane
+/// count either side keeps and whenever each table was made. A share per table
+/// sized from this node's lane count could not hold that bound: the sender
+/// picks its lane, and a lane count read before discovery knew the peer gave
+/// one table the whole budget and the later ones a share each.
+///
+/// Lock-free, because each table's mutex guards only that table, and two
+/// lanes' handlers reserve at the same time.
+#[derive(Debug)]
+pub(crate) struct SharedByteBudget {
+    limit: u64,
+    used: AtomicU64,
+}
+
+impl SharedByteBudget {
+    /// A budget of `limit` bytes.
+    pub(crate) const fn new(limit: u64) -> Self {
+        Self {
+            limit,
+            used: AtomicU64::new(0),
+        }
+    }
+
+    /// The per-peer budget across all of that peer's slots.
+    #[cfg(test)]
+    pub(crate) const fn per_peer() -> Self {
+        Self::new(DEFAULT_PEER_BYTE_BUDGET)
+    }
+
+    /// The ceiling.
+    #[cfg(test)]
+    pub(crate) const fn limit(&self) -> u64 {
+        self.limit
+    }
+
+    /// Bytes currently reserved.
+    #[cfg(test)]
+    pub(crate) fn used(&self) -> u64 {
+        self.used.load(Ordering::Relaxed)
+    }
+
+    /// Bytes still reservable.
+    #[cfg(test)]
+    pub(crate) fn available(&self) -> u64 {
+        self.limit - self.used()
+    }
+
+    /// Reserves `bytes`, or explains which kind of "no" this is.
+    ///
+    /// Compare-and-swap, not add-then-undo. Between an add and its undo, a
+    /// reservation from another lane would see the overshoot, be refused
+    /// although it fits, and close a healthy slot.
+    pub(crate) fn try_reserve(&self, bytes: usize) -> Result<(), ByteBudgetError> {
+        let requested = bytes as u64;
+        if requested > self.limit {
+            return Err(ByteBudgetError::ExceedsBudget {
+                requested,
+                limit: self.limit,
+            });
+        }
+        self.used
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                (requested <= self.limit - used).then_some(used + requested)
+            })
+            .map(|_| ())
+            .map_err(|used| ByteBudgetError::Exhausted {
+                requested,
+                available: self.limit - used,
+                limit: self.limit,
+            })
+    }
+
+    /// Returns `bytes` to the budget.
+    ///
+    /// Saturating, as [`ByteBudget::release`], so an accounting slip cannot
+    /// take down a node. Here a slip would also free bytes another table
+    /// reserved, so debug builds assert there is none.
+    pub(crate) fn release(&self, bytes: usize) {
+        let released = bytes as u64;
+        let before = self
+            .used
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                Some(used.saturating_sub(released))
+            })
+            .unwrap_or_else(|used| used);
+        debug_assert!(
+            before >= released,
+            "released {released} bytes with only {before} reserved"
+        );
+    }
+}
+
 /// Reserves `bytes` against a slot cap and its peer budget together, rolling
 /// the slot back if the peer budget refuses.
 ///
@@ -562,7 +653,7 @@ impl ByteBudget {
 /// reservation leaks budget for the life of the epoch, which is precisely the
 /// leak the `live_slots` gauge cannot see.
 pub(crate) fn try_reserve_pair(
-    peer: &mut ByteBudget,
+    peer: &SharedByteBudget,
     slot: &mut ByteBudget,
     bytes: usize,
 ) -> Result<(), ByteBudgetError> {
@@ -577,7 +668,7 @@ pub(crate) fn try_reserve_pair(
 }
 
 /// Returns `bytes` to both scopes.
-pub(crate) fn release_pair(peer: &mut ByteBudget, slot: &mut ByteBudget, bytes: usize) {
+pub(crate) fn release_pair(peer: &SharedByteBudget, slot: &mut ByteBudget, bytes: usize) {
     slot.release(bytes);
     peer.release(bytes);
 }
