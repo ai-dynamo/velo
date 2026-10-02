@@ -44,8 +44,8 @@ pub use velo_ext as ext;
 
 // Messenger surface
 pub use crate::messenger::{
-    Admitted, AmHandlerBuilder, AmSendBuilder, AmSyncBuilder, AsyncExecutor, Context, DispatchMode,
-    FireResult, Handler, HandlerExecutor, Messenger, MessengerBuilder, OrderedConfig, OrderingKey,
+    Admitted, AmHandlerBuilder, AmSendBuilder, AmSyncBuilder, AsyncExecutor, Context, FireResult,
+    Handler, HandlerExecutor, Messenger, MessengerBuilder, OrderedConfig, OrderingKey,
     OverflowPolicy, PeerDiscovery, SyncExecutor, SyncResult, TypedContext, TypedUnaryBuilder,
     TypedUnaryHandlerBuilder, TypedUnaryResult, UnaryBuilder, UnaryHandlerBuilder, UnaryResult,
     UnifiedResponse, VeloEvents,
@@ -172,6 +172,10 @@ pub enum StreamConfig {
 ///
 /// Wraps a [`Messenger`], [`AnchorManager`], and [`RendezvousManager`]
 /// and provides the same public API with a simpler name.
+///
+/// Clones share ownership of streaming services. Final drop cancels them;
+/// a retained [`Arc<Messenger>`] keeps only active messaging available.
+/// Use [`Self::shutdown`] to drain work and join owned tasks before dropping.
 #[derive(Clone)]
 pub struct Velo {
     messenger: Arc<Messenger>,
@@ -182,7 +186,7 @@ pub struct Velo {
     /// `FrameTransport`s) and so `peer_info()` can merge the streaming
     /// listener's WorkerAddress entry into the messenger-side WorkerAddress.
     stream_transport: Arc<dyn crate::streaming::FrameTransport>,
-    owned_stream_transport: OwnedStreamTransport,
+    stream_owner: Arc<StreamOwner>,
     /// RDMA registration layer, present only when a UCX transport was added
     /// through [`VeloBuilder::add_ucx_transport`].
     #[cfg(all(target_os = "linux", feature = "ucx"))]
@@ -214,12 +218,33 @@ enum OwnedStreamTransport {
 }
 
 impl OwnedStreamTransport {
+    fn stop(&self) {
+        match self {
+            Self::Tcp(transport) => transport.stop(),
+            #[cfg(feature = "grpc")]
+            Self::Grpc(transport) => transport.stop(),
+        }
+    }
+
     async fn shutdown(&self) {
         match self {
             Self::Tcp(transport) => transport.shutdown().await,
             #[cfg(feature = "grpc")]
             Self::Grpc(transport) => transport.shutdown().await,
         }
+    }
+}
+
+/// Shared by Velo clones, but not by Messenger or individual stream handles.
+struct StreamOwner {
+    manager: Arc<crate::streaming::AnchorManager>,
+    transport: OwnedStreamTransport,
+}
+
+impl Drop for StreamOwner {
+    fn drop(&mut self) {
+        self.manager.stop();
+        self.transport.stop();
     }
 }
 
@@ -496,14 +521,14 @@ impl VeloBuilder {
         }
 
         // Step 6: Register streaming control-plane handlers
-        anchor_manager.register_handlers(Arc::clone(&messenger))?;
+        anchor_manager.register_handlers_weak(Arc::clone(&messenger))?;
 
         // Step 7: Create RendezvousManager and register handlers
         let rendezvous_manager = Arc::new(match self.metrics.as_ref() {
             Some(m) => crate::rendezvous::RendezvousManager::with_metrics(worker_id, Arc::clone(m)),
             None => crate::rendezvous::RendezvousManager::new(worker_id),
         });
-        rendezvous_manager.register_handlers(Arc::clone(&messenger))?;
+        rendezvous_manager.register_handlers_weak(Arc::clone(&messenger))?;
 
         // Step 8: Enable transparent large payload support
         let stager = Arc::new(crate::rendezvous::RendezvousStager::new(Arc::clone(
@@ -564,10 +589,13 @@ impl VeloBuilder {
         startup.0.take();
         Ok(Arc::new(Velo {
             messenger,
+            stream_owner: Arc::new(StreamOwner {
+                manager: Arc::clone(&anchor_manager),
+                transport: owned_stream_transport,
+            }),
             anchor_manager,
             rendezvous_manager,
             stream_transport,
-            owned_stream_transport,
             #[cfg(all(target_os = "linux", feature = "ucx"))]
             rdma,
             shutdown: Arc::new(ShutdownOnce {
@@ -810,12 +838,11 @@ impl Velo {
     /// sender: its `cancellation_token` fires, and later sends fail. The reader
     /// ends when the application drops or finalizes the sender.
     /// Use this when an instance is removed while its Tokio runtime stays alive.
-    /// It closes resources. The instance and its handles stay valid, and
-    /// shutdown does not release them from memory.
+    /// It closes resources. Drop the instance and its handles to release their memory.
     pub async fn shutdown(&self, policy: ShutdownPolicy) {
         self.graceful_shutdown(policy).await;
         self.anchor_manager.shutdown().await;
-        self.owned_stream_transport.shutdown().await;
+        self.stream_owner.transport.shutdown().await;
         self.messenger.closed().await;
     }
 
@@ -1575,6 +1602,7 @@ mod tests {
         retained.closed().await;
         drop(retained);
         drop(manager);
+        assert!(weak.upgrade().is_none());
     }
 
     /// Shutdown must close resources while Tokio remains alive.
@@ -1597,12 +1625,16 @@ mod tests {
             .await
             .unwrap();
 
-        let stream_addr = match &velo.owned_stream_transport {
+        let stream_addr = match &velo.stream_owner.transport {
             OwnedStreamTransport::Tcp(transport) => transport.bound_addr(),
             #[cfg(feature = "grpc")]
             OwnedStreamTransport::Grpc(_) => unreachable!(),
         };
 
+        let messenger = Arc::downgrade(&velo.messenger);
+        let manager = Arc::downgrade(&velo.anchor_manager);
+        let rendezvous = Arc::downgrade(&velo.rendezvous_manager);
+        let events = Arc::downgrade(velo.messenger.events());
         let pending_event = velo.messenger.events().new_event().unwrap().into_handle();
         #[derive(serde::Serialize)]
         struct Subscription {
@@ -1640,15 +1672,28 @@ mod tests {
         std::net::TcpListener::bind(messenger_addr)
             .expect("shutdown retained the messenger listener");
         std::net::TcpListener::bind(stream_addr).expect("shutdown retained the streaming listener");
+        drop(velo);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while messenger.upgrade().is_some()
+                || manager.upgrade().is_some()
+                || rendezvous.upgrade().is_some()
+                || events.upgrade().is_some()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown retained a runtime manager");
     }
 
     #[tokio::test]
-    async fn retained_messenger_value_clone_keeps_streaming_after_velo_drop() {
+    async fn final_velo_drop_stops_streaming_but_keeps_a_retained_messenger() {
         use futures::StreamExt;
 
-        async fn node() -> Arc<Velo> {
+        async fn node() -> (Arc<Velo>, std::net::SocketAddr) {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            Velo::builder()
+            let addr = listener.local_addr().unwrap();
+            let node = Velo::builder()
                 .add_transport(Arc::new(
                     crate::transports::tcp::TcpTransportBuilder::new()
                         .from_listener(listener)
@@ -1658,17 +1703,42 @@ mod tests {
                 ))
                 .build()
                 .await
-                .unwrap()
+                .unwrap();
+            (node, addr)
         }
 
-        let server = node().await;
-        let client = node().await;
+        async fn wait_for_listener_close(addr: std::net::SocketAddr) {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    if std::net::TcpListener::bind(addr).is_ok() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("drop retained a listener");
+        }
+
+        let (server, messenger_addr) = node().await;
+        let (client, _) = node().await;
         client.register_peer(server.peer_info()).unwrap();
         server.register_peer(client.peer_info()).unwrap();
+        server
+            .register_handler(Handler::unary_handler("ping", |ctx| Ok(Some(ctx.payload))).build())
+            .unwrap();
         let mut anchor = server.create_anchor::<u32>();
         let manager = Arc::downgrade(&server.anchor_manager);
-        let owned_transport = server.owned_stream_transport.clone();
-        let retained = Arc::new(server.messenger.as_ref().clone());
+        let retained = Arc::clone(server.messenger());
+        let messenger = Arc::downgrade(&retained);
+        let tracker = retained.tracker().clone();
+        let frame_transport = match &server.stream_owner.transport {
+            OwnedStreamTransport::Tcp(transport) => Arc::clone(transport),
+            #[cfg(feature = "grpc")]
+            OwnedStreamTransport::Grpc(_) => unreachable!(),
+        };
+        let stream_addr = frame_transport.bound_addr();
+        let last_owner = server.as_ref().clone();
         drop(server);
 
         let sender = tokio::time::timeout(
@@ -1676,26 +1746,48 @@ mod tests {
             client.attach_anchor::<u32>(anchor.handle()),
         )
         .await
-        .expect("retained messenger lost its receive loop")
-        .expect("retained messenger lost streaming control handlers");
+        .expect("a Velo clone lost its receive loop")
+        .expect("a Velo clone lost streaming control handlers");
         sender.send(7).await.unwrap();
-        sender.finalize().unwrap();
         let frame = tokio::time::timeout(std::time::Duration::from_secs(2), anchor.next())
             .await
-            .expect("retained messenger lost its stream");
+            .expect("a Velo clone lost its stream");
         assert!(matches!(
             frame,
             Some(Ok(crate::streaming::StreamFrame::Item(7)))
         ));
 
+        drop(last_owner);
+        tokio::time::timeout(std::time::Duration::from_secs(2), anchor.next())
+            .await
+            .expect("final Velo drop left its stream open");
+        wait_for_listener_close(stream_addr).await;
+        assert!(manager.upgrade().is_none());
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client
+                .unary("ping")
+                .unwrap()
+                .raw_payload(bytes::Bytes::from_static(b"alive"))
+                .instance(retained.instance_id())
+                .send(),
+        )
+        .await
+        .expect("retained Messenger stopped with Velo")
+        .unwrap();
+        assert_eq!(response, bytes::Bytes::from_static(b"alive"));
+
         drop(anchor);
+        drop(sender);
+        drop(retained);
+        tracker.close();
+        tokio::time::timeout(std::time::Duration::from_secs(2), tracker.wait())
+            .await
+            .expect("final Messenger drop retained its receive loops");
+        assert!(messenger.upgrade().is_none());
+        wait_for_listener_close(messenger_addr).await;
+        frame_transport.shutdown().await;
         client.shutdown(ShutdownPolicy::WaitForever).await;
-        retained
-            .graceful_shutdown(ShutdownPolicy::WaitForever)
-            .await;
-        manager.upgrade().unwrap().shutdown().await;
-        owned_transport.shutdown().await;
-        retained.closed().await;
     }
 
     /// A node with one TCP transport on a loopback port and a loopback stream listener.

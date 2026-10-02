@@ -46,13 +46,12 @@ Use `Velo::shutdown(policy)` when an application removes a Velo instance but kee
 
 If the sender of a stream is on the same instance, shutdown cancels that sender. The `cancellation_token` of the sender fires, and later sends fail. The reader of the stream ends when the application drops or finalizes the sender. Shutdown does not end the reader itself. That needs a check on every read.
 
-Call shutdown explicitly. Dropping a `Velo` value or its last `Arc` does not perform a graceful drain.
-
-This release keeps the existing strong references between the runtime and its services. A retained Messenger keeps streaming services available after Velo is dropped. Explicit shutdown closes resources and joins owned tasks, but does not release this ownership graph from memory.
+Call shutdown explicitly to drain and join. Final Velo drop cancels its streams and stops builder-owned streaming services. A retained `Arc<Messenger>` keeps active messaging available, but does not keep those streams alive. Final Messenger drop starts immediate transport teardown. Neither Drop path waits for work to finish or reports RDMA memory as released. See [Ownership changes in 0.19](../guides/migrate-dispatch-and-cancellation.md#runtime-ownership).
 
 `graceful_shutdown` keeps its existing behavior: it drains and closes the messenger and RDMA services, but does not close the per-stream TCP or gRPC transport. `shutdown` is the complete instance shutdown operation. Application handlers that exceed a timeout can still be running after it returns.
 
-The public task tracker includes receive loops, tracked handlers, and tasks added by the application. `close()` allows `wait()` to finish when all tracked tasks exit; it does not cancel them. Ensure application tasks and idle ordering lanes can exit before waiting. An ordered handler with `with_idle_lane_ttl(None)` can leave a lane waiting forever while its router remains owned. Internal shutdown joins its own receive loops separately, so an application task cannot extend its timeout.
+The public task tracker includes receive loops, ordering lanes, and tasks added by the application. `close()` allows `wait()` to finish when all tracked tasks exit; it does not cancel them. Ensure application tasks and idle ordering lanes can exit before waiting. An ordered handler with `with_idle_lane_ttl(None)` can leave a lane waiting forever while its router remains owned. Internal shutdown joins its own receive loops separately, so an application task cannot extend its timeout.
+
 
 A handler panic fails its waiting caller in every dispatch mode, provided the program unwinds panics. The error reply remains counted work until the transport accepts it. An ordered lane continues with the next message.
 

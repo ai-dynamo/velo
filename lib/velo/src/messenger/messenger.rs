@@ -19,8 +19,7 @@ use crate::messenger::client::builders::MessageBuilder;
 use crate::messenger::handlers::{Handler, HandlerManager};
 use crate::messenger::server::ActiveMessageServer;
 
-/// The core active messaging system.
-#[derive(Clone)]
+/// The core active messaging system. Clone its [`Arc`] to share one instance.
 pub struct Messenger {
     instance_id: InstanceId,
     backend: Arc<VeloBackend>,
@@ -38,6 +37,13 @@ pub struct Messenger {
     /// Names of the handlers the drain gate lets through. See
     /// [`register_drain_exempt_handler`](Self::register_drain_exempt_handler).
     drain_exempt: DrainExemptNames,
+}
+
+impl Drop for Messenger {
+    fn drop(&mut self) {
+        // Drop cannot drain or join. Wake owned tasks and stop transport work.
+        self.backend.shutdown_now();
+    }
 }
 
 /// Handler names the drain gate lets through. A std lock rather than a
@@ -589,7 +595,7 @@ impl Messenger {
         &self.runtime
     }
 
-    /// Track receive loops, tracked handlers, and application tasks.
+    /// Track receive loops, ordering lanes, and application tasks.
     ///
     /// `close` allows `wait` to finish once all tracked tasks exit; it does not
     /// cancel them. Ensure application tasks and idle ordering lanes can exit

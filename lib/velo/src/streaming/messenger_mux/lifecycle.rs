@@ -6,7 +6,8 @@
 //! A mux that fails stops in one step: `stop_mux` stops its tasks and retires
 //! its slots. Shutdown uses two steps, so that streams can come off their
 //! slots in between: `stop_sending` stops the tasks, and `shutdown` retires
-//! the slots. If a shutdown was abandoned, `MuxCore::drop` retires them.
+//! the slots after joining tasks. Final owner Drop uses `stop` to retire slots
+//! without waiting. If a shutdown was abandoned, `MuxCore::drop` retires them.
 
 use std::sync::Arc;
 
@@ -34,6 +35,12 @@ impl MessengerMuxTransport {
 
     pub(crate) async fn shutdown(&self) {
         self.stop_sending_and_wait().await;
+        self.stop();
+    }
+
+    /// Retire slots after the owner has detached its streams, without waiting.
+    pub(crate) fn stop(&self) {
+        self.stop_sending();
         self.core.batchers.clear();
         close_ingress(&self.core.ingress, self.core.metrics.as_ref());
         self.core.drains.clear();

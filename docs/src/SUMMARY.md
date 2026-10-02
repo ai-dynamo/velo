@@ -17,7 +17,7 @@
 
 # Guides
 
-- [Migrate dispatch and cancellation to 0.19](guides/migrate-dispatch-and-cancellation.md)
+- [Migrate ownership, dispatch, and cancellation to 0.19](guides/migrate-dispatch-and-cancellation.md)
 - [Write an out-of-tree transport](guides/out-of-tree-transport.md)
 - [Tune batched streaming](guides/tune-batched-streaming.md)
 - [Run rendezvous over RDMA](guides/ucx-rdma.md)

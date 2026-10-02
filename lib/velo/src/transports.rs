@@ -66,6 +66,7 @@ pub mod quic;
 
 mod transport;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{collections::HashMap, sync::Arc};
 
 use crate::observability::{Direction, TransportRejection, VeloMetrics};
@@ -134,6 +135,7 @@ pub struct VeloBackend {
     alternative_transports: DashMap<InstanceId, Vec<TransportKey>>,
     workers: DashMap<WorkerId, InstanceId>,
     shutdown_state: ShutdownState,
+    teardown_started: AtomicBool,
 }
 
 /// Stop completed transports if construction fails or is cancelled.
@@ -247,6 +249,7 @@ impl VeloBackend {
                 alternative_transports: DashMap::new(),
                 workers: DashMap::new(),
                 shutdown_state,
+                teardown_started: AtomicBool::new(false),
             },
             data_streams,
         ))
@@ -688,6 +691,11 @@ impl VeloBackend {
 
     /// Stop transports after teardown or failed construction.
     pub(crate) fn shutdown_now(&self) {
+        // Explicit shutdown and final owner Drop share this path. A cancelled
+        // public token alone does not prove that transport shutdown hooks ran.
+        if self.teardown_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
         stop_transports(&self.shutdown_state, &self.transports);
     }
 

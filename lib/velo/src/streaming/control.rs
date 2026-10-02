@@ -23,11 +23,28 @@
 
 use crate::observability::{HandlerOutcome, StreamingOp};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Instant;
 
 use crate::streaming::anchor::AnchorManager;
 use crate::streaming::handle::StreamAnchorHandle;
+
+/// Public factories own their manager. Internal handlers borrow it to avoid
+/// the manager -> messenger -> handler -> manager ownership cycle.
+#[derive(Clone)]
+pub(crate) enum AnchorManagerRef {
+    Strong(Arc<AnchorManager>),
+    Weak(Weak<AnchorManager>),
+}
+
+impl AnchorManagerRef {
+    pub(crate) fn upgrade(&self) -> Option<Arc<AnchorManager>> {
+        match self {
+            Self::Strong(manager) => Some(Arc::clone(manager)),
+            Self::Weak(manager) => manager.upgrade(),
+        }
+    }
+}
 
 /// Number of consecutive missed heartbeat windows that trigger `Dropped` injection.
 ///
@@ -441,11 +458,18 @@ pub struct AnchorCancelRequest {
 /// Returns [`AnchorAttachResponse::Ok`] on success or [`AnchorAttachResponse::Err`] on
 /// any failure (not found, already attached, transport error).
 pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::messenger::Handler {
+    anchor_attach_handler(AnchorManagerRef::Strong(manager))
+}
+
+pub(crate) fn anchor_attach_handler(manager: AnchorManagerRef) -> crate::messenger::Handler {
     crate::messenger::Handler::typed_unary_async(
         "_anchor_attach",
         move |ctx: crate::messenger::TypedContext<AnchorAttachRequest>| {
             let manager = manager.clone();
             async move {
+                let manager = manager
+                    .upgrade()
+                    .ok_or_else(|| anyhow::anyhow!("anchor manager shut down"))?;
                 let started = Instant::now();
                 // The worker whose batches will carry this stream: the lane is placed
                 // against its load. From the envelope, not from the request body.
@@ -781,11 +805,18 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::messe
 ///
 /// Idempotent: if the anchor is not found, returns `Ok(())`.
 pub fn create_anchor_detach_handler(manager: Arc<AnchorManager>) -> crate::messenger::Handler {
+    anchor_detach_handler(AnchorManagerRef::Strong(manager))
+}
+
+pub(crate) fn anchor_detach_handler(manager: AnchorManagerRef) -> crate::messenger::Handler {
     crate::messenger::Handler::typed_unary_async(
         "_anchor_detach",
         move |ctx: crate::messenger::TypedContext<AnchorDetachRequest>| {
             let manager = manager.clone();
             async move {
+                let manager = manager
+                    .upgrade()
+                    .ok_or_else(|| anyhow::anyhow!("anchor manager shut down"))?;
                 let started = Instant::now();
                 let req = ctx.input;
                 let (_, local_id) = req.handle.unpack();
@@ -888,11 +919,18 @@ pub fn create_anchor_detach_handler(manager: Arc<AnchorManager>) -> crate::messe
 ///
 /// Idempotent: if the anchor is already absent, returns `Ok(())`.
 pub fn create_anchor_finalize_handler(manager: Arc<AnchorManager>) -> crate::messenger::Handler {
+    anchor_finalize_handler(AnchorManagerRef::Strong(manager))
+}
+
+pub(crate) fn anchor_finalize_handler(manager: AnchorManagerRef) -> crate::messenger::Handler {
     crate::messenger::Handler::typed_unary_async(
         "_anchor_finalize",
         move |ctx: crate::messenger::TypedContext<AnchorFinalizeRequest>| {
             let manager = manager.clone();
             async move {
+                let manager = manager
+                    .upgrade()
+                    .ok_or_else(|| anyhow::anyhow!("anchor manager shut down"))?;
                 let started = Instant::now();
                 let req = ctx.input;
                 let (_, local_id) = req.handle.unpack();
@@ -931,11 +969,18 @@ pub fn create_anchor_finalize_handler(manager: Arc<AnchorManager>) -> crate::mes
 ///
 /// Idempotent: calling cancel on an already-absent anchor does not panic.
 pub fn create_anchor_cancel_handler(manager: Arc<AnchorManager>) -> crate::messenger::Handler {
+    anchor_cancel_handler(AnchorManagerRef::Strong(manager))
+}
+
+pub(crate) fn anchor_cancel_handler(manager: AnchorManagerRef) -> crate::messenger::Handler {
     crate::messenger::Handler::typed_unary_async(
         "_anchor_cancel",
         move |ctx: crate::messenger::TypedContext<AnchorCancelRequest>| {
             let manager = manager.clone();
             async move {
+                let manager = manager
+                    .upgrade()
+                    .ok_or_else(|| anyhow::anyhow!("anchor manager shut down"))?;
                 let started = Instant::now();
                 let req = ctx.input;
                 let (_, local_id) = req.handle.unpack();

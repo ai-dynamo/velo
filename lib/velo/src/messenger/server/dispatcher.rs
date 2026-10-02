@@ -10,7 +10,7 @@ use dashmap::DashMap;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use std::panic::AssertUnwindSafe;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Instant;
 use tokio::sync::Semaphore;
 use tracing::{error, trace, warn};
@@ -460,7 +460,7 @@ pub(crate) struct DispatcherHub {
     backend: Arc<VeloBackend>,
 
     /// Messenger system reference (late-bound via OnceLock)
-    system: OnceLock<Arc<Messenger>>,
+    system: OnceLock<Weak<Messenger>>,
 
     /// Notifies waiters when `system` has been set
     system_ready: tokio::sync::Notify,
@@ -480,15 +480,15 @@ impl DispatcherHub {
     /// Initialize the system reference (must be called exactly once before dispatching)
     pub fn set_system(&self, system: Arc<Messenger>) -> anyhow::Result<()> {
         self.system
-            .set(system)
+            .set(Arc::downgrade(&system))
             .map_err(|_| anyhow::anyhow!("System already initialized"))?;
         self.system_ready.notify_waiters();
         Ok(())
     }
 
-    /// Keep the registered messenger available for every value clone.
+    /// Hold the messenger only while dispatching a message.
     pub(crate) fn system(&self) -> Option<Arc<Messenger>> {
-        self.system.get().cloned()
+        self.system.get().and_then(Weak::upgrade)
     }
 
     /// Wait until all startup handlers have been installed.

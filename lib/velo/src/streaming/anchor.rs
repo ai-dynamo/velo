@@ -1047,11 +1047,11 @@ impl AnchorManager {
         }
     }
 
-    /// End every stream this manager holds. Called by `Velo::shutdown` after
-    /// the messenger transports are torn down.
+    /// Detach streams before retiring mux slots. Explicit shutdown calls this
+    /// after messenger teardown; final owner Drop uses it without a drain.
     ///
-    /// Two rules hold from step 1 on. Nothing is sent to a peer, because the
-    /// transports are gone. No mux slot is retired while a stream still reads
+    /// After step 1, the mux accepts no new sends. No mux slot is retired
+    /// while a stream still reads
     /// from it, because retirement injects `Dropped` that the reader would
     /// take as its sender's. Hence the steps:
     ///
@@ -1060,7 +1060,7 @@ impl AnchorManager {
     /// 2. Take streams off their slots: SPSC feeds withdrawn, MPSC pumps
     ///    cancelled.
     /// 3. Remove anchors and MPSC entries, and cancel local senders.
-    /// 4. Join the mux's tasks and retire its slots.
+    /// The caller then retires mux slots, after joining tasks if it can wait.
     ///
     /// Steps 1-3 do not await. A caller that drops this future (a timeout
     /// around `Velo::shutdown`) still leaves no stream waiting on a slot or an
@@ -1068,7 +1068,7 @@ impl AnchorManager {
     ///
     /// `Velo::graceful_shutdown` stops and joins mux sends before transport
     /// teardown. Step 1 also makes direct calls to this method safe.
-    pub(crate) async fn shutdown(&self) {
+    fn prepare_stop(&self) {
         let mux = self.mux.get();
         if let Some(mux) = mux {
             mux.stop_sending();
@@ -1107,7 +1107,18 @@ impl AnchorManager {
         for id in ids {
             self.sender_registry.cancel(id);
         }
-        if let Some(mux) = mux {
+    }
+
+    pub(crate) fn stop(&self) {
+        self.prepare_stop();
+        if let Some(mux) = self.mux.get() {
+            mux.stop();
+        }
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        self.prepare_stop();
+        if let Some(mux) = self.mux.get() {
             mux.shutdown().await;
         }
     }
@@ -1931,19 +1942,39 @@ impl AnchorManager {
         self: &Arc<Self>,
         messenger: Arc<crate::messenger::Messenger>,
     ) -> anyhow::Result<()> {
+        self.register_handlers_with(
+            messenger,
+            crate::streaming::control::AnchorManagerRef::Strong(Arc::clone(self)),
+        )
+    }
+
+    /// Velo owns the manager, so its handlers must not retain it in a cycle.
+    pub(crate) fn register_handlers_weak(
+        self: &Arc<Self>,
+        messenger: Arc<crate::messenger::Messenger>,
+    ) -> anyhow::Result<()> {
+        self.register_handlers_with(
+            messenger,
+            crate::streaming::control::AnchorManagerRef::Weak(Arc::downgrade(self)),
+        )
+    }
+
+    fn register_handlers_with(
+        self: &Arc<Self>,
+        messenger: Arc<crate::messenger::Messenger>,
+        manager: crate::streaming::control::AnchorManagerRef,
+    ) -> anyhow::Result<()> {
         use crate::streaming::control::{
-            create_anchor_attach_handler, create_anchor_cancel_handler,
-            create_anchor_detach_handler, create_anchor_finalize_handler,
-            create_stream_cancel_handler,
+            anchor_attach_handler, anchor_cancel_handler, anchor_detach_handler,
+            anchor_finalize_handler, create_stream_cancel_handler,
         };
 
-        messenger.register_streaming_handler(create_anchor_attach_handler(Arc::clone(self)))?;
+        messenger.register_streaming_handler(anchor_attach_handler(manager.clone()))?;
         // Everything but the attaches serves a stream already open, so the
         // drain gate lets it through; an attach opens a new stream.
-        messenger.register_drain_exempt_handler(create_anchor_detach_handler(Arc::clone(self)))?;
-        messenger
-            .register_drain_exempt_handler(create_anchor_finalize_handler(Arc::clone(self)))?;
-        messenger.register_drain_exempt_handler(create_anchor_cancel_handler(Arc::clone(self)))?;
+        messenger.register_drain_exempt_handler(anchor_detach_handler(manager.clone()))?;
+        messenger.register_drain_exempt_handler(anchor_finalize_handler(manager.clone()))?;
+        messenger.register_drain_exempt_handler(anchor_cancel_handler(manager.clone()))?;
         messenger.register_drain_exempt_handler(create_stream_cancel_handler(Arc::clone(
             &self.sender_registry,
         )))?;
@@ -1957,13 +1988,13 @@ impl AnchorManager {
         // MPSC handlers — share the same SenderRegistry so `_stream_cancel`
         // covers both SPSC and MPSC senders uniformly.
         messenger.register_streaming_handler(
-            crate::streaming::mpsc::control::create_mpsc_anchor_attach_handler(Arc::clone(self)),
+            crate::streaming::mpsc::control::mpsc_anchor_attach_handler(manager.clone()),
         )?;
         messenger.register_drain_exempt_handler(
-            crate::streaming::mpsc::control::create_mpsc_anchor_detach_handler(Arc::clone(self)),
+            crate::streaming::mpsc::control::mpsc_anchor_detach_handler(manager.clone()),
         )?;
         messenger.register_drain_exempt_handler(
-            crate::streaming::mpsc::control::create_mpsc_anchor_cancel_handler(Arc::clone(self)),
+            crate::streaming::mpsc::control::mpsc_anchor_cancel_handler(manager),
         )?;
 
         self.messenger_lock
