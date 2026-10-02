@@ -306,7 +306,8 @@ impl<T: Serialize> StreamSender<T> {
     /// # Errors
     ///
     /// - [`SendError::SerializationError`] if `rmp_serde::to_vec` fails.
-    /// - [`SendError::ChannelClosed`] if the receiver has been dropped.
+    /// - [`SendError::ChannelClosed`] if the receiver has been dropped or the
+    ///   stream has been cancelled through [`Self::cancellation_token`].
     pub async fn send(&self, item: T) -> Result<(), SendError> {
         if self.cancel_token.is_cancelled() {
             return Err(SendError::ChannelClosed);
@@ -341,7 +342,8 @@ impl<T: Serialize> StreamSender<T> {
     ///
     /// # Errors
     ///
-    /// - [`SendError::ChannelClosed`] if the receiver has been dropped.
+    /// - [`SendError::ChannelClosed`] if the receiver has been dropped or the
+    ///   stream has been cancelled through [`Self::cancellation_token`].
     pub async fn send_err(&self, msg: impl ToString) -> Result<(), SendError> {
         // Safe to use StreamFrame::<()> here: the SenderError variant carries
         // only a String and its msgpack encoding is identical for any T.

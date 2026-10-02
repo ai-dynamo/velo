@@ -175,6 +175,11 @@ impl<T: Serialize> MpscStreamSender<T> {
     }
 
     /// Send a typed item through the channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SendError::ChannelClosed`] if the receiver has been dropped or
+    /// the stream has been cancelled through [`Self::cancellation_token`].
     pub async fn send(&self, item: T) -> Result<(), SendError> {
         if self.cancel_token.is_cancelled() {
             return Err(SendError::ChannelClosed);
@@ -208,6 +213,11 @@ impl<T: Serialize> MpscStreamSender<T> {
     }
 
     /// Send a soft error string. Does not terminate the sender.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SendError::ChannelClosed`] if the receiver has been dropped or
+    /// the stream has been cancelled through [`Self::cancellation_token`].
     pub async fn send_err(&self, msg: impl ToString) -> Result<(), SendError> {
         if self.cancel_token.is_cancelled() {
             return Err(SendError::ChannelClosed);
