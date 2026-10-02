@@ -886,7 +886,10 @@ async fn mpsc_identity_survives_early_cancel_and_cleans_up_failed_attach() {
                 .unwrap(),
         );
         am_b.register_handlers(messenger_b).unwrap();
-        let anchor = am_a.create_mpsc_anchor::<u32>();
+        let anchor = am_a.create_mpsc_anchor_with_config::<u32>(MpscAnchorConfig {
+            max_senders: Some(1),
+            ..Default::default()
+        });
         let handle = anchor.handle();
         let producer = am_b.clone();
         let attach =
@@ -928,6 +931,11 @@ async fn mpsc_identity_survives_early_cancel_and_cleans_up_failed_attach() {
                         .unwrap()
                         .is_err()
                 );
+                let replacement = am_a
+                    .attach_mpsc_stream_anchor::<u32>(handle)
+                    .await
+                    .expect("failed remote connect must release max_senders capacity");
+                drop(replacement);
             }
             "abort" => {
                 attach.abort();

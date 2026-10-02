@@ -181,7 +181,14 @@ async fn a_sender_from_before_negotiation_gets_the_legacy_transport() {
 
 #[test]
 fn a_receiver_without_a_mux_never_answers_with_one() {
-    let selected = select(&keys(&[MESSENGER_MUX_KEY]), None, &legacy(), peer(), None).unwrap();
+    let selected = select(
+        &keys(&[MESSENGER_MUX_KEY, "tcp-stream"]),
+        None,
+        &legacy(),
+        peer(),
+        None,
+    )
+    .unwrap();
     assert_eq!(
         selected.terms.key.as_str(),
         "tcp-stream",
@@ -189,6 +196,14 @@ fn a_receiver_without_a_mux_never_answers_with_one() {
          resolve, which hard-errors on an unknown key"
     );
     assert_eq!(selected.terms.initial_credit, 0);
+}
+
+#[test]
+fn a_nonempty_offer_must_include_the_selected_transport() {
+    for offered in [keys(&[MESSENGER_MUX_KEY]), keys(&["grpc-stream"])] {
+        assert!(select(&offered, None, &legacy(), peer(), None).is_err());
+    }
+    assert!(select(&[], None, &legacy(), peer(), None).is_ok());
 }
 
 // ---------------------------------------------------------------------------

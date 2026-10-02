@@ -116,11 +116,10 @@ pub(crate) struct Terms {
 
 /// Intersect the sender's advertisement with what is installed here.
 ///
-/// The mux wins only when both sides named it; everything else falls through to
-/// the behaviour that shipped before negotiation — answer with the local default
-/// transport's key. An empty `offered` (an older sender, which omits the field
-/// entirely) cannot intersect. A mux-only instance has no per-stream transport
-/// and rejects that sender instead.
+/// The mux wins when both sides named it. Otherwise the sender must support
+/// the local default transport. An empty offer comes from an older sender,
+/// which did not negotiate: preserve that peer's default-transport behavior.
+/// A mux-only instance has no per-stream transport and rejects that sender.
 ///
 /// When the mux wins, the stream is placed on a lane for `peer`, the sender
 /// that asked, by `lane_key` if it gave one
@@ -150,6 +149,11 @@ pub(crate) fn select(
     anyhow::ensure!(
         default_transport.key().as_str() != MESSENGER_MUX_KEY,
         "peer does not support the messenger mux required by this instance"
+    );
+    anyhow::ensure!(
+        offered.is_empty() || offered.contains(&default_transport.key()),
+        "no common streaming transport: peer does not support {}",
+        default_transport.key()
     );
     Ok(Selection {
         target: Target::Other(Arc::clone(default_transport)),
