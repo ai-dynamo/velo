@@ -480,6 +480,13 @@ impl MuxCore {
             }
         }
 
+        // A batch already in flight can claim a bind after shutdown visited
+        // its peer. Retire that late claim before returning from this handler.
+        if self.tasks.is_stopped() {
+            close_ingress(&self.ingress, self.metrics.as_ref());
+            return;
+        }
+
         if outcome.replies.is_empty()
             && outcome.grants.is_empty()
             && outcome.peer_closes.is_empty()
