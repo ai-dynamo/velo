@@ -24,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::observability::{HandlerOutcome, StreamingOp};
 use crate::streaming::anchor::AnchorManager;
-use crate::streaming::control::{AnchorManagerRef, DETECTION_MULTIPLIER, StreamCancelHandle};
+use crate::streaming::control::{DETECTION_MULTIPLIER, StreamCancelHandle};
 use crate::streaming::handle::StreamAnchorHandle;
 
 use super::anchor::{MpscAnchorEntry, MpscSenderSlot};
@@ -295,18 +295,11 @@ pub(crate) async fn mpsc_reader_pump(
 /// async `transport.bind().await` outside the shard lock, then atomic slot
 /// insertion under the lock.
 pub fn create_mpsc_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::messenger::Handler {
-    mpsc_anchor_attach_handler(AnchorManagerRef::Strong(manager))
-}
-
-pub(crate) fn mpsc_anchor_attach_handler(manager: AnchorManagerRef) -> crate::messenger::Handler {
     crate::messenger::Handler::typed_unary_async(
         "_mpsc_anchor_attach",
         move |ctx: crate::messenger::TypedContext<MpscAnchorAttachRequest>| {
             let manager = manager.clone();
             async move {
-                let manager = manager
-                    .upgrade()
-                    .ok_or_else(|| anyhow::anyhow!("anchor manager shut down"))?;
                 let started = Instant::now();
                 // The worker whose batches will carry this stream: the lane is placed
                 // against its load. From the envelope, not from the request body.
@@ -522,18 +515,11 @@ pub(crate) fn mpsc_anchor_attach_handler(manager: AnchorManagerRef) -> crate::me
 /// remains in the registry; the consumer will eventually see a `Detached`
 /// frame for this sender_id via the pump forwarding or via slot removal.
 pub fn create_mpsc_anchor_detach_handler(manager: Arc<AnchorManager>) -> crate::messenger::Handler {
-    mpsc_anchor_detach_handler(AnchorManagerRef::Strong(manager))
-}
-
-pub(crate) fn mpsc_anchor_detach_handler(manager: AnchorManagerRef) -> crate::messenger::Handler {
     crate::messenger::Handler::typed_unary_async(
         "_mpsc_anchor_detach",
         move |ctx: crate::messenger::TypedContext<MpscAnchorDetachRequest>| {
             let manager = manager.clone();
             async move {
-                let manager = manager
-                    .upgrade()
-                    .ok_or_else(|| anyhow::anyhow!("anchor manager shut down"))?;
                 let req = ctx.input;
                 let (_, local_id) = req.handle.unpack();
 
@@ -558,18 +544,11 @@ pub(crate) fn mpsc_anchor_detach_handler(manager: AnchorManagerRef) -> crate::me
 
 /// Build the `_mpsc_anchor_cancel` handler — remove the whole anchor silently.
 pub fn create_mpsc_anchor_cancel_handler(manager: Arc<AnchorManager>) -> crate::messenger::Handler {
-    mpsc_anchor_cancel_handler(AnchorManagerRef::Strong(manager))
-}
-
-pub(crate) fn mpsc_anchor_cancel_handler(manager: AnchorManagerRef) -> crate::messenger::Handler {
     crate::messenger::Handler::typed_unary_async(
         "_mpsc_anchor_cancel",
         move |ctx: crate::messenger::TypedContext<MpscAnchorCancelRequest>| {
             let manager = manager.clone();
             async move {
-                let manager = manager
-                    .upgrade()
-                    .ok_or_else(|| anyhow::anyhow!("anchor manager shut down"))?;
                 let req = ctx.input;
                 let (_, local_id) = req.handle.unpack();
 

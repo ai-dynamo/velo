@@ -386,12 +386,9 @@ impl Drop for PreBind {
 
 /// The sender-side identity one stream is opened under.
 ///
-/// A struct because it is allocated before the terms of the stream are known —
-/// the remote attach path has to name it in the request it sends to learn them
-/// — and then has to survive intact into the tail that registers it. Passing
-/// the four parts positionally would take that tail past clippy's argument
-/// limit, which `CLAUDE.md` says to answer with a config struct rather than an
-/// `allow`.
+/// Registered before publishing the identity to an anchor. The guard removes
+/// it if attach fails or its future is dropped; a constructed sender takes
+/// responsibility for the entry.
 struct SenderIdentity {
     sender_stream_id: u64,
     cancel_token: CancellationToken,
@@ -515,39 +512,13 @@ impl StreamController {
             );
         }
 
-        // Directly cancel the SenderEntry in the local sender_registry.
-        // This fires the user-facing cancel_token and poisons send() immediately
-        // without requiring an AM round-trip. Idempotent: remove returns None if
-        // the entry was already removed (e.g. finalize/detach ran first).
         if let Some(handle) = stream_cancel_handle {
-            let (sender_worker_id, sender_stream_id) = handle.unpack();
-            if sender_worker_id == self.inner.worker_id
-                && let Some((_, entry)) =
-                    self.inner.sender_registry.senders.remove(&sender_stream_id)
-            {
-                drop(entry.rx_closer.lock().unwrap().take());
-                entry.cancel_token.cancel();
-            }
-
-            // Also send _stream_cancel AM for cross-worker scenarios (messenger present)
-            if let Some(messenger) = self.inner.messenger.clone() {
-                let payload = serde_json::to_vec(&crate::streaming::control::StreamCancelRequest {
-                    sender_stream_id,
-                })
-                .expect("serialize StreamCancelRequest");
-                // Fire-and-forget: use tokio::spawn guarded by try_current()
-                if let Ok(rt) = tokio::runtime::Handle::try_current() {
-                    rt.spawn(async move {
-                        let _ = messenger
-                            .am_send_streaming("_stream_cancel")
-                            .expect("am_send_streaming builder")
-                            .raw_payload(bytes::Bytes::from(payload))
-                            .worker(sender_worker_id)
-                            .send()
-                            .await;
-                    });
-                }
-            }
+            crate::streaming::control::request_sender_cancel(
+                handle,
+                self.inner.worker_id,
+                &self.inner.sender_registry,
+                self.inner.messenger.as_ref(),
+            );
         }
     }
 }
@@ -1092,9 +1063,7 @@ impl AnchorManager {
             .map(|entry| *entry.key())
             .collect();
         for id in ids {
-            if let Some((_, entry)) = self.sender_registry.senders.remove(&id) {
-                entry.cancel_token.cancel();
-            }
+            self.sender_registry.cancel(id);
         }
         if let Some(mux) = self.mux.get() {
             mux.shutdown().await;
@@ -1391,7 +1360,7 @@ impl AnchorManager {
         // own pre-binds. Chosen before the bind so the bind is counted on it.
         let lane = mux.choose_lane(None, lane_key);
         let lane_index = lane.lane();
-        let receiver = mux.bind_on_lane(local_id, routing_session_id, lane);
+        let receiver = mux.bind_on_lane(local_id, routing_session_id, lane).ok()?;
         let drain = mux
             .take_drain_signal(local_id, routing_session_id)
             .expect("prebind parks a drain signal for the pair it just registered");
@@ -1899,39 +1868,19 @@ impl AnchorManager {
         self: &Arc<Self>,
         messenger: Arc<crate::messenger::Messenger>,
     ) -> anyhow::Result<()> {
-        self.register_handlers_with(
-            messenger,
-            crate::streaming::control::AnchorManagerRef::Strong(Arc::clone(self)),
-        )
-    }
-
-    /// Velo owns the manager, so its handlers must not retain it in a cycle.
-    pub(crate) fn register_handlers_weak(
-        self: &Arc<Self>,
-        messenger: Arc<crate::messenger::Messenger>,
-    ) -> anyhow::Result<()> {
-        self.register_handlers_with(
-            messenger,
-            crate::streaming::control::AnchorManagerRef::Weak(Arc::downgrade(self)),
-        )
-    }
-
-    fn register_handlers_with(
-        self: &Arc<Self>,
-        messenger: Arc<crate::messenger::Messenger>,
-        manager: crate::streaming::control::AnchorManagerRef,
-    ) -> anyhow::Result<()> {
         use crate::streaming::control::{
-            anchor_attach_handler, anchor_cancel_handler, anchor_detach_handler,
-            anchor_finalize_handler, create_stream_cancel_handler,
+            create_anchor_attach_handler, create_anchor_cancel_handler,
+            create_anchor_detach_handler, create_anchor_finalize_handler,
+            create_stream_cancel_handler,
         };
 
-        messenger.register_streaming_handler(anchor_attach_handler(manager.clone()))?;
+        messenger.register_streaming_handler(create_anchor_attach_handler(Arc::clone(self)))?;
         // Everything but the attaches serves a stream already open, so the
         // drain gate lets it through; an attach opens a new stream.
-        messenger.register_drain_exempt_handler(anchor_detach_handler(manager.clone()))?;
-        messenger.register_drain_exempt_handler(anchor_finalize_handler(manager.clone()))?;
-        messenger.register_drain_exempt_handler(anchor_cancel_handler(manager.clone()))?;
+        messenger.register_drain_exempt_handler(create_anchor_detach_handler(Arc::clone(self)))?;
+        messenger
+            .register_drain_exempt_handler(create_anchor_finalize_handler(Arc::clone(self)))?;
+        messenger.register_drain_exempt_handler(create_anchor_cancel_handler(Arc::clone(self)))?;
         messenger.register_drain_exempt_handler(create_stream_cancel_handler(Arc::clone(
             &self.sender_registry,
         )))?;
@@ -1945,13 +1894,13 @@ impl AnchorManager {
         // MPSC handlers — share the same SenderRegistry so `_stream_cancel`
         // covers both SPSC and MPSC senders uniformly.
         messenger.register_streaming_handler(
-            crate::streaming::mpsc::control::mpsc_anchor_attach_handler(manager.clone()),
+            crate::streaming::mpsc::control::create_mpsc_anchor_attach_handler(Arc::clone(self)),
         )?;
         messenger.register_drain_exempt_handler(
-            crate::streaming::mpsc::control::mpsc_anchor_detach_handler(manager.clone()),
+            crate::streaming::mpsc::control::create_mpsc_anchor_detach_handler(Arc::clone(self)),
         )?;
         messenger.register_drain_exempt_handler(
-            crate::streaming::mpsc::control::mpsc_anchor_cancel_handler(manager),
+            crate::streaming::mpsc::control::create_mpsc_anchor_cancel_handler(Arc::clone(self)),
         )?;
 
         self.messenger_lock
@@ -2582,15 +2531,8 @@ impl AnchorManager {
         // Local path: reserve a slot under the shard lock, then construct
         // the sender after the lock is released.
         use dashmap::mapref::entry::Entry;
-        let (
-            sender_id,
-            frame_tx,
-            heartbeat_interval,
-            cancel_token,
-            poison_tx,
-            poison_rx,
-            sender_stream_id,
-        ) = match self.mpsc_registry.entry(local_id) {
+        let mut identity = self.new_sender_identity();
+        let (sender_id, frame_tx, heartbeat_interval) = match self.mpsc_registry.entry(local_id) {
             Entry::Vacant(_) => return Err(AttachError::AnchorNotFound { handle }),
             Entry::Occupied(mut occ) => {
                 let entry = occ.get_mut();
@@ -2612,54 +2554,32 @@ impl AnchorManager {
                 let frame_tx = entry.frame_tx.clone();
                 let heartbeat_interval = entry.heartbeat_interval;
 
-                let sender_stream_id =
-                    self.next_sender_stream_id.fetch_add(1, Ordering::Relaxed) + 1;
-                let cancel_token = CancellationToken::new();
-                let (poison_tx, poison_rx) = flume::bounded::<()>(1);
-
                 let slot = crate::streaming::mpsc::anchor::MpscSenderSlot {
                     pump_token: None,
                     stream_cancel_handle: Some(
                         crate::streaming::control::StreamCancelHandle::pack(
                             self.worker_id,
-                            sender_stream_id,
+                            identity.sender_stream_id,
                         ),
                     ),
                 };
                 entry.senders.insert(sender_id, slot);
 
-                (
-                    sender_id,
-                    frame_tx,
-                    heartbeat_interval,
-                    cancel_token,
-                    poison_tx,
-                    poison_rx,
-                    sender_stream_id,
-                )
+                (sender_id, frame_tx, heartbeat_interval)
             }
         };
 
-        // Register SenderEntry outside the shard lock.
-        let sender_entry = crate::streaming::control::SenderEntry {
-            stop_token: cancel_token.child_token(),
-            cancel_token: cancel_token.clone(),
-            rx_closer: std::sync::Mutex::new(Some(poison_rx)),
-        };
-        self.sender_registry
-            .senders
-            .insert(sender_stream_id, sender_entry);
-
+        identity.armed = false;
         Ok(crate::streaming::mpsc::MpscStreamSender::new(
             crate::streaming::mpsc::SenderId(sender_id),
             crate::streaming::mpsc::sender::SenderChannel::Local(frame_tx),
             handle,
             self.mpsc_registry.clone(),
             crate::streaming::sender::StreamSenderCancelInfo {
-                cancel_token,
-                sender_stream_id,
+                cancel_token: identity.cancel_token.clone(),
+                sender_stream_id: identity.sender_stream_id,
                 sender_registry: self.sender_registry.clone(),
-                poison_tx,
+                poison_tx: identity.poison_tx.clone(),
             },
             heartbeat_interval,
             self.metrics.clone(),
@@ -2679,9 +2599,8 @@ impl AnchorManager {
             ))
         })?;
 
-        let sender_stream_id = self.next_sender_stream_id.fetch_add(1, Ordering::Relaxed) + 1;
-        let cancel_token = CancellationToken::new();
-        let (poison_tx, poison_rx) = flume::bounded::<()>(1);
+        let mut identity = self.new_sender_identity();
+        let sender_stream_id = identity.sender_stream_id;
         let stream_cancel_handle =
             crate::streaming::control::StreamCancelHandle::pack(self.worker_id, sender_stream_id);
 
@@ -2750,29 +2669,21 @@ impl AnchorManager {
                         },
                         handle_worker_id,
                         local_id,
-                        None,
+                        Some((identity.cancel_token.clone(), identity.stop_token.clone())),
                     )
                     .await?;
 
-                let sender_entry = crate::streaming::control::SenderEntry {
-                    stop_token: cancel_token.child_token(),
-                    cancel_token: cancel_token.clone(),
-                    rx_closer: std::sync::Mutex::new(Some(poison_rx)),
-                };
-                self.sender_registry
-                    .senders
-                    .insert(sender_stream_id, sender_entry);
-
+                identity.armed = false;
                 Ok(crate::streaming::mpsc::MpscStreamSender::new(
                     crate::streaming::mpsc::SenderId(sender_id),
                     crate::streaming::mpsc::sender::SenderChannel::Remote(frame_tx),
                     handle,
                     self.mpsc_registry.clone(),
                     crate::streaming::sender::StreamSenderCancelInfo {
-                        cancel_token,
+                        cancel_token: identity.cancel_token.clone(),
                         sender_stream_id,
                         sender_registry: self.sender_registry.clone(),
-                        poison_tx,
+                        poison_tx: identity.poison_tx.clone(),
                     },
                     Duration::from_millis(heartbeat_interval_ms),
                     self.metrics.clone(),
@@ -2830,6 +2741,65 @@ mod tests {
         ) -> BoxFuture<'_, AnyhowResult<flume::Sender<Vec<u8>>>> {
             Box::pin(async { Ok(flume::bounded::<Vec<u8>>(256).0) })
         }
+    }
+
+    /// A deferred local exit must release its channel when the consumer
+    /// cancels, even if the consumer retains the full anchor queue.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn off_runtime_mpsc_drop_stops_waiting_when_the_consumer_cancels() {
+        let manager = make_manager();
+        let anchor = manager.create_mpsc_anchor_with_config::<u32>(
+            crate::streaming::mpsc::MpscAnchorConfig {
+                channel_capacity: Some(1),
+                unattached_timeout: Some(Duration::from_secs(3600)),
+                ..Default::default()
+            },
+        );
+        let handle = anchor.handle();
+        let frame_tx = manager
+            .mpsc_registry
+            .get(&handle.unpack().1)
+            .unwrap()
+            .frame_tx
+            .clone();
+        let sender = manager
+            .attach_mpsc_stream_anchor::<u32>(handle)
+            .await
+            .unwrap();
+        sender.send(1).await.unwrap();
+        let (done, finished) = tokio::sync::oneshot::channel();
+        let thread = std::thread::spawn(move || {
+            drop(sender);
+            let _ = done.send(());
+        });
+        if tokio::time::timeout(Duration::from_secs(2), finished)
+            .await
+            .is_err()
+        {
+            // Release a blocking old implementation before failing the test.
+            drop(anchor);
+            thread.join().unwrap();
+            panic!("drop blocked on the full queue");
+        }
+        thread.join().unwrap();
+        assert!(manager.sender_registry.senders.is_empty());
+        assert!(
+            manager
+                .mpsc_registry
+                .get(&handle.unpack().1)
+                .unwrap()
+                .senders
+                .is_empty()
+        );
+        anchor.controller().cancel();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while frame_tx.sender_count() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deferred exit retained the cancelled anchor channel");
+        drop(anchor);
     }
 
     /// `velo_streaming_active_anchors` reads the registries when scraped, so

@@ -34,6 +34,7 @@ impl ActiveMessageServer {
         response_manager: ResponseManager,
         data_streams: DataStreams,
         backend: Arc<VeloBackend>,
+        public_tracker: TaskTracker,
         observability: Option<Arc<VeloMetrics>>,
         large_payload_resolver: Arc<
             std::sync::OnceLock<Arc<dyn crate::messenger::large_payload::LargePayloadResolver>>,
@@ -48,33 +49,33 @@ impl ActiveMessageServer {
         let hub = Arc::new(DispatcherHub::new(backend.clone()));
 
         // Spawn message handler with direct dispatch (hot path)
-        tracker.spawn(create_message_handler(
+        // Public waits include receive loops. Internal shutdown joins only
+        // these loops, so application tasks cannot extend its timeout.
+        tracker.spawn(public_tracker.track_future(create_message_handler(
             message_rx,
             hub.clone(),
             observability.clone(),
             large_payload_resolver,
             shutdown_state,
-        ));
+        )));
 
         tracker.spawn(
-            teardown
-                .clone()
-                .run_until_cancelled_owned(create_response_handler(
-                    response_manager.clone(),
-                    response_rx,
-                )),
+            public_tracker.track_future(teardown.clone().run_until_cancelled_owned(
+                create_response_handler(response_manager.clone(), response_rx),
+            )),
         );
         tracker.spawn(
-            teardown
-                .clone()
-                .run_until_cancelled_owned(create_ack_and_event_handler(
-                    response_manager.clone(),
-                    event_rx,
-                )),
+            public_tracker.track_future(teardown.clone().run_until_cancelled_owned(
+                create_ack_and_event_handler(response_manager.clone(), event_rx),
+            )),
         );
         tracker.spawn(
-            teardown
-                .run_until_cancelled_owned(create_shutdown_handler(response_manager, shutdown_rx)),
+            public_tracker.track_future(
+                teardown.run_until_cancelled_owned(create_shutdown_handler(
+                    response_manager,
+                    shutdown_rx,
+                )),
+            ),
         );
         Self { tracker, hub }
     }
@@ -102,7 +103,10 @@ async fn create_message_handler(
     shutdown_state: ShutdownState,
 ) -> anyhow::Result<()> {
     // Wait for system initialization before processing messages
-    hub.wait_for_system().await;
+    tokio::select! {
+        _ = hub.wait_for_system() => {},
+        _ = shutdown_state.teardown_token().cancelled() => {},
+    }
 
     // Phase 3 of graceful shutdown. `VeloBackend::graceful_shutdown` is the
     // only path that cancels this token *behind a drain*, so under

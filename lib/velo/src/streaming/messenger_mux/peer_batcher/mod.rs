@@ -243,7 +243,6 @@ impl BatcherHandle {
 
     /// Whether the task has taken its last drain, so a reply posted now is
     /// refused rather than taken.
-    #[cfg(test)]
     pub(crate) fn is_closed(&self) -> bool {
         self.control.is_closed()
     }
@@ -283,6 +282,7 @@ pub(crate) struct BatcherContext {
     pub(crate) metrics: Option<MuxMetricsHandle>,
     pub(crate) epochs: Arc<AtomicU64>,
     pub(crate) batchers: Arc<BatcherMap>,
+    pub(crate) ingress: Arc<super::ingress::IngressRegistry>,
     pub(crate) cancel: CancellationToken,
     /// A barrier in the run loop, installed only by the tests that need to stop
     /// it mid-wake. See [`test_hooks`].
@@ -323,6 +323,7 @@ pub(crate) fn spawn(key: PeerLane, ctx: BatcherContext) -> Arc<BatcherHandle> {
         handle: Arc::clone(&handle),
         epochs: ctx.epochs,
         batchers: ctx.batchers,
+        ingress: ctx.ingress,
         cancel: ctx.cancel,
         control,
         gate,
@@ -330,6 +331,7 @@ pub(crate) fn spawn(key: PeerLane, ctx: BatcherContext) -> Arc<BatcherHandle> {
         slots: EgressSlots::default(),
         streams: SelectAll::new(),
         stopping: false,
+        teardown_complete: false,
         async_open_ack,
         staged_credit: Vec::new(),
         #[cfg(test)]
@@ -371,6 +373,7 @@ struct Batcher {
     handle: Arc<BatcherHandle>,
     epochs: Arc<AtomicU64>,
     batchers: Arc<BatcherMap>,
+    ingress: Arc<super::ingress::IngressRegistry>,
     cancel: CancellationToken,
     /// The coalesced control state this task drains.
     control: Arc<ControlInbox>,
@@ -382,6 +385,8 @@ struct Batcher {
     /// Set once the task has decided to exit, so the drain loop stops pulling
     /// work it will never flush.
     stopping: bool,
+    /// Inbox closure precedes the final flush; only teardown completes an exit.
+    teardown_complete: bool,
     /// Whether an open acks before its `OpenSlot` is admitted. See
     /// [`MuxConfig::async_open_ack`].
     async_open_ack: bool,
@@ -400,10 +405,15 @@ struct Batcher {
 impl Drop for Batcher {
     fn drop(&mut self) {
         // Tokio can drop this task without polling the run loop's cleanup.
-        // Stop reply retries before closing an inbox still in the registry.
-        // Normal exits already closed it and must not stop other batchers.
-        if !self.control.is_closed() {
-            self.cancel.cancel();
+        // Retirement closes the inbox before awaiting its final flush. An
+        // abort during that flush still loses credit and must stop the mux.
+        if !self.teardown_complete {
+            let already_cancelled = self.cancel.is_cancelled();
+            if self.tasks.stop() && !already_cancelled {
+                tracing::error!(peer = %self.key.peer, lane = %self.key.lane,
+                    "messenger mux stopped: batcher task aborted unexpectedly");
+            }
+            super::close_ingress(&self.ingress, self.metrics.as_ref());
         }
         // A refused spawn can drop here under the batcher-map entry guard.
         // Normal exits unregister in run; whole-mux shutdown clears the map.
@@ -1150,5 +1160,6 @@ impl Batcher {
         let closed = self.slots.close_all();
         self.streams = SelectAll::new();
         self.account_closed(closed);
+        self.teardown_complete = true;
     }
 }

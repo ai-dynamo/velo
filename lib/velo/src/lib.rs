@@ -496,14 +496,14 @@ impl VeloBuilder {
         }
 
         // Step 6: Register streaming control-plane handlers
-        anchor_manager.register_handlers_weak(Arc::clone(&messenger))?;
+        anchor_manager.register_handlers(Arc::clone(&messenger))?;
 
         // Step 7: Create RendezvousManager and register handlers
         let rendezvous_manager = Arc::new(match self.metrics.as_ref() {
             Some(m) => crate::rendezvous::RendezvousManager::with_metrics(worker_id, Arc::clone(m)),
             None => crate::rendezvous::RendezvousManager::new(worker_id),
         });
-        rendezvous_manager.register_handlers_weak(Arc::clone(&messenger))?;
+        rendezvous_manager.register_handlers(Arc::clone(&messenger))?;
 
         // Step 8: Enable transparent large payload support
         let stager = Arc::new(crate::rendezvous::RendezvousStager::new(Arc::clone(
@@ -801,6 +801,7 @@ impl Velo {
     /// remain the caller's responsibility. Stream watchdogs and heartbeats are
     /// cancelled; application handlers that exceed `policy` can still be running.
     /// Use this when an instance is removed while its Tokio runtime stays alive.
+    /// This closes resources but retains the legacy ownership graph in memory.
     pub async fn shutdown(&self, policy: ShutdownPolicy) {
         self.graceful_shutdown(policy).await;
         self.anchor_manager.shutdown().await;
@@ -1564,14 +1565,14 @@ mod tests {
         retained.closed().await;
         drop(retained);
         drop(manager);
-        assert!(weak.upgrade().is_none());
     }
 
-    /// Shutdown must release the runtime graph while Tokio remains alive.
+    /// Shutdown must close resources while Tokio remains alive.
     #[tokio::test]
-    async fn shutdown_releases_messenger_and_anchor_manager() {
+    async fn shutdown_joins_owned_tasks_and_closes_listener() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let messenger_addr = listener.local_addr().unwrap();
         let transport = {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             Arc::new(
                 crate::transports::tcp::TcpTransportBuilder::new()
                     .from_listener(listener)
@@ -1586,10 +1587,12 @@ mod tests {
             .await
             .unwrap();
 
-        let messenger = Arc::downgrade(&velo.messenger);
-        let manager = Arc::downgrade(&velo.anchor_manager);
-        let rendezvous = Arc::downgrade(&velo.rendezvous_manager);
-        let events = Arc::downgrade(velo.messenger.events());
+        let stream_addr = match &velo.owned_stream_transport {
+            OwnedStreamTransport::Tcp(transport) => transport.bound_addr(),
+            #[cfg(feature = "grpc")]
+            OwnedStreamTransport::Grpc(_) => unreachable!(),
+        };
+
         let pending_event = velo.messenger.events().new_event().unwrap().into_handle();
         #[derive(serde::Serialize)]
         struct Subscription {
@@ -1619,18 +1622,69 @@ mod tests {
         drop(anchor);
         velo.shutdown(ShutdownPolicy::Timeout(std::time::Duration::from_secs(1)))
             .await;
-        drop(velo);
+        assert!(velo.anchor_manager.registry.is_empty());
+        velo.tracker().close();
+        tokio::time::timeout(std::time::Duration::from_secs(2), velo.tracker().wait())
+            .await
+            .expect("shutdown retained a tracked task");
+        std::net::TcpListener::bind(messenger_addr)
+            .expect("shutdown retained the messenger listener");
+        std::net::TcpListener::bind(stream_addr).expect("shutdown retained the streaming listener");
+    }
 
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while messenger.upgrade().is_some()
-                || manager.upgrade().is_some()
-                || rendezvous.upgrade().is_some()
-                || events.upgrade().is_some()
-            {
-                tokio::task::yield_now().await;
-            }
-        })
+    #[tokio::test]
+    async fn retained_messenger_value_clone_keeps_streaming_after_velo_drop() {
+        use futures::StreamExt;
+
+        async fn node() -> Arc<Velo> {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            Velo::builder()
+                .add_transport(Arc::new(
+                    crate::transports::tcp::TcpTransportBuilder::new()
+                        .from_listener(listener)
+                        .unwrap()
+                        .build()
+                        .unwrap(),
+                ))
+                .build()
+                .await
+                .unwrap()
+        }
+
+        let server = node().await;
+        let client = node().await;
+        client.register_peer(server.peer_info()).unwrap();
+        server.register_peer(client.peer_info()).unwrap();
+        let mut anchor = server.create_anchor::<u32>();
+        let manager = Arc::downgrade(&server.anchor_manager);
+        let owned_transport = server.owned_stream_transport.clone();
+        let retained = Arc::new(server.messenger.as_ref().clone());
+        drop(server);
+
+        let sender = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.attach_anchor::<u32>(anchor.handle()),
+        )
         .await
-        .expect("shutdown retained a runtime manager");
+        .expect("retained messenger lost its receive loop")
+        .expect("retained messenger lost streaming control handlers");
+        sender.send(7).await.unwrap();
+        sender.finalize().unwrap();
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), anchor.next())
+            .await
+            .expect("retained messenger lost its stream");
+        assert!(matches!(
+            frame,
+            Some(Ok(crate::streaming::StreamFrame::Item(7)))
+        ));
+
+        drop(anchor);
+        client.shutdown(ShutdownPolicy::WaitForever).await;
+        retained
+            .graceful_shutdown(ShutdownPolicy::WaitForever)
+            .await;
+        manager.upgrade().unwrap().shutdown().await;
+        owned_transport.shutdown().await;
+        retained.closed().await;
     }
 }

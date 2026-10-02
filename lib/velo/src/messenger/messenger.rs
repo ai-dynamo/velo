@@ -169,6 +169,7 @@ impl Messenger {
             response_manager.clone(),
             data_streams,
             backend.clone(),
+            tracker.clone(),
             metrics.clone(),
             large_payload_resolver.clone(),
         )
@@ -588,6 +589,10 @@ impl Messenger {
         &self.runtime
     }
 
+    /// Track receive loops, tracked handlers, and application tasks.
+    ///
+    /// Call `close` and `wait` after shutdown to wait for all tracked work.
+    /// Internal shutdown waits only for its own receive loops.
     pub fn tracker(&self) -> &tokio_util::task::TaskTracker {
         &self.tracker
     }
@@ -684,6 +689,34 @@ mod tests {
 
     fn test_transport_registry() -> &'static Mutex<HashMap<String, TransportAdapter>> {
         TEST_TRANSPORT_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    #[tokio::test]
+    async fn public_tracker_covers_receive_loops_without_extending_internal_shutdown() {
+        use futures::FutureExt;
+
+        let messenger = Messenger::builder().build().await.unwrap();
+        messenger.tracker().close();
+        assert!(
+            messenger.tracker().wait().now_or_never().is_none(),
+            "public tracker must include the idle receive loops"
+        );
+
+        let (release, pending) = tokio::sync::oneshot::channel::<()>();
+        messenger.tracker().spawn(async move {
+            let _ = pending.await;
+        });
+        messenger
+            .graceful_shutdown(crate::ShutdownPolicy::WaitForever)
+            .await;
+        tokio::time::timeout(Duration::from_secs(2), messenger.closed())
+            .await
+            .expect("internal shutdown waited for an application task");
+        assert!(messenger.tracker().wait().now_or_never().is_none());
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), messenger.tracker().wait())
+            .await
+            .expect("public tracker retained a completed receive loop");
     }
 
     fn make_test_address(key: &str, endpoint: &str) -> WorkerAddress {

@@ -440,6 +440,7 @@ async fn a_cancelled_batcher_is_unregistered_before_it_refuses_a_reply() {
                 metrics: None,
                 epochs: Arc::new(AtomicU64::new(1)),
                 batchers: Arc::clone(&batchers),
+                ingress: Arc::default(),
                 cancel: cancel.clone(),
                 hooks: None,
             },

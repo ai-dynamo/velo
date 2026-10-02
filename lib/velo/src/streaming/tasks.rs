@@ -8,14 +8,30 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 /// Tasks owned by one streaming service. Shutdown refuses new tasks before it waits.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct StreamTasks {
     cancel: CancellationToken,
     tracker: TaskTracker,
-    stopped: Arc<parking_lot::Mutex<bool>>,
+    admission: Arc<parking_lot::Mutex<()>>,
+    runtime: tokio::runtime::Handle,
+}
+
+impl Default for StreamTasks {
+    fn default() -> Self {
+        Self::new(tokio::runtime::Handle::current())
+    }
 }
 
 impl StreamTasks {
+    pub(crate) fn new(runtime: tokio::runtime::Handle) -> Self {
+        Self {
+            cancel: CancellationToken::new(),
+            tracker: TaskTracker::new(),
+            admission: Arc::default(),
+            runtime,
+        }
+    }
+
     pub(crate) fn spawn(&self, future: impl Future<Output = ()> + Send + 'static) -> bool {
         let cancel = self.cancel.clone();
         self.spawn_until_done(async move {
@@ -27,11 +43,16 @@ impl StreamTasks {
         &self,
         future: impl Future<Output = ()> + Send + 'static,
     ) -> bool {
-        let stopped = self.stopped.lock();
-        if *stopped {
-            return false;
-        }
-        self.tracker.spawn(future);
+        let tracked = {
+            let _admission = self.admission.lock();
+            if self.is_stopped() {
+                return false;
+            }
+            self.tracker.track_future(future)
+        };
+        // A stopped runtime can drop the future inside spawn. Its Drop may
+        // stop this service, so the admission lock must already be released.
+        self.runtime.spawn(tracked);
         true
     }
 
@@ -43,11 +64,13 @@ impl StreamTasks {
         self.cancel.is_cancelled()
     }
 
-    pub(crate) fn stop(&self) {
-        let mut stopped = self.stopped.lock();
-        *stopped = true;
+    /// Returns true only for the first stop request.
+    pub(crate) fn stop(&self) -> bool {
+        let _admission = self.admission.lock();
+        let first = !self.is_stopped();
         self.cancel.cancel();
         self.tracker.close();
+        first
     }
 
     pub(crate) async fn wait(&self) {

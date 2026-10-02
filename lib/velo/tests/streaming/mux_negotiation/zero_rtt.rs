@@ -103,6 +103,33 @@ async fn a_stop_requested_off_runtime_reaches_a_remote_sender() {
     }
 }
 
+/// A synchronous controller must route remote cancellation on the messenger
+/// runtime even when its caller has no Tokio runtime.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancel_requested_off_runtime_reaches_a_remote_sender() {
+    for mux in [Some(mux_config()), None] {
+        let (consumer, producer) = pair(mux.clone(), mux).await;
+        let anchor = consumer.velo.create_anchor::<u32>();
+        let controller = anchor.controller();
+        let sender = producer
+            .velo
+            .attach_anchor::<u32>(transfer(anchor.handle()))
+            .await
+            .unwrap();
+        std::thread::spawn(move || controller.cancel())
+            .join()
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            sender.cancellation_token().cancelled(),
+        )
+        .await
+        .expect("off-runtime cancel must reach the remote sender");
+        assert!(sender.send(1).await.is_err());
+        drop(anchor);
+    }
+}
+
 /// A stop reaches a sender on the anchor's own worker.
 ///
 /// A same-worker attach puts the sender in the local sender registry, the way

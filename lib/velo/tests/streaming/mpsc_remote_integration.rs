@@ -777,9 +777,16 @@ async fn test_mpsc_controller_cancel_propagates_cross_worker() {
     sender.send(1).await.unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Cancel on A fires `_stream_cancel` AM to B.
-    controller.cancel();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // A plain thread must still send `_stream_cancel` through A's runtime.
+    std::thread::spawn(move || controller.cancel())
+        .join()
+        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        sender.cancellation_token().cancelled(),
+    )
+    .await
+    .expect("off-runtime cancel must reach the remote sender");
 
     // Remote sender's poison channel should be disconnected by now.
     let result = sender.send(2).await;
@@ -823,4 +830,112 @@ async fn test_mpsc_pending_next_wakes_on_cross_worker_cancel() {
     );
 
     drop(sender);
+}
+
+/// Pause the data-plane connect after the receiver has accepted the attach.
+struct PausedConnect {
+    entered: flume::Sender<()>,
+    result: flume::Receiver<anyhow::Result<flume::Sender<Vec<u8>>>>,
+}
+
+impl FrameTransport for PausedConnect {
+    fn key(&self) -> velo_ext::TransportKey {
+        velo_ext::TransportKey::new(velo::streaming::tcp_transport::TCP_STREAM_KEY)
+    }
+
+    fn address(&self) -> velo_ext::WorkerAddress {
+        velo_ext::WorkerAddress::empty()
+    }
+
+    fn bind(
+        &self,
+        _: u64,
+        _: u64,
+    ) -> futures::future::BoxFuture<'_, anyhow::Result<flume::Receiver<Vec<u8>>>> {
+        Box::pin(async { anyhow::bail!("sender-only test transport") })
+    }
+
+    fn connect(
+        &self,
+        _: WorkerId,
+        _: u64,
+        _: u64,
+    ) -> futures::future::BoxFuture<'_, anyhow::Result<flume::Sender<Vec<u8>>>> {
+        Box::pin(async {
+            self.entered.send_async(()).await?;
+            self.result.recv_async().await?
+        })
+    }
+}
+
+/// Cancellation can arrive before connect returns. A failed or abandoned
+/// connect must also remove the identity it registered before the attach RPC.
+#[tokio::test(flavor = "multi_thread")]
+async fn mpsc_identity_survives_early_cancel_and_cleans_up_failed_attach() {
+    for outcome in ["cancel", "error", "abort"] {
+        let (messenger_a, messenger_b) = make_two_messengers().await;
+        let am_a = make_am(messenger_a).await;
+        let (entered, connected) = flume::bounded(1);
+        let (finish, result) = flume::bounded(1);
+        let am_b = Arc::new(
+            AnchorManagerBuilder::default()
+                .worker_id(messenger_b.instance_id().worker_id())
+                .transport(Arc::new(PausedConnect { entered, result }) as Arc<dyn FrameTransport>)
+                .messenger(Some(messenger_b.clone()))
+                .build()
+                .unwrap(),
+        );
+        am_b.register_handlers(messenger_b).unwrap();
+        let anchor = am_a.create_mpsc_anchor::<u32>();
+        let handle = anchor.handle();
+        let producer = am_b.clone();
+        let attach =
+            tokio::spawn(async move { producer.attach_mpsc_stream_anchor::<u32>(handle).await });
+        tokio::time::timeout(Duration::from_secs(3), connected.recv_async())
+            .await
+            .unwrap()
+            .unwrap();
+        let token = am_b
+            .sender_registry
+            .senders
+            .iter()
+            .next()
+            .expect("identity must be registered before connect")
+            .cancel_token
+            .clone();
+        match outcome {
+            "cancel" => {
+                anchor.controller().cancel();
+                tokio::time::timeout(Duration::from_secs(3), token.cancelled())
+                    .await
+                    .unwrap();
+                let (tx, _rx) = flume::bounded(1);
+                finish.send(Ok(tx)).unwrap();
+                let sender = tokio::time::timeout(Duration::from_secs(3), attach)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                assert!(sender.cancellation_token().is_cancelled());
+                assert!(sender.send(1).await.is_err());
+            }
+            "error" => {
+                finish.send(Err(anyhow::anyhow!("connect failed"))).unwrap();
+                assert!(
+                    tokio::time::timeout(Duration::from_secs(3), attach)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .is_err()
+                );
+            }
+            "abort" => {
+                attach.abort();
+                assert!(attach.await.unwrap_err().is_cancelled());
+            }
+            _ => unreachable!(),
+        }
+        assert!(am_b.sender_registry.senders.is_empty(), "{outcome}");
+        drop(anchor);
+    }
 }

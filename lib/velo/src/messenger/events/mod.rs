@@ -19,7 +19,7 @@ use lru::LruCache;
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use tokio_util::task::TaskTracker;
 use tracing::warn;
 
@@ -53,7 +53,7 @@ pub struct VeloEvents {
     system_id: u64,
     instance_id: InstanceId,
     backend: Arc<VeloBackend>,
-    messenger: RwLock<Weak<Messenger>>,
+    messenger: RwLock<Option<Arc<Messenger>>>,
     remote_events: DashMap<RemoteEventKey, Arc<RemoteEvent>>,
     completed_cache: Arc<Mutex<LruCache<RemoteEventKey, CompletedEventInfo>>>,
     owner_subscribers: DashMap<RemoteEventKey, DashMap<InstanceId, u32>>,
@@ -100,7 +100,7 @@ impl VeloEvents {
             system_id,
             instance_id,
             backend,
-            messenger: RwLock::new(Weak::new()),
+            messenger: RwLock::new(None),
             remote_events: DashMap::new(),
             completed_cache: Arc::new(Mutex::new(LruCache::new(
                 NonZeroUsize::new(DEFAULT_COMPLETED_CACHE_SIZE).unwrap(),
@@ -186,7 +186,7 @@ impl VeloEvents {
     }
 
     pub(crate) fn set_messenger(&self, messenger: Arc<Messenger>) {
-        *self.messenger.write() = Arc::downgrade(&messenger);
+        *self.messenger.write() = Some(messenger);
     }
 
     // ── Fire-and-forget remote operations (for EventBackend trait) ──
@@ -241,7 +241,7 @@ impl VeloEvents {
         let messenger = self
             .messenger
             .read()
-            .upgrade()
+            .clone()
             .ok_or_else(|| anyhow!("Event messenger is unavailable"))?;
 
         let discovery = messenger.discovery().ok_or_else(|| {
@@ -836,7 +836,7 @@ impl VeloEvents {
         let messenger = self
             .messenger
             .read()
-            .upgrade()
+            .clone()
             .ok_or_else(|| anyhow!("Event messenger is unavailable"))?;
         let bytes = Bytes::from(serde_json::to_vec(&payload)?);
         messenger

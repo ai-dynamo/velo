@@ -46,7 +46,13 @@ Use `Velo::shutdown(policy)` when an application removes a Velo instance but kee
 
 Call shutdown explicitly. Dropping a `Velo` value or its last `Arc` does not perform a graceful drain.
 
+This release keeps the existing strong references between the runtime and its services. A retained Messenger keeps streaming services available after Velo is dropped. Explicit shutdown closes resources and joins owned tasks, but does not release this ownership graph from memory.
+
 `graceful_shutdown` keeps its existing behavior: it drains and closes the messenger and RDMA services, but does not close the per-stream TCP or gRPC transport. `shutdown` is the complete instance shutdown operation. Application handlers that exceed a timeout can still be running after it returns.
+
+The public task tracker includes receive loops, tracked handlers, and tasks added by the application. Call `close` and `wait` after shutdown to wait for all of them. Internal shutdown joins its own receive loops separately, so an application task cannot extend its timeout.
+
+A handler panic fails its waiting caller in every dispatch mode, provided the program unwinds panics. The error reply remains counted work until the transport accepts it. An ordered lane continues with the next message.
 
 Hard teardown interrupts a blocked TCP or UDS write and fails the frames still held by the writer. The connection is discarded if a write may be partial. A reported write failure does not prove that the peer received no bytes; applications must not treat it as permission to retry a non-idempotent request.
 

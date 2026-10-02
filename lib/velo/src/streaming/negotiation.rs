@@ -93,7 +93,7 @@ impl Selection {
         session_id: u64,
     ) -> anyhow::Result<(flume::Receiver<Vec<u8>>, Terms)> {
         let receiver = match self.target {
-            Target::Mux(mux, lane) => mux.bind_on_lane(anchor_id, session_id, lane),
+            Target::Mux(mux, lane) => mux.bind_on_lane(anchor_id, session_id, lane)?,
             Target::Other(transport) => transport.bind(anchor_id, session_id).await?,
         };
         Ok((receiver, self.terms))

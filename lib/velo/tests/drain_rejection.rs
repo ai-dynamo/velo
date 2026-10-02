@@ -815,7 +815,13 @@ async fn a_parked_dispatch_loop_leaves_admitted_messages_uncounted() {
 /// Error replies are still admitted work while their transport queue is full.
 #[tokio::test]
 async fn graceful_shutdown_waits_for_negative_reply_admission() {
-    for case in ["unknown", "missing_resolver", "ordered_panic"] {
+    for case in [
+        "unknown",
+        "missing_resolver",
+        "ordered_panic",
+        "spawned_panic",
+        "inline_panic",
+    ] {
         let transport = Arc::new(LoopbackTransport::default());
         let messenger = Messenger::builder()
             .add_transport(transport.clone())
@@ -829,6 +835,18 @@ async fn graceful_shutdown_waits_for_negative_reply_admission() {
             .register_streaming_handler(
                 Handler::unary_handler("_panic", |_| panic!("test handler panic"))
                     .ordered_global()
+                    .build(),
+            )
+            .unwrap();
+        messenger
+            .register_streaming_handler(
+                Handler::unary_handler("_spawned_panic", |_| panic!("test handler panic")).build(),
+            )
+            .unwrap();
+        messenger
+            .register_streaming_handler(
+                Handler::unary_handler("_inline_panic", |_| panic!("test handler panic"))
+                    .inline()
                     .build(),
             )
             .unwrap();
@@ -850,10 +868,11 @@ async fn graceful_shutdown_waits_for_negative_reply_admission() {
         if case == "missing_resolver" {
             headers.insert("_rv".to_string(), "missing".to_string());
         }
-        let name = if case == "ordered_panic" {
-            "_panic"
-        } else {
-            "_missing"
+        let name = match case {
+            "ordered_panic" => "_panic",
+            "spawned_panic" => "_spawned_panic",
+            "inline_panic" => "_inline_panic",
+            _ => "_missing",
         };
         let reply = tokio::spawn(
             messenger
@@ -890,7 +909,7 @@ async fn graceful_shutdown_waits_for_negative_reply_admission() {
         let error = reply.await.unwrap().unwrap_err().to_string();
         let expected = match case {
             "missing_resolver" => "resolver not configured",
-            "ordered_panic" => "handler panicked",
+            "ordered_panic" | "spawned_panic" | "inline_panic" => "handler panicked",
             _ => "not found",
         };
         assert!(error.contains(expected), "{case}: {error}");
