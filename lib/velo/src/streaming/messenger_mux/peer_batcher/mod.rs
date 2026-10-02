@@ -277,6 +277,7 @@ impl BatcherHandle {
 
 /// Everything a batcher task needs that is not per-peer state.
 pub(crate) struct BatcherContext {
+    pub(crate) tasks: crate::streaming::tasks::StreamTasks,
     pub(crate) messenger: Arc<Messenger>,
     pub(crate) config: MuxConfig,
     pub(crate) metrics: Option<MuxMetricsHandle>,
@@ -314,7 +315,9 @@ pub(crate) fn spawn(key: PeerLane, ctx: BatcherContext) -> Arc<BatcherHandle> {
         ctx.metrics.clone(),
         epoch,
     );
+    let tasks = ctx.tasks.clone();
     let batcher = Batcher {
+        tasks: ctx.tasks,
         key,
         metrics: ctx.metrics,
         handle: Arc::clone(&handle),
@@ -332,7 +335,7 @@ pub(crate) fn spawn(key: PeerLane, ctx: BatcherContext) -> Arc<BatcherHandle> {
         #[cfg(test)]
         hooks: ctx.hooks,
     };
-    tokio::spawn(batcher.run(open_rx));
+    tasks.spawn(batcher.run(open_rx));
     handle
 }
 
@@ -361,6 +364,7 @@ enum FenceSkip {
 }
 
 struct Batcher {
+    tasks: crate::streaming::tasks::StreamTasks,
     /// The (peer, lane) this batcher serves, and its key in the registry.
     key: PeerLane,
     metrics: Option<MuxMetricsHandle>,
@@ -391,6 +395,14 @@ struct Batcher {
     staged_credit: Vec<(SlotId, u32)>,
     #[cfg(test)]
     hooks: Option<Arc<TestHooks>>,
+}
+
+impl Drop for Batcher {
+    fn drop(&mut self) {
+        // A refused spawn can drop here under the batcher-map entry guard.
+        // Normal exits unregister in run; whole-mux shutdown clears the map.
+        self.teardown(false);
+    }
 }
 
 impl Batcher {
@@ -514,7 +526,10 @@ impl Batcher {
             Work::Control(drained) => self.on_control(drained).await,
             Work::Linger => {}
             Work::Probe => {
-                if !self.writer.peer_is_alive().await {
+                if let Err(error) = self.writer.check_peer_health().await {
+                    tracing::warn!(peer = %self.key.peer, lane = %self.key.lane,
+                        epoch = self.writer.epoch(), live_slots = self.slots.live(),
+                        %error, "messenger mux: peer health failed; failing the epoch");
                     self.epoch_death();
                 }
             }
@@ -575,6 +590,10 @@ impl Batcher {
         // A failed singleton is epoch death; nothing else about the slot
         // matters afterwards, because the slot does not survive the epoch.
         if entry.singleton == Some(false) {
+            tracing::warn!(peer = %self.key.peer, lane = %self.key.lane,
+                epoch = self.writer.epoch(), slot = ?slot, live_slots = self.slots.live(),
+                error = entry.singleton_error.as_deref().unwrap_or("admission failed"),
+                "messenger mux: singleton was never admitted; failing the peer epoch");
             self.epoch_death();
             return;
         }
@@ -836,8 +855,8 @@ impl Batcher {
         let control = Arc::clone(&self.control);
         #[cfg(test)]
         let hooks = self.hooks.clone();
-        tokio::spawn(async move {
-            let admitted = fire.await.is_ok();
+        self.tasks.spawn(async move {
+            let admission = fire.await;
             #[cfg(test)]
             if let Some(hooks) = &hooks {
                 hooks.await_resolutions_release().await;
@@ -850,8 +869,10 @@ impl Batcher {
             // singleton's entry under the same `SlotId` key and release a
             // fence that has not actually resolved (see `fire_singleton`'s
             // doc above).
-            if needs_fence || !admitted {
-                control.singleton_resolved(id, admitted);
+            match admission {
+                Ok(()) if needs_fence => control.singleton_resolved(id, true),
+                Ok(()) => {}
+                Err(error) => control.singleton_failed(id, Arc::from(error.to_string())),
             }
         });
         true

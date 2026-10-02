@@ -114,6 +114,88 @@ fn roundtrip_handle(handle: StreamAnchorHandle) -> StreamAnchorHandle {
     StreamAnchorHandle::from_u128(handle.as_u128())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_sender_detach_and_drop_preserve_unrelated_local_slots() {
+    let (messenger_a, messenger_b) = make_two_messengers().await;
+    let am_a = make_am(messenger_a).await;
+    let am_b = make_am(messenger_b).await;
+    let remote_anchor = am_a.create_mpsc_anchor::<u32>();
+    let local_anchor = am_b.create_mpsc_anchor_with_config::<u32>(MpscAnchorConfig {
+        max_senders: Some(2),
+        ..Default::default()
+    });
+    assert_eq!(
+        remote_anchor.handle().unpack().1,
+        local_anchor.handle().unpack().1
+    );
+
+    let local_one = am_b
+        .attach_mpsc_stream_anchor::<u32>(local_anchor.handle())
+        .await
+        .unwrap();
+    let local_two = am_b
+        .attach_mpsc_stream_anchor::<u32>(local_anchor.handle())
+        .await
+        .unwrap();
+    let remote_one = am_b
+        .attach_mpsc_stream_anchor::<u32>(remote_anchor.handle())
+        .await
+        .unwrap();
+    let remote_two = am_b
+        .attach_mpsc_stream_anchor::<u32>(remote_anchor.handle())
+        .await
+        .unwrap();
+    assert_eq!(local_one.sender_id(), remote_one.sender_id());
+    assert_eq!(local_two.sender_id(), remote_two.sender_id());
+
+    remote_one.detach().await.unwrap();
+    drop(remote_two);
+    assert!(matches!(
+        am_b.attach_mpsc_stream_anchor::<u32>(local_anchor.handle())
+            .await,
+        Err(AttachError::MaxSendersReached { .. })
+    ));
+    local_anchor.cancel();
+    remote_anchor.cancel();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_sender_cancel_preserves_an_unrelated_local_sender() {
+    let (messenger_a, messenger_b) = make_two_messengers().await;
+    let am_a = make_am(messenger_a).await;
+    let am_b = make_am(messenger_b).await;
+    let remote_anchor = am_a.create_mpsc_anchor::<u32>();
+    let mut local_anchor = am_a.create_mpsc_anchor::<u32>();
+    let local_sender = am_a
+        .attach_mpsc_stream_anchor::<u32>(local_anchor.handle())
+        .await
+        .unwrap();
+    let remote_sender = am_b
+        .attach_mpsc_stream_anchor::<u32>(remote_anchor.handle())
+        .await
+        .unwrap();
+    // Sender IDs belong to workers, so both first senders have registry key 1.
+    assert!(am_a.sender_registry.senders.contains_key(&1));
+    assert!(am_b.sender_registry.senders.contains_key(&1));
+
+    remote_anchor.cancel();
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        remote_sender.cancellation_token().cancelled(),
+    )
+    .await
+    .expect("remote sender was not cancelled");
+    assert!(!local_sender.cancellation_token().is_cancelled());
+    local_sender.send(42).await.unwrap();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(3), local_anchor.next())
+            .await
+            .unwrap(),
+        Some(Ok((_, MpscFrame::Item(42))))
+    ));
+    local_anchor.cancel();
+}
+
 /// Two remote senders attach to one MPSC anchor on a separate worker and
 /// deliver items. Each sender gets a distinct `SenderId`, and the anchor
 /// reports both.

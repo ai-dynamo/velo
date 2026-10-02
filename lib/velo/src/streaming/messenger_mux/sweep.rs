@@ -206,7 +206,7 @@ pub(super) fn spawn_sweep(core: &Arc<MuxCore>) {
     let interval = core.config.credit_sweep_interval;
     let floor = core.config.drain_visit_floor;
     let drain_rx = core.drain_rx.clone();
-    tokio::spawn(async move {
+    core.tasks.spawn(async move {
         enum Wake {
             Tick,
             Peer(PeerLane),

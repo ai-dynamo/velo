@@ -73,6 +73,7 @@ pub(crate) struct MpscAnchorEntry {
 // ---------------------------------------------------------------------------
 
 struct MpscStreamControllerInner {
+    worker_id: velo_ext::WorkerId,
     local_id: u64,
     registry: Arc<DashMap<u64, MpscAnchorEntry>>,
     sender_registry: Arc<crate::streaming::control::SenderRegistry>,
@@ -120,6 +121,7 @@ impl MpscStreamController {
 
         cancel_all_senders(
             &entry,
+            self.inner.worker_id,
             &self.inner.sender_registry,
             self.inner.messenger.as_ref(),
         );
@@ -163,6 +165,7 @@ impl<T> MpscStreamAnchor<T> {
         } = ctx;
         let (cancel_wake, cancel_rx) = flume::bounded::<()>(1);
         let inner = Arc::new(MpscStreamControllerInner {
+            worker_id: handle.unpack().0,
             local_id,
             registry: registry.clone(),
             sender_registry,
@@ -274,6 +277,7 @@ impl<T: DeserializeOwned> Stream for MpscStreamAnchor<T> {
 /// handler so both paths give attached senders the same cleanup.
 pub(crate) fn cancel_all_senders(
     entry: &MpscAnchorEntry,
+    local_worker: velo_ext::WorkerId,
     sender_registry: &Arc<crate::streaming::control::SenderRegistry>,
     messenger: Option<&Arc<crate::messenger::Messenger>>,
 ) {
@@ -287,9 +291,12 @@ pub(crate) fn cancel_all_senders(
         };
         let (sender_worker_id, sender_stream_id) = handle.unpack();
 
-        if let Some((_, sender_entry)) = sender_registry.senders.remove(&sender_stream_id) {
-            drop(sender_entry.rx_closer.lock().unwrap().take());
-            sender_entry.cancel_token.cancel();
+        if sender_worker_id == local_worker {
+            if let Some((_, sender_entry)) = sender_registry.senders.remove(&sender_stream_id) {
+                drop(sender_entry.rx_closer.lock().unwrap().take());
+                sender_entry.cancel_token.cancel();
+            }
+            continue;
         }
 
         if let Some(messenger) = messenger.cloned() {

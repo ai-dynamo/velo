@@ -226,6 +226,7 @@ pub(crate) async fn reader_pump(
             received = transport_rx.recv_async() => {
                 match received {
                     Ok(bytes) => {
+                        let detached = bytes == *crate::streaming::sender::cached_detached();
                         // Forward to anchor's frame channel.
                         //
                         // The per-anchor frame_tx is bounded(256) — the first
@@ -244,6 +245,18 @@ pub(crate) async fn reader_pump(
                                 }
                             }
                             Err(flume::TrySendError::Disconnected(_)) => break,
+                        }
+                        if detached {
+                            // Retired pumps must not clear a replacement stream.
+                            // Attach cancels the old token under this shard lock.
+                            if let Some(mut entry) = registry.get_mut(&local_id)
+                                && !cancel_token.is_cancelled()
+                            {
+                                entry.retire_pump();
+                                entry.attachment = false;
+                                entry.restart_unattached_timeout(&registry, local_id);
+                            }
+                            break;
                         }
                         // Any frame (data or heartbeat) proves liveness -- but
                         // only once it is actually forwarded. A `frame_tx` that

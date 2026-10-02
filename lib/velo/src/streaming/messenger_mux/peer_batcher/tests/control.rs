@@ -434,6 +434,7 @@ async fn a_cancelled_batcher_is_unregistered_before_it_refuses_a_reply() {
         let handle = spawn(
             key,
             BatcherContext {
+                tasks: Default::default(),
                 messenger: Arc::clone(&sender),
                 config: MuxConfig::default(),
                 metrics: None,

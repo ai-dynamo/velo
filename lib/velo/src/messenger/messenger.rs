@@ -167,10 +167,8 @@ impl Messenger {
         // 4. Create server (no event frame handler — events use AM handlers)
         let server = ActiveMessageServer::new(
             response_manager.clone(),
-            None,
             data_streams,
             backend.clone(),
-            tracker.clone(),
             metrics.clone(),
             large_payload_resolver.clone(),
         )
@@ -649,6 +647,15 @@ impl Messenger {
     /// shutdown.
     pub async fn graceful_shutdown(&self, policy: crate::transports::ShutdownPolicy) {
         self.backend.graceful_shutdown(policy).await;
+    }
+
+    pub(crate) fn abort_startup(&self) {
+        self.backend.shutdown_now();
+    }
+
+    pub(crate) async fn closed(&self) {
+        self.server.closed().await;
+        self.events.closed().await;
     }
 
     /// Internal: create an unchecked message builder (for system messages)

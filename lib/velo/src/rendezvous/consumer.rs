@@ -88,7 +88,7 @@ impl Consumer {
     /// offered, and returns owned bytes. The read lock remains held until
     /// `detach()` or `release()` is called.
     pub async fn get(manager: &RendezvousManager, handle: DataHandle) -> Result<(Bytes, u64)> {
-        let messenger = manager.messenger();
+        let messenger = &manager.messenger()?;
         let target_worker = handle.worker_id();
         let response = acquire(manager, handle, rdma_offer(manager, target_worker)).await?;
 
@@ -160,7 +160,7 @@ impl Consumer {
         manager: &RendezvousManager,
         handle: DataHandle,
     ) -> Result<(crate::rendezvous::rdma::PinnedBuf, u64)> {
-        let messenger = manager.messenger();
+        let messenger = &manager.messenger()?;
         let target_worker = handle.worker_id();
         let response = acquire(manager, handle, rdma_offer(manager, target_worker)).await?;
 
@@ -232,7 +232,7 @@ impl Consumer {
         handle: DataHandle,
         dest: &mut impl RendezvousWrite,
     ) -> Result<u64> {
-        let messenger = manager.messenger();
+        let messenger = &manager.messenger()?;
         let target_worker = handle.worker_id();
         let response = acquire(manager, handle, rdma_offer(manager, target_worker)).await?;
 
@@ -379,7 +379,7 @@ async fn acquire(
     offer: Option<RdmaOffer>,
 ) -> Result<AcquireResponse> {
     let response: AcquireResponse = manager
-        .messenger()
+        .messenger()?
         .typed_unary_streaming::<AcquireResponse>("_rv_acquire")
         .payload(&RvAcquireRequest {
             handle: RvHandleWire::from_handle(handle),
@@ -416,7 +416,8 @@ fn rdma_offer(manager: &RendezvousManager, target: WorkerId) -> Option<RdmaOffer
         return None;
     }
     let key = ctx.backend.key();
-    let backend = manager.messenger().backend();
+    let messenger = manager.messenger().ok()?;
+    let backend = messenger.backend();
     // An owner this instance has never registered has no endpoint to GET over,
     // whatever transports it advertises.
     let Ok(instance) = backend.try_translate_worker_id(target) else {
@@ -654,6 +655,7 @@ async fn run_get(
     })?;
     let peer = manager
         .messenger()
+        .map_err(|e| RdmaFallback::new(RdmaPathReason::GetFailed, e.to_string()))?
         .backend()
         .try_translate_worker_id(handle.worker_id())
         .map_err(|e| {
@@ -801,7 +803,7 @@ async fn send_lease_renewal(manager: &RendezvousManager, handle: DataHandle, lea
     };
     let sent = async {
         manager
-            .messenger()
+            .messenger()?
             .am_send_streaming("_rv_lease_renew")?
             .raw_payload(Bytes::from(payload))
             .worker(handle.worker_id())
@@ -839,7 +841,7 @@ async fn fallback_chunked(
     // The owner's lease is tied to a transfer that will never happen. Detach it
     // before asking for another, or the slot carries two read locks and the
     // first is released only when its deadline passes.
-    if let Err(e) = Consumer::detach(manager.messenger(), handle, lease_id).await {
+    if let Err(e) = Consumer::detach(&manager.messenger()?, handle, lease_id).await {
         tracing::warn!(%handle, error = %e, "rendezvous: could not detach before falling back");
     }
     chunked_only(manager, handle).await
@@ -861,7 +863,7 @@ async fn unsolicited_rdma(
         "rendezvous: owner answered with an RDMA descriptor for an acquire that offered \
          nothing; falling back to the chunked path"
     );
-    if let Err(e) = Consumer::detach(manager.messenger(), handle, lease_id).await {
+    if let Err(e) = Consumer::detach(&manager.messenger()?, handle, lease_id).await {
         tracing::warn!(%handle, error = %e, "rendezvous: could not detach before falling back");
     }
     chunked_only(manager, handle).await
@@ -874,7 +876,7 @@ async fn unsolicited_rdma(
 /// than recursing — a retry loop here would turn one such owner into an
 /// unbounded storm of round trips.
 async fn chunked_only(manager: &RendezvousManager, handle: DataHandle) -> Result<(Bytes, u64)> {
-    let messenger = manager.messenger();
+    let messenger = &manager.messenger()?;
     let target_worker = handle.worker_id();
     match acquire(manager, handle, None).await? {
         AcquireResponse::Ready {

@@ -97,7 +97,7 @@ impl<T: Serialize> MpscStreamSender<T> {
             sender_registry,
             poison_tx,
         } = cancel;
-        let heartbeat_cancel = CancellationToken::new();
+        let heartbeat_cancel = cancel_token.child_token();
 
         // Heartbeat task — skip first immediate tick, then emit cached
         // heartbeat bytes via non-blocking `try_send`. Matches the SPSC
@@ -240,11 +240,13 @@ impl<T: Serialize> MpscStreamSender<T> {
         // immediately. Cross-worker: the remote pump forwards the Detached
         // sentinel and the anchor's `poll_next` removes the slot on its side.
         let (_, local_id) = self.handle.unpack();
-        if let Some(slot) = crate::streaming::mpsc::anchor::remove_sender_slot(
-            &self.mpsc_registry,
-            local_id,
-            self.sender_id.0,
-        ) && let Some(pt) = slot.pump_token
+        if matches!(self.channel, SenderChannel::Local(_))
+            && let Some(slot) = crate::streaming::mpsc::anchor::remove_sender_slot(
+                &self.mpsc_registry,
+                local_id,
+                self.sender_id.0,
+            )
+            && let Some(pt) = slot.pump_token
         {
             pt.cancel();
         }
@@ -279,14 +281,52 @@ impl<T> Drop for MpscStreamSender<T> {
             // and the unattached timeout can re-arm when the last sender
             // leaves. Cross-worker removal is performed by the remote pump.
             let (_, local_id) = self.handle.unpack();
-            if let Some(slot) = crate::streaming::mpsc::anchor::remove_sender_slot(
-                &self.mpsc_registry,
-                local_id,
-                self.sender_id.0,
-            ) && let Some(pt) = slot.pump_token
+            if matches!(self.channel, SenderChannel::Local(_))
+                && let Some(slot) = crate::streaming::mpsc::anchor::remove_sender_slot(
+                    &self.mpsc_registry,
+                    local_id,
+                    self.sender_id.0,
+                )
+                && let Some(pt) = slot.pump_token
             {
                 pt.cancel();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_stops_heartbeats_while_the_sender_is_retained() {
+        let (tx, rx) = flume::bounded(16);
+        let (poison_tx, _poison_rx) = flume::bounded(1);
+        let cancel_token = CancellationToken::new();
+        let heartbeat = Duration::from_secs(5);
+        let sender = MpscStreamSender::<u32>::new(
+            SenderId(1),
+            SenderChannel::Remote(tx),
+            StreamAnchorHandle::pack(velo_ext::WorkerId::from_u64(1), 1),
+            Arc::new(DashMap::new()),
+            StreamSenderCancelInfo {
+                cancel_token: cancel_token.clone(),
+                sender_stream_id: 1,
+                sender_registry: Arc::new(crate::streaming::control::SenderRegistry::default()),
+                poison_tx,
+            },
+            heartbeat,
+            None,
+        );
+        assert_eq!(rx.recv_async().await.unwrap(), *cached_heartbeat());
+        cancel_token.cancel();
+        tokio::task::yield_now().await;
+        assert!(
+            tokio::time::timeout(heartbeat * 2, rx.recv_async())
+                .await
+                .is_err()
+        );
+        drop(sender);
     }
 }

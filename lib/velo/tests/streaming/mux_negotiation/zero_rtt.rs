@@ -991,3 +991,43 @@ async fn a_finished_zero_rtt_stream_leaves_no_task_behind() {
         alive()
     );
 }
+
+/// Worker-local anchor IDs can match; detaching a remote sender must not change a local anchor.
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_detach_leaves_an_unrelated_local_anchor_attached() {
+    let (consumer, producer) = pair(Some(mux_config()), Some(mux_config())).await;
+    let mut remote_anchor = consumer.velo.create_anchor::<u32>();
+    let local_anchor = producer.velo.create_anchor::<u32>();
+    assert_eq!(
+        remote_anchor.handle().unpack().1,
+        local_anchor.handle().unpack().1
+    );
+    let _local_sender = producer
+        .velo
+        .attach_anchor::<u32>(local_anchor.handle())
+        .await
+        .unwrap();
+    let ticket = consumer
+        .velo
+        .prebind_anchor(remote_anchor.handle())
+        .unwrap();
+    let remote_sender = producer
+        .velo
+        .open_anchor_stream::<u32>(remote_anchor.handle(), ship(ticket))
+        .await
+        .unwrap();
+    remote_sender.detach().unwrap();
+    assert!(matches!(
+        tokio::time::timeout(PATIENCE, remote_anchor.next())
+            .await
+            .unwrap(),
+        Some(Ok(StreamFrame::Detached))
+    ));
+    assert!(matches!(
+        producer
+            .velo
+            .attach_anchor::<u32>(local_anchor.handle())
+            .await,
+        Err(AttachError::AlreadyAttached { .. })
+    ));
+}

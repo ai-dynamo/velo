@@ -53,14 +53,13 @@ use tokio_util::task::TaskTracker;
 
 /// Wait for a queued frame to reach the send channel.
 ///
-/// Response and ack paths are fire-and-forget from here on: a failed admission
-/// is already reported through the backend's error handler, so there is nothing
-/// left for this caller to do with it.
+/// Admission failures must reach the caller even when no transport callback runs.
 #[inline]
-async fn await_admission(outcome: SendOutcome) {
+async fn await_admission(outcome: SendOutcome) -> Result<()> {
     if let SendOutcome::Pending(admission) = outcome {
-        let _ = admission.await;
+        admission.await?;
     }
+    Ok(())
 }
 
 // ============================================================================
@@ -1022,7 +1021,7 @@ async fn send_ack(backend: Arc<VeloBackend>, response_id: ResponseId) -> Result<
         MessageType::Ack,
         get_ack_error_handler(),
     )?;
-    await_admission(outcome).await;
+    await_admission(outcome).await?;
 
     Ok(())
 }
@@ -1059,7 +1058,7 @@ async fn send_nack(
         MessageType::Ack,
         get_nack_error_handler(),
     )?;
-    await_admission(outcome).await;
+    await_admission(outcome).await?;
 
     Ok(())
 }
@@ -1079,7 +1078,7 @@ async fn send_response_ok(
         MessageType::Response,
         get_response_error_handler(),
     )?;
-    await_admission(outcome).await;
+    await_admission(outcome).await?;
 
     Ok(())
 }
@@ -1100,7 +1099,7 @@ async fn send_response(
         MessageType::Response,
         get_response_error_handler(),
     )?;
-    await_admission(outcome).await;
+    await_admission(outcome).await?;
 
     Ok(())
 }
@@ -1122,7 +1121,7 @@ async fn send_response_error(
         MessageType::Response,
         get_response_error_handler(),
     )?;
-    await_admission(outcome).await;
+    await_admission(outcome).await?;
 
     Ok(())
 }
@@ -1407,18 +1406,6 @@ mod tests {
     use serde::{Deserialize, Serialize};
 
     #[derive(Serialize, Deserialize, Debug, Clone)]
-    struct CalcRequest {
-        a: f64,
-        b: f64,
-        operation: String,
-    }
-
-    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-    struct CalcResponse {
-        result: f64,
-    }
-
-    #[derive(Serialize, Deserialize, Debug, Clone)]
     struct PingRequest {
         message: String,
     }
@@ -1501,41 +1488,6 @@ mod tests {
         )
         .build();
         assert_eq!(handler.name(), "test_typed_async");
-    }
-
-    #[test]
-    fn test_typed_unary_calculator() {
-        let handler = typed_unary("calculator", |ctx: TypedContext<CalcRequest>| {
-            let req = ctx.input;
-            let result = match req.operation.as_str() {
-                "add" => req.a + req.b,
-                "subtract" => req.a - req.b,
-                "multiply" => req.a * req.b,
-                "divide" => {
-                    if req.b == 0.0 {
-                        return Err(anyhow::anyhow!("Division by zero"));
-                    }
-                    req.a / req.b
-                }
-                _ => return Err(anyhow::anyhow!("Unknown operation: {}", req.operation)),
-            };
-            Ok(CalcResponse { result })
-        })
-        .build();
-
-        assert_eq!(handler.name(), "calculator");
-    }
-
-    #[test]
-    fn test_dispatch_modes() {
-        let handler = am_handler("default", |_ctx| Ok(())).build();
-        assert_eq!(handler.name(), "default");
-
-        let handler = am_handler("inline", |_ctx| Ok(())).inline().build();
-        assert_eq!(handler.name(), "inline");
-
-        let handler = am_handler("spawn", |_ctx| Ok(())).spawn().build();
-        assert_eq!(handler.name(), "spawn");
     }
 
     #[test]

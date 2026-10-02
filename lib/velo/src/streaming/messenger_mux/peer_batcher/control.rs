@@ -54,7 +54,7 @@
 //! for any number of pending changes.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::Notify;
 
@@ -63,7 +63,7 @@ use super::ReplyRecord;
 use crate::observability::MuxMetricsHandle;
 
 /// Coalesced control for one slot **this** batcher owns.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct OwnedControl {
     pub(super) lifecycle: Option<(u64, bool)>,
     /// Credit granted since the batcher last looked.
@@ -73,6 +73,7 @@ pub(super) struct OwnedControl {
     /// A singleton (rendezvous, or an `OpenSlot` under
     /// `MuxConfig::async_open_ack`) resolved; `false` is a failed admission.
     pub(super) singleton: Option<bool>,
+    pub(super) singleton_error: Option<Arc<str>>,
 }
 
 /// Coalesced control to send back for one slot the **peer** owns.
@@ -204,7 +205,7 @@ struct ControlState {
     /// growing.
     ///
     /// [`drain`]: Self::drain
-    resolutions: HashMap<u32, bool>,
+    resolutions: HashMap<u32, (bool, Option<Arc<str>>)>,
     /// `OpenSlot`s the ingress rejected without admitting, capped at
     /// [`MAX_PENDING_REJECTS`] for the reason given there — unlike
     /// everything else in `peers`, dropping one costs no credit. Merged
@@ -284,13 +285,14 @@ impl ControlState {
     /// been. No coalescing happens at this boundary: `mine`'s own writers
     /// (`entry_mine`, reached from `grant` and `peer_closed`) never touch
     /// `singleton`, so an entry taken from `mine` here is always fresh, and
-    /// the failed-admission-wins rule lives entirely in
-    /// [`ControlInbox::singleton_resolved`], the one place that writes
-    /// `resolutions`.
+    /// the failed-admission-wins rule lives in the singleton resolution
+    /// methods, which preserve the first admission error.
     fn drain(&mut self) -> DrainedControl {
         let mut mine = std::mem::take(&mut self.mine);
-        for (raw, admitted) in std::mem::take(&mut self.resolutions) {
-            mine.entry(raw).or_default().singleton = Some(admitted);
+        for (raw, (admitted, error)) in std::mem::take(&mut self.resolutions) {
+            let entry = mine.entry(raw).or_default();
+            entry.singleton = Some(admitted);
+            entry.singleton_error = error;
         }
         let mut peers = std::mem::take(&mut self.peers);
         for (raw, reason) in std::mem::take(&mut self.rejects) {
@@ -337,8 +339,8 @@ impl ControlState {
     /// Its own map rather than one more key into `mine`: a refused
     /// resolution is a leak rather than a dropped message, and keeping the
     /// lane apart is what makes that statement hold whatever else is pending.
-    fn entry_mine_owed(&mut self, slot: SlotId) -> &mut bool {
-        self.resolutions.entry(slot.raw()).or_insert(true)
+    fn entry_mine_owed(&mut self, slot: SlotId) -> &mut (bool, Option<Arc<str>>) {
+        self.resolutions.entry(slot.raw()).or_insert((true, None))
     }
 
     /// The entry for control this side sends back about a slot the peer owns.
@@ -540,7 +542,15 @@ impl ControlInbox {
             let entry = state.entry_mine_owed(slot);
             // A failed admission is epoch death and must survive any number
             // of successful resolutions coalescing over it.
-            *entry = *entry && admitted;
+            entry.0 &= admitted;
+        });
+    }
+
+    pub(super) fn singleton_failed(&self, slot: SlotId, error: Arc<str>) {
+        self.mutate(|state| {
+            let entry = state.entry_mine_owed(slot);
+            entry.0 = false;
+            entry.1.get_or_insert(error);
         });
     }
 
@@ -756,7 +766,7 @@ mod tests {
         inbox.grant(id, 5);
 
         let drained = inbox.take().expect("something pending");
-        let entry = drained.mine[&id.raw()];
+        let entry = &drained.mine[&id.raw()];
         assert_eq!(entry.close, Some(CloseReason::UnknownSlot));
         assert_eq!(
             entry.credit, 10,
@@ -769,10 +779,14 @@ mod tests {
         let inbox = ControlInbox::default();
         let id = slot(2, 7);
         inbox.singleton_resolved(id, true);
-        inbox.singleton_resolved(id, false);
+        inbox.singleton_failed(id, Arc::from("transport closed"));
         inbox.singleton_resolved(id, true);
 
         let drained = inbox.take().expect("something pending");
+        assert_eq!(
+            drained.mine[&id.raw()].singleton_error.as_deref(),
+            Some("transport closed")
+        );
         assert_eq!(
             drained.mine[&id.raw()].singleton,
             Some(false),

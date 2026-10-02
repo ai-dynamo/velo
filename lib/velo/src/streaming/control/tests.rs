@@ -55,6 +55,32 @@ fn make_test_manager() -> Arc<AnchorManager> {
     Arc::new(AnchorManager::new(worker_id, transport))
 }
 
+#[test]
+fn public_handler_factories_keep_the_manager_alive() {
+    use crate::streaming::mpsc::control::{
+        create_mpsc_anchor_attach_handler, create_mpsc_anchor_cancel_handler,
+        create_mpsc_anchor_detach_handler,
+    };
+
+    let factories: [fn(Arc<AnchorManager>) -> crate::messenger::Handler; 7] = [
+        create_anchor_attach_handler,
+        create_anchor_detach_handler,
+        create_anchor_finalize_handler,
+        create_anchor_cancel_handler,
+        create_mpsc_anchor_attach_handler,
+        create_mpsc_anchor_detach_handler,
+        create_mpsc_anchor_cancel_handler,
+    ];
+    for factory in factories {
+        let manager = make_test_manager();
+        let weak = Arc::downgrade(&manager);
+        let handler = factory(manager);
+        assert!(weak.upgrade().is_some());
+        drop(handler);
+        assert!(weak.upgrade().is_none());
+    }
+}
+
 // -----------------------------------------------------------------------
 // Watchdog firing test
 // -----------------------------------------------------------------------

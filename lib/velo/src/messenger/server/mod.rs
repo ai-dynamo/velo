@@ -24,30 +24,24 @@ use tokio_util::task::TaskTracker;
 
 pub(crate) use dispatcher::{DispatcherHub, HandlerContext};
 
-/// Handler for event frames received on the shared ack/event channel.
-/// Higher-level crates (e.g., one that wraps velo-events) implement this.
-pub trait EventFrameHandler: Send + Sync {
-    fn on_event(&self, raw_handle: u128, is_error: bool, payload: Bytes);
-}
-
 pub(crate) struct ActiveMessageServer {
-    _tracker: TaskTracker,
+    tracker: TaskTracker,
     hub: Arc<DispatcherHub>,
 }
 
 impl ActiveMessageServer {
     pub async fn new(
         response_manager: ResponseManager,
-        event_handler: Option<Arc<dyn EventFrameHandler>>,
         data_streams: DataStreams,
         backend: Arc<VeloBackend>,
-        tracker: TaskTracker,
         observability: Option<Arc<VeloMetrics>>,
         large_payload_resolver: Arc<
             std::sync::OnceLock<Arc<dyn crate::messenger::large_payload::LargePayloadResolver>>,
         >,
     ) -> Self {
         let shutdown_state = data_streams.shutdown_state.clone();
+        let teardown = shutdown_state.teardown_token().clone();
+        let tracker = TaskTracker::new();
         let (message_rx, response_rx, event_rx, shutdown_rx) = data_streams.into_parts();
 
         // Create dispatcher hub (shareable)
@@ -62,23 +56,32 @@ impl ActiveMessageServer {
             shutdown_state,
         ));
 
-        tracker.spawn(create_response_handler(
-            response_manager.clone(),
-            response_rx,
-        ));
-        tracker.spawn(create_ack_and_event_handler(
-            response_manager.clone(),
-            event_handler,
-            event_rx,
-        ));
-        tracker.spawn(create_shutdown_handler(
-            response_manager.clone(),
-            shutdown_rx,
-        ));
-        Self {
-            _tracker: tracker,
-            hub,
-        }
+        tracker.spawn(
+            teardown
+                .clone()
+                .run_until_cancelled_owned(create_response_handler(
+                    response_manager.clone(),
+                    response_rx,
+                )),
+        );
+        tracker.spawn(
+            teardown
+                .clone()
+                .run_until_cancelled_owned(create_ack_and_event_handler(
+                    response_manager.clone(),
+                    event_rx,
+                )),
+        );
+        tracker.spawn(
+            teardown
+                .run_until_cancelled_owned(create_shutdown_handler(response_manager, shutdown_rx)),
+        );
+        Self { tracker, hub }
+    }
+
+    pub(crate) async fn closed(&self) {
+        self.tracker.close();
+        self.tracker.wait().await;
     }
 
     /// Get a reference to the dispatcher hub
@@ -238,6 +241,9 @@ async fn create_message_handler(
 
         match decode_active_message(header, payload) {
             Ok(message) => {
+                let Some(system) = hub.system() else {
+                    break;
+                };
                 #[cfg(feature = "distributed-tracing")]
                 let span = {
                     let span = tracing::info_span!(
@@ -286,7 +292,7 @@ async fn create_message_handler(
                                         payload: resolved_payload,
                                         response_type,
                                         headers,
-                                        system: hub.system().clone(),
+                                        system,
                                         in_flight,
                                     };
                                     hub.dispatch_message(&handler_name, ctx);
@@ -307,6 +313,7 @@ async fn create_message_handler(
                                             format!("Failed to resolve large payload: {e}"),
                                         )
                                         .await
+                                        && !send_err.is::<crate::transports::AdmissionError>()
                                     {
                                         tracing::error!(
                                             target: "crate::messenger::server",
@@ -333,6 +340,7 @@ async fn create_message_handler(
                             let hub = hub.clone();
                             let message_id = message.metadata.response_id;
                             tokio::spawn(async move {
+                                let _in_flight = in_flight;
                                 if let Err(e) = hub
                                     .send_error_response(
                                         message_id,
@@ -340,6 +348,7 @@ async fn create_message_handler(
                                             .to_string(),
                                     )
                                     .await
+                                    && !e.is::<crate::transports::AdmissionError>()
                                 {
                                     tracing::error!(
                                         target: "crate::messenger::server",
@@ -354,10 +363,10 @@ async fn create_message_handler(
 
                 let ctx = HandlerContext {
                     message_id: message.metadata.response_id,
-                    payload: message.payload.clone(),
+                    payload: message.payload,
                     response_type: message.metadata.response_type,
-                    headers: message.metadata.headers.clone(),
-                    system: hub.system().clone(),
+                    headers: message.metadata.headers,
+                    system,
                     in_flight,
                 };
 
@@ -468,7 +477,6 @@ async fn create_shutdown_handler(
 /// Creates a task that handles events and acks from the event channel.
 async fn create_ack_and_event_handler(
     response_manager: ResponseManager,
-    event_handler: Option<Arc<dyn EventFrameHandler>>,
     event_rx: flume::Receiver<(Bytes, Bytes)>,
 ) -> anyhow::Result<()> {
     while let Ok((header, payload)) = event_rx.recv_async().await {
@@ -482,27 +490,12 @@ async fn create_ack_and_event_handler(
                     String::from_utf8(payload.to_vec()).unwrap_or("unknown error".to_string());
                 response_manager.complete_outcome(response_id, Err(error_message));
             }
-            Some(EventType::Event(raw_handle, Outcome::Ok)) => {
-                if let Some(ref handler) = event_handler {
-                    handler.on_event(raw_handle, false, payload);
-                } else {
-                    tracing::warn!(
-                        target: "crate::messenger::server",
-                        raw_handle = raw_handle,
-                        "Received event frame but no EventFrameHandler configured"
-                    );
-                }
-            }
-            Some(EventType::Event(raw_handle, Outcome::Error)) => {
-                if let Some(ref handler) = event_handler {
-                    handler.on_event(raw_handle, true, payload);
-                } else {
-                    tracing::warn!(
-                        target: "crate::messenger::server",
-                        raw_handle = raw_handle,
-                        "Received error event frame but no EventFrameHandler configured"
-                    );
-                }
+            Some(EventType::Event(raw_handle, _)) => {
+                tracing::warn!(
+                    target: "crate::messenger::server",
+                    raw_handle,
+                    "Received unsupported event frame; distributed events use active messages"
+                );
             }
             None => {}
         }
@@ -514,18 +507,7 @@ async fn create_ack_and_event_handler(
 mod tests {
     use super::*;
     use crate::messenger::common::events::{EventType, Outcome, encode_event_header};
-    use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::time::{Duration, timeout};
-
-    struct TestEventHandler {
-        called: AtomicBool,
-    }
-
-    impl EventFrameHandler for TestEventHandler {
-        fn on_event(&self, _raw_handle: u128, _is_error: bool, _payload: Bytes) {
-            self.called.store(true, Ordering::SeqCst);
-        }
-    }
 
     #[tokio::test]
     async fn ack_ok_completes_response() -> anyhow::Result<()> {
@@ -533,11 +515,7 @@ mod tests {
         let response_manager = ResponseManager::new(worker_id);
         let (tx, rx) = flume::bounded(1);
 
-        let handler = tokio::spawn(create_ack_and_event_handler(
-            response_manager.clone(),
-            None,
-            rx,
-        ));
+        let handler = tokio::spawn(create_ack_and_event_handler(response_manager.clone(), rx));
 
         let mut awaiter = response_manager.register_outcome()?;
         let response_id = awaiter.response_id();
@@ -554,32 +532,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn event_frame_dispatched_to_handler() -> anyhow::Result<()> {
-        let worker_id = 7;
-        let response_manager = ResponseManager::new(worker_id);
-        let event_handler = Arc::new(TestEventHandler {
-            called: AtomicBool::new(false),
-        });
-        let (tx, rx) = flume::bounded(1);
-
-        let eh = event_handler.clone();
-        let handler = tokio::spawn(create_ack_and_event_handler(response_manager, Some(eh), rx));
-
-        let raw_handle: u128 = 42;
-        let header = encode_event_header(EventType::Event(raw_handle, Outcome::Ok));
-        tx.send((header, Bytes::new())).expect("send frame");
-        drop(tx);
-
-        handler.await??;
-        assert!(event_handler.called.load(Ordering::SeqCst));
-        Ok(())
-    }
-
-    /// A transport-level drain rejection arrives on the shutdown channel as
-    /// the echoed *request* header with an empty payload. The shutdown handler
-    /// must recover the response id from the request format and fail the
-    /// awaiter immediately.
+    /// Drain rejections echo the request header, not a response-format header.
     #[tokio::test]
     async fn drain_rejection_echo_completes_awaiter() -> anyhow::Result<()> {
         use crate::messenger::common::messages::{ActiveMessage, MessageMetadata};

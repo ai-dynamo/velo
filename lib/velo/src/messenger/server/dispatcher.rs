@@ -10,7 +10,7 @@ use dashmap::DashMap;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use std::panic::AssertUnwindSafe;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Instant;
 use tokio::sync::Semaphore;
 use tokio_util::task::TaskTracker;
@@ -107,8 +107,8 @@ impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for SpawnedDispa
 /// Dispatcher implementation that spawns handlers on a detached task.
 ///
 /// Despite the name this does not execute on the dispatcher task; it is
-/// [`SpawnedDispatcher`] without the task-tracker registration, so a graceful
-/// shutdown cannot wait for handlers dispatched this way.
+/// [`SpawnedDispatcher`] without task-tracker registration. Both modes keep
+/// the inbound guard, so graceful shutdown still waits for the invocation.
 pub(crate) struct InlineDispatcher<H: ActiveMessageHandler> {
     handler: Arc<H>,
 }
@@ -262,6 +262,7 @@ impl<H: ActiveMessageHandler + 'static> OrderedDispatcher<H> {
                 let message_id = ctx.message_id;
                 let response_type = ctx.response_type;
                 let system = ctx.system.clone();
+                let in_flight = ctx.in_flight.clone();
 
                 // Unlike `SpawnedDispatcher`, a panic here would take down the
                 // whole lane task rather than a single message — and every
@@ -288,7 +289,13 @@ impl<H: ActiveMessageHandler + 'static> OrderedDispatcher<H> {
                         message_id = %message_id,
                         "Ordered handler panicked; lane preserved"
                     );
-                    Self::fail_fast(&system, message_id, response_type, "handler panicked");
+                    Self::fail_fast(
+                        &system,
+                        message_id,
+                        response_type,
+                        "handler panicked",
+                        in_flight,
+                    );
                 }
 
                 if let Some(metrics) = metrics.as_ref() {
@@ -321,18 +328,21 @@ impl<H: ActiveMessageHandler + 'static> OrderedDispatcher<H> {
         message_id: ResponseId,
         response_type: ResponseType,
         reason: &'static str,
+        in_flight: Option<Arc<velo_ext::InFlightGuard>>,
     ) {
         if matches!(response_type, ResponseType::FireAndForget) {
             return;
         }
         let backend = system.backend().clone();
         tokio::spawn(async move {
+            let _in_flight = in_flight;
             if let Err(e) = DispatcherHub::send_error_response_static(
                 &backend,
                 message_id,
                 format!("Handler failed: {reason}"),
             )
             .await
+                && !e.is::<crate::transports::AdmissionError>()
             {
                 error!(
                     target: "crate::messenger::dispatcher",
@@ -418,7 +428,7 @@ impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for OrderedDispa
                     );
                 }
             }
-            Err(_shed) => {
+            Err(shed) => {
                 // Every shed message is counted; the log line fires once per
                 // handler so a shed storm cannot flood. `OrderedLaneShed` is
                 // the signal to alert on.
@@ -441,6 +451,7 @@ impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for OrderedDispa
                     message_id,
                     response_type,
                     "ordered lane queue full",
+                    shed.ctx.in_flight,
                 );
             }
         }
@@ -449,7 +460,7 @@ impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for OrderedDispa
 
 /// Main message dispatcher hub that routes messages to handlers.
 pub(crate) struct DispatcherHub {
-    /// Handler registry (lock-free for fast dispatch).
+    /// Handler registry shared with registration.
     /// Shared with HandlerManager so registration is immediately visible.
     handlers: Arc<DashMap<String, Arc<dyn ActiveMessageDispatcher>>>,
 
@@ -457,7 +468,7 @@ pub(crate) struct DispatcherHub {
     backend: Arc<VeloBackend>,
 
     /// Messenger system reference (late-bound via OnceLock)
-    system: OnceLock<Arc<Messenger>>,
+    system: OnceLock<Weak<Messenger>>,
 
     /// Notifies waiters when `system` has been set
     system_ready: tokio::sync::Notify,
@@ -477,34 +488,26 @@ impl DispatcherHub {
     /// Initialize the system reference (must be called exactly once before dispatching)
     pub fn set_system(&self, system: Arc<Messenger>) -> anyhow::Result<()> {
         self.system
-            .set(system)
+            .set(Arc::downgrade(&system))
             .map_err(|_| anyhow::anyhow!("System already initialized"))?;
         self.system_ready.notify_waiters();
         Ok(())
     }
 
-    /// Get the system reference (panics if not initialized)
-    pub(crate) fn system(&self) -> &Arc<Messenger> {
-        self.system
-            .get()
-            .expect("System must be initialized before dispatching messages")
+    /// Upgrade the runtime only while a message is being dispatched.
+    pub(crate) fn system(&self) -> Option<Arc<Messenger>> {
+        self.system.get().and_then(Weak::upgrade)
     }
 
-    /// Wait until the system reference is available, then return it.
-    pub(crate) async fn wait_for_system(&self) -> &Arc<Messenger> {
-        // Fast path: already initialized
-        if let Some(system) = self.system.get() {
-            return system;
+    /// Wait for startup without keeping the messenger alive while idle.
+    pub(crate) async fn wait_for_system(&self) {
+        if self.system.get().is_some() {
+            return;
         }
-        // Register interest before re-checking to avoid missed notification
         let notified = self.system_ready.notified();
-        if let Some(system) = self.system.get() {
-            return system;
+        if self.system.get().is_none() {
+            notified.await;
         }
-        notified.await;
-        self.system
-            .get()
-            .expect("system must be set after notification")
     }
 
     /// Get a clone of the handlers Arc for sharing with HandlerManager.
@@ -552,8 +555,10 @@ impl DispatcherHub {
             ResponseType::AckNack | ResponseType::Unary => {
                 let error_message = format!("Handler '{}' not found", handler_name);
                 tokio::spawn(async move {
+                    let _in_flight = ctx.in_flight;
                     if let Err(e) =
                         Self::send_error_response_static(&backend, message_id, error_message).await
+                        && !e.is::<crate::transports::AdmissionError>()
                     {
                         error!(
                             target: "crate::messenger::dispatcher",
@@ -573,6 +578,7 @@ impl DispatcherHub {
     }
 
     /// Send an error response back to the sender.
+    /// Admission errors are already logged by the backend's error callback.
     pub(crate) async fn send_error_response(
         &self,
         response_id: ResponseId,
@@ -614,9 +620,7 @@ impl DispatcherHub {
             error_handler,
         )?;
         if let crate::transports::SendOutcome::Pending(admission) = outcome {
-            // A failed admission is already reported through the backend's
-            // error handler; this path has nowhere else to put it.
-            let _ = admission.await;
+            admission.await?;
         }
 
         Ok(())

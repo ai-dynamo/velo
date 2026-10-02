@@ -4,9 +4,9 @@
 //! Batched, multiplexed streaming over the Messenger — the `messenger-mux-v2`
 //! transport described by `docs/src/concepts/batched-streaming.md`.
 //!
-//! Today one stream owns one connection: X concurrent streams to one peer means
+//! With a per-stream transport, one stream owns one connection: X concurrent streams to one peer means
 //! X sockets, X egress pumps, X heartbeat timers, and one `write` syscall per
-//! token. The mux collapses that to **one batcher per peer** and packs every
+//! token. The mux collapses that to **one batcher per (peer, lane)** and packs every
 //! stream's records into `_stream_batch` active messages that ride the
 //! Messenger's existing connectivity. There is no dial, no listener, no
 //! acceptor and no connection lifecycle, because there is no connection: the
@@ -28,7 +28,7 @@
 //!   per-slot credit, with one reserved terminal credit, control records that
 //!   data exhaustion cannot block, and byte budgets standing in for the
 //!   per-stream socket limit the kernel used to enforce for free.
-//! - [`peer_batcher`] — egress. One task per peer, packing every slot's records
+//! - [`peer_batcher`] — egress. One task per (peer, lane), packing every slot's records
 //!   and parking on send admission when the peer is congested.
 //! - [`ingress`] — receive. The `_stream_batch` handler body, ordered per
 //!   sender and nonblocking by construction.
@@ -225,6 +225,7 @@ struct MuxCore {
     /// batch of the new one as stale and discard it wholesale.
     epochs: Arc<AtomicU64>,
     cancel: CancellationToken,
+    tasks: crate::streaming::tasks::StreamTasks,
     /// The runtime the mux was built on, for work that has to spawn when the
     /// caller has none: a slot close from an anchor dropped off-runtime.
     runtime: Option<tokio::runtime::Handle>,
@@ -268,6 +269,20 @@ struct MuxCore {
 }
 
 impl MessengerMuxTransport {
+    pub(crate) async fn shutdown(&self) {
+        self.core.cancel.cancel();
+        self.core.tasks.stop();
+        self.core.tasks.wait().await;
+        self.core.batchers.clear();
+        let closed = self.core.ingress.shutdown();
+        self.core.drains.clear();
+        if let Some(metrics) = &self.core.metrics {
+            for _ in 0..closed {
+                metrics.slot_closed();
+            }
+        }
+    }
+
     /// Ask the sender of a claimed slot to stop, through the batcher of the
     /// lane its `OpenSlot` arrived on.
     pub(crate) fn request_stop(&self, key: PeerLane, slot: protocol::SlotId, session_id: u64) {
@@ -341,6 +356,7 @@ impl MessengerMuxTransport {
             ..config
         };
         let (drain_tx, drain_rx) = drain_wake_lane();
+        let tasks = crate::streaming::tasks::StreamTasks::default();
         let core = Arc::new(MuxCore {
             messenger: Arc::clone(&messenger),
             config,
@@ -351,7 +367,8 @@ impl MessengerMuxTransport {
             // Epochs start at 1 so zero is never a live epoch, which keeps a
             // zeroed header from reading as a legitimate one.
             epochs: Arc::new(AtomicU64::new(1)),
-            cancel: CancellationToken::new(),
+            cancel: tasks.cancellation_token(),
+            tasks,
             drain_tx,
             drain_rx,
             drains: DashMap::new(),
@@ -410,6 +427,7 @@ impl MuxCore {
                     peer_batcher::spawn(
                         key,
                         BatcherContext {
+                            tasks: self.tasks.clone(),
                             messenger: Arc::clone(&self.messenger),
                             config: self.config.clone(),
                             metrics: self.metrics.clone(),
@@ -508,7 +526,7 @@ impl MuxCore {
         if batcher.reply(replies) {
             return;
         }
-        while !self.batcher(key).reply(replies) {}
+        while !self.cancel.is_cancelled() && !self.batcher(key).reply(replies) {}
     }
 
     /// Reconcile every slot of one (peer, lane), on the periodic tick.
@@ -544,7 +562,7 @@ impl MuxCore {
     /// Hand a reconcile pass's grants to the batcher of the lane the slots
     /// arrived on.
     fn return_credit(&self, key: PeerLane, replies: Vec<peer_batcher::ReplyRecord>) {
-        if replies.is_empty() {
+        if replies.is_empty() || self.cancel.is_cancelled() {
             return;
         }
         let batcher = self.batcher(key);
@@ -678,6 +696,7 @@ impl MuxCore {
 impl Drop for MuxCore {
     fn drop(&mut self) {
         self.cancel.cancel();
+        self.tasks.stop();
         let closed = self.ingress.shutdown();
         if let Some(metrics) = &self.metrics {
             for _ in 0..closed {
@@ -935,6 +954,9 @@ impl MessengerMuxTransport {
         let core = Arc::clone(&self.core);
         Box::pin(async move {
             for _ in 0..CONNECT_ATTEMPTS {
+                if core.cancel.is_cancelled() {
+                    return Err(anyhow!("messenger mux shut down"));
+                }
                 let batcher = core.batcher(key);
                 // Sized to the credit window for symmetry with the receive
                 // buffer. A producer waits on it once its slot pauses at the

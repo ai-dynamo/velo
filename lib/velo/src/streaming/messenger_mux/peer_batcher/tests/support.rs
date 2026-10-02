@@ -180,6 +180,7 @@ pub(super) async fn harness_with_hooks(
     let handle = spawn(
         key,
         BatcherContext {
+            tasks: Default::default(),
             messenger: Arc::clone(&sender),
             config: config.clone(),
             metrics: Some(metrics.bind_mux()),
@@ -365,6 +366,7 @@ impl Harness {
         let handle = spawn(
             self.key,
             BatcherContext {
+                tasks: Default::default(),
                 messenger: Arc::clone(&self._sender),
                 config: self.config.clone(),
                 metrics: Some(self.metrics.bind_mux()),
@@ -468,6 +470,7 @@ pub(super) async fn stalled_harness_with_hooks(
     let handle = spawn(
         PeerLane::new(peer_instance.worker_id(), LaneIndex::ZERO),
         BatcherContext {
+            tasks: Default::default(),
             messenger: Arc::clone(&sender),
             config: config.clone(),
             metrics: Some(metrics.bind_mux()),

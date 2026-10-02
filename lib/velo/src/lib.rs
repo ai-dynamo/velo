@@ -182,6 +182,7 @@ pub struct Velo {
     /// `FrameTransport`s) and so `peer_info()` can merge the streaming
     /// listener's WorkerAddress entry into the messenger-side WorkerAddress.
     stream_transport: Arc<dyn crate::streaming::FrameTransport>,
+    owned_stream_transport: OwnedStreamTransport,
     /// RDMA registration layer, present only when a UCX transport was added
     /// through [`VeloBuilder::add_ucx_transport`].
     #[cfg(all(target_os = "linux", feature = "ucx"))]
@@ -202,6 +203,35 @@ pub struct Velo {
 struct ShutdownOnce {
     lock: tokio::sync::Mutex<()>,
     done: std::sync::atomic::AtomicBool,
+}
+
+/// Concrete handles let shutdown join listeners without changing `FrameTransport`.
+#[derive(Clone)]
+enum OwnedStreamTransport {
+    Tcp(Arc<crate::streaming::TcpFrameTransport>),
+    #[cfg(feature = "grpc")]
+    Grpc(Arc<crate::streaming::GrpcFrameTransport>),
+}
+
+impl OwnedStreamTransport {
+    async fn shutdown(&self) {
+        match self {
+            Self::Tcp(transport) => transport.shutdown().await,
+            #[cfg(feature = "grpc")]
+            Self::Grpc(transport) => transport.shutdown().await,
+        }
+    }
+}
+
+/// Stop transports if a later builder step fails or the build is cancelled.
+struct StartupGuard(Option<Arc<Messenger>>);
+
+impl Drop for StartupGuard {
+    fn drop(&mut self) {
+        if let Some(messenger) = self.0.take() {
+            messenger.abort_startup();
+        }
+    }
 }
 
 /// Builder for configuring and creating a [`Velo`] instance.
@@ -358,6 +388,7 @@ impl VeloBuilder {
     pub async fn build(self) -> Result<Arc<Velo>> {
         // Step 1: Build Messenger.
         let messenger = self.inner.build().await?;
+        let mut startup = StartupGuard(Some(Arc::clone(&messenger)));
 
         // Step 2: Extract worker_id (carried on the local PeerInfo).
         let worker_id = messenger.instance_id().worker_id();
@@ -372,7 +403,10 @@ impl VeloBuilder {
         // method (the FrameTransport trait stays observability-free so
         // out-of-tree implementors don't take a `prometheus` dep).
         let resolved = self.stream_config.unwrap_or(StreamConfig::Tcp(None));
-        let stream_transport: Arc<dyn crate::streaming::FrameTransport> = match resolved {
+        let (stream_transport, owned_stream_transport): (
+            Arc<dyn crate::streaming::FrameTransport>,
+            OwnedStreamTransport,
+        ) = match resolved {
             StreamConfig::Tcp(tcp_cfg) => {
                 let bind_addr = tcp_cfg
                     .map(|c| c.bind_addr)
@@ -381,7 +415,7 @@ impl VeloBuilder {
                 if let Some(m) = self.metrics.as_ref() {
                     tcp.set_metrics(Arc::clone(m));
                 }
-                tcp as _
+                (tcp.clone() as _, OwnedStreamTransport::Tcp(tcp))
             }
             #[cfg(feature = "grpc")]
             StreamConfig::Grpc(grpc_cfg) => {
@@ -396,7 +430,7 @@ impl VeloBuilder {
                 if let Some(m) = self.metrics.as_ref() {
                     grpc.set_metrics(Arc::clone(m));
                 }
-                grpc as _
+                (grpc.clone() as _, OwnedStreamTransport::Grpc(grpc))
             }
         };
 
@@ -462,14 +496,14 @@ impl VeloBuilder {
         }
 
         // Step 6: Register streaming control-plane handlers
-        anchor_manager.register_handlers(Arc::clone(&messenger))?;
+        anchor_manager.register_handlers_weak(Arc::clone(&messenger))?;
 
         // Step 7: Create RendezvousManager and register handlers
         let rendezvous_manager = Arc::new(match self.metrics.as_ref() {
             Some(m) => crate::rendezvous::RendezvousManager::with_metrics(worker_id, Arc::clone(m)),
             None => crate::rendezvous::RendezvousManager::new(worker_id),
         });
-        rendezvous_manager.register_handlers(Arc::clone(&messenger))?;
+        rendezvous_manager.register_handlers_weak(Arc::clone(&messenger))?;
 
         // Step 8: Enable transparent large payload support
         let stager = Arc::new(crate::rendezvous::RendezvousStager::new(Arc::clone(
@@ -527,11 +561,13 @@ impl VeloBuilder {
         };
 
         // Step 10: Assemble Velo
+        startup.0.take();
         Ok(Arc::new(Velo {
             messenger,
             anchor_manager,
             rendezvous_manager,
             stream_transport,
+            owned_stream_transport,
             #[cfg(all(target_os = "linux", feature = "ucx"))]
             rdma,
             shutdown: Arc::new(ShutdownOnce {
@@ -756,6 +792,20 @@ impl Velo {
         self.shutdown
             .done
             .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Drain messenger work and stop this instance's streaming services.
+    ///
+    /// This also cancels live streams and joins the receive loops and streaming
+    /// listener and pump tasks owned by the builder. Custom frame transports
+    /// remain the caller's responsibility. Stream watchdogs and heartbeats are
+    /// cancelled; application handlers that exceed `policy` can still be running.
+    /// Use this when an instance is removed while its Tokio runtime stays alive.
+    pub async fn shutdown(&self, policy: ShutdownPolicy) {
+        self.graceful_shutdown(policy).await;
+        self.anchor_manager.shutdown().await;
+        self.owned_stream_transport.shutdown().await;
+        self.messenger.closed().await;
     }
 
     /// Get the instance ID of this system.
@@ -1450,29 +1500,76 @@ mod tests {
         );
     }
 
-    /// Test 1: Velo struct has anchor_manager field of type Arc<AnchorManager>
-    /// (compile-time check via field accessor)
-    #[test]
-    fn velo_has_anchor_manager_accessor() {
-        // This test verifies the anchor_manager() method exists and returns &AnchorManager.
-        // It doesn't construct a Velo (that requires async + transport), so we verify
-        // the method signature exists by type-checking a function pointer.
-        let _: fn(&Velo) -> &crate::streaming::AnchorManager = Velo::anchor_manager;
-    }
-
-    /// Test 2: create_anchor method exists with correct generic signature
-    #[test]
-    fn velo_create_anchor_signature() {
-        // Verify the method exists and has the correct type.
-        // We can't call it without a Velo instance, but we can verify the signature.
-        let _: fn(&Velo) -> crate::streaming::StreamAnchor<String> = Velo::create_anchor::<String>;
-    }
-
-    /// Test 3: attach_anchor method exists with correct async generic signature
-    /// (verified via integration test that constructs a real Velo)
+    #[cfg(feature = "grpc")]
     #[tokio::test]
-    async fn velo_attach_anchor_type_checks() {
-        // Build a real Velo instance to exercise create_anchor + attach_anchor type-checking.
+    async fn failed_stream_start_stops_messenger_listener() {
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let messenger_addr = listener.local_addr().unwrap();
+        let transport = Arc::new(
+            crate::transports::tcp::TcpTransportBuilder::new()
+                .from_listener(listener)
+                .unwrap()
+                .build()
+                .unwrap(),
+        );
+        let result = Velo::builder()
+            .add_transport(transport)
+            .stream_config(StreamConfig::Grpc(Some(GrpcConfig {
+                bind_addr: occupied.local_addr().unwrap(),
+            })))
+            .unwrap()
+            .build()
+            .await;
+        assert!(
+            result.is_err(),
+            "occupied streaming port must reject the build"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Ok(listener) = std::net::TcpListener::bind(messenger_addr) {
+                    break listener;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed build retained the messenger listener");
+    }
+
+    #[tokio::test]
+    async fn standalone_rendezvous_registration_retains_messenger() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let transport = Arc::new(
+            crate::transports::tcp::TcpTransportBuilder::new()
+                .from_listener(listener)
+                .unwrap()
+                .build()
+                .unwrap(),
+        );
+        let messenger = Messenger::builder()
+            .add_transport(transport)
+            .build()
+            .await
+            .unwrap();
+        let weak = Arc::downgrade(&messenger);
+        let manager = Arc::new(RendezvousManager::new(messenger.instance_id().worker_id()));
+        manager.register_handlers(messenger).unwrap();
+        let retained = weak
+            .upgrade()
+            .expect("public registration must retain its messenger");
+        retained
+            .graceful_shutdown(ShutdownPolicy::WaitForever)
+            .await;
+        retained.closed().await;
+        drop(retained);
+        drop(manager);
+        assert!(weak.upgrade().is_none());
+    }
+
+    /// Shutdown must release the runtime graph while Tokio remains alive.
+    #[tokio::test]
+    async fn shutdown_releases_messenger_and_anchor_manager() {
         let transport = {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             Arc::new(
@@ -1489,19 +1586,51 @@ mod tests {
             .await
             .unwrap();
 
-        // Test 1: anchor_manager() returns &AnchorManager
-        let _am: &crate::streaming::AnchorManager = velo.anchor_manager();
+        let messenger = Arc::downgrade(&velo.messenger);
+        let manager = Arc::downgrade(&velo.anchor_manager);
+        let rendezvous = Arc::downgrade(&velo.rendezvous_manager);
+        let events = Arc::downgrade(velo.messenger.events());
+        let pending_event = velo.messenger.events().new_event().unwrap().into_handle();
+        #[derive(serde::Serialize)]
+        struct Subscription {
+            handle: u128,
+            subscriber_worker: u64,
+            subscriber_instance: InstanceId,
+        }
+        let subscribe = Subscription {
+            handle: pending_event.raw(),
+            subscriber_worker: velo.instance_id().worker_id().as_u64(),
+            subscriber_instance: velo.instance_id(),
+        };
+        velo.messenger
+            .events()
+            .handle_subscribe(bytes::Bytes::from(serde_json::to_vec(&subscribe).unwrap()))
+            .await
+            .unwrap();
 
-        // Test 2: create_anchor::<String>() returns StreamAnchor<String>
         let anchor: crate::streaming::StreamAnchor<String> = velo.create_anchor::<String>();
         let handle = anchor.handle();
 
-        // Test 3: attach_anchor::<String>(handle) returns correct Result type
-        // The local attach path no longer calls transport.connect(), so it
-        // should succeed for local handles.
         let result: Result<crate::streaming::StreamSender<String>, crate::streaming::AttachError> =
             velo.attach_anchor::<String>(handle).await;
 
-        let _sender = result.expect("local attach should succeed");
+        let sender = result.expect("local attach should succeed");
+        drop(sender);
+        drop(anchor);
+        velo.shutdown(ShutdownPolicy::Timeout(std::time::Duration::from_secs(1)))
+            .await;
+        drop(velo);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while messenger.upgrade().is_some()
+                || manager.upgrade().is_some()
+                || rendezvous.upgrade().is_some()
+                || events.upgrade().is_some()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown retained a runtime manager");
     }
 }
