@@ -397,6 +397,8 @@ impl VeloBuilder {
             !self.mux_only || self.stream_config.is_none(),
             "mux_only cannot be combined with stream_config or stream_bind_addr"
         );
+        // Read the override once at build so this instance keeps the same
+        // transport offers for every attach.
         let config = resolve_mux_config(
             self.mux_config.unwrap_or_default(),
             messenger_mux_disabled_by_env(),
@@ -418,6 +420,8 @@ impl VeloBuilder {
 
         // Default builds keep a per-stream listener for peers without the mux.
         // In mux-only mode, the mux itself fills the default transport field.
+        // Set metrics before type erasure: the public FrameTransport trait
+        // must not require Prometheus in external implementations.
         let (stream_transport, owned_stream_transport): (
             Arc<dyn crate::streaming::FrameTransport>,
             Option<OwnedStreamTransport>,
