@@ -16,12 +16,14 @@ let node = Velo::builder()
 node.discover_and_register_peer(peer_instance_id).await?;
 ```
 
+The discovery traits and custom implementations are available without `services`. Built-in backends require it; `nats-discovery` and `etcd` enable it automatically.
+
 `ServiceDiscovery` is a second trait. It maps a service name to the instances that provide it.
 
 | Backend | Feature | Implements | Use |
 |---|---|---|---|
-| `FilesystemPeerDiscovery` | always | `PeerDiscovery` | Development, tests, one host |
-| `FilesystemServiceDiscovery` | always | `ServiceDiscovery` | Development, tests, one host |
+| `FilesystemPeerDiscovery` | `services` | `PeerDiscovery` | Development, tests, one host |
+| `FilesystemServiceDiscovery` | `services` | `ServiceDiscovery` | Development, tests, one host |
 | `NatsPeerDiscovery` | `nats-discovery` | `PeerDiscovery` | More than one host, with NATS |
 | `EtcdServiceDiscovery` | `etcd` | `ServiceDiscovery` | More than one host, with etcd |
 

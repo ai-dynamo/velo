@@ -1,5 +1,7 @@
 # Work queues
 
+Work queues require the default `services` feature. The `queue-messenger` and `nats-queue` backend features enable it automatically.
+
 A work queue is a named queue of typed work items. You create or connect to a queue by name, and then you get a typed sender and a typed receiver for it.
 
 ```rust,ignore
@@ -15,6 +17,6 @@ let job = rx.next().await?.unwrap();
 
 | Backend | Feature | Description |
 |---|---|---|
-| `InMemoryBackend` | always | `DashMap` and `flume` channels. For tests. |
+| `InMemoryBackend` | `services` | `DashMap` and `flume` channels. For tests. |
 | `MessengerQueueBackend` | `queue-messenger` | An actor on a Velo instance, reached with active messages |
 | `NatsQueueBackend` | `nats-queue` | NATS JetStream with WorkQueue retention |
