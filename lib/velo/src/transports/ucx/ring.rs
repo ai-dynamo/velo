@@ -21,6 +21,8 @@ pub(crate) fn command_ring(capacity: usize) -> (CommandSender, CommandReceiver) 
 }
 
 impl CommandSender {
+    // Return the command for retry without allocating on the admission path.
+    #[allow(clippy::result_large_err)]
     pub fn try_send(&self, cmd: Cmd) -> Result<(), flume::TrySendError<Cmd>> {
         self.0.try_send(cmd).map_err(|error| match error {
             mpsc::error::TrySendError::Full(cmd) => flume::TrySendError::Full(cmd),

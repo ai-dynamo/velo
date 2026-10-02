@@ -70,7 +70,7 @@ impl SlowSendTransport {
             frame_delay,
             consumed: Arc::new(Mutex::new(Vec::new())),
             started: Arc::new(AtomicBool::new(false)),
-            paused: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(true)),
             metrics: OnceCell::new(),
         })
     }
@@ -81,10 +81,6 @@ impl SlowSendTransport {
 
     fn consumed_count(&self) -> usize {
         self.consumed.lock().len()
-    }
-
-    fn pause(&self) {
-        self.paused.store(true, Ordering::Release);
     }
 
     fn resume(&self) {
@@ -228,7 +224,7 @@ impl TransportErrorHandler for CountingHandler {
 /// timeouts on the interesting waits.
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Helper: build a started SlowSendTransport on the current runtime.
+/// Start paused, before the writer can consume a frame. Tests resume explicitly.
 async fn make_started(capacity: usize, frame_delay: Duration) -> Arc<SlowSendTransport> {
     let t = SlowSendTransport::new(capacity, frame_delay);
     let (adapter, _streams) = velo::transports::make_channels();
@@ -271,7 +267,6 @@ async fn wait_until(label: &str, mut condition: impl FnMut() -> bool) {
 async fn saturated_channel_queues_the_frame() {
     // Capacity 2, writer paused so the channel stays full deterministically.
     let t = make_started(2, Duration::from_millis(1)).await;
-    t.pause();
     let err = CountingHandler::new();
 
     for _ in 0..2 {
@@ -299,6 +294,7 @@ async fn many_concurrent_sends_all_resolve() {
     // Small capacity + fast drain. Many concurrent callers that all await
     // their admission must all complete.
     let t = make_started(4, Duration::from_millis(5)).await;
+    t.resume();
     let err = CountingHandler::new();
     let n = 64usize;
 
@@ -330,7 +326,6 @@ async fn dropping_an_admission_still_delivers() {
     // belongs to the gate, not to the handle, so dropping the handle without
     // polling it does not withdraw the send.
     let t = make_started(1, Duration::from_millis(5)).await;
-    t.pause();
     let err = CountingHandler::new();
 
     assert!(t.send(b"first", err.clone()).is_admitted());
@@ -350,7 +345,6 @@ async fn a_timeout_around_an_admission_does_not_cancel_it() {
     // Wrapping an admission in `timeout` abandons the *wait*, not the frame.
     // Callers who really want to withdraw a frame must say so with `cancel`.
     let t = make_started(1, Duration::from_millis(5)).await;
-    t.pause();
     let err = CountingHandler::new();
 
     assert!(t.send(b"first", err.clone()).is_admitted());
@@ -371,7 +365,6 @@ async fn a_timeout_around_an_admission_does_not_cancel_it() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelling_an_admission_withdraws_the_frame() {
     let t = make_started(1, Duration::from_millis(5)).await;
-    t.pause();
     let err = CountingHandler::new();
 
     assert!(t.send(b"first", err.clone()).is_admitted());
@@ -396,7 +389,6 @@ async fn queued_frames_keep_their_issue_order_unpolled() {
     // The guarantee the gate exists for, at the `Transport` seam: nothing here
     // is ever polled, and the frames still arrive in the order they were sent.
     let t = make_started(2, Duration::from_millis(1)).await;
-    t.pause();
     let err = CountingHandler::new();
 
     let order: [&'static [u8]; 5] = [b"a", b"b", b"c", b"d", b"e"];
@@ -425,7 +417,6 @@ async fn queued_sends_increment_the_backpressure_counter() {
     let t = make_started(1, Duration::from_millis(1)).await;
     t.set_observability(std::sync::Arc::new(metrics.bind_transport("slow"))
         as std::sync::Arc<dyn velo_ext::TransportObservability>);
-    t.pause();
     let err = CountingHandler::new();
 
     assert!(t.send(b"h", err.clone()).is_admitted());

@@ -38,7 +38,15 @@ The drain counts an exempt message while its handler runs. It does not count the
 - The drain finishes at the first moment that no message is in flight. A stream message is in flight only for microseconds, and consecutive batches are at least a credit round trip apart. An open stream, busy or quiet, therefore does not hold `graceful_shutdown` open.
 - Teardown then ends the mux streams, because they ride the messenger.
 
-To let open streams finish, call `begin_drain`, wait until your streams end, and then call `graceful_shutdown`. The per-stream transports have their own teardown, which `graceful_shutdown` does not do.
+To let open streams finish, call `begin_drain`, wait until your streams end, and then call `shutdown`. The application must wait for its streams: the messenger drain does not count their full lifetime.
+
+## Close an instance while Tokio keeps running
+
+Use `Velo::shutdown(policy)` when an application removes a Velo instance but keeps its Tokio runtime. It first runs `graceful_shutdown`, then cancels live anchors and senders, stops the builder-owned per-stream listener, and joins the messenger receive loops and streaming tasks. Pending remote event waits fail at teardown, and their subscription tasks stop. Local event completion remains available. Custom frame transports remain the caller's responsibility.
+
+`graceful_shutdown` keeps its existing behavior: it drains and closes the messenger and RDMA services, but does not close the per-stream TCP or gRPC transport. `shutdown` is the complete instance shutdown operation. Application handlers that exceed a timeout can still be running after it returns.
+
+Hard teardown interrupts a blocked TCP or UDS write and fails the frames still held by the writer. The connection is discarded if a write may be partial. A reported write failure does not prove that the peer received no bytes; applications must not treat it as permission to retry a non-idempotent request.
 
 ## A refused request fails fast
 
