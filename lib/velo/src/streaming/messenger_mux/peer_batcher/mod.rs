@@ -399,6 +399,12 @@ struct Batcher {
 
 impl Drop for Batcher {
     fn drop(&mut self) {
+        // Tokio can drop this task without polling the run loop's cleanup.
+        // Stop reply retries before closing an inbox still in the registry.
+        // Normal exits already closed it and must not stop other batchers.
+        if !self.control.is_closed() {
+            self.cancel.cancel();
+        }
         // A refused spawn can drop here under the batcher-map entry guard.
         // Normal exits unregister in run; whole-mux shutdown clears the map.
         self.teardown(false);

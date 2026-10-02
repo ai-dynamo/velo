@@ -460,9 +460,7 @@ impl ControlInbox {
         self.lock().len()
     }
 
-    /// Whether the task has taken its last drain, for the tests that post a
-    /// reply past it on purpose.
-    #[cfg(test)]
+    /// Whether the task has taken its last drain and refuses later replies.
     pub(super) fn is_closed(&self) -> bool {
         self.lock().closed
     }

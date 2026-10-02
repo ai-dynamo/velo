@@ -191,6 +191,32 @@ async fn eventually(mut predicate: impl FnMut() -> bool) {
     panic!("condition never held within {RECV_TIMEOUT:?}");
 }
 
+/// Tokio can drop a batcher before its run loop unregisters it. The mux must
+/// stop accepting work even when callers still hold its transport handles.
+#[test]
+fn runtime_shutdown_cancels_a_mux_with_live_batchers() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (pair, _receiver, _sender) = runtime.block_on(async {
+        let pair = mux_pair(test_config()).await;
+        let receiver = pair.bind(1, 1).await;
+        let sender = pair
+            .producer
+            .connect(pair.consumer_worker, 1, 1)
+            .await
+            .unwrap();
+        (pair, receiver, sender)
+    });
+    runtime.shutdown_timeout(Duration::from_secs(5));
+    assert!(
+        pair.producer.core.cancel.is_cancelled(),
+        "an aborted batcher must stop retries on its closed registry entry"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Identity
 // ---------------------------------------------------------------------------
