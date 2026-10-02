@@ -255,6 +255,7 @@ fn aborting_a_retiring_batchers_final_flush_stops_the_mux() {
             messenger,
             MuxConfig {
                 credit_sweep_interval: Duration::from_secs(60),
+                // The first sweep tick is immediate; retirement here is manual.
                 batcher_idle_ttl: Duration::from_secs(600),
                 ..MuxConfig::default()
             },
