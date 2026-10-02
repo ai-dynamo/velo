@@ -176,11 +176,8 @@ impl CreditClass {
     /// `is_terminal` is the caller's `is_terminal_sentinel(body)` verdict; only
     /// a `Data` record can carry one.
     ///
-    /// `SlotHeartbeat` is deliberately **not** control. A heartbeat dropped
-    /// under saturation *is* the per-slot saturation signal, which the
-    /// batcher's peer health check cannot see. Give it a reserve and the
-    /// stream watchdog's `DETECTION_MULTIPLIER` stops firing on a saturated
-    /// slot.
+    /// Heartbeats occupy the slot buffer and spend data credit. A sender
+    /// without credit cannot heartbeat, so the stream watchdog exempts it.
     pub(crate) const fn of(record_type: RecordType, is_terminal: bool) -> Self {
         match record_type {
             RecordType::OpenSlot

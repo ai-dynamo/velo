@@ -770,7 +770,7 @@ async fn a_one_lane_producer_opens_past_a_sixteenth_of_the_slot_ceiling() {
     for (session, index) in [(1u64, sixteenth), (2, last)] {
         let anchor_id = u64::MAX - session;
         let lane = mux.core.lane_load.reserve_on(Some(peer), LaneIndex::ZERO);
-        receivers.push(mux.bind_on_lane(anchor_id, session, lane));
+        receivers.push(mux.bind_on_lane(anchor_id, session, lane).unwrap());
         let mut encoder = BatchEncoder::new(1, session as u32, LaneIndex::ZERO);
         encoder
             .push_open_slot(

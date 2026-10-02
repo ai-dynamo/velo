@@ -191,6 +191,160 @@ async fn eventually(mut predicate: impl FnMut() -> bool) {
     panic!("condition never held within {RECV_TIMEOUT:?}");
 }
 
+/// Tokio can drop a batcher before its run loop unregisters it. The mux must
+/// stop accepting work even when callers still hold its transport handles.
+#[test]
+fn runtime_shutdown_cancels_a_mux_with_live_batchers() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (pair, _receiver, _sender) = runtime.block_on(async {
+        let pair = mux_pair(test_config()).await;
+        let receiver = pair.bind(1, 1).await;
+        let sender = pair
+            .producer
+            .connect(pair.consumer_worker, 1, 1)
+            .await
+            .unwrap();
+        (pair, receiver, sender)
+    });
+    runtime.shutdown_timeout(Duration::from_secs(5));
+    assert!(
+        pair.producer.core.cancel.is_cancelled(),
+        "an aborted batcher must stop retries on its closed registry entry"
+    );
+    // The consumer has no batcher yet. Submitting one to its stopped runtime
+    // drops the task synchronously; neither admission nor registry may deadlock.
+    let (done, result) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let key = lane0(pair.producer_worker);
+        assert!(pair.consumer.core.batcher(key).is_err());
+        assert!(pair.consumer.core.tasks.is_stopped());
+        assert!(futures::executor::block_on(pair.consumer.bind(2, 2)).is_err());
+        done.send(()).unwrap();
+    });
+    result
+        .recv_timeout(Duration::from_secs(5))
+        .expect("stopped runtime must refuse promptly");
+}
+
+/// Closing the control inbox starts the final flush; it does not finish teardown.
+#[test]
+fn aborting_a_retiring_batchers_final_flush_stops_the_mux() {
+    use super::test_support::{StallingTransport, stalling_address};
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (mux, receiver, _wire) = runtime.block_on(async {
+        let (transport, wire) = StallingTransport::new(tokio::runtime::Handle::current());
+        let messenger = Messenger::builder()
+            .add_transport(transport.clone())
+            .build()
+            .await
+            .unwrap();
+        let peer = velo_ext::InstanceId::new_v4();
+        messenger
+            .register_peer(velo_ext::PeerInfo::new(peer, stalling_address()))
+            .unwrap();
+        let mux = MessengerMuxTransport::new(
+            messenger,
+            MuxConfig {
+                credit_sweep_interval: Duration::from_secs(60),
+                // The first sweep tick is immediate; retirement here is manual.
+                batcher_idle_ttl: Duration::from_secs(600),
+                ..MuxConfig::default()
+            },
+            None,
+        )
+        .unwrap();
+        let hooks = Arc::new(TestHooks::default());
+        assert!(mux.core.hooks.set(hooks.clone()).is_ok());
+        let receiver = mux.bind(1, 1).await.unwrap();
+        let key = lane0(peer.worker_id());
+        let batcher = mux.core.batcher(key).unwrap();
+        let slot = protocol::SlotId::from_raw(7);
+        assert!(batcher.reply(&[peer_batcher::ReplyRecord::CloseSlot {
+            slot,
+            reason: protocol::CloseReason::UnknownSlot,
+        }]));
+        eventually(|| wire.len() == 1).await;
+
+        hooks.pause();
+        let (_, evicted) = mux
+            .core
+            .batchers
+            .remove_if(&key, |_, handle| handle.try_retire(0))
+            .unwrap();
+        evicted.retire();
+        hooks.wait_until_parked().await;
+        assert!(batcher.reply(&[peer_batcher::ReplyRecord::CreditUpdate { slot, delta: 1 }]));
+        hooks.release();
+        eventually(|| batcher.is_closed() && transport.stalled() == 1).await;
+        assert!(!mux.core.tasks.is_stopped());
+        (mux, receiver, wire)
+    });
+    runtime.shutdown_timeout(Duration::from_secs(5));
+    assert!(mux.core.tasks.is_stopped());
+    assert!(receiver.is_disconnected());
+}
+
+#[test]
+fn a_secondary_runtime_does_not_own_the_mux_batchers() {
+    let owner = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let caller = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let pair = owner.block_on(mux_pair(test_config()));
+    let receiver = owner.block_on(pair.bind(1, 1));
+    let sender = caller
+        .block_on(pair.producer.connect(pair.consumer_worker, 1, 1))
+        .unwrap();
+    caller.shutdown_timeout(Duration::from_secs(1));
+    owner.block_on(async {
+        assert!(!pair.producer.core.tasks.is_stopped());
+        sender.send_async(vec![7]).await.unwrap();
+        assert_eq!(receiver.recv().await, vec![7]);
+        pair.producer.shutdown().await;
+        pair.consumer.shutdown().await;
+    });
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_closed_registered_batcher_fails_without_replacement() {
+    let pair = mux_pair(test_config()).await;
+    let key = lane0(pair.producer_worker);
+    let handle = pair.consumer.core.batcher(key).unwrap();
+    pair.consumer.core.batchers.remove(&key);
+    handle.retire();
+    eventually(|| handle.is_closed()).await;
+    // Model the registry entry left by an aborted task.
+    pair.consumer.core.batchers.insert(key, Arc::clone(&handle));
+    let (done, result) = std::sync::mpsc::channel();
+    let core = Arc::clone(&pair.consumer.core);
+    std::thread::spawn(move || {
+        core.send_replies(&handle, key, &[]);
+        assert!(core.tasks.is_stopped());
+        assert!(Arc::ptr_eq(
+            core.batchers.get(&key).unwrap().value(),
+            &handle
+        ));
+        done.send(()).unwrap();
+    });
+    result
+        .recv_timeout(Duration::from_secs(5))
+        .expect("closed handle must not spin");
+}
+
 // ---------------------------------------------------------------------------
 // Identity
 // ---------------------------------------------------------------------------
@@ -1399,7 +1553,11 @@ async fn a_close_posted_past_the_batchers_last_drain_still_reaches_the_producer(
             .contains_key(&lane0(pair.producer_worker)),
         "an admitted OpenSlot owes no reply, so no batcher exists yet"
     );
-    let batcher = pair.consumer.core.batcher(lane0(pair.producer_worker));
+    let batcher = pair
+        .consumer
+        .core
+        .batcher(lane0(pair.producer_worker))
+        .unwrap();
 
     // The sweep's eviction, by hand, in the window after its live-slot check
     // passed: claim under the registry lock, then post.
@@ -1461,7 +1619,11 @@ async fn a_close_refused_by_a_retired_batcher_reaches_the_producer_through_its_r
     // Resolved first, as `close_claimed_slot` resolves it, then evicted by
     // hand the way the sweep does it: claim under the registry lock, post
     // `retire`, and this time let the task run all the way out.
-    let batcher = pair.consumer.core.batcher(lane0(pair.producer_worker));
+    let batcher = pair
+        .consumer
+        .core
+        .batcher(lane0(pair.producer_worker))
+        .unwrap();
     let (_, evicted) = pair
         .consumer
         .core

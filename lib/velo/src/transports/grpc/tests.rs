@@ -241,3 +241,59 @@ fn replacing_a_dead_connection_does_not_deadlock() {
     assert!(installed);
     transport.shutdown();
 }
+
+/// An old sender can enqueue after retirement begins, but cannot remove its successor.
+#[tokio::test]
+async fn retirement_reports_late_sends_and_preserves_successor() {
+    fn make_handle(capacity: usize) -> (ConnectionHandle, flume::Receiver<super::SendTask>) {
+        let (tx, rx) = flume::bounded(capacity);
+        (
+            ConnectionHandle {
+                gate: crate::transports::AdmissionGate::new(
+                    tx.clone(),
+                    tokio::runtime::Handle::current(),
+                ),
+                tx,
+            },
+            rx,
+        )
+    }
+    let key = crate::InstanceId::new_v4();
+    let connections = Arc::new(dashmap::DashMap::new());
+    let (old, rx) = make_handle(4);
+    connections.insert(key, old.clone());
+    let errors = Arc::new(TrackingErrorHandler::new());
+    let closing = tokio::spawn({
+        let connections = connections.clone();
+        let tx = old.tx.clone();
+        async move { super::retire_connection(key, tx, rx, &connections).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while connections.contains_key(&key) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let (next, _next_rx) = make_handle(4);
+    connections.insert(key, next.clone());
+    for _ in 0..2 {
+        assert!(
+            old.gate
+                .send(super::SendTask {
+                    msg_type: MessageType::Message,
+                    header: Bytes::new(),
+                    payload: Bytes::from_static(b"late"),
+                    on_error: errors.clone(),
+                })
+                .is_admitted()
+        );
+    }
+    drop(old);
+    tokio::time::timeout(Duration::from_secs(2), closing)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(errors.error_count(), 2);
+    assert!(connections.get(&key).unwrap().tx.same_channel(&next.tx));
+}

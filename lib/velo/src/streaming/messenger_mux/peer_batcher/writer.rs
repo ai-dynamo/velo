@@ -102,17 +102,19 @@ impl BatchWriter {
         }
     }
 
-    pub(super) async fn peer_is_alive(&mut self) -> bool {
-        let Some(peer) = self.peer_instance() else {
-            return false;
-        };
-        matches!(
-            self.messenger
-                .backend()
-                .check_peer_health(peer, std::time::Duration::from_secs(5))
-                .await,
-            Ok(()) | Err(crate::transports::HealthCheckError::NeverConnected)
-        )
+    pub(super) async fn check_peer_health(&mut self) -> anyhow::Result<()> {
+        let peer = self
+            .peer_instance()
+            .ok_or_else(|| anyhow::anyhow!("peer is not registered"))?;
+        match self
+            .messenger
+            .backend()
+            .check_peer_health(peer, std::time::Duration::from_secs(5))
+            .await
+        {
+            Ok(()) | Err(crate::transports::HealthCheckError::NeverConnected) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// The epoch every batch this writer opens is stamped with.

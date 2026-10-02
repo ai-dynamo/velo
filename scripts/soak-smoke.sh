@@ -10,7 +10,7 @@
 # escaped its guardrail.
 #
 # What runs:
-#   * messenger M1..M3, M5  — sustained AM, unary, mixed, drain-on-server-drop
+#   * messenger M1..M3, M5  — sustained AM, unary, mixed, graceful shutdown
 #   * streaming  S1, S4, S6 — single-stream / rapid create / large items
 #   * rendezvous R1..R4     — inline + chunked + refcount + gauge
 #

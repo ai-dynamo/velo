@@ -160,6 +160,37 @@ jobs:
       if: always()
       run: /tmp/use-sccache.sh show-stats "tests" || true
 
+  core-configurations:
+    name: Core configuration (${{ matrix.features }})
+    runs-on: prod-velo-default-v1
+    container:
+      image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.3
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - features: test-helpers
+          production-features: ""
+        - features: "ucx,test-helpers"
+          production-features: ucx
+    env:
+      UCX_TLS: tcp
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
+    steps:
+    - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 #v6.0.1
+    - name: Rust setup
+      uses: ./.github/actions/rust-setup
+    - name: sccache setup
+      uses: ./.github/actions/sccache-setup
+      with:
+        bucket: ${{ secrets.SCCACHE_S3_BUCKET }}
+    - name: Check production library without dev-dependency features
+      run: cargo check --locked -p velo --lib --no-default-features --features '${{ matrix.production-features }}'
+    - name: Test without default features
+      run: timeout 900 cargo test --locked -p velo --no-default-features --features '${{ matrix.features }}' --all-targets
+
   soak-smoke:
     name: Soak smoke
     needs: test
@@ -346,7 +377,7 @@ jobs:
     runs-on: prod-velo-default-v1
     container:
       image: ${{ vars.RUNNERS_REGISTRY }}/dynamo-ci/aws/dynamo/actions-runner/velo/default:0.0.3
-    needs: [pr-metadata, fmt, clippy, deny, test, soak-smoke, coverage, examples, book, semver]
+    needs: [pr-metadata, fmt, clippy, deny, test, core-configurations, soak-smoke, coverage, examples, book, semver]
     if: always()
     steps:
     - name: Check all jobs

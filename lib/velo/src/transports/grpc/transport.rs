@@ -216,6 +216,7 @@ impl GrpcTransport {
             addr,
             instance_id,
             rx,
+            handle.tx.clone(),
             conns,
             cancel,
             connect_timeout,
@@ -492,6 +493,7 @@ async fn connection_writer_task(
     addr: SocketAddr,
     instance_id: crate::InstanceId,
     rx: flume::Receiver<SendTask>,
+    tx: flume::Sender<SendTask>,
     connections: Arc<DashMap<crate::InstanceId, ConnectionHandle>>,
     cancel_token: tokio_util::sync::CancellationToken,
     connect_timeout: Duration,
@@ -513,22 +515,7 @@ async fn connection_writer_task(
     )
     .await;
 
-    // Drain queued messages and notify their error handlers.
-    while let Ok(msg) = rx.try_recv() {
-        msg.on_error("Connection closed");
-    }
-
-    // Drop the receiver so our sender half becomes disconnected, then remove
-    // the stale entry. The predicate ensures we only remove our own entry.
-    //
-    // Retiring the gate is what fails frames still queued behind it. Dropping
-    // `rx` would eventually fail them too (the driver's `send_async` sees a
-    // closed channel), but `ConnectionReplaced` names the cause and lands
-    // without waiting on the driver.
-    drop(rx);
-    if let Some((_, stale)) = connections.remove_if(&instance_id, |_, h| h.tx.is_disconnected()) {
-        stale.retire();
-    }
+    retire_connection(instance_id, tx, rx, &connections).await;
     if let Some(metrics) = metrics.as_ref() {
         metrics.set_active_connections(connections.len());
     }
@@ -536,6 +523,23 @@ async fn connection_writer_task(
     debug!("gRPC connection to {} ({}) closed", instance_id, addr);
 
     result
+}
+
+async fn retire_connection(
+    key: crate::InstanceId,
+    tx: flume::Sender<SendTask>,
+    rx: flume::Receiver<SendTask>,
+    connections: &DashMap<crate::InstanceId, ConnectionHandle>,
+) {
+    // Retire only this epoch before waiting for its last sender. A retained
+    // sender can still enqueue after the queue first becomes empty.
+    if let Some((_, stale)) = connections.remove_if(&key, |_, h| h.tx.same_channel(&tx)) {
+        stale.retire();
+    }
+    drop(tx);
+    while let Ok(msg) = rx.recv_async().await {
+        msg.on_error("Connection closed");
+    }
 }
 
 /// Inner loop: connect, open bidi stream, and send frames until the channel

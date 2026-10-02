@@ -73,6 +73,7 @@ pub(crate) struct MpscAnchorEntry {
 // ---------------------------------------------------------------------------
 
 struct MpscStreamControllerInner {
+    worker_id: velo_ext::WorkerId,
     local_id: u64,
     registry: Arc<DashMap<u64, MpscAnchorEntry>>,
     sender_registry: Arc<crate::streaming::control::SenderRegistry>,
@@ -120,6 +121,7 @@ impl MpscStreamController {
 
         cancel_all_senders(
             &entry,
+            self.inner.worker_id,
             &self.inner.sender_registry,
             self.inner.messenger.as_ref(),
         );
@@ -163,6 +165,7 @@ impl<T> MpscStreamAnchor<T> {
         } = ctx;
         let (cancel_wake, cancel_rx) = flume::bounded::<()>(1);
         let inner = Arc::new(MpscStreamControllerInner {
+            worker_id: handle.unpack().0,
             local_id,
             registry: registry.clone(),
             sender_registry,
@@ -274,6 +277,7 @@ impl<T: DeserializeOwned> Stream for MpscStreamAnchor<T> {
 /// handler so both paths give attached senders the same cleanup.
 pub(crate) fn cancel_all_senders(
     entry: &MpscAnchorEntry,
+    local_worker: velo_ext::WorkerId,
     sender_registry: &Arc<crate::streaming::control::SenderRegistry>,
     messenger: Option<&Arc<crate::messenger::Messenger>>,
 ) {
@@ -285,30 +289,12 @@ pub(crate) fn cancel_all_senders(
         let Some(handle) = &slot.stream_cancel_handle else {
             continue;
         };
-        let (sender_worker_id, sender_stream_id) = handle.unpack();
-
-        if let Some((_, sender_entry)) = sender_registry.senders.remove(&sender_stream_id) {
-            drop(sender_entry.rx_closer.lock().unwrap().take());
-            sender_entry.cancel_token.cancel();
-        }
-
-        if let Some(messenger) = messenger.cloned() {
-            let payload = serde_json::to_vec(&crate::streaming::control::StreamCancelRequest {
-                sender_stream_id,
-            })
-            .expect("serialize StreamCancelRequest");
-            if let Ok(rt) = tokio::runtime::Handle::try_current() {
-                rt.spawn(async move {
-                    let _ = messenger
-                        .am_send_streaming("_stream_cancel")
-                        .expect("am_send_streaming builder")
-                        .raw_payload(bytes::Bytes::from(payload))
-                        .worker(sender_worker_id)
-                        .send()
-                        .await;
-                });
-            }
-        }
+        crate::streaming::control::request_sender_cancel(
+            *handle,
+            local_worker,
+            sender_registry,
+            messenger,
+        );
     }
 }
 

@@ -301,6 +301,27 @@ impl Drop for AnchorEntry {
 }
 
 impl AnchorEntry {
+    pub(crate) fn restart_unattached_timeout(
+        &mut self,
+        registry: &Arc<DashMap<u64, AnchorEntry>>,
+        local_id: u64,
+    ) {
+        if let Some(previous) = self.timeout_cancel.take() {
+            previous.cancel();
+        }
+        if !self.attachment
+            && self.prebind.is_none()
+            && let Some(duration) = self.unattached_timeout
+        {
+            self.timeout_cancel = Some(AnchorManager::spawn_timeout_task(
+                Arc::clone(registry),
+                local_id,
+                duration,
+                &self.cancel_token,
+            ));
+        }
+    }
+
     /// Stop the pump or watchdog serving this anchor, and withdraw the direct
     /// feed with it.
     ///
@@ -323,13 +344,19 @@ impl AnchorEntry {
     /// own `Detached` ended it. The watchdog stops with the feed, so it
     /// cannot fire later on the entry a re-attach reuses. A newer feed is not
     /// this stream's to stop.
-    pub(crate) fn retire_ended_feed(&mut self, feed: &Arc<crate::streaming::control::DirectFeed>) {
+    pub(crate) fn retire_ended_feed(
+        &mut self,
+        feed: &Arc<crate::streaming::control::DirectFeed>,
+    ) -> bool {
         if self
             .feed
             .current()
             .is_some_and(|current| Arc::ptr_eq(&current, feed))
         {
             self.retire_pump();
+            true
+        } else {
+            false
         }
     }
 
@@ -348,32 +375,20 @@ impl AnchorEntry {
 
 impl Drop for PreBind {
     fn drop(&mut self) {
-        // The ordinary end of a zero-RTT stream: its terminal already retired
-        // the slot, so there is nothing to close and no reason to take the
-        // peer's ingress lock, once per request.
-        if self.drain.is_released() {
-            return;
+        crate::streaming::control::SlotRelease {
+            mux: self.mux.clone(),
+            anchor_id: self.anchor_id,
+            session_id: self.ticket.routing_session_id,
         }
-        let Some(mux) = self.mux.upgrade() else {
-            return;
-        };
-        match self.drain.cancel() {
-            Some((key, slot)) => {
-                mux.cancel_claimed_session(key, slot, self.ticket.routing_session_id)
-            }
-            None => mux.release_bind(self.anchor_id, self.ticket.routing_session_id),
-        }
+        .release(&self.drain);
     }
 }
 
 /// The sender-side identity one stream is opened under.
 ///
-/// A struct because it is allocated before the terms of the stream are known —
-/// the remote attach path has to name it in the request it sends to learn them
-/// — and then has to survive intact into the tail that registers it. Passing
-/// the four parts positionally would take that tail past clippy's argument
-/// limit, which `CLAUDE.md` says to answer with a config struct rather than an
-/// `allow`.
+/// Registered before publishing the identity to an anchor. The guard removes
+/// it if attach fails or its future is dropped; a constructed sender takes
+/// responsibility for the entry.
 struct SenderIdentity {
     sender_stream_id: u64,
     cancel_token: CancellationToken,
@@ -497,39 +512,13 @@ impl StreamController {
             );
         }
 
-        // Directly cancel the SenderEntry in the local sender_registry.
-        // This fires the user-facing cancel_token and poisons send() immediately
-        // without requiring an AM round-trip. Idempotent: remove returns None if
-        // the entry was already removed (e.g. finalize/detach ran first).
         if let Some(handle) = stream_cancel_handle {
-            let (sender_worker_id, sender_stream_id) = handle.unpack();
-            if sender_worker_id == self.inner.worker_id
-                && let Some((_, entry)) =
-                    self.inner.sender_registry.senders.remove(&sender_stream_id)
-            {
-                drop(entry.rx_closer.lock().unwrap().take());
-                entry.cancel_token.cancel();
-            }
-
-            // Also send _stream_cancel AM for cross-worker scenarios (messenger present)
-            if let Some(messenger) = self.inner.messenger.clone() {
-                let payload = serde_json::to_vec(&crate::streaming::control::StreamCancelRequest {
-                    sender_stream_id,
-                })
-                .expect("serialize StreamCancelRequest");
-                // Fire-and-forget: use tokio::spawn guarded by try_current()
-                if let Ok(rt) = tokio::runtime::Handle::try_current() {
-                    rt.spawn(async move {
-                        let _ = messenger
-                            .am_send_streaming("_stream_cancel")
-                            .expect("am_send_streaming builder")
-                            .raw_payload(bytes::Bytes::from(payload))
-                            .worker(sender_worker_id)
-                            .send()
-                            .await;
-                    });
-                }
-            }
+            crate::streaming::control::request_sender_cancel(
+                handle,
+                self.inner.worker_id,
+                &self.inner.sender_registry,
+                self.inner.messenger.as_ref(),
+            );
         }
     }
 }
@@ -542,8 +531,8 @@ impl StreamController {
 ///
 /// Implements [`futures::Stream`] yielding `Result<StreamFrame<T>, StreamError>`.
 /// Heartbeat frames are filtered out and never exposed to the consumer.
-/// Terminal sentinels (`Finalized`, `Detached`, `Dropped`, `TransportError`)
-/// cause the stream to yield one final item and then `None` on subsequent polls.
+/// `Finalized`, `Dropped`, and `TransportError` end the stream.
+/// `Detached` ends one attachment; the consumer can read a later attachment.
 ///
 /// Use [`StreamExt::next()`](futures::StreamExt::next) for async iteration.
 ///
@@ -791,36 +780,8 @@ impl<T> StreamAnchor<T> {
     /// paused while attached).
     pub fn set_timeout(&self, timeout: Option<Duration>) {
         if let Some(mut entry) = self.registry.get_mut(&self.local_id) {
-            // Cancel existing timeout task if any
-            if let Some(ref old_tc) = entry.timeout_cancel {
-                old_tc.cancel();
-            }
-
-            // Update the stored duration
             entry.unattached_timeout = timeout;
-
-            // If unattached and a timeout is set, spawn a new timeout task.
-            // A pre-bound anchor counts as spoken for: its slot is bound and
-            // fed and a sender is on its way to it, so the timer that
-            // measures "no sender attached" would be measuring nothing and
-            // would remove a stream that is about to run.
-            if !entry.attachment && entry.prebind.is_none() {
-                if let Some(duration) = timeout {
-                    let tc = AnchorManager::spawn_timeout_task(
-                        self.registry.clone(),
-                        self.local_id,
-                        duration,
-                        &entry.cancel_token,
-                    );
-                    entry.timeout_cancel = Some(tc);
-                } else {
-                    entry.timeout_cancel = None;
-                }
-            } else {
-                // Attached: just clear the old cancel token; duration is stored
-                // and will be used when detach respawns the timeout task.
-                entry.timeout_cancel = None;
-            }
+            entry.restart_unattached_timeout(&self.registry, self.local_id);
         }
     }
 }
@@ -880,104 +841,27 @@ impl<T: DeserializeOwned> Stream for StreamAnchor<T> {
                             return Poll::Ready(Some(Ok(StreamFrame::Finalized)));
                         }
                         Ok(StreamFrame::Detached) => {
-                            // Detached is NOT terminal — a new sender may
-                            // reattach. Clear the attachment flag so
-                            // `attach_stream_anchor` can succeed, and release
-                            // any pre-bind the way `adopt_prebind`'s
-                            // `Verdict::Mismatch` arm releases one: under
-                            // zero-RTT `attachment` is never set (there is no
-                            // attach to set it), so a claimed pre-bind is the
-                            // only thing a later attach or `open_anchor_stream`
-                            // sees, and it reads exactly like a stream still
-                            // running -- refused forever, with nothing left to
-                            // reap it. Re-arming the unattached timer restores
-                            // the same "anchor is unattached again" signal
-                            // Mismatch restores, for the same reason.
-                            //
-                            // Unlike Mismatch, this does not call
-                            // `retire_pump`, and that is safe only because of
-                            // an invariant this frame's arrival guarantees: an
-                            // unclaimed pre-bind has no connected producer, so
-                            // nothing could have put a `Detached` frame in
-                            // this anchor's `frame_tx` or slot buffer in the
-                            // first place -- the two writers of that
-                            // sentinel are `StreamSender::detach()`, reachable
-                            // only once `open_anchor_stream` has actually
-                            // opened the slot (which is what claims it), and
-                            // `_anchor_detach`'s handler, which takes and
-                            // drops `entry.prebind` itself before injecting
-                            // the sentinel, so `entry.prebind` already reads
-                            // `None` by the time it reaches here. So a
-                            // `Some(prebind)` seen at this line is always
-                            // claimed -- but `Detached` is a terminal
-                            // sentinel. Its sender puts it and its
-                            // `CloseSlot{TerminalSent}` in one batch, and the
-                            // ingress retires the slot on that close in the
-                            // same critical section that puts these very
-                            // bytes into the slot buffer the consumer reads.
-                            // The consumer can read them before that section
-                            // ends, but a close it posts takes the same lock
-                            // and so lands after the retire, and the slot's
-                            // generation and session checks make it find
-                            // nothing. `PreBind::drop`'s `close_claimed_slot`
-                            // is therefore a no-op here, and
-                            // the retiring slot closes the bind, which ends the
-                            // watchdog and the feed on their own: there is
-                            // nothing left to cancel, not a stream still
-                            // running -- unlike `adopt_prebind`'s Mismatch
-                            // arm, which does retire a watchdog and feed
-                            // because its pre-bind is genuinely still
-                            // unclaimed.
-                            // Calling `spawn_timeout_task` under this shard
-                            // guard (rather than hoisting it out the way
-                            // `AnchorManager::detach`'s two-phase shape does)
-                            // is fine now that the guard lives inside that
-                            // function: it never runs synchronously and never
-                            // touches the registry itself, so there is
-                            // nothing here for it to deadlock against.
-                            // A `Detached` read off the anchor channel while a
-                            // mux feed is installed belongs to an earlier
-                            // stream: a mux stream detaches through its own
-                            // slot. The live stream's attachment and pre-bind
-                            // are not this frame's to clear. Judged under the
-                            // entry's guard, against the entry's own feed, not
-                            // what this consumer cached at the top of its
-                            // poll: a new sender can land in between.
-                            //
-                            // A mux stream's own `Detached` ends its feed, so
-                            // the feed and its watchdog retire with it. Left
-                            // there, the feed would make the next non-mux
-                            // sender's `Detached` read as stale, and the
-                            // anchor would stay attached to nobody.
+                            // Channel writers clear their own attachment after
+                            // enqueueing Detached. Reading that old sentinel
+                            // must not change a later attachment. A direct feed
+                            // is retired here only while it is still current.
                             let from_feed = this.from_feed;
                             let ended_feed = this
                                 .feed
                                 .as_ref()
                                 .filter(|_| from_feed)
                                 .map(|(feed, _)| Arc::clone(feed));
-                            let released_prebind = this
-                                .registry
-                                .get_mut(&this.local_id)
-                                .filter(|entry| from_feed || entry.feed.current().is_none())
-                                .and_then(|mut entry| {
-                                    if let Some(feed) = &ended_feed {
-                                        entry.retire_ended_feed(feed);
+                            let released_prebind = ended_feed.and_then(|feed| {
+                                this.registry.get_mut(&this.local_id).and_then(|mut entry| {
+                                    if !entry.retire_ended_feed(&feed) {
+                                        return None;
                                     }
                                     entry.attachment = false;
                                     let released = entry.prebind.take();
-                                    if released.is_some()
-                                        && let Some(duration) = entry.unattached_timeout
-                                    {
-                                        let tc = AnchorManager::spawn_timeout_task(
-                                            Arc::clone(&this.registry),
-                                            this.local_id,
-                                            duration,
-                                            &entry.cancel_token,
-                                        );
-                                        entry.timeout_cancel = Some(tc);
-                                    }
+                                    entry.restart_unattached_timeout(&this.registry, this.local_id);
                                     released
-                                });
+                                })
+                            });
                             drop(released_prebind);
                             return Poll::Ready(Some(Ok(StreamFrame::Detached)));
                         }
@@ -1156,6 +1040,36 @@ impl AnchorManagerBuilder {
 }
 
 impl AnchorManager {
+    pub(crate) async fn shutdown(&self) {
+        // Remove entries outside shard guards: their Drop may close a mux slot.
+        let ids: Vec<_> = self.registry.iter().map(|entry| *entry.key()).collect();
+        for id in ids {
+            self.remove_anchor(id);
+        }
+        let ids: Vec<_> = self
+            .mpsc_registry
+            .iter()
+            .map(|entry| *entry.key())
+            .collect();
+        for id in ids {
+            if let Some((_, entry)) = self.mpsc_registry.remove(&id) {
+                entry.cancel_token.cancel();
+            }
+        }
+        let ids: Vec<_> = self
+            .sender_registry
+            .senders
+            .iter()
+            .map(|entry| *entry.key())
+            .collect();
+        for id in ids {
+            self.sender_registry.cancel(id);
+        }
+        if let Some(mux) = self.mux.get() {
+            mux.shutdown().await;
+        }
+    }
+
     /// Convenience constructor with no default timeout.
     ///
     /// Equivalent to `AnchorManagerBuilder::default().worker_id(id).transport(t).build()`.
@@ -1280,9 +1194,10 @@ impl AnchorManager {
                 }
                 _ = tokio::time::sleep(timeout) => {
                     // Timeout expired -- remove anchor
-                    if let Some((_, entry)) = registry.remove(&local_id) {
+                    if let Some((_, entry)) = registry.remove_if(&local_id, |_, entry| {
+                        !tc_clone.is_cancelled() && !entry.attachment && entry.prebind.is_none()
+                    }) {
                         entry.cancel_token.cancel();
-                        // Dropping frame_tx closes the channel -> StreamAnchor yields None
                     }
                 }
             }
@@ -1294,34 +1209,11 @@ impl AnchorManager {
     ///
     /// Cancels the entry's token before returning. Used by control-path cleanup
     /// handlers and drop impls.
-    #[allow(dead_code)]
     pub(crate) fn remove_anchor(&self, local_id: u64) -> Option<AnchorEntry> {
         self.registry.remove(&local_id).map(|(_, entry)| {
             entry.cancel_token.cancel();
             entry
         })
-    }
-
-    /// Inject a raw sentinel frame into the anchor's delivery channel.
-    ///
-    /// This is a non-blocking best-effort send used by the control path.
-    /// `Item` frames go through `StreamSender::send` instead, not this method.
-    ///
-    /// # Note
-    /// The registry reference is dropped before any other operation to ensure we do
-    /// NOT hold a DashMap shard lock across any await point.
-    #[allow(dead_code)]
-    pub(crate) fn inject_sentinel(&self, local_id: u64, frame_bytes: Vec<u8>) {
-        // Obtain a cloned Sender so we drop the DashMap reference immediately.
-        let maybe_sender = self
-            .registry
-            .get(&local_id)
-            .map(|entry| entry.frame_tx.clone());
-
-        if let Some(sender) = maybe_sender {
-            // Non-blocking best-effort -- control sentinels must never stall.
-            let _ = sender.try_send(frame_bytes);
-        }
     }
 
     /// Install the mux this manager negotiates with, once.
@@ -1468,7 +1360,7 @@ impl AnchorManager {
         // own pre-binds. Chosen before the bind so the bind is counted on it.
         let lane = mux.choose_lane(None, lane_key);
         let lane_index = lane.lane();
-        let receiver = mux.bind_on_lane(local_id, routing_session_id, lane);
+        let receiver = mux.bind_on_lane(local_id, routing_session_id, lane).ok()?;
         let drain = mux
             .take_drain_signal(local_id, routing_session_id)
             .expect("prebind parks a drain signal for the pair it just registered");
@@ -1687,15 +1579,7 @@ impl AnchorManager {
                     // `tokio::spawn` — the call never runs synchronously and
                     // never touches this registry, so there is nothing here
                     // for it to deadlock against.
-                    if let Some(duration) = entry.unattached_timeout {
-                        let tc = Self::spawn_timeout_task(
-                            Arc::clone(&self.registry),
-                            local_id,
-                            duration,
-                            &entry.cancel_token,
-                        );
-                        entry.timeout_cancel = Some(tc);
-                    }
+                    entry.restart_unattached_timeout(&self.registry, local_id);
                     (
                         PrebindAdoption::Refused(format!(
                             "anchor {} was pre-bound on {key}, which this sender does not support",
@@ -1873,79 +1757,6 @@ impl AnchorManager {
         )))
     }
 
-    /// Atomically attempt to mark an anchor as attached.
-    ///
-    /// Uses `DashMap::entry()` to perform the check-and-set atomically under
-    /// the shard lock, preventing TOCTOU races between concurrent attach attempts.
-    /// The reader pump or direct feed holds the transport receiver separately.
-    ///
-    /// If a timeout task is running, it is cancelled (paused) on successful attach.
-    ///
-    /// Returns `Err(AttachError::AlreadyAttached)` if a sender is already attached.
-    /// Returns `Err(AttachError::AnchorNotFound)` if `local_id` is not in the registry.
-    #[allow(dead_code)]
-    pub(crate) fn try_attach(
-        &self,
-        local_id: u64,
-        handle: StreamAnchorHandle,
-    ) -> Result<(), AttachError> {
-        use dashmap::mapref::entry::Entry;
-        match self.registry.entry(local_id) {
-            Entry::Vacant(_) => Err(AttachError::AnchorNotFound { handle }),
-            Entry::Occupied(mut occ) => {
-                let entry = occ.get_mut();
-                if entry.attachment {
-                    Err(AttachError::AlreadyAttached { handle })
-                } else {
-                    entry.attachment = true;
-                    // Cancel the timeout task while attached (pause timer)
-                    if let Some(ref tc) = entry.timeout_cancel {
-                        tc.cancel();
-                    }
-                    Ok(())
-                }
-            }
-        }
-    }
-
-    /// Clear the attachment flag on an anchor.
-    ///
-    /// If the anchor has a configured `unattached_timeout`, a new timeout task
-    /// is spawned (timer "resumes" by restarting from the full duration).
-    ///
-    /// Returns `true` if the anchor was found and was previously attached.
-    #[allow(dead_code)]
-    pub(crate) fn detach(&self, local_id: u64) -> bool {
-        // Phase 1: Clear attachment and read unattached_timeout + cancel_token (drop DashMap ref)
-        let (was_attached, maybe_timeout, maybe_parent) = self
-            .registry
-            .get_mut(&local_id)
-            .map(|mut entry| {
-                let was = entry.attachment;
-                entry.attachment = false;
-                (
-                    was,
-                    entry.unattached_timeout,
-                    Some(entry.cancel_token.clone()),
-                )
-            })
-            .unwrap_or((false, None, None));
-
-        // Phase 2: Respawn timeout task outside the DashMap borrow
-        if let Some(timeout) = maybe_timeout {
-            let parent = maybe_parent
-                .as_ref()
-                .expect("cancel_token present when unattached_timeout is");
-            let tc = Self::spawn_timeout_task(self.registry.clone(), local_id, timeout, parent);
-            // Store the new cancellation token back in the entry
-            if let Some(mut entry) = self.registry.get_mut(&local_id) {
-                entry.timeout_cancel = Some(tc);
-            }
-        }
-
-        was_attached
-    }
-
     /// Returns the number of anchors currently registered.
     ///
     /// Intended for testing and observability. Counts SPSC anchors only; the
@@ -2074,7 +1885,7 @@ impl AnchorManager {
             &self.sender_registry,
         )))?;
 
-        messenger.register_streaming_handler(
+        messenger.register_drain_exempt_handler(
             crate::streaming::control::create_stream_stop_handler(Arc::clone(
                 &self.sender_registry,
             )),
@@ -2720,15 +2531,8 @@ impl AnchorManager {
         // Local path: reserve a slot under the shard lock, then construct
         // the sender after the lock is released.
         use dashmap::mapref::entry::Entry;
-        let (
-            sender_id,
-            frame_tx,
-            heartbeat_interval,
-            cancel_token,
-            poison_tx,
-            poison_rx,
-            sender_stream_id,
-        ) = match self.mpsc_registry.entry(local_id) {
+        let mut identity = self.new_sender_identity();
+        let (sender_id, frame_tx, heartbeat_interval) = match self.mpsc_registry.entry(local_id) {
             Entry::Vacant(_) => return Err(AttachError::AnchorNotFound { handle }),
             Entry::Occupied(mut occ) => {
                 let entry = occ.get_mut();
@@ -2750,54 +2554,32 @@ impl AnchorManager {
                 let frame_tx = entry.frame_tx.clone();
                 let heartbeat_interval = entry.heartbeat_interval;
 
-                let sender_stream_id =
-                    self.next_sender_stream_id.fetch_add(1, Ordering::Relaxed) + 1;
-                let cancel_token = CancellationToken::new();
-                let (poison_tx, poison_rx) = flume::bounded::<()>(1);
-
                 let slot = crate::streaming::mpsc::anchor::MpscSenderSlot {
                     pump_token: None,
                     stream_cancel_handle: Some(
                         crate::streaming::control::StreamCancelHandle::pack(
                             self.worker_id,
-                            sender_stream_id,
+                            identity.sender_stream_id,
                         ),
                     ),
                 };
                 entry.senders.insert(sender_id, slot);
 
-                (
-                    sender_id,
-                    frame_tx,
-                    heartbeat_interval,
-                    cancel_token,
-                    poison_tx,
-                    poison_rx,
-                    sender_stream_id,
-                )
+                (sender_id, frame_tx, heartbeat_interval)
             }
         };
 
-        // Register SenderEntry outside the shard lock.
-        let sender_entry = crate::streaming::control::SenderEntry {
-            stop_token: cancel_token.child_token(),
-            cancel_token: cancel_token.clone(),
-            rx_closer: std::sync::Mutex::new(Some(poison_rx)),
-        };
-        self.sender_registry
-            .senders
-            .insert(sender_stream_id, sender_entry);
-
+        identity.armed = false;
         Ok(crate::streaming::mpsc::MpscStreamSender::new(
             crate::streaming::mpsc::SenderId(sender_id),
             crate::streaming::mpsc::sender::SenderChannel::Local(frame_tx),
             handle,
             self.mpsc_registry.clone(),
             crate::streaming::sender::StreamSenderCancelInfo {
-                cancel_token,
-                sender_stream_id,
+                cancel_token: identity.cancel_token.clone(),
+                sender_stream_id: identity.sender_stream_id,
                 sender_registry: self.sender_registry.clone(),
-                poison_tx,
+                poison_tx: identity.poison_tx.clone(),
             },
             heartbeat_interval,
             self.metrics.clone(),
@@ -2817,9 +2599,8 @@ impl AnchorManager {
             ))
         })?;
 
-        let sender_stream_id = self.next_sender_stream_id.fetch_add(1, Ordering::Relaxed) + 1;
-        let cancel_token = CancellationToken::new();
-        let (poison_tx, poison_rx) = flume::bounded::<()>(1);
+        let mut identity = self.new_sender_identity();
+        let sender_stream_id = identity.sender_stream_id;
         let stream_cancel_handle =
             crate::streaming::control::StreamCancelHandle::pack(self.worker_id, sender_stream_id);
 
@@ -2888,29 +2669,21 @@ impl AnchorManager {
                         },
                         handle_worker_id,
                         local_id,
-                        None,
+                        Some((identity.cancel_token.clone(), identity.stop_token.clone())),
                     )
                     .await?;
 
-                let sender_entry = crate::streaming::control::SenderEntry {
-                    stop_token: cancel_token.child_token(),
-                    cancel_token: cancel_token.clone(),
-                    rx_closer: std::sync::Mutex::new(Some(poison_rx)),
-                };
-                self.sender_registry
-                    .senders
-                    .insert(sender_stream_id, sender_entry);
-
+                identity.armed = false;
                 Ok(crate::streaming::mpsc::MpscStreamSender::new(
                     crate::streaming::mpsc::SenderId(sender_id),
                     crate::streaming::mpsc::sender::SenderChannel::Remote(frame_tx),
                     handle,
                     self.mpsc_registry.clone(),
                     crate::streaming::sender::StreamSenderCancelInfo {
-                        cancel_token,
+                        cancel_token: identity.cancel_token.clone(),
                         sender_stream_id,
                         sender_registry: self.sender_registry.clone(),
-                        poison_tx,
+                        poison_tx: identity.poison_tx.clone(),
                     },
                     Duration::from_millis(heartbeat_interval_ms),
                     self.metrics.clone(),
@@ -2968,6 +2741,65 @@ mod tests {
         ) -> BoxFuture<'_, AnyhowResult<flume::Sender<Vec<u8>>>> {
             Box::pin(async { Ok(flume::bounded::<Vec<u8>>(256).0) })
         }
+    }
+
+    /// A deferred local exit must release its channel when the consumer
+    /// cancels, even if the consumer retains the full anchor queue.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn off_runtime_mpsc_drop_stops_waiting_when_the_consumer_cancels() {
+        let manager = make_manager();
+        let anchor = manager.create_mpsc_anchor_with_config::<u32>(
+            crate::streaming::mpsc::MpscAnchorConfig {
+                channel_capacity: Some(1),
+                unattached_timeout: Some(Duration::from_secs(3600)),
+                ..Default::default()
+            },
+        );
+        let handle = anchor.handle();
+        let frame_tx = manager
+            .mpsc_registry
+            .get(&handle.unpack().1)
+            .unwrap()
+            .frame_tx
+            .clone();
+        let sender = manager
+            .attach_mpsc_stream_anchor::<u32>(handle)
+            .await
+            .unwrap();
+        sender.send(1).await.unwrap();
+        let (done, finished) = tokio::sync::oneshot::channel();
+        let thread = std::thread::spawn(move || {
+            drop(sender);
+            let _ = done.send(());
+        });
+        if tokio::time::timeout(Duration::from_secs(2), finished)
+            .await
+            .is_err()
+        {
+            // Release a blocking old implementation before failing the test.
+            drop(anchor);
+            thread.join().unwrap();
+            panic!("drop blocked on the full queue");
+        }
+        thread.join().unwrap();
+        assert!(manager.sender_registry.senders.is_empty());
+        assert!(
+            manager
+                .mpsc_registry
+                .get(&handle.unpack().1)
+                .unwrap()
+                .senders
+                .is_empty()
+        );
+        anchor.controller().cancel();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while frame_tx.sender_count() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deferred exit retained the cancelled anchor channel");
+        drop(anchor);
     }
 
     /// `velo_streaming_active_anchors` reads the registries when scraped, so
@@ -3124,33 +2956,34 @@ mod tests {
     // Test 3: Exclusive attach -- second attach while attached returns AlreadyAttached
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_exclusive_attach() {
+    #[tokio::test(start_paused = true)]
+    async fn test_exclusive_attach() {
         let mgr = make_manager();
-        let anchor = mgr.create_anchor::<u8>();
+        let mut anchor = mgr.create_anchor::<u8>();
+        anchor.set_timeout(Some(Duration::from_secs(1)));
         let handle = anchor.handle();
-        let (_, local_id) = handle.unpack();
-
-        // First attach succeeds.
-        let result1 = mgr.try_attach(local_id, handle);
-        assert!(result1.is_ok(), "first attach must succeed: {result1:?}");
-
-        // Second attach while still attached must fail with AlreadyAttached.
-        let result2 = mgr.try_attach(local_id, handle);
-        match result2 {
-            Err(AttachError::AlreadyAttached { .. }) => {}
-            other => panic!("expected AlreadyAttached, got {other:?}"),
-        }
-
-        // Detach and try again -- must succeed.
-        let was_attached = mgr.detach(local_id);
-        assert!(was_attached, "detach must return true when attached");
-
-        let result3 = mgr.try_attach(local_id, handle);
-        assert!(
-            result3.is_ok(),
-            "third attach after detach must succeed: {result3:?}"
-        );
+        let sender = mgr.attach_stream_anchor::<u8>(handle).await.unwrap();
+        assert!(matches!(
+            mgr.attach_stream_anchor::<u8>(handle).await,
+            Err(AttachError::AlreadyAttached { .. })
+        ));
+        sender.detach().unwrap();
+        let sender = mgr.attach_stream_anchor::<u8>(handle).await.unwrap();
+        assert!(matches!(
+            anchor.next().await,
+            Some(Ok(StreamFrame::Detached))
+        ));
+        // Reading the prior sender's Detached must not expire this attachment.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(matches!(
+            mgr.attach_stream_anchor::<u8>(handle).await,
+            Err(AttachError::AlreadyAttached { .. })
+        ));
+        sender.send(42).await.unwrap();
+        assert!(matches!(
+            anchor.next().await,
+            Some(Ok(StreamFrame::Item(42)))
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -3723,13 +3556,12 @@ mod tests {
 
         let anchor = mgr.create_anchor::<u32>();
         let handle = anchor.handle();
-        let (_, local_id) = handle.unpack();
 
         // Advance past timeout
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
         // Try to attach -- should get AnchorNotFound
-        let result = mgr.try_attach(local_id, handle);
+        let result = mgr.attach_stream_anchor::<u32>(handle).await;
         match result {
             Err(AttachError::AnchorNotFound { .. }) => {}
             other => panic!("expected AnchorNotFound after timeout, got {:?}", other),
@@ -3750,7 +3582,7 @@ mod tests {
             .build()
             .expect("builder should succeed");
 
-        let anchor = mgr.create_anchor::<u32>();
+        let mut anchor = mgr.create_anchor::<u32>();
         let handle = anchor.handle();
         let (_, local_id) = handle.unpack();
 
@@ -3762,7 +3594,9 @@ mod tests {
         );
 
         // Attach -- should cancel the timeout task
-        mgr.try_attach(local_id, handle)
+        let sender = mgr
+            .attach_stream_anchor::<u32>(handle)
+            .await
             .expect("attach should succeed");
 
         // Advance well past the original deadline
@@ -3773,7 +3607,11 @@ mod tests {
         );
 
         // Detach -- should respawn the timeout task
-        mgr.detach(local_id);
+        sender.detach().expect("detach");
+        assert!(matches!(
+            anchor.next().await,
+            Some(Ok(StreamFrame::Detached))
+        ));
 
         // Advance past the new timeout (2s from detach)
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -3876,12 +3714,14 @@ mod tests {
         tokio::time::pause();
 
         let mgr = make_manager();
-        let stream = mgr.create_anchor::<u32>();
+        let mut stream = mgr.create_anchor::<u32>();
         let handle = stream.handle();
         let (_, local_id) = handle.unpack();
 
         // Attach the anchor
-        mgr.try_attach(local_id, handle)
+        let sender = mgr
+            .attach_stream_anchor::<u32>(handle)
+            .await
             .expect("attach should succeed");
 
         // Set a timeout while attached -- should NOT spawn a task immediately
@@ -3897,7 +3737,11 @@ mod tests {
         );
 
         // Detach -- now the timeout should kick in (stored duration from set_timeout)
-        mgr.detach(local_id);
+        sender.detach().expect("detach");
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(StreamFrame::Detached))
+        ));
 
         // Advance past the timeout
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;

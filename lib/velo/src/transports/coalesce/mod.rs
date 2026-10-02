@@ -311,6 +311,12 @@ pub(crate) enum WriterFailure {
 
 /// Hooks for logging and metrics, so the loop itself stays transport-agnostic.
 pub(crate) trait WriterObserver {
+    /// QUIC bounds pending writes by closing its endpoint. It must finish or
+    /// fail those writes before it sends FIN and waits for acknowledgements.
+    fn interrupt_pending_writes(&self) -> bool {
+        true
+    }
+
     /// One batch reached the wire carrying `frames` frames. Not called for a
     /// failed write.
     ///
@@ -514,11 +520,15 @@ impl FrameBatchBuffer {
     /// The buffer is cleared whether or not the write succeeded: on failure the
     /// caller owns error reporting for the frames it staged, and retrying a
     /// partially-written frame stream would corrupt the peer's decoder.
-    async fn flush_to<W: AsyncWrite + Unpin>(&mut self, writer: &mut W) -> io::Result<()> {
+    async fn flush_to<W: AsyncWrite + Unpin>(
+        &mut self,
+        writer: &mut W,
+        cancel: Option<&CancellationToken>,
+    ) -> io::Result<()> {
         if self.frames == 0 {
             return Ok(());
         }
-        let result = writer.write_all(&self.buf).await;
+        let result = write_all_cancelled(writer, &self.buf, cancel).await;
         self.buf.clear();
         self.frames = 0;
         result
@@ -556,6 +566,7 @@ pub(crate) async fn run_coalescing_writer<W, I, T, O>(
     T: Coalescable,
     O: WriterObserver,
 {
+    let write_cancel = cancel.filter(|_| observer.interrupt_pending_writes());
     let mut batch = FrameBatchBuffer::new();
     // One token per frame staged into `batch` but not yet written, so a failed
     // write can report every frame it was carrying rather than just the last.
@@ -585,7 +596,15 @@ pub(crate) async fn run_coalescing_writer<W, I, T, O>(
             let staging = batch.classify(item.header().len(), item.payload().len());
 
             if staging.needs_flush_first()
-                && !flush::<_, T, _>(&mut batch, &mut staged, writer, observer, &mut egress).await
+                && !flush::<_, T, _>(
+                    &mut batch,
+                    &mut staged,
+                    writer,
+                    observer,
+                    &mut egress,
+                    write_cancel,
+                )
+                .await
             {
                 // `item` never entered the batch, so `flush` did not report it.
                 T::fail(item.into_failure_token(), FLUSH_FAILED);
@@ -603,7 +622,7 @@ pub(crate) async fn run_coalescing_writer<W, I, T, O>(
                     "a direct write must carry exactly the one frame staged for it"
                 );
                 let started = egress.started();
-                if let Err((kind, e)) = write_frame_direct(writer, &item).await {
+                if let Err((kind, e)) = write_frame_direct(writer, &item, write_cancel).await {
                     egress.failed();
                     observer.on_failure(kind, &e, 1);
                     T::fail(item.into_failure_token(), &e.to_string());
@@ -625,7 +644,15 @@ pub(crate) async fn run_coalescing_writer<W, I, T, O>(
                     observer.on_failure(WriterFailure::Encode, &e, 1);
                     T::fail(item.into_failure_token(), &e.to_string());
                     // Frames already staged are still valid — get them out.
-                    flush::<_, T, _>(&mut batch, &mut staged, writer, observer, &mut egress).await;
+                    flush::<_, T, _>(
+                        &mut batch,
+                        &mut staged,
+                        writer,
+                        observer,
+                        &mut egress,
+                        write_cancel,
+                    )
+                    .await;
                     break 'writer;
                 }
                 // Read before the move. `is_terminal` is consulted *after*
@@ -655,7 +682,15 @@ pub(crate) async fn run_coalescing_writer<W, I, T, O>(
             }
         }
 
-        if !flush::<_, T, _>(&mut batch, &mut staged, writer, observer, &mut egress).await
+        if !flush::<_, T, _>(
+            &mut batch,
+            &mut staged,
+            writer,
+            observer,
+            &mut egress,
+            write_cancel,
+        )
+        .await
             || terminal
         {
             break 'writer;
@@ -681,6 +716,7 @@ async fn flush<W, T, O>(
     writer: &mut W,
     observer: &O,
     egress: &mut EgressLog,
+    cancel: Option<&CancellationToken>,
 ) -> bool
 where
     W: AsyncWrite + Unpin,
@@ -705,7 +741,7 @@ where
         return true;
     }
     let started = egress.started();
-    match batch.flush_to(writer).await {
+    match batch.flush_to(writer, cancel).await {
         Ok(()) => {
             staged.clear();
             observer.on_flush(frames);
@@ -736,6 +772,7 @@ where
 async fn write_frame_direct<W, T>(
     writer: &mut W,
     item: &T,
+    cancel: Option<&CancellationToken>,
 ) -> Result<(), (WriterFailure, io::Error)>
 where
     W: AsyncWrite + Unpin,
@@ -761,12 +798,28 @@ where
         None => &[&preamble[..], header, payload],
     };
     for segment in segments {
-        writer
-            .write_all(segment)
+        write_all_cancelled(writer, segment, cancel)
             .await
             .map_err(|e| (WriterFailure::Write, e))?;
     }
     Ok(())
+}
+
+/// Complete an immediately writable frame, but stop a blocked write during
+/// teardown. The caller must discard the connection after a partial write.
+async fn write_all_cancelled<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    bytes: &[u8],
+    cancel: Option<&CancellationToken>,
+) -> io::Result<()> {
+    let Some(cancel) = cancel else {
+        return writer.write_all(bytes).await;
+    };
+    tokio::select! {
+        biased;
+        result = writer.write_all(bytes) => result,
+        () = cancel.cancelled() => Err(io::Error::new(io::ErrorKind::Interrupted, "transport torn down during write")),
+    }
 }
 
 /// Completes when `cancel` fires; never completes when there is no token.

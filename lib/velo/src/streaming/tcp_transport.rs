@@ -36,6 +36,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::tasks::StreamTasks;
 use crate::transports::MessageType;
 use crate::transports::address::WorkerAddressBuilder;
 use crate::transports::coalesce::{
@@ -100,8 +101,9 @@ pub struct TcpFrameTransport {
     /// Resolved peer endpoints keyed by WorkerId.
     peers: Arc<DashMap<WorkerId, SocketAddr>>,
     registry: Arc<SessionRegistry>,
-    /// Cancellation handle for the accept loop. Tripped on `Drop`.
-    cancel: CancellationToken,
+    /// Drop stops accepting; explicit shutdown also stops active streams.
+    listener_cancel: CancellationToken,
+    tasks: StreamTasks,
     /// Optional metrics handle. Set once by the Velo builder via
     /// [`Self::set_metrics`] before any bind/connect; read on the hot path
     /// by the accept loop and the pump tasks.
@@ -149,16 +151,21 @@ impl TcpFrameTransport {
             .map_err(|e| anyhow!("Failed to build WorkerAddress: {e}"))?;
 
         let registry: Arc<SessionRegistry> = Arc::new(DashMap::new());
-        let cancel = CancellationToken::new();
+        let tasks = StreamTasks::default();
+        let listener_cancel = CancellationToken::new();
         let metrics: Arc<std::sync::OnceLock<Arc<crate::observability::VeloMetrics>>> =
             Arc::new(std::sync::OnceLock::new());
 
-        tokio::spawn(run_accept_loop(
+        let accept_loop = run_accept_loop(
             Arc::new(listener),
             registry.clone(),
-            cancel.clone(),
+            tasks.clone(),
             metrics.clone(),
-        ));
+        );
+        let accept_cancel = listener_cancel.clone();
+        tasks.spawn(async move {
+            accept_cancel.run_until_cancelled_owned(accept_loop).await;
+        });
 
         Ok(Arc::new(Self {
             key,
@@ -169,7 +176,8 @@ impl TcpFrameTransport {
             numa_hint,
             peers: Arc::new(DashMap::new()),
             registry,
-            cancel,
+            listener_cancel,
+            tasks,
             metrics,
         }))
     }
@@ -203,11 +211,18 @@ impl TcpFrameTransport {
     pub fn bound_addr(&self) -> SocketAddr {
         self.bind_addr
     }
+
+    pub(crate) async fn shutdown(&self) {
+        self.listener_cancel.cancel();
+        self.tasks.stop();
+        self.registry.clear();
+        self.tasks.wait().await;
+    }
 }
 
 impl Drop for TcpFrameTransport {
     fn drop(&mut self) {
-        self.cancel.cancel();
+        self.listener_cancel.cancel();
     }
 }
 
@@ -215,26 +230,23 @@ impl Drop for TcpFrameTransport {
 async fn run_accept_loop(
     listener: Arc<TcpListener>,
     registry: Arc<SessionRegistry>,
-    cancel: CancellationToken,
+    tasks: StreamTasks,
     metrics: Arc<std::sync::OnceLock<Arc<crate::observability::VeloMetrics>>>,
 ) {
     loop {
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => {
-                tracing::debug!("TCP streaming accept loop cancelled, exiting");
-                return;
+        match listener.accept().await {
+            Ok((stream, _peer)) => {
+                let pump_metrics = metrics.get().cloned();
+                tasks.spawn(handle_one_connection(
+                    stream,
+                    registry.clone(),
+                    pump_metrics,
+                ));
             }
-            res = listener.accept() => match res {
-                Ok((stream, _peer)) => {
-                    let pump_metrics = metrics.get().cloned();
-                    tokio::spawn(handle_one_connection(stream, registry.clone(), pump_metrics));
-                }
-                Err(e) => {
-                    tracing::warn!("TCP streaming accept error: {}", e);
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-            },
+            Err(e) => {
+                tracing::warn!("TCP streaming accept error: {}", e);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
         }
     }
 }
@@ -549,12 +561,15 @@ impl FrameTransport for TcpFrameTransport {
     ) -> BoxFuture<'_, Result<flume::Receiver<Vec<u8>>>> {
         let registry = self.registry.clone();
         Box::pin(async move {
+            if self.tasks.is_stopped() {
+                return Err(anyhow!("TCP streaming transport shut down"));
+            }
             let (frame_tx, frame_rx) = flume::bounded::<Vec<u8>>(4096);
             registry.insert((anchor_id, session_id), PendingStream { frame_tx });
 
             // Expire the slot if no peer connects within ACCEPT_TIMEOUT.
             let expiry_registry = registry.clone();
-            tokio::spawn(async move {
+            if !self.tasks.spawn(async move {
                 tokio::time::sleep(ACCEPT_TIMEOUT).await;
                 if expiry_registry.remove(&(anchor_id, session_id)).is_some() {
                     tracing::warn!(
@@ -563,7 +578,10 @@ impl FrameTransport for TcpFrameTransport {
                         session_id
                     );
                 }
-            });
+            }) {
+                registry.remove(&(anchor_id, session_id));
+                return Err(anyhow!("TCP streaming transport shut down"));
+            }
 
             Ok(frame_rx)
         })
@@ -578,6 +596,9 @@ impl FrameTransport for TcpFrameTransport {
         let peers = self.peers.clone();
         let metrics = self.metrics.clone();
         Box::pin(async move {
+            if self.tasks.is_stopped() {
+                return Err(anyhow!("TCP streaming transport shut down"));
+            }
             let addr = *peers.get(&peer).ok_or_else(|| {
                 anyhow!(
                     "TCP streaming: peer {} not registered (call register_peer first)",
@@ -617,7 +638,9 @@ impl FrameTransport for TcpFrameTransport {
             let (tx, rx) = flume::bounded::<Vec<u8>>(4096);
             let pump_metrics = metrics.get().cloned();
 
-            tokio::spawn(egress_pump(stream, rx, pump_metrics));
+            if !self.tasks.spawn(egress_pump(stream, rx, pump_metrics)) {
+                return Err(anyhow!("TCP streaming transport shut down"));
+            }
 
             Ok(tx)
         })
@@ -636,6 +659,29 @@ mod tests {
         let inst = InstanceId::new_v4();
         let wid = inst.worker_id();
         (wid, PeerInfo::new(inst, address))
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_listener_pending_binds_and_idle_connections() {
+        let server = TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into())
+            .await
+            .unwrap();
+        let addr = server.bound_addr();
+        let pending = server.bind(1, 1).await.unwrap();
+        let mut idle = TcpStream::connect(addr).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), server.shutdown())
+            .await
+            .unwrap();
+        assert!(pending.is_disconnected());
+        assert!(server.bind(2, 2).await.is_err());
+        let mut byte = [0];
+        let closed = tokio::time::timeout(Duration::from_secs(2), idle.read(&mut byte))
+            .await
+            .unwrap();
+        assert!(matches!(closed, Ok(0) | Err(_)));
+        let _listener = TcpListener::bind(addr)
+            .await
+            .expect("listener released before shutdown returns");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -662,6 +708,19 @@ mod tests {
             .expect("recv timeout")
             .expect("channel closed");
         assert_eq!(received, frame_bytes);
+        // Public transport handles may go away before retained channels finish.
+        drop(server);
+        drop(client);
+        let finalized = crate::streaming::sender::cached_finalized().clone();
+        tx.send_async(finalized.clone()).await.unwrap();
+        drop(tx);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), rx.recv_async())
+                .await
+                .expect("retained stream stalled after transport drop")
+                .unwrap(),
+            finalized
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

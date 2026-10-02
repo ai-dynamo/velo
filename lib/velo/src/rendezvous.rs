@@ -294,11 +294,12 @@ impl RendezvousManager {
         Ok(())
     }
 
-    /// Get the messenger reference (panics if `register_handlers` not called).
-    fn messenger(&self) -> &Arc<crate::messenger::Messenger> {
+    /// Get the messenger installed by handler registration.
+    fn messenger(&self) -> Result<Arc<crate::messenger::Messenger>> {
         self.messenger_lock
             .get()
-            .expect("RendezvousManager::register_handlers must be called before use")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Rendezvous messenger is unavailable"))
     }
 
     // -----------------------------------------------------------------------
@@ -712,7 +713,7 @@ impl RendezvousManager {
                 .metadata(local_id)
                 .ok_or_else(|| anyhow::anyhow!("rendezvous handle not found: {handle}"))
         } else {
-            consumer::Consumer::metadata(self.messenger(), handle).await
+            consumer::Consumer::metadata(&self.messenger()?, handle).await
         };
         if let Some(m) = &self.metrics {
             let outcome = if result.is_ok() {
@@ -952,7 +953,7 @@ impl RendezvousManager {
             }
             Ok(())
         } else {
-            consumer::Consumer::ref_handle(self.messenger(), handle).await
+            consumer::Consumer::ref_handle(&self.messenger()?, handle).await
         };
         if let Some(m) = &self.metrics {
             let outcome = if result.is_ok() {
@@ -984,7 +985,7 @@ impl RendezvousManager {
                 }
             }
         } else {
-            consumer::Consumer::detach(self.messenger(), handle, lease_id).await
+            consumer::Consumer::detach(&self.messenger()?, handle, lease_id).await
         };
         if let Some(m) = &self.metrics {
             let outcome = if result.is_ok() {
@@ -1020,7 +1021,7 @@ impl RendezvousManager {
                 }
             }
         } else {
-            consumer::Consumer::release(self.messenger(), handle, lease_id).await
+            consumer::Consumer::release(&self.messenger()?, handle, lease_id).await
         };
         if let Some(m) = &self.metrics {
             let outcome = if result.is_ok() {
@@ -1051,18 +1052,15 @@ impl RendezvousManager {
     /// fourth error arm.
     pub(crate) fn lease_guard(&self, handle: DataHandle, lease_id: u64) -> LeaseGuard {
         let local = handle.worker_id() == self.worker_id;
+        let messenger = self.messenger_lock.get().cloned();
+        let runtime = messenger
+            .as_ref()
+            .map(|m| m.runtime().clone())
+            .unwrap_or_else(tokio::runtime::Handle::current);
         LeaseGuard {
             store: Arc::clone(&self.store),
-            messenger: if local {
-                None
-            } else {
-                self.messenger_lock.get().cloned()
-            },
-            runtime: self
-                .messenger_lock
-                .get()
-                .map(|m| m.runtime().clone())
-                .unwrap_or_else(tokio::runtime::Handle::current),
+            messenger: if local { None } else { messenger },
+            runtime,
             handle,
             lease_id,
             armed: true,

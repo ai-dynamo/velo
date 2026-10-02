@@ -4,9 +4,9 @@
 //! Batched, multiplexed streaming over the Messenger — the `messenger-mux-v2`
 //! transport described by `docs/src/concepts/batched-streaming.md`.
 //!
-//! Today one stream owns one connection: X concurrent streams to one peer means
+//! With a per-stream transport, one stream owns one connection: X concurrent streams to one peer means
 //! X sockets, X egress pumps, X heartbeat timers, and one `write` syscall per
-//! token. The mux collapses that to **one batcher per peer** and packs every
+//! token. The mux collapses that to **one batcher per (peer, lane)** and packs every
 //! stream's records into `_stream_batch` active messages that ride the
 //! Messenger's existing connectivity. There is no dial, no listener, no
 //! acceptor and no connection lifecycle, because there is no connection: the
@@ -28,7 +28,7 @@
 //!   per-slot credit, with one reserved terminal credit, control records that
 //!   data exhaustion cannot block, and byte budgets standing in for the
 //!   per-stream socket limit the kernel used to enforce for free.
-//! - [`peer_batcher`] — egress. One task per peer, packing every slot's records
+//! - [`peer_batcher`] — egress. One task per (peer, lane), packing every slot's records
 //!   and parking on send admission when the peer is congested.
 //! - [`ingress`] — receive. The `_stream_batch` handler body, ordered per
 //!   sender and nonblocking by construction.
@@ -225,9 +225,7 @@ struct MuxCore {
     /// batch of the new one as stale and discard it wholesale.
     epochs: Arc<AtomicU64>,
     cancel: CancellationToken,
-    /// The runtime the mux was built on, for work that has to spawn when the
-    /// caller has none: a slot close from an anchor dropped off-runtime.
-    runtime: Option<tokio::runtime::Handle>,
+    tasks: crate::streaming::tasks::StreamTasks,
     /// Peers with credit to return, posted by draining consumers. See
     /// [`ingress::DrainSignal`].
     drain_tx: flume::Sender<PeerLane>,
@@ -268,6 +266,14 @@ struct MuxCore {
 }
 
 impl MessengerMuxTransport {
+    pub(crate) async fn shutdown(&self) {
+        self.core.tasks.stop();
+        self.core.tasks.wait().await;
+        self.core.batchers.clear();
+        close_ingress(&self.core.ingress, self.core.metrics.as_ref());
+        self.core.drains.clear();
+    }
+
     /// Ask the sender of a claimed slot to stop, through the batcher of the
     /// lane its `OpenSlot` arrived on.
     pub(crate) fn request_stop(&self, key: PeerLane, slot: protocol::SlotId, session_id: u64) {
@@ -341,6 +347,7 @@ impl MessengerMuxTransport {
             ..config
         };
         let (drain_tx, drain_rx) = drain_wake_lane();
+        let tasks = crate::streaming::tasks::StreamTasks::new(messenger.runtime().clone());
         let core = Arc::new(MuxCore {
             messenger: Arc::clone(&messenger),
             config,
@@ -351,11 +358,11 @@ impl MessengerMuxTransport {
             // Epochs start at 1 so zero is never a live epoch, which keeps a
             // zeroed header from reading as a legitimate one.
             epochs: Arc::new(AtomicU64::new(1)),
-            cancel: CancellationToken::new(),
+            cancel: tasks.cancellation_token(),
+            tasks,
             drain_tx,
             drain_rx,
             drains: DashMap::new(),
-            runtime: tokio::runtime::Handle::try_current().ok(),
             bind_deadlines: std::sync::Mutex::default(),
             #[cfg(test)]
             hooks: std::sync::OnceLock::new(),
@@ -399,30 +406,51 @@ impl MessengerMuxTransport {
 
 impl MuxCore {
     /// The batcher for one (peer, lane), created on first use.
-    fn batcher(&self, key: PeerLane) -> Arc<BatcherHandle> {
-        if let Some(existing) = self.batchers.get(&key) {
-            return Arc::clone(existing.value());
+    fn batcher(&self, key: PeerLane) -> Result<Arc<BatcherHandle>> {
+        if self.tasks.is_stopped() {
+            return Err(anyhow!("messenger mux shut down"));
         }
-        Arc::clone(
-            self.batchers
-                .entry(key)
-                .or_insert_with(|| {
-                    peer_batcher::spawn(
-                        key,
-                        BatcherContext {
-                            messenger: Arc::clone(&self.messenger),
-                            config: self.config.clone(),
-                            metrics: self.metrics.clone(),
-                            epochs: Arc::clone(&self.epochs),
-                            batchers: Arc::clone(&self.batchers),
-                            cancel: self.cancel.clone(),
-                            #[cfg(test)]
-                            hooks: self.hooks.get().cloned(),
-                        },
-                    )
-                })
-                .value(),
-        )
+        if let Some(existing) = self.batchers.get(&key) {
+            return self.checked_batcher(key, existing.value());
+        }
+        let entry = self.batchers.entry(key).or_insert_with(|| {
+            peer_batcher::spawn(
+                key,
+                BatcherContext {
+                    tasks: self.tasks.clone(),
+                    messenger: Arc::clone(&self.messenger),
+                    config: self.config.clone(),
+                    metrics: self.metrics.clone(),
+                    epochs: Arc::clone(&self.epochs),
+                    batchers: Arc::clone(&self.batchers),
+                    ingress: Arc::clone(&self.ingress),
+                    cancel: self.cancel.clone(),
+                    #[cfg(test)]
+                    hooks: self.hooks.get().cloned(),
+                },
+            )
+        });
+        self.checked_batcher(key, entry.value())
+    }
+
+    /// The caller holds the registry guard, so a closed handle here cannot
+    /// have been removed by normal retirement between lookup and validation.
+    fn checked_batcher(
+        &self,
+        key: PeerLane,
+        handle: &Arc<BatcherHandle>,
+    ) -> Result<Arc<BatcherHandle>> {
+        // Spawn on a stopped runtime can drop the batcher immediately. A
+        // closed registered handle is a failed epoch, not normal retirement.
+        if self.tasks.is_stopped() || handle.is_closed() {
+            if self.tasks.stop() {
+                tracing::error!(peer = %key.peer, lane = %key.lane,
+                    "messenger mux stopped: registered batcher closed unexpectedly");
+            }
+            close_ingress(&self.ingress, self.metrics.as_ref());
+            return Err(anyhow!("messenger mux batcher shut down"));
+        }
+        Ok(Arc::clone(handle))
     }
 
     /// Hand one decoded batch to the ingress lane and act on what it produced.
@@ -432,6 +460,9 @@ impl MuxCore {
     /// grants, closes and stops name this side's slots, whose ids are unique
     /// only within that lane's batcher.
     fn deliver_batch(&self, key: PeerLane, payload: &bytes::Bytes) {
+        if self.tasks.is_stopped() {
+            return;
+        }
         let outcome = ingress::handle_batch(
             &self.ingress,
             &self.config,
@@ -449,6 +480,13 @@ impl MuxCore {
             }
         }
 
+        // A batch already in flight can claim a bind after shutdown visited
+        // its peer. Retire that late claim before returning from this handler.
+        if self.tasks.is_stopped() {
+            close_ingress(&self.ingress, self.metrics.as_ref());
+            return;
+        }
+
         if outcome.replies.is_empty()
             && outcome.grants.is_empty()
             && outcome.peer_closes.is_empty()
@@ -457,7 +495,9 @@ impl MuxCore {
             return;
         }
 
-        let batcher = self.batcher(key);
+        let Ok(batcher) = self.batcher(key) else {
+            return;
+        };
         for (slot, session_id, cancel) in outcome.peer_stops {
             batcher.peer_stopped(slot, session_id, cancel);
         }
@@ -495,10 +535,8 @@ impl MuxCore {
     /// the idle producer it names has no other way to learn, because every
     /// later record it sends is dropped here as `ClosedSlot` with no reply.
     ///
-    /// The loop runs once in practice. A further turn needs the batcher
-    /// `batcher()` just handed back to be evicted inside this call, which is
-    /// a sweep tick landing in microseconds of straight-line code; it cannot
-    /// spin, because a tick is what each turn waits for.
+    /// Retry normal retirement only. A closed handle still in the registry
+    /// makes `batcher()` fail, so an aborted task cannot cause a retry loop.
     fn send_replies(
         &self,
         batcher: &Arc<BatcherHandle>,
@@ -508,7 +546,11 @@ impl MuxCore {
         if batcher.reply(replies) {
             return;
         }
-        while !self.batcher(key).reply(replies) {}
+        while let Ok(current) = self.batcher(key) {
+            if current.reply(replies) {
+                return;
+            }
+        }
     }
 
     /// Reconcile every slot of one (peer, lane), on the periodic tick.
@@ -544,10 +586,12 @@ impl MuxCore {
     /// Hand a reconcile pass's grants to the batcher of the lane the slots
     /// arrived on.
     fn return_credit(&self, key: PeerLane, replies: Vec<peer_batcher::ReplyRecord>) {
-        if replies.is_empty() {
+        if replies.is_empty() || self.cancel.is_cancelled() {
             return;
         }
-        let batcher = self.batcher(key);
+        let Ok(batcher) = self.batcher(key) else {
+            return;
+        };
         self.send_replies(&batcher, key, &replies);
     }
 
@@ -562,38 +606,8 @@ impl MuxCore {
     /// fault that carries the same news to it otherwise rides on the next
     /// record it sends.
     fn close_claimed_slot(&self, key: PeerLane, slot: protocol::SlotId, session_id: Option<u64>) {
-        // Resolving a batcher may spawn its task, and this runs from a `Drop`
-        // that can land on a thread with no runtime under it. Enter the runtime
-        // the mux was built on in that case: waiting for the slot's next record
-        // is no answer, because a dead or parked sender sends none. Checked
-        // before touching the ingress table, not after, so a mux with no
-        // runtime at all leaves the slot as it found it rather than retiring
-        // it with nowhere to post the reply.
-        let _entered = match tokio::runtime::Handle::try_current() {
-            Ok(_) => None,
-            // Only for a thread with no runtime. A destroyed thread-local (a
-            // drop from a TLS destructor) would make `enter` panic inside a
-            // `Drop`, so that case keeps the quiet return below.
-            Err(error) if !error.is_missing_context() => {
-                tracing::debug!(
-                    peer = %key.peer,
-                    lane = %key.lane,
-                    "messenger mux: runtime context unavailable here; the peer learns on its next record"
-                );
-                return;
-            }
-            Err(_) => match self.runtime.as_ref() {
-                Some(runtime) => Some(runtime.enter()),
-                None => {
-                    tracing::debug!(
-                        peer = %key.peer,
-                        lane = %key.lane,
-                        "messenger mux: no runtime to post a slot close on; the peer learns on its next record"
-                    );
-                    return;
-                }
-            },
-        };
+        // Task submission uses the service runtime, including calls from Drop
+        // on a plain thread or a different runtime.
         let Some(reply) =
             self.ingress
                 .close_consumer_gone(key, slot, self.metrics.as_ref(), session_id)
@@ -603,7 +617,9 @@ impl MuxCore {
         if let Some(metrics) = &self.metrics {
             metrics.slot_closed();
         }
-        let batcher = self.batcher(key);
+        let Ok(batcher) = self.batcher(key) else {
+            return;
+        };
         self.send_replies(&batcher, key, &[reply]);
     }
 
@@ -675,15 +691,19 @@ impl MuxCore {
     }
 }
 
+fn close_ingress(ingress: &IngressRegistry, metrics: Option<&MuxMetricsHandle>) {
+    let closed = ingress.shutdown();
+    if let Some(metrics) = metrics {
+        for _ in 0..closed {
+            metrics.slot_closed();
+        }
+    }
+}
+
 impl Drop for MuxCore {
     fn drop(&mut self) {
-        self.cancel.cancel();
-        let closed = self.ingress.shutdown();
-        if let Some(metrics) = &self.metrics {
-            for _ in 0..closed {
-                metrics.slot_closed();
-            }
-        }
+        self.tasks.stop();
+        close_ingress(&self.ingress, self.metrics.as_ref());
     }
 }
 
@@ -701,7 +721,8 @@ fn open_bind(
     anchor_id: u64,
     session_id: u64,
     lane: LaneReservation,
-) -> flume::Receiver<Vec<u8>> {
+) -> Result<flume::Receiver<Vec<u8>>> {
+    anyhow::ensure!(!core.tasks.is_stopped(), "messenger mux shut down");
     // `C + 1`: `C` data credits plus the one reserved terminal credit.
     // Credit is issued against *this* buffer and never against the
     // anchor's `frame_tx`, which has writers other than the mux.
@@ -711,6 +732,13 @@ fn open_bind(
         .insert((anchor_id, session_id), Arc::clone(&drain));
     core.ingress
         .register_bind(anchor_id, session_id, frame_tx, drain, lane);
+
+    // Close the race with shutdown between the initial check and registration.
+    if core.tasks.is_stopped() {
+        core.drains.remove(&(anchor_id, session_id));
+        core.ingress.expire_bind(anchor_id, session_id);
+        return Err(anyhow!("messenger mux shut down"));
+    }
 
     // A deadline, not a task: the sweep expires it (`MuxCore::expire_binds`).
     // Nothing here may pin the core either, which a task holding a strong
@@ -726,7 +754,7 @@ fn open_bind(
     ));
     drop(deadlines);
 
-    frame_rx
+    Ok(frame_rx)
 }
 
 impl FrameTransport for MessengerMuxTransport {
@@ -750,7 +778,7 @@ impl FrameTransport for MessengerMuxTransport {
         // Lane 0, as `connect` below: the bare trait names no peer and carries
         // no lane to the sender. Counted, so the next choice sees it.
         let lane = core.lane_load.reserve_on(None, LaneIndex::ZERO);
-        Box::pin(async move { Ok(open_bind(&core, anchor_id, session_id, lane)) })
+        Box::pin(async move { open_bind(&core, anchor_id, session_id, lane) })
     }
 
     /// Opens a slot at *this node's* limits.
@@ -799,13 +827,13 @@ impl MessengerMuxTransport {
         anchor_id: u64,
         session_id: u64,
         lane: LaneReservation,
-    ) -> flume::Receiver<Vec<u8>> {
-        let receiver = open_bind(&self.core, anchor_id, session_id, lane);
+    ) -> Result<flume::Receiver<Vec<u8>>> {
+        let receiver = open_bind(&self.core, anchor_id, session_id, lane)?;
         #[cfg(test)]
         if let Some(hook) = self.core.bind_hook.get() {
             hook(anchor_id);
         }
-        receiver
+        Ok(receiver)
     }
 
     /// Give back a bind nobody claimed, along with the drain signal parked with
@@ -935,7 +963,10 @@ impl MessengerMuxTransport {
         let core = Arc::clone(&self.core);
         Box::pin(async move {
             for _ in 0..CONNECT_ATTEMPTS {
-                let batcher = core.batcher(key);
+                if core.cancel.is_cancelled() {
+                    return Err(anyhow!("messenger mux shut down"));
+                }
+                let batcher = core.batcher(key)?;
                 // Sized to the credit window for symmetry with the receive
                 // buffer. A producer waits on it once its slot pauses at the
                 // byte cap, or while the batcher is parked on admission. See

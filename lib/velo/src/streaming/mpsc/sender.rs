@@ -50,11 +50,16 @@ pub(crate) enum SenderChannel {
 /// task and cancel/poison plumbing. Created by
 /// [`crate::AnchorManager::attach_mpsc_stream_anchor`] (local) or by the
 /// `_mpsc_anchor_attach` handler round-trip (remote).
+///
+/// Local drop queues `Dropped` after buffered items without blocking the caller.
+/// A full queue needs a live runtime to deliver that event. Consumer cancellation
+/// stops the wait; a runtime that has stopped cannot deliver the event.
 pub struct MpscStreamSender<T> {
     sender_id: SenderId,
     channel: SenderChannel,
     handle: StreamAnchorHandle,
     heartbeat_cancel: CancellationToken,
+    runtime: tokio::runtime::Handle,
     sent_terminal: bool,
     mpsc_registry: Arc<DashMap<u64, MpscAnchorEntry>>,
     cancel_token: CancellationToken,
@@ -97,7 +102,7 @@ impl<T: Serialize> MpscStreamSender<T> {
             sender_registry,
             poison_tx,
         } = cancel;
-        let heartbeat_cancel = CancellationToken::new();
+        let heartbeat_cancel = cancel_token.child_token();
 
         // Heartbeat task — skip first immediate tick, then emit cached
         // heartbeat bytes via non-blocking `try_send`. Matches the SPSC
@@ -132,6 +137,7 @@ impl<T: Serialize> MpscStreamSender<T> {
             channel,
             handle,
             heartbeat_cancel,
+            runtime: tokio::runtime::Handle::current(),
             sent_terminal: false,
             mpsc_registry,
             cancel_token,
@@ -223,51 +229,120 @@ impl<T: Serialize> MpscStreamSender<T> {
     /// Detach the sender cleanly, returning the anchor handle for reattach.
     ///
     /// Reattaching via [`crate::AnchorManager::attach_mpsc_stream_anchor`]
-    /// allocates a fresh [`SenderId`].
+    /// allocates a fresh [`SenderId`]. Once polled, detach runs to completion
+    /// on the sender's runtime even if this future is dropped. Consumer
+    /// cancellation stops a detach that is waiting for channel space.
     pub async fn detach(mut self) -> Result<StreamAnchorHandle, SendError> {
         self.heartbeat_cancel.cancel();
-        self.sent_terminal = true;
-        let bytes = cached_detached().clone();
-        let result = match &self.channel {
-            SenderChannel::Local(tx) => {
-                self.until_cancelled(tx.send_async((self.sender_id.0, bytes)))
-                    .await
+        let cleanup = self.cleanup_guard();
+        let channel = self.channel.clone();
+        let cancel = self.cancel_token.clone();
+        let sender_id = self.sender_id.0;
+        // Flume can enqueue a frame before its send future is polled Ready.
+        // Keep one task responsible for the terminal event and cleanup, so
+        // abandoning this caller cannot send both Detached and Dropped.
+        // Capture only transport state: T does not need a Send bound.
+        let task = self.runtime.spawn(async move {
+            let _cleanup = cleanup;
+            let send = async {
+                let bytes = cached_detached().clone();
+                match channel {
+                    SenderChannel::Local(tx) => tx
+                        .send_async((sender_id, bytes))
+                        .await
+                        .map_err(|_| SendError::ChannelClosed),
+                    SenderChannel::Remote(tx) => tx
+                        .send_async(bytes)
+                        .await
+                        .map_err(|_| SendError::ChannelClosed),
+                }
+            };
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Err(SendError::ChannelClosed),
+                result = send => result,
             }
-            SenderChannel::Remote(tx) => self.until_cancelled(tx.send_async(bytes)).await,
-        };
-
-        // Same-worker: remove the slot locally so reattach can reuse capacity
-        // immediately. Cross-worker: the remote pump forwards the Detached
-        // sentinel and the anchor's `poll_next` removes the slot on its side.
-        let (_, local_id) = self.handle.unpack();
-        if let Some(slot) = crate::streaming::mpsc::anchor::remove_sender_slot(
-            &self.mpsc_registry,
-            local_id,
-            self.sender_id.0,
-        ) && let Some(pt) = slot.pump_token
-        {
-            pt.cancel();
-        }
-
-        self.sender_registry.senders.remove(&self.sender_stream_id);
-        result?;
+        });
+        self.sent_terminal = true;
+        task.await.map_err(|_| SendError::ChannelClosed)??;
         Ok(self.handle)
+    }
+}
+
+/// Cleanup belongs to the committed detach task, or to synchronous sender Drop.
+/// The task guard also runs if its runtime shuts down.
+struct SenderCleanup {
+    local: bool,
+    local_id: u64,
+    sender_id: u64,
+    mpsc_registry: Arc<DashMap<u64, MpscAnchorEntry>>,
+    sender_stream_id: u64,
+    sender_registry: Arc<crate::streaming::control::SenderRegistry>,
+    runtime: tokio::runtime::Handle,
+}
+
+impl Drop for SenderCleanup {
+    fn drop(&mut self) {
+        self.sender_registry.senders.remove(&self.sender_stream_id);
+        // The last local slot may start an unattached timeout. Drop can run
+        // on a plain thread, so provide the runtime captured at construction.
+        let _entered = self.runtime.enter();
+        if self.local
+            && let Some(slot) = super::anchor::remove_sender_slot(
+                &self.mpsc_registry,
+                self.local_id,
+                self.sender_id,
+            )
+            && let Some(token) = slot.pump_token
+        {
+            token.cancel();
+        }
+    }
+}
+
+impl<T> MpscStreamSender<T> {
+    fn cleanup_guard(&self) -> SenderCleanup {
+        SenderCleanup {
+            local: matches!(self.channel, SenderChannel::Local(_)),
+            local_id: self.handle.unpack().1,
+            sender_id: self.sender_id.0,
+            mpsc_registry: self.mpsc_registry.clone(),
+            sender_stream_id: self.sender_stream_id,
+            sender_registry: self.sender_registry.clone(),
+            runtime: self.runtime.clone(),
+        }
     }
 }
 
 impl<T> Drop for MpscStreamSender<T> {
     fn drop(&mut self) {
-        // Idempotent sender-registry cleanup.
-        self.sender_registry.senders.remove(&self.sender_stream_id);
         if !self.sent_terminal {
+            let _cleanup = self.cleanup_guard();
             self.heartbeat_cancel.cancel();
             let bytes = cached_dropped().clone();
             match &self.channel {
                 SenderChannel::Local(tx) => {
-                    // Match SPSC drop semantics: local sender exits are
-                    // load-bearing protocol events and must not be lost when
-                    // the shared anchor queue is full.
-                    let _ = tx.send((self.sender_id.0, bytes));
+                    let (_, local_id) = self.handle.unpack();
+                    let consumer_cancel = self
+                        .mpsc_registry
+                        .get(&local_id)
+                        .map(|entry| entry.cancel_token.clone());
+                    if let Err(flume::TrySendError::Full(frame)) =
+                        tx.try_send((self.sender_id.0, bytes))
+                        && let Some(consumer_cancel) = consumer_cancel
+                    {
+                        // Keep the exit after queued items without blocking a
+                        // runtime worker. Drop removes the sender registry
+                        // entry, so only the anchor token can stop this wait.
+                        let tx = tx.clone();
+                        self.runtime.spawn(async move {
+                            tokio::select! {
+                                biased;
+                                _ = consumer_cancel.cancelled() => {}
+                                _ = tx.send_async(frame) => {}
+                            }
+                        });
+                    }
                 }
                 SenderChannel::Remote(tx) => {
                     // Keep remote drop non-blocking; transport close is the
@@ -275,18 +350,42 @@ impl<T> Drop for MpscStreamSender<T> {
                     let _ = tx.try_send(bytes);
                 }
             }
-            // Same-worker: drop the slot immediately so capacity is released
-            // and the unattached timeout can re-arm when the last sender
-            // leaves. Cross-worker removal is performed by the remote pump.
-            let (_, local_id) = self.handle.unpack();
-            if let Some(slot) = crate::streaming::mpsc::anchor::remove_sender_slot(
-                &self.mpsc_registry,
-                local_id,
-                self.sender_id.0,
-            ) && let Some(pt) = slot.pump_token
-            {
-                pt.cancel();
-            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_stops_heartbeats_while_the_sender_is_retained() {
+        let (tx, rx) = flume::bounded(16);
+        let (poison_tx, _poison_rx) = flume::bounded(1);
+        let cancel_token = CancellationToken::new();
+        let heartbeat = Duration::from_secs(5);
+        let sender = MpscStreamSender::<u32>::new(
+            SenderId(1),
+            SenderChannel::Remote(tx),
+            StreamAnchorHandle::pack(velo_ext::WorkerId::from_u64(1), 1),
+            Arc::new(DashMap::new()),
+            StreamSenderCancelInfo {
+                cancel_token: cancel_token.clone(),
+                sender_stream_id: 1,
+                sender_registry: Arc::new(crate::streaming::control::SenderRegistry::default()),
+                poison_tx,
+            },
+            heartbeat,
+            None,
+        );
+        assert_eq!(rx.recv_async().await.unwrap(), *cached_heartbeat());
+        cancel_token.cancel();
+        tokio::task::yield_now().await;
+        assert!(
+            tokio::time::timeout(heartbeat * 2, rx.recv_async())
+                .await
+                .is_err()
+        );
+        drop(sender);
     }
 }

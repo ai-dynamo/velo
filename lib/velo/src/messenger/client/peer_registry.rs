@@ -4,7 +4,7 @@
 //! Peer registry for tracking remote peer state and handler availability.
 
 use dashmap::DashMap;
-use std::{collections::HashSet, sync::Arc, time::Instant};
+use std::collections::HashSet;
 use velo_ext::InstanceId;
 
 /// State information for a registered peer.
@@ -12,25 +12,15 @@ use velo_ext::InstanceId;
 pub(crate) struct PeerState {
     /// Known handlers on this peer (None = haven't queried yet)
     pub handlers: Option<HashSet<String>>,
-    /// Last time we communicated with this peer
-    pub last_seen: Instant,
 }
 
 impl PeerState {
     pub fn new() -> Self {
-        Self {
-            handlers: None,
-            last_seen: Instant::now(),
-        }
-    }
-
-    pub fn update_last_seen(&mut self) {
-        self.last_seen = Instant::now();
+        Self { handlers: None }
     }
 
     pub fn set_handlers(&mut self, handlers: Vec<String>) {
         self.handlers = Some(handlers.into_iter().collect());
-        self.update_last_seen();
     }
 
     pub fn has_handler(&self, handler: &str) -> bool {
@@ -42,15 +32,14 @@ impl PeerState {
 }
 
 /// Registry for tracking remote peers and their state.
-#[derive(Clone)]
 pub(crate) struct PeerRegistry {
-    peers: Arc<DashMap<InstanceId, PeerState>>,
+    peers: DashMap<InstanceId, PeerState>,
 }
 
 impl PeerRegistry {
     pub fn new() -> Self {
         Self {
-            peers: Arc::new(DashMap::new()),
+            peers: DashMap::new(),
         }
     }
 

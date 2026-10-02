@@ -634,7 +634,7 @@ async fn batch_bytes_identical_to_sequential_writes() {
     }
     assert_eq!(batch.frame_count(), frames.len());
     let mut batched = Vec::new();
-    batch.flush_to(&mut batched).await.unwrap();
+    batch.flush_to(&mut batched, None).await.unwrap();
 
     assert_eq!(batched, sequential, "batched bytes must match sequential");
     assert_eq!(batch.frame_count(), 0, "flush resets the buffer");
@@ -651,7 +651,7 @@ async fn coalesced_batch_decodes_frame_by_frame() {
             .expect("push");
     }
     let mut wire = RecordingSink::default();
-    batch.flush_to(&mut wire).await.unwrap();
+    batch.flush_to(&mut wire, None).await.unwrap();
 
     let decoded = wire.decode_frames();
     assert_eq!(decoded.len(), 32);
@@ -756,7 +756,7 @@ async fn large_frames_never_enter_the_staging_buffer() {
             batch.push(MessageType::Message, &[], &[7u8; 4096]).unwrap();
         }
         let mut sink = RecordingSink::default();
-        batch.flush_to(&mut sink).await.unwrap();
+        batch.flush_to(&mut sink, None).await.unwrap();
     }
     assert!(
         batch.capacity() <= 4 * DEFAULT_MAX_BATCH_BYTES,
@@ -778,7 +778,7 @@ async fn staging_a_large_frame_would_retain_its_capacity() {
         .push(MessageType::Message, &[], &vec![0u8; BIG])
         .unwrap();
     let mut sink = RecordingSink::default();
-    batch.flush_to(&mut sink).await.unwrap();
+    batch.flush_to(&mut sink, None).await.unwrap();
 
     assert_eq!(batch.frame_count(), 0, "flush resets the frame count");
     assert!(
@@ -1382,5 +1382,41 @@ fn a_bound_handle_records_under_its_own_key_regardless_of_transport_label() {
             "{name} must exist under the transport's own key once it actually \
              records — the old allowlist would have silently dropped this"
         );
+    }
+}
+
+/// Both staged and direct writes must release their frames when teardown
+/// arrives while the socket is blocked.
+#[tokio::test]
+async fn cancellation_interrupts_a_blocked_write() {
+    for size in [32, COALESCE_THRESHOLD + 1] {
+        let factory = ItemFactory::new();
+        let observer = TestObserver::default();
+        let state = Arc::new(Mutex::new(ParkState::default()));
+        let mut sink = ParkingSink {
+            state: state.clone(),
+        };
+        let cancel = CancellationToken::new();
+        let (tx, rx) = flume::unbounded();
+        tx.send(factory.item("blocked", vec![0; size])).unwrap();
+        let write = run_coalescing_writer(
+            &mut sink,
+            &rx,
+            std::convert::identity,
+            Some(&cancel),
+            &observer,
+        );
+        tokio::pin!(write);
+        assert!(futures::poll!(&mut write).is_pending());
+        assert!(
+            state.lock().waker.is_some(),
+            "write must reach the blocked socket"
+        );
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), write)
+            .await
+            .unwrap();
+        assert_eq!(factory.errors().len(), 1);
+        assert_eq!(observer.frames_written(), 0);
     }
 }

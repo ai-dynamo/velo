@@ -732,14 +732,14 @@ fn open_slot(
     slot.session_id = session_id;
     state.slots[index] = Some(slot);
     outcome.opened += 1;
-    if lifecycle == 2 {
+    if lifecycle == drain::Lifecycle::Cancelled {
         finish_close(state, id, CloseReason::UnknownSlot, ctx.metrics, outcome);
         outcome.replies.push(ReplyRecord::LifecycleSlot {
             slot: id,
             session_id,
             cancel: true,
         });
-    } else if lifecycle == 1 {
+    } else if lifecycle == drain::Lifecycle::StopRequested {
         outcome.replies.push(ReplyRecord::LifecycleSlot {
             slot: id,
             session_id,

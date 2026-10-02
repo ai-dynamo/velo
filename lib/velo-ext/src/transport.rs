@@ -422,6 +422,10 @@ pub trait Transport: Send + Sync {
     }
 
     /// Start the transport (bind listener, spawn tasks) for the given instance.
+    ///
+    /// Startup must release partially initialized resources if it fails or its
+    /// future is dropped. The runtime calls [`shutdown`](Self::shutdown) and
+    /// [`closed`](Self::closed) only after this future returns `Ok(())`.
     fn start(
         &self,
         instance_id: InstanceId,
@@ -431,8 +435,10 @@ pub trait Transport: Send + Sync {
 
     /// Tear down the transport, cancelling all tasks and closing connections.
     ///
-    /// This is phase 3 of the runtime's graceful shutdown and the runtime calls
-    /// it only after [`ShutdownState::begin_drain`] and the drain wait. Several
+    /// This is phase 3 of the runtime's graceful shutdown, after
+    /// [`ShutdownState::begin_drain`] and the drain wait. Abandoned construction
+    /// and immediate teardown use a zero drain budget after a successful
+    /// [`start`](Self::start); queued requests may be discarded. Several
     /// in-tree transports (TCP, UDS, QUIC, gRPC, UCX) also cancel the *shared*
     /// [`ShutdownState::teardown_token`] here, which is instance-wide: it stops
     /// every transport's listeners **and** the runtime's inbound message

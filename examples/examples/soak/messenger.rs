@@ -7,11 +7,11 @@
 //! - **M2** sustained `unary` request/response; pending_responses bounded;
 //!   `response_slot_exhausted_total == 0`.
 //! - **M3** mixed traffic (am_send + unary interleaved).
-//! - **M5** drain under load: ramp to N in-flight, drop client, gauges reset.
+//! - **M5** drain under load: shut down the server, pending calls settle.
 //!
 //! Faults (run when `--faults` is set):
 //! - **F1** panicking handler: 1 in N requests panic; on_error count tracks injection.
-//! - **F2** peer kill mid-flight: drop server Arc; client unary calls error out.
+//! - **F2** peer loss mid-flight: drop server Arc; calls use response deadlines.
 //! - **F3** slow handler: handler sleeps > scenario budget for a fraction of requests.
 //!
 //! M4 (backpressure storm) and the more involved drain assertions are deferred —
@@ -26,7 +26,7 @@ use anyhow::{Result, anyhow};
 use bytes::Bytes;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use velo::{Handler, InstanceId, Velo};
+use velo::{Handler, InstanceId, ShutdownPolicy, Velo};
 
 use crate::faults::Dice;
 use crate::harness::oracle::{
@@ -257,9 +257,10 @@ pub async fn run_m2(ctx: &ScenarioCtx) -> Result<ScenarioReport> {
     let mut set: JoinSet<Result<()>> = JoinSet::new();
     while Instant::now() < deadline {
         if set.len() >= concurrency
-            && let Some(r) = set.join_next().await {
-                r??;
-            }
+            && let Some(r) = set.join_next().await
+        {
+            r??;
+        }
         let v = Arc::clone(&velo);
         let p = payload.clone();
         let oracle = Arc::clone(&oracle);
@@ -346,9 +347,10 @@ pub async fn run_m3(ctx: &ScenarioCtx) -> Result<ScenarioReport> {
     let mut set: JoinSet<Result<()>> = JoinSet::new();
     while Instant::now() < deadline {
         if set.len() >= concurrency
-            && let Some(r) = set.join_next().await {
-                r??;
-            }
+            && let Some(r) = set.join_next().await
+        {
+            r??;
+        }
         let v = Arc::clone(&velo);
         let p = payload.clone();
         let oracle = Arc::clone(&oracle);
@@ -396,7 +398,7 @@ pub async fn run_m3(ctx: &ScenarioCtx) -> Result<ScenarioReport> {
 }
 
 // ---------------------------------------------------------------------------
-// M5 — drain under load (best-effort)
+// M5 — graceful shutdown under load
 // ---------------------------------------------------------------------------
 
 pub async fn run_m5(ctx: &ScenarioCtx) -> Result<ScenarioReport> {
@@ -415,9 +417,10 @@ pub async fn run_m5(ctx: &ScenarioCtx) -> Result<ScenarioReport> {
     let stop_at = Instant::now() + duration;
     while Instant::now() < stop_at && oracle.sent() < concurrency as u64 * 10 {
         if set.len() >= concurrency
-            && let Some(r) = set.join_next().await {
-                let _ = r?; // tolerate errors; drain may produce them
-            }
+            && let Some(r) = set.join_next().await
+        {
+            let _ = r?; // tolerate errors; drain may produce them
+        }
         let v = Arc::clone(&velo);
         let p = payload.clone();
         let oracle = Arc::clone(&oracle);
@@ -439,19 +442,31 @@ pub async fn run_m5(ctx: &ScenarioCtx) -> Result<ScenarioReport> {
         });
     }
 
-    // Drop the server side. Its transports tear down; pending responses on the
-    // client should error out cleanly.
-    drop(pair.server);
+    // Some calls can still be in the client or network queue. Keep the
+    // server alive to reject those calls while accepted work completes.
+    pair.server.velo.begin_drain();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(r) = set.join_next().await {
+            let _ = r?;
+        }
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .map_err(|_| anyhow!("M5: client calls did not settle during server drain"))??;
 
-    while let Some(r) = set.join_next().await {
-        let _ = r?;
-    }
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        pair.server.velo.shutdown(ShutdownPolicy::WaitForever),
+    )
+    .await
+    .map_err(|_| anyhow!("M5: server shutdown did not finish"))?;
+    drop(pair.server);
 
     let client_snap = snapshot(&pair.client.registry);
     let pending = messenger_pending_responses(&client_snap);
     if pending != 0.0 {
         return Err(anyhow!(
-            "M5: client pending_responses={pending} after server drop (expected 0)"
+            "M5: client pending_responses={pending} after server shutdown (expected 0)"
         ));
     }
 
@@ -459,7 +474,7 @@ pub async fn run_m5(ctx: &ScenarioCtx) -> Result<ScenarioReport> {
         "M5",
         started.elapsed(),
         &oracle,
-        "server drop drains pending responses",
+        "server shutdown drains pending responses",
     ))
 }
 
@@ -564,16 +579,17 @@ pub async fn run_f2_peer_kill(ctx: &ScenarioCtx) -> Result<ScenarioReport> {
             if i % 2 == 1 {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            match v
+            let response = v
                 .unary(HANDLER_UNARY_ECHO)?
                 .raw_payload(p)
                 .instance(target)
-                .send()
-                .await
-            {
-                Ok(_) => Ok(true),
-                Err(_) => Ok(false),
-            }
+                .send();
+            // A peer can disappear after admission. The caller owns the
+            // response deadline; dropping the awaiter releases its slot.
+            Ok(matches!(
+                tokio::time::timeout(Duration::from_secs(10), response).await,
+                Ok(Ok(_))
+            ))
         });
     }
 
@@ -640,9 +656,10 @@ pub async fn run_f3_slow_handler(ctx: &ScenarioCtx) -> Result<ScenarioReport> {
     let concurrency = ctx.tier.budget().messenger_concurrency;
     for _ in 0..count {
         if set.len() >= concurrency
-            && let Some(r) = set.join_next().await {
-                r??;
-            }
+            && let Some(r) = set.join_next().await
+        {
+            r??;
+        }
         let v = Arc::clone(&velo);
         let p = payload.clone();
         let oracle = Arc::clone(&oracle);

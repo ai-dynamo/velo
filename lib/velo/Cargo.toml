@@ -19,7 +19,7 @@ default = ["http", "nats-transport", "grpc"]
 # Messenger transports
 http = ["dep:axum"]
 nats-transport = ["dep:async-nats"]
-grpc = ["dep:tonic", "dep:prost", "dep:tower", "dep:hyper", "dep:http", "dep:http-body", "dep:http-body-util", "dep:hyper-util", "dep:tokio-stream"]
+grpc = ["dep:tonic", "dep:tonic-build", "dep:prost", "dep:tower", "dep:hyper", "dep:http", "dep:http-body", "dep:http-body-util", "dep:hyper-util", "dep:tokio-stream"]
 zmq = ["dep:zmq"]
 # UCX messenger transport (Linux only; RDMA via rdma-core when the ucx-rs `ib`
 # default feature is on — CI without RDMA packages exercises it over UCX_TLS=tcp,
@@ -112,6 +112,7 @@ serde_bytes = { workspace = true, optional = true }
 offset-allocator = { workspace = true, optional = true }
 
 [dev-dependencies]
+bytes = { workspace = true, features = ["serde"] }
 paste = "1"
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread", "time"] }
@@ -119,7 +120,7 @@ tower = "0.5"
 tracing-subscriber = { workspace = true }
 
 [build-dependencies]
-tonic-build = "0.13.1"
+tonic-build = { version = "0.13.1", optional = true }
 
 [package.metadata.cargo-machete]
 ignored = ["axum", "http", "http-body", "http-body-util", "hyper", "hyper-util", "prost", "tower", "bs58"]

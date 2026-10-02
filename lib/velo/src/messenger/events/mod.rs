@@ -93,7 +93,7 @@ impl VeloEvents {
             proxy_base.clone() as Arc<dyn crate::events::EventBackend>,
         );
 
-        Arc::new(Self {
+        let events = Arc::new(Self {
             local_base,
             local_manager,
             proxy_manager,
@@ -108,7 +108,63 @@ impl VeloEvents {
             owner_subscribers: DashMap::new(),
             response_manager,
             tasks: TaskTracker::new(),
-        })
+        });
+        let weak = Arc::downgrade(&events);
+        let teardown = events.backend.shutdown_state().teardown_token().clone();
+        events.tasks.spawn(async move {
+            teardown.cancelled().await;
+            if let Some(events) = weak.upgrade() {
+                for event in &events.remote_events {
+                    event.value().cancel();
+                }
+            }
+        });
+        events
+    }
+
+    fn spawn(&self, future: impl std::future::Future<Output = ()> + Send + 'static) {
+        let teardown = self.backend.shutdown_state().teardown_token().clone();
+        if !teardown.is_cancelled() {
+            self.tasks.spawn(teardown.run_until_cancelled_owned(future));
+        }
+    }
+
+    fn ensure_remote_running(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self
+                .backend
+                .shutdown_state()
+                .teardown_token()
+                .is_cancelled(),
+            "Event runtime shut down"
+        );
+        Ok(())
+    }
+
+    fn remote_event(&self, key: RemoteEventKey) -> Result<Arc<RemoteEvent>> {
+        let remote = self
+            .remote_events
+            .entry(key)
+            .or_insert_with(|| Arc::new(RemoteEvent::new(self.proxy_manager.clone())))
+            .clone();
+        if let Err(error) = self.ensure_remote_running() {
+            remote.cancel();
+            return Err(error);
+        }
+        Ok(remote)
+    }
+
+    async fn remote_response(&self, mut awaiter: ResponseAwaiter) -> Result<()> {
+        let teardown = self.backend.shutdown_state().teardown_token();
+        match teardown.run_until_cancelled(awaiter.recv()).await {
+            Some(result) => result.map(|_| ()).map_err(anyhow::Error::msg),
+            None => Err(anyhow!("Event runtime shut down")),
+        }
+    }
+
+    pub(crate) async fn closed(&self) {
+        self.tasks.close();
+        self.tasks.wait().await;
     }
 
     /// Get the local event system base.
@@ -138,8 +194,9 @@ impl VeloEvents {
     /// Trigger a remote event without waiting for response.
     /// Spawns a task to send the trigger request over the network.
     fn trigger_remote_fire_and_forget(self: &Arc<Self>, handle: EventHandle) -> Result<()> {
+        self.ensure_remote_running()?;
         let system = Arc::clone(self);
-        self.tasks.spawn(async move {
+        self.spawn(async move {
             if let Err(e) = system.send_completion_request(handle, None, None).await {
                 warn!(
                     "Failed to send fire-and-forget trigger for {}: {}",
@@ -156,8 +213,9 @@ impl VeloEvents {
         handle: EventHandle,
         reason: Arc<str>,
     ) -> Result<()> {
+        self.ensure_remote_running()?;
         let system = Arc::clone(self);
-        self.tasks.spawn(async move {
+        self.spawn(async move {
             if let Err(e) = system
                 .send_completion_request(handle, Some(reason.to_string()), None)
                 .await
@@ -183,9 +241,8 @@ impl VeloEvents {
         let messenger = self
             .messenger
             .read()
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| anyhow!("Event messenger not initialized"))?;
+            .clone()
+            .ok_or_else(|| anyhow!("Event messenger is unavailable"))?;
 
         let discovery = messenger.discovery().ok_or_else(|| {
             anyhow!(
@@ -240,9 +297,7 @@ impl VeloEvents {
         if handle.system_id() == self.system_id {
             self.local_base.trigger_inner(handle)
         } else {
-            let mut awaiter = self.trigger_remote(handle)?;
-            awaiter.recv().await.map_err(|e| anyhow!("{}", e))?;
-            Ok(())
+            self.remote_response(self.trigger_remote(handle)?).await
         }
     }
 
@@ -260,9 +315,8 @@ impl VeloEvents {
             self.local_base
                 .poison_inner(handle, Arc::<str>::from(reason.into()))
         } else {
-            let mut awaiter = self.poison_remote(handle, reason.into())?;
-            awaiter.recv().await.map_err(|e| anyhow!("{}", e))?;
-            Ok(())
+            self.remote_response(self.poison_remote(handle, reason.into())?)
+                .await
         }
     }
 
@@ -356,7 +410,7 @@ impl VeloEvents {
                         .await?;
 
                     let system = Arc::clone(self);
-                    self.tasks.spawn(async move {
+                    self.spawn(async move {
                         if system.local_manager.poll(handle).ok() == Some(EventStatus::Poisoned) {
                             let reason = "event was poisoned".to_string();
                             let _ = system.send_nack(response_id, reason).await;
@@ -379,7 +433,7 @@ impl VeloEvents {
                     }
 
                     let system = Arc::clone(self);
-                    self.tasks.spawn(async move {
+                    self.spawn(async move {
                         match system.local_base.awaiter_inner(handle) {
                             Ok(waiter) => match waiter.await {
                                 Ok(()) => {
@@ -441,6 +495,7 @@ impl VeloEvents {
     // ── Subscriber-side paths ───────────────────────────────────────
 
     fn wait_remote(self: &Arc<Self>, handle: EventHandle) -> Result<EventAwaiter> {
+        self.ensure_remote_running()?;
         let key = RemoteEventKey::from_handle(handle);
         let generation = handle.generation();
 
@@ -461,11 +516,7 @@ impl VeloEvents {
         }
 
         // TIER 2: Check active DashMap
-        let remote_event = self
-            .remote_events
-            .entry(key)
-            .or_insert_with(|| Arc::new(RemoteEvent::new(self.proxy_manager.clone())))
-            .clone();
+        let remote_event = self.remote_event(key)?;
 
         match remote_event.register_waiter(generation)? {
             WaitRegistration::Ready => self.immediate_ok_awaiter(),
@@ -475,7 +526,7 @@ impl VeloEvents {
                 if remote_event.add_pending(generation) {
                     let system = Arc::clone(self);
                     let remote_event_clone = remote_event.clone();
-                    self.tasks.spawn(async move {
+                    self.spawn(async move {
                         if let Err(e) = system.send_subscribe(handle).await {
                             warn!("Failed to send subscribe for {}: {}", handle, e);
                             let poison_msg = format!("Failed to subscribe to remote event: {}", e);
@@ -494,12 +545,9 @@ impl VeloEvents {
     }
 
     fn poll_remote(self: &Arc<Self>, handle: EventHandle) -> Result<EventStatus> {
+        self.ensure_remote_running()?;
         let key = RemoteEventKey::from_handle(handle);
-        let remote_event = self
-            .remote_events
-            .entry(key)
-            .or_insert_with(|| Arc::new(RemoteEvent::new(self.proxy_manager.clone())))
-            .clone();
+        let remote_event = self.remote_event(key)?;
 
         let status = remote_event.status_for(handle.generation());
         if status != EventStatus::Pending {
@@ -509,7 +557,7 @@ impl VeloEvents {
         if remote_event.add_pending(handle.generation()) {
             let system = Arc::clone(self);
             let remote_event_clone = remote_event.clone();
-            self.tasks.spawn(async move {
+            self.spawn(async move {
                 if let Err(e) = system.send_subscribe(handle).await {
                     warn!("Failed to send subscribe for {}: {}", handle, e);
                     let poison_msg = format!("Failed to subscribe to remote event: {}", e);
@@ -525,6 +573,7 @@ impl VeloEvents {
     }
 
     fn trigger_remote(self: &Arc<Self>, handle: EventHandle) -> Result<ResponseAwaiter> {
+        self.ensure_remote_running()?;
         let key = RemoteEventKey::from_handle(handle);
         let generation = handle.generation();
 
@@ -548,11 +597,7 @@ impl VeloEvents {
         }
 
         // TIER 2: Check active DashMap
-        let remote_event = self
-            .remote_events
-            .entry(key)
-            .or_insert_with(|| Arc::new(RemoteEvent::new(self.proxy_manager.clone())))
-            .clone();
+        let remote_event = self.remote_event(key)?;
 
         match remote_event.register_waiter(generation)? {
             WaitRegistration::Ready => {
@@ -575,7 +620,7 @@ impl VeloEvents {
                 if remote_event.add_pending(generation) {
                     let system = Arc::clone(self);
                     let remote_event_clone = remote_event.clone();
-                    self.tasks.spawn(async move {
+                    self.spawn(async move {
                         if let Err(e) = system
                             .send_completion_request(handle, None, Some(response_id))
                             .await
@@ -605,6 +650,7 @@ impl VeloEvents {
         handle: EventHandle,
         reason: String,
     ) -> Result<ResponseAwaiter> {
+        self.ensure_remote_running()?;
         let key = RemoteEventKey::from_handle(handle);
         let generation = handle.generation();
 
@@ -628,11 +674,7 @@ impl VeloEvents {
         }
 
         // TIER 2: Check active DashMap
-        let remote_event = self
-            .remote_events
-            .entry(key)
-            .or_insert_with(|| Arc::new(RemoteEvent::new(self.proxy_manager.clone())))
-            .clone();
+        let remote_event = self.remote_event(key)?;
 
         match remote_event.register_waiter(generation)? {
             WaitRegistration::Ready => {
@@ -657,7 +699,7 @@ impl VeloEvents {
                 if remote_event.add_pending(generation) {
                     let system = Arc::clone(self);
                     let remote_event_clone = remote_event.clone();
-                    self.tasks.spawn(async move {
+                    self.spawn(async move {
                         if let Err(e) = system
                             .send_completion_request(
                                 handle,
@@ -702,7 +744,7 @@ impl VeloEvents {
         if insert {
             entry.insert(target, generation);
             let system = Arc::clone(self);
-            self.tasks.spawn(async move {
+            self.spawn(async move {
                 let completion = match system.local_base.awaiter_inner(handle) {
                     Ok(waiter) => waiter.await,
                     Err(err) => Err(err),
@@ -794,9 +836,8 @@ impl VeloEvents {
         let messenger = self
             .messenger
             .read()
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| anyhow!("Event messenger not initialized"))?;
+            .clone()
+            .ok_or_else(|| anyhow!("Event messenger is unavailable"))?;
         let bytes = Bytes::from(serde_json::to_vec(&payload)?);
         messenger
             .message_builder_unchecked(handler)
@@ -844,9 +885,7 @@ impl VeloEvents {
             get_event_ack_error_handler(),
         )?;
         if let crate::transports::SendOutcome::Pending(admission) = outcome {
-            // A failed admission is already reported through the backend's
-            // error handler; this path has nowhere else to put it.
-            let _ = admission.await;
+            admission.await?;
         }
 
         Ok(())
@@ -864,9 +903,7 @@ impl VeloEvents {
             get_event_nack_error_handler(),
         )?;
         if let crate::transports::SendOutcome::Pending(admission) = outcome {
-            // A failed admission is already reported through the backend's
-            // error handler; this path has nowhere else to put it.
-            let _ = admission.await;
+            admission.await?;
         }
 
         Ok(())
@@ -1166,6 +1203,63 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         (a, b)
+    }
+
+    #[tokio::test]
+    async fn shutdown_fails_remote_waiters_and_preserves_local_events() {
+        let (owner, subscriber) = make_pair().await;
+        let events = subscriber.events();
+        let waiting = owner.events().new_event().unwrap().into_handle();
+        let triggering = owner.events().new_event().unwrap().into_handle();
+        let poisoning = owner.events().new_event().unwrap().into_handle();
+        let local = events.new_event().unwrap();
+        let local_waiter = local.awaiter().unwrap();
+        let waiter = events.awaiter(waiting).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !owner.has_event_subscriber(waiting, subscriber.instance_id()) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("remote subscription did not reach its owner");
+        let trigger = events.trigger(triggering);
+        let poison = events.poison(poisoning, "test poison");
+        tokio::pin!(trigger, poison);
+        assert!(futures::poll!(&mut trigger).is_pending());
+        assert!(futures::poll!(&mut poison).is_pending());
+
+        subscriber
+            .graceful_shutdown(crate::ShutdownPolicy::WaitForever)
+            .await;
+        subscriber.closed().await;
+        for result in [
+            tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .unwrap(),
+            tokio::time::timeout(Duration::from_secs(1), trigger)
+                .await
+                .unwrap(),
+            tokio::time::timeout(Duration::from_secs(1), poison)
+                .await
+                .unwrap(),
+        ] {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Event runtime shut down")
+            );
+        }
+        assert!(events.awaiter(waiting).is_err());
+        assert!(events.poll(waiting).is_err());
+        assert!(events.trigger(triggering).await.is_err());
+        assert!(events.poison(poisoning, "after shutdown").await.is_err());
+        local.trigger().unwrap();
+        local_waiter.await.unwrap();
+        owner
+            .graceful_shutdown(crate::ShutdownPolicy::WaitForever)
+            .await;
+        owner.closed().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
