@@ -243,6 +243,7 @@ impl UdsTransport {
             path,
             instance_id,
             rx,
+            handle.tx.clone(),
             WriterTaskContext {
                 connections: Arc::clone(&self.connections),
                 cancel_token: self.cancel_token.clone(),
@@ -583,6 +584,7 @@ async fn connection_writer_task(
     path: PathBuf,
     instance_id: crate::InstanceId,
     rx: flume::Receiver<SendTask>,
+    tx: flume::Sender<SendTask>,
     ctx: WriterTaskContext,
 ) -> Result<()> {
     let WriterTaskContext {
@@ -603,25 +605,7 @@ async fn connection_writer_task(
     )
     .await;
 
-    // Always drain queued messages and notify their error handlers.
-    while let Ok(msg) = rx.try_recv() {
-        msg.on_error("Connection closed");
-    }
-
-    // Drop the receiver so our sender half becomes disconnected, then remove
-    // the stale entry. The predicate ensures we only remove our own entry —
-    // a replacement connection's tx will still be connected.
-    //
-    // Retiring the gate is what fails frames still queued behind it. Dropping
-    // `rx` would eventually fail them too (the driver's `send_async` sees a
-    // closed channel), but `ConnectionReplaced` names the cause and lands
-    // without waiting on the driver. If the entry was already replaced, the
-    // successor's gate is a different one and the old gate's frames take the
-    // closed-channel route instead.
-    drop(rx);
-    if let Some((_, stale)) = connections.remove_if(&instance_id, |_, h| h.tx.is_disconnected()) {
-        stale.retire();
-    }
+    retire_connection(instance_id, tx, rx, &connections).await;
     if let Some(metrics) = metrics.as_ref() {
         metrics.set_active_connections(connections.len());
     }
@@ -629,6 +613,23 @@ async fn connection_writer_task(
     debug!("UDS connection to {} ({:?}) closed", instance_id, path);
 
     result
+}
+
+async fn retire_connection(
+    key: crate::InstanceId,
+    tx: flume::Sender<SendTask>,
+    rx: flume::Receiver<SendTask>,
+    connections: &DashMap<crate::InstanceId, ConnectionHandle>,
+) {
+    // Retire only this epoch before waiting for its last sender. A retained
+    // sender can still enqueue after the queue first becomes empty.
+    if let Some((_, stale)) = connections.remove_if(&key, |_, h| h.tx.same_channel(&tx)) {
+        stale.retire();
+    }
+    drop(tx);
+    while let Ok(msg) = rx.recv_async().await {
+        msg.on_error("Connection closed");
+    }
 }
 
 /// Inner loop: connect and send frames until the channel closes, a write error

@@ -38,7 +38,9 @@ use velo_ext::{
 use super::address::{AM_ID_BASE, BLOB_VERSION, UcxEndpoint};
 use super::ring::{CommandReceiver, CommandSender, command_ring};
 use super::rma::{RdmaEndpoint, RmaState};
-use super::worker::{Cmd, Doorbell, SendTask, StartupSlot, WorkerArgs, WorkerShared, worker_main};
+use super::worker::{
+    Cmd, Doorbell, SendTask, StartupOut, StartupSlot, WorkerArgs, WorkerShared, worker_main,
+};
 
 /// Hard ceiling on `eager_max`, matching the TCP codec's frame cap.
 const MAX_EAGER: u32 = 16 * 1024 * 1024;
@@ -269,7 +271,7 @@ impl UcxTransport {
                 let (tx, rx) = flume::bounded::<SendTask>(self.config.channel_capacity);
                 let gate = AdmissionGate::new(tx.clone(), rt.clone());
                 let epoch_tx = tx.clone();
-                let connections = self.connections.clone();
+                let connections = Arc::downgrade(&self.connections);
                 let cancel = tokio_util::sync::CancellationToken::new();
                 let lifetime = Arc::new(cancel.clone().drop_guard());
                 let permits = Arc::new(tokio::sync::Semaphore::new(self.config.channel_capacity));
@@ -295,11 +297,11 @@ impl UcxTransport {
                         task.permit = Some(permit);
                         match ring.try_send(Cmd::Send(task)) {
                             Ok(()) => {}
-                            Err(flume::TrySendError::Disconnected(command)) => {
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(command)) => {
                                 command.refuse_for_shutdown();
                                 break;
                             }
-                            Err(flume::TrySendError::Full(Cmd::Send(task))) => {
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(Cmd::Send(task))) => {
                                 let header = task.header.clone();
                                 let payload = task.payload.clone();
                                 let on_error = task.on_error.clone();
@@ -317,15 +319,19 @@ impl UcxTransport {
                                     }
                                 }
                             }
-                            Err(flume::TrySendError::Full(_)) => unreachable!("only sends enter the peer queue"),
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => unreachable!("only sends enter the peer queue"),
                         }
                         doorbell.ring();
                     }
-                    if let Some((_, stale)) = connections.remove_if(&peer, |_, h| h.tx.same_channel(&epoch_tx)) {
-                        stale.gate.fail_all(AdmissionError::ChannelClosed);
-                    }
-                    if let Some(metrics) = metrics {
-                        metrics.set_active_connections(connections.len());
+                    if let Some(connections) = connections.upgrade() {
+                        if let Some((_, stale)) = connections.remove_if(&peer, |_, h| h.tx.same_channel(&epoch_tx)) {
+                            stale.gate.fail_all(AdmissionError::ChannelClosed);
+                        }
+                        if let Some(metrics) = metrics.as_ref() {
+                            metrics.set_active_connections(connections.len());
+                        }
+                    } else if let Some(metrics) = metrics {
+                        metrics.set_active_connections(0);
                     }
                     pending.fail_all(AdmissionError::ChannelClosed);
                     drop(pending);
@@ -377,6 +383,63 @@ impl UcxTransport {
             if let Some(m) = self.shared.metrics.get() {
                 m.set_active_connections(self.connections.len());
             }
+        }
+    }
+
+    async fn finish_startup(
+        &self,
+        startup: tokio::sync::oneshot::Receiver<Result<StartupOut>>,
+    ) -> Result<()> {
+        // The worker belongs to this future until its address is published.
+        // Generic transport cleanup cannot call shutdown on a partial start.
+        struct StartupGuard<'a>(Option<&'a UcxTransport>);
+        impl Drop for StartupGuard<'_> {
+            fn drop(&mut self) {
+                if let Some(transport) = self.0 {
+                    transport.stop_worker();
+                }
+            }
+        }
+        let mut guard = StartupGuard(Some(self));
+        let out = startup
+            .await
+            .map_err(|_| anyhow::anyhow!("ucx progress thread died during startup"))??;
+        let blob = UcxEndpoint {
+            v: BLOB_VERSION,
+            am_id_base: AM_ID_BASE,
+            eager_max: self.config.eager_max.min(MAX_EAGER),
+            incarnation: self.incarnation,
+            worker_addr: out.worker_addr.clone(),
+        }
+        .encode()?;
+        let mut builder = crate::transports::address::WorkerAddressBuilder::new();
+        builder.add_entry(self.key.clone(), blob)?;
+        let address = builder.build()?;
+        info!(
+            "UCX transport started (worker address {} B, max_am_header {} B)",
+            out.worker_addr.len(),
+            out.max_am_header
+        );
+        self.startup.set(out).ok();
+        self.local_address.set(address).ok();
+        // RMA becomes available only after the worker consumes commands.
+        self.rma.mark_started(self.runtime.get().cloned());
+        guard.0 = None;
+        Ok(())
+    }
+
+    fn stop_worker(&self) {
+        // The flag remains reliable when the ring is full; the doorbell wakes
+        // a parked worker so it can drain and destroy its native resources.
+        self.shared
+            .shutdown_requested
+            .store(true, Ordering::Release);
+        let _ = self.ring_tx.try_send(Cmd::Shutdown);
+        self.shared.doorbell.ring_force();
+        if let Some(join) = self.join.lock().unwrap_or_else(|e| e.into_inner()).take()
+            && join.join().is_err()
+        {
+            warn!("ucx progress thread panicked during shutdown");
         }
     }
 }
@@ -538,35 +601,7 @@ impl Transport for UcxTransport {
                 .spawn(move || worker_main(args))?;
             *self.join.lock().unwrap_or_else(|e| e.into_inner()) = Some(join);
 
-            let out = startup_rx
-                .await
-                .map_err(|_| anyhow::anyhow!("ucx progress thread died during startup"))??;
-
-            let blob = UcxEndpoint {
-                v: BLOB_VERSION,
-                am_id_base: AM_ID_BASE,
-                eager_max: self.config.eager_max.min(MAX_EAGER),
-                incarnation: self.incarnation,
-                worker_addr: out.worker_addr.clone(),
-            }
-            .encode()?;
-            let mut builder = crate::transports::address::WorkerAddressBuilder::new();
-            builder.add_entry(self.key.clone(), blob)?;
-            let address = builder.build()?;
-
-            info!(
-                "UCX transport started (worker address {} B, max_am_header {} B)",
-                out.worker_addr.len(),
-                out.max_am_header
-            );
-            self.startup.set(out).ok();
-            self.local_address.set(address).ok();
-            // Only now is the ring being consumed: before this, an RMA command
-            // would push successfully and never be answered. The runtime handle
-            // rides along so a cancelled `map_region` can retry its rollback push
-            // rather than drop it (see `MapRollback`).
-            self.rma.mark_started(self.runtime.get().cloned());
-            Ok(())
+            self.finish_startup(startup_rx).await
         })
     }
 
@@ -580,20 +615,7 @@ impl Transport for UcxTransport {
         if let Some(state) = self.shutdown_state.get() {
             state.teardown_token().cancel();
         }
-        // Ask the progress thread to exit. The flag is the reliable signal
-        // (a full ring can drop the command, and `Disconnected` is
-        // unreachable while the worker holds its own senders); the command
-        // and the forced doorbell just make exit prompt.
-        self.shared
-            .shutdown_requested
-            .store(true, std::sync::atomic::Ordering::Release);
-        let _ = self.ring_tx.try_send(Cmd::Shutdown);
-        self.shared.doorbell.ring_force();
-        if let Some(join) = self.join.lock().unwrap_or_else(|e| e.into_inner()).take()
-            && join.join().is_err()
-        {
-            warn!("ucx progress thread panicked during shutdown");
-        }
+        self.stop_worker();
         for entry in self.connections.iter() {
             entry.value().gate.fail_all(AdmissionError::ChannelClosed);
         }

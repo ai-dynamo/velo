@@ -136,16 +136,21 @@ pub struct VeloBackend {
     shutdown_state: ShutdownState,
 }
 
-/// Stop every transport whose startup began if construction fails or is cancelled.
+/// Stop completed transports if construction fails or is cancelled.
 struct StartupTransports {
     transports: HashMap<TransportKey, Arc<dyn Transport>>,
-    teardown: Option<tokio_util::sync::CancellationToken>,
+    shutdown: Option<ShutdownState>,
 }
 
 impl StartupTransports {
     fn stop(&mut self) {
-        if let Some(teardown) = self.teardown.take() {
-            teardown.cancel();
+        if let Some(shutdown) = self.shutdown.take() {
+            shutdown.begin_drain();
+            for transport in self.transports.values() {
+                transport.begin_drain();
+            }
+            // Construction has no caller to drain work for. Use a zero budget.
+            shutdown.teardown_token().cancel();
             for transport in self.transports.values() {
                 transport.shutdown();
             }
@@ -153,7 +158,7 @@ impl StartupTransports {
     }
 
     fn finish(mut self) -> HashMap<TransportKey, Arc<dyn Transport>> {
-        self.teardown = None;
+        self.shutdown = None;
         std::mem::take(&mut self.transports)
     }
 }
@@ -185,7 +190,7 @@ impl VeloBackend {
         let shutdown_state = adapter.shutdown_state.clone();
         let mut started = StartupTransports {
             transports: HashMap::new(),
-            teardown: Some(shutdown_state.teardown_token().clone()),
+            shutdown: Some(shutdown_state.clone()),
         };
 
         let runtime = tokio::runtime::Handle::current();
@@ -197,9 +202,6 @@ impl VeloBackend {
                     !started.transports.contains_key(&key),
                     "Duplicate transport key: {key}"
                 );
-                started
-                    .transports
-                    .insert(key.clone(), Arc::clone(&transport));
                 if let Some(metrics) = observability.as_ref() {
                     let handle = Arc::new(metrics.bind_transport(key.as_str()));
                     transport.set_observability(
@@ -210,6 +212,9 @@ impl VeloBackend {
                 transport
                     .start(instance_id, adapter.clone(), runtime.clone())
                     .await?;
+                started
+                    .transports
+                    .insert(key.clone(), Arc::clone(&transport));
                 builder.merge(&transport.address())?;
                 priorities.push(key.clone());
             }
@@ -677,6 +682,9 @@ impl VeloBackend {
 
     /// Stop transports after teardown or failed construction.
     pub(crate) fn shutdown_now(&self) {
+        if !self.shutdown_state.is_draining() {
+            self.begin_drain();
+        }
         self.shutdown_state.teardown_token().cancel();
         for transport in self.transports.values() {
             transport.shutdown();

@@ -124,6 +124,32 @@ impl ZmqTransport {
             .or_insert_with(|| AdmissionGate::new(tx.clone(), rt.clone()))
             .clone()
     }
+    fn stop_threads(&self) {
+        // Signal the listener thread to stop via control PAIR socket
+        if let Ok(ctrl) = self.zmq_context.socket(zmq::PAIR)
+            && ctrl.connect(&self.listener_control_endpoint).is_ok()
+        {
+            let _ = ctrl.send("shutdown", 0);
+        }
+
+        // Signal the sender thread to stop via the message channel. This
+        // unblocks the sender's blocking recv() without polling. It deliberately
+        // bypasses the gates: shutdown is control traffic, not a frame, and must
+        // not queue behind a saturated peer.
+        if let Some(tx) = self.sender_tx.get()
+            && let Err(e) = tx.try_send(SenderCommand::Shutdown)
+        {
+            debug!("ZMQ shutdown signal not sent (channel full or disconnected): {e}");
+        }
+
+        // Join threads (they exit promptly after receiving their shutdown signals).
+        if let Some(handle) = self.listener_handle.lock().expect("mutex poisoned").take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.sender_handle.lock().expect("mutex poisoned").take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 // `max_message_size` is left at the trait's `None`. The only ZMQ socket option
@@ -265,14 +291,32 @@ impl Transport for ZmqTransport {
             // Wait for the listener to signal ready (or fail)
             match ready_rx.recv() {
                 Ok(Ok(())) => {}
-                Ok(Err(e)) => anyhow::bail!("ZMQ listener failed to start: {}", e),
-                Err(_) => anyhow::bail!("ZMQ listener thread exited before signaling ready"),
+                Ok(Err(e)) => {
+                    let _ = listener_handle.join();
+                    anyhow::bail!("ZMQ listener failed to start: {}", e);
+                }
+                Err(_) => {
+                    let _ = listener_handle.join();
+                    anyhow::bail!("ZMQ listener thread exited before signaling ready");
+                }
             }
 
             *self
                 .listener_handle
                 .lock()
                 .expect("listener_handle mutex poisoned") = Some(listener_handle);
+
+            // The listener is live even if sender startup fails. Its control
+            // socket is ready now, so rollback can stop and join both threads.
+            struct StartupGuard<'a>(Option<&'a ZmqTransport>);
+            impl Drop for StartupGuard<'_> {
+                fn drop(&mut self) {
+                    if let Some(transport) = self.0 {
+                        transport.stop_threads();
+                    }
+                }
+            }
+            let mut guard = StartupGuard(Some(self));
 
             // Spawn the sender thread with a ready handshake
             let (sender_ready_tx, sender_ready_rx) = std::sync::mpsc::sync_channel(1);
@@ -292,6 +336,11 @@ impl Transport for ZmqTransport {
                 })
                 .context("Failed to spawn ZMQ sender thread")?;
 
+            *self
+                .sender_handle
+                .lock()
+                .expect("sender_handle mutex poisoned") = Some(sender_handle);
+
             // Wait for the sender to signal ready
             match sender_ready_rx.recv() {
                 Ok(Ok(())) => {}
@@ -299,12 +348,8 @@ impl Transport for ZmqTransport {
                 Err(_) => anyhow::bail!("ZMQ sender thread exited before signaling ready"),
             }
 
-            *self
-                .sender_handle
-                .lock()
-                .expect("sender_handle mutex poisoned") = Some(sender_handle);
-
             info!("ZMQ transport started on {}", self.bind_endpoint);
+            guard.0 = None;
             Ok(())
         })
     }
@@ -318,30 +363,7 @@ impl Transport for ZmqTransport {
     fn shutdown(&self) {
         info!("Shutting down ZMQ transport");
 
-        // Signal the listener thread to stop via control PAIR socket
-        if let Ok(ctrl) = self.zmq_context.socket(zmq::PAIR)
-            && ctrl.connect(&self.listener_control_endpoint).is_ok()
-        {
-            let _ = ctrl.send("shutdown", 0);
-        }
-
-        // Signal the sender thread to stop via the message channel. This
-        // unblocks the sender's blocking recv() without polling. It deliberately
-        // bypasses the gates: shutdown is control traffic, not a frame, and must
-        // not queue behind a saturated peer.
-        if let Some(tx) = self.sender_tx.get()
-            && let Err(e) = tx.try_send(SenderCommand::Shutdown)
-        {
-            debug!("ZMQ shutdown signal not sent (channel full or disconnected): {e}");
-        }
-
-        // Join threads (they exit promptly after receiving their shutdown signals).
-        if let Some(handle) = self.listener_handle.lock().expect("mutex poisoned").take() {
-            let _ = handle.join();
-        }
-        if let Some(handle) = self.sender_handle.lock().expect("mutex poisoned").take() {
-            let _ = handle.join();
-        }
+        self.stop_threads();
     }
 
     fn set_observability(

@@ -18,6 +18,7 @@ struct MockTransport {
     started: AtomicBool,
     fail_start: bool,
     pending_start: bool,
+    start_completed: AtomicBool,
     drained: AtomicBool,
     shut_down: AtomicBool,
     /// Set by `closed()`, after a delay, so a test can tell whether graceful
@@ -50,6 +51,7 @@ impl MockTransport {
             started: AtomicBool::new(false),
             fail_start: false,
             pending_start: false,
+            start_completed: AtomicBool::new(false),
             drained: AtomicBool::new(false),
             shut_down: AtomicBool::new(false),
             closed: Arc::new(AtomicBool::new(false)),
@@ -74,6 +76,7 @@ impl MockTransport {
             started: AtomicBool::new(false),
             fail_start: false,
             pending_start: false,
+            start_completed: AtomicBool::new(false),
             drained: AtomicBool::new(false),
             shut_down: AtomicBool::new(false),
             closed: Arc::new(AtomicBool::new(false)),
@@ -156,13 +159,18 @@ impl Transport for MockTransport {
             if self.pending_start {
                 std::future::pending::<()>().await;
             }
+            self.start_completed.store(true, Ordering::Relaxed);
             Ok(())
         })
     }
     fn shutdown(&self) {
+        assert!(self.start_completed.load(Ordering::Relaxed));
+        assert!(self.drained.load(Ordering::Relaxed));
         self.shut_down.store(true, Ordering::Relaxed);
     }
     fn closed(&self) -> futures::future::BoxFuture<'_, ()> {
+        assert!(self.start_completed.load(Ordering::Relaxed));
+        assert!(self.shut_down.load(Ordering::Relaxed));
         let closed = self.closed.clone();
         Box::pin(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -595,11 +603,11 @@ async fn failed_start_closes_all_transports_already_started() {
     )
     .await;
     assert!(result.is_err());
-    for transport in [first, failing] {
-        assert!(transport.started.load(Ordering::Relaxed));
-        assert!(transport.shut_down.load(Ordering::Relaxed));
-        assert!(transport.closed.load(Ordering::Relaxed));
-    }
+    assert!(first.shut_down.load(Ordering::Relaxed));
+    assert!(first.closed.load(Ordering::Relaxed));
+    assert!(failing.started.load(Ordering::Relaxed));
+    assert!(!failing.shut_down.load(Ordering::Relaxed));
+    assert!(!failing.closed.load(Ordering::Relaxed));
 }
 
 #[tokio::test]
@@ -716,7 +724,7 @@ async fn test_peer_info_roundtrip() {
 }
 
 #[tokio::test]
-async fn cancelled_start_stops_started_and_pending_transports() {
+async fn cancelled_start_stops_only_completed_transports() {
     let ready = MockTransport::new("ready", true);
     let mut pending = MockTransport::new("pending", true);
     Arc::get_mut(&mut pending).unwrap().pending_start = true;
@@ -728,5 +736,5 @@ async fn cancelled_start_stops_started_and_pending_transports() {
     assert!(!pending.shut_down.load(Ordering::Relaxed));
     drop(build);
     assert!(ready.shut_down.load(Ordering::Relaxed));
-    assert!(pending.shut_down.load(Ordering::Relaxed));
+    assert!(!pending.shut_down.load(Ordering::Relaxed));
 }

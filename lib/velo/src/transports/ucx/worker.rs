@@ -1695,8 +1695,8 @@ fn drain_ring(
                     return (false, false);
                 }
             }
-            Err(flume::TryRecvError::Empty) => return (true, true),
-            Err(flume::TryRecvError::Disconnected) => return (true, false),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return (true, true),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return (true, false),
         }
     }
     (false, true)

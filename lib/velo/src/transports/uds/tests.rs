@@ -235,6 +235,7 @@ async fn test_writer_task_cleans_up_on_write_error() {
         socket_path.clone(),
         iid,
         rx,
+        tx.clone(),
         WriterTaskContext {
             connections: conns,
             cancel_token: cancel,
@@ -260,6 +261,7 @@ async fn test_writer_task_cleans_up_on_write_error() {
     .unwrap();
 
     // Wait for writer task to finish
+    drop(tx);
     let _ = writer.await;
 
     // The writer should have removed the stale entry from the map
@@ -453,6 +455,7 @@ async fn test_writer_task_drains_on_connect_failure() {
         dead_socket,
         iid,
         rx,
+        tx,
         WriterTaskContext {
             connections: conns,
             cancel_token: cancel,
@@ -782,4 +785,38 @@ fn replacing_a_dead_connection_does_not_deadlock() {
     );
     transport.shutdown();
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// An old sender can enqueue after retirement begins, but cannot remove its successor.
+#[tokio::test]
+async fn retirement_reports_late_sends_and_preserves_successor() {
+    let key = crate::InstanceId::new_v4();
+    let connections = Arc::new(dashmap::DashMap::new());
+    let (old, rx) = make_handle(4);
+    connections.insert(key, old.clone());
+    let errors = Arc::new(TrackingErrorHandler::new());
+    let closing = tokio::spawn({
+        let connections = connections.clone();
+        let tx = old.tx.clone();
+        async move { super::retire_connection(key, tx, rx, &connections).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while connections.contains_key(&key) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let (next, _next_rx) = make_handle(4);
+    connections.insert(key, next.clone());
+    for _ in 0..2 {
+        assert!(old.gate.send(task(errors.clone())).is_admitted());
+    }
+    drop(old);
+    tokio::time::timeout(Duration::from_secs(2), closing)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(errors.error_count(), 2);
+    assert!(connections.get(&key).unwrap().tx.same_channel(&next.tx));
 }

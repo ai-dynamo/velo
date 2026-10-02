@@ -27,6 +27,69 @@ use crate::transports::ucx::rma::{
 use crate::transports::ucx::worker::{Cmd, PARK_MS, SENDER_SLOTS, SenderSightings, ep_scan_period};
 use velo_ext::{InstanceId, MessageType, PeerInfo};
 
+#[tokio::test]
+async fn dropping_transport_releases_peer_drivers() {
+    let transport = UcxTransportBuilder::new().build().unwrap();
+    transport
+        .runtime
+        .set(tokio::runtime::Handle::current())
+        .ok();
+    let peer = InstanceId::new_v4();
+    transport.shared.peers.insert(
+        peer,
+        super::UcxEndpoint {
+            v: super::BLOB_VERSION,
+            am_id_base: super::AM_ID_BASE,
+            eager_max: 1024,
+            incarnation: 1,
+            worker_addr: Vec::new(),
+        },
+    );
+    // No native worker is needed: this exercises the driver's own lifetime.
+    let mut ring = transport.ring_rx.lock().unwrap().take().unwrap();
+    let connections = Arc::downgrade(&transport.connections);
+    drop(transport.get_or_create_connection(peer).unwrap());
+    drop(transport);
+    assert!(connections.upgrade().is_none());
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), ring.recv_async())
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn incomplete_startup_stops_and_joins_its_worker() {
+    for cancelled in [true, false] {
+        let transport = UcxTransportBuilder::new().build().unwrap();
+        let (adapter, _streams) = make_channels();
+        let state = adapter.shutdown_state.clone();
+        transport.shutdown_state.set(state.clone()).ok();
+        let mut ring = transport.ring_rx.lock().unwrap().take().unwrap();
+        // Model the native worker waiting for commands, while its startup
+        // result is held. This makes both failure paths deterministic.
+        *transport.join.lock().unwrap() = Some(std::thread::spawn(move || {
+            assert!(matches!(ring.blocking_recv(), Some(Cmd::Shutdown)));
+        }));
+        let (result, startup) = tokio::sync::oneshot::channel();
+        let mut starting = Box::pin(transport.finish_startup(startup));
+        assert!(futures::poll!(starting.as_mut()).is_pending());
+        if cancelled {
+            drop(starting);
+        } else {
+            assert!(result.send(Err(anyhow::anyhow!("startup failed"))).is_ok());
+            assert!(starting.await.is_err());
+        }
+        assert!(transport.shared.shutdown_requested.load(Ordering::Acquire));
+        assert!(transport.join.lock().unwrap().is_none());
+        assert!(
+            !state.teardown_token().is_cancelled(),
+            "partial cleanup must not stop sibling transports"
+        );
+    }
+}
+
 struct CountingErrors {
     count: AtomicUsize,
     notify: tokio::sync::Notify,

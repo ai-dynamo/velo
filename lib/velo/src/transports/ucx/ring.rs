@@ -5,6 +5,7 @@
 //!
 //! Closing refuses new submissions. Draining also waits for a sender which
 //! reserved capacity before close, so accepted commands cannot miss teardown.
+//! Tokio provides this boundary; Flume cannot close a receiver and retain its queue.
 
 use tokio::sync::mpsc;
 
@@ -23,27 +24,18 @@ pub(crate) fn command_ring(capacity: usize) -> (CommandSender, CommandReceiver) 
 impl CommandSender {
     // Return the command for retry without allocating on the admission path.
     #[allow(clippy::result_large_err)]
-    pub fn try_send(&self, cmd: Cmd) -> Result<(), flume::TrySendError<Cmd>> {
-        self.0.try_send(cmd).map_err(|error| match error {
-            mpsc::error::TrySendError::Full(cmd) => flume::TrySendError::Full(cmd),
-            mpsc::error::TrySendError::Closed(cmd) => flume::TrySendError::Disconnected(cmd),
-        })
+    pub fn try_send(&self, cmd: Cmd) -> Result<(), mpsc::error::TrySendError<Cmd>> {
+        self.0.try_send(cmd)
     }
 
-    pub async fn send_async(&self, cmd: Cmd) -> Result<(), flume::SendError<Cmd>> {
-        self.0
-            .send(cmd)
-            .await
-            .map_err(|error| flume::SendError(error.0))
+    pub async fn send_async(&self, cmd: Cmd) -> Result<(), mpsc::error::SendError<Cmd>> {
+        self.0.send(cmd).await
     }
 }
 
 impl CommandReceiver {
-    pub fn try_recv(&mut self) -> Result<Cmd, flume::TryRecvError> {
-        self.0.try_recv().map_err(|error| match error {
-            mpsc::error::TryRecvError::Empty => flume::TryRecvError::Empty,
-            mpsc::error::TryRecvError::Disconnected => flume::TryRecvError::Disconnected,
-        })
+    pub fn try_recv(&mut self) -> Result<Cmd, mpsc::error::TryRecvError> {
+        self.0.try_recv()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -59,8 +51,8 @@ impl CommandReceiver {
     }
 
     #[cfg(test)]
-    pub async fn recv_async(&mut self) -> Result<Cmd, flume::RecvError> {
-        self.0.recv().await.ok_or(flume::RecvError::Disconnected)
+    pub async fn recv_async(&mut self) -> Option<Cmd> {
+        self.0.recv().await
     }
 }
 
@@ -77,8 +69,8 @@ mod tests {
         assert!(futures::poll!(&mut waiting).is_pending());
         rx.close();
         assert!(waiting.await.is_err());
-        assert!(rx.recv_async().await.is_ok());
-        assert!(rx.recv_async().await.is_err());
+        assert!(rx.recv_async().await.is_some());
+        assert!(rx.recv_async().await.is_none());
         assert!(tx.try_send(Cmd::Shutdown).is_err());
 
         let (tx, mut rx) = command_ring(1);
@@ -88,6 +80,6 @@ mod tests {
         tokio::pin!(receiving);
         assert!(futures::poll!(&mut receiving).is_pending());
         reserved.send(Cmd::Shutdown);
-        assert!(receiving.await.is_ok());
+        assert!(receiving.await.is_some());
     }
 }
