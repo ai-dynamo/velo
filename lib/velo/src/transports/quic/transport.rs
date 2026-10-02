@@ -850,6 +850,10 @@ struct QuicWriterObserver<'a> {
 }
 
 impl WriterObserver for QuicWriterObserver<'_> {
+    fn interrupt_pending_writes(&self) -> bool {
+        false
+    }
+
     fn on_failure(&self, kind: WriterFailure, err: &std::io::Error, frames: usize) {
         match kind {
             WriterFailure::Write => error!(

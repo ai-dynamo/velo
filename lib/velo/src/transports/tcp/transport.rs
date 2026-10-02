@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! High-performance TCP transport with single-threaded optimizations
+//! TCP messenger transport with one ordered writer queue per peer and lane.
 //!
-//! This implementation uses Rc+RefCell+LocalSet for maximum performance on a single CPU core.
-//! All operations run on the same thread as the TCP listener for optimal cache locality.
+//! Connection maps are shared across Tokio tasks. Each connection has its own
+//! admission gate, socket reader, and coalescing writer.
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -40,11 +40,10 @@ pub use builder::TcpTransportBuilder;
 /// builder asked for more.
 type LaneKey = (crate::InstanceId, u16);
 
-/// High-performance TCP transport with lock-free concurrent access
+/// TCP transport with shared connection state and per-lane ordering.
 ///
-/// This transport uses `DashMap` for lock-free concurrent access to connection state.
-/// Tasks are spawned using `tokio::spawn` for compatibility with the `Transport` trait.
-/// For single-threaded performance, run the entire transport in a `LocalSet` context.
+/// DashMap guards protect connection state; socket tasks run on the supplied
+/// Tokio runtime. No map guard is held while a socket operation waits.
 ///
 /// It keeps up to [`TcpTransportBuilder::lanes`] connections to each peer, one
 /// for each lane used.
@@ -54,7 +53,7 @@ pub struct TcpTransport {
     bind_addr: SocketAddr,
     local_address: WorkerAddress,
 
-    // Shared mutable state with DashMap (lock-free)
+    // Shared connection state, protected by DashMap shard locks.
     peers: Arc<DashMap<crate::InstanceId, SocketAddr>>,
     connections: Arc<DashMap<LaneKey, ConnectionHandle>>,
 
@@ -122,7 +121,7 @@ impl ConnectionHandle {
     }
 }
 
-/// Task sent to writer task containing pre-encoded frame
+/// Header and payload queued for the writer to frame.
 ///
 /// Fields are `pub(super)`: `writer.rs`'s `impl Coalescable for SendTask`
 /// reads them directly, and constructs nothing here, so `tcp` is the visibility
@@ -285,7 +284,13 @@ impl TcpTransport {
             tx,
         };
 
-        rt.spawn(connection_writer_task(addr, key, rx, self.writer_context()));
+        rt.spawn(connection_writer_task(
+            addr,
+            key,
+            rx,
+            handle.tx.clone(),
+            self.writer_context(),
+        ));
 
         debug!(
             "Created new connection to {} lane {} ({})",
@@ -624,8 +629,8 @@ struct WriterTaskContext {
 
 /// Connection writer task
 ///
-/// This task runs on the LocalSet and handles writing framed bytes to the TCP stream.
-/// It receives pre-encoded frames via a flume channel and writes them to the socket.
+/// Runs on the supplied Tokio runtime. It receives headers and payloads from
+/// the admission gate, frames them, and writes them to the socket.
 ///
 /// Cleanup (draining queued messages and removing the stale map entry) always runs,
 /// even if the initial TCP connect fails.
@@ -633,49 +638,43 @@ async fn connection_writer_task(
     addr: SocketAddr,
     key: LaneKey,
     rx: flume::Receiver<SendTask>,
+    tx: flume::Sender<SendTask>,
     ctx: WriterTaskContext,
 ) -> Result<()> {
     let result = connection_writer_inner(addr, key, &rx, &ctx).await;
-    let WriterTaskContext {
-        connections,
-        metrics,
-        ..
-    } = ctx;
-
-    // Always drain queued messages and notify their error handlers.
-    //
-    // TODO: There is a tiny race between the drain finishing and `drop(rx)`:
-    // a sender on another thread could `try_send` successfully in that window,
-    // and the message would be silently dropped when rx is destroyed. Closing
-    // this fully would require swapping the map entry with a "poisoned" handle
-    // (a disconnected tx) before draining, so fast-path senders see a failure
-    // instead. Not worth the complexity today — at most one message is affected,
-    // and async senders already get `SendError` once rx is dropped.
-    while let Ok(msg) = rx.try_recv() {
-        msg.on_error("Connection closed");
+    let reason = match &result {
+        Ok(()) => "Connection closed".to_string(),
+        Err(error) => {
+            warn!(peer = %key.0, lane = key.1, %addr, error = %format!("{error:#}"), "TCP connection failed");
+            format!("TCP connection to {addr} failed: {error:#}")
+        }
+    };
+    retire_connection(key, tx, rx, &ctx.connections, &reason).await;
+    if let Some(metrics) = ctx.metrics.as_ref() {
+        metrics.set_active_connections(ctx.connections.len());
     }
+    debug!("Connection to {} lane {} ({}) closed", key.0, key.1, addr);
+    result
+}
 
-    // Drop the receiver so our sender half becomes disconnected, then remove
-    // the stale entry. The predicate ensures we only remove our own entry —
-    // a replacement connection's tx will still be connected.
-    //
-    // Retiring the gate is what fails frames still queued behind it. Dropping
-    // `rx` would eventually fail them too (the driver's `send_async` sees a
-    // closed channel), but `ConnectionReplaced` names the cause and lands
-    // without waiting on the driver. If the entry was already replaced, the
-    // successor's gate is a different one and the old gate's frames take the
-    // closed-channel route instead.
-    drop(rx);
-    if let Some((_, stale)) = connections.remove_if(&key, |_, h| h.tx.is_disconnected()) {
+async fn retire_connection(
+    key: LaneKey,
+    tx: flume::Sender<SendTask>,
+    rx: flume::Receiver<SendTask>,
+    connections: &DashMap<LaneKey, ConnectionHandle>,
+    reason: &str,
+) {
+    // Remove only this epoch. New sends can now create a successor while
+    // outstanding handles finish sending to this receiver.
+    if let Some((_, stale)) = connections.remove_if(&key, |_, h| h.tx.same_channel(&tx)) {
         stale.retire();
     }
-    if let Some(metrics) = metrics.as_ref() {
-        metrics.set_active_connections(connections.len());
+    drop(tx);
+    // Empty is not closed: a sender which already held this epoch can still
+    // enqueue. Keep receiving until every old handle and gate driver is gone.
+    while let Ok(msg) = rx.recv_async().await {
+        msg.on_error(reason);
     }
-
-    debug!("Connection to {} lane {} ({}) closed", key.0, key.1, addr);
-
-    result
 }
 
 /// Connect to `addr` and set up the socket before its first write, or `None`

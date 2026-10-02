@@ -359,6 +359,19 @@ impl Decoder for TcpFrameCodec {
     type Item = (MessageType, Bytes, Bytes);
     type Error = io::Error;
 
+    fn decode_eof(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        if let Some(frame) = self.decode(src)? {
+            return Ok(Some(frame));
+        }
+        if !src.is_empty() || matches!(self.state, DecodeState::AwaitingData { .. }) {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "incomplete TCP frame",
+            ));
+        }
+        Ok(None)
+    }
+
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         loop {
             match self.state {
@@ -445,6 +458,27 @@ impl Decoder for TcpFrameCodec {
 mod tests {
     use super::*;
     use tokio_util::codec::Framed;
+
+    #[test]
+    fn eof_rejects_every_incomplete_frame() {
+        let mut wire = Vec::new();
+        TcpFrameCodec::encode_frame_sync(&mut wire, MessageType::Response, b"header", b"body")
+            .unwrap();
+        for cut in 1..wire.len() {
+            let mut codec = TcpFrameCodec::new();
+            let mut buffer = BytesMut::from(&wire[..cut]);
+            assert!(codec.decode(&mut buffer).unwrap().is_none());
+            assert_eq!(
+                codec.decode_eof(&mut buffer).unwrap_err().kind(),
+                io::ErrorKind::UnexpectedEof,
+                "cut at {cut}"
+            );
+        }
+        let mut codec = TcpFrameCodec::new();
+        let mut buffer = BytesMut::from(wire.as_slice());
+        assert!(codec.decode_eof(&mut buffer).unwrap().is_some());
+        assert!(codec.decode_eof(&mut buffer).unwrap().is_none());
+    }
 
     /// Test helper to encode a frame into a Vec<u8> for verification (async)
     async fn encode_frame_to_bytes(

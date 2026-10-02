@@ -36,6 +36,7 @@ use velo_ext::{
 };
 
 use super::address::{AM_ID_BASE, BLOB_VERSION, UcxEndpoint};
+use super::ring::{CommandReceiver, CommandSender, command_ring};
 use super::rma::{RdmaEndpoint, RmaState};
 use super::worker::{Cmd, Doorbell, SendTask, StartupSlot, WorkerArgs, WorkerShared, worker_main};
 
@@ -127,6 +128,7 @@ impl Default for UcxConfig {
 /// gates admitted. An epoch is retired when the peer's endpoint fails.
 #[derive(Clone)]
 struct ConnHandle {
+    tx: flume::Sender<SendTask>,
     admission: Arc<Mutex<()>>,
     gate: AdmissionGate<SendTask>,
     _lifetime: Arc<tokio_util::sync::DropGuard>,
@@ -138,15 +140,15 @@ pub struct UcxTransport {
     config: UcxConfig,
     incarnation: u64,
 
-    ring_tx: flume::Sender<Cmd>,
-    ring_rx: Mutex<Option<flume::Receiver<Cmd>>>,
+    ring_tx: CommandSender,
+    ring_rx: Mutex<Option<CommandReceiver>>,
     shared: Arc<WorkerShared>,
 
     /// Populated at `start()`; `address()` before start returns an empty map.
     local_address: OnceLock<WorkerAddress>,
     startup: StartupSlot,
 
-    connections: DashMap<InstanceId, ConnHandle>,
+    connections: Arc<DashMap<InstanceId, ConnHandle>>,
     runtime: OnceLock<tokio::runtime::Handle>,
     shutdown_state: OnceLock<ShutdownState>,
     join: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -158,7 +160,7 @@ pub struct UcxTransport {
 
 impl UcxTransport {
     fn new(key: TransportKey, config: UcxConfig) -> Self {
-        let (ring_tx, ring_rx) = flume::bounded(config.channel_capacity);
+        let (ring_tx, ring_rx) = command_ring(config.channel_capacity);
         // Never zero: the receiver's sighting slots use zero for "empty".
         let incarnation = (uuid::Uuid::new_v4().as_u128() as u64).max(1);
         let shared = Arc::new(WorkerShared {
@@ -201,7 +203,7 @@ impl UcxTransport {
             shared,
             local_address: OnceLock::new(),
             startup: OnceLock::new(),
-            connections: DashMap::new(),
+            connections: Arc::new(DashMap::new()),
             runtime: OnceLock::new(),
             shutdown_state: OnceLock::new(),
             join: Mutex::new(None),
@@ -265,13 +267,16 @@ impl UcxTransport {
             .entry(peer)
             .or_insert_with(|| {
                 let (tx, rx) = flume::bounded::<SendTask>(self.config.channel_capacity);
-                let gate = AdmissionGate::new(tx, rt.clone());
+                let gate = AdmissionGate::new(tx.clone(), rt.clone());
+                let epoch_tx = tx.clone();
+                let connections = self.connections.clone();
                 let cancel = tokio_util::sync::CancellationToken::new();
                 let lifetime = Arc::new(cancel.clone().drop_guard());
                 let permits = Arc::new(tokio::sync::Semaphore::new(self.config.channel_capacity));
                 let ring = self.ring_tx.clone();
                 let doorbell = self.shared.doorbell.clone();
                 let pending = gate.clone();
+                let metrics = self.shared.metrics.get().cloned();
                 rt.spawn(async move {
                     loop {
                         let mut task = tokio::select! {
@@ -316,12 +321,20 @@ impl UcxTransport {
                         }
                         doorbell.ring();
                     }
+                    if let Some((_, stale)) = connections.remove_if(&peer, |_, h| h.tx.same_channel(&epoch_tx)) {
+                        stale.gate.fail_all(AdmissionError::ChannelClosed);
+                    }
+                    if let Some(metrics) = metrics {
+                        metrics.set_active_connections(connections.len());
+                    }
                     pending.fail_all(AdmissionError::ChannelClosed);
-                    while let Ok(task) = rx.try_recv() {
+                    drop(pending);
+                    drop(epoch_tx);
+                    while let Ok(task) = rx.recv_async().await {
                         task.fail("ucx connection closed");
                     }
                 });
-                ConnHandle { admission: Arc::new(Mutex::new(())), gate, _lifetime: lifetime }
+                ConnHandle { tx, admission: Arc::new(Mutex::new(())), gate, _lifetime: lifetime }
             })
             .clone();
         if let Some(m) = self.shared.metrics.get() {

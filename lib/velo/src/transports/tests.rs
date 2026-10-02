@@ -16,6 +16,8 @@ struct MockTransport {
     address: WorkerAddress,
     accept_register: bool,
     started: AtomicBool,
+    fail_start: bool,
+    pending_start: bool,
     drained: AtomicBool,
     shut_down: AtomicBool,
     /// Set by `closed()`, after a delay, so a test can tell whether graceful
@@ -46,6 +48,8 @@ impl MockTransport {
             address,
             accept_register,
             started: AtomicBool::new(false),
+            fail_start: false,
+            pending_start: false,
             drained: AtomicBool::new(false),
             shut_down: AtomicBool::new(false),
             closed: Arc::new(AtomicBool::new(false)),
@@ -68,6 +72,8 @@ impl MockTransport {
             address,
             accept_register: true,
             started: AtomicBool::new(false),
+            fail_start: false,
+            pending_start: false,
             drained: AtomicBool::new(false),
             shut_down: AtomicBool::new(false),
             closed: Arc::new(AtomicBool::new(false)),
@@ -145,7 +151,13 @@ impl Transport for MockTransport {
             let (tx, rx) = flume::bounded(1);
             let _ = self.queue.set((AdmissionGate::new(tx, rt), rx));
         }
-        Box::pin(async { Ok(()) })
+        Box::pin(async {
+            anyhow::ensure!(!self.fail_start, "mock startup failure");
+            if self.pending_start {
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        })
     }
     fn shutdown(&self) {
         self.shut_down.store(true, Ordering::Relaxed);
@@ -570,6 +582,27 @@ async fn test_try_translate_worker_id_not_found() {
 }
 
 #[tokio::test]
+async fn failed_start_closes_all_transports_already_started() {
+    let first = MockTransport::new("first", true);
+    let mut failing = MockTransport::new("failing", true);
+    Arc::get_mut(&mut failing).unwrap().fail_start = true;
+    let result = VeloBackend::new(
+        vec![
+            first.clone() as Arc<dyn Transport>,
+            failing.clone() as Arc<dyn Transport>,
+        ],
+        None,
+    )
+    .await;
+    assert!(result.is_err());
+    for transport in [first, failing] {
+        assert!(transport.started.load(Ordering::Relaxed));
+        assert!(transport.shut_down.load(Ordering::Relaxed));
+        assert!(transport.closed.load(Ordering::Relaxed));
+    }
+}
+
+#[tokio::test]
 async fn test_set_transport_priority_valid() {
     let t1 = MockTransport::new("tcp", true);
     let t2 = MockTransport::new("http", true);
@@ -584,6 +617,26 @@ async fn test_set_transport_priority_valid() {
     backend
         .set_transport_priority(vec![TransportKey::from("http"), TransportKey::from("tcp")])
         .unwrap();
+}
+
+#[tokio::test]
+async fn test_set_transport_priority_rejects_duplicate_without_changing_priority() {
+    let tcp = MockTransport::new("tcp", true);
+    let ucx = MockTransport::new("ucx", true);
+    let (backend, _streams) = VeloBackend::new(
+        vec![tcp as Arc<dyn Transport>, ucx as Arc<dyn Transport>],
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        backend.set_transport_priority(vec![TransportKey::from("tcp"), TransportKey::from("tcp")]),
+        Err(VeloBackendError::InvalidTransportPriority(_))
+    ));
+    assert_eq!(
+        *backend.priorities.lock(),
+        vec![TransportKey::from("tcp"), TransportKey::from("ucx")]
+    );
 }
 
 #[tokio::test]
@@ -660,4 +713,20 @@ async fn test_peer_info_roundtrip() {
 
     let info = backend.peer_info();
     assert_eq!(info.instance_id(), backend.instance_id());
+}
+
+#[tokio::test]
+async fn cancelled_start_stops_started_and_pending_transports() {
+    let ready = MockTransport::new("ready", true);
+    let mut pending = MockTransport::new("pending", true);
+    Arc::get_mut(&mut pending).unwrap().pending_start = true;
+    let mut build = Box::pin(VeloBackend::new(vec![ready.clone(), pending.clone()], None));
+    assert!(futures::poll!(build.as_mut()).is_pending());
+    assert!(ready.started.load(Ordering::Relaxed));
+    assert!(pending.started.load(Ordering::Relaxed));
+    assert!(!ready.shut_down.load(Ordering::Relaxed));
+    assert!(!pending.shut_down.load(Ordering::Relaxed));
+    drop(build);
+    assert!(ready.shut_down.load(Ordering::Relaxed));
+    assert!(pending.shut_down.load(Ordering::Relaxed));
 }

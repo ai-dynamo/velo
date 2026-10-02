@@ -291,6 +291,11 @@ async fn draining_receiver_echoes_shutting_down() {
     let a = start_node().await;
     let b = start_node().await;
     cross_register(&a, &b);
+    use crate::observability::{VeloMetrics, test_helpers::MetricSnapshot};
+    let registry = prometheus::Registry::new();
+    let metrics = VeloMetrics::register(&registry).unwrap();
+    b.transport
+        .set_observability(Arc::new(metrics.bind_transport("ucx")));
     let errs = CountingErrors::new();
 
     // Warm the path so the ShuttingDown reply exercises an established pair.
@@ -326,6 +331,46 @@ async fn draining_receiver_echoes_shutting_down() {
         .await
         .expect("ShuttingDown echo");
     assert_eq!(&h[..], b"corr-id");
+
+    let snap = MetricSnapshot::from_registry(&registry);
+    assert_eq!(
+        snap.counter(
+            "velo_transport_rejections_total",
+            &[("transport", "ucx"), ("reason", "drain_rejected")]
+        ),
+        1.0
+    );
+    assert_eq!(
+        snap.counter(
+            "velo_transport_frames_total",
+            &[
+                ("transport", "ucx"),
+                ("direction", "inbound"),
+                ("message_type", "message"),
+                ("outcome", "accepted")
+            ]
+        ),
+        1.0
+    );
+
+    drop(b.streams.response_stream);
+    a.transport.send_message(
+        b.instance_id,
+        Bytes::new(),
+        Bytes::new(),
+        MessageType::Response,
+        errs,
+    );
+    assert!(
+        wait_until(T, || {
+            MetricSnapshot::from_registry(&registry).counter(
+                "velo_transport_rejections_total",
+                &[("transport", "ucx"), ("reason", "route_failed")],
+            ) == 1.0
+        })
+        .await,
+        "disconnected response receiver must record a rejection"
+    );
 
     a.transport.shutdown();
     b.transport.shutdown();
@@ -428,7 +473,7 @@ async fn send_budget_bounds_admission_and_releases_on_peer_retirement() {
             worker_addr: vec![],
         },
     );
-    let rx = transport.ring_rx.lock().unwrap().take().unwrap();
+    let mut rx = transport.ring_rx.lock().unwrap().take().unwrap();
     let errors = CountingErrors::new();
     let send = || {
         transport.send_message(
