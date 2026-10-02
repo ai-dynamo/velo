@@ -301,7 +301,7 @@ async fn test_cancel_03_remote_cancel() {
 // one is available depends on how the stream was opened:
 //
 // - **Attach.** `_anchor_attach` carries a `StreamCancelHandle`, so the anchor
-//   can name the producer's `SenderEntry` and poison it directly. This works
+//   can name the producer's `SenderEntry` and cancel it directly. This works
 //   whether or not the producer is sending.
 // - **Ingress.** The next record to arrive for a slot whose consumer dropped
 //   its receiver faults with `CloseReason::UnknownSlot` (`fault_reason`'s
@@ -423,7 +423,7 @@ async fn cancel_with_a_record_in_flight_already_errors() {
 }
 
 /// Behavioural. Under zero-RTT setup there is no attach, so the anchor never
-/// learns a [`velo::streaming::control::StreamCancelHandle`] and cannot poison
+/// learns a [`velo::streaming::control::StreamCancelHandle`] and cannot cancel
 /// its producer directly. The producer is idle, so the ingress fault that rides
 /// on the next arriving record cannot reach it either. The close the dying
 /// pre-bind posts is the only thing left, and this is the test of it.

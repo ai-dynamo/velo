@@ -13,7 +13,6 @@ use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tokio::sync::Semaphore;
-use tokio_util::task::TaskTracker;
 use tracing::{error, trace, warn};
 use velo_ext::WorkerId;
 
@@ -162,17 +161,15 @@ pub(crate) async fn send_error_reply(
     }
 }
 
-/// Dispatcher implementation that spawns handlers on a task tracker.
+/// Run each handler on its own task. The context keeps its drain guard.
 pub(crate) struct SpawnedDispatcher<H: ActiveMessageHandler> {
     handler: Arc<H>,
-    task_tracker: TaskTracker,
 }
 
 impl<H: ActiveMessageHandler> SpawnedDispatcher<H> {
-    pub fn new(handler: H, task_tracker: TaskTracker) -> Self {
+    pub fn new(handler: H) -> Self {
         Self {
             handler: Arc::new(handler),
-            task_tracker,
         }
     }
 }
@@ -184,36 +181,6 @@ impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for SpawnedDispa
 
     fn dispatch(&self, ctx: HandlerContext) {
         let handler = self.handler.clone();
-        self.task_tracker
-            .spawn(run_handler(handler, ctx, DispatchFailure::HandlerPanic));
-    }
-}
-
-/// Dispatcher implementation that spawns handlers on a detached task.
-///
-/// Despite the name this does not execute on the dispatcher task; it is
-/// [`SpawnedDispatcher`] without task-tracker registration. Both modes keep
-/// the inbound guard, so graceful shutdown still waits for the invocation.
-pub(crate) struct InlineDispatcher<H: ActiveMessageHandler> {
-    handler: Arc<H>,
-}
-
-impl<H: ActiveMessageHandler> InlineDispatcher<H> {
-    pub fn new(handler: H) -> Self {
-        Self {
-            handler: Arc::new(handler),
-        }
-    }
-}
-
-impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for InlineDispatcher<H> {
-    fn name(&self) -> &str {
-        self.handler.name()
-    }
-
-    fn dispatch(&self, ctx: HandlerContext) {
-        let handler = self.handler.clone();
-
         tokio::spawn(run_handler(handler, ctx, DispatchFailure::HandlerPanic));
     }
 }
@@ -677,7 +644,7 @@ mod tests {
             .unwrap();
         messenger.register_peer(messenger.peer_info()).unwrap();
 
-        for mode in ["spawn", "inline", "ordered"] {
+        for mode in ["spawn", "ordered"] {
             for during_construction in [true, false] {
                 let name = format!("_panic_{mode}_{during_construction}");
                 let handler = PanickingHandler {
@@ -685,10 +652,7 @@ mod tests {
                     during_construction,
                 };
                 let dispatcher: Arc<dyn ActiveMessageDispatcher> = match mode {
-                    "spawn" => {
-                        Arc::new(SpawnedDispatcher::new(handler, messenger.tracker().clone()))
-                    }
-                    "inline" => Arc::new(InlineDispatcher::new(handler)),
+                    "spawn" => Arc::new(SpawnedDispatcher::new(handler)),
                     _ => Arc::new(OrderedDispatcher::new(handler, OrderedConfig::global())),
                 };
                 messenger

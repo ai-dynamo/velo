@@ -134,18 +134,12 @@ pub struct StreamCancelRequest {
 /// A single slot in the sender-side registry, representing an active [`crate::streaming::sender::StreamSender`].
 ///
 /// Stored per active stream. The `_stream_cancel` handler retrieves and removes
-/// the entry then triggers both the user-facing cancellation token and the
-/// poison-drop mechanism via `rx_closer`.
+/// the entry then cancels its token. The token also wakes blocked sends.
 pub struct SenderEntry {
     /// Fires when `_stream_cancel` is received — user-facing via `cancellation_token()`.
     pub cancel_token: tokio_util::sync::CancellationToken,
     /// Graceful stop leaves the response channel open.
     pub stop_token: tokio_util::sync::CancellationToken,
-
-    /// Drop this to signal cancellation to `StreamSender::send()` via
-    /// `poison_tx.is_disconnected()`. Wrapped in `Mutex<Option<...>>` so the
-    /// cancel handler can take it exactly once.
-    pub rx_closer: std::sync::Mutex<Option<flume::Receiver<()>>>,
 }
 
 /// Sender-side registry of active [`SenderEntry`] slots.
@@ -161,11 +155,10 @@ pub struct SenderRegistry {
 }
 
 impl SenderRegistry {
-    /// Remove a sender and signal both cancellation APIs. Graceful cleanup only
+    /// Remove a sender and signal cancellation. Graceful cleanup only
     /// removes the entry, because it must leave queued output usable.
     pub(crate) fn cancel(&self, sender_stream_id: u64) {
         if let Some((_, entry)) = self.senders.remove(&sender_stream_id) {
-            drop(entry.rx_closer.lock().unwrap().take());
             entry.cancel_token.cancel();
         }
     }
@@ -209,8 +202,7 @@ pub(crate) fn request_sender_cancel(
 /// When the consumer-side anchor receives a cancel request, it sends a
 /// `_stream_cancel` active message to the sender's worker. This handler:
 /// 1. Looks up the [`SenderEntry`] by `sender_stream_id`.
-/// 2. Drops the `rx_closer` to poison the sender channel.
-/// 3. Cancels the user-facing `cancel_token`.
+/// 2. Removes the entry and cancels its token.
 ///
 /// Idempotent: if the entry is absent the handler returns `Ok(())` silently.
 pub fn create_stream_cancel_handler(
@@ -660,7 +652,7 @@ pub fn create_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::messe
                             })
                         } else {
                             // Derive a child token for this pump or watchdog so detach can cancel
-                            // it without poisoning the parent (which lives for the anchor's lifetime).
+                            // it without cancelling the parent (which lives for the anchor's lifetime).
                             let pump_cancel = entry.cancel_token.child_token();
                             entry.active_pump_token = Some(pump_cancel.clone());
                             let pump_frame_tx = entry.frame_tx.clone();

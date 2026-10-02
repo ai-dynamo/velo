@@ -47,7 +47,7 @@ pub(crate) enum SenderChannel {
 /// Typed sender for an MPSC anchor.
 ///
 /// Holds one of two channels ([`SenderChannel`]) plus the usual heartbeat
-/// task and cancel/poison plumbing. Created by
+/// task and cancellation token. Created by
 /// [`crate::AnchorManager::attach_mpsc_stream_anchor`] (local) or by the
 /// `_mpsc_anchor_attach` handler round-trip (remote).
 ///
@@ -65,7 +65,6 @@ pub struct MpscStreamSender<T> {
     cancel_token: CancellationToken,
     sender_stream_id: u64,
     sender_registry: Arc<crate::streaming::control::SenderRegistry>,
-    poison_tx: flume::Sender<()>,
     metrics: Option<Arc<crate::observability::VeloMetrics>>,
     _phantom: PhantomData<T>,
 }
@@ -100,7 +99,6 @@ impl<T: Serialize> MpscStreamSender<T> {
             cancel_token,
             sender_stream_id,
             sender_registry,
-            poison_tx,
         } = cancel;
         let heartbeat_cancel = cancel_token.child_token();
 
@@ -143,7 +141,6 @@ impl<T: Serialize> MpscStreamSender<T> {
             cancel_token,
             sender_stream_id,
             sender_registry,
-            poison_tx,
             metrics,
             _phantom: PhantomData,
         }
@@ -179,7 +176,7 @@ impl<T: Serialize> MpscStreamSender<T> {
 
     /// Send a typed item through the channel.
     pub async fn send(&self, item: T) -> Result<(), SendError> {
-        if self.poison_tx.is_disconnected() {
+        if self.cancel_token.is_cancelled() {
             return Err(SendError::ChannelClosed);
         }
         let bytes = rmp_serde::to_vec(&StreamFrame::Item(item))
@@ -212,7 +209,7 @@ impl<T: Serialize> MpscStreamSender<T> {
 
     /// Send a soft error string. Does not terminate the sender.
     pub async fn send_err(&self, msg: impl ToString) -> Result<(), SendError> {
-        if self.poison_tx.is_disconnected() {
+        if self.cancel_token.is_cancelled() {
             return Err(SendError::ChannelClosed);
         }
         let bytes = rmp_serde::to_vec(&StreamFrame::<()>::SenderError(msg.to_string()))
@@ -382,7 +379,6 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn cancellation_stops_heartbeats_while_the_sender_is_retained() {
         let (tx, rx) = flume::bounded(16);
-        let (poison_tx, _poison_rx) = flume::bounded(1);
         let cancel_token = CancellationToken::new();
         let heartbeat = Duration::from_secs(5);
         let sender = MpscStreamSender::<u32>::new(
@@ -394,13 +390,20 @@ mod tests {
                 cancel_token: cancel_token.clone(),
                 sender_stream_id: 1,
                 sender_registry: Arc::new(crate::streaming::control::SenderRegistry::default()),
-                poison_tx,
             },
             heartbeat,
             None,
         );
         assert_eq!(rx.recv_async().await.unwrap(), *cached_heartbeat());
         cancel_token.cancel();
+        assert!(matches!(
+            sender.send(42).await,
+            Err(SendError::ChannelClosed)
+        ));
+        assert!(matches!(
+            sender.send_err("late error").await,
+            Err(SendError::ChannelClosed)
+        ));
         tokio::task::yield_now().await;
         assert!(
             tokio::time::timeout(heartbeat * 2, rx.recv_async())
