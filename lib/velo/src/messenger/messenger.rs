@@ -18,6 +18,7 @@ use crate::PeerDiscovery;
 #[cfg(feature = "services")]
 use crate::messenger::VeloEvents;
 use crate::messenger::client::ActiveMessageClient;
+#[cfg(feature = "services")]
 use crate::messenger::client::builders::MessageBuilder;
 use crate::messenger::handlers::{Handler, HandlerManager};
 use crate::messenger::server::ActiveMessageServer;
@@ -678,6 +679,7 @@ impl Messenger {
     }
 
     /// Internal: create an unchecked message builder (for system messages)
+    #[cfg(feature = "services")]
     pub(crate) fn message_builder_unchecked(&self, handler: &str) -> MessageBuilder {
         MessageBuilder::new_unchecked(self.client.clone(), handler)
     }
