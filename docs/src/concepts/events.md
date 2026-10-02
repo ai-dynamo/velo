@@ -1,5 +1,7 @@
 # Events
 
+The event APIs require the default `services` feature. Messenger ACK/NACK messages are part of core and do not require it.
+
 Velo has a generational event system to coordinate async tasks. An event has a compact `u128` handle. You can share the handle between threads, or send it to another instance.
 
 ## Local events

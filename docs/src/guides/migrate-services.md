@@ -27,7 +27,7 @@ The following APIs need `services`:
 
 `nats-discovery`, `etcd`, `nats-queue`, and `queue-messenger` enable `services`
 automatically. They still select their own backends. `nats-transport` does not
-enable `services`. Simulation remains independent of this feature.
+enable `services`. This is a deliberate coarse boundary: selecting a discovery or queue backend also includes the other service APIs and their shared dependencies. It keeps the supported feature combinations small. Simulation remains independent of this feature.
 
 If an existing dependency disables defaults and uses these APIs, add the feature:
 
@@ -64,7 +64,7 @@ Do not combine `mux_only()` with `stream_config()` or `stream_bind_addr()`.
 active `VELO_MESSENGER_MUX_DISABLE` switch. It validates these choices before
 starting transports. Peers that need a per-stream transport receive an attach
 error. There is no silent fallback. To restore that fallback, remove `mux_only()`
-and restart the instance.
+and restart the instance. The fleet-wide mux kill switch is therefore not a fallback for mux-only nodes.
 
 The compile-time services choice and the runtime stream choice are independent.
 A node can keep all services and use mux-only streams, or omit services and keep
