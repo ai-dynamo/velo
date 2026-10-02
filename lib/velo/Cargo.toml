@@ -13,8 +13,11 @@ repository.workspace = true
 keywords.workspace = true
 
 [features]
-# `default` matches the previous workspace defaults (HTTP + NATS messaging + gRPC).
-default = ["http", "nats-transport", "grpc"]
+# Full service APIs remain available in default builds.
+default = ["http", "nats-transport", "grpc", "services"]
+
+# Distributed events, named work queues, and concrete discovery backends.
+services = ["dep:fs4", "dep:lru"]
 
 # Messenger transports
 http = ["dep:axum"]
@@ -29,12 +32,12 @@ ucx = ["dep:ucx-rs", "dep:serde_bytes", "dep:offset-allocator"]
 quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:ring"]
 
 # Discovery backends
-nats-discovery = ["dep:async-nats"]
-etcd = ["dep:etcd-client"]
+nats-discovery = ["services", "dep:async-nats"]
+etcd = ["services", "dep:etcd-client"]
 
 # Queue backends
-nats-queue = ["dep:async-nats"]
-queue-messenger = []
+nats-queue = ["services", "dep:async-nats"]
+queue-messenger = ["services"]
 
 # Optional subsystems
 distributed-tracing = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
@@ -54,9 +57,9 @@ dashmap = { workspace = true }
 derive_builder = { workspace = true }
 derive-getters = { workspace = true }
 flume = { workspace = true }
-fs4 = { version = "0.13", features = ["tokio"] }
+fs4 = { version = "0.13", features = ["tokio"], optional = true }
 futures = { workspace = true }
-lru = "0.18.0"
+lru = { version = "0.18.0", optional = true }
 parking_lot = { workspace = true }
 prometheus = { workspace = true }
 rmp-serde = { workspace = true }
@@ -301,3 +304,8 @@ path = "tests/transports/uds_shutdown.rs"
 name = "transports_zmq"
 path = "tests/transports/zmq_integration.rs"
 required-features = ["zmq"]
+
+[[test]]
+name = "two_instance_events"
+path = "tests/two_instance_events.rs"
+required-features = ["services"]

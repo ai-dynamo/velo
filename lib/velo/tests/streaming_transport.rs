@@ -307,6 +307,7 @@ async fn test_velo_builder_default_stream_config_is_tcp() {
 /// each with discovery, has worker B resolve worker A via
 /// `discover_and_register_peer`, and then drives a full attach + send cycle
 /// across the streaming transport. A pre-fix Velo fails at the attach step.
+#[cfg(feature = "services")]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_discover_and_register_peer_fans_out_to_streaming() {
     use futures::StreamExt;
@@ -461,4 +462,195 @@ async fn turning_the_mux_off_falls_back_to_the_per_stream_transport() {
         ..velo::streaming::MuxConfig::default()
     };
     assert_eq!(negotiated_key(Some(off)).await, "tcp-stream");
+}
+
+async fn tcp_node(builder: velo::VeloBuilder) -> Arc<velo::Velo> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let transport = velo::transports::tcp::TcpTransportBuilder::new()
+        .from_listener(listener)
+        .unwrap()
+        .build()
+        .unwrap();
+    builder
+        .add_transport(Arc::new(transport))
+        .build()
+        .await
+        .unwrap()
+}
+
+/// All stream forms and transparent large-message transfers work without an
+/// extra stream listener, including when the services feature is absent.
+#[tokio::test(flavor = "multi_thread")]
+async fn mux_only_carries_streams_and_large_messages() {
+    use bytes::Bytes;
+    use futures::StreamExt;
+    use velo::streaming::{MESSENGER_MUX_KEY, StreamFrame, mpsc::MpscFrame};
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let producer = tcp_node(velo::Velo::builder().mux_only()).await;
+        let consumer = tcp_node(velo::Velo::builder().mux_only()).await;
+        producer.register_peer(consumer.peer_info()).unwrap();
+        consumer.register_peer(producer.peer_info()).unwrap();
+        for node in [&producer, &consumer] {
+            let registry = &node.anchor_manager().transport_registry;
+            assert_eq!(registry.len(), 1);
+            assert!(registry.contains_key(MESSENGER_MUX_KEY));
+            assert!(
+                node.peer_info()
+                    .worker_address
+                    .get_entry("tcp-stream")
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        let payloads = [vec![1, 2, 3], vec![7; 512 * 1024]];
+        for prebound in [false, true] {
+            let mut anchor = consumer.create_anchor::<Vec<u8>>();
+            let sender = if prebound {
+                let ticket = consumer.prebind_anchor(anchor.handle()).unwrap();
+                producer
+                    .open_anchor_stream(anchor.handle(), ticket)
+                    .await
+                    .unwrap()
+            } else {
+                producer.attach_anchor(anchor.handle()).await.unwrap()
+            };
+            for payload in &payloads {
+                sender.send(payload.clone()).await.unwrap();
+            }
+            sender.finalize().unwrap();
+            let mut received = Vec::new();
+            while let Some(frame) = anchor.next().await {
+                if let StreamFrame::Item(payload) = frame.unwrap() {
+                    received.push(payload);
+                }
+            }
+            assert_eq!(received, payloads);
+        }
+
+        let mut anchor = consumer.create_mpsc_anchor::<u32>();
+        let s1 = producer
+            .attach_mpsc_anchor::<u32>(anchor.handle())
+            .await
+            .unwrap();
+        let s2 = producer
+            .attach_mpsc_anchor::<u32>(anchor.handle())
+            .await
+            .unwrap();
+        s1.send(10).await.unwrap();
+        s2.send(20).await.unwrap();
+        let mut received = Vec::new();
+        while received.len() < 2 {
+            if let (id, MpscFrame::Item(value)) = anchor.next().await.unwrap().unwrap() {
+                received.push((id, value));
+            }
+        }
+        assert!(received.contains(&(s1.sender_id(), 10)));
+        assert!(received.contains(&(s2.sender_id(), 20)));
+        anchor.cancel();
+        drop((s1, s2));
+
+        consumer
+            .register_handler(
+                velo::Handler::unary_handler("echo", |ctx| Ok(Some(ctx.payload))).build(),
+            )
+            .unwrap();
+        let large = Bytes::from(payloads[1].clone());
+        let response = producer
+            .unary("echo")
+            .unwrap()
+            .raw_payload(large.clone())
+            .instance(consumer.instance_id())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response, large);
+        producer.shutdown(velo::ShutdownPolicy::WaitForever).await;
+        consumer.shutdown(velo::ShutdownPolicy::WaitForever).await;
+    })
+    .await
+    .expect("mux-only operations must finish");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mux_only_rejects_peers_that_need_a_stream_listener() {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mux = tcp_node(velo::Velo::builder().mux_only()).await;
+        let legacy = tcp_node(
+            velo::Velo::builder()
+                .messenger_mux(velo::streaming::MuxConfig {
+                    enabled: false,
+                    ..Default::default()
+                })
+                .unwrap(),
+        )
+        .await;
+        mux.register_peer(legacy.peer_info()).unwrap();
+        legacy.register_peer(mux.peer_info()).unwrap();
+        let anchor = mux.create_anchor::<u32>();
+        let error = legacy
+            .attach_anchor::<u32>(anchor.handle())
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not support the messenger mux"),
+            "{error}"
+        );
+        let mpsc = mux.create_mpsc_anchor::<u32>();
+        let error = legacy
+            .attach_mpsc_anchor::<u32>(mpsc.handle())
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not support the messenger mux"),
+            "{error}"
+        );
+        let legacy_anchor = legacy.create_anchor::<u32>();
+        let error = mux
+            .attach_anchor::<u32>(legacy_anchor.handle())
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported streaming transport key"),
+            "{error}"
+        );
+        drop((anchor, mpsc, legacy_anchor));
+        mux.shutdown(velo::ShutdownPolicy::WaitForever).await;
+        legacy.shutdown(velo::ShutdownPolicy::WaitForever).await;
+    })
+    .await
+    .expect("incompatible peers must fail promptly");
+}
+
+#[tokio::test]
+async fn mux_only_rejects_conflicting_configuration_before_startup() {
+    for builder in [
+        velo::Velo::builder()
+            .mux_only()
+            .stream_config(velo::StreamConfig::Tcp(None))
+            .unwrap(),
+        velo::Velo::builder()
+            .stream_bind_addr("127.0.0.1".parse().unwrap())
+            .mux_only(),
+        velo::Velo::builder()
+            .mux_only()
+            .messenger_mux(velo::streaming::MuxConfig {
+                enabled: false,
+                ..Default::default()
+            })
+            .unwrap(),
+    ] {
+        let error = match builder.build().await {
+            Ok(_) => panic!("conflicting mux-only configuration was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("mux_only"), "{error}");
+    }
 }

@@ -1660,7 +1660,7 @@ impl AnchorManager {
         offered: &[velo_ext::TransportKey],
         peer: velo_ext::WorkerId,
         lane_key: Option<u64>,
-    ) -> crate::streaming::negotiation::Selection {
+    ) -> anyhow::Result<crate::streaming::negotiation::Selection> {
         crate::streaming::negotiation::select(
             offered,
             self.mux.get(),

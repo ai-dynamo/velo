@@ -379,8 +379,11 @@ pub fn create_mpsc_anchor_attach_handler(manager: Arc<AnchorManager>) -> crate::
                     sender,
                     req.lane_key,
                 );
-                let (transport_rx, terms) = match selection.bind(local_id, routing_session_id).await
-                {
+                let bound = match selection {
+                    Ok(selection) => selection.bind(local_id, routing_session_id).await,
+                    Err(error) => Err(error),
+                };
+                let (transport_rx, terms) = match bound {
                     Ok(bound) => bound,
                     Err(e) => {
                         manager.record_streaming_operation(

@@ -17,9 +17,11 @@ use anyhow::Result;
 
 // ── Subsystem modules (each was previously a sibling crate) ────────────────
 pub mod discovery;
+#[cfg(feature = "services")]
 pub mod events;
 pub mod messenger;
 pub mod observability;
+#[cfg(feature = "services")]
 pub mod queue;
 pub mod rendezvous;
 pub mod streaming;
@@ -48,13 +50,16 @@ pub use crate::messenger::{
     FireResult, Handler, HandlerExecutor, Messenger, MessengerBuilder, OrderedConfig, OrderingKey,
     OverflowPolicy, PeerDiscovery, SyncExecutor, SyncResult, TypedContext, TypedUnaryBuilder,
     TypedUnaryHandlerBuilder, TypedUnaryResult, UnaryBuilder, UnaryHandlerBuilder, UnaryResult,
-    UnifiedResponse, VeloEvents,
+    UnifiedResponse,
 };
 
 // Events
+#[cfg(feature = "services")]
 pub use crate::events::{
     Event, EventAwaiter, EventBackend, EventHandle, EventManager, EventPoison, EventStatus,
 };
+#[cfg(feature = "services")]
+pub use crate::messenger::VeloEvents;
 
 // Streaming (flat at root for convenience; full surface still under [`streaming`])
 pub use crate::streaming::control::StreamOpenTicket;
@@ -138,7 +143,8 @@ impl Default for GrpcConfig {
 ///
 /// # Default
 ///
-/// If neither [`VeloBuilder::stream_config`] nor [`VeloBuilder::stream_bind_addr`]
+/// Unless [`VeloBuilder::mux_only`] is set, if neither
+/// [`VeloBuilder::stream_config`] nor [`VeloBuilder::stream_bind_addr`]
 /// is called, the builder defaults to [`StreamConfig::Tcp(None)`](StreamConfig::Tcp)
 /// — bind `0.0.0.0:<ephemeral>` and advertise every UP non-loopback interface
 /// via [`Vec<InterfaceEndpoint>`](crate::transports::utils::interfaces::InterfaceEndpoint)
@@ -182,7 +188,7 @@ pub struct Velo {
     /// `FrameTransport`s) and so `peer_info()` can merge the streaming
     /// listener's WorkerAddress entry into the messenger-side WorkerAddress.
     stream_transport: Arc<dyn crate::streaming::FrameTransport>,
-    owned_stream_transport: OwnedStreamTransport,
+    owned_stream_transport: Option<OwnedStreamTransport>,
     /// RDMA registration layer, present only when a UCX transport was added
     /// through [`VeloBuilder::add_ucx_transport`].
     #[cfg(all(target_os = "linux", feature = "ucx"))]
@@ -239,6 +245,7 @@ pub struct VeloBuilder {
     inner: MessengerBuilder,
     stream_config: Option<StreamConfig>,
     mux_config: Option<crate::streaming::MuxConfig>,
+    mux_only: bool,
     metrics: Option<Arc<VeloMetrics>>,
     /// The concrete UCX transport, kept beside the type-erased one so the
     /// registration layer can reach its RMA endpoint. `Arc<dyn Transport>`
@@ -258,6 +265,7 @@ impl VeloBuilder {
             inner: MessengerBuilder::new(),
             stream_config: None,
             mux_config: None,
+            mux_only: false,
             metrics: None,
             #[cfg(all(target_os = "linux", feature = "ucx"))]
             ucx_transport: None,
@@ -356,6 +364,16 @@ impl VeloBuilder {
         Ok(self)
     }
 
+    /// Use only the messenger mux for remote streams, with no extra listener.
+    ///
+    /// Peers must support the messenger mux. An explicit `stream_config` or
+    /// `stream_bind_addr`, a disabled mux, or an active
+    /// `VELO_MESSENGER_MUX_DISABLE` makes `build` return an error.
+    pub fn mux_only(mut self) -> Self {
+        self.mux_only = true;
+        self
+    }
+
     /// Set the peer discovery backend.
     pub fn discovery(mut self, discovery: Arc<dyn PeerDiscovery>) -> Self {
         self.inner = self.inner.discovery(discovery);
@@ -371,114 +389,79 @@ impl VeloBuilder {
 
     /// Build the Velo system with the configured transports and discovery.
     ///
-    /// Construction order:
-    /// 1. Build Messenger (async)
-    /// 2. Extract WorkerId
-    /// 3. Resolve the streaming transport from `stream_config` (default: TCP
-    ///    on `0.0.0.0:0` with multi-interface advertise via WorkerAddress).
-    /// 4. Merge the streaming transport's `address()` into the local
-    ///    PeerInfo's WorkerAddress (so peers can discover the streaming
-    ///    listener alongside messenger endpoints).
-    /// 5. Create AnchorManager via builder, with the streaming transport
-    ///    wired in as the default and registered under its TransportKey,
-    ///    beside the mux unless the mux is switched off.
-    /// 6. Register streaming control-plane handlers on Messenger.
-    /// 7. Assemble Velo struct, holding a clone of the streaming transport
-    ///    so `register_peer` can fan out to it on every newly-known peer.
+    /// Validates the streaming mode before starting transports. Default builds
+    /// install the mux beside a per-stream TCP or gRPC listener. `mux_only`
+    /// installs only the mux. Both modes retain the full rendezvous API.
     pub async fn build(self) -> Result<Arc<Velo>> {
-        // Step 1: Build Messenger.
+        anyhow::ensure!(
+            !self.mux_only || self.stream_config.is_none(),
+            "mux_only cannot be combined with stream_config or stream_bind_addr"
+        );
+        let config = resolve_mux_config(
+            self.mux_config.unwrap_or_default(),
+            messenger_mux_disabled_by_env(),
+            self.mux_only,
+        )?;
         let messenger = self.inner.build().await?;
         let mut startup = StartupGuard(Some(Arc::clone(&messenger)));
-
-        // Step 2: Extract worker_id (carried on the local PeerInfo).
         let worker_id = messenger.instance_id().worker_id();
-
-        // Step 3: Resolve the streaming transport. Default is Tcp(None) —
-        // bind on 0.0.0.0:0 and advertise every UP non-loopback interface
-        // via Vec<InterfaceEndpoint> in WorkerAddress. Multi-node correctness
-        // comes from the advertise list, not from defaulting away from TCP.
-        //
-        // Metrics are installed before the transport is type-erased into
-        // `Arc<dyn FrameTransport>` because `set_metrics` is a concrete
-        // method (the FrameTransport trait stays observability-free so
-        // out-of-tree implementors don't take a `prometheus` dep).
-        let resolved = self.stream_config.unwrap_or(StreamConfig::Tcp(None));
-        let (stream_transport, owned_stream_transport): (
-            Arc<dyn crate::streaming::FrameTransport>,
-            OwnedStreamTransport,
-        ) = match resolved {
-            StreamConfig::Tcp(tcp_cfg) => {
-                let bind_addr = tcp_cfg
-                    .map(|c| c.bind_addr)
-                    .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
-                let tcp = crate::streaming::TcpFrameTransport::new(bind_addr).await?;
-                if let Some(m) = self.metrics.as_ref() {
-                    tcp.set_metrics(Arc::clone(m));
-                }
-                (tcp.clone() as _, OwnedStreamTransport::Tcp(tcp))
-            }
-            #[cfg(feature = "grpc")]
-            StreamConfig::Grpc(grpc_cfg) => {
-                let bind_addr = grpc_cfg
-                    .map(|c| c.bind_addr)
-                    .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
-                let grpc = crate::streaming::GrpcFrameTransport::new(bind_addr)
-                    .await
-                    .map_err(|e| {
-                        anyhow::anyhow!("Failed to start gRPC streaming transport: {}", e)
-                    })?;
-                if let Some(m) = self.metrics.as_ref() {
-                    grpc.set_metrics(Arc::clone(m));
-                }
-                (grpc.clone() as _, OwnedStreamTransport::Grpc(grpc))
-            }
-        };
-
-        // Step 4: Build the streaming-transport registry, keyed by
-        // TransportKey: the chosen transport here, and the mux in Step 5.
-        // The AnchorManager passes the response's `streaming_transport_key`
-        // through this map to find the FrameTransport on the client side at
-        // attach time.
-        let mut registry: std::collections::HashMap<
-            String,
-            Arc<dyn crate::streaming::FrameTransport>,
-        > = std::collections::HashMap::new();
-        registry.insert(
-            stream_transport.key().as_str().to_string(),
-            Arc::clone(&stream_transport),
-        );
-
-        // Step 5: Build the mux unless the caller switched it off (it is on by
-        // default; see `messenger_mux`). It joins the registry *beside* the
-        // per-stream transport rather than replacing it: negotiation answers
-        // `messenger-mux-v2` only to peers that advertised it, and every other
-        // peer is still answered — and must still be served — on the
-        // per-stream key.
-        let mut config = self.mux_config.unwrap_or_default();
-        // Read once, here, for the reason the RDMA kill switch is: one process
-        // must not answer half its attaches one way and half the other.
-        if config.enabled && messenger_mux_disabled_by_env() {
-            tracing::info!(
-                "VELO_MESSENGER_MUX_DISABLE is set: the messenger mux is off. \
-                 Streams negotiate the per-stream transport."
-            );
-            config.enabled = false;
-        }
+        let mut registry = std::collections::HashMap::new();
         let mux = if config.enabled {
             let mux = crate::streaming::messenger_mux::MessengerMuxTransport::new(
                 Arc::clone(&messenger),
                 config,
                 self.metrics.clone(),
             )?;
-            let mux_key = crate::streaming::FrameTransport::key(mux.as_ref());
             registry.insert(
-                mux_key.as_str().to_string(),
+                crate::streaming::FrameTransport::key(mux.as_ref())
+                    .as_str()
+                    .to_string(),
                 Arc::clone(&mux) as Arc<dyn crate::streaming::FrameTransport>,
             );
             Some(mux)
         } else {
             None
         };
+
+        // Default builds keep a per-stream listener for peers without the mux.
+        // In mux-only mode, the mux itself fills the default transport field.
+        let (stream_transport, owned_stream_transport): (
+            Arc<dyn crate::streaming::FrameTransport>,
+            Option<OwnedStreamTransport>,
+        ) = if self.mux_only {
+            (
+                Arc::clone(mux.as_ref().expect("mux-only config was validated")) as _,
+                None,
+            )
+        } else {
+            match self.stream_config.unwrap_or(StreamConfig::Tcp(None)) {
+                StreamConfig::Tcp(tcp_cfg) => {
+                    let bind_addr = tcp_cfg.unwrap_or_default().bind_addr;
+                    let tcp = crate::streaming::TcpFrameTransport::new(bind_addr).await?;
+                    if let Some(metrics) = &self.metrics {
+                        tcp.set_metrics(Arc::clone(metrics));
+                    }
+                    (tcp.clone() as _, Some(OwnedStreamTransport::Tcp(tcp)))
+                }
+                #[cfg(feature = "grpc")]
+                StreamConfig::Grpc(grpc_cfg) => {
+                    let bind_addr = grpc_cfg.unwrap_or_default().bind_addr;
+                    let grpc = crate::streaming::GrpcFrameTransport::new(bind_addr)
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!("Failed to start gRPC streaming transport: {e}")
+                        })?;
+                    if let Some(metrics) = &self.metrics {
+                        grpc.set_metrics(Arc::clone(metrics));
+                    }
+                    (grpc.clone() as _, Some(OwnedStreamTransport::Grpc(grpc)))
+                }
+            }
+        };
+        registry.insert(
+            stream_transport.key().as_str().to_string(),
+            Arc::clone(&stream_transport),
+        );
 
         let anchor_manager = Arc::new(
             crate::streaming::AnchorManagerBuilder::default()
@@ -593,6 +576,22 @@ fn rdma_rendezvous_disabled_by_env() -> bool {
             .ok()
             .as_deref(),
     )
+}
+
+fn resolve_mux_config(
+    mut config: crate::streaming::MuxConfig,
+    disabled_by_env: bool,
+    mux_only: bool,
+) -> Result<crate::streaming::MuxConfig> {
+    if disabled_by_env && config.enabled {
+        tracing::info!("VELO_MESSENGER_MUX_DISABLE is set: disabling the messenger mux");
+        config.enabled = false;
+    }
+    anyhow::ensure!(
+        config.enabled || !mux_only,
+        "mux_only requires the messenger mux; it was disabled by config or VELO_MESSENGER_MUX_DISABLE"
+    );
+    Ok(config)
 }
 
 /// Whether `VELO_MESSENGER_MUX_DISABLE` asks for the messenger mux to be
@@ -805,7 +804,9 @@ impl Velo {
     pub async fn shutdown(&self, policy: ShutdownPolicy) {
         self.graceful_shutdown(policy).await;
         self.anchor_manager.shutdown().await;
-        self.owned_stream_transport.shutdown().await;
+        if let Some(transport) = &self.owned_stream_transport {
+            transport.shutdown().await;
+        }
         self.messenger.closed().await;
     }
 
@@ -909,11 +910,13 @@ impl Velo {
     }
 
     /// Get the distributed event system.
+    #[cfg(feature = "services")]
     pub fn events(&self) -> &Arc<VeloEvents> {
         self.messenger.events()
     }
 
     /// Create an EventManager wired with the distributed backend.
+    #[cfg(feature = "services")]
     pub fn event_manager(&self) -> EventManager {
         self.messenger.event_manager()
     }
@@ -999,6 +1002,7 @@ impl Velo {
     }
 
     /// Check whether a specific instance has subscribed to a locally-owned event.
+    #[cfg(feature = "services")]
     pub fn has_event_subscriber(&self, handle: EventHandle, subscriber: InstanceId) -> bool {
         self.messenger.has_event_subscriber(handle, subscriber)
     }
@@ -1446,6 +1450,16 @@ impl Velo {
 mod tests {
     use super::*;
 
+    #[test]
+    fn mux_only_rejects_the_environment_kill_switch() {
+        assert!(resolve_mux_config(Default::default(), true, true).is_err());
+        assert!(
+            !resolve_mux_config(Default::default(), true, false)
+                .unwrap()
+                .enabled
+        );
+    }
+
     /// Every kill switch fires on an affirmative and on nothing else.
     ///
     /// The asymmetry is deliberate and worth pinning down: a switch that fired
@@ -1587,29 +1601,32 @@ mod tests {
             .await
             .unwrap();
 
-        let stream_addr = match &velo.owned_stream_transport {
+        let stream_addr = match velo.owned_stream_transport.as_ref().unwrap() {
             OwnedStreamTransport::Tcp(transport) => transport.bound_addr(),
             #[cfg(feature = "grpc")]
             OwnedStreamTransport::Grpc(_) => unreachable!(),
         };
 
-        let pending_event = velo.messenger.events().new_event().unwrap().into_handle();
-        #[derive(serde::Serialize)]
-        struct Subscription {
-            handle: u128,
-            subscriber_worker: u64,
-            subscriber_instance: InstanceId,
+        #[cfg(feature = "services")]
+        {
+            let pending_event = velo.messenger.events().new_event().unwrap().into_handle();
+            #[derive(serde::Serialize)]
+            struct Subscription {
+                handle: u128,
+                subscriber_worker: u64,
+                subscriber_instance: InstanceId,
+            }
+            let subscribe = Subscription {
+                handle: pending_event.raw(),
+                subscriber_worker: velo.instance_id().worker_id().as_u64(),
+                subscriber_instance: velo.instance_id(),
+            };
+            velo.messenger
+                .events()
+                .handle_subscribe(bytes::Bytes::from(serde_json::to_vec(&subscribe).unwrap()))
+                .await
+                .unwrap();
         }
-        let subscribe = Subscription {
-            handle: pending_event.raw(),
-            subscriber_worker: velo.instance_id().worker_id().as_u64(),
-            subscriber_instance: velo.instance_id(),
-        };
-        velo.messenger
-            .events()
-            .handle_subscribe(bytes::Bytes::from(serde_json::to_vec(&subscribe).unwrap()))
-            .await
-            .unwrap();
 
         let anchor: crate::streaming::StreamAnchor<String> = velo.create_anchor::<String>();
         let handle = anchor.handle();
@@ -1684,7 +1701,7 @@ mod tests {
             .graceful_shutdown(ShutdownPolicy::WaitForever)
             .await;
         manager.upgrade().unwrap().shutdown().await;
-        owned_transport.shutdown().await;
+        owned_transport.unwrap().shutdown().await;
         retained.closed().await;
     }
 }
