@@ -338,7 +338,8 @@ impl VeloBuilder {
     /// to tune it, or with `enabled: false` to turn it off, in which case
     /// nothing is registered and nothing is advertised.
     ///
-    /// The per-stream transport stays configured either way — a mux-enabled
+    /// Unless `mux_only()` is selected, the per-stream transport stays
+    /// configured either way — a mux-enabled
     /// node registers both, and each attach picks between them from what the
     /// peer advertised, so a peer without the mux is still served. **Rollback
     /// is the same flag**: set it to `false` and the node stops advertising
@@ -347,8 +348,8 @@ impl VeloBuilder {
     /// a key that is never advertised is never selected. An application that
     /// never calls this can still turn the mux off: set
     /// `VELO_MESSENGER_MUX_DISABLE=1` and restart. The variable is read once,
-    /// in [`build`](Self::build), and it wins over `enabled: true` set in
-    /// code, as an operator's switch must.
+    /// per [`build`](Self::build), and it wins over `enabled: true` set in
+    /// code. With `mux_only()`, disabling the mux makes the build fail.
     ///
     /// Only one mux may be installed per instance: its `_stream_batch` handler
     /// is registered on the messenger for its lifetime. The messenger would
@@ -405,19 +406,12 @@ impl VeloBuilder {
         let messenger = self.inner.build().await?;
         let mut startup = StartupGuard(Some(Arc::clone(&messenger)));
         let worker_id = messenger.instance_id().worker_id();
-        let mut registry = std::collections::HashMap::new();
         let mux = if config.enabled {
             let mux = crate::streaming::messenger_mux::MessengerMuxTransport::new(
                 Arc::clone(&messenger),
                 config,
                 self.metrics.clone(),
             )?;
-            registry.insert(
-                crate::streaming::FrameTransport::key(mux.as_ref())
-                    .as_str()
-                    .to_string(),
-                Arc::clone(&mux) as Arc<dyn crate::streaming::FrameTransport>,
-            );
             Some(mux)
         } else {
             None
@@ -429,10 +423,10 @@ impl VeloBuilder {
             Arc<dyn crate::streaming::FrameTransport>,
             Option<OwnedStreamTransport>,
         ) = if self.mux_only {
-            (
-                Arc::clone(mux.as_ref().expect("mux-only config was validated")) as _,
-                None,
-            )
+            let mux = mux
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("mux_only requires the messenger mux"))?;
+            (Arc::clone(mux) as _, None)
         } else {
             match self.stream_config.unwrap_or(StreamConfig::Tcp(None)) {
                 StreamConfig::Tcp(tcp_cfg) => {
@@ -458,10 +452,21 @@ impl VeloBuilder {
                 }
             }
         };
+        let mut registry = std::collections::HashMap::new();
         registry.insert(
             stream_transport.key().as_str().to_string(),
             Arc::clone(&stream_transport),
         );
+        if !self.mux_only
+            && let Some(mux) = &mux
+        {
+            registry.insert(
+                crate::streaming::FrameTransport::key(mux.as_ref())
+                    .as_str()
+                    .to_string(),
+                Arc::clone(mux) as Arc<dyn crate::streaming::FrameTransport>,
+            );
+        }
 
         let anchor_manager = Arc::new(
             crate::streaming::AnchorManagerBuilder::default()
@@ -478,17 +483,17 @@ impl VeloBuilder {
             anchor_manager.install_mux(mux)?;
         }
 
-        // Step 6: Register streaming control-plane handlers
+        // Register streaming control-plane handlers
         anchor_manager.register_handlers(Arc::clone(&messenger))?;
 
-        // Step 7: Create RendezvousManager and register handlers
+        // Create RendezvousManager and register handlers
         let rendezvous_manager = Arc::new(match self.metrics.as_ref() {
             Some(m) => crate::rendezvous::RendezvousManager::with_metrics(worker_id, Arc::clone(m)),
             None => crate::rendezvous::RendezvousManager::new(worker_id),
         });
         rendezvous_manager.register_handlers(Arc::clone(&messenger))?;
 
-        // Step 8: Enable transparent large payload support
+        // Enable transparent large payload support
         let stager = Arc::new(crate::rendezvous::RendezvousStager::new(Arc::clone(
             &rendezvous_manager,
         )));
@@ -497,7 +502,7 @@ impl VeloBuilder {
         )));
         messenger.set_large_payload_support(stager, resolver);
 
-        // Step 9: Build the RDMA registration layer, if a UCX transport was
+        // Build the RDMA registration layer, if a UCX transport was
         // added through `add_ucx_transport`.
         //
         // Ordering: `MessengerBuilder::build` above has already called
@@ -543,7 +548,7 @@ impl VeloBuilder {
             None => None,
         };
 
-        // Step 10: Assemble Velo
+        // Assemble Velo
         startup.0.take();
         Ok(Arc::new(Velo {
             messenger,
@@ -583,14 +588,14 @@ fn resolve_mux_config(
     disabled_by_env: bool,
     mux_only: bool,
 ) -> Result<crate::streaming::MuxConfig> {
+    anyhow::ensure!(
+        !mux_only || (config.enabled && !disabled_by_env),
+        "mux_only requires the messenger mux; it was disabled by config or VELO_MESSENGER_MUX_DISABLE"
+    );
     if disabled_by_env && config.enabled {
         tracing::info!("VELO_MESSENGER_MUX_DISABLE is set: disabling the messenger mux");
         config.enabled = false;
     }
-    anyhow::ensure!(
-        config.enabled || !mux_only,
-        "mux_only requires the messenger mux; it was disabled by config or VELO_MESSENGER_MUX_DISABLE"
-    );
     Ok(config)
 }
 

@@ -70,3 +70,14 @@ The compile-time services choice and the runtime stream choice are independent.
 A node can keep all services and use mux-only streams, or omit services and keep
 the default stream listener. Use `Velo::shutdown(policy)` to close either kind
 of instance. See [Shutdown and drain](../concepts/shutdown.md).
+
+If a peer accepts an attach but the producer cannot connect, the producer waits
+up to one second for rollback before it returns the original connect error.
+SPSC rollback checks the producer identity so a late cleanup cannot detach a
+replacement. MPSC uses its sender ID. Rollback does not emit a `Detached` frame.
+
+Older peers may not support the SPSC rollback handler. Cleanup failure is logged;
+there is no unqualified detach fallback. Existing receiver watchdogs and accept
+timeouts remain the backstop. A legacy transport's pending bind can remain until
+its accept timeout even after anchor rollback succeeds. Dropping the attach
+future, or losing the attach reply, is outside this cleanup guarantee.
