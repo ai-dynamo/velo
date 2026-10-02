@@ -177,6 +177,9 @@ impl Batcher {
             self.flush().await;
             cap = self.ensure_batch();
             if BATCH_HEADER_LEN.saturating_add(needed) > cap {
+                // The refreshed eager budget shrank. Refund the empty batch's
+                // sequence before the singleton reserves the next one.
+                self.flush().await;
                 self.send_singleton(index, bytes, terminal).await;
                 return;
             }

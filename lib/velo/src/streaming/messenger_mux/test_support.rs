@@ -38,6 +38,8 @@ pub(super) struct StallingTransport {
     offered: AtomicUsize,
     /// Of those, the ones admission did not take synchronously.
     stalled: AtomicUsize,
+    /// One changed budget report, then the usual unknown transport limit.
+    next_message_limit: AtomicUsize,
 }
 
 impl StallingTransport {
@@ -51,8 +53,13 @@ impl StallingTransport {
             peers: Mutex::new(HashSet::new()),
             offered: AtomicUsize::new(0),
             stalled: AtomicUsize::new(0),
+            next_message_limit: AtomicUsize::new(0),
         });
         (transport, rx)
+    }
+
+    pub(super) fn report_next_message_limit(&self, bytes: usize) {
+        self.next_message_limit.store(bytes, Ordering::Release);
     }
 
     /// How many frames the messenger has handed this transport.
@@ -117,6 +124,11 @@ impl velo_ext::Transport for StallingTransport {
             self.stalled.fetch_add(1, Ordering::AcqRel);
         }
         outcome
+    }
+
+    fn max_message_size(&self, _target: velo_ext::InstanceId) -> Option<usize> {
+        let bytes = self.next_message_limit.swap(0, Ordering::AcqRel);
+        (bytes != 0).then_some(bytes)
     }
 
     fn start(

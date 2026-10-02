@@ -1,18 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The three-way batch clamp, at the level where all three terms are reachable.
-//!
-//! Two of them bind end to end and have wire tests over in [`super::egress`].
-//! The eager budget does not and cannot in process: every messenger transport
-//! reports either the 256 KiB rendezvous staging threshold or its own smaller
-//! ceiling — NATS' ~1 MiB message limit loses to the threshold — and both are
-//! far above the 64 KiB coalescing threshold, so the eager term is never the
-//! minimum on a loopback pair. It would bind on a transport with a message
-//! limit under 64 KiB, and this is where that node is expressible.
+//! Configured and eager batch limits, including small transport budgets.
 
 use crate::streaming::messenger_mux::peer_batcher::writer::{MIN_BATCH_CAP, batch_cap};
-use crate::transports::tcp::framing::COALESCE_THRESHOLD;
 
 #[test]
 fn the_configured_cap_binds_when_it_is_the_smallest() {
@@ -20,16 +11,13 @@ fn the_configured_cap_binds_when_it_is_the_smallest() {
 }
 
 #[test]
-fn the_coalescing_threshold_binds_over_a_larger_configured_cap() {
-    assert_eq!(batch_cap(1 << 20, usize::MAX), COALESCE_THRESHOLD);
+fn a_larger_configured_cap_is_not_limited_by_tcp_coalescing() {
+    assert_eq!(batch_cap(120 * 1024, usize::MAX), 120 * 1024);
+    assert_eq!(batch_cap(1 << 20, 256 * 1024), 256 * 1024);
 }
 
 #[test]
-fn a_transport_with_a_tight_eager_budget_binds_over_both() {
-    // The arm no in-process pair reaches: a peer served by a transport whose
-    // message limit lands under the coalescing threshold. Exceeding it does not
-    // fail the flush — it silently stages the batch through rendezvous, paying a
-    // round trip on behalf of every slot packed into it.
+fn a_transport_with_a_tight_eager_budget_bounds_the_batch() {
     assert_eq!(batch_cap(60 * 1024, 8192), 8192);
     assert_eq!(batch_cap(1 << 20, 8192), 8192);
 }

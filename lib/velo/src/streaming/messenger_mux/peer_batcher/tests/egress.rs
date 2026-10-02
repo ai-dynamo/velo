@@ -114,19 +114,46 @@ async fn the_configured_cap_bounds_every_batch() {
     assert_eq!(delivered, 12);
 }
 
-/// The coalescing threshold is the clamp that binds when nothing else does.
-///
-/// It is the packing *target*, not merely a ceiling: the shared coalescing
-/// writer stages a frame into one buffered `write_all` only while
-/// `header + payload` fits under it, so a batch above the threshold gives back
-/// exactly what batching bought. With a configured cap far above it and a
-/// transport reporting megabytes of eager budget, this is the arm that has to
-/// hold — and the default configuration sits just under the threshold, which
-/// would hide a regression here forever.
+/// A new eager budget can make a record oversized after a full batch was
+/// admitted. The empty retry batch must not leave a sequence gap before it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_smaller_retry_budget_keeps_batch_sequences_contiguous() {
+    let harness = stalled_harness(MuxConfig {
+        max_batch_bytes: 1024,
+        ..MuxConfig::default()
+    })
+    .await;
+    let (inlet, ack) = harness.open(1, 1, 4).await;
+    ack.await.unwrap().unwrap();
+    let frame =
+        rmp_serde::to_vec(&crate::streaming::frame::StreamFrame::Item("x".repeat(800))).unwrap();
+    // Both records are queued before this single-threaded runtime can poll
+    // the batcher. The second cuts a batch and parks behind the unread open.
+    inlet.send(frame.clone()).unwrap();
+    inlet.send(frame.clone()).unwrap();
+    eventually(|| harness.transport.stalled() == 1).await;
+    harness.transport.report_next_message_limit(512);
+
+    let open = harness.next_wire_batch().await;
+    let first = harness.next_wire_batch().await;
+    let second = harness.next_wire_batch().await;
+    assert_eq!(open.header.batch_seq, 0);
+    assert_eq!(first.header.batch_seq, 1);
+    assert_eq!(second.header.batch_seq, 2);
+    assert_eq!(first.records.len(), 1);
+    assert_eq!(second.records.len(), 1);
+    assert_eq!(first.records[0].data, frame);
+    assert_eq!(second.records[0].data, frame);
+    assert_eq!(first.records[0].frame_seq, 1);
+    assert_eq!(second.records[0].frame_seq, 2);
+}
+
+/// A caller may batch beyond TCP's coalescing threshold without losing records.
 #[tokio::test(flavor = "multi_thread")]
-async fn the_coalescing_threshold_bounds_a_batch_when_the_configured_cap_does_not() {
+async fn the_configured_cap_can_exceed_the_tcp_coalescing_threshold() {
+    const CAP: usize = 120 * 1024;
     let harness = harness(MuxConfig {
-        max_batch_bytes: 1 << 20,
+        max_batch_bytes: CAP,
         ..MuxConfig::default()
     })
     .await;
@@ -134,11 +161,11 @@ async fn the_coalescing_threshold_bounds_a_batch_when_the_configured_cap_does_no
     let (inlet, id) = harness.open(1, 1).await;
     let payload = rmp_serde::to_vec(&crate::streaming::frame::StreamFrame::Item(vec![7u8; 1000]))
         .expect("encode payload");
-    const RECORDS: usize = 100;
+    const RECORDS: usize = 200;
     for _ in 0..RECORDS {
         inlet.send(payload.clone()).expect("queue record");
     }
-    eventually(|| harness.try_next_batch().is_none()).await;
+    harness.await_withheld(RECORDS).await;
     harness.grant(id, 256);
 
     let mut delivered = 0;
@@ -147,8 +174,8 @@ async fn the_coalescing_threshold_bounds_a_batch_when_the_configured_cap_does_no
     while delivered < RECORDS {
         let batch = harness.next_batch().await;
         assert!(
-            batch.encoded_len <= COALESCE_THRESHOLD,
-            "batch of {} bytes is over the {COALESCE_THRESHOLD}-byte coalescing threshold",
+            batch.encoded_len <= CAP,
+            "batch of {} bytes is over the {CAP}-byte configured cap",
             batch.encoded_len
         );
         largest = largest.max(batch.encoded_len);
@@ -158,11 +185,11 @@ async fn the_coalescing_threshold_bounds_a_batch_when_the_configured_cap_does_no
     assert_eq!(delivered, RECORDS);
     assert!(
         batches > 1,
-        "100 KiB of records has to be cut into more than one batch"
+        "200 KiB of records has to be cut into more than one batch"
     );
     assert!(
-        largest > COALESCE_THRESHOLD / 2,
-        "the threshold, not some smaller clamp, is what bound these batches: \
+        largest > COALESCE_THRESHOLD,
+        "the configured cap must allow a batch above the coalescing threshold: \
          largest was {largest} bytes"
     );
 }

@@ -4,7 +4,7 @@
 //! Batch assembly and the send that ends it.
 //!
 //! Everything between "there is a record to put on the wire" and "the messenger
-//! has it" lives here: the staging buffer, the three clamps that decide how big
+//! has it" lives here: the staging buffer, the two clamps that decide how big
 //! a batch may get, the sequence numbering, and the two ways a batch leaves — a
 //! packed flush that parks on admission, and a singleton that does not.
 //!
@@ -33,32 +33,19 @@ use crate::transports::tcp::framing::COALESCE_THRESHOLD;
 /// answer for them.
 pub(super) const MIN_BATCH_CAP: usize = BATCH_HEADER_LEN + 13;
 
-/// `min(configured cap, effective eager budget, COALESCE_THRESHOLD)`, floored
-/// at [`MIN_BATCH_CAP`].
+/// `min(configured cap, effective eager budget)`, floored at [`MIN_BATCH_CAP`].
 ///
-/// The threshold is the packing *target*: the shared coalescing writer stages a
-/// frame into one buffered `write_all` only while it fits, so a batch above it
-/// gives back what batching bought. The eager budget is the ceiling above it —
-/// exceed it and the batch quietly becomes a rendezvous transfer, paying a round
-/// trip on behalf of every slot packed into it.
-///
-/// Split out from the caller because the eager term is the one an in-process
-/// pair cannot make bind: every messenger transport's budget is the 256 KiB
-/// rendezvous threshold or its own smaller limit, both far above the 64 KiB
-/// coalescing threshold, so end to end the other two terms always win. The
-/// arithmetic is where that arm is reachable.
+/// The eager budget prevents a packed batch from becoming a rendezvous
+/// transfer. TCP's coalescing threshold is not a message limit: larger frames
+/// use its direct write path. Let the caller choose that tradeoff, also for
+/// transports that do not use TCP's coalescing writer.
 pub(super) const fn batch_cap(configured: usize, eager: usize) -> usize {
     let clamped = if configured < eager {
         configured
     } else {
         eager
     };
-    let clamped = if clamped < COALESCE_THRESHOLD {
-        clamped
-    } else {
-        COALESCE_THRESHOLD
-    };
-    // Not `clamp`: the floor is applied *after* the three ceilings, and a
+    // Not `clamp`: the floor is applied *after* the two ceilings, and a
     // configured cap below the floor is a legitimate (if useless) setting rather
     // than the panic `clamp` would give it.
     if clamped > MIN_BATCH_CAP {
@@ -182,7 +169,7 @@ impl BatchWriter {
     /// will inject. An unresolved peer costs the conservative clamp rather than
     /// a failed flush.
     fn compute_cap(&mut self) -> usize {
-        let eager = self.peer_instance().map_or(usize::MAX, |instance| {
+        let eager = self.peer_instance().map_or(COALESCE_THRESHOLD, |instance| {
             self.messenger
                 .effective_eager_payload(instance, self.key.lane.handler_name(), None)
         });
@@ -241,32 +228,14 @@ impl BatchWriter {
     /// caller fences the one slot involved and watches the admission from a
     /// detached task.
     ///
-    /// Both ways out without a send give the reserved sequence back, so this
-    /// call's own reservation never leaks — whatever a caller does with the
-    /// `Option<FireResult>` it gets back. That does not, by itself, keep the
-    /// wire contiguous against a *separate* reservation a caller holds open
-    /// across this call: `emit_data`'s clamp-retry path calls `ensure_batch`
-    /// (reserving a sequence for a fresh, still-empty encoder) and can in
-    /// principle fall through to this method without flushing it first, which
-    /// would leave that encoder's sequence to be refunded later out of order
-    /// and read at the receiver as a hole followed by a duplicate. It cannot
-    /// today: that fallthrough needs [`Self::compute_cap`] to shrink between
-    /// the two `ensure_batch` calls in one `emit_data` invocation, and
-    /// [`batch_cap`]'s own doc records that the eager term never binds
-    /// end-to-end for any transport in this workspace. So this is a caller
-    /// discipline the writer cannot enforce by itself — held today by that
-    /// arithmetic fact about `emit_data`, not by construction here.
+    /// Both ways out without a send give this call's reserved sequence back.
+    /// Callers must flush any staged batch first, including an empty batch
+    /// opened before a refreshed eager budget routes a record here. Otherwise
+    /// its reserved sequence would become a gap ahead of this singleton.
     ///
-    /// Every caller flushes immediately before reaching here, so `self.buffer`
-    /// is free capacity the last flush handed back — take it the way
-    /// `ensure_batch` does, rather than allocating a fresh `BytesMut`, so the
-    /// path this flag adds costs no more per open than the awaited one did.
-    /// The one caller that does not arrive with `self.buffer` free is
-    /// `emit_data`'s clamp-retry arm, which re-opens an encoder (and so
-    /// re-takes the buffer into it) before learning the record still does not
-    /// fit; a staged `self.encoder` is how that case is told apart, and it
-    /// falls back to a fresh allocation because the buffer is already spoken
-    /// for.
+    /// The previous flush returns spare buffer capacity for this write. The
+    /// fallback allocation keeps this helper from taking a live encoder's
+    /// buffer if another internal caller is added later.
     pub(super) fn dispatch_singleton(
         &mut self,
         write: impl FnOnce(&mut BatchEncoder) -> Result<(), EncodeError>,
