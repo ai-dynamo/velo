@@ -183,10 +183,9 @@ pub struct Velo {
     messenger: Arc<Messenger>,
     anchor_manager: Arc<crate::streaming::AnchorManager>,
     rendezvous_manager: Arc<crate::rendezvous::RendezvousManager>,
-    /// The single streaming transport bound for this instance. Held here so
-    /// `register_peer` can fan out to it (the messenger does not know about
-    /// `FrameTransport`s) and so `peer_info()` can merge the streaming
-    /// listener's WorkerAddress entry into the messenger-side WorkerAddress.
+    /// The primary stream transport: the mux in `mux_only` mode, otherwise
+    /// the configured per-stream transport. Used for peer registration and
+    /// address publication. The mux adds no streaming listener or endpoint.
     stream_transport: Arc<dyn crate::streaming::FrameTransport>,
     owned_stream_transport: Option<OwnedStreamTransport>,
     /// RDMA registration layer, present only when a UCX transport was added
@@ -860,11 +859,11 @@ impl Velo {
 
     /// Get the peer information for this instance.
     ///
-    /// The returned [`PeerInfo`] carries a [`WorkerAddress`] with both the
-    /// messenger transport entries (TCP / gRPC / NATS / etc.) and the
-    /// streaming transport entry (e.g., `tcp-stream` / `grpc-stream`). The
-    /// streaming entry is required for peers to resolve the streaming
-    /// listener via [`crate::streaming::FrameTransport::register`].
+    /// The returned [`PeerInfo`] carries the messenger transport entries.
+    /// Default builds also publish a per-stream endpoint, such as `tcp-stream`
+    /// or `grpc-stream`, for [`crate::streaming::FrameTransport::register`].
+    /// In [`VeloBuilder::mux_only`] mode the primary stream transport is the
+    /// mux, which uses the messenger endpoints and adds no streaming endpoint.
     pub fn peer_info(&self) -> PeerInfo {
         let messenger_peer = self.messenger.peer_info();
         let stream_addr = self.stream_transport.address();
