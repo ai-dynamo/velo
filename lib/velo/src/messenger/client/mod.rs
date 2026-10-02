@@ -242,7 +242,7 @@ impl ActiveMessageClient {
 
     /// Record a peer's handlers as a handshake would, so a test can take the
     /// direct send path to a peer that never answers a handshake.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "queue-messenger"))]
     pub(crate) fn record_peer_handlers(&self, instance_id: InstanceId, handlers: Vec<String>) {
         self.peer_registry.update_handlers(instance_id, handlers);
     }

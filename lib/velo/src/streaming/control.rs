@@ -428,14 +428,18 @@ pub(crate) fn anchor_attach_handler(manager: Weak<AnchorManager>) -> crate::mess
                     + 1;
                 // Which transport this attach rides is decided here, from what
                 // the sender advertised: `messenger-mux-v2` when both sides
-                // named it, and otherwise exactly the local default this
-                // handler answered with before negotiation existed.
+                // named it. Otherwise use the per-stream default, or reject
+                // the peer if this instance is mux-only.
                 let selection = manager.select_streaming_transport(
                     &req.supported_transport_keys,
                     sender,
                     req.lane_key,
                 );
-                let (receiver, terms) = match selection.bind(local_id, routing_session_id).await {
+                let bound = match selection {
+                    Ok(selection) => selection.bind(local_id, routing_session_id).await,
+                    Err(error) => Err(error),
+                };
+                let (receiver, terms) = match bound {
                     Ok(bound) => bound,
                     Err(e) => {
                         manager.record_streaming_operation(

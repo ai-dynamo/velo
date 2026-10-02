@@ -99,12 +99,15 @@ The acceptance test for the boundary: `cargo tree -p velo-ext | grep -c promethe
 `velo`'s top-level features (after the workspace collapse):
 
 - Messenger transports: `http`, `nats-transport`, `grpc`, `zmq`, `ucx` (Linux only; UCX Active Messages over RDMA/tcp/shm via the in-workspace `ucx-rs` crate), `quic` (quinn; TLS 1.3 with a pinned self-signed certificate)
-- Discovery backends: `nats-discovery`, `etcd` (filesystem is unconditional)
-- Queue backends: `nats-queue`, `queue-messenger`
+- Services: `services` (default; distributed events, named work queues, and filesystem discovery)
+- Discovery backends: `nats-discovery`, `etcd` (both enable `services`)
+- Queue backends: `nats-queue`, `queue-messenger` (both enable `services`)
 - Optional subsystems: `distributed-tracing`, `simulation`, `test-helpers`
-- Default: `["http", "nats-transport", "grpc"]`
+- Default: `["http", "nats-transport", "grpc", "services"]`
 
-`nats-transport`, `nats-discovery`, and `nats-queue` are independent — different code paths sharing the `async-nats` dep. Enabling one does not enable the others.
+`nats-transport`, `nats-discovery`, and `nats-queue` select separate code paths that share `async-nats`. They do not enable each other. The discovery and queue features enable `services`; the transport feature does not.
+
+Core builds retain discovery traits, direct peer registration, metrics, ACK/NACK messages, all streaming APIs, and full rendezvous. The `ucx` feature keeps its messaging and RDMA APIs without `services`. Use `VeloBuilder::mux_only()` to omit the extra stream listener at runtime; this adds no compile-time feature. See `docs/src/guides/migrate-services.md`.
 
 ## Transport layer
 
