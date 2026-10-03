@@ -649,11 +649,25 @@ async fn a_detached_mux_stream_leaves_no_feed_to_skip_a_later_detached() {
     assert_eq!(next().await, "Detached");
     assert_eq!(consumer.attaches_over(LEGACY_KEY), 1.0);
 
-    with_mux
-        .velo
-        .attach_anchor::<u32>(handle)
-        .await
-        .expect("both senders detached, so the anchor takes a third");
+    // The legacy pump queues Detached before clearing its attachment. Reading
+    // the frame can win that race, so retry only the transient attach refusal.
+    // A stale mux feed would leave the anchor attached forever and still fail.
+    tokio::time::timeout(PATIENCE, async {
+        loop {
+            match with_mux.velo.attach_anchor::<u32>(handle).await {
+                Ok(sender) => break sender,
+                Err(error) => {
+                    assert!(
+                        error.to_string().contains("already attached"),
+                        "unexpected reattach failure: {error}"
+                    );
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+    })
+    .await
+    .expect("both senders detached, so the anchor must accept a third");
 }
 
 /// (d) A mux sender against a receiver without one: SPSC.

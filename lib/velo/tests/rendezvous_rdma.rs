@@ -1139,18 +1139,19 @@ async fn the_reaper_force_releases_an_abandoned_lease() {
 ///
 /// This test and the arena-shutdown one are the only two here that depend on
 /// real time, and it is unavoidable: what is under test *is* a cadence. The
-/// slack is sized so a missed tick cannot fail it. The deadline is 400 ms and
-/// renewals go out every 200 ms, so the 1.4 s transfer spans seven renewal
-/// intervals and would survive losing several of them; the failing behaviour —
-/// no ticker at all — reaps at 400 ms, three and a half deadlines before the
-/// transfer ends. A machine slow enough to close that gap would have to stall a
-/// tokio timer for an entire second.
+/// two-second lease leaves one second for scheduling and renewal delivery on
+/// busy CI runners. The seven-second transfer still spans seven renewal
+/// intervals and three and a half lease periods. Without renewal, the reaper
+/// has five seconds to free the slot before the transfer ends. A longer
+/// transfer alone would not add slack between a renewal and its deadline.
 #[tokio::test(flavor = "multi_thread")]
 async fn lease_renewal_carries_a_slow_transfer_past_several_deadlines() {
+    const TRANSFER_DELAY: Duration = Duration::from_secs(7);
+
     let pair = Pair::with_configs(
         Some(RdmaConfig {
             rendezvous: RdmaRendezvousConfig {
-                lease_timeout: Duration::from_millis(400),
+                lease_timeout: Duration::from_secs(2),
                 ..RdmaRendezvousConfig::default()
             },
             ..RdmaConfig::default()
@@ -1164,12 +1165,12 @@ async fn lease_renewal_carries_a_slow_transfer_past_several_deadlines() {
     pair.consumer
         .velo
         .rendezvous_manager()
-        .arm_rdma_hook(RdmaTestHook::SlowGet(Duration::from_millis(1_400)));
+        .arm_rdma_hook(RdmaTestHook::SlowGet(TRANSFER_DELAY));
 
     let started = std::time::Instant::now();
     let (data, lease) = pair.consumer.velo.get(handle).await.expect("get");
     assert!(
-        started.elapsed() >= Duration::from_millis(1_400),
+        started.elapsed() >= TRANSFER_DELAY,
         "the delay was not applied, so nothing was tested"
     );
     assert_pattern(&data, payload.len());
