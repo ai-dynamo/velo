@@ -266,12 +266,16 @@ struct MuxCore {
 }
 
 impl MessengerMuxTransport {
-    pub(crate) async fn shutdown(&self) {
+    pub(crate) fn stop(&self) {
         self.core.tasks.stop();
-        self.core.tasks.wait().await;
         self.core.batchers.clear();
         close_ingress(&self.core.ingress, self.core.metrics.as_ref());
         self.core.drains.clear();
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        self.stop();
+        self.core.tasks.wait().await;
     }
 
     /// Ask the sender of a claimed slot to stop, through the batcher of the

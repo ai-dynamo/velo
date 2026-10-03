@@ -83,13 +83,14 @@ async fn native_lifecycle_survives_early_stop_and_escalation() {
 async fn a_stop_requested_off_runtime_reaches_a_remote_sender() {
     for mux in [Some(mux_config()), None] {
         let (consumer, producer) = pair(mux.clone(), mux).await;
-        let anchor = consumer.velo.create_anchor::<u32>();
+        let mut anchor = consumer.velo.create_anchor::<u32>();
         let controller = anchor.controller();
         let sender = producer
             .velo
             .attach_anchor::<u32>(transfer(anchor.handle()))
             .await
             .expect("remote attach");
+        sender.send(41).await.unwrap();
 
         std::thread::spawn(move || controller.request_stop())
             .join()
@@ -99,7 +100,23 @@ async fn a_stop_requested_off_runtime_reaches_a_remote_sender() {
             .await
             .expect("the remote sender never saw the stop");
         assert!(!sender.cancellation_token().is_cancelled());
-        drop(anchor);
+        sender.send(42).await.unwrap();
+        sender.finalize().unwrap();
+        tokio::time::timeout(PATIENCE, async {
+            for expected in [41, 42] {
+                assert!(matches!(
+                    anchor.next().await,
+                    Some(Ok(StreamFrame::Item(value))) if value == expected
+                ));
+            }
+            assert!(matches!(
+                anchor.next().await,
+                Some(Ok(StreamFrame::Finalized))
+            ));
+            assert!(anchor.next().await.is_none());
+        })
+        .await
+        .expect("buffered output and finalization did not drain after stop");
     }
 }
 

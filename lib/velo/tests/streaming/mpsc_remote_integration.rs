@@ -788,7 +788,7 @@ async fn test_mpsc_controller_cancel_propagates_cross_worker() {
     .await
     .expect("off-runtime cancel must reach the remote sender");
 
-    // Remote sender's poison channel should be disconnected by now.
+    // The remote sender's cancellation token should be set by now.
     let result = sender.send(2).await;
     assert!(
         matches!(result, Err(velo::streaming::SendError::ChannelClosed)),

@@ -323,10 +323,14 @@ impl GrpcFrameTransport {
         self.bind_addr
     }
 
-    pub(crate) async fn shutdown(&self) {
+    pub(crate) fn stop(&self) {
         self.listener_cancel.cancel();
         self.tasks.stop();
         self.routing.clear();
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        self.stop();
         self.tasks.wait().await;
     }
 }

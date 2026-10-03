@@ -242,7 +242,7 @@ async fn test_mpsc_max_senders() {
     assert_eq!(mgr.sender_registry.senders.len(), 2);
 }
 
-/// Test 6: controller.cancel() poisons every attached sender.
+/// Test 6: controller.cancel() cancels every attached sender.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mpsc_controller_cancel_propagates() {
     let mgr = make_manager();
@@ -255,7 +255,7 @@ async fn test_mpsc_controller_cancel_propagates() {
 
     controller.cancel();
 
-    // Give the cancel poison a beat to propagate.
+    // Give the cancellation a beat to propagate.
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     assert!(
@@ -600,9 +600,8 @@ async fn test_mpsc_controller_cancel_idempotent() {
 /// the consumer cancels, even though the consumer still holds the anchor.
 ///
 /// Holding the anchor keeps its channel open, so only the cancel can end the
-/// wait. The task hands the sender back rather than dropping it: a local MPSC
-/// sender's `Drop` blocks while the channel is full, which is a separate, known
-/// limit, and the anchor is dropped first so that `Drop` finds it closed.
+/// wait. The task returns the sender so the test observes completion of the
+/// blocked send before sender cleanup.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_local_sender_parked_on_a_full_channel_wakes_on_cancel() {
     let mgr = make_manager();
