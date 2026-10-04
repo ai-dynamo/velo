@@ -14,6 +14,14 @@ use super::{MessengerMuxTransport, MuxCore, PeerLane};
 use crate::observability::MuxMetricsHandle;
 
 impl MessengerMuxTransport {
+    /// Stop the mux's tasks, so nothing more is written to any peer, but
+    /// leave its slots open: [`Self::shutdown`] retires them. Shutdown calls
+    /// this first so streams can be detached from their slots before
+    /// retirement injects `Dropped` into them.
+    pub(crate) fn stop_sending(&self) {
+        self.core.tasks.stop();
+    }
+
     pub(crate) async fn shutdown(&self) {
         self.core.tasks.stop();
         self.core.tasks.wait().await;

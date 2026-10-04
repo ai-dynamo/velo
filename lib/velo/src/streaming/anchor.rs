@@ -1041,18 +1041,28 @@ impl AnchorManagerBuilder {
 
 impl AnchorManager {
     pub(crate) async fn shutdown(&self) {
-        // Feeds come out first: stopping the mux injects `Dropped` into every
-        // ingress slot, and a consumer still reading one would take it as its
-        // sender's and end with `SenderDropped`. Nothing here closes a slot.
+        // `Velo::shutdown` has already torn down the messenger transports, so
+        // the mux stops sending first. Every slot close below (an anchor's
+        // drop, a stopped MPSC pump's release) then finds no batcher, rather
+        // than writing to a transport with nothing left to send on.
+        let mux = self.mux.get();
+        if let Some(mux) = mux {
+            mux.stop_sending();
+        }
+        // Then streams come off their slots: retiring the slots injects
+        // `Dropped` into each, and a consumer still reading one, directly or
+        // through an MPSC pump, would take it as its sender's.
         for mut entry in self.registry.iter_mut() {
             entry.retire_pump();
         }
-        // Then the mux stops, before anchors are removed. `Velo::shutdown` has
-        // already torn down the messenger transports, and a live mux stream's
-        // anchor closes its slot as it is removed below; a running mux would
-        // batch that close to the peer over a transport with nothing left to
-        // send on.
-        if let Some(mux) = self.mux.get() {
+        for entry in self.mpsc_registry.iter() {
+            for slot in entry.senders.values() {
+                if let Some(pump) = &slot.pump_token {
+                    pump.cancel();
+                }
+            }
+        }
+        if let Some(mux) = mux {
             mux.shutdown().await;
         }
         // Remove entries outside shard guards: their Drop may close a mux slot.
