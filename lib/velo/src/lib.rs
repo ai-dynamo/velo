@@ -801,7 +801,8 @@ impl Velo {
     /// remain the caller's responsibility. Stream watchdogs and heartbeats are
     /// cancelled; application handlers that exceed `policy` can still be running.
     /// Use this when an instance is removed while its Tokio runtime stays alive.
-    /// This closes resources but retains the legacy ownership graph in memory.
+    /// It closes resources, but the instance and its handles stay valid; their
+    /// memory is released when the last handle is dropped.
     pub async fn shutdown(&self, policy: ShutdownPolicy) {
         self.graceful_shutdown(policy).await;
         self.anchor_manager.shutdown().await;
