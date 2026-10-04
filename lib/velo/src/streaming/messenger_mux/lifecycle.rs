@@ -1,8 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! How the mux starts batchers and how it stops: the one stop path every
-//! failure and shutdown goes through.
+//! How the mux starts batchers and how it stops.
+//!
+//! A mux that fails stops in one step: `stop_mux` stops its tasks and retires
+//! its slots. Shutdown uses two steps, so that streams can come off their
+//! slots in between: `stop_sending` stops the tasks, and `shutdown` retires
+//! the slots. `MuxCore::drop` retires them if a shutdown was abandoned.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;

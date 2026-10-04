@@ -1040,18 +1040,29 @@ impl AnchorManagerBuilder {
 }
 
 impl AnchorManager {
+    /// End every stream this manager holds. Called by `Velo::shutdown` after
+    /// the messenger transports are torn down.
+    ///
+    /// Two rules hold throughout: nothing is sent to a peer, because the
+    /// transports are gone, and no mux slot is retired while a stream still
+    /// reads from it, because retirement injects `Dropped` that the reader
+    /// would take as its sender's. Hence the phases:
+    ///
+    /// 1. Stop the mux's tasks. A slot close after this finds no batcher and
+    ///    sends nothing. The slots stay open.
+    /// 2. Take streams off their slots: SPSC feeds withdrawn, MPSC pumps
+    ///    cancelled.
+    /// 3. Remove anchors and MPSC entries, and cancel local senders.
+    /// 4. Join the mux's tasks and retire its slots.
+    ///
+    /// Steps 1-3 do not await, so a caller that drops this future (a timeout
+    /// around `Velo::shutdown`) still leaves no stream waiting on a slot or an
+    /// anchor; `MuxCore::drop` retires the slots then.
     pub(crate) async fn shutdown(&self) {
-        // `Velo::shutdown` has already torn down the messenger transports, so
-        // the mux stops sending first. Every slot close below (an anchor's
-        // drop, a stopped MPSC pump's release) then finds no batcher, rather
-        // than writing to a transport with nothing left to send on.
         let mux = self.mux.get();
         if let Some(mux) = mux {
             mux.stop_sending();
         }
-        // Then streams come off their slots: retiring the slots injects
-        // `Dropped` into each, and a consumer still reading one, directly or
-        // through an MPSC pump, would take it as its sender's.
         for mut entry in self.registry.iter_mut() {
             entry.retire_pump();
         }
@@ -1061,9 +1072,6 @@ impl AnchorManager {
                     pump.cancel();
                 }
             }
-        }
-        if let Some(mux) = mux {
-            mux.shutdown().await;
         }
         // Remove entries outside shard guards: their Drop may close a mux slot.
         let ids: Vec<_> = self.registry.iter().map(|entry| *entry.key()).collect();
@@ -1088,6 +1096,9 @@ impl AnchorManager {
             .collect();
         for id in ids {
             self.sender_registry.cancel(id);
+        }
+        if let Some(mux) = mux {
+            mux.shutdown().await;
         }
     }
 

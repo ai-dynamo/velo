@@ -2024,4 +2024,40 @@ mod tests {
             "got {ended:?}"
         );
     }
+
+    /// Every state change in shutdown happens before its first await.
+    ///
+    /// A caller can bound `Velo::shutdown` with a timeout and drop it while it
+    /// waits for the mux's tasks. Streams must already be off their slots and
+    /// their anchors removed by then; a dropped future that had withdrawn the
+    /// feeds but not removed the anchors would leave their readers waiting on
+    /// nothing. The runtime is single-threaded, so the mux's own tasks have
+    /// not run and its join is still pending at the first poll.
+    #[tokio::test(flavor = "current_thread")]
+    async fn abandoning_anchor_shutdown_still_removes_every_anchor() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let velo = Velo::builder()
+            .add_transport(Arc::new(
+                crate::transports::tcp::TcpTransportBuilder::new()
+                    .from_listener(listener)
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+            ))
+            .build()
+            .await
+            .unwrap();
+        let _anchor = velo.create_anchor::<u32>();
+        let _mpsc_anchor = velo.create_mpsc_anchor::<u32>();
+        {
+            let shutdown = velo.anchor_manager.shutdown();
+            futures::pin_mut!(shutdown);
+            assert!(
+                futures::poll!(shutdown.as_mut()).is_pending(),
+                "the test needs shutdown to wait at its first poll"
+            );
+        }
+        assert!(velo.anchor_manager.registry.is_empty());
+        assert!(velo.anchor_manager.mpsc_registry.is_empty());
+    }
 }
