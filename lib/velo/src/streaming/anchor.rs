@@ -2986,6 +2986,30 @@ mod tests {
         ));
     }
 
+    /// A sender may be moved to a thread with no runtime (a language
+    /// binding's thread). Detaching there must still arm the unattached
+    /// timeout; otherwise an anchor nobody re-attaches is never reaped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn detach_from_plain_thread_arms_unattached_timeout() {
+        let mgr = make_manager();
+        let anchor = mgr.create_anchor::<u8>();
+        anchor.set_timeout(Some(Duration::from_millis(100)));
+        let handle = anchor.handle();
+        let (_, local_id) = handle.unpack();
+        let sender = mgr.attach_stream_anchor::<u8>(handle).await.unwrap();
+        std::thread::spawn(move || sender.detach().unwrap())
+            .join()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while mgr.registry.contains_key(&local_id) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("detached anchor was never reaped");
+        drop(anchor);
+    }
+
     // -----------------------------------------------------------------------
     // Test 4: CancellationToken is idempotent across multiple cancel() calls
     // -----------------------------------------------------------------------

@@ -411,7 +411,13 @@ impl<T: Serialize> StreamSender<T> {
         let registry = self.local_registry.clone();
         let (worker_id, local_id) = self.handle.unpack();
         let sender_stream_id = self.sender_stream_id;
+        let runtime = self.runtime.clone();
         send_terminal(&self.runtime, &self.tx, bytes, move || {
+            // The fast path runs this on the caller's thread, which may have
+            // no runtime; the unattached timeout must still be armed.
+            let _runtime = tokio::runtime::Handle::try_current()
+                .is_err()
+                .then(|| runtime.enter());
             if let Some(registry) = registry
                 && let Some(mut entry) = registry.get_mut(&local_id)
                 && entry
