@@ -1775,4 +1775,84 @@ mod tests {
         drop(anchor);
         producer.shutdown(ShutdownPolicy::WaitForever).await;
     }
+
+    /// A consumer still reading when its node shuts down must see the stream
+    /// end, not `SenderDropped`: the sender did nothing wrong.
+    ///
+    /// Stopping the mux retires every ingress slot by injecting `Dropped` into
+    /// it. A consumer whose direct feed is still installed reads that record
+    /// as its sender's. So each anchor's feed must be withdrawn before the mux
+    /// stops, which is also what `AnchorEntry::drop` does before it closes a
+    /// slot, for the same reason.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_ends_a_live_mux_stream_without_sender_dropped() {
+        use futures::StreamExt;
+
+        async fn node() -> Arc<Velo> {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            Velo::builder()
+                .add_transport(Arc::new(
+                    crate::transports::tcp::TcpTransportBuilder::new()
+                        .from_listener(listener)
+                        .unwrap()
+                        .build()
+                        .unwrap(),
+                ))
+                .stream_bind_addr(std::net::Ipv4Addr::LOCALHOST.into())
+                .build()
+                .await
+                .unwrap()
+        }
+
+        let consumer = node().await;
+        let producer = node().await;
+        consumer.register_peer(producer.peer_info()).unwrap();
+        producer.register_peer(consumer.peer_info()).unwrap();
+        for (node, peer) in [
+            (&consumer, producer.instance_id()),
+            (&producer, consumer.instance_id()),
+        ] {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                node.wait_for_handler(peer, "_anchor_attach"),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        }
+
+        let mut anchor = consumer.create_anchor::<u32>();
+        let sender = producer
+            .attach_anchor::<u32>(anchor.handle())
+            .await
+            .unwrap();
+        sender.send(1).await.unwrap();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), anchor.next())
+            .await
+            .unwrap();
+        assert!(matches!(
+            first,
+            Some(Ok(crate::streaming::StreamFrame::Item(1)))
+        ));
+
+        let reader = tokio::spawn(async move { anchor.next().await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            consumer.shutdown(ShutdownPolicy::WaitForever),
+        )
+        .await
+        .expect("consumer shutdown hung");
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), reader)
+            .await
+            .expect("reader still waiting after shutdown")
+            .unwrap();
+        assert!(
+            ended.is_none(),
+            "shutdown must end a live stream cleanly, got {ended:?}"
+        );
+
+        drop(sender);
+        producer.shutdown(ShutdownPolicy::WaitForever).await;
+    }
 }

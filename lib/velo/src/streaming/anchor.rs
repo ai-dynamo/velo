@@ -1041,10 +1041,17 @@ impl AnchorManagerBuilder {
 
 impl AnchorManager {
     pub(crate) async fn shutdown(&self) {
-        // The mux stops first. `Velo::shutdown` has already torn down the
-        // messenger transports, and a live mux stream's anchor closes its slot
-        // as it is removed below; a running mux would batch that close to the
-        // peer over a transport with nothing left to send on.
+        // Feeds come out first: stopping the mux injects `Dropped` into every
+        // ingress slot, and a consumer still reading one would take it as its
+        // sender's and end with `SenderDropped`. Nothing here closes a slot.
+        for mut entry in self.registry.iter_mut() {
+            entry.retire_pump();
+        }
+        // Then the mux stops, before anchors are removed. `Velo::shutdown` has
+        // already torn down the messenger transports, and a live mux stream's
+        // anchor closes its slot as it is removed below; a running mux would
+        // batch that close to the peer over a transport with nothing left to
+        // send on.
         if let Some(mux) = self.mux.get() {
             mux.shutdown().await;
         }
