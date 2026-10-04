@@ -1055,9 +1055,9 @@ impl AnchorManager {
     /// 3. Remove anchors and MPSC entries, and cancel local senders.
     /// 4. Join the mux's tasks and retire its slots.
     ///
-    /// Steps 1-3 do not await, so a caller that drops this future (a timeout
+    /// Steps 1-3 do not await. A caller that drops this future (a timeout
     /// around `Velo::shutdown`) still leaves no stream waiting on a slot or an
-    /// anchor; `MuxCore::drop` retires the slots then.
+    /// anchor. The slots then stay open, with no reader, until the mux drops.
     pub(crate) async fn shutdown(&self) {
         let mux = self.mux.get();
         if let Some(mux) = mux {

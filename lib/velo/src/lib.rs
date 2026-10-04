@@ -804,8 +804,8 @@ impl Velo {
     /// sender: its `cancellation_token` fires, and later sends fail. The reader
     /// ends when the application drops or finalizes the sender.
     /// Use this when an instance is removed while its Tokio runtime stays alive.
-    /// It closes resources. The instance and its handles stay valid, and their
-    /// memory is released when the last handle is dropped.
+    /// It closes resources. The instance and its handles stay valid, and
+    /// shutdown does not release them from memory.
     pub async fn shutdown(&self, policy: ShutdownPolicy) {
         self.graceful_shutdown(policy).await;
         self.anchor_manager.shutdown().await;
