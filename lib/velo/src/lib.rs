@@ -800,8 +800,11 @@ impl Velo {
     /// listener and pump tasks owned by the builder. Custom frame transports
     /// remain the caller's responsibility. Stream watchdogs and heartbeats are
     /// cancelled; application handlers that exceed `policy` can still be running.
+    /// If the sender of a stream is on this instance, shutdown cancels that
+    /// sender: its `cancellation_token` fires, and later sends fail. The reader
+    /// ends when the application drops or finalizes the sender.
     /// Use this when an instance is removed while its Tokio runtime stays alive.
-    /// It closes resources, but the instance and its handles stay valid; their
+    /// It closes resources. The instance and its handles stay valid, and their
     /// memory is released when the last handle is dropped.
     pub async fn shutdown(&self, policy: ShutdownPolicy) {
         self.graceful_shutdown(policy).await;
@@ -1950,5 +1953,75 @@ mod tests {
 
         drop(sender);
         producer.shutdown(ShutdownPolicy::WaitForever).await;
+    }
+
+    /// What `Velo::shutdown` does to a stream whose sender is on this node
+    /// and still held by the application: the sender is cancelled (its
+    /// `cancellation_token` fires and later sends fail), and its reader ends
+    /// when the application drops it. Shutdown does not end the reader itself:
+    /// a consumer poll that watched for it would cost every read a check.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_cancels_a_held_local_sender_and_its_reader_ends_on_drop() {
+        use futures::StreamExt;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let velo = Velo::builder()
+            .add_transport(Arc::new(
+                crate::transports::tcp::TcpTransportBuilder::new()
+                    .from_listener(listener)
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+            ))
+            .build()
+            .await
+            .unwrap();
+
+        let mut anchor = velo.create_anchor::<u32>();
+        let sender = velo.attach_anchor::<u32>(anchor.handle()).await.unwrap();
+        let mut mpsc_anchor = velo.create_mpsc_anchor::<u32>();
+        let mpsc_sender = velo
+            .attach_mpsc_anchor::<u32>(mpsc_anchor.handle())
+            .await
+            .unwrap();
+        let reader = tokio::spawn(async move { anchor.next().await });
+        let mpsc_reader = tokio::spawn(async move { mpsc_anchor.next().await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            velo.shutdown(ShutdownPolicy::WaitForever),
+        )
+        .await
+        .expect("shutdown hung");
+        assert!(sender.cancellation_token().is_cancelled());
+        assert!(mpsc_sender.cancellation_token().is_cancelled());
+        assert!(sender.send(1).await.is_err());
+        assert!(mpsc_sender.send(1).await.is_err());
+
+        drop(sender);
+        drop(mpsc_sender);
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(2), reader)
+            .await
+            .expect("SPSC reader still waiting after its sender was dropped")
+            .unwrap();
+        assert!(
+            matches!(
+                ended,
+                Some(Err(crate::streaming::StreamError::SenderDropped))
+            ),
+            "got {ended:?}"
+        );
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(2), mpsc_reader)
+            .await
+            .expect("MPSC reader still waiting after its sender was dropped")
+            .unwrap();
+        assert!(
+            matches!(
+                ended,
+                Some(Ok((_, crate::streaming::mpsc::MpscFrame::Dropped(_))))
+            ),
+            "got {ended:?}"
+        );
     }
 }
