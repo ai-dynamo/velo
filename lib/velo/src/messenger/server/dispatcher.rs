@@ -456,6 +456,11 @@ impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for OrderedDispa
                          {{reason=\"ordered_lane_shed\"}} for the rate"
                     );
                 });
+                // Fire-and-forget has no caller to tell, and the shed path
+                // must stay cheaper than accepting.
+                if matches!(response_type, ResponseType::FireAndForget) {
+                    return;
+                }
                 // `dispatch` is sync, so the reply needs its own task; the
                 // tracker keeps it from being untracked.
                 let system = system.clone();
@@ -704,5 +709,63 @@ mod tests {
             .graceful_shutdown(crate::ShutdownPolicy::WaitForever)
             .await;
         messenger.closed().await;
+    }
+
+    struct PendingHandler;
+
+    impl ActiveMessageHandler for PendingHandler {
+        fn handle(&self, _ctx: HandlerContext) -> BoxFuture<'static, ()> {
+            Box::pin(std::future::pending())
+        }
+
+        fn name(&self) -> &str {
+            "_pending"
+        }
+    }
+
+    /// A shed fire-and-forget message has no caller to tell, so the shed path
+    /// must not start a reply task for it: shedding is the overload path, and
+    /// it must stay cheaper than accepting. The runtime is single-threaded and
+    /// nothing below yields, so a spawned reply task is still counted by the
+    /// tracker when it is read.
+    #[tokio::test(flavor = "current_thread")]
+    async fn shedding_fire_and_forget_spawns_no_reply_task() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let messenger = Messenger::builder()
+            .add_transport(Arc::new(
+                TcpTransportBuilder::new()
+                    .from_listener(listener)
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+            ))
+            .build()
+            .await
+            .unwrap();
+        let dispatcher = OrderedDispatcher::new(
+            PendingHandler,
+            OrderedConfig::global()
+                .with_max_queue_depth(Some(1))
+                .with_overflow(crate::messenger::OverflowPolicy::Reject),
+        );
+        let ctx = |n: u128| HandlerContext {
+            message_id: ResponseId::from_u128(n),
+            payload: Bytes::new(),
+            response_type: ResponseType::FireAndForget,
+            headers: None,
+            system: Arc::clone(&messenger),
+            in_flight: None,
+        };
+
+        dispatcher.dispatch(ctx(1));
+        let tasks = messenger.tracker().len();
+        for n in 2..10 {
+            dispatcher.dispatch(ctx(n));
+        }
+        assert_eq!(
+            messenger.tracker().len(),
+            tasks,
+            "a shed fire-and-forget message started a task"
+        );
     }
 }
