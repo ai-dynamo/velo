@@ -1041,6 +1041,13 @@ impl AnchorManagerBuilder {
 
 impl AnchorManager {
     pub(crate) async fn shutdown(&self) {
+        // The mux stops first. `Velo::shutdown` has already torn down the
+        // messenger transports, and a live mux stream's anchor closes its slot
+        // as it is removed below; a running mux would batch that close to the
+        // peer over a transport with nothing left to send on.
+        if let Some(mux) = self.mux.get() {
+            mux.shutdown().await;
+        }
         // Remove entries outside shard guards: their Drop may close a mux slot.
         let ids: Vec<_> = self.registry.iter().map(|entry| *entry.key()).collect();
         for id in ids {
@@ -1064,9 +1071,6 @@ impl AnchorManager {
             .collect();
         for id in ids {
             self.sender_registry.cancel(id);
-        }
-        if let Some(mux) = self.mux.get() {
-            mux.shutdown().await;
         }
     }
 

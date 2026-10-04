@@ -1687,4 +1687,92 @@ mod tests {
         owned_transport.shutdown().await;
         retained.closed().await;
     }
+
+    /// Shutdown must not write to peers after its transports are gone.
+    ///
+    /// `graceful_shutdown` tears down the messenger transports first. Removing
+    /// an anchor with a live mux stream then closes its slot, and while the mux
+    /// still runs that close is batched to the peer: the TCP transport has no
+    /// connection left, dials, finds itself cancelled, and fails the frame as
+    /// a send error that the default handler logs at ERROR.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_with_live_mux_stream_sends_nothing_after_teardown() {
+        use crate::observability::test_helpers::MetricSnapshot;
+        use futures::StreamExt;
+
+        async fn node(metrics: Option<Arc<VeloMetrics>>) -> Arc<Velo> {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut builder = Velo::builder()
+                .add_transport(Arc::new(
+                    crate::transports::tcp::TcpTransportBuilder::new()
+                        .from_listener(listener)
+                        .unwrap()
+                        .build()
+                        .unwrap(),
+                ))
+                .stream_bind_addr(std::net::Ipv4Addr::LOCALHOST.into());
+            if let Some(metrics) = metrics {
+                builder = builder.metrics(metrics);
+            }
+            builder.build().await.unwrap()
+        }
+
+        let registry = prometheus::Registry::new();
+        let metrics = Arc::new(VeloMetrics::register(&registry).unwrap());
+        let consumer = node(Some(metrics)).await;
+        let producer = node(None).await;
+        consumer.register_peer(producer.peer_info()).unwrap();
+        producer.register_peer(consumer.peer_info()).unwrap();
+        for (node, peer) in [
+            (&consumer, producer.instance_id()),
+            (&producer, consumer.instance_id()),
+        ] {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                node.wait_for_handler(peer, "_anchor_attach"),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        }
+
+        let mut anchor = consumer.create_anchor::<u32>();
+        let sender = producer
+            .attach_anchor::<u32>(anchor.handle())
+            .await
+            .unwrap();
+        sender.send(1).await.unwrap();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), anchor.next())
+            .await
+            .unwrap();
+        assert!(matches!(
+            first,
+            Some(Ok(crate::streaming::StreamFrame::Item(1)))
+        ));
+
+        let send_errors = || {
+            MetricSnapshot::from_registry(&registry).counter(
+                "velo_transport_rejections_total",
+                &[("transport", "tcp"), ("reason", "send_error")],
+            )
+        };
+        let before = send_errors();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            consumer.shutdown(ShutdownPolicy::WaitForever),
+        )
+        .await
+        .expect("consumer shutdown hung");
+        // A failed dial reports from the writer task after shutdown returns.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            send_errors(),
+            before,
+            "shutdown sent a frame after its transport was torn down"
+        );
+
+        drop(sender);
+        drop(anchor);
+        producer.shutdown(ShutdownPolicy::WaitForever).await;
+    }
 }
