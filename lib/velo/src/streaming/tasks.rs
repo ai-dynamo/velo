@@ -3,6 +3,7 @@
 
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -11,6 +12,9 @@ use tokio_util::task::TaskTracker;
 #[derive(Clone)]
 pub(crate) struct StreamTasks {
     cancel: CancellationToken,
+    /// Mirrors `cancel` for hot-path readers: `CancellationToken::is_cancelled`
+    /// takes a mutex that every peer and lane of a mux would share.
+    stopped: Arc<AtomicBool>,
     tracker: TaskTracker,
     admission: Arc<parking_lot::Mutex<()>>,
     runtime: tokio::runtime::Handle,
@@ -26,6 +30,7 @@ impl StreamTasks {
     pub(crate) fn new(runtime: tokio::runtime::Handle) -> Self {
         Self {
             cancel: CancellationToken::new(),
+            stopped: Arc::default(),
             tracker: TaskTracker::new(),
             admission: Arc::default(),
             runtime,
@@ -61,13 +66,13 @@ impl StreamTasks {
     }
 
     pub(crate) fn is_stopped(&self) -> bool {
-        self.cancel.is_cancelled()
+        self.stopped.load(Ordering::Acquire)
     }
 
     /// Returns true only for the first stop request.
     pub(crate) fn stop(&self) -> bool {
         let _admission = self.admission.lock();
-        let first = !self.is_stopped();
+        let first = !self.stopped.swap(true, Ordering::AcqRel);
         self.cancel.cancel();
         self.tracker.close();
         first
@@ -75,5 +80,29 @@ impl StreamTasks {
 
     pub(crate) async fn wait(&self) {
         self.tracker.wait().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `is_stopped` reads a flag, not the token, so the two must move
+    /// together: the first stop wins, refuses later spawns, and cancels
+    /// what is running.
+    #[tokio::test]
+    async fn stop_is_seen_by_flag_token_and_spawn() {
+        let tasks = StreamTasks::default();
+        let token = tasks.cancellation_token();
+        assert!(tasks.spawn(std::future::pending()));
+        assert!(!tasks.is_stopped());
+        assert!(tasks.stop());
+        assert!(!tasks.stop());
+        assert!(tasks.is_stopped());
+        assert!(token.is_cancelled());
+        assert!(!tasks.spawn(async {}));
+        tokio::time::timeout(std::time::Duration::from_secs(1), tasks.wait())
+            .await
+            .expect("a stopped tracker waits only for running tasks");
     }
 }
