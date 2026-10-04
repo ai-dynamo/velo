@@ -105,6 +105,7 @@ mod lane;
 mod lane_choice;
 #[cfg(all(test, feature = "quic"))]
 mod lane_tests;
+mod lifecycle;
 pub(crate) mod peer_batcher;
 pub(crate) mod protocol;
 mod sweep;
@@ -127,9 +128,8 @@ use velo_ext::{TransportKey, WorkerAddress, WorkerId};
 use self::flow_control::NegotiatedLimits;
 use self::ingress::IngressRegistry;
 use self::lane_choice::LaneLoad;
-use self::peer_batcher::{
-    BatcherContext, BatcherHandle, BatcherMap, OpenRejected, OpenSlotRequest,
-};
+use self::lifecycle::close_ingress;
+use self::peer_batcher::{BatcherHandle, BatcherMap, OpenRejected, OpenSlotRequest};
 use crate::messenger::{Context, Handler, Messenger};
 use crate::observability::{MuxMetricsHandle, VeloMetrics};
 use crate::streaming::transport::FrameTransport;
@@ -224,7 +224,6 @@ struct MuxCore {
     /// lazily recreated must not restart its epoch, or the peer would read every
     /// batch of the new one as stale and discard it wholesale.
     epochs: Arc<AtomicU64>,
-    cancel: CancellationToken,
     tasks: crate::streaming::tasks::StreamTasks,
     /// Peers with credit to return, posted by draining consumers. See
     /// [`ingress::DrainSignal`].
@@ -266,14 +265,6 @@ struct MuxCore {
 }
 
 impl MessengerMuxTransport {
-    pub(crate) async fn shutdown(&self) {
-        self.core.tasks.stop();
-        self.core.tasks.wait().await;
-        self.core.batchers.clear();
-        close_ingress(&self.core.ingress, self.core.metrics.as_ref());
-        self.core.drains.clear();
-    }
-
     /// Ask the sender of a claimed slot to stop, through the batcher of the
     /// lane its `OpenSlot` arrived on.
     pub(crate) fn request_stop(&self, key: PeerLane, slot: protocol::SlotId, session_id: u64) {
@@ -358,7 +349,6 @@ impl MessengerMuxTransport {
             // Epochs start at 1 so zero is never a live epoch, which keeps a
             // zeroed header from reading as a legitimate one.
             epochs: Arc::new(AtomicU64::new(1)),
-            cancel: tasks.cancellation_token(),
             tasks,
             drain_tx,
             drain_rx,
@@ -405,54 +395,6 @@ impl MessengerMuxTransport {
 }
 
 impl MuxCore {
-    /// The batcher for one (peer, lane), created on first use.
-    fn batcher(&self, key: PeerLane) -> Result<Arc<BatcherHandle>> {
-        if self.tasks.is_stopped() {
-            return Err(anyhow!("messenger mux shut down"));
-        }
-        if let Some(existing) = self.batchers.get(&key) {
-            return self.checked_batcher(key, existing.value());
-        }
-        let entry = self.batchers.entry(key).or_insert_with(|| {
-            peer_batcher::spawn(
-                key,
-                BatcherContext {
-                    tasks: self.tasks.clone(),
-                    messenger: Arc::clone(&self.messenger),
-                    config: self.config.clone(),
-                    metrics: self.metrics.clone(),
-                    epochs: Arc::clone(&self.epochs),
-                    batchers: Arc::clone(&self.batchers),
-                    ingress: Arc::clone(&self.ingress),
-                    cancel: self.cancel.clone(),
-                    #[cfg(test)]
-                    hooks: self.hooks.get().cloned(),
-                },
-            )
-        });
-        self.checked_batcher(key, entry.value())
-    }
-
-    /// The caller holds the registry guard, so a closed handle here cannot
-    /// have been removed by normal retirement between lookup and validation.
-    fn checked_batcher(
-        &self,
-        key: PeerLane,
-        handle: &Arc<BatcherHandle>,
-    ) -> Result<Arc<BatcherHandle>> {
-        // Spawn on a stopped runtime can drop the batcher immediately. A
-        // closed registered handle is a failed epoch, not normal retirement.
-        if self.tasks.is_stopped() || handle.is_closed() {
-            if self.tasks.stop() {
-                tracing::error!(peer = %key.peer, lane = %key.lane,
-                    "messenger mux stopped: registered batcher closed unexpectedly");
-            }
-            close_ingress(&self.ingress, self.metrics.as_ref());
-            return Err(anyhow!("messenger mux batcher shut down"));
-        }
-        Ok(Arc::clone(handle))
-    }
-
     /// Hand one decoded batch to the ingress lane and act on what it produced.
     ///
     /// Everything the batch produced goes back through the batcher for the
@@ -586,7 +528,7 @@ impl MuxCore {
     /// Hand a reconcile pass's grants to the batcher of the lane the slots
     /// arrived on.
     fn return_credit(&self, key: PeerLane, replies: Vec<peer_batcher::ReplyRecord>) {
-        if replies.is_empty() || self.cancel.is_cancelled() {
+        if replies.is_empty() || self.tasks.is_stopped() {
             return;
         }
         let Ok(batcher) = self.batcher(key) else {
@@ -688,22 +630,6 @@ impl MuxCore {
                 handle.retire();
             }
         }
-    }
-}
-
-fn close_ingress(ingress: &IngressRegistry, metrics: Option<&MuxMetricsHandle>) {
-    let closed = ingress.shutdown();
-    if let Some(metrics) = metrics {
-        for _ in 0..closed {
-            metrics.slot_closed();
-        }
-    }
-}
-
-impl Drop for MuxCore {
-    fn drop(&mut self) {
-        self.tasks.stop();
-        close_ingress(&self.ingress, self.metrics.as_ref());
     }
 }
 
@@ -963,7 +889,7 @@ impl MessengerMuxTransport {
         let core = Arc::clone(&self.core);
         Box::pin(async move {
             for _ in 0..CONNECT_ATTEMPTS {
-                if core.cancel.is_cancelled() {
+                if core.tasks.is_stopped() {
                     return Err(anyhow!("messenger mux shut down"));
                 }
                 let batcher = core.batcher(key)?;

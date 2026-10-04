@@ -212,7 +212,7 @@ fn runtime_shutdown_cancels_a_mux_with_live_batchers() {
     });
     runtime.shutdown_timeout(Duration::from_secs(5));
     assert!(
-        pair.producer.core.cancel.is_cancelled(),
+        pair.producer.core.tasks.is_stopped(),
         "an aborted batcher must stop retries on its closed registry entry"
     );
     // The consumer has no batcher yet. Submitting one to its stopped runtime

@@ -283,6 +283,10 @@ pub(crate) struct BatcherContext {
     pub(crate) epochs: Arc<AtomicU64>,
     pub(crate) batchers: Arc<BatcherMap>,
     pub(crate) ingress: Arc<super::ingress::IngressRegistry>,
+    /// The run loop's own exit. The mux passes `tasks.cancellation_token()`;
+    /// a stop that lands while the loop is being polled exits here, through
+    /// `teardown(true)`, rather than by the spawn wrapper dropping the loop.
+    /// Tests pass a separate token to drive that exit on purpose.
     pub(crate) cancel: CancellationToken,
     /// A barrier in the run loop, installed only by the tests that need to stop
     /// it mid-wake. See [`test_hooks`].
@@ -409,11 +413,12 @@ impl Drop for Batcher {
         // abort during that flush still loses credit and must stop the mux.
         if !self.teardown_complete {
             let already_cancelled = self.cancel.is_cancelled();
-            if self.tasks.stop() && !already_cancelled {
+            if super::lifecycle::stop_mux(&self.tasks, &self.ingress, self.metrics.as_ref())
+                && !already_cancelled
+            {
                 tracing::error!(peer = %self.key.peer, lane = %self.key.lane,
                     "messenger mux stopped: batcher task aborted unexpectedly");
             }
-            super::close_ingress(&self.ingress, self.metrics.as_ref());
         }
         // A refused spawn can drop here under the batcher-map entry guard.
         // Normal exits unregister in run; whole-mux shutdown clears the map.
