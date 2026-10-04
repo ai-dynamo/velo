@@ -833,7 +833,7 @@ impl Batcher {
     /// (`docs/src/concepts/batched-streaming.md` § "Slots"), so nothing about the *sender's* admission
     /// order says anything about the order the receiver applies it in.
     ///
-    /// The `tokio::spawn` below always watches the admission — even an
+    /// The task spawned below always watches the admission — even an
     /// unfenced dispatch has to learn of a *failure*, which is epoch death
     /// whether or not the fence was ever raised. But it reports *success* to
     /// `singleton_resolved` only when this call actually fenced: an unfenced
