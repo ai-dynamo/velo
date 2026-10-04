@@ -230,22 +230,39 @@ impl<T: Serialize> MpscStreamSender<T> {
     ///
     /// Reattaching via [`crate::AnchorManager::attach_mpsc_stream_anchor`]
     /// allocates a fresh [`SenderId`]. Once polled, detach runs to completion
-    /// on the sender's runtime even if this future is dropped. Consumer
-    /// cancellation stops a detach that is waiting for channel space.
+    /// even if this future is dropped: at once when the channel has room, else
+    /// on the caller's runtime (the sender's own when the caller has none).
+    /// Consumer cancellation stops a detach that is waiting for channel space.
     pub async fn detach(mut self) -> Result<StreamAnchorHandle, SendError> {
         self.heartbeat_cancel.cancel();
         let cleanup = self.cleanup_guard();
+        self.sent_terminal = true;
+        if self.cancel_token.is_cancelled() {
+            return Err(SendError::ChannelClosed);
+        }
+        let sender_id = self.sender_id.0;
+        let bytes = cached_detached().clone();
+        let bytes = match &self.channel {
+            SenderChannel::Local(tx) => match tx.try_send((sender_id, bytes)) {
+                Ok(()) => return Ok(self.handle),
+                Err(flume::TrySendError::Full((_, bytes))) => bytes,
+                Err(flume::TrySendError::Disconnected(_)) => return Err(SendError::ChannelClosed),
+            },
+            SenderChannel::Remote(tx) => match tx.try_send(bytes) {
+                Ok(()) => return Ok(self.handle),
+                Err(flume::TrySendError::Full(bytes)) => bytes,
+                Err(flume::TrySendError::Disconnected(_)) => return Err(SendError::ChannelClosed),
+            },
+        };
         let channel = self.channel.clone();
         let cancel = self.cancel_token.clone();
-        let sender_id = self.sender_id.0;
         // Flume can enqueue a frame before its send future is polled Ready.
         // Keep one task responsible for the terminal event and cleanup, so
         // abandoning this caller cannot send both Detached and Dropped.
         // Capture only transport state: T does not need a Send bound.
-        let task = self.runtime.spawn(async move {
+        let task = self.spawn_runtime().spawn(async move {
             let _cleanup = cleanup;
             let send = async {
-                let bytes = cached_detached().clone();
                 match channel {
                     SenderChannel::Local(tx) => tx
                         .send_async((sender_id, bytes))
@@ -263,7 +280,6 @@ impl<T: Serialize> MpscStreamSender<T> {
                 result = send => result,
             }
         });
-        self.sent_terminal = true;
         task.await.map_err(|_| SendError::ChannelClosed)??;
         Ok(self.handle)
     }
@@ -286,7 +302,9 @@ impl Drop for SenderCleanup {
         self.sender_registry.senders.remove(&self.sender_stream_id);
         // The last local slot may start an unattached timeout. Drop can run
         // on a plain thread, so provide the runtime captured at construction.
-        let _entered = self.runtime.enter();
+        let _entered = tokio::runtime::Handle::try_current()
+            .is_err()
+            .then(|| self.runtime.enter());
         if self.local
             && let Some(slot) = super::anchor::remove_sender_slot(
                 &self.mpsc_registry,
@@ -301,6 +319,11 @@ impl Drop for SenderCleanup {
 }
 
 impl<T> MpscStreamSender<T> {
+    /// The caller's runtime first: the sender can outlive the one it was made on.
+    fn spawn_runtime(&self) -> tokio::runtime::Handle {
+        tokio::runtime::Handle::try_current().unwrap_or_else(|_| self.runtime.clone())
+    }
+
     fn cleanup_guard(&self) -> SenderCleanup {
         SenderCleanup {
             local: matches!(self.channel, SenderChannel::Local(_)),
@@ -335,7 +358,7 @@ impl<T> Drop for MpscStreamSender<T> {
                         // runtime worker. Drop removes the sender registry
                         // entry, so only the anchor token can stop this wait.
                         let tx = tx.clone();
-                        self.runtime.spawn(async move {
+                        self.spawn_runtime().spawn(async move {
                             tokio::select! {
                                 biased;
                                 _ = consumer_cancel.cancelled() => {}
