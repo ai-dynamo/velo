@@ -432,8 +432,13 @@ async fn mpsc_sender_dropped_during_thread_local_teardown() {
             const { RefCell::new(None) };
     }
 
+    // With an unattached timeout, the last sender leaving re-arms it, which
+    // spawns: that spawn must degrade the same way.
     let mgr = make_manager();
-    let mut anchor = mgr.create_mpsc_anchor::<u32>();
+    let mut anchor = mgr.create_mpsc_anchor_with_config::<u32>(MpscAnchorConfig {
+        unattached_timeout: Some(Duration::from_secs(60)),
+        ..Default::default()
+    });
     let sender = mgr
         .attach_mpsc_stream_anchor::<u32>(anchor.handle())
         .await
