@@ -418,6 +418,41 @@ async fn mpsc_detach_after_attaching_runtime_stops() {
     anchor.cancel();
 }
 
+/// A sender kept in a `thread_local!` (a language binding's thread) is
+/// dropped while that thread's locals are torn down. Tokio's own context can
+/// already be gone then, and `Handle::enter` panics on a destroyed context; a
+/// panic in a thread-local destructor aborts the process. The drop must
+/// degrade instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn mpsc_sender_dropped_during_thread_local_teardown() {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static HELD: RefCell<Option<velo::streaming::MpscStreamSender<u32>>> =
+            const { RefCell::new(None) };
+    }
+
+    let mgr = make_manager();
+    let mut anchor = mgr.create_mpsc_anchor::<u32>();
+    let sender = mgr
+        .attach_mpsc_stream_anchor::<u32>(anchor.handle())
+        .await
+        .unwrap();
+    let sid = sender.sender_id();
+    std::thread::spawn(move || {
+        HELD.with(|held| *held.borrow_mut() = Some(sender));
+        // Touch tokio's context after `HELD`, so its destructor is registered
+        // later and runs first.
+        assert!(tokio::runtime::Handle::try_current().is_err());
+    })
+    .join()
+    .expect("dropping the sender during thread-local teardown panicked");
+    assert!(
+        matches!(next_frame(&mut anchor).await, Some(Ok((id, MpscFrame::Dropped(None)))) if id == sid)
+    );
+    anchor.cancel();
+}
+
 /// A pending `anchor.next()` must terminate promptly when the controller
 /// cancels, even if sender handles are still alive.
 #[tokio::test(flavor = "multi_thread")]

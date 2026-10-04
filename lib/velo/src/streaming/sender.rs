@@ -415,9 +415,7 @@ impl<T: Serialize> StreamSender<T> {
         send_terminal(&self.runtime, &self.tx, bytes, move || {
             // The fast path runs this on the caller's thread, which may have
             // no runtime; the unattached timeout must still be armed.
-            let _runtime = tokio::runtime::Handle::try_current()
-                .is_err()
-                .then(|| runtime.enter());
+            let _runtime = crate::streaming::tasks::enter_if_outside_runtime(&runtime);
             if let Some(registry) = registry
                 && let Some(mut entry) = registry.get_mut(&local_id)
                 && entry

@@ -302,9 +302,7 @@ impl Drop for SenderCleanup {
         self.sender_registry.senders.remove(&self.sender_stream_id);
         // The last local slot may start an unattached timeout. Drop can run
         // on a plain thread, so provide the runtime captured at construction.
-        let _entered = tokio::runtime::Handle::try_current()
-            .is_err()
-            .then(|| self.runtime.enter());
+        let _entered = crate::streaming::tasks::enter_if_outside_runtime(&self.runtime);
         if self.local
             && let Some(slot) = super::anchor::remove_sender_slot(
                 &self.mpsc_registry,

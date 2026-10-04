@@ -83,6 +83,20 @@ impl StreamTasks {
     }
 }
 
+/// Enter `runtime` when the calling thread has none, so a drop or callback
+/// on a plain thread can still spawn. Not when the thread's runtime context
+/// is already destroyed (thread-local teardown): `Handle::enter` panics then,
+/// and a panic there aborts the process. The caller's spawns then degrade
+/// the way they do with no runtime at all.
+pub(crate) fn enter_if_outside_runtime(
+    runtime: &tokio::runtime::Handle,
+) -> Option<tokio::runtime::EnterGuard<'_>> {
+    match tokio::runtime::Handle::try_current() {
+        Err(error) if error.is_missing_context() => Some(runtime.enter()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
