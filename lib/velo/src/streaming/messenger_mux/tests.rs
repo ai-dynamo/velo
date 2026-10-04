@@ -293,6 +293,53 @@ fn aborting_a_retiring_batchers_final_flush_stops_the_mux() {
     assert!(receiver.is_disconnected());
 }
 
+/// Once shutdown has stopped the mux's tasks, the slots stay open until
+/// `shutdown` retires them, even when the stop drops a batcher mid-wake.
+///
+/// `AnchorManager::shutdown` stops the mux, then takes every stream off its
+/// slot, then retires the slots: retirement injects `Dropped`, and a reader
+/// still on its slot would take that as its sender's. A batcher parked at an
+/// await outside its own cancel arm is dropped by its task wrapper when the
+/// stop lands, and its `Drop` used to retire every slot on the spot, inside
+/// that window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_batcher_dropped_by_stop_sending_leaves_slots_to_shutdown() {
+    use super::test_support::{StallingTransport, stalling_address};
+
+    let (transport, _wire) = StallingTransport::new(tokio::runtime::Handle::current());
+    let messenger = Messenger::builder()
+        .add_transport(transport)
+        .build()
+        .await
+        .unwrap();
+    let peer = velo_ext::InstanceId::new_v4();
+    messenger
+        .register_peer(velo_ext::PeerInfo::new(peer, stalling_address()))
+        .unwrap();
+    let mux = MessengerMuxTransport::new(messenger, MuxConfig::default(), None).unwrap();
+    let hooks = Arc::new(TestHooks::default());
+    assert!(mux.core.hooks.set(hooks.clone()).is_ok());
+    let receiver = mux.bind(1, 1).await.unwrap();
+    let batcher = mux.core.batcher(lane0(peer.worker_id())).unwrap();
+
+    hooks.pause();
+    assert!(batcher.reply(&[peer_batcher::ReplyRecord::CloseSlot {
+        slot: protocol::SlotId::from_raw(7),
+        reason: protocol::CloseReason::UnknownSlot,
+    }]));
+    hooks.wait_until_parked().await;
+    mux.stop_sending();
+    eventually(|| batcher.is_closed()).await;
+    assert!(
+        !receiver.is_disconnected(),
+        "a batcher dropped by the stop retired the slots before shutdown did"
+    );
+
+    hooks.release();
+    mux.shutdown().await;
+    assert!(receiver.is_disconnected());
+}
+
 #[test]
 fn a_secondary_runtime_does_not_own_the_mux_batchers() {
     let owner = tokio::runtime::Builder::new_multi_thread()

@@ -116,7 +116,7 @@ mod tests;
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
@@ -225,6 +225,9 @@ struct MuxCore {
     /// batch of the new one as stale and discard it wholesale.
     epochs: Arc<AtomicU64>,
     tasks: crate::streaming::tasks::StreamTasks,
+    /// Set once the slots are retired, which is later than the tasks stop:
+    /// shutdown takes streams off their slots in between.
+    slots_retired: AtomicBool,
     /// Peers with credit to return, posted by draining consumers. See
     /// [`ingress::DrainSignal`].
     drain_tx: flume::Sender<PeerLane>,
@@ -350,6 +353,7 @@ impl MessengerMuxTransport {
             // zeroed header from reading as a legitimate one.
             epochs: Arc::new(AtomicU64::new(1)),
             tasks,
+            slots_retired: AtomicBool::new(false),
             drain_tx,
             drain_rx,
             drains: DashMap::new(),
@@ -422,10 +426,15 @@ impl MuxCore {
             }
         }
 
-        // A batch already in flight can claim a bind after shutdown visited
-        // its peer. Retire that late claim before returning from this handler.
-        if self.tasks.is_stopped() {
+        // A batch already in flight can claim a bind after shutdown retired
+        // the slots. Retire that late claim before returning from this
+        // handler. Shutdown sets the flag before it retires, so a claim this
+        // check misses is one that retirement still covers.
+        if self.slots_retired.load(Ordering::SeqCst) {
             close_ingress(&self.ingress, self.metrics.as_ref());
+            return;
+        }
+        if self.tasks.is_stopped() {
             return;
         }
 

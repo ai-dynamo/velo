@@ -5,6 +5,7 @@
 //! failure and shutdown goes through.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use anyhow::{Result, anyhow};
 
@@ -26,7 +27,7 @@ impl MessengerMuxTransport {
         self.core.tasks.stop();
         self.core.tasks.wait().await;
         self.core.batchers.clear();
-        close_ingress(&self.core.ingress, self.core.metrics.as_ref());
+        self.core.retire_slots();
         self.core.drains.clear();
     }
 }
@@ -80,15 +81,31 @@ impl MuxCore {
     }
 }
 
-/// Stop the mux's tasks and close every ingress slot. Returns true only for
-/// the first stop request.
+impl MuxCore {
+    /// Close every ingress slot, injecting `Dropped` into each. The flag goes
+    /// first; `deliver_batch` reads it after a claim (see there).
+    fn retire_slots(&self) {
+        self.slots_retired.store(true, Ordering::SeqCst);
+        close_ingress(&self.ingress, self.metrics.as_ref());
+    }
+}
+
+/// Stop a mux that failed: stop its tasks and close every ingress slot.
+/// Returns true only for the first stop request.
+///
+/// A stop that was not the first leaves the slots alone. Shutdown stops the
+/// tasks first and retires the slots only after it has taken every stream off
+/// them; a batcher its stop drops mid-wake ends here, and closing the slots
+/// now would hand a live reader `Dropped` as its sender's.
 pub(super) fn stop_mux(
     tasks: &crate::streaming::tasks::StreamTasks,
     ingress: &IngressRegistry,
     metrics: Option<&MuxMetricsHandle>,
 ) -> bool {
     let first = tasks.stop();
-    close_ingress(ingress, metrics);
+    if first {
+        close_ingress(ingress, metrics);
+    }
     first
 }
 
@@ -103,6 +120,9 @@ pub(super) fn close_ingress(ingress: &IngressRegistry, metrics: Option<&MuxMetri
 
 impl Drop for MuxCore {
     fn drop(&mut self) {
-        stop_mux(&self.tasks, &self.ingress, self.metrics.as_ref());
+        // Unconditional: a shutdown abandoned after `stop_sending` left the
+        // slots open.
+        self.tasks.stop();
+        self.retire_slots();
     }
 }
