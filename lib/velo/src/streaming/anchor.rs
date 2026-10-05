@@ -1040,6 +1040,14 @@ impl AnchorManagerBuilder {
 }
 
 impl AnchorManager {
+    /// Stop and join mux sends while their messenger transports still exist.
+    /// Readers stay attached until full shutdown withdraws their feeds.
+    pub(crate) async fn stop_mux_sending(&self) {
+        if let Some(mux) = self.mux.get() {
+            mux.stop_sending_and_wait().await;
+        }
+    }
+
     /// End every stream this manager holds. Called by `Velo::shutdown` after
     /// the messenger transports are torn down.
     ///
@@ -1059,12 +1067,8 @@ impl AnchorManager {
     /// around `Velo::shutdown`) still leaves no stream waiting on a slot or an
     /// anchor. The slots then stay open, with no reader, until the mux drops.
     ///
-    /// Known gap: the mux runs until step 1, which comes after transport
-    /// teardown. While `graceful_shutdown` tears the transports down, a
-    /// batcher can still hand a batch (credit, a local sender's records) to a
-    /// transport that is going away. Stopping the mux before teardown needs
-    /// `Velo::shutdown` to be split around this function, which is not done
-    /// here.
+    /// `Velo::graceful_shutdown` stops and joins mux sends before transport
+    /// teardown. Step 1 also makes direct calls to this method safe.
     pub(crate) async fn shutdown(&self) {
         let mux = self.mux.get();
         if let Some(mux) = mux {

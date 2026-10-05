@@ -536,9 +536,13 @@ async fn graceful_shutdown_timeout_drops_queued_work() {
         "both queued messages must be counted work before shutdown starts"
     );
 
+    // Test the messenger drain while its consumer cannot run. Velo shutdown
+    // also joins mux tasks, which need the owning runtime to make progress.
     tokio::time::timeout(
         Duration::from_secs(5),
-        server.graceful_shutdown(ShutdownPolicy::Timeout(Duration::from_millis(50))),
+        server
+            .messenger()
+            .graceful_shutdown(ShutdownPolicy::Timeout(Duration::from_millis(50))),
     )
     .await
     .expect("graceful_shutdown must give up once its timeout expires");

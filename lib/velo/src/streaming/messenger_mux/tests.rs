@@ -340,6 +340,55 @@ async fn a_batcher_dropped_by_stop_sending_leaves_slots_to_shutdown() {
     assert!(receiver.is_disconnected());
 }
 
+/// A mux task already running must exit before transport teardown. Cancelling
+/// a shutdown caller while it waits must leave that ordering intact on retry.
+#[tokio::test]
+async fn velo_joins_mux_tasks_before_transport_teardown() {
+    let velo = crate::Velo::builder().build().await.unwrap();
+    let mux = velo.anchor_manager.mux_handle().unwrap().upgrade().unwrap();
+    let stopped = mux.core.tasks.cancellation_token();
+    let state = velo.messenger.backend().shutdown_state();
+    let teardown = state.teardown_token();
+    let accepted = state.acquire();
+    let (exiting, exit_started) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    assert!(mux.core.tasks.spawn_until_done(async move {
+        stopped.cancelled().await;
+        let _ = exiting.send(());
+        let _ = released.await;
+    }));
+
+    let mut shutdown = Box::pin(velo.shutdown(crate::ShutdownPolicy::WaitForever));
+    assert!(futures::poll!(&mut shutdown).is_pending());
+    assert!(
+        !mux.core.tasks.is_stopped(),
+        "mux stopped before drain ended"
+    );
+    drop(accepted);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            result = exit_started => result.unwrap(),
+            _ = &mut shutdown => panic!("shutdown did not join the mux task"),
+        }
+    })
+    .await
+    .expect("shutdown did not stop the mux");
+    assert!(
+        !teardown.is_cancelled(),
+        "transport teardown overtook a running mux task"
+    );
+
+    drop(shutdown);
+    release.send(()).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        velo.shutdown(crate::ShutdownPolicy::WaitForever),
+    )
+    .await
+    .expect("cancelled shutdown could not resume");
+    assert!(teardown.is_cancelled());
+}
+
 #[test]
 fn a_secondary_runtime_does_not_own_the_mux_batchers() {
     let owner = tokio::runtime::Builder::new_multi_thread()

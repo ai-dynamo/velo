@@ -713,10 +713,10 @@ impl Velo {
     ///
     /// # One deadline, not one per phase
     ///
-    /// [`ShutdownPolicy::Timeout`] names a bound on *this call*, so the sweep
-    /// and the messenger drain share it rather than each taking the full
-    /// duration — which would make the worst case twice what was asked for.
-    /// The transports' close step comes on top: it is bounded by each
+    /// [`ShutdownPolicy::Timeout`] bounds the sweep and messenger drain
+    /// together, rather than giving each phase the full duration. Joining mux
+    /// tasks comes after the drain and needs the owning runtime to make
+    /// progress. The transports' close step also comes on top: it is bounded by each
     /// transport's own [`Transport::closed`] (QUIC: 2.5 s), not by the policy,
     /// because cutting it short would discard frames already written.
     /// Under [`ShutdownPolicy::WaitForever`] the sweep still takes
@@ -779,7 +779,12 @@ impl Velo {
             }
         };
 
-        self.messenger.graceful_shutdown(policy).await;
+        let backend = self.messenger.backend();
+        backend.drain(policy).await;
+        // A cancelled task can still be in a poll that sends a batch. Join it
+        // before transport teardown, but leave ingress for reader detachment.
+        self.anchor_manager.stop_mux_sending().await;
+        backend.finish_shutdown().await;
 
         // Teardown has returned, so the progress thread has force-unmapped
         // everything it still held: nothing is pinned any more, and every latch
@@ -1737,11 +1742,10 @@ mod tests {
 
     /// Shutdown must not write to peers after its transports are gone.
     ///
-    /// `graceful_shutdown` tears down the messenger transports first. Removing
-    /// an anchor with a live mux stream then closes its slot, and while the mux
-    /// still runs that close is batched to the peer: the TCP transport has no
-    /// connection left, dials, finds itself cancelled, and fails the frame as
-    /// a send error that the default handler logs at ERROR.
+    /// Credit and slot-close records can race transport teardown even when
+    /// the application has stopped sending. Graceful shutdown must stop and
+    /// join the mux before closing its transports, then detach readers before
+    /// retiring ingress slots.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn shutdown_with_live_mux_stream_sends_nothing_after_teardown() {
         use crate::observability::test_helpers::MetricSnapshot;

@@ -36,7 +36,7 @@ Each handler declares its exemption in the code where it is registered, so the g
 The drain counts an exempt message while its handler runs. It does not count the stream that the message serves. This has two results:
 
 - The drain finishes at the first moment that no message is in flight. A stream message is in flight only for microseconds, and consecutive batches are at least a credit round trip apart. An open stream, busy or quiet, therefore does not hold `graceful_shutdown` open.
-- Teardown then ends the mux streams, because they ride the messenger.
+- Velo then stops and joins mux sends before transport teardown. Ingress slots stay in place until full shutdown detaches their readers, so orderly shutdown does not report a false sender-drop error. The shutdown timeout bounds the drain; joining mux tasks comes after it and needs the owning Tokio runtime to keep running.
 
 To let open streams finish, call `begin_drain`, wait until your streams end, and then call `shutdown`. The application must wait for its streams: the messenger drain does not count their full lifetime.
 

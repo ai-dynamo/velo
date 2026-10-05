@@ -699,6 +699,12 @@ impl VeloBackend {
     /// 4. **Close**: Await each transport's `closed()`, so what it wrote reaches the peer
     ///    before this returns.
     pub async fn graceful_shutdown(&self, policy: ShutdownPolicy) {
+        self.drain(policy).await;
+        self.finish_shutdown().await;
+    }
+
+    /// Gate and drain while transports still serve accepted work.
+    pub(crate) async fn drain(&self, policy: ShutdownPolicy) {
         // Phase 1: Gate
         self.begin_drain();
 
@@ -711,7 +717,10 @@ impl VeloBackend {
                 let _ = tokio::time::timeout(duration, self.shutdown_state.wait_for_drain()).await;
             }
         }
+    }
 
+    /// Tear down after services that send through these transports have stopped.
+    pub(crate) async fn finish_shutdown(&self) {
         // Phase 3: Teardown
         self.shutdown_now();
 

@@ -18,17 +18,22 @@ use super::{MessengerMuxTransport, MuxCore, PeerLane};
 use crate::observability::MuxMetricsHandle;
 
 impl MessengerMuxTransport {
-    /// Stop the mux's tasks, so nothing more is written to any peer, but
-    /// leave its slots open: [`Self::shutdown`] retires them. Shutdown calls
+    /// Request that the mux's tasks stop, but leave its slots open:
+    /// [`Self::shutdown`] retires them. Shutdown calls
     /// this first so streams can be detached from their slots before
     /// retirement injects `Dropped` into them.
     pub(crate) fn stop_sending(&self) {
         self.core.tasks.stop();
     }
 
-    pub(crate) async fn shutdown(&self) {
-        self.core.tasks.stop();
+    /// Join running sends before messenger teardown, without retiring ingress.
+    pub(crate) async fn stop_sending_and_wait(&self) {
+        self.stop_sending();
         self.core.tasks.wait().await;
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        self.stop_sending_and_wait().await;
         self.core.batchers.clear();
         close_ingress(&self.core.ingress, self.core.metrics.as_ref());
         self.core.drains.clear();
