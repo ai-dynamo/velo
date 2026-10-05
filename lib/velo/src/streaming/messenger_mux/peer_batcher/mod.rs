@@ -416,8 +416,12 @@ impl Drop for Batcher {
             if super::lifecycle::stop_mux(&self.tasks, &self.ingress, self.metrics.as_ref())
                 && !already_cancelled
             {
-                tracing::error!(peer = %self.key.peer, lane = %self.key.lane,
-                    "messenger mux stopped: batcher task aborted unexpectedly");
+                // Nothing aborts a batcher on purpose. This is a panic, which
+                // tokio reports itself, or a runtime dropped before
+                // `Velo::shutdown` ran, which is not an error of its own.
+                tracing::warn!(peer = %self.key.peer, lane = %self.key.lane,
+                    "messenger mux stopped: a batcher task ended without its teardown \
+                     (a panic, or the runtime shut down before Velo::shutdown)");
             }
         }
         // A refused spawn can drop here under the batcher-map entry guard.
