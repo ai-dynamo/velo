@@ -51,6 +51,8 @@ impl StreamTasks {
         let tracked = {
             let _admission = self.admission.lock();
             if self.is_stopped() {
+                // `future` is a parameter, so it drops after `_admission`.
+                // Its Drop may stop this service and take the lock again.
                 return false;
             }
             self.tracker.track_future(future)
@@ -118,5 +120,34 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), tasks.wait())
             .await
             .expect("a stopped tracker waits only for running tasks");
+    }
+
+    /// A refused future is dropped after the admission lock is released. Its
+    /// `Drop` can stop the service (a batcher's does), and that takes the
+    /// same, non-reentrant lock.
+    #[tokio::test]
+    async fn a_refused_future_may_stop_the_service_from_its_drop() {
+        struct StopOnDrop(StreamTasks);
+        impl Drop for StopOnDrop {
+            fn drop(&mut self) {
+                self.0.stop();
+            }
+        }
+
+        let tasks = StreamTasks::default();
+        tasks.stop();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let refused = tasks.clone();
+        std::thread::spawn(move || {
+            let guard = StopOnDrop(refused.clone());
+            let spawned = refused.spawn_until_done(async move {
+                let _guard = guard;
+            });
+            done_tx.send(spawned).unwrap();
+        });
+        let spawned = done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("dropping a refused future deadlocked on the admission lock");
+        assert!(!spawned);
     }
 }
