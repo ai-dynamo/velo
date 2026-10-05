@@ -1040,7 +1040,46 @@ impl AnchorManagerBuilder {
 }
 
 impl AnchorManager {
+    /// End every stream this manager holds. Called by `Velo::shutdown` after
+    /// the messenger transports are torn down.
+    ///
+    /// Two rules hold from step 1 on. Nothing is sent to a peer, because the
+    /// transports are gone. No mux slot is retired while a stream still reads
+    /// from it, because retirement injects `Dropped` that the reader would
+    /// take as its sender's. Hence the steps:
+    ///
+    /// 1. Stop the mux's tasks. A slot close after this finds no batcher and
+    ///    sends nothing. The slots stay open.
+    /// 2. Take streams off their slots: SPSC feeds withdrawn, MPSC pumps
+    ///    cancelled.
+    /// 3. Remove anchors and MPSC entries, and cancel local senders.
+    /// 4. Join the mux's tasks and retire its slots.
+    ///
+    /// Steps 1-3 do not await. A caller that drops this future (a timeout
+    /// around `Velo::shutdown`) still leaves no stream waiting on a slot or an
+    /// anchor. The slots then stay open, with no reader, until the mux drops.
+    ///
+    /// Known gap: the mux runs until step 1, which comes after transport
+    /// teardown. While `graceful_shutdown` tears the transports down, a
+    /// batcher can still hand a batch (credit, a local sender's records) to a
+    /// transport that is going away. Stopping the mux before teardown needs
+    /// `Velo::shutdown` to be split around this function, which is not done
+    /// here.
     pub(crate) async fn shutdown(&self) {
+        let mux = self.mux.get();
+        if let Some(mux) = mux {
+            mux.stop_sending();
+        }
+        for mut entry in self.registry.iter_mut() {
+            entry.retire_pump();
+        }
+        for entry in self.mpsc_registry.iter() {
+            for slot in entry.senders.values() {
+                if let Some(pump) = &slot.pump_token {
+                    pump.cancel();
+                }
+            }
+        }
         // Remove entries outside shard guards: their Drop may close a mux slot.
         let ids: Vec<_> = self.registry.iter().map(|entry| *entry.key()).collect();
         for id in ids {
@@ -1065,7 +1104,7 @@ impl AnchorManager {
         for id in ids {
             self.sender_registry.cancel(id);
         }
-        if let Some(mux) = self.mux.get() {
+        if let Some(mux) = mux {
             mux.shutdown().await;
         }
     }
@@ -1360,10 +1399,31 @@ impl AnchorManager {
         // own pre-binds. Chosen before the bind so the bind is counted on it.
         let lane = mux.choose_lane(None, lane_key);
         let lane_index = lane.lane();
-        let receiver = mux.bind_on_lane(local_id, routing_session_id, lane).ok()?;
-        let drain = mux
-            .take_drain_signal(local_id, routing_session_id)
-            .expect("prebind parks a drain signal for the pair it just registered");
+        // The bind fails once the mux is stopped. Its drain signal is missing
+        // only when mux shutdown cleared it after the bind, which is the same
+        // case, a moment later.
+        let bound = mux
+            .bind_on_lane(local_id, routing_session_id, lane)
+            .ok()
+            .and_then(
+                |receiver| match mux.take_drain_signal(local_id, routing_session_id) {
+                    Some(drain) => Some((receiver, drain)),
+                    None => {
+                        mux.release_bind(local_id, routing_session_id);
+                        None
+                    }
+                },
+            );
+        let Some((receiver, drain)) = bound else {
+            tracing::debug!(%handle, "prebind_anchor: the mux is shut down; no ticket minted");
+            self.record_streaming_operation(
+                StreamingOp::Prebind,
+                HandlerOutcome::Error,
+                "unknown",
+                started,
+            );
+            return None;
+        };
 
         // Negotiated against the local mux alone. There is no peer here to
         // intersect with — that is the whole point — so the terms are this
@@ -2984,6 +3044,30 @@ mod tests {
             anchor.next().await,
             Some(Ok(StreamFrame::Item(42)))
         ));
+    }
+
+    /// A sender may be moved to a thread with no runtime (a language
+    /// binding's thread). Detaching there must still arm the unattached
+    /// timeout; otherwise an anchor nobody re-attaches is never reaped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn detach_from_plain_thread_arms_unattached_timeout() {
+        let mgr = make_manager();
+        let anchor = mgr.create_anchor::<u8>();
+        anchor.set_timeout(Some(Duration::from_millis(100)));
+        let handle = anchor.handle();
+        let (_, local_id) = handle.unpack();
+        let sender = mgr.attach_stream_anchor::<u8>(handle).await.unwrap();
+        std::thread::spawn(move || sender.detach().unwrap())
+            .join()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while mgr.registry.contains_key(&local_id) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("detached anchor was never reaped");
+        drop(anchor);
     }
 
     // -----------------------------------------------------------------------

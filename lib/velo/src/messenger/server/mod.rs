@@ -22,6 +22,7 @@ use crate::transports::{DataStreams, InboundMessage, ShutdownState, VeloBackend}
 use bytes::Bytes;
 use tokio_util::task::TaskTracker;
 
+use dispatcher::send_error_reply;
 pub(crate) use dispatcher::{DispatcherHub, HandlerContext};
 
 pub(crate) struct ActiveMessageServer {
@@ -311,19 +312,14 @@ async fn create_message_handler(
                                         response_type,
                                         crate::messenger::common::messages::ResponseType::AckNack
                                             | crate::messenger::common::messages::ResponseType::Unary
-                                    ) && let Err(send_err) = hub
-                                        .send_error_response(
+                                    ) {
+                                        send_error_reply(
+                                            system.backend(),
+                                            &handler_name,
                                             message_id,
                                             format!("Failed to resolve large payload: {e}"),
                                         )
-                                        .await
-                                        && !send_err.is::<crate::transports::AdmissionError>()
-                                    {
-                                        tracing::error!(
-                                            target: "crate::messenger::server",
-                                            handler = %handler_name,
-                                            "Failed to send error response: {send_err}"
-                                        );
+                                        .await;
                                     }
                                 }
                             }
@@ -341,24 +337,18 @@ async fn create_message_handler(
                             crate::messenger::common::messages::ResponseType::AckNack
                                 | crate::messenger::common::messages::ResponseType::Unary
                         ) {
-                            let hub = hub.clone();
+                            let backend = system.backend().clone();
+                            let handler_name = message.metadata.handler_name.clone();
                             let message_id = message.metadata.response_id;
                             tokio::spawn(async move {
                                 let _in_flight = in_flight;
-                                if let Err(e) = hub
-                                    .send_error_response(
-                                        message_id,
-                                        "Rendezvous resolver not configured on receiver"
-                                            .to_string(),
-                                    )
-                                    .await
-                                    && !e.is::<crate::transports::AdmissionError>()
-                                {
-                                    tracing::error!(
-                                        target: "crate::messenger::server",
-                                        "Failed to send error response for missing resolver: {e}"
-                                    );
-                                }
+                                send_error_reply(
+                                    &backend,
+                                    &handler_name,
+                                    message_id,
+                                    "Rendezvous resolver not configured on receiver".to_string(),
+                                )
+                                .await;
                             });
                         }
                         continue;

@@ -796,12 +796,17 @@ impl Velo {
 
     /// Drain messenger work and stop this instance's streaming services.
     ///
-    /// This also cancels live streams and joins the receive loops and streaming
-    /// listener and pump tasks owned by the builder. Custom frame transports
+    /// This also cancels live streams, and joins the receive loops and the
+    /// streaming transport tasks owned by the builder. Stream reader pumps are
+    /// cancelled, not joined. Custom frame transports
     /// remain the caller's responsibility. Stream watchdogs and heartbeats are
     /// cancelled; application handlers that exceed `policy` can still be running.
+    /// If the sender of a stream is on this instance, shutdown cancels that
+    /// sender: its `cancellation_token` fires, and later sends fail. The reader
+    /// ends when the application drops or finalizes the sender.
     /// Use this when an instance is removed while its Tokio runtime stays alive.
-    /// This closes resources but retains the legacy ownership graph in memory.
+    /// It closes resources. The instance and its handles stay valid, and
+    /// shutdown does not release them from memory.
     pub async fn shutdown(&self, policy: ShutdownPolicy) {
         self.graceful_shutdown(policy).await;
         self.anchor_manager.shutdown().await;
@@ -1686,5 +1691,321 @@ mod tests {
         manager.upgrade().unwrap().shutdown().await;
         owned_transport.shutdown().await;
         retained.closed().await;
+    }
+
+    /// A node with one TCP transport on a loopback port and a loopback stream listener.
+    async fn tcp_stream_node(metrics: Option<Arc<VeloMetrics>>) -> Arc<Velo> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut builder = Velo::builder()
+            .add_transport(Arc::new(
+                crate::transports::tcp::TcpTransportBuilder::new()
+                    .from_listener(listener)
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+            ))
+            .stream_bind_addr(std::net::Ipv4Addr::LOCALHOST.into());
+        if let Some(metrics) = metrics {
+            builder = builder.metrics(metrics);
+        }
+        builder.build().await.unwrap()
+    }
+
+    /// A (consumer, producer) pair that know each other and both serve `attach_handler`.
+    async fn connected_pair(
+        consumer_metrics: Option<Arc<VeloMetrics>>,
+        attach_handler: &str,
+    ) -> (Arc<Velo>, Arc<Velo>) {
+        let consumer = tcp_stream_node(consumer_metrics).await;
+        let producer = tcp_stream_node(None).await;
+        consumer.register_peer(producer.peer_info()).unwrap();
+        producer.register_peer(consumer.peer_info()).unwrap();
+        for (node, peer) in [
+            (&consumer, producer.instance_id()),
+            (&producer, consumer.instance_id()),
+        ] {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                node.wait_for_handler(peer, attach_handler),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        }
+        (consumer, producer)
+    }
+
+    /// Shutdown must not write to peers after its transports are gone.
+    ///
+    /// `graceful_shutdown` tears down the messenger transports first. Removing
+    /// an anchor with a live mux stream then closes its slot, and while the mux
+    /// still runs that close is batched to the peer: the TCP transport has no
+    /// connection left, dials, finds itself cancelled, and fails the frame as
+    /// a send error that the default handler logs at ERROR.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_with_live_mux_stream_sends_nothing_after_teardown() {
+        use crate::observability::test_helpers::MetricSnapshot;
+        use futures::StreamExt;
+
+        let registry = prometheus::Registry::new();
+        let metrics = Arc::new(VeloMetrics::register(&registry).unwrap());
+        let (consumer, producer) = connected_pair(Some(metrics), "_anchor_attach").await;
+
+        let mut anchor = consumer.create_anchor::<u32>();
+        let sender = producer
+            .attach_anchor::<u32>(anchor.handle())
+            .await
+            .unwrap();
+        sender.send(1).await.unwrap();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), anchor.next())
+            .await
+            .unwrap();
+        assert!(matches!(
+            first,
+            Some(Ok(crate::streaming::StreamFrame::Item(1)))
+        ));
+
+        let send_errors = || {
+            MetricSnapshot::from_registry(&registry).counter(
+                "velo_transport_rejections_total",
+                &[("transport", "tcp"), ("reason", "send_error")],
+            )
+        };
+        let before = send_errors();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            consumer.shutdown(ShutdownPolicy::WaitForever),
+        )
+        .await
+        .expect("consumer shutdown hung");
+        // A failed dial reports from the writer task after shutdown returns.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            send_errors(),
+            before,
+            "shutdown sent a frame after its transport was torn down"
+        );
+
+        drop(sender);
+        drop(anchor);
+        producer.shutdown(ShutdownPolicy::WaitForever).await;
+    }
+
+    /// A consumer still reading when its node shuts down must see the stream
+    /// end, not `SenderDropped`: the sender did nothing wrong.
+    ///
+    /// Stopping the mux retires every ingress slot by injecting `Dropped` into
+    /// it. A consumer whose direct feed is still installed reads that record
+    /// as its sender's. So each anchor's feed must be withdrawn before the mux
+    /// stops, which is also what `AnchorEntry::drop` does before it closes a
+    /// slot, for the same reason.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_ends_a_live_mux_stream_without_sender_dropped() {
+        use futures::StreamExt;
+
+        let (consumer, producer) = connected_pair(None, "_anchor_attach").await;
+
+        let mut anchor = consumer.create_anchor::<u32>();
+        let sender = producer
+            .attach_anchor::<u32>(anchor.handle())
+            .await
+            .unwrap();
+        sender.send(1).await.unwrap();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), anchor.next())
+            .await
+            .unwrap();
+        assert!(matches!(
+            first,
+            Some(Ok(crate::streaming::StreamFrame::Item(1)))
+        ));
+
+        let reader = tokio::spawn(async move { anchor.next().await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            consumer.shutdown(ShutdownPolicy::WaitForever),
+        )
+        .await
+        .expect("consumer shutdown hung");
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), reader)
+            .await
+            .expect("reader still waiting after shutdown")
+            .unwrap();
+        assert!(
+            ended.is_none(),
+            "shutdown must end a live stream cleanly, got {ended:?}"
+        );
+
+        drop(sender);
+        producer.shutdown(ShutdownPolicy::WaitForever).await;
+    }
+
+    /// The MPSC form of the test above. An MPSC slot's records reach the
+    /// consumer through a pump, so stopping the mux injects `Dropped` that a
+    /// live pump forwards as the sender's own `Dropped`. The pumps must stop
+    /// before the mux does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_ends_a_live_mpsc_mux_stream_without_dropped() {
+        use futures::StreamExt;
+
+        use crate::observability::test_helpers::MetricSnapshot;
+
+        let registry = prometheus::Registry::new();
+        let metrics = Arc::new(VeloMetrics::register(&registry).unwrap());
+        let (consumer, producer) = connected_pair(Some(metrics), "_mpsc_anchor_attach").await;
+
+        let mut anchor = consumer.create_mpsc_anchor::<u32>();
+        let sender = producer
+            .attach_mpsc_anchor::<u32>(anchor.handle())
+            .await
+            .unwrap();
+        sender.send(1).await.unwrap();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), anchor.next())
+            .await
+            .unwrap();
+        assert!(matches!(
+            first,
+            Some(Ok((_, crate::streaming::mpsc::MpscFrame::Item(1))))
+        ));
+
+        let send_errors = || {
+            MetricSnapshot::from_registry(&registry).counter(
+                "velo_transport_rejections_total",
+                &[("transport", "tcp"), ("reason", "send_error")],
+            )
+        };
+        let before = send_errors();
+        let reader = tokio::spawn(async move { anchor.next().await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            consumer.shutdown(ShutdownPolicy::WaitForever),
+        )
+        .await
+        .expect("consumer shutdown hung");
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), reader)
+            .await
+            .expect("reader still waiting after shutdown")
+            .unwrap();
+        assert!(
+            ended.is_none(),
+            "shutdown must end a live MPSC stream cleanly, got {ended:?}"
+        );
+        // A stopped pump releases its slot; that must not reach the wire.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            send_errors(),
+            before,
+            "shutdown sent a frame after its transport was torn down"
+        );
+
+        drop(sender);
+        producer.shutdown(ShutdownPolicy::WaitForever).await;
+    }
+
+    /// What `Velo::shutdown` does to a stream whose sender is on this node
+    /// and still held by the application: the sender is cancelled (its
+    /// `cancellation_token` fires and later sends fail), and its reader ends
+    /// when the application drops it. Shutdown does not end the reader itself:
+    /// a consumer poll that watched for it would cost every read a check.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_cancels_a_held_local_sender_and_its_reader_ends_on_drop() {
+        use futures::StreamExt;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let velo = Velo::builder()
+            .add_transport(Arc::new(
+                crate::transports::tcp::TcpTransportBuilder::new()
+                    .from_listener(listener)
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+            ))
+            .build()
+            .await
+            .unwrap();
+
+        let mut anchor = velo.create_anchor::<u32>();
+        let sender = velo.attach_anchor::<u32>(anchor.handle()).await.unwrap();
+        let mut mpsc_anchor = velo.create_mpsc_anchor::<u32>();
+        let mpsc_sender = velo
+            .attach_mpsc_anchor::<u32>(mpsc_anchor.handle())
+            .await
+            .unwrap();
+        let reader = tokio::spawn(async move { anchor.next().await });
+        let mpsc_reader = tokio::spawn(async move { mpsc_anchor.next().await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            velo.shutdown(ShutdownPolicy::WaitForever),
+        )
+        .await
+        .expect("shutdown hung");
+        assert!(sender.cancellation_token().is_cancelled());
+        assert!(mpsc_sender.cancellation_token().is_cancelled());
+        assert!(sender.send(1).await.is_err());
+        assert!(mpsc_sender.send(1).await.is_err());
+
+        drop(sender);
+        drop(mpsc_sender);
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(2), reader)
+            .await
+            .expect("SPSC reader still waiting after its sender was dropped")
+            .unwrap();
+        assert!(
+            matches!(
+                ended,
+                Some(Err(crate::streaming::StreamError::SenderDropped))
+            ),
+            "got {ended:?}"
+        );
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(2), mpsc_reader)
+            .await
+            .expect("MPSC reader still waiting after its sender was dropped")
+            .unwrap();
+        assert!(
+            matches!(
+                ended,
+                Some(Ok((_, crate::streaming::mpsc::MpscFrame::Dropped(_))))
+            ),
+            "got {ended:?}"
+        );
+    }
+
+    /// Every state change in shutdown happens before its first await.
+    ///
+    /// A caller can bound `Velo::shutdown` with a timeout and drop it while it
+    /// waits for the mux's tasks. Streams must already be off their slots and
+    /// their anchors removed by then; a dropped future that had withdrawn the
+    /// feeds but not removed the anchors would leave their readers waiting on
+    /// nothing. The runtime is single-threaded, so the mux's own tasks have
+    /// not run and its join is still pending at the first poll.
+    #[tokio::test(flavor = "current_thread")]
+    async fn abandoning_anchor_shutdown_still_removes_every_anchor() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let velo = Velo::builder()
+            .add_transport(Arc::new(
+                crate::transports::tcp::TcpTransportBuilder::new()
+                    .from_listener(listener)
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+            ))
+            .build()
+            .await
+            .unwrap();
+        let _anchor = velo.create_anchor::<u32>();
+        let _mpsc_anchor = velo.create_mpsc_anchor::<u32>();
+        {
+            let shutdown = velo.anchor_manager.shutdown();
+            futures::pin_mut!(shutdown);
+            assert!(
+                futures::poll!(shutdown.as_mut()).is_pending(),
+                "the test needs shutdown to wait at its first poll"
+            );
+        }
+        assert!(velo.anchor_manager.registry.is_empty());
+        assert!(velo.anchor_manager.mpsc_registry.is_empty());
     }
 }

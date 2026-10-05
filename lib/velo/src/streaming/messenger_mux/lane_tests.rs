@@ -1143,3 +1143,55 @@ async fn a_lane_that_refuses_admission_fails_only_its_own_streams() {
         .await
         .expect("the streams on the other lanes finish in order");
 }
+
+/// A pre-bind that races shutdown fails, and is counted as a failed pre-bind;
+/// it does not panic.
+///
+/// `prebind_anchor` is a public sync call an application can make on any
+/// thread. Mux shutdown clears the parked drain signals, so one can vanish
+/// between the pre-bind's bind and its take. The bind hook plays that
+/// shutdown.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_prebind_racing_shutdown_returns_none() {
+    use crate::observability::test_helpers::MetricSnapshot;
+
+    let registry = prometheus::Registry::new();
+    let metrics = Arc::new(crate::observability::VeloMetrics::register(&registry).unwrap());
+    let velo = Velo::builder()
+        .add_transport(Arc::new(
+            QuicTransportBuilder::new()
+                .bind_addr("127.0.0.1:0".parse().expect("loopback"))
+                .build()
+                .expect("quic transport"),
+        ) as Arc<dyn crate::Transport>)
+        .stream_bind_addr(std::net::Ipv4Addr::LOCALHOST.into())
+        .metrics(metrics)
+        .build()
+        .await
+        .expect("build velo");
+    let mux = velo
+        .anchor_manager()
+        .mux_handle()
+        .and_then(|mux| mux.upgrade())
+        .expect("velo installs the mux by default");
+    let core = Arc::downgrade(&mux.core);
+    assert!(
+        mux.core
+            .bind_hook
+            .set(Box::new(move |_| {
+                if let Some(core) = core.upgrade() {
+                    core.drains.clear();
+                }
+            }))
+            .is_ok()
+    );
+    let anchor = velo.create_anchor::<u32>();
+    assert!(velo.prebind_anchor(anchor.handle()).is_none());
+    assert_eq!(
+        MetricSnapshot::from_registry(&registry).counter(
+            "velo_streaming_anchor_operations_total",
+            &[("operation", "prebind"), ("outcome", "error")],
+        ),
+        1.0
+    );
+}

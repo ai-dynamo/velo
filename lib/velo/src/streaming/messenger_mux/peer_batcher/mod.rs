@@ -283,6 +283,10 @@ pub(crate) struct BatcherContext {
     pub(crate) epochs: Arc<AtomicU64>,
     pub(crate) batchers: Arc<BatcherMap>,
     pub(crate) ingress: Arc<super::ingress::IngressRegistry>,
+    /// The run loop's own exit. The mux passes `tasks.cancellation_token()`;
+    /// a stop that lands while the loop is being polled exits here, through
+    /// `teardown(true)`, rather than by the spawn wrapper dropping the loop.
+    /// Tests pass a separate token to drive that exit on purpose.
     pub(crate) cancel: CancellationToken,
     /// A barrier in the run loop, installed only by the tests that need to stop
     /// it mid-wake. See [`test_hooks`].
@@ -409,11 +413,16 @@ impl Drop for Batcher {
         // abort during that flush still loses credit and must stop the mux.
         if !self.teardown_complete {
             let already_cancelled = self.cancel.is_cancelled();
-            if self.tasks.stop() && !already_cancelled {
-                tracing::error!(peer = %self.key.peer, lane = %self.key.lane,
-                    "messenger mux stopped: batcher task aborted unexpectedly");
+            if super::lifecycle::stop_mux(&self.tasks, &self.ingress, self.metrics.as_ref())
+                && !already_cancelled
+            {
+                // Nothing aborts a batcher on purpose. This is a panic, which
+                // tokio reports itself, or a runtime dropped before
+                // `Velo::shutdown` ran, which is not an error of its own.
+                tracing::warn!(peer = %self.key.peer, lane = %self.key.lane,
+                    "messenger mux stopped: a batcher task ended without its teardown \
+                     (a panic, or the runtime shut down before Velo::shutdown)");
             }
-            super::close_ingress(&self.ingress, self.metrics.as_ref());
         }
         // A refused spawn can drop here under the batcher-map entry guard.
         // Normal exits unregister in run; whole-mux shutdown clears the map.
@@ -828,7 +837,7 @@ impl Batcher {
     /// (`docs/src/concepts/batched-streaming.md` § "Slots"), so nothing about the *sender's* admission
     /// order says anything about the order the receiver applies it in.
     ///
-    /// The `tokio::spawn` below always watches the admission — even an
+    /// The task spawned below always watches the admission — even an
     /// unfenced dispatch has to learn of a *failure*, which is epoch death
     /// whether or not the fence was ever raised. But it reports *success* to
     /// `singleton_resolved` only when this call actually fenced: an unfenced
@@ -1132,9 +1141,10 @@ impl Batcher {
         // that terminates only if a closed batcher is never the registered
         // one. The retire path holds it because the sweep removes the entry
         // before posting `retire`; this order is what holds it on the other
-        // exit. Nothing writes after cancel today — it comes only from
-        // `MuxCore::drop` — which is why the invariant is kept structural
-        // rather than argued from the callers.
+        // exit. Cancel comes from `stop_sending`, `stop_mux` and
+        // `MuxCore::drop`. A writer that runs after it (a slot close during
+        // anchor removal at shutdown) is refused by `MuxCore::batcher`, and
+        // this order keeps the invariant even if that guard were missed.
         if unregister {
             let handle = Arc::clone(&self.handle);
             self.batchers

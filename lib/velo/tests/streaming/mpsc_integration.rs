@@ -386,6 +386,78 @@ async fn abandoning_mpsc_detach_completes_or_stops_on_consumer_cancel() {
     }
 }
 
+/// A sender can outlive the runtime it was attached on. Detaching it from
+/// another runtime must still deliver `Detached`: work spawned on the stopped
+/// runtime is dropped, so the consumer would see no terminal at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn mpsc_detach_after_attaching_runtime_stops() {
+    let mgr = make_manager();
+    let mut anchor = mgr.create_mpsc_anchor::<u32>();
+    let handle = anchor.handle();
+    let attach_mgr = Arc::clone(&mgr);
+    let sender = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(attach_mgr.attach_mpsc_stream_anchor::<u32>(handle))
+        // `runtime` drops here and shuts down.
+    })
+    .join()
+    .unwrap()
+    .expect("attach");
+    let sid = sender.sender_id();
+    let returned = tokio::time::timeout(Duration::from_secs(2), sender.detach())
+        .await
+        .expect("detach stalled")
+        .expect("detach after the attaching runtime stopped");
+    assert_eq!(returned, handle);
+    assert!(
+        matches!(next_frame(&mut anchor).await, Some(Ok((id, MpscFrame::Detached))) if id == sid)
+    );
+    anchor.cancel();
+}
+
+/// A sender kept in a `thread_local!` (a language binding's thread) is
+/// dropped while that thread's locals are torn down. Tokio's own context can
+/// already be gone then, and `Handle::enter` panics on a destroyed context; a
+/// panic in a thread-local destructor aborts the process. The drop must
+/// degrade instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn mpsc_sender_dropped_during_thread_local_teardown() {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static HELD: RefCell<Option<velo::streaming::MpscStreamSender<u32>>> =
+            const { RefCell::new(None) };
+    }
+
+    // With an unattached timeout, the last sender leaving re-arms it, which
+    // spawns: that spawn must degrade the same way.
+    let mgr = make_manager();
+    let mut anchor = mgr.create_mpsc_anchor_with_config::<u32>(MpscAnchorConfig {
+        unattached_timeout: Some(Duration::from_secs(60)),
+        ..Default::default()
+    });
+    let sender = mgr
+        .attach_mpsc_stream_anchor::<u32>(anchor.handle())
+        .await
+        .unwrap();
+    let sid = sender.sender_id();
+    std::thread::spawn(move || {
+        HELD.with(|held| *held.borrow_mut() = Some(sender));
+        // Touch tokio's context after `HELD`, so its destructor is registered
+        // later and runs first.
+        assert!(tokio::runtime::Handle::try_current().is_err());
+    })
+    .join()
+    .expect("dropping the sender during thread-local teardown panicked");
+    assert!(
+        matches!(next_frame(&mut anchor).await, Some(Ok((id, MpscFrame::Dropped(None)))) if id == sid)
+    );
+    anchor.cancel();
+}
+
 /// A pending `anchor.next()` must terminate promptly when the controller
 /// cancels, even if sender handles are still alive.
 #[tokio::test(flavor = "multi_thread")]

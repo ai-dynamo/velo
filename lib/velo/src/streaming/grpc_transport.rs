@@ -64,6 +64,11 @@ const SESSION_ID_META: &str = "x-session-id";
 /// so the heartbeat watchdog is what reports a wedged consumer, not this.
 const TERMINAL_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// How long `shutdown` lets open HTTP/2 connections finish GOAWAY before it
+/// drops the server. A clean close takes one round trip; this bounds the case
+/// where a peer never answers.
+const SERVER_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
 use crate::streaming::sender::is_terminal_sentinel;
 
 // ---------------------------------------------------------------------------
@@ -273,11 +278,29 @@ impl GrpcFrameTransport {
         tasks.spawn_until_done(async move {
             let server =
                 tonic::transport::Server::builder().add_service(VeloStreamingServer::new(service));
-            if let Err(e) = server
-                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), cancel.cancelled())
-                .await
-            {
-                tracing::warn!("GrpcFrameTransport server error: {}", e);
+            let serve = server
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), cancel.cancelled());
+            // Graceful shutdown waits for every connection, and a connection
+            // that never finished its HTTP/2 handshake cannot be sent GOAWAY,
+            // so it would hold `shutdown` open forever. After the grace period
+            // drop the server: the listener closes, and tonic's own connection
+            // tasks end when their peers close.
+            let grace_expired = async {
+                cancel.cancelled().await;
+                tokio::time::sleep(SERVER_CLOSE_GRACE).await;
+            };
+            tokio::select! {
+                result = serve => {
+                    if let Err(e) = result {
+                        tracing::warn!("GrpcFrameTransport server error: {}", e);
+                    }
+                }
+                () = grace_expired => {
+                    tracing::debug!(
+                        "GrpcFrameTransport: connections still open after {:?}; releasing listener",
+                        SERVER_CLOSE_GRACE
+                    );
+                }
             }
         });
 
@@ -551,18 +574,6 @@ mod tests {
         (wid, PeerInfo::new(inst, address))
     }
 
-    /// Regression: the streaming RPC must not complete its response until it
-    /// has consumed the whole request stream.
-    ///
-    /// `connect`'s frame pump uses end-of-response as the acknowledgement that
-    /// its terminal sentinel reached the consumer. When the handler answered
-    /// with an already-empty stream, tonic sent the trailers before reading the
-    /// request body, so the pump had nothing to wait on: it queued its frames
-    /// into a 256-slot channel and tore the call down, discarding whatever had
-    /// not yet been flushed. On a short stream that routinely threw away *every*
-    /// frame including the terminal, and the server — having seen a request
-    /// stream that ended without a sentinel — injected `Dropped`. The consumer
-    /// then failed with `SenderDropped` despite a clean `finalize()`.
     #[tokio::test]
     async fn shutdown_closes_listener_binds_and_active_pumps() {
         let server = GrpcFrameTransport::new("127.0.0.1:0".parse().unwrap())
@@ -600,6 +611,39 @@ mod tests {
             .expect("listener released before shutdown returns");
     }
 
+    /// A peer that opens TCP to the stream port and never sends the HTTP/2
+    /// preface (a health check, a port scan, a peer that died mid-handshake)
+    /// must not hold shutdown open. tonic's graceful shutdown waits for every
+    /// connection, and hyper cannot send GOAWAY before the handshake ends, so
+    /// waiting for the server task alone never returns.
+    #[tokio::test]
+    async fn shutdown_does_not_wait_for_silent_connection() {
+        let server = GrpcFrameTransport::new("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let addr = server.bound_addr();
+        let _silent = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::timeout(Duration::from_secs(5), server.shutdown())
+            .await
+            .expect("shutdown waited for a connection that never spoke HTTP/2");
+        let _listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .expect("listener released before shutdown returns");
+    }
+
+    /// Regression: the streaming RPC must not complete its response until it
+    /// has consumed the whole request stream.
+    ///
+    /// `connect`'s frame pump uses end-of-response as the acknowledgement that
+    /// its terminal sentinel reached the consumer. When the handler answered
+    /// with an already-empty stream, tonic sent the trailers before reading the
+    /// request body, so the pump had nothing to wait on: it queued its frames
+    /// into a 256-slot channel and tore the call down, discarding whatever had
+    /// not yet been flushed. On a short stream that routinely threw away *every*
+    /// frame including the terminal, and the server — having seen a request
+    /// stream that ended without a sentinel — injected `Dropped`. The consumer
+    /// then failed with `SenderDropped` despite a clean `finalize()`.
     #[tokio::test(flavor = "multi_thread")]
     async fn response_completes_only_after_request_stream_drains() {
         let server = GrpcFrameTransport::default_new().await.unwrap();

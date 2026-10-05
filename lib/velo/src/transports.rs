@@ -145,21 +145,27 @@ struct StartupTransports {
 impl StartupTransports {
     fn stop(&mut self) {
         if let Some(shutdown) = self.shutdown.take() {
-            shutdown.begin_drain();
-            for transport in self.transports.values() {
-                transport.begin_drain();
-            }
             // Construction has no caller to drain work for. Use a zero budget.
-            shutdown.teardown_token().cancel();
-            for transport in self.transports.values() {
-                transport.shutdown();
-            }
+            stop_transports(&shutdown, &self.transports);
         }
     }
 
     fn finish(mut self) -> HashMap<TransportKey, Arc<dyn Transport>> {
         self.shutdown = None;
         std::mem::take(&mut self.transports)
+    }
+}
+
+/// Gate, tear down, and shut down every transport. Both `begin_drain` calls
+/// are idempotent, so this is safe after a graceful drain already ran.
+fn stop_transports(state: &ShutdownState, transports: &HashMap<TransportKey, Arc<dyn Transport>>) {
+    state.begin_drain();
+    for transport in transports.values() {
+        transport.begin_drain();
+    }
+    state.teardown_token().cancel();
+    for transport in transports.values() {
+        transport.shutdown();
     }
 }
 
@@ -682,13 +688,7 @@ impl VeloBackend {
 
     /// Stop transports after teardown or failed construction.
     pub(crate) fn shutdown_now(&self) {
-        if !self.shutdown_state.is_draining() {
-            self.begin_drain();
-        }
-        self.shutdown_state.teardown_token().cancel();
-        for transport in self.transports.values() {
-            transport.shutdown();
-        }
+        stop_transports(&self.shutdown_state, &self.transports);
     }
 
     /// Perform a graceful 4-phase shutdown.

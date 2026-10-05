@@ -130,7 +130,6 @@ impl Default for UcxConfig {
 /// gates admitted. An epoch is retired when the peer's endpoint fails.
 #[derive(Clone)]
 struct ConnHandle {
-    tx: flume::Sender<SendTask>,
     admission: Arc<Mutex<()>>,
     gate: AdmissionGate<SendTask>,
     _lifetime: Arc<tokio_util::sync::DropGuard>,
@@ -269,8 +268,11 @@ impl UcxTransport {
             .entry(peer)
             .or_insert_with(|| {
                 let (tx, rx) = flume::bounded::<SendTask>(self.config.channel_capacity);
-                let gate = AdmissionGate::new(tx.clone(), rt.clone());
-                let epoch_tx = tx.clone();
+                let gate = AdmissionGate::new(tx, rt.clone());
+                // Identifies this epoch in cleanup; cheaper per send than a
+                // channel sender clone inside every `ConnHandle` copy.
+                let admission = Arc::new(Mutex::new(()));
+                let epoch_admission = admission.clone();
                 let connections = Arc::downgrade(&self.connections);
                 let cancel = tokio_util::sync::CancellationToken::new();
                 let lifetime = Arc::new(cancel.clone().drop_guard());
@@ -324,7 +326,7 @@ impl UcxTransport {
                         doorbell.ring();
                     }
                     if let Some(connections) = connections.upgrade() {
-                        if let Some((_, stale)) = connections.remove_if(&peer, |_, h| h.tx.same_channel(&epoch_tx)) {
+                        if let Some((_, stale)) = connections.remove_if(&peer, |_, h| Arc::ptr_eq(&h.admission, &epoch_admission)) {
                             stale.gate.fail_all(AdmissionError::ChannelClosed);
                         }
                         if let Some(metrics) = metrics.as_ref() {
@@ -335,12 +337,11 @@ impl UcxTransport {
                     }
                     pending.fail_all(AdmissionError::ChannelClosed);
                     drop(pending);
-                    drop(epoch_tx);
                     while let Ok(task) = rx.recv_async().await {
                         task.fail("ucx connection closed");
                     }
                 });
-                ConnHandle { tx, admission: Arc::new(Mutex::new(())), gate, _lifetime: lifetime }
+                ConnHandle { admission, gate, _lifetime: lifetime }
             })
             .clone();
         if let Some(m) = self.shared.metrics.get() {
