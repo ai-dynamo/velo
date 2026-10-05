@@ -1137,9 +1137,10 @@ impl Batcher {
         // that terminates only if a closed batcher is never the registered
         // one. The retire path holds it because the sweep removes the entry
         // before posting `retire`; this order is what holds it on the other
-        // exit. Nothing writes after cancel today — it comes only from
-        // `MuxCore::drop` — which is why the invariant is kept structural
-        // rather than argued from the callers.
+        // exit. Cancel comes from `stop_sending`, `stop_mux` and
+        // `MuxCore::drop`. A writer that runs after it (a slot close during
+        // anchor removal at shutdown) is refused by `MuxCore::batcher`, and
+        // this order keeps the invariant even if that guard were missed.
         if unregister {
             let handle = Arc::clone(&self.handle);
             self.batchers

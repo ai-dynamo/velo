@@ -450,8 +450,9 @@ impl IngressRegistry {
 
     /// Tear down every slot of every peer, injecting `Dropped` into each.
     ///
-    /// Used when the transport itself goes away, so a consumer never waits out
-    /// its heartbeat watchdog for a sender that has already been dismantled.
+    /// Used when the mux stops (shutdown, or a failed mux), so a consumer
+    /// never waits out its heartbeat watchdog for a sender that has already
+    /// been dismantled.
     ///
     /// Binds go first. A batch handler can be claiming one concurrently, and
     /// it claims under its peer table's lock, in a table it inserted before
