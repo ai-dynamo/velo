@@ -20,7 +20,7 @@ let streams = Arc::clone(&velo); // Keep this owner while streams are active.
 
 A retained Messenger supports active messages after the final Velo owner is dropped; it does not keep Velo streaming services alive. Stream handles and handler contexts can also hold Messenger references. Final Messenger drop starts immediate transport teardown and wakes remote event waits. Local event completion remains available through retained event handles.
 
-Drop requests cancellation. It does not drain accepted work or wait for tasks to exit. Continue to call `Velo::shutdown(policy).await` when those guarantees are needed. RDMA users must use explicit shutdown before relying on deregistration; Drop does not report registered memory as released. Discovery registration guards and custom frame transports remain the caller's responsibility.
+Drop requests cancellation and starts transport cleanup on an owned thread. It does not drain accepted work or wait for tasks or native threads to exit. Explicit shutdown waits for that same cleanup before it waits for transport close. Continue to call `Velo::shutdown(policy).await` when those guarantees are needed. RDMA users must use explicit shutdown before relying on deregistration; Drop does not report registered memory as released. Discovery registration guards and custom frame transports remain the caller's responsibility.
 
 ## Handler dispatch
 

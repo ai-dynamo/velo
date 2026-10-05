@@ -41,7 +41,7 @@ pub struct Messenger {
 
 impl Drop for Messenger {
     fn drop(&mut self) {
-        // Drop cannot drain or join. Wake owned tasks and stop transport work.
+        // Request cleanup; the owned worker runs transport hooks and native joins.
         self.backend.shutdown_now();
     }
 }

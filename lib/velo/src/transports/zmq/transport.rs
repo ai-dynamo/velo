@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use dashmap::DashMap;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tracing::{debug, error, info};
@@ -40,9 +41,10 @@ pub struct ZmqTransport {
     /// Shared ZMQ context for all sockets.
     zmq_context: Arc<zmq::Context>,
     /// Single shared sender channel, set once during `start()`. Lock-free reads
-    /// via `OnceLock::get()` on the send hot path. Shutdown signals the sender
-    /// thread by sending `SenderCommand::Shutdown` through this channel.
+    /// via `OnceLock::get()` on the send hot path. A shutdown command wakes the
+    /// sender when idle; `sender_stop` also stops it when this queue is full.
     sender_tx: OnceLock<flume::Sender<SenderCommand>>,
+    sender_stop: Arc<AtomicBool>,
     /// One admission gate per peer, all feeding `sender_tx`.
     ///
     /// The sender thread multiplexes every peer through one channel, but
@@ -125,6 +127,7 @@ impl ZmqTransport {
             .clone()
     }
     fn stop_threads(&self) {
+        self.sender_stop.store(true, Ordering::Release);
         // Signal the listener thread to stop via control PAIR socket
         if let Ok(ctrl) = self.zmq_context.socket(zmq::PAIR)
             && ctrl.connect(&self.listener_control_endpoint).is_ok()
@@ -132,10 +135,8 @@ impl ZmqTransport {
             let _ = ctrl.send("shutdown", 0);
         }
 
-        // Signal the sender thread to stop via the message channel. This
-        // unblocks the sender's blocking recv() without polling. It deliberately
-        // bypasses the gates: shutdown is control traffic, not a frame, and must
-        // not queue behind a saturated peer.
+        // Wake an idle sender. The flag is the stop request: if the queue is
+        // full, the sender will see it when it takes the next queued frame.
         if let Some(tx) = self.sender_tx.get()
             && let Err(e) = tx.try_send(SenderCommand::Shutdown)
         {
@@ -323,6 +324,7 @@ impl Transport for ZmqTransport {
             let sender_cfg = SenderConfig {
                 ctx,
                 rx: sender_rx,
+                stop: self.sender_stop.clone(),
                 peers,
                 identity: instance_id_bytes,
                 sndhwm,
@@ -459,6 +461,7 @@ impl Transport for ZmqTransport {
 struct SenderConfig {
     ctx: Arc<zmq::Context>,
     rx: flume::Receiver<SenderCommand>,
+    stop: Arc<AtomicBool>,
     peers: Arc<DashMap<crate::InstanceId, String>>,
     identity: Vec<u8>,
     sndhwm: i32,
@@ -470,16 +473,32 @@ struct SenderConfig {
 ///
 /// Owns a `HashMap<InstanceId, zmq::Socket>` of lazily-created DEALER sockets.
 /// Reads `SenderCommand` from a shared flume channel and dispatches to the correct socket.
-/// Shutdown is signaled via `SenderCommand::Shutdown` through the same channel —
-/// no separate control socket or polling loop needed.
+/// The stop flag is independent of queue capacity. A command wakes an idle
+/// sender; a full queue already gives it work on which to observe the flag.
 fn run_sender(cfg: SenderConfig) {
     // Signal that the sender is ready
     let _ = cfg.ready_tx.send(Ok(()));
 
     let mut dealer_sockets: HashMap<crate::InstanceId, zmq::Socket> = HashMap::new();
 
-    // Blocking recv — wakes only on actual messages or shutdown.
-    while let Ok(cmd) = cfg.rx.recv() {
+    // Keep frames already queued ahead of shutdown. Once the flag is seen,
+    // drain only that queue prefix so later sends cannot extend the join.
+    let mut remaining = None;
+    loop {
+        if remaining.is_none() && cfg.stop.load(Ordering::Acquire) {
+            remaining = Some(cfg.rx.len());
+        }
+        let cmd = match remaining.as_mut() {
+            Some(0) => break,
+            Some(left) => {
+                *left -= 1;
+                cfg.rx.try_recv().ok()
+            }
+            None => cfg.rx.recv().ok(),
+        };
+        let Some(cmd) = cmd else {
+            break;
+        };
         let task = match cmd {
             SenderCommand::Send(task) => task,
             SenderCommand::Shutdown => {
@@ -716,6 +735,7 @@ impl ZmqTransportBuilder {
             peers: Arc::new(DashMap::new()),
             zmq_context: Arc::new(ctx),
             sender_tx: OnceLock::new(),
+            sender_stop: Arc::new(AtomicBool::new(false)),
             gates: DashMap::new(),
             runtime: OnceLock::new(),
             shutdown_state: OnceLock::new(),
@@ -751,6 +771,86 @@ mod tests {
             .add_entry("zmq", endpoint.as_bytes().to_vec())
             .unwrap();
         PeerInfo::new(instance_id, builder.build().unwrap())
+    }
+
+    #[test]
+    fn full_sender_queue_cannot_lose_shutdown_or_queued_replies() {
+        struct BlockSender {
+            entered: flume::Sender<()>,
+            release: flume::Receiver<()>,
+        }
+        impl TransportErrorHandler for BlockSender {
+            fn on_error(&self, _: Bytes, _: Bytes, _: String) {
+                self.entered.send(()).unwrap();
+                self.release.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+        }
+        struct UnexpectedError;
+        impl TransportErrorHandler for UnexpectedError {
+            fn on_error(&self, _: Bytes, _: Bytes, error: String) {
+                panic!("queued reply failed: {error}");
+            }
+        }
+        let ctx = Arc::new(zmq::Context::new());
+        let router = ctx.socket(zmq::ROUTER).unwrap();
+        router.bind("tcp://127.0.0.1:*").unwrap();
+        router.set_rcvtimeo(2000).unwrap();
+        let target = crate::InstanceId::new_v4();
+        let peers = Arc::new(DashMap::new());
+        peers.insert(target, router.get_last_endpoint().unwrap().unwrap());
+        let (tx, rx) = flume::bounded(1);
+        let (entered_tx, entered) = flume::bounded(1);
+        let (release, release_rx) = flume::bounded(1);
+        tx.send(SenderCommand::Send(OutboundTask {
+            target: crate::InstanceId::new_v4(),
+            msg_type: MessageType::Message,
+            header: Bytes::new(),
+            payload: Bytes::new(),
+            on_error: Arc::new(BlockSender {
+                entered: entered_tx,
+                release: release_rx,
+            }),
+        }))
+        .unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let (ready_tx, _ready) = std::sync::mpsc::sync_channel(1);
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            run_sender(SenderConfig {
+                ctx,
+                rx,
+                stop: worker_stop,
+                peers,
+                identity: b"sender".to_vec(),
+                sndhwm: 1,
+                linger_ms: 1000,
+                ready_tx,
+            });
+            done_tx.send(()).unwrap();
+        });
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        tx.send(SenderCommand::Send(OutboundTask {
+            target,
+            msg_type: MessageType::Response,
+            header: Bytes::new(),
+            payload: Bytes::from_static(b"reply"),
+            on_error: Arc::new(UnexpectedError),
+        }))
+        .unwrap();
+        stop.store(true, Ordering::Release);
+        assert!(matches!(
+            tx.try_send(SenderCommand::Shutdown),
+            Err(flume::TrySendError::Full(_))
+        ));
+        release.send(()).unwrap();
+        let reply = router.recv_multipart(0);
+        let stopped = done.recv_timeout(Duration::from_secs(2));
+        // Keep the channel alive while checking that the stop request worked.
+        drop(tx);
+        worker.join().unwrap();
+        assert_eq!(reply.unwrap().last().unwrap(), b"reply");
+        stopped.expect("full queue lost the sender stop request");
     }
 
     #[test]

@@ -64,9 +64,10 @@ pub mod zmq;
 #[cfg(feature = "quic")]
 pub mod quic;
 
+mod teardown;
 mod transport;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::{collections::HashMap, sync::Arc};
 
 use crate::observability::{Direction, TransportRejection, VeloMetrics};
@@ -135,7 +136,8 @@ pub struct VeloBackend {
     alternative_transports: DashMap<InstanceId, Vec<TransportKey>>,
     workers: DashMap<WorkerId, InstanceId>,
     shutdown_state: ShutdownState,
-    teardown_started: AtomicBool,
+    teardown: OnceLock<teardown::Completion>,
+    runtime: tokio::runtime::Handle,
 }
 
 /// Stop completed transports if construction fails or is cancelled.
@@ -249,7 +251,8 @@ impl VeloBackend {
                 alternative_transports: DashMap::new(),
                 workers: DashMap::new(),
                 shutdown_state,
-                teardown_started: AtomicBool::new(false),
+                teardown: OnceLock::new(),
+                runtime,
             },
             data_streams,
         ))
@@ -689,14 +692,23 @@ impl VeloBackend {
         }
     }
 
-    /// Stop transports after teardown or failed construction.
+    /// Request transport cleanup without waiting for native thread joins.
     pub(crate) fn shutdown_now(&self) {
-        // Explicit shutdown and final owner Drop share this path. A cancelled
-        // public token alone does not prove that transport shutdown hooks ran.
-        if self.teardown_started.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        stop_transports(&self.shutdown_state, &self.transports);
+        // The worker starts immediately; polling the completion is not required.
+        drop(self.request_teardown());
+    }
+
+    fn request_teardown(&self) -> teardown::Completion {
+        self.shutdown_state.begin_drain();
+        self.teardown
+            .get_or_init(|| {
+                teardown::start(
+                    self.shutdown_state.clone(),
+                    self.transports.clone(),
+                    self.runtime.clone(),
+                )
+            })
+            .clone()
     }
 
     /// Perform a graceful 4-phase shutdown.
@@ -729,8 +741,11 @@ impl VeloBackend {
 
     /// Tear down after services that send through these transports have stopped.
     pub(crate) async fn finish_shutdown(&self) {
-        // Phase 3: Teardown
-        self.shutdown_now();
+        // Phase 3: All callers wait for the same hooks before inspecting close.
+        if let Err(error) = self.request_teardown().await {
+            // Returning success would let Velo report RDMA memory as released.
+            panic!("transport teardown failed: {error}");
+        }
 
         // Phase 4: Wait for each transport's close to finish on the wire, so a
         // process that exits right after this returns does not discard frames

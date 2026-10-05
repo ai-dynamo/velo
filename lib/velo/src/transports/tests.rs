@@ -21,6 +21,9 @@ struct MockTransport {
     start_completed: AtomicBool,
     drained: AtomicBool,
     shut_down: AtomicBool,
+    shutdown_complete: AtomicBool,
+    shutdown_block: Option<(flume::Sender<()>, flume::Receiver<()>)>,
+    shutdown_panics: bool,
     /// Set by `closed()`, after a delay, so a test can tell whether graceful
     /// shutdown waited for it.
     closed: Arc<AtomicBool>,
@@ -54,6 +57,9 @@ impl MockTransport {
             start_completed: AtomicBool::new(false),
             drained: AtomicBool::new(false),
             shut_down: AtomicBool::new(false),
+            shutdown_complete: AtomicBool::new(false),
+            shutdown_block: None,
+            shutdown_panics: false,
             closed: Arc::new(AtomicBool::new(false)),
             send_count: AtomicUsize::new(0),
             last_lane: AtomicUsize::new(usize::MAX),
@@ -79,6 +85,9 @@ impl MockTransport {
             start_completed: AtomicBool::new(false),
             drained: AtomicBool::new(false),
             shut_down: AtomicBool::new(false),
+            shutdown_complete: AtomicBool::new(false),
+            shutdown_block: None,
+            shutdown_panics: false,
             closed: Arc::new(AtomicBool::new(false)),
             send_count: AtomicUsize::new(0),
             last_lane: AtomicUsize::new(usize::MAX),
@@ -170,10 +179,16 @@ impl Transport for MockTransport {
             !self.shut_down.swap(true, Ordering::Relaxed),
             "transport shutdown called twice"
         );
+        if let Some((entered, release)) = &self.shutdown_block {
+            entered.send(()).unwrap();
+            release.recv_timeout(Duration::from_secs(10)).unwrap();
+        }
+        assert!(!self.shutdown_panics, "mock teardown failure");
+        self.shutdown_complete.store(true, Ordering::Release);
     }
     fn closed(&self) -> futures::future::BoxFuture<'_, ()> {
         assert!(self.start_completed.load(Ordering::Relaxed));
-        assert!(self.shut_down.load(Ordering::Relaxed));
+        assert!(self.shutdown_complete.load(Ordering::Acquire));
         let closed = self.closed.clone();
         Box::pin(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -737,11 +752,131 @@ async fn final_messenger_drop_stops_transports_once_after_any_teardown_path() {
                 .cancel(),
             _ => {}
         }
+        let backend = messenger.backend().clone();
         drop(messenger);
+        backend
+            .teardown
+            .get()
+            .expect("drop did not request teardown")
+            .clone()
+            .await
+            .unwrap();
         assert!(
             transport.shut_down.load(Ordering::Relaxed),
             "{prior_shutdown}"
         );
+    }
+}
+
+/// A cancelled waiter must not interrupt hooks or let another caller skip them.
+#[tokio::test]
+async fn concurrent_shutdown_waits_for_hooks_after_first_waiter_is_cancelled() {
+    let mut transport = MockTransport::new("mock", true);
+    let (entered_tx, entered) = flume::bounded(1);
+    let (release, release_rx) = flume::bounded(1);
+    Arc::get_mut(&mut transport).unwrap().shutdown_block = Some((entered_tx, release_rx));
+    let messenger = crate::Messenger::builder()
+        .add_transport(transport.clone())
+        .build()
+        .await
+        .unwrap();
+    let first_owner = messenger.clone();
+    let first = tokio::spawn(async move {
+        first_owner
+            .graceful_shutdown(ShutdownPolicy::WaitForever)
+            .await;
+    });
+    tokio::time::timeout(Duration::from_secs(2), entered.recv_async())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut second = Box::pin(messenger.graceful_shutdown(ShutdownPolicy::WaitForever));
+    assert!(futures::poll!(second.as_mut()).is_pending());
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    assert!(futures::poll!(second.as_mut()).is_pending());
+    assert!(!transport.closed.load(Ordering::Relaxed));
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), second)
+        .await
+        .unwrap();
+    assert!(transport.closed.load(Ordering::Relaxed));
+}
+
+/// Drop must return while the hook is still blocked, even on one Tokio thread.
+#[tokio::test]
+async fn final_drop_does_not_join_a_blocked_shutdown_hook() {
+    let mut transport = MockTransport::new("mock", true);
+    let (entered_tx, entered) = flume::bounded(1);
+    let (release, release_rx) = flume::bounded(1);
+    Arc::get_mut(&mut transport).unwrap().shutdown_block = Some((entered_tx, release_rx));
+    let messenger = crate::Messenger::builder()
+        .add_transport(transport.clone())
+        .build()
+        .await
+        .unwrap();
+    let backend = messenger.backend().clone();
+    drop(messenger);
+    tokio::time::timeout(Duration::from_secs(2), entered.recv_async())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!transport.shutdown_complete.load(Ordering::Acquire));
+    release.send(()).unwrap();
+    backend.request_teardown().await.unwrap();
+}
+
+#[test]
+fn final_drop_runs_hooks_outside_tokio_and_after_runtime_shutdown() {
+    for stop_runtime in [false, true] {
+        let mut transport = MockTransport::new("mock", true);
+        let (entered_tx, entered) = flume::bounded(1);
+        let (release, release_rx) = flume::bounded(1);
+        Arc::get_mut(&mut transport).unwrap().shutdown_block = Some((entered_tx, release_rx));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let messenger = runtime
+            .block_on(
+                crate::Messenger::builder()
+                    .add_transport(transport.clone())
+                    .build(),
+            )
+            .unwrap();
+        let backend = messenger.backend().clone();
+        let runtime = if stop_runtime {
+            drop(runtime);
+            None
+        } else {
+            Some(runtime)
+        };
+        drop(messenger);
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(!transport.shutdown_complete.load(Ordering::Acquire));
+        release.send(()).unwrap();
+        futures::executor::block_on(backend.request_teardown()).unwrap();
+        drop(runtime);
+    }
+}
+
+#[tokio::test]
+async fn failed_teardown_never_reports_successful_shutdown() {
+    use futures::FutureExt;
+    let mut transport = MockTransport::new("mock", true);
+    Arc::get_mut(&mut transport).unwrap().shutdown_panics = true;
+    let messenger = crate::Messenger::builder()
+        .add_transport(transport.clone())
+        .build()
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let result =
+            std::panic::AssertUnwindSafe(messenger.graceful_shutdown(ShutdownPolicy::WaitForever))
+                .catch_unwind()
+                .await;
+        assert!(result.is_err());
+        assert!(!transport.closed.load(Ordering::Relaxed));
     }
 }
 
