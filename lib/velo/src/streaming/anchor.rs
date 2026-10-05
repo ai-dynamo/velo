@@ -1051,8 +1051,8 @@ impl AnchorManager {
     /// after messenger teardown; final owner Drop uses it without a drain.
     ///
     /// After step 1, the mux accepts no new sends. No mux slot is retired
-    /// while a stream still reads
-    /// from it, because retirement injects `Dropped` that the reader would
+    /// while a stream still reads from it, because retirement injects
+    /// `Dropped` that the reader would
     /// take as its sender's. Hence the steps:
     ///
     /// 1. Stop the mux's tasks. A slot close after this finds no batcher and
@@ -1060,9 +1060,10 @@ impl AnchorManager {
     /// 2. Take streams off their slots: SPSC feeds withdrawn, MPSC pumps
     ///    cancelled.
     /// 3. Remove anchors and MPSC entries, and cancel local senders.
+    ///
     /// The caller then retires mux slots, after joining tasks if it can wait.
     ///
-    /// Steps 1-3 do not await. A caller that drops this future (a timeout
+    /// Steps 1-3 do not await. A caller that drops the shutdown future (a timeout
     /// around `Velo::shutdown`) still leaves no stream waiting on a slot or an
     /// anchor. The slots then stay open, with no reader, until the mux drops.
     ///

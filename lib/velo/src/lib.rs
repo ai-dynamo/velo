@@ -1758,9 +1758,10 @@ mod tests {
         ));
 
         drop(last_owner);
-        tokio::time::timeout(std::time::Duration::from_secs(2), anchor.next())
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(2), anchor.next())
             .await
             .expect("final Velo drop left its stream open");
+        assert!(ended.is_none(), "final Velo drop returned {ended:?}");
         wait_for_listener_close(stream_addr).await;
         assert!(manager.upgrade().is_none());
         let response = tokio::time::timeout(
@@ -1899,41 +1900,49 @@ mod tests {
     async fn shutdown_ends_a_live_mux_stream_without_sender_dropped() {
         use futures::StreamExt;
 
-        let (consumer, producer) = connected_pair(None, "_anchor_attach").await;
+        for drop_owner in [false, true] {
+            let (consumer, producer) = connected_pair(None, "_anchor_attach").await;
 
-        let mut anchor = consumer.create_anchor::<u32>();
-        let sender = producer
-            .attach_anchor::<u32>(anchor.handle())
-            .await
-            .unwrap();
-        sender.send(1).await.unwrap();
-        let first = tokio::time::timeout(std::time::Duration::from_secs(5), anchor.next())
-            .await
-            .unwrap();
-        assert!(matches!(
-            first,
-            Some(Ok(crate::streaming::StreamFrame::Item(1)))
-        ));
+            let mut anchor = consumer.create_anchor::<u32>();
+            let sender = producer
+                .attach_anchor::<u32>(anchor.handle())
+                .await
+                .unwrap();
+            sender.send(1).await.unwrap();
+            let first = tokio::time::timeout(std::time::Duration::from_secs(5), anchor.next())
+                .await
+                .unwrap();
+            assert!(matches!(
+                first,
+                Some(Ok(crate::streaming::StreamFrame::Item(1)))
+            ));
 
-        let reader = tokio::spawn(async move { anchor.next().await });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            consumer.shutdown(ShutdownPolicy::WaitForever),
-        )
-        .await
-        .expect("consumer shutdown hung");
-        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), reader)
-            .await
-            .expect("reader still waiting after shutdown")
-            .unwrap();
-        assert!(
-            ended.is_none(),
-            "shutdown must end a live stream cleanly, got {ended:?}"
-        );
+            let reader = tokio::spawn(async move { anchor.next().await });
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let retained = Arc::clone(consumer.messenger());
+            if drop_owner {
+                drop(consumer);
+            } else {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    consumer.shutdown(ShutdownPolicy::WaitForever),
+                )
+                .await
+                .expect("consumer shutdown hung");
+            }
+            let ended = tokio::time::timeout(std::time::Duration::from_secs(5), reader)
+                .await
+                .expect("reader still waiting after shutdown")
+                .unwrap();
+            assert!(
+                ended.is_none(),
+                "shutdown must end a live stream cleanly, got {ended:?}"
+            );
 
-        drop(sender);
-        producer.shutdown(ShutdownPolicy::WaitForever).await;
+            drop(sender);
+            producer.shutdown(ShutdownPolicy::WaitForever).await;
+            drop(retained);
+        }
     }
 
     /// The MPSC form of the test above. An MPSC slot's records reach the
@@ -1946,57 +1955,65 @@ mod tests {
 
         use crate::observability::test_helpers::MetricSnapshot;
 
-        let registry = prometheus::Registry::new();
-        let metrics = Arc::new(VeloMetrics::register(&registry).unwrap());
-        let (consumer, producer) = connected_pair(Some(metrics), "_mpsc_anchor_attach").await;
+        for drop_owner in [false, true] {
+            let registry = prometheus::Registry::new();
+            let metrics = Arc::new(VeloMetrics::register(&registry).unwrap());
+            let (consumer, producer) = connected_pair(Some(metrics), "_mpsc_anchor_attach").await;
 
-        let mut anchor = consumer.create_mpsc_anchor::<u32>();
-        let sender = producer
-            .attach_mpsc_anchor::<u32>(anchor.handle())
-            .await
-            .unwrap();
-        sender.send(1).await.unwrap();
-        let first = tokio::time::timeout(std::time::Duration::from_secs(5), anchor.next())
-            .await
-            .unwrap();
-        assert!(matches!(
-            first,
-            Some(Ok((_, crate::streaming::mpsc::MpscFrame::Item(1))))
-        ));
+            let mut anchor = consumer.create_mpsc_anchor::<u32>();
+            let sender = producer
+                .attach_mpsc_anchor::<u32>(anchor.handle())
+                .await
+                .unwrap();
+            sender.send(1).await.unwrap();
+            let first = tokio::time::timeout(std::time::Duration::from_secs(5), anchor.next())
+                .await
+                .unwrap();
+            assert!(matches!(
+                first,
+                Some(Ok((_, crate::streaming::mpsc::MpscFrame::Item(1))))
+            ));
 
-        let send_errors = || {
-            MetricSnapshot::from_registry(&registry).counter(
-                "velo_transport_rejections_total",
-                &[("transport", "tcp"), ("reason", "send_error")],
-            )
-        };
-        let before = send_errors();
-        let reader = tokio::spawn(async move { anchor.next().await });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            consumer.shutdown(ShutdownPolicy::WaitForever),
-        )
-        .await
-        .expect("consumer shutdown hung");
-        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), reader)
-            .await
-            .expect("reader still waiting after shutdown")
-            .unwrap();
-        assert!(
-            ended.is_none(),
-            "shutdown must end a live MPSC stream cleanly, got {ended:?}"
-        );
-        // A stopped pump releases its slot; that must not reach the wire.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        assert_eq!(
-            send_errors(),
-            before,
-            "shutdown sent a frame after its transport was torn down"
-        );
+            let send_errors = || {
+                MetricSnapshot::from_registry(&registry).counter(
+                    "velo_transport_rejections_total",
+                    &[("transport", "tcp"), ("reason", "send_error")],
+                )
+            };
+            let before = send_errors();
+            let reader = tokio::spawn(async move { anchor.next().await });
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let retained = Arc::clone(consumer.messenger());
+            if drop_owner {
+                drop(consumer);
+            } else {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    consumer.shutdown(ShutdownPolicy::WaitForever),
+                )
+                .await
+                .expect("consumer shutdown hung");
+            }
+            let ended = tokio::time::timeout(std::time::Duration::from_secs(5), reader)
+                .await
+                .expect("reader still waiting after shutdown")
+                .unwrap();
+            assert!(
+                ended.is_none(),
+                "shutdown must end a live MPSC stream cleanly, got {ended:?}"
+            );
+            // A stopped pump releases its slot; that must not reach the wire.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            assert_eq!(
+                send_errors(),
+                before,
+                "shutdown sent a frame after its transport was torn down"
+            );
 
-        drop(sender);
-        producer.shutdown(ShutdownPolicy::WaitForever).await;
+            drop(sender);
+            producer.shutdown(ShutdownPolicy::WaitForever).await;
+            drop(retained);
+        }
     }
 
     /// What `Velo::shutdown` does to a stream whose sender is on this node
