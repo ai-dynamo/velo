@@ -1755,20 +1755,22 @@ mod tests {
     async fn final_velo_drop_stops_streaming_but_keeps_a_retained_messenger() {
         use futures::StreamExt;
 
-        async fn node() -> (Arc<Velo>, std::net::SocketAddr) {
+        async fn node(mux_only: bool) -> (Arc<Velo>, std::net::SocketAddr) {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
-            let node = Velo::builder()
-                .add_transport(Arc::new(
-                    crate::transports::tcp::TcpTransportBuilder::new()
-                        .from_listener(listener)
-                        .unwrap()
-                        .build()
-                        .unwrap(),
-                ))
-                .build()
-                .await
-                .unwrap();
+            let builder = Velo::builder().add_transport(Arc::new(
+                crate::transports::tcp::TcpTransportBuilder::new()
+                    .from_listener(listener)
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+            ));
+            let builder = if mux_only {
+                builder.mux_only()
+            } else {
+                builder
+            };
+            let node = builder.build().await.unwrap();
             (node, addr)
         }
 
@@ -1785,109 +1787,143 @@ mod tests {
             .expect("drop retained a listener");
         }
 
-        let (server, messenger_addr) = node().await;
-        let (client, _) = node().await;
-        client.register_peer(server.peer_info()).unwrap();
-        server.register_peer(client.peer_info()).unwrap();
-        server
-            .register_handler(Handler::unary_handler("ping", |ctx| Ok(Some(ctx.payload))).build())
-            .unwrap();
-        let mut anchor = server.create_anchor::<u32>();
-        let manager = Arc::downgrade(&server.anchor_manager);
-        let retained = Arc::clone(server.messenger());
-        let messenger = Arc::downgrade(&retained);
-        let backend = Arc::clone(retained.backend());
-        let tracker = retained.tracker().clone();
-        let frame_transport = match server.stream_owner.transport.as_ref().unwrap() {
-            OwnedStreamTransport::Tcp(transport) => Arc::clone(transport),
-            #[cfg(feature = "grpc")]
-            OwnedStreamTransport::Grpc(_) => unreachable!(),
-        };
-        let stream_addr = frame_transport.bound_addr();
-        let last_owner = server.as_ref().clone();
-        drop(server);
+        for mux_only in [false, true] {
+            let (server, messenger_addr) = node(mux_only).await;
+            let (client, _) = node(mux_only).await;
+            client.register_peer(server.peer_info()).unwrap();
+            server.register_peer(client.peer_info()).unwrap();
+            server
+                .register_handler(
+                    Handler::unary_handler("ping", |ctx| Ok(Some(ctx.payload))).build(),
+                )
+                .unwrap();
+            let mut anchor = server.create_anchor::<u32>();
+            let manager = Arc::downgrade(&server.anchor_manager);
+            let retained = Arc::clone(server.messenger());
+            let messenger = Arc::downgrade(&retained);
+            let backend = Arc::clone(retained.backend());
+            let tracker = retained.tracker().clone();
+            let frame_transport = match &server.stream_owner.transport {
+                Some(OwnedStreamTransport::Tcp(transport)) => Some(Arc::clone(transport)),
+                #[cfg(feature = "grpc")]
+                Some(OwnedStreamTransport::Grpc(_)) => unreachable!(),
+                None => None,
+            };
+            let stream_addr = frame_transport
+                .as_ref()
+                .map(|transport| transport.bound_addr());
+            let last_owner = server.as_ref().clone();
+            drop(server);
 
-        let sender = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            client.attach_anchor::<u32>(anchor.handle()),
-        )
-        .await
-        .expect("a Velo clone lost its receive loop")
-        .expect("a Velo clone lost streaming control handlers");
-        sender.send(7).await.unwrap();
-        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), anchor.next())
+            let sender = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                client.attach_anchor::<u32>(anchor.handle()),
+            )
             .await
-            .expect("a Velo clone lost its stream");
-        assert!(matches!(
-            frame,
-            Some(Ok(crate::streaming::StreamFrame::Item(7)))
-        ));
+            .expect("a Velo clone lost its receive loop")
+            .expect("a Velo clone lost streaming control handlers");
+            sender.send(7).await.unwrap();
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(2), anchor.next())
+                .await
+                .expect("a Velo clone lost its stream");
+            assert!(matches!(
+                frame,
+                Some(Ok(crate::streaming::StreamFrame::Item(7)))
+            ));
 
-        drop(last_owner);
-        let ended = tokio::time::timeout(std::time::Duration::from_secs(2), anchor.next())
-            .await
-            .expect("final Velo drop left its stream open");
-        assert!(ended.is_none(), "final Velo drop returned {ended:?}");
-        wait_for_listener_close(stream_addr).await;
-        assert!(manager.upgrade().is_none());
-        let response = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            client
-                .unary("ping")
-                .unwrap()
-                .raw_payload(bytes::Bytes::from_static(b"alive"))
-                .instance(retained.instance_id())
-                .send(),
-        )
-        .await
-        .expect("retained Messenger stopped with Velo")
-        .unwrap();
-        assert_eq!(response, bytes::Bytes::from_static(b"alive"));
-        // Cleanup handlers stay idempotent once the manager is gone: an
-        // absent manager holds no anchor, so a peer's cleanup has succeeded.
-        let handle = anchor.handle();
-        let cleanups = [
-            ("_anchor_detach", serde_json::json!({ "handle": handle })),
-            ("_anchor_finalize", serde_json::json!({ "handle": handle })),
-            ("_anchor_cancel", serde_json::json!({ "handle": handle })),
-            (
-                "_mpsc_anchor_detach",
-                serde_json::json!({ "handle": handle, "sender_id": 1 }),
-            ),
-            (
-                "_mpsc_anchor_cancel",
-                serde_json::json!({ "handle": handle }),
-            ),
-        ];
-        for (name, request) in cleanups {
-            tokio::time::timeout(
+            drop(last_owner);
+            let ended = tokio::time::timeout(std::time::Duration::from_secs(2), anchor.next())
+                .await
+                .expect("final Velo drop left its stream open");
+            assert!(ended.is_none(), "final Velo drop returned {ended:?}");
+            if let Some(stream_addr) = stream_addr {
+                wait_for_listener_close(stream_addr).await;
+            }
+            assert!(manager.upgrade().is_none());
+            let rollback = crate::streaming::control::AnchorAbortAttachRequest {
+                handle: anchor.handle(),
+                stream_cancel_handle: crate::streaming::control::StreamCancelHandle::pack(
+                    client.instance_id().worker_id(),
+                    1,
+                ),
+            };
+            let error = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
                 client
                     .messenger()
-                    .typed_unary_streaming::<()>(name)
-                    .payload(request)
+                    .typed_unary_streaming::<()>("_anchor_abort_attach")
+                    .payload(&rollback)
                     .unwrap()
                     .instance(retained.instance_id())
                     .send(),
             )
             .await
-            .unwrap_or_else(|_| panic!("{name} did not answer"))
-            .unwrap_or_else(|error| panic!("{name} failed after final Velo drop: {error}"));
-        }
-
-        drop(anchor);
-        drop(sender);
-        drop(retained);
-        // Teardown runs on its own thread; wait for it before timing the
-        // receive loops, so the budget below covers only their exit.
-        wait_for_final_messenger_drop(&messenger, &backend).await;
-        tracker.close();
-        tokio::time::timeout(std::time::Duration::from_secs(2), tracker.wait())
+            .expect("rollback handler hung after final Velo drop")
+            .unwrap_err();
+            assert!(error.to_string().contains("anchor manager shut down"));
+            assert!(manager.upgrade().is_none());
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                client
+                    .unary("ping")
+                    .unwrap()
+                    .raw_payload(bytes::Bytes::from_static(b"alive"))
+                    .instance(retained.instance_id())
+                    .send(),
+            )
             .await
-            .expect("final Messenger drop retained its receive loops");
-        wait_for_listener_close(messenger_addr).await;
-        frame_transport.shutdown().await;
-        client.shutdown(ShutdownPolicy::WaitForever).await;
+            .expect("retained Messenger stopped with Velo")
+            .unwrap();
+            assert_eq!(response, bytes::Bytes::from_static(b"alive"));
+            // Cleanup handlers stay idempotent once the manager is gone: an
+            // absent manager holds no anchor, so a peer's cleanup has succeeded.
+            let handle = anchor.handle();
+            let cleanups = [
+                ("_anchor_detach", serde_json::json!({ "handle": handle })),
+                ("_anchor_finalize", serde_json::json!({ "handle": handle })),
+                ("_anchor_cancel", serde_json::json!({ "handle": handle })),
+                (
+                    "_mpsc_anchor_detach",
+                    serde_json::json!({ "handle": handle, "sender_id": 1 }),
+                ),
+                (
+                    "_mpsc_anchor_cancel",
+                    serde_json::json!({ "handle": handle }),
+                ),
+            ];
+            for (name, request) in cleanups {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    client
+                        .messenger()
+                        .typed_unary_streaming::<()>(name)
+                        .payload(request)
+                        .unwrap()
+                        .instance(retained.instance_id())
+                        .send(),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("{name} did not answer"))
+                .unwrap_or_else(|error| panic!("{name} failed after final Velo drop: {error}"));
+            }
+            assert!(manager.upgrade().is_none());
+
+            drop(anchor);
+            drop(sender);
+            drop(retained);
+            // Teardown runs on its own thread; wait for it before timing the
+            // receive loops, so the budget below covers only their exit.
+            wait_for_final_messenger_drop(&messenger, &backend).await;
+            tracker.close();
+            tokio::time::timeout(std::time::Duration::from_secs(2), tracker.wait())
+                .await
+                .expect("final Messenger drop retained its receive loops");
+            wait_for_listener_close(messenger_addr).await;
+            if let Some(frame_transport) = frame_transport {
+                frame_transport.shutdown().await;
+            }
+            client.shutdown(ShutdownPolicy::WaitForever).await;
+        }
     }
 
     /// A node with one TCP transport on a loopback port and a loopback stream listener.
