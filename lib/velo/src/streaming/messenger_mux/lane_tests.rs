@@ -1143,3 +1143,28 @@ async fn a_lane_that_refuses_admission_fails_only_its_own_streams() {
         .await
         .expect("the streams on the other lanes finish in order");
 }
+
+/// A pre-bind that races shutdown fails; it does not panic.
+///
+/// `prebind_anchor` is a public sync call an application can make on any
+/// thread. Mux shutdown clears the parked drain signals, so one can vanish
+/// between the pre-bind's bind and its take. The bind hook plays that
+/// shutdown.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_prebind_racing_shutdown_returns_none() {
+    let node = Node::new(1).await;
+    let mux = node.mux();
+    let core = Arc::downgrade(&mux.core);
+    assert!(
+        mux.core
+            .bind_hook
+            .set(Box::new(move |_| {
+                if let Some(core) = core.upgrade() {
+                    core.drains.clear();
+                }
+            }))
+            .is_ok()
+    );
+    let anchor = node.velo.create_anchor::<u32>();
+    assert!(node.velo.prebind_anchor(anchor.handle()).is_none());
+}

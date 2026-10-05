@@ -1400,9 +1400,12 @@ impl AnchorManager {
         let lane = mux.choose_lane(None, lane_key);
         let lane_index = lane.lane();
         let receiver = mux.bind_on_lane(local_id, routing_session_id, lane).ok()?;
-        let drain = mux
-            .take_drain_signal(local_id, routing_session_id)
-            .expect("prebind parks a drain signal for the pair it just registered");
+        // Missing only when mux shutdown cleared it after the bind; the
+        // pre-bind then fails like one that found the mux stopped.
+        let Some(drain) = mux.take_drain_signal(local_id, routing_session_id) else {
+            mux.release_bind(local_id, routing_session_id);
+            return None;
+        };
 
         // Negotiated against the local mux alone. There is no peer here to
         // intersect with — that is the whole point — so the terms are this
