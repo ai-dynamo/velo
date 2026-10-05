@@ -133,6 +133,9 @@ jobs:
     permissions:
       contents: read
     env:
+      # Keep line-number backtraces without full debug data in every test binary.
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      CARGO_INCREMENTAL: "0"
       NATS_URL: nats://127.0.0.1:4222
       ETCD_URL: http://127.0.0.1:2379
       RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
