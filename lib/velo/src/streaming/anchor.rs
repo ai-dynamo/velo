@@ -1399,11 +1399,29 @@ impl AnchorManager {
         // own pre-binds. Chosen before the bind so the bind is counted on it.
         let lane = mux.choose_lane(None, lane_key);
         let lane_index = lane.lane();
-        let receiver = mux.bind_on_lane(local_id, routing_session_id, lane).ok()?;
-        // Missing only when mux shutdown cleared it after the bind; the
-        // pre-bind then fails like one that found the mux stopped.
-        let Some(drain) = mux.take_drain_signal(local_id, routing_session_id) else {
-            mux.release_bind(local_id, routing_session_id);
+        // The bind fails once the mux is stopped. Its drain signal is missing
+        // only when mux shutdown cleared it after the bind, which is the same
+        // case, a moment later.
+        let bound = mux
+            .bind_on_lane(local_id, routing_session_id, lane)
+            .ok()
+            .and_then(
+                |receiver| match mux.take_drain_signal(local_id, routing_session_id) {
+                    Some(drain) => Some((receiver, drain)),
+                    None => {
+                        mux.release_bind(local_id, routing_session_id);
+                        None
+                    }
+                },
+            );
+        let Some((receiver, drain)) = bound else {
+            tracing::debug!(%handle, "prebind_anchor: the mux is shut down; no ticket minted");
+            self.record_streaming_operation(
+                StreamingOp::Prebind,
+                HandlerOutcome::Error,
+                "unknown",
+                started,
+            );
             return None;
         };
 
