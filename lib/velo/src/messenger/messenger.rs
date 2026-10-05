@@ -591,7 +591,9 @@ impl Messenger {
 
     /// Track receive loops, tracked handlers, and application tasks.
     ///
-    /// Call `close` and `wait` after shutdown to wait for all tracked work.
+    /// `close` allows `wait` to finish once all tracked tasks exit; it does not
+    /// cancel them. Ensure application tasks and idle ordering lanes can exit
+    /// before waiting. A lane with no idle expiry can otherwise wait forever.
     /// Internal shutdown waits only for its own receive loops.
     pub fn tracker(&self) -> &tokio_util::task::TaskTracker {
         &self.tracker

@@ -52,7 +52,7 @@ This release keeps the existing strong references between the runtime and its se
 
 `graceful_shutdown` keeps its existing behavior: it drains and closes the messenger and RDMA services, but does not close the per-stream TCP or gRPC transport. `shutdown` is the complete instance shutdown operation. Application handlers that exceed a timeout can still be running after it returns.
 
-The public task tracker includes receive loops, tracked handlers, and tasks added by the application. Call `close` and `wait` after shutdown to wait for all of them. Internal shutdown joins its own receive loops separately, so an application task cannot extend its timeout.
+The public task tracker includes receive loops, tracked handlers, and tasks added by the application. `close()` allows `wait()` to finish when all tracked tasks exit; it does not cancel them. Ensure application tasks and idle ordering lanes can exit before waiting. An ordered handler with `with_idle_lane_ttl(None)` can leave a lane waiting forever while its router remains owned. Internal shutdown joins its own receive loops separately, so an application task cannot extend its timeout.
 
 A handler panic fails its waiting caller in every dispatch mode, provided the program unwinds panics. The error reply remains counted work until the transport accepts it. An ordered lane continues with the next message.
 

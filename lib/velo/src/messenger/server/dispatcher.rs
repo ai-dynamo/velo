@@ -156,7 +156,8 @@ pub(crate) async fn send_error_reply(
             target: "crate::messenger::dispatcher",
             handler = %handler,
             message_id = %message_id,
-            "Failed to send error response: {e}"
+            error = %e,
+            "Failed to send error response"
         );
     }
 }

@@ -26,6 +26,8 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status, Streaming};
 use velo_ext::{PeerInfo, TransportKey, WorkerAddress, WorkerId};
 
+mod connection;
+
 use crate::streaming::transport::FrameTransport;
 use crate::transports::address::WorkerAddressBuilder;
 use crate::transports::utils::interfaces::{
@@ -65,7 +67,7 @@ const SESSION_ID_META: &str = "x-session-id";
 const TERMINAL_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// How long `shutdown` lets open HTTP/2 connections finish GOAWAY before it
-/// drops the server. A clean close takes one round trip; this bounds the case
+/// cancels connection I/O. A clean close takes one round trip; this bounds the case
 /// where a peer never answers.
 const SERVER_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 
@@ -235,6 +237,7 @@ pub struct GrpcFrameTransport {
     routing: Arc<SessionRouting>,
     listener_cancel: tokio_util::sync::CancellationToken,
     tasks: StreamTasks,
+    connections: tokio_util::task::TaskTracker,
     /// Optional metrics handle. Set once by the Velo builder via
     /// [`Self::set_metrics`] before any bind/connect.
     metrics: Arc<std::sync::OnceLock<Arc<crate::observability::VeloMetrics>>>,
@@ -250,6 +253,7 @@ impl GrpcFrameTransport {
     ) -> Result<Arc<Self>> {
         let routing: Arc<SessionRouting> = Arc::new(DashMap::new());
         let tasks = StreamTasks::default();
+        let connections = tokio_util::task::TaskTracker::new();
         let listener_cancel = tokio_util::sync::CancellationToken::new();
         let metrics: Arc<std::sync::OnceLock<Arc<crate::observability::VeloMetrics>>> =
             Arc::new(std::sync::OnceLock::new());
@@ -275,32 +279,35 @@ impl GrpcFrameTransport {
         };
 
         let cancel = listener_cancel.clone();
+        let accepted = connections.clone();
         tasks.spawn_until_done(async move {
+            let force_close = tokio_util::sync::CancellationToken::new();
+            // Also close accepted sockets if serving exits with an error.
+            let _close_connections = force_close.clone().drop_guard();
+            let incoming = TcpListenerStream::new(listener).map(|socket| {
+                socket.map(|socket| {
+                    connection::Connection::new(socket, force_close.clone(), accepted.token())
+                })
+            });
             let server =
                 tonic::transport::Server::builder().add_service(VeloStreamingServer::new(service));
-            let serve = server
-                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), cancel.cancelled());
-            // Graceful shutdown waits for every connection, and a connection
-            // that never finished its HTTP/2 handshake cannot be sent GOAWAY,
-            // so it would hold `shutdown` open forever. After the grace period
-            // drop the server: the listener closes, and tonic's own connection
-            // tasks end when their peers close.
+            let serve = server.serve_with_incoming_shutdown(incoming, cancel.cancelled());
+            tokio::pin!(serve);
             let grace_expired = async {
                 cancel.cancelled().await;
                 tokio::time::sleep(SERVER_CLOSE_GRACE).await;
             };
-            tokio::select! {
-                result = serve => {
-                    if let Err(e) = result {
-                        tracing::warn!("GrpcFrameTransport server error: {}", e);
-                    }
-                }
+            let result = tokio::select! {
+                result = &mut serve => result,
                 () = grace_expired => {
-                    tracing::debug!(
-                        "GrpcFrameTransport: connections still open after {:?}; releasing listener",
-                        SERVER_CLOSE_GRACE
-                    );
+                    // Dropping `serve` would leave tonic's connection tasks alive.
+                    // Interrupt their I/O, then let the server join them.
+                    force_close.cancel();
+                    serve.await
                 }
+            };
+            if let Err(error) = result {
+                tracing::warn!(%error, "GrpcFrameTransport server failed");
             }
         });
 
@@ -315,6 +322,7 @@ impl GrpcFrameTransport {
             routing,
             listener_cancel,
             tasks,
+            connections,
             metrics,
         }))
     }
@@ -351,6 +359,8 @@ impl GrpcFrameTransport {
         self.tasks.stop();
         self.routing.clear();
         self.tasks.wait().await;
+        self.connections.close();
+        self.connections.wait().await;
     }
 }
 
@@ -622,11 +632,27 @@ mod tests {
             .await
             .unwrap();
         let addr = server.bound_addr();
-        let _silent = tokio::net::TcpStream::connect(addr).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut silent = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while server.connections.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("connection was not accepted");
         tokio::time::timeout(Duration::from_secs(5), server.shutdown())
             .await
             .expect("shutdown waited for a connection that never spoke HTTP/2");
+        assert!(server.connections.is_empty());
+        let closed = tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::io::AsyncReadExt::read_to_end(&mut silent, &mut Vec::new()),
+        )
+        .await
+        .expect("accepted socket stayed open after shutdown");
+        if let Err(error) = closed {
+            assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+        }
         let _listener = tokio::net::TcpListener::bind(addr)
             .await
             .expect("listener released before shutdown returns");
