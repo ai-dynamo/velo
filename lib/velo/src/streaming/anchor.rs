@@ -1043,10 +1043,10 @@ impl AnchorManager {
     /// End every stream this manager holds. Called by `Velo::shutdown` after
     /// the messenger transports are torn down.
     ///
-    /// Two rules hold throughout: nothing is sent to a peer, because the
-    /// transports are gone, and no mux slot is retired while a stream still
-    /// reads from it, because retirement injects `Dropped` that the reader
-    /// would take as its sender's. Hence the phases:
+    /// Two rules hold from step 1 on. Nothing is sent to a peer, because the
+    /// transports are gone. No mux slot is retired while a stream still reads
+    /// from it, because retirement injects `Dropped` that the reader would
+    /// take as its sender's. Hence the steps:
     ///
     /// 1. Stop the mux's tasks. A slot close after this finds no batcher and
     ///    sends nothing. The slots stay open.
@@ -1058,6 +1058,13 @@ impl AnchorManager {
     /// Steps 1-3 do not await. A caller that drops this future (a timeout
     /// around `Velo::shutdown`) still leaves no stream waiting on a slot or an
     /// anchor. The slots then stay open, with no reader, until the mux drops.
+    ///
+    /// Known gap: the mux runs until step 1, which comes after transport
+    /// teardown. While `graceful_shutdown` tears the transports down, a
+    /// batcher can still hand a batch (credit, a local sender's records) to a
+    /// transport that is going away. Stopping the mux before teardown needs
+    /// `Velo::shutdown` to be split around this function, which is not done
+    /// here.
     pub(crate) async fn shutdown(&self) {
         let mux = self.mux.get();
         if let Some(mux) = mux {
