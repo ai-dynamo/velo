@@ -240,8 +240,17 @@ pub(crate) async fn reader_pump(
                                 if let Some(m) = metrics.as_ref() {
                                     m.record_reader_pump_backpressure();
                                 }
-                                if frame_tx.send_async(b).await.is_err() {
-                                    break; // consumer dropped
+                                // Raced against the cancel, as the MPSC pump
+                                // does: a consumer that holds its anchor
+                                // without reading keeps this send waiting,
+                                // and shutdown must still end the pump.
+                                let sent = tokio::select! {
+                                    biased;
+                                    _ = &mut cancelled => false,
+                                    sent = frame_tx.send_async(b) => sent.is_ok(),
+                                };
+                                if !sent {
+                                    break; // cancelled, or consumer dropped
                                 }
                             }
                             Err(flume::TrySendError::Disconnected(_)) => break,

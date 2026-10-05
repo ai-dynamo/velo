@@ -796,8 +796,9 @@ impl Velo {
 
     /// Drain messenger work and stop this instance's streaming services.
     ///
-    /// This also cancels live streams and joins the receive loops and streaming
-    /// listener and pump tasks owned by the builder. Custom frame transports
+    /// This also cancels live streams, and joins the receive loops and the
+    /// streaming transport tasks owned by the builder. Stream reader pumps are
+    /// cancelled, not joined. Custom frame transports
     /// remain the caller's responsibility. Stream watchdogs and heartbeats are
     /// cancelled; application handlers that exceed `policy` can still be running.
     /// If the sender of a stream is on this instance, shutdown cancels that
