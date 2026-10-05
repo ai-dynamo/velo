@@ -9,7 +9,6 @@
 //! the slots. If a shutdown was abandoned, `MuxCore::drop` retires them.
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use anyhow::{Result, anyhow};
 
@@ -31,7 +30,7 @@ impl MessengerMuxTransport {
         self.core.tasks.stop();
         self.core.tasks.wait().await;
         self.core.batchers.clear();
-        self.core.retire_slots();
+        close_ingress(&self.core.ingress, self.core.metrics.as_ref());
         self.core.drains.clear();
     }
 }
@@ -85,15 +84,6 @@ impl MuxCore {
     }
 }
 
-impl MuxCore {
-    /// Close every ingress slot, injecting `Dropped` into each. The flag goes
-    /// first; `deliver_batch` reads it after a claim (see there).
-    fn retire_slots(&self) {
-        self.slots_retired.store(true, Ordering::SeqCst);
-        close_ingress(&self.ingress, self.metrics.as_ref());
-    }
-}
-
 /// Stop a mux that failed: stop its tasks and close every ingress slot.
 /// Returns true only for the first stop request.
 ///
@@ -113,7 +103,7 @@ pub(super) fn stop_mux(
     first
 }
 
-pub(super) fn close_ingress(ingress: &IngressRegistry, metrics: Option<&MuxMetricsHandle>) {
+fn close_ingress(ingress: &IngressRegistry, metrics: Option<&MuxMetricsHandle>) {
     let closed = ingress.shutdown();
     if let Some(metrics) = metrics {
         for _ in 0..closed {
@@ -127,6 +117,6 @@ impl Drop for MuxCore {
         // Unconditional: a shutdown abandoned after `stop_sending` left the
         // slots open.
         self.tasks.stop();
-        self.retire_slots();
+        close_ingress(&self.ingress, self.metrics.as_ref());
     }
 }
