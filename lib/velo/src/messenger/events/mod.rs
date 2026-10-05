@@ -1198,13 +1198,48 @@ mod tests {
         (a, b)
     }
 
+    struct PendingDiscovery(tokio::sync::Notify);
+    impl crate::PeerDiscovery for PendingDiscovery {
+        fn discover_by_worker_id(
+            &self,
+            _: velo_ext::WorkerId,
+        ) -> futures::future::BoxFuture<'_, anyhow::Result<velo_ext::PeerInfo>> {
+            Box::pin(async move {
+                self.0.notify_one();
+                std::future::pending().await
+            })
+        }
+
+        fn discover_by_instance_id(
+            &self,
+            _: velo_ext::InstanceId,
+        ) -> futures::future::BoxFuture<'_, anyhow::Result<velo_ext::PeerInfo>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
     #[tokio::test]
     async fn shutdown_fails_remote_waiters_and_preserves_local_events() {
-        let (owner, subscriber) = make_pair().await;
+        let owner = Messenger::builder()
+            .add_transport(new_transport())
+            .build()
+            .await
+            .unwrap();
+        let subscriber = Messenger::builder()
+            .add_transport(new_transport())
+            .discovery(Arc::new(PendingDiscovery(tokio::sync::Notify::new())))
+            .build()
+            .await
+            .unwrap();
+        owner.register_peer(subscriber.peer_info()).unwrap();
+        subscriber.register_peer(owner.peer_info()).unwrap();
         let events = subscriber.events();
         let waiting = owner.events().new_event().unwrap().into_handle();
-        let triggering = owner.events().new_event().unwrap().into_handle();
-        let poisoning = owner.events().new_event().unwrap().into_handle();
+        // Keep these requests in discovery so neither can finish while the
+        // cleanup worker starts. A live peer may reply before cancellation.
+        let undiscovered = Messenger::builder().build().await.unwrap();
+        let triggering = undiscovered.events().new_event().unwrap().into_handle();
+        let poisoning = undiscovered.events().new_event().unwrap().into_handle();
         let local = events.new_event().unwrap();
         let local_waiter = local.awaiter().unwrap();
         let waiter = events.awaiter(waiting).unwrap();
@@ -1257,26 +1292,6 @@ mod tests {
 
     #[tokio::test]
     async fn messenger_drop_finishes_event_tasks_and_remote_waits() {
-        struct PendingDiscovery(tokio::sync::Notify);
-        impl crate::PeerDiscovery for PendingDiscovery {
-            fn discover_by_worker_id(
-                &self,
-                _: velo_ext::WorkerId,
-            ) -> futures::future::BoxFuture<'_, anyhow::Result<velo_ext::PeerInfo>> {
-                Box::pin(async move {
-                    self.0.notify_one();
-                    std::future::pending().await
-                })
-            }
-
-            fn discover_by_instance_id(
-                &self,
-                _: velo_ext::InstanceId,
-            ) -> futures::future::BoxFuture<'_, anyhow::Result<velo_ext::PeerInfo>> {
-                Box::pin(std::future::pending())
-            }
-        }
-
         let owner = Messenger::builder().build().await.unwrap();
         let discovery = Arc::new(PendingDiscovery(tokio::sync::Notify::new()));
         let subscriber = Messenger::builder()
