@@ -1692,6 +1692,48 @@ mod tests {
         retained.closed().await;
     }
 
+    /// A node with one TCP transport on a loopback port and a loopback stream listener.
+    async fn tcp_stream_node(metrics: Option<Arc<VeloMetrics>>) -> Arc<Velo> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut builder = Velo::builder()
+            .add_transport(Arc::new(
+                crate::transports::tcp::TcpTransportBuilder::new()
+                    .from_listener(listener)
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+            ))
+            .stream_bind_addr(std::net::Ipv4Addr::LOCALHOST.into());
+        if let Some(metrics) = metrics {
+            builder = builder.metrics(metrics);
+        }
+        builder.build().await.unwrap()
+    }
+
+    /// A (consumer, producer) pair that know each other and both serve `attach_handler`.
+    async fn connected_pair(
+        consumer_metrics: Option<Arc<VeloMetrics>>,
+        attach_handler: &str,
+    ) -> (Arc<Velo>, Arc<Velo>) {
+        let consumer = tcp_stream_node(consumer_metrics).await;
+        let producer = tcp_stream_node(None).await;
+        consumer.register_peer(producer.peer_info()).unwrap();
+        producer.register_peer(consumer.peer_info()).unwrap();
+        for (node, peer) in [
+            (&consumer, producer.instance_id()),
+            (&producer, consumer.instance_id()),
+        ] {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                node.wait_for_handler(peer, attach_handler),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        }
+        (consumer, producer)
+    }
+
     /// Shutdown must not write to peers after its transports are gone.
     ///
     /// `graceful_shutdown` tears down the messenger transports first. Removing
@@ -1704,41 +1746,9 @@ mod tests {
         use crate::observability::test_helpers::MetricSnapshot;
         use futures::StreamExt;
 
-        async fn node(metrics: Option<Arc<VeloMetrics>>) -> Arc<Velo> {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let mut builder = Velo::builder()
-                .add_transport(Arc::new(
-                    crate::transports::tcp::TcpTransportBuilder::new()
-                        .from_listener(listener)
-                        .unwrap()
-                        .build()
-                        .unwrap(),
-                ))
-                .stream_bind_addr(std::net::Ipv4Addr::LOCALHOST.into());
-            if let Some(metrics) = metrics {
-                builder = builder.metrics(metrics);
-            }
-            builder.build().await.unwrap()
-        }
-
         let registry = prometheus::Registry::new();
         let metrics = Arc::new(VeloMetrics::register(&registry).unwrap());
-        let consumer = node(Some(metrics)).await;
-        let producer = node(None).await;
-        consumer.register_peer(producer.peer_info()).unwrap();
-        producer.register_peer(consumer.peer_info()).unwrap();
-        for (node, peer) in [
-            (&consumer, producer.instance_id()),
-            (&producer, consumer.instance_id()),
-        ] {
-            tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                node.wait_for_handler(peer, "_anchor_attach"),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        }
+        let (consumer, producer) = connected_pair(Some(metrics), "_anchor_attach").await;
 
         let mut anchor = consumer.create_anchor::<u32>();
         let sender = producer
@@ -1792,38 +1802,7 @@ mod tests {
     async fn shutdown_ends_a_live_mux_stream_without_sender_dropped() {
         use futures::StreamExt;
 
-        async fn node() -> Arc<Velo> {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            Velo::builder()
-                .add_transport(Arc::new(
-                    crate::transports::tcp::TcpTransportBuilder::new()
-                        .from_listener(listener)
-                        .unwrap()
-                        .build()
-                        .unwrap(),
-                ))
-                .stream_bind_addr(std::net::Ipv4Addr::LOCALHOST.into())
-                .build()
-                .await
-                .unwrap()
-        }
-
-        let consumer = node().await;
-        let producer = node().await;
-        consumer.register_peer(producer.peer_info()).unwrap();
-        producer.register_peer(consumer.peer_info()).unwrap();
-        for (node, peer) in [
-            (&consumer, producer.instance_id()),
-            (&producer, consumer.instance_id()),
-        ] {
-            tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                node.wait_for_handler(peer, "_anchor_attach"),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        }
+        let (consumer, producer) = connected_pair(None, "_anchor_attach").await;
 
         let mut anchor = consumer.create_anchor::<u32>();
         let sender = producer
@@ -1870,41 +1849,9 @@ mod tests {
 
         use crate::observability::test_helpers::MetricSnapshot;
 
-        async fn node(metrics: Option<Arc<VeloMetrics>>) -> Arc<Velo> {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let mut builder = Velo::builder()
-                .add_transport(Arc::new(
-                    crate::transports::tcp::TcpTransportBuilder::new()
-                        .from_listener(listener)
-                        .unwrap()
-                        .build()
-                        .unwrap(),
-                ))
-                .stream_bind_addr(std::net::Ipv4Addr::LOCALHOST.into());
-            if let Some(metrics) = metrics {
-                builder = builder.metrics(metrics);
-            }
-            builder.build().await.unwrap()
-        }
-
         let registry = prometheus::Registry::new();
         let metrics = Arc::new(VeloMetrics::register(&registry).unwrap());
-        let consumer = node(Some(metrics)).await;
-        let producer = node(None).await;
-        consumer.register_peer(producer.peer_info()).unwrap();
-        producer.register_peer(consumer.peer_info()).unwrap();
-        for (node, peer) in [
-            (&consumer, producer.instance_id()),
-            (&producer, consumer.instance_id()),
-        ] {
-            tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                node.wait_for_handler(peer, "_mpsc_anchor_attach"),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        }
+        let (consumer, producer) = connected_pair(Some(metrics), "_mpsc_anchor_attach").await;
 
         let mut anchor = consumer.create_mpsc_anchor::<u32>();
         let sender = producer
