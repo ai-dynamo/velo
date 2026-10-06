@@ -19,11 +19,12 @@ pub(super) fn start(
 ) -> Completion {
     let (finished, completion) = tokio::sync::oneshot::channel();
     let (worker_state, worker_transports) = (state.clone(), transports.clone());
+    let worker_runtime = runtime.clone();
     let worker = std::thread::Builder::new()
         .name("velo-teardown".into())
         .spawn(move || {
             let result = {
-                let _runtime = runtime.enter();
+                let _runtime = worker_runtime.enter();
                 super::stop_transports(&worker_state, &worker_transports)
             };
             if let Err(error) = &result {
@@ -36,7 +37,10 @@ pub(super) fn start(
         // Hooks that never run keep their threads and memory for the life of
         // the process. Blocking this caller is the lesser cost.
         tracing::error!(%error, "Could not start transport teardown; running it inline");
-        let result = super::stop_transports(&state, &transports);
+        let result = {
+            let _runtime = runtime.enter();
+            super::stop_transports(&state, &transports)
+        };
         return futures::future::ready(result).boxed().shared();
     }
 

@@ -449,12 +449,14 @@ pub trait Transport: Send + Sync {
     /// the runtime's graceful shutdown instead unless that is precisely what
     /// you want.
     ///
-    /// The runtime calls this at most once per instance, on a dedicated OS
-    /// thread that has entered the instance's Tokio runtime handle, so the
-    /// hook may block, for example to join its own threads. After the final
-    /// owner is dropped, that runtime may already have shut down: a task
-    /// spawned here then never runs. A panic here fails the runtime's
-    /// shutdown, but the other transports' hooks still run.
+    /// The runtime calls this at most once per instance, with the instance's
+    /// Tokio runtime handle entered. Once the instance is built, it calls it
+    /// on a dedicated OS thread, so the hook may block, for example to join
+    /// its own threads. If building the instance fails, it calls it on the
+    /// building task instead. After the final owner is dropped, the runtime
+    /// may already have shut down: a task spawned here then never runs. A
+    /// panic here fails the runtime's shutdown, but the other transports'
+    /// hooks still run.
     fn shutdown(&self);
 
     /// Wait until the teardown that [`shutdown`](Transport::shutdown) started
