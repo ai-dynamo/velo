@@ -814,9 +814,10 @@ pub(crate) fn anchor_detach_handler(manager: AnchorManagerRef) -> crate::messeng
         move |ctx: crate::messenger::TypedContext<AnchorDetachRequest>| {
             let manager = manager.clone();
             async move {
-                let manager = manager
-                    .upgrade()
-                    .ok_or_else(|| anyhow::anyhow!("anchor manager shut down"))?;
+                // A manager that is gone holds no anchor: cleanup has succeeded.
+                let Some(manager) = manager.upgrade() else {
+                    return Ok(());
+                };
                 let started = Instant::now();
                 let req = ctx.input;
                 let (_, local_id) = req.handle.unpack();
@@ -928,9 +929,10 @@ pub(crate) fn anchor_finalize_handler(manager: AnchorManagerRef) -> crate::messe
         move |ctx: crate::messenger::TypedContext<AnchorFinalizeRequest>| {
             let manager = manager.clone();
             async move {
-                let manager = manager
-                    .upgrade()
-                    .ok_or_else(|| anyhow::anyhow!("anchor manager shut down"))?;
+                // A manager that is gone holds no anchor: cleanup has succeeded.
+                let Some(manager) = manager.upgrade() else {
+                    return Ok(());
+                };
                 let started = Instant::now();
                 let req = ctx.input;
                 let (_, local_id) = req.handle.unpack();
@@ -978,9 +980,10 @@ pub(crate) fn anchor_cancel_handler(manager: AnchorManagerRef) -> crate::messeng
         move |ctx: crate::messenger::TypedContext<AnchorCancelRequest>| {
             let manager = manager.clone();
             async move {
-                let manager = manager
-                    .upgrade()
-                    .ok_or_else(|| anyhow::anyhow!("anchor manager shut down"))?;
+                // A manager that is gone holds no anchor: cleanup has succeeded.
+                let Some(manager) = manager.upgrade() else {
+                    return Ok(());
+                };
                 let started = Instant::now();
                 let req = ctx.input;
                 let (_, local_id) = req.handle.unpack();

@@ -531,9 +531,10 @@ pub(crate) fn mpsc_anchor_detach_handler(manager: AnchorManagerRef) -> crate::me
         move |ctx: crate::messenger::TypedContext<MpscAnchorDetachRequest>| {
             let manager = manager.clone();
             async move {
-                let manager = manager
-                    .upgrade()
-                    .ok_or_else(|| anyhow::anyhow!("anchor manager shut down"))?;
+                // A manager that is gone holds no anchor: cleanup has succeeded.
+                let Some(manager) = manager.upgrade() else {
+                    return Ok(());
+                };
                 let req = ctx.input;
                 let (_, local_id) = req.handle.unpack();
 
@@ -567,9 +568,10 @@ pub(crate) fn mpsc_anchor_cancel_handler(manager: AnchorManagerRef) -> crate::me
         move |ctx: crate::messenger::TypedContext<MpscAnchorCancelRequest>| {
             let manager = manager.clone();
             async move {
-                let manager = manager
-                    .upgrade()
-                    .ok_or_else(|| anyhow::anyhow!("anchor manager shut down"))?;
+                // A manager that is gone holds no anchor: cleanup has succeeded.
+                let Some(manager) = manager.upgrade() else {
+                    return Ok(());
+                };
                 let req = ctx.input;
                 let (_, local_id) = req.handle.unpack();
 

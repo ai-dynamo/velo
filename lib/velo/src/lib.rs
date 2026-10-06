@@ -1777,6 +1777,37 @@ mod tests {
         .expect("retained Messenger stopped with Velo")
         .unwrap();
         assert_eq!(response, bytes::Bytes::from_static(b"alive"));
+        // Cleanup handlers stay idempotent once the manager is gone: an
+        // absent manager holds no anchor, so a peer's cleanup has succeeded.
+        let handle = anchor.handle();
+        let cleanups = [
+            ("_anchor_detach", serde_json::json!({ "handle": handle })),
+            ("_anchor_finalize", serde_json::json!({ "handle": handle })),
+            ("_anchor_cancel", serde_json::json!({ "handle": handle })),
+            (
+                "_mpsc_anchor_detach",
+                serde_json::json!({ "handle": handle, "sender_id": 1 }),
+            ),
+            (
+                "_mpsc_anchor_cancel",
+                serde_json::json!({ "handle": handle }),
+            ),
+        ];
+        for (name, request) in cleanups {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                client
+                    .messenger()
+                    .typed_unary_streaming::<()>(name)
+                    .payload(request)
+                    .unwrap()
+                    .instance(retained.instance_id())
+                    .send(),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{name} did not answer"))
+            .unwrap_or_else(|error| panic!("{name} failed after final Velo drop: {error}"));
+        }
 
         drop(anchor);
         drop(sender);
