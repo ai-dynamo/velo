@@ -42,6 +42,7 @@ pub(crate) mod messenger_mux;
 pub mod mpsc;
 pub(crate) mod negotiation;
 pub mod sender;
+mod tasks;
 pub mod tcp_transport;
 pub mod transport;
 

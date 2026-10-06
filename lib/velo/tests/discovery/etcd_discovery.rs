@@ -3,7 +3,7 @@
 
 //! Etcd service discovery integration tests.
 //!
-//! Requires a running etcd server at http://127.0.0.1:2379.
+//! Requires a running etcd server at http://127.0.0.1:2379 (or `ETCD_URL`).
 //! Locally: `docker run -d -p 2379:2379 -e ALLOW_NONE_AUTHENTICATION=yes bitnami/etcd:latest`
 
 #![cfg(feature = "etcd")]
@@ -15,10 +15,14 @@ use velo::discovery::etcd::EtcdServiceDiscoveryBuilder;
 use velo::discovery::{ServiceDiscovery, ServiceEvent, ServiceRegistrationGuard};
 use velo_ext::InstanceId;
 
+fn etcd_url() -> String {
+    std::env::var("ETCD_URL").unwrap_or_else(|_| "http://127.0.0.1:2379".into())
+}
+
 async fn make_discovery() -> velo::discovery::etcd::EtcdServiceDiscovery {
-    let client = etcd_client::Client::connect(["http://127.0.0.1:2379"], None)
+    let client = etcd_client::Client::connect([etcd_url()], None)
         .await
-        .expect("Failed to connect to etcd — is it running on 127.0.0.1:2379?");
+        .expect("Failed to connect to the test etcd server");
     // Use a unique cluster_id per test to avoid cross-test interference
     let cluster_id = format!("test-{}", InstanceId::new_v4());
     EtcdServiceDiscoveryBuilder::new(client, cluster_id)
@@ -130,7 +134,7 @@ async fn test_watch_removed_on_unregister() {
 
 #[tokio::test]
 async fn test_cluster_isolation() {
-    let client = etcd_client::Client::connect(["http://127.0.0.1:2379"], None)
+    let client = etcd_client::Client::connect([etcd_url()], None)
         .await
         .unwrap();
 

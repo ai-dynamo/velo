@@ -259,10 +259,12 @@ pub(crate) fn reap_unclaimed(
     registry: &dashmap::DashMap<u64, crate::streaming::anchor::AnchorEntry>,
     metrics: Option<&crate::observability::VeloMetrics>,
 ) -> bool {
-    if !bind_unclaimed(Some(&feed.drain)) || feed.pump_token.is_cancelled() {
+    if !bind_unclaimed(Some(&feed.drain)) {
         return false;
     }
-    let Some((_, entry)) = registry.remove(&local_id) else {
+    // Retirement cancels this token under the same registry lock.
+    let Some((_, entry)) = registry.remove_if(&local_id, |_, _| !feed.pump_token.is_cancelled())
+    else {
         return false;
     };
     if let Some(m) = metrics {

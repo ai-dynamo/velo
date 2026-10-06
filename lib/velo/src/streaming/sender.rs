@@ -148,7 +148,7 @@ pub struct StreamSender<T> {
     heartbeat_cancel: CancellationToken,
     sent_terminal: bool,
     /// Registry reference for clearing the attachment flag on detach.
-    registry: Arc<DashMap<u64, AnchorEntry>>,
+    local_registry: Option<Arc<DashMap<u64, AnchorEntry>>>,
     /// User-facing cancellation signal: fires when _stream_cancel is received.
     cancel_token: CancellationToken,
     stop_token: CancellationToken,
@@ -218,7 +218,7 @@ impl<T: Serialize> StreamSender<T> {
             .get(&sender_stream_id)
             .map(|entry| entry.stop_token.clone())
             .unwrap_or_else(|| cancel_token.child_token());
-        let heartbeat_cancel = CancellationToken::new();
+        let heartbeat_cancel = cancel_token.child_token();
 
         // Spawn heartbeat background task
         let cancel = heartbeat_cancel.clone();
@@ -249,7 +249,7 @@ impl<T: Serialize> StreamSender<T> {
             heartbeat_cancel,
             stop_token,
             sent_terminal: false,
-            registry,
+            local_registry: negotiated_transport.is_none().then_some(registry),
             cancel_token,
             sender_stream_id,
             sender_registry,
@@ -408,11 +408,22 @@ impl<T: Serialize> StreamSender<T> {
         self.heartbeat_cancel.cancel();
         let bytes = cached_detached().clone();
         self.sent_terminal = true;
-        let registry = Arc::clone(&self.registry);
-        let (_, local_id) = self.handle.unpack();
+        let registry = self.local_registry.clone();
+        let (worker_id, local_id) = self.handle.unpack();
+        let sender_stream_id = self.sender_stream_id;
+        let runtime = self.runtime.clone();
         send_terminal(&self.runtime, &self.tx, bytes, move || {
-            if let Some(mut entry) = registry.get_mut(&local_id) {
+            // The fast path runs this on the caller's thread, which may have
+            // no runtime; the unattached timeout must still be armed.
+            let _runtime = crate::streaming::tasks::enter_if_outside_runtime(&runtime);
+            if let Some(registry) = registry
+                && let Some(mut entry) = registry.get_mut(&local_id)
+                && entry
+                    .stream_cancel_handle
+                    .is_some_and(|handle| handle.unpack() == (worker_id, sender_stream_id))
+            {
                 entry.attachment = false;
+                entry.restart_unattached_timeout(&registry, local_id);
             }
         })?;
         // Clean up sender registry entry

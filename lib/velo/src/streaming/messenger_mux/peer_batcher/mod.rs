@@ -243,7 +243,6 @@ impl BatcherHandle {
 
     /// Whether the task has taken its last drain, so a reply posted now is
     /// refused rather than taken.
-    #[cfg(test)]
     pub(crate) fn is_closed(&self) -> bool {
         self.control.is_closed()
     }
@@ -277,11 +276,17 @@ impl BatcherHandle {
 
 /// Everything a batcher task needs that is not per-peer state.
 pub(crate) struct BatcherContext {
+    pub(crate) tasks: crate::streaming::tasks::StreamTasks,
     pub(crate) messenger: Arc<Messenger>,
     pub(crate) config: MuxConfig,
     pub(crate) metrics: Option<MuxMetricsHandle>,
     pub(crate) epochs: Arc<AtomicU64>,
     pub(crate) batchers: Arc<BatcherMap>,
+    pub(crate) ingress: Arc<super::ingress::IngressRegistry>,
+    /// The run loop's own exit. The mux passes `tasks.cancellation_token()`;
+    /// a stop that lands while the loop is being polled exits here, through
+    /// `teardown(true)`, rather than by the spawn wrapper dropping the loop.
+    /// Tests pass a separate token to drive that exit on purpose.
     pub(crate) cancel: CancellationToken,
     /// A barrier in the run loop, installed only by the tests that need to stop
     /// it mid-wake. See [`test_hooks`].
@@ -314,12 +319,15 @@ pub(crate) fn spawn(key: PeerLane, ctx: BatcherContext) -> Arc<BatcherHandle> {
         ctx.metrics.clone(),
         epoch,
     );
+    let tasks = ctx.tasks.clone();
     let batcher = Batcher {
+        tasks: ctx.tasks,
         key,
         metrics: ctx.metrics,
         handle: Arc::clone(&handle),
         epochs: ctx.epochs,
         batchers: ctx.batchers,
+        ingress: ctx.ingress,
         cancel: ctx.cancel,
         control,
         gate,
@@ -327,12 +335,13 @@ pub(crate) fn spawn(key: PeerLane, ctx: BatcherContext) -> Arc<BatcherHandle> {
         slots: EgressSlots::default(),
         streams: SelectAll::new(),
         stopping: false,
+        teardown_complete: false,
         async_open_ack,
         staged_credit: Vec::new(),
         #[cfg(test)]
         hooks: ctx.hooks,
     };
-    tokio::spawn(batcher.run(open_rx));
+    tasks.spawn(batcher.run(open_rx));
     handle
 }
 
@@ -361,12 +370,14 @@ enum FenceSkip {
 }
 
 struct Batcher {
+    tasks: crate::streaming::tasks::StreamTasks,
     /// The (peer, lane) this batcher serves, and its key in the registry.
     key: PeerLane,
     metrics: Option<MuxMetricsHandle>,
     handle: Arc<BatcherHandle>,
     epochs: Arc<AtomicU64>,
     batchers: Arc<BatcherMap>,
+    ingress: Arc<super::ingress::IngressRegistry>,
     cancel: CancellationToken,
     /// The coalesced control state this task drains.
     control: Arc<ControlInbox>,
@@ -378,6 +389,8 @@ struct Batcher {
     /// Set once the task has decided to exit, so the drain loop stops pulling
     /// work it will never flush.
     stopping: bool,
+    /// Inbox closure precedes the final flush; only teardown completes an exit.
+    teardown_complete: bool,
     /// Whether an open acks before its `OpenSlot` is admitted. See
     /// [`MuxConfig::async_open_ack`].
     async_open_ack: bool,
@@ -391,6 +404,30 @@ struct Batcher {
     staged_credit: Vec<(SlotId, u32)>,
     #[cfg(test)]
     hooks: Option<Arc<TestHooks>>,
+}
+
+impl Drop for Batcher {
+    fn drop(&mut self) {
+        // Tokio can drop this task without polling the run loop's cleanup.
+        // Retirement closes the inbox before awaiting its final flush. An
+        // abort during that flush still loses credit and must stop the mux.
+        if !self.teardown_complete {
+            let already_cancelled = self.cancel.is_cancelled();
+            if super::lifecycle::stop_mux(&self.tasks, &self.ingress, self.metrics.as_ref())
+                && !already_cancelled
+            {
+                // Nothing aborts a batcher on purpose. This is a panic, which
+                // tokio reports itself, or a runtime dropped before
+                // `Velo::shutdown` ran, which is not an error of its own.
+                tracing::warn!(peer = %self.key.peer, lane = %self.key.lane,
+                    "messenger mux stopped: a batcher task ended without its teardown \
+                     (a panic, or the runtime shut down before Velo::shutdown)");
+            }
+        }
+        // A refused spawn can drop here under the batcher-map entry guard.
+        // Normal exits unregister in run; whole-mux shutdown clears the map.
+        self.teardown(false);
+    }
 }
 
 impl Batcher {
@@ -514,7 +551,10 @@ impl Batcher {
             Work::Control(drained) => self.on_control(drained).await,
             Work::Linger => {}
             Work::Probe => {
-                if !self.writer.peer_is_alive().await {
+                if let Err(error) = self.writer.check_peer_health().await {
+                    tracing::warn!(peer = %self.key.peer, lane = %self.key.lane,
+                        epoch = self.writer.epoch(), live_slots = self.slots.live(),
+                        %error, "messenger mux: peer health failed; failing the epoch");
                     self.epoch_death();
                 }
             }
@@ -575,6 +615,10 @@ impl Batcher {
         // A failed singleton is epoch death; nothing else about the slot
         // matters afterwards, because the slot does not survive the epoch.
         if entry.singleton == Some(false) {
+            tracing::warn!(peer = %self.key.peer, lane = %self.key.lane,
+                epoch = self.writer.epoch(), slot = ?slot, live_slots = self.slots.live(),
+                error = entry.singleton_error.as_deref().unwrap_or("admission failed"),
+                "messenger mux: singleton was never admitted; failing the peer epoch");
             self.epoch_death();
             return;
         }
@@ -793,7 +837,7 @@ impl Batcher {
     /// (`docs/src/concepts/batched-streaming.md` § "Slots"), so nothing about the *sender's* admission
     /// order says anything about the order the receiver applies it in.
     ///
-    /// The `tokio::spawn` below always watches the admission — even an
+    /// The task spawned below always watches the admission — even an
     /// unfenced dispatch has to learn of a *failure*, which is epoch death
     /// whether or not the fence was ever raised. But it reports *success* to
     /// `singleton_resolved` only when this call actually fenced: an unfenced
@@ -836,8 +880,8 @@ impl Batcher {
         let control = Arc::clone(&self.control);
         #[cfg(test)]
         let hooks = self.hooks.clone();
-        tokio::spawn(async move {
-            let admitted = fire.await.is_ok();
+        self.tasks.spawn(async move {
+            let admission = fire.await;
             #[cfg(test)]
             if let Some(hooks) = &hooks {
                 hooks.await_resolutions_release().await;
@@ -850,8 +894,10 @@ impl Batcher {
             // singleton's entry under the same `SlotId` key and release a
             // fence that has not actually resolved (see `fire_singleton`'s
             // doc above).
-            if needs_fence || !admitted {
-                control.singleton_resolved(id, admitted);
+            match admission {
+                Ok(()) if needs_fence => control.singleton_resolved(id, true),
+                Ok(()) => {}
+                Err(error) => control.singleton_failed(id, Arc::from(error.to_string())),
             }
         });
         true
@@ -1095,9 +1141,10 @@ impl Batcher {
         // that terminates only if a closed batcher is never the registered
         // one. The retire path holds it because the sweep removes the entry
         // before posting `retire`; this order is what holds it on the other
-        // exit. Nothing writes after cancel today — it comes only from
-        // `MuxCore::drop` — which is why the invariant is kept structural
-        // rather than argued from the callers.
+        // exit. Cancel comes from `stop_sending`, `stop_mux` and
+        // `MuxCore::drop`. A writer that runs after it (a slot close during
+        // anchor removal at shutdown) is refused by `MuxCore::batcher`, and
+        // this order keeps the invariant even if that guard were missed.
         if unregister {
             let handle = Arc::clone(&self.handle);
             self.batchers
@@ -1123,5 +1170,6 @@ impl Batcher {
         let closed = self.slots.close_all();
         self.streams = SelectAll::new();
         self.account_closed(closed);
+        self.teardown_complete = true;
     }
 }

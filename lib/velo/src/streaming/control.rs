@@ -160,6 +160,46 @@ pub struct SenderRegistry {
     pub senders: dashmap::DashMap<u64, SenderEntry>,
 }
 
+impl SenderRegistry {
+    /// Remove a sender and signal both cancellation APIs. Graceful cleanup only
+    /// removes the entry, because it must leave queued output usable.
+    pub(crate) fn cancel(&self, sender_stream_id: u64) {
+        if let Some((_, entry)) = self.senders.remove(&sender_stream_id) {
+            drop(entry.rx_closer.lock().unwrap().take());
+            entry.cancel_token.cancel();
+        }
+    }
+}
+
+/// Route cancellation on the messenger runtime, including calls from plain threads.
+pub(crate) fn request_sender_cancel(
+    handle: StreamCancelHandle,
+    local_worker: velo_ext::WorkerId,
+    registry: &SenderRegistry,
+    messenger: Option<&Arc<crate::messenger::Messenger>>,
+) {
+    let (worker, sender_stream_id) = handle.unpack();
+    if worker == local_worker {
+        registry.cancel(sender_stream_id);
+        return;
+    }
+    if let Some(messenger) = messenger {
+        let rt = messenger.runtime().clone();
+        let messenger = Arc::clone(messenger);
+        rt.spawn(async move {
+            let payload = serde_json::to_vec(&StreamCancelRequest { sender_stream_id })
+                .expect("stream identity");
+            let _ = messenger
+                .am_send_streaming("_stream_cancel")
+                .expect("stream cancel handler")
+                .raw_payload(bytes::Bytes::from(payload))
+                .worker(worker)
+                .send()
+                .await;
+        });
+    }
+}
+
 // ---------------------------------------------------------------------------
 // create_stream_cancel_handler
 // ---------------------------------------------------------------------------
@@ -180,13 +220,7 @@ pub fn create_stream_cancel_handler(
         "_stream_cancel",
         move |ctx: crate::messenger::Context| {
             let req = serde_json::from_slice::<StreamCancelRequest>(&ctx.payload)?;
-            if let Some((_, entry)) = sender_registry.senders.remove(&req.sender_stream_id) {
-                // Poison the tx channel: drop the receiver end so
-                // poison_tx.is_disconnected() is true in StreamSender::send()
-                drop(entry.rx_closer.lock().unwrap().take());
-                // Signal the token so user code can react proactively
-                entry.cancel_token.cancel();
-            }
+            sender_registry.cancel(req.sender_stream_id);
             Ok(())
         },
     )
@@ -789,17 +823,7 @@ pub fn create_anchor_detach_handler(manager: Arc<AnchorManager>) -> crate::messe
                         // its own `tokio::spawn` — the call never runs
                         // synchronously and never touches this registry, so
                         // there is nothing here for it to deadlock against.
-                        if released.is_some()
-                            && let Some(duration) = entry.unattached_timeout
-                        {
-                            let tc = AnchorManager::spawn_timeout_task(
-                                Arc::clone(&manager.registry),
-                                local_id,
-                                duration,
-                                &entry.cancel_token,
-                            );
-                            entry.timeout_cancel = Some(tc);
-                        }
+                        entry.restart_unattached_timeout(&manager.registry, local_id);
                         // Take the child token (leaves None) so the next attach creates a fresh one,
                         // cancel it and withdraw the feed here, before the shard lock drops and
                         // before the `released_prebind` below is dropped. Retiring first is

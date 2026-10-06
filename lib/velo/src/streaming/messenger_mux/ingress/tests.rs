@@ -2056,3 +2056,31 @@ fn the_lanes_of_one_peer_share_one_byte_budget() {
         "a retired epoch's holds must go back to the shared budget"
     );
 }
+
+/// A slot claimed while the registry shuts down is retired with the rest.
+///
+/// A batch handler can be inside `handle_batch` while the mux fails or shuts
+/// down. Shutdown walked the slot tables and only then cleared the binds, so
+/// an `OpenSlot` landing between the two claimed a bind into a table already
+/// walked: a live slot nobody would retire, and a reader that waited on it
+/// forever. The hook lands the claim at exactly that point.
+#[test]
+fn a_claim_during_shutdown_is_retired_or_refused() {
+    let (registry, consumer, config) = bound();
+    let claim_config = config.clone();
+    assert!(
+        registry
+            .shutdown_hook
+            .set(Box::new(move |registry| {
+                open(registry, &claim_config, SlotId::new(0, 0).unwrap(), 1);
+            }))
+            .is_ok()
+    );
+    registry.shutdown();
+    assert_eq!(
+        registry.live_slots(peer()),
+        0,
+        "a claimed slot outlived shutdown"
+    );
+    assert!(consumer.rx.is_disconnected());
+}

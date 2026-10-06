@@ -55,6 +55,32 @@ fn make_test_manager() -> Arc<AnchorManager> {
     Arc::new(AnchorManager::new(worker_id, transport))
 }
 
+#[test]
+fn public_handler_factories_keep_the_manager_alive() {
+    use crate::streaming::mpsc::control::{
+        create_mpsc_anchor_attach_handler, create_mpsc_anchor_cancel_handler,
+        create_mpsc_anchor_detach_handler,
+    };
+
+    let factories: [fn(Arc<AnchorManager>) -> crate::messenger::Handler; 7] = [
+        create_anchor_attach_handler,
+        create_anchor_detach_handler,
+        create_anchor_finalize_handler,
+        create_anchor_cancel_handler,
+        create_mpsc_anchor_attach_handler,
+        create_mpsc_anchor_detach_handler,
+        create_mpsc_anchor_cancel_handler,
+    ];
+    for factory in factories {
+        let manager = make_test_manager();
+        let weak = Arc::downgrade(&manager);
+        let handler = factory(manager);
+        assert!(weak.upgrade().is_some());
+        drop(handler);
+        assert!(weak.upgrade().is_none());
+    }
+}
+
 // -----------------------------------------------------------------------
 // Watchdog firing test
 // -----------------------------------------------------------------------
@@ -2173,4 +2199,39 @@ fn attach_messages_from_before_lanes_read_as_lane_zero() {
             "{name}: a request with no lane key must encode as before lanes"
         );
     }
+}
+
+/// Cancelling a reader pump stops it even while it waits for room in a full
+/// anchor channel.
+///
+/// A consumer that holds its anchor without reading fills the channel, and
+/// the pump then waits on the send. `Velo::shutdown` cancels the pump's token
+/// and removes the anchor, but the anchor's receiver lives on with the
+/// application, so the send would never fail. A pump that did not race the
+/// cancel would hold its transport receiver and channel until the
+/// application read or dropped the anchor.
+#[tokio::test]
+async fn reader_pump_cancel_ends_a_send_waiting_on_a_full_channel() {
+    let manager = make_test_manager();
+    let (transport_tx, transport_rx) = flume::bounded::<Vec<u8>>(4);
+    let (frame_tx, _frame_rx) = flume::bounded::<Vec<u8>>(1);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let pump = tokio::spawn(reader_pump(
+        transport_rx,
+        frame_tx,
+        cancel.clone(),
+        manager.anchor_context(),
+        999,
+        std::time::Duration::from_secs(60),
+    ));
+    let item = rmp_serde::to_vec(&crate::streaming::frame::StreamFrame::Item(1u32)).unwrap();
+    transport_tx.send_async(item.clone()).await.unwrap();
+    transport_tx.send_async(item).await.unwrap();
+    // The first item fills the channel; the pump now waits to forward the second.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    cancel.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(2), pump)
+        .await
+        .expect("a cancelled pump kept waiting on a full channel")
+        .unwrap();
 }

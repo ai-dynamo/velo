@@ -202,11 +202,11 @@ async fn deferred_visit_due(due: Option<tokio::time::Instant>) {
 /// entry is what used to leave one entry behind per tick, for good.
 pub(super) fn spawn_sweep(core: &Arc<MuxCore>) {
     let weak = Arc::downgrade(core);
-    let cancel = core.cancel.clone();
+    let cancel = core.tasks.cancellation_token();
     let interval = core.config.credit_sweep_interval;
     let floor = core.config.drain_visit_floor;
     let drain_rx = core.drain_rx.clone();
-    tokio::spawn(async move {
+    core.tasks.spawn(async move {
         enum Wake {
             Tick,
             Peer(PeerLane),

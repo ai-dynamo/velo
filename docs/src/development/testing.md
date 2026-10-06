@@ -13,6 +13,17 @@ bash scripts/check-semver.sh
 
 Always use `--all-features`. Without it, the code behind `zmq`, `grpc`, `quic`, `nats-*`, `etcd`, `ucx`, and `simulation` does not compile, and its tests do not run.
 
+Also test the core configuration. An all-features build can hide a missing
+dependency feature in a smaller build:
+
+```bash
+timeout 900 cargo test --locked -p velo --no-default-features --features test-helpers --all-targets
+UCX_TLS=tcp timeout 900 cargo test --locked -p velo --no-default-features --features ucx,test-helpers --all-targets
+```
+
+The `bytes` serde feature is enabled explicitly for tests. Tests must not rely on
+an unrelated transport to enable it.
+
 Run one integration test by its name. The name is `<module>_<file>`. For example, `tests/transports/zmq_integration.rs` is `transports_zmq`:
 
 ```bash
@@ -47,6 +58,7 @@ CI links with `mold` (`RUSTFLAGS="-C linker=clang -C link-arg=-fuse-ld=mold"`). 
 | Clippy | clippy with `-D warnings`, then `cargo machete` |
 | Cargo Deny | license and ban checks |
 | Tests | `cargo test --locked --all-features --all-targets`, with NATS and etcd services |
+| Core configuration | TCP and UCX tests with default features disabled |
 | Coverage | `cargo llvm-cov` over the same set |
 | Examples | builds all examples and runs the short ones, including `rendezvous_rdma_two_proc` with `UCX_TLS=tcp` |
 | Soak smoke | `scripts/soak-smoke.sh` |

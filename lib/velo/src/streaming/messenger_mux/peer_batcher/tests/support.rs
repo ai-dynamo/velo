@@ -180,11 +180,13 @@ pub(super) async fn harness_with_hooks(
     let handle = spawn(
         key,
         BatcherContext {
+            tasks: Default::default(),
             messenger: Arc::clone(&sender),
             config: config.clone(),
             metrics: Some(metrics.bind_mux()),
             epochs: Arc::clone(&epochs),
             batchers: Arc::clone(&batchers),
+            ingress: Arc::default(),
             cancel: cancel.clone(),
             hooks,
         },
@@ -365,11 +367,13 @@ impl Harness {
         let handle = spawn(
             self.key,
             BatcherContext {
+                tasks: Default::default(),
                 messenger: Arc::clone(&self._sender),
                 config: self.config.clone(),
                 metrics: Some(self.metrics.bind_mux()),
                 epochs: Arc::clone(&self.epochs),
                 batchers: Arc::clone(&self.batchers),
+                ingress: Arc::default(),
                 cancel: self.cancel.clone(),
                 hooks: None,
             },
@@ -468,11 +472,13 @@ pub(super) async fn stalled_harness_with_hooks(
     let handle = spawn(
         PeerLane::new(peer_instance.worker_id(), LaneIndex::ZERO),
         BatcherContext {
+            tasks: Default::default(),
             messenger: Arc::clone(&sender),
             config: config.clone(),
             metrics: Some(metrics.bind_mux()),
             epochs: Arc::new(AtomicU64::new(1)),
             batchers: Arc::new(DashMap::new()),
+            ingress: Arc::default(),
             cancel: cancel.clone(),
             hooks,
         },

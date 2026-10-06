@@ -182,6 +182,7 @@ pub struct Velo {
     /// `FrameTransport`s) and so `peer_info()` can merge the streaming
     /// listener's WorkerAddress entry into the messenger-side WorkerAddress.
     stream_transport: Arc<dyn crate::streaming::FrameTransport>,
+    owned_stream_transport: OwnedStreamTransport,
     /// RDMA registration layer, present only when a UCX transport was added
     /// through [`VeloBuilder::add_ucx_transport`].
     #[cfg(all(target_os = "linux", feature = "ucx"))]
@@ -202,6 +203,35 @@ pub struct Velo {
 struct ShutdownOnce {
     lock: tokio::sync::Mutex<()>,
     done: std::sync::atomic::AtomicBool,
+}
+
+/// Concrete handles let shutdown join listeners without changing `FrameTransport`.
+#[derive(Clone)]
+enum OwnedStreamTransport {
+    Tcp(Arc<crate::streaming::TcpFrameTransport>),
+    #[cfg(feature = "grpc")]
+    Grpc(Arc<crate::streaming::GrpcFrameTransport>),
+}
+
+impl OwnedStreamTransport {
+    async fn shutdown(&self) {
+        match self {
+            Self::Tcp(transport) => transport.shutdown().await,
+            #[cfg(feature = "grpc")]
+            Self::Grpc(transport) => transport.shutdown().await,
+        }
+    }
+}
+
+/// Stop transports if a later builder step fails or the build is cancelled.
+struct StartupGuard(Option<Arc<Messenger>>);
+
+impl Drop for StartupGuard {
+    fn drop(&mut self) {
+        if let Some(messenger) = self.0.take() {
+            messenger.abort_startup();
+        }
+    }
 }
 
 /// Builder for configuring and creating a [`Velo`] instance.
@@ -358,6 +388,7 @@ impl VeloBuilder {
     pub async fn build(self) -> Result<Arc<Velo>> {
         // Step 1: Build Messenger.
         let messenger = self.inner.build().await?;
+        let mut startup = StartupGuard(Some(Arc::clone(&messenger)));
 
         // Step 2: Extract worker_id (carried on the local PeerInfo).
         let worker_id = messenger.instance_id().worker_id();
@@ -372,7 +403,10 @@ impl VeloBuilder {
         // method (the FrameTransport trait stays observability-free so
         // out-of-tree implementors don't take a `prometheus` dep).
         let resolved = self.stream_config.unwrap_or(StreamConfig::Tcp(None));
-        let stream_transport: Arc<dyn crate::streaming::FrameTransport> = match resolved {
+        let (stream_transport, owned_stream_transport): (
+            Arc<dyn crate::streaming::FrameTransport>,
+            OwnedStreamTransport,
+        ) = match resolved {
             StreamConfig::Tcp(tcp_cfg) => {
                 let bind_addr = tcp_cfg
                     .map(|c| c.bind_addr)
@@ -381,7 +415,7 @@ impl VeloBuilder {
                 if let Some(m) = self.metrics.as_ref() {
                     tcp.set_metrics(Arc::clone(m));
                 }
-                tcp as _
+                (tcp.clone() as _, OwnedStreamTransport::Tcp(tcp))
             }
             #[cfg(feature = "grpc")]
             StreamConfig::Grpc(grpc_cfg) => {
@@ -396,7 +430,7 @@ impl VeloBuilder {
                 if let Some(m) = self.metrics.as_ref() {
                     grpc.set_metrics(Arc::clone(m));
                 }
-                grpc as _
+                (grpc.clone() as _, OwnedStreamTransport::Grpc(grpc))
             }
         };
 
@@ -527,11 +561,13 @@ impl VeloBuilder {
         };
 
         // Step 10: Assemble Velo
+        startup.0.take();
         Ok(Arc::new(Velo {
             messenger,
             anchor_manager,
             rendezvous_manager,
             stream_transport,
+            owned_stream_transport,
             #[cfg(all(target_os = "linux", feature = "ucx"))]
             rdma,
             shutdown: Arc::new(ShutdownOnce {
@@ -677,10 +713,10 @@ impl Velo {
     ///
     /// # One deadline, not one per phase
     ///
-    /// [`ShutdownPolicy::Timeout`] names a bound on *this call*, so the sweep
-    /// and the messenger drain share it rather than each taking the full
-    /// duration — which would make the worst case twice what was asked for.
-    /// The transports' close step comes on top: it is bounded by each
+    /// [`ShutdownPolicy::Timeout`] bounds the sweep and messenger drain
+    /// together, rather than giving each phase the full duration. Joining mux
+    /// tasks comes after the drain and needs the owning runtime to make
+    /// progress. The transports' close step also comes on top: it is bounded by each
     /// transport's own [`Transport::closed`] (QUIC: 2.5 s), not by the policy,
     /// because cutting it short would discard frames already written.
     /// Under [`ShutdownPolicy::WaitForever`] the sweep still takes
@@ -743,7 +779,12 @@ impl Velo {
             }
         };
 
-        self.messenger.graceful_shutdown(policy).await;
+        let backend = self.messenger.backend();
+        backend.drain(policy).await;
+        // A cancelled task can still be in a poll that sends a batch. Join it
+        // before transport teardown, but leave ingress for reader detachment.
+        self.anchor_manager.stop_mux_sending().await;
+        backend.finish_shutdown().await;
 
         // Teardown has returned, so the progress thread has force-unmapped
         // everything it still held: nothing is pinned any more, and every latch
@@ -756,6 +797,26 @@ impl Velo {
         self.shutdown
             .done
             .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Drain messenger work and stop this instance's streaming services.
+    ///
+    /// This also cancels live streams, and joins the receive loops and the
+    /// streaming transport tasks owned by the builder. Stream reader pumps are
+    /// cancelled, not joined. Custom frame transports
+    /// remain the caller's responsibility. Stream watchdogs and heartbeats are
+    /// cancelled; application handlers that exceed `policy` can still be running.
+    /// If the sender of a stream is on this instance, shutdown cancels that
+    /// sender: its `cancellation_token` fires, and later sends fail. The reader
+    /// ends when the application drops or finalizes the sender.
+    /// Use this when an instance is removed while its Tokio runtime stays alive.
+    /// It closes resources. The instance and its handles stay valid, and
+    /// shutdown does not release them from memory.
+    pub async fn shutdown(&self, policy: ShutdownPolicy) {
+        self.graceful_shutdown(policy).await;
+        self.anchor_manager.shutdown().await;
+        self.owned_stream_transport.shutdown().await;
+        self.messenger.closed().await;
     }
 
     /// Get the instance ID of this system.
@@ -1450,31 +1511,78 @@ mod tests {
         );
     }
 
-    /// Test 1: Velo struct has anchor_manager field of type Arc<AnchorManager>
-    /// (compile-time check via field accessor)
-    #[test]
-    fn velo_has_anchor_manager_accessor() {
-        // This test verifies the anchor_manager() method exists and returns &AnchorManager.
-        // It doesn't construct a Velo (that requires async + transport), so we verify
-        // the method signature exists by type-checking a function pointer.
-        let _: fn(&Velo) -> &crate::streaming::AnchorManager = Velo::anchor_manager;
-    }
-
-    /// Test 2: create_anchor method exists with correct generic signature
-    #[test]
-    fn velo_create_anchor_signature() {
-        // Verify the method exists and has the correct type.
-        // We can't call it without a Velo instance, but we can verify the signature.
-        let _: fn(&Velo) -> crate::streaming::StreamAnchor<String> = Velo::create_anchor::<String>;
-    }
-
-    /// Test 3: attach_anchor method exists with correct async generic signature
-    /// (verified via integration test that constructs a real Velo)
+    #[cfg(feature = "grpc")]
     #[tokio::test]
-    async fn velo_attach_anchor_type_checks() {
-        // Build a real Velo instance to exercise create_anchor + attach_anchor type-checking.
+    async fn failed_stream_start_stops_messenger_listener() {
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let messenger_addr = listener.local_addr().unwrap();
+        let transport = Arc::new(
+            crate::transports::tcp::TcpTransportBuilder::new()
+                .from_listener(listener)
+                .unwrap()
+                .build()
+                .unwrap(),
+        );
+        let result = Velo::builder()
+            .add_transport(transport)
+            .stream_config(StreamConfig::Grpc(Some(GrpcConfig {
+                bind_addr: occupied.local_addr().unwrap(),
+            })))
+            .unwrap()
+            .build()
+            .await;
+        assert!(
+            result.is_err(),
+            "occupied streaming port must reject the build"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Ok(listener) = std::net::TcpListener::bind(messenger_addr) {
+                    break listener;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed build retained the messenger listener");
+    }
+
+    #[tokio::test]
+    async fn standalone_rendezvous_registration_retains_messenger() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let transport = Arc::new(
+            crate::transports::tcp::TcpTransportBuilder::new()
+                .from_listener(listener)
+                .unwrap()
+                .build()
+                .unwrap(),
+        );
+        let messenger = Messenger::builder()
+            .add_transport(transport)
+            .build()
+            .await
+            .unwrap();
+        let weak = Arc::downgrade(&messenger);
+        let manager = Arc::new(RendezvousManager::new(messenger.instance_id().worker_id()));
+        manager.register_handlers(messenger).unwrap();
+        let retained = weak
+            .upgrade()
+            .expect("public registration must retain its messenger");
+        retained
+            .graceful_shutdown(ShutdownPolicy::WaitForever)
+            .await;
+        retained.closed().await;
+        drop(retained);
+        drop(manager);
+    }
+
+    /// Shutdown must close resources while Tokio remains alive.
+    #[tokio::test]
+    async fn shutdown_joins_owned_tasks_and_closes_listener() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let messenger_addr = listener.local_addr().unwrap();
         let transport = {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             Arc::new(
                 crate::transports::tcp::TcpTransportBuilder::new()
                     .from_listener(listener)
@@ -1489,19 +1597,419 @@ mod tests {
             .await
             .unwrap();
 
-        // Test 1: anchor_manager() returns &AnchorManager
-        let _am: &crate::streaming::AnchorManager = velo.anchor_manager();
+        let stream_addr = match &velo.owned_stream_transport {
+            OwnedStreamTransport::Tcp(transport) => transport.bound_addr(),
+            #[cfg(feature = "grpc")]
+            OwnedStreamTransport::Grpc(_) => unreachable!(),
+        };
 
-        // Test 2: create_anchor::<String>() returns StreamAnchor<String>
+        let pending_event = velo.messenger.events().new_event().unwrap().into_handle();
+        #[derive(serde::Serialize)]
+        struct Subscription {
+            handle: u128,
+            subscriber_worker: u64,
+            subscriber_instance: InstanceId,
+        }
+        let subscribe = Subscription {
+            handle: pending_event.raw(),
+            subscriber_worker: velo.instance_id().worker_id().as_u64(),
+            subscriber_instance: velo.instance_id(),
+        };
+        velo.messenger
+            .events()
+            .handle_subscribe(bytes::Bytes::from(serde_json::to_vec(&subscribe).unwrap()))
+            .await
+            .unwrap();
+
         let anchor: crate::streaming::StreamAnchor<String> = velo.create_anchor::<String>();
         let handle = anchor.handle();
 
-        // Test 3: attach_anchor::<String>(handle) returns correct Result type
-        // The local attach path no longer calls transport.connect(), so it
-        // should succeed for local handles.
         let result: Result<crate::streaming::StreamSender<String>, crate::streaming::AttachError> =
             velo.attach_anchor::<String>(handle).await;
 
-        let _sender = result.expect("local attach should succeed");
+        let sender = result.expect("local attach should succeed");
+        drop(sender);
+        drop(anchor);
+        velo.shutdown(ShutdownPolicy::Timeout(std::time::Duration::from_secs(1)))
+            .await;
+        assert!(velo.anchor_manager.registry.is_empty());
+        velo.tracker().close();
+        tokio::time::timeout(std::time::Duration::from_secs(2), velo.tracker().wait())
+            .await
+            .expect("shutdown retained a tracked task");
+        std::net::TcpListener::bind(messenger_addr)
+            .expect("shutdown retained the messenger listener");
+        std::net::TcpListener::bind(stream_addr).expect("shutdown retained the streaming listener");
+    }
+
+    #[tokio::test]
+    async fn retained_messenger_value_clone_keeps_streaming_after_velo_drop() {
+        use futures::StreamExt;
+
+        async fn node() -> Arc<Velo> {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            Velo::builder()
+                .add_transport(Arc::new(
+                    crate::transports::tcp::TcpTransportBuilder::new()
+                        .from_listener(listener)
+                        .unwrap()
+                        .build()
+                        .unwrap(),
+                ))
+                .build()
+                .await
+                .unwrap()
+        }
+
+        let server = node().await;
+        let client = node().await;
+        client.register_peer(server.peer_info()).unwrap();
+        server.register_peer(client.peer_info()).unwrap();
+        let mut anchor = server.create_anchor::<u32>();
+        let manager = Arc::downgrade(&server.anchor_manager);
+        let owned_transport = server.owned_stream_transport.clone();
+        let retained = Arc::new(server.messenger.as_ref().clone());
+        drop(server);
+
+        let sender = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.attach_anchor::<u32>(anchor.handle()),
+        )
+        .await
+        .expect("retained messenger lost its receive loop")
+        .expect("retained messenger lost streaming control handlers");
+        sender.send(7).await.unwrap();
+        sender.finalize().unwrap();
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), anchor.next())
+            .await
+            .expect("retained messenger lost its stream");
+        assert!(matches!(
+            frame,
+            Some(Ok(crate::streaming::StreamFrame::Item(7)))
+        ));
+
+        drop(anchor);
+        client.shutdown(ShutdownPolicy::WaitForever).await;
+        retained
+            .graceful_shutdown(ShutdownPolicy::WaitForever)
+            .await;
+        manager.upgrade().unwrap().shutdown().await;
+        owned_transport.shutdown().await;
+        retained.closed().await;
+    }
+
+    /// A node with one TCP transport on a loopback port and a loopback stream listener.
+    async fn tcp_stream_node(metrics: Option<Arc<VeloMetrics>>) -> Arc<Velo> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut builder = Velo::builder()
+            .add_transport(Arc::new(
+                crate::transports::tcp::TcpTransportBuilder::new()
+                    .from_listener(listener)
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+            ))
+            .stream_bind_addr(std::net::Ipv4Addr::LOCALHOST.into());
+        if let Some(metrics) = metrics {
+            builder = builder.metrics(metrics);
+        }
+        builder.build().await.unwrap()
+    }
+
+    /// A (consumer, producer) pair that know each other and both serve `attach_handler`.
+    async fn connected_pair(
+        consumer_metrics: Option<Arc<VeloMetrics>>,
+        attach_handler: &str,
+    ) -> (Arc<Velo>, Arc<Velo>) {
+        let consumer = tcp_stream_node(consumer_metrics).await;
+        let producer = tcp_stream_node(None).await;
+        consumer.register_peer(producer.peer_info()).unwrap();
+        producer.register_peer(consumer.peer_info()).unwrap();
+        for (node, peer) in [
+            (&consumer, producer.instance_id()),
+            (&producer, consumer.instance_id()),
+        ] {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                node.wait_for_handler(peer, attach_handler),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        }
+        (consumer, producer)
+    }
+
+    /// Shutdown must not write to peers after its transports are gone.
+    ///
+    /// Credit and slot-close records can race transport teardown even when
+    /// the application has stopped sending. Graceful shutdown must stop and
+    /// join the mux before closing its transports, then detach readers before
+    /// retiring ingress slots.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_with_live_mux_stream_sends_nothing_after_teardown() {
+        use crate::observability::test_helpers::MetricSnapshot;
+        use futures::StreamExt;
+
+        let registry = prometheus::Registry::new();
+        let metrics = Arc::new(VeloMetrics::register(&registry).unwrap());
+        let (consumer, producer) = connected_pair(Some(metrics), "_anchor_attach").await;
+
+        let mut anchor = consumer.create_anchor::<u32>();
+        let sender = producer
+            .attach_anchor::<u32>(anchor.handle())
+            .await
+            .unwrap();
+        sender.send(1).await.unwrap();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), anchor.next())
+            .await
+            .unwrap();
+        assert!(matches!(
+            first,
+            Some(Ok(crate::streaming::StreamFrame::Item(1)))
+        ));
+
+        let send_errors = || {
+            MetricSnapshot::from_registry(&registry).counter(
+                "velo_transport_rejections_total",
+                &[("transport", "tcp"), ("reason", "send_error")],
+            )
+        };
+        let before = send_errors();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            consumer.shutdown(ShutdownPolicy::WaitForever),
+        )
+        .await
+        .expect("consumer shutdown hung");
+        // A failed dial reports from the writer task after shutdown returns.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            send_errors(),
+            before,
+            "shutdown sent a frame after its transport was torn down"
+        );
+
+        drop(sender);
+        drop(anchor);
+        producer.shutdown(ShutdownPolicy::WaitForever).await;
+    }
+
+    /// A consumer still reading when its node shuts down must see the stream
+    /// end, not `SenderDropped`: the sender did nothing wrong.
+    ///
+    /// Stopping the mux retires every ingress slot by injecting `Dropped` into
+    /// it. A consumer whose direct feed is still installed reads that record
+    /// as its sender's. So each anchor's feed must be withdrawn before the mux
+    /// stops, which is also what `AnchorEntry::drop` does before it closes a
+    /// slot, for the same reason.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_ends_a_live_mux_stream_without_sender_dropped() {
+        use futures::StreamExt;
+
+        let (consumer, producer) = connected_pair(None, "_anchor_attach").await;
+
+        let mut anchor = consumer.create_anchor::<u32>();
+        let sender = producer
+            .attach_anchor::<u32>(anchor.handle())
+            .await
+            .unwrap();
+        sender.send(1).await.unwrap();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), anchor.next())
+            .await
+            .unwrap();
+        assert!(matches!(
+            first,
+            Some(Ok(crate::streaming::StreamFrame::Item(1)))
+        ));
+
+        let reader = tokio::spawn(async move { anchor.next().await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            consumer.shutdown(ShutdownPolicy::WaitForever),
+        )
+        .await
+        .expect("consumer shutdown hung");
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), reader)
+            .await
+            .expect("reader still waiting after shutdown")
+            .unwrap();
+        assert!(
+            ended.is_none(),
+            "shutdown must end a live stream cleanly, got {ended:?}"
+        );
+
+        drop(sender);
+        producer.shutdown(ShutdownPolicy::WaitForever).await;
+    }
+
+    /// The MPSC form of the test above. An MPSC slot's records reach the
+    /// consumer through a pump, so stopping the mux injects `Dropped` that a
+    /// live pump forwards as the sender's own `Dropped`. The pumps must stop
+    /// before the mux does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_ends_a_live_mpsc_mux_stream_without_dropped() {
+        use futures::StreamExt;
+
+        use crate::observability::test_helpers::MetricSnapshot;
+
+        let registry = prometheus::Registry::new();
+        let metrics = Arc::new(VeloMetrics::register(&registry).unwrap());
+        let (consumer, producer) = connected_pair(Some(metrics), "_mpsc_anchor_attach").await;
+
+        let mut anchor = consumer.create_mpsc_anchor::<u32>();
+        let sender = producer
+            .attach_mpsc_anchor::<u32>(anchor.handle())
+            .await
+            .unwrap();
+        sender.send(1).await.unwrap();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), anchor.next())
+            .await
+            .unwrap();
+        assert!(matches!(
+            first,
+            Some(Ok((_, crate::streaming::mpsc::MpscFrame::Item(1))))
+        ));
+
+        let send_errors = || {
+            MetricSnapshot::from_registry(&registry).counter(
+                "velo_transport_rejections_total",
+                &[("transport", "tcp"), ("reason", "send_error")],
+            )
+        };
+        let before = send_errors();
+        let reader = tokio::spawn(async move { anchor.next().await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            consumer.shutdown(ShutdownPolicy::WaitForever),
+        )
+        .await
+        .expect("consumer shutdown hung");
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), reader)
+            .await
+            .expect("reader still waiting after shutdown")
+            .unwrap();
+        assert!(
+            ended.is_none(),
+            "shutdown must end a live MPSC stream cleanly, got {ended:?}"
+        );
+        // A stopped pump releases its slot; that must not reach the wire.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            send_errors(),
+            before,
+            "shutdown sent a frame after its transport was torn down"
+        );
+
+        drop(sender);
+        producer.shutdown(ShutdownPolicy::WaitForever).await;
+    }
+
+    /// What `Velo::shutdown` does to a stream whose sender is on this node
+    /// and still held by the application: the sender is cancelled (its
+    /// `cancellation_token` fires and later sends fail), and its reader ends
+    /// when the application drops it. Shutdown does not end the reader itself:
+    /// a consumer poll that watched for it would cost every read a check.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_cancels_a_held_local_sender_and_its_reader_ends_on_drop() {
+        use futures::StreamExt;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let velo = Velo::builder()
+            .add_transport(Arc::new(
+                crate::transports::tcp::TcpTransportBuilder::new()
+                    .from_listener(listener)
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+            ))
+            .build()
+            .await
+            .unwrap();
+
+        let mut anchor = velo.create_anchor::<u32>();
+        let sender = velo.attach_anchor::<u32>(anchor.handle()).await.unwrap();
+        let mut mpsc_anchor = velo.create_mpsc_anchor::<u32>();
+        let mpsc_sender = velo
+            .attach_mpsc_anchor::<u32>(mpsc_anchor.handle())
+            .await
+            .unwrap();
+        let reader = tokio::spawn(async move { anchor.next().await });
+        let mpsc_reader = tokio::spawn(async move { mpsc_anchor.next().await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            velo.shutdown(ShutdownPolicy::WaitForever),
+        )
+        .await
+        .expect("shutdown hung");
+        assert!(sender.cancellation_token().is_cancelled());
+        assert!(mpsc_sender.cancellation_token().is_cancelled());
+        assert!(sender.send(1).await.is_err());
+        assert!(mpsc_sender.send(1).await.is_err());
+
+        drop(sender);
+        drop(mpsc_sender);
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(2), reader)
+            .await
+            .expect("SPSC reader still waiting after its sender was dropped")
+            .unwrap();
+        assert!(
+            matches!(
+                ended,
+                Some(Err(crate::streaming::StreamError::SenderDropped))
+            ),
+            "got {ended:?}"
+        );
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(2), mpsc_reader)
+            .await
+            .expect("MPSC reader still waiting after its sender was dropped")
+            .unwrap();
+        assert!(
+            matches!(
+                ended,
+                Some(Ok((_, crate::streaming::mpsc::MpscFrame::Dropped(_))))
+            ),
+            "got {ended:?}"
+        );
+    }
+
+    /// Every state change in shutdown happens before its first await.
+    ///
+    /// A caller can bound `Velo::shutdown` with a timeout and drop it while it
+    /// waits for the mux's tasks. Streams must already be off their slots and
+    /// their anchors removed by then; a dropped future that had withdrawn the
+    /// feeds but not removed the anchors would leave their readers waiting on
+    /// nothing. The runtime is single-threaded, so the mux's own tasks have
+    /// not run and its join is still pending at the first poll.
+    #[tokio::test(flavor = "current_thread")]
+    async fn abandoning_anchor_shutdown_still_removes_every_anchor() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let velo = Velo::builder()
+            .add_transport(Arc::new(
+                crate::transports::tcp::TcpTransportBuilder::new()
+                    .from_listener(listener)
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+            ))
+            .build()
+            .await
+            .unwrap();
+        let _anchor = velo.create_anchor::<u32>();
+        let _mpsc_anchor = velo.create_mpsc_anchor::<u32>();
+        {
+            let shutdown = velo.anchor_manager.shutdown();
+            futures::pin_mut!(shutdown);
+            assert!(
+                futures::poll!(shutdown.as_mut()).is_pending(),
+                "the test needs shutdown to wait at its first poll"
+            );
+        }
+        assert!(velo.anchor_manager.registry.is_empty());
+        assert!(velo.anchor_manager.mpsc_registry.is_empty());
     }
 }

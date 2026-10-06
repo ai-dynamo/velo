@@ -83,7 +83,7 @@ const MAX_GENERATION: u64 = (1u64 << 48) - 1;
 
 #[derive(Debug, Error)]
 pub(crate) enum DecodeError {
-    #[error("Response header too short: expected at least 18 bytes, got {0}")]
+    #[error("Response header too short: expected at least 19 bytes, got {0}")]
     HeaderTooShort(usize),
 
     #[error("Invalid headers length")]

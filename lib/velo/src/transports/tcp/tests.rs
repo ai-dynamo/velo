@@ -19,12 +19,14 @@ impl TransportErrorHandler for NullErrorHandler {
 /// Error handler that counts errors (for tests that verify error routing).
 struct TrackingErrorHandler {
     count: AtomicUsize,
+    reasons: Mutex<Vec<String>>,
 }
 
 impl TrackingErrorHandler {
     fn new() -> Self {
         Self {
             count: AtomicUsize::new(0),
+            reasons: Mutex::new(Vec::new()),
         }
     }
 
@@ -34,7 +36,8 @@ impl TrackingErrorHandler {
 }
 
 impl TransportErrorHandler for TrackingErrorHandler {
-    fn on_error(&self, _: Bytes, _: Bytes, _: String) {
+    fn on_error(&self, _: Bytes, _: Bytes, reason: String) {
+        self.reasons.lock().unwrap().push(reason);
         self.count.fetch_add(1, Ordering::SeqCst);
     }
 }
@@ -476,6 +479,7 @@ async fn test_writer_task_cleans_up_on_write_error() {
         addr,
         (iid, 0),
         rx,
+        tx.clone(),
         WriterTaskContext {
             connections: conns,
             cancel_token: cancel,
@@ -510,6 +514,8 @@ async fn test_writer_task_cleans_up_on_write_error() {
         }
         tokio::task::yield_now().await;
     }
+
+    drop(tx);
 
     // Wait for writer task to finish, bounded so a stuck test fails loudly.
     let join_result = tokio::time::timeout(Duration::from_secs(5), writer)
@@ -623,6 +629,7 @@ async fn test_writer_task_drains_on_connect_failure() {
         addr,
         (iid, 0),
         rx,
+        tx.clone(),
         WriterTaskContext {
             connections: conns,
             cancel_token: cancel,
@@ -632,7 +639,10 @@ async fn test_writer_task_drains_on_connect_failure() {
             socket_buffers: None,
         },
     ));
-    let _ = writer.await;
+    drop(tx);
+    let error = writer.await.unwrap().unwrap_err();
+    assert!(format!("{error:#}").contains("connect failed"));
+    assert!(error_handler.reasons.lock().unwrap()[0].contains("connect failed"));
 
     assert_eq!(
         error_handler.error_count(),
@@ -1287,4 +1297,39 @@ async fn shutdown_closes_every_lane() {
         FRAMES,
         "{delivered} delivered + {failed} failed != {FRAMES} sent"
     );
+}
+
+/// A sender can retain an old epoch while its writer retires. Its accepted
+/// frames must fail, and cleanup must leave a replacement entry intact.
+#[tokio::test]
+async fn retirement_accounts_for_late_sends_without_removing_the_successor() {
+    let key = (crate::InstanceId::new_v4(), 0);
+    let connections = Arc::new(DashMap::new());
+    let (old, rx) = make_handle(4);
+    connections.insert(key, old.clone());
+    let errors = Arc::new(TrackingErrorHandler::new());
+    let closing = tokio::spawn({
+        let connections = connections.clone();
+        let tx = old.tx.clone();
+        async move { retire_connection(key, tx, rx, &connections, "retired").await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while connections.contains_key(&key) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let (next, _next_rx) = make_handle(4);
+    connections.insert(key, next.clone());
+    for _ in 0..2 {
+        assert!(old.gate.send(task(errors.clone())).is_admitted());
+    }
+    drop(old);
+    tokio::time::timeout(Duration::from_secs(2), closing)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(errors.error_count(), 2);
+    assert!(connections.get(&key).unwrap().tx.same_channel(&next.tx));
 }

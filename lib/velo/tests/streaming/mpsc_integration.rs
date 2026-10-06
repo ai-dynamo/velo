@@ -239,6 +239,7 @@ async fn test_mpsc_max_senders() {
         matches!(result, Err(AttachError::MaxSendersReached { limit: 2, .. })),
         "expected MaxSendersReached, got {result:?}"
     );
+    assert_eq!(mgr.sender_registry.senders.len(), 2);
 }
 
 /// Test 6: controller.cancel() poisons every attached sender.
@@ -301,27 +302,159 @@ async fn test_mpsc_local_drop_preserved_under_backpressure() {
     let drop_task = tokio::spawn(async move {
         drop(sender);
     });
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    assert!(
-        !drop_task.is_finished(),
-        "drop should block while the bounded channel is full"
-    );
+    match tokio::time::timeout(Duration::from_secs(2), drop_task).await {
+        Ok(result) => result.expect("drop task join"),
+        Err(_) => {
+            // Unblock an old synchronous Drop before failing the test.
+            drop(anchor);
+            panic!("drop must return before the consumer drains the queue");
+        }
+    }
 
     match next_frame(&mut anchor).await.expect("frame") {
         Ok((got_sid, MpscFrame::Item(1))) => assert_eq!(got_sid, sid),
         other => panic!("expected Item(1), got {:?}", other),
     }
 
-    tokio::time::timeout(Duration::from_secs(2), drop_task)
-        .await
-        .expect("drop task should finish once the queue drains")
-        .expect("drop task join");
-
     match next_frame(&mut anchor).await.expect("frame") {
         Ok((got_sid, MpscFrame::Dropped(None))) => assert_eq!(got_sid, sid),
         other => panic!("expected Dropped(None), got {:?}", other),
     }
 
+    anchor.cancel();
+}
+
+/// A polled detach has committed its terminal event. Abandoning the caller
+/// must neither cancel that event nor add a second Dropped event.
+#[tokio::test(flavor = "multi_thread")]
+async fn abandoning_mpsc_detach_completes_or_stops_on_consumer_cancel() {
+    for (cancel_consumer, exit_observed) in [(false, false), (false, true), (true, false)] {
+        let mgr = make_manager();
+        let mut anchor = mgr.create_mpsc_anchor_with_config::<u32>(MpscAnchorConfig {
+            channel_capacity: Some(1),
+            max_senders: Some(1),
+            ..Default::default()
+        });
+        let sender = mgr
+            .attach_mpsc_stream_anchor::<u32>(anchor.handle())
+            .await
+            .unwrap();
+        let sid = sender.sender_id();
+        sender.send(1).await.unwrap();
+        let mut detach = Box::pin(sender.detach());
+        assert!(futures::poll!(&mut detach).is_pending());
+        if exit_observed {
+            // The terminal has reached the consumer, but the caller has not
+            // polled the detach future again to observe its completion.
+            assert!(
+                matches!(next_frame(&mut anchor).await, Some(Ok((id, MpscFrame::Item(1)))) if id == sid)
+            );
+            assert!(
+                matches!(next_frame(&mut anchor).await, Some(Ok((id, MpscFrame::Detached))) if id == sid)
+            );
+        }
+        drop(detach);
+        if cancel_consumer {
+            anchor.controller().cancel();
+        } else {
+            if !exit_observed {
+                assert!(
+                    matches!(next_frame(&mut anchor).await, Some(Ok((id, MpscFrame::Item(1)))) if id == sid)
+                );
+                assert!(
+                    matches!(next_frame(&mut anchor).await, Some(Ok((id, MpscFrame::Detached))) if id == sid)
+                );
+            }
+            let replacement = mgr
+                .attach_mpsc_stream_anchor::<u32>(anchor.handle())
+                .await
+                .expect("completed detach must release max_senders capacity");
+            replacement.send(2).await.unwrap();
+            assert!(matches!(
+                next_frame(&mut anchor).await,
+                Some(Ok((_, MpscFrame::Item(2))))
+            ));
+            anchor.controller().cancel();
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !mgr.sender_registry.senders.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("abandoned detach retained its sender registry entry");
+    }
+}
+
+/// A sender can outlive the runtime it was attached on. Detaching it from
+/// another runtime must still deliver `Detached`: work spawned on the stopped
+/// runtime is dropped, so the consumer would see no terminal at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn mpsc_detach_after_attaching_runtime_stops() {
+    let mgr = make_manager();
+    let mut anchor = mgr.create_mpsc_anchor::<u32>();
+    let handle = anchor.handle();
+    let attach_mgr = Arc::clone(&mgr);
+    let sender = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(attach_mgr.attach_mpsc_stream_anchor::<u32>(handle))
+        // `runtime` drops here and shuts down.
+    })
+    .join()
+    .unwrap()
+    .expect("attach");
+    let sid = sender.sender_id();
+    let returned = tokio::time::timeout(Duration::from_secs(2), sender.detach())
+        .await
+        .expect("detach stalled")
+        .expect("detach after the attaching runtime stopped");
+    assert_eq!(returned, handle);
+    assert!(
+        matches!(next_frame(&mut anchor).await, Some(Ok((id, MpscFrame::Detached))) if id == sid)
+    );
+    anchor.cancel();
+}
+
+/// A sender kept in a `thread_local!` (a language binding's thread) is
+/// dropped while that thread's locals are torn down. Tokio's own context can
+/// already be gone then, and `Handle::enter` panics on a destroyed context; a
+/// panic in a thread-local destructor aborts the process. The drop must
+/// degrade instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn mpsc_sender_dropped_during_thread_local_teardown() {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static HELD: RefCell<Option<velo::streaming::MpscStreamSender<u32>>> =
+            const { RefCell::new(None) };
+    }
+
+    // With an unattached timeout, the last sender leaving re-arms it, which
+    // spawns: that spawn must degrade the same way.
+    let mgr = make_manager();
+    let mut anchor = mgr.create_mpsc_anchor_with_config::<u32>(MpscAnchorConfig {
+        unattached_timeout: Some(Duration::from_secs(60)),
+        ..Default::default()
+    });
+    let sender = mgr
+        .attach_mpsc_stream_anchor::<u32>(anchor.handle())
+        .await
+        .unwrap();
+    let sid = sender.sender_id();
+    std::thread::spawn(move || {
+        HELD.with(|held| *held.borrow_mut() = Some(sender));
+        // Touch tokio's context after `HELD`, so its destructor is registered
+        // later and runs first.
+        assert!(tokio::runtime::Handle::try_current().is_err());
+    })
+    .join()
+    .expect("dropping the sender during thread-local teardown panicked");
+    assert!(
+        matches!(next_frame(&mut anchor).await, Some(Ok((id, MpscFrame::Dropped(None)))) if id == sid)
+    );
     anchor.cancel();
 }
 

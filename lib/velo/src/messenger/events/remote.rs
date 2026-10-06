@@ -52,7 +52,8 @@ pub(crate) struct RemoteEvent {
     /// Fast-path: highest generation known to be complete
     known_triggered: AtomicU32,
     /// Active proxy event handles mapped by generation
-    proxy_handles: Mutex<BTreeMap<u32, EventHandle>>,
+    /// `None` after shutdown: new waiters must not reopen the remote event.
+    proxy_handles: Mutex<Option<BTreeMap<u32, EventHandle>>>,
     /// Completion history for resolved generations
     completions: Mutex<BTreeMap<u32, Arc<CompletionKind>>>,
     /// Deduplication: generations for which we've sent a subscription request
@@ -70,7 +71,7 @@ impl RemoteEvent {
         Self {
             proxy_manager,
             known_triggered: AtomicU32::new(0),
-            proxy_handles: Mutex::new(BTreeMap::new()),
+            proxy_handles: Mutex::new(Some(BTreeMap::new())),
             completions: Mutex::new(BTreeMap::new()),
             pending: Mutex::new(BTreeSet::new()),
         }
@@ -104,6 +105,9 @@ impl RemoteEvent {
         // Create or reuse a proxy event for this generation
         let proxy_handle = {
             let mut proxy_handles = self.proxy_handles.lock();
+            let proxy_handles = proxy_handles
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("Event runtime shut down"))?;
             match proxy_handles.entry(generation) {
                 Entry::Occupied(e) => *e.get(),
                 Entry::Vacant(e) => {
@@ -121,7 +125,11 @@ impl RemoteEvent {
     }
 
     pub fn add_pending(&self, generation: u32) -> bool {
-        self.pending.lock().insert(generation)
+        let mut pending = self.pending.lock();
+        if self.proxy_handles.lock().is_none() {
+            return false;
+        }
+        pending.insert(generation)
     }
 
     pub fn complete_generation(&self, generation: u32, completion: CompletionKind) {
@@ -144,6 +152,9 @@ impl RemoteEvent {
         // Trigger or poison all proxy events for generations <= this one
         let handles_to_complete = {
             let mut proxy_handles = self.proxy_handles.lock();
+            let Some(proxy_handles) = proxy_handles.as_mut() else {
+                return;
+            };
             let gens_to_wake: Vec<u32> = proxy_handles
                 .range(..=generation)
                 .map(|(g, _)| *g)
@@ -182,7 +193,18 @@ impl RemoteEvent {
         }
     }
 
+    pub fn cancel(&self) {
+        let handles = self.proxy_handles.lock().take().unwrap_or_default();
+        for handle in handles.into_values() {
+            let _ = self.proxy_manager.poison(handle, "Event runtime shut down");
+        }
+        self.pending.lock().clear();
+    }
+
     pub fn status_for(&self, generation: u32) -> EventStatus {
+        if self.proxy_handles.lock().is_none() {
+            return EventStatus::Poisoned;
+        }
         if generation <= self.known_generation() {
             let completions = self.completions.lock();
             match completions.get(&generation) {
@@ -211,6 +233,6 @@ impl RemoteEvent {
     pub fn is_cacheable(&self) -> bool {
         let pending = self.pending.lock();
         let proxy_handles = self.proxy_handles.lock();
-        pending.is_empty() && proxy_handles.is_empty()
+        pending.is_empty() && proxy_handles.as_ref().is_some_and(BTreeMap::is_empty)
     }
 }

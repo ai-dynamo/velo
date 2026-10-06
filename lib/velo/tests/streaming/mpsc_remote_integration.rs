@@ -114,6 +114,88 @@ fn roundtrip_handle(handle: StreamAnchorHandle) -> StreamAnchorHandle {
     StreamAnchorHandle::from_u128(handle.as_u128())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_sender_detach_and_drop_preserve_unrelated_local_slots() {
+    let (messenger_a, messenger_b) = make_two_messengers().await;
+    let am_a = make_am(messenger_a).await;
+    let am_b = make_am(messenger_b).await;
+    let remote_anchor = am_a.create_mpsc_anchor::<u32>();
+    let local_anchor = am_b.create_mpsc_anchor_with_config::<u32>(MpscAnchorConfig {
+        max_senders: Some(2),
+        ..Default::default()
+    });
+    assert_eq!(
+        remote_anchor.handle().unpack().1,
+        local_anchor.handle().unpack().1
+    );
+
+    let local_one = am_b
+        .attach_mpsc_stream_anchor::<u32>(local_anchor.handle())
+        .await
+        .unwrap();
+    let local_two = am_b
+        .attach_mpsc_stream_anchor::<u32>(local_anchor.handle())
+        .await
+        .unwrap();
+    let remote_one = am_b
+        .attach_mpsc_stream_anchor::<u32>(remote_anchor.handle())
+        .await
+        .unwrap();
+    let remote_two = am_b
+        .attach_mpsc_stream_anchor::<u32>(remote_anchor.handle())
+        .await
+        .unwrap();
+    assert_eq!(local_one.sender_id(), remote_one.sender_id());
+    assert_eq!(local_two.sender_id(), remote_two.sender_id());
+
+    remote_one.detach().await.unwrap();
+    drop(remote_two);
+    assert!(matches!(
+        am_b.attach_mpsc_stream_anchor::<u32>(local_anchor.handle())
+            .await,
+        Err(AttachError::MaxSendersReached { .. })
+    ));
+    local_anchor.cancel();
+    remote_anchor.cancel();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_sender_cancel_preserves_an_unrelated_local_sender() {
+    let (messenger_a, messenger_b) = make_two_messengers().await;
+    let am_a = make_am(messenger_a).await;
+    let am_b = make_am(messenger_b).await;
+    let remote_anchor = am_a.create_mpsc_anchor::<u32>();
+    let mut local_anchor = am_a.create_mpsc_anchor::<u32>();
+    let local_sender = am_a
+        .attach_mpsc_stream_anchor::<u32>(local_anchor.handle())
+        .await
+        .unwrap();
+    let remote_sender = am_b
+        .attach_mpsc_stream_anchor::<u32>(remote_anchor.handle())
+        .await
+        .unwrap();
+    // Sender IDs belong to workers, so both first senders have registry key 1.
+    assert!(am_a.sender_registry.senders.contains_key(&1));
+    assert!(am_b.sender_registry.senders.contains_key(&1));
+
+    remote_anchor.cancel();
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        remote_sender.cancellation_token().cancelled(),
+    )
+    .await
+    .expect("remote sender was not cancelled");
+    assert!(!local_sender.cancellation_token().is_cancelled());
+    local_sender.send(42).await.unwrap();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(3), local_anchor.next())
+            .await
+            .unwrap(),
+        Some(Ok((_, MpscFrame::Item(42))))
+    ));
+    local_anchor.cancel();
+}
+
 /// Two remote senders attach to one MPSC anchor on a separate worker and
 /// deliver items. Each sender gets a distinct `SenderId`, and the anchor
 /// reports both.
@@ -695,9 +777,16 @@ async fn test_mpsc_controller_cancel_propagates_cross_worker() {
     sender.send(1).await.unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Cancel on A fires `_stream_cancel` AM to B.
-    controller.cancel();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // A plain thread must still send `_stream_cancel` through A's runtime.
+    std::thread::spawn(move || controller.cancel())
+        .join()
+        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        sender.cancellation_token().cancelled(),
+    )
+    .await
+    .expect("off-runtime cancel must reach the remote sender");
 
     // Remote sender's poison channel should be disconnected by now.
     let result = sender.send(2).await;
@@ -741,4 +830,112 @@ async fn test_mpsc_pending_next_wakes_on_cross_worker_cancel() {
     );
 
     drop(sender);
+}
+
+/// Pause the data-plane connect after the receiver has accepted the attach.
+struct PausedConnect {
+    entered: flume::Sender<()>,
+    result: flume::Receiver<anyhow::Result<flume::Sender<Vec<u8>>>>,
+}
+
+impl FrameTransport for PausedConnect {
+    fn key(&self) -> velo_ext::TransportKey {
+        velo_ext::TransportKey::new(velo::streaming::tcp_transport::TCP_STREAM_KEY)
+    }
+
+    fn address(&self) -> velo_ext::WorkerAddress {
+        velo_ext::WorkerAddress::empty()
+    }
+
+    fn bind(
+        &self,
+        _: u64,
+        _: u64,
+    ) -> futures::future::BoxFuture<'_, anyhow::Result<flume::Receiver<Vec<u8>>>> {
+        Box::pin(async { anyhow::bail!("sender-only test transport") })
+    }
+
+    fn connect(
+        &self,
+        _: WorkerId,
+        _: u64,
+        _: u64,
+    ) -> futures::future::BoxFuture<'_, anyhow::Result<flume::Sender<Vec<u8>>>> {
+        Box::pin(async {
+            self.entered.send_async(()).await?;
+            self.result.recv_async().await?
+        })
+    }
+}
+
+/// Cancellation can arrive before connect returns. A failed or abandoned
+/// connect must also remove the identity it registered before the attach RPC.
+#[tokio::test(flavor = "multi_thread")]
+async fn mpsc_identity_survives_early_cancel_and_cleans_up_failed_attach() {
+    for outcome in ["cancel", "error", "abort"] {
+        let (messenger_a, messenger_b) = make_two_messengers().await;
+        let am_a = make_am(messenger_a).await;
+        let (entered, connected) = flume::bounded(1);
+        let (finish, result) = flume::bounded(1);
+        let am_b = Arc::new(
+            AnchorManagerBuilder::default()
+                .worker_id(messenger_b.instance_id().worker_id())
+                .transport(Arc::new(PausedConnect { entered, result }) as Arc<dyn FrameTransport>)
+                .messenger(Some(messenger_b.clone()))
+                .build()
+                .unwrap(),
+        );
+        am_b.register_handlers(messenger_b).unwrap();
+        let anchor = am_a.create_mpsc_anchor::<u32>();
+        let handle = anchor.handle();
+        let producer = am_b.clone();
+        let attach =
+            tokio::spawn(async move { producer.attach_mpsc_stream_anchor::<u32>(handle).await });
+        tokio::time::timeout(Duration::from_secs(3), connected.recv_async())
+            .await
+            .unwrap()
+            .unwrap();
+        let token = am_b
+            .sender_registry
+            .senders
+            .iter()
+            .next()
+            .expect("identity must be registered before connect")
+            .cancel_token
+            .clone();
+        match outcome {
+            "cancel" => {
+                anchor.controller().cancel();
+                tokio::time::timeout(Duration::from_secs(3), token.cancelled())
+                    .await
+                    .unwrap();
+                let (tx, _rx) = flume::bounded(1);
+                finish.send(Ok(tx)).unwrap();
+                let sender = tokio::time::timeout(Duration::from_secs(3), attach)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                assert!(sender.cancellation_token().is_cancelled());
+                assert!(sender.send(1).await.is_err());
+            }
+            "error" => {
+                finish.send(Err(anyhow::anyhow!("connect failed"))).unwrap();
+                assert!(
+                    tokio::time::timeout(Duration::from_secs(3), attach)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .is_err()
+                );
+            }
+            "abort" => {
+                attach.abort();
+                assert!(attach.await.unwrap_err().is_cancelled());
+            }
+            _ => unreachable!(),
+        }
+        assert!(am_b.sender_registry.senders.is_empty(), "{outcome}");
+        drop(anchor);
+    }
 }

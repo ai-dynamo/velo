@@ -293,6 +293,8 @@ struct LoopbackTransport {
     /// than a mysterious one.
     hold: Mutex<Option<&'static [u8]>>,
     held: Mutex<VecDeque<(Bytes, Bytes)>>,
+    reply_gate: Mutex<Option<velo_ext::AdmissionGate<()>>>,
+    reply_sent: tokio::sync::Notify,
 }
 
 impl LoopbackTransport {
@@ -353,6 +355,11 @@ impl Transport for LoopbackTransport {
             }
             MessageType::Ack | MessageType::Event => {
                 let _ = adapter.event_stream.send((header, payload));
+                if let Some(gate) = self.reply_gate.lock().unwrap().as_ref() {
+                    let outcome = gate.send(());
+                    self.reply_sent.notify_one();
+                    return outcome;
+                }
             }
             MessageType::ShuttingDown => {
                 let _ = adapter.shutdown_stream.send((header, payload));
@@ -529,9 +536,13 @@ async fn graceful_shutdown_timeout_drops_queued_work() {
         "both queued messages must be counted work before shutdown starts"
     );
 
+    // Test the messenger drain while its consumer cannot run. Velo shutdown
+    // also joins mux tasks, which need the owning runtime to make progress.
     tokio::time::timeout(
         Duration::from_secs(5),
-        server.graceful_shutdown(ShutdownPolicy::Timeout(Duration::from_millis(50))),
+        server
+            .messenger()
+            .graceful_shutdown(ShutdownPolicy::Timeout(Duration::from_millis(50))),
     )
     .await
     .expect("graceful_shutdown must give up once its timeout expires");
@@ -803,4 +814,108 @@ async fn a_parked_dispatch_loop_leaves_admitted_messages_uncounted() {
     .expect("the drained backlog must release its guards");
 
     server_rt.shutdown_background();
+}
+
+/// Error replies are still admitted work while their transport queue is full.
+#[tokio::test]
+async fn graceful_shutdown_waits_for_negative_reply_admission() {
+    for case in [
+        "unknown",
+        "missing_resolver",
+        "ordered_panic",
+        "spawned_panic",
+        "inline_panic",
+    ] {
+        let transport = Arc::new(LoopbackTransport::default());
+        let messenger = Messenger::builder()
+            .add_transport(transport.clone())
+            .build()
+            .await
+            .unwrap();
+        messenger
+            .register_handler(Handler::unary_handler("ping", |ctx| Ok(Some(ctx.payload))).build())
+            .unwrap();
+        messenger
+            .register_streaming_handler(
+                Handler::unary_handler("_panic", |_| panic!("test handler panic"))
+                    .ordered_global()
+                    .build(),
+            )
+            .unwrap();
+        messenger
+            .register_streaming_handler(
+                Handler::unary_handler("_spawned_panic", |_| panic!("test handler panic")).build(),
+            )
+            .unwrap();
+        messenger
+            .register_streaming_handler(
+                Handler::unary_handler("_inline_panic", |_| panic!("test handler panic"))
+                    .inline()
+                    .build(),
+            )
+            .unwrap();
+        messenger.register_peer(messenger.peer_info()).unwrap();
+        messenger
+            .unary("ping")
+            .unwrap()
+            .instance(messenger.instance_id())
+            .send()
+            .await
+            .unwrap();
+        transport.adapter().shutdown_state.wait_for_drain().await;
+
+        let (tx, rx) = flume::bounded(1);
+        let gate = velo_ext::AdmissionGate::new(tx, tokio::runtime::Handle::current());
+        assert!(gate.send(()).is_admitted());
+        *transport.reply_gate.lock().unwrap() = Some(gate);
+        let mut headers = std::collections::HashMap::new();
+        if case == "missing_resolver" {
+            headers.insert("_rv".to_string(), "missing".to_string());
+        }
+        let name = match case {
+            "ordered_panic" => "_panic",
+            "spawned_panic" => "_spawned_panic",
+            "inline_panic" => "_inline_panic",
+            _ => "_missing",
+        };
+        let reply = tokio::spawn(
+            messenger
+                .unary_streaming(name)
+                .headers(headers)
+                .instance(messenger.instance_id())
+                .send(),
+        );
+        tokio::time::timeout(Duration::from_secs(2), transport.reply_sent.notified())
+            .await
+            .expect("negative reply was not sent");
+        assert_eq!(
+            transport.adapter().shutdown_state.in_flight_count(),
+            1,
+            "{case}"
+        );
+        let shutdown = messenger.graceful_shutdown(ShutdownPolicy::WaitForever);
+        tokio::pin!(shutdown);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut shutdown)
+                .await
+                .is_err(),
+            "{case}"
+        );
+        rx.try_recv().expect("release reply admission");
+        tokio::time::timeout(Duration::from_secs(2), shutdown)
+            .await
+            .expect("drain did not finish after reply admission");
+        assert_eq!(
+            transport.adapter().shutdown_state.in_flight_count(),
+            0,
+            "{case}"
+        );
+        let error = reply.await.unwrap().unwrap_err().to_string();
+        let expected = match case {
+            "missing_resolver" => "resolver not configured",
+            "ordered_panic" | "spawned_panic" | "inline_panic" => "handler panicked",
+            _ => "not found",
+        };
+        assert!(error.contains(expected), "{case}: {error}");
+    }
 }

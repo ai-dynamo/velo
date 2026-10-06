@@ -29,6 +29,7 @@
 //! [`AdmissionGate`]: crate::transports::AdmissionGate
 
 mod address;
+mod ring;
 // The RMA surface backs the rendezvous registration layer in `rendezvous::rdma`;
 // some items here have no caller yet outside this module's own tests.
 #[allow(dead_code)]

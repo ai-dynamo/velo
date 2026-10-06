@@ -36,9 +36,27 @@ Each handler declares its exemption in the code where it is registered, so the g
 The drain counts an exempt message while its handler runs. It does not count the stream that the message serves. This has two results:
 
 - The drain finishes at the first moment that no message is in flight. A stream message is in flight only for microseconds, and consecutive batches are at least a credit round trip apart. An open stream, busy or quiet, therefore does not hold `graceful_shutdown` open.
-- Teardown then ends the mux streams, because they ride the messenger.
+- Velo then stops and joins mux sends before transport teardown. Ingress slots stay in place until full shutdown detaches their readers, so orderly shutdown does not report a false sender-drop error. The shutdown timeout bounds the drain; joining mux tasks comes after it and needs the owning Tokio runtime to keep running.
 
-To let open streams finish, call `begin_drain`, wait until your streams end, and then call `graceful_shutdown`. The per-stream transports have their own teardown, which `graceful_shutdown` does not do.
+To let open streams finish, call `begin_drain`, wait until your streams end, and then call `shutdown`. The application must wait for its streams: the messenger drain does not count their full lifetime.
+
+## Close an instance while Tokio keeps running
+
+Use `Velo::shutdown(policy)` when an application removes a Velo instance but keeps its Tokio runtime. It first runs `graceful_shutdown`, then cancels live anchors and senders, stops the builder-owned per-stream listener, and joins the messenger receive loops and streaming tasks. Pending remote event waits fail at teardown, and their subscription tasks stop. Local event completion remains available. Custom frame transports remain the caller's responsibility.
+
+If the sender of a stream is on the same instance, shutdown cancels that sender. The `cancellation_token` of the sender fires, and later sends fail. The reader of the stream ends when the application drops or finalizes the sender. Shutdown does not end the reader itself. That needs a check on every read.
+
+Call shutdown explicitly. Dropping a `Velo` value or its last `Arc` does not perform a graceful drain.
+
+This release keeps the existing strong references between the runtime and its services. A retained Messenger keeps streaming services available after Velo is dropped. Explicit shutdown closes resources and joins owned tasks, but does not release this ownership graph from memory.
+
+`graceful_shutdown` keeps its existing behavior: it drains and closes the messenger and RDMA services, but does not close the per-stream TCP or gRPC transport. `shutdown` is the complete instance shutdown operation. Application handlers that exceed a timeout can still be running after it returns.
+
+The public task tracker includes receive loops, tracked handlers, and tasks added by the application. `close()` allows `wait()` to finish when all tracked tasks exit; it does not cancel them. Ensure application tasks and idle ordering lanes can exit before waiting. An ordered handler with `with_idle_lane_ttl(None)` can leave a lane waiting forever while its router remains owned. Internal shutdown joins its own receive loops separately, so an application task cannot extend its timeout.
+
+A handler panic fails its waiting caller in every dispatch mode, provided the program unwinds panics. The error reply remains counted work until the transport accepts it. An ordered lane continues with the next message.
+
+Hard teardown interrupts a blocked TCP or UDS write and fails the frames still held by the writer. The connection is discarded if a write may be partial. A reported write failure does not prove that the peer received no bytes; applications must not treat it as permission to retry a non-idempotent request.
 
 ## A refused request fails fast
 
@@ -49,6 +67,10 @@ gRPC has no return path on its client-side read half. There, the transport recor
 ## Admission owns the in-flight count
 
 The rule is: **a message on the inbound queue is counted work.** `TransportAdapter::admit_message` is the only way onto the inbound queue. It takes the in-flight guard first, and then it reads the drain flag. The queued message carries the guard, and the guard is not optional.
+
+This count starts at server admission. It does not include requests still in a client or network queue. To settle a known set of client calls before shutdown, call `begin_drain`, keep the server alive until those calls finish or reach their deadlines, then call `shutdown`.
+
+Each caller must bound its response wait, for example with `tokio::time::timeout`. A peer disconnect does not complete every outstanding response slot. A request admitted before peer failure can therefore wait until its caller's deadline. Dropping its response awaiter releases the slot.
 
 Two faults made this the rule:
 

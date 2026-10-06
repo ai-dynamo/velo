@@ -455,22 +455,24 @@ impl Drop for MapRollback<'_> {
             reply: tx,
         }) {
             Ok(()) => shared.doorbell.ring(),
-            Err(flume::TrySendError::Full(cmd)) => match self.endpoint.state.runtime.get() {
-                Some(runtime) => {
-                    runtime.spawn(async move {
-                        if shared.ring_tx.send_async(cmd).await.is_ok() {
-                            shared.doorbell.ring();
-                        }
-                    });
-                }
-                None => tracing::warn!(
-                    "ucx: ring full and no runtime to retry on; region {region_id} stays \
+            Err(tokio::sync::mpsc::error::TrySendError::Full(cmd)) => {
+                match self.endpoint.state.runtime.get() {
+                    Some(runtime) => {
+                        runtime.spawn(async move {
+                            if shared.ring_tx.send_async(cmd).await.is_ok() {
+                                shared.doorbell.ring();
+                            }
+                        });
+                    }
+                    None => tracing::warn!(
+                        "ucx: ring full and no runtime to retry on; region {region_id} stays \
                          mapped until teardown"
-                ),
-            },
+                    ),
+                }
+            }
             // A disconnected ring means the progress thread is already tearing
             // down, and teardown unmaps whatever it still holds.
-            Err(flume::TrySendError::Disconnected(_)) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
         }
     }
 }

@@ -17,14 +17,16 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use super::tasks::StreamTasks;
 use anyhow::{Result, anyhow};
 use dashmap::DashMap;
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use tokio_stream::wrappers::TcpListenerStream;
-use tokio_util::sync::CancellationToken;
 use tonic::{Request, Response, Status, Streaming};
 use velo_ext::{PeerInfo, TransportKey, WorkerAddress, WorkerId};
+
+mod connection;
 
 use crate::streaming::transport::FrameTransport;
 use crate::transports::address::WorkerAddressBuilder;
@@ -64,6 +66,11 @@ const SESSION_ID_META: &str = "x-session-id";
 /// so the heartbeat watchdog is what reports a wedged consumer, not this.
 const TERMINAL_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// How long `shutdown` lets open HTTP/2 connections finish GOAWAY before it
+/// cancels connection I/O. A clean close takes one round trip; this bounds the case
+/// where a peer never answers.
+const SERVER_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
 use crate::streaming::sender::is_terminal_sentinel;
 
 // ---------------------------------------------------------------------------
@@ -75,6 +82,7 @@ type SessionRouting = DashMap<(u64, u64), flume::Sender<Vec<u8>>>;
 
 #[derive(Clone)]
 struct GrpcStreamingService {
+    tasks: StreamTasks,
     routing: Arc<SessionRouting>,
     metrics: Arc<std::sync::OnceLock<Arc<crate::observability::VeloMetrics>>>,
 }
@@ -110,7 +118,7 @@ impl VeloStreaming for GrpcStreamingService {
         // mid-poll and the consumer would be left waiting on the 15s heartbeat
         // watchdog instead.
         let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
-        tokio::spawn(async move {
+        if !self.tasks.spawn(async move {
             let mut last_was_terminal = false;
             let mut frames_seen = 0u64;
             let mut end_reason = "end-of-stream";
@@ -173,7 +181,9 @@ impl VeloStreaming for GrpcStreamingService {
             // consumer's channel, so the client observing end-of-response is a
             // genuine delivery acknowledgement.
             let _ = done_tx.send(());
-        });
+        }) {
+            return Err(Status::unavailable("streaming transport shut down"));
+        }
 
         // The response carries no items; it exists purely so that its
         // completion (the gRPC trailers) signals "request stream fully
@@ -225,7 +235,9 @@ pub struct GrpcFrameTransport {
     numa_hint: Option<u32>,
     peers: Arc<DashMap<WorkerId, SocketAddr>>,
     routing: Arc<SessionRouting>,
-    cancel: CancellationToken,
+    listener_cancel: tokio_util::sync::CancellationToken,
+    tasks: StreamTasks,
+    connections: tokio_util::task::TaskTracker,
     /// Optional metrics handle. Set once by the Velo builder via
     /// [`Self::set_metrics`] before any bind/connect.
     metrics: Arc<std::sync::OnceLock<Arc<crate::observability::VeloMetrics>>>,
@@ -240,7 +252,9 @@ impl GrpcFrameTransport {
         numa_hint: Option<u32>,
     ) -> Result<Arc<Self>> {
         let routing: Arc<SessionRouting> = Arc::new(DashMap::new());
-        let cancel = CancellationToken::new();
+        let tasks = StreamTasks::default();
+        let connections = tokio_util::task::TaskTracker::new();
+        let listener_cancel = tokio_util::sync::CancellationToken::new();
         let metrics: Arc<std::sync::OnceLock<Arc<crate::observability::VeloMetrics>>> =
             Arc::new(std::sync::OnceLock::new());
 
@@ -259,22 +273,41 @@ impl GrpcFrameTransport {
             .map_err(|e| anyhow!("Failed to build WorkerAddress: {e}"))?;
 
         let service = GrpcStreamingService {
+            tasks: tasks.clone(),
             routing: routing.clone(),
             metrics: metrics.clone(),
         };
 
-        let cancel_clone = cancel.clone();
-        tokio::spawn(async move {
+        let cancel = listener_cancel.clone();
+        let accepted = connections.clone();
+        tasks.spawn_until_done(async move {
+            let force_close = tokio_util::sync::CancellationToken::new();
+            // Also close accepted sockets if serving exits with an error.
+            let _close_connections = force_close.clone().drop_guard();
+            let incoming = TcpListenerStream::new(listener).map(|socket| {
+                socket.map(|socket| {
+                    connection::Connection::new(socket, force_close.clone(), accepted.token())
+                })
+            });
             let server =
                 tonic::transport::Server::builder().add_service(VeloStreamingServer::new(service));
-            if let Err(e) = server
-                .serve_with_incoming_shutdown(
-                    TcpListenerStream::new(listener),
-                    cancel_clone.cancelled(),
-                )
-                .await
-            {
-                tracing::warn!("GrpcFrameTransport server error: {}", e);
+            let serve = server.serve_with_incoming_shutdown(incoming, cancel.cancelled());
+            tokio::pin!(serve);
+            let grace_expired = async {
+                cancel.cancelled().await;
+                tokio::time::sleep(SERVER_CLOSE_GRACE).await;
+            };
+            let result = tokio::select! {
+                result = &mut serve => result,
+                () = grace_expired => {
+                    // Dropping `serve` would leave tonic's connection tasks alive.
+                    // Interrupt their I/O, then let the server join them.
+                    force_close.cancel();
+                    serve.await
+                }
+            };
+            if let Err(error) = result {
+                tracing::warn!(%error, "GrpcFrameTransport server failed");
             }
         });
 
@@ -287,7 +320,9 @@ impl GrpcFrameTransport {
             numa_hint,
             peers: Arc::new(DashMap::new()),
             routing,
-            cancel,
+            listener_cancel,
+            tasks,
+            connections,
             metrics,
         }))
     }
@@ -318,11 +353,20 @@ impl GrpcFrameTransport {
     pub fn bound_addr(&self) -> SocketAddr {
         self.bind_addr
     }
+
+    pub(crate) async fn shutdown(&self) {
+        self.listener_cancel.cancel();
+        self.tasks.stop();
+        self.routing.clear();
+        self.tasks.wait().await;
+        self.connections.close();
+        self.connections.wait().await;
+    }
 }
 
 impl Drop for GrpcFrameTransport {
     fn drop(&mut self) {
-        self.cancel.cancel();
+        self.listener_cancel.cancel();
     }
 }
 
@@ -375,6 +419,9 @@ impl FrameTransport for GrpcFrameTransport {
     ) -> BoxFuture<'_, Result<flume::Receiver<Vec<u8>>>> {
         let routing = self.routing.clone();
         Box::pin(async move {
+            if self.tasks.is_stopped() {
+                return Err(anyhow!("gRPC streaming transport shut down"));
+            }
             let (frame_tx, frame_rx) = flume::bounded::<Vec<u8>>(4096);
             if routing.insert((anchor_id, session_id), frame_tx).is_some() {
                 tracing::warn!(
@@ -383,6 +430,10 @@ impl FrameTransport for GrpcFrameTransport {
                     "GrpcFrameTransport::bind overwrote an existing routing entry; \
                      previous frame_tx dropped (consumer will see channel close)"
                 );
+            }
+            if self.tasks.is_stopped() {
+                routing.remove(&(anchor_id, session_id));
+                return Err(anyhow!("gRPC streaming transport shut down"));
             }
             Ok(frame_rx)
         })
@@ -396,6 +447,9 @@ impl FrameTransport for GrpcFrameTransport {
     ) -> BoxFuture<'_, Result<flume::Sender<Vec<u8>>>> {
         let peers = self.peers.clone();
         Box::pin(async move {
+            if self.tasks.is_stopped() {
+                return Err(anyhow!("gRPC streaming transport shut down"));
+            }
             let addr = *peers.get(&peer).ok_or_else(|| {
                 anyhow!(
                     "gRPC streaming: peer {} not registered (call register_peer first)",
@@ -435,7 +489,7 @@ impl FrameTransport for GrpcFrameTransport {
                 .await
                 .map_err(|status| anyhow!("gRPC stream rejected: {}", status))?;
 
-            tokio::spawn(async move {
+            if !self.tasks.spawn(async move {
                 // Hold the inbound half (and thus the underlying H2 bidi call)
                 // for as long as we are pumping frames; dropping it sends
                 // RST_STREAM and cancels the call.
@@ -508,7 +562,9 @@ impl FrameTransport for GrpcFrameTransport {
                          terminal sentinel"
                     );
                 }
-            });
+            }) {
+                return Err(anyhow!("gRPC streaming transport shut down"));
+            }
 
             Ok(frame_tx)
         })
@@ -526,6 +582,80 @@ mod tests {
         let inst = InstanceId::new_v4();
         let wid = inst.worker_id();
         (wid, PeerInfo::new(inst, address))
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_listener_binds_and_active_pumps() {
+        let server = GrpcFrameTransport::new("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let addr = server.bound_addr();
+        let pending = server.bind(1, 1).await.unwrap();
+        let active = server.bind(2, 2).await.unwrap();
+        let client = GrpcFrameTransport::new("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let (peer, info) = fresh_peer(server.address());
+        client.register(&info).unwrap();
+        let sender = client.connect(peer, 2, 2).await.unwrap();
+        sender.send_async(b"data".to_vec()).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), active.recv_async())
+                .await
+                .unwrap()
+                .unwrap(),
+            b"data"
+        );
+        tokio::time::timeout(Duration::from_secs(2), server.shutdown())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), client.shutdown())
+            .await
+            .unwrap();
+        assert!(sender.is_disconnected());
+        assert!(active.is_disconnected());
+        assert!(pending.is_disconnected());
+        assert!(server.bind(2, 2).await.is_err());
+        let _listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .expect("listener released before shutdown returns");
+    }
+
+    /// A peer that opens TCP to the stream port and never sends the HTTP/2
+    /// preface (a health check, a port scan, a peer that died mid-handshake)
+    /// must not hold shutdown open. tonic's graceful shutdown waits for every
+    /// connection, and hyper cannot send GOAWAY before the handshake ends, so
+    /// waiting for the server task alone never returns.
+    #[tokio::test]
+    async fn shutdown_does_not_wait_for_silent_connection() {
+        let server = GrpcFrameTransport::new("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let addr = server.bound_addr();
+        let mut silent = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while server.connections.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("connection was not accepted");
+        tokio::time::timeout(Duration::from_secs(5), server.shutdown())
+            .await
+            .expect("shutdown waited for a connection that never spoke HTTP/2");
+        assert!(server.connections.is_empty());
+        let closed = tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::io::AsyncReadExt::read_to_end(&mut silent, &mut Vec::new()),
+        )
+        .await
+        .expect("accepted socket stayed open after shutdown");
+        if let Err(error) = closed {
+            assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+        }
+        let _listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .expect("listener released before shutdown returns");
     }
 
     /// Regression: the streaming RPC must not complete its response until it
@@ -680,6 +810,19 @@ mod tests {
             .expect("recv timeout")
             .expect("channel closed");
         assert_eq!(received, payload);
+        // Dropping the public handles stops listeners, not active streams.
+        drop(server);
+        drop(client);
+        let finalized = crate::streaming::sender::cached_finalized().clone();
+        tx.send_async(finalized.clone()).await.unwrap();
+        drop(tx);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), rx.recv_async())
+                .await
+                .expect("retained stream stalled after transport drop")
+                .unwrap(),
+            finalized
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

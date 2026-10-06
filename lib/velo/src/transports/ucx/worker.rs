@@ -7,7 +7,7 @@
 //! `UCS_THREAD_MODE_SINGLE` worker (lock-free even in an `--enable-mt` build;
 //! the price is that every `ucp_*` call on the worker must happen on this
 //! thread — enforced here by construction: the raw handles never leave
-//! [`worker_main`]). Work arrives over a bounded flume ring fed by the
+//! [`worker_main`]). Work arrives over a bounded command ring fed by the
 //! per-peer [`AdmissionGate`](crate::transports::transport::AdmissionGate)s;
 //! completions leave through UCX callbacks that resolve directly into velo's
 //! channels, which wake tokio tasks from any thread.
@@ -297,6 +297,7 @@ use ucx_rs::{decode_status_ptr, status_string, sys};
 use velo_ext::{AdmitOutcome, InstanceId, MessageType, TransportAdapter, TransportErrorHandler};
 
 use super::address::{AM_ID_BASE, AM_KIND_COUNT, AM_KIND_PING, AM_KIND_PONG, UcxEndpoint};
+use super::ring::{CommandReceiver, CommandSender};
 use super::rma::{
     MAX_PACKED_RKEY, MappedRegion, RKEY_UNPACK_PAD, RmaError, RmaGetRequest, validate_packed_rkey,
 };
@@ -463,7 +464,7 @@ impl Doorbell {
 
 /// State shared between the transport (any thread) and the progress thread.
 pub(crate) struct WorkerShared {
-    pub ring_tx: flume::Sender<Cmd>,
+    pub ring_tx: CommandSender,
     pub doorbell: Arc<Doorbell>,
     /// Peers registered via `Transport::register`, keyed by instance.
     pub peers: Arc<DashMap<InstanceId, UcxEndpoint>>,
@@ -591,7 +592,7 @@ pub(crate) struct StartupOut {
 /// Everything [`worker_main`] needs, assembled by `UcxTransport::start`.
 pub(crate) struct WorkerArgs {
     pub config: UcxConfig,
-    pub ring_rx: flume::Receiver<Cmd>,
+    pub ring_rx: CommandReceiver,
     pub shared: Arc<WorkerShared>,
     pub adapter: TransportAdapter,
     pub startup: tokio::sync::oneshot::Sender<anyhow::Result<StartupOut>>,
@@ -1005,6 +1006,12 @@ struct RecvArg {
     kind: u8,
 }
 
+fn record_rejection(shared: &WorkerShared, reason: velo_ext::TransportRejection) {
+    if let Some(metrics) = shared.metrics.get() {
+        metrics.record_rejection(reason);
+    }
+}
+
 /// The `ucp_am_recv_callback_t` registered for each of velo's AM ids.
 ///
 /// v1 copies both header and payload out of UCX's buffers inside the callback
@@ -1032,6 +1039,7 @@ unsafe extern "C" fn recv_trampoline(
         if p.recv_attr & sys::ucp_am_recv_attr_t_UCP_AM_RECV_ATTR_FLAG_RNDV as u64 != 0 {
             // Protocol violation (velo pins EAGER). Refusing with an error
             // completes the sender's request with this status.
+            record_rejection(&ra.shared.worker, velo_ext::TransportRejection::DecodeError);
             warn!("ucx: rejecting rendezvous-mode AM (kind {})", ra.kind);
             return sys::ucs_status_t_UCS_ERR_UNSUPPORTED;
         }
@@ -1040,6 +1048,7 @@ unsafe extern "C" fn recv_trampoline(
         // header is not from velo (or is from a peer on another blob
         // version, which `register` refuses), so it is dropped.
         if header_length < SENDER_TAG_LEN {
+            record_rejection(&ra.shared.worker, velo_ext::TransportRejection::DecodeError);
             warn!("ucx: dropping AM without a sender tag (kind {})", ra.kind);
             return sys::ucs_status_t_UCS_OK;
         }
@@ -1074,10 +1083,21 @@ unsafe extern "C" fn recv_trampoline(
             AM_KIND_PING => {
                 if header.len() >= 8 && !p.reply_ep.is_null() {
                     let token = u64::from_le_bytes(header[..8].try_into().unwrap());
-                    let _ = ra.shared.worker.ring_tx.try_send(Cmd::PongTo {
-                        reply_ep: p.reply_ep as usize,
-                        token,
-                    });
+                    if ra
+                        .shared
+                        .worker
+                        .ring_tx
+                        .try_send(Cmd::PongTo {
+                            reply_ep: p.reply_ep as usize,
+                            token,
+                        })
+                        .is_err()
+                    {
+                        record_rejection(
+                            &ra.shared.worker,
+                            velo_ext::TransportRejection::SendError,
+                        );
+                    }
                 }
             }
             AM_KIND_PONG => {
@@ -1130,6 +1150,10 @@ unsafe extern "C" fn recv_trampoline(
                                 record(MessageType::Message);
                             }
                             AdmitOutcome::Draining { header, .. } => {
+                                record_rejection(
+                                    &ra.shared.worker,
+                                    velo_ext::TransportRejection::DrainRejected,
+                                );
                                 // Echo the header back as ShuttingDown, like the
                                 // TCP listener's per-frame drain gate.
                                 if !p.reply_ep.is_null()
@@ -1145,27 +1169,54 @@ unsafe extern "C" fn recv_trampoline(
                                 {
                                     // Best-effort: a full ring drops the echo and
                                     // the requester waits out its own timeout.
-                                    debug!("ucx: drain echo dropped (ring full)");
+                                    record_rejection(
+                                        &ra.shared.worker,
+                                        velo_ext::TransportRejection::SendError,
+                                    );
+                                    debug!("ucx: drain echo dropped (ring full or closed)");
                                 }
                             }
                             AdmitOutcome::Disconnected { .. } => {
+                                record_rejection(
+                                    &ra.shared.worker,
+                                    velo_ext::TransportRejection::RouteFailed,
+                                );
                                 debug!("ucx: inbound Message dropped (receiver gone)");
                             }
                         }
                     }
                     Some(MessageType::Response) => {
                         record(MessageType::Response);
-                        let _ = adapter.response_stream.send((header, payload));
+                        if adapter.response_stream.send((header, payload)).is_err() {
+                            record_rejection(
+                                &ra.shared.worker,
+                                velo_ext::TransportRejection::RouteFailed,
+                            );
+                        }
                     }
                     Some(MessageType::ShuttingDown) => {
                         record(MessageType::ShuttingDown);
-                        let _ = adapter.shutdown_stream.send((header, payload));
+                        if adapter.shutdown_stream.send((header, payload)).is_err() {
+                            record_rejection(
+                                &ra.shared.worker,
+                                velo_ext::TransportRejection::RouteFailed,
+                            );
+                        }
                     }
                     Some(event @ (MessageType::Ack | MessageType::Event)) => {
                         record(event);
-                        let _ = adapter.event_stream.send((header, payload));
+                        if adapter.event_stream.send((header, payload)).is_err() {
+                            record_rejection(
+                                &ra.shared.worker,
+                                velo_ext::TransportRejection::RouteFailed,
+                            );
+                        }
                     }
                     None => {
+                        record_rejection(
+                            &ra.shared.worker,
+                            velo_ext::TransportRejection::DecodeError,
+                        );
                         warn!("ucx: inbound AM with unknown kind {kind}");
                     }
                 }
@@ -1405,6 +1456,37 @@ pub(crate) fn worker_main(args: WorkerArgs) {
     run_loop(state, ring_rx);
 }
 
+/// Own partial initialization until WorkerState takes the worker and context.
+/// Receive callback arguments remain alive until after worker destruction.
+struct NativeInit {
+    config: *mut sys::ucp_config_t,
+    context: sys::ucp_context_h,
+    worker: sys::ucp_worker_h,
+    recv_args: Vec<Arc<RecvArg>>,
+}
+
+impl Drop for NativeInit {
+    fn drop(&mut self) {
+        // SAFETY: initialization owns these handles and runs on this thread.
+        unsafe {
+            if !self.worker.is_null() {
+                sys::ucp_worker_destroy(self.worker);
+            }
+            if !self.context.is_null() {
+                sys::ucp_cleanup(self.context);
+            }
+            if !self.config.is_null() {
+                sys::ucp_config_release(self.config);
+            }
+        }
+    }
+}
+
+fn config_value(name: &str, value: &str) -> anyhow::Result<std::ffi::CString> {
+    std::ffi::CString::new(value)
+        .map_err(|_| anyhow::anyhow!("UCX {name} value contains a NUL byte"))
+}
+
 /// All UCX object creation, in one place. Runs once, on the progress thread.
 unsafe fn init_ucx(
     config: &UcxConfig,
@@ -1420,6 +1502,12 @@ unsafe fn init_ucx(
             "ucp_config_read: {}",
             status_string(st)
         );
+        let mut native = NativeInit {
+            config: ucp_cfg,
+            context: std::ptr::null_mut(),
+            worker: std::ptr::null_mut(),
+            recv_args: Vec::with_capacity(AM_KIND_COUNT as usize),
+        };
         // Operator-set UCX_* env always wins; these are velo's defaults.
         // MEM_EVENTS/RCACHE control UCM's process-global malloc/mmap hooks —
         // the messaging path never uses the registration cache, so keep the
@@ -1435,7 +1523,7 @@ unsafe fn init_ucx(
             && std::env::var_os("UCX_TLS").is_none()
         {
             let k = std::ffi::CString::new("TLS").unwrap();
-            let v = std::ffi::CString::new(tls.as_str()).unwrap();
+            let v = config_value("TLS", tls)?;
             let st = sys::ucp_config_modify(ucp_cfg, k.as_ptr(), v.as_ptr());
             anyhow::ensure!(
                 st == sys::ucs_status_t_UCS_OK,
@@ -1447,7 +1535,7 @@ unsafe fn init_ucx(
             && std::env::var_os("UCX_NET_DEVICES").is_none()
         {
             let k = std::ffi::CString::new("NET_DEVICES").unwrap();
-            let v = std::ffi::CString::new(devices.as_str()).unwrap();
+            let v = config_value("NET_DEVICES", devices)?;
             let st = sys::ucp_config_modify(ucp_cfg, k.as_ptr(), v.as_ptr());
             anyhow::ensure!(
                 st == sys::ucs_status_t_UCS_OK,
@@ -1476,12 +1564,15 @@ unsafe fn init_ucx(
             &mut context,
         );
         sys::ucp_config_release(ucp_cfg);
+        native.config = std::ptr::null_mut();
         anyhow::ensure!(
             st == sys::ucs_status_t_UCS_OK,
             "ucp_init: {} (if this is InvalidParam with no UCX log output, a \
              constructor reference is missing — see ucx-rs)",
             status_string(st)
         );
+
+        native.context = context;
 
         // -- worker ----------------------------------------------------------
         let mut wparams: sys::ucp_worker_params_t = MaybeUninit::zeroed().assume_init();
@@ -1491,9 +1582,10 @@ unsafe fn init_ucx(
         let mut worker: sys::ucp_worker_h = std::ptr::null_mut();
         let st = sys::ucp_worker_create(context, &wparams, &mut worker);
         if st != sys::ucs_status_t_UCS_OK {
-            sys::ucp_cleanup(context);
             anyhow::bail!("ucp_worker_create: {}", status_string(st));
         }
+
+        native.worker = worker;
 
         // -- AM handlers -----------------------------------------------------
         let recv_shared = Arc::new(RecvShared {
@@ -1501,7 +1593,6 @@ unsafe fn init_ucx(
             worker: Arc::clone(shared),
             stamp_inbound: config.ep_idle_timeout.is_some(),
         });
-        let mut recv_args = Vec::with_capacity(AM_KIND_COUNT as usize);
         for kind in 0..AM_KIND_COUNT {
             let arg = Arc::new(RecvArg {
                 shared: Arc::clone(&recv_shared),
@@ -1515,13 +1606,11 @@ unsafe fn init_ucx(
             hp.id = (AM_ID_BASE as u32) + kind as u32;
             hp.cb = Some(recv_trampoline);
             hp.arg = Arc::as_ptr(&arg) as *mut c_void;
+            native.recv_args.push(arg);
             let st = sys::ucp_worker_set_am_recv_handler(worker, &hp);
             if st != sys::ucs_status_t_UCS_OK {
-                sys::ucp_worker_destroy(worker);
-                sys::ucp_cleanup(context);
                 anyhow::bail!("set_am_recv_handler(kind {kind}): {}", status_string(st));
             }
-            recv_args.push(arg);
         }
 
         // -- address + limits ------------------------------------------------
@@ -1531,8 +1620,6 @@ unsafe fn init_ucx(
             as u64;
         let st = sys::ucp_worker_query(worker, &mut attr);
         if st != sys::ucs_status_t_UCS_OK {
-            sys::ucp_worker_destroy(worker);
-            sys::ucp_cleanup(context);
             anyhow::bail!("ucp_worker_query: {}", status_string(st));
         }
         let worker_addr =
@@ -1544,12 +1631,12 @@ unsafe fn init_ucx(
         let mut efd: c_int = -1;
         let st = sys::ucp_worker_get_efd(worker, &mut efd);
         if st != sys::ucs_status_t_UCS_OK {
-            sys::ucp_worker_destroy(worker);
-            sys::ucp_cleanup(context);
             anyhow::bail!("ucp_worker_get_efd: {}", status_string(st));
         }
 
         shared.doorbell.install(worker);
+        native.worker = std::ptr::null_mut();
+        native.context = std::ptr::null_mut();
 
         Ok((
             WorkerState {
@@ -1565,7 +1652,7 @@ unsafe fn init_ucx(
                 seen_reg_epoch: shared.reg_epoch.load(Ordering::Acquire),
                 shared: Arc::clone(shared),
                 config: config.clone(),
-                _recv_args: recv_args,
+                _recv_args: std::mem::take(&mut native.recv_args),
                 parked_for_close: Vec::new(),
                 pending_closes: Vec::new(),
                 now: Instant::now(),
@@ -1585,7 +1672,7 @@ unsafe fn init_ucx(
 /// Drain up to `budget` commands. Returns `(observed_empty, keep_running)`.
 fn drain_ring(
     state: &mut WorkerState,
-    ring_rx: &flume::Receiver<Cmd>,
+    ring_rx: &mut CommandReceiver,
     budget: usize,
     last_activity: &mut Instant,
 ) -> (bool, bool) {
@@ -1608,8 +1695,8 @@ fn drain_ring(
                     return (false, false);
                 }
             }
-            Err(flume::TryRecvError::Empty) => return (true, true),
-            Err(flume::TryRecvError::Disconnected) => return (true, false),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return (true, true),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return (true, false),
         }
     }
     (false, true)
@@ -1645,7 +1732,7 @@ fn wait_while_held(shared: &WorkerShared) {
     }
 }
 
-fn run_loop(mut state: WorkerState, ring_rx: flume::Receiver<Cmd>) {
+fn run_loop(mut state: WorkerState, mut ring_rx: CommandReceiver) {
     const DRAIN_BUDGET: usize = 64;
 
     let spin_window = Duration::from_micros(state.config.spin_us);
@@ -1678,7 +1765,8 @@ fn run_loop(mut state: WorkerState, ring_rx: flume::Receiver<Cmd>) {
         }
 
         // -- drain the ring --------------------------------------------------
-        let (_, keep_running) = drain_ring(&mut state, &ring_rx, DRAIN_BUDGET, &mut last_activity);
+        let (_, keep_running) =
+            drain_ring(&mut state, &mut ring_rx, DRAIN_BUDGET, &mut last_activity);
         if !keep_running {
             break 'outer;
         }
@@ -1717,7 +1805,7 @@ fn run_loop(mut state: WorkerState, ring_rx: flume::Receiver<Cmd>) {
         // closing is postponed; a stale-but-unclosed endpoint stays valid and
         // merely fails posts, which is safe.
         let (observed_empty, keep_running) =
-            drain_ring(&mut state, &ring_rx, flush_budget, &mut last_activity);
+            drain_ring(&mut state, &mut ring_rx, flush_budget, &mut last_activity);
         if !keep_running {
             break 'outer;
         }
@@ -2860,20 +2948,16 @@ impl WorkerState {
         }
     }
 
-    fn teardown(mut self, ring_rx: flume::Receiver<Cmd>) {
+    fn teardown(mut self, mut ring_rx: CommandReceiver) {
         debug!("ucx: progress thread tearing down");
 
-        // Fail everything still queued — mirrors the TCP writer's drain. A
-        // second pass after a short pause shrinks (not closes — see the
-        // module docs) the window where a racing sender's frame lands between
-        // our last try_recv and the receiver drop and is discarded silently.
-        for pass in 0..2 {
-            while let Ok(cmd) = ring_rx.try_recv() {
+        // Close before draining. A reserved send may still complete, and
+        // blocking_recv waits for it before declaring the queue finished.
+        ring_rx.close();
+        while let Some(cmd) = ring_rx.blocking_recv() {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 cmd.refuse_for_shutdown();
-            }
-            if pass == 0 {
-                std::thread::sleep(Duration::from_millis(1));
-            }
+            }));
         }
         drop(ring_rx);
 
@@ -3007,3 +3091,18 @@ impl WorkerState {
 
 /// Records the `OnceLock` slot type used by the transport for startup output.
 pub(crate) type StartupSlot = OnceLock<StartupOut>;
+
+#[cfg(test)]
+mod initialization_tests {
+    use super::config_value;
+
+    #[test]
+    fn configuration_strings_reject_nul_with_context() {
+        for name in ["TLS", "NET_DEVICES"] {
+            let error = config_value(name, "invalid\0value").unwrap_err();
+            assert!(error.to_string().contains(name));
+            assert!(error.to_string().contains("NUL"));
+        }
+        assert_eq!(config_value("TLS", "tcp").unwrap().as_bytes(), b"tcp");
+    }
+}

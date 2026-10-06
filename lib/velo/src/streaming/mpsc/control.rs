@@ -559,6 +559,7 @@ pub fn create_mpsc_anchor_cancel_handler(manager: Arc<AnchorManager>) -> crate::
                     }
                     super::anchor::cancel_all_senders(
                         &entry,
+                        ctx.msg.instance_id().worker_id(),
                         &manager.sender_registry,
                         manager.messenger_lock.get(),
                     );

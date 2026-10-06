@@ -261,6 +261,7 @@ impl QuicTransport {
             connection_writer_task(
                 key,
                 rx,
+                handle.tx.clone(),
                 WriterTaskContext {
                     endpoint,
                     addr,
@@ -672,6 +673,7 @@ struct WriterTaskContext {
 async fn connection_writer_task(
     key: LaneKey,
     rx: flume::Receiver<SendTask>,
+    tx: flume::Sender<SendTask>,
     ctx: WriterTaskContext,
 ) {
     // Names the connection in logs: with lanes, one peer has several.
@@ -683,21 +685,28 @@ async fn connection_writer_task(
         warn!("QUIC: connection to {peer_name} ({addr}) failed: {e:#}");
     }
 
-    // Drain queued messages and notify their error handlers. The same small
-    // race as the TCP writer: a sender can `try_send` between the drain and
-    // `drop(rx)`, and that one message is dropped silently (see the TODO in
-    // `tcp/transport.rs`).
-    while let Ok(msg) = rx.try_recv() {
-        msg.on_error("Connection closed");
-    }
-    drop(rx);
-    if let Some((_, stale)) = connections.remove_if(&key, |_, h| h.tx.is_disconnected()) {
-        stale.retire();
-    }
+    retire_connection(key, tx, rx, &connections).await;
     if let Some(metrics) = metrics.as_ref() {
         metrics.set_active_connections(connections.len());
     }
     debug!("QUIC connection to {peer_name} ({addr}) closed");
+}
+
+async fn retire_connection(
+    key: LaneKey,
+    tx: flume::Sender<SendTask>,
+    rx: flume::Receiver<SendTask>,
+    connections: &DashMap<LaneKey, ConnectionHandle>,
+) {
+    // Retire only this epoch before waiting for its last sender. A retained
+    // sender can still enqueue after the queue first becomes empty.
+    if let Some((_, stale)) = connections.remove_if(&key, |_, h| h.tx.same_channel(&tx)) {
+        stale.retire();
+    }
+    drop(tx);
+    while let Ok(msg) = rx.recv_async().await {
+        msg.on_error("Connection closed");
+    }
 }
 
 async fn connection_writer_inner(
@@ -850,6 +859,10 @@ struct QuicWriterObserver<'a> {
 }
 
 impl WriterObserver for QuicWriterObserver<'_> {
+    fn interrupt_pending_writes(&self) -> bool {
+        false
+    }
+
     fn on_failure(&self, kind: WriterFailure, err: &std::io::Error, frames: usize) {
         match kind {
             WriterFailure::Write => error!(

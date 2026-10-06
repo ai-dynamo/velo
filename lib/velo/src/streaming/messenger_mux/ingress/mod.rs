@@ -98,6 +98,9 @@ impl Drop for BindEntry {
     }
 }
 
+#[cfg(test)]
+pub(crate) type ShutdownHook = Box<dyn Fn(&IngressRegistry) + Send + Sync>;
+
 /// Registry of binds and per-peer slot tables.
 #[derive(Default)]
 pub(crate) struct IngressRegistry {
@@ -110,6 +113,10 @@ pub(crate) struct IngressRegistry {
     /// Calls into `close_consumer_gone`, each of which takes a peer's lock.
     #[cfg(test)]
     consumer_gone_calls: std::sync::atomic::AtomicUsize,
+    /// Runs inside [`Self::shutdown`], between its two steps, so a test can
+    /// land a claim there.
+    #[cfg(test)]
+    pub(crate) shutdown_hook: std::sync::OnceLock<ShutdownHook>,
     /// Per-table "a credit-return visit is already queued" flags, read and set
     /// by draining consumers without taking the table's mutex. See
     /// [`DrainSignal`].
@@ -443,15 +450,26 @@ impl IngressRegistry {
 
     /// Tear down every slot of every peer, injecting `Dropped` into each.
     ///
-    /// Used when the transport itself goes away, so a consumer never waits out
-    /// its heartbeat watchdog for a sender that has already been dismantled.
+    /// Used when the mux stops (shutdown, or a failed mux), so a consumer
+    /// never waits out its heartbeat watchdog for a sender that has already
+    /// been dismantled.
+    ///
+    /// Binds go first. A batch handler can be claiming one concurrently, and
+    /// it claims under its peer table's lock, in a table it inserted before
+    /// the claim. So a claim either finds no bind, or put its slot in a table
+    /// the walk below has yet to lock. The other order let a claim land in a
+    /// table already walked, and that slot was never retired.
     pub(crate) fn shutdown(&self) -> usize {
+        self.binds.clear();
+        #[cfg(test)]
+        if let Some(hook) = self.shutdown_hook.get() {
+            hook(self);
+        }
         let mut closed = 0;
         for entry in self.peers.iter() {
             let mut state = lock(entry.value());
             closed += retire_epoch(&mut state, None);
         }
-        self.binds.clear();
         closed
     }
 }
@@ -732,14 +750,14 @@ fn open_slot(
     slot.session_id = session_id;
     state.slots[index] = Some(slot);
     outcome.opened += 1;
-    if lifecycle == 2 {
+    if lifecycle == drain::Lifecycle::Cancelled {
         finish_close(state, id, CloseReason::UnknownSlot, ctx.metrics, outcome);
         outcome.replies.push(ReplyRecord::LifecycleSlot {
             slot: id,
             session_id,
             cancel: true,
         });
-    } else if lifecycle == 1 {
+    } else if lifecycle == drain::Lifecycle::StopRequested {
         outcome.replies.push(ReplyRecord::LifecycleSlot {
             slot: id,
             session_id,

@@ -13,6 +13,13 @@ use super::super::PeerLane;
 use super::super::protocol::SlotId;
 use super::dirty::DirtySlots;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Lifecycle {
+    Active,
+    StopRequested,
+    Cancelled,
+}
+
 /// Told when the consumer takes a record out of the buffer credit is issued
 /// against, so credit comes back by draining instead of by a timer.
 ///
@@ -47,7 +54,7 @@ pub(crate) struct DrainSignal {
     /// of it arrives together when an `OpenSlot` claims the bind.
     claim: OnceLock<SlotClaim>,
     // Serializes claim with early stop/cancel; neither side can miss the other.
-    lifecycle: std::sync::Mutex<u8>,
+    lifecycle: parking_lot::Mutex<Lifecycle>,
     /// Records this slot's consumer has taken out of the buffer since the last
     /// [`IngressSlot::reconcile`](super::slot::IngressSlot::reconcile) swapped
     /// it to zero.
@@ -90,7 +97,7 @@ impl DrainSignal {
     pub(crate) fn new(wake: flume::Sender<PeerLane>) -> Self {
         Self {
             claim: OnceLock::new(),
-            lifecycle: std::sync::Mutex::new(0),
+            lifecycle: parking_lot::Mutex::new(Lifecycle::Active),
             drained: AtomicU32::new(0),
             arrivals: AtomicU64::new(0),
             sender_parked: AtomicBool::new(false),
@@ -109,8 +116,8 @@ impl DrainSignal {
         slot: SlotId,
         pending: Arc<AtomicBool>,
         dirty: Arc<DirtySlots>,
-    ) -> u8 {
-        let lifecycle = self.lifecycle.lock().unwrap();
+    ) -> Lifecycle {
+        let lifecycle = self.lifecycle.lock();
         let _ = self.claim.set(SlotClaim {
             key,
             slot,
@@ -121,16 +128,16 @@ impl DrainSignal {
     }
 
     pub(crate) fn request_stop(&self) -> Option<(PeerLane, SlotId)> {
-        let mut state = self.lifecycle.lock().unwrap();
-        if *state != 0 {
+        let mut state = self.lifecycle.lock();
+        if *state != Lifecycle::Active {
             return None;
         }
-        *state = 1;
+        *state = Lifecycle::StopRequested;
         self.claimed()
     }
 
     pub(crate) fn cancel(&self) -> Option<(PeerLane, SlotId)> {
-        *self.lifecycle.lock().unwrap() = 2;
+        *self.lifecycle.lock() = Lifecycle::Cancelled;
         self.claimed()
     }
 

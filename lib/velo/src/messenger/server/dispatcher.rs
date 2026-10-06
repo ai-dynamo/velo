@@ -72,6 +72,96 @@ pub(crate) trait ActiveMessageDispatcher: Send + Sync {
     fn dispatch(&self, ctx: HandlerContext);
 }
 
+/// Catch both a panic in `handle()` and a panic while its future is polled.
+/// Keep the admission guard until the error reply reaches its transport queue.
+async fn run_handler<H: ActiveMessageHandler + 'static>(
+    handler: Arc<H>,
+    ctx: HandlerContext,
+    failure: DispatchFailure,
+) {
+    let message_id = ctx.message_id;
+    let response_type = ctx.response_type;
+    let system = Arc::clone(&ctx.system);
+    let in_flight = ctx.in_flight.clone();
+    trace!(target: "crate::messenger::dispatcher", handler = %handler.name(), "Handler task started");
+    let outcome = AssertUnwindSafe(async { handler.handle(ctx).await })
+        .catch_unwind()
+        .await;
+    if let Err(panic) = outcome {
+        if let Some(metrics) = system.observability().as_ref() {
+            metrics.record_dispatch_failure(failure);
+        }
+        let reason = panic
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("non-string panic payload");
+        error!(
+            target: "crate::messenger::dispatcher",
+            handler = %handler.name(),
+            message_id = %message_id,
+            panic = reason,
+            "Handler panicked"
+        );
+        fail_fast(
+            &system,
+            handler.name(),
+            message_id,
+            response_type,
+            "handler panicked",
+            in_flight,
+        )
+        .await;
+    }
+    trace!(target: "crate::messenger::dispatcher", handler = %handler.name(), "Handler task completed");
+}
+
+/// Send an error response so a waiting caller fails immediately instead of
+/// hanging until its own timeout. No-op for fire-and-forget. Awaited inline,
+/// so the caller's task tracking covers the reply; `in_flight` is held until
+/// the reply is sent.
+async fn fail_fast(
+    system: &Arc<Messenger>,
+    handler: &str,
+    message_id: ResponseId,
+    response_type: ResponseType,
+    reason: &'static str,
+    in_flight: Option<Arc<velo_ext::InFlightGuard>>,
+) {
+    if matches!(response_type, ResponseType::FireAndForget) {
+        return;
+    }
+    let _in_flight = in_flight;
+    send_error_reply(
+        system.backend(),
+        handler,
+        message_id,
+        format!("Handler failed: {reason}"),
+    )
+    .await;
+}
+
+/// Send an error response to the caller and log a failure to do so. Admission
+/// refusals are expected during shutdown, so they are not logged.
+pub(crate) async fn send_error_reply(
+    backend: &VeloBackend,
+    handler: &str,
+    message_id: ResponseId,
+    message: String,
+) {
+    if let Err(e) = DispatcherHub::send_error_response_static(backend, message_id, message).await
+        && !e.is::<crate::transports::AdmissionError>()
+    {
+        error!(
+            target: "crate::messenger::dispatcher",
+            handler = %handler,
+            message_id = %message_id,
+            error = %e,
+            "Failed to send error response"
+        );
+    }
+}
+
 /// Dispatcher implementation that spawns handlers on a task tracker.
 pub(crate) struct SpawnedDispatcher<H: ActiveMessageHandler> {
     handler: Arc<H>,
@@ -94,21 +184,16 @@ impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for SpawnedDispa
 
     fn dispatch(&self, ctx: HandlerContext) {
         let handler = self.handler.clone();
-        let handler_name = handler.name().to_string();
-
-        self.task_tracker.spawn(async move {
-            trace!(target: "crate::messenger::dispatcher", handler = %handler_name, "Handler task started");
-            handler.handle(ctx).await;
-            trace!(target: "crate::messenger::dispatcher", handler = %handler_name, "Handler task completed");
-        });
+        self.task_tracker
+            .spawn(run_handler(handler, ctx, DispatchFailure::HandlerPanic));
     }
 }
 
 /// Dispatcher implementation that spawns handlers on a detached task.
 ///
 /// Despite the name this does not execute on the dispatcher task; it is
-/// [`SpawnedDispatcher`] without the task-tracker registration, so a graceful
-/// shutdown cannot wait for handlers dispatched this way.
+/// [`SpawnedDispatcher`] without task-tracker registration. Both modes keep
+/// the inbound guard, so graceful shutdown still waits for the invocation.
 pub(crate) struct InlineDispatcher<H: ActiveMessageHandler> {
     handler: Arc<H>,
 }
@@ -129,9 +214,7 @@ impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for InlineDispat
     fn dispatch(&self, ctx: HandlerContext) {
         let handler = self.handler.clone();
 
-        tokio::spawn(async move {
-            handler.handle(ctx).await;
-        });
+        tokio::spawn(run_handler(handler, ctx, DispatchFailure::HandlerPanic));
     }
 }
 
@@ -230,19 +313,16 @@ impl<H: ActiveMessageHandler + 'static> OrderedDispatcher<H> {
 
     fn bind(&self, system: &Arc<Messenger>) -> BoundRouter {
         let handler = self.handler.clone();
-        // `Arc<str>`, not `String`: the consumer clones this per message but
-        // only reads it on the panic branch.
-        let handler_name: Arc<str> = Arc::from(self.handler.name());
+        let handler_name = self.handler.name();
         let limiter = self.limiter.clone();
         let metrics = system
             .observability()
             .as_ref()
-            .and_then(|m| m.bind_ordered_dispatcher(&handler_name));
+            .and_then(|m| m.bind_ordered_dispatcher(handler_name));
 
         let consumer_metrics = metrics.clone();
         let consumer = Arc::new(move |item: LaneItem| {
             let handler = handler.clone();
-            let handler_name = Arc::clone(&handler_name);
             let limiter = limiter.clone();
             let metrics = consumer_metrics.clone();
 
@@ -258,38 +338,7 @@ impl<H: ActiveMessageHandler + 'static> OrderedDispatcher<H> {
                     None => None,
                 };
 
-                let ctx = item.ctx;
-                let message_id = ctx.message_id;
-                let response_type = ctx.response_type;
-                let system = ctx.system.clone();
-
-                // Unlike `SpawnedDispatcher`, a panic here would take down the
-                // whole lane task rather than a single message — and every
-                // later message for that key with it. Catch it so the lane
-                // survives, and unblock the caller rather than letting it hang
-                // to timeout. (Inert under `panic = "abort"`.)
-                //
-                // `handle()` is called *inside* the async block on purpose.
-                // `AssertUnwindSafe(handler.handle(ctx))` would evaluate
-                // `handle()` first and only wrap the future it returns, leaving
-                // the adapter's synchronous prologue — context construction and
-                // the lazy `bind_handler` metrics binding — outside the guard.
-                let outcome = AssertUnwindSafe(async move { handler.handle(ctx).await })
-                    .catch_unwind()
-                    .await;
-
-                if outcome.is_err() {
-                    if let Some(metrics) = system.observability().as_ref() {
-                        metrics.record_dispatch_failure(DispatchFailure::OrderedHandlerPanic);
-                    }
-                    error!(
-                        target: "crate::messenger::dispatcher",
-                        handler = %handler_name,
-                        message_id = %message_id,
-                        "Ordered handler panicked; lane preserved"
-                    );
-                    Self::fail_fast(&system, message_id, response_type, "handler panicked");
-                }
+                run_handler(handler, item.ctx, DispatchFailure::OrderedHandlerPanic).await;
 
                 if let Some(metrics) = metrics.as_ref() {
                     metrics.dequeued();
@@ -312,34 +361,6 @@ impl<H: ActiveMessageHandler + 'static> OrderedDispatcher<H> {
         ));
 
         BoundRouter { router, metrics }
-    }
-
-    /// Send an error response so a waiting caller fails immediately instead of
-    /// hanging until its own timeout. No-op for fire-and-forget.
-    fn fail_fast(
-        system: &Arc<Messenger>,
-        message_id: ResponseId,
-        response_type: ResponseType,
-        reason: &'static str,
-    ) {
-        if matches!(response_type, ResponseType::FireAndForget) {
-            return;
-        }
-        let backend = system.backend().clone();
-        tokio::spawn(async move {
-            if let Err(e) = DispatcherHub::send_error_response_static(
-                &backend,
-                message_id,
-                format!("Handler failed: {reason}"),
-            )
-            .await
-            {
-                error!(
-                    target: "crate::messenger::dispatcher",
-                    "Failed to send error response for ordered handler: {}", e
-                );
-            }
-        });
     }
 }
 
@@ -418,7 +439,7 @@ impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for OrderedDispa
                     );
                 }
             }
-            Err(_shed) => {
+            Err(shed) => {
                 // Every shed message is counted; the log line fires once per
                 // handler so a shed storm cannot flood. `OrderedLaneShed` is
                 // the signal to alert on.
@@ -436,12 +457,27 @@ impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for OrderedDispa
                          {{reason=\"ordered_lane_shed\"}} for the rate"
                     );
                 });
-                Self::fail_fast(
-                    &system,
-                    message_id,
-                    response_type,
-                    "ordered lane queue full",
-                );
+                // Fire-and-forget has no caller to tell, and the shed path
+                // must stay cheaper than accepting.
+                if matches!(response_type, ResponseType::FireAndForget) {
+                    return;
+                }
+                // `dispatch` is sync, so the reply needs its own task; the
+                // tracker keeps it from being untracked.
+                let system = system.clone();
+                let handler_name = self.handler.name().to_string();
+                let in_flight = shed.ctx.in_flight;
+                system.tracker().clone().spawn(async move {
+                    fail_fast(
+                        &system,
+                        &handler_name,
+                        message_id,
+                        response_type,
+                        "ordered lane queue full",
+                        in_flight,
+                    )
+                    .await;
+                });
             }
         }
     }
@@ -449,7 +485,7 @@ impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for OrderedDispa
 
 /// Main message dispatcher hub that routes messages to handlers.
 pub(crate) struct DispatcherHub {
-    /// Handler registry (lock-free for fast dispatch).
+    /// Handler registry shared with registration.
     /// Shared with HandlerManager so registration is immediately visible.
     handlers: Arc<DashMap<String, Arc<dyn ActiveMessageDispatcher>>>,
 
@@ -483,28 +519,20 @@ impl DispatcherHub {
         Ok(())
     }
 
-    /// Get the system reference (panics if not initialized)
-    pub(crate) fn system(&self) -> &Arc<Messenger> {
-        self.system
-            .get()
-            .expect("System must be initialized before dispatching messages")
+    /// Keep the registered messenger available for every value clone.
+    pub(crate) fn system(&self) -> Option<Arc<Messenger>> {
+        self.system.get().cloned()
     }
 
-    /// Wait until the system reference is available, then return it.
-    pub(crate) async fn wait_for_system(&self) -> &Arc<Messenger> {
-        // Fast path: already initialized
-        if let Some(system) = self.system.get() {
-            return system;
+    /// Wait until all startup handlers have been installed.
+    pub(crate) async fn wait_for_system(&self) {
+        if self.system.get().is_some() {
+            return;
         }
-        // Register interest before re-checking to avoid missed notification
         let notified = self.system_ready.notified();
-        if let Some(system) = self.system.get() {
-            return system;
+        if self.system.get().is_none() {
+            notified.await;
         }
-        notified.await;
-        self.system
-            .get()
-            .expect("system must be set after notification")
     }
 
     /// Get a clone of the handlers Arc for sharing with HandlerManager.
@@ -552,14 +580,8 @@ impl DispatcherHub {
             ResponseType::AckNack | ResponseType::Unary => {
                 let error_message = format!("Handler '{}' not found", handler_name);
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        Self::send_error_response_static(&backend, message_id, error_message).await
-                    {
-                        error!(
-                            target: "crate::messenger::dispatcher",
-                            "Failed to send error response for unknown handler: {}", e
-                        );
-                    }
+                    let _in_flight = ctx.in_flight;
+                    send_error_reply(&backend, &handler_name, message_id, error_message).await;
                 });
             }
             ResponseType::FireAndForget => {
@@ -570,15 +592,6 @@ impl DispatcherHub {
                 );
             }
         }
-    }
-
-    /// Send an error response back to the sender.
-    pub(crate) async fn send_error_response(
-        &self,
-        response_id: ResponseId,
-        error_message: String,
-    ) -> anyhow::Result<()> {
-        Self::send_error_response_static(&self.backend, response_id, error_message).await
     }
 
     /// Send an error response back to the sender (static method)
@@ -614,11 +627,146 @@ impl DispatcherHub {
             error_handler,
         )?;
         if let crate::transports::SendOutcome::Pending(admission) = outcome {
-            // A failed admission is already reported through the backend's
-            // error handler; this path has nowhere else to put it.
-            let _ = admission.await;
+            admission.await?;
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::messenger::Handler;
+    use crate::transports::tcp::TcpTransportBuilder;
+    use std::time::Duration;
+
+    struct PanickingHandler {
+        name: String,
+        during_construction: bool,
+    }
+
+    impl ActiveMessageHandler for PanickingHandler {
+        fn handle(&self, _ctx: HandlerContext) -> BoxFuture<'static, ()> {
+            assert!(
+                !self.during_construction,
+                "panic while constructing handler future"
+            );
+            Box::pin(async { panic!("panic while polling handler future") })
+        }
+
+        fn name(&self) -> &str {
+            &self.name
+        }
+    }
+
+    #[tokio::test]
+    async fn every_dispatch_mode_replies_to_construction_and_poll_panics() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let transport = Arc::new(
+            TcpTransportBuilder::new()
+                .from_listener(listener)
+                .unwrap()
+                .build()
+                .unwrap(),
+        );
+        let messenger = Messenger::builder()
+            .add_transport(transport)
+            .build()
+            .await
+            .unwrap();
+        messenger.register_peer(messenger.peer_info()).unwrap();
+
+        for mode in ["spawn", "inline", "ordered"] {
+            for during_construction in [true, false] {
+                let name = format!("_panic_{mode}_{during_construction}");
+                let handler = PanickingHandler {
+                    name: name.clone(),
+                    during_construction,
+                };
+                let dispatcher: Arc<dyn ActiveMessageDispatcher> = match mode {
+                    "spawn" => {
+                        Arc::new(SpawnedDispatcher::new(handler, messenger.tracker().clone()))
+                    }
+                    "inline" => Arc::new(InlineDispatcher::new(handler)),
+                    _ => Arc::new(OrderedDispatcher::new(handler, OrderedConfig::global())),
+                };
+                messenger
+                    .register_streaming_handler(Handler { dispatcher })
+                    .unwrap();
+                let result = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    messenger
+                        .unary_streaming(&name)
+                        .instance(messenger.instance_id())
+                        .send(),
+                )
+                .await
+                .expect("handler panic left its caller waiting");
+                assert!(result.unwrap_err().to_string().contains("handler panicked"));
+            }
+        }
+        messenger
+            .graceful_shutdown(crate::ShutdownPolicy::WaitForever)
+            .await;
+        messenger.closed().await;
+    }
+
+    struct PendingHandler;
+
+    impl ActiveMessageHandler for PendingHandler {
+        fn handle(&self, _ctx: HandlerContext) -> BoxFuture<'static, ()> {
+            Box::pin(std::future::pending())
+        }
+
+        fn name(&self) -> &str {
+            "_pending"
+        }
+    }
+
+    /// A shed fire-and-forget message has no caller to tell, so the shed path
+    /// must not start a reply task for it: shedding is the overload path, and
+    /// it must stay cheaper than accepting. The runtime is single-threaded and
+    /// nothing below yields, so a spawned reply task is still counted by the
+    /// tracker when it is read.
+    #[tokio::test(flavor = "current_thread")]
+    async fn shedding_fire_and_forget_spawns_no_reply_task() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let messenger = Messenger::builder()
+            .add_transport(Arc::new(
+                TcpTransportBuilder::new()
+                    .from_listener(listener)
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+            ))
+            .build()
+            .await
+            .unwrap();
+        let dispatcher = OrderedDispatcher::new(
+            PendingHandler,
+            OrderedConfig::global()
+                .with_max_queue_depth(Some(1))
+                .with_overflow(crate::messenger::OverflowPolicy::Reject),
+        );
+        let ctx = |n: u128| HandlerContext {
+            message_id: ResponseId::from_u128(n),
+            payload: Bytes::new(),
+            response_type: ResponseType::FireAndForget,
+            headers: None,
+            system: Arc::clone(&messenger),
+            in_flight: None,
+        };
+
+        dispatcher.dispatch(ctx(1));
+        let tasks = messenger.tracker().len();
+        for n in 2..10 {
+            dispatcher.dispatch(ctx(n));
+        }
+        assert_eq!(
+            messenger.tracker().len(),
+            tasks,
+            "a shed fire-and-forget message started a task"
+        );
     }
 }

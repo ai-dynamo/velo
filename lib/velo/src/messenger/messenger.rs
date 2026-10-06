@@ -167,7 +167,6 @@ impl Messenger {
         // 4. Create server (no event frame handler — events use AM handlers)
         let server = ActiveMessageServer::new(
             response_manager.clone(),
-            None,
             data_streams,
             backend.clone(),
             tracker.clone(),
@@ -590,6 +589,12 @@ impl Messenger {
         &self.runtime
     }
 
+    /// Track receive loops, tracked handlers, and application tasks.
+    ///
+    /// `close` allows `wait` to finish once all tracked tasks exit; it does not
+    /// cancel them. Ensure application tasks and idle ordering lanes can exit
+    /// before waiting. A lane with no idle expiry can otherwise wait forever.
+    /// Internal shutdown waits only for its own receive loops.
     pub fn tracker(&self) -> &tokio_util::task::TaskTracker {
         &self.tracker
     }
@@ -651,6 +656,15 @@ impl Messenger {
         self.backend.graceful_shutdown(policy).await;
     }
 
+    pub(crate) fn abort_startup(&self) {
+        self.backend.shutdown_now();
+    }
+
+    pub(crate) async fn closed(&self) {
+        self.server.closed().await;
+        self.events.closed().await;
+    }
+
     /// Internal: create an unchecked message builder (for system messages)
     pub(crate) fn message_builder_unchecked(&self, handler: &str) -> MessageBuilder {
         MessageBuilder::new_unchecked(self.client.clone(), handler)
@@ -677,6 +691,34 @@ mod tests {
 
     fn test_transport_registry() -> &'static Mutex<HashMap<String, TransportAdapter>> {
         TEST_TRANSPORT_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    #[tokio::test]
+    async fn public_tracker_covers_receive_loops_without_extending_internal_shutdown() {
+        use futures::FutureExt;
+
+        let messenger = Messenger::builder().build().await.unwrap();
+        messenger.tracker().close();
+        assert!(
+            messenger.tracker().wait().now_or_never().is_none(),
+            "public tracker must include the idle receive loops"
+        );
+
+        let (release, pending) = tokio::sync::oneshot::channel::<()>();
+        messenger.tracker().spawn(async move {
+            let _ = pending.await;
+        });
+        messenger
+            .graceful_shutdown(crate::ShutdownPolicy::WaitForever)
+            .await;
+        tokio::time::timeout(Duration::from_secs(2), messenger.closed())
+            .await
+            .expect("internal shutdown waited for an application task");
+        assert!(messenger.tracker().wait().now_or_never().is_none());
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), messenger.tracker().wait())
+            .await
+            .expect("public tracker retained a completed receive loop");
     }
 
     fn make_test_address(key: &str, endpoint: &str) -> WorkerAddress {

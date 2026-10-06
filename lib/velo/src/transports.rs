@@ -134,9 +134,45 @@ pub struct VeloBackend {
     alternative_transports: DashMap<InstanceId, Vec<TransportKey>>,
     workers: DashMap<WorkerId, InstanceId>,
     shutdown_state: ShutdownState,
+}
 
-    #[allow(dead_code)]
-    runtime: tokio::runtime::Handle,
+/// Stop completed transports if construction fails or is cancelled.
+struct StartupTransports {
+    transports: HashMap<TransportKey, Arc<dyn Transport>>,
+    shutdown: Option<ShutdownState>,
+}
+
+impl StartupTransports {
+    fn stop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            // Construction has no caller to drain work for. Use a zero budget.
+            stop_transports(&shutdown, &self.transports);
+        }
+    }
+
+    fn finish(mut self) -> HashMap<TransportKey, Arc<dyn Transport>> {
+        self.shutdown = None;
+        std::mem::take(&mut self.transports)
+    }
+}
+
+/// Gate, tear down, and shut down every transport. Both `begin_drain` calls
+/// are idempotent, so this is safe after a graceful drain already ran.
+fn stop_transports(state: &ShutdownState, transports: &HashMap<TransportKey, Arc<dyn Transport>>) {
+    state.begin_drain();
+    for transport in transports.values() {
+        transport.begin_drain();
+    }
+    state.teardown_token().cancel();
+    for transport in transports.values() {
+        transport.shutdown();
+    }
+}
+
+impl Drop for StartupTransports {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 impl VeloBackend {
@@ -154,43 +190,63 @@ impl VeloBackend {
         // build worker address
         let mut priorities = Vec::new();
         let mut builder = WorkerAddressBuilder::new();
-        let mut transports = HashMap::new();
         let mut transport_metrics = HashMap::new();
 
         let (adapter, data_streams) = transport::make_channels();
         let shutdown_state = adapter.shutdown_state.clone();
+        let mut started = StartupTransports {
+            transports: HashMap::new(),
+            shutdown: Some(shutdown_state.clone()),
+        };
 
         let runtime = tokio::runtime::Handle::current();
 
-        for transport in backend_transports {
-            let key = transport.key();
-            if let Some(metrics) = observability.as_ref() {
-                let handle = Arc::new(metrics.bind_transport(key.as_str()));
+        let startup = async {
+            for transport in backend_transports {
+                let key = transport.key();
+                anyhow::ensure!(
+                    !started.transports.contains_key(&key),
+                    "Duplicate transport key: {key}"
+                );
+                if let Some(metrics) = observability.as_ref() {
+                    let handle = Arc::new(metrics.bind_transport(key.as_str()));
+                    transport.set_observability(
+                        handle.clone() as Arc<dyn velo_ext::TransportObservability>
+                    );
+                    transport_metrics.insert(key.clone(), handle);
+                }
                 transport
-                    .set_observability(handle.clone() as Arc<dyn velo_ext::TransportObservability>);
-                transport_metrics.insert(key.clone(), handle);
+                    .start(instance_id, adapter.clone(), runtime.clone())
+                    .await?;
+                started
+                    .transports
+                    .insert(key.clone(), Arc::clone(&transport));
+                builder.merge(&transport.address())?;
+                priorities.push(key.clone());
             }
-            transport
-                .start(instance_id, adapter.clone(), runtime.clone())
-                .await?;
-            builder.merge(&transport.address())?;
-            priorities.push(key.clone());
-            transports.insert(key, transport);
+            Ok::<_, anyhow::Error>(builder.build()?)
         }
-        let address = builder.build()?;
+        .await;
+        let address = match startup {
+            Ok(address) => address,
+            Err(error) => {
+                started.stop();
+                futures::future::join_all(started.transports.values().map(|t| t.closed())).await;
+                return Err(error);
+            }
+        };
 
         Ok((
             Self {
                 instance_id,
                 address,
-                transports,
+                transports: started.finish(),
                 transport_metrics,
                 priorities: Mutex::new(priorities),
                 primary_transport: DashMap::new(),
                 alternative_transports: DashMap::new(),
                 workers: DashMap::new(),
                 shutdown_state,
-                runtime,
             },
             data_streams,
         ))
@@ -368,9 +424,6 @@ impl VeloBackend {
             .get(&target)
             .ok_or(VeloBackendError::InstanceNotRegistered(target))?;
         let transport_key = transport.value().key();
-        let transport_name = transport_key.to_string();
-        #[cfg(not(feature = "distributed-tracing"))]
-        let _ = &transport_name;
         // Only the span below needs this; `finalize_send_outcome` recomputes it
         // from the report's own frame handles.
         #[cfg(feature = "distributed-tracing")]
@@ -390,7 +443,7 @@ impl VeloBackend {
         let outcome = {
             let span = tracing::info_span!(
                 "velo.transport.send",
-                transport = transport_name.as_str(),
+                transport = transport_key.as_str(),
                 message_type = message_type_label(message_type),
                 bytes
             );
@@ -439,7 +492,6 @@ impl VeloBackend {
             .ok_or(VeloBackendError::InstanceNotRegistered(target))?;
 
         if transport.value().key() == transport_key {
-            let _transport_name = transport_key.to_string();
             let metrics = self.transport_metrics.get(&transport_key);
 
             let error_handler = instrument_transport_error_handler(metrics.cloned(), on_error);
@@ -465,7 +517,6 @@ impl VeloBackend {
                 if *alternative_transport == transport_key
                     && let Some(transport) = self.transports.get(alternative_transport)
                 {
-                    let _transport_name = alternative_transport.to_string();
                     let metrics = self.transport_metrics.get(alternative_transport);
 
                     let error_handler =
@@ -533,16 +584,17 @@ impl VeloBackend {
     /// Returns [`VeloBackendError::NoCompatibleTransports`] if no transport
     /// can accept the peer's address.
     pub fn register_peer(&self, peer: PeerInfo) -> Result<(), VeloBackendError> {
-        // try to register the peer with each transport
-        // we must have at least one compatible transport; otherwise, return an error
         let instance_id = peer.instance_id();
         let mut compatible_transports = Vec::new();
+        let mut failures = Vec::new();
         for (key, transport) in self.transports.iter() {
-            if transport.register(peer.clone()).is_ok() {
-                compatible_transports.push(key.clone());
+            match transport.register(peer.clone()) {
+                Ok(()) => compatible_transports.push(key.clone()),
+                Err(error) => failures.push((key, error)),
             }
         }
         if compatible_transports.is_empty() {
+            tracing::warn!(peer = %instance_id, ?failures, "No transport could register peer");
             return Err(VeloBackendError::NoCompatibleTransports);
         }
 
@@ -562,6 +614,7 @@ impl VeloBackend {
 
         let primary_transport_key = sorted_transports[0].clone();
         let alternative_transport_keys = sorted_transports[1..].to_vec();
+        tracing::debug!(peer = %instance_id, transport = %primary_transport_key, "Registered peer");
 
         let primary_transport = self.transports.get(&primary_transport_key).unwrap();
 
@@ -581,7 +634,7 @@ impl VeloBackend {
 
     /// Set the priority of the transports.
     ///
-    /// The list of [`TransportKey`]s must be an order set of the available transports.
+    /// Every available transport must occur exactly once.
     pub fn set_transport_priority(
         &self,
         priorities: Vec<TransportKey>,
@@ -594,11 +647,16 @@ impl VeloBackend {
             )));
         }
 
-        for priority in &priorities {
+        for (index, priority) in priorities.iter().enumerate() {
             if !required_transports.contains(priority) {
                 return Err(VeloBackendError::InvalidTransportPriority(format!(
                     "Priority transport not found: {:?}",
                     priority
+                )));
+            }
+            if priorities[..index].contains(priority) {
+                return Err(VeloBackendError::InvalidTransportPriority(format!(
+                    "Duplicate priority transport: {priority}"
                 )));
             }
         }
@@ -628,6 +686,11 @@ impl VeloBackend {
         }
     }
 
+    /// Stop transports after teardown or failed construction.
+    pub(crate) fn shutdown_now(&self) {
+        stop_transports(&self.shutdown_state, &self.transports);
+    }
+
     /// Perform a graceful 4-phase shutdown.
     ///
     /// 1. **Gate**: Flip the draining flag and notify each transport via `begin_drain()`.
@@ -636,6 +699,12 @@ impl VeloBackend {
     /// 4. **Close**: Await each transport's `closed()`, so what it wrote reaches the peer
     ///    before this returns.
     pub async fn graceful_shutdown(&self, policy: ShutdownPolicy) {
+        self.drain(policy).await;
+        self.finish_shutdown().await;
+    }
+
+    /// Gate and drain while transports still serve accepted work.
+    pub(crate) async fn drain(&self, policy: ShutdownPolicy) {
         // Phase 1: Gate
         self.begin_drain();
 
@@ -648,12 +717,12 @@ impl VeloBackend {
                 let _ = tokio::time::timeout(duration, self.shutdown_state.wait_for_drain()).await;
             }
         }
+    }
 
+    /// Tear down after services that send through these transports have stopped.
+    pub(crate) async fn finish_shutdown(&self) {
         // Phase 3: Teardown
-        self.shutdown_state.teardown_token().cancel();
-        for transport in self.transports.values() {
-            transport.shutdown();
-        }
+        self.shutdown_now();
 
         // Phase 4: Wait for each transport's close to finish on the wire, so a
         // process that exits right after this returns does not discard frames
@@ -674,15 +743,13 @@ pub(crate) fn message_type_label(message_type: MessageType) -> &'static str {
 }
 
 struct InstrumentedTransportErrorHandler {
-    metrics: Option<Arc<crate::observability::TransportMetricsHandle>>,
+    metrics: Arc<crate::observability::TransportMetricsHandle>,
     inner: Arc<dyn TransportErrorHandler>,
 }
 
 impl TransportErrorHandler for InstrumentedTransportErrorHandler {
     fn on_error(&self, header: Bytes, payload: Bytes, error: String) {
-        if let Some(metrics) = self.metrics.as_ref() {
-            metrics.record_rejection(TransportRejection::SendError);
-        }
+        self.metrics.record_rejection(TransportRejection::SendError);
         self.inner.on_error(header, payload, error);
     }
 }
@@ -691,7 +758,10 @@ fn instrument_transport_error_handler(
     metrics: Option<Arc<crate::observability::TransportMetricsHandle>>,
     inner: Arc<dyn TransportErrorHandler>,
 ) -> Arc<dyn TransportErrorHandler> {
-    Arc::new(InstrumentedTransportErrorHandler { metrics, inner })
+    match metrics {
+        Some(metrics) => Arc::new(InstrumentedTransportErrorHandler { metrics, inner }),
+        None => inner,
+    }
 }
 
 /// What [`finalize_send_outcome`] needs to close the loop on one send.
