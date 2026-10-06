@@ -450,10 +450,10 @@ pub trait Transport: Send + Sync {
     /// you want.
     ///
     /// The runtime calls this at most once per instance, with the instance's
-    /// Tokio runtime handle entered. Once the instance is built, it calls it
-    /// on a dedicated OS thread, so the hook may block, for example to join
-    /// its own threads. If building the instance fails, it calls it on the
-    /// building task instead. After the final owner is dropped, the runtime
+    /// Tokio runtime handle entered, on a dedicated OS thread, so the hook may
+    /// block, for example to join its own threads. One exception: if another
+    /// transport of the same instance fails to [`start`](Self::start), the
+    /// runtime calls this on the task that was building the instance. After the final owner is dropped, the runtime
     /// may already have shut down: a task spawned here then never runs. A
     /// panic here fails the runtime's shutdown, but the other transports'
     /// hooks still run.
