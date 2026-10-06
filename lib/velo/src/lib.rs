@@ -2089,12 +2089,16 @@ mod tests {
                 wait_for_final_messenger_drop(&messenger, &backend).await;
             }
             // A stopped pump releases its slot; that must not reach the wire.
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            assert_eq!(
-                send_errors(),
-                before,
-                "shutdown sent a frame after its transport was torn down"
-            );
+            // Only arms that tear the transports down can check this: a
+            // retained Messenger keeps them up, so no send can fail there.
+            if !(drop_owner && retain_messenger) {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                assert_eq!(
+                    send_errors(),
+                    before,
+                    "shutdown sent a frame after its transport was torn down"
+                );
+            }
 
             drop(sender);
             producer.shutdown(ShutdownPolicy::WaitForever).await;
