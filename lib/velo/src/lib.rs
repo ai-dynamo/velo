@@ -253,17 +253,6 @@ impl Drop for StreamOwner {
     }
 }
 
-/// Stop transports if a later builder step fails or the build is cancelled.
-struct StartupGuard(Option<Arc<Messenger>>);
-
-impl Drop for StartupGuard {
-    fn drop(&mut self) {
-        if let Some(messenger) = self.0.take() {
-            messenger.abort_startup();
-        }
-    }
-}
-
 /// Builder for configuring and creating a [`Velo`] instance.
 pub struct VeloBuilder {
     inner: MessengerBuilder,
@@ -418,7 +407,6 @@ impl VeloBuilder {
     pub async fn build(self) -> Result<Arc<Velo>> {
         // Step 1: Build Messenger.
         let messenger = self.inner.build().await?;
-        let mut startup = StartupGuard(Some(Arc::clone(&messenger)));
 
         // Step 2: Extract worker_id (carried on the local PeerInfo).
         let worker_id = messenger.instance_id().worker_id();
@@ -591,7 +579,6 @@ impl VeloBuilder {
         };
 
         // Step 10: Assemble Velo
-        startup.0.take();
         Ok(Arc::new(Velo {
             messenger,
             stream_owner: Arc::new(StreamOwner {

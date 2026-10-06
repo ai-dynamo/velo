@@ -662,10 +662,6 @@ impl Messenger {
         self.backend.graceful_shutdown(policy).await;
     }
 
-    pub(crate) fn abort_startup(&self) {
-        self.backend.shutdown_now();
-    }
-
     pub(crate) async fn closed(&self) {
         self.server.closed().await;
         self.events.closed().await;
