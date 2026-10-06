@@ -55,32 +55,6 @@ fn make_test_manager() -> Arc<AnchorManager> {
     Arc::new(AnchorManager::new(worker_id, transport))
 }
 
-#[test]
-fn public_handler_factories_keep_the_manager_alive() {
-    use crate::streaming::mpsc::control::{
-        create_mpsc_anchor_attach_handler, create_mpsc_anchor_cancel_handler,
-        create_mpsc_anchor_detach_handler,
-    };
-
-    let factories: [fn(Arc<AnchorManager>) -> crate::messenger::Handler; 7] = [
-        create_anchor_attach_handler,
-        create_anchor_detach_handler,
-        create_anchor_finalize_handler,
-        create_anchor_cancel_handler,
-        create_mpsc_anchor_attach_handler,
-        create_mpsc_anchor_detach_handler,
-        create_mpsc_anchor_cancel_handler,
-    ];
-    for factory in factories {
-        let manager = make_test_manager();
-        let weak = Arc::downgrade(&manager);
-        let handler = factory(manager);
-        assert!(weak.upgrade().is_some());
-        drop(handler);
-        assert!(weak.upgrade().is_none());
-    }
-}
-
 // -----------------------------------------------------------------------
 // Watchdog firing test
 // -----------------------------------------------------------------------
@@ -590,9 +564,6 @@ async fn test_anchor_attach_handler() {
             .unwrap_or(false),
         "attachment must be true after attach"
     );
-
-    // Verify handler constructor compiles and returns Handler
-    let _handler = create_anchor_attach_handler(manager.clone());
 }
 
 #[tokio::test]
@@ -741,9 +712,6 @@ async fn test_anchor_detach_handler() {
         "sentinel must be Detached, got {:?}",
         result
     );
-
-    // Verify handler constructor compiles
-    let _handler = create_anchor_detach_handler(manager.clone());
 }
 
 // -----------------------------------------------------------------------
@@ -790,9 +758,6 @@ async fn test_anchor_finalize_handler() {
         "sentinel must be Finalized, got {:?}",
         result
     );
-
-    // Verify handler constructor compiles
-    let _handler = create_anchor_finalize_handler(manager.clone());
 }
 
 // -----------------------------------------------------------------------
@@ -821,9 +786,6 @@ async fn test_anchor_cancel_handler() {
         entry.cancel_token.cancel();
     }
     // No panic -- test passes
-
-    // Verify handler constructor compiles
-    let _handler = create_anchor_cancel_handler(manager.clone());
 }
 
 // -----------------------------------------------------------------------

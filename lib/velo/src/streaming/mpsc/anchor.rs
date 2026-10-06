@@ -42,7 +42,7 @@ pub(crate) struct MpscSenderSlot {
 /// Lives in `Arc<DashMap<u64, MpscAnchorEntry>>`. Every mutation of
 /// `senders` runs under the DashMap shard lock and must not be held across an
 /// `.await` point — follow the bind-then-lock precedent in
-/// [`crate::streaming::control::create_anchor_attach_handler`].
+/// the `_anchor_attach` handler.
 #[allow(dead_code)] // `max_senders` / `heartbeat_interval` accessed via direct field read in attach paths
 pub(crate) struct MpscAnchorEntry {
     /// Shared `(sender_id, bytes)` delivery channel. Every attached sender

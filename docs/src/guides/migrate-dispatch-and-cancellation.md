@@ -18,6 +18,8 @@ let messages = Arc::clone(velo.messenger());
 let streams = Arc::clone(&velo); // Keep this owner while streams are active.
 ```
 
+`AnchorManager::register_handlers` and `RendezvousManager::register_handlers` no longer keep their manager or Messenger alive. Keep your own `Arc` of each for as long as you use it. The public handler factories `streaming::control::create_anchor_{attach,detach,finalize,cancel}_handler` and `streaming::mpsc::create_mpsc_anchor_{attach,detach,cancel}_handler` are removed; call `AnchorManager::register_handlers` instead. A manager whose handlers owned it formed a cycle with its Messenger, so neither was ever dropped.
+
 A retained Messenger supports active messages after the final Velo owner is dropped; it does not keep Velo streaming services alive. Stream handles and handler contexts can also hold Messenger references. Final Messenger drop starts immediate transport teardown and wakes remote event waits. Local event completion remains available through retained event handles.
 
 Drop requests cancellation and starts transport cleanup on an owned thread. It does not drain accepted work or wait for tasks or native threads to exit. A failed `VeloBuilder::build` cleans up the same way, so a listener port can stay bound for a short time after the error returns. Explicit shutdown waits for that same cleanup before it waits for transport close. Continue to call `Velo::shutdown(policy).await` when those guarantees are needed. RDMA users must use explicit shutdown before relying on deregistration; Drop does not report registered memory as released. Discovery registration guards and custom frame transports remain the caller's responsibility.

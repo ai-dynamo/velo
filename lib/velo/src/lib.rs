@@ -514,14 +514,14 @@ impl VeloBuilder {
         }
 
         // Step 6: Register streaming control-plane handlers
-        anchor_manager.register_handlers_weak(Arc::clone(&messenger))?;
+        anchor_manager.register_handlers(Arc::clone(&messenger))?;
 
         // Step 7: Create RendezvousManager and register handlers
         let rendezvous_manager = Arc::new(match self.metrics.as_ref() {
             Some(m) => crate::rendezvous::RendezvousManager::with_metrics(worker_id, Arc::clone(m)),
             None => crate::rendezvous::RendezvousManager::new(worker_id),
         });
-        rendezvous_manager.register_handlers_weak(Arc::clone(&messenger))?;
+        rendezvous_manager.register_handlers(Arc::clone(&messenger))?;
 
         // Step 8: Enable transparent large payload support
         let stager = Arc::new(crate::rendezvous::RendezvousStager::new(Arc::clone(
@@ -1579,8 +1579,12 @@ mod tests {
         .expect("failed build retained the messenger listener");
     }
 
+    /// Handlers never own their manager, and a manager never owns its
+    /// messenger beyond what it needs for ordering. Registration through the
+    /// public API therefore forms no cycle: once the caller drops its
+    /// references, the Messenger drops and starts its teardown.
     #[tokio::test]
-    async fn standalone_rendezvous_registration_retains_messenger() {
+    async fn standalone_registration_does_not_retain_the_messenger() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let transport = Arc::new(
             crate::transports::tcp::TcpTransportBuilder::new()
@@ -1594,19 +1598,33 @@ mod tests {
             .build()
             .await
             .unwrap();
+        let worker_id = messenger.instance_id().worker_id();
+        let stream = crate::streaming::TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into())
+            .await
+            .unwrap();
+        let anchors = Arc::new(crate::streaming::AnchorManager::new(
+            worker_id,
+            Arc::clone(&stream) as Arc<dyn crate::streaming::FrameTransport>,
+        ));
+        anchors.register_handlers(Arc::clone(&messenger)).unwrap();
+        let rendezvous = Arc::new(RendezvousManager::new(worker_id));
+        rendezvous
+            .register_handlers(Arc::clone(&messenger))
+            .unwrap();
+
         let weak = Arc::downgrade(&messenger);
-        let manager = Arc::new(RendezvousManager::new(messenger.instance_id().worker_id()));
-        manager.register_handlers(messenger).unwrap();
-        let retained = weak
-            .upgrade()
-            .expect("public registration must retain its messenger");
-        retained
-            .graceful_shutdown(ShutdownPolicy::WaitForever)
-            .await;
-        retained.closed().await;
-        drop(retained);
-        drop(manager);
-        assert!(weak.upgrade().is_none());
+        let weak_anchors = Arc::downgrade(&anchors);
+        drop(messenger);
+        drop(anchors);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while weak.upgrade().is_some() || weak_anchors.upgrade().is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("public handler registration kept the messenger alive");
+        drop(rendezvous);
+        stream.shutdown().await;
     }
 
     /// Shutdown must close resources while Tokio remains alive.

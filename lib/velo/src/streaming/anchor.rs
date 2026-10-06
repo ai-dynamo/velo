@@ -1929,7 +1929,8 @@ impl AnchorManager {
     /// `_stream_cancel` (on `self.sender_registry`).
     ///
     /// Stores the messenger in `messenger_lock` (write-once) for use by
-    /// `attach_remote`.
+    /// `attach_remote`. The handlers hold this manager weakly, so the caller
+    /// must keep its own `Arc` for as long as the handlers should serve.
     ///
     /// # Errors
     ///
@@ -1943,28 +1944,9 @@ impl AnchorManager {
         self: &Arc<Self>,
         messenger: Arc<crate::messenger::Messenger>,
     ) -> anyhow::Result<()> {
-        self.register_handlers_with(
-            messenger,
-            crate::streaming::control::AnchorManagerRef::Strong(Arc::clone(self)),
-        )
-    }
-
-    /// Velo owns the manager, so its handlers must not retain it in a cycle.
-    pub(crate) fn register_handlers_weak(
-        self: &Arc<Self>,
-        messenger: Arc<crate::messenger::Messenger>,
-    ) -> anyhow::Result<()> {
-        self.register_handlers_with(
-            messenger,
-            crate::streaming::control::AnchorManagerRef::Weak(Arc::downgrade(self)),
-        )
-    }
-
-    fn register_handlers_with(
-        self: &Arc<Self>,
-        messenger: Arc<crate::messenger::Messenger>,
-        manager: crate::streaming::control::AnchorManagerRef,
-    ) -> anyhow::Result<()> {
+        // The manager holds the messenger, so its handlers must not hold the
+        // manager: that cycle would keep both alive after their owners drop.
+        let manager = Arc::downgrade(self);
         use crate::streaming::control::{
             anchor_attach_handler, anchor_cancel_handler, anchor_detach_handler,
             anchor_finalize_handler, create_stream_cancel_handler,

@@ -110,7 +110,7 @@ pub struct RendezvousManager {
     /// The data store holding staged slots and active transfers.
     store: Arc<store::DataStore>,
     /// Messenger reference, set once via `register_handlers()`.
-    messenger_lock: OnceLock<MessengerRef>,
+    messenger_lock: OnceLock<Weak<crate::messenger::Messenger>>,
     /// Optional Prometheus metrics.
     metrics: Option<Arc<VeloMetrics>>,
     /// Stops the lease reaper. Cancelled by `Velo::graceful_shutdown` before
@@ -122,20 +122,6 @@ pub struct RendezvousManager {
     /// [`arm_rdma_hook`](Self::arm_rdma_hook).
     #[cfg(all(target_os = "linux", feature = "ucx", feature = "test-helpers"))]
     test_hook: parking_lot::Mutex<Option<RdmaTestHook>>,
-}
-
-enum MessengerRef {
-    Strong(Arc<crate::messenger::Messenger>),
-    Weak(Weak<crate::messenger::Messenger>),
-}
-
-impl MessengerRef {
-    fn upgrade(&self) -> Option<Arc<crate::messenger::Messenger>> {
-        match self {
-            Self::Strong(messenger) => Some(Arc::clone(messenger)),
-            Self::Weak(messenger) => messenger.upgrade(),
-        }
-    }
 }
 
 /// A condition to force on the next RDMA transfer, for tests.
@@ -259,6 +245,8 @@ impl RendezvousManager {
 
     /// Register the rendezvous control-plane handlers on the messenger.
     ///
+    /// The manager holds the messenger weakly; the caller keeps it alive.
+    ///
     /// Must be called exactly once. Registers seven underscore-prefixed
     /// handlers: `_rv_metadata`, `_rv_acquire`, `_rv_pull`, `_rv_ref`,
     /// `_rv_detach`, `_rv_release`, `_rv_lease_renew`.
@@ -274,24 +262,6 @@ impl RendezvousManager {
     pub fn register_handlers(
         self: &Arc<Self>,
         messenger: Arc<crate::messenger::Messenger>,
-    ) -> Result<()> {
-        let retained = MessengerRef::Strong(Arc::clone(&messenger));
-        self.register_handlers_inner(messenger, retained)
-    }
-
-    /// Velo owns both managers; their back-link must not own the messenger.
-    pub(crate) fn register_handlers_weak(
-        self: &Arc<Self>,
-        messenger: Arc<crate::messenger::Messenger>,
-    ) -> Result<()> {
-        let retained = MessengerRef::Weak(Arc::downgrade(&messenger));
-        self.register_handlers_inner(messenger, retained)
-    }
-
-    fn register_handlers_inner(
-        self: &Arc<Self>,
-        messenger: Arc<crate::messenger::Messenger>,
-        retained: MessengerRef,
     ) -> Result<()> {
         use handlers::{
             create_rv_acquire_handler, create_rv_detach_handler, create_rv_lease_renew_handler,
@@ -320,7 +290,7 @@ impl RendezvousManager {
         )))?;
 
         self.messenger_lock
-            .set(retained)
+            .set(Arc::downgrade(&messenger))
             .map_err(|_| anyhow::anyhow!("register_handlers called twice"))?;
 
         Ok(())
@@ -330,7 +300,7 @@ impl RendezvousManager {
     fn messenger(&self) -> Result<Arc<crate::messenger::Messenger>> {
         self.messenger_lock
             .get()
-            .and_then(MessengerRef::upgrade)
+            .and_then(Weak::upgrade)
             .ok_or_else(|| anyhow::anyhow!("Rendezvous messenger is unavailable"))
     }
 
@@ -1084,7 +1054,7 @@ impl RendezvousManager {
     /// fourth error arm.
     pub(crate) fn lease_guard(&self, handle: DataHandle, lease_id: u64) -> LeaseGuard {
         let local = handle.worker_id() == self.worker_id;
-        let messenger = self.messenger_lock.get().and_then(MessengerRef::upgrade);
+        let messenger = self.messenger_lock.get().and_then(Weak::upgrade);
         let runtime = messenger
             .as_ref()
             .map(|m| m.runtime().clone())
