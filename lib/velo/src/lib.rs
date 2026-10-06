@@ -1753,6 +1753,7 @@ mod tests {
         let manager = Arc::downgrade(&server.anchor_manager);
         let retained = Arc::clone(server.messenger());
         let messenger = Arc::downgrade(&retained);
+        let backend = Arc::clone(retained.backend());
         let tracker = retained.tracker().clone();
         let frame_transport = match &server.stream_owner.transport {
             OwnedStreamTransport::Tcp(transport) => Arc::clone(transport),
@@ -1834,11 +1835,13 @@ mod tests {
         drop(anchor);
         drop(sender);
         drop(retained);
+        // Teardown runs on its own thread; wait for it before timing the
+        // receive loops, so the budget below covers only their exit.
+        wait_for_final_messenger_drop(&messenger, &backend).await;
         tracker.close();
         tokio::time::timeout(std::time::Duration::from_secs(2), tracker.wait())
             .await
             .expect("final Messenger drop retained its receive loops");
-        assert!(messenger.upgrade().is_none());
         wait_for_listener_close(messenger_addr).await;
         frame_transport.shutdown().await;
         client.shutdown(ShutdownPolicy::WaitForever).await;
