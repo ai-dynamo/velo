@@ -186,14 +186,23 @@ async fn create_message_handler(
         .as_ref()
         .map(|metrics| metrics.bind_inbound_dequeued());
 
+    let mut held = BurstRef::default();
+
     loop {
-        let inbound = tokio::select! {
-            biased;
-            received = message_rx.recv_async() => match received {
-                Ok(inbound) => inbound,
-                Err(_) => break,
-            },
-            _ = teardown_fut.as_mut() => break,
+        let inbound = match message_rx.try_recv() {
+            Ok(inbound) => inbound,
+            Err(flume::TryRecvError::Disconnected) => break,
+            Err(flume::TryRecvError::Empty) => {
+                held.release();
+                tokio::select! {
+                    biased;
+                    received = message_rx.recv_async() => match received {
+                        Ok(inbound) => inbound,
+                        Err(_) => break,
+                    },
+                    _ = teardown_fut.as_mut() => break,
+                }
+            }
         };
 
         if teardown.is_cancelled() {
@@ -246,7 +255,7 @@ async fn create_message_handler(
 
         match decode_active_message(header, payload) {
             Ok(message) => {
-                let Some(system) = hub.system() else {
+                let Some(system) = held.get(|| hub.system()) else {
                     break;
                 };
                 #[cfg(feature = "distributed-tracing")]
@@ -497,11 +506,79 @@ async fn create_ack_and_event_handler(
     Ok(())
 }
 
+/// A strong reference to a weakly held value, kept across a burst of work.
+///
+/// The hub holds the messenger weakly, so its final drop can start teardown.
+/// Upgrading per message costs a CAS loop on a count that handler tasks on
+/// other threads keep moving: measured 2-4x a clone under contention. So the
+/// receive loop upgrades once per burst and clones per message, as a strong
+/// reference would. When the queue drains to one message per park, each park
+/// costs a drop, an upgrade, and a clone where a strong reference cost one
+/// clone; the park and wake cost far more.
+///
+/// Two bounds keep the held reference from extending the value's life: the
+/// loop calls [`release`](Self::release) before it parks, and `get` upgrades
+/// again every [`BURST_REFRESH`] calls. Without the second, a peer that keeps
+/// the queue from ever draining would keep the messenger alive after its
+/// owner dropped it, and teardown would never start.
+struct BurstRef<T> {
+    held: Option<Arc<T>>,
+    uses: u32,
+}
+
+/// Re-upgrade after this many messages. Adds well under 1 ns per message.
+const BURST_REFRESH: u32 = 128;
+
+impl<T> Default for BurstRef<T> {
+    fn default() -> Self {
+        Self {
+            held: None,
+            uses: 0,
+        }
+    }
+}
+
+impl<T> BurstRef<T> {
+    /// A strong reference, or `None` once `upgrade` finds the value gone.
+    fn get(&mut self, upgrade: impl FnOnce() -> Option<Arc<T>>) -> Option<Arc<T>> {
+        if self.uses >= BURST_REFRESH {
+            self.release();
+        }
+        if self.held.is_none() {
+            self.held = Some(upgrade()?);
+        }
+        self.uses += 1;
+        self.held.clone()
+    }
+
+    fn release(&mut self) {
+        self.held = None;
+        self.uses = 0;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::messenger::common::events::{EventType, Outcome, encode_event_header};
     use tokio::time::{Duration, timeout};
+
+    /// A queue that never drains must not keep the messenger alive: once its
+    /// owner drops it, the loop must see it gone within one refresh, so that
+    /// final drop starts teardown even under a flood.
+    #[test]
+    fn a_burst_that_never_ends_still_releases_the_value() {
+        let owner = Arc::new(7u32);
+        let weak = Arc::downgrade(&owner);
+        let mut held = BurstRef::default();
+        assert!(held.get(|| weak.upgrade()).is_some());
+        drop(owner);
+        let seen = (0..=BURST_REFRESH)
+            .map_while(|_| held.get(|| weak.upgrade()))
+            .count();
+        assert!(seen < BURST_REFRESH as usize, "held past one refresh");
+        assert!(weak.upgrade().is_none());
+    }
 
     #[tokio::test]
     async fn ack_ok_completes_response() -> anyhow::Result<()> {

@@ -486,7 +486,8 @@ impl DispatcherHub {
         Ok(())
     }
 
-    /// Hold the messenger only while dispatching a message.
+    /// Upgrade the weakly held messenger. Each call is a CAS loop, so the
+    /// receive loop calls this once per burst, not per message (`BurstRef`).
     pub(crate) fn system(&self) -> Option<Arc<Messenger>> {
         self.system.get().and_then(Weak::upgrade)
     }
