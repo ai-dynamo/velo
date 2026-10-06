@@ -26,7 +26,7 @@ velo-ext = "0.5"
 5. Route the other inbound types to their streams on the adapter: `Response` to the response stream, `Ack` and `Event` to the event stream, and `ShuttingDown` to the shutdown stream.
 6. Store the handle that `set_observability` gives you. Record each inbound frame as you route it.
 7. On the `Admitted` arm, and only there, record the frame as inbound `message`.
-8. In `shutdown`, stop your tasks and threads. The runtime calls it at most once, with its Tokio runtime handle entered, on a dedicated thread, so you may block there, for example to join a thread. The exception is when another transport of the same instance fails to start: then the runtime calls it on the task that was building the instance. After the final owner is dropped, the runtime may already be gone, so a task that `shutdown` spawns may never run. If `shutdown` panics, the runtime still calls the other transports' hooks, and then the shutdown call panics.
+8. In `shutdown`, stop your tasks and threads. The runtime calls it at most once, with its Tokio runtime handle entered, on a dedicated thread, so you may block there, for example to join a thread. Three cases run it on the caller instead: another transport of the same instance fails to start, the build is cancelled while transports start, or the thread cannot be created. After the final owner is dropped, the runtime may already be gone, so a task that `shutdown` spawns may never run. If `shutdown` panics, the runtime still calls the other transports' hooks, and then the shutdown call panics.
 
 Step 7 matters because the inbound queue depth is a difference between two counters. If your transport admits a frame and does not record it, the depth goes negative. See [Observability](../operations/observability.md).
 
