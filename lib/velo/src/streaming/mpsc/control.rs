@@ -11,9 +11,10 @@
 //!   entry; re-arms the unattached timeout if it was the last one.
 //! - `_mpsc_anchor_cancel`: removes the whole anchor silently.
 //!
-//! `_stream_cancel` is **not** duplicated — the existing SPSC handler at
-//! `control.rs:152` is keyed off `sender_stream_id` and works for MPSC
-//! senders unchanged (they register in the same `SenderRegistry`).
+//! `_stream_cancel` is **not** duplicated — the SPSC handler,
+//! `create_stream_cancel_handler` in `control::registry`, is keyed off
+//! `sender_stream_id` and works for MPSC senders unchanged (they register in
+//! the same `SenderRegistry`).
 
 use std::sync::{Arc, Weak};
 use std::time::Instant;

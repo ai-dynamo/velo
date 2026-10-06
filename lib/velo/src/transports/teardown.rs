@@ -27,9 +27,6 @@ pub(super) fn start(
                 let _runtime = worker_runtime.enter();
                 super::stop_transports(&worker_state, &worker_transports)
             };
-            if let Err(error) = &result {
-                tracing::error!(%error, "Transport teardown failed");
-            }
             let _ = finished.send(result);
         });
 

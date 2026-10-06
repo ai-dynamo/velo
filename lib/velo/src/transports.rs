@@ -152,11 +152,7 @@ impl StartupTransports {
             return Ok(());
         };
         // Construction has no caller to drain work for. Use a zero budget.
-        let result = stop_transports(&shutdown, &self.transports);
-        if let Err(error) = &result {
-            tracing::error!(%error, "Transport teardown failed");
-        }
-        result
+        stop_transports(&shutdown, &self.transports)
     }
 
     fn finish(mut self) -> HashMap<TransportKey, Arc<dyn Transport>> {
@@ -177,23 +173,25 @@ fn stop_transports(
     transports: &HashMap<TransportKey, Arc<dyn Transport>>,
 ) -> Result<(), Arc<str>> {
     let mut failure = None;
-    let mut run = |hook: &dyn Fn()| {
+    // Logged here, so every path that runs the hooks reports the same way.
+    let mut run = |key: &TransportKey, hook: &dyn Fn()| {
         if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook)) {
             let message = panic
                 .downcast_ref::<String>()
                 .map(String::as_str)
                 .or_else(|| panic.downcast_ref::<&str>().copied())
                 .unwrap_or("transport shutdown hook panicked");
+            tracing::error!(transport = %key.as_str(), error = message, "Transport teardown failed");
             failure.get_or_insert_with(|| Arc::<str>::from(message));
         }
     };
     state.begin_drain();
-    for transport in transports.values() {
-        run(&|| transport.begin_drain());
+    for (key, transport) in transports {
+        run(key, &|| transport.begin_drain());
     }
     state.teardown_token().cancel();
-    for transport in transports.values() {
-        run(&|| transport.shutdown());
+    for (key, transport) in transports {
+        run(key, &|| transport.shutdown());
     }
     failure.map_or(Ok(()), Err)
 }
