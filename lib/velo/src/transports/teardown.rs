@@ -8,7 +8,7 @@ use futures::FutureExt;
 use futures::future::{BoxFuture, Shared};
 use velo_ext::{ShutdownState, Transport, TransportKey};
 
-pub(super) type Completion = Shared<BoxFuture<'static, Result<(), Arc<str>>>>;
+pub(crate) type Completion = Shared<BoxFuture<'static, Result<(), Arc<str>>>>;
 
 /// Own the hooks independently of shutdown waiters and the Tokio runtime.
 /// Native transports may join threads here, including after final owner drop.

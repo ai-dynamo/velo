@@ -64,7 +64,7 @@ pub mod zmq;
 #[cfg(feature = "quic")]
 pub mod quic;
 
-mod teardown;
+pub(crate) mod teardown;
 mod transport;
 
 use std::sync::OnceLock;
@@ -720,7 +720,7 @@ impl VeloBackend {
         drop(self.request_teardown());
     }
 
-    fn request_teardown(&self) -> teardown::Completion {
+    pub(crate) fn request_teardown(&self) -> teardown::Completion {
         self.shutdown_state.begin_drain();
         self.teardown
             .get_or_init(|| {

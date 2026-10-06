@@ -236,6 +236,11 @@ impl OwnedStreamTransport {
 }
 
 /// Shared by Velo clones, but not by Messenger or individual stream handles.
+///
+/// Drop detaches streams before the Messenger can tear its transports down,
+/// because `AnchorManager` holds its Messenger strongly. A weak back-link
+/// there would let the Velo's own Messenger reference go first and tear
+/// down transports under live streams.
 struct StreamOwner {
     manager: Arc<crate::streaming::AnchorManager>,
     transport: OwnedStreamTransport,
@@ -1922,6 +1927,22 @@ mod tests {
     /// A consumer still reading when its node shuts down must see the stream
     /// end, not `SenderDropped`: the sender did nothing wrong.
     ///
+    /// Final Messenger drop runs transport teardown on its own thread. Wait
+    /// until the Messenger is gone and that teardown has finished.
+    async fn wait_for_final_messenger_drop(
+        messenger: &std::sync::Weak<Messenger>,
+        backend: &crate::transports::VeloBackend,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while messenger.upgrade().is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("final Velo drop retained its Messenger");
+        backend.request_teardown().await.unwrap();
+    }
+
     /// Stopping the mux retires every ingress slot by injecting `Dropped` into
     /// it. A consumer whose direct feed is still installed reads that record
     /// as its sender's. So each anchor's feed must be withdrawn before the mux
@@ -1931,7 +1952,9 @@ mod tests {
     async fn shutdown_ends_a_live_mux_stream_without_sender_dropped() {
         use futures::StreamExt;
 
-        for drop_owner in [false, true] {
+        // Explicit shutdown; final Velo drop with a retained Messenger; and
+        // final Velo drop that is also the final Messenger drop.
+        for (drop_owner, retain_messenger) in [(false, true), (true, true), (true, false)] {
             let (consumer, producer) = connected_pair(None, "_anchor_attach").await;
 
             let mut anchor = consumer.create_anchor::<u32>();
@@ -1950,7 +1973,9 @@ mod tests {
 
             let reader = tokio::spawn(async move { anchor.next().await });
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            let retained = Arc::clone(consumer.messenger());
+            let messenger = Arc::downgrade(consumer.messenger());
+            let backend = Arc::clone(consumer.messenger().backend());
+            let retained = retain_messenger.then(|| Arc::clone(consumer.messenger()));
             if drop_owner {
                 drop(consumer);
             } else {
@@ -1969,6 +1994,9 @@ mod tests {
                 ended.is_none(),
                 "shutdown must end a live stream cleanly, got {ended:?}"
             );
+            if !retain_messenger {
+                wait_for_final_messenger_drop(&messenger, &backend).await;
+            }
 
             drop(sender);
             producer.shutdown(ShutdownPolicy::WaitForever).await;
@@ -1986,7 +2014,9 @@ mod tests {
 
         use crate::observability::test_helpers::MetricSnapshot;
 
-        for drop_owner in [false, true] {
+        // Explicit shutdown; final Velo drop with a retained Messenger; and
+        // final Velo drop that is also the final Messenger drop.
+        for (drop_owner, retain_messenger) in [(false, true), (true, true), (true, false)] {
             let registry = prometheus::Registry::new();
             let metrics = Arc::new(VeloMetrics::register(&registry).unwrap());
             let (consumer, producer) = connected_pair(Some(metrics), "_mpsc_anchor_attach").await;
@@ -2014,7 +2044,9 @@ mod tests {
             let before = send_errors();
             let reader = tokio::spawn(async move { anchor.next().await });
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            let retained = Arc::clone(consumer.messenger());
+            let messenger = Arc::downgrade(consumer.messenger());
+            let backend = Arc::clone(consumer.messenger().backend());
+            let retained = retain_messenger.then(|| Arc::clone(consumer.messenger()));
             if drop_owner {
                 drop(consumer);
             } else {
@@ -2033,6 +2065,9 @@ mod tests {
                 ended.is_none(),
                 "shutdown must end a live MPSC stream cleanly, got {ended:?}"
             );
+            if !retain_messenger {
+                wait_for_final_messenger_drop(&messenger, &backend).await;
+            }
             // A stopped pump releases its slot; that must not reach the wire.
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             assert_eq!(
