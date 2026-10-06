@@ -956,6 +956,48 @@ async fn velo_shutdown_retry_after_a_failed_hook_skips_the_drain() {
     );
 }
 
+/// The same, when the first attempt was cut off while the hooks ran: no
+/// waiter saw the failure, so the retry must look at the finished teardown
+/// itself, not at what an earlier waiter observed.
+#[tokio::test]
+async fn velo_shutdown_retry_sees_a_failure_no_waiter_observed() {
+    use futures::FutureExt;
+    let mut transport = MockTransport::new("mock", true);
+    let (entered_tx, entered) = flume::bounded(1);
+    let (release, release_rx) = flume::bounded(1);
+    {
+        let mock = Arc::get_mut(&mut transport).unwrap();
+        mock.shutdown_panics = true;
+        mock.shutdown_block = Some((entered_tx, release_rx));
+    }
+    let velo = crate::Velo::builder()
+        .add_transport(transport.clone())
+        .build()
+        .await
+        .unwrap();
+    {
+        let first = velo.graceful_shutdown(ShutdownPolicy::WaitForever);
+        tokio::pin!(first);
+        tokio::select! {
+            _ = &mut first => panic!("shutdown finished while its hook was blocked"),
+            _ = entered.recv_async() => {}
+        }
+    }
+    release.send(()).unwrap();
+    // The hook now panics on the teardown thread; nothing here polls the result.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let drains = transport.drain_calls.load(Ordering::Relaxed);
+    let retry = std::panic::AssertUnwindSafe(velo.graceful_shutdown(ShutdownPolicy::WaitForever))
+        .catch_unwind()
+        .await;
+    assert!(retry.is_err());
+    assert_eq!(
+        transport.drain_calls.load(Ordering::Relaxed),
+        drains,
+        "the retry ran the drain again"
+    );
+}
+
 #[tokio::test]
 async fn test_peer_info_roundtrip() {
     let t = MockTransport::new("tcp", true);

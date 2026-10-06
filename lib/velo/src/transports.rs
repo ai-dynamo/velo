@@ -728,11 +728,16 @@ impl VeloBackend {
 
     /// The error of a teardown that has already run and failed. Teardown runs
     /// once, so the failure is final.
+    ///
+    /// Polls a clone once rather than `Shared::peek`, which sees only a result
+    /// some waiter already took: a first attempt cut off by a timeout leaves
+    /// none.
     pub(crate) fn teardown_failure(&self) -> Option<Arc<str>> {
+        use futures::FutureExt;
         self.teardown
             .get()
-            .and_then(|completion| completion.peek())
-            .and_then(|result| result.clone().err())
+            .and_then(|completion| completion.clone().now_or_never())
+            .and_then(Result::err)
     }
 
     pub(crate) fn request_teardown(&self) -> teardown::Completion {
