@@ -35,7 +35,12 @@ pub(super) fn start(
         // the process. Blocking this caller is the lesser cost.
         tracing::error!(%error, "Could not start transport teardown; running it inline");
         let result = {
-            let _runtime = runtime.enter();
+            // Not during thread-local teardown: `Handle::enter` panics there,
+            // and this may run in a drop, where a panic aborts the process.
+            let _runtime = match tokio::runtime::Handle::try_current() {
+                Err(error) if error.is_thread_local_destroyed() => None,
+                _ => Some(runtime.enter()),
+            };
             super::stop_transports(&state, &transports)
         };
         return futures::future::ready(result).boxed().shared();
