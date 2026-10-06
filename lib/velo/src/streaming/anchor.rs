@@ -1925,12 +1925,14 @@ impl AnchorManager {
     /// Register all five control-plane AM handlers on a live Messenger.
     ///
     /// Registers: `_anchor_attach`, `_anchor_detach`, `_anchor_finalize`,
-    /// `_anchor_cancel` (all on `self` as `Arc<AnchorManager>`), and
+    /// `_anchor_cancel` (each holding this manager weakly), and
     /// `_stream_cancel` (on `self.sender_registry`).
     ///
-    /// Stores the messenger in `messenger_lock` (write-once) for use by
-    /// `attach_remote`. The handlers hold this manager weakly, so the caller
-    /// must keep its own `Arc` for as long as the handlers should serve.
+    /// Stores the messenger strongly in `messenger_lock` (write-once) for use
+    /// by `attach_remote`. The handlers hold this manager weakly, so the
+    /// caller must keep its own `Arc` for as long as the handlers should
+    /// serve. The manager keeps the messenger alive: drop the manager too
+    /// before expecting final Messenger drop to start teardown.
     ///
     /// # Errors
     ///

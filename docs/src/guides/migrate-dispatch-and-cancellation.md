@@ -18,7 +18,7 @@ let messages = Arc::clone(velo.messenger());
 let streams = Arc::clone(&velo); // Keep this owner while streams are active.
 ```
 
-`AnchorManager::register_handlers` and `RendezvousManager::register_handlers` no longer keep their manager or Messenger alive. Keep your own `Arc` of each for as long as you use it. The public handler factories `streaming::control::create_anchor_{attach,detach,finalize,cancel}_handler` and `streaming::mpsc::create_mpsc_anchor_{attach,detach,cancel}_handler` are removed; call `AnchorManager::register_handlers` instead. A manager whose handlers owned it formed a cycle with its Messenger, so neither was ever dropped.
+The handlers that `AnchorManager::register_handlers` installs no longer keep their manager alive, so keep your own `Arc<AnchorManager>` for as long as you use it. The manager still keeps its Messenger alive: drop the manager too before you expect final Messenger drop to start teardown. `RendezvousManager::register_handlers` no longer keeps the Messenger alive. The public handler factories `streaming::control::create_anchor_{attach,detach,finalize,cancel}_handler` and `streaming::mpsc::create_mpsc_anchor_{attach,detach,cancel}_handler` are removed; call `AnchorManager::register_handlers` instead. A manager whose handlers owned it formed a cycle with its Messenger, so neither was ever dropped.
 
 A retained Messenger supports active messages after the final Velo owner is dropped; it does not keep Velo streaming services alive. Stream handles and handler contexts can also hold Messenger references. Final Messenger drop starts immediate transport teardown and wakes remote event waits. Local event completion remains available through retained event handles.
 
