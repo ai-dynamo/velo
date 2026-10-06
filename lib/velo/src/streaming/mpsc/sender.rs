@@ -194,7 +194,8 @@ impl<T: Serialize> MpscStreamSender<T> {
     /// Returns [`SendError::ChannelClosed`] if the receiver has been dropped or
     /// the stream has been cancelled. A cancel through `SenderEntry::cancel` is
     /// seen at once; a direct cancel of [`Self::cancellation_token`] once the
-    /// sender's heartbeat task has run.
+    /// sender's heartbeat task has run, which needs the runtime that built the
+    /// sender to be alive.
     pub async fn send(&self, item: T) -> Result<(), SendError> {
         if self.closed.is_closed() {
             return Err(SendError::ChannelClosed);
@@ -234,7 +235,8 @@ impl<T: Serialize> MpscStreamSender<T> {
     /// Returns [`SendError::ChannelClosed`] if the receiver has been dropped or
     /// the stream has been cancelled. A cancel through `SenderEntry::cancel` is
     /// seen at once; a direct cancel of [`Self::cancellation_token`] once the
-    /// sender's heartbeat task has run.
+    /// sender's heartbeat task has run, which needs the runtime that built the
+    /// sender to be alive.
     pub async fn send_err(&self, msg: impl ToString) -> Result<(), SendError> {
         if self.closed.is_closed() {
             return Err(SendError::ChannelClosed);
@@ -424,8 +426,14 @@ mod tests {
         );
         assert_eq!(rx.recv_async().await.unwrap(), *cached_heartbeat());
         cancel_token.cancel();
-        // A direct token cancel reaches the per-record flag one hop later.
-        tokio::task::yield_now().await;
+        // A direct token cancel reaches the per-record flag once the heartbeat
+        // task runs. Bounded, not one hop, so the runtime flavour does not matter.
+        for _ in 0..1000 {
+            if sender.closed.is_closed() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
         assert!(matches!(
             sender.send(42).await,
             Err(SendError::ChannelClosed)

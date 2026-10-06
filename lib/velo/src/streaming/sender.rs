@@ -324,7 +324,8 @@ impl<T: Serialize> StreamSender<T> {
     /// - [`SendError::ChannelClosed`] if the receiver has been dropped or the
     ///   stream has been cancelled. A cancel through `SenderEntry::cancel` is
     ///   seen at once; a direct cancel of [`Self::cancellation_token`] once
-    ///   the sender's heartbeat task has run.
+    ///   the sender's heartbeat task has run, which needs the runtime that
+    ///   built the sender to be alive.
     pub async fn send(&self, item: T) -> Result<(), SendError> {
         if self.closed.is_closed() {
             return Err(SendError::ChannelClosed);
@@ -1048,6 +1049,27 @@ mod tests {
         assert!(rx.is_empty());
     }
 
+    /// The registry cancel needs no task: it sets the flag itself. So it
+    /// still stops a sender whose building runtime is gone, when a direct
+    /// token cancel no longer can (no heartbeat task is left to see it).
+    #[test]
+    fn registry_cancel_works_after_the_senders_runtime_is_gone() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tx, _rx) = flume::bounded::<Vec<u8>>(256);
+        let handle = StreamAnchorHandle::pack(velo_ext::WorkerId::from_u64(1), 1);
+        let (sender, registry) =
+            runtime.block_on(async { make_sender_with_registry(tx, handle, 7) });
+        drop(runtime);
+        registry.cancel(7);
+        assert!(matches!(
+            futures::executor::block_on(sender.send(42)),
+            Err(SendError::ChannelClosed)
+        ));
+    }
+
     /// A token cancelled directly, not through the registry, reaches the
     /// per-record flag from the heartbeat task, one scheduler hop later.
     /// Checking the token itself per record would take its mutex every time.
@@ -1055,7 +1077,14 @@ mod tests {
     async fn test_send_after_cancel() {
         let (sender, rx) = make_sender();
         sender.cancellation_token().cancel();
-        tokio::task::yield_now().await;
+        // Bounded, not one hop: on a multi-thread runtime the heartbeat task
+        // may run on another worker.
+        for _ in 0..1000 {
+            if sender.closed.is_closed() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
         assert!(matches!(
             sender.send(42).await,
             Err(SendError::ChannelClosed)
