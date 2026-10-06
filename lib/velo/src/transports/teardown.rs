@@ -18,21 +18,14 @@ pub(super) fn start(
     runtime: tokio::runtime::Handle,
 ) -> Completion {
     let (finished, completion) = tokio::sync::oneshot::channel();
+    let (worker_state, worker_transports) = (state.clone(), transports.clone());
     let worker = std::thread::Builder::new()
         .name("velo-teardown".into())
         .spawn(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let result = {
                 let _runtime = runtime.enter();
-                super::stop_transports(&state, &transports);
-            }))
-            .map_err(|panic| {
-                let message = panic
-                    .downcast_ref::<String>()
-                    .map(String::as_str)
-                    .or_else(|| panic.downcast_ref::<&str>().copied())
-                    .unwrap_or("transport shutdown hook panicked");
-                Arc::<str>::from(message)
-            });
+                super::stop_transports(&worker_state, &worker_transports)
+            };
             if let Err(error) = &result {
                 tracing::error!(%error, "Transport teardown failed");
             }
@@ -40,10 +33,11 @@ pub(super) fn start(
         });
 
     if let Err(error) = worker {
-        tracing::error!(%error, "Could not start transport teardown");
-        return futures::future::ready(Err(Arc::from(error.to_string())))
-            .boxed()
-            .shared();
+        // Hooks that never run keep their threads and memory for the life of
+        // the process. Blocking this caller is the lesser cost.
+        tracing::error!(%error, "Could not start transport teardown; running it inline");
+        let result = super::stop_transports(&state, &transports);
+        return futures::future::ready(result).boxed().shared();
     }
 
     async move {

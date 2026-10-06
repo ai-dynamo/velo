@@ -880,6 +880,29 @@ async fn failed_teardown_never_reports_successful_shutdown() {
     }
 }
 
+/// A panicking hook must not skip the hooks after it. Teardown runs once, so a
+/// skipped hook would never run: its threads and registered memory would stay
+/// for the life of the process. Both hooks panic here, so the result does not
+/// depend on the order in which the backend's map visits them.
+#[tokio::test]
+async fn a_failed_hook_does_not_skip_the_other_hooks() {
+    let mut first = MockTransport::new("mock_a", true);
+    Arc::get_mut(&mut first).unwrap().shutdown_panics = true;
+    let mut second = MockTransport::new("mock_b", true);
+    Arc::get_mut(&mut second).unwrap().shutdown_panics = true;
+    let messenger = crate::Messenger::builder()
+        .add_transport(first.clone())
+        .add_transport(second.clone())
+        .build()
+        .await
+        .unwrap();
+    let backend = messenger.backend().clone();
+    drop(messenger);
+    assert!(backend.request_teardown().await.is_err());
+    assert!(first.shut_down.load(Ordering::Relaxed));
+    assert!(second.shut_down.load(Ordering::Relaxed));
+}
+
 #[tokio::test]
 async fn test_peer_info_roundtrip() {
     let t = MockTransport::new("tcp", true);

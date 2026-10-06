@@ -150,7 +150,9 @@ impl StartupTransports {
     fn stop(&mut self) {
         if let Some(shutdown) = self.shutdown.take() {
             // Construction has no caller to drain work for. Use a zero budget.
-            stop_transports(&shutdown, &self.transports);
+            if let Err(error) = stop_transports(&shutdown, &self.transports) {
+                tracing::error!(%error, "Transport teardown failed");
+            }
         }
     }
 
@@ -162,15 +164,35 @@ impl StartupTransports {
 
 /// Gate, tear down, and shut down every transport. Both `begin_drain` calls
 /// are idempotent, so this is safe after a graceful drain already ran.
-fn stop_transports(state: &ShutdownState, transports: &HashMap<TransportKey, Arc<dyn Transport>>) {
+///
+/// Teardown runs once, so a panicking hook must not skip the hooks after it:
+/// a skipped hook would leave its threads and memory for the life of the
+/// process. Each hook runs in its own `catch_unwind`; the first panic is
+/// returned after all of them have run.
+fn stop_transports(
+    state: &ShutdownState,
+    transports: &HashMap<TransportKey, Arc<dyn Transport>>,
+) -> Result<(), Arc<str>> {
+    let mut failure = None;
+    let mut run = |hook: &dyn Fn()| {
+        if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook)) {
+            let message = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("transport shutdown hook panicked");
+            failure.get_or_insert_with(|| Arc::<str>::from(message));
+        }
+    };
     state.begin_drain();
     for transport in transports.values() {
-        transport.begin_drain();
+        run(&|| transport.begin_drain());
     }
     state.teardown_token().cancel();
     for transport in transports.values() {
-        transport.shutdown();
+        run(&|| transport.shutdown());
     }
+    failure.map_or(Ok(()), Err)
 }
 
 impl Drop for StartupTransports {
