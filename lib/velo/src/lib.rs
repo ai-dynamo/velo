@@ -210,7 +210,6 @@ struct ShutdownOnce {
 }
 
 /// Concrete handles let shutdown join listeners without changing `FrameTransport`.
-#[derive(Clone)]
 enum OwnedStreamTransport {
     Tcp(Arc<crate::streaming::TcpFrameTransport>),
     #[cfg(feature = "grpc")]
