@@ -903,6 +903,25 @@ async fn a_failed_hook_does_not_skip_the_other_hooks() {
     assert!(second.shut_down.load(Ordering::Relaxed));
 }
 
+/// A failed build stops the transports that started. If one of their hooks
+/// panicked, its `closed` may wait on state the hook never set up, so the
+/// build must return its error without waiting for it.
+#[tokio::test]
+async fn failed_build_with_a_panicking_hook_returns_without_closing() {
+    let mut started = MockTransport::new("started", true);
+    Arc::get_mut(&mut started).unwrap().shutdown_panics = true;
+    let mut failing = MockTransport::new("failing", true);
+    Arc::get_mut(&mut failing).unwrap().fail_start = true;
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        VeloBackend::new(vec![started.clone(), failing.clone()], None),
+    )
+    .await
+    .expect("a failed build waited on a transport whose hook failed");
+    assert!(result.is_err());
+    assert!(started.shut_down.load(Ordering::Relaxed));
+}
+
 #[tokio::test]
 async fn test_peer_info_roundtrip() {
     let t = MockTransport::new("tcp", true);

@@ -147,13 +147,16 @@ struct StartupTransports {
 }
 
 impl StartupTransports {
-    fn stop(&mut self) {
-        if let Some(shutdown) = self.shutdown.take() {
-            // Construction has no caller to drain work for. Use a zero budget.
-            if let Err(error) = stop_transports(&shutdown, &self.transports) {
-                tracing::error!(%error, "Transport teardown failed");
-            }
+    fn stop(&mut self) -> Result<(), Arc<str>> {
+        let Some(shutdown) = self.shutdown.take() else {
+            return Ok(());
+        };
+        // Construction has no caller to drain work for. Use a zero budget.
+        let result = stop_transports(&shutdown, &self.transports);
+        if let Err(error) = &result {
+            tracing::error!(%error, "Transport teardown failed");
         }
+        result
     }
 
     fn finish(mut self) -> HashMap<TransportKey, Arc<dyn Transport>> {
@@ -197,7 +200,7 @@ fn stop_transports(
 
 impl Drop for StartupTransports {
     fn drop(&mut self) {
-        self.stop();
+        let _ = self.stop();
     }
 }
 
@@ -256,8 +259,13 @@ impl VeloBackend {
         let address = match startup {
             Ok(address) => address,
             Err(error) => {
-                started.stop();
-                futures::future::join_all(started.transports.values().map(|t| t.closed())).await;
+                // A hook that panicked may never set up what its `closed`
+                // waits on, so wait only after a clean teardown, as
+                // `finish_shutdown` does.
+                if started.stop().is_ok() {
+                    futures::future::join_all(started.transports.values().map(|t| t.closed()))
+                        .await;
+                }
                 return Err(error);
             }
         };
