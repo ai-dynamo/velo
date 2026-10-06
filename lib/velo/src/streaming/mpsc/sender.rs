@@ -103,9 +103,6 @@ impl<T: Serialize> MpscStreamSender<T> {
             sender_registry,
             closed,
         } = cancel;
-        if cancel_token.is_cancelled() {
-            closed.close();
-        }
         let heartbeat_cancel = cancel_token.child_token();
 
         // Heartbeat task — skip first immediate tick, then emit cached
@@ -243,12 +240,19 @@ impl<T: Serialize> MpscStreamSender<T> {
         }
         let bytes = rmp_serde::to_vec(&StreamFrame::<()>::SenderError(msg.to_string()))
             .expect("SenderError serializes infallibly");
+        // The same shape as `send`: the token is raced only when the channel
+        // is full, so a free channel takes no lock.
         match &self.channel {
-            SenderChannel::Local(tx) => {
-                self.until_cancelled(tx.send_async((self.sender_id.0, bytes)))
-                    .await
-            }
-            SenderChannel::Remote(tx) => self.until_cancelled(tx.send_async(bytes)).await,
+            SenderChannel::Local(tx) => match tx.try_send((self.sender_id.0, bytes)) {
+                Ok(()) => Ok(()),
+                Err(flume::TrySendError::Full(b)) => self.until_cancelled(tx.send_async(b)).await,
+                Err(flume::TrySendError::Disconnected(_)) => Err(SendError::ChannelClosed),
+            },
+            SenderChannel::Remote(tx) => match tx.try_send(bytes) {
+                Ok(()) => Ok(()),
+                Err(flume::TrySendError::Full(b)) => self.until_cancelled(tx.send_async(b)).await,
+                Err(flume::TrySendError::Disconnected(_)) => Err(SendError::ChannelClosed),
+            },
         }
     }
 

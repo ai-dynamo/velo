@@ -44,7 +44,12 @@ pub(crate) struct CloseOnCancel {
 }
 
 impl CloseOnCancel {
+    /// Built with the sender. A token already cancelled by then closes the
+    /// flag at once: no task needs to run for it.
     pub(crate) fn new(token: &tokio_util::sync::CancellationToken, closed: &SenderClosed) -> Self {
+        if token.is_cancelled() {
+            closed.close();
+        }
         Self {
             token: token.clone(),
             closed: closed.clone(),

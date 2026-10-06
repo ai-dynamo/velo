@@ -212,9 +212,6 @@ impl<T: Serialize> StreamSender<T> {
             sender_registry,
             closed,
         } = cancel;
-        if cancel_token.is_cancelled() {
-            closed.close();
-        }
         let stop_token = sender_registry
             .senders
             .get(&sender_stream_id)
@@ -361,18 +358,26 @@ impl<T: Serialize> StreamSender<T> {
     /// # Errors
     ///
     /// - [`SendError::ChannelClosed`] if the receiver has been dropped or the
-    ///   stream has been cancelled through [`Self::cancellation_token`].
-    ///   Errors are rare, so this checks the token itself.
+    ///   stream has been cancelled, under the same rule as [`Self::send`].
     pub async fn send_err(&self, msg: impl ToString) -> Result<(), SendError> {
+        if self.closed.is_closed() {
+            return Err(SendError::ChannelClosed);
+        }
         // Safe to use StreamFrame::<()> here: the SenderError variant carries
         // only a String and its msgpack encoding is identical for any T.
         let bytes = rmp_serde::to_vec(&StreamFrame::<()>::SenderError(msg.to_string()))
             .expect("SenderError serializes infallibly");
-        // Raced against the cancel for the same reason as `send`.
-        tokio::select! {
-            biased;
-            _ = self.cancel_token.cancelled() => Err(SendError::ChannelClosed),
-            result = self.tx.send_async(bytes) => result.map_err(|_| SendError::ChannelClosed),
+        // The same shape as `send`, so the two agree on a cancel.
+        match self.tx.try_send(bytes) {
+            Ok(()) => Ok(()),
+            Err(flume::TrySendError::Full(b)) => {
+                tokio::select! {
+                    biased;
+                    _ = self.cancel_token.cancelled() => Err(SendError::ChannelClosed),
+                    result = self.tx.send_async(b) => result.map_err(|_| SendError::ChannelClosed),
+                }
+            }
+            Err(flume::TrySendError::Disconnected(_)) => Err(SendError::ChannelClosed),
         }
     }
 
@@ -1044,6 +1049,10 @@ mod tests {
         registry.cancel(7);
         assert!(matches!(
             sender.send(42).await,
+            Err(SendError::ChannelClosed)
+        ));
+        assert!(matches!(
+            sender.send_err("late error").await,
             Err(SendError::ChannelClosed)
         ));
         assert!(rx.is_empty());
