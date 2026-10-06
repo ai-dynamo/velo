@@ -740,6 +740,11 @@ impl VeloBackend {
     /// 3. **Teardown**: Cancel the teardown token and call `shutdown()` on each transport.
     /// 4. **Close**: Await each transport's `closed()`, so what it wrote reaches the peer
     ///    before this returns.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a transport's shutdown hook panicked. The other hooks still
+    /// ran, but shutdown cannot report the instance as stopped.
     pub async fn graceful_shutdown(&self, policy: ShutdownPolicy) {
         self.drain(policy).await;
         self.finish_shutdown().await;

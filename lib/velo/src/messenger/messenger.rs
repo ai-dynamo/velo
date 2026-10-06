@@ -658,6 +658,11 @@ impl Messenger {
     /// finishes in the background after this call has returned. Sequence
     /// anything a handler touches accordingly. Both are the price of bounding
     /// shutdown.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a transport's shutdown hook panicked. The other hooks still
+    /// ran, but shutdown cannot report the instance as stopped.
     pub async fn graceful_shutdown(&self, policy: crate::transports::ShutdownPolicy) {
         self.backend.graceful_shutdown(policy).await;
     }

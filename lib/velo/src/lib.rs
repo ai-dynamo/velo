@@ -743,6 +743,12 @@ impl Velo {
     /// [`RdmaConfig::shutdown_timeout`], because a peer that crashed
     /// mid-transfer must not wedge shutdown forever even when the caller is
     /// willing to wait on local work.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a transport's shutdown hook panicked. The other hooks still
+    /// ran, but shutdown cannot report the instance, or its RDMA memory, as
+    /// released.
     pub async fn graceful_shutdown(&self, policy: ShutdownPolicy) {
         // Serialised, and run once. `Velo` is `Clone`, so two clones can arrive
         // here together; the sequence below takes a transport join handle and
@@ -831,6 +837,12 @@ impl Velo {
     /// ends when the application drops or finalizes the sender.
     /// Use this when an instance is removed while its Tokio runtime stays alive.
     /// It closes resources. Drop the instance and its handles to release their memory.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a transport's shutdown hook panicked. The other hooks still
+    /// ran, but shutdown cannot report the instance, or its RDMA memory, as
+    /// released.
     pub async fn shutdown(&self, policy: ShutdownPolicy) {
         self.graceful_shutdown(policy).await;
         self.anchor_manager.shutdown().await;
