@@ -61,6 +61,14 @@ pub struct VeloEvents {
     tasks: TaskTracker,
 }
 
+/// The teardown watcher holds a weak reference, so after final Messenger drop
+/// the last strong holder can go before the watcher runs.
+impl Drop for VeloEvents {
+    fn drop(&mut self) {
+        self.fail_remote_waits();
+    }
+}
+
 impl VeloEvents {
     pub(crate) fn new(
         instance_id: InstanceId,
@@ -114,12 +122,17 @@ impl VeloEvents {
         events.tasks.spawn(async move {
             teardown.cancelled().await;
             if let Some(events) = weak.upgrade() {
-                for event in &events.remote_events {
-                    event.value().cancel();
-                }
+                events.fail_remote_waits();
             }
         });
         events
+    }
+
+    /// Remote waiters hold only their proxy event, so nothing else ends them.
+    fn fail_remote_waits(&self) {
+        for event in &self.remote_events {
+            event.value().cancel();
+        }
     }
 
     fn spawn(&self, future: impl std::future::Future<Output = ()> + Send + 'static) {
@@ -1330,6 +1343,47 @@ mod tests {
             .graceful_shutdown(crate::ShutdownPolicy::WaitForever)
             .await;
         owner.closed().await;
+    }
+
+    /// Remote waiters hold only their proxy event, not `VeloEvents`. The
+    /// teardown watcher holds a weak reference, so on final Messenger drop the
+    /// last strong holder can go before the watcher runs. Dropping `VeloEvents`
+    /// must then fail the waits itself, or they hang forever.
+    #[tokio::test]
+    async fn dropping_events_fails_pending_remote_waits() {
+        use super::VeloEvents;
+        use crate::messenger::common::responses::ResponseManager;
+
+        let (backend, _streams) = crate::transports::VeloBackend::new(vec![new_transport()], None)
+            .await
+            .unwrap();
+        let backend = Arc::new(backend);
+        let worker_id = backend.instance_id().worker_id();
+        let system_id = NonZero::new(worker_id.as_u64()).unwrap();
+        let local_base = DistributedEventFactory::new(system_id).system().clone();
+        let events = VeloEvents::new(
+            backend.instance_id(),
+            local_base,
+            Arc::clone(&backend),
+            ResponseManager::new(worker_id.as_u64()),
+        );
+        let other = Messenger::builder().build().await.unwrap();
+        let handle = other.events().new_event().unwrap().into_handle();
+        let remote = events
+            .remote_event(RemoteEventKey::from_handle(handle))
+            .unwrap();
+        let WaitRegistration::Pending(waiter) = remote.register_waiter(1).unwrap() else {
+            panic!("a new remote event must be pending");
+        };
+        drop(remote);
+
+        drop(events);
+        let error = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("dropping VeloEvents left a remote wait pending")
+            .unwrap_err();
+        assert!(error.to_string().contains("Event runtime shut down"));
+        backend.shutdown_now();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
