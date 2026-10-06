@@ -46,6 +46,9 @@ pub(crate) struct StreamSenderCancelInfo {
     pub sender_stream_id: u64,
     /// Sender-side registry shared with `_stream_cancel`.
     pub sender_registry: Arc<crate::streaming::control::SenderRegistry>,
+    /// The flag the registry entry's cancel sets. Passed in, not looked up:
+    /// a cancel that arrives before the sender is built removes the entry.
+    pub closed: crate::streaming::control::SenderClosed,
 }
 
 // ---------------------------------------------------------------------------
@@ -148,6 +151,8 @@ pub struct StreamSender<T> {
     local_registry: Option<Arc<DashMap<u64, AnchorEntry>>>,
     /// User-facing cancellation signal: fires when _stream_cancel is received.
     cancel_token: CancellationToken,
+    /// Checked per record instead of the token, which takes a lock.
+    closed: crate::streaming::control::SenderClosed,
     stop_token: CancellationToken,
     /// Key in the sender-side registry for cleanup and for the _stream_cancel handler.
     sender_stream_id: u64,
@@ -205,7 +210,11 @@ impl<T: Serialize> StreamSender<T> {
             cancel_token,
             sender_stream_id,
             sender_registry,
+            closed,
         } = cancel;
+        if cancel_token.is_cancelled() {
+            closed.close();
+        }
         let stop_token = sender_registry
             .senders
             .get(&sender_stream_id)
@@ -216,10 +225,15 @@ impl<T: Serialize> StreamSender<T> {
         // Spawn heartbeat background task
         let cancel = heartbeat_cancel.clone();
         let tx_clone = tx.clone();
+        let hb_closed = crate::streaming::control::CloseOnCancel::new(&cancel_token, &closed);
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(heartbeat_interval);
-            // Skip the first immediate tick
-            interval.tick().await;
+            let _close = hb_closed;
+            // First tick one period out. Waiting for an immediate first
+            // tick would delay seeing a cancelled token by a timer turn.
+            let mut interval = tokio::time::interval_at(
+                tokio::time::Instant::now() + heartbeat_interval,
+                heartbeat_interval,
+            );
 
             loop {
                 tokio::select! {
@@ -244,6 +258,7 @@ impl<T: Serialize> StreamSender<T> {
             sent_terminal: false,
             local_registry: negotiated_transport.is_none().then_some(registry),
             cancel_token,
+            closed,
             sender_stream_id,
             sender_registry,
             metrics,
@@ -307,9 +322,11 @@ impl<T: Serialize> StreamSender<T> {
     ///
     /// - [`SendError::SerializationError`] if `rmp_serde::to_vec` fails.
     /// - [`SendError::ChannelClosed`] if the receiver has been dropped or the
-    ///   stream has been cancelled through [`Self::cancellation_token`].
+    ///   stream has been cancelled. A cancel through `SenderEntry::cancel` is
+    ///   seen at once; a direct cancel of [`Self::cancellation_token`] once
+    ///   the sender's heartbeat task has run.
     pub async fn send(&self, item: T) -> Result<(), SendError> {
-        if self.cancel_token.is_cancelled() {
+        if self.closed.is_closed() {
             return Err(SendError::ChannelClosed);
         }
         let bytes = rmp_serde::to_vec(&StreamFrame::Item(item))
@@ -344,6 +361,7 @@ impl<T: Serialize> StreamSender<T> {
     ///
     /// - [`SendError::ChannelClosed`] if the receiver has been dropped or the
     ///   stream has been cancelled through [`Self::cancellation_token`].
+    ///   Errors are rare, so this checks the token itself.
     pub async fn send_err(&self, msg: impl ToString) -> Result<(), SendError> {
         // Safe to use StreamFrame::<()> here: the SenderError variant carries
         // only a String and its msgpack encoding is identical for any T.
@@ -604,6 +622,7 @@ mod tests {
                 cancel_token,
                 sender_stream_id: 1,
                 sender_registry,
+                closed: Default::default(),
             },
             Duration::from_secs(5),
             None,
@@ -626,9 +645,11 @@ mod tests {
             std::sync::Arc::new(crate::streaming::control::SenderRegistry::default());
 
         // Insert the SenderEntry into the registry (simulating what attach_stream_anchor does)
+        let closed = crate::streaming::control::SenderClosed::default();
         let entry = crate::streaming::control::SenderEntry {
             stop_token: cancel_token.child_token(),
             cancel_token: cancel_token.clone(),
+            closed: closed.clone(),
         };
         sender_registry.senders.insert(sender_stream_id, entry);
 
@@ -640,6 +661,7 @@ mod tests {
                 cancel_token,
                 sender_stream_id,
                 sender_registry: sender_registry.clone(),
+                closed,
             },
             Duration::from_secs(5),
             None,
@@ -888,6 +910,7 @@ mod tests {
                 cancel_token,
                 sender_stream_id: 1,
                 sender_registry,
+                closed: Default::default(),
             },
             Duration::from_secs(5),
             None,
@@ -930,6 +953,7 @@ mod tests {
                 cancel_token,
                 sender_stream_id: 1,
                 sender_registry,
+                closed: Default::default(),
             },
             Duration::from_secs(5),
             None,
@@ -1008,10 +1032,30 @@ mod tests {
     // Test 11: cancellation rejects sends while the receiver remains open
     // -----------------------------------------------------------------------
 
+    /// A cancel through the registry is seen by the very next send: the
+    /// sender checks a flag that the cancel sets first. `_stream_cancel` and
+    /// shutdown cancel this way.
+    #[tokio::test]
+    async fn registry_cancel_fails_the_next_send_at_once() {
+        let (tx, rx) = flume::bounded::<Vec<u8>>(256);
+        let handle = StreamAnchorHandle::pack(velo_ext::WorkerId::from_u64(1), 1);
+        let (sender, registry) = make_sender_with_registry(tx, handle, 7);
+        registry.cancel(7);
+        assert!(matches!(
+            sender.send(42).await,
+            Err(SendError::ChannelClosed)
+        ));
+        assert!(rx.is_empty());
+    }
+
+    /// A token cancelled directly, not through the registry, reaches the
+    /// per-record flag from the heartbeat task, one scheduler hop later.
+    /// Checking the token itself per record would take its mutex every time.
     #[tokio::test]
     async fn test_send_after_cancel() {
         let (sender, rx) = make_sender();
         sender.cancellation_token().cancel();
+        tokio::task::yield_now().await;
         assert!(matches!(
             sender.send(42).await,
             Err(SendError::ChannelClosed)

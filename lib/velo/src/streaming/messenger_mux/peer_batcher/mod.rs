@@ -106,7 +106,7 @@ pub(crate) struct OpenSlotRequest {
     pub(crate) anchor_id: u64,
     pub(crate) session_id: u64,
     pub(crate) inlet: flume::Receiver<Vec<u8>>,
-    pub(crate) lifecycle: Option<(CancellationToken, CancellationToken)>,
+    pub(crate) lifecycle: Option<crate::streaming::control::SenderSignals>,
     /// The ledger the slot opens with — the window the receiver advertised on
     /// its attach response, already granted.
     ///
@@ -634,8 +634,8 @@ impl Batcher {
                 self.close_local(slot.index());
                 return;
             }
-            if let Some((_, stop)) = &live.lifecycle {
-                stop.cancel();
+            if let Some(signals) = &live.lifecycle {
+                signals.stop.cancel();
             }
         }
         let mut touched = false;

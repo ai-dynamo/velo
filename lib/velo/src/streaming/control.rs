@@ -25,6 +25,7 @@
 
 use crate::observability::{HandlerOutcome, StreamingOp};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Instant;
 
@@ -133,15 +134,90 @@ pub struct StreamCancelRequest {
 // SenderEntry + SenderRegistry
 // ---------------------------------------------------------------------------
 
+/// Whether a sender is cancelled, readable on every send without a lock.
+///
+/// `CancellationToken::is_cancelled` locks a mutex (tokio-util 0.7.18 and
+/// 0.7.19): 8.7 ns per call against 0.3 ns for this load, paid on every
+/// record. [`SenderEntry::cancel`] sets the flag before it cancels the token,
+/// so a send after it fails at once. A token cancelled any other way sets the
+/// flag from the sender's heartbeat task, one scheduler hop later.
+#[derive(Clone, Debug, Default)]
+pub struct SenderClosed(Arc<AtomicBool>);
+
+impl SenderClosed {
+    /// Mark the sender cancelled.
+    pub fn close(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    /// Whether the sender is cancelled.
+    pub fn is_closed(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// Held by a sender's heartbeat task, which ends when the sender's token is
+/// cancelled. A token cancelled other than through [`SenderEntry::cancel`]
+/// reaches the per-record check here. A drop guard, so the flag is also set if
+/// the task is dropped with its runtime.
+pub(crate) struct CloseOnCancel {
+    token: tokio_util::sync::CancellationToken,
+    closed: SenderClosed,
+}
+
+impl CloseOnCancel {
+    pub(crate) fn new(token: &tokio_util::sync::CancellationToken, closed: &SenderClosed) -> Self {
+        Self {
+            token: token.clone(),
+            closed: closed.clone(),
+        }
+    }
+}
+
+impl Drop for CloseOnCancel {
+    fn drop(&mut self) {
+        if self.token.is_cancelled() {
+            self.closed.close();
+        }
+    }
+}
+
+/// The signals a mux slot fires at its sender: a graceful stop, and a cancel.
+/// The cancel sets the per-record flag before the token, as
+/// [`SenderEntry::cancel`] does, so the next send fails at once.
+#[derive(Clone)]
+pub(crate) struct SenderSignals {
+    pub(crate) cancel: tokio_util::sync::CancellationToken,
+    pub(crate) stop: tokio_util::sync::CancellationToken,
+    pub(crate) closed: SenderClosed,
+}
+
+impl SenderSignals {
+    pub(crate) fn cancel(&self) {
+        self.closed.close();
+        self.cancel.cancel();
+    }
+}
+
 /// A single slot in the sender-side registry, representing an active [`crate::streaming::sender::StreamSender`].
 ///
-/// Stored per active stream. The `_stream_cancel` handler retrieves and removes
-/// the entry then cancels its token. The token also wakes blocked sends.
+/// Stored per active stream. The `_stream_cancel` handler removes the entry
+/// and calls [`cancel`](Self::cancel). The token also wakes blocked sends.
 pub struct SenderEntry {
     /// Fires when `_stream_cancel` is received — user-facing via `cancellation_token()`.
     pub cancel_token: tokio_util::sync::CancellationToken,
     /// Graceful stop leaves the response channel open.
     pub stop_token: tokio_util::sync::CancellationToken,
+    /// What the sender checks per record. Set by [`cancel`](Self::cancel).
+    pub closed: SenderClosed,
+}
+
+impl SenderEntry {
+    /// Cancel the sender: later sends fail at once, and blocked sends wake.
+    pub fn cancel(&self) {
+        self.closed.close();
+        self.cancel_token.cancel();
+    }
 }
 
 /// Sender-side registry of active [`SenderEntry`] slots.
@@ -161,7 +237,7 @@ impl SenderRegistry {
     /// removes the entry, because it must leave queued output usable.
     pub(crate) fn cancel(&self, sender_stream_id: u64) {
         if let Some((_, entry)) = self.senders.remove(&sender_stream_id) {
-            entry.cancel_token.cancel();
+            entry.cancel();
         }
     }
 }
