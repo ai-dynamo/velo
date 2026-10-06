@@ -1059,7 +1059,9 @@ impl AnchorManager {
     ///    sends nothing. The slots stay open.
     /// 2. Take streams off their slots: SPSC feeds withdrawn, MPSC pumps
     ///    cancelled.
-    /// 3. Remove anchors and MPSC entries, and cancel local senders.
+    /// 3. Remove anchors and MPSC entries, and cancel their senders: local
+    ///    ones directly, remote ones by `_stream_cancel` while the messenger's
+    ///    transports are still up (final drop, not explicit shutdown).
     ///
     /// The caller then retires mux slots, after joining tasks if it can wait.
     ///
@@ -1084,10 +1086,29 @@ impl AnchorManager {
                 }
             }
         }
+        // Remote senders hear of the end only through `_stream_cancel`: the
+        // mux is stopping, so no slot close reaches them, and a retained
+        // Messenger drops their batches once the mux is gone. Without it they
+        // fill the window and wait forever. Only while the transports are up:
+        // explicit shutdown calls this after teardown, and must send nothing.
+        let peers = self
+            .messenger_lock
+            .get()
+            .filter(|m| !m.backend().shutdown_state().teardown_token().is_cancelled());
         // Remove entries outside shard guards: their Drop may close a mux slot.
         let ids: Vec<_> = self.registry.iter().map(|entry| *entry.key()).collect();
         for id in ids {
-            self.remove_anchor(id);
+            if let Some(handle) = self
+                .remove_anchor(id)
+                .and_then(|entry| entry.stream_cancel_handle)
+            {
+                crate::streaming::control::request_sender_cancel(
+                    handle,
+                    self.worker_id,
+                    &self.sender_registry,
+                    peers,
+                );
+            }
         }
         let ids: Vec<_> = self
             .mpsc_registry
@@ -1096,6 +1117,12 @@ impl AnchorManager {
             .collect();
         for id in ids {
             if let Some((_, entry)) = self.mpsc_registry.remove(&id) {
+                crate::streaming::mpsc::anchor::cancel_all_senders(
+                    &entry,
+                    self.worker_id,
+                    &self.sender_registry,
+                    peers,
+                );
                 entry.cancel_token.cancel();
             }
         }
