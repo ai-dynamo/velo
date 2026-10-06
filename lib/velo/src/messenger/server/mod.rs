@@ -237,6 +237,7 @@ async fn create_message_handler(
         if let Some(dequeued) = &inbound_dequeued {
             dequeued.inc();
         }
+        held.tick();
 
         // The guard was acquired by the transport at admission
         // (`TransportAdapter::admit_message`) and travelled with the frame, so
@@ -517,13 +518,15 @@ async fn create_ack_and_event_handler(
 /// clone; the park and wake cost far more.
 ///
 /// Two bounds keep the held reference from extending the value's life: the
-/// loop calls [`release`](Self::release) before it parks, and `get` upgrades
-/// again every [`BURST_REFRESH`] calls. Without the second, a peer that keeps
-/// the queue from ever draining would keep the messenger alive after its
-/// owner dropped it, and teardown would never start.
+/// loop calls [`release`](Self::release) before it parks, and releases again
+/// every [`BURST_REFRESH`] dequeues ([`tick`](Self::tick)). Without the
+/// second, a peer that keeps the queue from ever draining would keep the
+/// messenger alive after its owner dropped it, and teardown would never
+/// start. The bound counts dequeues, not uses, so frames that fail to decode
+/// count too.
 struct BurstRef<T> {
     held: Option<Arc<T>>,
-    uses: u32,
+    dequeues: u32,
 }
 
 /// Re-upgrade after this many messages. Adds well under 1 ns per message.
@@ -533,7 +536,7 @@ impl<T> Default for BurstRef<T> {
     fn default() -> Self {
         Self {
             held: None,
-            uses: 0,
+            dequeues: 0,
         }
     }
 }
@@ -541,19 +544,23 @@ impl<T> Default for BurstRef<T> {
 impl<T> BurstRef<T> {
     /// A strong reference, or `None` once `upgrade` finds the value gone.
     fn get(&mut self, upgrade: impl FnOnce() -> Option<Arc<T>>) -> Option<Arc<T>> {
-        if self.uses >= BURST_REFRESH {
-            self.release();
-        }
         if self.held.is_none() {
             self.held = Some(upgrade()?);
         }
-        self.uses += 1;
         self.held.clone()
+    }
+
+    /// Count one dequeue; release the reference every [`BURST_REFRESH`].
+    fn tick(&mut self) {
+        self.dequeues += 1;
+        if self.dequeues > BURST_REFRESH {
+            self.release();
+        }
     }
 
     fn release(&mut self) {
         self.held = None;
-        self.uses = 0;
+        self.dequeues = 0;
     }
 }
 
@@ -571,13 +578,33 @@ mod tests {
         let owner = Arc::new(7u32);
         let weak = Arc::downgrade(&owner);
         let mut held = BurstRef::default();
+        held.tick();
         assert!(held.get(|| weak.upgrade()).is_some());
         drop(owner);
         let seen = (0..=BURST_REFRESH)
-            .map_while(|_| held.get(|| weak.upgrade()))
+            .map_while(|_| {
+                held.tick();
+                held.get(|| weak.upgrade())
+            })
             .count();
         assert!(seen < BURST_REFRESH as usize, "held past one refresh");
         assert!(weak.upgrade().is_none());
+    }
+
+    /// The bound counts dequeues, not uses: a flood of frames that fail to
+    /// decode never asks for the messenger, and must still let it go.
+    #[test]
+    fn dequeues_that_never_use_the_value_still_release_it() {
+        let owner = Arc::new(7u32);
+        let weak = Arc::downgrade(&owner);
+        let mut held = BurstRef::default();
+        held.tick();
+        assert!(held.get(|| weak.upgrade()).is_some());
+        drop(owner);
+        for _ in 0..=BURST_REFRESH {
+            held.tick();
+        }
+        assert!(weak.upgrade().is_none(), "held past one refresh");
     }
 
     #[tokio::test]
