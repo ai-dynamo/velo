@@ -20,6 +20,8 @@ struct MockTransport {
     pending_start: bool,
     start_completed: AtomicBool,
     drained: AtomicBool,
+    /// How many times `begin_drain` ran: phase 1 of each shutdown attempt.
+    drain_calls: AtomicUsize,
     shut_down: AtomicBool,
     shutdown_complete: AtomicBool,
     shutdown_block: Option<(flume::Sender<()>, flume::Receiver<()>)>,
@@ -56,6 +58,7 @@ impl MockTransport {
             pending_start: false,
             start_completed: AtomicBool::new(false),
             drained: AtomicBool::new(false),
+            drain_calls: AtomicUsize::new(0),
             shut_down: AtomicBool::new(false),
             shutdown_complete: AtomicBool::new(false),
             shutdown_block: None,
@@ -84,6 +87,7 @@ impl MockTransport {
             pending_start: false,
             start_completed: AtomicBool::new(false),
             drained: AtomicBool::new(false),
+            drain_calls: AtomicUsize::new(0),
             shut_down: AtomicBool::new(false),
             shutdown_complete: AtomicBool::new(false),
             shutdown_block: None,
@@ -197,6 +201,7 @@ impl Transport for MockTransport {
     }
     fn begin_drain(&self) {
         self.drained.store(true, Ordering::Relaxed);
+        self.drain_calls.fetch_add(1, Ordering::Relaxed);
     }
     fn check_health(
         &self,
@@ -920,6 +925,35 @@ async fn failed_build_with_a_panicking_hook_returns_without_closing() {
     .expect("a failed build waited on a transport whose hook failed");
     assert!(result.is_err());
     assert!(started.shut_down.load(Ordering::Relaxed));
+}
+
+/// A retry after a failed teardown must fail at once. Teardown ran once and
+/// failed for good, so running the drain and the RDMA sweep again only spends
+/// their budget (30 s by default for the sweep) before the same panic.
+#[tokio::test]
+async fn velo_shutdown_retry_after_a_failed_hook_skips_the_drain() {
+    use futures::FutureExt;
+    let mut transport = MockTransport::new("mock", true);
+    Arc::get_mut(&mut transport).unwrap().shutdown_panics = true;
+    let velo = crate::Velo::builder()
+        .add_transport(transport.clone())
+        .build()
+        .await
+        .unwrap();
+    let first = std::panic::AssertUnwindSafe(velo.graceful_shutdown(ShutdownPolicy::WaitForever))
+        .catch_unwind()
+        .await;
+    assert!(first.is_err());
+    let drains = transport.drain_calls.load(Ordering::Relaxed);
+    let retry = std::panic::AssertUnwindSafe(velo.graceful_shutdown(ShutdownPolicy::WaitForever))
+        .catch_unwind()
+        .await;
+    assert!(retry.is_err(), "a retry reported a failed teardown as done");
+    assert_eq!(
+        transport.drain_calls.load(Ordering::Relaxed),
+        drains,
+        "the retry ran the drain again"
+    );
 }
 
 #[tokio::test]

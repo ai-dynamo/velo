@@ -747,7 +747,7 @@ impl Velo {
     ///
     /// Panics if a transport's shutdown hook panicked. The other hooks still
     /// ran, but shutdown cannot report the instance, or its RDMA memory, as
-    /// released.
+    /// released. A later call panics at once, without draining again.
     pub async fn graceful_shutdown(&self, policy: ShutdownPolicy) {
         // Serialised, and run once. `Velo` is `Clone`, so two clones can arrive
         // here together; the sequence below takes a transport join handle and
@@ -761,6 +761,11 @@ impl Velo {
             .load(std::sync::atomic::Ordering::Acquire)
         {
             return;
+        }
+        // A failed teardown is final. Running the sweep and drain again would
+        // spend their budget against torn-down transports, then panic anyway.
+        if let Some(error) = self.messenger.backend().teardown_failure() {
+            panic!("transport teardown failed: {error}");
         }
 
         // Shadowed with what is left of the caller budget after the sweep, so
@@ -841,7 +846,7 @@ impl Velo {
     ///
     /// Panics if a transport's shutdown hook panicked. The other hooks still
     /// ran, but shutdown cannot report the instance, or its RDMA memory, as
-    /// released.
+    /// released. A later call panics at once, without draining again.
     pub async fn shutdown(&self, policy: ShutdownPolicy) {
         self.graceful_shutdown(policy).await;
         self.anchor_manager.shutdown().await;

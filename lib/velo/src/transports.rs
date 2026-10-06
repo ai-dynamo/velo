@@ -726,6 +726,15 @@ impl VeloBackend {
         drop(self.request_teardown());
     }
 
+    /// The error of a teardown that has already run and failed. Teardown runs
+    /// once, so the failure is final.
+    pub(crate) fn teardown_failure(&self) -> Option<Arc<str>> {
+        self.teardown
+            .get()
+            .and_then(|completion| completion.peek())
+            .and_then(|result| result.clone().err())
+    }
+
     pub(crate) fn request_teardown(&self) -> teardown::Completion {
         self.shutdown_state.begin_drain();
         self.teardown
