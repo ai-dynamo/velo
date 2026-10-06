@@ -16,7 +16,7 @@ use anyhow::{Result, anyhow, bail};
 use bytes::Bytes;
 use dashmap::DashMap;
 use lru::LruCache;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use serde::Serialize;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Weak};
@@ -53,7 +53,7 @@ pub struct VeloEvents {
     system_id: u64,
     instance_id: InstanceId,
     backend: Arc<VeloBackend>,
-    messenger: RwLock<Weak<Messenger>>,
+    messenger: std::sync::OnceLock<Weak<Messenger>>,
     remote_events: DashMap<RemoteEventKey, Arc<RemoteEvent>>,
     completed_cache: Arc<Mutex<LruCache<RemoteEventKey, CompletedEventInfo>>>,
     owner_subscribers: DashMap<RemoteEventKey, DashMap<InstanceId, u32>>,
@@ -108,7 +108,7 @@ impl VeloEvents {
             system_id,
             instance_id,
             backend,
-            messenger: RwLock::new(Weak::new()),
+            messenger: std::sync::OnceLock::new(),
             remote_events: DashMap::new(),
             completed_cache: Arc::new(Mutex::new(LruCache::new(
                 NonZeroUsize::new(DEFAULT_COMPLETED_CACHE_SIZE).unwrap(),
@@ -198,15 +198,18 @@ impl VeloEvents {
         self.event_manager().new_event()
     }
 
+    /// Set once, when the messenger is built. A `OnceLock`, not a lock: every
+    /// remote event operation reads it.
     pub(crate) fn set_messenger(&self, messenger: Arc<Messenger>) {
-        *self.messenger.write() = Arc::downgrade(&messenger);
+        let installed = self.messenger.set(Arc::downgrade(&messenger)).is_ok();
+        debug_assert!(installed, "set_messenger called twice");
     }
 
     /// Borrow the owner only for synchronous setup, never across a network wait.
     fn messenger(&self) -> Result<Arc<Messenger>> {
         self.messenger
-            .read()
-            .upgrade()
+            .get()
+            .and_then(Weak::upgrade)
             .ok_or_else(|| anyhow!("Event messenger is unavailable"))
     }
 
