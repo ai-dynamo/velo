@@ -882,7 +882,7 @@ impl MessengerMuxTransport {
         anchor_id: u64,
         session_id: u64,
         limits: NegotiatedLimits,
-        lifecycle: Option<crate::streaming::control::SenderSignals>,
+        lifecycle: Option<crate::streaming::control::SenderEntry>,
     ) -> BoxFuture<'_, Result<flume::Sender<Vec<u8>>>> {
         let core = Arc::clone(&self.core);
         Box::pin(async move {

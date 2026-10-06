@@ -391,21 +391,10 @@ impl Drop for PreBind {
 /// responsibility for the entry.
 struct SenderIdentity {
     sender_stream_id: u64,
-    cancel_token: CancellationToken,
-    stop_token: CancellationToken,
-    closed: crate::streaming::control::SenderClosed,
+    /// A clone of the registered entry: the same tokens and flag.
+    entry: crate::streaming::control::SenderEntry,
     registry: Arc<crate::streaming::control::SenderRegistry>,
     armed: bool,
-}
-
-impl SenderIdentity {
-    fn signals(&self) -> crate::streaming::control::SenderSignals {
-        crate::streaming::control::SenderSignals {
-            cancel: self.cancel_token.clone(),
-            stop: self.stop_token.clone(),
-            closed: self.closed.clone(),
-        }
-    }
 }
 
 impl Drop for SenderIdentity {
@@ -1788,7 +1777,7 @@ impl AnchorManager {
         ticket: &crate::streaming::control::StreamOpenTicket,
         peer: velo_ext::WorkerId,
         anchor_id: u64,
-        lifecycle: Option<crate::streaming::control::SenderSignals>,
+        lifecycle: Option<crate::streaming::control::SenderEntry>,
     ) -> Result<flume::Sender<Vec<u8>>, AttachError> {
         let key = &ticket.streaming_transport_key;
         let session_id = ticket.routing_session_id;
@@ -2202,21 +2191,17 @@ impl AnchorManager {
     fn new_sender_identity(&self) -> SenderIdentity {
         let sender_stream_id = self.next_sender_stream_id.fetch_add(1, Ordering::Relaxed) + 1;
         let cancel_token = CancellationToken::new();
-        let stop_token = cancel_token.child_token();
-        let closed = crate::streaming::control::SenderClosed::default();
-        self.sender_registry.senders.insert(
-            sender_stream_id,
-            crate::streaming::control::SenderEntry {
-                cancel_token: cancel_token.clone(),
-                stop_token: stop_token.clone(),
-                closed: closed.clone(),
-            },
-        );
+        let entry = crate::streaming::control::SenderEntry {
+            stop_token: cancel_token.child_token(),
+            cancel_token,
+            closed: Default::default(),
+        };
+        self.sender_registry
+            .senders
+            .insert(sender_stream_id, entry.clone());
         SenderIdentity {
             sender_stream_id,
-            cancel_token,
-            stop_token,
-            closed,
+            entry,
             registry: self.sender_registry.clone(),
             armed: true,
         }
@@ -2241,7 +2226,12 @@ impl AnchorManager {
         // Resolve the local FrameTransport that matches the remote worker's
         // bound streaming transport, then connect by WorkerId.
         let frame_tx = match self
-            .connect_streaming(ticket, handle_worker_id, local_id, Some(identity.signals()))
+            .connect_streaming(
+                ticket,
+                handle_worker_id,
+                local_id,
+                Some(identity.entry.clone()),
+            )
             .await
         {
             Ok(frame_tx) => frame_tx,
@@ -2257,7 +2247,7 @@ impl AnchorManager {
         };
 
         let sender_stream_id = identity.sender_stream_id;
-        let cancel_token = identity.cancel_token.clone();
+        let cancel_token = identity.entry.cancel_token.clone();
         identity.armed = false;
 
         // Build StreamSender: frame_tx from the transport (not a local registry
@@ -2270,7 +2260,7 @@ impl AnchorManager {
                 cancel_token,
                 sender_stream_id,
                 sender_registry: self.sender_registry.clone(),
-                closed: identity.closed.clone(),
+                closed: identity.entry.closed.clone(),
             },
             Duration::from_millis(ticket.heartbeat_interval_ms),
             self.metrics.clone(),
@@ -2660,10 +2650,10 @@ impl AnchorManager {
             handle,
             self.mpsc_registry.clone(),
             crate::streaming::sender::StreamSenderCancelInfo {
-                cancel_token: identity.cancel_token.clone(),
+                cancel_token: identity.entry.cancel_token.clone(),
                 sender_stream_id: identity.sender_stream_id,
                 sender_registry: self.sender_registry.clone(),
-                closed: identity.closed.clone(),
+                closed: identity.entry.closed.clone(),
             },
             heartbeat_interval,
             self.metrics.clone(),
@@ -2753,7 +2743,7 @@ impl AnchorManager {
                         },
                         handle_worker_id,
                         local_id,
-                        Some(identity.signals()),
+                        Some(identity.entry.clone()),
                     )
                     .await?;
 
@@ -2764,10 +2754,10 @@ impl AnchorManager {
                     handle,
                     self.mpsc_registry.clone(),
                     crate::streaming::sender::StreamSenderCancelInfo {
-                        cancel_token: identity.cancel_token.clone(),
+                        cancel_token: identity.entry.cancel_token.clone(),
                         sender_stream_id,
                         sender_registry: self.sender_registry.clone(),
-                        closed: identity.closed.clone(),
+                        closed: identity.entry.closed.clone(),
                     },
                     Duration::from_millis(heartbeat_interval_ms),
                     self.metrics.clone(),
