@@ -457,6 +457,15 @@ impl Transport for ZmqTransport {
     }
 }
 
+/// How long a stopping sender may spend on the frames queued before the
+/// stop. Each send to a peer that is gone blocks for [`SEND_TIMEOUT`], so with
+/// no shared budget a full queue to a dead peer held the sender join, and so
+/// teardown, for minutes, past any timeout the caller gave its shutdown.
+const DRAIN_BUDGET: Duration = Duration::from_secs(1);
+
+/// How long one send may block on a peer with no free pipe before it fails.
+const SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Configuration bundle for the sender thread.
 struct SenderConfig {
     ctx: Arc<zmq::Context>,
@@ -482,11 +491,15 @@ fn run_sender(cfg: SenderConfig) {
     let mut dealer_sockets: HashMap<crate::InstanceId, zmq::Socket> = HashMap::new();
 
     // Keep frames already queued ahead of shutdown. Once the flag is seen,
-    // drain only that queue prefix so later sends cannot extend the join.
+    // drain only that queue prefix, and only within `DRAIN_BUDGET`, so neither
+    // later sends nor a dead peer can extend the join. A send already under
+    // way when the flag is set can still take up to `SEND_TIMEOUT`.
     let mut remaining = None;
+    let mut drain_deadline = None;
     loop {
         if remaining.is_none() && cfg.stop.load(Ordering::Acquire) {
             remaining = Some(cfg.rx.len());
+            drain_deadline = Some(std::time::Instant::now() + DRAIN_BUDGET);
         }
         let cmd = match remaining.as_mut() {
             Some(0) => break,
@@ -505,6 +518,19 @@ fn run_sender(cfg: SenderConfig) {
                 debug!("ZMQ sender received shutdown signal");
                 break;
             }
+        };
+
+        // While draining, each send gets only what is left of the budget,
+        // and a frame that finds none left fails without being sent.
+        let drain_left = match drain_deadline {
+            Some(deadline) => match deadline.checked_duration_since(std::time::Instant::now()) {
+                Some(left) if !left.is_zero() => Some(left),
+                _ => {
+                    task.on_error("Transport shutting down");
+                    continue;
+                }
+            },
+            None => None,
         };
 
         let target = task.target;
@@ -539,6 +565,14 @@ fn run_sender(cfg: SenderConfig) {
                 }
             }
         };
+
+        if let Some(left) = drain_left {
+            let millis = i32::try_from(left.as_millis()).unwrap_or(i32::MAX).max(1);
+            if let Err(e) = sock.set_sndtimeo(millis) {
+                task.on_error(format!("ZMQ send failed: {e}"));
+                continue;
+            }
+        }
 
         // Send 3-part multipart: [msg_type, header, payload]
         let type_byte: &[u8] = &[task.msg_type.as_u8()];
@@ -593,7 +627,7 @@ fn create_dealer_socket(
     sock.set_linger(linger_ms)
         .context("Failed to set ZMQ_LINGER")?;
     // Set a send timeout to avoid blocking forever on a dead peer
-    sock.set_sndtimeo(5000)
+    sock.set_sndtimeo(SEND_TIMEOUT.as_millis() as i32)
         .context("Failed to set ZMQ_SNDTIMEO")?;
     // Only queue messages for peers that have completed the TCP handshake.
     // Without this, messages to not-yet-connected peers sit in ZMQ's queue,
@@ -851,6 +885,60 @@ mod tests {
         worker.join().unwrap();
         assert_eq!(reply.unwrap().last().unwrap(), b"reply");
         stopped.expect("full queue lost the sender stop request");
+    }
+
+    /// Frames queued before a stop are still sent, but only within one shared
+    /// budget. Each send to a peer that is gone blocks for the full send
+    /// timeout, so a drain with no budget held the sender join, and so
+    /// teardown, for that timeout once per queued frame.
+    #[test]
+    fn a_stopping_sender_drains_within_its_budget() {
+        struct CountErrors(Arc<std::sync::atomic::AtomicUsize>);
+        impl TransportErrorHandler for CountErrors {
+            fn on_error(&self, _: Bytes, _: Bytes, _: String) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        // A port nothing listens on: with `ZMQ_IMMEDIATE` the dealer never
+        // gets a pipe, so every send waits out its timeout.
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("tcp://{}", dead.local_addr().unwrap());
+        drop(dead);
+        let target = crate::InstanceId::new_v4();
+        let peers = Arc::new(DashMap::new());
+        peers.insert(target, endpoint);
+        let failed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let frames = 3;
+        let (tx, rx) = flume::bounded(frames);
+        for _ in 0..frames {
+            tx.send(SenderCommand::Send(OutboundTask {
+                target,
+                msg_type: MessageType::Message,
+                header: Bytes::new(),
+                payload: Bytes::new(),
+                on_error: Arc::new(CountErrors(Arc::clone(&failed))),
+            }))
+            .unwrap();
+        }
+        // Stopped before it starts, so every queued frame is part of the drain.
+        let (ready_tx, _ready) = std::sync::mpsc::sync_channel(1);
+        let started = std::time::Instant::now();
+        run_sender(SenderConfig {
+            ctx: Arc::new(zmq::Context::new()),
+            rx,
+            stop: Arc::new(AtomicBool::new(true)),
+            peers,
+            identity: b"sender".to_vec(),
+            sndhwm: 1,
+            linger_ms: 0,
+            ready_tx,
+        });
+        let took = started.elapsed();
+        assert!(
+            took < DRAIN_BUDGET + Duration::from_secs(1),
+            "draining {frames} frames to a dead peer took {took:?}"
+        );
+        assert_eq!(failed.load(Ordering::Relaxed), frames);
     }
 
     #[test]
