@@ -2646,6 +2646,75 @@ mod tests {
         );
     }
 
+    /// The event handlers send completions to the peer that asked, inline in
+    /// the handler. A handler body that keeps its context keeps the Messenger
+    /// across that send, which can wait on a peer that stopped reading. The
+    /// handler bodies pass only `ctx.payload` into their `async move` block,
+    /// and the block captures only that field, so the context, and its
+    /// Messenger, drops before the send. Touching `ctx` itself inside the
+    /// block would capture all of it; this test fails if that happens.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_event_completion_does_not_hold_the_messenger() {
+        let (messenger, peer_instance) = stalled_messenger().await;
+        let weak = Arc::downgrade(&messenger);
+        let backend = Arc::clone(messenger.backend());
+        let handlers = std::sync::Mutex::new(Vec::new());
+        crate::messenger::events::handlers::register_event_handlers(
+            |handler| {
+                handlers.lock().unwrap().push(handler);
+                Ok(())
+            },
+            Arc::clone(messenger.events()),
+        )
+        .unwrap();
+        let handlers = handlers.into_inner().unwrap();
+        let subscribe = handlers
+            .iter()
+            .find(|handler| handler.name() == "_event_subscribe")
+            .unwrap();
+        // The gate holds one frame: the first completion is admitted at once,
+        // the second waits on admission for as long as the peer stays stalled.
+        for slot in 1..=2u128 {
+            let event = messenger.event_manager().new_event().unwrap();
+            let handle = event.handle();
+            event.trigger().unwrap();
+            let payload =
+                serde_json::to_vec(&crate::messenger::events::messages::EventSubscribeMessage {
+                    handle: handle.raw(),
+                    subscriber_worker: peer_instance.worker_id().as_u64(),
+                    subscriber_instance: peer_instance,
+                })
+                .unwrap();
+            subscribe
+                .dispatcher
+                .dispatch(crate::messenger::server::HandlerContext {
+                    message_id: crate::messenger::common::responses::ResponseId::from_u128(
+                        u128::from(peer_instance.worker_id().as_u64()) | (slot << 64),
+                    ),
+                    payload: bytes::Bytes::from(payload),
+                    response_type: crate::messenger::common::messages::ResponseType::FireAndForget,
+                    headers: None,
+                    system: Arc::clone(&messenger),
+                    in_flight: None,
+                });
+        }
+        drop(handlers);
+        drop(messenger);
+        let gone = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while weak.upgrade().is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let still_alive = weak.upgrade().is_some();
+        backend.shutdown_now();
+        let _ = backend.request_teardown().await;
+        assert!(
+            gone.is_ok() && !still_alive,
+            "an event completion parked in admission kept the Messenger alive after its final drop"
+        );
+    }
+
     /// A best-effort `_stream_cancel` to a peer that never admits a frame
     /// must not keep the Messenger alive after its final drop.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
