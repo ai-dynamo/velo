@@ -1075,7 +1075,10 @@ impl AnchorManager {
     /// anchor. The slots then stay open, with no reader, until the mux drops.
     ///
     /// `Velo::graceful_shutdown` stops and joins mux sends before transport
-    /// teardown. Step 1 also makes direct calls to this method safe.
+    /// teardown. A direct call to this method is safe because slots are
+    /// retired only after the streams leave them, never by this method: step
+    /// 1 runs only when the transports are already gone, so it is not what
+    /// keeps a direct call safe.
     fn prepare_stop(&self) {
         // Remote senders hear of the end only from this node: the mux is
         // stopping, and a retained Messenger drops their batches once the mux
