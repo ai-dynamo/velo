@@ -67,7 +67,6 @@ impl MuxCore {
                     epochs: Arc::clone(&self.epochs),
                     batchers: Arc::clone(&self.batchers),
                     ingress: Arc::clone(&self.ingress),
-                    cancel: self.tasks.cancellation_token(),
                     #[cfg(test)]
                     hooks: self.hooks.get().cloned(),
                 },

@@ -2094,9 +2094,12 @@ mod tests {
                 wait_for_final_messenger_drop(&messenger, &backend).await;
             }
             // A stopped pump releases its slot; that must not reach the wire.
-            // Only arms that tear the transports down can check this: a
-            // retained Messenger keeps them up, so no send can fail there.
-            if !(drop_owner && retain_messenger) {
+            // Only explicit shutdown can check this. A retained Messenger keeps
+            // the transports up, so no send can fail; and on a final drop that
+            // also drops the Messenger, the notices to remote producers are
+            // admitted just before teardown and may fail there, by design
+            // (best effort, see the shutdown chapter).
+            if !drop_owner {
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 assert_eq!(
                     send_errors(),
@@ -2111,8 +2114,8 @@ mod tests {
         }
     }
 
-    /// Final Velo drop must tell remote producers their stream ended, whether
-    /// or not a Messenger is retained, and however the stream was opened. The
+    /// Final Velo drop with a retained Messenger must tell remote producers
+    /// their stream ended, however the stream was opened. The
     /// mux stops on drop, and a retained Messenger's mux handler drops their
     /// batches once the mux is gone, so a producer told nothing fills its
     /// window and then waits forever. An attached stream is told by
@@ -2168,14 +2171,19 @@ mod tests {
                 };
                 let retained = retain.then(|| Arc::clone(consumer.messenger()));
                 drop(consumer);
-                tokio::time::timeout(std::time::Duration::from_secs(5), token.cancelled())
-                    .await
-                    .unwrap_or_else(|_| {
-                        panic!(
-                            "{mode}, retain={retain}: the remote producer was never told \
-                             its stream ended"
-                        )
+                let told =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), token.cancelled())
+                        .await;
+                // Only with a retained Messenger is the notice certain. Without
+                // one, the Messenger's own final drop tears the transport down
+                // right after the notice is queued, and may fail it there: best
+                // effort, as the shutdown chapter says. That arm still has to
+                // drop cleanly, without a panic or a hang.
+                if retain {
+                    told.unwrap_or_else(|_| {
+                        panic!("{mode}: the remote producer was never told its stream ended")
                     });
+                }
                 drop((token, _mpsc_sender, _sender));
                 producer.shutdown(ShutdownPolicy::WaitForever).await;
                 drop(retained);

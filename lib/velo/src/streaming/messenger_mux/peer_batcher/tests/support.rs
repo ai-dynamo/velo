@@ -192,7 +192,6 @@ pub(super) async fn harness_with_hooks(
             epochs: Arc::clone(&epochs),
             batchers: Arc::clone(&batchers),
             ingress: Arc::default(),
-            cancel: cancel.clone(),
             hooks,
         },
     );
@@ -380,7 +379,6 @@ impl Harness {
                 epochs: Arc::clone(&self.epochs),
                 batchers: Arc::clone(&self.batchers),
                 ingress: Arc::default(),
-                cancel: self.cancel.clone(),
                 hooks: None,
             },
         );
@@ -486,7 +484,6 @@ pub(super) async fn stalled_harness_with_hooks(
             epochs: Arc::new(AtomicU64::new(1)),
             batchers: Arc::new(DashMap::new()),
             ingress: Arc::default(),
-            cancel: cancel.clone(),
             hooks,
         },
     );

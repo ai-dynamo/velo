@@ -283,11 +283,6 @@ pub(crate) struct BatcherContext {
     pub(crate) epochs: Arc<AtomicU64>,
     pub(crate) batchers: Arc<BatcherMap>,
     pub(crate) ingress: Arc<super::ingress::IngressRegistry>,
-    /// The run loop's own exit. The mux passes `tasks.cancellation_token()`;
-    /// a stop that lands while the loop is being polled exits here, through
-    /// `teardown(true)`, rather than by the spawn wrapper dropping the loop.
-    /// Tests pass a separate token to drive that exit on purpose.
-    pub(crate) cancel: CancellationToken,
     /// A barrier in the run loop, installed only by the tests that need to stop
     /// it mid-wake. See [`test_hooks`].
     #[cfg(test)]
@@ -320,7 +315,9 @@ pub(crate) fn spawn(key: PeerLane, ctx: BatcherContext) -> Arc<BatcherHandle> {
         epoch,
     );
     let tasks = ctx.tasks.clone();
-    let ctx_cancel = ctx.cancel.clone();
+    // The run loop's exit is its task set's own token: a stop reaches both the
+    // loop and the grace below, so the join in shutdown always returns.
+    let cancel = ctx.tasks.cancellation_token();
     let batcher = Batcher {
         tasks: ctx.tasks,
         key,
@@ -329,7 +326,7 @@ pub(crate) fn spawn(key: PeerLane, ctx: BatcherContext) -> Arc<BatcherHandle> {
         epochs: ctx.epochs,
         batchers: ctx.batchers,
         ingress: ctx.ingress,
-        cancel: ctx.cancel,
+        cancel: cancel.clone(),
         control,
         gate,
         writer,
@@ -348,7 +345,6 @@ pub(crate) fn spawn(key: PeerLane, ctx: BatcherContext) -> Arc<BatcherHandle> {
     // stream ended). The loop exits on its own cancel arm instead; the grace
     // only bounds a send to a stalled peer, so the join in shutdown stays
     // bounded.
-    let cancel = ctx_cancel;
     tasks.spawn_until_done(async move {
         let run = batcher.run(open_rx);
         tokio::pin!(run);
@@ -438,9 +434,10 @@ impl Drop for Batcher {
             if super::lifecycle::stop_mux(&self.tasks, &self.ingress, self.metrics.as_ref())
                 && !already_cancelled
             {
-                // Nothing aborts a batcher on purpose. This is a panic, which
-                // tokio reports itself, or a runtime dropped before
-                // `Velo::shutdown` ran, which is not an error of its own.
+                // Cancellation and its grace expiring are already excluded
+                // above. What is left is a panic, which tokio reports itself,
+                // or a runtime dropped before `Velo::shutdown` ran, which is
+                // not an error of its own.
                 tracing::warn!(peer = %self.key.peer, lane = %self.key.lane,
                     "messenger mux stopped: a batcher task ended without its teardown \
                      (a panic, or the runtime shut down before Velo::shutdown)");
