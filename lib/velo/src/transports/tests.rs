@@ -875,6 +875,7 @@ async fn failed_teardown_never_reports_successful_shutdown() {
         .build()
         .await
         .unwrap();
+    let mut drains = Vec::new();
     for _ in 0..2 {
         let result =
             std::panic::AssertUnwindSafe(messenger.graceful_shutdown(ShutdownPolicy::WaitForever))
@@ -882,7 +883,11 @@ async fn failed_teardown_never_reports_successful_shutdown() {
                 .await;
         assert!(result.is_err());
         assert!(!transport.closed.load(Ordering::Relaxed));
+        drains.push(transport.drain_calls.load(Ordering::Relaxed));
     }
+    // A retry fails at once: the failed teardown is final, so draining again
+    // would only spend the caller's budget.
+    assert_eq!(drains[0], drains[1], "the retry ran the drain again");
 }
 
 /// A panicking hook must not skip the hooks after it. Teardown runs once, so a
@@ -984,8 +989,16 @@ async fn velo_shutdown_retry_sees_a_failure_no_waiter_observed() {
         }
     }
     release.send(()).unwrap();
-    // The hook now panics on the teardown thread; nothing here polls the result.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The hook now panics on the teardown thread. Wait for that result without
+    // waiting on the completion, which would be a waiter observing it.
+    let backend = velo.messenger().backend().clone();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while backend.teardown_failure().is_none() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the teardown thread never finished");
     let drains = transport.drain_calls.load(Ordering::Relaxed);
     let retry = std::panic::AssertUnwindSafe(velo.graceful_shutdown(ShutdownPolicy::WaitForever))
         .catch_unwind()

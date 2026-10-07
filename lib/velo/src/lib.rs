@@ -762,8 +762,9 @@ impl Velo {
         {
             return;
         }
-        // A failed teardown is final. Running the sweep and drain again would
-        // spend their budget against torn-down transports, then panic anyway.
+        // A failed teardown is final. Running the RDMA sweep again would spend
+        // its budget against torn-down transports, then panic anyway. (The
+        // backend refuses to drain again on its own.)
         if let Some(error) = self.messenger.backend().teardown_failure() {
             panic!("transport teardown failed: {error}");
         }

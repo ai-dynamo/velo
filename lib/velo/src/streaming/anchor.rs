@@ -1084,7 +1084,7 @@ impl AnchorManager {
         let peers = self
             .messenger_lock
             .get()
-            .filter(|m| !m.backend().shutdown_state().teardown_token().is_cancelled());
+            .filter(|m| !m.backend().teardown_requested());
         let mux = self.mux.get();
         // With transports up, stop the mux only after the removals below have
         // queued their slot closes: a zero-RTT producer has no other signal,

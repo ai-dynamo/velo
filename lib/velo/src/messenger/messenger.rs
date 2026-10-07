@@ -662,7 +662,8 @@ impl Messenger {
     /// # Panics
     ///
     /// Panics if a transport's shutdown hook panicked. The other hooks still
-    /// ran, but shutdown cannot report the instance as stopped.
+    /// ran, but shutdown cannot report the instance as stopped. A later call
+    /// panics at once, without draining again.
     pub async fn graceful_shutdown(&self, policy: crate::transports::ShutdownPolicy) {
         self.backend.graceful_shutdown(policy).await;
     }

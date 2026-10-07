@@ -740,6 +740,12 @@ impl VeloBackend {
             .and_then(Result::err)
     }
 
+    /// Whether this backend has started its own teardown. Not the shared
+    /// teardown token, which an out-of-tree transport may cancel itself.
+    pub(crate) fn teardown_requested(&self) -> bool {
+        self.teardown.get().is_some()
+    }
+
     pub(crate) fn request_teardown(&self) -> teardown::Completion {
         self.shutdown_state.begin_drain();
         self.teardown
@@ -764,8 +770,14 @@ impl VeloBackend {
     /// # Panics
     ///
     /// Panics if a transport's shutdown hook panicked. The other hooks still
-    /// ran, but shutdown cannot report the instance as stopped.
+    /// ran, but shutdown cannot report the instance as stopped. A later call
+    /// panics at once, without draining again.
     pub async fn graceful_shutdown(&self, policy: ShutdownPolicy) {
+        // A failed teardown is final: draining again would only spend the
+        // caller's budget against torn-down transports.
+        if let Some(error) = self.teardown_failure() {
+            panic!("transport teardown failed: {error}");
+        }
         self.drain(policy).await;
         self.finish_shutdown().await;
     }
