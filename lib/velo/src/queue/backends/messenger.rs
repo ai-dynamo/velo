@@ -534,18 +534,22 @@ impl SenderBackend for RemoteMessengerSender {
             };
             let target = self.target;
             // Ends at teardown: the RPC waits for an answer with no deadline
-            // of its own, and final Messenger drop does not complete it.
-            let teardown = self
-                .messenger
-                .backend()
-                .shutdown_state()
-                .teardown_token()
-                .clone();
-            handle.spawn(teardown.run_until_cancelled_owned(async move {
-                if let Err(e) = builder.send_to(target).await {
-                    tracing::warn!("messenger queue try_send failed: {e}");
+            // of its own, and final Messenger drop does not complete it. The
+            // task owns a ShutdownState, one Arc increment per record. A token
+            // clone would take the token tree's mutex on clone and on drop.
+            let shutdown = self.messenger.backend().shutdown_state().clone();
+            handle.spawn(async move {
+                // Biased to the send: a reply that is ready wins over teardown.
+                tokio::select! {
+                    biased;
+                    result = builder.send_to(target) => {
+                        if let Err(e) = result {
+                            tracing::warn!("messenger queue try_send failed: {e}");
+                        }
+                    }
+                    () = shutdown.teardown_token().cancelled() => {}
                 }
-            }));
+            });
         } else {
             tracing::warn!(
                 "messenger queue try_send called without an active Tokio runtime; message will be dropped"
