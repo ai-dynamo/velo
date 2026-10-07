@@ -2557,6 +2557,49 @@ mod tests {
         );
     }
 
+    /// A typed handler that cannot decode its input still owes the caller an
+    /// error reply, and that reply can wait on admission to a peer that stopped
+    /// reading. The handler task must not hold the Messenger meanwhile.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_decode_error_reply_does_not_hold_the_messenger() {
+        let (messenger, peer_instance) = stalled_messenger().await;
+        let weak = Arc::downgrade(&messenger);
+        let backend = Arc::clone(messenger.backend());
+        let handler =
+            crate::messenger::Handler::typed_unary("typed", |_: TypedContext<u32>| Ok(0u32))
+                .build();
+        // The gate holds one frame: the first error reply is admitted at once,
+        // the second waits on admission for as long as the peer stays stalled.
+        for slot in 1..=2u128 {
+            handler
+                .dispatcher
+                .dispatch(crate::messenger::server::HandlerContext {
+                    message_id: crate::messenger::common::responses::ResponseId::from_u128(
+                        u128::from(peer_instance.worker_id().as_u64()) | (slot << 64),
+                    ),
+                    payload: bytes::Bytes::from_static(b"not json"),
+                    response_type: crate::messenger::common::messages::ResponseType::Unary,
+                    headers: None,
+                    system: Arc::clone(&messenger),
+                    in_flight: None,
+                });
+        }
+        drop(messenger);
+        let gone = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while weak.upgrade().is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let still_alive = weak.upgrade().is_some();
+        backend.shutdown_now();
+        let _ = backend.request_teardown().await;
+        assert!(
+            gone.is_ok() && !still_alive,
+            "a decode-error reply parked in admission kept the Messenger alive after its final drop"
+        );
+    }
+
     /// A best-effort `_stream_cancel` to a peer that never admits a frame
     /// must not keep the Messenger alive after its final drop.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

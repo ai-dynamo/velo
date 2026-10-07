@@ -812,6 +812,10 @@ where
             } {
                 Ok(input) => input,
                 Err(e) => {
+                    // The reply below can wait on admission to a peer that
+                    // stopped reading; holding the Messenger there would keep
+                    // its final drop, and so its teardown, from running.
+                    drop(system);
                     let error_msg = format!("Failed to deserialize input: {}", e);
                     let error_msg_len = error_msg.len();
                     if let Some(metrics) = observability.as_ref() {
