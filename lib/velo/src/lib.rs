@@ -2578,18 +2578,18 @@ mod tests {
         // The gate holds one frame: the first error reply is admitted at once,
         // the second waits on admission for as long as the peer stays stalled.
         for slot in 1..=2u128 {
-            handler
-                .dispatcher
-                .dispatch(crate::messenger::server::HandlerContext {
+            handler.dispatcher.dispatch(
+                crate::messenger::server::InboundCall {
                     message_id: crate::messenger::common::responses::ResponseId::from_u128(
                         u128::from(peer_instance.worker_id().as_u64()) | (slot << 64),
                     ),
                     payload: bytes::Bytes::from_static(b"not json"),
                     response_type: crate::messenger::common::messages::ResponseType::Unary,
                     headers: None,
-                    system: Arc::clone(&messenger),
                     in_flight: None,
-                });
+                },
+                &messenger,
+            );
         }
         drop(messenger);
         let gone = tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -2612,7 +2612,6 @@ mod tests {
     /// wait in the lane queue. Those queued messages must not hold the
     /// Messenger, or its final drop, and so its teardown, never runs.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "ordered lane holds the Messenger: each queued HandlerContext keeps a strong Arc<Messenger> while the lane waits on a stalled reply; awaiting a design ruling on the fix"]
     async fn a_stalled_ordered_lane_does_not_hold_the_messenger() {
         let (messenger, peer_instance) = stalled_messenger().await;
         let weak = Arc::downgrade(&messenger);
@@ -2624,18 +2623,18 @@ mod tests {
         // The gate holds one frame: the first reply is admitted at once, the
         // second waits on admission, and the third waits in the lane queue.
         for slot in 1..=3u128 {
-            handler
-                .dispatcher
-                .dispatch(crate::messenger::server::HandlerContext {
+            handler.dispatcher.dispatch(
+                crate::messenger::server::InboundCall {
                     message_id: crate::messenger::common::responses::ResponseId::from_u128(
                         u128::from(peer_instance.worker_id().as_u64()) | (slot << 64),
                     ),
                     payload: bytes::Bytes::from_static(b"1"),
                     response_type: crate::messenger::common::messages::ResponseType::Unary,
                     headers: None,
-                    system: Arc::clone(&messenger),
                     in_flight: None,
-                });
+                },
+                &messenger,
+            );
         }
         drop(messenger);
         let gone = tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -2692,18 +2691,18 @@ mod tests {
                     subscriber_instance: peer_instance,
                 })
                 .unwrap();
-            subscribe
-                .dispatcher
-                .dispatch(crate::messenger::server::HandlerContext {
+            subscribe.dispatcher.dispatch(
+                crate::messenger::server::InboundCall {
                     message_id: crate::messenger::common::responses::ResponseId::from_u128(
                         u128::from(peer_instance.worker_id().as_u64()) | (slot << 64),
                     ),
                     payload: bytes::Bytes::from(payload),
                     response_type: crate::messenger::common::messages::ResponseType::FireAndForget,
                     headers: None,
-                    system: Arc::clone(&messenger),
                     in_flight: None,
-                });
+                },
+                &messenger,
+            );
         }
         drop(handlers);
         drop(messenger);

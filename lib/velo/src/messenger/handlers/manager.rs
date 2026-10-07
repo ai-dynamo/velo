@@ -55,7 +55,7 @@ impl HandlerManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::messenger::server::dispatcher::HandlerContext;
+    use crate::messenger::server::dispatcher::InboundCall;
 
     struct MockDispatcher {
         name: String,
@@ -66,7 +66,7 @@ mod tests {
             &self.name
         }
 
-        fn dispatch(&self, _ctx: HandlerContext) {
+        fn dispatch(&self, _call: InboundCall, _system: &Arc<crate::Messenger>) {
             // No-op for testing
         }
     }

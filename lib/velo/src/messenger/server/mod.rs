@@ -23,7 +23,7 @@ use bytes::Bytes;
 use tokio_util::task::TaskTracker;
 
 use dispatcher::send_error_reply;
-pub(crate) use dispatcher::{DispatcherHub, HandlerContext};
+pub(crate) use dispatcher::{DispatcherHub, InboundCall};
 
 pub(crate) struct ActiveMessageServer {
     tracker: TaskTracker,
@@ -304,7 +304,6 @@ async fn create_message_handler(
                         // would keep its final drop, and teardown, from ever
                         // happening. The hub upgrades it again afterwards.
                         let backend = Arc::clone(system.backend());
-                        drop(system);
                         tokio::spawn(async move {
                             match resolver.resolve(&handle_str).await {
                                 Ok(resolved_payload) => {
@@ -313,15 +312,14 @@ async fn create_message_handler(
                                     let Some(system) = hub.system() else {
                                         return;
                                     };
-                                    let ctx = HandlerContext {
+                                    let call = InboundCall {
                                         message_id,
                                         payload: resolved_payload,
                                         response_type,
                                         headers,
-                                        system,
                                         in_flight,
                                     };
-                                    hub.dispatch_message(&handler_name, ctx);
+                                    hub.dispatch_message(&handler_name, call, &system);
                                 }
                                 Err(e) => {
                                     tracing::error!(
@@ -376,17 +374,18 @@ async fn create_message_handler(
                     }
                 }
 
-                let ctx = HandlerContext {
+                let call = InboundCall {
                     message_id: message.metadata.response_id,
                     payload: message.payload,
                     response_type: message.metadata.response_type,
                     headers: message.metadata.headers,
-                    system,
                     in_flight,
                 };
 
-                // Direct dispatch - inline, no channel hop!
-                hub.dispatch_message(&message.metadata.handler_name, ctx);
+                // Direct dispatch - inline, no channel hop! The Messenger is
+                // lent, not cloned: each dispatcher takes its own reference
+                // when it needs one.
+                hub.dispatch_message(&message.metadata.handler_name, call, system);
             }
             Err(e) => {
                 if let Some(metrics) = observability.as_ref() {
@@ -554,11 +553,12 @@ impl<T> Default for BurstRef<T> {
 
 impl<T> BurstRef<T> {
     /// A strong reference, or `None` once `upgrade` finds the value gone.
-    fn get(&mut self, upgrade: impl FnOnce() -> Option<Arc<T>>) -> Option<Arc<T>> {
+    /// Lent, so a caller that does not keep it pays no reference count.
+    fn get(&mut self, upgrade: impl FnOnce() -> Option<Arc<T>>) -> Option<&Arc<T>> {
         if self.held.is_none() {
             self.held = Some(upgrade()?);
         }
-        self.held.clone()
+        self.held.as_ref()
     }
 
     /// Count one dequeue; release the reference every [`BURST_REFRESH`].
@@ -595,7 +595,7 @@ mod tests {
         let seen = (0..=BURST_REFRESH)
             .map_while(|_| {
                 held.tick();
-                held.get(|| weak.upgrade())
+                held.get(|| weak.upgrade()).cloned()
             })
             .count();
         assert!(seen < BURST_REFRESH as usize, "held past one refresh");

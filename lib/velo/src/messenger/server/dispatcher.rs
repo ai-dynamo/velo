@@ -50,6 +50,36 @@ pub(crate) struct HandlerContext {
     pub in_flight: Option<Arc<velo_ext::InFlightGuard>>,
 }
 
+/// A decoded inbound message, before it is bound to the Messenger.
+///
+/// Dispatch takes this and a borrowed Messenger, so each dispatcher decides
+/// when to take its own reference: a spawned handler takes it at once, and an
+/// ordered lane only when it takes the message off its queue. A queued message
+/// that held the Messenger would keep its final drop, and so its transport
+/// teardown, from running while the lane waits on a reply to a stalled peer.
+pub(crate) struct InboundCall {
+    pub message_id: ResponseId,
+    pub payload: Bytes,
+    pub response_type: ResponseType,
+    pub headers: Option<std::collections::HashMap<String, String>>,
+    /// See [`HandlerContext::in_flight`].
+    pub in_flight: Option<Arc<velo_ext::InFlightGuard>>,
+}
+
+impl InboundCall {
+    /// Bind the message to the Messenger for its handler.
+    pub(crate) fn into_context(self, system: Arc<Messenger>) -> HandlerContext {
+        HandlerContext {
+            message_id: self.message_id,
+            payload: self.payload,
+            response_type: self.response_type,
+            headers: self.headers,
+            system,
+            in_flight: self.in_flight,
+        }
+    }
+}
+
 /// Base trait for active message handlers.
 pub(crate) trait ActiveMessageHandler: Send + Sync {
     /// Handle a message asynchronously
@@ -68,7 +98,7 @@ pub(crate) trait ActiveMessageDispatcher: Send + Sync {
     fn name(&self) -> &str;
 
     /// Dispatch a message to the handler (non-async, kicks off handler execution)
-    fn dispatch(&self, ctx: HandlerContext);
+    fn dispatch(&self, call: InboundCall, system: &Arc<Messenger>);
 }
 
 /// Catch both a panic in `handle()` and a panic while its future is polled.
@@ -184,8 +214,9 @@ impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for SpawnedDispa
         self.handler.name()
     }
 
-    fn dispatch(&self, ctx: HandlerContext) {
+    fn dispatch(&self, call: InboundCall, system: &Arc<Messenger>) {
         let handler = self.handler.clone();
+        let ctx = call.into_context(Arc::clone(system));
         tokio::spawn(run_handler(handler, ctx, DispatchFailure::HandlerPanic));
     }
 }
@@ -235,7 +266,7 @@ type LaneKey = Option<WorkerId>;
 
 /// A message queued on an ordering lane.
 struct LaneItem {
-    ctx: HandlerContext,
+    call: InboundCall,
     enqueued_at: Instant,
 }
 
@@ -269,7 +300,7 @@ impl<H: ActiveMessageHandler + 'static> OrderedDispatcher<H> {
         }
     }
 
-    fn lane_key(&self, ctx: &HandlerContext) -> LaneKey {
+    fn lane_key(&self, call: &InboundCall) -> LaneKey {
         match self.config.key {
             OrderingKey::Global => None,
             // The sender's worker id is bit-packed into the response id it
@@ -279,7 +310,7 @@ impl<H: ActiveMessageHandler + 'static> OrderedDispatcher<H> {
             // to 64, so a collision would merge two peers onto one lane --
             // harmless for ordering (it only over-serialises), which is why
             // this is the lane key rather than the identity handlers see.
-            OrderingKey::Sender => Some(WorkerId::from_u64(ctx.message_id.worker_id())),
+            OrderingKey::Sender => Some(WorkerId::from_u64(call.message_id.worker_id())),
         }
     }
 
@@ -293,10 +324,12 @@ impl<H: ActiveMessageHandler + 'static> OrderedDispatcher<H> {
             .and_then(|m| m.bind_ordered_dispatcher(handler_name));
 
         let consumer_metrics = metrics.clone();
+        let messenger = Arc::downgrade(system);
         let consumer = Arc::new(move |item: LaneItem| {
             let handler = handler.clone();
             let limiter = limiter.clone();
             let metrics = consumer_metrics.clone();
+            let messenger = messenger.clone();
 
             Box::pin(async move {
                 if let Some(metrics) = metrics.as_ref() {
@@ -310,7 +343,14 @@ impl<H: ActiveMessageHandler + 'static> OrderedDispatcher<H> {
                     None => None,
                 };
 
-                run_handler(handler, item.ctx, DispatchFailure::OrderedHandlerPanic).await;
+                // Upgraded only now, after the permit: a reference held while
+                // the item waited would keep the Messenger alive behind a
+                // stalled reply. Gone means the instance is being torn down,
+                // and the item, with its drain guard, drops unhandled.
+                if let Some(system) = messenger.upgrade() {
+                    let ctx = item.call.into_context(system);
+                    run_handler(handler, ctx, DispatchFailure::OrderedHandlerPanic).await;
+                }
 
                 if let Some(metrics) = metrics.as_ref() {
                     metrics.dequeued();
@@ -341,17 +381,17 @@ impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for OrderedDispa
         self.handler.name()
     }
 
-    fn dispatch(&self, ctx: HandlerContext) {
+    fn dispatch(&self, call: InboundCall, system: &Arc<Messenger>) {
         // One lazy init for both the router and the pre-labelled metrics, so
         // the hot path does no `with_label_values` lookups.
-        let bound = self.bound.get_or_init(|| self.bind(&ctx.system));
+        let bound = self.bound.get_or_init(|| self.bind(system));
         let metrics = bound.metrics.as_ref();
 
         // The rendezvous path resolves large payloads in a detached task before
         // dispatching (see `create_message_handler`), so two rendezvous
         // messages from one sender can reach us out of order. Ordered mode
         // cannot restore that; warn once so it is not silently surprising.
-        if ctx
+        if call
             .headers
             .as_ref()
             .is_some_and(|h| h.contains_key(crate::messenger::large_payload::RV_HEADER_KEY))
@@ -377,15 +417,14 @@ impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for OrderedDispa
             OverflowPolicy::Warn => None,
         };
 
-        let key = self.lane_key(&ctx);
-        let message_id = ctx.message_id;
-        let response_type = ctx.response_type;
-        let system = ctx.system.clone();
+        let key = self.lane_key(&call);
+        let message_id = call.message_id;
+        let response_type = call.response_type;
 
         match bound.router.route(
             key,
             LaneItem {
-                ctx,
+                call,
                 enqueued_at: Instant::now(),
             },
             capacity,
@@ -440,7 +479,7 @@ impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for OrderedDispa
                 // gives.
                 let backend = Arc::clone(system.backend());
                 let handler_name = self.handler.name().to_string();
-                let in_flight = shed.ctx.in_flight;
+                let in_flight = shed.call.in_flight;
                 system.tracker().clone().spawn(async move {
                     fail_fast(
                         &backend,
@@ -524,20 +563,20 @@ impl DispatcherHub {
     }
 
     /// Dispatch a message to the appropriate handler
-    pub fn dispatch_message(&self, handler_name: &str, ctx: HandlerContext) {
+    pub fn dispatch_message(&self, handler_name: &str, call: InboundCall, system: &Arc<Messenger>) {
         match self.handlers.get(handler_name) {
             Some(dispatcher) => {
-                dispatcher.dispatch(ctx);
+                dispatcher.dispatch(call, system);
             }
             None => {
-                self.handle_unknown_handler(handler_name, ctx);
+                self.handle_unknown_handler(handler_name, call, system);
             }
         }
     }
 
     /// Handle messages for unknown handlers
-    fn handle_unknown_handler(&self, handler_name: &str, ctx: HandlerContext) {
-        if let Some(metrics) = ctx.system.observability().as_ref() {
+    fn handle_unknown_handler(&self, handler_name: &str, ctx: InboundCall, system: &Messenger) {
+        if let Some(metrics) = system.observability().as_ref() {
             metrics.record_dispatch_failure(DispatchFailure::DispatchUnknownHandler);
         }
         error!(
@@ -767,19 +806,18 @@ mod tests {
                 .with_max_queue_depth(Some(1))
                 .with_overflow(crate::messenger::OverflowPolicy::Reject),
         );
-        let ctx = |n: u128| HandlerContext {
+        let call = |n: u128| InboundCall {
             message_id: ResponseId::from_u128(n),
             payload: Bytes::new(),
             response_type: ResponseType::FireAndForget,
             headers: None,
-            system: Arc::clone(&messenger),
             in_flight: None,
         };
 
-        dispatcher.dispatch(ctx(1));
+        dispatcher.dispatch(call(1), &messenger);
         let tasks = messenger.tracker().len();
         for n in 2..10 {
-            dispatcher.dispatch(ctx(n));
+            dispatcher.dispatch(call(n), &messenger);
         }
         assert_eq!(
             messenger.tracker().len(),
