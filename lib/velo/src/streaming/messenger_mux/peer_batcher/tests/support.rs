@@ -94,6 +94,8 @@ pub(super) struct Harness {
     pub(super) batches: flume::Receiver<Bytes>,
     pub(super) registry: prometheus::Registry,
     pub(super) cancel: CancellationToken,
+    /// The task set `cancel` belongs to, for a replacement batcher.
+    tasks: crate::streaming::tasks::StreamTasks,
     /// The peer registry this batcher was spawned against, so a test can put a
     /// replacement batcher for the same peer in it — the shape `on_retire`
     /// meets when a `connect()` loses the race with the sweep.
@@ -173,21 +175,23 @@ pub(super) async fn harness_with_hooks(
 
     let registry = prometheus::Registry::new();
     let metrics = Arc::new(VeloMetrics::register(&registry).expect("register metrics"));
-    let cancel = CancellationToken::new();
+    // The batcher's cancel is its task set's token, as `MuxCore::batcher`
+    // wires it, so a cancel here also reaches the task wrapper.
+    let tasks = crate::streaming::tasks::StreamTasks::default();
+    let cancel = tasks.cancellation_token();
     let key = PeerLane::new(capture.instance_id().worker_id(), LaneIndex::ZERO);
     let batchers: Arc<BatcherMap> = Arc::new(DashMap::new());
     let epochs = Arc::new(AtomicU64::new(1));
     let handle = spawn(
         key,
         BatcherContext {
-            tasks: Default::default(),
+            tasks: tasks.clone(),
             messenger: Arc::clone(&sender),
             config: config.clone(),
             metrics: Some(metrics.bind_mux()),
             epochs: Arc::clone(&epochs),
             batchers: Arc::clone(&batchers),
             ingress: Arc::default(),
-            cancel: cancel.clone(),
             hooks,
         },
     );
@@ -198,6 +202,7 @@ pub(super) async fn harness_with_hooks(
         batches,
         registry,
         cancel,
+        tasks,
         batchers,
         key,
         metrics,
@@ -367,14 +372,13 @@ impl Harness {
         let handle = spawn(
             self.key,
             BatcherContext {
-                tasks: Default::default(),
+                tasks: self.tasks.clone(),
                 messenger: Arc::clone(&self._sender),
                 config: self.config.clone(),
                 metrics: Some(self.metrics.bind_mux()),
                 epochs: Arc::clone(&self.epochs),
                 batchers: Arc::clone(&self.batchers),
                 ingress: Arc::default(),
-                cancel: self.cancel.clone(),
                 hooks: None,
             },
         );
@@ -468,18 +472,18 @@ pub(super) async fn stalled_harness_with_hooks(
 
     let registry = prometheus::Registry::new();
     let metrics = Arc::new(VeloMetrics::register(&registry).expect("register metrics"));
-    let cancel = CancellationToken::new();
+    let tasks = crate::streaming::tasks::StreamTasks::default();
+    let cancel = tasks.cancellation_token();
     let handle = spawn(
         PeerLane::new(peer_instance.worker_id(), LaneIndex::ZERO),
         BatcherContext {
-            tasks: Default::default(),
+            tasks: tasks.clone(),
             messenger: Arc::clone(&sender),
             config: config.clone(),
             metrics: Some(metrics.bind_mux()),
             epochs: Arc::new(AtomicU64::new(1)),
             batchers: Arc::new(DashMap::new()),
             ingress: Arc::default(),
-            cancel: cancel.clone(),
             hooks,
         },
     );

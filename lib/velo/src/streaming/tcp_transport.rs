@@ -212,10 +212,14 @@ impl TcpFrameTransport {
         self.bind_addr
     }
 
-    pub(crate) async fn shutdown(&self) {
+    pub(crate) fn stop(&self) {
         self.listener_cancel.cancel();
         self.tasks.stop();
         self.registry.clear();
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        self.stop();
         self.tasks.wait().await;
     }
 }

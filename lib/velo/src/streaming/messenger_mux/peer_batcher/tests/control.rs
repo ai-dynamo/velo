@@ -8,7 +8,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use dashmap::DashMap;
-use tokio_util::sync::CancellationToken;
 
 use super::super::test_hooks::TestHooks;
 use super::super::*;
@@ -404,6 +403,33 @@ async fn cancelling_the_transport_closes_every_producer_channel() {
     );
 }
 
+/// A stopping batcher sends the control it already holds, once.
+///
+/// On final Velo drop the node removes its anchors and then stops the mux.
+/// A zero-RTT producer learns that its stream ended only from the slot close
+/// those removals queue. The batcher's select is biased to the cancel, so
+/// without this a close queued just before the stop was dropped, and the
+/// producer filled its window and waited forever. Current-thread, so the
+/// batcher cannot run between the post and the cancel.
+#[tokio::test]
+async fn a_cancelled_batcher_sends_the_control_it_already_holds() {
+    let harness = harness(MuxConfig::default()).await;
+    let slot = crate::streaming::messenger_mux::protocol::SlotId::from_raw(7);
+    assert!(harness.handle.reply(&[ReplyRecord::CloseSlot {
+        slot,
+        reason: crate::streaming::messenger_mux::protocol::CloseReason::UnknownSlot,
+    }]));
+    harness.cancel.cancel();
+    let batch = harness.next_batch().await;
+    assert!(
+        batch
+            .records
+            .iter()
+            .any(|record| record.kind == RecordType::CloseSlot && record.slot == slot),
+        "the queued close never went out"
+    );
+}
+
 /// A cancelled batcher leaves the registry before it refuses a reply.
 ///
 /// `send_replies` re-resolves a refused reply through the registry and loops
@@ -411,9 +437,10 @@ async fn cancelling_the_transport_closes_every_producer_channel() {
 /// is never the registered one. The retire path holds it because the sweep
 /// removes the entry before posting `retire`. Cancellation is the other exit,
 /// and it closed the inbox first and unregistered second, so a writer refused
-/// in between resolved the same batcher again. Nothing writes after cancel
-/// today — it comes only from `MuxCore::drop` — which is exactly why the
-/// order is pinned here rather than argued from the callers.
+/// in between resolved the same batcher again. Writers do run around a
+/// cancel: final drop queues slot closes just before it stops the mux, so
+/// that the stopping batcher sends them. The order is pinned here rather than
+/// argued from the callers.
 ///
 /// The window is the few instructions between the two, so one attempt would
 /// prove little; the writer spins on a thread of its own, as `send_replies`
@@ -429,19 +456,19 @@ async fn a_cancelled_batcher_is_unregistered_before_it_refuses_a_reply() {
     let key = PeerLane::new(capture.instance_id().worker_id(), LaneIndex::ZERO);
 
     for attempt in 0..64 {
-        let cancel = CancellationToken::new();
+        let tasks = crate::streaming::tasks::StreamTasks::default();
+        let cancel = tasks.cancellation_token();
         let batchers: Arc<BatcherMap> = Arc::new(DashMap::new());
         let handle = spawn(
             key,
             BatcherContext {
-                tasks: Default::default(),
+                tasks,
                 messenger: Arc::clone(&sender),
                 config: MuxConfig::default(),
                 metrics: None,
                 epochs: Arc::new(AtomicU64::new(1)),
                 batchers: Arc::clone(&batchers),
                 ingress: Arc::default(),
-                cancel: cancel.clone(),
                 hooks: None,
             },
         );

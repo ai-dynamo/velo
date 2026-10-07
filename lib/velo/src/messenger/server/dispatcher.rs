@@ -10,10 +10,9 @@ use dashmap::DashMap;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use std::panic::AssertUnwindSafe;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Instant;
 use tokio::sync::Semaphore;
-use tokio_util::task::TaskTracker;
 use tracing::{error, trace, warn};
 use velo_ext::WorkerId;
 
@@ -51,6 +50,36 @@ pub(crate) struct HandlerContext {
     pub in_flight: Option<Arc<velo_ext::InFlightGuard>>,
 }
 
+/// A decoded inbound message, before it is bound to the Messenger.
+///
+/// Dispatch takes this and a borrowed Messenger, so each dispatcher decides
+/// when to take its own reference: a spawned handler takes it at once, and an
+/// ordered lane only when it takes the message off its queue. A queued message
+/// that held the Messenger would keep its final drop, and so its transport
+/// teardown, from running while the lane waits on a reply to a stalled peer.
+pub(crate) struct InboundCall {
+    pub message_id: ResponseId,
+    pub payload: Bytes,
+    pub response_type: ResponseType,
+    pub headers: Option<std::collections::HashMap<String, String>>,
+    /// See [`HandlerContext::in_flight`].
+    pub in_flight: Option<Arc<velo_ext::InFlightGuard>>,
+}
+
+impl InboundCall {
+    /// Bind the message to the Messenger for its handler.
+    pub(crate) fn into_context(self, system: Arc<Messenger>) -> HandlerContext {
+        HandlerContext {
+            message_id: self.message_id,
+            payload: self.payload,
+            response_type: self.response_type,
+            headers: self.headers,
+            system,
+            in_flight: self.in_flight,
+        }
+    }
+}
+
 /// Base trait for active message handlers.
 pub(crate) trait ActiveMessageHandler: Send + Sync {
     /// Handle a message asynchronously
@@ -69,26 +98,31 @@ pub(crate) trait ActiveMessageDispatcher: Send + Sync {
     fn name(&self) -> &str;
 
     /// Dispatch a message to the handler (non-async, kicks off handler execution)
-    fn dispatch(&self, ctx: HandlerContext);
+    fn dispatch(&self, call: InboundCall, system: &Arc<Messenger>);
 }
 
 /// Catch both a panic in `handle()` and a panic while its future is polled.
 /// Keep the admission guard until the error reply reaches its transport queue.
 async fn run_handler<H: ActiveMessageHandler + 'static>(
-    handler: Arc<H>,
+    handler: &H,
     ctx: HandlerContext,
     failure: DispatchFailure,
 ) {
     let message_id = ctx.message_id;
     let response_type = ctx.response_type;
-    let system = Arc::clone(&ctx.system);
+    // The backend, not the Messenger: the reply can wait on admission to a
+    // peer that stopped reading, and holding the Messenger there would keep
+    // its final drop, and so its transport teardown, from ever happening.
+    let backend = Arc::clone(ctx.system.backend());
     let in_flight = ctx.in_flight.clone();
     trace!(target: "crate::messenger::dispatcher", handler = %handler.name(), "Handler task started");
     let outcome = AssertUnwindSafe(async { handler.handle(ctx).await })
         .catch_unwind()
         .await;
     if let Err(panic) = outcome {
-        if let Some(metrics) = system.observability().as_ref() {
+        // Read from the backend only here: a clone of the metrics handle per
+        // message would cost every handler call an atomic for a panic path.
+        if let Some(metrics) = backend.observability() {
             metrics.record_dispatch_failure(failure);
         }
         let reason = panic
@@ -104,7 +138,7 @@ async fn run_handler<H: ActiveMessageHandler + 'static>(
             "Handler panicked"
         );
         fail_fast(
-            &system,
+            &backend,
             handler.name(),
             message_id,
             response_type,
@@ -121,7 +155,7 @@ async fn run_handler<H: ActiveMessageHandler + 'static>(
 /// so the caller's task tracking covers the reply; `in_flight` is held until
 /// the reply is sent.
 async fn fail_fast(
-    system: &Arc<Messenger>,
+    backend: &VeloBackend,
     handler: &str,
     message_id: ResponseId,
     response_type: ResponseType,
@@ -133,7 +167,7 @@ async fn fail_fast(
     }
     let _in_flight = in_flight;
     send_error_reply(
-        system.backend(),
+        backend,
         handler,
         message_id,
         format!("Handler failed: {reason}"),
@@ -162,17 +196,15 @@ pub(crate) async fn send_error_reply(
     }
 }
 
-/// Dispatcher implementation that spawns handlers on a task tracker.
+/// Run each handler on its own task. The context keeps its drain guard.
 pub(crate) struct SpawnedDispatcher<H: ActiveMessageHandler> {
     handler: Arc<H>,
-    task_tracker: TaskTracker,
 }
 
 impl<H: ActiveMessageHandler> SpawnedDispatcher<H> {
-    pub fn new(handler: H, task_tracker: TaskTracker) -> Self {
+    pub fn new(handler: H) -> Self {
         Self {
             handler: Arc::new(handler),
-            task_tracker,
         }
     }
 }
@@ -182,39 +214,12 @@ impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for SpawnedDispa
         self.handler.name()
     }
 
-    fn dispatch(&self, ctx: HandlerContext) {
+    fn dispatch(&self, call: InboundCall, system: &Arc<Messenger>) {
         let handler = self.handler.clone();
-        self.task_tracker
-            .spawn(run_handler(handler, ctx, DispatchFailure::HandlerPanic));
-    }
-}
-
-/// Dispatcher implementation that spawns handlers on a detached task.
-///
-/// Despite the name this does not execute on the dispatcher task; it is
-/// [`SpawnedDispatcher`] without task-tracker registration. Both modes keep
-/// the inbound guard, so graceful shutdown still waits for the invocation.
-pub(crate) struct InlineDispatcher<H: ActiveMessageHandler> {
-    handler: Arc<H>,
-}
-
-impl<H: ActiveMessageHandler> InlineDispatcher<H> {
-    pub fn new(handler: H) -> Self {
-        Self {
-            handler: Arc::new(handler),
-        }
-    }
-}
-
-impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for InlineDispatcher<H> {
-    fn name(&self) -> &str {
-        self.handler.name()
-    }
-
-    fn dispatch(&self, ctx: HandlerContext) {
-        let handler = self.handler.clone();
-
-        tokio::spawn(run_handler(handler, ctx, DispatchFailure::HandlerPanic));
+        let ctx = call.into_context(Arc::clone(system));
+        tokio::spawn(async move {
+            run_handler(&*handler, ctx, DispatchFailure::HandlerPanic).await;
+        });
     }
 }
 
@@ -261,9 +266,17 @@ struct BoundRouter {
 /// is the per-sender lane used by [`OrderingKey::Sender`].
 type LaneKey = Option<WorkerId>;
 
+/// What every item on one ordered dispatcher's lanes shares.
+struct LaneShared<H> {
+    handler: Arc<H>,
+    limiter: Option<Arc<Semaphore>>,
+    metrics: Option<OrderedMetricsHandle>,
+    messenger: Weak<Messenger>,
+}
+
 /// A message queued on an ordering lane.
 struct LaneItem {
-    ctx: HandlerContext,
+    call: InboundCall,
     enqueued_at: Instant,
 }
 
@@ -297,7 +310,7 @@ impl<H: ActiveMessageHandler + 'static> OrderedDispatcher<H> {
         }
     }
 
-    fn lane_key(&self, ctx: &HandlerContext) -> LaneKey {
+    fn lane_key(&self, call: &InboundCall) -> LaneKey {
         match self.config.key {
             OrderingKey::Global => None,
             // The sender's worker id is bit-packed into the response id it
@@ -307,40 +320,50 @@ impl<H: ActiveMessageHandler + 'static> OrderedDispatcher<H> {
             // to 64, so a collision would merge two peers onto one lane --
             // harmless for ordering (it only over-serialises), which is why
             // this is the lane key rather than the identity handlers see.
-            OrderingKey::Sender => Some(WorkerId::from_u64(ctx.message_id.worker_id())),
+            OrderingKey::Sender => Some(WorkerId::from_u64(call.message_id.worker_id())),
         }
     }
 
     fn bind(&self, system: &Arc<Messenger>) -> BoundRouter {
-        let handler = self.handler.clone();
         let handler_name = self.handler.name();
-        let limiter = self.limiter.clone();
         let metrics = system
             .observability()
             .as_ref()
             .and_then(|m| m.bind_ordered_dispatcher(handler_name));
 
-        let consumer_metrics = metrics.clone();
+        // One `Arc` for everything an item needs, so taking an item off a
+        // lane costs one reference count, not one per part.
+        let shared = Arc::new(LaneShared {
+            handler: Arc::clone(&self.handler),
+            limiter: self.limiter.clone(),
+            metrics: metrics.clone(),
+            messenger: Arc::downgrade(system),
+        });
         let consumer = Arc::new(move |item: LaneItem| {
-            let handler = handler.clone();
-            let limiter = limiter.clone();
-            let metrics = consumer_metrics.clone();
+            let shared = Arc::clone(&shared);
 
             Box::pin(async move {
-                if let Some(metrics) = metrics.as_ref() {
+                if let Some(metrics) = shared.metrics.as_ref() {
                     metrics.observe_wait(item.enqueued_at.elapsed());
                 }
 
                 // Held for the duration of the handler. Tokio's semaphore is
                 // FIFO-fair, so a busy handler cannot starve any lane.
-                let _permit = match limiter.as_ref() {
-                    Some(sem) => sem.clone().acquire_owned().await.ok(),
+                let _permit = match shared.limiter.as_ref() {
+                    Some(sem) => sem.acquire().await.ok(),
                     None => None,
                 };
 
-                run_handler(handler, item.ctx, DispatchFailure::OrderedHandlerPanic).await;
+                // Upgraded only now, after the permit: a reference held while
+                // the item waited would keep the Messenger alive behind a
+                // stalled reply. Gone means the instance is being torn down,
+                // and the item, with its drain guard, drops unhandled.
+                if let Some(system) = shared.messenger.upgrade() {
+                    let ctx = item.call.into_context(system);
+                    run_handler(&*shared.handler, ctx, DispatchFailure::OrderedHandlerPanic).await;
+                }
 
-                if let Some(metrics) = metrics.as_ref() {
+                if let Some(metrics) = shared.metrics.as_ref() {
                     metrics.dequeued();
                 }
             }) as BoxFuture<'static, ()>
@@ -369,17 +392,17 @@ impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for OrderedDispa
         self.handler.name()
     }
 
-    fn dispatch(&self, ctx: HandlerContext) {
+    fn dispatch(&self, call: InboundCall, system: &Arc<Messenger>) {
         // One lazy init for both the router and the pre-labelled metrics, so
         // the hot path does no `with_label_values` lookups.
-        let bound = self.bound.get_or_init(|| self.bind(&ctx.system));
+        let bound = self.bound.get_or_init(|| self.bind(system));
         let metrics = bound.metrics.as_ref();
 
         // The rendezvous path resolves large payloads in a detached task before
         // dispatching (see `create_message_handler`), so two rendezvous
         // messages from one sender can reach us out of order. Ordered mode
         // cannot restore that; warn once so it is not silently surprising.
-        if ctx
+        if call
             .headers
             .as_ref()
             .is_some_and(|h| h.contains_key(crate::messenger::large_payload::RV_HEADER_KEY))
@@ -405,15 +428,14 @@ impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for OrderedDispa
             OverflowPolicy::Warn => None,
         };
 
-        let key = self.lane_key(&ctx);
-        let message_id = ctx.message_id;
-        let response_type = ctx.response_type;
-        let system = ctx.system.clone();
+        let key = self.lane_key(&call);
+        let message_id = call.message_id;
+        let response_type = call.response_type;
 
         match bound.router.route(
             key,
             LaneItem {
-                ctx,
+                call,
                 enqueued_at: Instant::now(),
             },
             capacity,
@@ -464,12 +486,14 @@ impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for OrderedDispa
                 }
                 // `dispatch` is sync, so the reply needs its own task; the
                 // tracker keeps it from being untracked.
-                let system = system.clone();
+                // The backend, not the Messenger, for the reason `run_handler`
+                // gives.
+                let backend = Arc::clone(system.backend());
                 let handler_name = self.handler.name().to_string();
-                let in_flight = shed.ctx.in_flight;
+                let in_flight = shed.call.in_flight;
                 system.tracker().clone().spawn(async move {
                     fail_fast(
-                        &system,
+                        &backend,
                         &handler_name,
                         message_id,
                         response_type,
@@ -493,7 +517,7 @@ pub(crate) struct DispatcherHub {
     backend: Arc<VeloBackend>,
 
     /// Messenger system reference (late-bound via OnceLock)
-    system: OnceLock<Arc<Messenger>>,
+    system: OnceLock<Weak<Messenger>>,
 
     /// Notifies waiters when `system` has been set
     system_ready: tokio::sync::Notify,
@@ -513,15 +537,16 @@ impl DispatcherHub {
     /// Initialize the system reference (must be called exactly once before dispatching)
     pub fn set_system(&self, system: Arc<Messenger>) -> anyhow::Result<()> {
         self.system
-            .set(system)
+            .set(Arc::downgrade(&system))
             .map_err(|_| anyhow::anyhow!("System already initialized"))?;
         self.system_ready.notify_waiters();
         Ok(())
     }
 
-    /// Keep the registered messenger available for every value clone.
+    /// Upgrade the weakly held messenger. Each call is a CAS loop, so the
+    /// receive loop calls this once per burst, not per message (`BurstRef`).
     pub(crate) fn system(&self) -> Option<Arc<Messenger>> {
-        self.system.get().cloned()
+        self.system.get().and_then(Weak::upgrade)
     }
 
     /// Wait until all startup handlers have been installed.
@@ -549,20 +574,20 @@ impl DispatcherHub {
     }
 
     /// Dispatch a message to the appropriate handler
-    pub fn dispatch_message(&self, handler_name: &str, ctx: HandlerContext) {
+    pub fn dispatch_message(&self, handler_name: &str, call: InboundCall, system: &Arc<Messenger>) {
         match self.handlers.get(handler_name) {
             Some(dispatcher) => {
-                dispatcher.dispatch(ctx);
+                dispatcher.dispatch(call, system);
             }
             None => {
-                self.handle_unknown_handler(handler_name, ctx);
+                self.handle_unknown_handler(handler_name, call, system);
             }
         }
     }
 
     /// Handle messages for unknown handlers
-    fn handle_unknown_handler(&self, handler_name: &str, ctx: HandlerContext) {
-        if let Some(metrics) = ctx.system.observability().as_ref() {
+    fn handle_unknown_handler(&self, handler_name: &str, ctx: InboundCall, system: &Messenger) {
+        if let Some(metrics) = system.observability().as_ref() {
             metrics.record_dispatch_failure(DispatchFailure::DispatchUnknownHandler);
         }
         error!(
@@ -670,14 +695,25 @@ mod tests {
                 .build()
                 .unwrap(),
         );
+        let registry = prometheus::Registry::new();
+        let metrics = Arc::new(crate::observability::VeloMetrics::register(&registry).unwrap());
         let messenger = Messenger::builder()
             .add_transport(transport)
+            .metrics(metrics)
             .build()
             .await
             .unwrap();
         messenger.register_peer(messenger.peer_info()).unwrap();
+        // The panic arm reads the metrics from the backend, not the Messenger;
+        // a backend built without them would drop these counts silently.
+        let panics = |reason| {
+            crate::observability::test_helpers::MetricSnapshot::from_registry(&registry).counter(
+                "velo_messenger_dispatch_failures_total",
+                &[("stage", "dispatch"), ("reason", reason)],
+            )
+        };
 
-        for mode in ["spawn", "inline", "ordered"] {
+        for mode in ["spawn", "ordered"] {
             for during_construction in [true, false] {
                 let name = format!("_panic_{mode}_{during_construction}");
                 let handler = PanickingHandler {
@@ -685,10 +721,7 @@ mod tests {
                     during_construction,
                 };
                 let dispatcher: Arc<dyn ActiveMessageDispatcher> = match mode {
-                    "spawn" => {
-                        Arc::new(SpawnedDispatcher::new(handler, messenger.tracker().clone()))
-                    }
-                    "inline" => Arc::new(InlineDispatcher::new(handler)),
+                    "spawn" => Arc::new(SpawnedDispatcher::new(handler)),
                     _ => Arc::new(OrderedDispatcher::new(handler, OrderedConfig::global())),
                 };
                 messenger
@@ -706,6 +739,8 @@ mod tests {
                 assert!(result.unwrap_err().to_string().contains("handler panicked"));
             }
         }
+        assert_eq!(panics("handler_panic"), 2.0);
+        assert_eq!(panics("ordered_handler_panic"), 2.0);
         messenger
             .graceful_shutdown(crate::ShutdownPolicy::WaitForever)
             .await;
@@ -722,6 +757,37 @@ mod tests {
         fn name(&self) -> &str {
             "_pending"
         }
+    }
+
+    /// A handler task must not keep the Messenger alive. Its reply can wait
+    /// on admission to a peer that stopped reading, for as long as the peer
+    /// stays stopped; holding the Messenger there would keep its final drop,
+    /// and so its transport teardown, from ever happening. `PendingHandler`
+    /// drops its context and then waits forever, as such a reply does.
+    #[tokio::test]
+    async fn a_handler_task_does_not_hold_the_messenger() {
+        let messenger = Messenger::builder().build().await.unwrap();
+        let weak = Arc::downgrade(&messenger);
+        let ctx = HandlerContext {
+            message_id: ResponseId::from_u128(1),
+            payload: Bytes::new(),
+            response_type: ResponseType::Unary,
+            headers: None,
+            system: Arc::clone(&messenger),
+            in_flight: None,
+        };
+        let task = tokio::spawn(async move {
+            run_handler(&PendingHandler, ctx, DispatchFailure::HandlerPanic).await;
+        });
+        drop(messenger);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while weak.upgrade().is_some() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("a waiting handler task kept the Messenger alive");
+        task.abort();
     }
 
     /// A shed fire-and-forget message has no caller to tell, so the shed path
@@ -749,19 +815,18 @@ mod tests {
                 .with_max_queue_depth(Some(1))
                 .with_overflow(crate::messenger::OverflowPolicy::Reject),
         );
-        let ctx = |n: u128| HandlerContext {
+        let call = |n: u128| InboundCall {
             message_id: ResponseId::from_u128(n),
             payload: Bytes::new(),
             response_type: ResponseType::FireAndForget,
             headers: None,
-            system: Arc::clone(&messenger),
             in_flight: None,
         };
 
-        dispatcher.dispatch(ctx(1));
+        dispatcher.dispatch(call(1), &messenger);
         let tasks = messenger.tracker().len();
         for n in 2..10 {
-            dispatcher.dispatch(ctx(n));
+            dispatcher.dispatch(call(n), &messenger);
         }
         assert_eq!(
             messenger.tracker().len(),

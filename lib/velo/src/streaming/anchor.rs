@@ -141,7 +141,7 @@ pub(crate) struct AnchorEntry {
     /// Anchor-lifetime parent token. Created at anchor creation; cancelled only
     /// by finalize/remove/cancel. Child tokens are derived for transient tasks
     /// (reader pump or stream watchdog, timeout) so that stopping a child never
-    /// poisons the parent.
+    /// cancels the parent.
     pub cancel_token: CancellationToken,
 
     /// Child token for the currently active reader pump or, for a mux bind,
@@ -391,9 +391,8 @@ impl Drop for PreBind {
 /// responsibility for the entry.
 struct SenderIdentity {
     sender_stream_id: u64,
-    cancel_token: CancellationToken,
-    poison_tx: flume::Sender<()>,
-    stop_token: CancellationToken,
+    /// A clone of the registered entry: the same tokens and flag.
+    entry: crate::streaming::control::SenderEntry,
     registry: Arc<crate::streaming::control::SenderRegistry>,
     armed: bool,
 }
@@ -1048,30 +1047,55 @@ impl AnchorManager {
         }
     }
 
-    /// End every stream this manager holds. Called by `Velo::shutdown` after
-    /// the messenger transports are torn down.
+    /// Detach streams before retiring mux slots. Explicit shutdown calls this
+    /// after messenger teardown; final owner Drop uses it without a drain.
     ///
-    /// Two rules hold from step 1 on. Nothing is sent to a peer, because the
-    /// transports are gone. No mux slot is retired while a stream still reads
-    /// from it, because retirement injects `Dropped` that the reader would
+    /// After step 1, the mux accepts no new sends. No mux slot is retired
+    /// while a stream still reads from it, because retirement injects
+    /// `Dropped` that the reader would
     /// take as its sender's. Hence the steps:
     ///
-    /// 1. Stop the mux's tasks. A slot close after this finds no batcher and
-    ///    sends nothing. The slots stay open.
+    /// 1. Stop the mux's tasks, if the transports are already gone (explicit
+    ///    shutdown). A slot close after this finds no batcher and sends
+    ///    nothing. The slots stay open.
     /// 2. Take streams off their slots: SPSC feeds withdrawn, MPSC pumps
     ///    cancelled.
-    /// 3. Remove anchors and MPSC entries, and cancel local senders.
-    /// 4. Join the mux's tasks and retire its slots.
+    /// 3. Remove anchors and MPSC entries, and cancel their senders: local
+    ///    ones directly, remote ones by `_stream_cancel` while the messenger's
+    ///    transports are still up (final drop).
     ///
-    /// Steps 1-3 do not await. A caller that drops this future (a timeout
+    /// On final drop the caller stops the mux next, so each batcher sends the
+    /// slot closes step 3 queued before it exits; a zero-RTT producer learns
+    /// that its stream ended only from that close.
+    ///
+    /// The caller then retires mux slots, after joining tasks if it can wait.
+    ///
+    /// Steps 1-3 do not await. A caller that drops the shutdown future (a timeout
     /// around `Velo::shutdown`) still leaves no stream waiting on a slot or an
     /// anchor. The slots then stay open, with no reader, until the mux drops.
     ///
     /// `Velo::graceful_shutdown` stops and joins mux sends before transport
-    /// teardown. Step 1 also makes direct calls to this method safe.
-    pub(crate) async fn shutdown(&self) {
+    /// teardown. A direct call to this method is safe because slots are
+    /// retired only after the streams leave them, never by this method: step
+    /// 1 runs only when the transports are already gone, so it is not what
+    /// keeps a direct call safe.
+    fn prepare_stop(&self) {
+        // Remote senders hear of the end only from this node: the mux is
+        // stopping, and a retained Messenger drops their batches once the mux
+        // is gone. Without word they fill the window and wait forever. Only
+        // while the transports are up: explicit shutdown calls this after
+        // teardown, and must send nothing.
+        let peers = self
+            .messenger_lock
+            .get()
+            .filter(|m| !m.backend().teardown_requested());
         let mux = self.mux.get();
-        if let Some(mux) = mux {
+        // With transports up, the caller stops the mux after the removals
+        // below have queued their slot closes: a zero-RTT producer has no
+        // other signal, and a stopping batcher sends what is already queued.
+        if peers.is_none()
+            && let Some(mux) = mux
+        {
             mux.stop_sending();
         }
         for mut entry in self.registry.iter_mut() {
@@ -1085,9 +1109,20 @@ impl AnchorManager {
             }
         }
         // Remove entries outside shard guards: their Drop may close a mux slot.
+        // An attached sender is also told by `_stream_cancel`.
         let ids: Vec<_> = self.registry.iter().map(|entry| *entry.key()).collect();
         for id in ids {
-            self.remove_anchor(id);
+            if let Some(handle) = self
+                .remove_anchor(id)
+                .and_then(|entry| entry.stream_cancel_handle)
+            {
+                crate::streaming::control::request_sender_cancel(
+                    handle,
+                    self.worker_id,
+                    &self.sender_registry,
+                    peers,
+                );
+            }
         }
         let ids: Vec<_> = self
             .mpsc_registry
@@ -1096,6 +1131,12 @@ impl AnchorManager {
             .collect();
         for id in ids {
             if let Some((_, entry)) = self.mpsc_registry.remove(&id) {
+                crate::streaming::mpsc::anchor::cancel_all_senders(
+                    &entry,
+                    self.worker_id,
+                    &self.sender_registry,
+                    peers,
+                );
                 entry.cancel_token.cancel();
             }
         }
@@ -1108,7 +1149,18 @@ impl AnchorManager {
         for id in ids {
             self.sender_registry.cancel(id);
         }
-        if let Some(mux) = mux {
+    }
+
+    pub(crate) fn stop(&self) {
+        self.prepare_stop();
+        if let Some(mux) = self.mux.get() {
+            mux.stop();
+        }
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        self.prepare_stop();
+        if let Some(mux) = self.mux.get() {
             mux.shutdown().await;
         }
     }
@@ -1451,7 +1503,7 @@ impl AnchorManager {
                             lane_index,
                         );
                         // A child of the anchor's token, as at attach: finalize,
-                        // cancel and detach stop the watchdog without poisoning
+                        // cancel and detach stop the watchdog without cancelling
                         // the parent.
                         let pump_cancel = entry.cancel_token.child_token();
                         entry.active_pump_token = Some(pump_cancel.clone());
@@ -1766,7 +1818,7 @@ impl AnchorManager {
         ticket: &crate::streaming::control::StreamOpenTicket,
         peer: velo_ext::WorkerId,
         anchor_id: u64,
-        lifecycle: Option<(CancellationToken, CancellationToken)>,
+        lifecycle: Option<crate::streaming::control::SenderEntry>,
     ) -> Result<flume::Sender<Vec<u8>>, AttachError> {
         let key = &ticket.streaming_transport_key;
         let session_id = ticket.routing_session_id;
@@ -1914,11 +1966,14 @@ impl AnchorManager {
     /// Register all five control-plane AM handlers on a live Messenger.
     ///
     /// Registers: `_anchor_attach`, `_anchor_detach`, `_anchor_finalize`,
-    /// `_anchor_cancel` (all on `self` as `Arc<AnchorManager>`), and
+    /// `_anchor_cancel` (each holding this manager weakly), and
     /// `_stream_cancel` (on `self.sender_registry`).
     ///
-    /// Stores the messenger in `messenger_lock` (write-once) for use by
-    /// `attach_remote`.
+    /// Stores the messenger strongly in `messenger_lock` (write-once) for use
+    /// by `attach_remote`. The handlers hold this manager weakly, so the
+    /// caller must keep its own `Arc` for as long as the handlers should
+    /// serve. The manager keeps the messenger alive: drop the manager too
+    /// before expecting final Messenger drop to start teardown.
     ///
     /// # Errors
     ///
@@ -1932,19 +1987,20 @@ impl AnchorManager {
         self: &Arc<Self>,
         messenger: Arc<crate::messenger::Messenger>,
     ) -> anyhow::Result<()> {
+        // The manager holds the messenger, so its handlers must not hold the
+        // manager: that cycle would keep both alive after their owners drop.
+        let manager = Arc::downgrade(self);
         use crate::streaming::control::{
-            create_anchor_attach_handler, create_anchor_cancel_handler,
-            create_anchor_detach_handler, create_anchor_finalize_handler,
-            create_stream_cancel_handler,
+            anchor_attach_handler, anchor_cancel_handler, anchor_detach_handler,
+            anchor_finalize_handler, create_stream_cancel_handler,
         };
 
-        messenger.register_streaming_handler(create_anchor_attach_handler(Arc::clone(self)))?;
+        messenger.register_streaming_handler(anchor_attach_handler(manager.clone()))?;
         // Everything but the attaches serves a stream already open, so the
         // drain gate lets it through; an attach opens a new stream.
-        messenger.register_drain_exempt_handler(create_anchor_detach_handler(Arc::clone(self)))?;
-        messenger
-            .register_drain_exempt_handler(create_anchor_finalize_handler(Arc::clone(self)))?;
-        messenger.register_drain_exempt_handler(create_anchor_cancel_handler(Arc::clone(self)))?;
+        messenger.register_drain_exempt_handler(anchor_detach_handler(manager.clone()))?;
+        messenger.register_drain_exempt_handler(anchor_finalize_handler(manager.clone()))?;
+        messenger.register_drain_exempt_handler(anchor_cancel_handler(manager.clone()))?;
         messenger.register_drain_exempt_handler(create_stream_cancel_handler(Arc::clone(
             &self.sender_registry,
         )))?;
@@ -1958,13 +2014,13 @@ impl AnchorManager {
         // MPSC handlers — share the same SenderRegistry so `_stream_cancel`
         // covers both SPSC and MPSC senders uniformly.
         messenger.register_streaming_handler(
-            crate::streaming::mpsc::control::create_mpsc_anchor_attach_handler(Arc::clone(self)),
+            crate::streaming::mpsc::control::mpsc_anchor_attach_handler(manager.clone()),
         )?;
         messenger.register_drain_exempt_handler(
-            crate::streaming::mpsc::control::create_mpsc_anchor_detach_handler(Arc::clone(self)),
+            crate::streaming::mpsc::control::mpsc_anchor_detach_handler(manager.clone()),
         )?;
         messenger.register_drain_exempt_handler(
-            crate::streaming::mpsc::control::create_mpsc_anchor_cancel_handler(Arc::clone(self)),
+            crate::streaming::mpsc::control::mpsc_anchor_cancel_handler(manager),
         )?;
 
         self.messenger_lock
@@ -2174,23 +2230,19 @@ impl AnchorManager {
 
     /// Allocate the sender-side identity one stream is opened under.
     fn new_sender_identity(&self) -> SenderIdentity {
-        let (poison_tx, poison_rx) = flume::bounded::<()>(1);
         let sender_stream_id = self.next_sender_stream_id.fetch_add(1, Ordering::Relaxed) + 1;
         let cancel_token = CancellationToken::new();
-        let stop_token = cancel_token.child_token();
-        self.sender_registry.senders.insert(
-            sender_stream_id,
-            crate::streaming::control::SenderEntry {
-                cancel_token: cancel_token.clone(),
-                stop_token: stop_token.clone(),
-                rx_closer: std::sync::Mutex::new(Some(poison_rx)),
-            },
-        );
+        let entry = crate::streaming::control::SenderEntry {
+            stop_token: cancel_token.child_token(),
+            cancel_token,
+            closed: Default::default(),
+        };
+        self.sender_registry
+            .senders
+            .insert(sender_stream_id, entry.clone());
         SenderIdentity {
             sender_stream_id,
-            cancel_token,
-            stop_token,
-            poison_tx,
+            entry,
             registry: self.sender_registry.clone(),
             armed: true,
         }
@@ -2219,7 +2271,7 @@ impl AnchorManager {
                 ticket,
                 handle_worker_id,
                 local_id,
-                Some((identity.cancel_token.clone(), identity.stop_token.clone())),
+                Some(identity.entry.clone()),
             )
             .await
         {
@@ -2236,8 +2288,7 @@ impl AnchorManager {
         };
 
         let sender_stream_id = identity.sender_stream_id;
-        let cancel_token = identity.cancel_token.clone();
-        let poison_tx = identity.poison_tx.clone();
+        let cancel_token = identity.entry.cancel_token.clone();
         identity.armed = false;
 
         // Build StreamSender: frame_tx from the transport (not a local registry
@@ -2250,7 +2301,7 @@ impl AnchorManager {
                 cancel_token,
                 sender_stream_id,
                 sender_registry: self.sender_registry.clone(),
-                poison_tx,
+                closed: identity.entry.closed.clone(),
             },
             Duration::from_millis(ticket.heartbeat_interval_ms),
             self.metrics.clone(),
@@ -2430,12 +2481,12 @@ impl AnchorManager {
                     let sender_stream_id =
                         self.next_sender_stream_id.fetch_add(1, Ordering::Relaxed) + 1;
                     let cancel_token = tokio_util::sync::CancellationToken::new();
-                    let (poison_tx, poison_rx) = flume::bounded::<()>(1);
 
+                    let closed = crate::streaming::control::SenderClosed::default();
                     let sender_entry = crate::streaming::control::SenderEntry {
                         stop_token: cancel_token.child_token(),
                         cancel_token: cancel_token.clone(),
-                        rx_closer: std::sync::Mutex::new(Some(poison_rx)),
+                        closed: closed.clone(),
                     };
                     if entry.stop_requested {
                         sender_entry.stop_token.cancel();
@@ -2460,7 +2511,7 @@ impl AnchorManager {
                             cancel_token,
                             sender_stream_id,
                             sender_registry: self.sender_registry.clone(),
-                            poison_tx,
+                            closed,
                         },
                         heartbeat_interval,
                         self.metrics.clone(),
@@ -2640,10 +2691,10 @@ impl AnchorManager {
             handle,
             self.mpsc_registry.clone(),
             crate::streaming::sender::StreamSenderCancelInfo {
-                cancel_token: identity.cancel_token.clone(),
+                cancel_token: identity.entry.cancel_token.clone(),
                 sender_stream_id: identity.sender_stream_id,
                 sender_registry: self.sender_registry.clone(),
-                poison_tx: identity.poison_tx.clone(),
+                closed: identity.entry.closed.clone(),
             },
             heartbeat_interval,
             self.metrics.clone(),
@@ -2733,7 +2784,7 @@ impl AnchorManager {
                         },
                         handle_worker_id,
                         local_id,
-                        Some((identity.cancel_token.clone(), identity.stop_token.clone())),
+                        Some(identity.entry.clone()),
                     )
                     .await?;
 
@@ -2744,10 +2795,10 @@ impl AnchorManager {
                     handle,
                     self.mpsc_registry.clone(),
                     crate::streaming::sender::StreamSenderCancelInfo {
-                        cancel_token: identity.cancel_token.clone(),
+                        cancel_token: identity.entry.cancel_token.clone(),
                         sender_stream_id,
                         sender_registry: self.sender_registry.clone(),
-                        poison_tx: identity.poison_tx.clone(),
+                        closed: identity.entry.closed.clone(),
                     },
                     Duration::from_millis(heartbeat_interval_ms),
                     self.metrics.clone(),

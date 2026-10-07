@@ -19,6 +19,7 @@ pub(crate) mod server;
 pub mod discovery;
 pub mod events;
 
+pub(crate) use client::ActiveMessageClient;
 pub use client::builders::{
     Admitted, AmSendBuilder, AmSyncBuilder, FireResult, SyncResult, TypedUnaryBuilder,
     TypedUnaryResult, UnaryBuilder, UnaryResult,
@@ -27,8 +28,8 @@ pub use common::MessageId;
 pub use discovery::PeerDiscovery;
 pub use events::VeloEvents;
 pub use handlers::{
-    AmHandlerBuilder, AsyncExecutor, Context, DispatchMode, Handler, HandlerExecutor,
-    OrderedConfig, OrderingKey, OverflowPolicy, SyncExecutor, TypedContext,
-    TypedUnaryHandlerBuilder, UnaryHandlerBuilder, UnifiedResponse,
+    AmHandlerBuilder, AsyncExecutor, Context, Handler, HandlerExecutor, OrderedConfig, OrderingKey,
+    OverflowPolicy, SyncExecutor, TypedContext, TypedUnaryHandlerBuilder, UnaryHandlerBuilder,
+    UnifiedResponse,
 };
 pub use messenger::{Messenger, MessengerBuilder};

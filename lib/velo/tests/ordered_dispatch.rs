@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Integration tests for `DispatchMode::Ordered`.
+//! Integration tests for ordered handler dispatch.
 //!
 //! The guarantee under test is that messages from one sending instance reach
 //! the handler in the order that instance sent them, while messages from

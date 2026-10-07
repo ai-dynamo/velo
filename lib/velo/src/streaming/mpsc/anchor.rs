@@ -27,7 +27,7 @@ use super::types::SenderId;
 /// One attached sender's tracking state inside an [`MpscAnchorEntry`].
 pub(crate) struct MpscSenderSlot {
     /// Child of `MpscAnchorEntry::cancel_token`. `Some` for remote senders
-    /// (used to stop the per-sender reader pump without poisoning the parent);
+    /// (used to stop the per-sender reader pump without cancelling the parent);
     /// `None` for local senders (no pump).
     pub pump_token: Option<CancellationToken>,
     /// The sender's `StreamCancelHandle` — used by
@@ -42,7 +42,7 @@ pub(crate) struct MpscSenderSlot {
 /// Lives in `Arc<DashMap<u64, MpscAnchorEntry>>`. Every mutation of
 /// `senders` runs under the DashMap shard lock and must not be held across an
 /// `.await` point — follow the bind-then-lock precedent in
-/// [`crate::streaming::control::create_anchor_attach_handler`].
+/// the `_anchor_attach` handler.
 #[allow(dead_code)] // `max_senders` / `heartbeat_interval` accessed via direct field read in attach paths
 pub(crate) struct MpscAnchorEntry {
     /// Shared `(sender_id, bytes)` delivery channel. Every attached sender
@@ -85,7 +85,7 @@ struct MpscStreamControllerInner {
 /// Cloneable cancel handle for an [`MpscStreamAnchor`].
 ///
 /// Unlike [`crate::StreamController`] (single-sender), this iterates every
-/// attached sender and poisons/cancels each in turn. Idempotent: the first
+/// attached sender and cancels each in turn. Idempotent: the first
 /// caller wins via [`AtomicBool::compare_exchange`]; subsequent calls return
 /// immediately.
 #[derive(Clone)]
@@ -96,7 +96,7 @@ pub struct MpscStreamController {
 impl MpscStreamController {
     /// Close the anchor. Removes it from the MPSC registry, cancels every
     /// attached sender (same-worker via [`crate::streaming::control::SenderRegistry`]
-    /// poisoning, cross-worker via fire-and-forget `_stream_cancel` AM), and
+    /// cancellation, cross-worker via fire-and-forget `_stream_cancel` AM), and
     /// cancels the anchor's parent [`CancellationToken`] (which in turn
     /// cancels every remote pump).
     pub fn cancel(&self) {
@@ -270,7 +270,7 @@ impl<T: DeserializeOwned> Stream for MpscStreamAnchor<T> {
 ///
 /// For each slot:
 /// 1. Cancel the pump_token (remote senders — stops the per-sender reader pump).
-/// 2. Poison same-worker senders via [`crate::streaming::control::SenderRegistry`].
+/// 2. Cancel same-worker senders via [`crate::streaming::control::SenderRegistry`].
 /// 3. Fire-and-forget `_stream_cancel` AM for cross-worker senders.
 ///
 /// Shared by [`MpscStreamController::cancel`] and the `_mpsc_anchor_cancel`

@@ -23,7 +23,7 @@ use bytes::Bytes;
 use tokio_util::task::TaskTracker;
 
 use dispatcher::send_error_reply;
-pub(crate) use dispatcher::{DispatcherHub, HandlerContext};
+pub(crate) use dispatcher::{DispatcherHub, InboundCall};
 
 pub(crate) struct ActiveMessageServer {
     tracker: TaskTracker,
@@ -116,7 +116,8 @@ async fn create_message_handler(
     // queued). Under `Timeout` it is what stops leftover queued work from
     // dispatching into an instance that has already declared itself dead.
     //
-    // It is not the only caller: the TCP, UDS, QUIC, gRPC, and UCX
+    // It is not the only caller: the final `Messenger` drop cancels it too
+    // (`shutdown_now`, no drain), and so do the TCP, UDS, QUIC, gRPC, and UCX
     // `Transport::shutdown` impls cancel this same shared token (ZMQ, NATS,
     // and the simulation transport tear down only their own private
     // machinery), so a direct `shutdown()` on one of those five on a live
@@ -186,14 +187,30 @@ async fn create_message_handler(
         .as_ref()
         .map(|metrics| metrics.bind_inbound_dequeued());
 
+    let mut held = BurstRef::default();
+
     loop {
-        let inbound = tokio::select! {
-            biased;
-            received = message_rx.recv_async() => match received {
-                Ok(inbound) => inbound,
-                Err(_) => break,
-            },
-            _ = teardown_fut.as_mut() => break,
+        let inbound = {
+            // One queue poll per message, as with a plain `recv_async`. The
+            // held reference is released inside that poll when it would park,
+            // so this task never parks holding the Messenger, and a busy queue
+            // pays no extra lock for a separate `try_recv` first.
+            let mut recv = std::pin::pin!(message_rx.recv_async());
+            let recv_or_release = std::future::poll_fn(|cx| {
+                let poll = recv.as_mut().poll(cx);
+                if poll.is_pending() {
+                    held.release();
+                }
+                poll
+            });
+            tokio::select! {
+                biased;
+                received = recv_or_release => match received {
+                    Ok(inbound) => inbound,
+                    Err(_) => break,
+                },
+                _ = teardown_fut.as_mut() => break,
+            }
         };
 
         if teardown.is_cancelled() {
@@ -228,6 +245,7 @@ async fn create_message_handler(
         if let Some(dequeued) = &inbound_dequeued {
             dequeued.inc();
         }
+        held.tick();
 
         // The guard was acquired by the transport at admission
         // (`TransportAdapter::admit_message`) and travelled with the frame, so
@@ -246,7 +264,7 @@ async fn create_message_handler(
 
         match decode_active_message(header, payload) {
             Ok(message) => {
-                let Some(system) = hub.system() else {
+                let Some(system) = held.get(|| hub.system()) else {
                     break;
                 };
                 #[cfg(feature = "distributed-tracing")]
@@ -289,40 +307,21 @@ async fn create_message_handler(
                         let message_id = message.metadata.response_id;
                         let response_type = message.metadata.response_type;
                         let headers = message.metadata.headers.clone();
-                        tokio::spawn(async move {
-                            match resolver.resolve(&handle_str).await {
-                                Ok(resolved_payload) => {
-                                    let ctx = HandlerContext {
-                                        message_id,
-                                        payload: resolved_payload,
-                                        response_type,
-                                        headers,
-                                        system,
-                                        in_flight,
-                                    };
-                                    hub.dispatch_message(&handler_name, ctx);
-                                }
-                                Err(e) => {
-                                    tracing::error!(
-                                        target: "crate::messenger::server",
-                                        handler = %handler_name,
-                                        "Failed to resolve large payload: {e}"
-                                    );
-                                    if matches!(
-                                        response_type,
-                                        crate::messenger::common::messages::ResponseType::AckNack
-                                            | crate::messenger::common::messages::ResponseType::Unary
-                                    ) {
-                                        send_error_reply(
-                                            system.backend(),
-                                            &handler_name,
-                                            message_id,
-                                            format!("Failed to resolve large payload: {e}"),
-                                        )
-                                        .await;
-                                    }
-                                }
-                            }
+                        // The resolve waits on the payload's owner, so the
+                        // task must not hold the Messenger across it: that
+                        // would keep its final drop, and teardown, from ever
+                        // happening. The hub upgrades it again afterwards.
+                        let backend = Arc::clone(system.backend());
+                        spawn_resolve(ResolveJob {
+                            resolver,
+                            hub,
+                            handler_name,
+                            message_id,
+                            response_type,
+                            headers,
+                            handle_str,
+                            in_flight,
+                            backend,
                         });
                         continue;
                     } else {
@@ -355,17 +354,18 @@ async fn create_message_handler(
                     }
                 }
 
-                let ctx = HandlerContext {
+                let call = InboundCall {
                     message_id: message.metadata.response_id,
                     payload: message.payload,
                     response_type: message.metadata.response_type,
                     headers: message.metadata.headers,
-                    system,
                     in_flight,
                 };
 
-                // Direct dispatch - inline, no channel hop!
-                hub.dispatch_message(&message.metadata.handler_name, ctx);
+                // Direct dispatch - inline, no channel hop! The Messenger is
+                // lent, not cloned: each dispatcher takes its own reference
+                // when it needs one.
+                hub.dispatch_message(&message.metadata.handler_name, call, system);
             }
             Err(e) => {
                 if let Some(metrics) = observability.as_ref() {
@@ -376,9 +376,11 @@ async fn create_message_handler(
         }
     }
 
-    // Teardown reached with work still on the queue — only possible under
-    // `ShutdownPolicy::Timeout`, since `WaitForever` cannot cancel the token
-    // until the queue is empty. Abandoning those messages is what the timeout
+    // Teardown reached with work still on the queue. Three paths get here:
+    // `ShutdownPolicy::Timeout` (`WaitForever` cannot cancel the token until
+    // the queue is empty), the final `Messenger` drop (`shutdown_now` cancels
+    // the token with no drain), and the `break` above when the hub's
+    // `Messenger` upgrade fails. Abandoning those messages is what the timeout
     // buys; abandoning their in-flight guards is not. flume frees a buffered
     // item only once *both* ends of the channel are gone, and every transport
     // holds a sender clone for the instance's lifetime, so guards left parked
@@ -404,6 +406,91 @@ async fn create_message_handler(
     }
 
     Ok(())
+}
+
+/// A message whose payload must be pulled from its owner before dispatch.
+struct ResolveJob {
+    resolver: Arc<dyn crate::messenger::large_payload::LargePayloadResolver>,
+    hub: Arc<DispatcherHub>,
+    handler_name: String,
+    message_id: crate::messenger::common::responses::ResponseId,
+    response_type: crate::messenger::common::messages::ResponseType,
+    headers: Option<std::collections::HashMap<String, String>>,
+    handle_str: String,
+    in_flight: Option<Arc<velo_ext::InFlightGuard>>,
+    backend: Arc<VeloBackend>,
+}
+
+/// Resolve a large payload off the receive loop, then dispatch it.
+///
+/// Ends at teardown. The pull waits on the payload's owner with no deadline
+/// of its own, and final Messenger drop does not complete a response wait,
+/// so a task that outlived teardown would keep the backend, the resolver,
+/// and the message's drain guard for the life of the process.
+fn spawn_resolve(job: ResolveJob) -> tokio::task::JoinHandle<()> {
+    // The task borrows the teardown token through the backend it already
+    // holds. A token clone would take the token tree's mutex on clone and
+    // on drop, once per message.
+    let backend = Arc::clone(&job.backend);
+    tokio::spawn(async move {
+        // Biased to the resolve: a payload that is ready wins over teardown.
+        tokio::select! {
+            biased;
+            () = resolve_and_dispatch(job) => {}
+            () = backend.shutdown_state().teardown_token().cancelled() => {}
+        }
+    })
+}
+
+async fn resolve_and_dispatch(job: ResolveJob) {
+    let ResolveJob {
+        resolver,
+        hub,
+        handler_name,
+        message_id,
+        response_type,
+        headers,
+        handle_str,
+        in_flight,
+        backend,
+    } = job;
+    match resolver.resolve(&handle_str).await {
+        Ok(resolved_payload) => {
+            // Gone: the instance is being torn down,
+            // and the message dies with its guard.
+            let Some(system) = hub.system() else {
+                return;
+            };
+            let call = InboundCall {
+                message_id,
+                payload: resolved_payload,
+                response_type,
+                headers,
+                in_flight,
+            };
+            hub.dispatch_message(&handler_name, call, &system);
+        }
+        Err(e) => {
+            tracing::error!(
+                target: "crate::messenger::server",
+                handler = %handler_name,
+                "Failed to resolve large payload: {e}"
+            );
+            if matches!(
+                response_type,
+                crate::messenger::common::messages::ResponseType::AckNack
+                    | crate::messenger::common::messages::ResponseType::Unary
+            ) {
+                send_error_reply(
+                    &backend,
+                    &handler_name,
+                    message_id,
+                    format!("Failed to resolve large payload: {e}"),
+                )
+                .await;
+            }
+        }
+    }
 }
 
 /// Creates a task that handles responses from the response channel.
@@ -497,11 +584,150 @@ async fn create_ack_and_event_handler(
     Ok(())
 }
 
+/// A strong reference to a weakly held value, kept across a burst of work.
+///
+/// The hub holds the messenger weakly, so its final drop can start teardown.
+/// Upgrading per message costs a CAS loop on a count that handler tasks on
+/// other threads keep moving: measured 2-4x a clone under contention. So the
+/// receive loop upgrades once per burst and clones per message, as a strong
+/// reference would. When the queue drains to one message per park, each park
+/// costs a drop, an upgrade, and a clone where a strong reference cost one
+/// clone; the park and wake cost far more. The release rides on the queue
+/// poll that would park, so a message that is already queued costs no extra
+/// queue access.
+///
+/// Two bounds keep the held reference from extending the value's life: the
+/// loop calls [`release`](Self::release) before it parks, and releases again
+/// every [`BURST_REFRESH`] dequeues ([`tick`](Self::tick)). Without the
+/// second, a peer that keeps the queue from ever draining would keep the
+/// messenger alive after its owner dropped it, and teardown would never
+/// start. The bound counts dequeues, not uses, so frames that fail to decode
+/// count too.
+struct BurstRef<T> {
+    held: Option<Arc<T>>,
+    dequeues: u32,
+}
+
+/// Re-upgrade after this many messages. Adds well under 1 ns per message.
+const BURST_REFRESH: u32 = 128;
+
+impl<T> Default for BurstRef<T> {
+    fn default() -> Self {
+        Self {
+            held: None,
+            dequeues: 0,
+        }
+    }
+}
+
+impl<T> BurstRef<T> {
+    /// A strong reference, or `None` once `upgrade` finds the value gone.
+    /// Lent, so a caller that does not keep it pays no reference count.
+    fn get(&mut self, upgrade: impl FnOnce() -> Option<Arc<T>>) -> Option<&Arc<T>> {
+        if self.held.is_none() {
+            self.held = Some(upgrade()?);
+        }
+        self.held.as_ref()
+    }
+
+    /// Count one dequeue; release the reference every [`BURST_REFRESH`].
+    fn tick(&mut self) {
+        self.dequeues += 1;
+        if self.dequeues > BURST_REFRESH {
+            self.release();
+        }
+    }
+
+    fn release(&mut self) {
+        self.held = None;
+        self.dequeues = 0;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::messenger::common::events::{EventType, Outcome, encode_event_header};
     use tokio::time::{Duration, timeout};
+
+    /// A resolver that waits forever, as a pull from an owner that stopped
+    /// answering does: final Messenger drop does not complete a response
+    /// wait.
+    struct NeverResolves;
+    impl crate::messenger::large_payload::LargePayloadResolver for NeverResolves {
+        fn resolve(&self, _: &str) -> futures::future::BoxFuture<'_, anyhow::Result<Bytes>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// The resolver task must end at teardown. It holds the backend, the
+    /// resolver, and the message's drain guard, and its pull waits on the
+    /// payload's owner with no deadline of its own, so a task that outlived
+    /// teardown would keep them for the life of the process.
+    #[tokio::test]
+    async fn a_waiting_resolve_ends_at_teardown() {
+        let messenger = crate::Messenger::builder().build().await.unwrap();
+        let backend = Arc::clone(messenger.backend());
+        let resolver: Arc<dyn crate::messenger::large_payload::LargePayloadResolver> =
+            Arc::new(NeverResolves);
+        let resolver_alive = Arc::downgrade(&resolver);
+        let task = spawn_resolve(ResolveJob {
+            resolver,
+            hub: Arc::new(DispatcherHub::new(Arc::clone(&backend))),
+            handler_name: "large".to_string(),
+            message_id: crate::messenger::common::responses::ResponseId::from_u128(1),
+            response_type: crate::messenger::common::messages::ResponseType::Unary,
+            headers: None,
+            handle_str: "1".to_string(),
+            in_flight: None,
+            backend: Arc::clone(&backend),
+        });
+        tokio::task::yield_now().await;
+        backend.shutdown_state().teardown_token().cancel();
+        timeout(Duration::from_secs(2), task)
+            .await
+            .expect("a resolve waiting on its owner outlived teardown")
+            .unwrap();
+        assert!(resolver_alive.upgrade().is_none());
+        drop(messenger);
+    }
+
+    /// A queue that never drains must not keep the messenger alive: once its
+    /// owner drops it, the loop must see it gone within one refresh, so that
+    /// final drop starts teardown even under a flood.
+    #[test]
+    fn a_burst_that_never_ends_still_releases_the_value() {
+        let owner = Arc::new(7u32);
+        let weak = Arc::downgrade(&owner);
+        let mut held = BurstRef::default();
+        held.tick();
+        assert!(held.get(|| weak.upgrade()).is_some());
+        drop(owner);
+        let seen = (0..=BURST_REFRESH)
+            .map_while(|_| {
+                held.tick();
+                held.get(|| weak.upgrade()).cloned()
+            })
+            .count();
+        assert!(seen < BURST_REFRESH as usize, "held past one refresh");
+        assert!(weak.upgrade().is_none());
+    }
+
+    /// The bound counts dequeues, not uses: a flood of frames that fail to
+    /// decode never asks for the messenger, and must still let it go.
+    #[test]
+    fn dequeues_that_never_use_the_value_still_release_it() {
+        let owner = Arc::new(7u32);
+        let weak = Arc::downgrade(&owner);
+        let mut held = BurstRef::default();
+        held.tick();
+        assert!(held.get(|| weak.upgrade()).is_some());
+        drop(owner);
+        for _ in 0..=BURST_REFRESH {
+            held.tick();
+        }
+        assert!(weak.upgrade().is_none(), "held past one refresh");
+    }
 
     #[tokio::test]
     async fn ack_ok_completes_response() -> anyhow::Result<()> {

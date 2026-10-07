@@ -62,7 +62,6 @@ Handler names that start with `_` are reserved for system handlers.
 | Mode | Behavior |
 |---|---|
 | `.spawn()` (default) | One task for each message. Two messages from one peer can run in either order. |
-| `.inline()` | One task for each message, not registered with the task tracker of the messenger |
 | `.ordered()` | One lane for each sending instance. A lane handles its messages in arrival order. Different senders run in parallel. |
 | `.ordered_global()` | One lane for all senders. This gives total order and no parallelism. |
 | `.ordered_with(OrderedConfig)` | Ordered dispatch with an explicit configuration |

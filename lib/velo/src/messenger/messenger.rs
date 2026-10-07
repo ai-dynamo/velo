@@ -19,8 +19,7 @@ use crate::messenger::client::builders::MessageBuilder;
 use crate::messenger::handlers::{Handler, HandlerManager};
 use crate::messenger::server::ActiveMessageServer;
 
-/// The core active messaging system.
-#[derive(Clone)]
+/// The core active messaging system. Clone its [`Arc`] to share one instance.
 pub struct Messenger {
     instance_id: InstanceId,
     backend: Arc<VeloBackend>,
@@ -38,6 +37,13 @@ pub struct Messenger {
     /// Names of the handlers the drain gate lets through. See
     /// [`register_drain_exempt_handler`](Self::register_drain_exempt_handler).
     drain_exempt: DrainExemptNames,
+}
+
+impl Drop for Messenger {
+    fn drop(&mut self) {
+        // Request cleanup; the owned worker runs transport hooks and native joins.
+        self.backend.shutdown_now();
+    }
 }
 
 /// Handler names the drain gate lets through. A std lock rather than a
@@ -283,6 +289,13 @@ impl Messenger {
     /// Convenience: create an EventManager wired with the distributed backend.
     pub fn event_manager(&self) -> crate::events::EventManager {
         self.events.event_manager()
+    }
+
+    /// The client every request builder sends through. It owns the backend
+    /// but not the Messenger, so an internal task that must wait on a peer
+    /// holds this rather than the Messenger, whose final drop starts teardown.
+    pub(crate) fn client(&self) -> &Arc<ActiveMessageClient> {
+        &self.client
     }
 
     /// Fire-and-forget builder (no response expected).
@@ -589,7 +602,7 @@ impl Messenger {
         &self.runtime
     }
 
-    /// Track receive loops, tracked handlers, and application tasks.
+    /// Track receive loops, ordering lanes, and application tasks.
     ///
     /// `close` allows `wait` to finish once all tracked tasks exit; it does not
     /// cancel them. Ensure application tasks and idle ordering lanes can exit
@@ -652,12 +665,14 @@ impl Messenger {
     /// finishes in the background after this call has returned. Sequence
     /// anything a handler touches accordingly. Both are the price of bounding
     /// shutdown.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a transport's shutdown hook panicked. The other hooks still
+    /// ran, but shutdown cannot report the instance as stopped. A later call
+    /// panics at once, without draining again.
     pub async fn graceful_shutdown(&self, policy: crate::transports::ShutdownPolicy) {
         self.backend.graceful_shutdown(policy).await;
-    }
-
-    pub(crate) fn abort_startup(&self) {
-        self.backend.shutdown_now();
     }
 
     pub(crate) async fn closed(&self) {

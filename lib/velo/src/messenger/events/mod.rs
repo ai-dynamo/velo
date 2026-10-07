@@ -16,10 +16,10 @@ use anyhow::{Result, anyhow, bail};
 use bytes::Bytes;
 use dashmap::DashMap;
 use lru::LruCache;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use serde::Serialize;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use tokio_util::task::TaskTracker;
 use tracing::warn;
 
@@ -53,12 +53,20 @@ pub struct VeloEvents {
     system_id: u64,
     instance_id: InstanceId,
     backend: Arc<VeloBackend>,
-    messenger: RwLock<Option<Arc<Messenger>>>,
+    messenger: std::sync::OnceLock<Weak<Messenger>>,
     remote_events: DashMap<RemoteEventKey, Arc<RemoteEvent>>,
     completed_cache: Arc<Mutex<LruCache<RemoteEventKey, CompletedEventInfo>>>,
     owner_subscribers: DashMap<RemoteEventKey, DashMap<InstanceId, u32>>,
     response_manager: ResponseManager,
     tasks: TaskTracker,
+}
+
+/// The teardown watcher holds a weak reference, so after final Messenger drop
+/// the last strong holder can go before the watcher runs.
+impl Drop for VeloEvents {
+    fn drop(&mut self) {
+        self.fail_remote_waits();
+    }
 }
 
 impl VeloEvents {
@@ -100,7 +108,7 @@ impl VeloEvents {
             system_id,
             instance_id,
             backend,
-            messenger: RwLock::new(None),
+            messenger: std::sync::OnceLock::new(),
             remote_events: DashMap::new(),
             completed_cache: Arc::new(Mutex::new(LruCache::new(
                 NonZeroUsize::new(DEFAULT_COMPLETED_CACHE_SIZE).unwrap(),
@@ -114,12 +122,17 @@ impl VeloEvents {
         events.tasks.spawn(async move {
             teardown.cancelled().await;
             if let Some(events) = weak.upgrade() {
-                for event in &events.remote_events {
-                    event.value().cancel();
-                }
+                events.fail_remote_waits();
             }
         });
         events
+    }
+
+    /// Remote waiters hold only their proxy event, so nothing else ends them.
+    fn fail_remote_waits(&self) {
+        for event in &self.remote_events {
+            event.value().cancel();
+        }
     }
 
     fn spawn(&self, future: impl std::future::Future<Output = ()> + Send + 'static) {
@@ -185,8 +198,19 @@ impl VeloEvents {
         self.event_manager().new_event()
     }
 
+    /// Set once, when the messenger is built. A `OnceLock`, not a lock: every
+    /// remote event operation reads it.
     pub(crate) fn set_messenger(&self, messenger: Arc<Messenger>) {
-        *self.messenger.write() = Some(messenger);
+        let installed = self.messenger.set(Arc::downgrade(&messenger)).is_ok();
+        debug_assert!(installed, "set_messenger called twice");
+    }
+
+    /// Borrow the owner only for synchronous setup, never across a network wait.
+    fn messenger(&self) -> Result<Arc<Messenger>> {
+        self.messenger
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or_else(|| anyhow!("Event messenger is unavailable"))
     }
 
     // ── Fire-and-forget remote operations (for EventBackend trait) ──
@@ -238,13 +262,7 @@ impl VeloEvents {
         }
 
         // Slow path: use messenger's discovery to resolve worker_id -> peer_info
-        let messenger = self
-            .messenger
-            .read()
-            .clone()
-            .ok_or_else(|| anyhow!("Event messenger is unavailable"))?;
-
-        let discovery = messenger.discovery().ok_or_else(|| {
+        let discovery = self.messenger()?.discovery().ok_or_else(|| {
             anyhow!(
                 "No discovery backend configured. Cannot resolve worker {}",
                 worker_id
@@ -255,7 +273,7 @@ impl VeloEvents {
         let instance_id = peer_info.instance_id();
 
         // Auto-register discovered peer for future fast-path lookups
-        messenger.register_peer(peer_info)?;
+        self.messenger()?.register_peer(peer_info)?;
 
         Ok(instance_id)
     }
@@ -833,18 +851,9 @@ impl VeloEvents {
         handler: &str,
         payload: T,
     ) -> Result<()> {
-        let messenger = self
-            .messenger
-            .read()
-            .clone()
-            .ok_or_else(|| anyhow!("Event messenger is unavailable"))?;
         let bytes = Bytes::from(serde_json::to_vec(&payload)?);
-        messenger
-            .message_builder_unchecked(handler)
-            .raw_payload(bytes)
-            .instance(target)
-            .fire()
-            .await
+        let message = self.messenger()?.message_builder_unchecked(handler);
+        message.raw_payload(bytes).instance(target).fire().await
     }
 
     // ── LRU cache management ────────────────────────────────────────
@@ -1205,13 +1214,48 @@ mod tests {
         (a, b)
     }
 
+    struct PendingDiscovery(tokio::sync::Notify);
+    impl crate::PeerDiscovery for PendingDiscovery {
+        fn discover_by_worker_id(
+            &self,
+            _: velo_ext::WorkerId,
+        ) -> futures::future::BoxFuture<'_, anyhow::Result<velo_ext::PeerInfo>> {
+            Box::pin(async move {
+                self.0.notify_one();
+                std::future::pending().await
+            })
+        }
+
+        fn discover_by_instance_id(
+            &self,
+            _: velo_ext::InstanceId,
+        ) -> futures::future::BoxFuture<'_, anyhow::Result<velo_ext::PeerInfo>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
     #[tokio::test]
     async fn shutdown_fails_remote_waiters_and_preserves_local_events() {
-        let (owner, subscriber) = make_pair().await;
+        let owner = Messenger::builder()
+            .add_transport(new_transport())
+            .build()
+            .await
+            .unwrap();
+        let subscriber = Messenger::builder()
+            .add_transport(new_transport())
+            .discovery(Arc::new(PendingDiscovery(tokio::sync::Notify::new())))
+            .build()
+            .await
+            .unwrap();
+        owner.register_peer(subscriber.peer_info()).unwrap();
+        subscriber.register_peer(owner.peer_info()).unwrap();
         let events = subscriber.events();
         let waiting = owner.events().new_event().unwrap().into_handle();
-        let triggering = owner.events().new_event().unwrap().into_handle();
-        let poisoning = owner.events().new_event().unwrap().into_handle();
+        // Keep these requests in discovery so neither can finish while the
+        // cleanup worker starts. A live peer may reply before cancellation.
+        let undiscovered = Messenger::builder().build().await.unwrap();
+        let triggering = undiscovered.events().new_event().unwrap().into_handle();
+        let poisoning = undiscovered.events().new_event().unwrap().into_handle();
         let local = events.new_event().unwrap();
         let local_waiter = local.awaiter().unwrap();
         let waiter = events.awaiter(waiting).unwrap();
@@ -1260,6 +1304,89 @@ mod tests {
             .graceful_shutdown(crate::ShutdownPolicy::WaitForever)
             .await;
         owner.closed().await;
+    }
+
+    #[tokio::test]
+    async fn messenger_drop_finishes_event_tasks_and_remote_waits() {
+        let owner = Messenger::builder().build().await.unwrap();
+        let discovery = Arc::new(PendingDiscovery(tokio::sync::Notify::new()));
+        let subscriber = Messenger::builder()
+            .discovery(discovery.clone())
+            .build()
+            .await
+            .unwrap();
+        let events = Arc::clone(subscriber.events());
+        let messenger = Arc::downgrade(&subscriber);
+        let tracker = subscriber.tracker().clone();
+        let waiting = owner.events().new_event().unwrap().into_handle();
+        let waiter = events.awaiter(waiting).unwrap();
+        let local = events.new_event().unwrap();
+        let local_waiter = local.awaiter().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), discovery.0.notified())
+            .await
+            .expect("remote subscription did not start discovery");
+
+        drop(subscriber);
+        let error = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("final Messenger drop left its remote event pending")
+            .unwrap_err();
+        assert!(error.to_string().contains("Event runtime shut down"));
+        tokio::time::timeout(Duration::from_secs(2), events.closed())
+            .await
+            .expect("final Messenger drop left its event watcher parked");
+        tracker.close();
+        tokio::time::timeout(Duration::from_secs(2), tracker.wait())
+            .await
+            .expect("final Messenger drop retained receive loops");
+        assert!(messenger.upgrade().is_none());
+        local.trigger().unwrap();
+        local_waiter.await.unwrap();
+        owner
+            .graceful_shutdown(crate::ShutdownPolicy::WaitForever)
+            .await;
+        owner.closed().await;
+    }
+
+    /// Remote waiters hold only their proxy event, not `VeloEvents`. The
+    /// teardown watcher holds a weak reference, so on final Messenger drop the
+    /// last strong holder can go before the watcher runs. Dropping `VeloEvents`
+    /// must then fail the waits itself, or they hang forever.
+    #[tokio::test]
+    async fn dropping_events_fails_pending_remote_waits() {
+        use super::VeloEvents;
+        use crate::messenger::common::responses::ResponseManager;
+
+        let (backend, _streams) = crate::transports::VeloBackend::new(vec![new_transport()], None)
+            .await
+            .unwrap();
+        let backend = Arc::new(backend);
+        let worker_id = backend.instance_id().worker_id();
+        let system_id = NonZero::new(worker_id.as_u64()).unwrap();
+        let local_base = DistributedEventFactory::new(system_id).system().clone();
+        let events = VeloEvents::new(
+            backend.instance_id(),
+            local_base,
+            Arc::clone(&backend),
+            ResponseManager::new(worker_id.as_u64()),
+        );
+        let other = Messenger::builder().build().await.unwrap();
+        let handle = other.events().new_event().unwrap().into_handle();
+        let remote = events
+            .remote_event(RemoteEventKey::from_handle(handle))
+            .unwrap();
+        let WaitRegistration::Pending(waiter) = remote.register_waiter(1).unwrap() else {
+            panic!("a new remote event must be pending");
+        };
+        drop(remote);
+
+        drop(events);
+        let error = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("dropping VeloEvents left a remote wait pending")
+            .unwrap_err();
+        assert!(error.to_string().contains("Event runtime shut down"));
+        backend.shutdown_now();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

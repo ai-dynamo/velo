@@ -122,7 +122,6 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use dashmap::DashMap;
 use futures::future::BoxFuture;
-use tokio_util::sync::CancellationToken;
 use velo_ext::{TransportKey, WorkerAddress, WorkerId};
 
 use self::flow_control::NegotiatedLimits;
@@ -883,7 +882,7 @@ impl MessengerMuxTransport {
         anchor_id: u64,
         session_id: u64,
         limits: NegotiatedLimits,
-        lifecycle: Option<(CancellationToken, CancellationToken)>,
+        lifecycle: Option<crate::streaming::control::SenderEntry>,
     ) -> BoxFuture<'_, Result<flume::Sender<Vec<u8>>>> {
         let core = Arc::clone(&self.core);
         Box::pin(async move {

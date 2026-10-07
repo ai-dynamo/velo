@@ -245,10 +245,7 @@ impl WithheldQueue {
 /// One live egress slot.
 pub(super) struct EgressSlot {
     pub(super) session_id: u64,
-    pub(super) lifecycle: Option<(
-        tokio_util::sync::CancellationToken,
-        tokio_util::sync::CancellationToken,
-    )>,
+    pub(super) lifecycle: Option<crate::streaming::control::SenderEntry>,
     /// Index and generation as they travel on the wire.
     pub(super) id: SlotId,
     /// What this side may still send. Opens at the window the peer advertised
@@ -327,8 +324,8 @@ impl EgressSlot {
 
     /// End the producer's inlet and cancel the slot's lifecycle token.
     fn disconnect(&self) {
-        if let Some((cancel, _)) = &self.lifecycle {
-            cancel.cancel();
+        if let Some(sender) = &self.lifecycle {
+            sender.cancel();
         }
         self.gate.close();
     }

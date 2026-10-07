@@ -824,7 +824,6 @@ async fn graceful_shutdown_waits_for_negative_reply_admission() {
         "missing_resolver",
         "ordered_panic",
         "spawned_panic",
-        "inline_panic",
     ] {
         let transport = Arc::new(LoopbackTransport::default());
         let messenger = Messenger::builder()
@@ -845,13 +844,6 @@ async fn graceful_shutdown_waits_for_negative_reply_admission() {
         messenger
             .register_streaming_handler(
                 Handler::unary_handler("_spawned_panic", |_| panic!("test handler panic")).build(),
-            )
-            .unwrap();
-        messenger
-            .register_streaming_handler(
-                Handler::unary_handler("_inline_panic", |_| panic!("test handler panic"))
-                    .inline()
-                    .build(),
             )
             .unwrap();
         messenger.register_peer(messenger.peer_info()).unwrap();
@@ -875,7 +867,6 @@ async fn graceful_shutdown_waits_for_negative_reply_admission() {
         let name = match case {
             "ordered_panic" => "_panic",
             "spawned_panic" => "_spawned_panic",
-            "inline_panic" => "_inline_panic",
             _ => "_missing",
         };
         let reply = tokio::spawn(
@@ -913,7 +904,7 @@ async fn graceful_shutdown_waits_for_negative_reply_admission() {
         let error = reply.await.unwrap().unwrap_err().to_string();
         let expected = match case {
             "missing_resolver" => "resolver not configured",
-            "ordered_panic" | "spawned_panic" | "inline_panic" => "handler panicked",
+            "ordered_panic" | "spawned_panic" => "handler panicked",
             _ => "not found",
         };
         assert!(error.contains(expected), "{case}: {error}");
