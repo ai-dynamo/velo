@@ -17,6 +17,21 @@ pub(crate) type Completion = Shared<BoxFuture<'static, Result<(), Arc<str>>>>;
 /// is mid-poll.
 pub(crate) type Outcome = Arc<std::sync::OnceLock<Result<(), Arc<str>>>>;
 
+/// Records a failure if teardown unwinds before it writes its own result.
+///
+/// Each hook runs under its own `catch_unwind`, but the code around them can
+/// still unwind (a panicking tracing subscriber, say). Without this the cell
+/// stays empty, `teardown_failure` reports no failure for a teardown that
+/// died, and a later shutdown drains again instead of panicking at once. No
+/// disarm is needed: once the result is written, this write is a no-op.
+struct RecordUnwind<'a>(&'a Outcome);
+
+impl Drop for RecordUnwind<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.set(Err(Arc::from("transport teardown panicked")));
+    }
+}
+
 /// Own the hooks independently of shutdown waiters and the Tokio runtime.
 /// Native transports may join threads here, including after final owner drop.
 pub(super) fn start(
@@ -32,6 +47,7 @@ pub(super) fn start(
     let worker = std::thread::Builder::new()
         .name("velo-teardown".into())
         .spawn(move || {
+            let _unwind = RecordUnwind(&worker_outcome);
             let result = {
                 let _runtime = worker_runtime.enter();
                 super::stop_transports(&worker_state, &worker_transports)
@@ -44,6 +60,7 @@ pub(super) fn start(
         // Hooks that never run keep their threads and memory for the life of
         // the process. Blocking this caller is the lesser cost.
         tracing::error!(%error, "Could not start transport teardown; running it inline");
+        let _unwind = RecordUnwind(&outcome);
         let result = {
             // Not during thread-local teardown: `Handle::enter` panics there,
             // and this may run in a drop, where a panic aborts the process.
@@ -66,4 +83,31 @@ pub(super) fn start(
     }
     .boxed()
     .shared()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The worker's body can unwind outside any hook, and no transport can
+    /// make it do so on purpose, so the guard is tested on its own, under a
+    /// real unwind. The control case shows it never overwrites a result that
+    /// was written.
+    #[test]
+    fn a_teardown_that_unwinds_still_records_a_failure() {
+        let outcome = Outcome::default();
+        let unwound = std::panic::catch_unwind(|| {
+            let _unwind = RecordUnwind(&outcome);
+            panic!("teardown body unwound");
+        });
+        assert!(unwound.is_err());
+        assert!(matches!(outcome.get(), Some(Err(_))));
+
+        let finished = Outcome::default();
+        {
+            let _unwind = RecordUnwind(&finished);
+            let _ = finished.set(Ok(()));
+        }
+        assert!(matches!(finished.get(), Some(Ok(()))));
+    }
 }
