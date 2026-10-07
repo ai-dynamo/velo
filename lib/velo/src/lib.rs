@@ -2403,6 +2403,8 @@ mod tests {
     struct Stalling {
         gate: velo_ext::AdmissionGate<(bytes::Bytes, bytes::Bytes)>,
         _rx: flume::Receiver<(bytes::Bytes, bytes::Bytes)>,
+        /// How many sends reached the transport, admitted or parked.
+        sends: Arc<std::sync::atomic::AtomicUsize>,
     }
     fn stalling_address() -> velo_ext::WorkerAddress {
         let entries =
@@ -2427,6 +2429,7 @@ mod tests {
             _: velo_ext::MessageType,
             _: Arc<dyn velo_ext::TransportErrorHandler>,
         ) -> velo_ext::SendOutcome {
+            self.sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.gate.send((header, payload))
         }
         fn max_message_size(&self, _: velo_ext::InstanceId) -> Option<usize> {
@@ -2458,10 +2461,23 @@ mod tests {
 
     /// A Messenger on a [`Stalling`] transport, with one registered peer.
     pub(crate) async fn stalled_messenger() -> (Arc<Messenger>, crate::InstanceId) {
+        let (messenger, peer, _) = counted_stalled_messenger().await;
+        (messenger, peer)
+    }
+
+    /// [`stalled_messenger`], with the count of sends that reached the
+    /// transport.
+    async fn counted_stalled_messenger() -> (
+        Arc<Messenger>,
+        crate::InstanceId,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
         let (tx, rx) = flume::bounded(1);
+        let sends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let transport = Arc::new(Stalling {
             gate: velo_ext::AdmissionGate::new(tx, tokio::runtime::Handle::current()),
             _rx: rx,
+            sends: Arc::clone(&sends),
         });
         let messenger = Messenger::builder()
             .add_transport(transport)
@@ -2472,7 +2488,7 @@ mod tests {
         messenger
             .register_peer(velo_ext::PeerInfo::new(peer_instance, stalling_address()))
             .unwrap();
-        (messenger, peer_instance)
+        (messenger, peer_instance, sends)
     }
 
     /// The detach a dropped lease guard sends must not hold the Messenger
@@ -2515,7 +2531,7 @@ mod tests {
     /// keep the Messenger, and so its transport teardown, alive forever.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_stalled_rendezvous_call_does_not_hold_the_messenger() {
-        let (messenger, peer_instance) = stalled_messenger().await;
+        let (messenger, peer_instance, sends) = counted_stalled_messenger().await;
         let rendezvous = Arc::new(RendezvousManager::new(messenger.instance_id().worker_id()));
         rendezvous
             .register_handlers(Arc::clone(&messenger))
@@ -2554,8 +2570,16 @@ mod tests {
                 async move { drop(rendezvous.release(handle, 1).await) }
             }),
         ];
-        // Let every call reach its wait before the final drop.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Every call has reached its wait once the fill and all five sends
+        // have reached the transport.
+        let calls_parked = calls.len() + 1;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while sends.load(std::sync::atomic::Ordering::SeqCst) < calls_parked {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("not every rendezvous call reached the stalled transport");
         drop(messenger);
         let gone = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while weak.upgrade().is_some() {
