@@ -124,17 +124,19 @@ pub(crate) fn request_sender_cancel(
     }
     if let Some(messenger) = messenger {
         let rt = messenger.runtime().clone();
-        let messenger = Arc::clone(messenger);
+        let payload =
+            serde_json::to_vec(&StreamCancelRequest { sender_stream_id }).expect("stream identity");
+        // Built here, so the task holds the client and not the Messenger. A
+        // send to a peer that stopped reading can wait on admission forever;
+        // holding the Messenger there would keep its final drop, and so its
+        // transport teardown, from ever happening.
+        let send = messenger
+            .am_send_streaming("_stream_cancel")
+            .expect("stream cancel handler")
+            .raw_payload(bytes::Bytes::from(payload))
+            .worker(worker);
         rt.spawn(async move {
-            let payload = serde_json::to_vec(&StreamCancelRequest { sender_stream_id })
-                .expect("stream identity");
-            let _ = messenger
-                .am_send_streaming("_stream_cancel")
-                .expect("stream cancel handler")
-                .raw_payload(bytes::Bytes::from(payload))
-                .worker(worker)
-                .send()
-                .await;
+            let _ = send.send().await;
         });
     }
 }
@@ -189,17 +191,17 @@ pub(crate) fn request_sender_stop(
         // synchronous and can run on a thread with no runtime, where the stop
         // would be dropped after the anchor had already recorded it.
         let rt = messenger.runtime().clone();
-        let messenger = Arc::clone(messenger);
+        let payload =
+            serde_json::to_vec(&StreamCancelRequest { sender_stream_id }).expect("stream identity");
+        // Built here, so the task holds the client and not the Messenger, for
+        // the reason `request_sender_cancel` gives.
+        let send = messenger
+            .am_send_streaming("_stream_stop")
+            .expect("stream stop handler")
+            .raw_payload(bytes::Bytes::from(payload))
+            .worker(worker);
         rt.spawn(async move {
-            let payload = serde_json::to_vec(&StreamCancelRequest { sender_stream_id })
-                .expect("stream identity");
-            let _ = messenger
-                .am_send_streaming("_stream_stop")
-                .expect("stream stop handler")
-                .raw_payload(bytes::Bytes::from(payload))
-                .worker(worker)
-                .send()
-                .await;
+            let _ = send.send().await;
         });
     } else if let Some(entry) = registry.senders.get(&sender_stream_id) {
         entry.stop_token.cancel();

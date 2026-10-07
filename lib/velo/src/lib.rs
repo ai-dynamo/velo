@@ -2296,4 +2296,198 @@ mod tests {
         assert!(velo.anchor_manager.registry.is_empty());
         assert!(velo.anchor_manager.mpsc_registry.is_empty());
     }
+
+    /// Final Velo drop can run on a thread with no Tokio context, and after
+    /// the runtime that built the instance is gone. The anchor cleanup that
+    /// `Velo::shutdown` runs on the runtime now also runs in `Drop`.
+    #[test]
+    fn final_velo_drop_off_runtime_with_live_mux_streams() {
+        for stop_runtime in [false, true] {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            let (consumer, producer, senders, tokens) = runtime.block_on(async {
+                let (consumer, producer) = connected_pair(None, "_anchor_attach").await;
+                let mut anchor = consumer.create_anchor::<u32>();
+                let ticket = consumer.prebind_anchor(anchor.handle()).unwrap();
+                let zero_rtt = producer
+                    .open_anchor_stream::<u32>(anchor.handle(), ticket)
+                    .await
+                    .unwrap();
+                zero_rtt.send(1).await.unwrap();
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    futures::StreamExt::next(&mut anchor),
+                )
+                .await
+                .unwrap();
+                tokio::spawn(async move {
+                    while futures::StreamExt::next(&mut anchor).await.is_some() {}
+                });
+                let mut anchor2 = consumer.create_anchor::<u32>();
+                let attached = producer
+                    .attach_anchor::<u32>(anchor2.handle())
+                    .await
+                    .unwrap();
+                attached.send(1).await.unwrap();
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    futures::StreamExt::next(&mut anchor2),
+                )
+                .await
+                .unwrap();
+                tokio::spawn(async move {
+                    while futures::StreamExt::next(&mut anchor2).await.is_some() {}
+                });
+                let tokens = (zero_rtt.cancellation_token(), attached.cancellation_token());
+                (consumer, producer, (zero_rtt, attached), tokens)
+            });
+            let messenger = Arc::downgrade(consumer.messenger());
+            let backend = Arc::clone(consumer.messenger().backend());
+            let runtime = if stop_runtime {
+                drop(runtime);
+                None
+            } else {
+                Some(runtime)
+            };
+            // A plain thread: no Tokio context at all.
+            std::thread::spawn(move || drop(consumer))
+                .join()
+                .unwrap_or_else(|_| {
+                    panic!("stop_runtime={stop_runtime}: final Velo drop panicked off the runtime")
+                });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while messenger.upgrade().is_some() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(
+                messenger.upgrade().is_none(),
+                "stop_runtime={stop_runtime}: final Velo drop left the Messenger alive"
+            );
+            futures::executor::block_on(backend.request_teardown()).unwrap();
+            if let Some(runtime) = runtime {
+                // With the runtime alive, both remote producers must be told.
+                runtime.block_on(async {
+                    tokio::time::timeout(std::time::Duration::from_secs(5), tokens.0.cancelled())
+                        .await
+                        .expect("zero-RTT producer was never told");
+                    tokio::time::timeout(std::time::Duration::from_secs(5), tokens.1.cancelled())
+                        .await
+                        .expect("attached producer was never told");
+                    drop(senders);
+                    producer.shutdown(ShutdownPolicy::WaitForever).await;
+                });
+                drop(runtime);
+            } else {
+                drop(senders);
+                drop(producer);
+            }
+        }
+    }
+
+    /// A best-effort `_stream_cancel` to a peer that never admits a frame
+    /// must not keep the Messenger alive after its final drop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_stream_cancel_does_not_hold_the_messenger() {
+        struct Stalling {
+            gate: velo_ext::AdmissionGate<(bytes::Bytes, bytes::Bytes)>,
+            _rx: flume::Receiver<(bytes::Bytes, bytes::Bytes)>,
+        }
+        fn stalling_address() -> velo_ext::WorkerAddress {
+            let entries =
+                std::collections::HashMap::from([("stalling".to_string(), b"stalling".to_vec())]);
+            velo_ext::WorkerAddress::from_encoded(rmp_serde::to_vec(&entries).unwrap())
+        }
+        impl velo_ext::Transport for Stalling {
+            fn key(&self) -> velo_ext::TransportKey {
+                velo_ext::TransportKey::new("stalling")
+            }
+            fn address(&self) -> velo_ext::WorkerAddress {
+                stalling_address()
+            }
+            fn register(&self, _: velo_ext::PeerInfo) -> Result<(), velo_ext::TransportError> {
+                Ok(())
+            }
+            fn send_message(
+                &self,
+                _: velo_ext::InstanceId,
+                header: bytes::Bytes,
+                payload: bytes::Bytes,
+                _: velo_ext::MessageType,
+                _: Arc<dyn velo_ext::TransportErrorHandler>,
+            ) -> velo_ext::SendOutcome {
+                self.gate.send((header, payload))
+            }
+            fn max_message_size(&self, _: velo_ext::InstanceId) -> Option<usize> {
+                None
+            }
+            fn start(
+                &self,
+                _: velo_ext::InstanceId,
+                _: velo_ext::TransportAdapter,
+                _: tokio::runtime::Handle,
+            ) -> futures::future::BoxFuture<'_, anyhow::Result<()>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn shutdown(&self) {}
+            fn check_health(
+                &self,
+                _: velo_ext::InstanceId,
+                _: std::time::Duration,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<(), velo_ext::HealthCheckError>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let (tx, rx) = flume::bounded(1);
+        let transport = Arc::new(Stalling {
+            gate: velo_ext::AdmissionGate::new(tx, tokio::runtime::Handle::current()),
+            _rx: rx,
+        });
+        let messenger = Messenger::builder()
+            .add_transport(transport)
+            .build()
+            .await
+            .unwrap();
+        let peer_instance = crate::InstanceId::new_v4();
+        messenger
+            .register_peer(velo_ext::PeerInfo::new(peer_instance, stalling_address()))
+            .unwrap();
+        let registry = Arc::new(crate::streaming::control::SenderRegistry::default());
+        let weak = Arc::downgrade(&messenger);
+        let backend = Arc::clone(messenger.backend());
+        // The gate holds one frame: the first notice is admitted at once, the
+        // second parks in admission for as long as the peer stays stalled.
+        for id in 1..=2 {
+            crate::streaming::control::request_sender_cancel(
+                crate::streaming::control::StreamCancelHandle::pack(peer_instance.worker_id(), id),
+                messenger.instance_id().worker_id(),
+                &registry,
+                Some(&messenger),
+            );
+        }
+        drop(messenger);
+        let gone = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while weak.upgrade().is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let still_alive = weak.upgrade().is_some();
+        // Force the teardown so the test exits cleanly either way.
+        backend.shutdown_now();
+        let _ = backend.request_teardown().await;
+        assert!(
+            gone.is_ok() && !still_alive,
+            "a notice parked in admission to a stalled peer kept the Messenger alive after its final drop"
+        );
+    }
 }
