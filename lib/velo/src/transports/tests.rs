@@ -23,6 +23,9 @@ struct MockTransport {
     /// How many times `begin_drain` ran: phase 1 of each shutdown attempt.
     drain_calls: AtomicUsize,
     shut_down: AtomicBool,
+    /// How many times `shutdown` ran. Counted, not asserted in the hook:
+    /// the hook runs inside a `catch_unwind`, so a panic there is only logged.
+    shutdown_calls: AtomicUsize,
     shutdown_complete: AtomicBool,
     shutdown_block: Option<(flume::Sender<()>, flume::Receiver<()>)>,
     shutdown_panics: bool,
@@ -63,6 +66,7 @@ impl MockTransport {
             shutdown_complete: AtomicBool::new(false),
             shutdown_block: None,
             shutdown_panics: false,
+            shutdown_calls: AtomicUsize::new(0),
             closed: Arc::new(AtomicBool::new(false)),
             send_count: AtomicUsize::new(0),
             last_lane: AtomicUsize::new(usize::MAX),
@@ -92,6 +96,7 @@ impl MockTransport {
             shutdown_complete: AtomicBool::new(false),
             shutdown_block: None,
             shutdown_panics: false,
+            shutdown_calls: AtomicUsize::new(0),
             closed: Arc::new(AtomicBool::new(false)),
             send_count: AtomicUsize::new(0),
             last_lane: AtomicUsize::new(usize::MAX),
@@ -177,6 +182,7 @@ impl Transport for MockTransport {
         })
     }
     fn shutdown(&self) {
+        self.shutdown_calls.fetch_add(1, Ordering::Relaxed);
         assert!(self.start_completed.load(Ordering::Relaxed));
         assert!(self.drained.load(Ordering::Relaxed));
         assert!(
@@ -766,8 +772,9 @@ async fn final_messenger_drop_stops_transports_once_after_any_teardown_path() {
             .clone()
             .await
             .unwrap();
-        assert!(
-            transport.shut_down.load(Ordering::Relaxed),
+        assert_eq!(
+            transport.shutdown_calls.load(Ordering::Relaxed),
+            1,
             "{prior_shutdown}"
         );
     }
