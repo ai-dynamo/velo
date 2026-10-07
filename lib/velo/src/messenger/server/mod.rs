@@ -312,20 +312,17 @@ async fn create_message_handler(
                         // would keep its final drop, and teardown, from ever
                         // happening. The hub upgrades it again afterwards.
                         let backend = Arc::clone(system.backend());
-                        spawn_resolve(
-                            &teardown,
-                            ResolveJob {
-                                resolver,
-                                hub,
-                                handler_name,
-                                message_id,
-                                response_type,
-                                headers,
-                                handle_str,
-                                in_flight,
-                                backend,
-                            },
-                        );
+                        spawn_resolve(ResolveJob {
+                            resolver,
+                            hub,
+                            handler_name,
+                            message_id,
+                            response_type,
+                            headers,
+                            handle_str,
+                            in_flight,
+                            backend,
+                        });
                         continue;
                     } else {
                         // No resolver installed — cannot process rendezvous payload
@@ -430,15 +427,19 @@ struct ResolveJob {
 /// of its own, and final Messenger drop does not complete a response wait,
 /// so a task that outlived teardown would keep the backend, the resolver,
 /// and the message's drain guard for the life of the process.
-fn spawn_resolve(
-    teardown: &tokio_util::sync::CancellationToken,
-    job: ResolveJob,
-) -> tokio::task::JoinHandle<Option<()>> {
-    tokio::spawn(
-        teardown
-            .clone()
-            .run_until_cancelled_owned(resolve_and_dispatch(job)),
-    )
+fn spawn_resolve(job: ResolveJob) -> tokio::task::JoinHandle<()> {
+    // The task borrows the teardown token through the backend it already
+    // holds. A token clone would take the token tree's mutex on clone and
+    // on drop, once per message.
+    let backend = Arc::clone(&job.backend);
+    tokio::spawn(async move {
+        // Biased to the resolve: a payload that is ready wins over teardown.
+        tokio::select! {
+            biased;
+            () = resolve_and_dispatch(job) => {}
+            () = backend.shutdown_state().teardown_token().cancelled() => {}
+        }
+    })
 }
 
 async fn resolve_and_dispatch(job: ResolveJob) {
@@ -670,23 +671,19 @@ mod tests {
         let resolver: Arc<dyn crate::messenger::large_payload::LargePayloadResolver> =
             Arc::new(NeverResolves);
         let resolver_alive = Arc::downgrade(&resolver);
-        let teardown = tokio_util::sync::CancellationToken::new();
-        let task = spawn_resolve(
-            &teardown,
-            ResolveJob {
-                resolver,
-                hub: Arc::new(DispatcherHub::new(Arc::clone(&backend))),
-                handler_name: "large".to_string(),
-                message_id: crate::messenger::common::responses::ResponseId::from_u128(1),
-                response_type: crate::messenger::common::messages::ResponseType::Unary,
-                headers: None,
-                handle_str: "1".to_string(),
-                in_flight: None,
-                backend,
-            },
-        );
+        let task = spawn_resolve(ResolveJob {
+            resolver,
+            hub: Arc::new(DispatcherHub::new(Arc::clone(&backend))),
+            handler_name: "large".to_string(),
+            message_id: crate::messenger::common::responses::ResponseId::from_u128(1),
+            response_type: crate::messenger::common::messages::ResponseType::Unary,
+            headers: None,
+            handle_str: "1".to_string(),
+            in_flight: None,
+            backend: Arc::clone(&backend),
+        });
         tokio::task::yield_now().await;
-        teardown.cancel();
+        backend.shutdown_state().teardown_token().cancel();
         timeout(Duration::from_secs(2), task)
             .await
             .expect("a resolve waiting on its owner outlived teardown")
