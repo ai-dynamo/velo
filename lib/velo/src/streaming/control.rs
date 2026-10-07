@@ -307,9 +307,11 @@ pub(crate) fn anchor_attach_handler(manager: Weak<AnchorManager>) -> crate::mess
         move |ctx: crate::messenger::TypedContext<AnchorAttachRequest>| {
             let manager = manager.clone();
             async move {
-                let manager = manager
-                    .upgrade()
-                    .ok_or_else(|| anyhow::anyhow!("anchor manager shut down"))?;
+                let Some(manager) = manager.upgrade() else {
+                    return Ok(AnchorAttachResponse::Err {
+                        reason: "anchor manager shut down".into(),
+                    });
+                };
                 let started = Instant::now();
                 // The worker whose batches will carry this stream: the lane is placed
                 // against its load. From the envelope, not from the request body.
