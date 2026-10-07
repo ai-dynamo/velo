@@ -130,11 +130,15 @@ impl ZmqTransport {
     }
     fn stop_threads(&self) {
         self.sender_stop.store(true, Ordering::Release);
-        // Signal the listener thread to stop via control PAIR socket
+        // Wake the listener early. Best effort and never blocking: the flag
+        // is the real stop request, and the listener may already have stopped
+        // on it and closed its socket, so a blocking send could wait forever
+        // and the joins below would never run. A lost message costs at most
+        // one poll interval.
         if let Ok(ctrl) = self.zmq_context.socket(zmq::PAIR)
             && ctrl.connect(&self.listener_control_endpoint).is_ok()
         {
-            let _ = ctrl.send("shutdown", 0);
+            let _ = ctrl.send("shutdown", zmq::DONTWAIT);
         }
 
         // Wake an idle sender. The flag is the stop request: if the queue is
@@ -975,6 +979,42 @@ mod tests {
             done.recv_timeout(Duration::from_secs(2)).is_ok(),
             "the listener ignored its stop flag"
         );
+    }
+
+    /// The control send in `stop_threads` must not block. The listener can
+    /// stop on the flag alone and close its control socket between the
+    /// connect and the send, and a blocking send to a PAIR whose peer closed
+    /// waits forever, so the join after it never runs. This pins the libzmq
+    /// behavior that `stop_threads` relies on: with `DONTWAIT` that send
+    /// returns at once.
+    #[test]
+    fn a_control_send_to_a_closed_listener_does_not_block() {
+        let ctx = zmq::Context::new();
+        let endpoint = format!("inproc://control-{}", crate::InstanceId::new_v4());
+        let (blocking_tx, blocking) = std::sync::mpsc::channel();
+        let (dontwait_tx, dontwait) = std::sync::mpsc::channel();
+        for (flags, done) in [(0, blocking_tx), (zmq::DONTWAIT, dontwait_tx)] {
+            let listener = ctx.socket(zmq::PAIR).unwrap();
+            let endpoint = format!("{endpoint}-{flags}");
+            listener.bind(&endpoint).unwrap();
+            let ctrl = ctx.socket(zmq::PAIR).unwrap();
+            ctrl.connect(&endpoint).unwrap();
+            drop(listener);
+            std::thread::sleep(Duration::from_millis(50));
+            std::thread::spawn(move || {
+                let _ = done.send(ctrl.send("shutdown", flags));
+            });
+        }
+        // The control: the blocking form really does hang here, so the case
+        // below is about the flag, not about a send that could not block.
+        assert!(
+            blocking.recv_timeout(Duration::from_millis(500)).is_err(),
+            "a blocking send to a closed PAIR returned; the test no longer shows the hang"
+        );
+        assert!(matches!(
+            dontwait.recv_timeout(Duration::from_secs(2)),
+            Ok(Err(zmq::Error::EAGAIN))
+        ));
     }
 
     #[test]
