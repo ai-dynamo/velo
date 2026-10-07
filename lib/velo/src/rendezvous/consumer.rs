@@ -142,12 +142,14 @@ impl Consumer {
                     // space goes back immediately. `get_pinned` is the version
                     // that skips this copy.
                     Ok(buf) => Ok((Bytes::copy_from_slice(&buf), lease_id)),
-                    Err(reason) => fallback_chunked(manager, handle, lease_id, reason).await,
+                    Err(reason) => {
+                        fallback_chunked(manager, client, handle, lease_id, reason).await
+                    }
                 }
             }
             #[cfg(not(all(target_os = "linux", feature = "ucx")))]
             AcquireResponse::Rdma { lease_id, .. } => {
-                unsolicited_rdma(manager, handle, lease_id).await
+                unsolicited_rdma(client, handle, lease_id).await
             }
         }
     }
@@ -184,8 +186,8 @@ impl Consumer {
                         // registry that has gone away. Guard it, or the failure
                         // strands a chunked lease the reaper cannot reclaim.
                         let (data, lease_id) =
-                            fallback_chunked(manager, handle, lease_id, reason).await?;
-                        let lease = manager.lease_guard(handle, lease_id);
+                            fallback_chunked(manager, client, handle, lease_id, reason).await?;
+                        let lease = manager.lease_guard(handle, lease_id, Some(client));
                         let buf = copy_into_pool(manager, &data).await?;
                         Ok((buf, lease.disarm()))
                     }
@@ -209,7 +211,7 @@ impl Consumer {
                 .await
                 {
                     Ok(data) => {
-                        let lease = manager.lease_guard(handle, lease_id);
+                        let lease = manager.lease_guard(handle, lease_id, Some(client));
                         let buf = copy_into_pool(manager, &data).await?;
                         Ok((buf, lease.disarm()))
                     }
@@ -290,11 +292,11 @@ impl Consumer {
                     Ok(()) => Ok(lease_id),
                     Err(reason) => {
                         let (data, lease_id) =
-                            fallback_chunked(manager, handle, lease_id, reason).await?;
+                            fallback_chunked(manager, client, handle, lease_id, reason).await?;
                         // `write_chunk` refuses a destination too small for the
                         // payload, and that refusal must not take the fresh
                         // lease with it.
-                        let lease = manager.lease_guard(handle, lease_id);
+                        let lease = manager.lease_guard(handle, lease_id, Some(client));
                         dest.write_chunk(0, &data)?;
                         Ok(lease.disarm())
                     }
@@ -302,8 +304,8 @@ impl Consumer {
             }
             #[cfg(not(all(target_os = "linux", feature = "ucx")))]
             AcquireResponse::Rdma { lease_id, .. } => {
-                let (data, lease_id) = unsolicited_rdma(manager, handle, lease_id).await?;
-                let lease = manager.lease_guard(handle, lease_id);
+                let (data, lease_id) = unsolicited_rdma(client, handle, lease_id).await?;
+                let lease = manager.lease_guard(handle, lease_id, Some(client));
                 dest.write_chunk(0, &data)?;
                 Ok(lease.disarm())
             }
@@ -849,6 +851,7 @@ async fn send_lease_renewal(manager: &RendezvousManager, handle: DataHandle, lea
 #[cfg(all(target_os = "linux", feature = "ucx"))]
 async fn fallback_chunked(
     manager: &RendezvousManager,
+    client: &Arc<ActiveMessageClient>,
     handle: DataHandle,
     lease_id: u64,
     fallback: RdmaFallback,
@@ -866,11 +869,10 @@ async fn fallback_chunked(
     // The owner's lease is tied to a transfer that will never happen. Detach it
     // before asking for another, or the slot carries two read locks and the
     // first is released only when its deadline passes.
-    let send = Consumer::detach_request(manager.messenger()?.client(), handle, lease_id)?;
-    if let Err(e) = send.send().await {
+    if let Err(e) = detach(client, handle, lease_id).await {
         tracing::warn!(%handle, error = %e, "rendezvous: could not detach before falling back");
     }
-    chunked_only(manager, handle).await
+    chunked_only(client, handle).await
 }
 
 /// An owner answered `Rdma` to an acquire that carried no offer.
@@ -880,7 +882,7 @@ async fn fallback_chunked(
 /// cannot perform.
 #[cfg(not(all(target_os = "linux", feature = "ucx")))]
 async fn unsolicited_rdma(
-    manager: &RendezvousManager,
+    client: &Arc<ActiveMessageClient>,
     handle: DataHandle,
     lease_id: u64,
 ) -> Result<(Bytes, u64)> {
@@ -889,11 +891,10 @@ async fn unsolicited_rdma(
         "rendezvous: owner answered with an RDMA descriptor for an acquire that offered \
          nothing; falling back to the chunked path"
     );
-    let send = Consumer::detach_request(manager.messenger()?.client(), handle, lease_id)?;
-    if let Err(e) = send.send().await {
+    if let Err(e) = detach(client, handle, lease_id).await {
         tracing::warn!(%handle, error = %e, "rendezvous: could not detach before falling back");
     }
-    chunked_only(manager, handle).await
+    chunked_only(client, handle).await
 }
 
 /// Acquire with no offer and pull the chunks.
@@ -902,8 +903,10 @@ async fn unsolicited_rdma(
 /// a no-offer acquire with a descriptor is broken, and this reports that rather
 /// than recursing — a retry loop here would turn one such owner into an
 /// unbounded storm of round trips.
-async fn chunked_only(manager: &RendezvousManager, handle: DataHandle) -> Result<(Bytes, u64)> {
-    let client = &manager.client()?;
+async fn chunked_only(
+    client: &Arc<ActiveMessageClient>,
+    handle: DataHandle,
+) -> Result<(Bytes, u64)> {
     let target_worker = handle.worker_id();
     match acquire(client, handle, None).await? {
         AcquireResponse::Ready {

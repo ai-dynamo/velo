@@ -766,7 +766,7 @@ impl RendezvousManager {
                 .store
                 .acquire_read_lock(local_id)
                 .ok_or_else(|| anyhow::anyhow!("rendezvous handle not found: {handle}"))?;
-            let lease = self.lease_guard(handle, lease_id);
+            let lease = self.lease_guard(handle, lease_id, None);
             let data = self
                 .store
                 .get_data(local_id)
@@ -855,7 +855,7 @@ impl RendezvousManager {
             // this call on an instance with no UCX transport, so without the
             // guard the ordinary configuration leaked a deadline-free lease on
             // every single invocation.
-            let lease = self.lease_guard(handle, lease_id);
+            let lease = self.lease_guard(handle, lease_id, None);
             let data = self
                 .store
                 .get_data(local_id)
@@ -946,7 +946,7 @@ impl RendezvousManager {
                 .store
                 .acquire_read_lock(local_id)
                 .ok_or_else(|| anyhow::anyhow!("rendezvous handle not found: {handle}"))?;
-            let lease = self.lease_guard(handle, lease_id);
+            let lease = self.lease_guard(handle, lease_id, None);
             let data = self
                 .store
                 .get_data(local_id)
@@ -1082,22 +1082,32 @@ impl RendezvousManager {
     /// Wrap every step between acquiring a lease and returning it; see
     /// [`LeaseGuard`] for why the alternative did not survive contact with a
     /// fourth error arm.
-    pub(crate) fn lease_guard(&self, handle: DataHandle, lease_id: u64) -> LeaseGuard {
-        let local = handle.worker_id() == self.worker_id;
-        let link = self.messenger_lock.get();
-        // A local lease never needs the messenger; only a remote one upgrades,
-        // and keeps the client alone: the guard can stay armed across a wait
-        // on a silent owner, and the Messenger must be free to drop meanwhile.
-        let client = link
-            .filter(|_| !local)
-            .and_then(|link| link.messenger.upgrade())
-            .map(|messenger| Arc::clone(messenger.client()));
-        let runtime = link
+    ///
+    /// `client` is what a remote lease is detached through; the caller passes
+    /// the one it already holds. It is ignored for a local lease.
+    pub(crate) fn lease_guard(
+        &self,
+        handle: DataHandle,
+        lease_id: u64,
+        client: Option<&Arc<crate::messenger::ActiveMessageClient>>,
+    ) -> LeaseGuard {
+        // Locality comes from the handle, never from whether there is a
+        // client: a remote get can lose its Messenger while it waits, and a
+        // remote lease read as local would be released from this store, where
+        // the owner's lease and slot ids can name a live lease of our own.
+        let lease = if handle.worker_id() == self.worker_id {
+            Lease::Local
+        } else {
+            Lease::Remote(client.cloned())
+        };
+        let runtime = self
+            .messenger_lock
+            .get()
             .map(|link| link.runtime.clone())
             .unwrap_or_else(tokio::runtime::Handle::current);
         LeaseGuard {
             store: Arc::clone(&self.store),
-            client,
+            lease,
             runtime,
             handle,
             lease_id,
@@ -1205,13 +1215,20 @@ fn normalize_lease_timeout(configured: std::time::Duration) -> std::time::Durati
 #[must_use = "the lease is released when this is dropped; call disarm() to keep it"]
 pub(crate) struct LeaseGuard {
     store: Arc<store::DataStore>,
-    /// `None` for a lease on this instance's own store, which is released
-    /// without touching the network.
-    client: Option<Arc<crate::messenger::ActiveMessageClient>>,
+    lease: Lease,
     runtime: tokio::runtime::Handle,
     handle: DataHandle,
     lease_id: u64,
     armed: bool,
+}
+
+/// Where a guarded lease lives, and so how it is released.
+enum Lease {
+    /// On this instance's own store, released without touching the network.
+    Local,
+    /// On another instance, detached through the client. `None` when there
+    /// was no client to hold: the lease cannot be detached from here.
+    Remote(Option<Arc<crate::messenger::ActiveMessageClient>>),
 }
 
 impl LeaseGuard {
@@ -1231,13 +1248,20 @@ impl Drop for LeaseGuard {
         let lease_id = self.lease_id;
         let handle = self.handle;
 
-        let Some(client) = self.client.take() else {
-            // Local: the store is right here.
-            if self.store.consume_lease(lease_id, local_id) == store::LeaseOutcome::Consumed {
-                self.store.release_read_lock(local_id);
-                self.store.remove_transfers_by_lease(lease_id);
+        let client = match std::mem::replace(&mut self.lease, Lease::Local) {
+            Lease::Local => {
+                if self.store.consume_lease(lease_id, local_id) == store::LeaseOutcome::Consumed {
+                    self.store.release_read_lock(local_id);
+                    self.store.remove_transfers_by_lease(lease_id);
+                }
+                return;
             }
-            return;
+            Lease::Remote(Some(client)) => client,
+            Lease::Remote(None) => {
+                tracing::warn!(%handle, lease = lease_id,
+                    "rendezvous: could not detach a lease after a failed get: the messenger is gone");
+                return;
+            }
         };
 
         tracing::debug!(
@@ -1413,5 +1437,28 @@ mod lease_timeout_tests {
                 "a usable timeout must be left alone"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod lease_guard_tests {
+    use super::*;
+
+    /// A remote lease whose guard has no client must not be released from
+    /// this instance's own store. Lease and slot ids count from 1 on every
+    /// instance, so the remote owner's ids can name a live local lease, and
+    /// the Messenger can drop while a remote get waits, leaving no client.
+    #[tokio::test]
+    async fn a_remote_lease_guard_never_touches_the_local_store() {
+        let manager = RendezvousManager::new(WorkerId::from_u64(1));
+        let (_, slot) = manager.register_data(Bytes::from_static(b"local")).unpack();
+        let lease = manager.data_store().acquire_read_lock(slot).unwrap();
+        let remote = DataHandle::pack(WorkerId::from_u64(2), slot);
+        drop(manager.lease_guard(remote, lease, None));
+        assert_eq!(
+            manager.data_store().consume_lease(lease, slot),
+            store::LeaseOutcome::Consumed,
+            "a remote lease guard released a local lease with the same ids"
+        );
     }
 }

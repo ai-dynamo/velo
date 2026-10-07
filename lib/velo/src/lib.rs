@@ -2480,7 +2480,7 @@ mod tests {
         // second waits on admission for as long as the peer stays stalled.
         for lease in 1..=2 {
             let handle = crate::rendezvous::DataHandle::pack(peer_instance.worker_id(), lease);
-            drop(rendezvous.lease_guard(handle, lease));
+            drop(rendezvous.lease_guard(handle, lease, Some(messenger.client())));
         }
         drop(messenger);
         let gone = tokio::time::timeout(std::time::Duration::from_secs(2), async {
