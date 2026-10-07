@@ -1226,8 +1226,8 @@ pub(crate) struct LeaseGuard {
 enum Lease {
     /// On this instance's own store, released without touching the network.
     Local,
-    /// On another instance, detached through the client. `None` when there
-    /// was no client to hold: the lease cannot be detached from here.
+    /// On another instance, detached through the client. `None` when the
+    /// caller gave no client, so the lease cannot be detached from here.
     Remote(Option<Arc<crate::messenger::ActiveMessageClient>>),
 }
 
@@ -1259,7 +1259,8 @@ impl Drop for LeaseGuard {
             Lease::Remote(Some(client)) => client,
             Lease::Remote(None) => {
                 tracing::warn!(%handle, lease = lease_id,
-                    "rendezvous: could not detach a lease after a failed get: the messenger is gone");
+                    "rendezvous: could not detach a lease after a failed get: no client was given, so \
+                     the lease cannot be detached from here");
                 return;
             }
         };
