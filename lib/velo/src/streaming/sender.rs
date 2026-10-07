@@ -1080,7 +1080,8 @@ mod tests {
     }
 
     /// A token cancelled directly, not through the registry, reaches the
-    /// per-record flag from the heartbeat task, one scheduler hop later.
+    /// per-record flag from the heartbeat task, once the cancelling task
+    /// yields and the heartbeat task runs.
     /// Checking the token itself per record would take its mutex every time.
     #[tokio::test]
     async fn test_send_after_cancel() {
