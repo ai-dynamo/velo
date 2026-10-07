@@ -60,8 +60,7 @@ pub(super) fn start(
         // Hooks that never run keep their threads and memory for the life of
         // the process. Blocking this caller is the lesser cost.
         tracing::error!(%error, "Could not start transport teardown; running it inline");
-        let _unwind = RecordUnwind(&outcome);
-        let result = {
+        return run_inline(&outcome, || {
             // Not during thread-local teardown: `Handle::enter` panics there,
             // and this may run in a drop, where a panic aborts the process.
             let _runtime = match tokio::runtime::Handle::try_current() {
@@ -69,9 +68,7 @@ pub(super) fn start(
                 _ => Some(runtime.enter()),
             };
             super::stop_transports(&state, &transports)
-        };
-        let _ = outcome.set(result.clone());
-        return futures::future::ready(result).boxed().shared();
+        });
     }
 
     async move {
@@ -83,6 +80,19 @@ pub(super) fn start(
     }
     .boxed()
     .shared()
+}
+
+/// Runs teardown on the caller's thread and returns a ready completion.
+///
+/// A panic in `body` is caught and becomes the failure. It must not unwind
+/// out of the caller's `OnceLock::get_or_init`: that leaves the lock empty
+/// and the next caller runs every hook again.
+fn run_inline(outcome: &Outcome, body: impl FnOnce() -> Result<(), Arc<str>>) -> Completion {
+    let _unwind = RecordUnwind(outcome);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body))
+        .unwrap_or_else(|_| Err(Arc::from("transport teardown panicked")));
+    let _ = outcome.set(result.clone());
+    futures::future::ready(result).boxed().shared()
 }
 
 #[cfg(test)]
@@ -109,5 +119,21 @@ mod tests {
             let _ = finished.set(Ok(()));
         }
         assert!(matches!(finished.get(), Some(Ok(()))));
+    }
+
+    /// The inline path runs inside `OnceLock::get_or_init`. A body that
+    /// unwinds there leaves the lock empty, so the next `request_teardown`
+    /// would run every `Transport::shutdown` a second time. The body must
+    /// not escape: the completion is ready with a failure instead. It
+    /// cannot be forced through `start`, which needs a failed thread spawn.
+    #[test]
+    fn an_inline_teardown_that_unwinds_returns_a_ready_failure() {
+        let outcome = Outcome::default();
+        let completion = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_inline(&outcome, || panic!("teardown body unwound"))
+        }))
+        .expect("the panic must not reach the caller");
+        assert!(matches!(outcome.get(), Some(Err(_))));
+        assert!(matches!(completion.now_or_never(), Some(Err(_))));
     }
 }
