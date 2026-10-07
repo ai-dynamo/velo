@@ -13,6 +13,10 @@ use tracing::{debug, error, warn};
 
 use velo_ext::{AdmitOutcome, MessageType, TransportAdapter};
 
+/// How long one poll may wait before the listener looks at its stop flag.
+/// This bounds the join in `stop_threads` when the control message is lost.
+const STOP_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Configuration bundle for the listener thread (avoids too-many-arguments).
 pub(crate) struct ListenerConfig {
     pub ctx: Arc<zmq::Context>,
@@ -27,6 +31,9 @@ pub(crate) struct ListenerConfig {
     pub router_socket: Option<zmq::Socket>,
     /// Oneshot sender to signal that the listener is ready (or failed).
     pub ready_tx: std::sync::mpsc::SyncSender<Result<(), String>>,
+    /// Set by `stop_threads`. Read between polls, so the listener stops even
+    /// when the control message could not be sent.
+    pub stop: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Run the ROUTER listener thread.
@@ -102,13 +109,18 @@ pub(crate) fn run_listener(cfg: ListenerConfig) {
             control.as_poll_item(zmq::POLLIN),
         ];
 
-        match zmq::poll(&mut poll_items, -1) {
+        match zmq::poll(&mut poll_items, STOP_POLL.as_millis() as i64) {
             Ok(_) => {}
             Err(zmq::Error::EINTR) => continue, // interrupted by signal, retry
             Err(e) => {
                 error!("ZMQ poll error: {}", e);
                 break;
             }
+        }
+
+        if cfg.stop.load(std::sync::atomic::Ordering::Acquire) {
+            debug!("ZMQ listener saw the stop flag");
+            break;
         }
 
         // Check control socket first (higher priority)

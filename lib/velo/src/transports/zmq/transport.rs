@@ -44,6 +44,8 @@ pub struct ZmqTransport {
     /// via `OnceLock::get()` on the send hot path. A shutdown command wakes the
     /// sender when idle; `sender_stop` also stops it when this queue is full.
     sender_tx: OnceLock<flume::Sender<SenderCommand>>,
+    /// Stops both threads. The listener reads it between polls, so it stops
+    /// even when its control message cannot be sent.
     sender_stop: Arc<AtomicBool>,
     /// One admission gate per peer, all feeding `sender_tx`.
     ///
@@ -281,6 +283,7 @@ impl Transport for ZmqTransport {
                 metrics,
                 router_socket,
                 ready_tx,
+                stop: self.sender_stop.clone(),
             };
             let listener_handle = std::thread::Builder::new()
                 .name("zmq-listener".to_string())
@@ -939,6 +942,39 @@ mod tests {
             "draining {frames} frames to a dead peer took {took:?}"
         );
         assert_eq!(failed.load(Ordering::Relaxed), frames);
+    }
+
+    /// The listener must stop on the stop flag alone. Its control message is
+    /// best effort: with no socket to send it on (file descriptors run out),
+    /// a listener that waited only for that message never let the join return.
+    #[test]
+    fn a_listener_stops_without_its_control_message() {
+        let (adapter, _streams) = crate::transports::transport::make_channels();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (ready_tx, ready) = std::sync::mpsc::sync_channel(1);
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let cfg = listener::ListenerConfig {
+            ctx: Arc::new(zmq::Context::new()),
+            bind_endpoint: "tcp://127.0.0.1:*".to_string(),
+            control_endpoint: format!("inproc://listener-stop-{}", crate::InstanceId::new_v4()),
+            adapter,
+            rcvhwm: 1,
+            linger_ms: 0,
+            metrics: None,
+            router_socket: None,
+            ready_tx,
+            stop: Arc::clone(&stop),
+        };
+        std::thread::spawn(move || {
+            listener::run_listener(cfg);
+            let _ = done_tx.send(());
+        });
+        ready.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        stop.store(true, Ordering::Release);
+        assert!(
+            done.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "the listener ignored its stop flag"
+        );
     }
 
     #[test]
