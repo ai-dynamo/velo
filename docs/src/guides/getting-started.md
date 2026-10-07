@@ -9,10 +9,11 @@ cargo add tokio --features macros,rt-multi-thread
 cargo add anyhow
 ```
 
-The default features are `http`, `nats-transport`, and `grpc`. Add other features as you need them:
+The default features are `http`, `nats-transport`, `grpc`, and `services`. Add other features as you need them:
 
 | Feature | What it adds |
 |---|---|
+| `services` (default) | Distributed events, work queues, and filesystem discovery. See [Services and mux-only mode](migrate-services.md). |
 | `nats-transport` (default) | NATS messenger transport |
 | `grpc` (default) | gRPC messenger transport and gRPC frame transport |
 | `http` (default) | The `axum` dependency. The HTTP messenger transport is not built at this time. |
@@ -27,7 +28,7 @@ The default features are `http`, `nats-transport`, and `grpc`. Add other feature
 | `simulation` | Discrete-event simulation transport |
 | `test-helpers` | Prometheus snapshot helpers for tests |
 
-TCP and filesystem discovery are always available. UDS is always available on Unix.
+TCP is always available. UDS is always available on Unix. Filesystem discovery needs `services`. Discovery and queue backend features enable `services` too.
 
 `nats-transport`, `nats-discovery`, and `nats-queue` are independent. They share the `async-nats` dependency, but one does not enable the others.
 

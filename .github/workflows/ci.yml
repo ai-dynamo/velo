@@ -193,6 +193,14 @@ jobs:
       run: cargo check --locked -p velo --lib --no-default-features --features '${{ matrix.production-features }}'
     - name: Test without default features
       run: timeout 900 cargo test --locked -p velo --no-default-features --features '${{ matrix.features }}' --all-targets
+    - name: Clippy without default features
+      run: cargo clippy --locked -p velo --no-default-features --features '${{ matrix.features }}' --all-targets --no-deps -- -D warnings
+    - name: Check individual service backends
+      if: matrix.features == 'test-helpers'
+      run: |
+        for backend in services etcd nats-discovery nats-queue queue-messenger; do
+          cargo check --locked -p velo --lib --no-default-features --features "$backend"
+        done
 
   soak-smoke:
     name: Soak smoke

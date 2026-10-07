@@ -17,6 +17,7 @@ pub(crate) mod handlers;
 pub(crate) mod server;
 
 pub mod discovery;
+#[cfg(feature = "services")]
 pub mod events;
 
 pub(crate) use client::ActiveMessageClient;
@@ -26,6 +27,7 @@ pub use client::builders::{
 };
 pub use common::MessageId;
 pub use discovery::PeerDiscovery;
+#[cfg(feature = "services")]
 pub use events::VeloEvents;
 pub use handlers::{
     AmHandlerBuilder, AsyncExecutor, Context, Handler, HandlerExecutor, OrderedConfig, OrderingKey,

@@ -17,9 +17,11 @@ use anyhow::Result;
 
 // ── Subsystem modules (each was previously a sibling crate) ────────────────
 pub mod discovery;
+#[cfg(feature = "services")]
 pub mod events;
 pub mod messenger;
 pub mod observability;
+#[cfg(feature = "services")]
 pub mod queue;
 pub mod rendezvous;
 pub mod streaming;
@@ -48,13 +50,16 @@ pub use crate::messenger::{
     Handler, HandlerExecutor, Messenger, MessengerBuilder, OrderedConfig, OrderingKey,
     OverflowPolicy, PeerDiscovery, SyncExecutor, SyncResult, TypedContext, TypedUnaryBuilder,
     TypedUnaryHandlerBuilder, TypedUnaryResult, UnaryBuilder, UnaryHandlerBuilder, UnaryResult,
-    UnifiedResponse, VeloEvents,
+    UnifiedResponse,
 };
 
 // Events
+#[cfg(feature = "services")]
 pub use crate::events::{
     Event, EventAwaiter, EventBackend, EventHandle, EventManager, EventPoison, EventStatus,
 };
+#[cfg(feature = "services")]
+pub use crate::messenger::VeloEvents;
 
 // Streaming (flat at root for convenience; full surface still under [`streaming`])
 pub use crate::streaming::control::StreamOpenTicket;
@@ -138,7 +143,8 @@ impl Default for GrpcConfig {
 ///
 /// # Default
 ///
-/// If neither [`VeloBuilder::stream_config`] nor [`VeloBuilder::stream_bind_addr`]
+/// Unless [`VeloBuilder::mux_only`] is set, if neither
+/// [`VeloBuilder::stream_config`] nor [`VeloBuilder::stream_bind_addr`]
 /// is called, the builder defaults to [`StreamConfig::Tcp(None)`](StreamConfig::Tcp)
 /// — bind `0.0.0.0:<ephemeral>` and advertise every UP non-loopback interface
 /// via [`Vec<InterfaceEndpoint>`](crate::transports::utils::interfaces::InterfaceEndpoint)
@@ -181,10 +187,9 @@ pub struct Velo {
     messenger: Arc<Messenger>,
     anchor_manager: Arc<crate::streaming::AnchorManager>,
     rendezvous_manager: Arc<crate::rendezvous::RendezvousManager>,
-    /// The single streaming transport bound for this instance. Held here so
-    /// `register_peer` can fan out to it (the messenger does not know about
-    /// `FrameTransport`s) and so `peer_info()` can merge the streaming
-    /// listener's WorkerAddress entry into the messenger-side WorkerAddress.
+    /// The primary stream transport: the mux in `mux_only` mode, otherwise
+    /// the configured per-stream transport. Used for peer registration and
+    /// address publication. The mux adds no streaming listener or endpoint.
     stream_transport: Arc<dyn crate::streaming::FrameTransport>,
     stream_owner: Arc<StreamOwner>,
     /// RDMA registration layer, present only when a UCX transport was added
@@ -242,13 +247,15 @@ impl OwnedStreamTransport {
 /// down transports under live streams.
 struct StreamOwner {
     manager: Arc<crate::streaming::AnchorManager>,
-    transport: OwnedStreamTransport,
+    transport: Option<OwnedStreamTransport>,
 }
 
 impl Drop for StreamOwner {
     fn drop(&mut self) {
         self.manager.stop();
-        self.transport.stop();
+        if let Some(transport) = &self.transport {
+            transport.stop();
+        }
     }
 }
 
@@ -257,6 +264,7 @@ pub struct VeloBuilder {
     inner: MessengerBuilder,
     stream_config: Option<StreamConfig>,
     mux_config: Option<crate::streaming::MuxConfig>,
+    mux_only: bool,
     metrics: Option<Arc<VeloMetrics>>,
     /// The concrete UCX transport, kept beside the type-erased one so the
     /// registration layer can reach its RMA endpoint. `Arc<dyn Transport>`
@@ -276,6 +284,7 @@ impl VeloBuilder {
             inner: MessengerBuilder::new(),
             stream_config: None,
             mux_config: None,
+            mux_only: false,
             metrics: None,
             #[cfg(all(target_os = "linux", feature = "ucx"))]
             ucx_transport: None,
@@ -348,7 +357,8 @@ impl VeloBuilder {
     /// to tune it, or with `enabled: false` to turn it off, in which case
     /// nothing is registered and nothing is advertised.
     ///
-    /// The per-stream transport stays configured either way — a mux-enabled
+    /// Unless `mux_only()` is selected, the per-stream transport stays
+    /// configured either way — a mux-enabled
     /// node registers both, and each attach picks between them from what the
     /// peer advertised, so a peer without the mux is still served. **Rollback
     /// is the same flag**: set it to `false` and the node stops advertising
@@ -357,8 +367,8 @@ impl VeloBuilder {
     /// a key that is never advertised is never selected. An application that
     /// never calls this can still turn the mux off: set
     /// `VELO_MESSENGER_MUX_DISABLE=1` and restart. The variable is read once,
-    /// in [`build`](Self::build), and it wins over `enabled: true` set in
-    /// code, as an operator's switch must.
+    /// per [`build`](Self::build), and it wins over `enabled: true` set in
+    /// code. With `mux_only()`, disabling the mux makes the build fail.
     ///
     /// Only one mux may be installed per instance: its `_stream_batch` handler
     /// is registered on the messenger for its lifetime. The messenger would
@@ -372,6 +382,16 @@ impl VeloBuilder {
         }
         self.mux_config = Some(config);
         Ok(self)
+    }
+
+    /// Use only the messenger mux for remote streams, with no extra listener.
+    ///
+    /// Peers must support the messenger mux. An explicit `stream_config` or
+    /// `stream_bind_addr`, a disabled mux, or an active
+    /// `VELO_MESSENGER_MUX_DISABLE` makes `build` return an error.
+    pub fn mux_only(mut self) -> Self {
+        self.mux_only = true;
+        self
     }
 
     /// Set the peer discovery backend.
@@ -389,113 +409,86 @@ impl VeloBuilder {
 
     /// Build the Velo system with the configured transports and discovery.
     ///
-    /// Construction order:
-    /// 1. Build Messenger (async)
-    /// 2. Extract WorkerId
-    /// 3. Resolve the streaming transport from `stream_config` (default: TCP
-    ///    on `0.0.0.0:0` with multi-interface advertise via WorkerAddress).
-    /// 4. Merge the streaming transport's `address()` into the local
-    ///    PeerInfo's WorkerAddress (so peers can discover the streaming
-    ///    listener alongside messenger endpoints).
-    /// 5. Create AnchorManager via builder, with the streaming transport
-    ///    wired in as the default and registered under its TransportKey,
-    ///    beside the mux unless the mux is switched off.
-    /// 6. Register streaming control-plane handlers on Messenger.
-    /// 7. Assemble Velo struct, holding a clone of the streaming transport
-    ///    so `register_peer` can fan out to it on every newly-known peer.
+    /// Validates the streaming mode before starting transports. Default builds
+    /// install the mux beside a per-stream TCP or gRPC listener. `mux_only`
+    /// installs only the mux. Both modes retain the full rendezvous API.
     pub async fn build(self) -> Result<Arc<Velo>> {
-        // Step 1: Build Messenger.
-        let messenger = self.inner.build().await?;
-
-        // Step 2: Extract worker_id (carried on the local PeerInfo).
-        let worker_id = messenger.instance_id().worker_id();
-
-        // Step 3: Resolve the streaming transport. Default is Tcp(None) —
-        // bind on 0.0.0.0:0 and advertise every UP non-loopback interface
-        // via Vec<InterfaceEndpoint> in WorkerAddress. Multi-node correctness
-        // comes from the advertise list, not from defaulting away from TCP.
-        //
-        // Metrics are installed before the transport is type-erased into
-        // `Arc<dyn FrameTransport>` because `set_metrics` is a concrete
-        // method (the FrameTransport trait stays observability-free so
-        // out-of-tree implementors don't take a `prometheus` dep).
-        let resolved = self.stream_config.unwrap_or(StreamConfig::Tcp(None));
-        let (stream_transport, owned_stream_transport): (
-            Arc<dyn crate::streaming::FrameTransport>,
-            OwnedStreamTransport,
-        ) = match resolved {
-            StreamConfig::Tcp(tcp_cfg) => {
-                let bind_addr = tcp_cfg
-                    .map(|c| c.bind_addr)
-                    .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
-                let tcp = crate::streaming::TcpFrameTransport::new(bind_addr).await?;
-                if let Some(m) = self.metrics.as_ref() {
-                    tcp.set_metrics(Arc::clone(m));
-                }
-                (tcp.clone() as _, OwnedStreamTransport::Tcp(tcp))
-            }
-            #[cfg(feature = "grpc")]
-            StreamConfig::Grpc(grpc_cfg) => {
-                let bind_addr = grpc_cfg
-                    .map(|c| c.bind_addr)
-                    .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
-                let grpc = crate::streaming::GrpcFrameTransport::new(bind_addr)
-                    .await
-                    .map_err(|e| {
-                        anyhow::anyhow!("Failed to start gRPC streaming transport: {}", e)
-                    })?;
-                if let Some(m) = self.metrics.as_ref() {
-                    grpc.set_metrics(Arc::clone(m));
-                }
-                (grpc.clone() as _, OwnedStreamTransport::Grpc(grpc))
-            }
-        };
-
-        // Step 4: Build the streaming-transport registry, keyed by
-        // TransportKey: the chosen transport here, and the mux in Step 5.
-        // The AnchorManager passes the response's `streaming_transport_key`
-        // through this map to find the FrameTransport on the client side at
-        // attach time.
-        let mut registry: std::collections::HashMap<
-            String,
-            Arc<dyn crate::streaming::FrameTransport>,
-        > = std::collections::HashMap::new();
-        registry.insert(
-            stream_transport.key().as_str().to_string(),
-            Arc::clone(&stream_transport),
+        anyhow::ensure!(
+            !self.mux_only || self.stream_config.is_none(),
+            "mux_only cannot be combined with stream_config or stream_bind_addr"
         );
-
-        // Step 5: Build the mux unless the caller switched it off (it is on by
-        // default; see `messenger_mux`). It joins the registry *beside* the
-        // per-stream transport rather than replacing it: negotiation answers
-        // `messenger-mux-v2` only to peers that advertised it, and every other
-        // peer is still answered — and must still be served — on the
-        // per-stream key.
-        let mut config = self.mux_config.unwrap_or_default();
-        // Read once, here, for the reason the RDMA kill switch is: one process
-        // must not answer half its attaches one way and half the other.
-        if config.enabled && messenger_mux_disabled_by_env() {
-            tracing::info!(
-                "VELO_MESSENGER_MUX_DISABLE is set: the messenger mux is off. \
-                 Streams negotiate the per-stream transport."
-            );
-            config.enabled = false;
-        }
+        // Read the override once at build so this instance keeps the same
+        // transport offers for every attach.
+        let config = resolve_mux_config(
+            self.mux_config.unwrap_or_default(),
+            messenger_mux_disabled_by_env(),
+            self.mux_only,
+        )?;
+        let messenger = self.inner.build().await?;
+        let worker_id = messenger.instance_id().worker_id();
         let mux = if config.enabled {
             let mux = crate::streaming::messenger_mux::MessengerMuxTransport::new(
                 Arc::clone(&messenger),
                 config,
                 self.metrics.clone(),
             )?;
-            let mux_key = crate::streaming::FrameTransport::key(mux.as_ref());
-            registry.insert(
-                mux_key.as_str().to_string(),
-                Arc::clone(&mux) as Arc<dyn crate::streaming::FrameTransport>,
-            );
             Some(mux)
         } else {
             None
         };
+
+        // Default builds keep a per-stream listener for peers without the mux.
+        // In mux-only mode, the mux itself fills the default transport field.
+        // Set metrics before type erasure: the public FrameTransport trait
+        // must not require Prometheus in external implementations.
+        let (stream_transport, owned_stream_transport): (
+            Arc<dyn crate::streaming::FrameTransport>,
+            Option<OwnedStreamTransport>,
+        ) = if self.mux_only {
+            let mux = mux
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("mux_only requires the messenger mux"))?;
+            (Arc::clone(mux) as _, None)
+        } else {
+            match self.stream_config.unwrap_or(StreamConfig::Tcp(None)) {
+                StreamConfig::Tcp(tcp_cfg) => {
+                    let bind_addr = tcp_cfg.unwrap_or_default().bind_addr;
+                    let tcp = crate::streaming::TcpFrameTransport::new(bind_addr).await?;
+                    if let Some(metrics) = &self.metrics {
+                        tcp.set_metrics(Arc::clone(metrics));
+                    }
+                    (tcp.clone() as _, Some(OwnedStreamTransport::Tcp(tcp)))
+                }
+                #[cfg(feature = "grpc")]
+                StreamConfig::Grpc(grpc_cfg) => {
+                    let bind_addr = grpc_cfg.unwrap_or_default().bind_addr;
+                    let grpc = crate::streaming::GrpcFrameTransport::new(bind_addr)
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!("Failed to start gRPC streaming transport: {e}")
+                        })?;
+                    if let Some(metrics) = &self.metrics {
+                        grpc.set_metrics(Arc::clone(metrics));
+                    }
+                    (grpc.clone() as _, Some(OwnedStreamTransport::Grpc(grpc)))
+                }
+            }
+        };
+        let mut registry = std::collections::HashMap::new();
+        registry.insert(
+            stream_transport.key().as_str().to_string(),
+            Arc::clone(&stream_transport),
+        );
+        if !self.mux_only
+            && let Some(mux) = &mux
+        {
+            registry.insert(
+                crate::streaming::FrameTransport::key(mux.as_ref())
+                    .as_str()
+                    .to_string(),
+                Arc::clone(mux) as Arc<dyn crate::streaming::FrameTransport>,
+            );
+        }
 
         let anchor_manager = Arc::new(
             crate::streaming::AnchorManagerBuilder::default()
@@ -512,17 +505,17 @@ impl VeloBuilder {
             anchor_manager.install_mux(mux)?;
         }
 
-        // Step 6: Register streaming control-plane handlers
+        // Register streaming control-plane handlers
         anchor_manager.register_handlers(Arc::clone(&messenger))?;
 
-        // Step 7: Create RendezvousManager and register handlers
+        // Create RendezvousManager and register handlers
         let rendezvous_manager = Arc::new(match self.metrics.as_ref() {
             Some(m) => crate::rendezvous::RendezvousManager::with_metrics(worker_id, Arc::clone(m)),
             None => crate::rendezvous::RendezvousManager::new(worker_id),
         });
         rendezvous_manager.register_handlers(Arc::clone(&messenger))?;
 
-        // Step 8: Enable transparent large payload support
+        // Enable transparent large payload support
         let stager = Arc::new(crate::rendezvous::RendezvousStager::new(Arc::clone(
             &rendezvous_manager,
         )));
@@ -531,7 +524,7 @@ impl VeloBuilder {
         )));
         messenger.set_large_payload_support(stager, resolver);
 
-        // Step 9: Build the RDMA registration layer, if a UCX transport was
+        // Build the RDMA registration layer, if a UCX transport was
         // added through `add_ucx_transport`.
         //
         // Ordering: `MessengerBuilder::build` above has already called
@@ -577,7 +570,7 @@ impl VeloBuilder {
             None => None,
         };
 
-        // Step 10: Assemble Velo
+        // Assemble Velo
         Ok(Arc::new(Velo {
             messenger,
             stream_owner: Arc::new(StreamOwner {
@@ -612,6 +605,22 @@ fn rdma_rendezvous_disabled_by_env() -> bool {
             .ok()
             .as_deref(),
     )
+}
+
+fn resolve_mux_config(
+    mut config: crate::streaming::MuxConfig,
+    disabled_by_env: bool,
+    mux_only: bool,
+) -> Result<crate::streaming::MuxConfig> {
+    anyhow::ensure!(
+        !mux_only || (config.enabled && !disabled_by_env),
+        "mux_only requires the messenger mux; it was disabled by config or VELO_MESSENGER_MUX_DISABLE"
+    );
+    if disabled_by_env && config.enabled {
+        tracing::info!("VELO_MESSENGER_MUX_DISABLE is set: disabling the messenger mux");
+        config.enabled = false;
+    }
+    Ok(config)
 }
 
 /// Whether `VELO_MESSENGER_MUX_DISABLE` asks for the messenger mux to be
@@ -851,7 +860,9 @@ impl Velo {
     pub async fn shutdown(&self, policy: ShutdownPolicy) {
         self.graceful_shutdown(policy).await;
         self.anchor_manager.shutdown().await;
-        self.stream_owner.transport.shutdown().await;
+        if let Some(transport) = &self.stream_owner.transport {
+            transport.shutdown().await;
+        }
         self.messenger.closed().await;
     }
 
@@ -900,11 +911,11 @@ impl Velo {
 
     /// Get the peer information for this instance.
     ///
-    /// The returned [`PeerInfo`] carries a [`WorkerAddress`] with both the
-    /// messenger transport entries (TCP / gRPC / NATS / etc.) and the
-    /// streaming transport entry (e.g., `tcp-stream` / `grpc-stream`). The
-    /// streaming entry is required for peers to resolve the streaming
-    /// listener via [`crate::streaming::FrameTransport::register`].
+    /// The returned [`PeerInfo`] carries the messenger transport entries.
+    /// Default builds also publish a per-stream endpoint, such as `tcp-stream`
+    /// or `grpc-stream`, for [`crate::streaming::FrameTransport::register`].
+    /// In [`VeloBuilder::mux_only`] mode the primary stream transport is the
+    /// mux, which uses the messenger endpoints and adds no streaming endpoint.
     pub fn peer_info(&self) -> PeerInfo {
         let messenger_peer = self.messenger.peer_info();
         let stream_addr = self.stream_transport.address();
@@ -955,11 +966,13 @@ impl Velo {
     }
 
     /// Get the distributed event system.
+    #[cfg(feature = "services")]
     pub fn events(&self) -> &Arc<VeloEvents> {
         self.messenger.events()
     }
 
     /// Create an EventManager wired with the distributed backend.
+    #[cfg(feature = "services")]
     pub fn event_manager(&self) -> EventManager {
         self.messenger.event_manager()
     }
@@ -1045,6 +1058,7 @@ impl Velo {
     }
 
     /// Check whether a specific instance has subscribed to a locally-owned event.
+    #[cfg(feature = "services")]
     pub fn has_event_subscriber(&self, handle: EventHandle, subscriber: InstanceId) -> bool {
         self.messenger.has_event_subscriber(handle, subscriber)
     }
@@ -1492,6 +1506,16 @@ impl Velo {
 mod tests {
     use super::*;
 
+    #[test]
+    fn mux_only_rejects_the_environment_kill_switch() {
+        assert!(resolve_mux_config(Default::default(), true, true).is_err());
+        assert!(
+            !resolve_mux_config(Default::default(), true, false)
+                .unwrap()
+                .enabled
+        );
+    }
+
     /// Every kill switch fires on an affirmative and on nothing else.
     ///
     /// The asymmetry is deliberate and worth pinning down: a switch that fired
@@ -1652,7 +1676,7 @@ mod tests {
             .await
             .unwrap();
 
-        let stream_addr = match &velo.stream_owner.transport {
+        let stream_addr = match velo.stream_owner.transport.as_ref().unwrap() {
             OwnedStreamTransport::Tcp(transport) => transport.bound_addr(),
             #[cfg(feature = "grpc")]
             OwnedStreamTransport::Grpc(_) => unreachable!(),
@@ -1661,24 +1685,38 @@ mod tests {
         let messenger = Arc::downgrade(&velo.messenger);
         let manager = Arc::downgrade(&velo.anchor_manager);
         let rendezvous = Arc::downgrade(&velo.rendezvous_manager);
+        #[cfg(feature = "services")]
         let events = Arc::downgrade(velo.messenger.events());
-        let pending_event = velo.messenger.events().new_event().unwrap().into_handle();
-        #[derive(serde::Serialize)]
-        struct Subscription {
-            handle: u128,
-            subscriber_worker: u64,
-            subscriber_instance: InstanceId,
-        }
-        let subscribe = Subscription {
-            handle: pending_event.raw(),
-            subscriber_worker: velo.instance_id().worker_id().as_u64(),
-            subscriber_instance: velo.instance_id(),
+        let events_alive = || {
+            #[cfg(feature = "services")]
+            {
+                events.upgrade().is_some()
+            }
+            #[cfg(not(feature = "services"))]
+            {
+                false
+            }
         };
-        velo.messenger
-            .events()
-            .handle_subscribe(bytes::Bytes::from(serde_json::to_vec(&subscribe).unwrap()))
-            .await
-            .unwrap();
+        #[cfg(feature = "services")]
+        {
+            let pending_event = velo.messenger.events().new_event().unwrap().into_handle();
+            #[derive(serde::Serialize)]
+            struct Subscription {
+                handle: u128,
+                subscriber_worker: u64,
+                subscriber_instance: InstanceId,
+            }
+            let subscribe = Subscription {
+                handle: pending_event.raw(),
+                subscriber_worker: velo.instance_id().worker_id().as_u64(),
+                subscriber_instance: velo.instance_id(),
+            };
+            velo.messenger
+                .events()
+                .handle_subscribe(bytes::Bytes::from(serde_json::to_vec(&subscribe).unwrap()))
+                .await
+                .unwrap();
+        }
 
         let anchor: crate::streaming::StreamAnchor<String> = velo.create_anchor::<String>();
         let handle = anchor.handle();
@@ -1704,7 +1742,7 @@ mod tests {
             while messenger.upgrade().is_some()
                 || manager.upgrade().is_some()
                 || rendezvous.upgrade().is_some()
-                || events.upgrade().is_some()
+                || events_alive()
             {
                 tokio::task::yield_now().await;
             }
@@ -1717,20 +1755,22 @@ mod tests {
     async fn final_velo_drop_stops_streaming_but_keeps_a_retained_messenger() {
         use futures::StreamExt;
 
-        async fn node() -> (Arc<Velo>, std::net::SocketAddr) {
+        async fn node(mux_only: bool) -> (Arc<Velo>, std::net::SocketAddr) {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
-            let node = Velo::builder()
-                .add_transport(Arc::new(
-                    crate::transports::tcp::TcpTransportBuilder::new()
-                        .from_listener(listener)
-                        .unwrap()
-                        .build()
-                        .unwrap(),
-                ))
-                .build()
-                .await
-                .unwrap();
+            let builder = Velo::builder().add_transport(Arc::new(
+                crate::transports::tcp::TcpTransportBuilder::new()
+                    .from_listener(listener)
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+            ));
+            let builder = if mux_only {
+                builder.mux_only()
+            } else {
+                builder
+            };
+            let node = builder.build().await.unwrap();
             (node, addr)
         }
 
@@ -1747,109 +1787,133 @@ mod tests {
             .expect("drop retained a listener");
         }
 
-        let (server, messenger_addr) = node().await;
-        let (client, _) = node().await;
-        client.register_peer(server.peer_info()).unwrap();
-        server.register_peer(client.peer_info()).unwrap();
-        server
-            .register_handler(Handler::unary_handler("ping", |ctx| Ok(Some(ctx.payload))).build())
-            .unwrap();
-        let mut anchor = server.create_anchor::<u32>();
-        let manager = Arc::downgrade(&server.anchor_manager);
-        let retained = Arc::clone(server.messenger());
-        let messenger = Arc::downgrade(&retained);
-        let backend = Arc::clone(retained.backend());
-        let tracker = retained.tracker().clone();
-        let frame_transport = match &server.stream_owner.transport {
-            OwnedStreamTransport::Tcp(transport) => Arc::clone(transport),
-            #[cfg(feature = "grpc")]
-            OwnedStreamTransport::Grpc(_) => unreachable!(),
-        };
-        let stream_addr = frame_transport.bound_addr();
-        let last_owner = server.as_ref().clone();
-        drop(server);
+        for mux_only in [false, true] {
+            let (server, messenger_addr) = node(mux_only).await;
+            let (client, _) = node(mux_only).await;
+            client.register_peer(server.peer_info()).unwrap();
+            server.register_peer(client.peer_info()).unwrap();
+            server
+                .register_handler(
+                    Handler::unary_handler("ping", |ctx| Ok(Some(ctx.payload))).build(),
+                )
+                .unwrap();
+            let mut anchor = server.create_anchor::<u32>();
+            let manager = Arc::downgrade(&server.anchor_manager);
+            let retained = Arc::clone(server.messenger());
+            let messenger = Arc::downgrade(&retained);
+            let backend = Arc::clone(retained.backend());
+            let tracker = retained.tracker().clone();
+            let frame_transport = match &server.stream_owner.transport {
+                Some(OwnedStreamTransport::Tcp(transport)) => Some(Arc::clone(transport)),
+                #[cfg(feature = "grpc")]
+                Some(OwnedStreamTransport::Grpc(_)) => unreachable!(),
+                None => None,
+            };
+            let stream_addr = frame_transport
+                .as_ref()
+                .map(|transport| transport.bound_addr());
+            let last_owner = server.as_ref().clone();
+            drop(server);
 
-        let sender = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            client.attach_anchor::<u32>(anchor.handle()),
-        )
-        .await
-        .expect("a Velo clone lost its receive loop")
-        .expect("a Velo clone lost streaming control handlers");
-        sender.send(7).await.unwrap();
-        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), anchor.next())
+            let sender = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                client.attach_anchor::<u32>(anchor.handle()),
+            )
             .await
-            .expect("a Velo clone lost its stream");
-        assert!(matches!(
-            frame,
-            Some(Ok(crate::streaming::StreamFrame::Item(7)))
-        ));
+            .expect("a Velo clone lost its receive loop")
+            .expect("a Velo clone lost streaming control handlers");
+            sender.send(7).await.unwrap();
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(2), anchor.next())
+                .await
+                .expect("a Velo clone lost its stream");
+            assert!(matches!(
+                frame,
+                Some(Ok(crate::streaming::StreamFrame::Item(7)))
+            ));
 
-        drop(last_owner);
-        let ended = tokio::time::timeout(std::time::Duration::from_secs(2), anchor.next())
-            .await
-            .expect("final Velo drop left its stream open");
-        assert!(ended.is_none(), "final Velo drop returned {ended:?}");
-        wait_for_listener_close(stream_addr).await;
-        assert!(manager.upgrade().is_none());
-        let response = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            client
-                .unary("ping")
-                .unwrap()
-                .raw_payload(bytes::Bytes::from_static(b"alive"))
-                .instance(retained.instance_id())
-                .send(),
-        )
-        .await
-        .expect("retained Messenger stopped with Velo")
-        .unwrap();
-        assert_eq!(response, bytes::Bytes::from_static(b"alive"));
-        // Cleanup handlers stay idempotent once the manager is gone: an
-        // absent manager holds no anchor, so a peer's cleanup has succeeded.
-        let handle = anchor.handle();
-        let cleanups = [
-            ("_anchor_detach", serde_json::json!({ "handle": handle })),
-            ("_anchor_finalize", serde_json::json!({ "handle": handle })),
-            ("_anchor_cancel", serde_json::json!({ "handle": handle })),
-            (
-                "_mpsc_anchor_detach",
-                serde_json::json!({ "handle": handle, "sender_id": 1 }),
-            ),
-            (
-                "_mpsc_anchor_cancel",
-                serde_json::json!({ "handle": handle }),
-            ),
-        ];
-        for (name, request) in cleanups {
-            tokio::time::timeout(
+            drop(last_owner);
+            let ended = tokio::time::timeout(std::time::Duration::from_secs(2), anchor.next())
+                .await
+                .expect("final Velo drop left its stream open");
+            assert!(ended.is_none(), "final Velo drop returned {ended:?}");
+            if let Some(stream_addr) = stream_addr {
+                wait_for_listener_close(stream_addr).await;
+            }
+            assert!(manager.upgrade().is_none());
+            let response = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
                 client
-                    .messenger()
-                    .typed_unary_streaming::<()>(name)
-                    .payload(request)
+                    .unary("ping")
                     .unwrap()
+                    .raw_payload(bytes::Bytes::from_static(b"alive"))
                     .instance(retained.instance_id())
                     .send(),
             )
             .await
-            .unwrap_or_else(|_| panic!("{name} did not answer"))
-            .unwrap_or_else(|error| panic!("{name} failed after final Velo drop: {error}"));
-        }
+            .expect("retained Messenger stopped with Velo")
+            .unwrap();
+            assert_eq!(response, bytes::Bytes::from_static(b"alive"));
+            // Cleanup handlers stay idempotent once the manager is gone: an
+            // absent manager holds no anchor, so a peer's cleanup has succeeded.
+            // That includes the rollback of a failed connect.
+            let handle = anchor.handle();
+            let cleanups = [
+                ("_anchor_detach", serde_json::json!({ "handle": handle })),
+                ("_anchor_finalize", serde_json::json!({ "handle": handle })),
+                ("_anchor_cancel", serde_json::json!({ "handle": handle })),
+                (
+                    "_anchor_abort_attach",
+                    serde_json::to_value(crate::streaming::control::AnchorAbortAttachRequest {
+                        handle,
+                        stream_cancel_handle: crate::streaming::control::StreamCancelHandle::pack(
+                            client.instance_id().worker_id(),
+                            1,
+                        ),
+                    })
+                    .unwrap(),
+                ),
+                (
+                    "_mpsc_anchor_detach",
+                    serde_json::json!({ "handle": handle, "sender_id": 1 }),
+                ),
+                (
+                    "_mpsc_anchor_cancel",
+                    serde_json::json!({ "handle": handle }),
+                ),
+            ];
+            for (name, request) in cleanups {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    client
+                        .messenger()
+                        .typed_unary_streaming::<()>(name)
+                        .payload(request)
+                        .unwrap()
+                        .instance(retained.instance_id())
+                        .send(),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("{name} did not answer"))
+                .unwrap_or_else(|error| panic!("{name} failed after final Velo drop: {error}"));
+            }
+            assert!(manager.upgrade().is_none());
 
-        drop(anchor);
-        drop(sender);
-        drop(retained);
-        // Teardown runs on its own thread; wait for it before timing the
-        // receive loops, so the budget below covers only their exit.
-        wait_for_final_messenger_drop(&messenger, &backend).await;
-        tracker.close();
-        tokio::time::timeout(std::time::Duration::from_secs(2), tracker.wait())
-            .await
-            .expect("final Messenger drop retained its receive loops");
-        wait_for_listener_close(messenger_addr).await;
-        frame_transport.shutdown().await;
-        client.shutdown(ShutdownPolicy::WaitForever).await;
+            drop(anchor);
+            drop(sender);
+            drop(retained);
+            // Teardown runs on its own thread; wait for it before timing the
+            // receive loops, so the budget below covers only their exit.
+            wait_for_final_messenger_drop(&messenger, &backend).await;
+            tracker.close();
+            tokio::time::timeout(std::time::Duration::from_secs(2), tracker.wait())
+                .await
+                .expect("final Messenger drop retained its receive loops");
+            wait_for_listener_close(messenger_addr).await;
+            if let Some(frame_transport) = frame_transport {
+                frame_transport.shutdown().await;
+            }
+            client.shutdown(ShutdownPolicy::WaitForever).await;
+        }
     }
 
     /// A node with one TCP transport on a loopback port and a loopback stream listener.
@@ -2805,6 +2869,7 @@ mod tests {
     /// and the block captures only that field, so the context, and its
     /// Messenger, drops before the send. Touching `ctx` itself inside the
     /// block would capture all of it; this test fails if that happens.
+    #[cfg(feature = "services")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_stalled_event_completion_does_not_hold_the_messenger() {
         let (messenger, peer_instance) = stalled_messenger().await;
