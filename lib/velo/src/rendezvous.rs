@@ -1209,7 +1209,7 @@ impl Drop for LeaseGuard {
         let lease_id = self.lease_id;
         let handle = self.handle;
 
-        let Some(messenger) = self.messenger.clone() else {
+        let Some(messenger) = self.messenger.take() else {
             // Local: the store is right here.
             if self.store.consume_lease(lease_id, local_id) == store::LeaseOutcome::Consumed {
                 self.store.release_read_lock(local_id);
@@ -1223,12 +1223,26 @@ impl Drop for LeaseGuard {
             lease = lease_id,
             "rendezvous: releasing a lease whose get did not complete"
         );
+        // Built here and the Messenger dropped: the detach can wait on
+        // admission to an owner that stopped answering, the likely reason this
+        // guard is armed, and a task holding the Messenger there would keep its
+        // final drop, and so its transport teardown, from ever happening.
+        let send = consumer::Consumer::detach_request(&messenger, handle, lease_id);
+        drop(messenger);
+        let send = match send {
+            Ok(send) => send,
+            Err(e) => {
+                tracing::warn!(%handle, lease = lease_id, error = %e,
+                    "rendezvous: could not detach a lease after a failed get");
+                return;
+            }
+        };
         // `AssertUnwindSafe` because the only thing this closure touches is a
-        // runtime handle and two `Arc`s, and a panic from `spawn` leaves none of
-        // them observably half-updated.
+        // runtime handle and the send it moves, and a panic from `spawn` leaves
+        // neither observably half-updated.
         let spawned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.runtime.spawn(async move {
-                if let Err(e) = consumer::Consumer::detach(&messenger, handle, lease_id).await {
+                if let Err(e) = send.send().await {
                     tracing::warn!(
                         %handle,
                         lease = lease_id,

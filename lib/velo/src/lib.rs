@@ -2387,66 +2387,66 @@ mod tests {
         }
     }
 
-    /// A best-effort `_stream_cancel` to a peer that never admits a frame
-    /// must not keep the Messenger alive after its final drop.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_stalled_stream_cancel_does_not_hold_the_messenger() {
-        struct Stalling {
-            gate: velo_ext::AdmissionGate<(bytes::Bytes, bytes::Bytes)>,
-            _rx: flume::Receiver<(bytes::Bytes, bytes::Bytes)>,
+    /// A transport whose peer never reads: its gate holds one frame, and
+    /// every later send waits on admission for as long as the test runs.
+    struct Stalling {
+        gate: velo_ext::AdmissionGate<(bytes::Bytes, bytes::Bytes)>,
+        _rx: flume::Receiver<(bytes::Bytes, bytes::Bytes)>,
+    }
+    fn stalling_address() -> velo_ext::WorkerAddress {
+        let entries =
+            std::collections::HashMap::from([("stalling".to_string(), b"stalling".to_vec())]);
+        velo_ext::WorkerAddress::from_encoded(rmp_serde::to_vec(&entries).unwrap())
+    }
+    impl velo_ext::Transport for Stalling {
+        fn key(&self) -> velo_ext::TransportKey {
+            velo_ext::TransportKey::new("stalling")
         }
-        fn stalling_address() -> velo_ext::WorkerAddress {
-            let entries =
-                std::collections::HashMap::from([("stalling".to_string(), b"stalling".to_vec())]);
-            velo_ext::WorkerAddress::from_encoded(rmp_serde::to_vec(&entries).unwrap())
+        fn address(&self) -> velo_ext::WorkerAddress {
+            stalling_address()
         }
-        impl velo_ext::Transport for Stalling {
-            fn key(&self) -> velo_ext::TransportKey {
-                velo_ext::TransportKey::new("stalling")
-            }
-            fn address(&self) -> velo_ext::WorkerAddress {
-                stalling_address()
-            }
-            fn register(&self, _: velo_ext::PeerInfo) -> Result<(), velo_ext::TransportError> {
-                Ok(())
-            }
-            fn send_message(
-                &self,
-                _: velo_ext::InstanceId,
-                header: bytes::Bytes,
-                payload: bytes::Bytes,
-                _: velo_ext::MessageType,
-                _: Arc<dyn velo_ext::TransportErrorHandler>,
-            ) -> velo_ext::SendOutcome {
-                self.gate.send((header, payload))
-            }
-            fn max_message_size(&self, _: velo_ext::InstanceId) -> Option<usize> {
-                None
-            }
-            fn start(
-                &self,
-                _: velo_ext::InstanceId,
-                _: velo_ext::TransportAdapter,
-                _: tokio::runtime::Handle,
-            ) -> futures::future::BoxFuture<'_, anyhow::Result<()>> {
-                Box::pin(async { Ok(()) })
-            }
-            fn shutdown(&self) {}
-            fn check_health(
-                &self,
-                _: velo_ext::InstanceId,
-                _: std::time::Duration,
-            ) -> std::pin::Pin<
-                Box<
-                    dyn std::future::Future<Output = Result<(), velo_ext::HealthCheckError>>
-                        + Send
-                        + '_,
-                >,
-            > {
-                Box::pin(async { Ok(()) })
-            }
+        fn register(&self, _: velo_ext::PeerInfo) -> Result<(), velo_ext::TransportError> {
+            Ok(())
         }
+        fn send_message(
+            &self,
+            _: velo_ext::InstanceId,
+            header: bytes::Bytes,
+            payload: bytes::Bytes,
+            _: velo_ext::MessageType,
+            _: Arc<dyn velo_ext::TransportErrorHandler>,
+        ) -> velo_ext::SendOutcome {
+            self.gate.send((header, payload))
+        }
+        fn max_message_size(&self, _: velo_ext::InstanceId) -> Option<usize> {
+            None
+        }
+        fn start(
+            &self,
+            _: velo_ext::InstanceId,
+            _: velo_ext::TransportAdapter,
+            _: tokio::runtime::Handle,
+        ) -> futures::future::BoxFuture<'_, anyhow::Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn shutdown(&self) {}
+        fn check_health(
+            &self,
+            _: velo_ext::InstanceId,
+            _: std::time::Duration,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<(), velo_ext::HealthCheckError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+    }
 
+    /// A Messenger on a [`Stalling`] transport, with one registered peer.
+    async fn stalled_messenger() -> (Arc<Messenger>, crate::InstanceId) {
         let (tx, rx) = flume::bounded(1);
         let transport = Arc::new(Stalling {
             gate: velo_ext::AdmissionGate::new(tx, tokio::runtime::Handle::current()),
@@ -2461,6 +2461,48 @@ mod tests {
         messenger
             .register_peer(velo_ext::PeerInfo::new(peer_instance, stalling_address()))
             .unwrap();
+        (messenger, peer_instance)
+    }
+
+    /// The detach a dropped lease guard sends must not hold the Messenger
+    /// either. A guard drops armed when a get fails or is cancelled, which is
+    /// most likely when the payload's owner has stopped answering.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_lease_detach_does_not_hold_the_messenger() {
+        let (messenger, peer_instance) = stalled_messenger().await;
+        let rendezvous = Arc::new(RendezvousManager::new(messenger.instance_id().worker_id()));
+        rendezvous
+            .register_handlers(Arc::clone(&messenger))
+            .unwrap();
+        let weak = Arc::downgrade(&messenger);
+        let backend = Arc::clone(messenger.backend());
+        // The gate holds one frame: the first detach is admitted at once, the
+        // second waits on admission for as long as the peer stays stalled.
+        for lease in 1..=2 {
+            let handle = crate::rendezvous::DataHandle::pack(peer_instance.worker_id(), lease);
+            drop(rendezvous.lease_guard(handle, lease));
+        }
+        drop(messenger);
+        let gone = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while weak.upgrade().is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let still_alive = weak.upgrade().is_some();
+        backend.shutdown_now();
+        let _ = backend.request_teardown().await;
+        assert!(
+            gone.is_ok() && !still_alive,
+            "a detach parked in admission kept the Messenger alive after its final drop"
+        );
+    }
+
+    /// A best-effort `_stream_cancel` to a peer that never admits a frame
+    /// must not keep the Messenger alive after its final drop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_stream_cancel_does_not_hold_the_messenger() {
+        let (messenger, peer_instance) = stalled_messenger().await;
         let registry = Arc::new(crate::streaming::control::SenderRegistry::default());
         let weak = Arc::downgrade(&messenger);
         let backend = Arc::clone(messenger.backend());

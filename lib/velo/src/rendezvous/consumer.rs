@@ -335,19 +335,27 @@ impl Consumer {
         handle: DataHandle,
         lease_id: u64,
     ) -> Result<()> {
-        let target_worker = handle.worker_id();
+        Self::detach_request(messenger, handle, lease_id)?
+            .send()
+            .await?;
+        Ok(())
+    }
 
-        messenger
+    /// The detach message, built without sending it. The send holds only the
+    /// messenger's client, so a task that awaits it does not keep the
+    /// Messenger alive.
+    pub(crate) fn detach_request(
+        messenger: &Messenger,
+        handle: DataHandle,
+        lease_id: u64,
+    ) -> Result<crate::messenger::AmSendBuilder> {
+        Ok(messenger
             .am_send_streaming("_rv_detach")?
             .raw_payload(Bytes::from(serde_json::to_vec(&RvDetachRequest {
                 handle: RvHandleWire::from_handle(handle),
                 lease_id,
             })?))
-            .worker(target_worker)
-            .send()
-            .await?;
-
-        Ok(())
+            .worker(handle.worker_id()))
     }
 
     /// Release the read lock AND decrement refcount. Frees data when both hit 0.
