@@ -84,14 +84,15 @@ async fn run_handler<H: ActiveMessageHandler + 'static>(
     // peer that stopped reading, and holding the Messenger there would keep
     // its final drop, and so its transport teardown, from ever happening.
     let backend = Arc::clone(ctx.system.backend());
-    let metrics = ctx.system.observability();
     let in_flight = ctx.in_flight.clone();
     trace!(target: "crate::messenger::dispatcher", handler = %handler.name(), "Handler task started");
     let outcome = AssertUnwindSafe(async { handler.handle(ctx).await })
         .catch_unwind()
         .await;
     if let Err(panic) = outcome {
-        if let Some(metrics) = metrics.as_ref() {
+        // Read from the backend only here: a clone of the metrics handle per
+        // message would cost every handler call an atomic for a panic path.
+        if let Some(metrics) = backend.observability() {
             metrics.record_dispatch_failure(failure);
         }
         let reason = panic
@@ -644,12 +645,23 @@ mod tests {
                 .build()
                 .unwrap(),
         );
+        let registry = prometheus::Registry::new();
+        let metrics = Arc::new(crate::observability::VeloMetrics::register(&registry).unwrap());
         let messenger = Messenger::builder()
             .add_transport(transport)
+            .metrics(metrics)
             .build()
             .await
             .unwrap();
         messenger.register_peer(messenger.peer_info()).unwrap();
+        // The panic arm reads the metrics from the backend, not the Messenger;
+        // a backend built without them would drop these counts silently.
+        let panics = |reason| {
+            crate::observability::test_helpers::MetricSnapshot::from_registry(&registry).counter(
+                "velo_messenger_dispatch_failures_total",
+                &[("stage", "dispatch"), ("reason", reason)],
+            )
+        };
 
         for mode in ["spawn", "ordered"] {
             for during_construction in [true, false] {
@@ -677,6 +689,8 @@ mod tests {
                 assert!(result.unwrap_err().to_string().contains("handler panicked"));
             }
         }
+        assert_eq!(panics("handler_panic"), 2.0);
+        assert_eq!(panics("ordered_handler_panic"), 2.0);
         messenger
             .graceful_shutdown(crate::ShutdownPolicy::WaitForever)
             .await;

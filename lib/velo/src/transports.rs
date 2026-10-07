@@ -138,6 +138,7 @@ pub struct VeloBackend {
     shutdown_state: ShutdownState,
     teardown: OnceLock<teardown::Completion>,
     runtime: tokio::runtime::Handle,
+    observability: Option<Arc<VeloMetrics>>,
 }
 
 /// Stop completed transports if construction fails or is cancelled.
@@ -281,9 +282,16 @@ impl VeloBackend {
                 shutdown_state,
                 teardown: OnceLock::new(),
                 runtime,
+                observability,
             },
             data_streams,
         ))
+    }
+
+    /// The metrics this backend was built with. Borrowed, so a reader on a
+    /// per-message path pays for no reference count unless it keeps one.
+    pub(crate) fn observability(&self) -> Option<&Arc<VeloMetrics>> {
+        self.observability.as_ref()
     }
 
     /// Returns this backend's unique instance identifier.
