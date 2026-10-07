@@ -320,6 +320,7 @@ pub(crate) fn spawn(key: PeerLane, ctx: BatcherContext) -> Arc<BatcherHandle> {
         epoch,
     );
     let tasks = ctx.tasks.clone();
+    let ctx_cancel = ctx.cancel.clone();
     let batcher = Batcher {
         tasks: ctx.tasks,
         key,
@@ -341,9 +342,30 @@ pub(crate) fn spawn(key: PeerLane, ctx: BatcherContext) -> Arc<BatcherHandle> {
         #[cfg(test)]
         hooks: ctx.hooks,
     };
-    tasks.spawn(batcher.run(open_rx));
+    // Not `tasks.spawn`: that drops the future at its first await once the
+    // shared token is cancelled, which is exactly when the run loop sends the
+    // control it still holds (a zero-RTT producer's only notice that its
+    // stream ended). The loop exits on its own cancel arm instead; the grace
+    // only bounds a send to a stalled peer, so the join in shutdown stays
+    // bounded.
+    let cancel = ctx_cancel;
+    tasks.spawn_until_done(async move {
+        let run = batcher.run(open_rx);
+        tokio::pin!(run);
+        tokio::select! {
+            () = &mut run => {}
+            () = async {
+                cancel.cancelled().await;
+                tokio::time::sleep(STOP_GRACE).await;
+            } => {}
+        }
+    });
     handle
 }
+
+/// How long a stopped batcher may take to send what it held. On a live link
+/// that is one write; only a stalled peer waits this long.
+const STOP_GRACE: Duration = Duration::from_millis(500);
 
 /// One unit of work pulled by the main loop.
 enum Work {
@@ -1147,13 +1169,14 @@ impl Batcher {
         (!Arc::ptr_eq(entry.value(), &self.handle)).then(|| Arc::clone(entry.value()))
     }
 
-    /// Close every slot on the way out, so producers learn immediately.
+    /// Leave the peer registry, if this batcher is still the one in it.
     fn unregister(&self) {
         let handle = Arc::clone(&self.handle);
         self.batchers
             .remove_if(&self.key, |_, entry| Arc::ptr_eq(entry, &handle));
     }
 
+    /// Close every slot on the way out, so producers learn immediately.
     fn teardown(&mut self, unregister: bool) {
         // Unregistered before the inbox closes. `send_replies` re-resolves a
         // refused reply through the registry until a batcher takes it, and

@@ -1063,13 +1063,14 @@ impl AnchorManager {
     /// 3. Remove anchors and MPSC entries, and cancel their senders: local
     ///    ones directly, remote ones by `_stream_cancel` while the messenger's
     ///    transports are still up (final drop).
-    /// 4. On final drop, stop the mux's tasks now. Each batcher sends the
-    ///    slot closes step 3 queued before it exits; a zero-RTT producer
-    ///    learns that its stream ended only from that close.
+    ///
+    /// On final drop the caller stops the mux next, so each batcher sends the
+    /// slot closes step 3 queued before it exits; a zero-RTT producer learns
+    /// that its stream ended only from that close.
     ///
     /// The caller then retires mux slots, after joining tasks if it can wait.
     ///
-    /// Steps 1-4 do not await. A caller that drops the shutdown future (a timeout
+    /// Steps 1-3 do not await. A caller that drops the shutdown future (a timeout
     /// around `Velo::shutdown`) still leaves no stream waiting on a slot or an
     /// anchor. The slots then stay open, with no reader, until the mux drops.
     ///
@@ -1086,9 +1087,9 @@ impl AnchorManager {
             .get()
             .filter(|m| !m.backend().teardown_requested());
         let mux = self.mux.get();
-        // With transports up, stop the mux only after the removals below have
-        // queued their slot closes: a zero-RTT producer has no other signal,
-        // and a stopping batcher sends what is already queued.
+        // With transports up, the caller stops the mux after the removals
+        // below have queued their slot closes: a zero-RTT producer has no
+        // other signal, and a stopping batcher sends what is already queued.
         if peers.is_none()
             && let Some(mux) = mux
         {
@@ -1144,11 +1145,6 @@ impl AnchorManager {
             .collect();
         for id in ids {
             self.sender_registry.cancel(id);
-        }
-        if peers.is_some()
-            && let Some(mux) = mux
-        {
-            mux.stop_sending();
         }
     }
 
