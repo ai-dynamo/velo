@@ -2604,7 +2604,7 @@ mod tests {
     /// reading. The handler task must not hold the Messenger meanwhile.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_stalled_decode_error_reply_does_not_hold_the_messenger() {
-        let (messenger, peer_instance) = stalled_messenger().await;
+        let (messenger, peer_instance, sends) = counted_stalled_messenger().await;
         let weak = Arc::downgrade(&messenger);
         let backend = Arc::clone(messenger.backend());
         let handler =
@@ -2626,6 +2626,15 @@ mod tests {
                 &messenger,
             );
         }
+        // Wait until both replies reached the transport, so the handler
+        // tasks are past their upgrade and parked on the stalled peer.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while sends.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the replies never reached the stalled transport");
         drop(messenger);
         let gone = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while weak.upgrade().is_some() {
@@ -2648,7 +2657,7 @@ mod tests {
     /// Messenger, or its final drop, and so its teardown, never runs.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_stalled_ordered_lane_does_not_hold_the_messenger() {
-        let (messenger, peer_instance) = stalled_messenger().await;
+        let (messenger, peer_instance, sends) = counted_stalled_messenger().await;
         let weak = Arc::downgrade(&messenger);
         let backend = Arc::clone(messenger.backend());
         let handler =
@@ -2671,6 +2680,15 @@ mod tests {
                 &messenger,
             );
         }
+        // Wait until both replies reached the transport, so the handler
+        // tasks are past their upgrade and parked on the stalled peer.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while sends.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the replies never reached the stalled transport");
         drop(messenger);
         let gone = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while weak.upgrade().is_some() {
