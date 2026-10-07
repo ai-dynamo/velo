@@ -109,8 +109,8 @@ pub struct RendezvousManager {
     worker_id: WorkerId,
     /// The data store holding staged slots and active transfers.
     store: Arc<store::DataStore>,
-    /// Messenger reference, set once via `register_handlers()`.
-    messenger_lock: OnceLock<MessengerRef>,
+    /// Messenger and its runtime, set once via `register_handlers()`.
+    messenger_lock: OnceLock<MessengerLink>,
     /// Optional Prometheus metrics.
     metrics: Option<Arc<VeloMetrics>>,
     /// Stops the lease reaper. Cancelled by `Velo::graceful_shutdown` before
@@ -124,18 +124,12 @@ pub struct RendezvousManager {
     test_hook: parking_lot::Mutex<Option<RdmaTestHook>>,
 }
 
-enum MessengerRef {
-    Strong(Arc<crate::messenger::Messenger>),
-    Weak(Weak<crate::messenger::Messenger>),
-}
-
-impl MessengerRef {
-    fn upgrade(&self) -> Option<Arc<crate::messenger::Messenger>> {
-        match self {
-            Self::Strong(messenger) => Some(Arc::clone(messenger)),
-            Self::Weak(messenger) => messenger.upgrade(),
-        }
-    }
+/// The messenger is held weakly: its owner, not this manager, keeps it alive.
+/// Its runtime handle is kept beside it, so a local lease can name the runtime
+/// without upgrading the messenger on every get.
+struct MessengerLink {
+    messenger: Weak<crate::messenger::Messenger>,
+    runtime: tokio::runtime::Handle,
 }
 
 /// A condition to force on the next RDMA transfer, for tests.
@@ -259,6 +253,8 @@ impl RendezvousManager {
 
     /// Register the rendezvous control-plane handlers on the messenger.
     ///
+    /// The manager holds the messenger weakly; the caller keeps it alive.
+    ///
     /// Must be called exactly once. Registers seven underscore-prefixed
     /// handlers: `_rv_metadata`, `_rv_acquire`, `_rv_pull`, `_rv_ref`,
     /// `_rv_detach`, `_rv_release`, `_rv_lease_renew`.
@@ -274,24 +270,6 @@ impl RendezvousManager {
     pub fn register_handlers(
         self: &Arc<Self>,
         messenger: Arc<crate::messenger::Messenger>,
-    ) -> Result<()> {
-        let retained = MessengerRef::Strong(Arc::clone(&messenger));
-        self.register_handlers_inner(messenger, retained)
-    }
-
-    /// Velo owns both managers; their back-link must not own the messenger.
-    pub(crate) fn register_handlers_weak(
-        self: &Arc<Self>,
-        messenger: Arc<crate::messenger::Messenger>,
-    ) -> Result<()> {
-        let retained = MessengerRef::Weak(Arc::downgrade(&messenger));
-        self.register_handlers_inner(messenger, retained)
-    }
-
-    fn register_handlers_inner(
-        self: &Arc<Self>,
-        messenger: Arc<crate::messenger::Messenger>,
-        retained: MessengerRef,
     ) -> Result<()> {
         use handlers::{
             create_rv_acquire_handler, create_rv_detach_handler, create_rv_lease_renew_handler,
@@ -320,7 +298,10 @@ impl RendezvousManager {
         )))?;
 
         self.messenger_lock
-            .set(retained)
+            .set(MessengerLink {
+                messenger: Arc::downgrade(&messenger),
+                runtime: messenger.runtime().clone(),
+            })
             .map_err(|_| anyhow::anyhow!("register_handlers called twice"))?;
 
         Ok(())
@@ -330,8 +311,17 @@ impl RendezvousManager {
     fn messenger(&self) -> Result<Arc<crate::messenger::Messenger>> {
         self.messenger_lock
             .get()
-            .and_then(MessengerRef::upgrade)
+            .and_then(|link| link.messenger.upgrade())
             .ok_or_else(|| anyhow::anyhow!("Rendezvous messenger is unavailable"))
+    }
+
+    /// The messenger's client, for a remote operation that waits on the
+    /// owner. The Messenger itself is dropped before any wait: the resolver
+    /// for large payloads runs these calls on an internal task, and holding
+    /// the Messenger there would keep its final drop, and so its transport
+    /// teardown, from ever running while an owner stays silent.
+    fn client(&self) -> Result<Arc<crate::messenger::ActiveMessageClient>> {
+        Ok(Arc::clone(self.messenger()?.client()))
     }
 
     // -----------------------------------------------------------------------
@@ -745,7 +735,9 @@ impl RendezvousManager {
                 .metadata(local_id)
                 .ok_or_else(|| anyhow::anyhow!("rendezvous handle not found: {handle}"))
         } else {
-            consumer::Consumer::metadata(&self.messenger()?, handle).await
+            // Built in its own statement so the Messenger is dropped before the wait.
+            let send = consumer::Consumer::metadata_request(self.messenger()?.client(), handle)?;
+            send.send().await
         };
         if let Some(m) = &self.metrics {
             let outcome = if result.is_ok() {
@@ -774,7 +766,7 @@ impl RendezvousManager {
                 .store
                 .acquire_read_lock(local_id)
                 .ok_or_else(|| anyhow::anyhow!("rendezvous handle not found: {handle}"))?;
-            let lease = self.lease_guard(handle, lease_id);
+            let lease = self.lease_guard(handle, lease_id, None);
             let data = self
                 .store
                 .get_data(local_id)
@@ -863,7 +855,7 @@ impl RendezvousManager {
             // this call on an instance with no UCX transport, so without the
             // guard the ordinary configuration leaked a deadline-free lease on
             // every single invocation.
-            let lease = self.lease_guard(handle, lease_id);
+            let lease = self.lease_guard(handle, lease_id, None);
             let data = self
                 .store
                 .get_data(local_id)
@@ -954,7 +946,7 @@ impl RendezvousManager {
                 .store
                 .acquire_read_lock(local_id)
                 .ok_or_else(|| anyhow::anyhow!("rendezvous handle not found: {handle}"))?;
-            let lease = self.lease_guard(handle, lease_id);
+            let lease = self.lease_guard(handle, lease_id, None);
             let data = self
                 .store
                 .get_data(local_id)
@@ -985,7 +977,9 @@ impl RendezvousManager {
             }
             Ok(())
         } else {
-            consumer::Consumer::ref_handle(&self.messenger()?, handle).await
+            // Built in its own statement so the Messenger is dropped before the wait.
+            let send = consumer::Consumer::ref_request(self.messenger()?.client(), handle)?;
+            send.send().await.map(drop)
         };
         if let Some(m) = &self.metrics {
             let outcome = if result.is_ok() {
@@ -1017,7 +1011,10 @@ impl RendezvousManager {
                 }
             }
         } else {
-            consumer::Consumer::detach(&self.messenger()?, handle, lease_id).await
+            // Built in its own statement so the Messenger is dropped before the wait.
+            let send =
+                consumer::Consumer::detach_request(self.messenger()?.client(), handle, lease_id)?;
+            send.send().await
         };
         if let Some(m) = &self.metrics {
             let outcome = if result.is_ok() {
@@ -1053,7 +1050,10 @@ impl RendezvousManager {
                 }
             }
         } else {
-            consumer::Consumer::release(&self.messenger()?, handle, lease_id).await
+            // Built in its own statement so the Messenger is dropped before the wait.
+            let send =
+                consumer::Consumer::release_request(self.messenger()?.client(), handle, lease_id)?;
+            send.send().await
         };
         if let Some(m) = &self.metrics {
             let outcome = if result.is_ok() {
@@ -1082,16 +1082,32 @@ impl RendezvousManager {
     /// Wrap every step between acquiring a lease and returning it; see
     /// [`LeaseGuard`] for why the alternative did not survive contact with a
     /// fourth error arm.
-    pub(crate) fn lease_guard(&self, handle: DataHandle, lease_id: u64) -> LeaseGuard {
-        let local = handle.worker_id() == self.worker_id;
-        let messenger = self.messenger_lock.get().and_then(MessengerRef::upgrade);
-        let runtime = messenger
-            .as_ref()
-            .map(|m| m.runtime().clone())
+    ///
+    /// `client` is what a remote lease is detached through; the caller passes
+    /// the one it already holds. It is ignored for a local lease.
+    pub(crate) fn lease_guard(
+        &self,
+        handle: DataHandle,
+        lease_id: u64,
+        client: Option<&Arc<crate::messenger::ActiveMessageClient>>,
+    ) -> LeaseGuard {
+        // Locality comes from the handle, never from whether there is a
+        // client: a remote get can lose its Messenger while it waits, and a
+        // remote lease read as local would be released from this store, where
+        // the owner's lease and slot ids can name a live lease of our own.
+        let lease = if handle.worker_id() == self.worker_id {
+            Lease::Local
+        } else {
+            Lease::Remote(client.cloned())
+        };
+        let runtime = self
+            .messenger_lock
+            .get()
+            .map(|link| link.runtime.clone())
             .unwrap_or_else(tokio::runtime::Handle::current);
         LeaseGuard {
             store: Arc::clone(&self.store),
-            messenger: if local { None } else { messenger },
+            lease,
             runtime,
             handle,
             lease_id,
@@ -1199,13 +1215,20 @@ fn normalize_lease_timeout(configured: std::time::Duration) -> std::time::Durati
 #[must_use = "the lease is released when this is dropped; call disarm() to keep it"]
 pub(crate) struct LeaseGuard {
     store: Arc<store::DataStore>,
-    /// `None` for a lease on this instance's own store, which is released
-    /// without touching the network.
-    messenger: Option<Arc<crate::messenger::Messenger>>,
+    lease: Lease,
     runtime: tokio::runtime::Handle,
     handle: DataHandle,
     lease_id: u64,
     armed: bool,
+}
+
+/// Where a guarded lease lives, and so how it is released.
+enum Lease {
+    /// On this instance's own store, released without touching the network.
+    Local,
+    /// On another instance, detached through the client. `None` when the
+    /// caller gave no client, so the lease cannot be detached from here.
+    Remote(Option<Arc<crate::messenger::ActiveMessageClient>>),
 }
 
 impl LeaseGuard {
@@ -1225,13 +1248,21 @@ impl Drop for LeaseGuard {
         let lease_id = self.lease_id;
         let handle = self.handle;
 
-        let Some(messenger) = self.messenger.clone() else {
-            // Local: the store is right here.
-            if self.store.consume_lease(lease_id, local_id) == store::LeaseOutcome::Consumed {
-                self.store.release_read_lock(local_id);
-                self.store.remove_transfers_by_lease(lease_id);
+        let client = match std::mem::replace(&mut self.lease, Lease::Local) {
+            Lease::Local => {
+                if self.store.consume_lease(lease_id, local_id) == store::LeaseOutcome::Consumed {
+                    self.store.release_read_lock(local_id);
+                    self.store.remove_transfers_by_lease(lease_id);
+                }
+                return;
             }
-            return;
+            Lease::Remote(Some(client)) => client,
+            Lease::Remote(None) => {
+                tracing::warn!(%handle, lease = lease_id,
+                    "rendezvous: could not detach a lease after a failed get: no client was given, so \
+                     the lease cannot be detached from here");
+                return;
+            }
         };
 
         tracing::debug!(
@@ -1239,12 +1270,24 @@ impl Drop for LeaseGuard {
             lease = lease_id,
             "rendezvous: releasing a lease whose get did not complete"
         );
+        // Built from the client alone: the detach can wait on admission to an
+        // owner that stopped answering, the likely reason this guard is armed,
+        // and a task holding the Messenger there would keep its final drop, and
+        // so its transport teardown, from ever happening.
+        let send = match consumer::Consumer::detach_request(&client, handle, lease_id) {
+            Ok(send) => send,
+            Err(e) => {
+                tracing::warn!(%handle, lease = lease_id, error = %e,
+                    "rendezvous: could not detach a lease after a failed get");
+                return;
+            }
+        };
         // `AssertUnwindSafe` because the only thing this closure touches is a
-        // runtime handle and two `Arc`s, and a panic from `spawn` leaves none of
-        // them observably half-updated.
+        // runtime handle and the send it moves, and a panic from `spawn` leaves
+        // neither observably half-updated.
         let spawned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.runtime.spawn(async move {
-                if let Err(e) = consumer::Consumer::detach(&messenger, handle, lease_id).await {
+                if let Err(e) = send.send().await {
                     tracing::warn!(
                         %handle,
                         lease = lease_id,
@@ -1395,5 +1438,28 @@ mod lease_timeout_tests {
                 "a usable timeout must be left alone"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod lease_guard_tests {
+    use super::*;
+
+    /// A remote lease whose guard has no client must not be released from
+    /// this instance's own store. Lease and slot ids count from 1 on every
+    /// instance, so the remote owner's ids can name a live local lease, and
+    /// the Messenger can drop while a remote get waits, leaving no client.
+    #[tokio::test]
+    async fn a_remote_lease_guard_never_touches_the_local_store() {
+        let manager = RendezvousManager::new(WorkerId::from_u64(1));
+        let (_, slot) = manager.register_data(Bytes::from_static(b"local")).unpack();
+        let lease = manager.data_store().acquire_read_lock(slot).unwrap();
+        let remote = DataHandle::pack(WorkerId::from_u64(2), slot);
+        drop(manager.lease_guard(remote, lease, None));
+        assert_eq!(
+            manager.data_store().consume_lease(lease, slot),
+            store::LeaseOutcome::Consumed,
+            "a remote lease guard released a local lease with the same ids"
+        );
     }
 }

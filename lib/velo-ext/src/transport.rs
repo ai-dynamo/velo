@@ -448,6 +448,18 @@ pub trait Transport: Send + Sync {
     /// [`MessageType::ShuttingDown`] correlation for the senders. Reach for
     /// the runtime's graceful shutdown instead unless that is precisely what
     /// you want.
+    ///
+    /// The runtime calls this at most once per instance, with the instance's
+    /// Tokio runtime handle entered, on a dedicated OS thread, so the hook may
+    /// block, for example to join its own threads. Two cases run it on the
+    /// caller instead. Any failure while the transports start (another
+    /// transport's [`start`](Self::start) failing, a duplicate key, an address
+    /// that cannot be merged), or a build cancelled then, runs it on the
+    /// building task. A thread that cannot be created runs it on whatever
+    /// dropped or shut down the instance. After the final owner is dropped, the runtime
+    /// may already have shut down: a task spawned here then never runs. A
+    /// panic here fails the runtime's shutdown, but the other transports'
+    /// hooks still run.
     fn shutdown(&self);
 
     /// Wait until the teardown that [`shutdown`](Transport::shutdown) started

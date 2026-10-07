@@ -291,6 +291,13 @@ impl Messenger {
         self.events.event_manager()
     }
 
+    /// The client every request builder sends through. It owns the backend
+    /// but not the Messenger, so an internal task that must wait on a peer
+    /// holds this rather than the Messenger, whose final drop starts teardown.
+    pub(crate) fn client(&self) -> &Arc<ActiveMessageClient> {
+        &self.client
+    }
+
     /// Fire-and-forget builder (no response expected).
     pub fn am_send(
         &self,
@@ -658,12 +665,14 @@ impl Messenger {
     /// finishes in the background after this call has returned. Sequence
     /// anything a handler touches accordingly. Both are the price of bounding
     /// shutdown.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a transport's shutdown hook panicked. The other hooks still
+    /// ran, but shutdown cannot report the instance as stopped. A later call
+    /// panics at once, without draining again.
     pub async fn graceful_shutdown(&self, policy: crate::transports::ShutdownPolicy) {
         self.backend.graceful_shutdown(policy).await;
-    }
-
-    pub(crate) fn abort_startup(&self) {
-        self.backend.shutdown_now();
     }
 
     pub(crate) async fn closed(&self) {

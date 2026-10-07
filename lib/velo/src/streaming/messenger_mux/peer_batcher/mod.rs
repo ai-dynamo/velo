@@ -106,7 +106,7 @@ pub(crate) struct OpenSlotRequest {
     pub(crate) anchor_id: u64,
     pub(crate) session_id: u64,
     pub(crate) inlet: flume::Receiver<Vec<u8>>,
-    pub(crate) lifecycle: Option<(CancellationToken, CancellationToken)>,
+    pub(crate) lifecycle: Option<crate::streaming::control::SenderEntry>,
     /// The ledger the slot opens with — the window the receiver advertised on
     /// its attach response, already granted.
     ///
@@ -283,11 +283,6 @@ pub(crate) struct BatcherContext {
     pub(crate) epochs: Arc<AtomicU64>,
     pub(crate) batchers: Arc<BatcherMap>,
     pub(crate) ingress: Arc<super::ingress::IngressRegistry>,
-    /// The run loop's own exit. The mux passes `tasks.cancellation_token()`;
-    /// a stop that lands while the loop is being polled exits here, through
-    /// `teardown(true)`, rather than by the spawn wrapper dropping the loop.
-    /// Tests pass a separate token to drive that exit on purpose.
-    pub(crate) cancel: CancellationToken,
     /// A barrier in the run loop, installed only by the tests that need to stop
     /// it mid-wake. See [`test_hooks`].
     #[cfg(test)]
@@ -320,6 +315,9 @@ pub(crate) fn spawn(key: PeerLane, ctx: BatcherContext) -> Arc<BatcherHandle> {
         epoch,
     );
     let tasks = ctx.tasks.clone();
+    // The run loop's exit is its task set's own token: a stop reaches both the
+    // loop and the grace below, so the join in shutdown always returns.
+    let cancel = ctx.tasks.cancellation_token();
     let batcher = Batcher {
         tasks: ctx.tasks,
         key,
@@ -328,7 +326,7 @@ pub(crate) fn spawn(key: PeerLane, ctx: BatcherContext) -> Arc<BatcherHandle> {
         epochs: ctx.epochs,
         batchers: ctx.batchers,
         ingress: ctx.ingress,
-        cancel: ctx.cancel,
+        cancel: cancel.clone(),
         control,
         gate,
         writer,
@@ -341,9 +339,29 @@ pub(crate) fn spawn(key: PeerLane, ctx: BatcherContext) -> Arc<BatcherHandle> {
         #[cfg(test)]
         hooks: ctx.hooks,
     };
-    tasks.spawn(batcher.run(open_rx));
+    // Not `tasks.spawn`: that drops the future at its first await once the
+    // shared token is cancelled, which is exactly when the run loop sends the
+    // control it still holds (a zero-RTT producer's only notice that its
+    // stream ended). The loop exits on its own cancel arm instead; the grace
+    // only bounds a send to a stalled peer, so the join in shutdown stays
+    // bounded.
+    tasks.spawn_until_done(async move {
+        let run = batcher.run(open_rx);
+        tokio::pin!(run);
+        tokio::select! {
+            () = &mut run => {}
+            () = async {
+                cancel.cancelled().await;
+                tokio::time::sleep(STOP_GRACE).await;
+            } => {}
+        }
+    });
     handle
 }
+
+/// How long a stopped batcher may take to send what it held. On a live link
+/// that is one write; only a stalled peer waits this long.
+const STOP_GRACE: Duration = Duration::from_millis(500);
 
 /// One unit of work pulled by the main loop.
 enum Work {
@@ -416,9 +434,10 @@ impl Drop for Batcher {
             if super::lifecycle::stop_mux(&self.tasks, &self.ingress, self.metrics.as_ref())
                 && !already_cancelled
             {
-                // Nothing aborts a batcher on purpose. This is a panic, which
-                // tokio reports itself, or a runtime dropped before
-                // `Velo::shutdown` ran, which is not an error of its own.
+                // Cancellation and its grace expiring are already excluded
+                // above. What is left is a panic, which tokio reports itself,
+                // or a runtime dropped before `Velo::shutdown` ran, which is
+                // not an error of its own.
                 tracing::warn!(peer = %self.key.peer, lane = %self.key.lane,
                     "messenger mux stopped: a batcher task ended without its teardown \
                      (a panic, or the runtime shut down before Velo::shutdown)");
@@ -520,6 +539,19 @@ impl Batcher {
                 // The sweep already removed the registry entry.
                 return self.teardown(false);
             }
+        }
+        if cancel.is_cancelled() {
+            // Stopped: send what is already queued, once. The cancel arm is
+            // biased, so a slot close posted just before the stop would
+            // otherwise be dropped, and a zero-RTT producer learns that its
+            // stream ended only from that close. Unregistered first, for the
+            // reason `teardown` gives; closing the inbox refuses later writers.
+            self.unregister();
+            if let Some(leftover) = self.control.close() {
+                self.on_control(leftover).await;
+                self.flush().await;
+            }
+            return self.teardown(false);
         }
         self.teardown(true);
     }
@@ -634,8 +666,8 @@ impl Batcher {
                 self.close_local(slot.index());
                 return;
             }
-            if let Some((_, stop)) = &live.lifecycle {
-                stop.cancel();
+            if let Some(sender) = &live.lifecycle {
+                sender.stop_token.cancel();
             }
         }
         let mut touched = false;
@@ -1134,6 +1166,13 @@ impl Batcher {
         (!Arc::ptr_eq(entry.value(), &self.handle)).then(|| Arc::clone(entry.value()))
     }
 
+    /// Leave the peer registry, if this batcher is still the one in it.
+    fn unregister(&self) {
+        let handle = Arc::clone(&self.handle);
+        self.batchers
+            .remove_if(&self.key, |_, entry| Arc::ptr_eq(entry, &handle));
+    }
+
     /// Close every slot on the way out, so producers learn immediately.
     fn teardown(&mut self, unregister: bool) {
         // Unregistered before the inbox closes. `send_replies` re-resolves a
@@ -1146,15 +1185,12 @@ impl Batcher {
         // anchor removal at shutdown) is refused by `MuxCore::batcher`, and
         // this order keeps the invariant even if that guard were missed.
         if unregister {
-            let handle = Arc::clone(&self.handle);
-            self.batchers
-                .remove_if(&self.key, |_, entry| Arc::ptr_eq(entry, &handle));
+            self.unregister();
         }
-        // Already closed on the retirement path, where what it handed back
-        // rode the final flush. On cancellation whatever is still pending
-        // dies with the transport, and a writer that comes later is refused
-        // and re-resolves — onto a batcher on the same cancelled token, which
-        // exits the same way.
+        // Already closed on the retirement and cancellation paths, where what
+        // it handed back rode a final flush. A writer that comes later is
+        // refused and re-resolves — onto a batcher on the same cancelled
+        // token, which exits the same way.
         self.control.close();
         // Anything still staged dies with the task: the slots it belongs to are
         // being closed in the next line, so their consumers learn through

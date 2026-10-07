@@ -64,7 +64,7 @@ pub mod zmq;
 #[cfg(feature = "quic")]
 pub mod quic;
 
-mod teardown;
+pub(crate) mod teardown;
 mod transport;
 
 use std::sync::OnceLock;
@@ -137,7 +137,9 @@ pub struct VeloBackend {
     workers: DashMap<WorkerId, InstanceId>,
     shutdown_state: ShutdownState,
     teardown: OnceLock<teardown::Completion>,
+    teardown_outcome: teardown::Outcome,
     runtime: tokio::runtime::Handle,
+    observability: Option<Arc<VeloMetrics>>,
 }
 
 /// Stop completed transports if construction fails or is cancelled.
@@ -147,11 +149,12 @@ struct StartupTransports {
 }
 
 impl StartupTransports {
-    fn stop(&mut self) {
-        if let Some(shutdown) = self.shutdown.take() {
-            // Construction has no caller to drain work for. Use a zero budget.
-            stop_transports(&shutdown, &self.transports);
-        }
+    fn stop(&mut self) -> Result<(), Arc<str>> {
+        let Some(shutdown) = self.shutdown.take() else {
+            return Ok(());
+        };
+        // Construction has no caller to drain work for. Use a zero budget.
+        stop_transports(&shutdown, &self.transports)
     }
 
     fn finish(mut self) -> HashMap<TransportKey, Arc<dyn Transport>> {
@@ -162,20 +165,42 @@ impl StartupTransports {
 
 /// Gate, tear down, and shut down every transport. Both `begin_drain` calls
 /// are idempotent, so this is safe after a graceful drain already ran.
-fn stop_transports(state: &ShutdownState, transports: &HashMap<TransportKey, Arc<dyn Transport>>) {
+///
+/// Teardown runs once, so a panicking hook must not skip the hooks after it:
+/// a skipped hook would leave its threads and memory for the life of the
+/// process. Each hook runs in its own `catch_unwind`; the first panic is
+/// returned after all of them have run.
+fn stop_transports(
+    state: &ShutdownState,
+    transports: &HashMap<TransportKey, Arc<dyn Transport>>,
+) -> Result<(), Arc<str>> {
+    let mut failure = None;
+    // Logged here, so every path that runs the hooks reports the same way.
+    let mut run = |key: &TransportKey, hook: &dyn Fn()| {
+        if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook)) {
+            let message = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("transport shutdown hook panicked");
+            tracing::error!(transport = %key.as_str(), error = message, "Transport teardown failed");
+            failure.get_or_insert_with(|| Arc::<str>::from(message));
+        }
+    };
     state.begin_drain();
-    for transport in transports.values() {
-        transport.begin_drain();
+    for (key, transport) in transports {
+        run(key, &|| transport.begin_drain());
     }
     state.teardown_token().cancel();
-    for transport in transports.values() {
-        transport.shutdown();
+    for (key, transport) in transports {
+        run(key, &|| transport.shutdown());
     }
+    failure.map_or(Ok(()), Err)
 }
 
 impl Drop for StartupTransports {
     fn drop(&mut self) {
-        self.stop();
+        let _ = self.stop();
     }
 }
 
@@ -234,8 +259,13 @@ impl VeloBackend {
         let address = match startup {
             Ok(address) => address,
             Err(error) => {
-                started.stop();
-                futures::future::join_all(started.transports.values().map(|t| t.closed())).await;
+                // A hook that panicked may never set up what its `closed`
+                // waits on, so wait only after a clean teardown, as
+                // `finish_shutdown` does.
+                if started.stop().is_ok() {
+                    futures::future::join_all(started.transports.values().map(|t| t.closed()))
+                        .await;
+                }
                 return Err(error);
             }
         };
@@ -252,10 +282,18 @@ impl VeloBackend {
                 workers: DashMap::new(),
                 shutdown_state,
                 teardown: OnceLock::new(),
+                teardown_outcome: Default::default(),
                 runtime,
+                observability,
             },
             data_streams,
         ))
+    }
+
+    /// The metrics this backend was built with. Borrowed, so a reader on a
+    /// per-message path pays for no reference count unless it keeps one.
+    pub(crate) fn observability(&self) -> Option<&Arc<VeloMetrics>> {
+        self.observability.as_ref()
     }
 
     /// Returns this backend's unique instance identifier.
@@ -698,7 +736,24 @@ impl VeloBackend {
         drop(self.request_teardown());
     }
 
-    fn request_teardown(&self) -> teardown::Completion {
+    /// The error of a teardown that has already run and failed. Teardown runs
+    /// once, so the failure is final.
+    ///
+    /// Reads the result the teardown wrote, not the completion: `Shared::peek`
+    /// sees only a result some waiter already took, and polling a clone can
+    /// say "not yet" for a finished teardown when the task has spent its
+    /// cooperative budget. Either way a retry would drain again.
+    pub(crate) fn teardown_failure(&self) -> Option<Arc<str>> {
+        self.teardown_outcome.get()?.clone().err()
+    }
+
+    /// Whether this backend has started its own teardown. Not the shared
+    /// teardown token, which an out-of-tree transport may cancel itself.
+    pub(crate) fn teardown_requested(&self) -> bool {
+        self.teardown.get().is_some()
+    }
+
+    pub(crate) fn request_teardown(&self) -> teardown::Completion {
         self.shutdown_state.begin_drain();
         self.teardown
             .get_or_init(|| {
@@ -706,6 +761,7 @@ impl VeloBackend {
                     self.shutdown_state.clone(),
                     self.transports.clone(),
                     self.runtime.clone(),
+                    Arc::clone(&self.teardown_outcome),
                 )
             })
             .clone()
@@ -718,7 +774,18 @@ impl VeloBackend {
     /// 3. **Teardown**: Cancel the teardown token and call `shutdown()` on each transport.
     /// 4. **Close**: Await each transport's `closed()`, so what it wrote reaches the peer
     ///    before this returns.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a transport's shutdown hook panicked. The other hooks still
+    /// ran, but shutdown cannot report the instance as stopped. A later call
+    /// panics at once, without draining again.
     pub async fn graceful_shutdown(&self, policy: ShutdownPolicy) {
+        // A failed teardown is final: draining again would only spend the
+        // caller's budget against torn-down transports.
+        if let Some(error) = self.teardown_failure() {
+            panic!("transport teardown failed: {error}");
+        }
         self.drain(policy).await;
         self.finish_shutdown().await;
     }

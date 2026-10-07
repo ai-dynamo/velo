@@ -240,6 +240,13 @@ impl ActiveMessageClient {
         self.peer_registry.register_peer(instance_id);
     }
 
+    /// Record a peer's handlers as a handshake would, so a test can take the
+    /// direct send path to a peer that never answers a handshake.
+    #[cfg(test)]
+    pub(crate) fn record_peer_handlers(&self, instance_id: InstanceId, handlers: Vec<String>) {
+        self.peer_registry.update_handlers(instance_id, handlers);
+    }
+
     /// Check if a peer is registered in the backend
     pub(crate) fn is_peer_registered(&self, instance_id: InstanceId) -> bool {
         self.backend.is_registered(instance_id)

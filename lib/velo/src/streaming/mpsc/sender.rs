@@ -63,6 +63,8 @@ pub struct MpscStreamSender<T> {
     sent_terminal: bool,
     mpsc_registry: Arc<DashMap<u64, MpscAnchorEntry>>,
     cancel_token: CancellationToken,
+    /// Checked per record instead of the token, which takes a lock.
+    closed: crate::streaming::control::SenderClosed,
     sender_stream_id: u64,
     sender_registry: Arc<crate::streaming::control::SenderRegistry>,
     metrics: Option<Arc<crate::observability::VeloMetrics>>,
@@ -99,6 +101,7 @@ impl<T: Serialize> MpscStreamSender<T> {
             cancel_token,
             sender_stream_id,
             sender_registry,
+            closed,
         } = cancel;
         let heartbeat_cancel = cancel_token.child_token();
 
@@ -109,9 +112,15 @@ impl<T: Serialize> MpscStreamSender<T> {
         let hb_cancel = heartbeat_cancel.clone();
         let hb_channel = channel.clone();
         let hb_sender_id = sender_id.0;
+        let hb_closed = crate::streaming::control::CloseOnCancel::new(&cancel_token, &closed);
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(heartbeat_interval);
-            interval.tick().await; // drop the first immediate tick
+            let _close = hb_closed;
+            // First tick one period out. Waiting for an immediate first
+            // tick would delay seeing a cancelled token by a timer turn.
+            let mut interval = tokio::time::interval_at(
+                tokio::time::Instant::now() + heartbeat_interval,
+                heartbeat_interval,
+            );
             loop {
                 tokio::select! {
                     _ = hb_cancel.cancelled() => break,
@@ -139,6 +148,7 @@ impl<T: Serialize> MpscStreamSender<T> {
             sent_terminal: false,
             mpsc_registry,
             cancel_token,
+            closed,
             sender_stream_id,
             sender_registry,
             metrics,
@@ -179,9 +189,12 @@ impl<T: Serialize> MpscStreamSender<T> {
     /// # Errors
     ///
     /// Returns [`SendError::ChannelClosed`] if the receiver has been dropped or
-    /// the stream has been cancelled through [`Self::cancellation_token`].
+    /// the stream has been cancelled. A cancel through `SenderEntry::cancel` is
+    /// seen at once; a direct cancel of [`Self::cancellation_token`] once the
+    /// sender's heartbeat task has run, which needs the runtime that built the
+    /// sender to be alive.
     pub async fn send(&self, item: T) -> Result<(), SendError> {
-        if self.cancel_token.is_cancelled() {
+        if self.closed.is_closed() {
             return Err(SendError::ChannelClosed);
         }
         let bytes = rmp_serde::to_vec(&StreamFrame::Item(item))
@@ -217,19 +230,29 @@ impl<T: Serialize> MpscStreamSender<T> {
     /// # Errors
     ///
     /// Returns [`SendError::ChannelClosed`] if the receiver has been dropped or
-    /// the stream has been cancelled through [`Self::cancellation_token`].
+    /// the stream has been cancelled. A cancel through `SenderEntry::cancel` is
+    /// seen at once; a direct cancel of [`Self::cancellation_token`] once the
+    /// sender's heartbeat task has run, which needs the runtime that built the
+    /// sender to be alive.
     pub async fn send_err(&self, msg: impl ToString) -> Result<(), SendError> {
-        if self.cancel_token.is_cancelled() {
+        if self.closed.is_closed() {
             return Err(SendError::ChannelClosed);
         }
         let bytes = rmp_serde::to_vec(&StreamFrame::<()>::SenderError(msg.to_string()))
             .expect("SenderError serializes infallibly");
+        // The same shape as `send`: the token is raced only when the channel
+        // is full, so a free channel takes no lock.
         match &self.channel {
-            SenderChannel::Local(tx) => {
-                self.until_cancelled(tx.send_async((self.sender_id.0, bytes)))
-                    .await
-            }
-            SenderChannel::Remote(tx) => self.until_cancelled(tx.send_async(bytes)).await,
+            SenderChannel::Local(tx) => match tx.try_send((self.sender_id.0, bytes)) {
+                Ok(()) => Ok(()),
+                Err(flume::TrySendError::Full(b)) => self.until_cancelled(tx.send_async(b)).await,
+                Err(flume::TrySendError::Disconnected(_)) => Err(SendError::ChannelClosed),
+            },
+            SenderChannel::Remote(tx) => match tx.try_send(bytes) {
+                Ok(()) => Ok(()),
+                Err(flume::TrySendError::Full(b)) => self.until_cancelled(tx.send_async(b)).await,
+                Err(flume::TrySendError::Disconnected(_)) => Err(SendError::ChannelClosed),
+            },
         }
     }
 
@@ -400,12 +423,21 @@ mod tests {
                 cancel_token: cancel_token.clone(),
                 sender_stream_id: 1,
                 sender_registry: Arc::new(crate::streaming::control::SenderRegistry::default()),
+                closed: Default::default(),
             },
             heartbeat,
             None,
         );
         assert_eq!(rx.recv_async().await.unwrap(), *cached_heartbeat());
         cancel_token.cancel();
+        // A direct token cancel reaches the per-record flag once the heartbeat
+        // task runs. Bounded, not one hop, so the runtime flavour does not matter.
+        for _ in 0..1000 {
+            if sender.closed.is_closed() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
         assert!(matches!(
             sender.send(42).await,
             Err(SendError::ChannelClosed)

@@ -20,7 +20,12 @@ struct MockTransport {
     pending_start: bool,
     start_completed: AtomicBool,
     drained: AtomicBool,
+    /// How many times `begin_drain` ran: phase 1 of each shutdown attempt.
+    drain_calls: AtomicUsize,
     shut_down: AtomicBool,
+    /// How many times `shutdown` ran. Counted, not asserted in the hook:
+    /// the hook runs inside a `catch_unwind`, so a panic there is only logged.
+    shutdown_calls: AtomicUsize,
     shutdown_complete: AtomicBool,
     shutdown_block: Option<(flume::Sender<()>, flume::Receiver<()>)>,
     shutdown_panics: bool,
@@ -56,10 +61,12 @@ impl MockTransport {
             pending_start: false,
             start_completed: AtomicBool::new(false),
             drained: AtomicBool::new(false),
+            drain_calls: AtomicUsize::new(0),
             shut_down: AtomicBool::new(false),
             shutdown_complete: AtomicBool::new(false),
             shutdown_block: None,
             shutdown_panics: false,
+            shutdown_calls: AtomicUsize::new(0),
             closed: Arc::new(AtomicBool::new(false)),
             send_count: AtomicUsize::new(0),
             last_lane: AtomicUsize::new(usize::MAX),
@@ -84,10 +91,12 @@ impl MockTransport {
             pending_start: false,
             start_completed: AtomicBool::new(false),
             drained: AtomicBool::new(false),
+            drain_calls: AtomicUsize::new(0),
             shut_down: AtomicBool::new(false),
             shutdown_complete: AtomicBool::new(false),
             shutdown_block: None,
             shutdown_panics: false,
+            shutdown_calls: AtomicUsize::new(0),
             closed: Arc::new(AtomicBool::new(false)),
             send_count: AtomicUsize::new(0),
             last_lane: AtomicUsize::new(usize::MAX),
@@ -173,6 +182,7 @@ impl Transport for MockTransport {
         })
     }
     fn shutdown(&self) {
+        self.shutdown_calls.fetch_add(1, Ordering::Relaxed);
         assert!(self.start_completed.load(Ordering::Relaxed));
         assert!(self.drained.load(Ordering::Relaxed));
         assert!(
@@ -197,6 +207,7 @@ impl Transport for MockTransport {
     }
     fn begin_drain(&self) {
         self.drained.store(true, Ordering::Relaxed);
+        self.drain_calls.fetch_add(1, Ordering::Relaxed);
     }
     fn check_health(
         &self,
@@ -761,8 +772,9 @@ async fn final_messenger_drop_stops_transports_once_after_any_teardown_path() {
             .clone()
             .await
             .unwrap();
-        assert!(
-            transport.shut_down.load(Ordering::Relaxed),
+        assert_eq!(
+            transport.shutdown_calls.load(Ordering::Relaxed),
+            1,
             "{prior_shutdown}"
         );
     }
@@ -860,6 +872,47 @@ fn final_drop_runs_hooks_outside_tokio_and_after_runtime_shutdown() {
     }
 }
 
+/// A finished teardown failure must be visible however the task that asks is
+/// doing. Reading it by polling the completion asked Tokio's cooperative
+/// budget for permission, so a task that had spent its budget saw no failure,
+/// and a retry drained again.
+#[tokio::test]
+async fn a_teardown_failure_is_seen_with_the_coop_budget_spent() {
+    use futures::FutureExt;
+    // Each ready oneshot poll spends one unit of the task's budget.
+    fn spend_coop_budget() {
+        for _ in 0..1024 {
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            let _ = tx.send(());
+            let _ = rx.now_or_never();
+        }
+    }
+    let mut transport = MockTransport::new("mock", true);
+    Arc::get_mut(&mut transport).unwrap().shutdown_panics = true;
+    let messenger = crate::Messenger::builder()
+        .add_transport(transport.clone())
+        .build()
+        .await
+        .unwrap();
+    let backend = Arc::clone(messenger.backend());
+    // Started with no waiter, so nothing else ever polls the completion.
+    backend.shutdown_now();
+    let seen = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            spend_coop_budget();
+            if backend.teardown_failure().is_some() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+    assert!(
+        seen.is_ok(),
+        "a finished teardown failure was hidden from a task that spent its budget"
+    );
+}
+
 #[tokio::test]
 async fn failed_teardown_never_reports_successful_shutdown() {
     use futures::FutureExt;
@@ -870,6 +923,7 @@ async fn failed_teardown_never_reports_successful_shutdown() {
         .build()
         .await
         .unwrap();
+    let mut drains = Vec::new();
     for _ in 0..2 {
         let result =
             std::panic::AssertUnwindSafe(messenger.graceful_shutdown(ShutdownPolicy::WaitForever))
@@ -877,7 +931,132 @@ async fn failed_teardown_never_reports_successful_shutdown() {
                 .await;
         assert!(result.is_err());
         assert!(!transport.closed.load(Ordering::Relaxed));
+        drains.push(transport.drain_calls.load(Ordering::Relaxed));
     }
+    // A retry fails at once: the failed teardown is final, so draining again
+    // would only spend the caller's budget.
+    assert_eq!(drains[0], drains[1], "the retry ran the drain again");
+}
+
+/// A panicking hook must not skip the hooks after it. Teardown runs once, so a
+/// skipped hook would never run: its threads and registered memory would stay
+/// for the life of the process. Both hooks panic here, so the result does not
+/// depend on the order in which the backend's map visits them.
+#[tokio::test]
+async fn a_failed_hook_does_not_skip_the_other_hooks() {
+    let mut first = MockTransport::new("mock_a", true);
+    Arc::get_mut(&mut first).unwrap().shutdown_panics = true;
+    let mut second = MockTransport::new("mock_b", true);
+    Arc::get_mut(&mut second).unwrap().shutdown_panics = true;
+    let messenger = crate::Messenger::builder()
+        .add_transport(first.clone())
+        .add_transport(second.clone())
+        .build()
+        .await
+        .unwrap();
+    let backend = messenger.backend().clone();
+    drop(messenger);
+    assert!(backend.request_teardown().await.is_err());
+    assert!(first.shut_down.load(Ordering::Relaxed));
+    assert!(second.shut_down.load(Ordering::Relaxed));
+}
+
+/// A failed build stops the transports that started. If one of their hooks
+/// panicked, its `closed` may wait on state the hook never set up, so the
+/// build must return its error without waiting for it.
+#[tokio::test]
+async fn failed_build_with_a_panicking_hook_returns_without_closing() {
+    let mut started = MockTransport::new("started", true);
+    Arc::get_mut(&mut started).unwrap().shutdown_panics = true;
+    let mut failing = MockTransport::new("failing", true);
+    Arc::get_mut(&mut failing).unwrap().fail_start = true;
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        VeloBackend::new(vec![started.clone(), failing.clone()], None),
+    )
+    .await
+    .expect("a failed build waited on a transport whose hook failed");
+    assert!(result.is_err());
+    assert!(started.shut_down.load(Ordering::Relaxed));
+}
+
+/// A retry after a failed teardown must fail at once. Teardown ran once and
+/// failed for good, so running the drain and the RDMA sweep again only spends
+/// their budget (30 s by default for the sweep) before the same panic.
+#[tokio::test]
+async fn velo_shutdown_retry_after_a_failed_hook_skips_the_drain() {
+    use futures::FutureExt;
+    let mut transport = MockTransport::new("mock", true);
+    Arc::get_mut(&mut transport).unwrap().shutdown_panics = true;
+    let velo = crate::Velo::builder()
+        .add_transport(transport.clone())
+        .build()
+        .await
+        .unwrap();
+    let first = std::panic::AssertUnwindSafe(velo.graceful_shutdown(ShutdownPolicy::WaitForever))
+        .catch_unwind()
+        .await;
+    assert!(first.is_err());
+    let drains = transport.drain_calls.load(Ordering::Relaxed);
+    let retry = std::panic::AssertUnwindSafe(velo.graceful_shutdown(ShutdownPolicy::WaitForever))
+        .catch_unwind()
+        .await;
+    assert!(retry.is_err(), "a retry reported a failed teardown as done");
+    assert_eq!(
+        transport.drain_calls.load(Ordering::Relaxed),
+        drains,
+        "the retry ran the drain again"
+    );
+}
+
+/// The same, when the first attempt was cut off while the hooks ran: no
+/// waiter saw the failure, so the retry must look at the finished teardown
+/// itself, not at what an earlier waiter observed.
+#[tokio::test]
+async fn velo_shutdown_retry_sees_a_failure_no_waiter_observed() {
+    use futures::FutureExt;
+    let mut transport = MockTransport::new("mock", true);
+    let (entered_tx, entered) = flume::bounded(1);
+    let (release, release_rx) = flume::bounded(1);
+    {
+        let mock = Arc::get_mut(&mut transport).unwrap();
+        mock.shutdown_panics = true;
+        mock.shutdown_block = Some((entered_tx, release_rx));
+    }
+    let velo = crate::Velo::builder()
+        .add_transport(transport.clone())
+        .build()
+        .await
+        .unwrap();
+    {
+        let first = velo.graceful_shutdown(ShutdownPolicy::WaitForever);
+        tokio::pin!(first);
+        tokio::select! {
+            _ = &mut first => panic!("shutdown finished while its hook was blocked"),
+            _ = entered.recv_async() => {}
+        }
+    }
+    release.send(()).unwrap();
+    // The hook now panics on the teardown thread. Wait for that result without
+    // waiting on the completion, which would be a waiter observing it.
+    let backend = velo.messenger().backend().clone();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while backend.teardown_failure().is_none() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the teardown thread never finished");
+    let drains = transport.drain_calls.load(Ordering::Relaxed);
+    let retry = std::panic::AssertUnwindSafe(velo.graceful_shutdown(ShutdownPolicy::WaitForever))
+        .catch_unwind()
+        .await;
+    assert!(retry.is_err());
+    assert_eq!(
+        transport.drain_calls.load(Ordering::Relaxed),
+        drains,
+        "the retry ran the drain again"
+    );
 }
 
 #[tokio::test]

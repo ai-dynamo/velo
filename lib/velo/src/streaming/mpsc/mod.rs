@@ -23,8 +23,7 @@ pub mod types;
 pub use anchor::{MpscStreamAnchor, MpscStreamController};
 pub use control::{
     MpscAnchorAttachRequest, MpscAnchorAttachResponse, MpscAnchorCancelRequest,
-    MpscAnchorDetachRequest, create_mpsc_anchor_attach_handler, create_mpsc_anchor_cancel_handler,
-    create_mpsc_anchor_detach_handler,
+    MpscAnchorDetachRequest,
 };
 pub use frame::MpscFrame;
 pub use sender::MpscStreamSender;

@@ -44,6 +44,8 @@ pub struct ZmqTransport {
     /// via `OnceLock::get()` on the send hot path. A shutdown command wakes the
     /// sender when idle; `sender_stop` also stops it when this queue is full.
     sender_tx: OnceLock<flume::Sender<SenderCommand>>,
+    /// Stops both threads. The listener reads it between polls, so it stops
+    /// even when its control message cannot be sent.
     sender_stop: Arc<AtomicBool>,
     /// One admission gate per peer, all feeding `sender_tx`.
     ///
@@ -128,11 +130,15 @@ impl ZmqTransport {
     }
     fn stop_threads(&self) {
         self.sender_stop.store(true, Ordering::Release);
-        // Signal the listener thread to stop via control PAIR socket
+        // Wake the listener early. Best effort and never blocking: the flag
+        // is the real stop request, and the listener may already have stopped
+        // on it and closed its socket, so a blocking send could wait forever
+        // and the joins below would never run. A lost message costs at most
+        // one poll interval.
         if let Ok(ctrl) = self.zmq_context.socket(zmq::PAIR)
             && ctrl.connect(&self.listener_control_endpoint).is_ok()
         {
-            let _ = ctrl.send("shutdown", 0);
+            let _ = ctrl.send("shutdown", zmq::DONTWAIT);
         }
 
         // Wake an idle sender. The flag is the stop request: if the queue is
@@ -281,6 +287,7 @@ impl Transport for ZmqTransport {
                 metrics,
                 router_socket,
                 ready_tx,
+                stop: self.sender_stop.clone(),
             };
             let listener_handle = std::thread::Builder::new()
                 .name("zmq-listener".to_string())
@@ -457,6 +464,15 @@ impl Transport for ZmqTransport {
     }
 }
 
+/// How long a stopping sender may spend on the frames queued before the
+/// stop. Each send to a peer that is gone blocks for [`SEND_TIMEOUT`], so with
+/// no shared budget a full queue to a dead peer held the sender join, and so
+/// teardown, for minutes, past any timeout the caller gave its shutdown.
+const DRAIN_BUDGET: Duration = Duration::from_secs(1);
+
+/// How long one send may block on a peer with no free pipe before it fails.
+const SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Configuration bundle for the sender thread.
 struct SenderConfig {
     ctx: Arc<zmq::Context>,
@@ -482,11 +498,15 @@ fn run_sender(cfg: SenderConfig) {
     let mut dealer_sockets: HashMap<crate::InstanceId, zmq::Socket> = HashMap::new();
 
     // Keep frames already queued ahead of shutdown. Once the flag is seen,
-    // drain only that queue prefix so later sends cannot extend the join.
+    // drain only that queue prefix, and only within `DRAIN_BUDGET`, so neither
+    // later sends nor a dead peer can extend the join. A send already under
+    // way when the flag is set can still take up to `SEND_TIMEOUT`.
     let mut remaining = None;
+    let mut drain_deadline = None;
     loop {
         if remaining.is_none() && cfg.stop.load(Ordering::Acquire) {
             remaining = Some(cfg.rx.len());
+            drain_deadline = Some(std::time::Instant::now() + DRAIN_BUDGET);
         }
         let cmd = match remaining.as_mut() {
             Some(0) => break,
@@ -505,6 +525,19 @@ fn run_sender(cfg: SenderConfig) {
                 debug!("ZMQ sender received shutdown signal");
                 break;
             }
+        };
+
+        // While draining, each send gets only what is left of the budget,
+        // and a frame that finds none left fails without being sent.
+        let drain_left = match drain_deadline {
+            Some(deadline) => match deadline.checked_duration_since(std::time::Instant::now()) {
+                Some(left) if !left.is_zero() => Some(left),
+                _ => {
+                    task.on_error("Transport shutting down");
+                    continue;
+                }
+            },
+            None => None,
         };
 
         let target = task.target;
@@ -539,6 +572,14 @@ fn run_sender(cfg: SenderConfig) {
                 }
             }
         };
+
+        if let Some(left) = drain_left {
+            let millis = i32::try_from(left.as_millis()).unwrap_or(i32::MAX).max(1);
+            if let Err(e) = sock.set_sndtimeo(millis) {
+                task.on_error(format!("ZMQ send failed: {e}"));
+                continue;
+            }
+        }
 
         // Send 3-part multipart: [msg_type, header, payload]
         let type_byte: &[u8] = &[task.msg_type.as_u8()];
@@ -593,7 +634,7 @@ fn create_dealer_socket(
     sock.set_linger(linger_ms)
         .context("Failed to set ZMQ_LINGER")?;
     // Set a send timeout to avoid blocking forever on a dead peer
-    sock.set_sndtimeo(5000)
+    sock.set_sndtimeo(SEND_TIMEOUT.as_millis() as i32)
         .context("Failed to set ZMQ_SNDTIMEO")?;
     // Only queue messages for peers that have completed the TCP handshake.
     // Without this, messages to not-yet-connected peers sit in ZMQ's queue,
@@ -851,6 +892,129 @@ mod tests {
         worker.join().unwrap();
         assert_eq!(reply.unwrap().last().unwrap(), b"reply");
         stopped.expect("full queue lost the sender stop request");
+    }
+
+    /// Frames queued before a stop are still sent, but only within one shared
+    /// budget. Each send to a peer that is gone blocks for the full send
+    /// timeout, so a drain with no budget held the sender join, and so
+    /// teardown, for that timeout once per queued frame.
+    #[test]
+    fn a_stopping_sender_drains_within_its_budget() {
+        struct CountErrors(Arc<std::sync::atomic::AtomicUsize>);
+        impl TransportErrorHandler for CountErrors {
+            fn on_error(&self, _: Bytes, _: Bytes, _: String) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        // A port nothing listens on: with `ZMQ_IMMEDIATE` the dealer never
+        // gets a pipe, so every send waits out its timeout.
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("tcp://{}", dead.local_addr().unwrap());
+        drop(dead);
+        let target = crate::InstanceId::new_v4();
+        let peers = Arc::new(DashMap::new());
+        peers.insert(target, endpoint);
+        let failed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let frames = 3;
+        let (tx, rx) = flume::bounded(frames);
+        for _ in 0..frames {
+            tx.send(SenderCommand::Send(OutboundTask {
+                target,
+                msg_type: MessageType::Message,
+                header: Bytes::new(),
+                payload: Bytes::new(),
+                on_error: Arc::new(CountErrors(Arc::clone(&failed))),
+            }))
+            .unwrap();
+        }
+        // Stopped before it starts, so every queued frame is part of the drain.
+        let (ready_tx, _ready) = std::sync::mpsc::sync_channel(1);
+        let started = std::time::Instant::now();
+        run_sender(SenderConfig {
+            ctx: Arc::new(zmq::Context::new()),
+            rx,
+            stop: Arc::new(AtomicBool::new(true)),
+            peers,
+            identity: b"sender".to_vec(),
+            sndhwm: 1,
+            linger_ms: 0,
+            ready_tx,
+        });
+        let took = started.elapsed();
+        assert!(
+            took < DRAIN_BUDGET + Duration::from_secs(1),
+            "draining {frames} frames to a dead peer took {took:?}"
+        );
+        assert_eq!(failed.load(Ordering::Relaxed), frames);
+    }
+
+    /// The listener must stop on the stop flag alone. Its control message is
+    /// best effort: with no socket to send it on (file descriptors run out),
+    /// a listener that waited only for that message never let the join return.
+    #[test]
+    fn a_listener_stops_without_its_control_message() {
+        let (adapter, _streams) = crate::transports::transport::make_channels();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (ready_tx, ready) = std::sync::mpsc::sync_channel(1);
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let cfg = listener::ListenerConfig {
+            ctx: Arc::new(zmq::Context::new()),
+            bind_endpoint: "tcp://127.0.0.1:*".to_string(),
+            control_endpoint: format!("inproc://listener-stop-{}", crate::InstanceId::new_v4()),
+            adapter,
+            rcvhwm: 1,
+            linger_ms: 0,
+            metrics: None,
+            router_socket: None,
+            ready_tx,
+            stop: Arc::clone(&stop),
+        };
+        std::thread::spawn(move || {
+            listener::run_listener(cfg);
+            let _ = done_tx.send(());
+        });
+        ready.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        stop.store(true, Ordering::Release);
+        assert!(
+            done.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "the listener ignored its stop flag"
+        );
+    }
+
+    /// The control send in `stop_threads` must not block. The listener can
+    /// stop on the flag alone and close its control socket between the
+    /// connect and the send, and a blocking send to a PAIR whose peer closed
+    /// waits forever, so the join after it never runs. This pins the libzmq
+    /// behavior that `stop_threads` relies on: with `DONTWAIT` that send
+    /// returns at once.
+    #[test]
+    fn a_control_send_to_a_closed_listener_does_not_block() {
+        let ctx = zmq::Context::new();
+        let endpoint = format!("inproc://control-{}", crate::InstanceId::new_v4());
+        let (blocking_tx, blocking) = std::sync::mpsc::channel();
+        let (dontwait_tx, dontwait) = std::sync::mpsc::channel();
+        for (flags, done) in [(0, blocking_tx), (zmq::DONTWAIT, dontwait_tx)] {
+            let listener = ctx.socket(zmq::PAIR).unwrap();
+            let endpoint = format!("{endpoint}-{flags}");
+            listener.bind(&endpoint).unwrap();
+            let ctrl = ctx.socket(zmq::PAIR).unwrap();
+            ctrl.connect(&endpoint).unwrap();
+            drop(listener);
+            std::thread::sleep(Duration::from_millis(50));
+            std::thread::spawn(move || {
+                let _ = done.send(ctrl.send("shutdown", flags));
+            });
+        }
+        // The control: the blocking form really does hang here, so the case
+        // below is about the flag, not about a send that could not block.
+        assert!(
+            blocking.recv_timeout(Duration::from_millis(500)).is_err(),
+            "a blocking send to a closed PAIR returned; the test no longer shows the hang"
+        );
+        assert!(matches!(
+            dontwait.recv_timeout(Duration::from_secs(2)),
+            Ok(Err(zmq::Error::EAGAIN))
+        ));
     }
 
     #[test]

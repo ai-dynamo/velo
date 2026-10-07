@@ -210,7 +210,6 @@ struct ShutdownOnce {
 }
 
 /// Concrete handles let shutdown join listeners without changing `FrameTransport`.
-#[derive(Clone)]
 enum OwnedStreamTransport {
     Tcp(Arc<crate::streaming::TcpFrameTransport>),
     #[cfg(feature = "grpc")]
@@ -236,6 +235,11 @@ impl OwnedStreamTransport {
 }
 
 /// Shared by Velo clones, but not by Messenger or individual stream handles.
+///
+/// Drop detaches streams before the Messenger can tear its transports down,
+/// because `AnchorManager` holds its Messenger strongly. A weak back-link
+/// there would let the Velo's own Messenger reference go first and tear
+/// down transports under live streams.
 struct StreamOwner {
     manager: Arc<crate::streaming::AnchorManager>,
     transport: OwnedStreamTransport,
@@ -245,17 +249,6 @@ impl Drop for StreamOwner {
     fn drop(&mut self) {
         self.manager.stop();
         self.transport.stop();
-    }
-}
-
-/// Stop transports if a later builder step fails or the build is cancelled.
-struct StartupGuard(Option<Arc<Messenger>>);
-
-impl Drop for StartupGuard {
-    fn drop(&mut self) {
-        if let Some(messenger) = self.0.take() {
-            messenger.abort_startup();
-        }
     }
 }
 
@@ -413,7 +406,6 @@ impl VeloBuilder {
     pub async fn build(self) -> Result<Arc<Velo>> {
         // Step 1: Build Messenger.
         let messenger = self.inner.build().await?;
-        let mut startup = StartupGuard(Some(Arc::clone(&messenger)));
 
         // Step 2: Extract worker_id (carried on the local PeerInfo).
         let worker_id = messenger.instance_id().worker_id();
@@ -521,14 +513,14 @@ impl VeloBuilder {
         }
 
         // Step 6: Register streaming control-plane handlers
-        anchor_manager.register_handlers_weak(Arc::clone(&messenger))?;
+        anchor_manager.register_handlers(Arc::clone(&messenger))?;
 
         // Step 7: Create RendezvousManager and register handlers
         let rendezvous_manager = Arc::new(match self.metrics.as_ref() {
             Some(m) => crate::rendezvous::RendezvousManager::with_metrics(worker_id, Arc::clone(m)),
             None => crate::rendezvous::RendezvousManager::new(worker_id),
         });
-        rendezvous_manager.register_handlers_weak(Arc::clone(&messenger))?;
+        rendezvous_manager.register_handlers(Arc::clone(&messenger))?;
 
         // Step 8: Enable transparent large payload support
         let stager = Arc::new(crate::rendezvous::RendezvousStager::new(Arc::clone(
@@ -586,7 +578,6 @@ impl VeloBuilder {
         };
 
         // Step 10: Assemble Velo
-        startup.0.take();
         Ok(Arc::new(Velo {
             messenger,
             stream_owner: Arc::new(StreamOwner {
@@ -751,6 +742,12 @@ impl Velo {
     /// [`RdmaConfig::shutdown_timeout`], because a peer that crashed
     /// mid-transfer must not wedge shutdown forever even when the caller is
     /// willing to wait on local work.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a transport's shutdown hook panicked. The other hooks still
+    /// ran, but shutdown cannot report the instance, or its RDMA memory, as
+    /// released. A later call panics at once, without draining again.
     pub async fn graceful_shutdown(&self, policy: ShutdownPolicy) {
         // Serialised, and run once. `Velo` is `Clone`, so two clones can arrive
         // here together; the sequence below takes a transport join handle and
@@ -764,6 +761,12 @@ impl Velo {
             .load(std::sync::atomic::Ordering::Acquire)
         {
             return;
+        }
+        // A failed teardown is final. Running the RDMA sweep again would spend
+        // its budget against torn-down transports, then panic anyway. (The
+        // backend refuses to drain again on its own.)
+        if let Some(error) = self.messenger.backend().teardown_failure() {
+            panic!("transport teardown failed: {error}");
         }
 
         // Shadowed with what is left of the caller budget after the sweep, so
@@ -839,6 +842,12 @@ impl Velo {
     /// ends when the application drops or finalizes the sender.
     /// Use this when an instance is removed while its Tokio runtime stays alive.
     /// It closes resources. Drop the instance and its handles to release their memory.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a transport's shutdown hook panicked. The other hooks still
+    /// ran, but shutdown cannot report the instance, or its RDMA memory, as
+    /// released. A later call panics at once, without draining again.
     pub async fn shutdown(&self, policy: ShutdownPolicy) {
         self.graceful_shutdown(policy).await;
         self.anchor_manager.shutdown().await;
@@ -1575,8 +1584,12 @@ mod tests {
         .expect("failed build retained the messenger listener");
     }
 
+    /// Handlers never own their manager, and a manager never owns its
+    /// messenger beyond what it needs for ordering. Registration through the
+    /// public API therefore forms no cycle: once the caller drops its
+    /// references, the Messenger drops and starts its teardown.
     #[tokio::test]
-    async fn standalone_rendezvous_registration_retains_messenger() {
+    async fn standalone_registration_does_not_retain_the_messenger() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let transport = Arc::new(
             crate::transports::tcp::TcpTransportBuilder::new()
@@ -1590,19 +1603,33 @@ mod tests {
             .build()
             .await
             .unwrap();
+        let worker_id = messenger.instance_id().worker_id();
+        let stream = crate::streaming::TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into())
+            .await
+            .unwrap();
+        let anchors = Arc::new(crate::streaming::AnchorManager::new(
+            worker_id,
+            Arc::clone(&stream) as Arc<dyn crate::streaming::FrameTransport>,
+        ));
+        anchors.register_handlers(Arc::clone(&messenger)).unwrap();
+        let rendezvous = Arc::new(RendezvousManager::new(worker_id));
+        rendezvous
+            .register_handlers(Arc::clone(&messenger))
+            .unwrap();
+
         let weak = Arc::downgrade(&messenger);
-        let manager = Arc::new(RendezvousManager::new(messenger.instance_id().worker_id()));
-        manager.register_handlers(messenger).unwrap();
-        let retained = weak
-            .upgrade()
-            .expect("public registration must retain its messenger");
-        retained
-            .graceful_shutdown(ShutdownPolicy::WaitForever)
-            .await;
-        retained.closed().await;
-        drop(retained);
-        drop(manager);
-        assert!(weak.upgrade().is_none());
+        let weak_anchors = Arc::downgrade(&anchors);
+        drop(messenger);
+        drop(anchors);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while weak.upgrade().is_some() || weak_anchors.upgrade().is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("public handler registration kept the messenger alive");
+        drop(rendezvous);
+        stream.shutdown().await;
     }
 
     /// Shutdown must close resources while Tokio remains alive.
@@ -1731,6 +1758,7 @@ mod tests {
         let manager = Arc::downgrade(&server.anchor_manager);
         let retained = Arc::clone(server.messenger());
         let messenger = Arc::downgrade(&retained);
+        let backend = Arc::clone(retained.backend());
         let tracker = retained.tracker().clone();
         let frame_transport = match &server.stream_owner.transport {
             OwnedStreamTransport::Tcp(transport) => Arc::clone(transport),
@@ -1777,15 +1805,48 @@ mod tests {
         .expect("retained Messenger stopped with Velo")
         .unwrap();
         assert_eq!(response, bytes::Bytes::from_static(b"alive"));
+        // Cleanup handlers stay idempotent once the manager is gone: an
+        // absent manager holds no anchor, so a peer's cleanup has succeeded.
+        let handle = anchor.handle();
+        let cleanups = [
+            ("_anchor_detach", serde_json::json!({ "handle": handle })),
+            ("_anchor_finalize", serde_json::json!({ "handle": handle })),
+            ("_anchor_cancel", serde_json::json!({ "handle": handle })),
+            (
+                "_mpsc_anchor_detach",
+                serde_json::json!({ "handle": handle, "sender_id": 1 }),
+            ),
+            (
+                "_mpsc_anchor_cancel",
+                serde_json::json!({ "handle": handle }),
+            ),
+        ];
+        for (name, request) in cleanups {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                client
+                    .messenger()
+                    .typed_unary_streaming::<()>(name)
+                    .payload(request)
+                    .unwrap()
+                    .instance(retained.instance_id())
+                    .send(),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{name} did not answer"))
+            .unwrap_or_else(|error| panic!("{name} failed after final Velo drop: {error}"));
+        }
 
         drop(anchor);
         drop(sender);
         drop(retained);
+        // Teardown runs on its own thread; wait for it before timing the
+        // receive loops, so the budget below covers only their exit.
+        wait_for_final_messenger_drop(&messenger, &backend).await;
         tracker.close();
         tokio::time::timeout(std::time::Duration::from_secs(2), tracker.wait())
             .await
             .expect("final Messenger drop retained its receive loops");
-        assert!(messenger.upgrade().is_none());
         wait_for_listener_close(messenger_addr).await;
         frame_transport.shutdown().await;
         client.shutdown(ShutdownPolicy::WaitForever).await;
@@ -1888,6 +1949,33 @@ mod tests {
         producer.shutdown(ShutdownPolicy::WaitForever).await;
     }
 
+    /// Final Messenger drop runs transport teardown on its own thread. Wait
+    /// until the Messenger is gone and that teardown has finished.
+    async fn wait_for_final_messenger_drop(
+        messenger: &std::sync::Weak<Messenger>,
+        backend: &crate::transports::VeloBackend,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while messenger.upgrade().is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("final Velo drop retained its Messenger");
+        // The Weak clears when the count reaches zero, just before
+        // `Messenger::drop` runs on the dropping thread, so wait for the
+        // request rather than read it once. Checked before `request_teardown`
+        // below, which would start teardown itself.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !backend.teardown_requested() {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("final Messenger drop did not start teardown");
+        backend.request_teardown().await.unwrap();
+    }
+
     /// A consumer still reading when its node shuts down must see the stream
     /// end, not `SenderDropped`: the sender did nothing wrong.
     ///
@@ -1900,7 +1988,9 @@ mod tests {
     async fn shutdown_ends_a_live_mux_stream_without_sender_dropped() {
         use futures::StreamExt;
 
-        for drop_owner in [false, true] {
+        // Explicit shutdown; final Velo drop with a retained Messenger; and
+        // final Velo drop that is also the final Messenger drop.
+        for (drop_owner, retain_messenger) in [(false, true), (true, true), (true, false)] {
             let (consumer, producer) = connected_pair(None, "_anchor_attach").await;
 
             let mut anchor = consumer.create_anchor::<u32>();
@@ -1919,7 +2009,9 @@ mod tests {
 
             let reader = tokio::spawn(async move { anchor.next().await });
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            let retained = Arc::clone(consumer.messenger());
+            let messenger = Arc::downgrade(consumer.messenger());
+            let backend = Arc::clone(consumer.messenger().backend());
+            let retained = retain_messenger.then(|| Arc::clone(consumer.messenger()));
             if drop_owner {
                 drop(consumer);
             } else {
@@ -1938,6 +2030,9 @@ mod tests {
                 ended.is_none(),
                 "shutdown must end a live stream cleanly, got {ended:?}"
             );
+            if !retain_messenger {
+                wait_for_final_messenger_drop(&messenger, &backend).await;
+            }
 
             drop(sender);
             producer.shutdown(ShutdownPolicy::WaitForever).await;
@@ -1955,7 +2050,9 @@ mod tests {
 
         use crate::observability::test_helpers::MetricSnapshot;
 
-        for drop_owner in [false, true] {
+        // Explicit shutdown; final Velo drop with a retained Messenger; and
+        // final Velo drop that is also the final Messenger drop.
+        for (drop_owner, retain_messenger) in [(false, true), (true, true), (true, false)] {
             let registry = prometheus::Registry::new();
             let metrics = Arc::new(VeloMetrics::register(&registry).unwrap());
             let (consumer, producer) = connected_pair(Some(metrics), "_mpsc_anchor_attach").await;
@@ -1983,7 +2080,9 @@ mod tests {
             let before = send_errors();
             let reader = tokio::spawn(async move { anchor.next().await });
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            let retained = Arc::clone(consumer.messenger());
+            let messenger = Arc::downgrade(consumer.messenger());
+            let backend = Arc::clone(consumer.messenger().backend());
+            let retained = retain_messenger.then(|| Arc::clone(consumer.messenger()));
             if drop_owner {
                 drop(consumer);
             } else {
@@ -2002,17 +2101,104 @@ mod tests {
                 ended.is_none(),
                 "shutdown must end a live MPSC stream cleanly, got {ended:?}"
             );
+            if !retain_messenger {
+                wait_for_final_messenger_drop(&messenger, &backend).await;
+            }
             // A stopped pump releases its slot; that must not reach the wire.
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            assert_eq!(
-                send_errors(),
-                before,
-                "shutdown sent a frame after its transport was torn down"
-            );
+            // Only explicit shutdown can check this. A retained Messenger keeps
+            // the transports up, so no send can fail; and on a final drop that
+            // also drops the Messenger, the notices to remote producers are
+            // admitted just before teardown and may fail there, by design
+            // (best effort, see the shutdown chapter).
+            if !drop_owner {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                assert_eq!(
+                    send_errors(),
+                    before,
+                    "shutdown sent a frame after its transport was torn down"
+                );
+            }
 
             drop(sender);
             producer.shutdown(ShutdownPolicy::WaitForever).await;
             drop(retained);
+        }
+    }
+
+    /// Final Velo drop with a retained Messenger must tell remote producers
+    /// their stream ended, however the stream was opened. The
+    /// mux stops on drop, and a retained Messenger's mux handler drops their
+    /// batches once the mux is gone, so a producer told nothing fills its
+    /// window and then waits forever. An attached stream is told by
+    /// `_stream_cancel`. A zero-RTT stream records no cancel handle; it is
+    /// told by its slot close, which must go out before the mux stops.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn final_velo_drop_cancels_remote_mux_producers() {
+        use futures::StreamExt;
+
+        for mode in ["attach", "mpsc", "ticket"] {
+            for retain in [true, false] {
+                let handler = if mode == "mpsc" {
+                    "_mpsc_anchor_attach"
+                } else {
+                    "_anchor_attach"
+                };
+                let (consumer, producer) = connected_pair(None, handler).await;
+                // The cancel token, plus the sender that must outlive the wait.
+                let (token, _mpsc_sender, _sender) = if mode == "mpsc" {
+                    let mut anchor = consumer.create_mpsc_anchor::<u32>();
+                    let sender = producer
+                        .attach_mpsc_anchor::<u32>(anchor.handle())
+                        .await
+                        .unwrap();
+                    sender.send(1).await.unwrap();
+                    tokio::time::timeout(std::time::Duration::from_secs(5), anchor.next())
+                        .await
+                        .unwrap();
+                    let token = sender.cancellation_token();
+                    tokio::spawn(async move { while anchor.next().await.is_some() {} });
+                    (token, Some(sender), None)
+                } else {
+                    let mut anchor = consumer.create_anchor::<u32>();
+                    let sender = if mode == "ticket" {
+                        let ticket = consumer.prebind_anchor(anchor.handle()).unwrap();
+                        producer
+                            .open_anchor_stream::<u32>(anchor.handle(), ticket)
+                            .await
+                            .unwrap()
+                    } else {
+                        producer
+                            .attach_anchor::<u32>(anchor.handle())
+                            .await
+                            .unwrap()
+                    };
+                    sender.send(1).await.unwrap();
+                    tokio::time::timeout(std::time::Duration::from_secs(5), anchor.next())
+                        .await
+                        .unwrap();
+                    let token = sender.cancellation_token();
+                    tokio::spawn(async move { while anchor.next().await.is_some() {} });
+                    (token, None, Some(sender))
+                };
+                let retained = retain.then(|| Arc::clone(consumer.messenger()));
+                drop(consumer);
+                let told =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), token.cancelled())
+                        .await;
+                // Only with a retained Messenger is the notice certain. Without
+                // one, the Messenger's own final drop tears the transport down
+                // right after the notice is queued, and may fail it there: best
+                // effort, as the shutdown chapter says. That arm still has to
+                // drop cleanly, without a panic or a hang.
+                if retain {
+                    told.unwrap_or_else(|_| {
+                        panic!("{mode}: the remote producer was never told its stream ended")
+                    });
+                }
+                drop((token, _mpsc_sender, _sender));
+                producer.shutdown(ShutdownPolicy::WaitForever).await;
+                drop(retained);
+            }
         }
     }
 
@@ -2120,5 +2306,599 @@ mod tests {
         }
         assert!(velo.anchor_manager.registry.is_empty());
         assert!(velo.anchor_manager.mpsc_registry.is_empty());
+    }
+
+    /// Final Velo drop can run on a thread with no Tokio context, and after
+    /// the runtime that built the instance is gone. The anchor cleanup that
+    /// `Velo::shutdown` runs on the runtime now also runs in `Drop`.
+    #[test]
+    fn final_velo_drop_off_runtime_with_live_mux_streams() {
+        for stop_runtime in [false, true] {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            let (consumer, producer, senders, tokens) = runtime.block_on(async {
+                let (consumer, producer) = connected_pair(None, "_anchor_attach").await;
+                let mut anchor = consumer.create_anchor::<u32>();
+                let ticket = consumer.prebind_anchor(anchor.handle()).unwrap();
+                let zero_rtt = producer
+                    .open_anchor_stream::<u32>(anchor.handle(), ticket)
+                    .await
+                    .unwrap();
+                zero_rtt.send(1).await.unwrap();
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    futures::StreamExt::next(&mut anchor),
+                )
+                .await
+                .unwrap();
+                tokio::spawn(async move {
+                    while futures::StreamExt::next(&mut anchor).await.is_some() {}
+                });
+                let mut anchor2 = consumer.create_anchor::<u32>();
+                let attached = producer
+                    .attach_anchor::<u32>(anchor2.handle())
+                    .await
+                    .unwrap();
+                attached.send(1).await.unwrap();
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    futures::StreamExt::next(&mut anchor2),
+                )
+                .await
+                .unwrap();
+                tokio::spawn(async move {
+                    while futures::StreamExt::next(&mut anchor2).await.is_some() {}
+                });
+                let tokens = (zero_rtt.cancellation_token(), attached.cancellation_token());
+                (consumer, producer, (zero_rtt, attached), tokens)
+            });
+            let messenger = Arc::downgrade(consumer.messenger());
+            let backend = Arc::clone(consumer.messenger().backend());
+            let runtime = if stop_runtime {
+                drop(runtime);
+                None
+            } else {
+                Some(runtime)
+            };
+            // A plain thread: no Tokio context at all.
+            std::thread::spawn(move || drop(consumer))
+                .join()
+                .unwrap_or_else(|_| {
+                    panic!("stop_runtime={stop_runtime}: final Velo drop panicked off the runtime")
+                });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while messenger.upgrade().is_some() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(
+                messenger.upgrade().is_none(),
+                "stop_runtime={stop_runtime}: final Velo drop left the Messenger alive"
+            );
+            futures::executor::block_on(backend.request_teardown()).unwrap();
+            if let Some(runtime) = runtime {
+                // With the runtime alive, both remote producers must be told.
+                runtime.block_on(async {
+                    tokio::time::timeout(std::time::Duration::from_secs(5), tokens.0.cancelled())
+                        .await
+                        .expect("zero-RTT producer was never told");
+                    tokio::time::timeout(std::time::Duration::from_secs(5), tokens.1.cancelled())
+                        .await
+                        .expect("attached producer was never told");
+                    drop(senders);
+                    producer.shutdown(ShutdownPolicy::WaitForever).await;
+                });
+                drop(runtime);
+            } else {
+                drop(senders);
+                drop(producer);
+            }
+        }
+    }
+
+    /// A transport whose peer never reads: its gate holds one frame, and
+    /// every later send waits on admission for as long as the test runs.
+    struct Stalling {
+        gate: velo_ext::AdmissionGate<(bytes::Bytes, bytes::Bytes)>,
+        _rx: flume::Receiver<(bytes::Bytes, bytes::Bytes)>,
+        /// How many sends reached the transport, admitted or parked.
+        sends: Arc<std::sync::atomic::AtomicUsize>,
+        /// The adapter `start` was given, so a test can feed inbound frames.
+        adapter: std::sync::OnceLock<velo_ext::TransportAdapter>,
+    }
+    fn stalling_address() -> velo_ext::WorkerAddress {
+        let entries =
+            std::collections::HashMap::from([("stalling".to_string(), b"stalling".to_vec())]);
+        velo_ext::WorkerAddress::from_encoded(rmp_serde::to_vec(&entries).unwrap())
+    }
+    impl velo_ext::Transport for Stalling {
+        fn key(&self) -> velo_ext::TransportKey {
+            velo_ext::TransportKey::new("stalling")
+        }
+        fn address(&self) -> velo_ext::WorkerAddress {
+            stalling_address()
+        }
+        fn register(&self, _: velo_ext::PeerInfo) -> Result<(), velo_ext::TransportError> {
+            Ok(())
+        }
+        fn send_message(
+            &self,
+            _: velo_ext::InstanceId,
+            header: bytes::Bytes,
+            payload: bytes::Bytes,
+            _: velo_ext::MessageType,
+            _: Arc<dyn velo_ext::TransportErrorHandler>,
+        ) -> velo_ext::SendOutcome {
+            self.sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.gate.send((header, payload))
+        }
+        fn max_message_size(&self, _: velo_ext::InstanceId) -> Option<usize> {
+            None
+        }
+        fn start(
+            &self,
+            _: velo_ext::InstanceId,
+            adapter: velo_ext::TransportAdapter,
+            _: tokio::runtime::Handle,
+        ) -> futures::future::BoxFuture<'_, anyhow::Result<()>> {
+            let _ = self.adapter.set(adapter);
+            Box::pin(async { Ok(()) })
+        }
+        fn shutdown(&self) {}
+        fn check_health(
+            &self,
+            _: velo_ext::InstanceId,
+            _: std::time::Duration,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<(), velo_ext::HealthCheckError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// A Messenger on a [`Stalling`] transport, with one registered peer.
+    pub(crate) async fn stalled_messenger() -> (Arc<Messenger>, crate::InstanceId) {
+        let (messenger, peer, _) = counted_stalled_messenger().await;
+        (messenger, peer)
+    }
+
+    /// [`stalled_messenger`], with the count of sends that reached the
+    /// transport.
+    async fn counted_stalled_messenger() -> (
+        Arc<Messenger>,
+        crate::InstanceId,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let (tx, rx) = flume::bounded(1);
+        let sends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let transport = Arc::new(Stalling {
+            gate: velo_ext::AdmissionGate::new(tx, tokio::runtime::Handle::current()),
+            _rx: rx,
+            sends: Arc::clone(&sends),
+            adapter: std::sync::OnceLock::new(),
+        });
+        let messenger = Messenger::builder()
+            .add_transport(transport)
+            .build()
+            .await
+            .unwrap();
+        let peer_instance = crate::InstanceId::new_v4();
+        messenger
+            .register_peer(velo_ext::PeerInfo::new(peer_instance, stalling_address()))
+            .unwrap();
+        (messenger, peer_instance, sends)
+    }
+
+    /// The detach a dropped lease guard sends must not hold the Messenger
+    /// either. A guard drops armed when a get fails or is cancelled, which is
+    /// most likely when the payload's owner has stopped answering.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_lease_detach_does_not_hold_the_messenger() {
+        let (messenger, peer_instance) = stalled_messenger().await;
+        let rendezvous = Arc::new(RendezvousManager::new(messenger.instance_id().worker_id()));
+        rendezvous
+            .register_handlers(Arc::clone(&messenger))
+            .unwrap();
+        let weak = Arc::downgrade(&messenger);
+        let backend = Arc::clone(messenger.backend());
+        // The gate holds one frame: the first detach is admitted at once, the
+        // second waits on admission for as long as the peer stays stalled.
+        for lease in 1..=2 {
+            let handle = crate::rendezvous::DataHandle::pack(peer_instance.worker_id(), lease);
+            drop(rendezvous.lease_guard(handle, lease, Some(messenger.client())));
+        }
+        drop(messenger);
+        let gone = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while weak.upgrade().is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let still_alive = weak.upgrade().is_some();
+        backend.shutdown_now();
+        let _ = backend.request_teardown().await;
+        assert!(
+            gone.is_ok() && !still_alive,
+            "a detach parked in admission kept the Messenger alive after its final drop"
+        );
+    }
+
+    /// No remote rendezvous call may hold the Messenger while it waits on the
+    /// owner. The large-payload resolver is an internal task that runs `get`
+    /// and then `release`, so an owner that stops answering would otherwise
+    /// keep the Messenger, and so its transport teardown, alive forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_rendezvous_call_does_not_hold_the_messenger() {
+        let (messenger, peer_instance, sends) = counted_stalled_messenger().await;
+        let rendezvous = Arc::new(RendezvousManager::new(messenger.instance_id().worker_id()));
+        rendezvous
+            .register_handlers(Arc::clone(&messenger))
+            .unwrap();
+        let weak = Arc::downgrade(&messenger);
+        let backend = Arc::clone(messenger.backend());
+        // The gate holds one frame. Fill it first, so every call below waits
+        // on admission, the fire-and-forget ones included.
+        messenger
+            .am_send_streaming("_fill")
+            .unwrap()
+            .worker(peer_instance.worker_id())
+            .send()
+            .await
+            .unwrap();
+        let handle = crate::rendezvous::DataHandle::pack(peer_instance.worker_id(), 1);
+        let calls: Vec<tokio::task::JoinHandle<()>> = vec![
+            tokio::spawn({
+                let rendezvous = Arc::clone(&rendezvous);
+                async move { drop(rendezvous.get(handle).await) }
+            }),
+            tokio::spawn({
+                let rendezvous = Arc::clone(&rendezvous);
+                async move { drop(rendezvous.metadata(handle).await) }
+            }),
+            tokio::spawn({
+                let rendezvous = Arc::clone(&rendezvous);
+                async move { drop(rendezvous.ref_handle(handle).await) }
+            }),
+            tokio::spawn({
+                let rendezvous = Arc::clone(&rendezvous);
+                async move { drop(rendezvous.detach(handle, 1).await) }
+            }),
+            tokio::spawn({
+                let rendezvous = Arc::clone(&rendezvous);
+                async move { drop(rendezvous.release(handle, 1).await) }
+            }),
+        ];
+        // Every call has reached its wait once the fill and all five sends
+        // have reached the transport.
+        let calls_parked = calls.len() + 1;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while sends.load(std::sync::atomic::Ordering::SeqCst) < calls_parked {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("not every rendezvous call reached the stalled transport");
+        drop(messenger);
+        let gone = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while weak.upgrade().is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let still_alive = weak.upgrade().is_some();
+        for call in calls {
+            call.abort();
+        }
+        backend.shutdown_now();
+        let _ = backend.request_teardown().await;
+        assert!(
+            gone.is_ok() && !still_alive,
+            "a rendezvous call waiting on a stalled owner kept the Messenger alive after its final drop"
+        );
+    }
+
+    /// A typed handler that cannot decode its input still owes the caller an
+    /// error reply, and that reply can wait on admission to a peer that stopped
+    /// reading. The handler task must not hold the Messenger meanwhile.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_decode_error_reply_does_not_hold_the_messenger() {
+        let (messenger, peer_instance, sends) = counted_stalled_messenger().await;
+        let weak = Arc::downgrade(&messenger);
+        let backend = Arc::clone(messenger.backend());
+        let handler =
+            crate::messenger::Handler::typed_unary("typed", |_: TypedContext<u32>| Ok(0u32))
+                .build();
+        // The gate holds one frame: the first error reply is admitted at once,
+        // the second waits on admission for as long as the peer stays stalled.
+        for slot in 1..=2u128 {
+            handler.dispatcher.dispatch(
+                crate::messenger::server::InboundCall {
+                    message_id: crate::messenger::common::responses::ResponseId::from_u128(
+                        u128::from(peer_instance.worker_id().as_u64()) | (slot << 64),
+                    ),
+                    payload: bytes::Bytes::from_static(b"not json"),
+                    response_type: crate::messenger::common::messages::ResponseType::Unary,
+                    headers: None,
+                    in_flight: None,
+                },
+                &messenger,
+            );
+        }
+        // Wait until both replies reached the transport, so the handler
+        // tasks are past their upgrade and parked on the stalled peer.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while sends.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the replies never reached the stalled transport");
+        drop(messenger);
+        let gone = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while weak.upgrade().is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let still_alive = weak.upgrade().is_some();
+        backend.shutdown_now();
+        let _ = backend.request_teardown().await;
+        assert!(
+            gone.is_ok() && !still_alive,
+            "a decode-error reply parked in admission kept the Messenger alive after its final drop"
+        );
+    }
+
+    /// An ordered lane runs one message at a time, so while one reply waits
+    /// on admission to a peer that stopped reading, the messages behind it
+    /// wait in the lane queue. Those queued messages must not hold the
+    /// Messenger, or its final drop, and so its teardown, never runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_ordered_lane_does_not_hold_the_messenger() {
+        let (messenger, peer_instance, sends) = counted_stalled_messenger().await;
+        let weak = Arc::downgrade(&messenger);
+        let backend = Arc::clone(messenger.backend());
+        let handler =
+            crate::messenger::Handler::typed_unary("ordered", |_: TypedContext<u32>| Ok(0u32))
+                .ordered()
+                .build();
+        // The gate holds one frame: the first reply is admitted at once, the
+        // second waits on admission, and the third waits in the lane queue.
+        for slot in 1..=3u128 {
+            handler.dispatcher.dispatch(
+                crate::messenger::server::InboundCall {
+                    message_id: crate::messenger::common::responses::ResponseId::from_u128(
+                        u128::from(peer_instance.worker_id().as_u64()) | (slot << 64),
+                    ),
+                    payload: bytes::Bytes::from_static(b"1"),
+                    response_type: crate::messenger::common::messages::ResponseType::Unary,
+                    headers: None,
+                    in_flight: None,
+                },
+                &messenger,
+            );
+        }
+        // Wait until both replies reached the transport, so the handler
+        // tasks are past their upgrade and parked on the stalled peer.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while sends.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the replies never reached the stalled transport");
+        drop(messenger);
+        let gone = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while weak.upgrade().is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let still_alive = weak.upgrade().is_some();
+        backend.shutdown_now();
+        let _ = backend.request_teardown().await;
+        assert!(
+            gone.is_ok() && !still_alive,
+            "a message queued on an ordered lane kept the Messenger alive after its final drop"
+        );
+    }
+
+    /// A resolver that waits forever, as a pull from an owner that stopped
+    /// answering does.
+    #[derive(Default)]
+    struct NeverResolves {
+        called: std::sync::atomic::AtomicBool,
+    }
+    impl crate::messenger::large_payload::LargePayloadStager for NeverResolves {
+        fn stage(&self, _: bytes::Bytes) -> String {
+            unreachable!("the test sends nothing large")
+        }
+        fn threshold(&self) -> usize {
+            usize::MAX
+        }
+    }
+    impl crate::messenger::large_payload::LargePayloadResolver for NeverResolves {
+        fn resolve(&self, _: &str) -> futures::future::BoxFuture<'_, anyhow::Result<bytes::Bytes>> {
+            self.called.store(true, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// A large-payload message whose owner never answers must not keep its
+    /// resolver task past teardown, through the real receive loop: final
+    /// Messenger drop does not complete the pull, so only the teardown token
+    /// the loop hands the task can end it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_large_payload_resolve_ends_at_final_messenger_drop() {
+        let (tx, rx) = flume::bounded(1);
+        let transport = Arc::new(Stalling {
+            gate: velo_ext::AdmissionGate::new(tx, tokio::runtime::Handle::current()),
+            _rx: rx,
+            sends: Default::default(),
+            adapter: std::sync::OnceLock::new(),
+        });
+        let messenger = Messenger::builder()
+            .add_transport(transport.clone())
+            .build()
+            .await
+            .unwrap();
+        let resolver = Arc::new(NeverResolves::default());
+        let resolver_alive = Arc::downgrade(&resolver);
+        messenger.set_large_payload_support(resolver.clone(), resolver);
+        let backend = Arc::clone(messenger.backend());
+        let headers = std::collections::HashMap::from([(
+            crate::messenger::large_payload::RV_HEADER_KEY.to_string(),
+            "1".to_string(),
+        )]);
+        let (header, payload, _) = crate::messenger::common::messages::ActiveMessage {
+            metadata: crate::messenger::common::messages::MessageMetadata::new_fire(
+                crate::messenger::common::responses::ResponseId::from_u128(1),
+                "large".to_string(),
+                Some(headers),
+            ),
+            payload: bytes::Bytes::new(),
+        }
+        .encode()
+        .unwrap();
+        assert!(matches!(
+            transport
+                .adapter
+                .get()
+                .unwrap()
+                .admit_message(header, payload),
+            velo_ext::AdmitOutcome::Admitted
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !resolver_alive
+                .upgrade()
+                .is_some_and(|r| r.called.load(std::sync::atomic::Ordering::SeqCst))
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the receive loop never started the resolve");
+        drop(messenger);
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while resolver_alive.upgrade().is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        backend.shutdown_now();
+        assert!(
+            ended.is_ok(),
+            "a resolve waiting on its owner outlived the final Messenger drop"
+        );
+    }
+
+    /// The event handlers send completions to the peer that asked, inline in
+    /// the handler. A handler body that keeps its context keeps the Messenger
+    /// across that send, which can wait on a peer that stopped reading. The
+    /// handler bodies pass only `ctx.payload` into their `async move` block,
+    /// and the block captures only that field, so the context, and its
+    /// Messenger, drops before the send. Touching `ctx` itself inside the
+    /// block would capture all of it; this test fails if that happens.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_event_completion_does_not_hold_the_messenger() {
+        let (messenger, peer_instance) = stalled_messenger().await;
+        let weak = Arc::downgrade(&messenger);
+        let backend = Arc::clone(messenger.backend());
+        let handlers = std::sync::Mutex::new(Vec::new());
+        crate::messenger::events::handlers::register_event_handlers(
+            |handler| {
+                handlers.lock().unwrap().push(handler);
+                Ok(())
+            },
+            Arc::clone(messenger.events()),
+        )
+        .unwrap();
+        let handlers = handlers.into_inner().unwrap();
+        let subscribe = handlers
+            .iter()
+            .find(|handler| handler.name() == "_event_subscribe")
+            .unwrap();
+        // The gate holds one frame: the first completion is admitted at once,
+        // the second waits on admission for as long as the peer stays stalled.
+        for slot in 1..=2u128 {
+            let event = messenger.event_manager().new_event().unwrap();
+            let handle = event.handle();
+            event.trigger().unwrap();
+            let payload =
+                serde_json::to_vec(&crate::messenger::events::messages::EventSubscribeMessage {
+                    handle: handle.raw(),
+                    subscriber_worker: peer_instance.worker_id().as_u64(),
+                    subscriber_instance: peer_instance,
+                })
+                .unwrap();
+            subscribe.dispatcher.dispatch(
+                crate::messenger::server::InboundCall {
+                    message_id: crate::messenger::common::responses::ResponseId::from_u128(
+                        u128::from(peer_instance.worker_id().as_u64()) | (slot << 64),
+                    ),
+                    payload: bytes::Bytes::from(payload),
+                    response_type: crate::messenger::common::messages::ResponseType::FireAndForget,
+                    headers: None,
+                    in_flight: None,
+                },
+                &messenger,
+            );
+        }
+        drop(handlers);
+        drop(messenger);
+        let gone = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while weak.upgrade().is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let still_alive = weak.upgrade().is_some();
+        backend.shutdown_now();
+        let _ = backend.request_teardown().await;
+        assert!(
+            gone.is_ok() && !still_alive,
+            "an event completion parked in admission kept the Messenger alive after its final drop"
+        );
+    }
+
+    /// A best-effort `_stream_cancel` to a peer that never admits a frame
+    /// must not keep the Messenger alive after its final drop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_stream_cancel_does_not_hold_the_messenger() {
+        let (messenger, peer_instance) = stalled_messenger().await;
+        let registry = Arc::new(crate::streaming::control::SenderRegistry::default());
+        let weak = Arc::downgrade(&messenger);
+        let backend = Arc::clone(messenger.backend());
+        // The gate holds one frame: the first notice is admitted at once, the
+        // second parks in admission for as long as the peer stays stalled.
+        for id in 1..=2 {
+            crate::streaming::control::request_sender_cancel(
+                crate::streaming::control::StreamCancelHandle::pack(peer_instance.worker_id(), id),
+                messenger.instance_id().worker_id(),
+                &registry,
+                Some(&messenger),
+            );
+        }
+        drop(messenger);
+        let gone = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while weak.upgrade().is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let still_alive = weak.upgrade().is_some();
+        // Force the teardown so the test exits cleanly either way.
+        backend.shutdown_now();
+        let _ = backend.request_teardown().await;
+        assert!(
+            gone.is_ok() && !still_alive,
+            "a notice parked in admission to a stalled peer kept the Messenger alive after its final drop"
+        );
     }
 }
