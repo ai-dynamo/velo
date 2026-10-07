@@ -2600,6 +2600,52 @@ mod tests {
         );
     }
 
+    /// An ordered lane runs one message at a time, so while one reply waits
+    /// on admission to a peer that stopped reading, the messages behind it
+    /// wait in the lane queue. Those queued messages must not hold the
+    /// Messenger, or its final drop, and so its teardown, never runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "ordered lane holds the Messenger: each queued HandlerContext keeps a strong Arc<Messenger> while the lane waits on a stalled reply; the fix needs a per-message upgrade, which the hot-path rule forbids"]
+    async fn a_stalled_ordered_lane_does_not_hold_the_messenger() {
+        let (messenger, peer_instance) = stalled_messenger().await;
+        let weak = Arc::downgrade(&messenger);
+        let backend = Arc::clone(messenger.backend());
+        let handler =
+            crate::messenger::Handler::typed_unary("ordered", |_: TypedContext<u32>| Ok(0u32))
+                .ordered()
+                .build();
+        // The gate holds one frame: the first reply is admitted at once, the
+        // second waits on admission, and the third waits in the lane queue.
+        for slot in 1..=3u128 {
+            handler
+                .dispatcher
+                .dispatch(crate::messenger::server::HandlerContext {
+                    message_id: crate::messenger::common::responses::ResponseId::from_u128(
+                        u128::from(peer_instance.worker_id().as_u64()) | (slot << 64),
+                    ),
+                    payload: bytes::Bytes::from_static(b"1"),
+                    response_type: crate::messenger::common::messages::ResponseType::Unary,
+                    headers: None,
+                    system: Arc::clone(&messenger),
+                    in_flight: None,
+                });
+        }
+        drop(messenger);
+        let gone = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while weak.upgrade().is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let still_alive = weak.upgrade().is_some();
+        backend.shutdown_now();
+        let _ = backend.request_teardown().await;
+        assert!(
+            gone.is_ok() && !still_alive,
+            "a message queued on an ordered lane kept the Messenger alive after its final drop"
+        );
+    }
+
     /// A best-effort `_stream_cancel` to a peer that never admits a frame
     /// must not keep the Messenger alive after its final drop.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
