@@ -2511,8 +2511,15 @@ mod tests {
             .unwrap();
         let weak = Arc::downgrade(&messenger);
         let backend = Arc::clone(messenger.backend());
-        // The gate holds one frame: the first call is admitted and waits for
-        // an answer that never comes, the others wait on admission.
+        // The gate holds one frame. Fill it first, so every call below waits
+        // on admission, the fire-and-forget ones included.
+        messenger
+            .am_send_streaming("_fill")
+            .unwrap()
+            .worker(peer_instance.worker_id())
+            .send()
+            .await
+            .unwrap();
         let handle = crate::rendezvous::DataHandle::pack(peer_instance.worker_id(), 1);
         let calls: Vec<tokio::task::JoinHandle<()>> = vec![
             tokio::spawn({
@@ -2605,7 +2612,7 @@ mod tests {
     /// wait in the lane queue. Those queued messages must not hold the
     /// Messenger, or its final drop, and so its teardown, never runs.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "ordered lane holds the Messenger: each queued HandlerContext keeps a strong Arc<Messenger> while the lane waits on a stalled reply; the fix needs a per-message upgrade, which the hot-path rule forbids"]
+    #[ignore = "ordered lane holds the Messenger: each queued HandlerContext keeps a strong Arc<Messenger> while the lane waits on a stalled reply; awaiting a design ruling on the fix"]
     async fn a_stalled_ordered_lane_does_not_hold_the_messenger() {
         let (messenger, peer_instance) = stalled_messenger().await;
         let weak = Arc::downgrade(&messenger);
