@@ -2405,6 +2405,8 @@ mod tests {
         _rx: flume::Receiver<(bytes::Bytes, bytes::Bytes)>,
         /// How many sends reached the transport, admitted or parked.
         sends: Arc<std::sync::atomic::AtomicUsize>,
+        /// The adapter `start` was given, so a test can feed inbound frames.
+        adapter: std::sync::OnceLock<velo_ext::TransportAdapter>,
     }
     fn stalling_address() -> velo_ext::WorkerAddress {
         let entries =
@@ -2438,9 +2440,10 @@ mod tests {
         fn start(
             &self,
             _: velo_ext::InstanceId,
-            _: velo_ext::TransportAdapter,
+            adapter: velo_ext::TransportAdapter,
             _: tokio::runtime::Handle,
         ) -> futures::future::BoxFuture<'_, anyhow::Result<()>> {
+            let _ = self.adapter.set(adapter);
             Box::pin(async { Ok(()) })
         }
         fn shutdown(&self) {}
@@ -2478,6 +2481,7 @@ mod tests {
             gate: velo_ext::AdmissionGate::new(tx, tokio::runtime::Handle::current()),
             _rx: rx,
             sends: Arc::clone(&sends),
+            adapter: std::sync::OnceLock::new(),
         });
         let messenger = Messenger::builder()
             .add_transport(transport)
@@ -2702,6 +2706,95 @@ mod tests {
         assert!(
             gone.is_ok() && !still_alive,
             "a message queued on an ordered lane kept the Messenger alive after its final drop"
+        );
+    }
+
+    /// A resolver that waits forever, as a pull from an owner that stopped
+    /// answering does.
+    #[derive(Default)]
+    struct NeverResolves {
+        called: std::sync::atomic::AtomicBool,
+    }
+    impl crate::messenger::large_payload::LargePayloadStager for NeverResolves {
+        fn stage(&self, _: bytes::Bytes) -> String {
+            unreachable!("the test sends nothing large")
+        }
+        fn threshold(&self) -> usize {
+            usize::MAX
+        }
+    }
+    impl crate::messenger::large_payload::LargePayloadResolver for NeverResolves {
+        fn resolve(&self, _: &str) -> futures::future::BoxFuture<'_, anyhow::Result<bytes::Bytes>> {
+            self.called.store(true, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// A large-payload message whose owner never answers must not keep its
+    /// resolver task past teardown, through the real receive loop: final
+    /// Messenger drop does not complete the pull, so only the teardown token
+    /// the loop hands the task can end it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_large_payload_resolve_ends_at_final_messenger_drop() {
+        let (tx, rx) = flume::bounded(1);
+        let transport = Arc::new(Stalling {
+            gate: velo_ext::AdmissionGate::new(tx, tokio::runtime::Handle::current()),
+            _rx: rx,
+            sends: Default::default(),
+            adapter: std::sync::OnceLock::new(),
+        });
+        let messenger = Messenger::builder()
+            .add_transport(transport.clone())
+            .build()
+            .await
+            .unwrap();
+        let resolver = Arc::new(NeverResolves::default());
+        let resolver_alive = Arc::downgrade(&resolver);
+        messenger.set_large_payload_support(resolver.clone(), resolver);
+        let backend = Arc::clone(messenger.backend());
+        let headers = std::collections::HashMap::from([(
+            crate::messenger::large_payload::RV_HEADER_KEY.to_string(),
+            "1".to_string(),
+        )]);
+        let (header, payload, _) = crate::messenger::common::messages::ActiveMessage {
+            metadata: crate::messenger::common::messages::MessageMetadata::new_fire(
+                crate::messenger::common::responses::ResponseId::from_u128(1),
+                "large".to_string(),
+                Some(headers),
+            ),
+            payload: bytes::Bytes::new(),
+        }
+        .encode()
+        .unwrap();
+        assert!(matches!(
+            transport
+                .adapter
+                .get()
+                .unwrap()
+                .admit_message(header, payload),
+            velo_ext::AdmitOutcome::Admitted
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !resolver_alive
+                .upgrade()
+                .is_some_and(|r| r.called.load(std::sync::atomic::Ordering::SeqCst))
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the receive loop never started the resolve");
+        drop(messenger);
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while resolver_alive.upgrade().is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        backend.shutdown_now();
+        assert!(
+            ended.is_ok(),
+            "a resolve waiting on its owner outlived the final Messenger drop"
         );
     }
 
