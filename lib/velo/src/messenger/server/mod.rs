@@ -311,45 +311,20 @@ async fn create_message_handler(
                         // would keep its final drop, and teardown, from ever
                         // happening. The hub upgrades it again afterwards.
                         let backend = Arc::clone(system.backend());
-                        tokio::spawn(async move {
-                            match resolver.resolve(&handle_str).await {
-                                Ok(resolved_payload) => {
-                                    // Gone: the instance is being torn down,
-                                    // and the message dies with its guard.
-                                    let Some(system) = hub.system() else {
-                                        return;
-                                    };
-                                    let call = InboundCall {
-                                        message_id,
-                                        payload: resolved_payload,
-                                        response_type,
-                                        headers,
-                                        in_flight,
-                                    };
-                                    hub.dispatch_message(&handler_name, call, &system);
-                                }
-                                Err(e) => {
-                                    tracing::error!(
-                                        target: "crate::messenger::server",
-                                        handler = %handler_name,
-                                        "Failed to resolve large payload: {e}"
-                                    );
-                                    if matches!(
-                                        response_type,
-                                        crate::messenger::common::messages::ResponseType::AckNack
-                                            | crate::messenger::common::messages::ResponseType::Unary
-                                    ) {
-                                        send_error_reply(
-                                            &backend,
-                                            &handler_name,
-                                            message_id,
-                                            format!("Failed to resolve large payload: {e}"),
-                                        )
-                                        .await;
-                                    }
-                                }
-                            }
-                        });
+                        spawn_resolve(
+                            &teardown,
+                            ResolveJob {
+                                resolver,
+                                hub,
+                                handler_name,
+                                message_id,
+                                response_type,
+                                headers,
+                                handle_str,
+                                in_flight,
+                                backend,
+                            },
+                        );
                         continue;
                     } else {
                         // No resolver installed — cannot process rendezvous payload
@@ -431,6 +406,87 @@ async fn create_message_handler(
     }
 
     Ok(())
+}
+
+/// A message whose payload must be pulled from its owner before dispatch.
+struct ResolveJob {
+    resolver: Arc<dyn crate::messenger::large_payload::LargePayloadResolver>,
+    hub: Arc<DispatcherHub>,
+    handler_name: String,
+    message_id: crate::messenger::common::responses::ResponseId,
+    response_type: crate::messenger::common::messages::ResponseType,
+    headers: Option<std::collections::HashMap<String, String>>,
+    handle_str: String,
+    in_flight: Option<Arc<velo_ext::InFlightGuard>>,
+    backend: Arc<VeloBackend>,
+}
+
+/// Resolve a large payload off the receive loop, then dispatch it.
+///
+/// Ends at teardown. The pull waits on the payload's owner with no deadline
+/// of its own, and final Messenger drop does not complete a response wait,
+/// so a task that outlived teardown would keep the backend, the resolver,
+/// and the message's drain guard for the life of the process.
+fn spawn_resolve(
+    teardown: &tokio_util::sync::CancellationToken,
+    job: ResolveJob,
+) -> tokio::task::JoinHandle<Option<()>> {
+    tokio::spawn(
+        teardown
+            .clone()
+            .run_until_cancelled_owned(resolve_and_dispatch(job)),
+    )
+}
+
+async fn resolve_and_dispatch(job: ResolveJob) {
+    let ResolveJob {
+        resolver,
+        hub,
+        handler_name,
+        message_id,
+        response_type,
+        headers,
+        handle_str,
+        in_flight,
+        backend,
+    } = job;
+    match resolver.resolve(&handle_str).await {
+        Ok(resolved_payload) => {
+            // Gone: the instance is being torn down,
+            // and the message dies with its guard.
+            let Some(system) = hub.system() else {
+                return;
+            };
+            let call = InboundCall {
+                message_id,
+                payload: resolved_payload,
+                response_type,
+                headers,
+                in_flight,
+            };
+            hub.dispatch_message(&handler_name, call, &system);
+        }
+        Err(e) => {
+            tracing::error!(
+                target: "crate::messenger::server",
+                handler = %handler_name,
+                "Failed to resolve large payload: {e}"
+            );
+            if matches!(
+                response_type,
+                crate::messenger::common::messages::ResponseType::AckNack
+                    | crate::messenger::common::messages::ResponseType::Unary
+            ) {
+                send_error_reply(
+                    &backend,
+                    &handler_name,
+                    message_id,
+                    format!("Failed to resolve large payload: {e}"),
+                )
+                .await;
+            }
+        }
+    }
 }
 
 /// Creates a task that handles responses from the response channel.
@@ -589,6 +645,52 @@ mod tests {
     use super::*;
     use crate::messenger::common::events::{EventType, Outcome, encode_event_header};
     use tokio::time::{Duration, timeout};
+
+    /// A resolver that waits forever, as a pull from an owner that stopped
+    /// answering does: final Messenger drop does not complete a response
+    /// wait.
+    struct NeverResolves;
+    impl crate::messenger::large_payload::LargePayloadResolver for NeverResolves {
+        fn resolve(&self, _: &str) -> futures::future::BoxFuture<'_, anyhow::Result<Bytes>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// The resolver task must end at teardown. It holds the backend, the
+    /// resolver, and the message's drain guard, and its pull waits on the
+    /// payload's owner with no deadline of its own, so a task that outlived
+    /// teardown would keep them for the life of the process.
+    #[tokio::test]
+    async fn a_waiting_resolve_ends_at_teardown() {
+        let messenger = crate::Messenger::builder().build().await.unwrap();
+        let backend = Arc::clone(messenger.backend());
+        let resolver: Arc<dyn crate::messenger::large_payload::LargePayloadResolver> =
+            Arc::new(NeverResolves);
+        let resolver_alive = Arc::downgrade(&resolver);
+        let teardown = tokio_util::sync::CancellationToken::new();
+        let task = spawn_resolve(
+            &teardown,
+            ResolveJob {
+                resolver,
+                hub: Arc::new(DispatcherHub::new(Arc::clone(&backend))),
+                handler_name: "large".to_string(),
+                message_id: crate::messenger::common::responses::ResponseId::from_u128(1),
+                response_type: crate::messenger::common::messages::ResponseType::Unary,
+                headers: None,
+                handle_str: "1".to_string(),
+                in_flight: None,
+                backend,
+            },
+        );
+        tokio::task::yield_now().await;
+        teardown.cancel();
+        timeout(Duration::from_secs(2), task)
+            .await
+            .expect("a resolve waiting on its owner outlived teardown")
+            .unwrap();
+        assert!(resolver_alive.upgrade().is_none());
+        drop(messenger);
+    }
 
     /// A queue that never drains must not keep the messenger alive: once its
     /// owner drops it, the loop must see it gone within one refresh, so that

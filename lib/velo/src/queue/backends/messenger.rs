@@ -533,11 +533,19 @@ impl SenderBackend for RemoteMessengerSender {
                 }
             };
             let target = self.target;
-            handle.spawn(async move {
+            // Ends at teardown: the RPC waits for an answer with no deadline
+            // of its own, and final Messenger drop does not complete it.
+            let teardown = self
+                .messenger
+                .backend()
+                .shutdown_state()
+                .teardown_token()
+                .clone();
+            handle.spawn(teardown.run_until_cancelled_owned(async move {
                 if let Err(e) = builder.send_to(target).await {
                     tracing::warn!("messenger queue try_send failed: {e}");
                 }
-            });
+            }));
         } else {
             tracing::warn!(
                 "messenger queue try_send called without an active Tokio runtime; message will be dropped"
@@ -704,6 +712,50 @@ mod tests {
     /// peer that stopped answering for as long as the peer stays stopped. The
     /// task must not hold the Messenger there, or its final drop, and so its
     /// transport teardown, never runs.
+    /// The try_send task must also end at teardown. Its RPC waits for an
+    /// answer with no deadline of its own, and final Messenger drop does not
+    /// complete that wait, so a task that outlived teardown would hold its
+    /// response slot, and what the task owns, for the life of the process.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_try_send_ends_at_teardown() {
+        let (messenger, peer_instance) = crate::tests::stalled_messenger().await;
+        // The client, not the Messenger: its response slots show whether the
+        // tasks still wait.
+        let client = Arc::clone(messenger.client());
+        // Known handlers, so the RPC is sent from this task. Otherwise a
+        // handshake task of the client's own, bounded by the handshake
+        // timeout, keeps the slots for that long whatever this task does.
+        client.record_peer_handlers(peer_instance, vec![QUEUE_RPC_HANDLER.to_string()]);
+        let sender = RemoteMessengerSender {
+            messenger,
+            target: peer_instance,
+            queue: "q".to_string(),
+            capacity: None,
+        };
+        for _ in 0..2 {
+            sender.try_send(Bytes::from_static(b"item")).unwrap();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while client.response_manager.pending_outcome_count() < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the RPCs never started waiting");
+        // The final Messenger drop starts teardown.
+        drop(sender);
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while client.response_manager.pending_outcome_count() > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            ended.is_ok(),
+            "a try_send task waiting on an answer outlived teardown"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_stalled_try_send_does_not_hold_the_messenger() {
         let (messenger, peer_instance) = crate::tests::stalled_messenger().await;
