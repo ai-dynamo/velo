@@ -708,11 +708,7 @@ impl ReceiverBackend for RemoteMessengerReceiver {
 mod tests {
     use super::*;
 
-    /// `try_send` hands its RPC to a detached task, and that task can wait on a
-    /// peer that stopped answering for as long as the peer stays stopped. The
-    /// task must not hold the Messenger there, or its final drop, and so its
-    /// transport teardown, never runs.
-    /// The try_send task must also end at teardown. Its RPC waits for an
+    /// The try_send task must end at teardown. Its RPC waits for an
     /// answer with no deadline of its own, and final Messenger drop does not
     /// complete that wait, so a task that outlived teardown would hold its
     /// response slot, and what the task owns, for the life of the process.
@@ -756,6 +752,10 @@ mod tests {
         );
     }
 
+    /// `try_send` hands its RPC to a detached task, and that task can wait on a
+    /// peer that stopped answering for as long as the peer stays stopped. The
+    /// task must not hold the Messenger there, or its final drop, and so its
+    /// transport teardown, never runs.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_stalled_try_send_does_not_hold_the_messenger() {
         let (messenger, peer_instance) = crate::tests::stalled_messenger().await;
