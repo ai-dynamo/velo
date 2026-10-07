@@ -404,6 +404,33 @@ async fn cancelling_the_transport_closes_every_producer_channel() {
     );
 }
 
+/// A stopping batcher sends the control it already holds, once.
+///
+/// On final Velo drop the node removes its anchors and then stops the mux.
+/// A zero-RTT producer learns that its stream ended only from the slot close
+/// those removals queue. The batcher's select is biased to the cancel, so
+/// without this a close queued just before the stop was dropped, and the
+/// producer filled its window and waited forever. Current-thread, so the
+/// batcher cannot run between the post and the cancel.
+#[tokio::test]
+async fn a_cancelled_batcher_sends_the_control_it_already_holds() {
+    let harness = harness(MuxConfig::default()).await;
+    let slot = crate::streaming::messenger_mux::protocol::SlotId::from_raw(7);
+    assert!(harness.handle.reply(&[ReplyRecord::CloseSlot {
+        slot,
+        reason: crate::streaming::messenger_mux::protocol::CloseReason::UnknownSlot,
+    }]));
+    harness.cancel.cancel();
+    let batch = harness.next_batch().await;
+    assert!(
+        batch
+            .records
+            .iter()
+            .any(|record| record.kind == RecordType::CloseSlot && record.slot == slot),
+        "the queued close never went out"
+    );
+}
+
 /// A cancelled batcher leaves the registry before it refuses a reply.
 ///
 /// `send_replies` re-resolves a refused reply through the registry and loops

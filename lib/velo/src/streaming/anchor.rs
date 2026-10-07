@@ -1055,25 +1055,43 @@ impl AnchorManager {
     /// `Dropped` that the reader would
     /// take as its sender's. Hence the steps:
     ///
-    /// 1. Stop the mux's tasks. A slot close after this finds no batcher and
-    ///    sends nothing. The slots stay open.
+    /// 1. Stop the mux's tasks, if the transports are already gone (explicit
+    ///    shutdown). A slot close after this finds no batcher and sends
+    ///    nothing. The slots stay open.
     /// 2. Take streams off their slots: SPSC feeds withdrawn, MPSC pumps
     ///    cancelled.
     /// 3. Remove anchors and MPSC entries, and cancel their senders: local
     ///    ones directly, remote ones by `_stream_cancel` while the messenger's
-    ///    transports are still up (final drop, not explicit shutdown).
+    ///    transports are still up (final drop).
+    /// 4. On final drop, stop the mux's tasks now. Each batcher sends the
+    ///    slot closes step 3 queued before it exits; a zero-RTT producer
+    ///    learns that its stream ended only from that close.
     ///
     /// The caller then retires mux slots, after joining tasks if it can wait.
     ///
-    /// Steps 1-3 do not await. A caller that drops the shutdown future (a timeout
+    /// Steps 1-4 do not await. A caller that drops the shutdown future (a timeout
     /// around `Velo::shutdown`) still leaves no stream waiting on a slot or an
     /// anchor. The slots then stay open, with no reader, until the mux drops.
     ///
     /// `Velo::graceful_shutdown` stops and joins mux sends before transport
     /// teardown. Step 1 also makes direct calls to this method safe.
     fn prepare_stop(&self) {
+        // Remote senders hear of the end only from this node: the mux is
+        // stopping, and a retained Messenger drops their batches once the mux
+        // is gone. Without word they fill the window and wait forever. Only
+        // while the transports are up: explicit shutdown calls this after
+        // teardown, and must send nothing.
+        let peers = self
+            .messenger_lock
+            .get()
+            .filter(|m| !m.backend().shutdown_state().teardown_token().is_cancelled());
         let mux = self.mux.get();
-        if let Some(mux) = mux {
+        // With transports up, stop the mux only after the removals below have
+        // queued their slot closes: a zero-RTT producer has no other signal,
+        // and a stopping batcher sends what is already queued.
+        if peers.is_none()
+            && let Some(mux) = mux
+        {
             mux.stop_sending();
         }
         for mut entry in self.registry.iter_mut() {
@@ -1086,16 +1104,8 @@ impl AnchorManager {
                 }
             }
         }
-        // Remote senders hear of the end only through `_stream_cancel`: the
-        // mux is stopping, so no slot close reaches them, and a retained
-        // Messenger drops their batches once the mux is gone. Without it they
-        // fill the window and wait forever. Only while the transports are up:
-        // explicit shutdown calls this after teardown, and must send nothing.
-        let peers = self
-            .messenger_lock
-            .get()
-            .filter(|m| !m.backend().shutdown_state().teardown_token().is_cancelled());
         // Remove entries outside shard guards: their Drop may close a mux slot.
+        // An attached sender is also told by `_stream_cancel`.
         let ids: Vec<_> = self.registry.iter().map(|entry| *entry.key()).collect();
         for id in ids {
             if let Some(handle) = self
@@ -1134,6 +1144,11 @@ impl AnchorManager {
             .collect();
         for id in ids {
             self.sender_registry.cancel(id);
+        }
+        if peers.is_some()
+            && let Some(mux) = mux
+        {
+            mux.stop_sending();
         }
     }
 

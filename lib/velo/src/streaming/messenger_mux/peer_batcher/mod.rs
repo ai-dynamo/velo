@@ -521,6 +521,19 @@ impl Batcher {
                 return self.teardown(false);
             }
         }
+        if cancel.is_cancelled() {
+            // Stopped: send what is already queued, once. The cancel arm is
+            // biased, so a slot close posted just before the stop would
+            // otherwise be dropped, and a zero-RTT producer learns that its
+            // stream ended only from that close. Unregistered first, for the
+            // reason `teardown` gives; closing the inbox refuses later writers.
+            self.unregister();
+            if let Some(leftover) = self.control.close() {
+                self.on_control(leftover).await;
+                self.flush().await;
+            }
+            return self.teardown(false);
+        }
         self.teardown(true);
     }
 
@@ -1135,6 +1148,12 @@ impl Batcher {
     }
 
     /// Close every slot on the way out, so producers learn immediately.
+    fn unregister(&self) {
+        let handle = Arc::clone(&self.handle);
+        self.batchers
+            .remove_if(&self.key, |_, entry| Arc::ptr_eq(entry, &handle));
+    }
+
     fn teardown(&mut self, unregister: bool) {
         // Unregistered before the inbox closes. `send_replies` re-resolves a
         // refused reply through the registry until a batcher takes it, and
@@ -1146,15 +1165,12 @@ impl Batcher {
         // anchor removal at shutdown) is refused by `MuxCore::batcher`, and
         // this order keeps the invariant even if that guard were missed.
         if unregister {
-            let handle = Arc::clone(&self.handle);
-            self.batchers
-                .remove_if(&self.key, |_, entry| Arc::ptr_eq(entry, &handle));
+            self.unregister();
         }
-        // Already closed on the retirement path, where what it handed back
-        // rode the final flush. On cancellation whatever is still pending
-        // dies with the transport, and a writer that comes later is refused
-        // and re-resolves — onto a batcher on the same cancelled token, which
-        // exits the same way.
+        // Already closed on the retirement and cancellation paths, where what
+        // it handed back rode a final flush. A writer that comes later is
+        // refused and re-resolves — onto a batcher on the same cancelled
+        // token, which exits the same way.
         self.control.close();
         // Anything still staged dies with the task: the slots it belongs to are
         // being closed in the next line, so their consumers learn through

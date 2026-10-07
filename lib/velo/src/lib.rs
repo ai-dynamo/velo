@@ -1948,9 +1948,6 @@ mod tests {
         producer.shutdown(ShutdownPolicy::WaitForever).await;
     }
 
-    /// A consumer still reading when its node shuts down must see the stream
-    /// end, not `SenderDropped`: the sender did nothing wrong.
-    ///
     /// Final Messenger drop runs transport teardown on its own thread. Wait
     /// until the Messenger is gone and that teardown has finished.
     async fn wait_for_final_messenger_drop(
@@ -1967,6 +1964,9 @@ mod tests {
         backend.request_teardown().await.unwrap();
     }
 
+    /// A consumer still reading when its node shuts down must see the stream
+    /// end, not `SenderDropped`: the sender did nothing wrong.
+    ///
     /// Stopping the mux retires every ingress slot by injecting `Dropped` into
     /// it. A consumer whose direct feed is still installed reads that record
     /// as its sender's. So each anchor's feed must be withdrawn before the mux
@@ -2023,63 +2023,6 @@ mod tests {
             }
 
             drop(sender);
-            producer.shutdown(ShutdownPolicy::WaitForever).await;
-            drop(retained);
-        }
-    }
-
-    /// Final Velo drop with a retained Messenger must tell remote producers
-    /// their stream ended. The mux is stopped, so no slot close reaches them,
-    /// and the retained Messenger's mux handler drops their batches once the
-    /// mux is gone. Without a `_stream_cancel` their tokens never fire, and
-    /// their sends fill the window and then wait forever.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn final_velo_drop_cancels_remote_mux_producers() {
-        use futures::StreamExt;
-
-        for mpsc in [false, true] {
-            let attach = if mpsc {
-                "_mpsc_anchor_attach"
-            } else {
-                "_anchor_attach"
-            };
-            let (consumer, producer) = connected_pair(None, attach).await;
-            // The cancel token, plus the sender that must outlive the wait.
-            let (token, _mpsc_sender, _sender) = if mpsc {
-                let mut anchor = consumer.create_mpsc_anchor::<u32>();
-                let sender = producer
-                    .attach_mpsc_anchor::<u32>(anchor.handle())
-                    .await
-                    .unwrap();
-                sender.send(1).await.unwrap();
-                tokio::time::timeout(std::time::Duration::from_secs(5), anchor.next())
-                    .await
-                    .unwrap();
-                let token = sender.cancellation_token();
-                tokio::spawn(async move { while anchor.next().await.is_some() {} });
-                (token, Some(sender), None)
-            } else {
-                let mut anchor = consumer.create_anchor::<u32>();
-                let sender = producer
-                    .attach_anchor::<u32>(anchor.handle())
-                    .await
-                    .unwrap();
-                sender.send(1).await.unwrap();
-                tokio::time::timeout(std::time::Duration::from_secs(5), anchor.next())
-                    .await
-                    .unwrap();
-                let token = sender.cancellation_token();
-                tokio::spawn(async move { while anchor.next().await.is_some() {} });
-                (token, None, Some(sender))
-            };
-            let retained = Arc::clone(consumer.messenger());
-            drop(consumer);
-            tokio::time::timeout(std::time::Duration::from_secs(5), token.cancelled())
-                .await
-                .unwrap_or_else(|_| {
-                    panic!("mpsc={mpsc}: the remote producer was never told its stream ended")
-                });
-            drop((token, _mpsc_sender, _sender));
             producer.shutdown(ShutdownPolicy::WaitForever).await;
             drop(retained);
         }
@@ -2164,6 +2107,78 @@ mod tests {
             drop(sender);
             producer.shutdown(ShutdownPolicy::WaitForever).await;
             drop(retained);
+        }
+    }
+
+    /// Final Velo drop must tell remote producers their stream ended, whether
+    /// or not a Messenger is retained, and however the stream was opened. The
+    /// mux stops on drop, and a retained Messenger's mux handler drops their
+    /// batches once the mux is gone, so a producer told nothing fills its
+    /// window and then waits forever. An attached stream is told by
+    /// `_stream_cancel`. A zero-RTT stream records no cancel handle; it is
+    /// told by its slot close, which must go out before the mux stops.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn final_velo_drop_cancels_remote_mux_producers() {
+        use futures::StreamExt;
+
+        for mode in ["attach", "mpsc", "ticket"] {
+            for retain in [true, false] {
+                let handler = if mode == "mpsc" {
+                    "_mpsc_anchor_attach"
+                } else {
+                    "_anchor_attach"
+                };
+                let (consumer, producer) = connected_pair(None, handler).await;
+                // The cancel token, plus the sender that must outlive the wait.
+                let (token, _mpsc_sender, _sender) = if mode == "mpsc" {
+                    let mut anchor = consumer.create_mpsc_anchor::<u32>();
+                    let sender = producer
+                        .attach_mpsc_anchor::<u32>(anchor.handle())
+                        .await
+                        .unwrap();
+                    sender.send(1).await.unwrap();
+                    tokio::time::timeout(std::time::Duration::from_secs(5), anchor.next())
+                        .await
+                        .unwrap();
+                    let token = sender.cancellation_token();
+                    tokio::spawn(async move { while anchor.next().await.is_some() {} });
+                    (token, Some(sender), None)
+                } else {
+                    let mut anchor = consumer.create_anchor::<u32>();
+                    let sender = if mode == "ticket" {
+                        let ticket = consumer.prebind_anchor(anchor.handle()).unwrap();
+                        producer
+                            .open_anchor_stream::<u32>(anchor.handle(), ticket)
+                            .await
+                            .unwrap()
+                    } else {
+                        producer
+                            .attach_anchor::<u32>(anchor.handle())
+                            .await
+                            .unwrap()
+                    };
+                    sender.send(1).await.unwrap();
+                    tokio::time::timeout(std::time::Duration::from_secs(5), anchor.next())
+                        .await
+                        .unwrap();
+                    let token = sender.cancellation_token();
+                    tokio::spawn(async move { while anchor.next().await.is_some() {} });
+                    (token, None, Some(sender))
+                };
+                let retained = retain.then(|| Arc::clone(consumer.messenger()));
+                drop(consumer);
+                tokio::time::timeout(std::time::Duration::from_secs(5), token.cancelled())
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "{mode}, retain={retain}: the remote producer was never told \
+                             its stream ended"
+                        )
+                    });
+                drop((token, _mpsc_sender, _sender));
+                producer.shutdown(ShutdownPolicy::WaitForever).await;
+                drop(retained);
+            }
         }
     }
 
