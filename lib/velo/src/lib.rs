@@ -1840,28 +1840,6 @@ mod tests {
                 wait_for_listener_close(stream_addr).await;
             }
             assert!(manager.upgrade().is_none());
-            let rollback = crate::streaming::control::AnchorAbortAttachRequest {
-                handle: anchor.handle(),
-                stream_cancel_handle: crate::streaming::control::StreamCancelHandle::pack(
-                    client.instance_id().worker_id(),
-                    1,
-                ),
-            };
-            let error = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                client
-                    .messenger()
-                    .typed_unary_streaming::<()>("_anchor_abort_attach")
-                    .payload(&rollback)
-                    .unwrap()
-                    .instance(retained.instance_id())
-                    .send(),
-            )
-            .await
-            .expect("rollback handler hung after final Velo drop")
-            .unwrap_err();
-            assert!(error.to_string().contains("anchor manager shut down"));
-            assert!(manager.upgrade().is_none());
             let response = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
                 client
@@ -1877,11 +1855,23 @@ mod tests {
             assert_eq!(response, bytes::Bytes::from_static(b"alive"));
             // Cleanup handlers stay idempotent once the manager is gone: an
             // absent manager holds no anchor, so a peer's cleanup has succeeded.
+            // That includes the rollback of a failed connect.
             let handle = anchor.handle();
             let cleanups = [
                 ("_anchor_detach", serde_json::json!({ "handle": handle })),
                 ("_anchor_finalize", serde_json::json!({ "handle": handle })),
                 ("_anchor_cancel", serde_json::json!({ "handle": handle })),
+                (
+                    "_anchor_abort_attach",
+                    serde_json::to_value(crate::streaming::control::AnchorAbortAttachRequest {
+                        handle,
+                        stream_cancel_handle: crate::streaming::control::StreamCancelHandle::pack(
+                            client.instance_id().worker_id(),
+                            1,
+                        ),
+                    })
+                    .unwrap(),
+                ),
                 (
                     "_mpsc_anchor_detach",
                     serde_json::json!({ "handle": handle, "sender_id": 1 }),

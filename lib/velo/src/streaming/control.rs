@@ -755,6 +755,10 @@ pub(crate) struct AnchorAbortAttachRequest {
     pub stream_cancel_handle: StreamCancelHandle,
 }
 
+/// Build the `_anchor_abort_attach` handler.
+///
+/// Idempotent: if the anchor, or its manager, is gone, or another sender now
+/// holds the attachment, returns `Ok(())`.
 pub(crate) fn anchor_abort_attach_handler(
     manager: Weak<AnchorManager>,
 ) -> crate::messenger::Handler {
@@ -763,9 +767,10 @@ pub(crate) fn anchor_abort_attach_handler(
         move |ctx: crate::messenger::TypedContext<AnchorAbortAttachRequest>| {
             let manager = manager.clone();
             async move {
-                let manager = manager
-                    .upgrade()
-                    .ok_or_else(|| anyhow::anyhow!("anchor manager shut down"))?;
+                // A manager that is gone holds no anchor: cleanup has succeeded.
+                let Some(manager) = manager.upgrade() else {
+                    return Ok(());
+                };
                 let req = ctx.input;
                 let (worker, local_id) = req.handle.unpack();
                 if worker != ctx.msg.instance_id().worker_id() || req.handle.is_mpsc_stream() {
