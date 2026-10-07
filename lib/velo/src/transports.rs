@@ -137,6 +137,7 @@ pub struct VeloBackend {
     workers: DashMap<WorkerId, InstanceId>,
     shutdown_state: ShutdownState,
     teardown: OnceLock<teardown::Completion>,
+    teardown_outcome: teardown::Outcome,
     runtime: tokio::runtime::Handle,
     observability: Option<Arc<VeloMetrics>>,
 }
@@ -281,6 +282,7 @@ impl VeloBackend {
                 workers: DashMap::new(),
                 shutdown_state,
                 teardown: OnceLock::new(),
+                teardown_outcome: Default::default(),
                 runtime,
                 observability,
             },
@@ -737,15 +739,12 @@ impl VeloBackend {
     /// The error of a teardown that has already run and failed. Teardown runs
     /// once, so the failure is final.
     ///
-    /// Polls a clone once rather than `Shared::peek`, which sees only a result
-    /// some waiter already took: a first attempt cut off by a timeout leaves
-    /// none.
+    /// Reads the result the teardown wrote, not the completion: `Shared::peek`
+    /// sees only a result some waiter already took, and polling a clone can
+    /// say "not yet" for a finished teardown when the task has spent its
+    /// cooperative budget. Either way a retry would drain again.
     pub(crate) fn teardown_failure(&self) -> Option<Arc<str>> {
-        use futures::FutureExt;
-        self.teardown
-            .get()
-            .and_then(|completion| completion.clone().now_or_never())
-            .and_then(Result::err)
+        self.teardown_outcome.get()?.clone().err()
     }
 
     /// Whether this backend has started its own teardown. Not the shared
@@ -762,6 +761,7 @@ impl VeloBackend {
                     self.shutdown_state.clone(),
                     self.transports.clone(),
                     self.runtime.clone(),
+                    Arc::clone(&self.teardown_outcome),
                 )
             })
             .clone()

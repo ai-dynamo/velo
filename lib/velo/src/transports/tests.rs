@@ -865,6 +865,47 @@ fn final_drop_runs_hooks_outside_tokio_and_after_runtime_shutdown() {
     }
 }
 
+/// A finished teardown failure must be visible however the task that asks is
+/// doing. Reading it by polling the completion asked Tokio's cooperative
+/// budget for permission, so a task that had spent its budget saw no failure,
+/// and a retry drained again.
+#[tokio::test]
+async fn a_teardown_failure_is_seen_with_the_coop_budget_spent() {
+    use futures::FutureExt;
+    // Each ready oneshot poll spends one unit of the task's budget.
+    fn spend_coop_budget() {
+        for _ in 0..1024 {
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            let _ = tx.send(());
+            let _ = rx.now_or_never();
+        }
+    }
+    let mut transport = MockTransport::new("mock", true);
+    Arc::get_mut(&mut transport).unwrap().shutdown_panics = true;
+    let messenger = crate::Messenger::builder()
+        .add_transport(transport.clone())
+        .build()
+        .await
+        .unwrap();
+    let backend = Arc::clone(messenger.backend());
+    // Started with no waiter, so nothing else ever polls the completion.
+    backend.shutdown_now();
+    let seen = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            spend_coop_budget();
+            if backend.teardown_failure().is_some() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+    assert!(
+        seen.is_ok(),
+        "a finished teardown failure was hidden from a task that spent its budget"
+    );
+}
+
 #[tokio::test]
 async fn failed_teardown_never_reports_successful_shutdown() {
     use futures::FutureExt;
