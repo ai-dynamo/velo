@@ -1962,6 +1962,17 @@ mod tests {
         })
         .await
         .expect("final Velo drop retained its Messenger");
+        // The Weak clears when the count reaches zero, just before
+        // `Messenger::drop` runs on the dropping thread, so wait for the
+        // request rather than read it once. Checked before `request_teardown`
+        // below, which would start teardown itself.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !backend.teardown_requested() {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("final Messenger drop did not start teardown");
         backend.request_teardown().await.unwrap();
     }
 
