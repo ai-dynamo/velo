@@ -866,7 +866,8 @@ async fn fallback_chunked(
     // The owner's lease is tied to a transfer that will never happen. Detach it
     // before asking for another, or the slot carries two read locks and the
     // first is released only when its deadline passes.
-    if let Err(e) = detach(&manager.client()?, handle, lease_id).await {
+    let send = Consumer::detach_request(manager.messenger()?.client(), handle, lease_id)?;
+    if let Err(e) = send.send().await {
         tracing::warn!(%handle, error = %e, "rendezvous: could not detach before falling back");
     }
     chunked_only(manager, handle).await
@@ -888,7 +889,8 @@ async fn unsolicited_rdma(
         "rendezvous: owner answered with an RDMA descriptor for an acquire that offered \
          nothing; falling back to the chunked path"
     );
-    if let Err(e) = detach(&manager.client()?, handle, lease_id).await {
+    let send = Consumer::detach_request(manager.messenger()?.client(), handle, lease_id)?;
+    if let Err(e) = send.send().await {
         tracing::warn!(%handle, error = %e, "rendezvous: could not detach before falling back");
     }
     chunked_only(manager, handle).await

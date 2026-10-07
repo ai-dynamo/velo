@@ -735,9 +735,9 @@ impl RendezvousManager {
                 .metadata(local_id)
                 .ok_or_else(|| anyhow::anyhow!("rendezvous handle not found: {handle}"))
         } else {
-            consumer::Consumer::metadata_request(&self.client()?, handle)?
-                .send()
-                .await
+            // Built in its own statement so the Messenger is dropped before the wait.
+            let send = consumer::Consumer::metadata_request(self.messenger()?.client(), handle)?;
+            send.send().await
         };
         if let Some(m) = &self.metrics {
             let outcome = if result.is_ok() {
@@ -977,10 +977,9 @@ impl RendezvousManager {
             }
             Ok(())
         } else {
-            consumer::Consumer::ref_request(&self.client()?, handle)?
-                .send()
-                .await
-                .map(drop)
+            // Built in its own statement so the Messenger is dropped before the wait.
+            let send = consumer::Consumer::ref_request(self.messenger()?.client(), handle)?;
+            send.send().await.map(drop)
         };
         if let Some(m) = &self.metrics {
             let outcome = if result.is_ok() {
@@ -1012,9 +1011,10 @@ impl RendezvousManager {
                 }
             }
         } else {
-            consumer::Consumer::detach_request(&self.client()?, handle, lease_id)?
-                .send()
-                .await
+            // Built in its own statement so the Messenger is dropped before the wait.
+            let send =
+                consumer::Consumer::detach_request(self.messenger()?.client(), handle, lease_id)?;
+            send.send().await
         };
         if let Some(m) = &self.metrics {
             let outcome = if result.is_ok() {
@@ -1050,9 +1050,10 @@ impl RendezvousManager {
                 }
             }
         } else {
-            consumer::Consumer::release_request(&self.client()?, handle, lease_id)?
-                .send()
-                .await
+            // Built in its own statement so the Messenger is dropped before the wait.
+            let send =
+                consumer::Consumer::release_request(self.messenger()?.client(), handle, lease_id)?;
+            send.send().await
         };
         if let Some(m) = &self.metrics {
             let outcome = if result.is_ok() {
