@@ -2498,6 +2498,65 @@ mod tests {
         );
     }
 
+    /// No remote rendezvous call may hold the Messenger while it waits on the
+    /// owner. The large-payload resolver is an internal task that runs `get`
+    /// and then `release`, so an owner that stops answering would otherwise
+    /// keep the Messenger, and so its transport teardown, alive forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_rendezvous_call_does_not_hold_the_messenger() {
+        let (messenger, peer_instance) = stalled_messenger().await;
+        let rendezvous = Arc::new(RendezvousManager::new(messenger.instance_id().worker_id()));
+        rendezvous
+            .register_handlers(Arc::clone(&messenger))
+            .unwrap();
+        let weak = Arc::downgrade(&messenger);
+        let backend = Arc::clone(messenger.backend());
+        // The gate holds one frame: the first call is admitted and waits for
+        // an answer that never comes, the others wait on admission.
+        let handle = crate::rendezvous::DataHandle::pack(peer_instance.worker_id(), 1);
+        let calls: Vec<tokio::task::JoinHandle<()>> = vec![
+            tokio::spawn({
+                let rendezvous = Arc::clone(&rendezvous);
+                async move { drop(rendezvous.get(handle).await) }
+            }),
+            tokio::spawn({
+                let rendezvous = Arc::clone(&rendezvous);
+                async move { drop(rendezvous.metadata(handle).await) }
+            }),
+            tokio::spawn({
+                let rendezvous = Arc::clone(&rendezvous);
+                async move { drop(rendezvous.ref_handle(handle).await) }
+            }),
+            tokio::spawn({
+                let rendezvous = Arc::clone(&rendezvous);
+                async move { drop(rendezvous.detach(handle, 1).await) }
+            }),
+            tokio::spawn({
+                let rendezvous = Arc::clone(&rendezvous);
+                async move { drop(rendezvous.release(handle, 1).await) }
+            }),
+        ];
+        // Let every call reach its wait before the final drop.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(messenger);
+        let gone = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while weak.upgrade().is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let still_alive = weak.upgrade().is_some();
+        for call in calls {
+            call.abort();
+        }
+        backend.shutdown_now();
+        let _ = backend.request_teardown().await;
+        assert!(
+            gone.is_ok() && !still_alive,
+            "a rendezvous call waiting on a stalled owner kept the Messenger alive after its final drop"
+        );
+    }
+
     /// A best-effort `_stream_cancel` to a peer that never admits a frame
     /// must not keep the Messenger alive after its final drop.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

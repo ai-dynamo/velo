@@ -291,6 +291,13 @@ impl Messenger {
         self.events.event_manager()
     }
 
+    /// The client every request builder sends through. It owns the backend
+    /// but not the Messenger, so an internal task that must wait on a peer
+    /// holds this rather than the Messenger, whose final drop starts teardown.
+    pub(crate) fn client(&self) -> &Arc<ActiveMessageClient> {
+        &self.client
+    }
+
     /// Fire-and-forget builder (no response expected).
     pub fn am_send(
         &self,

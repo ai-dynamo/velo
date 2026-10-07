@@ -41,7 +41,9 @@
 
 use std::sync::Arc;
 
-use crate::messenger::Messenger;
+use crate::messenger::{
+    ActiveMessageClient, AmSendBuilder, Messenger, TypedUnaryBuilder, UnaryBuilder,
+};
 use anyhow::Result;
 use bytes::{Bytes, BytesMut};
 use velo_ext::WorkerId;
@@ -68,18 +70,23 @@ pub struct Consumer;
 impl Consumer {
     /// Query metadata about remote data (no read lock acquired).
     pub async fn metadata(messenger: &Arc<Messenger>, handle: DataHandle) -> Result<DataMetadata> {
-        let target_worker = handle.worker_id();
-
-        let meta: DataMetadata = messenger
-            .typed_unary_streaming::<DataMetadata>("_rv_metadata")
-            .payload(&RvMetadataRequest {
-                handle: RvHandleWire::from_handle(handle),
-            })?
-            .worker(target_worker)
+        Self::metadata_request(messenger.client(), handle)?
             .send()
-            .await?;
+            .await
+    }
 
-        Ok(meta)
+    /// The metadata query, built without sending it.
+    pub(crate) fn metadata_request(
+        client: &Arc<ActiveMessageClient>,
+        handle: DataHandle,
+    ) -> Result<TypedUnaryBuilder<DataMetadata>> {
+        Ok(
+            TypedUnaryBuilder::new_unchecked(Arc::clone(client), "_rv_metadata")
+                .payload(&RvMetadataRequest {
+                    handle: RvHandleWire::from_handle(handle),
+                })?
+                .worker(handle.worker_id()),
+        )
     }
 
     /// Pull data from a remote handle into a new `Bytes`.
@@ -88,9 +95,9 @@ impl Consumer {
     /// offered, and returns owned bytes. The read lock remains held until
     /// `detach()` or `release()` is called.
     pub async fn get(manager: &RendezvousManager, handle: DataHandle) -> Result<(Bytes, u64)> {
-        let messenger = &manager.messenger()?;
+        let client = &manager.client()?;
         let target_worker = handle.worker_id();
-        let response = acquire(manager, handle, rdma_offer(manager, target_worker)).await?;
+        let response = acquire(client, handle, rdma_offer(manager, target_worker)).await?;
 
         match response {
             AcquireResponse::Ready {
@@ -101,7 +108,7 @@ impl Consumer {
                 chunk_count,
             } => {
                 match pull_chunks(
-                    messenger,
+                    client,
                     target_worker,
                     transfer_id,
                     total_len,
@@ -113,9 +120,7 @@ impl Consumer {
                     Ok(data) => Ok((data.freeze(), lease_id)),
                     Err(e) => {
                         // Best-effort cleanup: release read lock to prevent owner-side leak
-                        if let Err(cleanup_err) =
-                            Consumer::detach(messenger, handle, lease_id).await
-                        {
+                        if let Err(cleanup_err) = detach(client, handle, lease_id).await {
                             tracing::warn!(
                                 "Failed to detach lease {lease_id} after pull failure: {cleanup_err}"
                             );
@@ -160,9 +165,9 @@ impl Consumer {
         manager: &RendezvousManager,
         handle: DataHandle,
     ) -> Result<(crate::rendezvous::rdma::PinnedBuf, u64)> {
-        let messenger = &manager.messenger()?;
+        let client = &manager.client()?;
         let target_worker = handle.worker_id();
-        let response = acquire(manager, handle, rdma_offer(manager, target_worker)).await?;
+        let response = acquire(client, handle, rdma_offer(manager, target_worker)).await?;
 
         match response {
             AcquireResponse::Rdma {
@@ -194,7 +199,7 @@ impl Consumer {
                 chunk_count,
             } => {
                 match pull_chunks(
-                    messenger,
+                    client,
                     target_worker,
                     transfer_id,
                     total_len,
@@ -209,9 +214,7 @@ impl Consumer {
                         Ok((buf, lease.disarm()))
                     }
                     Err(e) => {
-                        if let Err(cleanup_err) =
-                            Consumer::detach(messenger, handle, lease_id).await
-                        {
+                        if let Err(cleanup_err) = detach(client, handle, lease_id).await {
                             tracing::warn!(
                                 "Failed to detach lease {lease_id} after pull failure: {cleanup_err}"
                             );
@@ -232,9 +235,9 @@ impl Consumer {
         handle: DataHandle,
         dest: &mut impl RendezvousWrite,
     ) -> Result<u64> {
-        let messenger = &manager.messenger()?;
+        let client = &manager.client()?;
         let target_worker = handle.worker_id();
-        let response = acquire(manager, handle, rdma_offer(manager, target_worker)).await?;
+        let response = acquire(client, handle, rdma_offer(manager, target_worker)).await?;
 
         match response {
             AcquireResponse::Ready {
@@ -245,7 +248,7 @@ impl Consumer {
                 chunk_count,
             } => {
                 match pull_chunks_into(
-                    messenger,
+                    client,
                     target_worker,
                     transfer_id,
                     total_len,
@@ -258,9 +261,7 @@ impl Consumer {
                     Ok(()) => Ok(lease_id),
                     Err(e) => {
                         // Best-effort cleanup: release read lock to prevent owner-side leak
-                        if let Err(cleanup_err) =
-                            Consumer::detach(messenger, handle, lease_id).await
-                        {
+                        if let Err(cleanup_err) = detach(client, handle, lease_id).await {
                             tracing::warn!(
                                 "Failed to detach lease {lease_id} after pull failure: {cleanup_err}"
                             );
@@ -315,18 +316,22 @@ impl Consumer {
     /// so callers can safely read metadata or pass the handle to another
     /// consumer immediately after this returns.
     pub async fn ref_handle(messenger: &Arc<Messenger>, handle: DataHandle) -> Result<()> {
-        let target_worker = handle.worker_id();
+        Self::ref_request(messenger.client(), handle)?
+            .send()
+            .await?;
+        Ok(())
+    }
 
-        messenger
-            .unary_streaming("_rv_ref")
+    /// The refcount increment, built without sending it.
+    pub(crate) fn ref_request(
+        client: &Arc<ActiveMessageClient>,
+        handle: DataHandle,
+    ) -> Result<UnaryBuilder> {
+        Ok(UnaryBuilder::new_unchecked(Arc::clone(client), "_rv_ref")
             .raw_payload(Bytes::from(serde_json::to_vec(&RvRefRequest {
                 handle: RvHandleWire::from_handle(handle),
             })?))
-            .worker(target_worker)
-            .send()
-            .await?;
-
-        Ok(())
+            .worker(handle.worker_id()))
     }
 
     /// Release the read lock without decrementing refcount (can get again).
@@ -335,27 +340,25 @@ impl Consumer {
         handle: DataHandle,
         lease_id: u64,
     ) -> Result<()> {
-        Self::detach_request(messenger, handle, lease_id)?
-            .send()
-            .await?;
-        Ok(())
+        detach(messenger.client(), handle, lease_id).await
     }
 
     /// The detach message, built without sending it. The send holds only the
     /// messenger's client, so a task that awaits it does not keep the
     /// Messenger alive.
     pub(crate) fn detach_request(
-        messenger: &Messenger,
+        client: &Arc<ActiveMessageClient>,
         handle: DataHandle,
         lease_id: u64,
-    ) -> Result<crate::messenger::AmSendBuilder> {
-        Ok(messenger
-            .am_send_streaming("_rv_detach")?
-            .raw_payload(Bytes::from(serde_json::to_vec(&RvDetachRequest {
-                handle: RvHandleWire::from_handle(handle),
-                lease_id,
-            })?))
-            .worker(handle.worker_id()))
+    ) -> Result<AmSendBuilder> {
+        Ok(
+            AmSendBuilder::new_unchecked(Arc::clone(client), "_rv_detach")
+                .raw_payload(Bytes::from(serde_json::to_vec(&RvDetachRequest {
+                    handle: RvHandleWire::from_handle(handle),
+                    lease_id,
+                })?))
+                .worker(handle.worker_id()),
+        )
     }
 
     /// Release the read lock AND decrement refcount. Frees data when both hit 0.
@@ -364,38 +367,54 @@ impl Consumer {
         handle: DataHandle,
         lease_id: u64,
     ) -> Result<()> {
-        let target_worker = handle.worker_id();
-
-        messenger
-            .am_send_streaming("_rv_release")?
-            .raw_payload(Bytes::from(serde_json::to_vec(&RvReleaseRequest {
-                handle: RvHandleWire::from_handle(handle),
-                lease_id,
-            })?))
-            .worker(target_worker)
+        Self::release_request(messenger.client(), handle, lease_id)?
             .send()
-            .await?;
-
-        Ok(())
+            .await
     }
+
+    /// The release message, built without sending it.
+    pub(crate) fn release_request(
+        client: &Arc<ActiveMessageClient>,
+        handle: DataHandle,
+        lease_id: u64,
+    ) -> Result<AmSendBuilder> {
+        Ok(
+            AmSendBuilder::new_unchecked(Arc::clone(client), "_rv_release")
+                .raw_payload(Bytes::from(serde_json::to_vec(&RvReleaseRequest {
+                    handle: RvHandleWire::from_handle(handle),
+                    lease_id,
+                })?))
+                .worker(handle.worker_id()),
+        )
+    }
+}
+
+/// Detach a lease through the client alone.
+async fn detach(
+    client: &Arc<ActiveMessageClient>,
+    handle: DataHandle,
+    lease_id: u64,
+) -> Result<()> {
+    Consumer::detach_request(client, handle, lease_id)?
+        .send()
+        .await
 }
 
 /// Send one `_rv_acquire`, carrying `offer` if there is one.
 async fn acquire(
-    manager: &RendezvousManager,
+    client: &Arc<ActiveMessageClient>,
     handle: DataHandle,
     offer: Option<RdmaOffer>,
 ) -> Result<AcquireResponse> {
-    let response: AcquireResponse = manager
-        .messenger()?
-        .typed_unary_streaming::<AcquireResponse>("_rv_acquire")
-        .payload(&RvAcquireRequest {
-            handle: RvHandleWire::from_handle(handle),
-            rdma: offer,
-        })?
-        .worker(handle.worker_id())
-        .send()
-        .await?;
+    let response: AcquireResponse =
+        TypedUnaryBuilder::<AcquireResponse>::new_unchecked(Arc::clone(client), "_rv_acquire")
+            .payload(&RvAcquireRequest {
+                handle: RvHandleWire::from_handle(handle),
+                rdma: offer,
+            })?
+            .worker(handle.worker_id())
+            .send()
+            .await?;
     Ok(response)
 }
 
@@ -810,9 +829,7 @@ async fn send_lease_renewal(manager: &RendezvousManager, handle: DataHandle, lea
         }
     };
     let sent = async {
-        manager
-            .messenger()?
-            .am_send_streaming("_rv_lease_renew")?
+        AmSendBuilder::new_unchecked(manager.client()?, "_rv_lease_renew")
             .raw_payload(Bytes::from(payload))
             .worker(handle.worker_id())
             .send()
@@ -849,7 +866,7 @@ async fn fallback_chunked(
     // The owner's lease is tied to a transfer that will never happen. Detach it
     // before asking for another, or the slot carries two read locks and the
     // first is released only when its deadline passes.
-    if let Err(e) = Consumer::detach(&manager.messenger()?, handle, lease_id).await {
+    if let Err(e) = detach(&manager.client()?, handle, lease_id).await {
         tracing::warn!(%handle, error = %e, "rendezvous: could not detach before falling back");
     }
     chunked_only(manager, handle).await
@@ -871,7 +888,7 @@ async fn unsolicited_rdma(
         "rendezvous: owner answered with an RDMA descriptor for an acquire that offered \
          nothing; falling back to the chunked path"
     );
-    if let Err(e) = Consumer::detach(&manager.messenger()?, handle, lease_id).await {
+    if let Err(e) = detach(&manager.client()?, handle, lease_id).await {
         tracing::warn!(%handle, error = %e, "rendezvous: could not detach before falling back");
     }
     chunked_only(manager, handle).await
@@ -884,9 +901,9 @@ async fn unsolicited_rdma(
 /// than recursing — a retry loop here would turn one such owner into an
 /// unbounded storm of round trips.
 async fn chunked_only(manager: &RendezvousManager, handle: DataHandle) -> Result<(Bytes, u64)> {
-    let messenger = &manager.messenger()?;
+    let client = &manager.client()?;
     let target_worker = handle.worker_id();
-    match acquire(manager, handle, None).await? {
+    match acquire(client, handle, None).await? {
         AcquireResponse::Ready {
             lease_id,
             transfer_id,
@@ -895,7 +912,7 @@ async fn chunked_only(manager: &RendezvousManager, handle: DataHandle) -> Result
             chunk_count,
         } => {
             match pull_chunks(
-                messenger,
+                client,
                 target_worker,
                 transfer_id,
                 total_len,
@@ -906,7 +923,7 @@ async fn chunked_only(manager: &RendezvousManager, handle: DataHandle) -> Result
             {
                 Ok(data) => Ok((data.freeze(), lease_id)),
                 Err(e) => {
-                    if let Err(cleanup_err) = Consumer::detach(messenger, handle, lease_id).await {
+                    if let Err(cleanup_err) = detach(client, handle, lease_id).await {
                         tracing::warn!(
                             "Failed to detach lease {lease_id} after pull failure: {cleanup_err}"
                         );
@@ -916,7 +933,7 @@ async fn chunked_only(manager: &RendezvousManager, handle: DataHandle) -> Result
             }
         }
         AcquireResponse::Rdma { lease_id, .. } => {
-            if let Err(e) = Consumer::detach(messenger, handle, lease_id).await {
+            if let Err(e) = detach(client, handle, lease_id).await {
                 tracing::warn!(
                     %handle,
                     error = %e,
@@ -949,7 +966,7 @@ async fn copy_into_pool(
 
 /// Pull all chunks for a chunked transfer into a `BytesMut` buffer.
 async fn pull_chunks(
-    messenger: &Arc<Messenger>,
+    client: &Arc<ActiveMessageClient>,
     target_worker: WorkerId,
     transfer_id: u64,
     total_len: u64,
@@ -967,8 +984,7 @@ async fn pull_chunks(
         };
         let payload = serde_json::to_vec(&req)?;
 
-        let chunk_bytes: Bytes = messenger
-            .unary_streaming("_rv_pull")
+        let chunk_bytes: Bytes = UnaryBuilder::new_unchecked(Arc::clone(client), "_rv_pull")
             .raw_payload(Bytes::from(payload))
             .worker(target_worker)
             .send()
@@ -984,7 +1000,7 @@ async fn pull_chunks(
 
 /// Pull all chunks for a chunked transfer into an explicit destination.
 async fn pull_chunks_into(
-    messenger: &Arc<Messenger>,
+    client: &Arc<ActiveMessageClient>,
     target_worker: WorkerId,
     transfer_id: u64,
     _total_len: u64,
@@ -999,8 +1015,7 @@ async fn pull_chunks_into(
         };
         let payload = serde_json::to_vec(&req)?;
 
-        let chunk_bytes: Bytes = messenger
-            .unary_streaming("_rv_pull")
+        let chunk_bytes: Bytes = UnaryBuilder::new_unchecked(Arc::clone(client), "_rv_pull")
             .raw_payload(Bytes::from(payload))
             .worker(target_worker)
             .send()

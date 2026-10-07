@@ -315,6 +315,15 @@ impl RendezvousManager {
             .ok_or_else(|| anyhow::anyhow!("Rendezvous messenger is unavailable"))
     }
 
+    /// The messenger's client, for a remote operation that waits on the
+    /// owner. The Messenger itself is dropped before any wait: the resolver
+    /// for large payloads runs these calls on an internal task, and holding
+    /// the Messenger there would keep its final drop, and so its transport
+    /// teardown, from ever running while an owner stays silent.
+    fn client(&self) -> Result<Arc<crate::messenger::ActiveMessageClient>> {
+        Ok(Arc::clone(self.messenger()?.client()))
+    }
+
     // -----------------------------------------------------------------------
     // Owner-side API
     // -----------------------------------------------------------------------
@@ -726,7 +735,9 @@ impl RendezvousManager {
                 .metadata(local_id)
                 .ok_or_else(|| anyhow::anyhow!("rendezvous handle not found: {handle}"))
         } else {
-            consumer::Consumer::metadata(&self.messenger()?, handle).await
+            consumer::Consumer::metadata_request(&self.client()?, handle)?
+                .send()
+                .await
         };
         if let Some(m) = &self.metrics {
             let outcome = if result.is_ok() {
@@ -966,7 +977,10 @@ impl RendezvousManager {
             }
             Ok(())
         } else {
-            consumer::Consumer::ref_handle(&self.messenger()?, handle).await
+            consumer::Consumer::ref_request(&self.client()?, handle)?
+                .send()
+                .await
+                .map(drop)
         };
         if let Some(m) = &self.metrics {
             let outcome = if result.is_ok() {
@@ -998,7 +1012,9 @@ impl RendezvousManager {
                 }
             }
         } else {
-            consumer::Consumer::detach(&self.messenger()?, handle, lease_id).await
+            consumer::Consumer::detach_request(&self.client()?, handle, lease_id)?
+                .send()
+                .await
         };
         if let Some(m) = &self.metrics {
             let outcome = if result.is_ok() {
@@ -1034,7 +1050,9 @@ impl RendezvousManager {
                 }
             }
         } else {
-            consumer::Consumer::release(&self.messenger()?, handle, lease_id).await
+            consumer::Consumer::release_request(&self.client()?, handle, lease_id)?
+                .send()
+                .await
         };
         if let Some(m) = &self.metrics {
             let outcome = if result.is_ok() {
@@ -1066,16 +1084,19 @@ impl RendezvousManager {
     pub(crate) fn lease_guard(&self, handle: DataHandle, lease_id: u64) -> LeaseGuard {
         let local = handle.worker_id() == self.worker_id;
         let link = self.messenger_lock.get();
-        // A local lease never needs the messenger; only a remote one upgrades.
-        let messenger = link
+        // A local lease never needs the messenger; only a remote one upgrades,
+        // and keeps the client alone: the guard can stay armed across a wait
+        // on a silent owner, and the Messenger must be free to drop meanwhile.
+        let client = link
             .filter(|_| !local)
-            .and_then(|link| link.messenger.upgrade());
+            .and_then(|link| link.messenger.upgrade())
+            .map(|messenger| Arc::clone(messenger.client()));
         let runtime = link
             .map(|link| link.runtime.clone())
             .unwrap_or_else(tokio::runtime::Handle::current);
         LeaseGuard {
             store: Arc::clone(&self.store),
-            messenger,
+            client,
             runtime,
             handle,
             lease_id,
@@ -1185,7 +1206,7 @@ pub(crate) struct LeaseGuard {
     store: Arc<store::DataStore>,
     /// `None` for a lease on this instance's own store, which is released
     /// without touching the network.
-    messenger: Option<Arc<crate::messenger::Messenger>>,
+    client: Option<Arc<crate::messenger::ActiveMessageClient>>,
     runtime: tokio::runtime::Handle,
     handle: DataHandle,
     lease_id: u64,
@@ -1209,7 +1230,7 @@ impl Drop for LeaseGuard {
         let lease_id = self.lease_id;
         let handle = self.handle;
 
-        let Some(messenger) = self.messenger.take() else {
+        let Some(client) = self.client.take() else {
             // Local: the store is right here.
             if self.store.consume_lease(lease_id, local_id) == store::LeaseOutcome::Consumed {
                 self.store.release_read_lock(local_id);
@@ -1223,13 +1244,11 @@ impl Drop for LeaseGuard {
             lease = lease_id,
             "rendezvous: releasing a lease whose get did not complete"
         );
-        // Built here and the Messenger dropped: the detach can wait on
-        // admission to an owner that stopped answering, the likely reason this
-        // guard is armed, and a task holding the Messenger there would keep its
-        // final drop, and so its transport teardown, from ever happening.
-        let send = consumer::Consumer::detach_request(&messenger, handle, lease_id);
-        drop(messenger);
-        let send = match send {
+        // Built from the client alone: the detach can wait on admission to an
+        // owner that stopped answering, the likely reason this guard is armed,
+        // and a task holding the Messenger there would keep its final drop, and
+        // so its transport teardown, from ever happening.
+        let send = match consumer::Consumer::detach_request(&client, handle, lease_id) {
             Ok(send) => send,
             Err(e) => {
                 tracing::warn!(%handle, lease = lease_id, error = %e,
