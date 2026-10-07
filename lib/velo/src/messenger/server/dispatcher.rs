@@ -104,7 +104,7 @@ pub(crate) trait ActiveMessageDispatcher: Send + Sync {
 /// Catch both a panic in `handle()` and a panic while its future is polled.
 /// Keep the admission guard until the error reply reaches its transport queue.
 async fn run_handler<H: ActiveMessageHandler + 'static>(
-    handler: Arc<H>,
+    handler: &H,
     ctx: HandlerContext,
     failure: DispatchFailure,
 ) {
@@ -217,7 +217,9 @@ impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for SpawnedDispa
     fn dispatch(&self, call: InboundCall, system: &Arc<Messenger>) {
         let handler = self.handler.clone();
         let ctx = call.into_context(Arc::clone(system));
-        tokio::spawn(run_handler(handler, ctx, DispatchFailure::HandlerPanic));
+        tokio::spawn(async move {
+            run_handler(&*handler, ctx, DispatchFailure::HandlerPanic).await;
+        });
     }
 }
 
@@ -263,6 +265,14 @@ struct BoundRouter {
 /// `None` is the single lane used by [`OrderingKey::Global`]; `Some(worker)`
 /// is the per-sender lane used by [`OrderingKey::Sender`].
 type LaneKey = Option<WorkerId>;
+
+/// What every item on one ordered dispatcher's lanes shares.
+struct LaneShared<H> {
+    handler: Arc<H>,
+    limiter: Option<Arc<Semaphore>>,
+    metrics: Option<OrderedMetricsHandle>,
+    messenger: Weak<Messenger>,
+}
 
 /// A message queued on an ordering lane.
 struct LaneItem {
@@ -315,31 +325,32 @@ impl<H: ActiveMessageHandler + 'static> OrderedDispatcher<H> {
     }
 
     fn bind(&self, system: &Arc<Messenger>) -> BoundRouter {
-        let handler = self.handler.clone();
         let handler_name = self.handler.name();
-        let limiter = self.limiter.clone();
         let metrics = system
             .observability()
             .as_ref()
             .and_then(|m| m.bind_ordered_dispatcher(handler_name));
 
-        let consumer_metrics = metrics.clone();
-        let messenger = Arc::downgrade(system);
+        // One `Arc` for everything an item needs, so taking an item off a
+        // lane costs one reference count, not one per part.
+        let shared = Arc::new(LaneShared {
+            handler: Arc::clone(&self.handler),
+            limiter: self.limiter.clone(),
+            metrics: metrics.clone(),
+            messenger: Arc::downgrade(system),
+        });
         let consumer = Arc::new(move |item: LaneItem| {
-            let handler = handler.clone();
-            let limiter = limiter.clone();
-            let metrics = consumer_metrics.clone();
-            let messenger = messenger.clone();
+            let shared = Arc::clone(&shared);
 
             Box::pin(async move {
-                if let Some(metrics) = metrics.as_ref() {
+                if let Some(metrics) = shared.metrics.as_ref() {
                     metrics.observe_wait(item.enqueued_at.elapsed());
                 }
 
                 // Held for the duration of the handler. Tokio's semaphore is
                 // FIFO-fair, so a busy handler cannot starve any lane.
-                let _permit = match limiter.as_ref() {
-                    Some(sem) => sem.clone().acquire_owned().await.ok(),
+                let _permit = match shared.limiter.as_ref() {
+                    Some(sem) => sem.acquire().await.ok(),
                     None => None,
                 };
 
@@ -347,12 +358,12 @@ impl<H: ActiveMessageHandler + 'static> OrderedDispatcher<H> {
                 // the item waited would keep the Messenger alive behind a
                 // stalled reply. Gone means the instance is being torn down,
                 // and the item, with its drain guard, drops unhandled.
-                if let Some(system) = messenger.upgrade() {
+                if let Some(system) = shared.messenger.upgrade() {
                     let ctx = item.call.into_context(system);
-                    run_handler(handler, ctx, DispatchFailure::OrderedHandlerPanic).await;
+                    run_handler(&*shared.handler, ctx, DispatchFailure::OrderedHandlerPanic).await;
                 }
 
-                if let Some(metrics) = metrics.as_ref() {
+                if let Some(metrics) = shared.metrics.as_ref() {
                     metrics.dequeued();
                 }
             }) as BoxFuture<'static, ()>
@@ -765,11 +776,9 @@ mod tests {
             system: Arc::clone(&messenger),
             in_flight: None,
         };
-        let task = tokio::spawn(run_handler(
-            Arc::new(PendingHandler),
-            ctx,
-            DispatchFailure::HandlerPanic,
-        ));
+        let task = tokio::spawn(async move {
+            run_handler(&PendingHandler, ctx, DispatchFailure::HandlerPanic).await;
+        });
         drop(messenger);
         tokio::time::timeout(Duration::from_secs(2), async {
             while weak.upgrade().is_some() {
