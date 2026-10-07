@@ -189,19 +189,26 @@ async fn create_message_handler(
     let mut held = BurstRef::default();
 
     loop {
-        let inbound = match message_rx.try_recv() {
-            Ok(inbound) => inbound,
-            Err(flume::TryRecvError::Disconnected) => break,
-            Err(flume::TryRecvError::Empty) => {
-                held.release();
-                tokio::select! {
-                    biased;
-                    received = message_rx.recv_async() => match received {
-                        Ok(inbound) => inbound,
-                        Err(_) => break,
-                    },
-                    _ = teardown_fut.as_mut() => break,
+        let inbound = {
+            // One queue poll per message, as with a plain `recv_async`. The
+            // held reference is released inside that poll when it would park,
+            // so this task never parks holding the Messenger, and a busy queue
+            // pays no extra lock for a separate `try_recv` first.
+            let mut recv = std::pin::pin!(message_rx.recv_async());
+            let recv_or_release = std::future::poll_fn(|cx| {
+                let poll = recv.as_mut().poll(cx);
+                if poll.is_pending() {
+                    held.release();
                 }
+                poll
+            });
+            tokio::select! {
+                biased;
+                received = recv_or_release => match received {
+                    Ok(inbound) => inbound,
+                    Err(_) => break,
+                },
+                _ = teardown_fut.as_mut() => break,
             }
         };
 
@@ -525,7 +532,9 @@ async fn create_ack_and_event_handler(
 /// receive loop upgrades once per burst and clones per message, as a strong
 /// reference would. When the queue drains to one message per park, each park
 /// costs a drop, an upgrade, and a clone where a strong reference cost one
-/// clone; the park and wake cost far more.
+/// clone; the park and wake cost far more. The release rides on the queue
+/// poll that would park, so a message that is already queued costs no extra
+/// queue access.
 ///
 /// Two bounds keep the held reference from extending the value's life: the
 /// loop calls [`release`](Self::release) before it parks, and releases again
